@@ -11,7 +11,6 @@
 //! on demand from the connection's standing II delegation (see `identities`).
 
 mod auth;
-mod delegation;
 mod discover;
 mod identities;
 mod management;
@@ -671,49 +670,20 @@ fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<auth::AuthedSessio
 
 /// Log each inbound request: method, path, response status, and latency — gives
 /// visibility into what external MCP clients probe (discovery URLs, unknown
-/// paths) at `RUST_LOG=info`. The query string is never logged, keeping the
-/// OAuth `?code=` out of logs. The one exception is `/oauth/authorize`, where
-/// the query KEY names (never values) are logged as `authorize_query_keys` to
-/// diagnose connector-client compatibility (e.g. a missing required
-/// `redirect_uri`).
+/// paths) at `RUST_LOG=info`. The query string is never logged (keeping the
+/// device-flow `?user_code=` out of logs), and request bodies are never logged
+/// (the connect callback carries the connection-scoped `state`).
 async fn log_request(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    // For /oauth/authorize only, capture which query KEYS the client sent (names
-    // only, never values). `<none>` distinguishes an absent/empty query from a
-    // request that did carry params.
-    let authorize_keys = (path == "/oauth/authorize").then(|| {
-        let keys: Vec<&str> = req
-            .uri()
-            .query()
-            .map(|q| {
-                q.split('&')
-                    .filter_map(|kv| kv.split('=').next())
-                    .filter(|k| !k.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-        if keys.is_empty() {
-            "<none>".to_string()
-        } else {
-            keys.join(",")
-        }
-    });
     let started = std::time::Instant::now();
     let resp = next.run(req).await;
     let status = resp.status().as_u16();
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    // Attach `authorize_query_keys` only for /oauth/authorize, so it doesn't add
-    // an empty field to every other log line.
-    match authorize_keys {
-        Some(keys) => {
-            tracing::info!(%method, %path, status, elapsed_ms, authorize_query_keys = %keys, "http request")
-        }
-        None => tracing::info!(%method, %path, status, elapsed_ms, "http request"),
-    }
+    tracing::info!(%method, %path, status, elapsed_ms, "http request");
     resp
 }
 
@@ -1013,7 +983,8 @@ async fn main() -> anyhow::Result<()> {
             "/.well-known/oauth-protected-resource/mcp",
             axum::routing::get(auth::protected_resource_metadata),
         )
-        .route("/oauth/authorize", axum::routing::get(auth::authorize))
+        .route("/oauth/device_authorization", axum::routing::post(auth::device_authorization))
+        .route("/oauth/device", axum::routing::get(auth::device_verify))
         .route("/oauth/connect/callback", axum::routing::post(auth::connect_callback))
         .route("/oauth/token", axum::routing::post(auth::token))
         .route("/oauth/register", axum::routing::post(auth::register))

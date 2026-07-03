@@ -1,14 +1,24 @@
 //! OAuth 2.1 authorization server for the MCP endpoint, with **Internet Identity**
-//! as the login mechanism. Connecting runs II's `/mcp` delegation flow: the
-//! authorize endpoint sends the browser to II with this connection's backend
-//! **public** key, and II form-POSTs back a delegation chain `anchor -> backend
-//! key` (the 60-minute standing credential). The server verifies the chain (see
-//! [`crate::delegation`]) — the chain itself is the proof of identity — stores
-//! it, and mints a principal-bound authorization code. No private key is ever
-//! transmitted.
+//! as the login mechanism, using II's session-key registration handshake.
 //!
-//! Implemented: dynamic client registration, PKCE (S256, enforced), short-lived
-//! codes, 1h access tokens, verified principal binding.
+//! II's new `/mcp` handshake has NO redirect back to this server — the II tab
+//! runs two background `fetch()` POSTs to our callback and then "finishes on its
+//! own" (see `docs/mcp-server-guide.md` / dfinity/internet-identity#4086). A
+//! classic auth-code `redirect_uri` therefore can't be delivered. We model the
+//! MCP client's login as the **OAuth 2.0 Device Authorization Grant (RFC 8628)**:
+//! the client asks `/oauth/device_authorization` for a `device_code` + a
+//! `verification_uri`, the user opens that URI (which launches II's `/mcp`
+//! handshake), and the client polls `/oauth/token` until the grant is live.
+//!
+//! Connect handshake (Phase 1b): our `/oauth/connect/callback` serves the two
+//! cross-origin JSON POSTs II makes — a key request `{state}` → `{public_key}`
+//! (a fresh session keypair minted per connection) and a completion notification
+//! `{state, expiration}` → mark the grant live. We never receive or verify a
+//! delegation chain, and never call `mcp_register` (II's frontend does, under the
+//! user's own authentication).
+//!
+//! Implemented: dynamic client registration, PKCE (S256) bound to the poll,
+//! short-lived device codes, 1h access tokens, session-key-bound principal.
 
 use std::{
     collections::HashMap,
@@ -33,27 +43,36 @@ use uuid::Uuid;
 
 use crate::identities::Identities;
 
-const CODE_TTL: Duration = Duration::from_secs(120);
-/// How long a started connect (pending II `/mcp` round-trip) stays valid.
-const CONNECT_TTL: Duration = Duration::from_secs(600);
+/// How long a device-authorization request (and its pending II handshake) stays
+/// valid before the user must restart.
+const DEVICE_CODE_TTL: Duration = Duration::from_secs(600);
+/// Minimum seconds a client should wait between token polls (RFC 8628 `interval`).
+const POLL_INTERVAL_SECS: u64 = 5;
+/// Access-token lifetime (also the II grant's default, 1h).
 const TOKEN_TTL: Duration = Duration::from_secs(3600);
+/// `ttl` (seconds) requested for the II grant. Omitting would default to 3600;
+/// we send it explicitly. Clamped by II to [600, 2592000].
+const GRANT_TTL_SECS: u64 = 3600;
+
+/// RFC 8628 device-code grant type.
+const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 /// Public base URL clients use to reach this server. Override with PUBLIC_URL.
 pub fn base_url() -> String {
     std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
 }
 
-/// A registered OAuth client (RFC 7591): the redirect URIs it declared. The
-/// authorize flow only redirects a code to one of these (exact match), so the
-/// server is not an open redirector and needs no hardcoded host allowlist.
+/// A registered OAuth client (RFC 7591). Redirect URIs are recorded for
+/// completeness but unused: the device grant has no redirect.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ClientReg {
+    #[serde(default)]
     redirect_uris: Vec<String>,
 }
 
 /// File the dynamic client registrations are persisted to. RFC 7591 clients are
 /// long-lived (they cache their `client_id`), so registrations must survive a
-/// restart — unlike codes/tokens/sessions, which are short-lived and stay in
+/// restart — unlike device codes/tokens, which are short-lived and stay in
 /// memory. Override with `OAUTH_CLIENTS_FILE`.
 fn clients_file() -> String {
     std::env::var("OAUTH_CLIENTS_FILE").unwrap_or_else(|_| "oauth-clients.json".to_string())
@@ -65,10 +84,6 @@ fn load_clients() -> HashMap<String, ClientReg> {
             tracing::warn!("could not parse {}: {e}; starting with no clients", clients_file());
             HashMap::new()
         }),
-        // No file yet (first run) is normal and silent; a real read error
-        // (permissions, EIO) is logged loudly — it silently drops previously
-        // issued client_ids, so it must be diagnosable — but we still start
-        // (clients can re-register) rather than refuse to boot.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
         Err(e) => {
             tracing::warn!("could not read {}: {e}; starting with no clients", clients_file());
@@ -91,54 +106,38 @@ fn persist_clients(clients: &HashMap<String, ClientReg>) {
     }
 }
 
-/// Acceptance rule for a redirect: loopback (any port, RFC 8252 §7.3) or a URI
-/// the client registered (exact match, OAuth 2.1).
-fn redirect_allowed(reg: Option<&ClientReg>, redirect_uri: &str) -> bool {
-    is_loopback_redirect(redirect_uri)
-        || reg.is_some_and(|c| c.redirect_uris.iter().any(|u| u == redirect_uri))
-}
-
 #[derive(Clone)]
 pub struct AuthStore {
     clients: Arc<RwLock<HashMap<String, ClientReg>>>,
-    codes: Arc<RwLock<HashMap<String, CodeGrant>>>,
     tokens: Arc<RwLock<HashMap<String, TokenInfo>>>,
-    /// Pending connects keyed by the single-use `state` carried through II's
-    /// `/mcp` flow (set at authorize, consumed at the callback).
-    connects: Arc<RwLock<HashMap<String, PendingConnect>>>,
-    /// Shared with the MCP tools: the connect callback stores the standing
-    /// credential here, keyed by `session_id`, for the tools to sign with.
+    /// Device-authorization grants in flight, keyed by `session_id` (which is
+    /// also the II connect `state`). Holds the `device_code`/`user_code` used by
+    /// the token poll and verification page.
+    devices: Arc<RwLock<HashMap<String, DeviceAuth>>>,
+    /// Shared with the MCP tools: the session's backend key / grant expiration
+    /// live here (keyed by `session_id`) for the tools to sign with.
     identities: Identities,
 }
 
+/// A device-authorization grant awaiting the user's II handshake.
 #[derive(Clone, Debug)]
-struct CodeGrant {
-    client_id: String,
-    scope: Option<String>,
-    /// Verified Internet Identity principal.
-    principal: String,
-    /// Session id minted at authorize and carried to the issued token. It keys
-    /// the connection's per-session backend key, standing II credential, and
-    /// on-demand per-app account delegations (see `crate::identities`).
+struct DeviceAuth {
+    device_code: String,
+    user_code: String,
+    /// The connection's session id; also the II connect `state`.
     session_id: String,
+    #[allow(dead_code)]
+    client_id: Option<String>,
+    scope: Option<String>,
+    /// PKCE challenge (S256), if the client supplied one; verified at token time.
     code_challenge: Option<String>,
     created: Instant,
-}
-
-/// A connect started at `/oauth/authorize`, awaiting the delegation II will
-/// form-POST back to `/oauth/connect/callback`.
-#[derive(Clone, Debug)]
-struct PendingConnect {
-    client_id: String,
-    redirect_uri: String,
-    scope: Option<String>,
-    /// The OAuth client's own `state`, echoed back on the final redirect.
-    client_state: String,
-    code_challenge: Option<String>,
-    /// The connection's session id (its backend key already exists in
-    /// `identities`); the standing credential lands here.
-    session_id: String,
-    created: Instant,
+    /// Verification page visited and II launched.
+    launched: bool,
+    /// Grant confirmed live (completion POST or a signed-call fallback).
+    live: bool,
+    /// Last token poll, for RFC 8628 `slow_down` enforcement.
+    last_poll: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -146,167 +145,203 @@ struct TokenInfo {
     principal: String,
     session_id: String,
     created: Instant,
+    ttl: Duration,
 }
 
 impl AuthStore {
     pub fn new(identities: Identities) -> Self {
         Self {
             clients: Arc::new(RwLock::new(load_clients())),
-            codes: Arc::default(),
             tokens: Arc::default(),
-            connects: Arc::default(),
+            devices: Arc::default(),
             identities,
         }
-    }
-
-    /// Whether `redirect_uri` is acceptable for `client_id`. Per OAuth 2.1 the
-    /// redirect must be one the client registered via DCR (exact match) — that,
-    /// not a hardcoded host list, is what keeps the server from being an open
-    /// redirector and lets any registration-compliant client (Claude, ChatGPT,
-    /// Grok, …) connect without code changes. Loopback is the one exception
-    /// (RFC 8252 §7.3): native clients bind an ephemeral port at runtime, so
-    /// any-port loopback is accepted regardless of the registered port.
-    async fn validate_client(&self, client_id: &str, redirect_uri: &str) -> bool {
-        redirect_allowed(self.clients.read().await.get(client_id), redirect_uri)
     }
 
     /// The verified principal + session id behind a bearer token, if valid.
     pub async fn session_for_token(&self, token: &str) -> Option<(String, String)> {
         let tokens = self.tokens.read().await;
         let info = tokens.get(token)?;
-        (info.created.elapsed() < TOKEN_TTL).then(|| (info.principal.clone(), info.session_id.clone()))
+        (info.created.elapsed() < info.ttl).then(|| (info.principal.clone(), info.session_id.clone()))
     }
-
 }
 
-// ---- Authorize: start the II /mcp delegation flow ----------------------
+// ---- Device authorization: start the II handshake -----------------------
 
 #[derive(Debug, Deserialize)]
-pub struct AuthorizeQuery {
-    #[allow(dead_code)]
-    response_type: Option<String>,
-    client_id: String,
-    redirect_uri: String,
+pub struct DeviceAuthzForm {
     #[serde(default)]
-    state: Option<String>,
+    client_id: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
     #[serde(default)]
     code_challenge: Option<String>,
     #[allow(dead_code)]
     #[serde(default)]
     code_challenge_method: Option<String>,
-    #[serde(default)]
-    scope: Option<String>,
 }
 
-/// GET /oauth/authorize — validate the client, mint this connection's session
-/// (its backend key), and redirect the browser to II's `/mcp` delegation flow,
-/// sending the backend **public** key. II will log the user in, then form-POST
-/// the delegation chain back to `/oauth/connect/callback`.
-pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<AuthorizeQuery>) -> Response {
-    if !store.validate_client(&q.client_id, &q.redirect_uri).await {
-        return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "unknown client_id / redirect_uri");
-    }
-
+/// POST /oauth/device_authorization (RFC 8628 §3.1–3.2) — mint a device code and
+/// point the user at the verification URI that launches II's `/mcp` handshake.
+pub async fn device_authorization(
+    State(store): State<AuthStore>,
+    Form(req): Form<DeviceAuthzForm>,
+) -> Response {
     let session_id = format!("sess-{}", Uuid::new_v4());
-    let pubkey_b64 = store.identities.session_pubkey_b64(&session_id).await;
+    let device_code = format!("dc-{}", Uuid::new_v4());
+    // A short, human-typable code for the verification page.
+    let user_code = Uuid::new_v4().simple().to_string()[..8].to_uppercase();
 
-    let connect_state = Uuid::new_v4().to_string();
-    store.connects.write().await.insert(
-        connect_state.clone(),
-        PendingConnect {
-            client_id: q.client_id.clone(),
-            redirect_uri: q.redirect_uri.clone(),
-            scope: q.scope.clone().filter(|s| !s.is_empty()),
-            client_state: q.state.clone().unwrap_or_default(),
-            code_challenge: q.code_challenge.clone(),
-            session_id,
+    store.devices.write().await.insert(
+        session_id.clone(),
+        DeviceAuth {
+            device_code: device_code.clone(),
+            user_code: user_code.clone(),
+            session_id: session_id.clone(),
+            client_id: req.client_id.clone(),
+            scope: req.scope.clone().filter(|s| !s.is_empty()),
+            code_challenge: req.code_challenge.clone(),
             created: Instant::now(),
+            launched: false,
+            live: false,
+            last_poll: None,
         },
     );
 
-    // II `/mcp` flow: backend public key out, delegation in. No `app` param —
-    // the connection is to the MCP server itself, whose origin II derives from
-    // this `callback` URL (used both for the delegation's derivation origin and
-    // the per-user trust check against the identity's config). `ttl` is 60 min.
+    let base = base_url();
+    let verification_uri = format!("{base}/oauth/device");
+    let verification_uri_complete = format!("{verification_uri}?user_code={user_code}");
+    Json(json!({
+        "device_code": device_code,
+        "user_code": user_code,
+        "verification_uri": verification_uri,
+        "verification_uri_complete": verification_uri_complete,
+        "expires_in": DEVICE_CODE_TTL.as_secs(),
+        "interval": POLL_INTERVAL_SECS,
+    }))
+    .into_response()
+}
+
+// ---- Verification page: launch II's /mcp handshake ----------------------
+
+#[derive(Debug, Deserialize)]
+pub struct DeviceVerifyQuery {
+    #[serde(default)]
+    user_code: Option<String>,
+}
+
+/// GET /oauth/device — the user opens this (via `verification_uri_complete`).
+/// With a valid `user_code` it launches II's `/mcp` handshake; otherwise it
+/// offers a minimal form to enter the code.
+pub async fn device_verify(State(store): State<AuthStore>, Query(q): Query<DeviceVerifyQuery>) -> Response {
+    let Some(user_code) = q.user_code.filter(|c| !c.is_empty()) else {
+        return device_code_form();
+    };
+    let user_code = user_code.trim().to_uppercase();
+
+    let session_id = {
+        let mut devices = store.devices.write().await;
+        let entry = devices
+            .values_mut()
+            .find(|d| d.user_code == user_code && d.created.elapsed() < DEVICE_CODE_TTL);
+        match entry {
+            Some(d) => {
+                d.launched = true;
+                d.session_id.clone()
+            }
+            None => return connect_error("unknown or expired code — restart the connection from your client"),
+        }
+    };
+
+    // Launch II's `/mcp` handshake. Everything is in the URL fragment (never sent
+    // to II's servers): the callback on our origin, the single-use `state` (= the
+    // session id), and the requested grant `ttl` in SECONDS. NO key material is
+    // put in the link — the session key is minted inside the key-request callback.
     let base = base_url();
     let callback = format!("{base}/oauth/connect/callback");
-    // II's `/mcp` reads `ttl` as MINUTES (it converts to ns canister-side), so
-    // send 60, not the nanosecond value.
-    let ttl_minutes: u64 = 60;
     let ii_mcp_url = format!(
-        "{ii}/mcp#public_key={pk}&callback={cb}&state={st}&ttl={ttl}",
+        "{ii}/mcp#callback={cb}&state={st}&ttl={ttl}",
         ii = crate::identities::ii_url(),
-        pk = urlencoding::encode(&pubkey_b64),
         cb = urlencoding::encode(&callback),
-        st = urlencoding::encode(&connect_state),
-        ttl = ttl_minutes,
+        st = urlencoding::encode(&session_id),
+        ttl = GRANT_TTL_SECS,
     );
     js_redirect(&ii_mcp_url)
 }
 
-// ---- Connect callback: II form-POSTs the delegation chain here ---------
+/// A minimal manual code-entry page for the bare `verification_uri`.
+fn device_code_form() -> Response {
+    Html(
+        "<!DOCTYPE html><meta charset=utf-8><body style=\"font-family:system-ui;max-width:32rem;margin:3rem auto\">\
+         <h1>Connect Internet Identity</h1>\
+         <form method=get action=\"/oauth/device\">\
+         <p>Enter the code shown by your client:</p>\
+         <input name=user_code autofocus style=\"font-size:1.2rem;padding:.4rem\">\
+         <button type=submit style=\"font-size:1.2rem;padding:.4rem 1rem\">Continue</button>\
+         </form></body>"
+            .to_string(),
+    )
+    .into_response()
+}
+
+// ---- Connect callback: II's two cross-origin JSON POSTs -----------------
 
 #[derive(Debug, Deserialize)]
 pub struct ConnectCallback {
-    /// `DelegationChain.toJSON()` for `anchor -> backend session key`.
-    delegation: String,
-    /// The single-use connect state set at `/oauth/authorize`.
+    /// The single-use connect state (= session id) set at device-authorization.
     state: String,
+    /// Present only on the completion notification; a decimal string of ns since
+    /// the epoch (u64 ns overflows JSON numbers, so it is a string on the wire).
+    #[serde(default)]
+    expiration: Option<String>,
 }
 
-/// POST /oauth/connect/callback — verify and store the standing credential, then
-/// redirect the browser back to the OAuth client with a principal-bound code.
-pub async fn connect_callback(
-    State(store): State<AuthStore>,
-    Form(form): Form<ConnectCallback>,
-) -> Response {
-    let pending = match store.connects.write().await.remove(&form.state) {
-        Some(p) if p.created.elapsed() < CONNECT_TTL => p,
-        Some(_) => return connect_error("connect request expired — reconnect and try again"),
-        None => return connect_error("unknown or already-used connect request"),
-    };
-
-    let principal = match store
-        .identities
-        .accept_standing(&pending.session_id, &form.delegation)
-        .await
+/// POST /oauth/connect/callback — II's frontend makes TWO cross-origin JSON
+/// POSTs here, distinguished by the `expiration` field:
+///   (a) key request `{state}` → 200 `{public_key}` (fresh session keypair);
+///   (b) completion `{state, expiration}` → mark the grant live; any 2xx.
+/// Never returns a redirect (the response is consumed by `fetch()`), and never
+/// receives or verifies a delegation chain.
+pub async fn connect_callback(State(store): State<AuthStore>, Json(body): Json<ConnectCallback>) -> Response {
+    // Look up the pending connection by state WITHOUT consuming it — `state`
+    // comes back on BOTH POSTs. Unknown/expired state → non-2xx so II aborts.
     {
-        Ok(p) => p,
-        Err(e) => return connect_error(&format!("could not accept Internet Identity credential: {e}")),
-    };
-
-    let code = format!("mcp-code-{}", Uuid::new_v4());
-    store.codes.write().await.insert(
-        code.clone(),
-        CodeGrant {
-            client_id: pending.client_id.clone(),
-            scope: pending.scope.clone(),
-            principal: principal.clone(),
-            session_id: pending.session_id.clone(),
-            code_challenge: pending.code_challenge.clone(),
-            created: Instant::now(),
-        },
-    );
-    tracing::info!(%principal, "captured standing II credential, issued authorization code");
-
-    let mut redirect = format!("{}?code={}", pending.redirect_uri, code);
-    if !pending.client_state.is_empty() {
-        redirect.push_str(&format!("&state={}", urlencoding::encode(&pending.client_state)));
+        let devices = store.devices.read().await;
+        match devices.get(&body.state) {
+            Some(d) if d.created.elapsed() < DEVICE_CODE_TTL => {}
+            _ => return (StatusCode::FORBIDDEN, Json(json!({ "error": "invalid_state" }))).into_response(),
+        }
     }
-    // JS navigation, not a 30x: II form-POSTed here, and `form-action` is enforced
-    // across redirects, so a `Location` to the client's redirect_uri would be
-    // blocked. See `js_redirect`.
-    js_redirect(&redirect)
+
+    match &body.expiration {
+        // (a) Key request — generate (lazily) this connection's session keypair
+        // and return its public key for II's frontend to register.
+        None => {
+            let public_key = store.identities.session_pubkey_b64(&body.state).await;
+            (StatusCode::OK, Json(json!({ "public_key": public_key }))).into_response()
+        }
+        // (b) Completion notification — store the grant expiration and mark live.
+        Some(exp) => {
+            match exp.trim().parse::<u64>() {
+                Ok(exp_ns) => store.identities.set_grant_expiration(&body.state, exp_ns).await,
+                Err(_) => {
+                    // Malformed expiration is non-fatal: the grant may still be
+                    // live (registration happened under the user's auth). Mark it
+                    // live and let a signed call be the source of truth.
+                    tracing::warn!("connect completion had unparseable expiration");
+                }
+            }
+            if let Some(d) = store.devices.write().await.get_mut(&body.state) {
+                d.live = true;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+    }
 }
 
 /// Top-level redirect via a script-initiated navigation (`location.replace`)
-/// rather than an HTTP `Location` header. Two reasons:
-///   * the II `/mcp` URL carries its params in the fragment (`#…`), which a
-///     `Location` redirect drops in some clients; and
-///   * the post-connect hop back to the OAuth client must NOT be a 30x response
-///     to II's form POST — browsers enforce `form-action` across redirects, so a
-///     `Location` to the client's `redirect_uri` (not in II's `form-action`) is
-///     blocked. A fresh JS navigation isn't a form submission, so it's exempt.
+/// rather than an HTTP `Location` header, so the II `/mcp` URL's fragment (`#…`)
+/// is preserved (a `Location` redirect drops it in some clients).
 fn js_redirect(url: &str) -> Response {
     let safe = url
         .replace('\\', "\\\\")
@@ -329,37 +364,75 @@ fn connect_error(message: &str) -> Response {
         .into_response()
 }
 
-// ---- Token: exchange auth code for an access token ---------------------
+// ---- Token: poll for the device grant -----------------------------------
 
 #[derive(Debug, Deserialize)]
 pub struct TokenForm {
     grant_type: String,
     #[serde(default)]
-    code: String,
+    device_code: String,
     #[serde(default)]
     client_id: String,
     #[serde(default)]
     code_verifier: Option<String>,
 }
 
-/// POST /oauth/token
+/// POST /oauth/token (RFC 8628 §3.4–3.5) — the client polls here with the device
+/// code until the user finishes the II handshake, then receives the access token.
 pub async fn token(State(store): State<AuthStore>, Form(req): Form<TokenForm>) -> Response {
-    if req.grant_type != "authorization_code" {
-        return oauth_err(StatusCode::BAD_REQUEST, "unsupported_grant_type", "only authorization_code");
+    if req.grant_type != DEVICE_GRANT_TYPE {
+        return oauth_err(StatusCode::BAD_REQUEST, "unsupported_grant_type", "only the device_code grant");
+    }
+    if req.device_code.is_empty() {
+        return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "device_code required");
     }
 
-    let grant = match store.codes.write().await.remove(&req.code) {
-        Some(g) if g.created.elapsed() < CODE_TTL => g,
-        Some(_) => return oauth_err(StatusCode::BAD_REQUEST, "invalid_grant", "code expired"),
-        None => return oauth_err(StatusCode::BAD_REQUEST, "invalid_grant", "unknown or used code"),
+    // Locate the device grant, enforce expiry + slow_down, and snapshot what we
+    // need. Done means: completion POST arrived, or a signed call now succeeds.
+    let (session_id, code_challenge, scope) = {
+        let mut devices = store.devices.write().await;
+        let Some(d) = devices.values_mut().find(|d| d.device_code == req.device_code) else {
+            return oauth_err(StatusCode::BAD_REQUEST, "invalid_grant", "unknown or used device_code");
+        };
+        if d.created.elapsed() >= DEVICE_CODE_TTL {
+            return oauth_err(StatusCode::BAD_REQUEST, "expired_token", "device_code expired — restart");
+        }
+        if !req.client_id.is_empty() {
+            if let Some(cid) = &d.client_id {
+                if cid != &req.client_id {
+                    return oauth_err(StatusCode::BAD_REQUEST, "invalid_client", "client_id mismatch");
+                }
+            }
+        }
+        // slow_down if polling faster than the advertised interval.
+        if let Some(last) = d.last_poll {
+            if last.elapsed() < Duration::from_secs(POLL_INTERVAL_SECS) {
+                return oauth_err(StatusCode::BAD_REQUEST, "slow_down", "poll no faster than the interval");
+            }
+        }
+        d.last_poll = Some(Instant::now());
+        (d.session_id.clone(), d.code_challenge.clone(), d.scope.clone())
     };
 
-    if !req.client_id.is_empty() && req.client_id != grant.client_id {
-        return oauth_err(StatusCode::BAD_REQUEST, "invalid_client", "client_id mismatch");
+    // Determine liveness. Prefer the completion-POST flag; fall back to a cheap
+    // signed call (the completion POST is best-effort and may never arrive).
+    let live = {
+        let flag = store
+            .devices
+            .read()
+            .await
+            .values()
+            .find(|d| d.device_code == req.device_code)
+            .map(|d| d.live)
+            .unwrap_or(false);
+        flag || store.identities.grant_is_live(&session_id).await
+    };
+    if !live {
+        return oauth_err(StatusCode::BAD_REQUEST, "authorization_pending", "waiting for Internet Identity");
     }
 
-    // Enforce PKCE when a challenge was supplied at authorize time.
-    if let Some(challenge) = &grant.code_challenge {
+    // Enforce PKCE if the client bound one at device-authorization time.
+    if let Some(challenge) = &code_challenge {
         let verifier = match &req.code_verifier {
             Some(v) => v,
             None => return oauth_err(StatusCode::BAD_REQUEST, "invalid_grant", "code_verifier required"),
@@ -369,43 +442,36 @@ pub async fn token(State(store): State<AuthStore>, Form(req): Form<TokenForm>) -
         }
     }
 
+    // Consume the device grant (single use) and issue the token, bound to the
+    // session key's principal (self_authenticating(session_pubkey)).
+    store.devices.write().await.retain(|_, d| d.device_code != req.device_code);
+    let principal = store
+        .identities
+        .session_principal(&session_id)
+        .await
+        .unwrap_or_else(|| "unknown".to_string());
+
     let access_token = format!("mcp-token-{}", Uuid::new_v4());
     store.tokens.write().await.insert(
         access_token.clone(),
         TokenInfo {
-            principal: grant.principal.clone(),
-            session_id: grant.session_id.clone(),
+            principal: principal.clone(),
+            session_id,
             created: Instant::now(),
+            ttl: TOKEN_TTL,
         },
     );
-    tracing::info!(principal = %grant.principal, "issued MCP access token");
+    tracing::info!(%principal, "issued MCP access token (device grant)");
 
-    let mut body = json!({
+    let mut resp = json!({
         "access_token": access_token,
         "token_type": "Bearer",
         "expires_in": TOKEN_TTL.as_secs(),
     });
-    if let Some(scope) = grant.scope {
-        body["scope"] = json!(scope);
+    if let Some(scope) = scope {
+        resp["scope"] = json!(scope);
     }
-    Json(body).into_response()
-}
-
-/// An `http://` loopback redirect (any port), matched on the parsed **host** so
-/// look-alikes can't slip through. Parsing (not `strip_prefix`) is what defends
-/// against authority tricks: `http://localhost.evil.com`, `http://localhost@evil.com`,
-/// and the userinfo-with-port form `http://localhost:1234@evil.com` all parse to
-/// host `evil.com` (or carry userinfo) and are rejected. Userinfo is rejected
-/// outright since a legitimate loopback callback never carries credentials.
-fn is_loopback_redirect(redirect_uri: &str) -> bool {
-    let Ok(url) = url::Url::parse(redirect_uri) else {
-        return false;
-    };
-    url.scheme() == "http"
-        && url.username().is_empty()
-        && url.password().is_none()
-        // host_str() serializes an IPv6 host with brackets ("[::1]").
-        && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+    Json(resp).into_response()
 }
 
 fn pkce_s256(verifier: &str) -> String {
@@ -419,18 +485,14 @@ fn pkce_s256(verifier: &str) -> String {
 pub struct RegisterRequest {
     #[serde(default)]
     client_name: Option<String>,
+    #[serde(default)]
     redirect_uris: Vec<String>,
 }
 
-/// POST /oauth/register
+/// POST /oauth/register — the device grant needs no redirect, so `redirect_uris`
+/// is optional; any supplied are recorded but unused.
 pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRequest>) -> Response {
-    if req.redirect_uris.is_empty() {
-        return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "redirect_uris required");
-    }
     let client_id = format!("client-{}", Uuid::new_v4());
-    // Insert under the lock, then persist a snapshot off the lock (and off the
-    // async runtime thread) so disk I/O never blocks readers like
-    // `/oauth/authorize`. Registration is infrequent, so the clone is cheap.
     let snapshot = {
         let mut clients = store.clients.write().await;
         clients.insert(
@@ -441,19 +503,16 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
         );
         clients.clone()
     };
-    tokio::task::spawn_blocking(move || persist_clients(&snapshot))
-        .await
-        .ok();
+    tokio::task::spawn_blocking(move || persist_clients(&snapshot)).await.ok();
 
-    // Public client (PKCE, no secret): build the response by hand and OMIT
-    // client_secret entirely. Returning client_secret: null breaks clients that
-    // validate it as a string; absence correctly signals a public client.
+    // Public client (PKCE, no secret): OMIT client_secret entirely (returning
+    // null breaks clients that validate it as a string).
     let mut resp = json!({
         "client_id": client_id,
         "redirect_uris": req.redirect_uris,
         "token_endpoint_auth_method": "none",
-        "grant_types": ["authorization_code"],
-        "response_types": ["code"],
+        "grant_types": [DEVICE_GRANT_TYPE],
+        "response_types": [],
     });
     if let Some(name) = req.client_name {
         resp["client_name"] = json!(name);
@@ -464,20 +523,14 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
 // ---- Discovery metadata -------------------------------------------------
 
 /// GET /.well-known/oauth-authorization-server
-///
-/// Built by hand rather than via `AuthorizationMetadata` so that absent optional
-/// fields are *omitted* — clients (e.g. Claude Code) validate this document and
-/// reject `null` where they expect an array (`scopes_supported` is optional per
-/// RFC 8414, so leaving it out is correct).
 pub async fn authorization_server_metadata() -> Response {
     let base = base_url();
     Json(json!({
         "issuer": base,
-        "authorization_endpoint": format!("{base}/oauth/authorize"),
+        "device_authorization_endpoint": format!("{base}/oauth/device_authorization"),
         "token_endpoint": format!("{base}/oauth/token"),
         "registration_endpoint": format!("{base}/oauth/register"),
-        "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": [DEVICE_GRANT_TYPE],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
     }))
@@ -547,7 +600,7 @@ pub type _JsonValue = Value;
 
 #[cfg(test)]
 mod tests {
-    use super::{is_loopback_redirect, pkce_s256, redirect_allowed, ClientReg};
+    use super::pkce_s256;
 
     /// RFC 7636 Appendix B test vector.
     #[test]
@@ -555,44 +608,5 @@ mod tests {
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let expected = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
         assert_eq!(pkce_s256(verifier), expected);
-    }
-
-    #[test]
-    fn redirect_requires_registration_or_loopback() {
-        let reg = ClientReg {
-            redirect_uris: vec![
-                "https://grok.com/connector/oauth/cb".to_string(),
-                "https://claude.ai/api/mcp/auth_callback".to_string(),
-            ],
-        };
-        // A hosted redirect is accepted iff this client registered it (exact).
-        assert!(redirect_allowed(Some(&reg), "https://grok.com/connector/oauth/cb"));
-        assert!(redirect_allowed(Some(&reg), "https://claude.ai/api/mcp/auth_callback"));
-        assert!(!redirect_allowed(Some(&reg), "https://grok.com/connector/oauth/other"));
-        assert!(!redirect_allowed(Some(&reg), "https://claude.ai/api/mcp/auth_callback/x"));
-        // An unregistered / unknown client can't use a hosted redirect.
-        assert!(!redirect_allowed(None, "https://grok.com/connector/oauth/cb"));
-        // Loopback (RFC 8252) is accepted at any port, even unregistered.
-        assert!(redirect_allowed(None, "http://127.0.0.1:51000/callback"));
-        assert!(redirect_allowed(None, "http://localhost:1234/cb"));
-        assert!(redirect_allowed(None, "http://[::1]:8080/cb"));
-    }
-
-    /// Loopback matching is on the parsed host, so authority tricks (suffix,
-    /// userinfo, userinfo-with-port) can't redirect a code off-box.
-    #[test]
-    fn loopback_rejects_lookalikes() {
-        assert!(is_loopback_redirect("http://127.0.0.1:51000/callback"));
-        assert!(is_loopback_redirect("http://localhost/cb"));
-        assert!(is_loopback_redirect("http://[::1]:8080/cb"));
-        assert!(!is_loopback_redirect("http://localhost.evil.com/cb"));
-        assert!(!is_loopback_redirect("http://127.0.0.1.evil.com/cb"));
-        assert!(!is_loopback_redirect("http://localhost@evil.com/cb"));
-        // userinfo-with-port bypass: real host is evil.com.
-        assert!(!is_loopback_redirect("http://localhost:1234@evil.com/cb"));
-        assert!(!is_loopback_redirect("http://127.0.0.1:5000@evil.com/cb"));
-        // https is not a loopback scheme; credentials never belong on a callback.
-        assert!(!is_loopback_redirect("https://localhost/cb"));
-        assert!(!is_loopback_redirect("https://evil.com/cb"));
     }
 }

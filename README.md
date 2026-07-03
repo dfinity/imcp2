@@ -45,8 +45,8 @@ covers the IC's labelled services, which is where the meaningful ones live.
 
 `call_canister` runs anonymously by default; pass a `domain` (e.g. `oisy.com`) to
 call as your account at that app. For a domain, the server mints a **short-lived
-(≤5 min) account delegation on demand** from the connection's standing Internet
-Identity credential (see [Domain identities](#domain-identities-on-demand)) —
+account delegation on demand** using the connection's registered Internet
+Identity session key (see [Domain identities](#domain-identities-on-demand)) —
 there is no per-app sign-in step. `get_principal` returns that account's principal
 without a call. A user may hold several accounts at an app — a default
 ("synthetic") account everyone gets automatically, plus any they have named — so
@@ -96,10 +96,11 @@ Add the server to Claude Code (replace the URL with wherever it's hosted):
 claude mcp add --transport http ic-poc https://YOUR-HOST/mcp
 ```
 
-Then run `/mcp` → **ic-poc** → authenticate: the browser is sent to **Internet
-Identity**'s `/mcp` flow, you sign in once, and the tools become available
-— that single login is the connection's standing credential. (Any MCP client
-with remote HTTP + OAuth support works.)
+Then run `/mcp` → **ic-poc** → authenticate: the client obtains a device code and
+opens a verification link that launches **Internet Identity**'s `/mcp` handshake;
+you sign in once, and the tools become available — that single login registers the
+connection's session key with II as a time-boxed grant. (Any MCP client that
+supports the OAuth 2.0 device authorization grant, RFC 8628, works.)
 
 ## Run
 
@@ -148,90 +149,90 @@ curl -s "${H[@]}" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"n
 # => ("Internet Computer")
 ```
 
-## Auth (OAuth 2.1, login via Internet Identity)
+## Auth (OAuth 2.0 device grant, login via Internet Identity)
 
-`/mcp` is gated by a bearer token. The MCP client obtains it with a standard
-OAuth 2.1 authorization-code flow, except logging in runs **Internet Identity's
-`/mcp` delegation flow** instead of username/password, and the issued token is
-bound to the resulting **principal**.
+`/mcp` is gated by a bearer token. II's `/mcp` handshake has **no redirect back
+to this server** — the II tab makes two background `fetch()` POSTs to our
+callback and then finishes on its own — so a classic authorization-code
+`redirect_uri` can't be delivered. The MCP client's login is therefore modelled
+as the **OAuth 2.0 Device Authorization Grant (RFC 8628)**: the client gets a
+`device_code` + a verification link, the user opens it (which launches II's
+handshake), and the client polls the token endpoint until the grant is live.
 
 Endpoints:
 
-- `GET /.well-known/oauth-authorization-server` — AS metadata
+- `GET /.well-known/oauth-authorization-server` — AS metadata (advertises the
+  device-code grant and the `device_authorization_endpoint`)
 - `GET /.well-known/oauth-protected-resource` — points clients at the AS
-- `POST /oauth/register` — dynamic client registration (RFC 7591); the client's
-  `redirect_uris` are stored (persisted to `OAUTH_CLIENTS_FILE`) and bound to the
-  issued `client_id`
-- `GET  /oauth/authorize` — mints the connection's backend key and redirects the
-  browser to II's `/mcp` flow, sending the backend **public** key
-- `POST /oauth/connect/callback` — II form-POSTs the delegation chain here; the
-  server verifies + stores it and redirects back with a principal-bound code
-- `POST /oauth/token` — exchanges the code for an access token
+- `POST /oauth/register` — dynamic client registration (RFC 7591); `redirect_uris`
+  are optional (the device grant has none) and persisted to `OAUTH_CLIENTS_FILE`
+- `POST /oauth/device_authorization` — mints a `device_code`/`user_code` and a
+  `verification_uri` (RFC 8628 §3.2)
+- `GET  /oauth/device` — the user opens this; it launches II's `/mcp` handshake
+  with the connect `state` (= session id) in the URL fragment, `ttl` in **seconds**
+- `POST /oauth/connect/callback` — serves II's **two cross-origin JSON POSTs**:
+  a key request `{state}` → `{public_key}` (a fresh session keypair, minted here),
+  and a completion notification `{state, expiration}` → mark the grant live
+- `POST /oauth/token` — the client polls with the `device_code`
+  (`authorization_pending`/`slow_down`) until the token is issued
 
 Unauthenticated `/mcp` requests get `401` with a `WWW-Authenticate` header
 pointing at the resource metadata, as the MCP spec expects.
 
-**Redirect validation is per-client, not a host allowlist.** `/oauth/authorize`
-accepts a `redirect_uri` only if the requesting `client_id` registered it (exact
-match, OAuth 2.1) — so any registration-compliant client (Claude, ChatGPT, Grok,
-…) works without code changes, and the server can't be steered to an
-unregistered URL. The one exception is loopback (`http://127.0.0.1|localhost|[::1]`,
-any port) per RFC 8252, for native clients that bind an ephemeral callback port.
+**The server is passive during the handshake and holds no key at link time.** On
+the key-request POST it generates a fresh per-connection Ed25519 keypair and
+returns only its **public** key (base64url, unpadded, DER). II's *frontend*
+registers that key with the II canister (`mcp_register`, under the user's own
+authentication) as a time-boxed grant bound to the user's anchor. **The server
+never receives or verifies a delegation chain that represents itself, and never
+calls `mcp_register`.** The issued access token is bound to the session key's
+principal (`self_authenticating(session_pubkey)`), which is exactly the identity
+the grant is bound to.
 
-**No private key is ever transmitted.** The backend generates a per-connection
-Ed25519 key and sends only its **public** key to II. II logs the user in and
-returns a delegation chain `anchor → backend key` (the 60-minute standing
-credential). The chain itself is the proof of identity, so there is no nonce
-round-trip; the server (`src/delegation.rs`) verifies:
+**PKCE (S256)** is bound to the poll when the client supplies a `code_challenge`;
+device codes live 600s, access tokens 1h. Treat any `Unauthorized` from II as
+"session over → reconnect": the server surfaces a reconnect message and does not
+retry.
 
-1. the chain links to the II root (the II canister signature is checked against
-   the IC mainnet root key via `ic-signature-verification`);
-2. no delegation has expired;
-3. the chain ends at this connection's backend key (so the backend, holding the
-   private half, can sign with it);
-4. the principal is `self_authenticating(user_key)`.
-
-Only then is a principal-bound code minted. This matters because the server
-keys per-principal session data off that identity — a spoofable principal would
-let one user read another's session. (Fund safety is independent: that's
-enforced by the IC at signing time, not here.) **PKCE (S256) is enforced**;
-codes live 120s, connects 600s, access tokens 1h.
-
-Set the public base URL (used in the discovery docs and as the MCP origin) with
-`PUBLIC_URL`. The Internet Identity instance is `II_URL` (browser login, default
-`beta.id.ai`) plus `II_CANISTER_ID` (the canister the account-delegation calls
-target, default `fgte5-ciaaa-aaaad-aaatq-cai`) — both point at the same II.
+Set the public base URL (used in the discovery docs, as the MCP origin, and as the
+management identity's derivation origin) with `PUBLIC_URL`. The Internet Identity
+instance is `II_URL` (browser login, default `beta.id.ai`) plus `II_CANISTER_ID`
+(the canister the `mcp_*` calls target, default `fgte5-ciaaa-aaaad-aaatq-cai`) —
+both point at the same II.
 
 ## Domain identities (on demand)
 
 There is no per-app browser sign-in. Instead the model is:
 
-- **One standing credential per connection.** When you connect (authenticate via
-  Internet Identity), the backend obtains a **60-minute standing delegation** —
-  a chain `anchor → backend session key` issued for the MCP origin. The backend
-  holds a per-session Ed25519 key that this delegation ends at, so it can sign as
-  the anchor's MCP-origin principal. Reconnect when it expires.
+- **One registered session key per connection.** When you connect, the backend
+  generates a per-connection Ed25519 **session key** and II's frontend registers
+  it as a time-boxed grant bound to your anchor. The backend signs II's `mcp_*`
+  calls directly with that key (its principal `self_authenticating(session_pubkey)`
+  is what the grant is bound to). Reconnect when the grant expires or is revoked.
 - **App delegations minted on demand.** When `call_canister` (or `get_principal`)
   is invoked with a `domain` (e.g. `oisy.com`), the backend mints a **short-lived
-  (≤5 min) per-app account delegation on demand**: signing *as the standing
-  identity*, it calls Internet Identity's account-derivation methods directly —
-  no browser round-trip — with the app's target origin and the backend session
-  key as `session_key`. The returned chain ends at the backend session key, so
-  the backend signs the canister call with `ic-agent`'s `DelegatedIdentity`.
+  per-app account delegation on demand**: signing *as the session key*, it calls
+  Internet Identity's account-derivation methods directly — no browser round-trip
+  — with the app's target origin and a fresh **per-app key** as `session_key`.
+  The returned delegation is issued to that per-app key, so the backend signs the
+  canister call with `ic-agent`'s `DelegatedIdentity` over `[user_key → per-app key]`.
 
-The on-demand derivation calls two **new II canister methods**:
+The on-demand derivation calls these II canister methods (per
+[dfinity/internet-identity#4086](https://github.com/dfinity/internet-identity/pull/4086)):
 
 ```candid
-mcp_prepare_account_delegation :
+mcp_prepare_delegation :
   (target_origin: text, account_number: opt nat64, session_key: blob, max_ttl: opt nat64)
     -> (variant {
          Ok: record { user_key: blob; account_number: opt nat64; expiration: nat64 };
          Err: AccountDelegationError });
-mcp_get_account_delegation :
+mcp_get_delegation :
   (target_origin: text, account_number: opt nat64, session_key: blob, expiration: nat64)
     -> (variant { Ok: SignedDelegation; Err: AccountDelegationError }) query;
 ```
 
+- `session_key` is the DER pubkey of a **fresh per-app key**, distinct from the
+  connection's session key; the minted delegation is issued to it.
 - `target_origin` is `https://<domain>`, with IC gateway domains remapped:
   `*.icp0.io` / `*.icp.net` → `*.ic0.app`.
 - `account_number` names which of the anchor's accounts at `target_origin` to act
@@ -240,9 +241,8 @@ mcp_get_account_delegation :
   `get` so both calls sign for the same account. The server passes `null` for the
   default account, or a specific number when an `account` name was given — resolved
   from `mcp_get_accounts` (see [Listing accounts](#listing-accounts) below).
-- `max_ttl` is in **nanoseconds**; the server passes 5 minutes
-  (`APP_DELEGATION_TTL_NS`), which is also II's hard cap. (Distinct from the
-  browser `/mcp` flow's `ttl`, which is in minutes.)
+- `max_ttl` is in **nanoseconds**; the server passes `null`, so II applies its
+  default (≤ 1 hour, and never past the grant).
 - These methods live on the **same II instance** as the connect-time login:
   `II_URL` (default `https://beta.id.ai`) is the browser login origin and
   `II_CANISTER_ID` (default `fgte5-ciaaa-aaaad-aaatq-cai`, that instance's
@@ -265,48 +265,39 @@ type AccountInfo = record {
 };
 ```
 
-signed as the standing identity. Like the `mcp_*_account_delegation` methods, II
-**recovers the anchor from the caller** (the connect-time MCP-origin principal),
-so no anchor number is needed. To act as a non-default account, pass its `name` to
+signed as the session key. Like the delegation methods, II **recovers the anchor
+from the caller** (the registered session-key principal), so no anchor number is
+needed. To act as a non-default account, pass its `name` to
 `call_canister`/`get_principal` as `account`; the server resolves the name to its
 `account_number` via `mcp_get_accounts` and threads that into the on-demand
-delegation. Omitting `account` uses the default account, as before.
+delegation. Omitting `account` uses the default account.
 
-> **Status:** the standing-credential connect flow runs against II's existing
-> `/mcp` delegation flow. The two `mcp_*_account_delegation` canister methods used
-> for on-demand app delegations were introduced in
-> [dfinity/internet-identity#4034](https://github.com/dfinity/internet-identity/pull/4034)
-> and reshaped (account-bound delegations) in
-> [dfinity/internet-identity#4052](https://github.com/dfinity/internet-identity/pull/4052);
-> the on-demand path works once that II build is deployed to the configured
-> `II_URL` (the server is built against the same candid contract). This is
-> compatible both before and after
-> [dfinity/internet-identity#4066](https://github.com/dfinity/internet-identity/pull/4066):
-> #4066 leaves these two methods' signatures unchanged (it only drops the
-> connect-time account picker and the `account_number` arg on
-> `mcp_set_access`/`mcp_access_enabled`, which this server never calls), and
-> passing `account_number = null` keeps resolving to the anchor's default
-> account, so the same build works against either II version.
->
-> **Account listing/selection** (`list_accounts`, the `account` arg) calls II's
-> `mcp_get_accounts(target_origin)` query, which — like the
-> `mcp_*_account_delegation` methods — recovers the anchor from the caller, so it
-> needs no anchor number and works as soon as the same II build is live.
+> **Status:** the connect handshake and the `mcp_register` / `mcp_get_accounts` /
+> `mcp_prepare_delegation` / `mcp_get_delegation` canister methods are the
+> session-key registration model from
+> [dfinity/internet-identity#4086](https://github.com/dfinity/internet-identity/pull/4086)
+> (the server is built against that candid contract). #4086 renames the on-demand
+> delegation methods from the earlier `mcp_prepare_account_delegation` /
+> `mcp_get_account_delegation` and removes `mcp_set_access` / `mcp_access_enabled`.
+> The live round-trip works once that II build is deployed to the configured
+> `II_URL`. Passing `account_number = null` resolves to the anchor's default
+> ("synthetic") account.
 
 ## Roadmap
 
 - [x] Candid tools over MCP streamable-HTTP; `discover_canisters`; Candid
       reference resources.
-- [x] OpenID/OAuth auth: connecting runs II's `/mcp` delegation flow (backend
-      public key out, delegation in); verified II delegation; PKCE; expiring tokens.
-- [x] On-demand **domain identities**: a 60-min standing II delegation per
-      connection mints ≤5-min per-app account delegations directly via II canister
-      methods (`call_canister`/`get_principal` `domain`); no per-app browser flow.
+- [x] OAuth auth (device grant, RFC 8628): the client polls while II's `/mcp`
+      handshake registers the connection's session key (two JSON callback POSTs,
+      no delegation chain); PKCE; expiring tokens.
+- [x] On-demand **domain identities**: the registered session key mints per-app
+      account delegations directly via II canister methods
+      (`call_canister`/`get_principal` `domain`); no per-app browser flow.
 - [x] **Per-app accounts**: `list_accounts(domain)` lists the user's accounts at
       an app (via `mcp_get_accounts`), and `call_canister`/`get_principal` take an
       `account` name to act as a specific (non-default) account.
-- [ ] Deploy the `mcp_*_account_delegation` + `mcp_get_accounts` canister methods
-      (server is built against their candid contract; the live round-trip lands
-      with the II side).
+- [ ] Deploy the `mcp_register` + `mcp_get_accounts` + `mcp_prepare_delegation` +
+      `mcp_get_delegation` canister methods (server is built against #4086's candid
+      contract; the live round-trip lands with the II side).
 - [ ] Persist sessions/delegations (currently in-memory, lost on restart).
 - [ ] Scoped delegations / per-call confirmation for sensitive methods.

@@ -1,23 +1,27 @@
-//! On-demand per-app delegated identities.
+//! On-demand per-app delegated identities — **session-key registration model**.
 //!
-//! Model: at connect/OpenID time the MCP backend obtains a **60-minute standing
-//! delegation** from Internet Identity — a chain `anchor -> backend session key`
-//! issued for the MCP origin. The backend holds an Ed25519 **session key per
-//! authenticated MCP (OpenID) session**; the standing delegation ends at that
-//! key, so the backend can sign as the anchor's MCP-origin principal.
+//! Model (Internet Identity MCP connect, per `docs/mcp-server-guide.md` and
+//! dfinity/internet-identity#4086): at connect time the server generates a fresh
+//! Ed25519 **session key per user-connection** (inside the key-request callback)
+//! and returns only its public key to II's frontend, which registers it with the
+//! II canister via `mcp_register` — under the user's own authentication — as a
+//! time-boxed **grant** bound to the user's anchor. The server never handles a
+//! delegation chain that represents itself, and never calls `mcp_register`. The
+//! session key's principal `self_authenticating(session_pubkey)` IS the identity
+//! the grant is bound to.
 //!
 //! To call a canister as the user's account for a given app (e.g. `oisy.com`)
-//! the backend mints a **short-lived (<=5 min) per-app account delegation ON
-//! DEMAND**: signing AS the standing identity, it calls II's
-//! `mcp_prepare_account_delegation` / `mcp_get_account_delegation` directly with
-//! the app's target origin and the backend session key as `session_key`. The
-//! returned chain ends at the backend session key, so the backend can sign
-//! canister calls as that per-app identity with `ic-agent`'s `DelegatedIdentity`.
-//! There is no per-app browser sign-in flow.
+//! the server mints a **short-lived per-app account delegation ON DEMAND**:
+//! signing the II calls DIRECTLY with the session key, it calls II's
+//! `mcp_get_accounts` / `mcp_prepare_delegation` / `mcp_get_delegation`, passing a
+//! fresh **per-app key** as the `session_key` argument. The returned delegation
+//! is issued to that per-app key, so the server acts as the user's app account
+//! via a `DelegatedIdentity` over the chain `[user_key -> per-app key]`. There is
+//! no per-app browser sign-in flow.
 //!
 //! The derived `(user_key, chain, expiration)` is cached per `(session_id,
-//! domain)` with a TTL slightly under the delegation's expiration; it is reused
-//! until near-expiry, then re-derived.
+//! domain, account_number)` with a margin under the delegation's expiration; it
+//! is reused until near-expiry, then re-derived.
 
 use std::{
     collections::HashMap,
@@ -37,13 +41,6 @@ use tokio::sync::RwLock;
 /// Public IC API boundary node the II canister calls are made against.
 const IC_URL: &str = "https://icp-api.io";
 
-/// Requested lifetime of an on-demand app delegation: 5 minutes, in
-/// **nanoseconds** — the unit of the contract's `max_ttl` arg (II caps it at its
-/// own 5-minute `MCP_MAX_EXPIRATION_PERIOD_NS`). Not to be confused with the
-/// browser `/mcp` flow's `ttl`, which is in minutes. The cache TTL is set
-/// slightly under the returned expiration.
-const APP_DELEGATION_TTL_NS: u64 = 5 * 60 * 1_000_000_000;
-
 /// Re-derive once the cached delegation is within this margin of expiry, so a
 /// call never goes out with an about-to-expire delegation.
 const REDERIVE_MARGIN_NS: u64 = 30 * 1_000_000_000;
@@ -51,13 +48,21 @@ const REDERIVE_MARGIN_NS: u64 = 30 * 1_000_000_000;
 /// Internet Identity instance, single source of truth. Default: **`beta.id.ai`**.
 /// A real domain is required: the raw `<canister>.icp0.io` origin is rate-limited
 /// (HTTP 429) for the browser login SPA, leaving the II popup blank. Used for the
-/// connect-time `/mcp` delegation flow (browser). Override with `II_URL`.
+/// connect-time `/mcp` handshake (browser). Override with `II_URL`.
 const II_URL_DEFAULT: &str = "https://beta.id.ai";
 
-/// Canister id of that same II instance, used for the on-demand
-/// account-delegation calls (`mcp_*_account_delegation`). Default is the
-/// `beta.id.ai` canister. Override with `II_CANISTER_ID`.
+/// Canister id of that same II instance, used for the on-demand account
+/// delegation calls (`mcp_get_accounts` / `mcp_prepare_delegation` /
+/// `mcp_get_delegation`). Default is the `beta.id.ai` canister. Override with
+/// `II_CANISTER_ID`.
 const II_CANISTER_ID_DEFAULT: &str = "fgte5-ciaaa-aaaad-aaatq-cai";
+
+/// Message shown whenever II reports the grant is gone (`Unauthorized`) or the
+/// stored grant expiration has passed. Per the spec, any `Unauthorized` means the
+/// session is over — the caller must start a fresh connect with a fresh session
+/// key; it must NOT retry.
+const RECONNECT_MSG: &str = "Your Internet Identity session is over (the grant expired, was revoked, \
+     or was replaced by a newer connection). Reconnect with Internet Identity to continue — do not retry.";
 
 /// Origin of the II instance (no trailing slash). Override with `II_URL`.
 pub fn ii_url() -> String {
@@ -94,35 +99,33 @@ fn target_origin(domain: &str) -> String {
 
 struct Session {
     /// Ed25519 session-key seed; rebuild a `BasicIdentity` from it on demand.
-    /// This is the backend session key the standing delegation ends at, and the
-    /// `session_key` sent to II so app delegations end at it too. Its private key
-    /// never leaves the backend — only its public key is ever sent to II.
+    /// This is the key generated for this connection and registered with II (via
+    /// the frontend's `mcp_register`); the server signs II's `mcp_*` calls
+    /// directly with it. Its private half never leaves the backend — only its
+    /// public key is ever sent to II.
     key_seed: [u8; 32],
     /// DER public key of the session key.
     pubkey_der: Vec<u8>,
-    /// The connect-time 60-minute standing delegation, captured via the II `/mcp`
-    /// flow (`anchor -> this session key`, issued for the MCP origin). `None`
-    /// until the connect flow completes.
-    standing: Option<Standing>,
+    /// The grant's expiration (ns since the Unix epoch), as reported by the
+    /// completion-notification callback POST. `None` until (or unless) that
+    /// best-effort POST arrives; a missing value is not treated as expired — an
+    /// `Unauthorized` from a signed call is the authoritative "session over"
+    /// signal.
+    grant_expiration_ns: Option<u64>,
     /// `(domain, account_number)` -> most recently derived per-app delegation.
     /// Keyed by account too, since each account at an origin signs as a distinct
     /// principal (`account_number == None` is that origin's default account).
     app_delegations: HashMap<(String, Option<u64>), AppDelegation>,
 }
 
-/// The connect-time standing credential: a chain `anchor -> backend session key`
-/// the backend signs II's account-derivation calls with.
-struct Standing {
-    user_key: Vec<u8>,
-    chain: Vec<SignedDelegation>,
-    expiration_ns: u64,
-}
-
-/// A cached on-demand per-app account delegation.
+/// A cached on-demand per-app account delegation. The chain ends at a per-app key
+/// distinct from the session key; its seed is kept so the identity can be rebuilt.
 struct AppDelegation {
     user_key: Vec<u8>,
     chain: Vec<SignedDelegation>,
     expiration_ns: u64,
+    /// Ed25519 seed of the per-app key the delegation is issued to.
+    app_key_seed: [u8; 32],
 }
 
 impl AppDelegation {
@@ -133,7 +136,7 @@ impl AppDelegation {
 }
 
 /// One of the user's Internet Identity accounts at an app origin, as returned by
-/// [`Identities::list_accounts`] (II's `get_accounts`). Each account is a
+/// [`Identities::list_accounts`] (II's `mcp_get_accounts`). Each account is a
 /// distinct per-origin principal; `account_number == None`/`name == None` is the
 /// origin's default ("synthetic") account, which every user has automatically.
 pub struct AccountInfo {
@@ -160,31 +163,27 @@ impl Identities {
     async fn ensure_session(&self, session_id: &str) {
         let mut sessions = self.sessions.write().await;
         sessions.entry(session_id.to_string()).or_insert_with(|| {
-            let mut seed = [0u8; 32];
-            getrandom::fill(&mut seed).expect("getrandom");
-            let pubkey_der = BasicIdentity::from_raw_key(&seed)
-                .public_key()
-                .expect("ed25519 public key");
+            let (key_seed, pubkey_der) = fresh_ed25519();
             Session {
-                key_seed: seed,
+                key_seed,
                 pubkey_der,
-                standing: None,
+                grant_expiration_ns: None,
                 app_delegations: HashMap::new(),
             }
         });
     }
 
-    /// The backend session key (its DER pubkey) and a `BasicIdentity` over it.
+    /// The backend session key seed and its DER pubkey.
     async fn session_key(&self, session_id: &str) -> Option<([u8; 32], Vec<u8>)> {
         let sessions = self.sessions.read().await;
         let s = sessions.get(session_id)?;
         Some((s.key_seed, s.pubkey_der.clone()))
     }
 
-    /// Ensure a session exists and return its backend **public** key (base64url,
-    /// no pad). This is the only thing sent to II — as `public_key` in the `/mcp`
-    /// delegation flow, so the standing delegation ends at this key and the
-    /// backend can sign with the private half it never discloses.
+    /// Ensure a session exists and return its session **public** key (base64url,
+    /// no pad, DER). This is what the key-request callback POST returns to II's
+    /// frontend, which registers it as the grant. Its private half never leaves
+    /// the backend.
     pub async fn session_pubkey_b64(&self, session_id: &str) -> String {
         self.ensure_session(session_id).await;
         let sessions = self.sessions.read().await;
@@ -192,90 +191,80 @@ impl Identities {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(der)
     }
 
-    /// Accept the connect-time standing delegation chain (the
-    /// `DelegationChain.toJSON()` II form-POSTs back from the `/mcp` flow): parse
-    /// it, verify it (II canister signature at the root, none expired), require
-    /// it to end at this session's backend key, and store it. Returns the
-    /// verified principal (`self_authenticating(user_key)` = `derive(anchor,
-    /// mcp_origin)`, the caller the II account methods recover the anchor from).
-    pub async fn accept_standing(
-        &self,
-        session_id: &str,
-        chain_json: &str,
-    ) -> Result<String, String> {
-        self.ensure_session(session_id).await;
-        let (_, pubkey_der) = self.session_key(session_id).await.ok_or("session vanished")?;
-
-        let parsed = parse_chain_json(chain_json)?;
-        let principal = crate::delegation::verify_chain(&parsed.user_key, &parsed.verify_chain, now_ns())?;
-
-        let leaf = parsed.agent_chain.last().ok_or("empty delegation chain")?;
-        if leaf.delegation.pubkey != pubkey_der {
-            return Err("standing delegation does not end at this connection's key".into());
-        }
-
-        let mut sessions = self.sessions.write().await;
-        if let Some(s) = sessions.get_mut(session_id) {
-            s.standing = Some(Standing {
-                user_key: parsed.user_key,
-                chain: parsed.agent_chain,
-                expiration_ns: parsed.max_exp,
-            });
-        }
-        Ok(principal.to_text())
+    /// The session's principal (`self_authenticating(session_pubkey)`), the
+    /// identity the II grant is bound to. Used for logging/attribution.
+    pub async fn session_principal(&self, session_id: &str) -> Option<String> {
+        let (_, der) = self.session_key(session_id).await?;
+        Some(Principal::self_authenticating(&der).to_text())
     }
 
-    /// The connect-time **60-minute standing delegation** (`anchor -> backend
-    /// session key`, issued for the MCP origin), as an `ic-agent` identity the
-    /// backend signs II's account-derivation calls with. The backend's private
-    /// key signs locally; it is never transmitted.
-    ///
-    /// Public so the canister-management tools can act as this stable per-user
-    /// principal (the user's controller/funder identity).
-    pub async fn standing_identity(&self, session_id: &str) -> Result<DelegatedIdentity, String> {
+    /// Record the grant's expiration reported by the completion-notification
+    /// callback POST (`{state, expiration}`). The value is nanoseconds since the
+    /// epoch (a decimal string on the wire, parsed before it reaches here).
+    pub async fn set_grant_expiration(&self, session_id: &str, expiration_ns: u64) {
+        self.ensure_session(session_id).await;
+        let mut sessions = self.sessions.write().await;
+        if let Some(s) = sessions.get_mut(session_id) {
+            s.grant_expiration_ns = Some(expiration_ns);
+        }
+    }
+
+    /// Build the plain session-key identity (`BasicIdentity`) the server signs
+    /// II's `mcp_*` calls with. Errors early if the stored grant expiration has
+    /// passed (a missing expiration is not treated as expired — the spec says to
+    /// fall back to attempting the signed call, where an `Unauthorized` is the
+    /// authoritative signal).
+    async fn session_signer(&self, session_id: &str) -> Result<BasicIdentity, String> {
+        self.ensure_session(session_id).await;
         let sessions = self.sessions.read().await;
         let s = sessions.get(session_id).ok_or("no such session")?;
-        let standing = s.standing.as_ref().ok_or(
-            "no standing Internet Identity credential for this connection — reconnect and sign \
-             in with Internet Identity",
-        )?;
-        if standing.expiration_ns <= now_ns() {
-            return Err(
-                "this connection's Internet Identity credential has expired (~60 min) — \
-                 reconnect to sign in again"
-                    .to_string(),
-            );
+        if let Some(exp) = s.grant_expiration_ns {
+            if exp <= now_ns() {
+                return Err(RECONNECT_MSG.to_string());
+            }
         }
-        let key = BasicIdentity::from_raw_key(&s.key_seed);
-        DelegatedIdentity::new(standing.user_key.clone(), Box::new(key), standing.chain.clone())
-            .map_err(|e| format!("invalid standing delegation chain: {e}"))
+        Ok(BasicIdentity::from_raw_key(&s.key_seed))
+    }
+
+    /// An `ic-agent` pointed at mainnet II, signing as this connection's session
+    /// key. This is the caller II recovers the anchor from for the `mcp_*` calls.
+    async fn session_agent(&self, session_id: &str) -> Result<Agent, String> {
+        let signer = self.session_signer(session_id).await?;
+        Agent::builder()
+            .with_url(IC_URL)
+            .with_identity(signer)
+            .build()
+            .map_err(|e| format!("could not build II agent: {e}"))
+    }
+
+    /// A stable per-user identity for the canister-management tools — the user's
+    /// default account at *this* MCP server's own origin, derived on demand like
+    /// any other app. Its principal (`self_authenticating(user_key)`) is stable
+    /// across reconnects (unlike the ephemeral session key), so it works as the
+    /// user's controller/funder identity.
+    pub async fn management_identity(&self, session_id: &str) -> Result<DelegatedIdentity, String> {
+        let origin = crate::auth::base_url();
+        self.delegated_identity(session_id, &origin, None).await
     }
 
     /// List the user's Internet Identity accounts at an app `domain`, via II's
-    /// `mcp_get_accounts(target_origin)` signed as the standing identity. II
-    /// recovers the anchor from the caller (the connect-time MCP-origin
-    /// principal), so no anchor number is needed. Every user has a default
-    /// ("synthetic") account (`account_number == None`, no name) at any origin,
-    /// plus any named accounts they created there; each is a distinct per-origin
-    /// principal. Requires the standing credential.
+    /// `mcp_get_accounts(target_origin)` signed as the session key. II recovers
+    /// the anchor from the caller (the registered session-key principal), so no
+    /// anchor number is needed. Every user has a default ("synthetic") account
+    /// (`account_number == None`, no name) at any origin, plus any named accounts
+    /// they created there; each is a distinct per-origin principal.
     pub async fn list_accounts(
         &self,
         session_id: &str,
         domain: &str,
     ) -> Result<Vec<AccountInfo>, String> {
-        self.ensure_session(session_id).await;
-        let standing = self.standing_identity(session_id).await?;
-        let agent = Agent::builder()
-            .with_url(IC_URL)
-            .with_identity(standing)
-            .build()
-            .map_err(|e| format!("could not build II agent: {e}"))?;
+        let agent = self.session_agent(session_id).await?;
         let canister = ii_canister_id()?;
         let origin = target_origin(domain);
 
         // mcp_get_accounts(target_origin) -> variant { Ok: vec AccountInfo; Err }
-        // A signed query: II recovers the anchor from the caller (the standing
-        // identity) and returns that anchor's accounts at `target_origin`.
+        // A signed query: II recovers the anchor from the caller (the session key)
+        // and returns that anchor's accounts at `target_origin`.
         let arg = Encode!(&origin).map_err(|e| format!("could not encode mcp_get_accounts args: {e}"))?;
         let reply = agent
             .query(&canister, "mcp_get_accounts")
@@ -285,7 +274,7 @@ impl Identities {
             .map_err(|e| format!("mcp_get_accounts failed: {e}"))?;
         let accounts = Decode!(&reply, McpGetAccountsReply)
             .map_err(|e| format!("could not decode mcp_get_accounts reply: {e}"))?
-            .map_err(|e| format!("II refused mcp_get_accounts: {e:?}"))?;
+            .map_err(map_delegation_error)?;
 
         Ok(accounts
             .into_iter()
@@ -295,6 +284,16 @@ impl Identities {
                 last_used: a.last_used,
             })
             .collect())
+    }
+
+    /// Whether the grant is currently usable: a signed `mcp_get_accounts` for the
+    /// MCP origin succeeds. Used by the device-flow poll as a best-effort "the
+    /// user has finished connecting" signal, since the completion-notification
+    /// POST is best-effort and may never arrive.
+    pub async fn grant_is_live(&self, session_id: &str) -> bool {
+        self.list_accounts(session_id, &crate::auth::base_url())
+            .await
+            .is_ok()
     }
 
     /// Resolve an optional account `name` at `domain` to its account number
@@ -350,12 +349,12 @@ impl Identities {
 
         // Reuse a cached, still-fresh delegation if present.
         if let Some(app) = self.cached_fresh(session_id, domain, account_number).await {
-            return self.build_identity(session_id, &app).await;
+            return build_identity(&app);
         }
 
         // Otherwise derive a fresh one on demand against the II canister.
         let app = self.derive_app_delegation(session_id, domain, account_number).await?;
-        let identity = self.build_identity(session_id, &app).await?;
+        let identity = build_identity(&app)?;
         self.store(session_id, domain, account_number, app).await;
         Ok(identity)
     }
@@ -378,6 +377,7 @@ impl Identities {
             user_key: app.user_key.clone(),
             chain: app.chain.clone(),
             expiration_ns: app.expiration_ns,
+            app_key_seed: app.app_key_seed,
         })
     }
 
@@ -388,25 +388,9 @@ impl Identities {
         }
     }
 
-    /// Build a `DelegatedIdentity` for a derived app delegation: the chain ends
-    /// at the backend session key, so the backend `BasicIdentity` signs.
-    async fn build_identity(
-        &self,
-        session_id: &str,
-        app: &AppDelegation,
-    ) -> Result<DelegatedIdentity, String> {
-        let (seed, _) = self
-            .session_key(session_id)
-            .await
-            .ok_or("session vanished")?;
-        let key = BasicIdentity::from_raw_key(&seed);
-        DelegatedIdentity::new(app.user_key.clone(), Box::new(key), app.chain.clone())
-            .map_err(|e| format!("invalid delegation chain: {e}"))
-    }
-
     /// Derive a fresh per-app account delegation by calling II's
-    /// `mcp_prepare_account_delegation` then `mcp_get_account_delegation`, AS the
-    /// standing identity, with the backend session key as `session_key`.
+    /// `mcp_prepare_delegation` then `mcp_get_delegation`, SIGNED AS the session
+    /// key, passing a fresh **per-app key** as the `session_key` argument.
     /// `account_number == None` selects the origin's default account.
     async fn derive_app_delegation(
         &self,
@@ -414,189 +398,115 @@ impl Identities {
         domain: &str,
         account_number: Option<u64>,
     ) -> Result<AppDelegation, String> {
-        let (_, session_key_der) = self
-            .session_key(session_id)
-            .await
-            .ok_or("session vanished")?;
         let origin = target_origin(domain);
         let canister = ii_canister_id()?;
 
-        // Call II AS the standing delegation identity (the anchor's MCP-origin
-        // principal) — that's the caller II requires for account derivation.
-        let standing = self.standing_identity(session_id).await?;
-        let agent = Agent::builder()
-            .with_url(IC_URL)
-            .with_identity(standing)
-            .build()
-            .map_err(|e| format!("could not build II agent: {e}"))?;
+        // The per-app key B the delegation is issued to — distinct from the
+        // session key. Its DER pubkey is the `session_key` argument to
+        // prepare/get; the returned chain ends at B, so the server signs canister
+        // calls at the app as B via a DelegatedIdentity over [user_key -> B].
+        let (app_key_seed, app_key_der) = fresh_ed25519();
 
-        // mcp_prepare_account_delegation(target_origin, opt account_number, session_key, opt max_ttl)
+        // Call II SIGNED AS the session key (the registered grant principal) —
+        // that's the caller II recovers the anchor from.
+        let agent = self.session_agent(session_id).await?;
+
+        // mcp_prepare_delegation(target_origin, opt account_number, session_key, opt max_ttl)
         //   -> variant { Ok: McpPrepareDelegation; Err: AccountDelegationError }
-        // `max_ttl` is in nanoseconds (we pass APP_DELEGATION_TTL_NS = 5 min).
-        // `account_number = null` selects the anchor's default account at
-        // `target_origin`; `Some(n)` selects a specific named account (its number
-        // resolved from `list_accounts`). The default is mutable, so II resolves
-        // the request to a concrete account at prepare time and returns it in the
-        // reply; we thread that resolved account into `mcp_get_account_delegation`
-        // below so `get` reads the same account `prepare` signed for.
-        //
-        // Threading the *returned* account (rather than re-sending our request) is
-        // what keeps this working across II versions: the two methods' signatures
-        // are identical in dfinity/internet-identity#4052 and #4066, and `null`
-        // resolves to the anchor's default account in both (synthetic fallback in
-        // #4052, `default_account_number()` in #4066 — both authorized, neither
-        // errors). #4066 only drops the connect-time account picker and the
-        // `account_number` arg on `mcp_set_access`/`mcp_access_enabled`, none of
-        // which this server calls.
-        let prepare_arg = Encode!(
-            &origin,
-            &account_number,
-            &session_key_der,
-            &Some(APP_DELEGATION_TTL_NS)
-        )
-        .map_err(|e| format!("could not encode prepare args: {e}"))?;
+        // `session_key` is the PER-APP key's DER pubkey. `max_ttl = null` uses
+        // II's default (<= 1 hour, and never past the grant). `account_number =
+        // null` selects the anchor's default account at `target_origin`; `Some(n)`
+        // selects a specific named account. The default is mutable, so II resolves
+        // the request to a concrete account at prepare time and returns it; we
+        // thread that resolved account into `mcp_get_delegation` so `get` reads the
+        // same account `prepare` signed for.
+        let prepare_arg = Encode!(&origin, &account_number, &app_key_der, &None::<u64>)
+            .map_err(|e| format!("could not encode prepare args: {e}"))?;
         let prepared = agent
-            .update(&canister, "mcp_prepare_account_delegation")
+            .update(&canister, "mcp_prepare_delegation")
             .with_arg(prepare_arg)
             .call_and_wait()
             .await
-            .map_err(|e| format!("mcp_prepare_account_delegation failed: {e}"))?;
+            .map_err(|e| format!("mcp_prepare_delegation failed: {e}"))?;
         let prepared = Decode!(&prepared, PrepareReply)
             .map_err(|e| format!("could not decode prepare reply: {e}"))?
-            .map_err(|e| format!("II refused mcp_prepare_account_delegation: {e:?}"))?;
+            .map_err(map_delegation_error)?;
 
-        // mcp_get_account_delegation(target_origin, opt account_number, session_key, expiration)
-        //   -> variant { Ok: SignedDelegation; Err: AccountDelegationError }
-        // Thread the account `prepare` resolved to, so `get` reads the same one
-        // (the default account at `target_origin` is mutable between the calls).
-        let get_arg = Encode!(
-            &origin,
-            &prepared.account_number,
-            &session_key_der,
-            &prepared.expiration
-        )
-        .map_err(|e| format!("could not encode get args: {e}"))?;
+        // mcp_get_delegation(target_origin, opt account_number, session_key, expiration)
+        //   -> variant { Ok: SignedDelegation; Err: AccountDelegationError } query
+        // Thread the account + expiration `prepare` returned VERBATIM, or II
+        // returns NoSuchDelegation (the default account is mutable between calls).
+        let get_arg = Encode!(&origin, &prepared.account_number, &app_key_der, &prepared.expiration)
+            .map_err(|e| format!("could not encode get args: {e}"))?;
         let got = agent
-            .query(&canister, "mcp_get_account_delegation")
+            .query(&canister, "mcp_get_delegation")
             .with_arg(get_arg)
             .call()
             .await
-            .map_err(|e| format!("mcp_get_account_delegation failed: {e}"))?;
+            .map_err(|e| format!("mcp_get_delegation failed: {e}"))?;
         let signed = Decode!(&got, GetReply)
             .map_err(|e| format!("could not decode get reply: {e}"))?
-            .map_err(|e| format!("II refused account delegation: {e:?}"))?;
+            .map_err(map_delegation_error)?;
 
-        let chain = vec![signed.into_agent(&session_key_der)?];
+        let chain = vec![signed.into_agent(&app_key_der)?];
         Ok(AppDelegation {
             user_key: prepared.user_key,
             chain,
             expiration_ns: prepared.expiration,
+            app_key_seed,
         })
     }
 }
 
-// ---- Standing-credential chain parsing (DelegationChain.toJSON()) ----------
-
-/// A delegation chain parsed into both representations we need: `agent_chain`
-/// for `ic-agent` (signing), `verify_chain` for [`crate::delegation`] (checking).
-struct ParsedChain {
-    user_key: Vec<u8>,
-    agent_chain: Vec<SignedDelegation>,
-    verify_chain: Vec<crate::delegation::SignedDelegation>,
-    max_exp: u64,
+/// Generate a fresh Ed25519 keypair; return its seed and DER SubjectPublicKeyInfo.
+fn fresh_ed25519() -> ([u8; 32], Vec<u8>) {
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).expect("getrandom");
+    let pubkey_der = BasicIdentity::from_raw_key(&seed)
+        .public_key()
+        .expect("ed25519 public key");
+    (seed, pubkey_der)
 }
 
-#[derive(Deserialize)]
-struct ChainJson {
-    #[serde(rename = "publicKey")]
-    public_key: String,
-    delegations: Vec<SignedDelJson>,
-}
-#[derive(Deserialize)]
-struct SignedDelJson {
-    delegation: DelJson,
-    signature: String,
-}
-#[derive(Deserialize)]
-struct DelJson {
-    pubkey: String,
-    /// Nanoseconds since epoch, hex-encoded (agent-js bigint form).
-    expiration: String,
-    #[serde(default)]
-    targets: Option<Vec<String>>,
+/// Build a `DelegatedIdentity` for a derived app delegation: the chain ends at
+/// the per-app key, so a `BasicIdentity` over that key's seed signs.
+fn build_identity(app: &AppDelegation) -> Result<DelegatedIdentity, String> {
+    let key = BasicIdentity::from_raw_key(&app.app_key_seed);
+    DelegatedIdentity::new(app.user_key.clone(), Box::new(key), app.chain.clone())
+        .map_err(|e| format!("invalid delegation chain: {e}"))
 }
 
-/// Parse `DelegationChain.toJSON()` (all hex) into [`ParsedChain`].
-fn parse_chain_json(json: &str) -> Result<ParsedChain, String> {
-    let chain: ChainJson =
-        serde_json::from_str(json).map_err(|e| format!("bad delegation JSON: {e}"))?;
-    let user_key = hex::decode(&chain.public_key).map_err(|_| "bad publicKey hex")?;
-    let mut agent_chain = Vec::with_capacity(chain.delegations.len());
-    let mut verify_chain = Vec::with_capacity(chain.delegations.len());
-    let mut max_exp = 0u64;
-    for d in chain.delegations {
-        let expiration = u64::from_str_radix(d.delegation.expiration.trim_start_matches("0x"), 16)
-            .map_err(|_| "bad expiration")?;
-        max_exp = max_exp.max(expiration);
-        let pubkey = hex::decode(&d.delegation.pubkey).map_err(|_| "bad delegation pubkey hex")?;
-        let signature = hex::decode(&d.signature).map_err(|_| "bad delegation signature hex")?;
-        let targets_hex = d.delegation.targets;
-        let agent_targets = match &targets_hex {
-            Some(ts) => Some(
-                ts.iter()
-                    .map(|t| hex::decode(t).map(|b| Principal::from_slice(&b)))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|_| "bad target hex")?,
-            ),
-            None => None,
-        };
-        let verify_targets = match &targets_hex {
-            Some(ts) => Some(
-                ts.iter()
-                    .map(|t| hex::decode(t).map_err(|_| "bad target hex".to_string()))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
-            None => None,
-        };
-        agent_chain.push(SignedDelegation {
-            delegation: Delegation {
-                pubkey: pubkey.clone(),
-                expiration,
-                targets: agent_targets,
-            },
-            signature: signature.clone(),
-        });
-        verify_chain.push(crate::delegation::SignedDelegation {
-            pubkey,
-            expiration,
-            targets: verify_targets,
-            signature,
-        });
+/// Render an `AccountDelegationError` as an actionable message. Any `Unauthorized`
+/// means the grant is gone → reconnect (do not retry).
+fn map_delegation_error(e: AccountDelegationError) -> String {
+    match e {
+        AccountDelegationError::Unauthorized(_) => RECONNECT_MSG.to_string(),
+        AccountDelegationError::NoSuchDelegation => {
+            "Internet Identity returned NoSuchDelegation — the prepared account/expiration were not \
+             threaded through. Retry the request."
+                .to_string()
+        }
+        AccountDelegationError::InternalCanisterError(t) => {
+            format!("Internet Identity internal error: {t}")
+        }
     }
-    Ok(ParsedChain {
-        user_key,
-        agent_chain,
-        verify_chain,
-        max_exp,
-    })
 }
 
-// ---- II candid contract for the mcp_*_account_delegation methods ----
+// ---- II candid contract for the mcp_* delegation methods --------------------
 
-/// `Ok` payload of `mcp_prepare_account_delegation` (II `McpPrepareDelegation`).
+/// `Ok` payload of `mcp_prepare_delegation` (II `McpPrepareDelegation`).
 #[derive(CandidType, Deserialize)]
 struct PreparedDelegation {
     user_key: Vec<u8>,
     /// The account II resolved the request to (`opt AccountNumber`, `null` =
-    /// the default account at `target_origin`). The default is mutable, so it's
-    /// resolved here and threaded back into `mcp_get_account_delegation` so both
-    /// calls sign for the same account.
+    /// the default account at `target_origin`). Threaded back into
+    /// `mcp_get_delegation` so both calls sign for the same account.
     account_number: Option<u64>,
     expiration: u64,
 }
 
-/// II's `AccountDelegationError` — the `Err` arm of both methods. We only need
-/// to decode and display it.
+/// II's `AccountDelegationError` — the `Err` arm of the delegation methods. We
+/// only need to decode and act on it.
 #[derive(CandidType, Deserialize, Debug)]
 enum AccountDelegationError {
     InternalCanisterError(String),
@@ -604,16 +514,15 @@ enum AccountDelegationError {
     NoSuchDelegation,
 }
 
-// Both methods return `variant { Ok; Err }`, i.e. a Rust `Result`. Aliased so the
+// The methods return `variant { Ok; Err }`, i.e. a Rust `Result`. Aliased so the
 // `Decode!` macro doesn't choke on the comma inside the generic.
 type PrepareReply = std::result::Result<PreparedDelegation, AccountDelegationError>;
 type GetReply = std::result::Result<IiSignedDelegation, AccountDelegationError>;
-
-// ---- II candid contract for mcp_get_accounts --------------------------------
+type McpGetAccountsReply = std::result::Result<Vec<IiAccountInfo>, AccountDelegationError>;
 
 /// One of an anchor's accounts at an origin (II `AccountInfo`). Decoded by name,
-/// so field order is irrelevant; the wire record's `origin` field is skipped (we
-/// already know the origin we queried).
+/// so field order is irrelevant and the wire record's `origin` field is skipped
+/// (we already know the origin we queried).
 #[derive(CandidType, Deserialize)]
 struct IiAccountInfo {
     account_number: Option<u64>,
@@ -621,12 +530,7 @@ struct IiAccountInfo {
     name: Option<String>,
 }
 
-// `mcp_get_accounts` returns `variant { Ok: vec AccountInfo; Err: AccountDelegationError }`
-// (the same `Err` type as the delegation methods). Aliased so the `Decode!` macro
-// doesn't choke on the comma inside the generic.
-type McpGetAccountsReply = std::result::Result<Vec<IiAccountInfo>, AccountDelegationError>;
-
-/// One delegation as returned by II's `mcp_get_account_delegation`.
+/// One delegation as returned by II's `mcp_get_delegation`.
 #[derive(CandidType, Deserialize)]
 struct IiDelegation {
     pubkey: Vec<u8>,
@@ -634,7 +538,7 @@ struct IiDelegation {
     targets: Option<Vec<Principal>>,
 }
 
-/// `SignedDelegation` as returned by II's `mcp_get_account_delegation`.
+/// `SignedDelegation` as returned by II's `mcp_get_delegation`.
 #[derive(CandidType, Deserialize)]
 struct IiSignedDelegation {
     delegation: IiDelegation,
@@ -642,14 +546,11 @@ struct IiSignedDelegation {
 }
 
 impl IiSignedDelegation {
-    /// Convert into `ic-agent`'s `SignedDelegation`, checking that the
-    /// delegation actually targets the backend session key (so the chain ends
-    /// where we can sign).
-    fn into_agent(self, session_key_der: &[u8]) -> Result<SignedDelegation, String> {
-        if self.delegation.pubkey != session_key_der {
-            return Err(
-                "II delegation does not delegate to the backend session key".to_string(),
-            );
+    /// Convert into `ic-agent`'s `SignedDelegation`, checking that the delegation
+    /// actually targets the per-app key (so the chain ends where we can sign).
+    fn into_agent(self, app_key_der: &[u8]) -> Result<SignedDelegation, String> {
+        if self.delegation.pubkey != app_key_der {
+            return Err("II delegation does not delegate to this app's per-app key".to_string());
         }
         Ok(SignedDelegation {
             delegation: Delegation {
@@ -672,10 +573,7 @@ mod tests {
             target_origin("rdmx6-jaaaa-aaaaa-aaadq-cai.icp0.io"),
             "https://rdmx6-jaaaa-aaaaa-aaadq-cai.ic0.app"
         );
-        assert_eq!(
-            target_origin("foo.icp.net"),
-            "https://foo.ic0.app"
-        );
+        assert_eq!(target_origin("foo.icp.net"), "https://foo.ic0.app");
     }
 
     #[test]
@@ -685,16 +583,12 @@ mod tests {
         assert_eq!(target_origin("http://oisy.com"), "https://oisy.com");
     }
 
-    // Seed a session with a standing credential, bypassing the network connect flow.
-    async fn seed_standing(ids: &Identities, session_id: &str) {
+    // Seed a session with a live grant, bypassing the network connect flow.
+    async fn seed_live(ids: &Identities, session_id: &str) {
         ids.ensure_session(session_id).await;
         let mut sessions = ids.sessions.write().await;
         let s = sessions.get_mut(session_id).expect("ensured session");
-        s.standing = Some(Standing {
-            user_key: vec![1, 2, 3],
-            chain: vec![],
-            expiration_ns: u64::MAX,
-        });
+        s.grant_expiration_ns = Some(u64::MAX);
     }
 
     // Insert a cached app delegation for (domain, account_number) directly.
@@ -703,14 +597,19 @@ mod tests {
         let s = sessions.get_mut(session_id).expect("session");
         s.app_delegations.insert(
             (domain.to_string(), account),
-            AppDelegation { user_key: vec![account.unwrap_or(0) as u8], chain: vec![], expiration_ns: exp },
+            AppDelegation {
+                user_key: vec![account.unwrap_or(0) as u8],
+                chain: vec![],
+                expiration_ns: exp,
+                app_key_seed: [account.unwrap_or(0) as u8; 32],
+            },
         );
     }
 
     #[tokio::test]
     async fn resolve_account_defaults_to_none_without_network() {
         let ids = Identities::new();
-        seed_standing(&ids, "sess").await;
+        seed_live(&ids, "sess").await;
         // No account name -> the default account, resolved with no network call.
         assert_eq!(ids.resolve_account("sess", "oisy.com", None).await.unwrap(), None);
     }
@@ -718,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn cached_delegations_are_keyed_by_account_number() {
         let ids = Identities::new();
-        seed_standing(&ids, "sess").await;
+        seed_live(&ids, "sess").await;
         let future = now_ns() + REDERIVE_MARGIN_NS + 60 * 1_000_000_000;
         seed_app(&ids, "sess", "oisy.com", None, future).await;
         seed_app(&ids, "sess", "oisy.com", Some(7), future).await;
@@ -735,16 +634,24 @@ mod tests {
     #[tokio::test]
     async fn cached_delegation_near_expiry_is_a_miss() {
         let ids = Identities::new();
-        seed_standing(&ids, "sess").await;
+        seed_live(&ids, "sess").await;
         // Expiry within the re-derive margin -> treated as stale.
         seed_app(&ids, "sess", "oisy.com", None, now_ns() + 1).await;
         assert!(ids.cached_fresh("sess", "oisy.com", None).await.is_none());
     }
 
+    #[tokio::test]
+    async fn expired_grant_blocks_signing() {
+        let ids = Identities::new();
+        ids.ensure_session("sess").await;
+        ids.set_grant_expiration("sess", now_ns().saturating_sub(1)).await;
+        // A past grant expiration short-circuits to the reconnect message.
+        assert!(ids.session_signer("sess").await.is_err());
+    }
+
     // Lock in the mcp_get_accounts Candid contract: a `vec AccountInfo` (with the
-    // full four-field record, incl. `origin`) decodes into our subset
-    // `IiAccountInfo` (origin skipped), and the Ok/Err variant maps to a Rust
-    // Result over AccountDelegationError.
+    // full record incl. `origin`) decodes into our subset `IiAccountInfo` (origin
+    // skipped), and the Ok/Err variant maps to a Rust Result over the error type.
     #[test]
     fn mcp_get_accounts_reply_decodes_account_records() {
         #[derive(CandidType)]

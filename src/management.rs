@@ -1,5 +1,6 @@
-//! Canister creation & management as the connection's **standing Internet
-//! Identity principal** — a stable per-user controller/funder.
+//! Canister creation & management as the connection's **management identity** —
+//! the user's default account at this server's own origin, a stable per-user
+//! controller/funder (derived on demand like any per-app account).
 //!
 //! Two on-chain surfaces are used:
 //!
@@ -8,7 +9,7 @@
 //!     `update_settings`, `start`/`stop`/`uninstall`/`delete`. Every call sets
 //!     the ic-agent **effective canister id** to the *target* canister (not
 //!     `aaaaa-aa`), as the boundary node requires, and is signed by a
-//!     controller (the standing identity).
+//!     controller (the management identity).
 //!
 //!   * The **cycles ledger** (`um5iw-rqaaa-aaaaq-qaaba-cai`) for funding: a user
 //!     ingress message cannot attach cycles, so `create_canister`/`top_up` draw
@@ -379,10 +380,11 @@ pub async fn delete_canister(ids: &Identities, sid: &str, canister_id: &str) -> 
 // Internal helpers
 // ===========================================================================
 
-/// Build an ic-agent backed by the connection's standing II identity, plus that
-/// identity's principal (the default controller/funder).
+/// Build an ic-agent backed by the connection's stable management identity (the
+/// user's default account at this server's own origin), plus that identity's
+/// principal (the default controller/funder).
 async fn standing_agent(ids: &Identities, session_id: &str) -> Result<(Agent, Principal), String> {
-    let identity = ids.standing_identity(session_id).await?;
+    let identity = ids.management_identity(session_id).await?;
     let principal = identity
         .sender()
         .map_err(|e| format!("could not derive your principal: {e}"))?;
