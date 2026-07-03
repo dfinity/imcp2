@@ -176,7 +176,6 @@ pub struct DeviceAuthzForm {
     scope: Option<String>,
     #[serde(default)]
     code_challenge: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     code_challenge_method: Option<String>,
 }
@@ -187,6 +186,18 @@ pub async fn device_authorization(
     State(store): State<AuthStore>,
     Form(req): Form<DeviceAuthzForm>,
 ) -> Response {
+    // We only verify PKCE with S256; reject any other method up front (rather
+    // than storing the challenge and failing confusingly with S256 at token
+    // time), and require a challenge whenever a method is named.
+    if let Some(method) = &req.code_challenge_method {
+        if method != "S256" {
+            return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "only code_challenge_method=S256 is supported");
+        }
+        if req.code_challenge.is_none() {
+            return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "code_challenge required when code_challenge_method is set");
+        }
+    }
+
     let session_id = format!("sess-{}", Uuid::new_v4());
     let device_code = format!("dc-{}", Uuid::new_v4());
     // A short, human-typable code for the verification page.
@@ -303,36 +314,48 @@ pub struct ConnectCallback {
 /// Never returns a redirect (the response is consumed by `fetch()`), and never
 /// receives or verifies a delegation chain.
 pub async fn connect_callback(State(store): State<AuthStore>, Json(body): Json<ConnectCallback>) -> Response {
-    // Look up the pending connection by state WITHOUT consuming it — `state`
-    // comes back on BOTH POSTs. Unknown/expired state → non-2xx so II aborts.
-    {
-        let devices = store.devices.read().await;
-        match devices.get(&body.state) {
-            Some(d) if d.created.elapsed() < DEVICE_CODE_TTL => {}
-            _ => return (StatusCode::FORBIDDEN, Json(json!({ "error": "invalid_state" }))).into_response(),
-        }
-    }
-
     match &body.expiration {
-        // (a) Key request — generate (lazily) this connection's session keypair
-        // and return its public key for II's frontend to register.
+        // (a) Key request — require a valid, unexpired pending connection (reject
+        // unknown/replayed/expired state with a non-2xx so II aborts), then
+        // generate (lazily) this connection's session keypair and return its
+        // public key for II's frontend to register.
         None => {
+            {
+                let devices = store.devices.read().await;
+                match devices.get(&body.state) {
+                    Some(d) if d.created.elapsed() < DEVICE_CODE_TTL => {}
+                    _ => {
+                        return (StatusCode::FORBIDDEN, Json(json!({ "error": "invalid_state" }))).into_response()
+                    }
+                }
+            }
             let public_key = store.identities.session_pubkey_b64(&body.state).await;
             (StatusCode::OK, Json(json!({ "public_key": public_key }))).into_response()
         }
-        // (b) Completion notification — store the grant expiration and mark live.
+        // (b) Completion notification — best-effort. Update the grant if the
+        // connection is still known; tolerate a missing/expired state (e.g. the
+        // grant was already consumed via the signed-call fallback) with a 2xx, so
+        // a late completion POST doesn't make II treat an otherwise-successful
+        // connect as failed. Never create a session for an unknown state.
         Some(exp) => {
-            match exp.trim().parse::<u64>() {
-                Ok(exp_ns) => store.identities.set_grant_expiration(&body.state, exp_ns).await,
-                Err(_) => {
-                    // Malformed expiration is non-fatal: the grant may still be
-                    // live (registration happened under the user's auth). Mark it
-                    // live and let a signed call be the source of truth.
-                    tracing::warn!("connect completion had unparseable expiration");
+            let known = {
+                let mut devices = store.devices.write().await;
+                match devices.get_mut(&body.state) {
+                    Some(d) => {
+                        d.live = true;
+                        true
+                    }
+                    None => false,
                 }
-            }
-            if let Some(d) = store.devices.write().await.get_mut(&body.state) {
-                d.live = true;
+            };
+            if known {
+                match exp.trim().parse::<u64>() {
+                    Ok(exp_ns) => store.identities.set_grant_expiration(&body.state, exp_ns).await,
+                    // A malformed expiration is non-fatal: the grant may still be
+                    // live (registration happened under the user's auth); a signed
+                    // call is the source of truth.
+                    Err(_) => tracing::warn!("connect completion had unparseable expiration"),
+                }
             }
             StatusCode::NO_CONTENT.into_response()
         }
