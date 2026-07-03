@@ -96,11 +96,11 @@ Add the server to Claude Code (replace the URL with wherever it's hosted):
 claude mcp add --transport http ic-poc https://YOUR-HOST/mcp
 ```
 
-Then run `/mcp` → **ic-poc** → authenticate: the client obtains a device code and
-opens a verification link that launches **Internet Identity**'s `/mcp` handshake;
-you sign in once, and the tools become available — that single login registers the
-connection's session key with II as a time-boxed grant. (Any MCP client that
-supports the OAuth 2.0 device authorization grant, RFC 8628, works.)
+Then run `/mcp` → **ic-poc** → authenticate: the client sends the browser to
+**Internet Identity**'s `/mcp` handshake; you sign in once, II registers the
+connection's session key as a time-boxed grant and returns you to the client, and
+the tools become available. Redirect-based clients (e.g. Claude.ai) use the
+authorization-code flow; clients that poll can use the device grant (RFC 8628).
 
 ## Run
 
@@ -149,35 +149,48 @@ curl -s "${H[@]}" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"n
 # => ("Internet Computer")
 ```
 
-## Auth (OAuth 2.0 device grant, login via Internet Identity)
+## Auth (OAuth 2.1, login via Internet Identity)
 
 `/mcp` is gated by a bearer token. II's `/mcp` handshake has **no redirect back
 to this server** — the II tab makes two background `fetch()` POSTs to our
 callback and then finishes on its own — so a classic authorization-code
-`redirect_uri` can't be delivered. The MCP client's login is therefore modelled
-as the **OAuth 2.0 Device Authorization Grant (RFC 8628)**: the client gets a
-`device_code` + a verification link, the user opens it (which launches II's
-handshake), and the client polls the token endpoint until the grant is live.
+`redirect_uri` can't be delivered *by II*. We bridge that gap and support **two
+flows**, so any MCP client works:
+
+- **Authorization code (finish redirect)** — for redirect-based clients (e.g.
+  Claude.ai). `/oauth/authorize` redirects to II's handshake; the key-request
+  response carries a `finish_url` on our origin, so after `mcp_register` II
+  navigates the browser to `/oauth/finish`, which confirms registration, mints a
+  PKCE-bound code, and 302s to the client's `redirect_uri?code=…&state=…`.
+- **Device grant (RFC 8628)** — for clients that can poll: `device_code` +
+  `verification_uri`, and the client polls `/oauth/token` until the grant is live.
 
 Endpoints:
 
-- `GET /.well-known/oauth-authorization-server` — AS metadata (advertises the
-  device-code grant and the `device_authorization_endpoint`)
+- `GET /.well-known/oauth-authorization-server` — AS metadata (advertises both
+  the `authorization_code` and `device_code` grants)
 - `GET /.well-known/oauth-protected-resource` — points clients at the AS
 - `POST /oauth/register` — dynamic client registration (RFC 7591); `redirect_uris`
-  are optional (the device grant has none) and persisted to `OAUTH_CLIENTS_FILE`
-- `POST /oauth/device_authorization` — mints a `device_code`/`user_code` and a
-  `verification_uri` (RFC 8628 §3.2)
+  are stored (device-only clients may register none) and persisted to
+  `OAUTH_CLIENTS_FILE`; requested `grant_types` are honoured
+- `GET  /oauth/authorize` — validates the client + redirect, requires PKCE, then
+  redirects to II's handshake
+- `GET  /oauth/finish` — II navigates here after registration; confirms the grant
+  is live, then 302s to `redirect_uri?code=…&state=…`
+- `POST /oauth/device_authorization` — device-grant entry: mints a `device_code`/
+  `user_code` + `verification_uri` (RFC 8628 §3.2)
 - `GET  /oauth/device` — the user opens this; it launches II's `/mcp` handshake
   with the connect `state` (= session id) in the URL fragment, `ttl` in **seconds**
 - `POST /oauth/connect/callback` — serves II's **two cross-origin JSON POSTs**:
   a key request `{state}` → `{public_key}` (a fresh session keypair, minted here),
   and a completion notification `{state, expiration}` → mark the grant live
-- `POST /oauth/token` — the client polls with the `device_code`
-  (`authorization_pending`/`slow_down`) until the token is issued
+- `POST /oauth/token` — exchanges an authorization `code` (PKCE), or polls with a
+  `device_code` (`authorization_pending`/`slow_down`), for the access token
 
-Unauthenticated `/mcp` requests get `401` with a `WWW-Authenticate` header
-pointing at the resource metadata, as the MCP spec expects.
+"Grant is live" means II's completion POST arrived **or** a signed
+`mcp_get_accounts` now succeeds (belt-and-suspenders, since the completion POST is
+best-effort). Unauthenticated `/mcp` requests get `401` with a `WWW-Authenticate`
+header pointing at the resource metadata, as the MCP spec expects.
 
 **The server is passive during the handshake and holds no key at link time.** On
 the key-request POST it generates a fresh per-connection Ed25519 keypair and
@@ -189,10 +202,10 @@ calls `mcp_register`.** The issued access token is bound to the session key's
 principal (`self_authenticating(session_pubkey)`), which is exactly the identity
 the grant is bound to.
 
-**PKCE (S256)** is bound to the poll when the client supplies a `code_challenge`;
-device codes live 600s, access tokens 1h. Treat any `Unauthorized` from II as
-"session over → reconnect": the server surfaces a reconnect message and does not
-retry.
+**PKCE (S256)** is required for the authorization-code flow and honoured for the
+device grant; auth codes live 120s, device codes 600s, access tokens 1h. Treat any
+`Unauthorized` from II as "session over → reconnect": the server surfaces a
+reconnect message and does not retry.
 
 Set the public base URL (used in the discovery docs, as the MCP origin, and as the
 management identity's derivation origin) with `PUBLIC_URL`. The Internet Identity
