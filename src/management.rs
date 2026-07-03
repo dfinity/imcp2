@@ -1,5 +1,6 @@
-//! Canister creation & management as the connection's **standing Internet
-//! Identity principal** — a stable per-user controller/funder.
+//! Canister creation & management as the connection's **management identity** —
+//! the user's default account at this server's own origin, a stable per-user
+//! controller/funder (derived on demand like any per-app account).
 //!
 //! Two on-chain surfaces are used:
 //!
@@ -8,7 +9,7 @@
 //!     `update_settings`, `start`/`stop`/`uninstall`/`delete`. Every call sets
 //!     the ic-agent **effective canister id** to the *target* canister (not
 //!     `aaaaa-aa`), as the boundary node requires, and is signed by a
-//!     controller (the standing identity).
+//!     controller (the management identity).
 //!
 //!   * The **cycles ledger** (`um5iw-rqaaa-aaaaq-qaaba-cai`) for funding: a user
 //!     ingress message cannot attach cycles, so `create_canister`/`top_up` draw
@@ -150,7 +151,7 @@ fn default_init_arg() -> String {
 
 /// Your cycles-ledger balance (the funds `create_canister`/`top_up_canister` spend).
 pub async fn cycles_balance(ids: &Identities, session_id: &str) -> Result<String, String> {
-    let (agent, principal) = standing_agent(ids, session_id).await?;
+    let (agent, principal) = management_agent(ids, session_id).await?;
     let ledger = parse_principal(CYCLES_LEDGER)?;
     let account = Account {
         owner: principal,
@@ -175,7 +176,7 @@ pub async fn create_canister(
     session_id: &str,
     args: CreateCanisterArgs,
 ) -> Result<String, String> {
-    let (agent, principal) = standing_agent(ids, session_id).await?;
+    let (agent, principal) = management_agent(ids, session_id).await?;
     let cycles = resolve_cycles(&agent, args.icp.as_deref(), args.cycles).await?;
 
     let controllers = if args.controllers.is_empty() {
@@ -235,7 +236,7 @@ pub async fn top_up_canister(
     args: TopUpArgs,
 ) -> Result<String, String> {
     let target = parse_principal(&args.canister_id)?;
-    let (agent, _) = standing_agent(ids, session_id).await?;
+    let (agent, _) = management_agent(ids, session_id).await?;
     let cycles = resolve_cycles(&agent, args.icp.as_deref(), args.cycles).await?;
 
     let ledger = parse_principal(CYCLES_LEDGER)?;
@@ -269,7 +270,7 @@ pub async fn install_code(
     }
     let mode = parse_mode(&args.mode)?;
     let init_arg = encode_textual_arg(&args.arg)?;
-    let (agent, _) = standing_agent(ids, session_id).await?;
+    let (agent, _) = management_agent(ids, session_id).await?;
 
     if wasm.len() <= MAX_SINGLE_SHOT_WASM {
         let install = InstallCodeArg {
@@ -304,7 +305,7 @@ pub async fn canister_status(
     args: CanisterRefArgs,
 ) -> Result<String, String> {
     let target = parse_principal(&args.canister_id)?;
-    let (agent, _) = standing_agent(ids, session_id).await?;
+    let (agent, _) = management_agent(ids, session_id).await?;
     let arg = Encode!(&CanisterIdRecord {
         canister_id: target
     })
@@ -338,7 +339,7 @@ pub async fn update_canister_settings(
         settings.log_visibility = Some(parse_log_visibility(lv)?);
     }
 
-    let (agent, _) = standing_agent(ids, session_id).await?;
+    let (agent, _) = management_agent(ids, session_id).await?;
     let arg = Encode!(&UpdateSettingsArg {
         canister_id: target,
         settings,
@@ -379,10 +380,11 @@ pub async fn delete_canister(ids: &Identities, sid: &str, canister_id: &str) -> 
 // Internal helpers
 // ===========================================================================
 
-/// Build an ic-agent backed by the connection's standing II identity, plus that
-/// identity's principal (the default controller/funder).
-async fn standing_agent(ids: &Identities, session_id: &str) -> Result<(Agent, Principal), String> {
-    let identity = ids.standing_identity(session_id).await?;
+/// Build an ic-agent backed by the connection's stable management identity (the
+/// user's default account at this server's own origin), plus that identity's
+/// principal (the default controller/funder).
+async fn management_agent(ids: &Identities, session_id: &str) -> Result<(Agent, Principal), String> {
+    let identity = ids.management_identity(session_id).await?;
     let principal = identity
         .sender()
         .map_err(|e| format!("could not derive your principal: {e}"))?;
@@ -434,7 +436,7 @@ async fn lifecycle(
     method: &str,
 ) -> Result<(), String> {
     let target = parse_principal(canister_id)?;
-    let (agent, _) = standing_agent(ids, session_id).await?;
+    let (agent, _) = management_agent(ids, session_id).await?;
     let arg = Encode!(&CanisterIdRecord {
         canister_id: target
     })
