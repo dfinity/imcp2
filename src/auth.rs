@@ -221,7 +221,6 @@ impl AuthStore {
 
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeQuery {
-    #[allow(dead_code)]
     #[serde(default)]
     response_type: Option<String>,
     client_id: String,
@@ -241,10 +240,16 @@ pub struct AuthorizeQuery {
     resource: Option<String>,
 }
 
-/// GET /oauth/authorize — the redirect-based entry point. Validates the client,
-/// records a pending connect, and serves a page that launches II's `/mcp`
-/// handshake and polls until the grant is live (see `connect_status`).
+/// GET /oauth/authorize — the redirect-based entry point. Validates the client
+/// and PKCE, records a pending connect, and redirects the browser to II's `/mcp`
+/// handshake; II navigates back to our `finish_url` once it registers the key.
 pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<AuthorizeQuery>) -> Response {
+    // Only the authorization-code response type is supported.
+    match q.response_type.as_deref() {
+        Some("code") => {}
+        Some(_) => return oauth_err(StatusCode::BAD_REQUEST, "unsupported_response_type", "only response_type=code"),
+        None => return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "response_type=code required"),
+    }
     if !store.validate_client(&q.client_id, &q.redirect_uri).await {
         return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "unknown client_id / redirect_uri");
     }
@@ -327,30 +332,34 @@ pub async fn finish(State(store): State<AuthStore>, Query(q): Query<FinishQuery>
         return finishing_page(&q.id, q.r + 1);
     }
 
-    // Mint the code once, guarding against a concurrent finish that already minted.
+    // Reserve the code under the `authz` lock, then insert into `codes` AFTER
+    // releasing it — never hold one map's lock while awaiting the other's, so the
+    // lock order is consistent with `token_authorization_code` (no deadlock).
     let fresh = format!("mcp-code-{}", Uuid::new_v4());
-    let code = {
+    let (code, newly_minted) = {
         let mut authz = store.authz.write().await;
         let Some(a) = authz.get_mut(&q.id) else {
             return connect_error("connect request vanished — restart from your client");
         };
         match &a.code {
-            Some(existing) => existing.clone(),
+            Some(existing) => (existing.clone(), false),
             None => {
                 a.code = Some(fresh.clone());
-                store.codes.write().await.insert(
-                    fresh.clone(),
-                    CodeGrant {
-                        client_id,
-                        code_challenge,
-                        session_id: q.id.clone(),
-                        created: Instant::now(),
-                    },
-                );
-                fresh
+                (fresh, true)
             }
         }
     };
+    if newly_minted {
+        store.codes.write().await.insert(
+            code.clone(),
+            CodeGrant {
+                client_id,
+                code_challenge,
+                session_id: q.id.clone(),
+                created: Instant::now(),
+            },
+        );
+    }
     tracing::info!(session_id = %q.id, "grant confirmed; issued authorization code");
     redirect_302(&build_redirect(&redirect_uri, &code, &client_state))
 }
