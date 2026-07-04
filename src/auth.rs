@@ -114,11 +114,32 @@ fn persist_clients(clients: &HashMap<String, ClientReg>) {
     }
 }
 
-/// Acceptance rule for a redirect: loopback (any port, RFC 8252 §7.3) or a URI
-/// the client registered (exact match, OAuth 2.1).
+/// Acceptance rule for a redirect (OAuth 2.1): the client must be REGISTERED,
+/// and the requested redirect must either exactly match a registered URI, or be
+/// a loopback URI matching a registered loopback URI on everything but the
+/// port. RFC 8252 §7.3 requires the any-port latitude — native clients bind an
+/// ephemeral loopback port at runtime, so the exact port can't be registered —
+/// but registration itself is still required, so every client that can receive
+/// a code is on record (DCR is open, so this is an audit trail, not vetting).
 fn redirect_allowed(reg: Option<&ClientReg>, redirect_uri: &str) -> bool {
-    is_loopback_redirect(redirect_uri)
-        || reg.is_some_and(|c| c.redirect_uris.iter().any(|u| u == redirect_uri))
+    let Some(reg) = reg else { return false };
+    reg.redirect_uris
+        .iter()
+        .any(|u| u == redirect_uri || loopback_match(u, redirect_uri))
+}
+
+/// Whether `requested` is a loopback redirect matching the registered loopback
+/// URI `registered` on scheme, host, path, and query — any port (RFC 8252 §7.3).
+/// Both sides must independently pass [`is_loopback_redirect`], so a registered
+/// hosted URI grants no loopback latitude and look-alike hosts are rejected.
+fn loopback_match(registered: &str, requested: &str) -> bool {
+    if !is_loopback_redirect(registered) || !is_loopback_redirect(requested) {
+        return false;
+    }
+    let (Ok(a), Ok(b)) = (url::Url::parse(registered), url::Url::parse(requested)) else {
+        return false;
+    };
+    a.host_str() == b.host_str() && a.path() == b.path() && a.query() == b.query()
 }
 
 #[derive(Clone)]
@@ -196,8 +217,9 @@ impl AuthStore {
         }
     }
 
-    /// Whether `redirect_uri` is acceptable for `client_id` (registered exact
-    /// match, or loopback per RFC 8252).
+    /// Whether `redirect_uri` is acceptable for `client_id`: the client must be
+    /// registered, and the redirect must match a registered URI (exactly, or
+    /// port-agnostically for loopback per RFC 8252 §7.3).
     async fn validate_client(&self, client_id: &str, redirect_uri: &str) -> bool {
         redirect_allowed(self.clients.read().await.get(client_id), redirect_uri)
     }
@@ -927,16 +949,40 @@ mod tests {
     }
 
     #[test]
-    fn redirect_requires_registration_or_loopback() {
+    fn redirect_requires_registration() {
         let reg = ClientReg {
             redirect_uris: vec!["https://claude.ai/api/mcp/auth_callback".to_string()],
         };
+        // Hosted redirects: exact registered match only.
         assert!(redirect_allowed(Some(&reg), "https://claude.ai/api/mcp/auth_callback"));
         assert!(!redirect_allowed(Some(&reg), "https://claude.ai/api/mcp/auth_callback/x"));
+        // Unregistered clients get nothing — not even loopback.
         assert!(!redirect_allowed(None, "https://claude.ai/api/mcp/auth_callback"));
-        // Loopback (RFC 8252) is accepted at any port, even unregistered.
-        assert!(redirect_allowed(None, "http://127.0.0.1:51000/callback"));
-        assert!(redirect_allowed(None, "http://[::1]:8080/cb"));
+        assert!(!redirect_allowed(None, "http://127.0.0.1:51000/callback"));
+        assert!(!redirect_allowed(None, "http://[::1]:8080/cb"));
+    }
+
+    /// A registered loopback redirect matches at ANY port (RFC 8252 §7.3 — the
+    /// client binds an ephemeral port each run), but host and path must match,
+    /// and a registered hosted URI grants no loopback latitude.
+    #[test]
+    fn registered_loopback_matches_any_port() {
+        let reg = ClientReg {
+            redirect_uris: vec!["http://localhost:54321/callback".to_string()],
+        };
+        assert!(redirect_allowed(Some(&reg), "http://localhost:54321/callback"));
+        assert!(redirect_allowed(Some(&reg), "http://localhost:61832/callback"));
+        assert!(redirect_allowed(Some(&reg), "http://localhost/callback"));
+        // Different path or host (even another loopback host): rejected.
+        assert!(!redirect_allowed(Some(&reg), "http://localhost:61832/other"));
+        assert!(!redirect_allowed(Some(&reg), "http://127.0.0.1:61832/callback"));
+        // Look-alike hosts fail is_loopback_redirect on the requested side.
+        assert!(!redirect_allowed(Some(&reg), "http://localhost.evil.com:54321/callback"));
+        // A registered HOSTED uri gives no loopback latitude.
+        let hosted = ClientReg {
+            redirect_uris: vec!["https://claude.ai/cb".to_string()],
+        };
+        assert!(!redirect_allowed(Some(&hosted), "http://localhost:1234/cb"));
     }
 
     #[test]
