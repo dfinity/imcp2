@@ -176,6 +176,7 @@ pub async fn create_canister(
     session_id: &str,
     args: CreateCanisterArgs,
 ) -> Result<String, String> {
+    ids.require_write(session_id).await?;
     let (agent, principal) = management_agent(ids, session_id).await?;
     let cycles = resolve_cycles(&agent, args.icp.as_deref(), args.cycles).await?;
 
@@ -235,6 +236,7 @@ pub async fn top_up_canister(
     session_id: &str,
     args: TopUpArgs,
 ) -> Result<String, String> {
+    ids.require_write(session_id).await?;
     let target = parse_principal(&args.canister_id)?;
     let (agent, _) = management_agent(ids, session_id).await?;
     let cycles = resolve_cycles(&agent, args.icp.as_deref(), args.cycles).await?;
@@ -263,6 +265,7 @@ pub async fn install_code(
     session_id: &str,
     args: InstallCodeArgs,
 ) -> Result<String, String> {
+    ids.require_write(session_id).await?;
     let target = parse_principal(&args.canister_id)?;
     let wasm = decode_wasm(&args)?;
     if wasm.is_empty() {
@@ -304,6 +307,9 @@ pub async fn canister_status(
     session_id: &str,
     args: CanisterRefArgs,
 ) -> Result<String, String> {
+    // canister_status is an UPDATE call (controller-gated), so a read-only
+    // session can't make it — fail early with an actionable message (H2).
+    ids.require_write(session_id).await?;
     let target = parse_principal(&args.canister_id)?;
     let (agent, _) = management_agent(ids, session_id).await?;
     let arg = Encode!(&CanisterIdRecord {
@@ -321,6 +327,7 @@ pub async fn update_canister_settings(
     session_id: &str,
     args: UpdateSettingsArgs,
 ) -> Result<String, String> {
+    ids.require_write(session_id).await?;
     let target = parse_principal(&args.canister_id)?;
     let mut settings = CanisterSettings::default();
     if let Some(cs) = &args.controllers {
@@ -428,13 +435,14 @@ async fn update_call(
         .map_err(|e| format!("{method} failed: {e}"))
 }
 
-/// Shared body for the no-payload lifecycle methods.
+/// Shared body for the no-payload lifecycle methods (all UPDATE calls).
 async fn lifecycle(
     ids: &Identities,
     session_id: &str,
     canister_id: &str,
     method: &str,
 ) -> Result<(), String> {
+    ids.require_write(session_id).await?;
     let target = parse_principal(canister_id)?;
     let (agent, _) = management_agent(ids, session_id).await?;
     let arg = Encode!(&CanisterIdRecord {

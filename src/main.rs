@@ -263,7 +263,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Get the Internet Computer principal you act as at a given application `domain` (e.g. \"oisy.com\"), without making a canister call. The app's account delegation is derived on demand (same as call_canister) from this connection's standing Internet Identity credential, and its principal is returned. By default this resolves the app's default account; pass `account` (an account name from list_accounts) for a specific named account there. Use this when a flow needs the principal itself (e.g. to look up a balance or account) rather than to invoke a method."
+        description = "Get the Internet Computer principal you act as at a given application `domain` (e.g. \"oisy.com\"), without making a canister call. The app's account delegation is derived on demand (same as call_canister) from this connection's standing Internet Identity credential, and its principal is returned. By default this resolves the app's default account; pass `account` (an account name from list_accounts) for a specific named account there. Use this when a flow needs the principal itself (e.g. to look up a balance or account) rather than to invoke a method. NOTE: the principal is derived from the app's DOMAIN, which is usually — but not always — the identity a browser sign-in to that app would use. Some apps declare a CUSTOM derivation origin (via /.well-known/ii-alternative-origins) that isn't exposed here; if the returned principal (or an account/balance) doesn't match what the user sees in their browser at that app, tell them so and offer to look up the app's ii-alternative-origins (web search / fetch) and retry."
     )]
     async fn get_principal(
         &self,
@@ -283,13 +283,25 @@ impl IcTools {
             Err(e) => return Ok(err(e)),
         };
         match delegated.sender() {
-            Ok(p) => Ok(ok(p.to_text())),
+            Ok(p) => {
+                let mut out = p.to_text();
+                // Surface a read-only session (H2) so the LLM won't attempt (and
+                // have the IC reject at ingress) canister-management updates.
+                if self.identities.is_read_only(&session_id).await == Some(true) {
+                    out.push_str(
+                        "\n\n(This Internet Identity session is READ-ONLY: reads work, but canister \
+                         management — create/install/start/stop/delete, and canister_status — needs \
+                         update access. Ask the user to reconnect with the read-only option turned OFF.)",
+                    );
+                }
+                Ok(ok(out))
+            }
             Err(e) => Ok(err(format!("could not derive principal for '{domain}': {e}"))),
         }
     }
 
     #[tool(
-        description = "List the user's Internet Identity accounts at an application `domain` (e.g. \"oisy.com\"). Internet Identity gives the user a distinct principal per app, and within an app they may hold several accounts: a default (\"synthetic\") account everyone gets automatically, plus any named accounts they created. Use this before acting on the user's behalf at an app: if there's only the default account, just proceed (call_canister/get_principal with no `account`); if there are several, pick one with the user (or act on each) by passing its name as `account`. Returns each account's name (the default has none), account number, and last-used time. Requires an authenticated session."
+        description = "List the user's Internet Identity accounts at an application `domain` (e.g. \"oisy.com\"). Internet Identity gives the user a distinct principal per app (derived from the app's domain), and within an app they may hold several accounts: a default account everyone gets automatically (the anchor's current, user-controllable default at that origin), plus any named accounts they created. Use this before acting on the user's behalf at an app: if there's only the default account, just proceed (call_canister/get_principal with no `account`); if there are several, pick one with the user (or act on each) by passing its name as `account`. Returns each account's name (the default has none), account number, and last-used time. If these accounts don't match what the user sees in their browser at this app, it may use a custom derivation origin not exposed here (offer to look up its ii-alternative-origins and retry). Requires an authenticated session."
     )]
     async fn list_accounts(
         &self,
@@ -671,7 +683,7 @@ fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<auth::AuthedSessio
 /// Log each inbound request: method, path, response status, and latency — gives
 /// visibility into what external MCP clients probe (discovery URLs, unknown
 /// paths) at `RUST_LOG=info`. The query string is never logged (keeping the
-/// device-flow `?user_code=` out of logs), and request bodies are never logged
+/// single-use `?code=` / `?id=` out of logs), and request bodies are never logged
 /// (the connect callback carries the connection-scoped `state`).
 async fn log_request(
     req: axum::http::Request<axum::body::Body>,
@@ -729,8 +741,17 @@ impl ServerHandler for IcTools {
              balance or account). A user may hold several accounts at an app (a default one plus \
              named ones); `list_accounts(domain)` lists them, and call_canister/get_principal take \
              an optional `account` (a name from that list) to act as a specific one — omit it for \
-             the default account. The standing credential is obtained when you connect \
-             (authenticate via Internet Identity) and lasts ~60 minutes; reconnect when it expires.\n\n\
+             the default account. The per-app principal is derived from the app's DOMAIN — usually, \
+             but NOT always, the same identity a browser sign-in to that app would use: some apps \
+             declare a custom derivation origin (via /.well-known/ii-alternative-origins) not \
+             exposed here. If a principal, account, or balance doesn't match what the user sees in \
+             their browser at that app, say so and offer to look up the app's ii-alternative-origins \
+             (web search / fetch) and retry. The standing credential is obtained when you connect \
+             (authenticate via Internet Identity) and lasts ~60 minutes; reconnect when it expires. \
+             The session may be READ-ONLY (Internet Identity's consent screen defaults to read-only): \
+             reads work, but the canister-management tools below make update calls the network \
+             rejects for a read-only session — if one fails that way, ask the user to reconnect with \
+             the read-only option turned OFF.\n\n\
              To AUTHOR, BUILD and DEPLOY IC code, first consult the official IC skills: \
              `list_ic_skills` lists them and `get_ic_skill(name)` loads one. Especially `motoko` \
              (language), `mops-cli` (deps/build), `icp-cli` (build & deploy), `cycles-management` \
@@ -854,7 +875,7 @@ fn format_accounts(domain: &str, accounts: &[identities::AccountInfo]) -> String
     }
     let mut out = format!("Your accounts at {domain}:\n");
     for a in accounts {
-        // The default ("synthetic") account has no name and no account number.
+        // The default account (anchor's current default) has no name/number.
         let label = match &a.name {
             Some(name) => format!("\"{name}\""),
             None => "(default account — no name)".to_string(),
@@ -1020,8 +1041,6 @@ async fn main() -> anyhow::Result<()> {
         axum::Router::new()
             .route("/oauth/authorize", axum::routing::get(auth::authorize))
             .route("/oauth/finish", axum::routing::get(auth::finish))
-            .route("/oauth/device_authorization", axum::routing::post(auth::device_authorization))
-            .route("/oauth/device", axum::routing::get(auth::device_verify))
             .route("/oauth/connect/callback", axum::routing::post(auth::connect_callback))
             .route("/oauth/token", axum::routing::post(auth::token))
             .route("/oauth/register", axum::routing::post(auth::register))
