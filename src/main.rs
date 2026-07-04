@@ -952,12 +952,39 @@ async fn main() -> anyhow::Result<()> {
     // `route_layer` (not `layer`) applies the gate ONLY to matched /mcp routes, so
     // unmatched paths fall through to a 404 instead of the token gate's 401 — and
     // the `/oauth/*` and `/.well-known/*` routes stay exempt from the bearer check.
+    //
+    // Browser-based MCP clients (e.g. the Grok/ChatGPT connector UIs) call `/mcp`
+    // via `fetch()`, so it needs CORS — applied as the OUTERMOST layer so the
+    // OPTIONS preflight is answered (2xx) BEFORE the bearer gate, and the 401's
+    // `WWW-Authenticate` (the auth-discovery hint) is exposed cross-origin.
+    // `Authorization` must be listed explicitly: the `*` wildcard for
+    // `Access-Control-Allow-Headers` does NOT cover it per the Fetch spec.
+    let mcp_cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::ACCEPT,
+            axum::http::HeaderName::from_static("mcp-protocol-version"),
+            axum::http::HeaderName::from_static("mcp-session-id"),
+            axum::http::HeaderName::from_static("last-event-id"),
+        ])
+        .expose_headers([
+            axum::http::header::WWW_AUTHENTICATE,
+            axum::http::HeaderName::from_static("mcp-session-id"),
+        ]);
     let protected_mcp = axum::Router::new()
         .nest_service("/mcp", mcp)
         .route_layer(axum::middleware::from_fn_with_state(
             store.clone(),
             auth::require_token,
-        ));
+        ))
+        .layer(mcp_cors);
 
     // OAuth authorization-server + discovery endpoints (CORS-open for clients).
     let cors = tower_http::cors::CorsLayer::new()
