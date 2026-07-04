@@ -4,3 +4,6 @@ candid-wasm/target
 
 # native deploy build artifact
 /build-out
+
+# runtime OAuth client registrations (OAUTH_CLIENTS_FILE)
+/oauth-clients.json

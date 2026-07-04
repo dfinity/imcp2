@@ -949,9 +949,12 @@ async fn main() -> anyhow::Result<()> {
     let store = auth::AuthStore::new(identities.clone());
 
     // /mcp is gated by a bearer token issued after Internet Identity login.
+    // `route_layer` (not `layer`) applies the gate ONLY to matched /mcp routes, so
+    // unmatched paths fall through to a 404 instead of the token gate's 401 — and
+    // the `/oauth/*` and `/.well-known/*` routes stay exempt from the bearer check.
     let protected_mcp = axum::Router::new()
         .nest_service("/mcp", mcp)
-        .layer(axum::middleware::from_fn_with_state(
+        .route_layer(axum::middleware::from_fn_with_state(
             store.clone(),
             auth::require_token,
         ));
@@ -983,6 +986,8 @@ async fn main() -> anyhow::Result<()> {
             "/.well-known/oauth-protected-resource/mcp",
             axum::routing::get(auth::protected_resource_metadata),
         )
+        .route("/oauth/authorize", axum::routing::get(auth::authorize))
+        .route("/oauth/finish", axum::routing::get(auth::finish))
         .route("/oauth/device_authorization", axum::routing::post(auth::device_authorization))
         .route("/oauth/device", axum::routing::get(auth::device_verify))
         .route("/oauth/connect/callback", axum::routing::post(auth::connect_callback))
