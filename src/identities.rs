@@ -303,13 +303,25 @@ impl Identities {
     }
 
     /// Record the session's access level from the completion POST's `permissions`
-    /// field (§0/H2): `"queries"` (case-insensitive) = read-only; anything else
-    /// (`"all"`) = full access. Same vocabulary as the delegation's `permissions`.
+    /// field (§0/H2), using the same vocabulary as the delegation's `permissions`:
+    /// `"queries"` = read-only, `"all"` = full access (both case-insensitive). Any
+    /// UNRECOGNIZED value leaves the level `None` (unknown) rather than assuming
+    /// full access — so an unexpected/future value falls through to the ingress
+    /// rejection fallback instead of the server wrongly considering the session
+    /// writable.
     pub async fn set_permissions(&self, session_id: &str, permissions: &str) {
+        let level = match permissions.trim().to_ascii_lowercase().as_str() {
+            "queries" => Some(true),
+            "all" => Some(false),
+            other => {
+                tracing::warn!("connect completion had unrecognized permissions {other:?}; access level left unknown");
+                return;
+            }
+        };
         self.ensure_session(session_id).await;
         let mut sessions = self.sessions.write().await;
         if let Some(s) = sessions.get_mut(session_id) {
-            s.read_only = Some(permissions.trim().eq_ignore_ascii_case("queries"));
+            s.read_only = level;
         }
     }
 
@@ -755,6 +767,13 @@ mod tests {
         ids.set_permissions("sess", "ALL").await;
         assert_eq!(ids.is_read_only("sess").await, Some(false));
         assert!(ids.require_write("sess").await.is_ok());
+        // An UNRECOGNIZED value must NOT assume full access: it leaves the level
+        // unknown (None) so the call falls through to the ingress-rejection path,
+        // rather than the server wrongly reporting the session as writable.
+        ids.ensure_session("sess2").await;
+        ids.set_permissions("sess2", "something-new").await;
+        assert_eq!(ids.is_read_only("sess2").await, None);
+        assert!(ids.require_write("sess2").await.is_ok());
     }
 
     // An Identities store over a dummy II instance (tests never hit the network).
