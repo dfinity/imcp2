@@ -222,11 +222,26 @@ acting as the victim. (The "arrival ≠ registration" check guards a different
 property; it doesn't bind the initiator to the consenting user, and II can't help
 — its trust model only ever identifies the origin.)
 
-The fix: `/oauth/authorize` sets an unguessable, single-use, `HttpOnly` `Secure`
-`SameSite=Lax` cookie (scoped to the instance's `…/oauth` path) and `/oauth/finish`
-requires it before minting the code — so only the browser that **started** the
-flow can complete it. `SameSite=Lax` still rides the top-level cross-site GET II
-uses to navigate back to `finish_url`.
+The mitigation: `/oauth/authorize` sets an unguessable, single-use, `HttpOnly`
+`Secure` `SameSite=Lax` cookie (scoped to the instance's `…/oauth` path) and
+`/oauth/finish` requires it before minting the code — so only the browser that
+**started** the flow can complete it. `SameSite=Lax` still rides the top-level
+cross-site GET II uses to navigate back to `finish_url`.
+
+> ⚠️ **This is a partial mitigation, not a complete fix — a residual takeover
+> path remains** (found by an adversarial review of this change). Because
+> `/oauth/authorize` requires no authentication, the *attacker* can be the flow
+> initiator: they call authorize themselves and keep **both** the cookie (from
+> their own response) and the `state` (from the II link), phish only the II link,
+> and after the victim consents they complete `/oauth/finish` **themselves** with
+> their cookie and redeem the code as the victim. The cookie only stops the
+> *zero-click* variant (the victim's browser passively delivering the code); it
+> can't tie "who receives the code" to "who consented," since consent happens
+> cross-origin at II keyed by the shared `state`. A complete fix needs an II-side
+> control that identifies the requesting **client**, not just the origin (which II
+> doesn't currently provide); reducing/vetting DCR shrinks but doesn't close it.
+> The cookie is kept as defense-in-depth. This gap is flagged back for the design
+> review.
 
 ### Read-only sessions
 

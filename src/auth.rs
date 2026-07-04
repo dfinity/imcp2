@@ -26,6 +26,23 @@
 //!
 //! Implemented: dynamic client registration, PKCE (S256) enforced, short-lived
 //! codes, 1h access tokens, session-key-bound principal.
+//!
+//! ## Known residual risk (H3 is only a partial mitigation)
+//!
+//! The browser-binding cookie stops the *zero-click* session-fixation variant (a
+//! phished victim's browser passively delivering the code to the attacker's
+//! `redirect_uri`), but it does NOT fully prevent the account takeover. Because
+//! `/oauth/authorize` requires no authentication, the ATTACKER can be the flow
+//! initiator (open DCR + their own `redirect_uri`/PKCE): they call authorize,
+//! keep both the cookie and the `state` from the II link, phish only the II link
+//! to a victim, and after the victim consents (registering the session key under
+//! the victim's anchor) they complete `/oauth/finish` themselves with their cookie
+//! and redeem the code as the victim. This is structural: consent happens
+//! cross-origin at II keyed by the shared `state`, so the server cannot tie "who
+//! receives the code" to "who consented" — the cookie only proves initiator ==
+//! finisher, and the attacker is the initiator. A complete fix needs an II-side
+//! control that identifies the requesting client (not just the origin), which II
+//! does not currently provide; reducing/vetting DCR shrinks but does not close it.
 
 use std::{
     collections::HashMap,
@@ -166,8 +183,13 @@ struct AuthzPending {
     code_challenge: Option<String>,
     /// Unguessable value set as a browser cookie at `/oauth/authorize` and
     /// required (matched) at `/oauth/finish` (H3) — so only the browser that
-    /// STARTED this flow can complete it, closing the session-fixation takeover
-    /// where an attacker phishes their own connect link to a trusting victim.
+    /// STARTED this flow can complete it. This is a PARTIAL mitigation of the
+    /// session-fixation takeover: it stops the zero-click variant (a phished
+    /// victim's browser auto-delivering the code to the attacker's redirect_uri),
+    /// but NOT a variant where the attacker — being the flow initiator, since
+    /// `/oauth/authorize` needs no auth — holds this cookie and completes finish
+    /// themselves after the victim consents. A full fix needs an II-side control
+    /// that identifies the client, not just the origin (see the module docs).
     cookie: String,
     created: Instant,
     /// Grant confirmed live (completion POST or a signed-call fallback).
@@ -306,8 +328,9 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
     let session_id = format!("sess-{}", Uuid::new_v4());
     // H3: bind this browser to the flow. The cookie is set now and required at
     // /oauth/finish; the `state` alone can't prove the finishing browser is the
-    // initiator (it's echoed to the client), so without this an attacker could
-    // phish their own connect link to a trusting victim and harvest the code.
+    // initiator (it's echoed to the client). This blocks the zero-click takeover
+    // variant (a phished victim's browser passively delivering the code) but is
+    // only a PARTIAL mitigation — see `AuthzPending::cookie` and the module docs.
     let cookie = format!("bind-{}", Uuid::new_v4());
     store.authz.write().await.insert(
         session_id.clone(),
@@ -393,8 +416,10 @@ pub async fn finish(
     }
     // H3: only the browser that STARTED this flow (and holds the binding cookie)
     // may complete it. A constant-time compare isn't warranted — the value is a
-    // fresh 122-bit UUID, unguessable and single-use — but the check itself is
-    // essential: it defeats the phish-your-own-link session-fixation takeover.
+    // fresh 122-bit UUID, unguessable and single-use. This blocks the zero-click
+    // takeover (a phished victim's browser passively delivering the code) but does
+    // NOT stop an initiator-attacker who holds the cookie and completes finish
+    // themselves after the victim consents — a PARTIAL mitigation (see module docs).
     if connect_cookie(&headers).as_deref() != Some(cookie.as_str()) {
         return connect_error(
             "this sign-in was started in a different browser session — restart the connection from your client",
