@@ -881,12 +881,16 @@ pub struct AuthedSession {
 }
 
 pub async fn require_token(State(store): State<AuthStore>, mut request: Request<Body>, next: Next) -> Response {
+    // The `Bearer` auth-scheme is case-insensitive (RFC 7235 §2.1), so match it
+    // that way — an `Authorization: bearer <token>` must be recognized too.
     let token = request
         .headers()
         .get("Authorization")
         .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .map(str::to_owned);
+        .and_then(|h| {
+            let (scheme, rest) = h.split_once(' ')?;
+            scheme.eq_ignore_ascii_case("Bearer").then(|| rest.trim().to_owned())
+        });
 
     let had_token = token.is_some();
     let session = match token {
@@ -900,25 +904,27 @@ pub async fn require_token(State(store): State<AuthStore>, mut request: Request<
             request.extensions_mut().insert(AuthedSession { session_id });
             next.run(request).await
         }
-        None => {
-            // RFC 6750 §3 / RFC 9728: point clients at the resource metadata, and
-            // — when a token WAS presented but is invalid/expired — carry
-            // `error="invalid_token"` in the header so the client can tell "expired,
-            // re-authorize" from "no token". A missing token gets a bare challenge
-            // (RFC 6750: don't include an error code when no credentials were sent).
-            let meta = format!("resource_metadata=\"{}/.well-known/oauth-protected-resource\"", base_url());
-            let challenge = if had_token {
-                format!("Bearer error=\"invalid_token\", error_description=\"The access token is invalid or expired\", {meta}")
-            } else {
-                format!("Bearer {meta}")
-            };
-            (
-                StatusCode::UNAUTHORIZED,
-                [(axum::http::header::WWW_AUTHENTICATE, challenge)],
-                Json(json!({ "error": "invalid_token" })),
-            )
-                .into_response()
-        }
+        None => (
+            StatusCode::UNAUTHORIZED,
+            [(axum::http::header::WWW_AUTHENTICATE, bearer_challenge(had_token))],
+            Json(json!({ "error": "invalid_token" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Build the `WWW-Authenticate` challenge for a 401 on `/mcp`. Always points
+/// clients at the resource metadata (RFC 9728); when a token WAS presented but is
+/// invalid/expired (`had_token`), also carries `error="invalid_token"` (RFC 6750
+/// §3) so the client can tell "expired → re-authorize" from "no token" and prompt
+/// an inline reconnect. A missing token gets a bare challenge (RFC 6750: omit the
+/// error code when no credentials were sent).
+fn bearer_challenge(had_token: bool) -> String {
+    let meta = format!("resource_metadata=\"{}/.well-known/oauth-protected-resource\"", base_url());
+    if had_token {
+        format!("Bearer error=\"invalid_token\", error_description=\"The access token is invalid or expired\", {meta}")
+    } else {
+        format!("Bearer {meta}")
     }
 }
 
@@ -1001,6 +1007,22 @@ mod tests {
         assert!(!is_loopback_redirect("http://localhost@evil.com/cb"));
         assert!(!is_loopback_redirect("http://localhost:1234@evil.com/cb"));
         assert!(!is_loopback_redirect("https://evil.com/cb"));
+    }
+
+    /// RFC 6750 §3 / 9728: the `error` code appears only when a token was
+    /// presented; the resource_metadata pointer is always present.
+    #[test]
+    fn bearer_challenge_carries_error_only_for_presented_tokens() {
+        let with_token = super::bearer_challenge(true);
+        assert!(with_token.starts_with("Bearer "));
+        assert!(with_token.contains("error=\"invalid_token\""));
+        assert!(with_token.contains("error_description="));
+        assert!(with_token.contains("resource_metadata="));
+
+        let no_token = super::bearer_challenge(false);
+        assert!(no_token.starts_with("Bearer "));
+        assert!(!no_token.contains("error="), "a bare challenge must omit the error code: {no_token}");
+        assert!(no_token.contains("resource_metadata="));
     }
 
     #[test]
