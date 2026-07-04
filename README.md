@@ -213,6 +213,25 @@ instance is `II_URL` (browser login, default `beta.id.ai`) plus `II_CANISTER_ID`
 (the canister the `mcp_*` calls target, default `fgte5-ciaaa-aaaad-aaatq-cai`) —
 both point at the same II.
 
+### Production instance (`/mcp-prod`)
+
+The same server exposes a second, fully isolated instance connected to
+**production** Internet Identity: MCP endpoint `/mcp-prod`, with its own
+path-scoped authorization server under `/prod/oauth/*` (issuer
+`<PUBLIC_URL>/prod`, an RFC 8414 path issuer; AS metadata at
+`/.well-known/oauth-authorization-server/prod`, resource metadata at
+`/.well-known/oauth-protected-resource/mcp-prod`). Configure with `II_URL_PROD`
+(default `https://id.ai`) and `II_CANISTER_ID_PROD` (default
+`rdmx6-jaaaa-aaaaa-aaadq-cai`).
+
+Sessions and tokens are per-instance — a `/mcp` token is not valid on
+`/mcp-prod` and vice versa — while dynamic client registrations are shared
+(they only pin redirect URIs). II trust is by origin, so users enable this
+server's origin as their trusted MCP server in their **id.ai** settings
+(a separate identity from their beta anchor). Note: `/mcp-prod` only completes
+once the production II carries the #4086 MCP feature set; until then the
+connect fails at the II step with a "may not support MCP connect yet" hint.
+
 ## Domain identities (on demand)
 
 There is no per-app browser sign-in. Instead the model is:

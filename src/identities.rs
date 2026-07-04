@@ -57,6 +57,14 @@ const II_URL_DEFAULT: &str = "https://beta.id.ai";
 /// `II_CANISTER_ID`.
 const II_CANISTER_ID_DEFAULT: &str = "fgte5-ciaaa-aaaad-aaatq-cai";
 
+/// Production Internet Identity origin, used by the `/mcp-prod` instance.
+/// Override with `II_URL_PROD`.
+const II_URL_PROD_DEFAULT: &str = "https://id.ai";
+
+/// Canister id of production Internet Identity (the canonical II canister).
+/// Override with `II_CANISTER_ID_PROD`.
+const II_CANISTER_ID_PROD_DEFAULT: &str = "rdmx6-jaaaa-aaaaa-aaadq-cai";
+
 /// Message shown whenever II reports the grant is gone (`Unauthorized`) or the
 /// stored grant expiration has passed. Per the spec, any `Unauthorized` means the
 /// session is over — the caller must start a fresh connect with a fresh session
@@ -64,16 +72,63 @@ const II_CANISTER_ID_DEFAULT: &str = "fgte5-ciaaa-aaaad-aaatq-cai";
 const RECONNECT_MSG: &str = "Your Internet Identity session is over (the grant expired, was revoked, \
      or was replaced by a newer connection). Reconnect with Internet Identity to continue — do not retry.";
 
-/// Origin of the II instance (no trailing slash). Override with `II_URL`.
-pub fn ii_url() -> String {
-    let raw = std::env::var("II_URL").unwrap_or_else(|_| II_URL_DEFAULT.to_string());
-    raw.trim_end_matches('/').to_string()
+/// One Internet Identity instance this server can connect users against. The
+/// default ("beta") instance serves `/mcp` with its OAuth AS at the root of
+/// `PUBLIC_URL`; the "prod" instance serves `/mcp-prod` with a path-scoped AS
+/// (issuer `<PUBLIC_URL>/prod`, RFC 8414 path issuer). Each instance gets its
+/// own `Identities` + `AuthStore`, so sessions/tokens never cross instances;
+/// II trust in the user's settings is by ORIGIN, which both instances share.
+#[derive(Clone, Debug)]
+pub struct IiInstance {
+    /// Short name for logging ("beta", "prod").
+    pub name: &'static str,
+    /// Origin of the II instance (no trailing slash), e.g. "https://beta.id.ai".
+    pub ii_url: String,
+    /// Canister id of that II instance — the target of the `mcp_*` calls.
+    pub ii_canister: Principal,
+    /// This instance's OAuth path prefix on the server: "" (root) or "/prod".
+    pub oauth_prefix: &'static str,
+    /// The MCP resource path this instance gates: "/mcp" or "/mcp-prod".
+    pub mcp_path: &'static str,
 }
 
-/// The II canister the on-demand delegation methods are called on.
-fn ii_canister_id() -> Result<Principal, String> {
-    let raw = std::env::var("II_CANISTER_ID").unwrap_or_else(|_| II_CANISTER_ID_DEFAULT.to_string());
-    Principal::from_text(&raw).map_err(|e| format!("invalid II_CANISTER_ID '{raw}': {e}"))
+impl IiInstance {
+    /// The default instance: beta Internet Identity (`II_URL` / `II_CANISTER_ID`).
+    pub fn beta() -> Result<Self, String> {
+        Ok(Self {
+            name: "beta",
+            ii_url: env_origin("II_URL", II_URL_DEFAULT),
+            ii_canister: env_principal("II_CANISTER_ID", II_CANISTER_ID_DEFAULT)?,
+            oauth_prefix: "",
+            mcp_path: "/mcp",
+        })
+    }
+
+    /// The production instance (`II_URL_PROD` / `II_CANISTER_ID_PROD`). Only
+    /// useful once production II carries the #4086 MCP feature set.
+    pub fn prod() -> Result<Self, String> {
+        Ok(Self {
+            name: "prod",
+            ii_url: env_origin("II_URL_PROD", II_URL_PROD_DEFAULT),
+            ii_canister: env_principal("II_CANISTER_ID_PROD", II_CANISTER_ID_PROD_DEFAULT)?,
+            oauth_prefix: "/prod",
+            mcp_path: "/mcp-prod",
+        })
+    }
+}
+
+/// An origin from the environment (no trailing slash), with a default.
+fn env_origin(var: &str, default: &str) -> String {
+    std::env::var(var)
+        .unwrap_or_else(|_| default.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// A principal from the environment, with a default.
+fn env_principal(var: &str, default: &str) -> Result<Principal, String> {
+    let raw = std::env::var(var).unwrap_or_else(|_| default.to_string());
+    Principal::from_text(&raw).map_err(|e| format!("invalid {var} '{raw}': {e}"))
 }
 
 fn now_ns() -> u64 {
@@ -150,14 +205,24 @@ pub struct AccountInfo {
     pub last_used: Option<u64>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Identities {
+    /// The II instance every session in this store is registered against.
+    instance: IiInstance,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
 }
 
 impl Identities {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(instance: IiInstance) -> Self {
+        Self {
+            instance,
+            sessions: Arc::default(),
+        }
+    }
+
+    /// The II instance this store connects against.
+    pub fn instance(&self) -> &IiInstance {
+        &self.instance
     }
 
     async fn ensure_session(&self, session_id: &str) {
@@ -259,7 +324,7 @@ impl Identities {
         domain: &str,
     ) -> Result<Vec<AccountInfo>, String> {
         let agent = self.session_agent(session_id).await?;
-        let canister = ii_canister_id()?;
+        let canister = self.instance.ii_canister;
         let origin = target_origin(domain);
 
         // mcp_get_accounts(target_origin) -> variant { Ok: vec AccountInfo; Err }
@@ -399,7 +464,7 @@ impl Identities {
         account_number: Option<u64>,
     ) -> Result<AppDelegation, String> {
         let origin = target_origin(domain);
-        let canister = ii_canister_id()?;
+        let canister = self.instance.ii_canister;
 
         // The per-app key B the delegation is issued to — distinct from the
         // session key. Its DER pubkey is the `session_key` argument to
@@ -567,6 +632,19 @@ impl IiSignedDelegation {
 mod tests {
     use super::*;
 
+    /// The built-in instance defaults must parse (canister ids are compile-time
+    /// strings) and carry the expected paths/prefixes.
+    #[test]
+    fn instance_defaults_are_valid() {
+        let beta = IiInstance::beta().expect("beta defaults");
+        assert_eq!(beta.oauth_prefix, "");
+        assert_eq!(beta.mcp_path, "/mcp");
+        let prod = IiInstance::prod().expect("prod defaults");
+        assert_eq!(prod.oauth_prefix, "/prod");
+        assert_eq!(prod.mcp_path, "/mcp-prod");
+        assert_ne!(beta.ii_canister, prod.ii_canister);
+    }
+
     #[test]
     fn remaps_gateway_domains_to_ic0_app() {
         assert_eq!(
@@ -581,6 +659,17 @@ mod tests {
         assert_eq!(target_origin("oisy.com"), "https://oisy.com");
         assert_eq!(target_origin("https://oisy.com/app"), "https://oisy.com");
         assert_eq!(target_origin("http://oisy.com"), "https://oisy.com");
+    }
+
+    // An Identities store over a dummy II instance (tests never hit the network).
+    fn test_ids() -> Identities {
+        Identities::new(IiInstance {
+            name: "test",
+            ii_url: "https://ii.test".into(),
+            ii_canister: Principal::anonymous(),
+            oauth_prefix: "",
+            mcp_path: "/mcp",
+        })
     }
 
     // Seed a session with a live grant, bypassing the network connect flow.
@@ -608,7 +697,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_account_defaults_to_none_without_network() {
-        let ids = Identities::new();
+        let ids = test_ids();
         seed_live(&ids, "sess").await;
         // No account name -> the default account, resolved with no network call.
         assert_eq!(ids.resolve_account("sess", "oisy.com", None).await.unwrap(), None);
@@ -616,7 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_delegations_are_keyed_by_account_number() {
-        let ids = Identities::new();
+        let ids = test_ids();
         seed_live(&ids, "sess").await;
         let future = now_ns() + REDERIVE_MARGIN_NS + 60 * 1_000_000_000;
         seed_app(&ids, "sess", "oisy.com", None, future).await;
@@ -633,7 +722,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_delegation_near_expiry_is_a_miss() {
-        let ids = Identities::new();
+        let ids = test_ids();
         seed_live(&ids, "sess").await;
         // Expiry within the re-derive margin -> treated as stale.
         seed_app(&ids, "sess", "oisy.com", None, now_ns() + 1).await;
@@ -642,7 +731,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_grant_blocks_signing() {
-        let ids = Identities::new();
+        let ids = test_ids();
         ids.ensure_session("sess").await;
         ids.set_grant_expiration("sess", now_ns().saturating_sub(1)).await;
         // A past grant expiration short-circuits to the reconnect message.

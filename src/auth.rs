@@ -205,15 +205,46 @@ struct TokenInfo {
     ttl: Duration,
 }
 
+/// The dynamic-client-registration store, shared by every instance's
+/// [`AuthStore`]. Client registration is II-agnostic (it only pins redirect
+/// URIs to a `client_id`), so a client registered against either instance's AS
+/// is known to both — and, since both stores share one map, the persisted
+/// snapshot never loses the other instance's entries.
+#[derive(Clone)]
+pub struct SharedClients(Arc<RwLock<HashMap<String, ClientReg>>>);
+
+/// Load the persisted client registrations once, to be shared by all stores.
+pub fn load_shared_clients() -> SharedClients {
+    SharedClients(Arc::new(RwLock::new(load_clients())))
+}
+
 impl AuthStore {
-    pub fn new(identities: Identities) -> Self {
+    pub fn new(identities: Identities, clients: SharedClients) -> Self {
         Self {
-            clients: Arc::new(RwLock::new(load_clients())),
+            clients: clients.0,
             tokens: Arc::default(),
             authz: Arc::default(),
             codes: Arc::default(),
             devices: Arc::default(),
             identities,
+        }
+    }
+
+    /// The II instance this store serves.
+    fn instance(&self) -> &crate::identities::IiInstance {
+        self.identities.instance()
+    }
+
+    /// This instance's protected-resource metadata URL (RFC 9728), advertised in
+    /// the 401 challenge. The default instance keeps the root document; other
+    /// instances use the path-inserted form for their resource path.
+    fn resource_metadata_url(&self) -> String {
+        let inst = self.instance();
+        let base = base_url();
+        if inst.oauth_prefix.is_empty() {
+            format!("{base}/.well-known/oauth-protected-resource")
+        } else {
+            format!("{base}/.well-known/oauth-protected-resource{}", inst.mcp_path)
         }
     }
 
@@ -299,9 +330,9 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
         },
     );
 
-    // Redirect the browser to II's handshake. II navigates back to our
-    // `finish_url` (returned in the key-request response) once it registers.
-    js_redirect(&ii_mcp_url(&session_id))
+    // Redirect the browser to this instance's II handshake. II navigates back to
+    // our `finish_url` (returned in the key-request response) once it registers.
+    js_redirect(&ii_mcp_url(store.instance(), &session_id))
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,9 +380,13 @@ pub async fn finish(State(store): State<AuthStore>, Query(q): Query<FinishQuery>
     // shortly — bounded so we don't loop forever.
     if !store.grant_live(&q.id, live_flag).await {
         if q.r >= 8 {
-            return connect_error("could not confirm the connection with Internet Identity — reconnect and try again");
+            return connect_error(&format!(
+                "could not confirm the connection with Internet Identity ({}) — it may not support \
+                 MCP connect yet; reconnect and try again",
+                store.instance().ii_url
+            ));
         }
-        return finishing_page(&q.id, q.r + 1);
+        return finishing_page(store.instance().oauth_prefix, &q.id, q.r + 1);
     }
 
     // Reserve the code under the `authz` lock, then insert into `codes` AFTER
@@ -387,9 +422,10 @@ pub async fn finish(State(store): State<AuthStore>, Query(q): Query<FinishQuery>
 }
 
 /// A tiny self-reloading page shown while we wait for II's registration to become
-/// confirmable, then it re-hits `/oauth/finish` (bounded by the retry counter).
-fn finishing_page(id: &str, next_try: u32) -> Response {
-    let url = js_escape(&format!("/oauth/finish?id={}&r={}", urlencoding::encode(id), next_try));
+/// confirmable, then it re-hits this instance's `/oauth/finish` (bounded by the
+/// retry counter).
+fn finishing_page(prefix: &str, id: &str, next_try: u32) -> Response {
+    let url = js_escape(&format!("{prefix}/oauth/finish?id={}&r={}", urlencoding::encode(id), next_try));
     Html(format!(
         "<!DOCTYPE html><meta charset=utf-8><title>Finishing…</title>\
          <body style=\"font-family:system-ui;max-width:32rem;margin:3rem auto\">\
@@ -460,8 +496,7 @@ pub async fn device_authorization(State(store): State<AuthStore>, Form(req): For
         },
     );
 
-    let base = base_url();
-    let verification_uri = format!("{base}/oauth/device");
+    let verification_uri = format!("{}{}/oauth/device", base_url(), store.instance().oauth_prefix);
     let verification_uri_complete = format!("{verification_uri}?user_code={user_code}");
     Json(json!({
         "device_code": device_code,
@@ -485,7 +520,7 @@ pub struct DeviceVerifyQuery {
 /// offers a minimal form to enter the code.
 pub async fn device_verify(State(store): State<AuthStore>, Query(q): Query<DeviceVerifyQuery>) -> Response {
     let Some(user_code) = q.user_code.filter(|c| !c.is_empty()) else {
-        return device_code_form();
+        return device_code_form(store.instance().oauth_prefix);
     };
     let user_code = user_code.trim().to_uppercase();
 
@@ -497,36 +532,34 @@ pub async fn device_verify(State(store): State<AuthStore>, Query(q): Query<Devic
             .map(|d| d.session_id.clone())
     };
     match session_id {
-        Some(sid) => js_redirect(&ii_mcp_url(&sid)),
+        Some(sid) => js_redirect(&ii_mcp_url(store.instance(), &sid)),
         None => connect_error("unknown or expired code — restart the connection from your client"),
     }
 }
 
 /// A minimal manual code-entry page for the bare `verification_uri`.
-fn device_code_form() -> Response {
-    Html(
+fn device_code_form(prefix: &str) -> Response {
+    Html(format!(
         "<!DOCTYPE html><meta charset=utf-8><body style=\"font-family:system-ui;max-width:32rem;margin:3rem auto\">\
          <h1>Connect Internet Identity</h1>\
-         <form method=get action=\"/oauth/device\">\
+         <form method=get action=\"{prefix}/oauth/device\">\
          <p>Enter the code shown by your client:</p>\
          <input name=user_code autofocus style=\"font-size:1.2rem;padding:.4rem\">\
          <button type=submit style=\"font-size:1.2rem;padding:.4rem 1rem\">Continue</button>\
          </form></body>"
-            .to_string(),
-    )
+    ))
     .into_response()
 }
 
-/// Build II's `/mcp` handshake URL for a connection. Everything is in the URL
-/// fragment (never sent to II's servers): the callback on our origin, the
-/// single-use `state` (= session id), and the requested grant `ttl` in SECONDS.
-/// NO key material is put in the link.
-fn ii_mcp_url(session_id: &str) -> String {
-    let base = base_url();
-    let callback = format!("{base}/oauth/connect/callback");
+/// Build an instance's II `/mcp` handshake URL for a connection. Everything is in
+/// the URL fragment (never sent to II's servers): this instance's callback on our
+/// origin, the single-use `state` (= session id), and the requested grant `ttl`
+/// in SECONDS. NO key material is put in the link.
+fn ii_mcp_url(inst: &crate::identities::IiInstance, session_id: &str) -> String {
+    let callback = format!("{}{}/oauth/connect/callback", base_url(), inst.oauth_prefix);
     format!(
         "{ii}/mcp#callback={cb}&state={st}&ttl={ttl}",
-        ii = crate::identities::ii_url(),
+        ii = inst.ii_url,
         cb = urlencoding::encode(&callback),
         st = urlencoding::encode(session_id),
         ttl = GRANT_TTL_SECS,
@@ -567,8 +600,12 @@ pub async fn connect_callback(State(store): State<AuthStore>, Json(body): Json<C
             let public_key = store.identities.session_pubkey_b64(&body.state).await;
             let mut resp = json!({ "public_key": public_key });
             if is_authcode {
-                resp["finish_url"] =
-                    json!(format!("{}/oauth/finish?id={}", base_url(), urlencoding::encode(&body.state)));
+                resp["finish_url"] = json!(format!(
+                    "{}{}/oauth/finish?id={}",
+                    base_url(),
+                    store.instance().oauth_prefix,
+                    urlencoding::encode(&body.state)
+                ));
             }
             (StatusCode::OK, Json(resp)).into_response()
         }
@@ -843,15 +880,17 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
 
 // ---- Discovery metadata -------------------------------------------------
 
-/// GET /.well-known/oauth-authorization-server
-pub async fn authorization_server_metadata() -> Response {
-    let base = base_url();
+/// GET /.well-known/oauth-authorization-server (root for the default instance,
+/// `…/prod` for the prod instance — RFC 8414 path issuer). The issuer is
+/// `<PUBLIC_URL><oauth_prefix>`, and every endpoint lives under it.
+pub async fn authorization_server_metadata(State(store): State<AuthStore>) -> Response {
+    let issuer = format!("{}{}", base_url(), store.instance().oauth_prefix);
     Json(json!({
-        "issuer": base,
-        "authorization_endpoint": format!("{base}/oauth/authorize"),
-        "device_authorization_endpoint": format!("{base}/oauth/device_authorization"),
-        "token_endpoint": format!("{base}/oauth/token"),
-        "registration_endpoint": format!("{base}/oauth/register"),
+        "issuer": issuer,
+        "authorization_endpoint": format!("{issuer}/oauth/authorize"),
+        "device_authorization_endpoint": format!("{issuer}/oauth/device_authorization"),
+        "token_endpoint": format!("{issuer}/oauth/token"),
+        "registration_endpoint": format!("{issuer}/oauth/register"),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", DEVICE_GRANT_TYPE],
         "code_challenge_methods_supported": ["S256"],
@@ -860,12 +899,14 @@ pub async fn authorization_server_metadata() -> Response {
     .into_response()
 }
 
-/// GET /.well-known/oauth-protected-resource
-pub async fn protected_resource_metadata() -> Response {
+/// GET /.well-known/oauth-protected-resource (and the path-inserted variants):
+/// this instance's MCP resource and the AS that protects it.
+pub async fn protected_resource_metadata(State(store): State<AuthStore>) -> Response {
     let base = base_url();
+    let inst = store.instance();
     Json(json!({
-        "resource": format!("{base}/mcp"),
-        "authorization_servers": [base],
+        "resource": format!("{base}{}", inst.mcp_path),
+        "authorization_servers": [format!("{base}{}", inst.oauth_prefix)],
     }))
     .into_response()
 }
@@ -906,21 +947,25 @@ pub async fn require_token(State(store): State<AuthStore>, mut request: Request<
         }
         None => (
             StatusCode::UNAUTHORIZED,
-            [(axum::http::header::WWW_AUTHENTICATE, bearer_challenge(had_token))],
+            [(
+                axum::http::header::WWW_AUTHENTICATE,
+                bearer_challenge(had_token, &store.resource_metadata_url()),
+            )],
             Json(json!({ "error": "invalid_token" })),
         )
             .into_response(),
     }
 }
 
-/// Build the `WWW-Authenticate` challenge for a 401 on `/mcp`. Always points
-/// clients at the resource metadata (RFC 9728); when a token WAS presented but is
-/// invalid/expired (`had_token`), also carries `error="invalid_token"` (RFC 6750
-/// §3) so the client can tell "expired → re-authorize" from "no token" and prompt
-/// an inline reconnect. A missing token gets a bare challenge (RFC 6750: omit the
-/// error code when no credentials were sent).
-fn bearer_challenge(had_token: bool) -> String {
-    let meta = format!("resource_metadata=\"{}/.well-known/oauth-protected-resource\"", base_url());
+/// Build the `WWW-Authenticate` challenge for a 401 on an MCP resource. Always
+/// points clients at that resource's metadata (RFC 9728); when a token WAS
+/// presented but is invalid/expired (`had_token`), also carries
+/// `error="invalid_token"` (RFC 6750 §3) so the client can tell "expired →
+/// re-authorize" from "no token" and prompt an inline reconnect. A missing token
+/// gets a bare challenge (RFC 6750: omit the error code when no credentials were
+/// sent).
+fn bearer_challenge(had_token: bool, resource_metadata_url: &str) -> String {
+    let meta = format!("resource_metadata=\"{resource_metadata_url}\"");
     if had_token {
         format!("Bearer error=\"invalid_token\", error_description=\"The access token is invalid or expired\", {meta}")
     } else {
@@ -1010,19 +1055,21 @@ mod tests {
     }
 
     /// RFC 6750 §3 / 9728: the `error` code appears only when a token was
-    /// presented; the resource_metadata pointer is always present.
+    /// presented; the resource_metadata pointer is always present and carries the
+    /// per-instance metadata URL verbatim.
     #[test]
     fn bearer_challenge_carries_error_only_for_presented_tokens() {
-        let with_token = super::bearer_challenge(true);
+        let meta = "https://x.test/.well-known/oauth-protected-resource/mcp-prod";
+        let with_token = super::bearer_challenge(true, meta);
         assert!(with_token.starts_with("Bearer "));
         assert!(with_token.contains("error=\"invalid_token\""));
         assert!(with_token.contains("error_description="));
-        assert!(with_token.contains("resource_metadata="));
+        assert!(with_token.contains(&format!("resource_metadata=\"{meta}\"")));
 
-        let no_token = super::bearer_challenge(false);
+        let no_token = super::bearer_challenge(false, meta);
         assert!(no_token.starts_with("Bearer "));
         assert!(!no_token.contains("error="), "a bare challenge must omit the error code: {no_token}");
-        assert!(no_token.contains("resource_metadata="));
+        assert!(no_token.contains(&format!("resource_metadata=\"{meta}\"")));
     }
 
     #[test]

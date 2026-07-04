@@ -904,7 +904,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>IC MCP PoC</title></head>
 <body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
 <h1>Internet Computer MCP PoC</h1>
-<p>MCP endpoint: <code>POST /mcp</code></p>
+<p>MCP endpoints: <code>POST /mcp</code> (beta Internet Identity) · <code>POST /mcp-prod</code> (production Internet Identity)</p>
 <p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>find_canister</code> (name → canister ids), <code>lookup_canister</code> (id → dashboard identity), <code>get_candid</code>, <code>call_canister</code> (anonymously, or as your account at an application domain, derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (your principal at an application domain, no call), <code>list_accounts</code> (your Internet Identity accounts at an app domain). All speak textual Candid.</p>
 <p>Skills: <code>list_ic_skills</code> / <code>get_ic_skill</code> (the official IC how-to guides — Motoko, mops, icp CLI, cycles, …).</p>
 <p>Canister management (as your Internet Identity): <code>cycles_balance</code>, <code>create_canister</code>, <code>install_code</code>, <code>canister_status</code>, <code>update_canister_settings</code>, <code>start_canister</code>, <code>stop_canister</code>, <code>uninstall_code</code>, <code>delete_canister</code>, <code>top_up_canister</code>.</p>
@@ -923,21 +923,35 @@ async fn main() -> anyhow::Result<()> {
     let agent = Agent::builder().with_url(IC_URL).build()?;
     tracing::info!("built ic-agent against {IC_URL}");
 
-    let identities = Identities::new();
+    // Two Internet Identity instances: beta serves `/mcp` (OAuth AS at the root
+    // of PUBLIC_URL, unchanged), prod serves `/mcp-prod` (path-scoped AS under
+    // `/prod`, issuer `<PUBLIC_URL>/prod` — RFC 8414 path issuer). Each has its
+    // own Identities + AuthStore, so sessions/tokens never cross instances.
+    let inst_beta = identities::IiInstance::beta().map_err(anyhow::Error::msg)?;
+    let inst_prod = identities::IiInstance::prod().map_err(anyhow::Error::msg)?;
+    for inst in [&inst_beta, &inst_prod] {
+        tracing::info!(
+            "II instance {}: {} ({}) at {}",
+            inst.name, inst.ii_url, inst.ii_canister, inst.mcp_path
+        );
+    }
+    let ids_beta = Identities::new(inst_beta);
+    let ids_prod = Identities::new(inst_prod);
     let skills = skills::SkillsCatalog::new();
 
     let ct = tokio_util::sync::CancellationToken::new();
-    let mcp = {
+    // One rmcp streamable-HTTP service per instance, differing only in which
+    // Identities store the tools sign with. Stateless + plain-JSON responses:
+    // our tools are pure request/response with no server-initiated messages, and
+    // this is the most compatible mode across MCP clients (ChatGPT's connector
+    // does not complete the stateful SSE/session handshake the rmcp defaults
+    // require).
+    let make_mcp = |ids: Identities| {
         let agent = agent.clone();
-        let identities = identities.clone();
         let skills = skills.clone();
         StreamableHttpService::new(
-            move || Ok(IcTools::new(agent.clone(), identities.clone(), skills.clone())),
+            move || Ok(IcTools::new(agent.clone(), ids.clone(), skills.clone())),
             LocalSessionManager::default().into(),
-            // Stateless + plain-JSON responses: our tools are pure request/response
-            // with no server-initiated messages, and this is the most compatible
-            // mode across MCP clients (ChatGPT's connector does not complete the
-            // stateful SSE/session handshake that the rmcp defaults require).
             StreamableHttpServerConfig::default()
                 .with_stateful_mode(false)
                 .with_json_response(true)
@@ -945,18 +959,26 @@ async fn main() -> anyhow::Result<()> {
                 .with_allowed_hosts(allowed_hosts()),
         )
     };
+    let mcp_beta = make_mcp(ids_beta.clone());
+    let mcp_prod = make_mcp(ids_prod.clone());
 
-    let store = auth::AuthStore::new(identities.clone());
+    // Dynamic client registrations are II-agnostic (redirect allow-list only),
+    // so both instances share one store — and one persisted snapshot.
+    let clients = auth::load_shared_clients();
+    let store_beta = auth::AuthStore::new(ids_beta.clone(), clients.clone());
+    let store_prod = auth::AuthStore::new(ids_prod.clone(), clients.clone());
 
-    // /mcp is gated by a bearer token issued after Internet Identity login.
-    // `route_layer` (not `layer`) applies the gate ONLY to matched /mcp routes, so
-    // unmatched paths fall through to a 404 instead of the token gate's 401 — and
-    // the `/oauth/*` and `/.well-known/*` routes stay exempt from the bearer check.
+    // The MCP resources are gated by a bearer token issued after Internet
+    // Identity login (each by its own instance's store — a beta token is unknown
+    // to /mcp-prod and vice versa). `route_layer` (not `layer`) applies the gate
+    // ONLY to matched routes, so unmatched paths fall through to a 404 instead of
+    // the token gate's 401 — and the `/oauth/*` and `/.well-known/*` routes stay
+    // exempt from the bearer check.
     //
-    // Browser-based MCP clients (e.g. the Grok/ChatGPT connector UIs) call `/mcp`
-    // via `fetch()`, so it needs CORS — applied as the OUTERMOST layer so the
-    // OPTIONS preflight is answered (2xx) BEFORE the bearer gate, and the 401's
-    // `WWW-Authenticate` (the auth-discovery hint) is exposed cross-origin.
+    // Browser-based MCP clients (e.g. the Grok/ChatGPT connector UIs) call the
+    // resource via `fetch()`, so it needs CORS — applied OUTSIDE the bearer gate
+    // so the OPTIONS preflight is answered (2xx) BEFORE authentication, and the
+    // 401's `WWW-Authenticate` (the auth-discovery hint) is exposed cross-origin.
     // `Authorization` must be listed explicitly: the `*` wildcard for
     // `Access-Control-Allow-Headers` does NOT cover it per the Fetch spec.
     let mcp_cors = tower_http::cors::CorsLayer::new()
@@ -979,19 +1001,50 @@ async fn main() -> anyhow::Result<()> {
             axum::http::HeaderName::from_static("mcp-session-id"),
         ]);
     let protected_mcp = axum::Router::new()
-        .nest_service("/mcp", mcp)
+        .nest_service("/mcp", mcp_beta)
         .route_layer(axum::middleware::from_fn_with_state(
-            store.clone(),
+            store_beta.clone(),
+            auth::require_token,
+        ))
+        .layer(mcp_cors.clone());
+    let protected_mcp_prod = axum::Router::new()
+        .nest_service("/mcp-prod", mcp_prod)
+        .route_layer(axum::middleware::from_fn_with_state(
+            store_prod.clone(),
             auth::require_token,
         ))
         .layer(mcp_cors);
 
-    // OAuth authorization-server + discovery endpoints (CORS-open for clients).
-    let cors = tower_http::cors::CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
-        .allow_methods(tower_http::cors::Any)
-        .allow_headers(tower_http::cors::Any);
-    let oauth = axum::Router::new()
+    // The per-instance OAuth endpoints, relative to the instance's prefix.
+    fn oauth_endpoints(store: auth::AuthStore) -> axum::Router {
+        axum::Router::new()
+            .route("/oauth/authorize", axum::routing::get(auth::authorize))
+            .route("/oauth/finish", axum::routing::get(auth::finish))
+            .route("/oauth/device_authorization", axum::routing::post(auth::device_authorization))
+            .route("/oauth/device", axum::routing::get(auth::device_verify))
+            .route("/oauth/connect/callback", axum::routing::post(auth::connect_callback))
+            .route("/oauth/token", axum::routing::post(auth::token))
+            .route("/oauth/register", axum::routing::post(auth::register))
+            .with_state(store)
+    }
+
+    // Discovery documents.
+    //
+    // Beta (the default instance) keeps the root docs. Path-aware
+    // protected-resource metadata (RFC 9728 §3.1): the resource `…/mcp` has a
+    // path, so its metadata canonically lives at
+    // `/.well-known/oauth-protected-resource/mcp`; clients that follow the
+    // `resource_metadata` hint use the root doc. We deliberately do NOT add a
+    // `/mcp`-suffixed *authorization-server* doc for beta: its issuer is
+    // `base_url()` (no path), so per RFC 8414 a strict client requesting the
+    // suffixed AS doc would reject it on issuer mismatch.
+    //
+    // Prod is a path issuer (`<base>/prod`), so its AS metadata lives at the
+    // RFC 8414 path-inserted URL `/.well-known/oauth-authorization-server/prod`
+    // (plus the OIDC-style `<issuer>/.well-known/…` alternate some clients
+    // derive), and its resource doc at
+    // `/.well-known/oauth-protected-resource/mcp-prod`.
+    let discovery_beta = axum::Router::new()
         .route(
             "/.well-known/oauth-authorization-server",
             axum::routing::get(auth::authorization_server_metadata),
@@ -1000,28 +1053,36 @@ async fn main() -> anyhow::Result<()> {
             "/.well-known/oauth-protected-resource",
             axum::routing::get(auth::protected_resource_metadata),
         )
-        // Path-aware protected-resource metadata (RFC 9728 §3.1): the resource
-        // `…/mcp` has a path, so its metadata canonically lives at
-        // `/.well-known/oauth-protected-resource/mcp`. Clients that follow the
-        // `resource_metadata` hint use the root doc above; spec-strict clients
-        // derive this `/mcp`-suffixed URL. We deliberately do NOT add a
-        // `/mcp`-suffixed *authorization-server* doc: our AS issuer is `base_url()`
-        // (no path), so per RFC 8414 a strict client requesting the suffixed AS
-        // doc would reject it on issuer mismatch — the AS is correctly discovered
-        // at the root via `authorization_servers` in the protected-resource doc.
         .route(
             "/.well-known/oauth-protected-resource/mcp",
             axum::routing::get(auth::protected_resource_metadata),
         )
-        .route("/oauth/authorize", axum::routing::get(auth::authorize))
-        .route("/oauth/finish", axum::routing::get(auth::finish))
-        .route("/oauth/device_authorization", axum::routing::post(auth::device_authorization))
-        .route("/oauth/device", axum::routing::get(auth::device_verify))
-        .route("/oauth/connect/callback", axum::routing::post(auth::connect_callback))
-        .route("/oauth/token", axum::routing::post(auth::token))
-        .route("/oauth/register", axum::routing::post(auth::register))
-        .layer(cors)
-        .with_state(store.clone());
+        .with_state(store_beta.clone());
+    let discovery_prod = axum::Router::new()
+        .route(
+            "/.well-known/oauth-authorization-server/prod",
+            axum::routing::get(auth::authorization_server_metadata),
+        )
+        .route(
+            "/prod/.well-known/oauth-authorization-server",
+            axum::routing::get(auth::authorization_server_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp-prod",
+            axum::routing::get(auth::protected_resource_metadata),
+        )
+        .with_state(store_prod.clone());
+
+    // OAuth authorization-server + discovery endpoints (CORS-open for clients).
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any);
+    let oauth = discovery_beta
+        .merge(discovery_prod)
+        .merge(oauth_endpoints(store_beta.clone()))
+        .nest("/prod", oauth_endpoints(store_prod.clone()))
+        .layer(cors);
 
     // When this process started — i.e. when the deployment last (re)started.
     // Every deploy restarts the service, so this is the "last redeployment" time.
@@ -1050,6 +1111,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .merge(oauth)
         .merge(protected_mcp)
+        .merge(protected_mcp_prod)
         // Log every inbound request (method, path, status, latency) so we can see
         // what external clients actually hit — discovery probes, unknown paths,
         // etc. Only the path is logged, never the query string, so single-use
