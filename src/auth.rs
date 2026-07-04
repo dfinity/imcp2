@@ -888,6 +888,7 @@ pub async fn require_token(State(store): State<AuthStore>, mut request: Request<
         .and_then(|h| h.strip_prefix("Bearer "))
         .map(str::to_owned);
 
+    let had_token = token.is_some();
     let session = match token {
         Some(t) => store.session_for_token(&t).await,
         None => None,
@@ -900,10 +901,17 @@ pub async fn require_token(State(store): State<AuthStore>, mut request: Request<
             next.run(request).await
         }
         None => {
-            let challenge = format!(
-                "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
-                base_url()
-            );
+            // RFC 6750 §3 / RFC 9728: point clients at the resource metadata, and
+            // — when a token WAS presented but is invalid/expired — carry
+            // `error="invalid_token"` in the header so the client can tell "expired,
+            // re-authorize" from "no token". A missing token gets a bare challenge
+            // (RFC 6750: don't include an error code when no credentials were sent).
+            let meta = format!("resource_metadata=\"{}/.well-known/oauth-protected-resource\"", base_url());
+            let challenge = if had_token {
+                format!("Bearer error=\"invalid_token\", error_description=\"The access token is invalid or expired\", {meta}")
+            } else {
+                format!("Bearer {meta}")
+            };
             (
                 StatusCode::UNAUTHORIZED,
                 [(axum::http::header::WWW_AUTHENTICATE, challenge)],
