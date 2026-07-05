@@ -32,7 +32,7 @@ use std::{
 use base64::Engine;
 use candid::{CandidType, Decode, Encode, Principal};
 use ic_agent::{
-    identity::{BasicIdentity, DelegatedIdentity, Delegation, SignedDelegation},
+    identity::{BasicIdentity, DelegatedIdentity, Delegation, DelegationPermissions, SignedDelegation},
     Agent, Identity,
 };
 use serde::Deserialize;
@@ -673,6 +673,32 @@ struct IiDelegation {
     pubkey: Vec<u8>,
     expiration: u64,
     targets: Option<Vec<Principal>>,
+    /// Which request kinds this delegation authorizes — II's per-MCP-session
+    /// access, `opt Permissions` (`variant { queries; all }`). Absent/`None`
+    /// means unrestricted. Part of what II signs, so it must be forwarded
+    /// verbatim into the `ic-agent` delegation for the hash to match.
+    permissions: Option<IiPermissions>,
+}
+
+/// II's `Permissions` variant on a delegation (`variant { queries; all }`),
+/// mirrored for Candid decoding since `ic-agent`'s `DelegationPermissions`
+/// isn't `CandidType`. Maps 1:1 into it, preserving the on-wire representation
+/// (`queries`/`all`) II hashed over.
+#[derive(CandidType, Deserialize)]
+enum IiPermissions {
+    #[serde(rename = "queries")]
+    Queries,
+    #[serde(rename = "all")]
+    All,
+}
+
+impl From<IiPermissions> for DelegationPermissions {
+    fn from(p: IiPermissions) -> Self {
+        match p {
+            IiPermissions::Queries => DelegationPermissions::Queries,
+            IiPermissions::All => DelegationPermissions::All,
+        }
+    }
 }
 
 /// `SignedDelegation` as returned by II's `mcp_get_delegation`.
@@ -694,6 +720,11 @@ impl IiSignedDelegation {
                 pubkey: self.delegation.pubkey,
                 expiration: self.delegation.expiration,
                 targets: self.delegation.targets,
+                // Forward II's per-MCP-session permission verbatim so the
+                // reconstructed delegation hashes to exactly what II signed.
+                // An absent permission (`None`) hashes identically to a
+                // pre-0.48 delegation, so unrestricted sessions are unaffected.
+                permissions: self.delegation.permissions.map(Into::into),
             },
             signature: self.signature,
         })
@@ -884,5 +915,229 @@ mod tests {
         assert_eq!(decoded[1].account_number, Some(7));
         assert_eq!(decoded[1].name.as_deref(), Some("savings"));
         assert_eq!(decoded[1].last_used, Some(123));
+    }
+
+    // II's `SignedDelegation` / `Delegation` / `Permissions` Candid contract,
+    // mirrored so tests can encode a reply exactly as II would and then drive the
+    // real `Decode!` -> `into_agent` path over it.
+    #[derive(CandidType, Deserialize)]
+    enum WirePermissions {
+        #[serde(rename = "queries")]
+        Queries,
+        #[serde(rename = "all")]
+        All,
+    }
+    #[derive(CandidType)]
+    struct WireDelegation {
+        pubkey: Vec<u8>,
+        expiration: u64,
+        targets: Option<Vec<Principal>>,
+        permissions: Option<WirePermissions>,
+    }
+    #[derive(CandidType)]
+    struct WireSignedDelegation {
+        delegation: WireDelegation,
+        signature: Vec<u8>,
+    }
+
+    // A pre-0.48 II reply whose `Delegation` record has NO `permissions` field at
+    // all — the older wire type, distinct from an `opt`-null field. Used to prove
+    // Candid decodes the absent optional as `None`, so old replies keep working.
+    #[derive(CandidType)]
+    struct WireLegacyDelegation {
+        pubkey: Vec<u8>,
+        expiration: u64,
+        targets: Option<Vec<Principal>>,
+    }
+    #[derive(CandidType)]
+    struct WireLegacySignedDelegation {
+        delegation: WireLegacyDelegation,
+        signature: Vec<u8>,
+    }
+
+    // Lock in the mcp_get_delegation permission contract: II's `Delegation`
+    // carries `permissions: opt variant { queries; all }`, and it must round-trip
+    // through `into_agent` onto the `ic-agent` delegation so the reconstructed
+    // hash matches what II signed. An absent permission stays `None`.
+    #[test]
+    fn signed_delegation_forwards_ii_permissions() {
+        let app_key = vec![1u8, 2, 3, 4];
+        // Decode a `queries`-scoped delegation and confirm it maps to Queries.
+        let make = |permissions| WireSignedDelegation {
+            delegation: WireDelegation {
+                pubkey: app_key.clone(),
+                expiration: 42,
+                targets: None,
+                permissions,
+            },
+            signature: vec![9, 9, 9],
+        };
+
+        let bytes = Encode!(&make(Some(WirePermissions::Queries))).expect("encode");
+        let agent = Decode!(&bytes, IiSignedDelegation)
+            .expect("decode")
+            .into_agent(&app_key)
+            .expect("into_agent");
+        assert_eq!(agent.delegation.permissions, Some(DelegationPermissions::Queries));
+
+        let bytes = Encode!(&make(Some(WirePermissions::All))).expect("encode");
+        let agent = Decode!(&bytes, IiSignedDelegation)
+            .expect("decode")
+            .into_agent(&app_key)
+            .expect("into_agent");
+        assert_eq!(agent.delegation.permissions, Some(DelegationPermissions::All));
+
+        // An unrestricted (present-but-null) permission decodes and forwards as
+        // None, hashing identically to a pre-0.48 delegation.
+        let bytes = Encode!(&make(None)).expect("encode");
+        let agent = Decode!(&bytes, IiSignedDelegation)
+            .expect("decode")
+            .into_agent(&app_key)
+            .expect("into_agent");
+        assert_eq!(agent.delegation.permissions, None);
+
+        // Backward compatibility: a pre-0.48 reply omits the `permissions` field
+        // from the record entirely (not `opt`-null as above). Candid's subtyping
+        // decodes the absent optional as None, so old II replies keep working.
+        let legacy = WireLegacySignedDelegation {
+            delegation: WireLegacyDelegation {
+                pubkey: app_key.clone(),
+                expiration: 42,
+                targets: None,
+            },
+            signature: vec![9, 9, 9],
+        };
+        let bytes = Encode!(&legacy).expect("encode legacy reply");
+        let agent = Decode!(&bytes, IiSignedDelegation)
+            .expect("decode legacy reply")
+            .into_agent(&app_key)
+            .expect("into_agent");
+        assert_eq!(agent.delegation.permissions, None);
+    }
+
+    // End-to-end: a read-only (`queries`) delegation from II must survive our full
+    // decode -> DelegatedIdentity path and scope EVERY request the resulting
+    // identity signs, so the replica allows reads but refuses update calls. This
+    // drives the real path — `IiSignedDelegation::into_agent` -> `build_identity`
+    // -> `Identity::sign` — with a genuinely anchor-signed chain, no network: the
+    // replica enforces the scope because it is bound into the delegation signature
+    // (proven by the tamper check at the end).
+    #[test]
+    fn read_only_delegation_scopes_signed_requests_end_to_end() {
+        use ic_agent::agent::EnvelopeContent;
+
+        // The anchor (II user) key that signs the delegation, and the per-app key
+        // it is issued to (what the server ultimately signs canister calls as).
+        let (user_seed, user_der) = fresh_ed25519();
+        let (app_seed, app_der) = fresh_ed25519();
+        let anchor = BasicIdentity::from_raw_key(&user_seed);
+        let expiration = now_ns() + 3_600_000_000_000;
+
+        // The exact `queries`-scoped delegation II would sign, signed as the
+        // anchor. `signable()` covers `permissions`, so this signature is valid
+        // ONLY for the read-only delegation.
+        let delegation = Delegation {
+            pubkey: app_der.clone(),
+            expiration,
+            targets: None,
+            permissions: Some(DelegationPermissions::Queries),
+        };
+        let signature = anchor
+            .sign_delegation(&delegation)
+            .expect("anchor signs delegation")
+            .signature
+            .expect("ed25519 signature present");
+
+        // Feed it back through the real II-reply -> decode -> into_agent path.
+        let wire = WireSignedDelegation {
+            delegation: WireDelegation {
+                pubkey: app_der.clone(),
+                expiration,
+                targets: None,
+                permissions: Some(WirePermissions::Queries),
+            },
+            signature,
+        };
+        let bytes = Encode!(&wire).expect("encode II reply");
+        let signed = Decode!(&bytes, IiSignedDelegation)
+            .expect("decode")
+            .into_agent(&app_der)
+            .expect("into_agent");
+        assert_eq!(
+            signed.delegation.permissions,
+            Some(DelegationPermissions::Queries),
+            "read-only scope survives decoding"
+        );
+
+        // Build the delegated identity exactly as the server does; the chain
+        // validates because the anchor's signature covers this read-only delegation.
+        let app = AppDelegation {
+            user_key: user_der.clone(),
+            chain: vec![signed.clone()],
+            expiration_ns: expiration,
+            app_key_seed: app_seed,
+        };
+        let identity = build_identity(&app).expect("valid read-only chain builds an identity");
+        let sender = identity.sender().expect("sender");
+
+        // Every request this identity signs — an update AND a read — carries the
+        // read-only delegation, so the replica scopes both to queries/read_state.
+        let update = EnvelopeContent::Call {
+            nonce: None,
+            ingress_expiry: expiration,
+            sender,
+            canister_id: Principal::management_canister(),
+            method_name: "some_update".to_string(),
+            arg: vec![],
+            sender_info: None,
+        };
+        let read = EnvelopeContent::Query {
+            ingress_expiry: expiration,
+            sender,
+            canister_id: Principal::management_canister(),
+            method_name: "some_query".to_string(),
+            arg: vec![],
+            nonce: None,
+            sender_info: None,
+        };
+        for content in [&update, &read] {
+            let chain = identity
+                .sign(content)
+                .expect("sign request")
+                .delegations
+                .expect("delegation chain attached to the request");
+            assert_eq!(chain.len(), 1);
+            assert_eq!(
+                chain[0].delegation.permissions,
+                Some(DelegationPermissions::Queries),
+                "the signed request carries the read-only scope the replica enforces"
+            );
+        }
+
+        // The restriction is bound into the signature, not cosmetic: widening it to
+        // an unrestricted delegation changes the signed bytes, so the anchor's
+        // signature no longer verifies and the identity refuses to build. A client
+        // cannot silently promote a read-only delegation to full access.
+        let unrestricted = Delegation {
+            permissions: None,
+            ..delegation.clone()
+        };
+        assert_ne!(
+            delegation.signable(),
+            unrestricted.signable(),
+            "the permission must change what is signed"
+        );
+        let mut tampered = signed;
+        tampered.delegation.permissions = None;
+        let tampered_app = AppDelegation {
+            user_key: user_der,
+            chain: vec![tampered],
+            expiration_ns: expiration,
+            app_key_seed: app_seed,
+        };
+        assert!(
+            build_identity(&tampered_app).is_err(),
+            "stripping the read-only scope must invalidate the delegation signature"
+        );
     }
 }

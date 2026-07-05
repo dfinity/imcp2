@@ -10,7 +10,7 @@ rmcp = { version = "1.7", features = [
     "transport-streamable-http-server",
     "auth",
 ] }
-ic-agent = "0.47"
+ic-agent = "0.48"
 candid = { version = "0.10", features = ["value"] }
 candid_parser = "0.3.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
