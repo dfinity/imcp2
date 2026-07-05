@@ -142,6 +142,18 @@ pub struct NoArgs {}
 // same data is also rendered to human-readable text via `human()`.
 // ===========================================================================
 
+/// Structured result of the lifecycle/action tools that confirm an operation on
+/// a specific canister (`canister_status`, `install_code`,
+/// `update_canister_settings`, `top_up_canister`, `start_canister`,
+/// `stop_canister`, `uninstall_code`, `delete_canister`).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CanisterActionOutput {
+    /// The canister the action targeted.
+    pub canister_id: String,
+    /// Human-readable summary of the outcome (same as the text content).
+    pub message: String,
+}
+
 /// Structured result of `cycles_balance`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CyclesBalance {

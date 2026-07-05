@@ -70,6 +70,13 @@ impl From<&Found> for DiscoveredCanister {
     }
 }
 
+/// Arguments for `discover_canisters`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DiscoverCanistersArgs {
+    /// A web domain or URL served from the IC, e.g. "oisy.com".
+    pub domain: String,
+}
+
 /// Structured output of `discover_canisters`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DiscoverOutput {
@@ -298,6 +305,13 @@ pub struct CanisterInfo {
     pub latest_upgrade_proposal: Option<u64>,
 }
 
+/// Arguments for `lookup_canister`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LookupCanisterArgs {
+    /// Canister principal to identify, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai".
+    pub canister_id: String,
+}
+
 /// The `lookup_canister` MCP output shape — the IC dashboard's identity for a
 /// canister id (a serialization mirror of [`CanisterInfo`]).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -455,6 +469,14 @@ impl From<&Match> for FoundCanister {
             note: m.note.clone(),
         }
     }
+}
+
+/// Arguments for `find_canister`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FindCanisterArgs {
+    /// A name, token symbol, or project to search for, e.g. "ckUSDC", "ICP",
+    /// "OpenChat".
+    pub query: String,
 }
 
 /// Structured output of `find_canister`.

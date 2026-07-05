@@ -235,6 +235,40 @@ pub struct AccountInfo {
     pub last_used: Option<u64>,
 }
 
+/// Arguments for `get_principal`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetPrincipalArgs {
+    /// The application domain to resolve, e.g. "oisy.com". Returns the principal
+    /// you act as at that app — its account delegation is derived on demand (same
+    /// as call_canister) and its principal returned.
+    pub domain: String,
+    /// Which of your accounts at `domain` to resolve, by account name (see
+    /// list_accounts). Omit to use that app's default account.
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// Structured output of `get_principal`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct PrincipalOutput {
+    /// The application domain the principal was derived for.
+    pub domain: String,
+    /// The account name resolved, or null for the app's default account.
+    pub account: Option<String>,
+    /// The principal you act as at that app.
+    pub principal: String,
+    /// True if this Internet Identity session is read-only (canister
+    /// management is unavailable until reconnected with read-only OFF).
+    pub read_only: bool,
+}
+
+/// Arguments for `list_accounts`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListAccountsArgs {
+    /// The application domain whose accounts to list, e.g. "oisy.com".
+    pub domain: String,
+}
+
 /// One account in the `list_accounts` MCP output (a serialization mirror of
 /// [`AccountInfo`]).
 #[derive(Debug, Serialize, schemars::JsonSchema)]

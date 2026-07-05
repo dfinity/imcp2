@@ -111,45 +111,11 @@ fn default_args() -> String {
     "()".to_string()
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct DiscoverCanistersArgs {
-    /// A web domain or URL served from the IC, e.g. "oisy.com".
-    domain: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct GetPrincipalArgs {
-    /// The application domain to resolve, e.g. "oisy.com". Returns the principal
-    /// you act as at that app — its account delegation is derived on demand (same
-    /// as call_canister) and its principal returned.
-    domain: String,
-    /// Which of your accounts at `domain` to resolve, by account name (see
-    /// list_accounts). Omit to use that app's default account.
-    #[serde(default)]
-    account: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct ListAccountsArgs {
-    /// The application domain whose accounts to list, e.g. "oisy.com".
-    domain: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct FindCanisterArgs {
-    /// A name, token symbol, or project to search for, e.g. "ckUSDC", "ICP",
-    /// "OpenChat".
-    query: String,
-}
-
-// ---------------------------------------------------------------------------
-// Structured tool outputs for the tools whose replies are assembled here at the
-// MCP boundary (no single domain module owns them). Each tool declares one of
-// these as its `outputSchema` and returns a matching object as structured
-// content, alongside the human-readable text. Output types that mirror a
-// domain module's data live next to it — see `discover`, `identities`,
-// `skills`, and `management`.
-// ---------------------------------------------------------------------------
+// get_candid and call_canister are implemented in main.rs itself (the Candid
+// encode/decode boundary — `encode_args`/`decode_reply`/`resolve_did` below),
+// so their arg and output types live here. Every other tool delegates to a
+// module (`discover`, `identities`, `skills`, `management`), and its arg +
+// output types live in that module.
 
 /// Output of `get_candid`.
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
@@ -171,44 +137,6 @@ struct CallCanisterOutput {
     is_query: bool,
     /// The decoded reply in textual Candid.
     reply: String,
-}
-
-/// Output of `get_principal`.
-#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
-struct PrincipalOutput {
-    /// The application domain the principal was derived for.
-    domain: String,
-    /// The account name resolved, or null for the app's default account.
-    account: Option<String>,
-    /// The principal you act as at that app.
-    principal: String,
-    /// True if this Internet Identity session is read-only (canister
-    /// management is unavailable until reconnected with read-only OFF).
-    read_only: bool,
-}
-
-/// Output of the canister management/lifecycle tools that confirm an action on
-/// a specific canister (`canister_status`, `install_code`, `update_canister_settings`,
-/// `top_up_canister`, `start_canister`, `stop_canister`, `uninstall_code`,
-/// `delete_canister`).
-#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
-struct CanisterActionOutput {
-    /// The canister the action targeted.
-    canister_id: String,
-    /// Human-readable summary of the outcome (same as the text content).
-    message: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct LookupCanisterArgs {
-    /// Canister principal to identify, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai".
-    canister_id: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct GetSkillArgs {
-    /// Skill name, e.g. "motoko", "icp-cli", "cycles-management".
-    name: String,
 }
 
 #[derive(Clone)]
@@ -331,11 +259,11 @@ impl IcTools {
     #[tool(
         description = "Get the Internet Computer principal you act as at a given application `domain` (e.g. \"oisy.com\"), without making a canister call. The app's account delegation is derived on demand (same as call_canister) from this connection's standing Internet Identity credential, and its principal is returned. By default this resolves the app's default account; pass `account` (an account name from list_accounts) for a specific named account there. Use this when a flow needs the principal itself (e.g. to look up a balance or account) rather than to invoke a method. NOTE: the principal is derived from the app's DOMAIN, which is usually — but not always — the identity a browser sign-in to that app would use. Some apps declare a CUSTOM derivation origin (via /.well-known/ii-alternative-origins) that isn't exposed here; if the returned principal (or an account/balance) doesn't match what the user sees in their browser at that app, tell them so and offer to look up the app's ii-alternative-origins (web search / fetch) and retry.",
         annotations(title = "Get your principal at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<PrincipalOutput>(),
+        output_schema = schema_for_output::<identities::PrincipalOutput>(),
     )]
     async fn get_principal(
         &self,
-        Parameters(GetPrincipalArgs { domain, account }): Parameters<GetPrincipalArgs>,
+        Parameters(identities::GetPrincipalArgs { domain, account }): Parameters<identities::GetPrincipalArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session_id = match authed_session(&ctx) {
@@ -363,7 +291,7 @@ impl IcTools {
                          update access. Ask the user to reconnect with the read-only option turned OFF.)",
                     );
                 }
-                let output = PrincipalOutput { domain, account, principal: p.to_text(), read_only };
+                let output = identities::PrincipalOutput { domain, account, principal: p.to_text(), read_only };
                 Ok(ok_structured(out, &output))
             }
             Err(e) => Ok(err(format!("could not derive principal for '{domain}': {e}"))),
@@ -377,7 +305,7 @@ impl IcTools {
     )]
     async fn list_accounts(
         &self,
-        Parameters(ListAccountsArgs { domain }): Parameters<ListAccountsArgs>,
+        Parameters(identities::ListAccountsArgs { domain }): Parameters<identities::ListAccountsArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session_id = match authed_session(&ctx) {
@@ -404,7 +332,7 @@ impl IcTools {
     )]
     async fn discover_canisters(
         &self,
-        Parameters(DiscoverCanistersArgs { domain }): Parameters<DiscoverCanistersArgs>,
+        Parameters(discover::DiscoverCanistersArgs { domain }): Parameters<discover::DiscoverCanistersArgs>,
     ) -> Result<CallToolResult, McpError> {
         match discover::discover(&domain).await {
             Ok(found) if !found.is_empty() => {
@@ -454,7 +382,7 @@ impl IcTools {
     )]
     async fn find_canister(
         &self,
-        Parameters(FindCanisterArgs { query }): Parameters<FindCanisterArgs>,
+        Parameters(discover::FindCanisterArgs { query }): Parameters<discover::FindCanisterArgs>,
     ) -> Result<CallToolResult, McpError> {
         match discover::search_by_name(&query).await {
             Ok(matches) if !matches.is_empty() => {
@@ -499,7 +427,7 @@ impl IcTools {
     )]
     async fn lookup_canister(
         &self,
-        Parameters(LookupCanisterArgs { canister_id }): Parameters<LookupCanisterArgs>,
+        Parameters(discover::LookupCanisterArgs { canister_id }): Parameters<discover::LookupCanisterArgs>,
     ) -> Result<CallToolResult, McpError> {
         let client = match discover::http_client() {
             Ok(c) => c,
@@ -545,7 +473,7 @@ impl IcTools {
     )]
     async fn get_ic_skill(
         &self,
-        Parameters(GetSkillArgs { name }): Parameters<GetSkillArgs>,
+        Parameters(skills::GetSkillArgs { name }): Parameters<skills::GetSkillArgs>,
     ) -> Result<CallToolResult, McpError> {
         match self.skills.get(&name).await {
             Ok(md) => {
@@ -601,7 +529,7 @@ impl IcTools {
     #[tool(
         description = "Add cycles to an existing canister, paying from your cycles-ledger balance. Specify `cycles` (exact) or `icp` (decimal-ICP string, converted at the current rate). Requires an authenticated session.",
         annotations(title = "Top up a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<CanisterActionOutput>(),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn top_up_canister(
         &self,
@@ -622,7 +550,7 @@ impl IcTools {
     #[tool(
         description = "Install a compiled Wasm module on a canister you control (as your Internet Identity). Provide the module as `wasm_base64` (or `wasm_hex`); large modules are uploaded via the chunk store automatically. `mode` is \"install\" (default, empty canister), \"reinstall\" (wipe state), or \"upgrade\" (preserve stable memory). `arg` is the init/upgrade argument in textual Candid, e.g. \"()\". Build the Wasm in your own environment first (see the motoko / icp-cli / mops-cli skills). Requires an authenticated session.",
         annotations(title = "Install code on a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<CanisterActionOutput>(),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn install_code(
         &self,
@@ -643,7 +571,7 @@ impl IcTools {
     #[tool(
         description = "Report a canister's status: run state, cycle balance, module hash, memory size, controllers, and allocations. Controller-only (acts as your Internet Identity). This only READS status (it changes nothing), but on the IC it is an update call, so it needs a full (non-read-only) Internet Identity session. Requires an authenticated session.",
         annotations(title = "Get canister status", read_only_hint = true, destructive_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<CanisterActionOutput>(),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn canister_status(
         &self,
@@ -664,7 +592,7 @@ impl IcTools {
     #[tool(
         description = "Update a canister's settings: controllers, compute/memory allocation, freezing threshold, reserved-cycles limit, wasm memory limit, or log visibility (\"controllers\"|\"public\"). Only the fields you pass are changed. WARNING: passing `controllers` REPLACES the whole set — include your own principal to remain a controller. Requires an authenticated session.",
         annotations(title = "Update canister settings", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true),
-        output_schema = schema_for_output::<CanisterActionOutput>(),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn update_canister_settings(
         &self,
@@ -685,7 +613,7 @@ impl IcTools {
     #[tool(
         description = "Start a stopped canister you control. Requires an authenticated session.",
         annotations(title = "Start a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
-        output_schema = schema_for_output::<CanisterActionOutput>(),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn start_canister(
         &self,
@@ -703,7 +631,7 @@ impl IcTools {
     #[tool(
         description = "Stop a running canister you control (required before deleting it). Requires an authenticated session.",
         annotations(title = "Stop a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
-        output_schema = schema_for_output::<CanisterActionOutput>(),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn stop_canister(
         &self,
@@ -721,7 +649,7 @@ impl IcTools {
     #[tool(
         description = "Remove a canister's code and state, leaving it empty (it keeps its id and cycles). Acts as your Internet Identity. Requires an authenticated session.",
         annotations(title = "Uninstall code from a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true),
-        output_schema = schema_for_output::<CanisterActionOutput>(),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn uninstall_code(
         &self,
@@ -739,7 +667,7 @@ impl IcTools {
     #[tool(
         description = "Delete a canister permanently (irreversible — stop it first; remaining cycles are burned). Acts as your Internet Identity. Requires an authenticated session.",
         annotations(title = "Delete a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<CanisterActionOutput>(),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn delete_canister(
         &self,
@@ -1098,12 +1026,12 @@ fn ok_structured<T: serde::Serialize>(text: String, value: &T) -> CallToolResult
 
 /// Map a management/lifecycle tool's `Result<String, String>` (the human
 /// confirmation message) to a `CallToolResult`, attaching a
-/// `CanisterActionOutput { canister_id, message }` as structured content on
+/// `management::CanisterActionOutput { canister_id, message }` as structured content on
 /// success so the reply conforms to the tool's declared `outputSchema`.
 fn ok_canister_action(canister_id: String, r: Result<String, String>) -> CallToolResult {
     match r {
         Ok(message) => {
-            let output = CanisterActionOutput { canister_id, message };
+            let output = management::CanisterActionOutput { canister_id, message };
             ok_structured(output.message.clone(), &output)
         }
         Err(text) => err(text),

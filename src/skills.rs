@@ -90,6 +90,13 @@ pub struct SkillUrls {
     pub markdown: String,
 }
 
+/// Arguments for `get_ic_skill`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetSkillArgs {
+    /// Skill name, e.g. "motoko", "icp-cli", "cycles-management".
+    pub name: String,
+}
+
 /// One skill in the `list_ic_skills` MCP output (the catalogue-facing subset of
 /// [`SkillEntry`] — the internal fetch `urls` are intentionally omitted).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
