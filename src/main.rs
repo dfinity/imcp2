@@ -179,6 +179,156 @@ impl From<&discover::Match> for FoundCanister {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Structured tool outputs. Each tool declares one of these as its MCP
+// `outputSchema` (so a model knows the exact shape of the reply) and returns a
+// matching object as structured content, alongside the human-readable text.
+// The roots are all objects, as MCP requires for `outputSchema`.
+// ---------------------------------------------------------------------------
+
+/// Output of `get_candid`.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct GetCandidOutput {
+    /// The canister whose interface was read.
+    canister_id: String,
+    /// The Candid (`.did`) interface text.
+    candid: String,
+}
+
+/// Output of `call_canister`.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct CallCanisterOutput {
+    /// The canister that was called.
+    canister_id: String,
+    /// The method that was invoked.
+    method: String,
+    /// Whether this was a read-only query call (vs. an update call).
+    is_query: bool,
+    /// The decoded reply in textual Candid.
+    reply: String,
+}
+
+/// Output of `get_principal`.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct PrincipalOutput {
+    /// The application domain the principal was derived for.
+    domain: String,
+    /// The account name resolved, or null for the app's default account.
+    account: Option<String>,
+    /// The principal you act as at that app.
+    principal: String,
+    /// True if this Internet Identity session is read-only (canister
+    /// management is unavailable until reconnected with read-only OFF).
+    read_only: bool,
+}
+
+/// One of the user's Internet Identity accounts at an app (in `list_accounts`).
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct AccountEntry {
+    /// The user-given account name, or null for the default account.
+    name: Option<String>,
+    /// The II account number, or null for the default account.
+    account_number: Option<u64>,
+    /// When the account was last used (ns since the Unix epoch), if known.
+    last_used: Option<u64>,
+}
+
+/// Output of `list_accounts`.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct AccountsOutput {
+    /// The application domain the accounts belong to.
+    domain: String,
+    /// The user's accounts at that app (empty if none).
+    accounts: Vec<AccountEntry>,
+}
+
+/// One canister discovered behind a web domain (in `discover_canisters`).
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct DiscoveredCanister {
+    /// The canister's principal id.
+    canister_id: String,
+    /// A human label if one was attached (env.json key, bundle constant, or
+    /// "frontend"); null for a bare bundle literal.
+    label: Option<String>,
+    /// IC dashboard label (e.g. "ICP Ledger"), when the id is a known canister.
+    name: Option<String>,
+    /// IC dashboard classification (e.g. "ledger"), when known.
+    kind: Option<String>,
+    /// Where it was found: "header", "env.json", "bundle:<LABEL>", or "bundle".
+    sources: Vec<String>,
+}
+
+/// Output of `discover_canisters`.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct DiscoverOutput {
+    /// The domain that was probed.
+    domain: String,
+    /// Canisters found behind the domain (empty if none).
+    canisters: Vec<DiscoveredCanister>,
+}
+
+/// Output of `lookup_canister` — the IC dashboard's identity for a canister id.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct CanisterIdentityOutput {
+    /// The canister that was identified.
+    canister_id: String,
+    /// Curated label, e.g. "ICP Ledger"; null for unlabelled canisters.
+    name: Option<String>,
+    /// Classification, e.g. "ledger"; null when unclassified.
+    canister_type: Option<String>,
+    /// Controller principals.
+    controllers: Vec<String>,
+    /// Hosting subnet id, if known.
+    subnet_id: Option<String>,
+    /// Module hash (hex), if known.
+    module_hash: Option<String>,
+    /// Implementation language, if known.
+    language: Option<String>,
+    /// Proposal id of the most recent recorded upgrade, if any.
+    latest_upgrade_proposal: Option<u64>,
+}
+
+/// One skill in the `list_ic_skills` catalog.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct SkillSummary {
+    /// The skill name to pass to get_ic_skill, e.g. "motoko".
+    name: String,
+    /// The skill's human title.
+    title: String,
+    /// The category it's grouped under.
+    category: String,
+    /// A one-line description.
+    description: String,
+}
+
+/// Output of `list_ic_skills`.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct SkillsOutput {
+    /// The available IC skills.
+    skills: Vec<SkillSummary>,
+}
+
+/// Output of `get_ic_skill`.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct SkillOutput {
+    /// The skill name.
+    name: String,
+    /// The full SKILL.md instructions (markdown).
+    content: String,
+}
+
+/// Output of the canister management/lifecycle tools that confirm an action on
+/// a specific canister (`canister_status`, `install_code`, `update_canister_settings`,
+/// `top_up_canister`, `start_canister`, `stop_canister`, `uninstall_code`,
+/// `delete_canister`).
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct CanisterActionOutput {
+    /// The canister the action targeted.
+    canister_id: String,
+    /// Human-readable summary of the outcome (same as the text content).
+    message: String,
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct LookupCanisterArgs {
     /// Canister principal to identify, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai".
@@ -213,6 +363,8 @@ impl IcTools {
     #[tool(
         description = "Fetch the Candid (.did) interface definition of an Internet Computer canister, read from its public `candid:service` metadata.",
         annotations(title = "Get Candid interface", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<GetCandidOutput>()
+            .expect("GetCandidOutput must produce an object-rooted schema"),
     )]
     async fn get_candid(
         &self,
@@ -228,7 +380,10 @@ impl IcTools {
             .await
         {
             Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(did) => Ok(ok(did)),
+                Ok(did) => {
+                    let output = GetCandidOutput { canister_id, candid: did };
+                    Ok(ok_structured(output.candid.clone(), &output))
+                }
                 Err(e) => Ok(err(format!("metadata is not valid UTF-8: {e}"))),
             },
             Err(e) => Ok(err(format!(
@@ -240,6 +395,8 @@ impl IcTools {
     #[tool(
         description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `domain` to call anonymously, or pass an application domain (e.g. \"oisy.com\") to call as your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. By default this uses the app's default account; pass `account` (an account name from list_accounts) to act as a specific named account there. Set is_query=true for read-only query calls. If get_candid couldn't fetch the interface, pass the `.did` text as `candid` (e.g. ask the user for it) so args/replies are still typed.",
         annotations(title = "Call a canister method", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CallCanisterOutput>()
+            .expect("CallCanisterOutput must produce an object-rooted schema"),
     )]
     async fn call_canister(
         &self,
@@ -298,12 +455,16 @@ impl IcTools {
             Err(e) => return Ok(err(format!("call failed: {e}"))),
         };
         // Decode against the Candid interface so field names are recovered.
-        Ok(ok(decode_reply(did.as_deref(), &method, &reply_bytes)))
+        let reply = decode_reply(did.as_deref(), &method, &reply_bytes);
+        let output = CallCanisterOutput { canister_id, method, is_query, reply };
+        Ok(ok_structured(output.reply.clone(), &output))
     }
 
     #[tool(
         description = "Get the Internet Computer principal you act as at a given application `domain` (e.g. \"oisy.com\"), without making a canister call. The app's account delegation is derived on demand (same as call_canister) from this connection's standing Internet Identity credential, and its principal is returned. By default this resolves the app's default account; pass `account` (an account name from list_accounts) for a specific named account there. Use this when a flow needs the principal itself (e.g. to look up a balance or account) rather than to invoke a method. NOTE: the principal is derived from the app's DOMAIN, which is usually — but not always — the identity a browser sign-in to that app would use. Some apps declare a CUSTOM derivation origin (via /.well-known/ii-alternative-origins) that isn't exposed here; if the returned principal (or an account/balance) doesn't match what the user sees in their browser at that app, tell them so and offer to look up the app's ii-alternative-origins (web search / fetch) and retry.",
         annotations(title = "Get your principal at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<PrincipalOutput>()
+            .expect("PrincipalOutput must produce an object-rooted schema"),
     )]
     async fn get_principal(
         &self,
@@ -324,17 +485,19 @@ impl IcTools {
         };
         match delegated.sender() {
             Ok(p) => {
-                let mut out = p.to_text();
                 // Surface a read-only session (H2) so the LLM won't attempt (and
                 // have the IC reject at ingress) canister-management updates.
-                if self.identities.is_read_only(&session_id).await == Some(true) {
+                let read_only = self.identities.is_read_only(&session_id).await == Some(true);
+                let mut out = p.to_text();
+                if read_only {
                     out.push_str(
                         "\n\n(This Internet Identity session is READ-ONLY: reads work, but canister \
                          management — create/install/start/stop/delete, and canister_status — needs \
                          update access. Ask the user to reconnect with the read-only option turned OFF.)",
                     );
                 }
-                Ok(ok(out))
+                let output = PrincipalOutput { domain, account, principal: p.to_text(), read_only };
+                Ok(ok_structured(out, &output))
             }
             Err(e) => Ok(err(format!("could not derive principal for '{domain}': {e}"))),
         }
@@ -343,6 +506,8 @@ impl IcTools {
     #[tool(
         description = "List the user's Internet Identity accounts at an application `domain` (e.g. \"oisy.com\"). Internet Identity gives the user a distinct principal per app (derived from the app's domain), and within an app they may hold several accounts: a default account everyone gets automatically (the anchor's current, user-controllable default at that origin), plus any named accounts they created. Use this before acting on the user's behalf at an app: if there's only the default account, just proceed (call_canister/get_principal with no `account`); if there are several, pick one with the user (or act on each) by passing its name as `account`. Returns each account's name (the default has none), account number, and last-used time. If these accounts don't match what the user sees in their browser at this app, it may use a custom derivation origin not exposed here (offer to look up its ii-alternative-origins and retry). Requires an authenticated session.",
         annotations(title = "List your accounts at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<AccountsOutput>()
+            .expect("AccountsOutput must produce an object-rooted schema"),
     )]
     async fn list_accounts(
         &self,
@@ -354,7 +519,21 @@ impl IcTools {
             None => return Ok(err("listing your accounts needs an authenticated session".into())),
         };
         match self.identities.list_accounts(&session_id, &domain).await {
-            Ok(accounts) => Ok(ok(format_accounts(&domain, &accounts))),
+            Ok(accounts) => {
+                let text = format_accounts(&domain, &accounts);
+                let output = AccountsOutput {
+                    domain,
+                    accounts: accounts
+                        .iter()
+                        .map(|a| AccountEntry {
+                            name: a.name.clone(),
+                            account_number: a.account_number,
+                            last_used: a.last_used,
+                        })
+                        .collect(),
+                };
+                Ok(ok_structured(text, &output))
+            }
             Err(e) => Ok(err(e)),
         }
     }
@@ -362,6 +541,8 @@ impl IcTools {
     #[tool(
         description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). Returns every canister id found, with provenance: the `x-ic-canister-id` header (the frontend/asset canister — authoritative), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. There is no authoritative reverse lookup for a site's backend, so results from env.json/bundle are candidates: pick by label (prefer production/IC ids) and confirm with get_candid before calling.",
         annotations(title = "Discover canisters behind a domain", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DiscoverOutput>()
+            .expect("DiscoverOutput must produce an object-rooted schema"),
     )]
     async fn discover_canisters(
         &self,
@@ -392,11 +573,27 @@ impl IcTools {
                      IC dashboard's label for that id. No authoritative reverse lookup exists — \
                      confirm an interface with get_candid before calling.",
                 );
-                Ok(ok(out))
+                let output = DiscoverOutput {
+                    domain,
+                    canisters: found
+                        .iter()
+                        .map(|f| DiscoveredCanister {
+                            canister_id: f.canister_id.clone(),
+                            label: f.label.clone(),
+                            name: f.name.clone(),
+                            kind: f.kind.clone(),
+                            sources: f.sources.clone(),
+                        })
+                        .collect(),
+                };
+                Ok(ok_structured(out, &output))
             }
-            Ok(_) => Ok(ok(format!(
-                "No IC canisters found for {domain} — is it served from the Internet Computer?"
-            ))),
+            Ok(_) => {
+                let text =
+                    format!("No IC canisters found for {domain} — is it served from the Internet Computer?");
+                let output = DiscoverOutput { domain, canisters: Vec::new() };
+                Ok(ok_structured(text, &output))
+            }
             Err(e) => Ok(err(e)),
         }
     }
@@ -450,6 +647,8 @@ impl IcTools {
     #[tool(
         description = "Identify what an Internet Computer canister IS, from the IC dashboard: its label/name (e.g. \"ICP Ledger\"), type (e.g. \"ledger\"), controllers, hosting subnet, module hash, language, and latest upgrade proposal. Use this to make sense of a bare canister id — e.g. one returned by discover_canisters.",
         annotations(title = "Identify a canister", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CanisterIdentityOutput>()
+            .expect("CanisterIdentityOutput must produce an object-rooted schema"),
     )]
     async fn lookup_canister(
         &self,
@@ -460,7 +659,20 @@ impl IcTools {
             Err(e) => return Ok(err(e)),
         };
         match discover::lookup_canister(&client, &canister_id).await {
-            Ok(info) => Ok(ok(format_canister_info(&info))),
+            Ok(info) => {
+                let text = format_canister_info(&info);
+                let output = CanisterIdentityOutput {
+                    canister_id: info.canister_id,
+                    name: info.name,
+                    canister_type: info.canister_type,
+                    controllers: info.controllers,
+                    subnet_id: info.subnet_id,
+                    module_hash: info.module_hash,
+                    language: info.language,
+                    latest_upgrade_proposal: info.latest_upgrade_proposal,
+                };
+                Ok(ok_structured(text, &output))
+            }
             Err(e) => Ok(err(e)),
         }
     }
@@ -470,13 +682,29 @@ impl IcTools {
     #[tool(
         description = "List the official Internet Computer skills — authoritative how-to guides for authoring and shipping IC apps (Motoko language, mops/icp CLIs, cycles management, stable memory & upgrades, security, DeFi, auth, …). Returns each skill's name and a one-line description. Load a skill's full instructions with get_ic_skill(name). Consult these BEFORE writing Motoko/Rust canister code, building, or deploying.",
         annotations(title = "List Internet Computer skills", read_only_hint = true, destructive_hint = false, open_world_hint = false),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<SkillsOutput>()
+            .expect("SkillsOutput must produce an object-rooted schema"),
     )]
     async fn list_ic_skills(
         &self,
         Parameters(_args): Parameters<management::NoArgs>,
     ) -> Result<CallToolResult, McpError> {
         match self.skills.list().await {
-            Ok(s) => Ok(ok(skills::SkillsCatalog::format_list(&s))),
+            Ok(s) => {
+                let text = skills::SkillsCatalog::format_list(&s);
+                let output = SkillsOutput {
+                    skills: s
+                        .iter()
+                        .map(|e| SkillSummary {
+                            name: e.name.clone(),
+                            title: e.title.clone(),
+                            category: e.category.clone(),
+                            description: e.description.clone(),
+                        })
+                        .collect(),
+                };
+                Ok(ok_structured(text, &output))
+            }
             Err(e) => Ok(err(e)),
         }
     }
@@ -484,13 +712,18 @@ impl IcTools {
     #[tool(
         description = "Fetch the full instructions (SKILL.md) of one Internet Computer skill by name (e.g. \"motoko\", \"icp-cli\", \"mops-cli\", \"cycles-management\", \"stable-memory\", \"canister-security\"). Call list_ic_skills first to see the available names. Use this to learn the exact, current way to do an IC task before doing it.",
         annotations(title = "Get an Internet Computer skill", read_only_hint = true, destructive_hint = false, open_world_hint = false),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<SkillOutput>()
+            .expect("SkillOutput must produce an object-rooted schema"),
     )]
     async fn get_ic_skill(
         &self,
         Parameters(GetSkillArgs { name }): Parameters<GetSkillArgs>,
     ) -> Result<CallToolResult, McpError> {
         match self.skills.get(&name).await {
-            Ok(md) => Ok(ok(md)),
+            Ok(md) => {
+                let output = SkillOutput { name, content: md };
+                Ok(ok_structured(output.content.clone(), &output))
+            }
             Err(e) => Ok(err(e)),
         }
     }
@@ -500,6 +733,8 @@ impl IcTools {
     #[tool(
         description = "Your cycles-ledger balance — the cycles that create_canister and top_up_canister spend. Acts as your Internet Identity principal (also printed). If it's empty, fund it first (e.g. via the icp CLI / cycles-management skill). Requires an authenticated session.",
         annotations(title = "Check your cycles balance", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<management::CyclesBalance>()
+            .expect("CyclesBalance must produce an object-rooted schema"),
     )]
     async fn cycles_balance(
         &self,
@@ -510,12 +745,17 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("checking your cycles balance needs an authenticated session".into())),
         };
-        Ok(into_result(management::cycles_balance(&self.identities, &sid).await))
+        match management::cycles_balance(&self.identities, &sid).await {
+            Ok(b) => Ok(ok_structured(b.human(), &b)),
+            Err(e) => Ok(err(e)),
+        }
     }
 
     #[tool(
         description = "Create and fund a NEW Internet Computer canister, paying from your cycles-ledger balance (as your Internet Identity). Specify the amount as `cycles` (exact) or `icp` (a decimal-ICP string like \"0.5\", converted to cycles at the network's current rate). Controllers default to your own principal. You must already hold cycles in the cycles ledger (check with cycles_balance; fund via the icp CLI / cycles-management skill). Returns the new canister id — then build your Wasm (see the motoko/icp-cli skills) and install it with install_code. Requires an authenticated session.",
         annotations(title = "Create a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<management::CreatedCanister>()
+            .expect("CreatedCanister must produce an object-rooted schema"),
     )]
     async fn create_canister(
         &self,
@@ -526,14 +766,17 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("creating a canister needs an authenticated session".into())),
         };
-        Ok(into_result(
-            management::create_canister(&self.identities, &sid, args).await,
-        ))
+        match management::create_canister(&self.identities, &sid, args).await {
+            Ok(c) => Ok(ok_structured(c.human(), &c)),
+            Err(e) => Ok(err(e)),
+        }
     }
 
     #[tool(
         description = "Add cycles to an existing canister, paying from your cycles-ledger balance. Specify `cycles` (exact) or `icp` (decimal-ICP string, converted at the current rate). Requires an authenticated session.",
         annotations(title = "Top up a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CanisterActionOutput>()
+            .expect("CanisterActionOutput must produce an object-rooted schema"),
     )]
     async fn top_up_canister(
         &self,
@@ -544,7 +787,9 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("topping up a canister needs an authenticated session".into())),
         };
-        Ok(into_result(
+        let canister_id = args.canister_id.clone();
+        Ok(ok_canister_action(
+            canister_id,
             management::top_up_canister(&self.identities, &sid, args).await,
         ))
     }
@@ -552,6 +797,8 @@ impl IcTools {
     #[tool(
         description = "Install a compiled Wasm module on a canister you control (as your Internet Identity). Provide the module as `wasm_base64` (or `wasm_hex`); large modules are uploaded via the chunk store automatically. `mode` is \"install\" (default, empty canister), \"reinstall\" (wipe state), or \"upgrade\" (preserve stable memory). `arg` is the init/upgrade argument in textual Candid, e.g. \"()\". Build the Wasm in your own environment first (see the motoko / icp-cli / mops-cli skills). Requires an authenticated session.",
         annotations(title = "Install code on a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CanisterActionOutput>()
+            .expect("CanisterActionOutput must produce an object-rooted schema"),
     )]
     async fn install_code(
         &self,
@@ -562,7 +809,9 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("installing code needs an authenticated session".into())),
         };
-        Ok(into_result(
+        let canister_id = args.canister_id.clone();
+        Ok(ok_canister_action(
+            canister_id,
             management::install_code(&self.identities, &sid, args).await,
         ))
     }
@@ -570,6 +819,8 @@ impl IcTools {
     #[tool(
         description = "Report a canister's status: run state, cycle balance, module hash, memory size, controllers, and allocations. Controller-only (acts as your Internet Identity). This only READS status (it changes nothing), but on the IC it is an update call, so it needs a full (non-read-only) Internet Identity session. Requires an authenticated session.",
         annotations(title = "Get canister status", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CanisterActionOutput>()
+            .expect("CanisterActionOutput must produce an object-rooted schema"),
     )]
     async fn canister_status(
         &self,
@@ -580,7 +831,9 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("reading canister status needs an authenticated session".into())),
         };
-        Ok(into_result(
+        let canister_id = args.canister_id.clone();
+        Ok(ok_canister_action(
+            canister_id,
             management::canister_status(&self.identities, &sid, args).await,
         ))
     }
@@ -588,6 +841,8 @@ impl IcTools {
     #[tool(
         description = "Update a canister's settings: controllers, compute/memory allocation, freezing threshold, reserved-cycles limit, wasm memory limit, or log visibility (\"controllers\"|\"public\"). Only the fields you pass are changed. WARNING: passing `controllers` REPLACES the whole set — include your own principal to remain a controller. Requires an authenticated session.",
         annotations(title = "Update canister settings", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CanisterActionOutput>()
+            .expect("CanisterActionOutput must produce an object-rooted schema"),
     )]
     async fn update_canister_settings(
         &self,
@@ -598,7 +853,9 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("updating settings needs an authenticated session".into())),
         };
-        Ok(into_result(
+        let canister_id = args.canister_id.clone();
+        Ok(ok_canister_action(
+            canister_id,
             management::update_canister_settings(&self.identities, &sid, args).await,
         ))
     }
@@ -606,6 +863,8 @@ impl IcTools {
     #[tool(
         description = "Start a stopped canister you control. Requires an authenticated session.",
         annotations(title = "Start a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CanisterActionOutput>()
+            .expect("CanisterActionOutput must produce an object-rooted schema"),
     )]
     async fn start_canister(
         &self,
@@ -616,14 +875,15 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("starting a canister needs an authenticated session".into())),
         };
-        Ok(into_result(
-            management::start_canister(&self.identities, &sid, &canister_id).await,
-        ))
+        let result = management::start_canister(&self.identities, &sid, &canister_id).await;
+        Ok(ok_canister_action(canister_id, result))
     }
 
     #[tool(
         description = "Stop a running canister you control (required before deleting it). Requires an authenticated session.",
         annotations(title = "Stop a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CanisterActionOutput>()
+            .expect("CanisterActionOutput must produce an object-rooted schema"),
     )]
     async fn stop_canister(
         &self,
@@ -634,14 +894,15 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("stopping a canister needs an authenticated session".into())),
         };
-        Ok(into_result(
-            management::stop_canister(&self.identities, &sid, &canister_id).await,
-        ))
+        let result = management::stop_canister(&self.identities, &sid, &canister_id).await;
+        Ok(ok_canister_action(canister_id, result))
     }
 
     #[tool(
         description = "Remove a canister's code and state, leaving it empty (it keeps its id and cycles). Acts as your Internet Identity. Requires an authenticated session.",
         annotations(title = "Uninstall code from a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CanisterActionOutput>()
+            .expect("CanisterActionOutput must produce an object-rooted schema"),
     )]
     async fn uninstall_code(
         &self,
@@ -652,14 +913,15 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("uninstalling code needs an authenticated session".into())),
         };
-        Ok(into_result(
-            management::uninstall_code(&self.identities, &sid, &canister_id).await,
-        ))
+        let result = management::uninstall_code(&self.identities, &sid, &canister_id).await;
+        Ok(ok_canister_action(canister_id, result))
     }
 
     #[tool(
         description = "Delete a canister permanently (irreversible — stop it first; remaining cycles are burned). Acts as your Internet Identity. Requires an authenticated session.",
         annotations(title = "Delete a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CanisterActionOutput>()
+            .expect("CanisterActionOutput must produce an object-rooted schema"),
     )]
     async fn delete_canister(
         &self,
@@ -670,9 +932,8 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("deleting a canister needs an authenticated session".into())),
         };
-        Ok(into_result(
-            management::delete_canister(&self.identities, &sid, &canister_id).await,
-        ))
+        let result = management::delete_canister(&self.identities, &sid, &canister_id).await;
+        Ok(ok_canister_action(canister_id, result))
     }
 }
 
@@ -987,24 +1248,38 @@ fn ok(text: String) -> CallToolResult {
 /// A success result carrying both the human-readable `text` and a machine-
 /// readable `value` that conforms to the tool's declared `outputSchema`.
 /// Clients that consume structured tool output get the typed form; the rest
-/// still get the text. If serialization somehow fails, we fall back to
-/// text-only rather than attaching a payload that wouldn't match the schema.
+/// still get the text.
+///
+/// MCP requires `outputSchema` (and therefore `structuredContent`) to be
+/// object-rooted, so we only attach `value` when it serializes to a JSON
+/// object; anything else (a bare array/string/number, or a serialization
+/// failure) falls back to text-only rather than emitting structured content
+/// that couldn't match the declared schema.
 fn ok_structured<T: serde::Serialize>(text: String, value: &T) -> CallToolResult {
     let mut result = ok(text);
-    result.structured_content = serde_json::to_value(value).ok();
+    result.structured_content = match serde_json::to_value(value) {
+        Ok(v @ serde_json::Value::Object(_)) => Some(v),
+        _ => None,
+    };
     result
+}
+
+/// Map a management/lifecycle tool's `Result<String, String>` (the human
+/// confirmation message) to a `CallToolResult`, attaching a
+/// `CanisterActionOutput { canister_id, message }` as structured content on
+/// success so the reply conforms to the tool's declared `outputSchema`.
+fn ok_canister_action(canister_id: String, r: Result<String, String>) -> CallToolResult {
+    match r {
+        Ok(message) => {
+            let output = CanisterActionOutput { canister_id, message };
+            ok_structured(output.message.clone(), &output)
+        }
+        Err(text) => err(text),
+    }
 }
 
 fn err(text: String) -> CallToolResult {
     CallToolResult::error(vec![Content::text(text)])
-}
-
-/// Map a tool's `Result<String, String>` to a success/error `CallToolResult`.
-fn into_result(r: Result<String, String>) -> CallToolResult {
-    match r {
-        Ok(text) => ok(text),
-        Err(text) => err(text),
-    }
 }
 
 const INDEX_HTML: &str = r#"<!DOCTYPE html>
@@ -1316,9 +1591,27 @@ mod tests {
         assert_eq!(cc.destructive_hint, Some(true));
     }
 
-    // find_canister declares an outputSchema so a model knows the shape of its
-    // reply (an object with a `matches` array). Assert the schema is present,
-    // object-rooted (an MCP requirement), and lists the expected properties.
+    // EVERY tool must declare an outputSchema so a model knows the shape of its
+    // reply — and MCP requires that schema to be object-rooted. This guards the
+    // whole surface: a new tool added without an output schema fails here.
+    #[test]
+    fn every_tool_declares_an_object_output_schema() {
+        let tools = super::IcTools::tool_router().list_all();
+        for t in &tools {
+            let schema = t
+                .output_schema
+                .as_ref()
+                .unwrap_or_else(|| panic!("tool {} must declare an output schema", t.name));
+            assert_eq!(
+                schema.get("type"),
+                Some(&serde_json::json!("object")),
+                "tool {}'s outputSchema must be object-rooted per the MCP spec",
+                t.name
+            );
+        }
+    }
+
+    // Spot-check find_canister's schema lists the expected properties.
     #[test]
     fn find_canister_declares_output_schema() {
         let tools = super::IcTools::tool_router().list_all();
@@ -1330,17 +1623,27 @@ mod tests {
             .output_schema
             .as_ref()
             .expect("find_canister must declare an output schema");
-        assert_eq!(
-            schema.get("type"),
-            Some(&serde_json::json!("object")),
-            "outputSchema root must be an object per the MCP spec"
-        );
         let props = schema
             .get("properties")
             .and_then(|v| v.as_object())
             .expect("outputSchema must have properties");
         assert!(props.contains_key("query"), "outputSchema should describe `query`");
         assert!(props.contains_key("matches"), "outputSchema should describe `matches`");
+    }
+
+    // The object-root guard in ok_structured must drop non-object payloads
+    // (a bare array/string can't match an MCP object outputSchema) while
+    // still attaching genuine objects.
+    #[test]
+    fn ok_structured_only_attaches_objects() {
+        let obj = super::ok_structured("t".to_string(), &serde_json::json!({"a": 1}));
+        assert!(obj.structured_content.is_some(), "an object payload must attach");
+
+        let arr = super::ok_structured("t".to_string(), &serde_json::json!([1, 2, 3]));
+        assert!(arr.structured_content.is_none(), "a bare array must be dropped");
+
+        let s = super::ok_structured("t".to_string(), &"hello");
+        assert!(s.structured_content.is_none(), "a bare string must be dropped");
     }
 
     // A structured find_canister reply must round-trip through the declared

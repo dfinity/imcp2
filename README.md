@@ -9,6 +9,11 @@ encoding/decoding and signing against the IC via
 
 ## Tools
 
+Every tool declares an MCP `outputSchema` and returns **structured content** —
+a machine-readable object matching that schema — alongside the human-readable
+text, so a model knows the exact shape of each reply. (Clients that don't
+consume structured output still get the text.)
+
 | Tool | Args | Returns |
 |------|------|---------|
 | `discover_canisters` | `domain` | Canister ids behind a web domain (frontend via `x-ic-canister-id`; backend via `/env.json` + JS-bundle mining), each with provenance and its IC dashboard label/type where known |
@@ -42,10 +47,6 @@ label, type, controllers, subnet, and module hash, so a raw principal becomes an
 identified service. (`discover_canisters` results are annotated with these labels
 inline.) There is no public name-search over arbitrary canisters, so `find_canister`
 covers the IC's labelled services, which is where the meaningful ones live.
-`find_canister` also declares an MCP `outputSchema` and returns its matches as
-**structured content** — an object with a `matches` array (each entry carrying
-`canister_id`, `name`, `kind`, and an optional `note`) — alongside the
-human-readable text, so a model knows the exact shape of the reply.
 
 `call_canister` runs anonymously by default; pass a `domain` (e.g. `oisy.com`) to
 call as your account at that app. For a domain, the server mints a **short-lived
