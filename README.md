@@ -174,9 +174,10 @@ callback and then finishes on its own — so a classic authorization-code
 
 - `/oauth/authorize` validates the client + redirect and PKCE, sets a
   **browser-binding cookie** (see below), and redirects to II's handshake. The
-  key-request response carries a `finish_url` on our origin, so after
-  `mcp_register` II navigates the browser to `/oauth/finish`, which checks that
-  cookie, confirms registration, mints a PKCE-bound code, and 302s to the client's
+  key-request response carries a `finish_url` on our origin (with a one-time
+  `finish_secret`), so after `mcp_register` II navigates the browser to
+  `/oauth/finish`, which requires the cookie **and** the secret, confirms
+  registration, mints a PKCE-bound code, and 302s to the client's
   `redirect_uri?code=…&state=…`.
 
 The **RFC 8628 device grant was dropped**: no listed MCP client uses it, and it
@@ -194,54 +195,72 @@ Endpoints:
 - `GET  /oauth/authorize` — validates the client + redirect, requires PKCE, sets
   the binding cookie, then redirects to II's handshake
 - `GET  /oauth/finish` — II navigates here after registration; requires the
-  binding cookie, confirms the grant is live, then 302s to `redirect_uri?code=…&state=…`
+  binding cookie **and** the one-time `finish_secret`, confirms the grant is
+  registered (proven, see below), then 302s to `redirect_uri?code=…&state=…`
 - `POST /oauth/connect/callback` — serves II's **two cross-origin JSON POSTs**:
-  a key request `{state}` → `{public_key, finish_url}` (a fresh session keypair,
-  minted here), and a completion notification `{state, expiration, permissions}` →
-  mark the grant live and record the session's access level
+  a **single-use** key request `{state}` → `{public_key, finish_url}` (a fresh
+  session keypair + one-time `finish_secret` embedded in `finish_url`; any later
+  key request for the same `state` gets `403`), and a completion notification
+  `{state, expiration, permissions}` → record the grant expiry + access level (a
+  best-effort latency hint only)
 - `POST /oauth/token` — exchanges an authorization `code` (PKCE) for the access token
 
-"Grant is live" means II's completion POST arrived **or** a signed
-`mcp_get_accounts` now succeeds (belt-and-suspenders, since the completion POST is
-best-effort). Unauthenticated `/mcp` requests get `401` with a `WWW-Authenticate`
-header pointing at the resource metadata, as the MCP spec expects.
+"Registered" is proven by a signed `mcp_get_accounts` that returns `Ok` under the
+minted session key — **not** by the completion POST, which is unauthenticated and
+therefore only a latency hint. Unauthenticated `/mcp` requests get `401` with a
+`WWW-Authenticate` header pointing at the resource metadata, as the MCP spec expects.
 
-### Browser-session binding (`/oauth/authorize` → `/oauth/finish`)
+### Consent-Bound Completion (`/oauth/authorize` → `/oauth/finish`)
 
 The `state` in the II connect link is echoed back to the client in the final
 redirect, so it **cannot by itself prove** that the browser finishing at
-`/oauth/finish` is the one that started at `/oauth/authorize`. Without a binding
-there's a session-fixation takeover: an attacker registers a client (open DCR)
-with their own `redirect_uri` + PKCE challenge, calls `/oauth/authorize`, reads
-the II connect link from the 302, and phishes it to a victim who already trusts
-this origin in II Settings (II's consent screen names only the *origin*, never the
-OAuth client, so nothing warns the victim). The victim consents, the server would
-mint a code for the *attacker's* pending auth and 302 the victim to the attacker's
-`redirect_uri`, and the attacker redeems it with their own PKCE verifier — a token
-acting as the victim. (The "arrival ≠ registration" check guards a different
-property; it doesn't bind the initiator to the consenting user, and II can't help
-— its trust model only ever identifies the origin.)
+`/oauth/finish` is the one that started at `/oauth/authorize` — nor that it is the
+one that actually **consented** at II. Without a binding there's a session-fixation
+takeover: an attacker registers a client (open DCR) with their own `redirect_uri` +
+PKCE challenge, calls `/oauth/authorize`, reads the II connect link from the 302,
+and phishes it to a victim who already trusts this origin in II Settings (II's
+consent screen names only the *origin*, never the OAuth client, so nothing warns the
+victim). The victim consents; the attacker completes the flow and redeems the code
+with their own PKCE verifier — a token acting as the victim. (An initiator-only
+cookie does *not* close this: the attacker is the initiator, so it holds the cookie.)
 
-The mitigation: `/oauth/authorize` sets an unguessable, single-use, `HttpOnly`
-`Secure` `SameSite=Lax` cookie (scoped to the instance's `…/oauth` path) and
-`/oauth/finish` requires it before minting the code — so only the browser that
-**started** the flow can complete it. `SameSite=Lax` still rides the top-level
-cross-site GET II uses to navigate back to `finish_url`.
+**The fix — Consent-Bound Completion.** `/oauth/finish` mints a code only when the
+requesting browser presents **both** proofs, which can co-reside in one browser
+only in the legitimate same-browser flow:
 
-> ⚠️ **This is a partial mitigation, not a complete fix — a residual takeover
-> path remains** (found by an adversarial review of this change). Because
-> `/oauth/authorize` requires no authentication, the *attacker* can be the flow
-> initiator: they call authorize themselves and keep **both** the cookie (from
-> their own response) and the `state` (from the II link), phish only the II link,
-> and after the victim consents they complete `/oauth/finish` **themselves** with
-> their cookie and redeem the code as the victim. The cookie only stops the
-> *zero-click* variant (the victim's browser passively delivering the code); it
-> can't tie "who receives the code" to "who consented," since consent happens
-> cross-origin at II keyed by the shared `state`. A complete fix needs an II-side
-> control that identifies the requesting **client**, not just the origin (which II
-> doesn't currently provide); reducing/vetting DCR shrinks but doesn't close it.
-> The cookie is kept as defense-in-depth. This gap is flagged back for the design
-> review.
+1. **initiator** — an unguessable `HttpOnly; Secure; SameSite=Lax` `sid` cookie
+   (scoped to the instance's `…/oauth` path) set at `/oauth/authorize`;
+2. **consenter** — a one-time `finish_secret` (≥128-bit) minted at the **single-use**
+   key request and disclosed *only* in that response (embedded in `finish_url`), so
+   only the browser that drove the II handshake holds it;
+3. plus **proven** registration (signed `mcp_get_accounts` = `Ok`), not a bare
+   completion POST.
+
+Because the single-use key request delivers *both* the `finish_secret` and the
+`public_key` a victim would register, the party that can register as the victim is
+exactly the party that gets the secret — and the `sid` cookie pins the finisher to
+the initiator. An attacker who initiates then phishes the II link holds `sid` but
+never the secret (the victim's key request consumes it); the victim holds the secret
+but never `sid`. Neither can finish. This closes the split-browser injection for
+**all transports incl. loopback** (a loopback redirect resolves on the consenter's
+own machine). `SameSite=Lax` still rides the top-level cross-site GET II uses to
+navigate back to `finish_url`.
+
+Load-bearing invariants (enforced in code): the key request is a single **atomic**
+compare-and-set (P1) and II's frontend issues exactly one per connect (a retry
+fails as "restart", never a takeover); `finish_secret` rides in the **query** (not a
+path segment), is kept out of logs, and `/oauth/finish` sends `Referrer-Policy:
+no-referrer` so it can't leak via `Referer` (P2); `registered` reflects a real
+on-chain grant (P3).
+
+> **Companion control (not in this change).** The *same-browser* variant — a victim
+> socially engineered into running the whole flow toward an attacker-registered
+> **hosted** `redirect_uri` — is not closed by Consent-Bound Completion (the
+> victim's browser legitimately holds both proofs). It needs **hosted-redirect
+> allow-listing**; loopback/native clients are safe either way (the code resolves on
+> the consenter's own machine). So "H3 fully closed" = Consent-Bound Completion +
+> hosted-redirect allow-listing — a product decision that trades only against open
+> DCR for hosted clients.
 
 ### Read-only sessions
 
@@ -399,8 +418,10 @@ delegation. Omitting `account` uses the default account.
       reference resources.
 - [x] OAuth 2.1 auth (authorization-code + PKCE): II's `/mcp` handshake registers
       the connection's session key (two JSON callback POSTs, no delegation chain),
-      with `/oauth/authorize`→`/oauth/finish` browser-session binding; expiring
-      tokens. (The RFC 8628 device grant was dropped.)
+      with **Consent-Bound Completion** binding `/oauth/finish` to both the initiator
+      (`sid` cookie) and the consenter (one-time `finish_secret`); expiring tokens.
+      (The RFC 8628 device grant was dropped. Same-browser-variant closure needs
+      hosted-redirect allow-listing — see Auth.)
 - [x] On-demand **domain identities**: the registered session key mints per-app
       account delegations directly via II canister methods
       (`call_canister`/`get_principal` `domain`); no per-app browser flow.

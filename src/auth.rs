@@ -27,22 +27,37 @@
 //! Implemented: dynamic client registration, PKCE (S256) enforced, short-lived
 //! codes, 1h access tokens, session-key-bound principal.
 //!
-//! ## Known residual risk (H3 is only a partial mitigation)
+//! ## H3: Consent-Bound Completion (closes the split-browser code injection)
 //!
-//! The browser-binding cookie stops the *zero-click* session-fixation variant (a
-//! phished victim's browser passively delivering the code to the attacker's
-//! `redirect_uri`), but it does NOT fully prevent the account takeover. Because
-//! `/oauth/authorize` requires no authentication, the ATTACKER can be the flow
-//! initiator (open DCR + their own `redirect_uri`/PKCE): they call authorize,
-//! keep both the cookie and the `state` from the II link, phish only the II link
-//! to a victim, and after the victim consents (registering the session key under
-//! the victim's anchor) they complete `/oauth/finish` themselves with their cookie
-//! and redeem the code as the victim. This is structural: consent happens
-//! cross-origin at II keyed by the shared `state`, so the server cannot tie "who
-//! receives the code" to "who consented" — the cookie only proves initiator ==
-//! finisher, and the attacker is the initiator. A complete fix needs an II-side
-//! control that identifies the requesting client (not just the origin), which II
-//! does not currently provide; reducing/vetting DCR shrinks but does not close it.
+//! `/oauth/finish` mints a code only when the requesting browser proves it is BOTH
+//! the **initiator** and the **consenter**:
+//!   1. *initiator* — the `sid` cookie ([`CONNECT_COOKIE`]) set at `/oauth/authorize`;
+//!   2. *consenter* — a one-time `finish_secret` (≥128-bit) minted at the **single-use
+//!      key request** and disclosed only in that response (embedded in `finish_url`),
+//!      so only the browser that drove the II handshake holds it;
+//!   3. plus a *proven* registration — a signed `mcp_get_accounts` returning `Ok`
+//!      (not a bare, unauthenticated completion POST).
+//!
+//! Because the key request is strictly single-use per `connect_state` (an atomic
+//! compare-and-set) and delivers BOTH `finish_secret` and the `public_key` a victim
+//! would register, the two proofs can co-reside in one browser only in the
+//! legitimate same-browser flow — so an attacker who initiates and then phishes the
+//! II link to a victim cannot obtain a code (they hold `sid` but never
+//! `finish_secret`; the victim holds `finish_secret` but never `sid`). This closes
+//! the split-browser injection for all transports incl. loopback (a loopback
+//! redirect resolves on the consenter's own machine).
+//!
+//! Not closed here (companion control): the *same-browser* variant where a victim
+//! is socially engineered into running the whole flow toward an attacker-registered
+//! **hosted** `redirect_uri`; that needs hosted-redirect allow-listing (loopback is
+//! safe either way). "H3 fully closed" = Consent-Bound Completion + that allow-list.
+//!
+//! Load-bearing (see the `P?` markers below): the key request is single-use and
+//! atomic (P1); `finish_secret` is disclosed only via `finish_url`'s query, never
+//! logged, no `Referer` leak (P2); `registered` reflects a real grant, never a bare
+//! completion POST (P3). P1 also assumes II's frontend issues exactly one key
+//! request per connect and never auto-retries (a retry then fails as "restart",
+//! never a takeover — the safe direction).
 
 use std::{
     collections::HashMap,
@@ -84,6 +99,32 @@ const CONNECT_COOKIE: &str = "mcp_connect";
 /// Public base URL clients use to reach this server. Override with PUBLIC_URL.
 pub fn base_url() -> String {
     std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
+}
+
+/// A fresh consent secret: 256 bits from the OS CSPRNG, URL-safe (base64url, no
+/// pad) so it can ride in a query string. Well above the ≥128-bit floor (P5).
+fn fresh_secret() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("getrandom");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// SHA-256 digest of `s` (used to store `finish_secret` hashed at rest — P5).
+fn sha256(s: &str) -> [u8; 32] {
+    Sha256::digest(s.as_bytes()).into()
+}
+
+/// Constant-time equality for two byte slices (P5) — no early-out on the first
+/// differing byte, so a compare doesn't leak how much of a secret matched.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// A registered OAuth client (RFC 7591): the redirect URIs it declared. The
@@ -181,20 +222,21 @@ struct AuthzPending {
     /// The OAuth client's own `state`, echoed back on the final redirect.
     client_state: String,
     code_challenge: Option<String>,
-    /// Unguessable value set as a browser cookie at `/oauth/authorize` and
-    /// required (matched) at `/oauth/finish` (H3) — so only the browser that
-    /// STARTED this flow can complete it. This is a PARTIAL mitigation of the
-    /// session-fixation takeover: it stops the zero-click variant (a phished
-    /// victim's browser auto-delivering the code to the attacker's redirect_uri),
-    /// but NOT a variant where the attacker — being the flow initiator, since
-    /// `/oauth/authorize` needs no auth — holds this cookie and completes finish
-    /// themselves after the victim consents. A full fix needs an II-side control
-    /// that identifies the client, not just the origin (see the module docs).
+    /// H3 clause 1 (*initiator* proof): unguessable value set as the `sid` browser
+    /// cookie at `/oauth/authorize` and matched at `/oauth/finish` — only the
+    /// browser that STARTED this flow presents it. On its own the cookie is a
+    /// partial mitigation; combined with `finish_secret_hash` (the *consenter*
+    /// proof) it closes the split-browser injection (see the module docs).
     cookie: String,
     created: Instant,
-    /// Grant confirmed live (completion POST or a signed-call fallback).
-    live: bool,
-    /// The authorization code minted once the grant is live (idempotent finish).
+    /// H3 clause 2 (*consenter* proof), and the single-use marker for the key
+    /// request (P1/P3): `None` until the FIRST key request for this connect
+    /// atomically claims it and stores `H(finish_secret)`; any later key request
+    /// then 403s. `/oauth/finish` requires a `finish_secret` hashing to this. Its
+    /// presence also means "the key request happened" — the only way `registered`
+    /// can legitimately become provable — so no alternate path materializes it.
+    finish_secret_hash: Option<[u8; 32]>,
+    /// The authorization code minted once the grant is confirmed (idempotent finish).
     code: Option<String>,
 }
 
@@ -271,12 +313,6 @@ impl AuthStore {
         (info.created.elapsed() < info.ttl).then(|| (info.principal.clone(), info.session_id.clone()))
     }
 
-    /// Whether this connection's grant is live: the completion POST arrived, or
-    /// (best-effort fallback) a signed `mcp_get_accounts` now succeeds. Takes no
-    /// lock across the network call.
-    async fn grant_live(&self, session_id: &str, flag: bool) -> bool {
-        flag || self.identities.grant_is_live(session_id).await
-    }
 }
 
 // ---- Authorization code (poll bridge) ----------------------------------
@@ -326,11 +362,11 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
     }
 
     let session_id = format!("sess-{}", Uuid::new_v4());
-    // H3: bind this browser to the flow. The cookie is set now and required at
-    // /oauth/finish; the `state` alone can't prove the finishing browser is the
-    // initiator (it's echoed to the client). This blocks the zero-click takeover
-    // variant (a phished victim's browser passively delivering the code) but is
-    // only a PARTIAL mitigation — see `AuthzPending::cookie` and the module docs.
+    // H3 clause 1: bind this browser to the flow (the `sid` cookie, set now and
+    // required at /oauth/finish). The `state` alone can't prove the finishing
+    // browser is the initiator (it's echoed to the client). The cookie proves
+    // *initiator*; the `finish_secret` minted at the key request proves
+    // *consenter*; requiring both closes the split-browser injection.
     let cookie = format!("bind-{}", Uuid::new_v4());
     store.authz.write().await.insert(
         session_id.clone(),
@@ -341,7 +377,7 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
             code_challenge: Some(code_challenge),
             cookie: cookie.clone(),
             created: Instant::now(),
-            live: false,
+            finish_secret_hash: None,
             code: None,
         },
     );
@@ -376,16 +412,22 @@ fn connect_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
 pub struct FinishQuery {
     /// The pending-auth id (= session id) carried by `finish_url`.
     id: String,
+    /// H3 clause 2: the one-time `finish_secret`, carried in `finish_url`'s QUERY
+    /// (not a path segment) so path-only access logs don't capture it (P2).
+    #[serde(default)]
+    fs: Option<String>,
     /// Retry counter, so the "finishing" reload is bounded.
     #[serde(default)]
     r: u32,
 }
 
-/// GET /oauth/finish — II navigates the browser here after registering the
-/// session key (this is the `finish_url` returned in the key-request response).
-/// Arrival is NOT proof of registration: confirm it (the completion POST flag, or
-/// a signed `mcp_get_accounts` that returns `Ok`), then mint the authorization
-/// code and 302 to the client's `redirect_uri` with `code` + the client's `state`.
+/// GET /oauth/finish — II navigates the CONSENTING browser here after registering
+/// the session key (this is the `finish_url` returned in the key-request response,
+/// carrying the one-time `finish_secret` in its query). Mints a code only if all of
+/// H3's predicate holds — (1) the `sid` cookie resolves to this PA, (2) `finish_secret`
+/// matches, (3) registration is *proven* by a signed `mcp_get_accounts` that returns
+/// `Ok`, (4) not expired / not already completed — then 302s to the client's
+/// `redirect_uri` with `code` + the client's `state`.
 pub async fn finish(
     State(store): State<AuthStore>,
     headers: axum::http::HeaderMap,
@@ -397,7 +439,7 @@ pub async fn finish(
         authz.get(&q.id).map(|a| {
             (
                 a.created.elapsed() >= CONNECT_TTL,
-                a.live,
+                a.finish_secret_hash,
                 a.code.clone(),
                 a.client_id.clone(),
                 a.redirect_uri.clone(),
@@ -407,32 +449,47 @@ pub async fn finish(
             )
         })
     };
-    let Some((expired, live_flag, existing_code, client_id, redirect_uri, client_state, code_challenge, cookie)) = snap
+    let Some((expired, finish_secret_hash, existing_code, client_id, redirect_uri, client_state, code_challenge, cookie)) =
+        snap
     else {
         return connect_error("unknown or already-used connect request — restart from your client");
     };
     if expired {
         return connect_error("connect request expired — restart from your client");
     }
-    // H3: only the browser that STARTED this flow (and holds the binding cookie)
-    // may complete it. A constant-time compare isn't warranted — the value is a
-    // fresh 122-bit UUID, unguessable and single-use. This blocks the zero-click
-    // takeover (a phished victim's browser passively delivering the code) but does
-    // NOT stop an initiator-attacker who holds the cookie and completes finish
-    // themselves after the victim consents — a PARTIAL mitigation (see module docs).
+    // H3 clause 1 (initiator): only the browser that STARTED this flow (holding the
+    // `sid` cookie) may complete it.
     if connect_cookie(&headers).as_deref() != Some(cookie.as_str()) {
         return connect_error(
             "this sign-in was started in a different browser session — restart the connection from your client",
         );
     }
+    // H3 clause 2 (consenter): the one-time `finish_secret`, disclosed only in the
+    // single-use key-request response, proves this browser drove the II consent.
+    // Requiring BOTH proofs forces initiator == consenter, closing the
+    // split-browser injection. `finish_secret_hash` is `Some` only after the key
+    // request ran (so this also gates on "the handshake happened"). Constant-time
+    // compare of the hashes (P5).
+    let secret_ok = match (q.fs.as_deref(), finish_secret_hash) {
+        (Some(fs), Some(hash)) => ct_eq(&sha256(fs), &hash),
+        _ => false,
+    };
+    if !secret_ok {
+        return connect_error(
+            "this sign-in can't be completed in this browser — restart the connection from your client",
+        );
+    }
+    let fs = q.fs.as_deref().unwrap_or_default();
     // Idempotent: if the code was already minted, just redirect again.
     if let Some(code) = existing_code {
         return redirect_302(&build_redirect(&redirect_uri, &code, &client_state));
     }
-    // Confirm registration (best-effort signed-call fallback, no lock held). If it
-    // isn't confirmable yet (a race with II's registration/propagation), reload
-    // shortly — bounded so we don't loop forever.
-    if !store.grant_live(&q.id, live_flag).await {
+    // H3 clause 3 (proven registration, P3): confirm the session key is actually
+    // registered on-chain via a signed `mcp_get_accounts` returning `Ok` — NOT a
+    // bare completion POST (which any `connect_state`-knower could forge). No lock
+    // held across the network call. If not yet visible (a race with II's
+    // registration/propagation), reload shortly — bounded so we don't loop forever.
+    if !store.identities.grant_is_live(&q.id).await {
         if q.r >= 8 {
             return connect_error(&format!(
                 "could not confirm the connection with Internet Identity ({}) — it may not support \
@@ -440,7 +497,7 @@ pub async fn finish(
                 store.instance().ii_url
             ));
         }
-        return finishing_page(store.instance().oauth_prefix, &q.id, q.r + 1);
+        return finishing_page(store.instance().oauth_prefix, &q.id, fs, q.r + 1);
     }
 
     // Reserve the code under the `authz` lock, then insert into `codes` AFTER
@@ -477,21 +534,36 @@ pub async fn finish(
 
 /// A tiny self-reloading page shown while we wait for II's registration to become
 /// confirmable, then it re-hits this instance's `/oauth/finish` (bounded by the
-/// retry counter).
-fn finishing_page(prefix: &str, id: &str, next_try: u32) -> Response {
-    let url = js_escape(&format!("{prefix}/oauth/finish?id={}&r={}", urlencoding::encode(id), next_try));
-    Html(format!(
+/// retry counter). Carries `finish_secret` across the reload (P6) and sets
+/// `Referrer-Policy: no-referrer` so the secret-bearing URL never rides a `Referer`.
+fn finishing_page(prefix: &str, id: &str, fs: &str, next_try: u32) -> Response {
+    let url = js_escape(&format!(
+        "{prefix}/oauth/finish?id={}&fs={}&r={}",
+        urlencoding::encode(id),
+        urlencoding::encode(fs),
+        next_try
+    ));
+    let mut resp = Html(format!(
         "<!DOCTYPE html><meta charset=utf-8><title>Finishing…</title>\
+         <meta name=referrer content=no-referrer>\
          <body style=\"font-family:system-ui;max-width:32rem;margin:3rem auto\">\
          <p>Finishing sign-in…</p>\
          <script>setTimeout(function(){{location.replace(\"{url}\")}},1200)</script></body>"
     ))
-    .into_response()
+    .into_response();
+    resp.headers_mut()
+        .insert(axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer"));
+    resp
 }
 
 /// A 302 to an absolute URL (used for the top-level hop back to the OAuth client).
+/// Sets `Referrer-Policy: no-referrer` so the `finish_secret` in this request's URL
+/// (query) is not leaked to `redirect_uri` via the `Referer` header (P2).
 fn redirect_302(url: &str) -> Response {
-    (StatusCode::FOUND, [(axum::http::header::LOCATION, url.to_string())]).into_response()
+    let mut resp = (StatusCode::FOUND, [(axum::http::header::LOCATION, url.to_string())]).into_response();
+    resp.headers_mut()
+        .insert(axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer"));
+    resp
 }
 
 fn build_redirect(redirect_uri: &str, code: &str, client_state: &str) -> String {
@@ -537,41 +609,56 @@ pub struct ConnectCallback {
 
 /// POST /oauth/connect/callback — II's frontend makes TWO cross-origin JSON
 /// POSTs here, distinguished by the `expiration` field:
-///   (a) key request `{state}` → 200 `{public_key, finish_url}` (fresh keypair);
-///   (b) completion `{state, expiration, permissions}` → mark the grant live and
-///       record the access level; any 2xx.
+///   (a) key request `{state}` → 200 `{public_key, finish_url}` (fresh keypair +
+///       one-time `finish_secret` embedded in `finish_url`; STRICTLY single-use);
+///   (b) completion `{state, expiration, permissions}` → record expiry + access
+///       level only (a latency hint; never sets `registered`); any 2xx.
 /// Never returns a redirect (the response is consumed by `fetch()`), and never
 /// receives or verifies a delegation chain.
 pub async fn connect_callback(State(store): State<AuthStore>, Json(body): Json<ConnectCallback>) -> Response {
     match &body.expiration {
-        // (a) Key request — require a valid, unexpired pending connection (reject
-        // unknown/replayed/expired state with a non-2xx so II aborts), then
-        // generate (lazily) this connection's session keypair and return its
-        // public key for II's frontend to register. Return `finish_url` so II
-        // navigates the browser back to us to close the OAuth loop.
+        // (a) Key request — STRICTLY single-use per `connect_state` (P1). Atomically
+        // (under one lock) require the PA is known/unexpired AND not yet claimed,
+        // then claim it by storing `H(finish_secret)`; any later or racing key
+        // request 403s (no keypair, no secret). This atomic compare-and-set is what
+        // makes secret-disclosure and victim-registration mutually exclusive.
         None => {
-            if !store.connect_known_authz(&body.state).await {
+            let secret = fresh_secret();
+            let claimed = {
+                let mut authz = store.authz.write().await;
+                match authz.get_mut(&body.state) {
+                    Some(a) if a.created.elapsed() < CONNECT_TTL && a.finish_secret_hash.is_none() => {
+                        a.finish_secret_hash = Some(sha256(&secret));
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if !claimed {
                 return (StatusCode::FORBIDDEN, Json(json!({ "error": "invalid_state" }))).into_response();
             }
+            // Only the single winner mints the session keypair and gets the secret.
             let public_key = store.identities.session_pubkey_b64(&body.state).await;
+            // `finish_secret` rides in the QUERY (P2): path-only access logs won't
+            // capture it, and /oauth/finish sends no `Referer`. It reaches only this
+            // (the consenting) browser, which II then navigates to `finish_url`.
             let finish_url = format!(
-                "{}{}/oauth/finish?id={}",
+                "{}{}/oauth/finish?id={}&fs={}",
                 base_url(),
                 store.instance().oauth_prefix,
-                urlencoding::encode(&body.state)
+                urlencoding::encode(&body.state),
+                urlencoding::encode(&secret),
             );
             (StatusCode::OK, Json(json!({ "public_key": public_key, "finish_url": finish_url }))).into_response()
         }
-        // (b) Completion notification — best-effort. Mark the grant live if the
-        // connection is still known, and record the session's access level
-        // (`permissions`, §0/H2) so tools can warn before attempting an update
-        // under a read-only session. Tolerate a missing/expired state (e.g. the
-        // grant was already consumed via the signed-call fallback) with a 2xx, so
-        // a late completion POST doesn't make II treat an otherwise-successful
-        // connect as failed. Never create a session for an unknown state.
+        // (b) Completion notification — a best-effort LATENCY HINT only (P3). Record
+        // the grant expiration and access level (`permissions`, §0/H2) if the PA is
+        // known, but NEVER set `registered`: this POST is unauthenticated (any
+        // `connect_state`-knower can send it), so registration is proven separately
+        // at /oauth/finish by a signed `mcp_get_accounts`. Tolerate a missing/expired
+        // state with a 2xx so a late POST doesn't fail an otherwise-good connect.
         Some(exp) => {
-            let known = store.mark_live(&body.state).await;
-            if known {
+            if store.authz_known(&body.state).await {
                 match exp.trim().parse::<u64>() {
                     Ok(exp_ns) => store.identities.set_grant_expiration(&body.state, exp_ns).await,
                     Err(_) => tracing::warn!("connect completion had unparseable expiration"),
@@ -586,23 +673,14 @@ pub async fn connect_callback(State(store): State<AuthStore>, Json(body): Json<C
 }
 
 impl AuthStore {
-    /// Whether `state` names a known, unexpired auth-code pending connect.
-    async fn connect_known_authz(&self, state: &str) -> bool {
+    /// Whether `state` names a known, unexpired pending connect (read-only; used by
+    /// the completion POST to decide whether to record its expiry/permissions hint).
+    async fn authz_known(&self, state: &str) -> bool {
         self.authz
             .read()
             .await
             .get(state)
             .is_some_and(|a| a.created.elapsed() < CONNECT_TTL)
-    }
-
-    /// Mark the pending connect live; returns whether `state` was known.
-    async fn mark_live(&self, state: &str) -> bool {
-        if let Some(a) = self.authz.write().await.get_mut(state) {
-            a.live = true;
-            true
-        } else {
-            false
-        }
     }
 }
 
@@ -981,5 +1059,115 @@ mod tests {
         // Appends with & when the redirect already has a query.
         let r2 = build_redirect("https://x.test/cb?foo=1", "c", "");
         assert_eq!(r2, "https://x.test/cb?foo=1&code=c");
+    }
+
+    /// H3/P5: `finish_secret` hygiene helpers. `fresh_secret` is high-entropy and
+    /// unique; `sha256` is deterministic; `ct_eq` matches equal inputs and rejects
+    /// unequal ones (and differing lengths) without early-out.
+    #[test]
+    fn secret_helpers_behave() {
+        let s1 = super::fresh_secret();
+        let s2 = super::fresh_secret();
+        assert_ne!(s1, s2, "secrets must be unique");
+        assert!(s1.len() >= 43, "256-bit base64url is 43 chars (>=128-bit floor): {}", s1.len());
+        // Deterministic hash; constant-time compare of equal vs. unequal.
+        assert_eq!(super::sha256(&s1), super::sha256(&s1));
+        assert!(super::ct_eq(&super::sha256(&s1), &super::sha256(&s1)));
+        assert!(!super::ct_eq(&super::sha256(&s1), &super::sha256(&s2)));
+        assert!(!super::ct_eq(b"abc", b"abcd"));
+        assert!(super::ct_eq(b"", b""));
+    }
+
+    // Build an AuthStore over a dummy II instance (these tests never hit the
+    // network — the key-request path is pure-local crypto/state).
+    fn test_store() -> super::AuthStore {
+        use crate::identities::{Identities, IiInstance};
+        use candid::Principal;
+        let ids = Identities::new(IiInstance {
+            name: "test",
+            ii_url: "https://ii.test".into(),
+            ii_canister: Principal::anonymous(),
+            oauth_prefix: "",
+            mcp_path: "/mcp",
+        });
+        super::AuthStore::new(ids, super::SharedClients(std::sync::Arc::default()))
+    }
+
+    async fn seed_pending(store: &super::AuthStore, id: &str, cookie: &str) {
+        // Insert a pending authorization directly (bypasses the browser redirect).
+        store.authz.write().await.insert(
+            id.to_string(),
+            super::AuthzPending {
+                client_id: "c".into(),
+                redirect_uri: "https://app.test/cb".into(),
+                client_state: String::new(),
+                code_challenge: Some("cc".into()),
+                cookie: cookie.into(),
+                created: std::time::Instant::now(),
+                finish_secret_hash: None,
+                code: None,
+            },
+        );
+    }
+
+    /// H3/P1: the key request is STRICTLY single-use per `connect_state`. The first
+    /// mints the keypair + `finish_secret` (embedded in `finish_url`'s query) and
+    /// claims the PA (`finish_secret_hash` set); a second one 403s — no keypair, no
+    /// secret. This is the atomic claim that makes secret-disclosure and
+    /// victim-registration mutually exclusive.
+    #[tokio::test]
+    async fn key_request_is_single_use_and_mints_finish_secret() {
+        use axum::extract::State;
+        use axum::Json;
+        let store = test_store();
+        seed_pending(&store, "sess-x", "bind-1").await;
+
+        let r1 = super::connect_callback(
+            State(store.clone()),
+            Json(super::ConnectCallback { state: "sess-x".into(), expiration: None, permissions: None }),
+        )
+        .await;
+        assert_eq!(r1.status(), axum::http::StatusCode::OK);
+        assert!(
+            store.authz.read().await.get("sess-x").unwrap().finish_secret_hash.is_some(),
+            "first key request must claim the PA"
+        );
+        let body = axum::body::to_bytes(r1.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let finish_url = v["finish_url"].as_str().unwrap();
+        assert!(finish_url.contains("&fs="), "finish_url must carry the secret in the query: {finish_url}");
+        assert!(!finish_url.contains("/fs/"), "secret must not be a path segment (P2)");
+        assert!(v["public_key"].as_str().is_some());
+
+        // Second key request for the same state (attacker race / replay) => 403.
+        let r2 = super::connect_callback(
+            State(store.clone()),
+            Json(super::ConnectCallback { state: "sess-x".into(), expiration: None, permissions: None }),
+        )
+        .await;
+        assert_eq!(r2.status(), axum::http::StatusCode::FORBIDDEN, "single-use: replay must 403");
+    }
+
+    /// P3: a completion POST must NOT materialize the connection — with no prior
+    /// key request it records nothing that could let `/oauth/finish` proceed (it
+    /// never sets a `finish_secret`, so the consenter proof can't be satisfied).
+    #[tokio::test]
+    async fn completion_post_does_not_materialize_finish_secret() {
+        use axum::extract::State;
+        use axum::Json;
+        let store = test_store();
+        seed_pending(&store, "sess-y", "bind-2").await;
+        let r = super::connect_callback(
+            State(store.clone()),
+            Json(super::ConnectCallback {
+                state: "sess-y".into(),
+                expiration: Some("1000".into()),
+                permissions: Some("all".into()),
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), axum::http::StatusCode::NO_CONTENT);
+        // No key request ran, so no finish_secret exists => finish can never pass clause 2.
+        assert!(store.authz.read().await.get("sess-y").unwrap().finish_secret_hash.is_none());
     }
 }
