@@ -12,6 +12,31 @@ const ANSI = {
 
 const ICON = { pass: "✔", warn: "▲", fail: "✘" };
 
+// Neutralize control characters in any value that may carry remote/probe-derived
+// text, so a crafted probe response body or error message can't inject ANSI
+// escapes or forge/overwrite dashboard lines in the operator's terminal
+// (CWE-150). Mirrors server.js's sanitizeForLog; uses a codepoint filter to avoid
+// embedding control-char literals, and caps length so a huge body can't flood the
+// view. Covers C0 controls + DEL, the C1 controls (U+0080–U+009F — notably
+// U+009B, the 8-bit CSI many terminals treat like ESC[), and the Unicode line /
+// paragraph separators (U+2028/U+2029) that render as line breaks. The deliberate
+// ANSI styling is added by the `c()` wrapper *after* this, so it is unaffected.
+const isDangerousCode = (code) =>
+  code < 0x20 ||
+  code === 0x7f ||
+  (code >= 0x80 && code <= 0x9f) ||
+  code === 0x2028 ||
+  code === 0x2029;
+
+const clean = (value, max = 2000) => {
+  const input = String(value ?? "").slice(0, max);
+  let out = "";
+  for (const ch of input) {
+    out += isDangerousCode(ch.codePointAt(0)) ? " " : ch;
+  }
+  return out;
+};
+
 /**
  * Format a Unix-epoch-seconds timestamp as ISO + a coarse relative age.
  * @param {number | undefined} epochSec
@@ -57,8 +82,8 @@ export const renderText = (report, opts = {}) => {
     c(ANSI.dim, `Generated: ${report.generatedAt}`),
   );
   lines.push(
-    `MCP server: ${c(ANSI.cyan, report.targets.mcpOrigin)}   ` +
-      `II instance: ${c(ANSI.cyan, report.targets.iiOrigin ?? "(unresolved)")}`,
+    `MCP server: ${c(ANSI.cyan, clean(report.targets.mcpOrigin))}   ` +
+      `II instance: ${c(ANSI.cyan, clean(report.targets.iiOrigin ?? "(unresolved)"))}`,
   );
   const dep = report.deployment;
   if (dep && (dep.version || dep.commit)) {
@@ -70,8 +95,8 @@ export const renderText = (report, opts = {}) => {
       .filter(Boolean)
       .join(" @ ");
     lines.push(
-      `Deployment: ${c(ANSI.cyan, label || "unknown")}` +
-        (dep.commitUrl ? `  ${c(ANSI.dim, dep.commitUrl)}` : ""),
+      `Deployment: ${c(ANSI.cyan, clean(label) || "unknown")}` +
+        (dep.commitUrl ? `  ${c(ANSI.dim, clean(dep.commitUrl))}` : ""),
     );
     const started = fmtTime(dep.startedAt);
     if (started) {
@@ -86,16 +111,16 @@ export const renderText = (report, opts = {}) => {
 
   for (const section of report.sections) {
     lines.push("");
-    lines.push(`${tag(section.status)}  ${c(ANSI.bold, section.title)}`);
+    lines.push(`${tag(section.status)}  ${c(ANSI.bold, clean(section.title))}`);
     for (const check of section.checks) {
       const latency =
         check.latencyMs != null ? c(ANSI.dim, ` (${check.latencyMs}ms)`) : "";
-      lines.push(`  ${tag(check.status)}  ${check.label}${latency}`);
+      lines.push(`  ${tag(check.status)}  ${clean(check.label)}${latency}`);
       if (check.description) {
-        lines.push(c(ANSI.dim, `      ${check.description}`));
+        lines.push(c(ANSI.dim, `      ${clean(check.description)}`));
       }
-      lines.push(c(ANSI.dim, `      ${check.target}`));
-      lines.push(`      ${check.detail}`);
+      lines.push(c(ANSI.dim, `      ${clean(check.target)}`));
+      lines.push(`      ${clean(check.detail)}`);
     }
   }
 
@@ -103,7 +128,7 @@ export const renderText = (report, opts = {}) => {
     lines.push("");
     lines.push(c(ANSI.bold, "Suggestions"));
     for (const s of report.suggestions) {
-      lines.push(`  ${c(ANSI.cyan, "•")} ${s}`);
+      lines.push(`  ${c(ANSI.cyan, "•")} ${clean(s)}`);
     }
   }
 

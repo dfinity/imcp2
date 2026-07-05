@@ -216,6 +216,39 @@ fn site_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, Stri
         .map_err(|e| format!("http client: {e}"))
 }
 
+// Response-size caps (CWE-770): a fully user-controlled discovery target could
+// stream an unbounded (or gzip-bomb-inflated) body and exhaust memory. reqwest's
+// `.text()`/`.bytes()` buffer the whole body with no ceiling, so we read chunk by
+// chunk and stop once the cap is hit. The connection is dropped when the response
+// is, so a truncated read cancels the transfer rather than draining it.
+const MAX_BODY_BYTES: usize = 2 * 1024 * 1024; // one document (HTML, one JS file)
+const MAX_ENV_JSON_BYTES: usize = 256 * 1024; // /env.json is tiny in practice
+const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024; // aggregate bundle text mined for ids
+
+/// Read up to `max` bytes of a response body, then stop — dropping the response
+/// (and so the connection) rather than draining the remainder. Best-effort: a
+/// mid-stream error just returns what we have (discovery is opportunistic).
+async fn read_capped(mut resp: reqwest::Response, max: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        if buf.len() >= max {
+            break;
+        }
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = (max - buf.len()).min(chunk.len());
+                buf.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    break; // hit the cap mid-chunk; stop (drops the connection)
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 fn add(found: &mut BTreeMap<String, Found>, id: &str, label: Option<String>, source: String) {
     // Drop false positives by validating as a real principal.
     if Principal::from_text(id).is_err() {
@@ -261,15 +294,14 @@ pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
     {
         add(&mut found, id, Some("frontend".into()), "header".into());
     }
-    let html = resp.text().await.unwrap_or_default();
+    let html = read_capped(resp, MAX_BODY_BYTES).await;
 
     // 2. Runtime config: /env.json with *canister_id* keys (e.g. Caffeine apps).
     if let Ok(resp) = client.get(format!("{base}/env.json")).send().await {
         if resp.status().is_success() {
-            if let Ok(text) = resp.text().await {
-                for (id, label) in canisters_from_env_json(&text) {
-                    add(&mut found, &id, Some(label), "env.json".into());
-                }
+            let text = read_capped(resp, MAX_ENV_JSON_BYTES).await;
+            for (id, label) in canisters_from_env_json(&text) {
+                add(&mut found, &id, Some(label), "env.json".into());
             }
         }
     }
@@ -284,11 +316,17 @@ pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
     scripts.sort();
     scripts.dedup();
     for s in scripts.iter().take(20) {
+        if blob.len() >= MAX_SCAN_BYTES {
+            break; // aggregate cap: stop mining once we've buffered enough text
+        }
         if let Ok(resp) = client.get(format!("{base}{s}")).send().await {
-            if let Ok(t) = resp.text().await {
-                blob.push('\n');
-                blob.push_str(&t);
-            }
+            // Push the separator first, then size the read against the space that
+            // remains — so the '\n' counts toward the cap and `blob` never exceeds
+            // MAX_SCAN_BYTES (loop guard guarantees room for the separator).
+            blob.push('\n');
+            let room = MAX_SCAN_BYTES.saturating_sub(blob.len());
+            let t = read_capped(resp, room.min(MAX_BODY_BYTES)).await;
+            blob.push_str(&t);
         }
     }
 
