@@ -18,6 +18,9 @@ use std::collections::BTreeMap;
 
 use candid::Principal;
 use regex::Regex;
+// rmcp re-exports schemars 1.x; the `#[tool]` output-schema machinery requires
+// THAT version's `JsonSchema`, so derive the MCP output types against it.
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
@@ -36,6 +39,44 @@ pub struct Found {
     /// IC dashboard classification (e.g. "ledger"), when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+}
+
+/// One canister discovered behind a web domain — the `discover_canisters` MCP
+/// output shape (a serialization mirror of [`Found`]).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DiscoveredCanister {
+    /// The canister's principal id.
+    pub canister_id: String,
+    /// A human label if one was attached (env.json key, bundle constant, or
+    /// "frontend"); null for a bare bundle literal.
+    pub label: Option<String>,
+    /// IC dashboard label (e.g. "ICP Ledger"), when the id is a known canister.
+    pub name: Option<String>,
+    /// IC dashboard classification (e.g. "ledger"), when known.
+    pub kind: Option<String>,
+    /// Where it was found: "header", "env.json", "bundle:<LABEL>", or "bundle".
+    pub sources: Vec<String>,
+}
+
+impl From<&Found> for DiscoveredCanister {
+    fn from(f: &Found) -> Self {
+        Self {
+            canister_id: f.canister_id.clone(),
+            label: f.label.clone(),
+            name: f.name.clone(),
+            kind: f.kind.clone(),
+            sources: f.sources.clone(),
+        }
+    }
+}
+
+/// Structured output of `discover_canisters`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DiscoverOutput {
+    /// The domain that was probed.
+    pub domain: String,
+    /// Canisters found behind the domain (empty if none).
+    pub canisters: Vec<DiscoveredCanister>,
 }
 
 /// Canister textual principals: four 5-char base32 groups + the `cai` suffix.
@@ -257,6 +298,43 @@ pub struct CanisterInfo {
     pub latest_upgrade_proposal: Option<u64>,
 }
 
+/// The `lookup_canister` MCP output shape — the IC dashboard's identity for a
+/// canister id (a serialization mirror of [`CanisterInfo`]).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CanisterIdentityOutput {
+    /// The canister that was identified.
+    pub canister_id: String,
+    /// Curated label, e.g. "ICP Ledger"; null for unlabelled canisters.
+    pub name: Option<String>,
+    /// Classification, e.g. "ledger"; null when unclassified.
+    pub canister_type: Option<String>,
+    /// Controller principals.
+    pub controllers: Vec<String>,
+    /// Hosting subnet id, if known.
+    pub subnet_id: Option<String>,
+    /// Module hash (hex), if known.
+    pub module_hash: Option<String>,
+    /// Implementation language, if known.
+    pub language: Option<String>,
+    /// Proposal id of the most recent recorded upgrade, if any.
+    pub latest_upgrade_proposal: Option<u64>,
+}
+
+impl From<CanisterInfo> for CanisterIdentityOutput {
+    fn from(info: CanisterInfo) -> Self {
+        Self {
+            canister_id: info.canister_id,
+            name: info.name,
+            canister_type: info.canister_type,
+            controllers: info.controllers,
+            subnet_id: info.subnet_id,
+            module_hash: info.module_hash,
+            language: info.language,
+            latest_upgrade_proposal: info.latest_upgrade_proposal,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct RawCanister {
     canister_id: String,
@@ -352,6 +430,41 @@ pub struct Match {
     /// "token" (ICRC ledger) or "sns" (SNS project root).
     pub kind: String,
     pub note: Option<String>,
+}
+
+/// One canister matched by `find_canister` — the MCP output shape (a
+/// serialization mirror of [`Match`]).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct FoundCanister {
+    /// The canister's principal id, e.g. "xevnm-gaaaa-aaaar-qafnq-cai".
+    pub canister_id: String,
+    /// Human-readable name or token symbol, e.g. "ckUSDC".
+    pub name: String,
+    /// What the id is: "token" (an ICRC ledger) or "sns" (an SNS project root).
+    pub kind: String,
+    /// An optional extra note about the match, when the registry provides one.
+    pub note: Option<String>,
+}
+
+impl From<&Match> for FoundCanister {
+    fn from(m: &Match) -> Self {
+        Self {
+            canister_id: m.canister_id.clone(),
+            name: m.name.clone(),
+            kind: m.kind.clone(),
+            note: m.note.clone(),
+        }
+    }
+}
+
+/// Structured output of `find_canister`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct FindCanisterOutput {
+    /// The name, token symbol, or project that was searched for.
+    pub query: String,
+    /// Canisters from the IC's labelled service registries that matched
+    /// `query` — empty when nothing matched.
+    pub matches: Vec<FoundCanister>,
 }
 
 #[derive(Deserialize)]

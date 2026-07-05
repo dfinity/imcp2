@@ -9,10 +9,12 @@ encoding/decoding and signing against the IC via
 
 ## Tools
 
-Every tool declares an MCP `outputSchema` and returns **structured content** —
-a machine-readable object matching that schema — alongside the human-readable
-text, so a model knows the exact shape of each reply. (Clients that don't
-consume structured output still get the text.)
+Every tool declares an MCP `outputSchema` and, on success, attaches
+**structured content** — a machine-readable object matching that schema —
+alongside the human-readable text, so a model knows the expected shape of each
+reply. The text is always present; the structured object is attached whenever
+the reply serializes to an object (which the schema guarantees for normal
+results).
 
 | Tool | Args | Returns |
 |------|------|---------|
