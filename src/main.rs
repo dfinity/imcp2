@@ -1028,9 +1028,19 @@ fn ok_structured<T: serde::Serialize>(text: String, value: &T) -> CallToolResult
 /// confirmation message) to a `CallToolResult`, attaching a
 /// `management::CanisterActionOutput { canister_id, message }` as structured content on
 /// success so the reply conforms to the tool's declared `outputSchema`.
+///
+/// The `canister_id` is normalized to its canonical principal text: the
+/// management layer accepts ids with surrounding whitespace (it parses via
+/// `Principal::from_text(s.trim())`) and renders the canonical form in its
+/// messages, so we canonicalize here too to keep the structured field
+/// consistent with the text. On the success path the id always parses (the
+/// operation just used it); the trimmed input is only a defensive fallback.
 fn ok_canister_action(canister_id: String, r: Result<String, String>) -> CallToolResult {
     match r {
         Ok(message) => {
+            let canister_id = Principal::from_text(canister_id.trim())
+                .map(|p| p.to_text())
+                .unwrap_or_else(|_| canister_id.trim().to_string());
             let output = management::CanisterActionOutput { canister_id, message };
             ok_structured(output.message.clone(), &output)
         }
@@ -1404,6 +1414,23 @@ mod tests {
 
         let s = super::ok_structured("t".to_string(), &"hello");
         assert!(s.structured_content.is_none(), "a bare string must be dropped");
+    }
+
+    // ok_canister_action normalizes the canister id to its canonical principal
+    // text, so the structured field matches the id the management layer acted
+    // on (it trims/parses the input) rather than echoing raw whitespace.
+    #[test]
+    fn ok_canister_action_canonicalizes_canister_id() {
+        let result = super::ok_canister_action(
+            "  ryjl3-tyaaa-aaaaa-aaaba-cai  ".to_string(),
+            Ok("Started ryjl3-tyaaa-aaaaa-aaaba-cai.".to_string()),
+        );
+        let value = result.structured_content.expect("structured content must be attached");
+        assert_eq!(
+            value.get("canister_id"),
+            Some(&serde_json::json!("ryjl3-tyaaa-aaaaa-aaaba-cai")),
+            "structured canister_id must be the canonical, trimmed principal text"
+        );
     }
 
     // A structured find_canister reply must round-trip through the declared
