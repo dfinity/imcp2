@@ -682,9 +682,10 @@ fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<auth::AuthedSessio
 
 /// Log each inbound request: method, path, response status, and latency — gives
 /// visibility into what external MCP clients probe (discovery URLs, unknown
-/// paths) at `RUST_LOG=info`. The query string is never logged (keeping the
-/// single-use `?code=` / `?id=` out of logs), and request bodies are never logged
-/// (the connect callback carries the connection-scoped `state`).
+/// paths) at `RUST_LOG=info`. The query string is never logged — keeping the
+/// single-use `?code=` / `?id=` and, critically, `/oauth/finish`'s one-time
+/// `?fs=` (the `finish_secret`, H3/P2) out of logs — and request bodies are never
+/// logged (the connect callback carries the connection-scoped `state`).
 async fn log_request(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
@@ -1125,6 +1126,10 @@ async fn main() -> anyhow::Result<()> {
                     "commit": option_env!("GIT_SHA").unwrap_or("unknown"),
                     "built_at": option_env!("BUILD_TIME").and_then(|s| s.parse::<u64>().ok()),
                     "started_at": started_at,
+                    // H3/P1 health: repeat key requests on a consumed connect_state.
+                    // Expected ~0; a sustained rise means II is re-issuing the key
+                    // request (breaks connects under strict single-use), so alert on it.
+                    "repeat_key_requests": auth::repeat_key_requests(),
                 }))
             }),
         )

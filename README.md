@@ -272,10 +272,12 @@ entire canister-management surface inert — `create`/`install`/`start`/`stop`/
 without opaque low-level errors:
 
 - The completion POST now carries `permissions: "queries" | "all"` (§0), so the
-  server learns the level at connect without minting a probe delegation (falling
-  back to a missing value = full access).
-- Management tools check it up front and, for a read-only session, return an
-  actionable *"reconnect with read-only off"* message instead of an ingress error.
+  server learns the level at connect without minting a probe delegation. A
+  missing or unrecognized value leaves the level **unknown** (not assumed
+  writable): the update is attempted and the IC's ingress rejection is the
+  fallback signal.
+- Management tools check it up front and, for a *known* read-only session, return
+  an actionable *"reconnect with read-only off"* message instead of an ingress error.
 - `get_principal` reflects a read-only session in its output, so the agent won't
   attempt updates it can't make.
 

@@ -61,7 +61,10 @@
 
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -95,6 +98,21 @@ const GRANT_TTL_SECS: u64 = 3600;
 /// Name of the browser-session cookie that binds `/oauth/authorize` to
 /// `/oauth/finish` (H3): only the browser that started the flow can complete it.
 const CONNECT_COOKIE: &str = "mcp_connect";
+
+/// Observability for the single-use key request (P1): number of key requests that
+/// hit a still-valid but ALREADY-CONSUMED `connect_state` — i.e. a *repeat* key
+/// request. Under strict single-use these are expected to be ~zero. An isolated
+/// hit is a stray replay / attacker probe (harmless — it 403s); a sustained rise
+/// means II's frontend started re-issuing the key request, which strict single-use
+/// turns into failed connects (a benign-but-breaking regression to fix upstream —
+/// never a takeover). Warn-logged with the instance name and surfaced on `/version`
+/// so a silent regression is caught without log scraping. Process-wide.
+static REPEAT_KEY_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// Current value of the repeat-key-request counter (for the `/version` probe).
+pub fn repeat_key_requests() -> u64 {
+    REPEAT_KEY_REQUESTS.load(Ordering::Relaxed)
+}
 
 /// Public base URL clients use to reach this server. Override with PUBLIC_URL.
 pub fn base_url() -> String {
@@ -386,8 +404,12 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
     // cookie. II navigates back to our `finish_url` (from the key-request
     // response) once it registers; SameSite=Lax lets the cookie ride that
     // top-level cross-site GET back to us. Scoped to this instance's OAuth prefix.
+    // `Secure` only when served over HTTPS (production always is): a `Secure`
+    // cookie is dropped by browsers over plain HTTP, which would break the
+    // initiator check for local `http://localhost` development.
+    let secure = if base_url().starts_with("https://") { "; Secure" } else { "" };
     let set_cookie = format!(
-        "{CONNECT_COOKIE}={cookie}; Path={}/oauth; Max-Age={}; HttpOnly; Secure; SameSite=Lax",
+        "{CONNECT_COOKIE}={cookie}; Path={}/oauth; Max-Age={}; HttpOnly{secure}; SameSite=Lax",
         store.instance().oauth_prefix,
         CONNECT_TTL.as_secs(),
     );
@@ -607,6 +629,16 @@ pub struct ConnectCallback {
     permissions: Option<String>,
 }
 
+/// Outcome of the atomic single-use claim on a key request's `connect_state`.
+enum KeyClaim {
+    /// Won the claim: mint the keypair + `finish_secret`.
+    Claimed,
+    /// Known + unexpired but already claimed — a repeat key request (observed).
+    RepeatConsumed,
+    /// Unknown or expired — an ordinary rejected replay/stale link.
+    Reject,
+}
+
 /// POST /oauth/connect/callback — II's frontend makes TWO cross-origin JSON
 /// POSTs here, distinguished by the `expiration` field:
 ///   (a) key request `{state}` → 200 `{public_key, finish_url}` (fresh keypair +
@@ -624,18 +656,37 @@ pub async fn connect_callback(State(store): State<AuthStore>, Json(body): Json<C
         // makes secret-disclosure and victim-registration mutually exclusive.
         None => {
             let secret = fresh_secret();
-            let claimed = {
+            let claim = {
                 let mut authz = store.authz.write().await;
                 match authz.get_mut(&body.state) {
+                    // Known, unexpired, not yet claimed: win the single-use claim.
                     Some(a) if a.created.elapsed() < CONNECT_TTL && a.finish_secret_hash.is_none() => {
                         a.finish_secret_hash = Some(sha256(&secret));
-                        true
+                        KeyClaim::Claimed
                     }
-                    _ => false,
+                    // Known, unexpired, ALREADY claimed: a repeat key request — the
+                    // signal we watch (II retry regression, or a stray probe).
+                    Some(a) if a.created.elapsed() < CONNECT_TTL => KeyClaim::RepeatConsumed,
+                    // Unknown or expired: an ordinary rejected replay/stale link.
+                    _ => KeyClaim::Reject,
                 }
             };
-            if !claimed {
-                return (StatusCode::FORBIDDEN, Json(json!({ "error": "invalid_state" }))).into_response();
+            match claim {
+                KeyClaim::Claimed => {}
+                KeyClaim::RepeatConsumed => {
+                    let total = REPEAT_KEY_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::warn!(
+                        instance = store.instance().name,
+                        total,
+                        "repeat key request on a consumed connect_state (single-use, P1) — \
+                         a sustained rise means II is re-issuing the key request; an isolated hit \
+                         is a stray replay/probe"
+                    );
+                    return (StatusCode::FORBIDDEN, Json(json!({ "error": "invalid_state" }))).into_response();
+                }
+                KeyClaim::Reject => {
+                    return (StatusCode::FORBIDDEN, Json(json!({ "error": "invalid_state" }))).into_response();
+                }
             }
             // Only the single winner mints the session keypair and gets the secret.
             let public_key = store.identities.session_pubkey_b64(&body.state).await;
@@ -1139,13 +1190,19 @@ mod tests {
         assert!(!finish_url.contains("/fs/"), "secret must not be a path segment (P2)");
         assert!(v["public_key"].as_str().is_some());
 
-        // Second key request for the same state (attacker race / replay) => 403.
+        // Second key request for the same state (attacker race / replay) => 403,
+        // and it bumps the repeat-key-request observability counter (P1 health).
+        let before = super::repeat_key_requests();
         let r2 = super::connect_callback(
             State(store.clone()),
             Json(super::ConnectCallback { state: "sess-x".into(), expiration: None, permissions: None }),
         )
         .await;
         assert_eq!(r2.status(), axum::http::StatusCode::FORBIDDEN, "single-use: replay must 403");
+        assert!(
+            super::repeat_key_requests() > before,
+            "a repeat key request on a consumed connect_state must be counted"
+        );
     }
 
     /// P3: a completion POST must NOT materialize the connection — with no prior
