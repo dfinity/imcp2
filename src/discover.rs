@@ -225,8 +225,9 @@ const MAX_BODY_BYTES: usize = 2 * 1024 * 1024; // one document (HTML, one JS fil
 const MAX_ENV_JSON_BYTES: usize = 256 * 1024; // /env.json is tiny in practice
 const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024; // aggregate bundle text mined for ids
 
-/// Read at most `max` bytes of a response body, discarding the rest. Best-effort:
-/// a mid-stream error just returns what we have (discovery is opportunistic).
+/// Read up to `max` bytes of a response body, then stop — dropping the response
+/// (and so the connection) rather than draining the remainder. Best-effort: a
+/// mid-stream error just returns what we have (discovery is opportunistic).
 async fn read_capped(mut resp: reqwest::Response, max: usize) -> String {
     let mut buf: Vec<u8> = Vec::new();
     loop {

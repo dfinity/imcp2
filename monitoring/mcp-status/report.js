@@ -12,19 +12,27 @@ const ANSI = {
 
 const ICON = { pass: "✔", warn: "▲", fail: "✘" };
 
-// Neutralize control characters (CR/LF, ESC, backspace, …) in any value that may
-// carry remote/probe-derived text, so a crafted probe response body or error
-// message can't inject ANSI escapes or forge/overwrite dashboard lines in the
-// operator's terminal (CWE-150). Mirrors server.js's sanitizeForLog; uses a
-// codepoint filter to avoid embedding control-char literals, and caps length so
-// a huge body can't flood the view. The deliberate ANSI styling is added by the
-// `c()` wrapper *after* this, so it is unaffected.
+// Neutralize control characters in any value that may carry remote/probe-derived
+// text, so a crafted probe response body or error message can't inject ANSI
+// escapes or forge/overwrite dashboard lines in the operator's terminal
+// (CWE-150). Mirrors server.js's sanitizeForLog; uses a codepoint filter to avoid
+// embedding control-char literals, and caps length so a huge body can't flood the
+// view. Covers C0 controls + DEL, the C1 controls (U+0080–U+009F — notably
+// U+009B, the 8-bit CSI many terminals treat like ESC[), and the Unicode line /
+// paragraph separators (U+2028/U+2029) that render as line breaks. The deliberate
+// ANSI styling is added by the `c()` wrapper *after* this, so it is unaffected.
+const isDangerousCode = (code) =>
+  code < 0x20 ||
+  code === 0x7f ||
+  (code >= 0x80 && code <= 0x9f) ||
+  code === 0x2028 ||
+  code === 0x2029;
+
 const clean = (value, max = 2000) => {
   const input = String(value ?? "").slice(0, max);
   let out = "";
   for (const ch of input) {
-    const code = ch.codePointAt(0);
-    out += code < 0x20 || code === 0x7f ? " " : ch;
+    out += isDangerousCode(ch.codePointAt(0)) ? " " : ch;
   }
   return out;
 };

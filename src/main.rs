@@ -665,11 +665,16 @@ pub(crate) const MAX_CANDID_DEPTH: usize = 128;
 /// is too large or too deeply nested to parse safely, BEFORE handing it to
 /// `candid_parser` (CWE-674). `what` names the input for the error message.
 ///
-/// Depth is measured structurally without parsing: `opt`/`vec` prefixes and the
-/// `(` `{` `[` group openers each add a level (matching how the parser recurses),
-/// closers and value separators pop the just-completed value's prefixes. String
-/// literals are skipped so their contents can't inflate the count. It is a safe
-/// over-approximation — it may over- but never under-count real nesting.
+/// Depth is measured structurally without parsing. The stack holds one frame per
+/// open nesting level: a bracket group (`(` `{` `[`) or an `opt`/`vec` prefix. A
+/// prefix wraps exactly the next value, so it stays on the stack until that value
+/// *completes* — at the leaf token, string, or matching bracket closer that ends
+/// it — NOT merely because the next token is a word: that word may be
+/// `record`/`variant`, which opens a bracket the prefix must outlive (so
+/// `opt record { … }` correctly counts as two levels, not one). String literals
+/// are skipped so their contents can't inflate the count. It is a conservative
+/// over-approximation that tracks the parser's container recursion without
+/// under-counting nested `opt`/`vec`/bracket levels.
 pub(crate) fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
     if text.len() > MAX_CANDID_TEXT_BYTES {
         return Err(format!(
@@ -677,11 +682,24 @@ pub(crate) fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
             text.len()
         ));
     }
-    // Stack of open nesting frames: b'B' = bracket group, b'P' = opt/vec prefix.
+    // Frames: b'B' = bracket group, b'P' = pending opt/vec prefix awaiting its value.
     let mut stack: Vec<u8> = Vec::new();
     let bytes = text.as_bytes();
-    let mut i = 0;
     let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    // Pop the prefix frames waiting on a value that has just completed.
+    fn resolve_prefixes(stack: &mut Vec<u8>) {
+        while stack.last() == Some(&b'P') {
+            stack.pop();
+        }
+    }
+    // The next non-whitespace byte at/after `j` (to tell `record {` from a leaf).
+    let peek_significant = |j: usize| -> Option<u8> {
+        bytes[j..]
+            .iter()
+            .find(|&&b| !b.is_ascii_whitespace())
+            .copied()
+    };
+    let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
         match c {
@@ -698,7 +716,8 @@ pub(crate) fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
                         _ => i += 1,
                     }
                 }
-                continue;
+                // A string is a complete leaf value: resolve prefixes waiting on it.
+                resolve_prefixes(&mut stack);
             }
             b'(' | b'{' | b'[' => {
                 stack.push(b'B');
@@ -708,21 +727,16 @@ pub(crate) fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
                 i += 1;
             }
             b')' | b'}' | b']' => {
-                while stack.last() == Some(&b'P') {
-                    stack.pop();
-                }
                 if stack.last() == Some(&b'B') {
                     stack.pop();
                 }
-                while stack.last() == Some(&b'P') {
-                    stack.pop();
-                }
+                // The group is a complete value: resolve prefixes waiting on it.
+                resolve_prefixes(&mut stack);
                 i += 1;
             }
             b',' | b';' => {
-                while stack.last() == Some(&b'P') {
-                    stack.pop();
-                }
+                // End of one element: resolve its prefixes, keep the enclosing bracket.
+                resolve_prefixes(&mut stack);
                 i += 1;
             }
             _ if is_word(c) => {
@@ -736,13 +750,13 @@ pub(crate) fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
                     if stack.len() > MAX_CANDID_DEPTH {
                         return Err(depth_err(what));
                     }
-                }
-                // Any other word is a leaf/keyword token; leaves pop their wrapping
-                // prefixes so sibling values don't accumulate.
-                else {
-                    while stack.last() == Some(&b'P') {
-                        stack.pop();
-                    }
+                } else if !matches!(peek_significant(i), Some(b'{') | Some(b'(') | Some(b'[')) {
+                    // A leaf token (a number, `nat`, `principal`, `blob`, a field
+                    // name, …) that does NOT open a group completes a value, so
+                    // resolve prefixes waiting on it. A group-introducing keyword
+                    // (`record`/`variant`/…) instead leaves them pending until its
+                    // bracket closes, so `opt record { … }` keeps both levels.
+                    resolve_prefixes(&mut stack);
                 }
             }
             _ => i += 1,
@@ -1334,6 +1348,22 @@ mod tests {
         assert!(guard_candid_text("v", &deep_opt).is_err(), "deep opt-chain must be refused");
         // Bracket nesting is caught too.
         assert!(guard_candid_text("v", &"{".repeat(200)).is_err(), "deep brackets must be refused");
+        // Mixed prefix+group nesting must count BOTH levels per step (each
+        // `opt record {` is depth 2), so the `opt` prefix isn't lost to the
+        // following `record` keyword. 100 levels ⇒ ~200 frames ⇒ refused.
+        let deep_mixed = format!(
+            "{}1{}",
+            "opt record { a = ".repeat(100),
+            " }".repeat(100),
+        );
+        assert!(
+            guard_candid_text("v", &deep_mixed).is_err(),
+            "deep opt-record nesting must be refused (no prefix under-count)"
+        );
+        // ...but a shallow mixed value stays well under the limit.
+        assert!(
+            guard_candid_text("v", "(opt record { a = opt variant { b = vec { 1; 2 } } })").is_ok()
+        );
         // Oversized-but-shallow input is caught by the byte cap.
         let big = "0,".repeat(MAX_CANDID_TEXT_BYTES);
         assert!(guard_candid_text("v", &big).is_err(), "oversized input must be refused");

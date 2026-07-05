@@ -94,15 +94,23 @@ const sendJson = (res, code, body) => {
   res.end(payload);
 };
 
-// Replace control characters (incl. CR/LF) with spaces and cap the length, so
-// that a logged error message can never forge or inject additional log entries.
-// Implemented with a codepoint filter to avoid embedding control-char literals.
+// Replace control characters with spaces and cap the length, so that a logged
+// error message can never forge or inject additional log entries. Covers C0
+// controls + DEL, the C1 controls (U+0080–U+009F, incl. U+009B the 8-bit CSI),
+// and the Unicode line/paragraph separators (U+2028/U+2029). Implemented with a
+// codepoint filter to avoid embedding control-char literals.
 const sanitizeForLog = (value) => {
   const input = String((value && value.message) || value).slice(0, 300);
   let out = "";
   for (const ch of input) {
     const code = ch.codePointAt(0);
-    out += code < 0x20 || code === 0x7f ? " " : ch;
+    const dangerous =
+      code < 0x20 ||
+      code === 0x7f ||
+      (code >= 0x80 && code <= 0x9f) ||
+      code === 0x2028 ||
+      code === 0x2029;
+    out += dangerous ? " " : ch;
   }
   return out;
 };
