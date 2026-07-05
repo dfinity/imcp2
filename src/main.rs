@@ -142,6 +142,43 @@ struct FindCanisterArgs {
     query: String,
 }
 
+/// Structured result of `find_canister`, declared as its `outputSchema` so a
+/// model knows the exact shape of the reply. The same information is also
+/// rendered as human-readable text for clients that don't consume structured
+/// output. The root is an object (MCP requires `outputSchema` to be one).
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct FindCanisterOutput {
+    /// The name, token symbol, or project that was searched for.
+    query: String,
+    /// Canisters from the IC's labelled service registries that matched
+    /// `query` — empty when nothing matched.
+    matches: Vec<FoundCanister>,
+}
+
+/// One canister matched by `find_canister`.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct FoundCanister {
+    /// The canister's principal id, e.g. "xevnm-gaaaa-aaaar-qafnq-cai".
+    canister_id: String,
+    /// Human-readable name or token symbol, e.g. "ckUSDC".
+    name: String,
+    /// What the id is: "token" (an ICRC ledger) or "sns" (an SNS project root).
+    kind: String,
+    /// An optional extra note about the match, when the registry provides one.
+    note: Option<String>,
+}
+
+impl From<&discover::Match> for FoundCanister {
+    fn from(m: &discover::Match) -> Self {
+        Self {
+            canister_id: m.canister_id.clone(),
+            name: m.name.clone(),
+            kind: m.kind.clone(),
+            note: m.note.clone(),
+        }
+    }
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct LookupCanisterArgs {
     /// Canister principal to identify, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai".
@@ -367,6 +404,8 @@ impl IcTools {
     #[tool(
         description = "Find Internet Computer canisters by NAME. Searches the IC dashboard's service registries — the ICRC token ledgers (e.g. ckBTC, ckETH, ckUSDC, SNS tokens) by symbol/name, and the SNS project catalog by name — and returns matching canister ids. Use this when the user names a token, project, or service (e.g. \"ckUSDC\") rather than a canister id; then confirm with get_candid and call methods with call_canister. (No public name-search exists over arbitrary canisters; this covers the IC's labelled services.)",
         annotations(title = "Find canisters by name", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<FindCanisterOutput>()
+            .expect("FindCanisterOutput must produce an object-rooted schema"),
     )]
     async fn find_canister(
         &self,
@@ -388,14 +427,22 @@ impl IcTools {
                     "\nConfirm an interface with get_candid, then call methods with call_canister. \
                      For an SNS match the id is the project root — lookup_canister it to learn more.",
                 );
-                Ok(ok(out))
+                let output = FindCanisterOutput {
+                    query,
+                    matches: matches.iter().map(FoundCanister::from).collect(),
+                };
+                Ok(ok_structured(out, &output))
             }
-            Ok(_) => Ok(ok(format!(
-                "No named canisters found matching \"{query}\". This searches known tokens (ICRC \
-                 ledgers) and SNS projects, so an arbitrary canister won't appear unless it's a \
-                 labelled service. If you have a website, try discover_canisters; if you already \
-                 have a canister id, try lookup_canister or get_candid."
-            ))),
+            Ok(_) => {
+                let text = format!(
+                    "No named canisters found matching \"{query}\". This searches known tokens (ICRC \
+                     ledgers) and SNS projects, so an arbitrary canister won't appear unless it's a \
+                     labelled service. If you have a website, try discover_canisters; if you already \
+                     have a canister id, try lookup_canister or get_candid."
+                );
+                let output = FindCanisterOutput { query, matches: Vec::new() };
+                Ok(ok_structured(text, &output))
+            }
             Err(e) => Ok(err(e)),
         }
     }
@@ -937,6 +984,17 @@ fn ok(text: String) -> CallToolResult {
     CallToolResult::success(vec![Content::text(text)])
 }
 
+/// A success result carrying both the human-readable `text` and a machine-
+/// readable `value` that conforms to the tool's declared `outputSchema`.
+/// Clients that consume structured tool output get the typed form; the rest
+/// still get the text. If serialization somehow fails, we fall back to
+/// text-only rather than attaching a payload that wouldn't match the schema.
+fn ok_structured<T: serde::Serialize>(text: String, value: &T) -> CallToolResult {
+    let mut result = ok(text);
+    result.structured_content = serde_json::to_value(value).ok();
+    result
+}
+
 fn err(text: String) -> CallToolResult {
     CallToolResult::error(vec![Content::text(text)])
 }
@@ -1256,5 +1314,60 @@ mod tests {
         let cc = ann("call_canister");
         assert_eq!(cc.read_only_hint, Some(false));
         assert_eq!(cc.destructive_hint, Some(true));
+    }
+
+    // find_canister declares an outputSchema so a model knows the shape of its
+    // reply (an object with a `matches` array). Assert the schema is present,
+    // object-rooted (an MCP requirement), and lists the expected properties.
+    #[test]
+    fn find_canister_declares_output_schema() {
+        let tools = super::IcTools::tool_router().list_all();
+        let tool = tools
+            .iter()
+            .find(|t| &*t.name == "find_canister")
+            .expect("find_canister tool not found");
+        let schema = tool
+            .output_schema
+            .as_ref()
+            .expect("find_canister must declare an output schema");
+        assert_eq!(
+            schema.get("type"),
+            Some(&serde_json::json!("object")),
+            "outputSchema root must be an object per the MCP spec"
+        );
+        let props = schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("outputSchema must have properties");
+        assert!(props.contains_key("query"), "outputSchema should describe `query`");
+        assert!(props.contains_key("matches"), "outputSchema should describe `matches`");
+    }
+
+    // A structured find_canister reply must round-trip through the declared
+    // schema shape: text for humans, plus a machine-readable object with a
+    // `matches` array carrying each match's fields.
+    #[test]
+    fn find_canister_output_serializes_to_declared_shape() {
+        let output = super::FindCanisterOutput {
+            query: "ckUSDC".to_string(),
+            matches: vec![super::FoundCanister {
+                canister_id: "xevnm-gaaaa-aaaar-qafnq-cai".to_string(),
+                name: "ckUSDC".to_string(),
+                kind: "token".to_string(),
+                note: None,
+            }],
+        };
+        let result = super::ok_structured("human text".to_string(), &output);
+        let value = result
+            .structured_content
+            .expect("structured content must be attached");
+        assert_eq!(value.get("query"), Some(&serde_json::json!("ckUSDC")));
+        let matches = value.get("matches").and_then(|v| v.as_array()).expect("matches array");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches[0].get("canister_id"),
+            Some(&serde_json::json!("xevnm-gaaaa-aaaar-qafnq-cai"))
+        );
+        assert_eq!(matches[0].get("kind"), Some(&serde_json::json!("token")));
     }
 }
