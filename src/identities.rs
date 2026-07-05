@@ -622,6 +622,10 @@ impl IiSignedDelegation {
                 pubkey: self.delegation.pubkey,
                 expiration: self.delegation.expiration,
                 targets: self.delegation.targets,
+                // II issues full-access delegations for the MCP flow and does not
+                // sign a `permissions` field, so leave it unset. `None` hashes and
+                // verifies identically to a pre-0.48 delegation.
+                permissions: None,
             },
             signature: self.signature,
         })
