@@ -825,6 +825,21 @@ mod tests {
         signature: Vec<u8>,
     }
 
+    // A pre-0.48 II reply whose `Delegation` record has NO `permissions` field at
+    // all — the older wire type, distinct from an `opt`-null field. Used to prove
+    // Candid decodes the absent optional as `None`, so old replies keep working.
+    #[derive(CandidType)]
+    struct WireLegacyDelegation {
+        pubkey: Vec<u8>,
+        expiration: u64,
+        targets: Option<Vec<Principal>>,
+    }
+    #[derive(CandidType)]
+    struct WireLegacySignedDelegation {
+        delegation: WireLegacyDelegation,
+        signature: Vec<u8>,
+    }
+
     // Lock in the mcp_get_delegation permission contract: II's `Delegation`
     // carries `permissions: opt variant { queries; all }`, and it must round-trip
     // through `into_agent` onto the `ic-agent` delegation so the reconstructed
@@ -857,11 +872,29 @@ mod tests {
             .expect("into_agent");
         assert_eq!(agent.delegation.permissions, Some(DelegationPermissions::All));
 
-        // An unrestricted (absent) permission decodes and forwards as None,
-        // hashing identically to a pre-0.48 delegation.
+        // An unrestricted (present-but-null) permission decodes and forwards as
+        // None, hashing identically to a pre-0.48 delegation.
         let bytes = Encode!(&make(None)).expect("encode");
         let agent = Decode!(&bytes, IiSignedDelegation)
             .expect("decode")
+            .into_agent(&app_key)
+            .expect("into_agent");
+        assert_eq!(agent.delegation.permissions, None);
+
+        // Backward compatibility: a pre-0.48 reply omits the `permissions` field
+        // from the record entirely (not `opt`-null as above). Candid's subtyping
+        // decodes the absent optional as None, so old II replies keep working.
+        let legacy = WireLegacySignedDelegation {
+            delegation: WireLegacyDelegation {
+                pubkey: app_key.clone(),
+                expiration: 42,
+                targets: None,
+            },
+            signature: vec![9, 9, 9],
+        };
+        let bytes = Encode!(&legacy).expect("encode legacy reply");
+        let agent = Decode!(&bytes, IiSignedDelegation)
+            .expect("decode legacy reply")
             .into_agent(&app_key)
             .expect("into_agent");
         assert_eq!(agent.delegation.permissions, None);
