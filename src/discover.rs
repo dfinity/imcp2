@@ -16,7 +16,7 @@
 
 use std::{
     collections::BTreeMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
 use candid::Principal;
@@ -111,8 +111,11 @@ fn ipv4_is_global(ip: &Ipv4Addr) -> bool {
 }
 
 fn ipv6_is_global(ip: &Ipv6Addr) -> bool {
-    // An IPv4-mapped address (::ffff:0:0/96) is only as global as the v4 it embeds.
-    if let Some(v4) = ip.to_ipv4_mapped() {
+    // An IPv4-mapped (`::ffff:0:0/96`) OR IPv4-compatible (`::/96`, e.g.
+    // `::127.0.0.1`) address is only as global as the v4 it embeds. `to_ipv4`
+    // (unlike `to_ipv4_mapped`) covers BOTH forms — plus `::`/`::1` — so a
+    // private/loopback v4 can't slip through via IPv6 embedding.
+    if let Some(v4) = ip.to_ipv4() {
         return ipv4_is_global(&v4);
     }
     let seg = ip.segments();
@@ -157,37 +160,40 @@ async fn resolve_public_url(raw: &str) -> Result<(url::Url, Vec<SocketAddr>), St
     Ok((url, addrs))
 }
 
-/// Whether a redirect target is an acceptable public https destination, used by
-/// the client redirect policy so a 3xx can't bounce a request to an internal
-/// host. Resolution here is blocking (reqwest's redirect callback is sync), but
-/// only runs on the rare cross-host redirect.
-fn redirect_target_ok(url: &url::Url) -> bool {
-    if url.scheme() != "https" {
+/// Whether a redirect hop is safe to follow — decided WITHOUT a DNS lookup (the
+/// reqwest redirect callback is synchronous, so resolving a fresh domain there
+/// would both block a worker thread and reopen a rebind TOCTOU on the redirect
+/// target). A hop is allowed only when it is https AND either (a) an IP literal
+/// that is globally routable, or (b) a SAME-HOST redirect — the host was already
+/// validated up front and, for the site client, pinned, so no new unvalidated
+/// destination is introduced. A redirect to a *different* domain is refused;
+/// discovery targets normally respond directly, so this trades that rare case for
+/// safety (a cross-host redirect would need its own validate+pin).
+fn redirect_hop_ok(next: &url::Url, prev_host: Option<&str>) -> bool {
+    if next.scheme() != "https" {
         return false;
     }
-    let port = url.port_or_known_default().unwrap_or(443);
-    match url.host() {
+    match next.host() {
         Some(url::Host::Ipv4(v4)) => ip_is_global(&IpAddr::V4(v4)),
         Some(url::Host::Ipv6(v6)) => ip_is_global(&IpAddr::V6(v6)),
-        Some(url::Host::Domain(host)) => match (host, port).to_socket_addrs() {
-            Ok(addrs) => {
-                let addrs: Vec<SocketAddr> = addrs.collect();
-                !addrs.is_empty() && addrs.iter().all(|a| ip_is_global(&a.ip()))
-            }
-            Err(_) => false,
-        },
+        Some(url::Host::Domain(h)) => prev_host == Some(h),
         None => false,
     }
 }
 
-/// Redirect policy shared by every discovery/dashboard client: follow only
-/// public https hops, bounded, and stop (rather than follow) on a refused hop so
+/// Redirect policy shared by every discovery/dashboard client: follow only safe
+/// public https hops (bounded), and stop — rather than follow — an unsafe hop, so
 /// no request is ever issued to an internal host.
 fn ssrf_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
+        let prev_host = attempt
+            .previous()
+            .last()
+            .and_then(|u| u.host_str())
+            .map(str::to_string);
         if attempt.previous().len() >= 10 {
             attempt.error("too many redirects")
-        } else if redirect_target_ok(attempt.url()) {
+        } else if redirect_hop_ok(attempt.url(), prev_host.as_deref()) {
             attempt.follow()
         } else {
             attempt.stop()
@@ -655,11 +661,14 @@ mod tests {
         assert!(g("8.8.8.8"));
         assert!(g("1.1.1.1"));
         assert!(g("2606:4700:4700::1111"));
-        // Loopback / private / link-local / CGNAT / reserved / doc / bench / mapped.
+        // Loopback / private / link-local / CGNAT / reserved / doc / bench, plus
+        // IPv4 embedded in IPv6 as MAPPED (::ffff:…) and COMPATIBLE (::…) forms.
         for bad in [
             "127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.1.1", "169.254.169.254",
             "100.64.0.1", "0.0.0.0", "255.255.255.255", "192.0.2.1", "198.18.0.1", "240.0.0.1",
-            "::1", "::", "fc00::1", "fd12::1", "fe80::1", "2001:db8::1", "::ffff:127.0.0.1",
+            "::1", "::", "fc00::1", "fd12::1", "fe80::1", "2001:db8::1",
+            "::ffff:127.0.0.1", "::ffff:10.0.0.1", // IPv4-mapped private/loopback
+            "::127.0.0.1", "::192.168.1.1",        // IPv4-compatible private/loopback
         ] {
             assert!(!g(bad), "{bad} must be classified non-global");
         }
@@ -685,15 +694,21 @@ mod tests {
         assert_eq!(addrs, vec!["8.8.8.8:443".parse().unwrap()]);
     }
 
-    // Redirect targets: only public https hops are followable.
+    // Redirect hops: same-host or global-IP-literal https only; no DNS involved.
     #[test]
-    fn redirect_target_rejects_internal_and_http() {
-        let ok = |s: &str| redirect_target_ok(&url::Url::parse(s).unwrap());
-        assert!(ok("https://8.8.8.8/x"));
-        assert!(!ok("http://8.8.8.8/x")); // non-https
-        assert!(!ok("https://127.0.0.1/x"));
-        assert!(!ok("https://169.254.169.254/x"));
-        assert!(!ok("https://[::1]/x"));
+    fn redirect_hop_policy() {
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        // Same-host https redirect is allowed (host already validated / pinned).
+        assert!(redirect_hop_ok(&u("https://oisy.com/app"), Some("oisy.com")));
+        // A redirect to a DIFFERENT domain is refused (can't validate+pin here).
+        assert!(!redirect_hop_ok(&u("https://evil.example/x"), Some("oisy.com")));
+        // Global IP-literal hop allowed; internal IP-literal hops refused.
+        assert!(redirect_hop_ok(&u("https://8.8.8.8/x"), Some("oisy.com")));
+        assert!(!redirect_hop_ok(&u("https://127.0.0.1/x"), Some("oisy.com")));
+        assert!(!redirect_hop_ok(&u("https://169.254.169.254/x"), Some("oisy.com")));
+        assert!(!redirect_hop_ok(&u("https://[::1]/x"), Some("oisy.com")));
+        // Non-https refused even on the same host.
+        assert!(!redirect_hop_ok(&u("http://oisy.com/x"), Some("oisy.com")));
     }
 
     // Live network test against a stable public IC app (OISY).
