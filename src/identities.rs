@@ -32,7 +32,7 @@ use std::{
 use base64::Engine;
 use candid::{CandidType, Decode, Encode, Principal};
 use ic_agent::{
-    identity::{BasicIdentity, DelegatedIdentity, Delegation, SignedDelegation},
+    identity::{BasicIdentity, DelegatedIdentity, Delegation, DelegationPermissions, SignedDelegation},
     Agent, Identity,
 };
 use serde::Deserialize;
@@ -601,6 +601,32 @@ struct IiDelegation {
     pubkey: Vec<u8>,
     expiration: u64,
     targets: Option<Vec<Principal>>,
+    /// Which request kinds this delegation authorizes — II's per-MCP-session
+    /// access, `opt Permissions` (`variant { queries; all }`). Absent/`None`
+    /// means unrestricted. Part of what II signs, so it must be forwarded
+    /// verbatim into the `ic-agent` delegation for the hash to match.
+    permissions: Option<IiPermissions>,
+}
+
+/// II's `Permissions` variant on a delegation (`variant { queries; all }`),
+/// mirrored for Candid decoding since `ic-agent`'s `DelegationPermissions`
+/// isn't `CandidType`. Maps 1:1 into it, preserving the on-wire representation
+/// (`queries`/`all`) II hashed over.
+#[derive(CandidType, Deserialize)]
+enum IiPermissions {
+    #[serde(rename = "queries")]
+    Queries,
+    #[serde(rename = "all")]
+    All,
+}
+
+impl From<IiPermissions> for DelegationPermissions {
+    fn from(p: IiPermissions) -> Self {
+        match p {
+            IiPermissions::Queries => DelegationPermissions::Queries,
+            IiPermissions::All => DelegationPermissions::All,
+        }
+    }
 }
 
 /// `SignedDelegation` as returned by II's `mcp_get_delegation`.
@@ -622,10 +648,11 @@ impl IiSignedDelegation {
                 pubkey: self.delegation.pubkey,
                 expiration: self.delegation.expiration,
                 targets: self.delegation.targets,
-                // II issues full-access delegations for the MCP flow and does not
-                // sign a `permissions` field, so leave it unset. `None` hashes and
-                // verifies identically to a pre-0.48 delegation.
-                permissions: None,
+                // Forward II's per-MCP-session permission verbatim so the
+                // reconstructed delegation hashes to exactly what II signed.
+                // An absent permission (`None`) hashes identically to a
+                // pre-0.48 delegation, so unrestricted sessions are unaffected.
+                permissions: self.delegation.permissions.map(Into::into),
             },
             signature: self.signature,
         })
@@ -773,5 +800,67 @@ mod tests {
         assert_eq!(decoded[1].account_number, Some(7));
         assert_eq!(decoded[1].name.as_deref(), Some("savings"));
         assert_eq!(decoded[1].last_used, Some(123));
+    }
+
+    // Lock in the mcp_get_delegation permission contract: II's `Delegation`
+    // carries `permissions: opt variant { queries; all }`, and it must round-trip
+    // through `into_agent` onto the `ic-agent` delegation so the reconstructed
+    // hash matches what II signed. An absent permission stays `None`.
+    #[test]
+    fn signed_delegation_forwards_ii_permissions() {
+        #[derive(CandidType, Deserialize)]
+        enum WirePermissions {
+            #[serde(rename = "queries")]
+            Queries,
+            #[serde(rename = "all")]
+            All,
+        }
+        #[derive(CandidType)]
+        struct WireDelegation {
+            pubkey: Vec<u8>,
+            expiration: u64,
+            targets: Option<Vec<Principal>>,
+            permissions: Option<WirePermissions>,
+        }
+        #[derive(CandidType)]
+        struct WireSignedDelegation {
+            delegation: WireDelegation,
+            signature: Vec<u8>,
+        }
+
+        let app_key = vec![1u8, 2, 3, 4];
+        // Decode a `queries`-scoped delegation and confirm it maps to Queries.
+        let make = |permissions| WireSignedDelegation {
+            delegation: WireDelegation {
+                pubkey: app_key.clone(),
+                expiration: 42,
+                targets: None,
+                permissions,
+            },
+            signature: vec![9, 9, 9],
+        };
+
+        let bytes = Encode!(&make(Some(WirePermissions::Queries))).expect("encode");
+        let agent = Decode!(&bytes, IiSignedDelegation)
+            .expect("decode")
+            .into_agent(&app_key)
+            .expect("into_agent");
+        assert_eq!(agent.delegation.permissions, Some(DelegationPermissions::Queries));
+
+        let bytes = Encode!(&make(Some(WirePermissions::All))).expect("encode");
+        let agent = Decode!(&bytes, IiSignedDelegation)
+            .expect("decode")
+            .into_agent(&app_key)
+            .expect("into_agent");
+        assert_eq!(agent.delegation.permissions, Some(DelegationPermissions::All));
+
+        // An unrestricted (absent) permission decodes and forwards as None,
+        // hashing identically to a pre-0.48 delegation.
+        let bytes = Encode!(&make(None)).expect("encode");
+        let agent = Decode!(&bytes, IiSignedDelegation)
+            .expect("decode")
+            .into_agent(&app_key)
+            .expect("into_agent");
+        assert_eq!(agent.delegation.permissions, None);
     }
 }
