@@ -650,6 +650,111 @@ impl IcTools {
     }
 }
 
+/// Maximum byte length of caller-supplied textual Candid we will parse. Real
+/// values are tiny and even large `.did` interfaces are well under this.
+pub(crate) const MAX_CANDID_TEXT_BYTES: usize = 1024 * 1024;
+/// Maximum nesting depth of caller-supplied textual Candid. `candid_parser` and
+/// its AST / type-check / `Display` passes recurse with NO depth guard, so deeply
+/// nested untrusted input (e.g. `opt opt … 1` thousands deep) would drive an
+/// unrecoverable stack-overflow **process abort** (CWE-674), killing every
+/// concurrent session. Real Candid nests only a handful of levels; 128 is far
+/// above any legitimate value/interface yet far below the stack-overflow depth.
+pub(crate) const MAX_CANDID_DEPTH: usize = 128;
+
+/// Reject caller-supplied textual Candid (a value, or `.did` service text) that
+/// is too large or too deeply nested to parse safely, BEFORE handing it to
+/// `candid_parser` (CWE-674). `what` names the input for the error message.
+///
+/// Depth is measured structurally without parsing: `opt`/`vec` prefixes and the
+/// `(` `{` `[` group openers each add a level (matching how the parser recurses),
+/// closers and value separators pop the just-completed value's prefixes. String
+/// literals are skipped so their contents can't inflate the count. It is a safe
+/// over-approximation — it may over- but never under-count real nesting.
+pub(crate) fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
+    if text.len() > MAX_CANDID_TEXT_BYTES {
+        return Err(format!(
+            "{what} is too large to parse ({} bytes; limit {MAX_CANDID_TEXT_BYTES})",
+            text.len()
+        ));
+    }
+    // Stack of open nesting frames: b'B' = bracket group, b'P' = opt/vec prefix.
+    let mut stack: Vec<u8> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'"' => {
+                // Skip a string literal (handles \" escapes) so its contents don't count.
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                continue;
+            }
+            b'(' | b'{' | b'[' => {
+                stack.push(b'B');
+                if stack.len() > MAX_CANDID_DEPTH {
+                    return Err(depth_err(what));
+                }
+                i += 1;
+            }
+            b')' | b'}' | b']' => {
+                while stack.last() == Some(&b'P') {
+                    stack.pop();
+                }
+                if stack.last() == Some(&b'B') {
+                    stack.pop();
+                }
+                while stack.last() == Some(&b'P') {
+                    stack.pop();
+                }
+                i += 1;
+            }
+            b',' | b';' => {
+                while stack.last() == Some(&b'P') {
+                    stack.pop();
+                }
+                i += 1;
+            }
+            _ if is_word(c) => {
+                let start = i;
+                while i < bytes.len() && is_word(bytes[i]) {
+                    i += 1;
+                }
+                let word = &bytes[start..i];
+                if word == b"opt" || word == b"vec" {
+                    stack.push(b'P');
+                    if stack.len() > MAX_CANDID_DEPTH {
+                        return Err(depth_err(what));
+                    }
+                }
+                // Any other word is a leaf/keyword token; leaves pop their wrapping
+                // prefixes so sibling values don't accumulate.
+                else {
+                    while stack.last() == Some(&b'P') {
+                        stack.pop();
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
+fn depth_err(what: &str) -> String {
+    format!("{what} is nested too deeply (limit {MAX_CANDID_DEPTH}) — refusing to parse")
+}
+
 /// Encode textual Candid args to bytes. With `did` (the canister interface),
 /// coerce the args to the method's declared parameter types — so plain literals
 /// land as the method expects (`42` -> `nat64`, `1` -> `float64`, `opt`/`vec`
@@ -658,9 +763,13 @@ impl IcTools {
 /// numeric literals default to `int`/`float64` and must be annotated (see the
 /// `candid://textual-syntax` resource).
 fn encode_args(did: Option<&str>, method: &str, args_text: &str) -> Result<Vec<u8>, String> {
+    // The value MUST be parsed to encode it, so an oversized/over-nested value is
+    // a hard reject (CWE-674). An over-limit `did` is non-fatal: skip the typed
+    // path (don't parse it) and fall back to type-less encoding below.
+    guard_candid_text("the `args` value", args_text)?;
     let parsed = candid_parser::parse_idl_args(args_text)
         .map_err(|e| format!("could not parse args `{args_text}`: {e}"))?;
-    if let Some(did) = did {
+    if let Some(did) = did.filter(|d| guard_candid_text("the `candid` interface", d).is_ok()) {
         if let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() {
             if let Ok(func) = env.get_method(&actor, method) {
                 return parsed
@@ -691,6 +800,9 @@ fn decode_reply(did: Option<&str>, method: &str, bytes: &[u8]) -> String {
 /// `.did` text, recovering record/variant field names. None if the interface
 /// can't be parsed, the method isn't found, or decoding fails.
 fn decode_bytes_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<String> {
+    // Skip (fall back to type-less decoding) if the interface is too large/nested
+    // to parse safely (CWE-674).
+    guard_candid_text("the `candid` interface", did).ok()?;
     let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
     let actor = actor?;
     let func = env.get_method(&actor, method).ok()?;
@@ -1206,6 +1318,29 @@ mod tests {
         let typed = decode_bytes_with_did(did, "stats", &bytes).expect("typed decode");
         assert!(typed.contains("name ="), "typed should have `name`: {typed}");
         assert!(typed.contains("url ="), "typed should have `url`: {typed}");
+    }
+
+    // CWE-674: the pre-parse guard rejects over-deep / oversized textual Candid
+    // (which would otherwise stack-overflow candid_parser and abort the process),
+    // without false-positiving on realistic values.
+    #[test]
+    fn candid_guard_rejects_deep_and_oversized() {
+        use super::{guard_candid_text, MAX_CANDID_TEXT_BYTES};
+        // Realistic, shallow values/interfaces pass.
+        assert!(guard_candid_text("v", "()").is_ok());
+        assert!(guard_candid_text("v", "(record { a = opt 1; b = vec { 1; 2; 3 } })").is_ok());
+        // The finding's exact vector: keyword nesting with NO brackets is caught.
+        let deep_opt = format!("{}1", "opt ".repeat(5000));
+        assert!(guard_candid_text("v", &deep_opt).is_err(), "deep opt-chain must be refused");
+        // Bracket nesting is caught too.
+        assert!(guard_candid_text("v", &"{".repeat(200)).is_err(), "deep brackets must be refused");
+        // Oversized-but-shallow input is caught by the byte cap.
+        let big = "0,".repeat(MAX_CANDID_TEXT_BYTES);
+        assert!(guard_candid_text("v", &big).is_err(), "oversized input must be refused");
+        // No false positives: brackets inside a STRING don't count, and many
+        // SIBLING (non-nested) opts stay shallow.
+        assert!(guard_candid_text("v", &format!("\"{}\"", "(".repeat(10_000))).is_ok());
+        assert!(guard_candid_text("v", &format!("(record {{ {} }})", "a = opt 1; ".repeat(1000))).is_ok());
     }
 
     // Every tool must carry MCP annotations, else clients fall back to the unsafe
