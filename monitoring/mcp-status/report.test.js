@@ -6,15 +6,17 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { renderText } from "./report.js";
 
-// Dangerous characters, referenced by escape so the source stays printable:
-//   ESC (C0), CR (C0), BEL (C0), U+009B (C1 8-bit CSI), U+2028/U+2029 (Unicode
-//   line / paragraph separators). All can move the cursor or begin a new line.
-const ESC = "\x1b";
-const CR = "\r";
-const BEL = "\x07";
-const C1_CSI = "";
-const LINE_SEP = " ";
-const PARA_SEP = " ";
+// Dangerous characters, built from code points so the source stays ASCII-safe and
+// parser-portable (raw U+2028/U+2029 are JS line terminators and can break some
+// tooling). ESC/CR/BEL are C0 controls; U+009B is the C1 8-bit CSI; U+2028/U+2029
+// are the Unicode line / paragraph separators. All can move the cursor or begin a
+// new line in a terminal.
+const ESC = String.fromCharCode(0x1b);
+const CR = String.fromCharCode(0x0d);
+const BEL = String.fromCharCode(0x07);
+const C1_CSI = String.fromCharCode(0x9b);
+const LINE_SEP = String.fromCharCode(0x2028);
+const PARA_SEP = String.fromCharCode(0x2029);
 
 /** A report whose probe-derived fields carry hostile control/ANSI payloads. */
 const evilReport = () => ({

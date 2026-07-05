@@ -320,9 +320,12 @@ pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
             break; // aggregate cap: stop mining once we've buffered enough text
         }
         if let Ok(resp) = client.get(format!("{base}{s}")).send().await {
-            let room = MAX_SCAN_BYTES - blob.len();
-            let t = read_capped(resp, room.min(MAX_BODY_BYTES)).await;
+            // Push the separator first, then size the read against the space that
+            // remains — so the '\n' counts toward the cap and `blob` never exceeds
+            // MAX_SCAN_BYTES (loop guard guarantees room for the separator).
             blob.push('\n');
+            let room = MAX_SCAN_BYTES.saturating_sub(blob.len());
+            let t = read_capped(resp, room.min(MAX_BODY_BYTES)).await;
             blob.push_str(&t);
         }
     }
