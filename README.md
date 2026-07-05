@@ -17,7 +17,7 @@ encoding/decoding and signing against the IC via
 | `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text) |
 | `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `domain?`, `account?` | Reply as textual Candid; called anonymously (no `domain`) or as your account at an application domain, derived on demand (`account` names a non-default account there) |
 | `get_principal` | `domain`, `account?` | The principal you act as at an application domain (derives the delegation on demand, same as `call_canister`), without making a call |
-| `list_accounts` | `domain` | The user's Internet Identity accounts at an app — the default ("synthetic") account plus any named ones — with name, account number, and last-used time; name one via `account` in `call_canister`/`get_principal` |
+| `list_accounts` | `domain` | The user's Internet Identity accounts at an app — the default account (the anchor's current default at that origin) plus any named ones — with name, account number, and last-used time; name one via `account` in `call_canister`/`get_principal` |
 | `list_ic_skills` | — | The official [IC skills](https://skills.internetcomputer.org) (Motoko, mops/icp CLIs, cycles, stable memory, security, …), grouped by category |
 | `get_ic_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `motoko`, `icp-cli`, `cycles-management`) |
 | `cycles_balance` | — | Your cycles-ledger balance (the funds `create_canister`/`top_up_canister` spend), as your standing II principal |
@@ -48,12 +48,23 @@ call as your account at that app. For a domain, the server mints a **short-lived
 account delegation on demand** using the connection's registered Internet
 Identity session key (see [Domain identities](#domain-identities-on-demand)) —
 there is no per-app sign-in step. `get_principal` returns that account's principal
-without a call. A user may hold several accounts at an app — a default
-("synthetic") account everyone gets automatically, plus any they have named — so
-`list_accounts(domain)` lists them (via II's `get_accounts`), and
-`call_canister`/`get_principal` take an optional `account` (a name from that list)
-to act as a specific one; omit it for the default account. All these tools require
-a bearer token (see Auth).
+without a call. A user may hold several accounts at an app — a default account
+everyone gets automatically (the anchor's current, user-controllable default at
+that origin), plus any they have named — so `list_accounts(domain)` lists them
+(via II's `get_accounts`), and `call_canister`/`get_principal` take an optional
+`account` (a name from that list) to act as a specific one; omit it for the
+default account. All these tools require a bearer token (see Auth).
+
+> **Derivation is domain-based — not guaranteed to equal a browser sign-in.** II
+> derives the per-app principal from the app's **domain**, which this server
+> normalizes to a bare `https://<host>` (with the gateway remap below). That is
+> usually the same identity a browser sign-in to the app would use, but **not
+> always**: an app can declare a *custom derivation origin* via
+> `/.well-known/ii-alternative-origins`, which browsers honour but the `mcp_*`
+> methods don't expose — so from the domain alone the server derives a different
+> principal, silently. If a principal, account, or balance doesn't match what the
+> user sees in their browser at that app, that's the likely cause; the tools tell
+> the agent to offer looking up the app's `ii-alternative-origins` and retrying.
 
 ### Skills awareness
 
@@ -99,8 +110,12 @@ claude mcp add --transport http ic-poc https://YOUR-HOST/mcp
 Then run `/mcp` → **ic-poc** → authenticate: the client sends the browser to
 **Internet Identity**'s `/mcp` handshake; you sign in once, II registers the
 connection's session key as a time-boxed grant and returns you to the client, and
-the tools become available. Redirect-based clients (e.g. Claude.ai) use the
-authorization-code flow; clients that poll can use the device grant (RFC 8628).
+the tools become available. All clients use the same **authorization-code + PKCE**
+flow.
+
+> On II's consent screen, **leave the read-only option OFF** if you want to create
+> or manage canisters — read-only is the default, and it makes every management
+> tool inert (see [Read-only sessions](#read-only-sessions) below).
 
 ## Run
 
@@ -154,43 +169,117 @@ curl -s "${H[@]}" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"n
 `/mcp` is gated by a bearer token. II's `/mcp` handshake has **no redirect back
 to this server** — the II tab makes two background `fetch()` POSTs to our
 callback and then finishes on its own — so a classic authorization-code
-`redirect_uri` can't be delivered *by II*. We bridge that gap and support **two
-flows**, so any MCP client works:
+`redirect_uri` can't be delivered *by II*. We bridge that gap with a single
+**authorization-code + PKCE** flow, so any OAuth 2.1 client works:
 
-- **Authorization code (finish redirect)** — for redirect-based clients (e.g.
-  Claude.ai). `/oauth/authorize` redirects to II's handshake; the key-request
-  response carries a `finish_url` on our origin, so after `mcp_register` II
-  navigates the browser to `/oauth/finish`, which confirms registration, mints a
-  PKCE-bound code, and 302s to the client's `redirect_uri?code=…&state=…`.
-- **Device grant (RFC 8628)** — for clients that can poll: `device_code` +
-  `verification_uri`, and the client polls `/oauth/token` until the grant is live.
+- `/oauth/authorize` validates the client + redirect and PKCE, sets a
+  **browser-binding cookie** (see below), and redirects to II's handshake. The
+  key-request response carries a `finish_url` on our origin (with a one-time
+  `finish_secret`), so after `mcp_register` II navigates the browser to
+  `/oauth/finish`, which requires the cookie **and** the secret, confirms
+  registration, mints a PKCE-bound code, and 302s to the client's
+  `redirect_uri?code=…&state=…`.
+
+The **RFC 8628 device grant was dropped**: no listed MCP client uses it, and it
+adds a device-code phishing surface with none of the PKCE binding the rest of the
+flow relies on.
 
 Endpoints:
 
-- `GET /.well-known/oauth-authorization-server` — AS metadata (advertises both
-  the `authorization_code` and `device_code` grants)
+- `GET /.well-known/oauth-authorization-server` — AS metadata (advertises
+  `grant_types_supported: ["authorization_code"]`)
 - `GET /.well-known/oauth-protected-resource` — points clients at the AS
 - `POST /oauth/register` — dynamic client registration (RFC 7591); `redirect_uris`
-  are stored (device-only clients may register none) and persisted to
-  `OAUTH_CLIENTS_FILE`; requested `grant_types` are honoured
-- `GET  /oauth/authorize` — validates the client + redirect, requires PKCE, then
-  redirects to II's handshake
-- `GET  /oauth/finish` — II navigates here after registration; confirms the grant
-  is live, then 302s to `redirect_uri?code=…&state=…`
-- `POST /oauth/device_authorization` — device-grant entry: mints a `device_code`/
-  `user_code` + `verification_uri` (RFC 8628 §3.2)
-- `GET  /oauth/device` — the user opens this; it launches II's `/mcp` handshake
-  with the connect `state` (= session id) in the URL fragment, `ttl` in **seconds**
+  are stored and persisted to `OAUTH_CLIENTS_FILE`; requested `grant_types` are
+  honoured (intersected with `authorization_code`)
+- `GET  /oauth/authorize` — validates the client + redirect, requires PKCE, sets
+  the binding cookie, then redirects to II's handshake
+- `GET  /oauth/finish` — II navigates here after registration; requires the
+  binding cookie **and** the one-time `finish_secret`, confirms the grant is
+  registered (proven, see below), then 302s to `redirect_uri?code=…&state=…`
 - `POST /oauth/connect/callback` — serves II's **two cross-origin JSON POSTs**:
-  a key request `{state}` → `{public_key}` (a fresh session keypair, minted here),
-  and a completion notification `{state, expiration}` → mark the grant live
-- `POST /oauth/token` — exchanges an authorization `code` (PKCE), or polls with a
-  `device_code` (`authorization_pending`/`slow_down`), for the access token
+  a **single-use** key request `{state}` → `{public_key, finish_url}` (a fresh
+  session keypair + one-time `finish_secret` embedded in `finish_url`; any later
+  key request for the same `state` gets `403`), and a completion notification
+  `{state, expiration, permissions}` → record the grant expiry + access level (a
+  best-effort latency hint only)
+- `POST /oauth/token` — exchanges an authorization `code` (PKCE) for the access token
 
-"Grant is live" means II's completion POST arrived **or** a signed
-`mcp_get_accounts` now succeeds (belt-and-suspenders, since the completion POST is
-best-effort). Unauthenticated `/mcp` requests get `401` with a `WWW-Authenticate`
-header pointing at the resource metadata, as the MCP spec expects.
+"Registered" is proven by a signed `mcp_get_accounts` that returns `Ok` under the
+minted session key — **not** by the completion POST, which is unauthenticated and
+therefore only a latency hint. Unauthenticated `/mcp` requests get `401` with a
+`WWW-Authenticate` header pointing at the resource metadata, as the MCP spec expects.
+
+### Consent-Bound Completion (`/oauth/authorize` → `/oauth/finish`)
+
+The `state` in the II connect link is echoed back to the client in the final
+redirect, so it **cannot by itself prove** that the browser finishing at
+`/oauth/finish` is the one that started at `/oauth/authorize` — nor that it is the
+one that actually **consented** at II. Without a binding there's a session-fixation
+takeover: an attacker registers a client (open DCR) with their own `redirect_uri` +
+PKCE challenge, calls `/oauth/authorize`, reads the II connect link from the 302,
+and phishes it to a victim who already trusts this origin in II Settings (II's
+consent screen names only the *origin*, never the OAuth client, so nothing warns the
+victim). The victim consents; the attacker completes the flow and redeems the code
+with their own PKCE verifier — a token acting as the victim. (An initiator-only
+cookie does *not* close this: the attacker is the initiator, so it holds the cookie.)
+
+**The fix — Consent-Bound Completion.** `/oauth/finish` mints a code only when the
+requesting browser presents **both** proofs, which can co-reside in one browser
+only in the legitimate same-browser flow:
+
+1. **initiator** — an unguessable `HttpOnly; Secure; SameSite=Lax` `sid` cookie
+   (scoped to the instance's `…/oauth` path) set at `/oauth/authorize`;
+2. **consenter** — a one-time `finish_secret` (≥128-bit) minted at the **single-use**
+   key request and disclosed *only* in that response (embedded in `finish_url`), so
+   only the browser that drove the II handshake holds it;
+3. plus **proven** registration (signed `mcp_get_accounts` = `Ok`), not a bare
+   completion POST.
+
+Because the single-use key request delivers *both* the `finish_secret` and the
+`public_key` a victim would register, the party that can register as the victim is
+exactly the party that gets the secret — and the `sid` cookie pins the finisher to
+the initiator. An attacker who initiates then phishes the II link holds `sid` but
+never the secret (the victim's key request consumes it); the victim holds the secret
+but never `sid`. Neither can finish. This closes the split-browser injection for
+**all transports incl. loopback** (a loopback redirect resolves on the consenter's
+own machine). `SameSite=Lax` still rides the top-level cross-site GET II uses to
+navigate back to `finish_url`.
+
+Load-bearing invariants (enforced in code): the key request is a single **atomic**
+compare-and-set (P1) and II's frontend issues exactly one per connect (a retry
+fails as "restart", never a takeover); `finish_secret` rides in the **query** (not a
+path segment), is kept out of logs, and `/oauth/finish` sends `Referrer-Policy:
+no-referrer` so it can't leak via `Referer` (P2); `registered` reflects a real
+on-chain grant (P3).
+
+> **Companion control (not in this change).** The *same-browser* variant — a victim
+> socially engineered into running the whole flow toward an attacker-registered
+> **hosted** `redirect_uri` — is not closed by Consent-Bound Completion (the
+> victim's browser legitimately holds both proofs). It needs **hosted-redirect
+> allow-listing**; loopback/native clients are safe either way (the code resolves on
+> the consenter's own machine). So "H3 fully closed" = Consent-Bound Completion +
+> hosted-redirect allow-listing — a product decision that trades only against open
+> DCR for hosted clients.
+
+### Read-only sessions
+
+II's consent screen **defaults to read-only** (opt-out). A user who just clicks
+"Allow" gets a session whose per-app delegations are `permissions = "queries"`,
+and the IC **rejects update calls made through them at ingress**. That makes the
+entire canister-management surface inert — `create`/`install`/`start`/`stop`/
+`uninstall`/`delete`, and even `canister_status`, are update calls. To handle this
+without opaque low-level errors:
+
+- The completion POST now carries `permissions: "queries" | "all"` (§0), so the
+  server learns the level at connect without minting a probe delegation. A
+  missing or unrecognized value leaves the level **unknown** (not assumed
+  writable): the update is attempted and the IC's ingress rejection is the
+  fallback signal.
+- Management tools check it up front and, for a *known* read-only session, return
+  an actionable *"reconnect with read-only off"* message instead of an ingress error.
+- `get_principal` reflects a read-only session in its output, so the agent won't
+  attempt updates it can't make.
 
 **The server is passive during the handshake and holds no key at link time.** On
 the key-request POST it generates a fresh per-connection Ed25519 keypair and
@@ -202,10 +291,11 @@ calls `mcp_register`.** The issued access token is bound to the session key's
 principal (`self_authenticating(session_pubkey)`), which is exactly the identity
 the grant is bound to.
 
-**PKCE (S256)** is required for the authorization-code flow and honoured for the
-device grant; auth codes live 120s, device codes 600s, access tokens 1h. Treat any
-`Unauthorized` from II as "session over → reconnect": the server surfaces a
-reconnect message and does not retry.
+**PKCE (S256)** is required for the authorization-code flow; auth codes live 120s,
+access tokens 1h (bounded by the II grant — refresh tokens are a deliberate
+non-goal, as they'd add no security over the grant and only pay off with
+server-side persistence). Treat any `Unauthorized` from II as "session over →
+reconnect": the server surfaces a reconnect message and does not retry.
 
 Set the public base URL (used in the discovery docs, as the MCP origin, and as the
 management identity's derivation origin) with `PUBLIC_URL`. The Internet Identity
@@ -265,8 +355,15 @@ mcp_get_delegation :
 
 - `session_key` is the DER pubkey of a **fresh per-app key**, distinct from the
   connection's session key; the minted delegation is issued to it.
-- `target_origin` is `https://<domain>`, with IC gateway domains remapped:
-  `*.icp0.io` / `*.icp.net` → `*.ic0.app`.
+- `target_origin` is the app's **bare** `https://<host>` origin. II derives the
+  principal from an anchored regex on that bare origin, so the server first strips
+  any path, query, fragment, trailing slash, or redundant `:443` (a stray one
+  would derive a *different* principal), then applies the gateway remap:
+  `*.icp0.io` / `*.icp.net` → `*.ic0.app`. Note this replicates only II's
+  *domain-based* derivation — a **custom derivation origin** declared via
+  `/.well-known/ii-alternative-origins` isn't visible through the `mcp_*` methods,
+  so an app using one derives a different principal here than in a browser (see the
+  caveat under [Tools](#tools)); fetching that declaration is a future enhancement.
 - `account_number` names which of the anchor's accounts at `target_origin` to act
   as; `null` selects the (mutable) default account there. `prepare` resolves it
   and returns the concrete account in its reply, which is threaded back into
@@ -284,10 +381,11 @@ mcp_get_delegation :
 
 ### Listing accounts
 
-A user can hold several accounts at one app: a default ("synthetic") account
-everyone gets automatically, plus any **named** accounts they created there. Each
-account is a **distinct per-origin principal** — the app never sees a global,
-cross-app identity. `list_accounts(domain)` returns them by calling II's
+A user can hold several accounts at one app: a default account everyone gets
+automatically (the anchor's current, user-controllable default at that origin),
+plus any **named** accounts they created there. Each account is a **distinct
+per-origin principal** — the app never sees a global, cross-app identity.
+`list_accounts(domain)` returns them by calling II's
 
 ```candid
 mcp_get_accounts : (target_origin: text)
@@ -312,16 +410,20 @@ delegation. Omitting `account` uses the default account.
 > delegation methods from the earlier `mcp_prepare_account_delegation` /
 > `mcp_get_account_delegation` and removes `mcp_set_access` / `mcp_access_enabled`.
 > The live round-trip works once that II build is deployed to the configured
-> `II_URL`. Passing `account_number = null` resolves to the anchor's default
-> ("synthetic") account.
+> `II_URL`. Passing `account_number = null` resolves to the anchor's current
+> (user-controllable) default account at the origin — which may be a named account
+> the user set as their default there, not necessarily the anchor's base account.
 
 ## Roadmap
 
 - [x] Candid tools over MCP streamable-HTTP; `discover_canisters`; Candid
       reference resources.
-- [x] OAuth auth (device grant, RFC 8628): the client polls while II's `/mcp`
-      handshake registers the connection's session key (two JSON callback POSTs,
-      no delegation chain); PKCE; expiring tokens.
+- [x] OAuth 2.1 auth (authorization-code + PKCE): II's `/mcp` handshake registers
+      the connection's session key (two JSON callback POSTs, no delegation chain),
+      with **Consent-Bound Completion** binding `/oauth/finish` to both the initiator
+      (`sid` cookie) and the consenter (one-time `finish_secret`); expiring tokens.
+      (The RFC 8628 device grant was dropped. Same-browser-variant closure needs
+      hosted-redirect allow-listing — see Auth.)
 - [x] On-demand **domain identities**: the registered session key mints per-app
       account delegations directly via II canister methods
       (`call_canister`/`get_principal` `domain`); no per-app browser flow.

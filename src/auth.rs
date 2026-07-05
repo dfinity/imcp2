@@ -3,32 +3,68 @@
 //!
 //! II's `/mcp` handshake registers the session key under the user's own auth and,
 //! if we ask, navigates the browser back to a `finish_url` on our origin (see
-//! `docs/mcp-server-guide.md` §2a/§2c / dfinity/internet-identity#4086). We use
-//! that hook to serve two flows, so any MCP client works:
+//! `docs/mcp-server-guide.md` §2a/§2c / dfinity/internet-identity#4086). We drive
+//! one flow — **authorization code + PKCE** — so any OAuth 2.1 client works:
 //!
-//!   * **Authorization code (finish redirect)** — for redirect-based clients
-//!     (e.g. Claude.ai). `/oauth/authorize` redirects to II's handshake; the
-//!     key-request response carries a `finish_url`, so after `mcp_register` II
-//!     navigates the browser to `/oauth/finish`, which confirms registration,
-//!     mints a PKCE-bound code, and 302s to the client's `redirect_uri`.
-//!   * **Device authorization grant (RFC 8628)** — for clients that can poll the
-//!     token endpoint: `/oauth/device_authorization` → `device_code` +
-//!     `verification_uri`; the user opens it (launching the same II handshake, no
-//!     `finish_url`); the client polls `/oauth/token` until the grant is live.
+//!   * `/oauth/authorize` sets a browser-binding cookie (H3) and redirects to
+//!     II's handshake; the key-request response carries a `finish_url`, so after
+//!     `mcp_register` II navigates the browser to `/oauth/finish`, which requires
+//!     that cookie, confirms registration, mints a PKCE-bound code, and 302s to
+//!     the client's `redirect_uri`.
+//!
+//! The RFC 8628 device grant was dropped (no listed client uses it, and it adds a
+//! device-code phishing surface with none of the PKCE binding the rest of the flow
+//! relies on).
 //!
 //! Connect handshake (Phase 1b): `/oauth/connect/callback` serves the two
-//! cross-origin JSON POSTs II makes — a key request `{state}` → `{public_key
-//! [, finish_url]}` (a fresh session keypair minted per connection) and a
-//! completion notification `{state, expiration}` → mark the grant live. We never
-//! receive or verify a delegation chain, and never call `mcp_register` (II's
-//! frontend does, under the user's own authentication).
+//! cross-origin JSON POSTs II makes — a key request `{state}` → `{public_key,
+//! finish_url}` (a fresh session keypair minted per connection) and a completion
+//! notification `{state, expiration, permissions}` → mark the grant live and
+//! record the session's access level. We never receive or verify a delegation
+//! chain, and never call `mcp_register` (II's frontend does, under the user's own
+//! authentication).
 //!
 //! Implemented: dynamic client registration, PKCE (S256) enforced, short-lived
-//! codes/device codes, 1h access tokens, session-key-bound principal.
+//! codes, 1h access tokens, session-key-bound principal.
+//!
+//! ## H3: Consent-Bound Completion (closes the split-browser code injection)
+//!
+//! `/oauth/finish` mints a code only when the requesting browser proves it is BOTH
+//! the **initiator** and the **consenter**:
+//!   1. *initiator* — the `sid` cookie ([`CONNECT_COOKIE`]) set at `/oauth/authorize`;
+//!   2. *consenter* — a one-time `finish_secret` (≥128-bit) minted at the **single-use
+//!      key request** and disclosed only in that response (embedded in `finish_url`),
+//!      so only the browser that drove the II handshake holds it;
+//!   3. plus a *proven* registration — a signed `mcp_get_accounts` returning `Ok`
+//!      (not a bare, unauthenticated completion POST).
+//!
+//! Because the key request is strictly single-use per `connect_state` (an atomic
+//! compare-and-set) and delivers BOTH `finish_secret` and the `public_key` a victim
+//! would register, the two proofs can co-reside in one browser only in the
+//! legitimate same-browser flow — so an attacker who initiates and then phishes the
+//! II link to a victim cannot obtain a code (they hold `sid` but never
+//! `finish_secret`; the victim holds `finish_secret` but never `sid`). This closes
+//! the split-browser injection for all transports incl. loopback (a loopback
+//! redirect resolves on the consenter's own machine).
+//!
+//! Not closed here (companion control): the *same-browser* variant where a victim
+//! is socially engineered into running the whole flow toward an attacker-registered
+//! **hosted** `redirect_uri`; that needs hosted-redirect allow-listing (loopback is
+//! safe either way). "H3 fully closed" = Consent-Bound Completion + that allow-list.
+//!
+//! Load-bearing (see the `P?` markers below): the key request is single-use and
+//! atomic (P1); `finish_secret` is disclosed only via `finish_url`'s query, never
+//! logged, no `Referer` leak (P2); `registered` reflects a real grant, never a bare
+//! completion POST (P3). P1 also assumes II's frontend issues exactly one key
+//! request per connect and never auto-retries (a retry then fails as "restart",
+//! never a takeover — the safe direction).
 
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -49,24 +85,64 @@ use uuid::Uuid;
 
 use crate::identities::Identities;
 
-/// How long an authorization request (auth-code or device) and its pending II
-/// handshake stay valid before the user must restart.
+/// How long an authorization request and its pending II handshake stay valid
+/// before the user must restart.
 const CONNECT_TTL: Duration = Duration::from_secs(600);
-/// Lifetime of a minted authorization code (auth-code flow).
+/// Lifetime of a minted authorization code.
 const CODE_TTL: Duration = Duration::from_secs(120);
-/// Minimum seconds a client should wait between token polls (RFC 8628 `interval`).
-const POLL_INTERVAL_SECS: u64 = 5;
 /// Access-token lifetime (also the II grant's default, 1h).
 const TOKEN_TTL: Duration = Duration::from_secs(3600);
 /// `ttl` (seconds) requested for the II grant. Clamped by II to [600, 2592000].
 const GRANT_TTL_SECS: u64 = 3600;
 
-/// RFC 8628 device-code grant type.
-const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+/// Name of the browser-session cookie that binds `/oauth/authorize` to
+/// `/oauth/finish` (H3): only the browser that started the flow can complete it.
+const CONNECT_COOKIE: &str = "mcp_connect";
+
+/// Observability for the single-use key request (P1): number of key requests that
+/// hit a still-valid but ALREADY-CONSUMED `connect_state` — i.e. a *repeat* key
+/// request. Under strict single-use these are expected to be ~zero. An isolated
+/// hit is a stray replay / attacker probe (harmless — it 403s); a sustained rise
+/// means II's frontend started re-issuing the key request, which strict single-use
+/// turns into failed connects (a benign-but-breaking regression to fix upstream —
+/// never a takeover). Warn-logged with the instance name and surfaced on `/version`
+/// so a silent regression is caught without log scraping. Process-wide.
+static REPEAT_KEY_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// Current value of the repeat-key-request counter (for the `/version` probe).
+pub fn repeat_key_requests() -> u64 {
+    REPEAT_KEY_REQUESTS.load(Ordering::Relaxed)
+}
 
 /// Public base URL clients use to reach this server. Override with PUBLIC_URL.
 pub fn base_url() -> String {
     std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
+}
+
+/// A fresh consent secret: 256 bits from the OS CSPRNG, URL-safe (base64url, no
+/// pad) so it can ride in a query string. Well above the ≥128-bit floor (P5).
+fn fresh_secret() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("getrandom");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// SHA-256 digest of `s` (used to store `finish_secret` hashed at rest — P5).
+fn sha256(s: &str) -> [u8; 32] {
+    Sha256::digest(s.as_bytes()).into()
+}
+
+/// Constant-time equality for two byte slices (P5) — no early-out on the first
+/// differing byte, so a compare doesn't leak how much of a secret matched.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// A registered OAuth client (RFC 7591): the redirect URIs it declared. The
@@ -147,18 +223,16 @@ pub struct AuthStore {
     clients: Arc<RwLock<HashMap<String, ClientReg>>>,
     tokens: Arc<RwLock<HashMap<String, TokenInfo>>>,
     /// Auth-code connects in flight, keyed by `session_id` (= the II connect
-    /// `state`). Serve the poll bridge for redirect-based clients.
+    /// `state`).
     authz: Arc<RwLock<HashMap<String, AuthzPending>>>,
     /// Minted authorization codes awaiting exchange at `/oauth/token`.
     codes: Arc<RwLock<HashMap<String, CodeGrant>>>,
-    /// Device-authorization grants in flight, keyed by `session_id`.
-    devices: Arc<RwLock<HashMap<String, DeviceAuth>>>,
     /// Shared with the MCP tools: the session's backend key / grant expiration
     /// live here (keyed by `session_id`) for the tools to sign with.
     identities: Identities,
 }
 
-/// An auth-code connect awaiting the user's II handshake (poll bridge).
+/// An auth-code connect awaiting the user's II handshake.
 #[derive(Clone, Debug)]
 struct AuthzPending {
     client_id: String,
@@ -166,10 +240,21 @@ struct AuthzPending {
     /// The OAuth client's own `state`, echoed back on the final redirect.
     client_state: String,
     code_challenge: Option<String>,
+    /// H3 clause 1 (*initiator* proof): unguessable value set as the `sid` browser
+    /// cookie at `/oauth/authorize` and matched at `/oauth/finish` — only the
+    /// browser that STARTED this flow presents it. On its own the cookie is a
+    /// partial mitigation; combined with `finish_secret_hash` (the *consenter*
+    /// proof) it closes the split-browser injection (see the module docs).
+    cookie: String,
     created: Instant,
-    /// Grant confirmed live (completion POST or a signed-call fallback).
-    live: bool,
-    /// The authorization code minted once the grant is live (idempotent polls).
+    /// H3 clause 2 (*consenter* proof), and the single-use marker for the key
+    /// request (P1/P3): `None` until the FIRST key request for this connect
+    /// atomically claims it and stores `H(finish_secret)`; any later key request
+    /// then 403s. `/oauth/finish` requires a `finish_secret` hashing to this. Its
+    /// presence also means "the key request happened" — the only way `registered`
+    /// can legitimately become provable — so no alternate path materializes it.
+    finish_secret_hash: Option<[u8; 32]>,
+    /// The authorization code minted once the grant is confirmed (idempotent finish).
     code: Option<String>,
 }
 
@@ -180,21 +265,6 @@ struct CodeGrant {
     code_challenge: Option<String>,
     session_id: String,
     created: Instant,
-}
-
-/// A device-authorization grant awaiting the user's II handshake.
-#[derive(Clone, Debug)]
-struct DeviceAuth {
-    device_code: String,
-    user_code: String,
-    session_id: String,
-    #[allow(dead_code)]
-    client_id: Option<String>,
-    scope: Option<String>,
-    code_challenge: Option<String>,
-    created: Instant,
-    live: bool,
-    last_poll: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -225,7 +295,6 @@ impl AuthStore {
             tokens: Arc::default(),
             authz: Arc::default(),
             codes: Arc::default(),
-            devices: Arc::default(),
             identities,
         }
     }
@@ -262,12 +331,6 @@ impl AuthStore {
         (info.created.elapsed() < info.ttl).then(|| (info.principal.clone(), info.session_id.clone()))
     }
 
-    /// Whether this connection's grant is live: the completion POST arrived, or
-    /// (best-effort fallback) a signed `mcp_get_accounts` now succeeds. Takes no
-    /// lock across the network call.
-    async fn grant_live(&self, session_id: &str, flag: bool) -> bool {
-        flag || self.identities.grant_is_live(session_id).await
-    }
 }
 
 // ---- Authorization code (poll bridge) ----------------------------------
@@ -317,6 +380,12 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
     }
 
     let session_id = format!("sess-{}", Uuid::new_v4());
+    // H3 clause 1: bind this browser to the flow (the `sid` cookie, set now and
+    // required at /oauth/finish). The `state` alone can't prove the finishing
+    // browser is the initiator (it's echoed to the client). The cookie proves
+    // *initiator*; the `finish_secret` minted at the key request proves
+    // *consenter*; requiring both closes the split-browser injection.
+    let cookie = format!("bind-{}", Uuid::new_v4());
     store.authz.write().await.insert(
         session_id.clone(),
         AuthzPending {
@@ -324,61 +393,125 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
             redirect_uri: q.redirect_uri.clone(),
             client_state: q.state.clone().unwrap_or_default(),
             code_challenge: Some(code_challenge),
+            cookie: cookie.clone(),
             created: Instant::now(),
-            live: false,
+            finish_secret_hash: None,
             code: None,
         },
     );
 
-    // Redirect the browser to this instance's II handshake. II navigates back to
-    // our `finish_url` (returned in the key-request response) once it registers.
-    js_redirect(&ii_mcp_url(store.instance(), &session_id))
+    // Redirect the browser to this instance's II handshake, setting the binding
+    // cookie. II navigates back to our `finish_url` (from the key-request
+    // response) once it registers; SameSite=Lax lets the cookie ride that
+    // top-level cross-site GET back to us. Scoped to this instance's OAuth prefix.
+    // `Secure` only when served over HTTPS (production always is): a `Secure`
+    // cookie is dropped by browsers over plain HTTP, which would break the
+    // initiator check for local `http://localhost` development.
+    let secure = if base_url().starts_with("https://") { "; Secure" } else { "" };
+    let set_cookie = format!(
+        "{CONNECT_COOKIE}={cookie}; Path={}/oauth; Max-Age={}; HttpOnly{secure}; SameSite=Lax",
+        store.instance().oauth_prefix,
+        CONNECT_TTL.as_secs(),
+    );
+    let mut resp = js_redirect(&ii_mcp_url(store.instance(), &session_id));
+    resp.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        axum::http::HeaderValue::from_str(&set_cookie).expect("valid cookie"),
+    );
+    resp
+}
+
+/// Extract our binding cookie's value from a request's `Cookie` header.
+fn connect_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    raw.split(';')
+        .filter_map(|kv| kv.trim().split_once('='))
+        .find(|(k, _)| *k == CONNECT_COOKIE)
+        .map(|(_, v)| v.to_string())
 }
 
 #[derive(Debug, Deserialize)]
 pub struct FinishQuery {
     /// The pending-auth id (= session id) carried by `finish_url`.
     id: String,
+    /// H3 clause 2: the one-time `finish_secret`, carried in `finish_url`'s QUERY
+    /// (not a path segment) so path-only access logs don't capture it (P2).
+    #[serde(default)]
+    fs: Option<String>,
     /// Retry counter, so the "finishing" reload is bounded.
     #[serde(default)]
     r: u32,
 }
 
-/// GET /oauth/finish — II navigates the browser here after registering the
-/// session key (this is the `finish_url` returned in the key-request response).
-/// Arrival is NOT proof of registration: confirm it (the completion POST flag, or
-/// a signed `mcp_get_accounts` that returns `Ok`), then mint the authorization
-/// code and 302 to the client's `redirect_uri` with `code` + the client's `state`.
-pub async fn finish(State(store): State<AuthStore>, Query(q): Query<FinishQuery>) -> Response {
+/// GET /oauth/finish — II navigates the CONSENTING browser here after registering
+/// the session key (this is the `finish_url` returned in the key-request response,
+/// carrying the one-time `finish_secret` in its query). Mints a code only if all of
+/// H3's predicate holds — (1) the `sid` cookie resolves to this PA, (2) `finish_secret`
+/// matches, (3) registration is *proven* by a signed `mcp_get_accounts` that returns
+/// `Ok`, (4) not expired / not already completed — then 302s to the client's
+/// `redirect_uri` with `code` + the client's `state`.
+pub async fn finish(
+    State(store): State<AuthStore>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<FinishQuery>,
+) -> Response {
     // Snapshot without holding the lock across the network probe.
     let snap = {
         let authz = store.authz.read().await;
         authz.get(&q.id).map(|a| {
             (
                 a.created.elapsed() >= CONNECT_TTL,
-                a.live,
+                a.finish_secret_hash,
                 a.code.clone(),
                 a.client_id.clone(),
                 a.redirect_uri.clone(),
                 a.client_state.clone(),
                 a.code_challenge.clone(),
+                a.cookie.clone(),
             )
         })
     };
-    let Some((expired, live_flag, existing_code, client_id, redirect_uri, client_state, code_challenge)) = snap else {
+    let Some((expired, finish_secret_hash, existing_code, client_id, redirect_uri, client_state, code_challenge, cookie)) =
+        snap
+    else {
         return connect_error("unknown or already-used connect request — restart from your client");
     };
     if expired {
         return connect_error("connect request expired — restart from your client");
     }
+    // H3 clause 1 (initiator): only the browser that STARTED this flow (holding the
+    // `sid` cookie) may complete it.
+    if connect_cookie(&headers).as_deref() != Some(cookie.as_str()) {
+        return connect_error(
+            "this sign-in was started in a different browser session — restart the connection from your client",
+        );
+    }
+    // H3 clause 2 (consenter): the one-time `finish_secret`, disclosed only in the
+    // single-use key-request response, proves this browser drove the II consent.
+    // Requiring BOTH proofs forces initiator == consenter, closing the
+    // split-browser injection. `finish_secret_hash` is `Some` only after the key
+    // request ran (so this also gates on "the handshake happened"). Constant-time
+    // compare of the hashes (P5).
+    let secret_ok = match (q.fs.as_deref(), finish_secret_hash) {
+        (Some(fs), Some(hash)) => ct_eq(&sha256(fs), &hash),
+        _ => false,
+    };
+    if !secret_ok {
+        return connect_error(
+            "this sign-in can't be completed in this browser — restart the connection from your client",
+        );
+    }
+    let fs = q.fs.as_deref().unwrap_or_default();
     // Idempotent: if the code was already minted, just redirect again.
     if let Some(code) = existing_code {
         return redirect_302(&build_redirect(&redirect_uri, &code, &client_state));
     }
-    // Confirm registration (best-effort signed-call fallback, no lock held). If it
-    // isn't confirmable yet (a race with II's registration/propagation), reload
-    // shortly — bounded so we don't loop forever.
-    if !store.grant_live(&q.id, live_flag).await {
+    // H3 clause 3 (proven registration, P3): confirm the session key is actually
+    // registered on-chain via a signed `mcp_get_accounts` returning `Ok` — NOT a
+    // bare completion POST (which any `connect_state`-knower could forge). No lock
+    // held across the network call. If not yet visible (a race with II's
+    // registration/propagation), reload shortly — bounded so we don't loop forever.
+    if !store.identities.grant_is_live(&q.id).await {
         if q.r >= 8 {
             return connect_error(&format!(
                 "could not confirm the connection with Internet Identity ({}) — it may not support \
@@ -386,7 +519,7 @@ pub async fn finish(State(store): State<AuthStore>, Query(q): Query<FinishQuery>
                 store.instance().ii_url
             ));
         }
-        return finishing_page(store.instance().oauth_prefix, &q.id, q.r + 1);
+        return finishing_page(store.instance().oauth_prefix, &q.id, fs, q.r + 1);
     }
 
     // Reserve the code under the `authz` lock, then insert into `codes` AFTER
@@ -423,21 +556,36 @@ pub async fn finish(State(store): State<AuthStore>, Query(q): Query<FinishQuery>
 
 /// A tiny self-reloading page shown while we wait for II's registration to become
 /// confirmable, then it re-hits this instance's `/oauth/finish` (bounded by the
-/// retry counter).
-fn finishing_page(prefix: &str, id: &str, next_try: u32) -> Response {
-    let url = js_escape(&format!("{prefix}/oauth/finish?id={}&r={}", urlencoding::encode(id), next_try));
-    Html(format!(
+/// retry counter). Carries `finish_secret` across the reload (P6) and sets
+/// `Referrer-Policy: no-referrer` so the secret-bearing URL never rides a `Referer`.
+fn finishing_page(prefix: &str, id: &str, fs: &str, next_try: u32) -> Response {
+    let url = js_escape(&format!(
+        "{prefix}/oauth/finish?id={}&fs={}&r={}",
+        urlencoding::encode(id),
+        urlencoding::encode(fs),
+        next_try
+    ));
+    let mut resp = Html(format!(
         "<!DOCTYPE html><meta charset=utf-8><title>Finishing…</title>\
+         <meta name=referrer content=no-referrer>\
          <body style=\"font-family:system-ui;max-width:32rem;margin:3rem auto\">\
          <p>Finishing sign-in…</p>\
          <script>setTimeout(function(){{location.replace(\"{url}\")}},1200)</script></body>"
     ))
-    .into_response()
+    .into_response();
+    resp.headers_mut()
+        .insert(axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer"));
+    resp
 }
 
 /// A 302 to an absolute URL (used for the top-level hop back to the OAuth client).
+/// Sets `Referrer-Policy: no-referrer` so the `finish_secret` in this request's URL
+/// (query) is not leaked to `redirect_uri` via the `Referer` header (P2).
 fn redirect_302(url: &str) -> Response {
-    (StatusCode::FOUND, [(axum::http::header::LOCATION, url.to_string())]).into_response()
+    let mut resp = (StatusCode::FOUND, [(axum::http::header::LOCATION, url.to_string())]).into_response();
+    resp.headers_mut()
+        .insert(axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer"));
+    resp
 }
 
 fn build_redirect(redirect_uri: &str, code: &str, client_state: &str) -> String {
@@ -447,108 +595,6 @@ fn build_redirect(redirect_uri: &str, code: &str, client_state: &str) -> String 
         r.push_str(&format!("&state={}", urlencoding::encode(client_state)));
     }
     r
-}
-
-// ---- Device authorization: start the II handshake -----------------------
-
-#[derive(Debug, Deserialize)]
-pub struct DeviceAuthzForm {
-    #[serde(default)]
-    client_id: Option<String>,
-    #[serde(default)]
-    scope: Option<String>,
-    #[serde(default)]
-    code_challenge: Option<String>,
-    #[serde(default)]
-    code_challenge_method: Option<String>,
-}
-
-/// POST /oauth/device_authorization (RFC 8628 §3.1–3.2) — mint a device code and
-/// point the user at the verification URI that launches II's `/mcp` handshake.
-pub async fn device_authorization(State(store): State<AuthStore>, Form(req): Form<DeviceAuthzForm>) -> Response {
-    // We only verify PKCE with S256; reject any other method up front, and
-    // require a challenge whenever a method is named.
-    if let Some(method) = &req.code_challenge_method {
-        if method != "S256" {
-            return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "only code_challenge_method=S256 is supported");
-        }
-        if req.code_challenge.is_none() {
-            return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "code_challenge required when code_challenge_method is set");
-        }
-    }
-
-    let session_id = format!("sess-{}", Uuid::new_v4());
-    let device_code = format!("dc-{}", Uuid::new_v4());
-    let user_code = Uuid::new_v4().simple().to_string()[..8].to_uppercase();
-
-    store.devices.write().await.insert(
-        session_id.clone(),
-        DeviceAuth {
-            device_code: device_code.clone(),
-            user_code: user_code.clone(),
-            session_id: session_id.clone(),
-            client_id: req.client_id.clone(),
-            scope: req.scope.clone().filter(|s| !s.is_empty()),
-            code_challenge: req.code_challenge.clone(),
-            created: Instant::now(),
-            live: false,
-            last_poll: None,
-        },
-    );
-
-    let verification_uri = format!("{}{}/oauth/device", base_url(), store.instance().oauth_prefix);
-    let verification_uri_complete = format!("{verification_uri}?user_code={user_code}");
-    Json(json!({
-        "device_code": device_code,
-        "user_code": user_code,
-        "verification_uri": verification_uri,
-        "verification_uri_complete": verification_uri_complete,
-        "expires_in": CONNECT_TTL.as_secs(),
-        "interval": POLL_INTERVAL_SECS,
-    }))
-    .into_response()
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DeviceVerifyQuery {
-    #[serde(default)]
-    user_code: Option<String>,
-}
-
-/// GET /oauth/device — the user opens this (via `verification_uri_complete`).
-/// With a valid `user_code` it launches II's `/mcp` handshake; otherwise it
-/// offers a minimal form to enter the code.
-pub async fn device_verify(State(store): State<AuthStore>, Query(q): Query<DeviceVerifyQuery>) -> Response {
-    let Some(user_code) = q.user_code.filter(|c| !c.is_empty()) else {
-        return device_code_form(store.instance().oauth_prefix);
-    };
-    let user_code = user_code.trim().to_uppercase();
-
-    let session_id = {
-        let devices = store.devices.read().await;
-        devices
-            .values()
-            .find(|d| d.user_code == user_code && d.created.elapsed() < CONNECT_TTL)
-            .map(|d| d.session_id.clone())
-    };
-    match session_id {
-        Some(sid) => js_redirect(&ii_mcp_url(store.instance(), &sid)),
-        None => connect_error("unknown or expired code — restart the connection from your client"),
-    }
-}
-
-/// A minimal manual code-entry page for the bare `verification_uri`.
-fn device_code_form(prefix: &str) -> Response {
-    Html(format!(
-        "<!DOCTYPE html><meta charset=utf-8><body style=\"font-family:system-ui;max-width:32rem;margin:3rem auto\">\
-         <h1>Connect Internet Identity</h1>\
-         <form method=get action=\"{prefix}/oauth/device\">\
-         <p>Enter the code shown by your client:</p>\
-         <input name=user_code autofocus style=\"font-size:1.2rem;padding:.4rem\">\
-         <button type=submit style=\"font-size:1.2rem;padding:.4rem 1rem\">Continue</button>\
-         </form></body>"
-    ))
-    .into_response()
 }
 
 /// Build an instance's II `/mcp` handshake URL for a connection. Everything is in
@@ -576,50 +622,100 @@ pub struct ConnectCallback {
     /// the epoch (u64 ns overflows JSON numbers, so it is a string on the wire).
     #[serde(default)]
     expiration: Option<String>,
+    /// Present on the completion notification (§0): `"queries"` = read-only
+    /// session, `"all"` = full access. Lets us learn the access level at connect
+    /// without minting a probe delegation; best-effort like the rest of the POST.
+    #[serde(default)]
+    permissions: Option<String>,
+}
+
+/// Outcome of the atomic single-use claim on a key request's `connect_state`.
+enum KeyClaim {
+    /// Won the claim: mint the keypair + `finish_secret`.
+    Claimed,
+    /// Known + unexpired but already claimed — a repeat key request (observed).
+    RepeatConsumed,
+    /// Unknown or expired — an ordinary rejected replay/stale link.
+    Reject,
 }
 
 /// POST /oauth/connect/callback — II's frontend makes TWO cross-origin JSON
 /// POSTs here, distinguished by the `expiration` field:
-///   (a) key request `{state}` → 200 `{public_key}` (fresh session keypair);
-///   (b) completion `{state, expiration}` → mark the grant live; any 2xx.
+///   (a) key request `{state}` → 200 `{public_key, finish_url}` (fresh keypair +
+///       one-time `finish_secret` embedded in `finish_url`; STRICTLY single-use);
+///   (b) completion `{state, expiration, permissions}` → record expiry + access
+///       level only (a latency hint; never sets `registered`); any 2xx.
 /// Never returns a redirect (the response is consumed by `fetch()`), and never
 /// receives or verifies a delegation chain.
 pub async fn connect_callback(State(store): State<AuthStore>, Json(body): Json<ConnectCallback>) -> Response {
     match &body.expiration {
-        // (a) Key request — require a valid, unexpired pending connection (reject
-        // unknown/replayed/expired state with a non-2xx so II aborts), then
-        // generate (lazily) this connection's session keypair and return its
-        // public key for II's frontend to register. For the auth-code flow, also
-        // return `finish_url` so II navigates the browser back to us to close the
-        // OAuth loop; the device flow omits it (the II tab finishes on its own).
+        // (a) Key request — STRICTLY single-use per `connect_state` (P1). Atomically
+        // (under one lock) require the PA is known/unexpired AND not yet claimed,
+        // then claim it by storing `H(finish_secret)`; any later or racing key
+        // request 403s (no keypair, no secret). This atomic compare-and-set is what
+        // makes secret-disclosure and victim-registration mutually exclusive.
         None => {
-            let is_authcode = store.connect_known_authz(&body.state).await;
-            if !is_authcode && !store.connect_known_device(&body.state).await {
-                return (StatusCode::FORBIDDEN, Json(json!({ "error": "invalid_state" }))).into_response();
+            let secret = fresh_secret();
+            let claim = {
+                let mut authz = store.authz.write().await;
+                match authz.get_mut(&body.state) {
+                    // Known, unexpired, not yet claimed: win the single-use claim.
+                    Some(a) if a.created.elapsed() < CONNECT_TTL && a.finish_secret_hash.is_none() => {
+                        a.finish_secret_hash = Some(sha256(&secret));
+                        KeyClaim::Claimed
+                    }
+                    // Known, unexpired, ALREADY claimed: a repeat key request — the
+                    // signal we watch (II retry regression, or a stray probe).
+                    Some(a) if a.created.elapsed() < CONNECT_TTL => KeyClaim::RepeatConsumed,
+                    // Unknown or expired: an ordinary rejected replay/stale link.
+                    _ => KeyClaim::Reject,
+                }
+            };
+            match claim {
+                KeyClaim::Claimed => {}
+                KeyClaim::RepeatConsumed => {
+                    let total = REPEAT_KEY_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::warn!(
+                        instance = store.instance().name,
+                        total,
+                        "repeat key request on a consumed connect_state (single-use, P1) — \
+                         a sustained rise means II is re-issuing the key request; an isolated hit \
+                         is a stray replay/probe"
+                    );
+                    return (StatusCode::FORBIDDEN, Json(json!({ "error": "invalid_state" }))).into_response();
+                }
+                KeyClaim::Reject => {
+                    return (StatusCode::FORBIDDEN, Json(json!({ "error": "invalid_state" }))).into_response();
+                }
             }
+            // Only the single winner mints the session keypair and gets the secret.
             let public_key = store.identities.session_pubkey_b64(&body.state).await;
-            let mut resp = json!({ "public_key": public_key });
-            if is_authcode {
-                resp["finish_url"] = json!(format!(
-                    "{}{}/oauth/finish?id={}",
-                    base_url(),
-                    store.instance().oauth_prefix,
-                    urlencoding::encode(&body.state)
-                ));
-            }
-            (StatusCode::OK, Json(resp)).into_response()
+            // `finish_secret` rides in the QUERY (P2): path-only access logs won't
+            // capture it, and /oauth/finish sends no `Referer`. It reaches only this
+            // (the consenting) browser, which II then navigates to `finish_url`.
+            let finish_url = format!(
+                "{}{}/oauth/finish?id={}&fs={}",
+                base_url(),
+                store.instance().oauth_prefix,
+                urlencoding::encode(&body.state),
+                urlencoding::encode(&secret),
+            );
+            (StatusCode::OK, Json(json!({ "public_key": public_key, "finish_url": finish_url }))).into_response()
         }
-        // (b) Completion notification — best-effort. Mark the grant live if the
-        // connection is still known; tolerate a missing/expired state (e.g. the
-        // grant was already consumed via the signed-call fallback) with a 2xx, so
-        // a late completion POST doesn't make II treat an otherwise-successful
-        // connect as failed. Never create a session for an unknown state.
+        // (b) Completion notification — a best-effort LATENCY HINT only (P3). Record
+        // the grant expiration and access level (`permissions`, §0/H2) if the PA is
+        // known, but NEVER set `registered`: this POST is unauthenticated (any
+        // `connect_state`-knower can send it), so registration is proven separately
+        // at /oauth/finish by a signed `mcp_get_accounts`. Tolerate a missing/expired
+        // state with a 2xx so a late POST doesn't fail an otherwise-good connect.
         Some(exp) => {
-            let known = store.mark_live(&body.state).await;
-            if known {
+            if store.authz_known(&body.state).await {
                 match exp.trim().parse::<u64>() {
                     Ok(exp_ns) => store.identities.set_grant_expiration(&body.state, exp_ns).await,
                     Err(_) => tracing::warn!("connect completion had unparseable expiration"),
+                }
+                if let Some(permissions) = &body.permissions {
+                    store.identities.set_permissions(&body.state, permissions).await;
                 }
             }
             StatusCode::NO_CONTENT.into_response()
@@ -628,37 +724,14 @@ pub async fn connect_callback(State(store): State<AuthStore>, Json(body): Json<C
 }
 
 impl AuthStore {
-    /// Whether `state` names a known, unexpired auth-code pending connect.
-    async fn connect_known_authz(&self, state: &str) -> bool {
+    /// Whether `state` names a known, unexpired pending connect (read-only; used by
+    /// the completion POST to decide whether to record its expiry/permissions hint).
+    async fn authz_known(&self, state: &str) -> bool {
         self.authz
             .read()
             .await
             .get(state)
             .is_some_and(|a| a.created.elapsed() < CONNECT_TTL)
-    }
-
-    /// Whether `state` names a known, unexpired device pending connect.
-    async fn connect_known_device(&self, state: &str) -> bool {
-        self.devices
-            .read()
-            .await
-            .get(state)
-            .is_some_and(|d| d.created.elapsed() < CONNECT_TTL)
-    }
-
-    /// Mark the pending connect live in whichever flow owns `state`; returns
-    /// whether it was known.
-    async fn mark_live(&self, state: &str) -> bool {
-        let mut known = false;
-        if let Some(a) = self.authz.write().await.get_mut(state) {
-            a.live = true;
-            known = true;
-        }
-        if let Some(d) = self.devices.write().await.get_mut(state) {
-            d.live = true;
-            known = true;
-        }
-        known
     }
 }
 
@@ -689,7 +762,7 @@ fn connect_error(message: &str) -> Response {
         .into_response()
 }
 
-// ---- Token: exchange a code, or poll a device grant ---------------------
+// ---- Token: exchange an authorization code ------------------------------
 
 #[derive(Debug, Deserialize)]
 pub struct TokenForm {
@@ -697,20 +770,17 @@ pub struct TokenForm {
     #[serde(default)]
     code: String,
     #[serde(default)]
-    device_code: String,
-    #[serde(default)]
     client_id: String,
     #[serde(default)]
     code_verifier: Option<String>,
 }
 
-/// POST /oauth/token — `authorization_code` (poll-bridge clients) or the RFC 8628
-/// `device_code` grant.
+/// POST /oauth/token — the `authorization_code` grant (the only grant we support;
+/// the RFC 8628 device grant was dropped).
 pub async fn token(State(store): State<AuthStore>, Form(req): Form<TokenForm>) -> Response {
     match req.grant_type.as_str() {
         "authorization_code" => token_authorization_code(store, req).await,
-        g if g == DEVICE_GRANT_TYPE => token_device_code(store, req).await,
-        _ => oauth_err(StatusCode::BAD_REQUEST, "unsupported_grant_type", "authorization_code or device_code"),
+        _ => oauth_err(StatusCode::BAD_REQUEST, "unsupported_grant_type", "only authorization_code is supported"),
     }
 }
 
@@ -734,65 +804,11 @@ async fn token_authorization_code(store: AuthStore, req: TokenForm) -> Response 
         }
     }
     store.authz.write().await.remove(&grant.session_id);
-    issue_token(&store, &grant.session_id, None).await
-}
-
-async fn token_device_code(store: AuthStore, req: TokenForm) -> Response {
-    if req.device_code.is_empty() {
-        return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "device_code required");
-    }
-    let (session_id, code_challenge, scope) = {
-        let mut devices = store.devices.write().await;
-        let Some(d) = devices.values_mut().find(|d| d.device_code == req.device_code) else {
-            return oauth_err(StatusCode::BAD_REQUEST, "invalid_grant", "unknown or used device_code");
-        };
-        if d.created.elapsed() >= CONNECT_TTL {
-            return oauth_err(StatusCode::BAD_REQUEST, "expired_token", "device_code expired — restart");
-        }
-        if !req.client_id.is_empty() {
-            if let Some(cid) = &d.client_id {
-                if cid != &req.client_id {
-                    return oauth_err(StatusCode::BAD_REQUEST, "invalid_client", "client_id mismatch");
-                }
-            }
-        }
-        if let Some(last) = d.last_poll {
-            if last.elapsed() < Duration::from_secs(POLL_INTERVAL_SECS) {
-                return oauth_err(StatusCode::BAD_REQUEST, "slow_down", "poll no faster than the interval");
-            }
-        }
-        d.last_poll = Some(Instant::now());
-        (d.session_id.clone(), d.code_challenge.clone(), d.scope.clone())
-    };
-
-    let live_flag = store
-        .devices
-        .read()
-        .await
-        .values()
-        .find(|d| d.device_code == req.device_code)
-        .map(|d| d.live)
-        .unwrap_or(false);
-    if !store.grant_live(&session_id, live_flag).await {
-        return oauth_err(StatusCode::BAD_REQUEST, "authorization_pending", "waiting for Internet Identity");
-    }
-
-    if let Some(challenge) = &code_challenge {
-        let verifier = match &req.code_verifier {
-            Some(v) => v,
-            None => return oauth_err(StatusCode::BAD_REQUEST, "invalid_grant", "code_verifier required"),
-        };
-        if &pkce_s256(verifier) != challenge {
-            return oauth_err(StatusCode::BAD_REQUEST, "invalid_grant", "PKCE verification failed");
-        }
-    }
-
-    store.devices.write().await.retain(|_, d| d.device_code != req.device_code);
-    issue_token(&store, &session_id, scope).await
+    issue_token(&store, &grant.session_id).await
 }
 
 /// Mint + store an access token bound to the session key's principal.
-async fn issue_token(store: &AuthStore, session_id: &str, scope: Option<String>) -> Response {
+async fn issue_token(store: &AuthStore, session_id: &str) -> Response {
     let principal = store
         .identities
         .session_principal(session_id)
@@ -811,15 +827,12 @@ async fn issue_token(store: &AuthStore, session_id: &str, scope: Option<String>)
     );
     tracing::info!(%principal, "issued MCP access token");
 
-    let mut resp = json!({
+    Json(json!({
         "access_token": access_token,
         "token_type": "Bearer",
         "expires_in": TOKEN_TTL.as_secs(),
-    });
-    if let Some(scope) = scope {
-        resp["scope"] = json!(scope);
-    }
-    Json(resp).into_response()
+    }))
+    .into_response()
 }
 
 fn pkce_s256(verifier: &str) -> String {
@@ -840,7 +853,7 @@ pub struct RegisterRequest {
 }
 
 /// POST /oauth/register (RFC 7591). `redirect_uris` are stored for the auth-code
-/// flow; a device-only client may register without any.
+/// flow — the only grant we support.
 pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRequest>) -> Response {
     let client_id = format!("client-{}", Uuid::new_v4());
     let snapshot = {
@@ -851,8 +864,8 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
     tokio::task::spawn_blocking(move || persist_clients(&snapshot)).await.ok();
 
     // Honour the requested grant types (intersected with what we support); fall
-    // back to both if the client didn't ask for any.
-    let supported = ["authorization_code", DEVICE_GRANT_TYPE];
+    // back to authorization_code if the client didn't ask for any.
+    let supported = ["authorization_code"];
     let granted: Vec<String> = if req.grant_types.is_empty() {
         supported.iter().map(|s| s.to_string()).collect()
     } else {
@@ -888,11 +901,10 @@ pub async fn authorization_server_metadata(State(store): State<AuthStore>) -> Re
     Json(json!({
         "issuer": issuer,
         "authorization_endpoint": format!("{issuer}/oauth/authorize"),
-        "device_authorization_endpoint": format!("{issuer}/oauth/device_authorization"),
         "token_endpoint": format!("{issuer}/oauth/token"),
         "registration_endpoint": format!("{issuer}/oauth/register"),
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", DEVICE_GRANT_TYPE],
+        "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
     }))
@@ -1072,6 +1084,25 @@ mod tests {
         assert!(no_token.contains(&format!("resource_metadata=\"{meta}\"")));
     }
 
+    /// H3: the binding cookie is extracted by name from the `Cookie` header
+    /// (among other cookies), and its absence yields `None` — `finish` then
+    /// refuses to complete a flow the browser didn't start.
+    #[test]
+    fn connect_cookie_extracts_named_value() {
+        use axum::http::{header::COOKIE, HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        assert_eq!(super::connect_cookie(&h), None);
+        h.insert(
+            COOKIE,
+            HeaderValue::from_static("other=1; mcp_connect=bind-xyz; last=2"),
+        );
+        assert_eq!(super::connect_cookie(&h).as_deref(), Some("bind-xyz"));
+        // A different cookie name present but not ours -> None.
+        let mut h2 = HeaderMap::new();
+        h2.insert(COOKIE, HeaderValue::from_static("session=abc"));
+        assert_eq!(super::connect_cookie(&h2), None);
+    }
+
     #[test]
     fn build_redirect_encodes_code_and_state() {
         let r = build_redirect("https://claude.ai/cb", "mcp-code-1", "abc/def");
@@ -1079,5 +1110,121 @@ mod tests {
         // Appends with & when the redirect already has a query.
         let r2 = build_redirect("https://x.test/cb?foo=1", "c", "");
         assert_eq!(r2, "https://x.test/cb?foo=1&code=c");
+    }
+
+    /// H3/P5: `finish_secret` hygiene helpers. `fresh_secret` is high-entropy and
+    /// unique; `sha256` is deterministic; `ct_eq` matches equal inputs and rejects
+    /// unequal ones (and differing lengths) without early-out.
+    #[test]
+    fn secret_helpers_behave() {
+        let s1 = super::fresh_secret();
+        let s2 = super::fresh_secret();
+        assert_ne!(s1, s2, "secrets must be unique");
+        assert!(s1.len() >= 43, "256-bit base64url is 43 chars (>=128-bit floor): {}", s1.len());
+        // Deterministic hash; constant-time compare of equal vs. unequal.
+        assert_eq!(super::sha256(&s1), super::sha256(&s1));
+        assert!(super::ct_eq(&super::sha256(&s1), &super::sha256(&s1)));
+        assert!(!super::ct_eq(&super::sha256(&s1), &super::sha256(&s2)));
+        assert!(!super::ct_eq(b"abc", b"abcd"));
+        assert!(super::ct_eq(b"", b""));
+    }
+
+    // Build an AuthStore over a dummy II instance (these tests never hit the
+    // network — the key-request path is pure-local crypto/state).
+    fn test_store() -> super::AuthStore {
+        use crate::identities::{Identities, IiInstance};
+        use candid::Principal;
+        let ids = Identities::new(IiInstance {
+            name: "test",
+            ii_url: "https://ii.test".into(),
+            ii_canister: Principal::anonymous(),
+            oauth_prefix: "",
+            mcp_path: "/mcp",
+        });
+        super::AuthStore::new(ids, super::SharedClients(std::sync::Arc::default()))
+    }
+
+    async fn seed_pending(store: &super::AuthStore, id: &str, cookie: &str) {
+        // Insert a pending authorization directly (bypasses the browser redirect).
+        store.authz.write().await.insert(
+            id.to_string(),
+            super::AuthzPending {
+                client_id: "c".into(),
+                redirect_uri: "https://app.test/cb".into(),
+                client_state: String::new(),
+                code_challenge: Some("cc".into()),
+                cookie: cookie.into(),
+                created: std::time::Instant::now(),
+                finish_secret_hash: None,
+                code: None,
+            },
+        );
+    }
+
+    /// H3/P1: the key request is STRICTLY single-use per `connect_state`. The first
+    /// mints the keypair + `finish_secret` (embedded in `finish_url`'s query) and
+    /// claims the PA (`finish_secret_hash` set); a second one 403s — no keypair, no
+    /// secret. This is the atomic claim that makes secret-disclosure and
+    /// victim-registration mutually exclusive.
+    #[tokio::test]
+    async fn key_request_is_single_use_and_mints_finish_secret() {
+        use axum::extract::State;
+        use axum::Json;
+        let store = test_store();
+        seed_pending(&store, "sess-x", "bind-1").await;
+
+        let r1 = super::connect_callback(
+            State(store.clone()),
+            Json(super::ConnectCallback { state: "sess-x".into(), expiration: None, permissions: None }),
+        )
+        .await;
+        assert_eq!(r1.status(), axum::http::StatusCode::OK);
+        assert!(
+            store.authz.read().await.get("sess-x").unwrap().finish_secret_hash.is_some(),
+            "first key request must claim the PA"
+        );
+        let body = axum::body::to_bytes(r1.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let finish_url = v["finish_url"].as_str().unwrap();
+        assert!(finish_url.contains("&fs="), "finish_url must carry the secret in the query: {finish_url}");
+        assert!(!finish_url.contains("/fs/"), "secret must not be a path segment (P2)");
+        assert!(v["public_key"].as_str().is_some());
+
+        // Second key request for the same state (attacker race / replay) => 403,
+        // and it bumps the repeat-key-request observability counter (P1 health).
+        let before = super::repeat_key_requests();
+        let r2 = super::connect_callback(
+            State(store.clone()),
+            Json(super::ConnectCallback { state: "sess-x".into(), expiration: None, permissions: None }),
+        )
+        .await;
+        assert_eq!(r2.status(), axum::http::StatusCode::FORBIDDEN, "single-use: replay must 403");
+        assert!(
+            super::repeat_key_requests() > before,
+            "a repeat key request on a consumed connect_state must be counted"
+        );
+    }
+
+    /// P3: a completion POST must NOT materialize the connection — with no prior
+    /// key request it records nothing that could let `/oauth/finish` proceed (it
+    /// never sets a `finish_secret`, so the consenter proof can't be satisfied).
+    #[tokio::test]
+    async fn completion_post_does_not_materialize_finish_secret() {
+        use axum::extract::State;
+        use axum::Json;
+        let store = test_store();
+        seed_pending(&store, "sess-y", "bind-2").await;
+        let r = super::connect_callback(
+            State(store.clone()),
+            Json(super::ConnectCallback {
+                state: "sess-y".into(),
+                expiration: Some("1000".into()),
+                permissions: Some("all".into()),
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), axum::http::StatusCode::NO_CONTENT);
+        // No key request ran, so no finish_secret exists => finish can never pass clause 2.
+        assert!(store.authz.read().await.get("sess-y").unwrap().finish_secret_hash.is_none());
     }
 }

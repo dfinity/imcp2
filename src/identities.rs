@@ -72,6 +72,17 @@ const II_CANISTER_ID_PROD_DEFAULT: &str = "rdmx6-jaaaa-aaaaa-aaadq-cai";
 const RECONNECT_MSG: &str = "Your Internet Identity session is over (the grant expired, was revoked, \
      or was replaced by a newer connection). Reconnect with Internet Identity to continue — do not retry.";
 
+/// Shown when a tool needs update (write) access but the II session is read-only
+/// (`permissions = "queries"` — the default when the user just clicks "Allow" on
+/// II's consent screen, which defaults to read-only). The IC rejects update calls
+/// made through a read-only session's delegations at ingress, which would
+/// otherwise surface as an opaque low-level rejection — so we stop early with an
+/// actionable message (H2).
+const READ_ONLY_MSG: &str = "This Internet Identity session is read-only, so it can't make changes. \
+     Creating, installing, starting, stopping, or deleting canisters — and even reading canister status \
+     — are update calls that a read-only session can't make. Reconnect with Internet Identity and turn \
+     OFF the read-only option on the consent screen, then try again.";
+
 /// One Internet Identity instance this server can connect users against. The
 /// default ("beta") instance serves `/mcp` with its OAuth AS at the root of
 /// `PUBLIC_URL`; the "prod" instance serves `/mcp-prod` with a path-scoped AS
@@ -137,13 +148,23 @@ fn now_ns() -> u64 {
 
 /// Remap a domain to the `target_origin` II expects for account derivation.
 /// IC gateway domains (`*.icp0.io`, `*.icp.net`) map to the canonical
-/// `*.ic0.app` origin; any other domain is passed through as `https://<domain>`.
+/// `*.ic0.app` origin; any other domain is passed through as `https://<host>`.
+///
+/// II derives the app principal from an anchored regex on a bare origin, so we
+/// first reduce the input to its authority (`host[:port]`): drop the scheme, then
+/// anything from the first path/query/fragment separator, then a redundant `:443`
+/// (the default HTTPS port). Without this, a `target_origin` carrying a path,
+/// `:443`, or a trailing slash would fall through un-remapped and derive a
+/// DIFFERENT principal (H1). Note this only replicates II's *domain-based*
+/// derivation — a dapp declaring a custom derivation origin via
+/// `/.well-known/ii-alternative-origins` is NOT handled here (a known limitation).
 fn target_origin(domain: &str) -> String {
     let host = domain
         .trim()
         .trim_start_matches("https://")
         .trim_start_matches("http://");
-    let host = host.split('/').next().unwrap_or(host);
+    let host = host.split(['/', '?', '#']).next().unwrap_or(host);
+    let host = host.strip_suffix(":443").unwrap_or(host);
     for gateway in [".icp0.io", ".icp.net"] {
         if let Some(label) = host.strip_suffix(gateway) {
             return format!("https://{label}.ic0.app");
@@ -167,6 +188,12 @@ struct Session {
     /// `Unauthorized` from a signed call is the authoritative "session over"
     /// signal.
     grant_expiration_ns: Option<u64>,
+    /// The session's access level from the completion POST's `permissions` field
+    /// (§0/H2): `Some(true)` = read-only (`"queries"`), `Some(false)` = full
+    /// (`"all"`), `None` = not yet learned (the best-effort POST didn't arrive).
+    /// Update calls are rejected by the IC at ingress under a read-only session,
+    /// so tools consult this to fail early with an actionable message.
+    read_only: Option<bool>,
     /// `(domain, account_number)` -> most recently derived per-app delegation.
     /// Keyed by account too, since each account at an origin signs as a distinct
     /// principal (`account_number == None` is that origin's default account).
@@ -192,8 +219,8 @@ impl AppDelegation {
 
 /// One of the user's Internet Identity accounts at an app origin, as returned by
 /// [`Identities::list_accounts`] (II's `mcp_get_accounts`). Each account is a
-/// distinct per-origin principal; `account_number == None`/`name == None` is the
-/// origin's default ("synthetic") account, which every user has automatically.
+/// distinct per-origin principal; `account_number == None`/`name == None` selects
+/// the anchor's current (user-controllable) default account at that origin.
 pub struct AccountInfo {
     /// II account number — `None` for the origin's default account. Pass the
     /// account's `name` to the acting tools to use a non-default account; the
@@ -233,6 +260,7 @@ impl Identities {
                 key_seed,
                 pubkey_der,
                 grant_expiration_ns: None,
+                read_only: None,
                 app_delegations: HashMap::new(),
             }
         });
@@ -272,6 +300,49 @@ impl Identities {
         if let Some(s) = sessions.get_mut(session_id) {
             s.grant_expiration_ns = Some(expiration_ns);
         }
+    }
+
+    /// Record the session's access level from the completion POST's `permissions`
+    /// field (§0/H2), using the same vocabulary as the delegation's `permissions`:
+    /// `"queries"` = read-only, `"all"` = full access (both case-insensitive). Any
+    /// UNRECOGNIZED value leaves the level `None` (unknown) rather than assuming
+    /// full access — so an unexpected/future value falls through to the ingress
+    /// rejection fallback instead of the server wrongly considering the session
+    /// writable.
+    pub async fn set_permissions(&self, session_id: &str, permissions: &str) {
+        let level = match permissions.trim().to_ascii_lowercase().as_str() {
+            "queries" => Some(true),
+            "all" => Some(false),
+            other => {
+                tracing::warn!("connect completion had unrecognized permissions {other:?}; access level left unknown");
+                return;
+            }
+        };
+        self.ensure_session(session_id).await;
+        let mut sessions = self.sessions.write().await;
+        if let Some(s) = sessions.get_mut(session_id) {
+            s.read_only = level;
+        }
+    }
+
+    /// This session's known access level: `Some(true)` = read-only, `Some(false)`
+    /// = full, `None` = not yet learned (the best-effort completion POST didn't
+    /// arrive). Surfaced by `get_principal` so the agent can set expectations.
+    pub async fn is_read_only(&self, session_id: &str) -> Option<bool> {
+        let sessions = self.sessions.read().await;
+        sessions.get(session_id).and_then(|s| s.read_only)
+    }
+
+    /// Guard a tool that needs update (write) access (H2): error early with an
+    /// actionable "reconnect with read-only off" message if the session is KNOWN
+    /// to be read-only. An unknown level (`None`) passes — we can't be sure the
+    /// POST simply didn't arrive, so the call proceeds and the IC's ingress
+    /// rejection (if any) surfaces as the fallback signal.
+    pub async fn require_write(&self, session_id: &str) -> Result<(), String> {
+        if self.is_read_only(session_id).await == Some(true) {
+            return Err(READ_ONLY_MSG.to_string());
+        }
+        Ok(())
     }
 
     /// Build the plain session-key identity (`BasicIdentity`) the server signs
@@ -315,9 +386,10 @@ impl Identities {
     /// List the user's Internet Identity accounts at an app `domain`, via II's
     /// `mcp_get_accounts(target_origin)` signed as the session key. II recovers
     /// the anchor from the caller (the registered session-key principal), so no
-    /// anchor number is needed. Every user has a default ("synthetic") account
-    /// (`account_number == None`, no name) at any origin, plus any named accounts
-    /// they created there; each is a distinct per-origin principal.
+    /// anchor number is needed. Every user has a default account (`account_number
+    /// == None`, no name) at any origin — the anchor's current, user-controllable
+    /// default there — plus any named accounts they created; each is a distinct
+    /// per-origin principal.
     pub async fn list_accounts(
         &self,
         session_id: &str,
@@ -352,9 +424,9 @@ impl Identities {
     }
 
     /// Whether the grant is currently usable: a signed `mcp_get_accounts` for the
-    /// MCP origin succeeds. Used by the device-flow poll as a best-effort "the
-    /// user has finished connecting" signal, since the completion-notification
-    /// POST is best-effort and may never arrive.
+    /// MCP origin succeeds. A best-effort fallback used at `/oauth/finish` to
+    /// confirm the user has finished connecting, since the completion-notification
+    /// POST (which also confirms this) is best-effort and may never arrive.
     pub async fn grant_is_live(&self, session_id: &str) -> bool {
         self.list_accounts(session_id, &crate::auth::base_url())
             .await
@@ -372,7 +444,7 @@ impl Identities {
         name: Option<&str>,
     ) -> Result<Option<u64>, String> {
         let Some(name) = name else {
-            return Ok(None); // default ("synthetic") account
+            return Ok(None); // the anchor's current (user-controllable) default account
         };
         let accounts = self.list_accounts(session_id, domain).await?;
         let mut matching = accounts.iter().filter(|a| a.name.as_deref() == Some(name));
@@ -661,6 +733,49 @@ mod tests {
         assert_eq!(target_origin("http://oisy.com"), "https://oisy.com");
     }
 
+    /// H1a: a `target_origin` carrying `:443`, a path, a trailing slash, a query,
+    /// or a fragment must normalize to the bare `https://<host>` origin — else II
+    /// derives a DIFFERENT principal. The gateway remap still applies afterwards.
+    #[test]
+    fn target_origin_normalizes_port_path_and_slash() {
+        assert_eq!(target_origin("https://oisy.com:443"), "https://oisy.com");
+        assert_eq!(target_origin("https://oisy.com/"), "https://oisy.com");
+        assert_eq!(target_origin("https://oisy.com/app/x"), "https://oisy.com");
+        assert_eq!(target_origin("https://oisy.com?a=1"), "https://oisy.com");
+        assert_eq!(target_origin("https://oisy.com#frag"), "https://oisy.com");
+        assert_eq!(target_origin("https://oisy.com:443/app/x"), "https://oisy.com");
+        // The gateway remap still fires once :443 / path is stripped.
+        assert_eq!(target_origin("foo.icp0.io:443"), "https://foo.ic0.app");
+        assert_eq!(target_origin("https://foo.icp0.io/app"), "https://foo.ic0.app");
+        // A non-default port is part of the origin and is kept.
+        assert_eq!(target_origin("https://localhost:8080"), "https://localhost:8080");
+    }
+
+    /// H2: `permissions` from the completion POST sets the read-only level, which
+    /// `require_write` gates on. Unknown (POST not yet arrived) permits the write
+    /// (we fall back to the IC's ingress rejection); `"queries"` refuses it.
+    #[tokio::test]
+    async fn permissions_set_read_only_and_gate_writes() {
+        let ids = test_ids();
+        ids.ensure_session("sess").await;
+        assert_eq!(ids.is_read_only("sess").await, None);
+        assert!(ids.require_write("sess").await.is_ok());
+        ids.set_permissions("sess", "queries").await;
+        assert_eq!(ids.is_read_only("sess").await, Some(true));
+        assert!(ids.require_write("sess").await.is_err());
+        // Case-insensitive, and "all" restores full access.
+        ids.set_permissions("sess", "ALL").await;
+        assert_eq!(ids.is_read_only("sess").await, Some(false));
+        assert!(ids.require_write("sess").await.is_ok());
+        // An UNRECOGNIZED value must NOT assume full access: it leaves the level
+        // unknown (None) so the call falls through to the ingress-rejection path,
+        // rather than the server wrongly reporting the session as writable.
+        ids.ensure_session("sess2").await;
+        ids.set_permissions("sess2", "something-new").await;
+        assert_eq!(ids.is_read_only("sess2").await, None);
+        assert!(ids.require_write("sess2").await.is_ok());
+    }
+
     // An Identities store over a dummy II instance (tests never hit the network).
     fn test_ids() -> Identities {
         Identities::new(IiInstance {
@@ -762,7 +877,7 @@ mod tests {
         let bytes = Encode!(&wire).expect("encode");
         let decoded = Decode!(&bytes, McpGetAccountsReply).expect("decode").expect("Ok arm");
         assert_eq!(decoded.len(), 2);
-        // Default (synthetic) account: no number, no name.
+        // Default account (the anchor's current default): no number, no name.
         assert_eq!(decoded[0].account_number, None);
         assert_eq!(decoded[0].name, None);
         // Named account: number, name, and last_used recovered (origin ignored).
