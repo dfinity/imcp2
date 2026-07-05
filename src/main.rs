@@ -174,7 +174,8 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Fetch the Candid (.did) interface definition of an Internet Computer canister, read from its public `candid:service` metadata."
+        description = "Fetch the Candid (.did) interface definition of an Internet Computer canister, read from its public `candid:service` metadata.",
+        annotations(title = "Get Candid interface", read_only_hint = true, destructive_hint = false, open_world_hint = true),
     )]
     async fn get_candid(
         &self,
@@ -200,7 +201,8 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `domain` to call anonymously, or pass an application domain (e.g. \"oisy.com\") to call as your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. By default this uses the app's default account; pass `account` (an account name from list_accounts) to act as a specific named account there. Set is_query=true for read-only query calls. If get_candid couldn't fetch the interface, pass the `.did` text as `candid` (e.g. ask the user for it) so args/replies are still typed."
+        description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `domain` to call anonymously, or pass an application domain (e.g. \"oisy.com\") to call as your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. By default this uses the app's default account; pass `account` (an account name from list_accounts) to act as a specific named account there. Set is_query=true for read-only query calls. If get_candid couldn't fetch the interface, pass the `.did` text as `candid` (e.g. ask the user for it) so args/replies are still typed.",
+        annotations(title = "Call a canister method", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
     )]
     async fn call_canister(
         &self,
@@ -263,7 +265,8 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Get the Internet Computer principal you act as at a given application `domain` (e.g. \"oisy.com\"), without making a canister call. The app's account delegation is derived on demand (same as call_canister) from this connection's standing Internet Identity credential, and its principal is returned. By default this resolves the app's default account; pass `account` (an account name from list_accounts) for a specific named account there. Use this when a flow needs the principal itself (e.g. to look up a balance or account) rather than to invoke a method. NOTE: the principal is derived from the app's DOMAIN, which is usually — but not always — the identity a browser sign-in to that app would use. Some apps declare a CUSTOM derivation origin (via /.well-known/ii-alternative-origins) that isn't exposed here; if the returned principal (or an account/balance) doesn't match what the user sees in their browser at that app, tell them so and offer to look up the app's ii-alternative-origins (web search / fetch) and retry."
+        description = "Get the Internet Computer principal you act as at a given application `domain` (e.g. \"oisy.com\"), without making a canister call. The app's account delegation is derived on demand (same as call_canister) from this connection's standing Internet Identity credential, and its principal is returned. By default this resolves the app's default account; pass `account` (an account name from list_accounts) for a specific named account there. Use this when a flow needs the principal itself (e.g. to look up a balance or account) rather than to invoke a method. NOTE: the principal is derived from the app's DOMAIN, which is usually — but not always — the identity a browser sign-in to that app would use. Some apps declare a CUSTOM derivation origin (via /.well-known/ii-alternative-origins) that isn't exposed here; if the returned principal (or an account/balance) doesn't match what the user sees in their browser at that app, tell them so and offer to look up the app's ii-alternative-origins (web search / fetch) and retry.",
+        annotations(title = "Get your principal at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
     )]
     async fn get_principal(
         &self,
@@ -301,7 +304,8 @@ impl IcTools {
     }
 
     #[tool(
-        description = "List the user's Internet Identity accounts at an application `domain` (e.g. \"oisy.com\"). Internet Identity gives the user a distinct principal per app (derived from the app's domain), and within an app they may hold several accounts: a default account everyone gets automatically (the anchor's current, user-controllable default at that origin), plus any named accounts they created. Use this before acting on the user's behalf at an app: if there's only the default account, just proceed (call_canister/get_principal with no `account`); if there are several, pick one with the user (or act on each) by passing its name as `account`. Returns each account's name (the default has none), account number, and last-used time. If these accounts don't match what the user sees in their browser at this app, it may use a custom derivation origin not exposed here (offer to look up its ii-alternative-origins and retry). Requires an authenticated session."
+        description = "List the user's Internet Identity accounts at an application `domain` (e.g. \"oisy.com\"). Internet Identity gives the user a distinct principal per app (derived from the app's domain), and within an app they may hold several accounts: a default account everyone gets automatically (the anchor's current, user-controllable default at that origin), plus any named accounts they created. Use this before acting on the user's behalf at an app: if there's only the default account, just proceed (call_canister/get_principal with no `account`); if there are several, pick one with the user (or act on each) by passing its name as `account`. Returns each account's name (the default has none), account number, and last-used time. If these accounts don't match what the user sees in their browser at this app, it may use a custom derivation origin not exposed here (offer to look up its ii-alternative-origins and retry). Requires an authenticated session.",
+        annotations(title = "List your accounts at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
     )]
     async fn list_accounts(
         &self,
@@ -319,7 +323,8 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). Returns every canister id found, with provenance: the `x-ic-canister-id` header (the frontend/asset canister — authoritative), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. There is no authoritative reverse lookup for a site's backend, so results from env.json/bundle are candidates: pick by label (prefer production/IC ids) and confirm with get_candid before calling."
+        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). Returns every canister id found, with provenance: the `x-ic-canister-id` header (the frontend/asset canister — authoritative), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. There is no authoritative reverse lookup for a site's backend, so results from env.json/bundle are candidates: pick by label (prefer production/IC ids) and confirm with get_candid before calling.",
+        annotations(title = "Discover canisters behind a domain", read_only_hint = true, destructive_hint = false, open_world_hint = true),
     )]
     async fn discover_canisters(
         &self,
@@ -360,7 +365,8 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Find Internet Computer canisters by NAME. Searches the IC dashboard's service registries — the ICRC token ledgers (e.g. ckBTC, ckETH, ckUSDC, SNS tokens) by symbol/name, and the SNS project catalog by name — and returns matching canister ids. Use this when the user names a token, project, or service (e.g. \"ckUSDC\") rather than a canister id; then confirm with get_candid and call methods with call_canister. (No public name-search exists over arbitrary canisters; this covers the IC's labelled services.)"
+        description = "Find Internet Computer canisters by NAME. Searches the IC dashboard's service registries — the ICRC token ledgers (e.g. ckBTC, ckETH, ckUSDC, SNS tokens) by symbol/name, and the SNS project catalog by name — and returns matching canister ids. Use this when the user names a token, project, or service (e.g. \"ckUSDC\") rather than a canister id; then confirm with get_candid and call methods with call_canister. (No public name-search exists over arbitrary canisters; this covers the IC's labelled services.)",
+        annotations(title = "Find canisters by name", read_only_hint = true, destructive_hint = false, open_world_hint = true),
     )]
     async fn find_canister(
         &self,
@@ -395,7 +401,8 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Identify what an Internet Computer canister IS, from the IC dashboard: its label/name (e.g. \"ICP Ledger\"), type (e.g. \"ledger\"), controllers, hosting subnet, module hash, language, and latest upgrade proposal. Use this to make sense of a bare canister id — e.g. one returned by discover_canisters."
+        description = "Identify what an Internet Computer canister IS, from the IC dashboard: its label/name (e.g. \"ICP Ledger\"), type (e.g. \"ledger\"), controllers, hosting subnet, module hash, language, and latest upgrade proposal. Use this to make sense of a bare canister id — e.g. one returned by discover_canisters.",
+        annotations(title = "Identify a canister", read_only_hint = true, destructive_hint = false, open_world_hint = true),
     )]
     async fn lookup_canister(
         &self,
@@ -414,7 +421,8 @@ impl IcTools {
     // ---- ICP skills awareness ----------------------------------------------
 
     #[tool(
-        description = "List the official Internet Computer skills — authoritative how-to guides for authoring and shipping IC apps (Motoko language, mops/icp CLIs, cycles management, stable memory & upgrades, security, DeFi, auth, …). Returns each skill's name and a one-line description. Load a skill's full instructions with get_ic_skill(name). Consult these BEFORE writing Motoko/Rust canister code, building, or deploying."
+        description = "List the official Internet Computer skills — authoritative how-to guides for authoring and shipping IC apps (Motoko language, mops/icp CLIs, cycles management, stable memory & upgrades, security, DeFi, auth, …). Returns each skill's name and a one-line description. Load a skill's full instructions with get_ic_skill(name). Consult these BEFORE writing Motoko/Rust canister code, building, or deploying.",
+        annotations(title = "List Internet Computer skills", read_only_hint = true, destructive_hint = false, open_world_hint = false),
     )]
     async fn list_ic_skills(
         &self,
@@ -427,7 +435,8 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Fetch the full instructions (SKILL.md) of one Internet Computer skill by name (e.g. \"motoko\", \"icp-cli\", \"mops-cli\", \"cycles-management\", \"stable-memory\", \"canister-security\"). Call list_ic_skills first to see the available names. Use this to learn the exact, current way to do an IC task before doing it."
+        description = "Fetch the full instructions (SKILL.md) of one Internet Computer skill by name (e.g. \"motoko\", \"icp-cli\", \"mops-cli\", \"cycles-management\", \"stable-memory\", \"canister-security\"). Call list_ic_skills first to see the available names. Use this to learn the exact, current way to do an IC task before doing it.",
+        annotations(title = "Get an Internet Computer skill", read_only_hint = true, destructive_hint = false, open_world_hint = false),
     )]
     async fn get_ic_skill(
         &self,
@@ -442,7 +451,8 @@ impl IcTools {
     // ---- Canister creation & management (as your standing II principal) -----
 
     #[tool(
-        description = "Your cycles-ledger balance — the cycles that create_canister and top_up_canister spend. Acts as your Internet Identity principal (also printed). If it's empty, fund it first (e.g. via the icp CLI / cycles-management skill). Requires an authenticated session."
+        description = "Your cycles-ledger balance — the cycles that create_canister and top_up_canister spend. Acts as your Internet Identity principal (also printed). If it's empty, fund it first (e.g. via the icp CLI / cycles-management skill). Requires an authenticated session.",
+        annotations(title = "Check your cycles balance", read_only_hint = true, destructive_hint = false, open_world_hint = true),
     )]
     async fn cycles_balance(
         &self,
@@ -457,7 +467,8 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Create and fund a NEW Internet Computer canister, paying from your cycles-ledger balance (as your Internet Identity). Specify the amount as `cycles` (exact) or `icp` (a decimal-ICP string like \"0.5\", converted to cycles at the network's current rate). Controllers default to your own principal. You must already hold cycles in the cycles ledger (check with cycles_balance; fund via the icp CLI / cycles-management skill). Returns the new canister id — then build your Wasm (see the motoko/icp-cli skills) and install it with install_code. Requires an authenticated session."
+        description = "Create and fund a NEW Internet Computer canister, paying from your cycles-ledger balance (as your Internet Identity). Specify the amount as `cycles` (exact) or `icp` (a decimal-ICP string like \"0.5\", converted to cycles at the network's current rate). Controllers default to your own principal. You must already hold cycles in the cycles ledger (check with cycles_balance; fund via the icp CLI / cycles-management skill). Returns the new canister id — then build your Wasm (see the motoko/icp-cli skills) and install it with install_code. Requires an authenticated session.",
+        annotations(title = "Create a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true),
     )]
     async fn create_canister(
         &self,
@@ -474,7 +485,8 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Add cycles to an existing canister, paying from your cycles-ledger balance. Specify `cycles` (exact) or `icp` (decimal-ICP string, converted at the current rate). Requires an authenticated session."
+        description = "Add cycles to an existing canister, paying from your cycles-ledger balance. Specify `cycles` (exact) or `icp` (decimal-ICP string, converted at the current rate). Requires an authenticated session.",
+        annotations(title = "Top up a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true),
     )]
     async fn top_up_canister(
         &self,
@@ -491,7 +503,8 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Install a compiled Wasm module on a canister you control (as your Internet Identity). Provide the module as `wasm_base64` (or `wasm_hex`); large modules are uploaded via the chunk store automatically. `mode` is \"install\" (default, empty canister), \"reinstall\" (wipe state), or \"upgrade\" (preserve stable memory). `arg` is the init/upgrade argument in textual Candid, e.g. \"()\". Build the Wasm in your own environment first (see the motoko / icp-cli / mops-cli skills). Requires an authenticated session."
+        description = "Install a compiled Wasm module on a canister you control (as your Internet Identity). Provide the module as `wasm_base64` (or `wasm_hex`); large modules are uploaded via the chunk store automatically. `mode` is \"install\" (default, empty canister), \"reinstall\" (wipe state), or \"upgrade\" (preserve stable memory). `arg` is the init/upgrade argument in textual Candid, e.g. \"()\". Build the Wasm in your own environment first (see the motoko / icp-cli / mops-cli skills). Requires an authenticated session.",
+        annotations(title = "Install code on a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
     )]
     async fn install_code(
         &self,
@@ -508,7 +521,8 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Report a canister's status: run state, cycle balance, module hash, memory size, controllers, and allocations. Controller-only (acts as your Internet Identity). Requires an authenticated session."
+        description = "Report a canister's status: run state, cycle balance, module hash, memory size, controllers, and allocations. Controller-only (acts as your Internet Identity). This only READS status (it changes nothing), but on the IC it is an update call, so it needs a full (non-read-only) Internet Identity session. Requires an authenticated session.",
+        annotations(title = "Get canister status", read_only_hint = true, destructive_hint = false, open_world_hint = true),
     )]
     async fn canister_status(
         &self,
@@ -525,7 +539,8 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Update a canister's settings: controllers, compute/memory allocation, freezing threshold, reserved-cycles limit, wasm memory limit, or log visibility (\"controllers\"|\"public\"). Only the fields you pass are changed. WARNING: passing `controllers` REPLACES the whole set — include your own principal to remain a controller. Requires an authenticated session."
+        description = "Update a canister's settings: controllers, compute/memory allocation, freezing threshold, reserved-cycles limit, wasm memory limit, or log visibility (\"controllers\"|\"public\"). Only the fields you pass are changed. WARNING: passing `controllers` REPLACES the whole set — include your own principal to remain a controller. Requires an authenticated session.",
+        annotations(title = "Update canister settings", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true),
     )]
     async fn update_canister_settings(
         &self,
@@ -541,7 +556,10 @@ impl IcTools {
         ))
     }
 
-    #[tool(description = "Start a stopped canister you control. Requires an authenticated session.")]
+    #[tool(
+        description = "Start a stopped canister you control. Requires an authenticated session.",
+        annotations(title = "Start a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
+    )]
     async fn start_canister(
         &self,
         Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
@@ -556,7 +574,10 @@ impl IcTools {
         ))
     }
 
-    #[tool(description = "Stop a running canister you control (required before deleting it). Requires an authenticated session.")]
+    #[tool(
+        description = "Stop a running canister you control (required before deleting it). Requires an authenticated session.",
+        annotations(title = "Stop a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
+    )]
     async fn stop_canister(
         &self,
         Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
@@ -571,7 +592,10 @@ impl IcTools {
         ))
     }
 
-    #[tool(description = "Remove a canister's code and state, leaving it empty (it keeps its id and cycles). Acts as your Internet Identity. Requires an authenticated session.")]
+    #[tool(
+        description = "Remove a canister's code and state, leaving it empty (it keeps its id and cycles). Acts as your Internet Identity. Requires an authenticated session.",
+        annotations(title = "Uninstall code from a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true),
+    )]
     async fn uninstall_code(
         &self,
         Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
@@ -586,7 +610,10 @@ impl IcTools {
         ))
     }
 
-    #[tool(description = "Delete a canister permanently (irreversible — stop it first; remaining cycles are burned). Acts as your Internet Identity. Requires an authenticated session.")]
+    #[tool(
+        description = "Delete a canister permanently (irreversible — stop it first; remaining cycles are burned). Acts as your Internet Identity. Requires an authenticated session.",
+        annotations(title = "Delete a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
+    )]
     async fn delete_canister(
         &self,
         Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
@@ -1179,5 +1206,55 @@ mod tests {
         let typed = decode_bytes_with_did(did, "stats", &bytes).expect("typed decode");
         assert!(typed.contains("name ="), "typed should have `name`: {typed}");
         assert!(typed.contains("url ="), "typed should have `url`: {typed}");
+    }
+
+    // Every tool must carry MCP annotations, else clients fall back to the unsafe
+    // defaults (readOnly=false, destructive=true) and mislabel reads like
+    // get_candid as destructive. Assert the read/write classification serializes.
+    #[test]
+    fn every_tool_has_correct_read_write_annotations() {
+        let tools = super::IcTools::tool_router().list_all();
+        assert_eq!(tools.len(), 19, "expected 19 tools, got {}", tools.len());
+        assert!(
+            tools.iter().all(|t| t.annotations.is_some()),
+            "every tool must carry annotations (else clients assume write/destructive)"
+        );
+        let ann = |name: &str| {
+            tools
+                .iter()
+                .find(|t| &*t.name == name)
+                .unwrap_or_else(|| panic!("tool {name} not found"))
+                .annotations
+                .clone()
+                .unwrap_or_else(|| panic!("tool {name} has no annotations"))
+        };
+        // Pure reads (and status, which reads but is an update call) are read-only,
+        // AND set destructive_hint=false explicitly so a naive client that doesn't
+        // gate destructive on read_only can't mislabel them.
+        for name in [
+            "get_candid", "discover_canisters", "find_canister", "lookup_canister",
+            "list_ic_skills", "get_ic_skill", "list_accounts", "cycles_balance",
+            "get_principal", "canister_status",
+        ] {
+            let a = ann(name);
+            assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");
+            assert_eq!(a.destructive_hint, Some(false), "{name} should set destructive=false explicitly");
+        }
+        // Destructive writes: not read-only, destructive.
+        for name in ["delete_canister", "uninstall_code", "install_code", "update_canister_settings"] {
+            let a = ann(name);
+            assert_eq!(a.read_only_hint, Some(false), "{name} should not be read-only");
+            assert_eq!(a.destructive_hint, Some(true), "{name} should be destructive");
+        }
+        // Additive/reversible writes: not read-only, not destructive.
+        for name in ["create_canister", "top_up_canister", "start_canister", "stop_canister"] {
+            let a = ann(name);
+            assert_eq!(a.read_only_hint, Some(false), "{name} should not be read-only");
+            assert_eq!(a.destructive_hint, Some(false), "{name} should not be destructive");
+        }
+        // The dual-mode caller is conservatively write + destructive.
+        let cc = ann("call_canister");
+        assert_eq!(cc.read_only_hint, Some(false));
+        assert_eq!(cc.destructive_hint, Some(true));
     }
 }
