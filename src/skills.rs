@@ -129,6 +129,14 @@ pub struct SkillsOutput {
     pub skills: Vec<SkillSummary>,
 }
 
+impl From<Vec<SkillEntry>> for SkillsOutput {
+    fn from(entries: Vec<SkillEntry>) -> Self {
+        Self {
+            skills: entries.iter().map(SkillSummary::from).collect(),
+        }
+    }
+}
+
 /// Structured output of `get_ic_skill`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct SkillOutput {

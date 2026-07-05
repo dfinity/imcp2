@@ -11,12 +11,13 @@
 //! on demand from the connection's standing II delegation (see `identities`).
 
 mod auth;
+mod calls;
 mod discover;
 mod identities;
 mod management;
 mod skills;
 
-use candid::{types::value::IDLArgs, Principal};
+use candid::Principal;
 use ic_agent::{Agent, Identity};
 use identities::Identities;
 use rmcp::{
@@ -72,72 +73,9 @@ fn allowed_hosts() -> Vec<String> {
     hosts
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct GetCandidArgs {
-    /// Canister principal, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai" (the ICP ledger).
-    canister_id: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct CallCanisterArgs {
-    /// Target canister principal.
-    canister_id: String,
-    /// Method name to invoke.
-    method: String,
-    /// Arguments in textual Candid syntax, e.g. `()` or `(record { owner = principal "..." })`.
-    #[serde(default = "default_args")]
-    args: String,
-    /// If true, perform a read-only `query` call; otherwise an `update` call.
-    #[serde(default)]
-    is_query: bool,
-    /// Application domain to call as, e.g. "oisy.com" — its account delegation is
-    /// derived on demand for this connection. Omit to call anonymously.
-    #[serde(default)]
-    domain: Option<String>,
-    /// Which of your accounts at `domain` to act as, by account name (see
-    /// list_accounts). Omit to use that app's default account. Ignored when
-    /// `domain` is omitted (anonymous calls have no account).
-    #[serde(default)]
-    account: Option<String>,
-    /// Optional Candid service definition (`.did` text) for the canister. Used to
-    /// encode the args to the method's declared types and decode the reply, for
-    /// when the canister's own `candid:service` metadata can't be read (e.g.
-    /// access-restricted) — get it from get_candid, or ask the user for it.
-    #[serde(default)]
-    candid: Option<String>,
-}
-
-fn default_args() -> String {
-    "()".to_string()
-}
-
-// get_candid and call_canister are implemented in main.rs itself (the Candid
-// encode/decode boundary — `encode_args`/`decode_reply`/`resolve_did` below),
-// so their arg and output types live here. Every other tool delegates to a
-// module (`discover`, `identities`, `skills`, `management`), and its arg +
-// output types live in that module.
-
-/// Output of `get_candid`.
-#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
-struct GetCandidOutput {
-    /// The canister whose interface was read.
-    canister_id: String,
-    /// The Candid (`.did`) interface text.
-    candid: String,
-}
-
-/// Output of `call_canister`.
-#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
-struct CallCanisterOutput {
-    /// The canister that was called.
-    canister_id: String,
-    /// The method that was invoked.
-    method: String,
-    /// Whether this was a read-only query call (vs. an update call).
-    is_query: bool,
-    /// The decoded reply in textual Candid.
-    reply: String,
-}
+// Per-tool argument and output types live in the module that implements the
+// tool: `calls` (get_candid, call_canister), `discover`, `identities`,
+// `skills`, `management`. main.rs only wires the tools together.
 
 #[derive(Clone)]
 struct IcTools {
@@ -161,11 +99,11 @@ impl IcTools {
     #[tool(
         description = "Fetch the Candid (.did) interface definition of an Internet Computer canister, read from its public `candid:service` metadata.",
         annotations(title = "Get Candid interface", read_only_hint = true, destructive_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<GetCandidOutput>(),
+        output_schema = schema_for_output::<calls::GetCandidOutput>(),
     )]
     async fn get_candid(
         &self,
-        Parameters(GetCandidArgs { canister_id }): Parameters<GetCandidArgs>,
+        Parameters(calls::GetCandidArgs { canister_id }): Parameters<calls::GetCandidArgs>,
     ) -> Result<CallToolResult, McpError> {
         let principal = match Principal::from_text(&canister_id) {
             Ok(p) => p,
@@ -178,7 +116,7 @@ impl IcTools {
         {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(did) => {
-                    let output = GetCandidOutput { canister_id, candid: did };
+                    let output = calls::GetCandidOutput { canister_id, candid: did };
                     Ok(ok_structured(output.candid.clone(), &output))
                 }
                 Err(e) => Ok(err(format!("metadata is not valid UTF-8: {e}"))),
@@ -192,11 +130,11 @@ impl IcTools {
     #[tool(
         description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `domain` to call anonymously, or pass an application domain (e.g. \"oisy.com\") to call as your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. By default this uses the app's default account; pass `account` (an account name from list_accounts) to act as a specific named account there. Set is_query=true for read-only query calls. If get_candid couldn't fetch the interface, pass the `.did` text as `candid` (e.g. ask the user for it) so args/replies are still typed.",
         annotations(title = "Call a canister method", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<CallCanisterOutput>(),
+        output_schema = schema_for_output::<calls::CallCanisterOutput>(),
     )]
     async fn call_canister(
         &self,
-        Parameters(CallCanisterArgs {
+        Parameters(calls::CallCanisterArgs {
             canister_id,
             method,
             args,
@@ -204,7 +142,7 @@ impl IcTools {
             domain,
             account,
             candid,
-        }): Parameters<CallCanisterArgs>,
+        }): Parameters<calls::CallCanisterArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let principal = match Principal::from_text(&canister_id) {
@@ -213,8 +151,8 @@ impl IcTools {
         };
         // The interface to encode/decode against: the canister's own
         // candid:service if exposed, else the caller-supplied `candid`.
-        let did = self.resolve_did(principal, candid.as_deref()).await;
-        let arg_bytes = match encode_args(did.as_deref(), &method, &args) {
+        let did = calls::resolve_did(&self.agent, principal, candid.as_deref()).await;
+        let arg_bytes = match calls::encode_args(did.as_deref(), &method, &args) {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
         };
@@ -224,7 +162,7 @@ impl IcTools {
         // builds an agent backed by it (the server signs as the user's account
         // for that app).
         let reply = match domain {
-            None => raw_call(&self.agent, principal, &method, arg_bytes, is_query).await,
+            None => calls::raw_call(&self.agent, principal, &method, arg_bytes, is_query).await,
             Some(domain) => {
                 let session_id = match authed_session(&ctx) {
                     Some(s) => s.session_id,
@@ -242,7 +180,7 @@ impl IcTools {
                     Ok(a) => a,
                     Err(e) => return Ok(err(format!("could not build agent: {e}"))),
                 };
-                raw_call(&agent, principal, &method, arg_bytes, is_query).await
+                calls::raw_call(&agent, principal, &method, arg_bytes, is_query).await
             }
         };
 
@@ -251,8 +189,8 @@ impl IcTools {
             Err(e) => return Ok(err(format!("call failed: {e}"))),
         };
         // Decode against the Candid interface so field names are recovered.
-        let reply = decode_reply(did.as_deref(), &method, &reply_bytes);
-        let output = CallCanisterOutput { canister_id, method, is_query, reply };
+        let reply = calls::decode_reply(did.as_deref(), &method, &reply_bytes);
+        let output = calls::CallCanisterOutput { canister_id, method, is_query, reply };
         Ok(ok_structured(output.reply.clone(), &output))
     }
 
@@ -315,10 +253,7 @@ impl IcTools {
         match self.identities.list_accounts(&session_id, &domain).await {
             Ok(accounts) => {
                 let text = format_accounts(&domain, &accounts);
-                let output = identities::AccountsOutput {
-                    domain,
-                    accounts: accounts.iter().map(identities::AccountEntry::from).collect(),
-                };
+                let output = identities::AccountsOutput::from((domain, accounts));
                 Ok(ok_structured(text, &output))
             }
             Err(e) => Ok(err(e)),
@@ -359,16 +294,13 @@ impl IcTools {
                      IC dashboard's label for that id. No authoritative reverse lookup exists — \
                      confirm an interface with get_candid before calling.",
                 );
-                let output = discover::DiscoverOutput {
-                    domain,
-                    canisters: found.iter().map(discover::DiscoveredCanister::from).collect(),
-                };
+                let output = discover::DiscoverOutput::from((domain, found));
                 Ok(ok_structured(out, &output))
             }
             Ok(_) => {
                 let text =
                     format!("No IC canisters found for {domain} — is it served from the Internet Computer?");
-                let output = discover::DiscoverOutput { domain, canisters: Vec::new() };
+                let output = discover::DiscoverOutput::from((domain, Vec::new()));
                 Ok(ok_structured(text, &output))
             }
             Err(e) => Ok(err(e)),
@@ -400,10 +332,7 @@ impl IcTools {
                     "\nConfirm an interface with get_candid, then call methods with call_canister. \
                      For an SNS match the id is the project root — lookup_canister it to learn more.",
                 );
-                let output = discover::FindCanisterOutput {
-                    query,
-                    matches: matches.iter().map(discover::FoundCanister::from).collect(),
-                };
+                let output = discover::FindCanisterOutput::from((query, matches));
                 Ok(ok_structured(out, &output))
             }
             Ok(_) => {
@@ -413,7 +342,7 @@ impl IcTools {
                      labelled service. If you have a website, try discover_canisters; if you already \
                      have a canister id, try lookup_canister or get_candid."
                 );
-                let output = discover::FindCanisterOutput { query, matches: Vec::new() };
+                let output = discover::FindCanisterOutput::from((query, Vec::new()));
                 Ok(ok_structured(text, &output))
             }
             Err(e) => Ok(err(e)),
@@ -457,9 +386,7 @@ impl IcTools {
         match self.skills.list().await {
             Ok(s) => {
                 let text = skills::SkillsCatalog::format_list(&s);
-                let output = skills::SkillsOutput {
-                    skills: s.iter().map(skills::SkillSummary::from).collect(),
-                };
+                let output = skills::SkillsOutput::from(s);
                 Ok(ok_structured(text, &output))
             }
             Err(e) => Ok(err(e)),
@@ -683,75 +610,6 @@ impl IcTools {
     }
 }
 
-impl IcTools {
-    /// The interface to encode/decode against: the canister's own
-    /// `candid:service` if exposed, else the caller-supplied `candid`.
-    async fn resolve_did(&self, canister: Principal, provided: Option<&str>) -> Option<String> {
-        if let Some(did) = self.candid_service(canister).await {
-            return Some(did);
-        }
-        provided.map(str::to_string)
-    }
-
-    /// The canister's `candid:service` interface (`.did` text), if exposed.
-    async fn candid_service(&self, canister: Principal) -> Option<String> {
-        let raw = self
-            .agent
-            .read_state_canister_metadata(canister, "candid:service")
-            .await
-            .ok()?;
-        String::from_utf8(raw).ok()
-    }
-}
-
-/// Encode textual Candid args to bytes. With `did` (the canister interface),
-/// coerce the args to the method's declared parameter types — so plain literals
-/// land as the method expects (`42` -> `nat64`, `1` -> `float64`, `opt`/`vec`
-/// element types) with no `: type` annotations. Without it (interface
-/// unreadable and no `candid` supplied), fall back to type-less inference, where
-/// numeric literals default to `int`/`float64` and must be annotated (see the
-/// `candid://textual-syntax` resource).
-fn encode_args(did: Option<&str>, method: &str, args_text: &str) -> Result<Vec<u8>, String> {
-    let parsed = candid_parser::parse_idl_args(args_text)
-        .map_err(|e| format!("could not parse args `{args_text}`: {e}"))?;
-    if let Some(did) = did {
-        if let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() {
-            if let Ok(func) = env.get_method(&actor, method) {
-                return parsed
-                    .to_bytes_with_types(&env, &func.args)
-                    .map_err(|e| format!("args don't match `{method}`'s Candid signature: {e}"));
-            }
-        }
-    }
-    parsed
-        .to_bytes()
-        .map_err(|e| format!("could not encode args `{args_text}`: {e}"))
-}
-
-/// Decode reply `bytes` to textual Candid. With `did`, decode against the
-/// method's declared return types so record/variant field names are recovered;
-/// otherwise (or on any failure) fall back to type-less decoding.
-fn decode_reply(did: Option<&str>, method: &str, bytes: &[u8]) -> String {
-    if let Some(text) = did.and_then(|d| decode_bytes_with_did(d, method, bytes)) {
-        return text;
-    }
-    match IDLArgs::from_bytes(bytes) {
-        Ok(decoded) => decoded.to_string(),
-        Err(e) => format!("(call succeeded but reply is not decodable as Candid: {e})"),
-    }
-}
-
-/// Decode Candid `bytes` against the return types of `method` declared in the
-/// `.did` text, recovering record/variant field names. None if the interface
-/// can't be parsed, the method isn't found, or decoding fails.
-fn decode_bytes_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<String> {
-    let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
-    let actor = actor?;
-    let func = env.get_method(&actor, method).ok()?;
-    let decoded = IDLArgs::from_bytes_with_types(bytes, &env, &func.rets).ok()?;
-    Some(decoded.to_string())
-}
-
 /// The authenticated MCP session of the calling request, if it carried a valid
 /// bearer token (injected by [`auth::require_token`]).
 fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<auth::AuthedSession> {
@@ -779,21 +637,6 @@ async fn log_request(
     let elapsed_ms = started.elapsed().as_millis() as u64;
     tracing::info!(%method, %path, status, elapsed_ms, "http request");
     resp
-}
-
-/// Perform a query or update call and return the raw Candid reply bytes.
-async fn raw_call(
-    agent: &Agent,
-    canister: Principal,
-    method: &str,
-    arg: Vec<u8>,
-    is_query: bool,
-) -> Result<Vec<u8>, ic_agent::AgentError> {
-    if is_query {
-        agent.query(&canister, method).with_arg(arg).call().await
-    } else {
-        agent.update(&canister, method).with_arg(arg).call_and_wait().await
-    }
 }
 
 #[tool_handler]
@@ -1286,7 +1129,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_bytes_with_did;
+    use super::calls::decode_bytes_with_did;
     use candid::types::value::IDLArgs;
     use candid_parser::parse_idl_args;
 

@@ -86,6 +86,16 @@ pub struct DiscoverOutput {
     pub canisters: Vec<DiscoveredCanister>,
 }
 
+impl From<(String, Vec<Found>)> for DiscoverOutput {
+    /// `(domain, found)` → the structured `discover_canisters` reply.
+    fn from((domain, found): (String, Vec<Found>)) -> Self {
+        Self {
+            domain,
+            canisters: found.iter().map(DiscoveredCanister::from).collect(),
+        }
+    }
+}
+
 /// Canister textual principals: four 5-char base32 groups + the `cai` suffix.
 fn canister_re() -> Regex {
     Regex::new(r"[a-z0-9]{5}-[a-z0-9]{5}-[a-z0-9]{5}-[a-z0-9]{5}-cai").unwrap()
@@ -487,6 +497,16 @@ pub struct FindCanisterOutput {
     /// Canisters from the IC's labelled service registries that matched
     /// `query` — empty when nothing matched.
     pub matches: Vec<FoundCanister>,
+}
+
+impl From<(String, Vec<Match>)> for FindCanisterOutput {
+    /// `(query, matches)` → the structured `find_canister` reply.
+    fn from((query, matches): (String, Vec<Match>)) -> Self {
+        Self {
+            query,
+            matches: matches.iter().map(FoundCanister::from).collect(),
+        }
+    }
 }
 
 #[derive(Deserialize)]

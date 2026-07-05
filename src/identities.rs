@@ -300,6 +300,16 @@ pub struct AccountsOutput {
     pub accounts: Vec<AccountEntry>,
 }
 
+impl From<(String, Vec<AccountInfo>)> for AccountsOutput {
+    /// `(domain, accounts)` → the structured `list_accounts` reply.
+    fn from((domain, accounts): (String, Vec<AccountInfo>)) -> Self {
+        Self {
+            domain,
+            accounts: accounts.iter().map(AccountEntry::from).collect(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Identities {
     /// The II instance every session in this store is registered against.
