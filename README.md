@@ -9,6 +9,13 @@ encoding/decoding and signing against the IC via
 
 ## Tools
 
+Every tool declares an MCP `outputSchema` and, on success, attaches
+**structured content** — a machine-readable object matching that schema —
+alongside the human-readable text, so a model knows the expected shape of each
+reply. The text is always present; the structured object is attached whenever
+the reply serializes to an object (which the schema guarantees for normal
+results).
+
 | Tool | Args | Returns |
 |------|------|---------|
 | `discover_canisters` | `domain` | Canister ids behind a web domain (frontend via `x-ic-canister-id`; backend via `/env.json` + JS-bundle mining), each with provenance and its IC dashboard label/type where known |

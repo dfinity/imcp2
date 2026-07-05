@@ -35,7 +35,10 @@ use ic_agent::{
     identity::{BasicIdentity, DelegatedIdentity, Delegation, DelegationPermissions, SignedDelegation},
     Agent, Identity,
 };
-use serde::Deserialize;
+// rmcp re-exports schemars 1.x; the `#[tool]` output-schema machinery requires
+// THAT version's `JsonSchema`, so derive the MCP output types against it.
+use rmcp::schemars;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 /// Public IC API boundary node the II canister calls are made against.
@@ -230,6 +233,81 @@ pub struct AccountInfo {
     pub name: Option<String>,
     /// When the account was last used (ns since the Unix epoch), if known.
     pub last_used: Option<u64>,
+}
+
+/// Arguments for `get_principal`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetPrincipalArgs {
+    /// The application domain to resolve, e.g. "oisy.com". Returns the principal
+    /// you act as at that app — its account delegation is derived on demand (same
+    /// as call_canister) and its principal returned.
+    pub domain: String,
+    /// Which of your accounts at `domain` to resolve, by account name (see
+    /// list_accounts). Omit to use that app's default account.
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// Structured output of `get_principal`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct PrincipalOutput {
+    /// The application domain the principal was derived for.
+    pub domain: String,
+    /// The account name resolved, or null for the app's default account.
+    pub account: Option<String>,
+    /// The principal you act as at that app.
+    pub principal: String,
+    /// True if this Internet Identity session is read-only (canister
+    /// management is unavailable until reconnected with read-only OFF).
+    pub read_only: bool,
+}
+
+/// Arguments for `list_accounts`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListAccountsArgs {
+    /// The application domain whose accounts to list, e.g. "oisy.com".
+    pub domain: String,
+}
+
+/// One account in the `list_accounts` MCP output (a serialization mirror of
+/// [`AccountInfo`]).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct AccountEntry {
+    /// The user-given account name, or null for the default account.
+    pub name: Option<String>,
+    /// The II account number, or null for the default account.
+    pub account_number: Option<u64>,
+    /// When the account was last used (ns since the Unix epoch), if known.
+    pub last_used: Option<u64>,
+}
+
+impl From<&AccountInfo> for AccountEntry {
+    fn from(a: &AccountInfo) -> Self {
+        Self {
+            name: a.name.clone(),
+            account_number: a.account_number,
+            last_used: a.last_used,
+        }
+    }
+}
+
+/// Structured output of `list_accounts`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct AccountsOutput {
+    /// The application domain the accounts belong to.
+    pub domain: String,
+    /// The user's accounts at that app (empty if none).
+    pub accounts: Vec<AccountEntry>,
+}
+
+impl From<(String, Vec<AccountInfo>)> for AccountsOutput {
+    /// `(domain, accounts)` → the structured `list_accounts` reply.
+    fn from((domain, accounts): (String, Vec<AccountInfo>)) -> Self {
+        Self {
+            domain,
+            accounts: accounts.iter().map(AccountEntry::from).collect(),
+        }
+    }
 }
 
 #[derive(Clone)]

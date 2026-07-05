@@ -16,7 +16,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Deserialize;
+// rmcp re-exports schemars 1.x; the `#[tool]` output-schema machinery requires
+// THAT version's `JsonSchema`, so derive the MCP output types against it.
+use rmcp::schemars;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 const SKILLS_BASE_DEFAULT: &str = "https://skills.internetcomputer.org";
@@ -85,6 +88,62 @@ pub struct SkillEntry {
 pub struct SkillUrls {
     #[serde(default)]
     pub markdown: String,
+}
+
+/// Arguments for `get_ic_skill`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetSkillArgs {
+    /// Skill name, e.g. "motoko", "icp-cli", "cycles-management".
+    pub name: String,
+}
+
+/// One skill in the `list_ic_skills` MCP output (the catalogue-facing subset of
+/// [`SkillEntry`] — the internal fetch `urls` are intentionally omitted).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SkillSummary {
+    /// The skill name to pass to get_ic_skill, e.g. "motoko".
+    pub name: String,
+    /// The skill's human title.
+    pub title: String,
+    /// The category it's grouped under.
+    pub category: String,
+    /// A one-line description.
+    pub description: String,
+}
+
+impl From<&SkillEntry> for SkillSummary {
+    fn from(e: &SkillEntry) -> Self {
+        Self {
+            name: e.name.clone(),
+            title: e.title.clone(),
+            category: e.category.clone(),
+            description: e.description.clone(),
+        }
+    }
+}
+
+/// Structured output of `list_ic_skills`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SkillsOutput {
+    /// The available IC skills.
+    pub skills: Vec<SkillSummary>,
+}
+
+impl From<Vec<SkillEntry>> for SkillsOutput {
+    fn from(entries: Vec<SkillEntry>) -> Self {
+        Self {
+            skills: entries.iter().map(SkillSummary::from).collect(),
+        }
+    }
+}
+
+/// Structured output of `get_ic_skill`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SkillOutput {
+    /// The skill name.
+    pub name: String,
+    /// The full SKILL.md instructions (markdown).
+    pub content: String,
 }
 
 #[derive(Deserialize)]

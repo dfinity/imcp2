@@ -28,7 +28,7 @@ use ic_agent::{Agent, Identity};
 // rmcp re-exports schemars 1.x; the `#[tool]` macro requires THAT version's
 // `JsonSchema` (not the top-level schemars 0.8 dep), so derive against it.
 use rmcp::schemars;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::identities::Identities;
 
@@ -137,6 +137,67 @@ pub struct UpdateSettingsArgs {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct NoArgs {}
 
+// ===========================================================================
+// Structured tool outputs (declared as each tool's MCP `outputSchema`). The
+// same data is also rendered to human-readable text via `human()`.
+// ===========================================================================
+
+/// Structured result of the lifecycle/action tools that confirm an operation on
+/// a specific canister (`canister_status`, `install_code`,
+/// `update_canister_settings`, `top_up_canister`, `start_canister`,
+/// `stop_canister`, `uninstall_code`, `delete_canister`).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CanisterActionOutput {
+    /// The canister the action targeted.
+    pub canister_id: String,
+    /// Human-readable summary of the outcome (same as the text content).
+    pub message: String,
+}
+
+/// Structured result of `cycles_balance`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CyclesBalance {
+    /// Your Internet Identity principal — the cycles-ledger account owner.
+    pub principal: String,
+    /// Balance in cycles, as a decimal string (cycle counts can exceed u64).
+    pub balance: String,
+}
+
+impl CyclesBalance {
+    pub fn human(&self) -> String {
+        format!(
+            "Your cycles-ledger balance (principal {}): {} cycles.",
+            self.principal, self.balance
+        )
+    }
+}
+
+/// Structured result of `create_canister`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CreatedCanister {
+    /// The new canister's principal id — install code on it with install_code.
+    pub canister_id: String,
+    /// Cycles the new canister was funded with, as a decimal string.
+    pub cycles: String,
+    /// Cycles-ledger block index of the funding transfer.
+    pub block_id: String,
+    /// The canister's controller principals.
+    pub controllers: Vec<String>,
+}
+
+impl CreatedCanister {
+    pub fn human(&self) -> String {
+        format!(
+            "Created canister {} — funded with {} cycles (cycles-ledger block {}). Controllers: {}.\n\
+             Next: build your Wasm and install it with install_code.",
+            self.canister_id,
+            self.cycles,
+            self.block_id,
+            self.controllers.join(", ")
+        )
+    }
+}
+
 fn default_install_mode() -> String {
     "install".to_string()
 }
@@ -150,7 +211,7 @@ fn default_init_arg() -> String {
 // ===========================================================================
 
 /// Your cycles-ledger balance (the funds `create_canister`/`top_up_canister` spend).
-pub async fn cycles_balance(ids: &Identities, session_id: &str) -> Result<String, String> {
+pub async fn cycles_balance(ids: &Identities, session_id: &str) -> Result<CyclesBalance, String> {
     let (agent, principal) = management_agent(ids, session_id).await?;
     let ledger = parse_principal(CYCLES_LEDGER)?;
     let account = Account {
@@ -165,9 +226,10 @@ pub async fn cycles_balance(ids: &Identities, session_id: &str) -> Result<String
         .await
         .map_err(|e| format!("icrc1_balance_of failed: {e}"))?;
     let balance = Decode!(&reply, Nat).map_err(|e| format!("decode balance: {e}"))?;
-    Ok(format!(
-        "Your cycles-ledger balance (principal {principal}): {balance} cycles."
-    ))
+    Ok(CyclesBalance {
+        principal: principal.to_text(),
+        balance: balance.to_string(),
+    })
 }
 
 /// Create + fund a canister from your cycles-ledger balance.
@@ -175,7 +237,7 @@ pub async fn create_canister(
     ids: &Identities,
     session_id: &str,
     args: CreateCanisterArgs,
-) -> Result<String, String> {
+) -> Result<CreatedCanister, String> {
     ids.require_write(session_id).await?;
     let (agent, principal) = management_agent(ids, session_id).await?;
     let cycles = resolve_cycles(&agent, args.icp.as_deref(), args.cycles).await?;
@@ -214,18 +276,12 @@ pub async fn create_canister(
     let result =
         Decode!(&reply, CreateResult).map_err(|e| format!("decode create_canister reply: {e}"))?;
     match result {
-        Ok(s) => Ok(format!(
-            "Created canister {} — funded with {} cycles (cycles-ledger block {}). Controllers: {}.\n\
-             Next: build your Wasm and install it with install_code.",
-            s.canister_id,
-            cycles,
-            s.block_id,
-            controllers
-                .iter()
-                .map(Principal::to_text)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
+        Ok(s) => Ok(CreatedCanister {
+            canister_id: s.canister_id.to_text(),
+            cycles: cycles.to_string(),
+            block_id: s.block_id.to_string(),
+            controllers: controllers.iter().map(Principal::to_text).collect(),
+        }),
         Err(e) => Err(format!("cycles ledger refused create_canister: {e:?}")),
     }
 }
@@ -606,7 +662,7 @@ fn parse_log_visibility(s: &str) -> Result<LogVisibility, String> {
 fn encode_textual_arg(arg: &str) -> Result<Vec<u8>, String> {
     // Bound size/nesting before parsing so untrusted input can't stack-overflow
     // the process (CWE-674).
-    crate::guard_candid_text("the install `arg`", arg)?;
+    crate::calls::guard_candid_text("the install `arg`", arg)?;
     candid_parser::parse_idl_args(arg)
         .map_err(|e| format!("could not parse init arg `{arg}`: {e}"))?
         .to_bytes()

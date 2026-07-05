@@ -11,12 +11,13 @@
 //! on demand from the connection's standing II delegation (see `identities`).
 
 mod auth;
+mod calls;
 mod discover;
 mod identities;
 mod management;
 mod skills;
 
-use candid::{types::value::IDLArgs, Principal};
+use candid::Principal;
 use ic_agent::{Agent, Identity};
 use identities::Identities;
 use rmcp::{
@@ -72,87 +73,9 @@ fn allowed_hosts() -> Vec<String> {
     hosts
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct GetCandidArgs {
-    /// Canister principal, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai" (the ICP ledger).
-    canister_id: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct CallCanisterArgs {
-    /// Target canister principal.
-    canister_id: String,
-    /// Method name to invoke.
-    method: String,
-    /// Arguments in textual Candid syntax, e.g. `()` or `(record { owner = principal "..." })`.
-    #[serde(default = "default_args")]
-    args: String,
-    /// If true, perform a read-only `query` call; otherwise an `update` call.
-    #[serde(default)]
-    is_query: bool,
-    /// Application domain to call as, e.g. "oisy.com" — its account delegation is
-    /// derived on demand for this connection. Omit to call anonymously.
-    #[serde(default)]
-    domain: Option<String>,
-    /// Which of your accounts at `domain` to act as, by account name (see
-    /// list_accounts). Omit to use that app's default account. Ignored when
-    /// `domain` is omitted (anonymous calls have no account).
-    #[serde(default)]
-    account: Option<String>,
-    /// Optional Candid service definition (`.did` text) for the canister. Used to
-    /// encode the args to the method's declared types and decode the reply, for
-    /// when the canister's own `candid:service` metadata can't be read (e.g.
-    /// access-restricted) — get it from get_candid, or ask the user for it.
-    #[serde(default)]
-    candid: Option<String>,
-}
-
-fn default_args() -> String {
-    "()".to_string()
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct DiscoverCanistersArgs {
-    /// A web domain or URL served from the IC, e.g. "oisy.com".
-    domain: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct GetPrincipalArgs {
-    /// The application domain to resolve, e.g. "oisy.com". Returns the principal
-    /// you act as at that app — its account delegation is derived on demand (same
-    /// as call_canister) and its principal returned.
-    domain: String,
-    /// Which of your accounts at `domain` to resolve, by account name (see
-    /// list_accounts). Omit to use that app's default account.
-    #[serde(default)]
-    account: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct ListAccountsArgs {
-    /// The application domain whose accounts to list, e.g. "oisy.com".
-    domain: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct FindCanisterArgs {
-    /// A name, token symbol, or project to search for, e.g. "ckUSDC", "ICP",
-    /// "OpenChat".
-    query: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct LookupCanisterArgs {
-    /// Canister principal to identify, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai".
-    canister_id: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct GetSkillArgs {
-    /// Skill name, e.g. "motoko", "icp-cli", "cycles-management".
-    name: String,
-}
+// Per-tool argument and output types live in the module that implements the
+// tool: `calls` (get_candid, call_canister), `discover`, `identities`,
+// `skills`, `management`. main.rs only wires the tools together.
 
 #[derive(Clone)]
 struct IcTools {
@@ -176,10 +99,11 @@ impl IcTools {
     #[tool(
         description = "Fetch the Candid (.did) interface definition of an Internet Computer canister, read from its public `candid:service` metadata.",
         annotations(title = "Get Candid interface", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<calls::GetCandidOutput>(),
     )]
     async fn get_candid(
         &self,
-        Parameters(GetCandidArgs { canister_id }): Parameters<GetCandidArgs>,
+        Parameters(calls::GetCandidArgs { canister_id }): Parameters<calls::GetCandidArgs>,
     ) -> Result<CallToolResult, McpError> {
         let principal = match Principal::from_text(&canister_id) {
             Ok(p) => p,
@@ -191,7 +115,10 @@ impl IcTools {
             .await
         {
             Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(did) => Ok(ok(did)),
+                Ok(did) => {
+                    let output = calls::GetCandidOutput { canister_id, candid: did };
+                    Ok(ok_structured(output.candid.clone(), &output))
+                }
                 Err(e) => Ok(err(format!("metadata is not valid UTF-8: {e}"))),
             },
             Err(e) => Ok(err(format!(
@@ -203,10 +130,11 @@ impl IcTools {
     #[tool(
         description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `domain` to call anonymously, or pass an application domain (e.g. \"oisy.com\") to call as your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. By default this uses the app's default account; pass `account` (an account name from list_accounts) to act as a specific named account there. Set is_query=true for read-only query calls. If get_candid couldn't fetch the interface, pass the `.did` text as `candid` (e.g. ask the user for it) so args/replies are still typed.",
         annotations(title = "Call a canister method", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<calls::CallCanisterOutput>(),
     )]
     async fn call_canister(
         &self,
-        Parameters(CallCanisterArgs {
+        Parameters(calls::CallCanisterArgs {
             canister_id,
             method,
             args,
@@ -214,7 +142,7 @@ impl IcTools {
             domain,
             account,
             candid,
-        }): Parameters<CallCanisterArgs>,
+        }): Parameters<calls::CallCanisterArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let principal = match Principal::from_text(&canister_id) {
@@ -223,8 +151,8 @@ impl IcTools {
         };
         // The interface to encode/decode against: the canister's own
         // candid:service if exposed, else the caller-supplied `candid`.
-        let did = self.resolve_did(principal, candid.as_deref()).await;
-        let arg_bytes = match encode_args(did.as_deref(), &method, &args) {
+        let did = calls::resolve_did(&self.agent, principal, candid.as_deref()).await;
+        let arg_bytes = match calls::encode_args(did.as_deref(), &method, &args) {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
         };
@@ -234,7 +162,7 @@ impl IcTools {
         // builds an agent backed by it (the server signs as the user's account
         // for that app).
         let reply = match domain {
-            None => raw_call(&self.agent, principal, &method, arg_bytes, is_query).await,
+            None => calls::raw_call(&self.agent, principal, &method, arg_bytes, is_query).await,
             Some(domain) => {
                 let session_id = match authed_session(&ctx) {
                     Some(s) => s.session_id,
@@ -252,7 +180,7 @@ impl IcTools {
                     Ok(a) => a,
                     Err(e) => return Ok(err(format!("could not build agent: {e}"))),
                 };
-                raw_call(&agent, principal, &method, arg_bytes, is_query).await
+                calls::raw_call(&agent, principal, &method, arg_bytes, is_query).await
             }
         };
 
@@ -261,16 +189,19 @@ impl IcTools {
             Err(e) => return Ok(err(format!("call failed: {e}"))),
         };
         // Decode against the Candid interface so field names are recovered.
-        Ok(ok(decode_reply(did.as_deref(), &method, &reply_bytes)))
+        let reply = calls::decode_reply(did.as_deref(), &method, &reply_bytes);
+        let output = calls::CallCanisterOutput { canister_id, method, is_query, reply };
+        Ok(ok_structured(output.reply.clone(), &output))
     }
 
     #[tool(
         description = "Get the Internet Computer principal you act as at a given application `domain` (e.g. \"oisy.com\"), without making a canister call. The app's account delegation is derived on demand (same as call_canister) from this connection's standing Internet Identity credential, and its principal is returned. By default this resolves the app's default account; pass `account` (an account name from list_accounts) for a specific named account there. Use this when a flow needs the principal itself (e.g. to look up a balance or account) rather than to invoke a method. NOTE: the principal is derived from the app's DOMAIN, which is usually — but not always — the identity a browser sign-in to that app would use. Some apps declare a CUSTOM derivation origin (via /.well-known/ii-alternative-origins) that isn't exposed here; if the returned principal (or an account/balance) doesn't match what the user sees in their browser at that app, tell them so and offer to look up the app's ii-alternative-origins (web search / fetch) and retry.",
         annotations(title = "Get your principal at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<identities::PrincipalOutput>(),
     )]
     async fn get_principal(
         &self,
-        Parameters(GetPrincipalArgs { domain, account }): Parameters<GetPrincipalArgs>,
+        Parameters(identities::GetPrincipalArgs { domain, account }): Parameters<identities::GetPrincipalArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session_id = match authed_session(&ctx) {
@@ -287,17 +218,19 @@ impl IcTools {
         };
         match delegated.sender() {
             Ok(p) => {
-                let mut out = p.to_text();
                 // Surface a read-only session (H2) so the LLM won't attempt (and
                 // have the IC reject at ingress) canister-management updates.
-                if self.identities.is_read_only(&session_id).await == Some(true) {
+                let read_only = self.identities.is_read_only(&session_id).await == Some(true);
+                let mut out = p.to_text();
+                if read_only {
                     out.push_str(
                         "\n\n(This Internet Identity session is READ-ONLY: reads work, but canister \
                          management — create/install/start/stop/delete, and canister_status — needs \
                          update access. Ask the user to reconnect with the read-only option turned OFF.)",
                     );
                 }
-                Ok(ok(out))
+                let output = identities::PrincipalOutput { domain, account, principal: p.to_text(), read_only };
+                Ok(ok_structured(out, &output))
             }
             Err(e) => Ok(err(format!("could not derive principal for '{domain}': {e}"))),
         }
@@ -306,10 +239,11 @@ impl IcTools {
     #[tool(
         description = "List the user's Internet Identity accounts at an application `domain` (e.g. \"oisy.com\"). Internet Identity gives the user a distinct principal per app (derived from the app's domain), and within an app they may hold several accounts: a default account everyone gets automatically (the anchor's current, user-controllable default at that origin), plus any named accounts they created. Use this before acting on the user's behalf at an app: if there's only the default account, just proceed (call_canister/get_principal with no `account`); if there are several, pick one with the user (or act on each) by passing its name as `account`. Returns each account's name (the default has none), account number, and last-used time. If these accounts don't match what the user sees in their browser at this app, it may use a custom derivation origin not exposed here (offer to look up its ii-alternative-origins and retry). Requires an authenticated session.",
         annotations(title = "List your accounts at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<identities::AccountsOutput>(),
     )]
     async fn list_accounts(
         &self,
-        Parameters(ListAccountsArgs { domain }): Parameters<ListAccountsArgs>,
+        Parameters(identities::ListAccountsArgs { domain }): Parameters<identities::ListAccountsArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session_id = match authed_session(&ctx) {
@@ -317,7 +251,11 @@ impl IcTools {
             None => return Ok(err("listing your accounts needs an authenticated session".into())),
         };
         match self.identities.list_accounts(&session_id, &domain).await {
-            Ok(accounts) => Ok(ok(format_accounts(&domain, &accounts))),
+            Ok(accounts) => {
+                let text = format_accounts(&domain, &accounts);
+                let output = identities::AccountsOutput::from((domain, accounts));
+                Ok(ok_structured(text, &output))
+            }
             Err(e) => Ok(err(e)),
         }
     }
@@ -325,10 +263,11 @@ impl IcTools {
     #[tool(
         description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). Returns every canister id found, with provenance: the `x-ic-canister-id` header (the frontend/asset canister — authoritative), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. There is no authoritative reverse lookup for a site's backend, so results from env.json/bundle are candidates: pick by label (prefer production/IC ids) and confirm with get_candid before calling.",
         annotations(title = "Discover canisters behind a domain", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<discover::DiscoverOutput>(),
     )]
     async fn discover_canisters(
         &self,
-        Parameters(DiscoverCanistersArgs { domain }): Parameters<DiscoverCanistersArgs>,
+        Parameters(discover::DiscoverCanistersArgs { domain }): Parameters<discover::DiscoverCanistersArgs>,
     ) -> Result<CallToolResult, McpError> {
         match discover::discover(&domain).await {
             Ok(found) if !found.is_empty() => {
@@ -355,11 +294,15 @@ impl IcTools {
                      IC dashboard's label for that id. No authoritative reverse lookup exists — \
                      confirm an interface with get_candid before calling.",
                 );
-                Ok(ok(out))
+                let output = discover::DiscoverOutput::from((domain, found));
+                Ok(ok_structured(out, &output))
             }
-            Ok(_) => Ok(ok(format!(
-                "No IC canisters found for {domain} — is it served from the Internet Computer?"
-            ))),
+            Ok(_) => {
+                let text =
+                    format!("No IC canisters found for {domain} — is it served from the Internet Computer?");
+                let output = discover::DiscoverOutput::from((domain, Vec::new()));
+                Ok(ok_structured(text, &output))
+            }
             Err(e) => Ok(err(e)),
         }
     }
@@ -367,10 +310,11 @@ impl IcTools {
     #[tool(
         description = "Find Internet Computer canisters by NAME. Searches the IC dashboard's service registries — the ICRC token ledgers (e.g. ckBTC, ckETH, ckUSDC, SNS tokens) by symbol/name, and the SNS project catalog by name — and returns matching canister ids. Use this when the user names a token, project, or service (e.g. \"ckUSDC\") rather than a canister id; then confirm with get_candid and call methods with call_canister. (No public name-search exists over arbitrary canisters; this covers the IC's labelled services.)",
         annotations(title = "Find canisters by name", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<discover::FindCanisterOutput>(),
     )]
     async fn find_canister(
         &self,
-        Parameters(FindCanisterArgs { query }): Parameters<FindCanisterArgs>,
+        Parameters(discover::FindCanisterArgs { query }): Parameters<discover::FindCanisterArgs>,
     ) -> Result<CallToolResult, McpError> {
         match discover::search_by_name(&query).await {
             Ok(matches) if !matches.is_empty() => {
@@ -388,14 +332,19 @@ impl IcTools {
                     "\nConfirm an interface with get_candid, then call methods with call_canister. \
                      For an SNS match the id is the project root — lookup_canister it to learn more.",
                 );
-                Ok(ok(out))
+                let output = discover::FindCanisterOutput::from((query, matches));
+                Ok(ok_structured(out, &output))
             }
-            Ok(_) => Ok(ok(format!(
-                "No named canisters found matching \"{query}\". This searches known tokens (ICRC \
-                 ledgers) and SNS projects, so an arbitrary canister won't appear unless it's a \
-                 labelled service. If you have a website, try discover_canisters; if you already \
-                 have a canister id, try lookup_canister or get_candid."
-            ))),
+            Ok(_) => {
+                let text = format!(
+                    "No named canisters found matching \"{query}\". This searches known tokens (ICRC \
+                     ledgers) and SNS projects, so an arbitrary canister won't appear unless it's a \
+                     labelled service. If you have a website, try discover_canisters; if you already \
+                     have a canister id, try lookup_canister or get_candid."
+                );
+                let output = discover::FindCanisterOutput::from((query, Vec::new()));
+                Ok(ok_structured(text, &output))
+            }
             Err(e) => Ok(err(e)),
         }
     }
@@ -403,17 +352,22 @@ impl IcTools {
     #[tool(
         description = "Identify what an Internet Computer canister IS, from the IC dashboard: its label/name (e.g. \"ICP Ledger\"), type (e.g. \"ledger\"), controllers, hosting subnet, module hash, language, and latest upgrade proposal. Use this to make sense of a bare canister id — e.g. one returned by discover_canisters.",
         annotations(title = "Identify a canister", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<discover::CanisterIdentityOutput>(),
     )]
     async fn lookup_canister(
         &self,
-        Parameters(LookupCanisterArgs { canister_id }): Parameters<LookupCanisterArgs>,
+        Parameters(discover::LookupCanisterArgs { canister_id }): Parameters<discover::LookupCanisterArgs>,
     ) -> Result<CallToolResult, McpError> {
         let client = match discover::http_client() {
             Ok(c) => c,
             Err(e) => return Ok(err(e)),
         };
         match discover::lookup_canister(&client, &canister_id).await {
-            Ok(info) => Ok(ok(format_canister_info(&info))),
+            Ok(info) => {
+                let text = format_canister_info(&info);
+                let output = discover::CanisterIdentityOutput::from(info);
+                Ok(ok_structured(text, &output))
+            }
             Err(e) => Ok(err(e)),
         }
     }
@@ -423,13 +377,18 @@ impl IcTools {
     #[tool(
         description = "List the official Internet Computer skills — authoritative how-to guides for authoring and shipping IC apps (Motoko language, mops/icp CLIs, cycles management, stable memory & upgrades, security, DeFi, auth, …). Returns each skill's name and a one-line description. Load a skill's full instructions with get_ic_skill(name). Consult these BEFORE writing Motoko/Rust canister code, building, or deploying.",
         annotations(title = "List Internet Computer skills", read_only_hint = true, destructive_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<skills::SkillsOutput>(),
     )]
     async fn list_ic_skills(
         &self,
         Parameters(_args): Parameters<management::NoArgs>,
     ) -> Result<CallToolResult, McpError> {
         match self.skills.list().await {
-            Ok(s) => Ok(ok(skills::SkillsCatalog::format_list(&s))),
+            Ok(s) => {
+                let text = skills::SkillsCatalog::format_list(&s);
+                let output = skills::SkillsOutput::from(s);
+                Ok(ok_structured(text, &output))
+            }
             Err(e) => Ok(err(e)),
         }
     }
@@ -437,13 +396,17 @@ impl IcTools {
     #[tool(
         description = "Fetch the full instructions (SKILL.md) of one Internet Computer skill by name (e.g. \"motoko\", \"icp-cli\", \"mops-cli\", \"cycles-management\", \"stable-memory\", \"canister-security\"). Call list_ic_skills first to see the available names. Use this to learn the exact, current way to do an IC task before doing it.",
         annotations(title = "Get an Internet Computer skill", read_only_hint = true, destructive_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<skills::SkillOutput>(),
     )]
     async fn get_ic_skill(
         &self,
-        Parameters(GetSkillArgs { name }): Parameters<GetSkillArgs>,
+        Parameters(skills::GetSkillArgs { name }): Parameters<skills::GetSkillArgs>,
     ) -> Result<CallToolResult, McpError> {
         match self.skills.get(&name).await {
-            Ok(md) => Ok(ok(md)),
+            Ok(md) => {
+                let output = skills::SkillOutput { name, content: md };
+                Ok(ok_structured(output.content.clone(), &output))
+            }
             Err(e) => Ok(err(e)),
         }
     }
@@ -453,6 +416,7 @@ impl IcTools {
     #[tool(
         description = "Your cycles-ledger balance — the cycles that create_canister and top_up_canister spend. Acts as your Internet Identity principal (also printed). If it's empty, fund it first (e.g. via the icp CLI / cycles-management skill). Requires an authenticated session.",
         annotations(title = "Check your cycles balance", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<management::CyclesBalance>(),
     )]
     async fn cycles_balance(
         &self,
@@ -463,12 +427,16 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("checking your cycles balance needs an authenticated session".into())),
         };
-        Ok(into_result(management::cycles_balance(&self.identities, &sid).await))
+        match management::cycles_balance(&self.identities, &sid).await {
+            Ok(b) => Ok(ok_structured(b.human(), &b)),
+            Err(e) => Ok(err(e)),
+        }
     }
 
     #[tool(
         description = "Create and fund a NEW Internet Computer canister, paying from your cycles-ledger balance (as your Internet Identity). Specify the amount as `cycles` (exact) or `icp` (a decimal-ICP string like \"0.5\", converted to cycles at the network's current rate). Controllers default to your own principal. You must already hold cycles in the cycles ledger (check with cycles_balance; fund via the icp CLI / cycles-management skill). Returns the new canister id — then build your Wasm (see the motoko/icp-cli skills) and install it with install_code. Requires an authenticated session.",
         annotations(title = "Create a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<management::CreatedCanister>(),
     )]
     async fn create_canister(
         &self,
@@ -479,14 +447,16 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("creating a canister needs an authenticated session".into())),
         };
-        Ok(into_result(
-            management::create_canister(&self.identities, &sid, args).await,
-        ))
+        match management::create_canister(&self.identities, &sid, args).await {
+            Ok(c) => Ok(ok_structured(c.human(), &c)),
+            Err(e) => Ok(err(e)),
+        }
     }
 
     #[tool(
         description = "Add cycles to an existing canister, paying from your cycles-ledger balance. Specify `cycles` (exact) or `icp` (decimal-ICP string, converted at the current rate). Requires an authenticated session.",
         annotations(title = "Top up a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn top_up_canister(
         &self,
@@ -497,7 +467,9 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("topping up a canister needs an authenticated session".into())),
         };
-        Ok(into_result(
+        let canister_id = args.canister_id.clone();
+        Ok(ok_canister_action(
+            canister_id,
             management::top_up_canister(&self.identities, &sid, args).await,
         ))
     }
@@ -505,6 +477,7 @@ impl IcTools {
     #[tool(
         description = "Install a compiled Wasm module on a canister you control (as your Internet Identity). Provide the module as `wasm_base64` (or `wasm_hex`); large modules are uploaded via the chunk store automatically. `mode` is \"install\" (default, empty canister), \"reinstall\" (wipe state), or \"upgrade\" (preserve stable memory). `arg` is the init/upgrade argument in textual Candid, e.g. \"()\". Build the Wasm in your own environment first (see the motoko / icp-cli / mops-cli skills). Requires an authenticated session.",
         annotations(title = "Install code on a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn install_code(
         &self,
@@ -515,7 +488,9 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("installing code needs an authenticated session".into())),
         };
-        Ok(into_result(
+        let canister_id = args.canister_id.clone();
+        Ok(ok_canister_action(
+            canister_id,
             management::install_code(&self.identities, &sid, args).await,
         ))
     }
@@ -523,6 +498,7 @@ impl IcTools {
     #[tool(
         description = "Report a canister's status: run state, cycle balance, module hash, memory size, controllers, and allocations. Controller-only (acts as your Internet Identity). This only READS status (it changes nothing), but on the IC it is an update call, so it needs a full (non-read-only) Internet Identity session. Requires an authenticated session.",
         annotations(title = "Get canister status", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn canister_status(
         &self,
@@ -533,7 +509,9 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("reading canister status needs an authenticated session".into())),
         };
-        Ok(into_result(
+        let canister_id = args.canister_id.clone();
+        Ok(ok_canister_action(
+            canister_id,
             management::canister_status(&self.identities, &sid, args).await,
         ))
     }
@@ -541,6 +519,7 @@ impl IcTools {
     #[tool(
         description = "Update a canister's settings: controllers, compute/memory allocation, freezing threshold, reserved-cycles limit, wasm memory limit, or log visibility (\"controllers\"|\"public\"). Only the fields you pass are changed. WARNING: passing `controllers` REPLACES the whole set — include your own principal to remain a controller. Requires an authenticated session.",
         annotations(title = "Update canister settings", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn update_canister_settings(
         &self,
@@ -551,7 +530,9 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("updating settings needs an authenticated session".into())),
         };
-        Ok(into_result(
+        let canister_id = args.canister_id.clone();
+        Ok(ok_canister_action(
+            canister_id,
             management::update_canister_settings(&self.identities, &sid, args).await,
         ))
     }
@@ -559,6 +540,7 @@ impl IcTools {
     #[tool(
         description = "Start a stopped canister you control. Requires an authenticated session.",
         annotations(title = "Start a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn start_canister(
         &self,
@@ -569,14 +551,14 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("starting a canister needs an authenticated session".into())),
         };
-        Ok(into_result(
-            management::start_canister(&self.identities, &sid, &canister_id).await,
-        ))
+        let result = management::start_canister(&self.identities, &sid, &canister_id).await;
+        Ok(ok_canister_action(canister_id, result))
     }
 
     #[tool(
         description = "Stop a running canister you control (required before deleting it). Requires an authenticated session.",
         annotations(title = "Stop a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn stop_canister(
         &self,
@@ -587,14 +569,14 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("stopping a canister needs an authenticated session".into())),
         };
-        Ok(into_result(
-            management::stop_canister(&self.identities, &sid, &canister_id).await,
-        ))
+        let result = management::stop_canister(&self.identities, &sid, &canister_id).await;
+        Ok(ok_canister_action(canister_id, result))
     }
 
     #[tool(
         description = "Remove a canister's code and state, leaving it empty (it keeps its id and cycles). Acts as your Internet Identity. Requires an authenticated session.",
         annotations(title = "Uninstall code from a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn uninstall_code(
         &self,
@@ -605,14 +587,14 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("uninstalling code needs an authenticated session".into())),
         };
-        Ok(into_result(
-            management::uninstall_code(&self.identities, &sid, &canister_id).await,
-        ))
+        let result = management::uninstall_code(&self.identities, &sid, &canister_id).await;
+        Ok(ok_canister_action(canister_id, result))
     }
 
     #[tool(
         description = "Delete a canister permanently (irreversible — stop it first; remaining cycles are burned). Acts as your Internet Identity. Requires an authenticated session.",
         annotations(title = "Delete a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn delete_canister(
         &self,
@@ -623,205 +605,9 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("deleting a canister needs an authenticated session".into())),
         };
-        Ok(into_result(
-            management::delete_canister(&self.identities, &sid, &canister_id).await,
-        ))
+        let result = management::delete_canister(&self.identities, &sid, &canister_id).await;
+        Ok(ok_canister_action(canister_id, result))
     }
-}
-
-impl IcTools {
-    /// The interface to encode/decode against: the canister's own
-    /// `candid:service` if exposed, else the caller-supplied `candid`.
-    async fn resolve_did(&self, canister: Principal, provided: Option<&str>) -> Option<String> {
-        if let Some(did) = self.candid_service(canister).await {
-            return Some(did);
-        }
-        provided.map(str::to_string)
-    }
-
-    /// The canister's `candid:service` interface (`.did` text), if exposed.
-    async fn candid_service(&self, canister: Principal) -> Option<String> {
-        let raw = self
-            .agent
-            .read_state_canister_metadata(canister, "candid:service")
-            .await
-            .ok()?;
-        String::from_utf8(raw).ok()
-    }
-}
-
-/// Maximum byte length of caller-supplied textual Candid we will parse. Real
-/// values are tiny and even large `.did` interfaces are well under this.
-pub(crate) const MAX_CANDID_TEXT_BYTES: usize = 1024 * 1024;
-/// Maximum nesting depth of caller-supplied textual Candid. `candid_parser` and
-/// its AST / type-check / `Display` passes recurse with NO depth guard, so deeply
-/// nested untrusted input (e.g. `opt opt … 1` thousands deep) would drive an
-/// unrecoverable stack-overflow **process abort** (CWE-674), killing every
-/// concurrent session. Real Candid nests only a handful of levels; 128 is far
-/// above any legitimate value/interface yet far below the stack-overflow depth.
-pub(crate) const MAX_CANDID_DEPTH: usize = 128;
-
-/// Reject caller-supplied textual Candid (a value, or `.did` service text) that
-/// is too large or too deeply nested to parse safely, BEFORE handing it to
-/// `candid_parser` (CWE-674). `what` names the input for the error message.
-///
-/// Depth is measured structurally without parsing. The stack holds one frame per
-/// open nesting level: a bracket group (`(` `{` `[`) or an `opt`/`vec` prefix. A
-/// prefix wraps exactly the next value, so it stays on the stack until that value
-/// *completes* — at the leaf token, string, or matching bracket closer that ends
-/// it — NOT merely because the next token is a word: that word may be
-/// `record`/`variant`, which opens a bracket the prefix must outlive (so
-/// `opt record { … }` correctly counts as two levels, not one). String literals
-/// are skipped so their contents can't inflate the count. It is a conservative
-/// over-approximation that tracks the parser's container recursion without
-/// under-counting nested `opt`/`vec`/bracket levels.
-pub(crate) fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
-    if text.len() > MAX_CANDID_TEXT_BYTES {
-        return Err(format!(
-            "{what} is too large to parse ({} bytes; limit {MAX_CANDID_TEXT_BYTES})",
-            text.len()
-        ));
-    }
-    // Frames: b'B' = bracket group, b'P' = pending opt/vec prefix awaiting its value.
-    let mut stack: Vec<u8> = Vec::new();
-    let bytes = text.as_bytes();
-    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
-    // Pop the prefix frames waiting on a value that has just completed.
-    fn resolve_prefixes(stack: &mut Vec<u8>) {
-        while stack.last() == Some(&b'P') {
-            stack.pop();
-        }
-    }
-    // The next non-whitespace byte at/after `j` (to tell `record {` from a leaf).
-    let peek_significant = |j: usize| -> Option<u8> {
-        bytes[j..]
-            .iter()
-            .find(|&&b| !b.is_ascii_whitespace())
-            .copied()
-    };
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        match c {
-            b'"' => {
-                // Skip a string literal (handles \" escapes) so its contents don't count.
-                i += 1;
-                while i < bytes.len() {
-                    match bytes[i] {
-                        b'\\' => i += 2,
-                        b'"' => {
-                            i += 1;
-                            break;
-                        }
-                        _ => i += 1,
-                    }
-                }
-                // A string is a complete leaf value: resolve prefixes waiting on it.
-                resolve_prefixes(&mut stack);
-            }
-            b'(' | b'{' | b'[' => {
-                stack.push(b'B');
-                if stack.len() > MAX_CANDID_DEPTH {
-                    return Err(depth_err(what));
-                }
-                i += 1;
-            }
-            b')' | b'}' | b']' => {
-                if stack.last() == Some(&b'B') {
-                    stack.pop();
-                }
-                // The group is a complete value: resolve prefixes waiting on it.
-                resolve_prefixes(&mut stack);
-                i += 1;
-            }
-            b',' | b';' => {
-                // End of one element: resolve its prefixes, keep the enclosing bracket.
-                resolve_prefixes(&mut stack);
-                i += 1;
-            }
-            _ if is_word(c) => {
-                let start = i;
-                while i < bytes.len() && is_word(bytes[i]) {
-                    i += 1;
-                }
-                let word = &bytes[start..i];
-                if word == b"opt" || word == b"vec" {
-                    stack.push(b'P');
-                    if stack.len() > MAX_CANDID_DEPTH {
-                        return Err(depth_err(what));
-                    }
-                } else if !matches!(peek_significant(i), Some(b'{') | Some(b'(') | Some(b'[')) {
-                    // A leaf token (a number, `nat`, `principal`, `blob`, a field
-                    // name, …) that does NOT open a group completes a value, so
-                    // resolve prefixes waiting on it. A group-introducing keyword
-                    // (`record`/`variant`/…) instead leaves them pending until its
-                    // bracket closes, so `opt record { … }` keeps both levels.
-                    resolve_prefixes(&mut stack);
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    Ok(())
-}
-
-fn depth_err(what: &str) -> String {
-    format!("{what} is nested too deeply (limit {MAX_CANDID_DEPTH}) — refusing to parse")
-}
-
-/// Encode textual Candid args to bytes. With `did` (the canister interface),
-/// coerce the args to the method's declared parameter types — so plain literals
-/// land as the method expects (`42` -> `nat64`, `1` -> `float64`, `opt`/`vec`
-/// element types) with no `: type` annotations. Without it (interface
-/// unreadable and no `candid` supplied), fall back to type-less inference, where
-/// numeric literals default to `int`/`float64` and must be annotated (see the
-/// `candid://textual-syntax` resource).
-fn encode_args(did: Option<&str>, method: &str, args_text: &str) -> Result<Vec<u8>, String> {
-    // The value MUST be parsed to encode it, so an oversized/over-nested value is
-    // a hard reject (CWE-674). An over-limit `did` is non-fatal: skip the typed
-    // path (don't parse it) and fall back to type-less encoding below.
-    guard_candid_text("the `args` value", args_text)?;
-    let parsed = candid_parser::parse_idl_args(args_text)
-        .map_err(|e| format!("could not parse args `{args_text}`: {e}"))?;
-    if let Some(did) = did.filter(|d| guard_candid_text("the `candid` interface", d).is_ok()) {
-        if let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() {
-            if let Ok(func) = env.get_method(&actor, method) {
-                return parsed
-                    .to_bytes_with_types(&env, &func.args)
-                    .map_err(|e| format!("args don't match `{method}`'s Candid signature: {e}"));
-            }
-        }
-    }
-    parsed
-        .to_bytes()
-        .map_err(|e| format!("could not encode args `{args_text}`: {e}"))
-}
-
-/// Decode reply `bytes` to textual Candid. With `did`, decode against the
-/// method's declared return types so record/variant field names are recovered;
-/// otherwise (or on any failure) fall back to type-less decoding.
-fn decode_reply(did: Option<&str>, method: &str, bytes: &[u8]) -> String {
-    if let Some(text) = did.and_then(|d| decode_bytes_with_did(d, method, bytes)) {
-        return text;
-    }
-    match IDLArgs::from_bytes(bytes) {
-        Ok(decoded) => decoded.to_string(),
-        Err(e) => format!("(call succeeded but reply is not decodable as Candid: {e})"),
-    }
-}
-
-/// Decode Candid `bytes` against the return types of `method` declared in the
-/// `.did` text, recovering record/variant field names. None if the interface
-/// can't be parsed, the method isn't found, or decoding fails.
-fn decode_bytes_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<String> {
-    // Skip (fall back to type-less decoding) if the interface is too large/nested
-    // to parse safely (CWE-674).
-    guard_candid_text("the `candid` interface", did).ok()?;
-    let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
-    let actor = actor?;
-    let func = env.get_method(&actor, method).ok()?;
-    let decoded = IDLArgs::from_bytes_with_types(bytes, &env, &func.rets).ok()?;
-    Some(decoded.to_string())
 }
 
 /// The authenticated MCP session of the calling request, if it carried a valid
@@ -851,21 +637,6 @@ async fn log_request(
     let elapsed_ms = started.elapsed().as_millis() as u64;
     tracing::info!(%method, %path, status, elapsed_ms, "http request");
     resp
-}
-
-/// Perform a query or update call and return the raw Candid reply bytes.
-async fn raw_call(
-    agent: &Agent,
-    canister: Principal,
-    method: &str,
-    arg: Vec<u8>,
-    is_query: bool,
-) -> Result<Vec<u8>, ic_agent::AgentError> {
-    if is_query {
-        agent.query(&canister, method).with_arg(arg).call().await
-    } else {
-        agent.update(&canister, method).with_arg(arg).call_and_wait().await
-    }
 }
 
 #[tool_handler]
@@ -1059,20 +830,69 @@ fn format_accounts(domain: &str, accounts: &[identities::AccountInfo]) -> String
     out
 }
 
+/// The MCP `outputSchema` for `T`, for use in a `#[tool(output_schema = …)]`
+/// attribute. Thin wrapper over rmcp's generator that unwraps the object-root
+/// validation: a non-object schema is a programming error (every tool output
+/// type is a struct), so it panics at router-construction time rather than
+/// forcing an `.expect(…)` at each of the ~19 call sites.
+fn schema_for_output<T: schemars::JsonSchema + std::any::Any>() -> std::sync::Arc<rmcp::model::JsonObject> {
+    rmcp::handler::server::tool::schema_for_output::<T>().unwrap_or_else(|e| {
+        panic!(
+            "output schema for `{}` must be object-rooted: {e}",
+            std::any::type_name::<T>()
+        )
+    })
+}
+
 fn ok(text: String) -> CallToolResult {
     CallToolResult::success(vec![Content::text(text)])
 }
 
-fn err(text: String) -> CallToolResult {
-    CallToolResult::error(vec![Content::text(text)])
+/// A success result carrying both the human-readable `text` and a machine-
+/// readable `value` that conforms to the tool's declared `outputSchema`.
+/// Clients that consume structured tool output get the typed form; the rest
+/// still get the text.
+///
+/// MCP requires `outputSchema` (and therefore `structuredContent`) to be
+/// object-rooted, so we only attach `value` when it serializes to a JSON
+/// object; anything else (a bare array/string/number, or a serialization
+/// failure) falls back to text-only rather than emitting structured content
+/// that couldn't match the declared schema.
+fn ok_structured<T: serde::Serialize>(text: String, value: &T) -> CallToolResult {
+    let mut result = ok(text);
+    result.structured_content = match serde_json::to_value(value) {
+        Ok(v @ serde_json::Value::Object(_)) => Some(v),
+        _ => None,
+    };
+    result
 }
 
-/// Map a tool's `Result<String, String>` to a success/error `CallToolResult`.
-fn into_result(r: Result<String, String>) -> CallToolResult {
+/// Map a management/lifecycle tool's `Result<String, String>` (the human
+/// confirmation message) to a `CallToolResult`, attaching a
+/// `management::CanisterActionOutput { canister_id, message }` as structured content on
+/// success so the reply conforms to the tool's declared `outputSchema`.
+///
+/// The `canister_id` is normalized to its canonical principal text: the
+/// management layer accepts ids with surrounding whitespace (it parses via
+/// `Principal::from_text(s.trim())`) and renders the canonical form in its
+/// messages, so we canonicalize here too to keep the structured field
+/// consistent with the text. On the success path the id always parses (the
+/// operation just used it); the trimmed input is only a defensive fallback.
+fn ok_canister_action(canister_id: String, r: Result<String, String>) -> CallToolResult {
     match r {
-        Ok(text) => ok(text),
+        Ok(message) => {
+            let canister_id = Principal::from_text(canister_id.trim())
+                .map(|p| p.to_text())
+                .unwrap_or_else(|_| canister_id.trim().to_string());
+            let output = management::CanisterActionOutput { canister_id, message };
+            ok_structured(output.message.clone(), &output)
+        }
         Err(text) => err(text),
     }
+}
+
+fn err(text: String) -> CallToolResult {
+    CallToolResult::error(vec![Content::text(text)])
 }
 
 const INDEX_HTML: &str = r#"<!DOCTYPE html>
@@ -1309,7 +1129,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_bytes_with_did;
+    use super::calls::decode_bytes_with_did;
     use candid::types::value::IDLArgs;
     use candid_parser::parse_idl_args;
 
@@ -1332,45 +1152,6 @@ mod tests {
         let typed = decode_bytes_with_did(did, "stats", &bytes).expect("typed decode");
         assert!(typed.contains("name ="), "typed should have `name`: {typed}");
         assert!(typed.contains("url ="), "typed should have `url`: {typed}");
-    }
-
-    // CWE-674: the pre-parse guard rejects over-deep / oversized textual Candid
-    // (which would otherwise stack-overflow candid_parser and abort the process),
-    // without false-positiving on realistic values.
-    #[test]
-    fn candid_guard_rejects_deep_and_oversized() {
-        use super::{guard_candid_text, MAX_CANDID_TEXT_BYTES};
-        // Realistic, shallow values/interfaces pass.
-        assert!(guard_candid_text("v", "()").is_ok());
-        assert!(guard_candid_text("v", "(record { a = opt 1; b = vec { 1; 2; 3 } })").is_ok());
-        // The finding's exact vector: keyword nesting with NO brackets is caught.
-        let deep_opt = format!("{}1", "opt ".repeat(5000));
-        assert!(guard_candid_text("v", &deep_opt).is_err(), "deep opt-chain must be refused");
-        // Bracket nesting is caught too.
-        assert!(guard_candid_text("v", &"{".repeat(200)).is_err(), "deep brackets must be refused");
-        // Mixed prefix+group nesting must count BOTH levels per step (each
-        // `opt record {` is depth 2), so the `opt` prefix isn't lost to the
-        // following `record` keyword. 100 levels ⇒ ~200 frames ⇒ refused.
-        let deep_mixed = format!(
-            "{}1{}",
-            "opt record { a = ".repeat(100),
-            " }".repeat(100),
-        );
-        assert!(
-            guard_candid_text("v", &deep_mixed).is_err(),
-            "deep opt-record nesting must be refused (no prefix under-count)"
-        );
-        // ...but a shallow mixed value stays well under the limit.
-        assert!(
-            guard_candid_text("v", "(opt record { a = opt variant { b = vec { 1; 2 } } })").is_ok()
-        );
-        // Oversized-but-shallow input is caught by the byte cap.
-        let big = "0,".repeat(MAX_CANDID_TEXT_BYTES);
-        assert!(guard_candid_text("v", &big).is_err(), "oversized input must be refused");
-        // No false positives: brackets inside a STRING don't count, and many
-        // SIBLING (non-nested) opts stay shallow.
-        assert!(guard_candid_text("v", &format!("\"{}\"", "(".repeat(10_000))).is_ok());
-        assert!(guard_candid_text("v", &format!("(record {{ {} }})", "a = opt 1; ".repeat(1000))).is_ok());
     }
 
     // Every tool must carry MCP annotations, else clients fall back to the unsafe
@@ -1421,5 +1202,105 @@ mod tests {
         let cc = ann("call_canister");
         assert_eq!(cc.read_only_hint, Some(false));
         assert_eq!(cc.destructive_hint, Some(true));
+    }
+
+    // EVERY tool must declare an outputSchema so a model knows the shape of its
+    // reply — and MCP requires that schema to be object-rooted. This guards the
+    // whole surface: a new tool added without an output schema fails here.
+    #[test]
+    fn every_tool_declares_an_object_output_schema() {
+        let tools = super::IcTools::tool_router().list_all();
+        for t in &tools {
+            let schema = t
+                .output_schema
+                .as_ref()
+                .unwrap_or_else(|| panic!("tool {} must declare an output schema", t.name));
+            assert_eq!(
+                schema.get("type"),
+                Some(&serde_json::json!("object")),
+                "tool {}'s outputSchema must be object-rooted per the MCP spec",
+                t.name
+            );
+        }
+    }
+
+    // Spot-check find_canister's schema lists the expected properties.
+    #[test]
+    fn find_canister_declares_output_schema() {
+        let tools = super::IcTools::tool_router().list_all();
+        let tool = tools
+            .iter()
+            .find(|t| &*t.name == "find_canister")
+            .expect("find_canister tool not found");
+        let schema = tool
+            .output_schema
+            .as_ref()
+            .expect("find_canister must declare an output schema");
+        let props = schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("outputSchema must have properties");
+        assert!(props.contains_key("query"), "outputSchema should describe `query`");
+        assert!(props.contains_key("matches"), "outputSchema should describe `matches`");
+    }
+
+    // The object-root guard in ok_structured must drop non-object payloads
+    // (a bare array/string can't match an MCP object outputSchema) while
+    // still attaching genuine objects.
+    #[test]
+    fn ok_structured_only_attaches_objects() {
+        let obj = super::ok_structured("t".to_string(), &serde_json::json!({"a": 1}));
+        assert!(obj.structured_content.is_some(), "an object payload must attach");
+
+        let arr = super::ok_structured("t".to_string(), &serde_json::json!([1, 2, 3]));
+        assert!(arr.structured_content.is_none(), "a bare array must be dropped");
+
+        let s = super::ok_structured("t".to_string(), &"hello");
+        assert!(s.structured_content.is_none(), "a bare string must be dropped");
+    }
+
+    // ok_canister_action normalizes the canister id to its canonical principal
+    // text, so the structured field matches the id the management layer acted
+    // on (it trims/parses the input) rather than echoing raw whitespace.
+    #[test]
+    fn ok_canister_action_canonicalizes_canister_id() {
+        let result = super::ok_canister_action(
+            "  ryjl3-tyaaa-aaaaa-aaaba-cai  ".to_string(),
+            Ok("Started ryjl3-tyaaa-aaaaa-aaaba-cai.".to_string()),
+        );
+        let value = result.structured_content.expect("structured content must be attached");
+        assert_eq!(
+            value.get("canister_id"),
+            Some(&serde_json::json!("ryjl3-tyaaa-aaaaa-aaaba-cai")),
+            "structured canister_id must be the canonical, trimmed principal text"
+        );
+    }
+
+    // A structured find_canister reply must round-trip through the declared
+    // schema shape: text for humans, plus a machine-readable object with a
+    // `matches` array carrying each match's fields.
+    #[test]
+    fn find_canister_output_serializes_to_declared_shape() {
+        let output = super::discover::FindCanisterOutput {
+            query: "ckUSDC".to_string(),
+            matches: vec![super::discover::FoundCanister {
+                canister_id: "xevnm-gaaaa-aaaar-qafnq-cai".to_string(),
+                name: "ckUSDC".to_string(),
+                kind: "token".to_string(),
+                note: None,
+            }],
+        };
+        let result = super::ok_structured("human text".to_string(), &output);
+        let value = result
+            .structured_content
+            .expect("structured content must be attached");
+        assert_eq!(value.get("query"), Some(&serde_json::json!("ckUSDC")));
+        let matches = value.get("matches").and_then(|v| v.as_array()).expect("matches array");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches[0].get("canister_id"),
+            Some(&serde_json::json!("xevnm-gaaaa-aaaar-qafnq-cai"))
+        );
+        assert_eq!(matches[0].get("kind"), Some(&serde_json::json!("token")));
     }
 }
