@@ -20,16 +20,21 @@ It answers three questions and adds a few suggestions:
 3. **Is that II instance healthy and is its `/mcp` delegation flow enabled?** —
    checks the II frontend is reachable and IC-certified, reports its frontend
    canister id and related origins, confirms it serves its runtime config
-   (textual Candid) at `/.config`, and verifies the `/mcp` delegation page is
-   served with a CSP `form-action` relaxed to allow posting the delegation
-   callback to an https MCP server (`'self' https:` on `/mcp` paths, vs the
-   tighter `'self' http://127.0.0.1:*` SPA-wide). Since
+   (textual Candid) at `/.config`, and verifies the `/mcp` connect page is
+   served. The connect flow runs on `fetch()` callbacks (governed by CSP
+   `connect-src`, which allows the https MCP origin) and a top-level navigation
+   back to the server's `finish_url` — neither is gated by `form-action` — so a
+   served page is the health signal. (The old delegation flow form-POSTed the
+   callback, which needed a relaxed `form-action`; that flow was retired in
+   [internet-identity#4086](https://github.com/dfinity/internet-identity/pull/4086),
+   and the `'self' http://127.0.0.1:*` `form-action` now on `/mcp` is for the
+   unrelated `/cli` loopback flow.) Since
    [internet-identity#4052](https://github.com/dfinity/internet-identity/pull/4052)
    there is no global `mcp_server_origin` and **trust is per-user**: each
    identity adds the MCP server it trusts in II Settings, synced on-chain. So
    whether a *specific* identity trusts this server is not inspectable from here
    without authenticating — what is instance-wide and checkable is that the
-   delegation flow itself is deployed and its callback POST is permitted.
+   connect page itself is deployed.
 
 Every check carries a plain-language description, and the report shows which
 **deployment is running** — the MCP server's version and git commit (read from
@@ -119,8 +124,8 @@ actually matters.
 
 Against `https://mcp.beta.id.ai` the server passes all endpoint checks; the
 linked II is `https://beta.id.ai` (frontend canister `gjxif-ryaaa-aaaad-ae4ka-cai`,
-backend `fgte5-ciaaa-aaaad-aaatq-cai`), whose `/mcp` delegation flow is enabled
-(its `/mcp` CSP `form-action` is relaxed to `'self' https:`, so the connect
-callback can post back). Whether a given identity trusts this MCP server is now
-per-user (set in II Settings, synced on-chain) and so is not asserted here. With
-the linked II healthy, the dashboard reports all green.
+backend `fgte5-ciaaa-aaaad-aaatq-cai`), whose `/mcp` connect page is served (the
+connect flow is `fetch()`/navigation-based, so its CSP is not asserted). Whether
+a given identity trusts this MCP server is now per-user (set in II Settings,
+synced on-chain) and so is not asserted here. With the linked II healthy, the
+dashboard reports all green.
