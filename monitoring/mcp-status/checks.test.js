@@ -255,10 +255,11 @@ test("checkIiHealth verifies the /mcp delegation flow and config", async () => {
         "content-security-policy": `default-src 'none';form-action 'self' http://127.0.0.1:*;frame-ancestors 'self' ${ii} https://beta.identity.ic0.app`,
       },
     }),
-    // The /mcp connect page relaxes form-action to allow https: callback posts.
+    // The /mcp connect page is served (200) — that is the whole health signal;
+    // the connect flow is fetch/navigation-based, so its CSP is not asserted.
     [`GET ${ii}/mcp`]: resp(200, {
       headers: {
-        "content-security-policy": `default-src 'none';form-action 'self' https:`,
+        "content-security-policy": `default-src 'none';form-action 'self' http://127.0.0.1:*`,
       },
     }),
     [`GET ${ii}/.config`]: resp(200, {
@@ -305,15 +306,17 @@ test("checkIiHealth fails when the /mcp flow is not served", async () => {
   }
 });
 
-test("checkIiHealth warns when the /mcp form-action forbids https posts", async () => {
+test("checkIiHealth passes on a served /mcp even with loopback-only form-action", async () => {
   const ii = "https://beta.test";
   const mcp = "https://mcp.beta.test";
   const restore = stubFetch({
     [`GET ${ii}/`]: resp(200, {
       headers: { "content-security-policy": `form-action 'self'` },
     }),
-    // Page served, but form-action only allows loopback — an https callback POST
-    // would be blocked, so the flow is reachable but misconfigured for remotes.
+    // /mcp is served but its form-action only allows loopback (that entry is for
+    // the unrelated /cli flow). Since II #4086 the MCP connect flow uses fetch()
+    // (connect-src) + a top-level navigation to finish_url, not a form POST, so a
+    // tightened form-action must NOT warn — a served page is healthy.
     [`GET ${ii}/mcp`]: resp(200, {
       headers: {
         "content-security-policy": `form-action 'self' http://127.0.0.1:*`,
@@ -326,7 +329,7 @@ test("checkIiHealth warns when the /mcp form-action forbids https posts", async 
   });
   try {
     const { section } = await checkIiHealth(ii, mcp, 2000);
-    assert.equal(byId(section, "ii-mcp-flow").status, "warn");
+    assert.equal(byId(section, "ii-mcp-flow").status, "pass");
     assert.equal(byId(section, "ii-config").status, "pass");
   } finally {
     restore();

@@ -14,7 +14,10 @@
 //! result carries its provenance and the caller decides (and should confirm
 //! with `get_candid`).
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 use candid::Principal;
 use regex::Regex;
@@ -126,6 +129,184 @@ fn normalize(domain: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SSRF guard (CWE-918). `discover`'s `domain` is fully user-controlled, so every
+// outbound request it drives must be constrained to PUBLIC https destinations:
+//   - the scheme is pinned to https (no http:// to metadata IPs / plaintext ports);
+//   - the host is resolved and refused if ANY address is loopback / private /
+//     link-local / CGNAT / documentation / otherwise-reserved;
+//   - the validated addresses are PINNED into the site client, so a later
+//     re-resolution can't rebind the connection to an internal address (DNS
+//     rebinding); and
+//   - each redirect hop is re-validated the same way (a 3xx can't bounce us to an
+//     internal host).
+// ---------------------------------------------------------------------------
+
+/// Whether `ip` is a publicly-routable ("global") address. Hand-rolled because
+/// `IpAddr::is_global` is still unstable; conservative — anything not clearly
+/// public is treated as non-global and refused.
+fn ip_is_global(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => ipv4_is_global(v4),
+        IpAddr::V6(v6) => ipv6_is_global(v6),
+    }
+}
+
+fn ipv4_is_global(ip: &Ipv4Addr) -> bool {
+    let o = ip.octets();
+    !(ip.is_unspecified()                       // 0.0.0.0
+        || o[0] == 0                            // 0.0.0.0/8 "this network"
+        || ip.is_loopback()                     // 127.0.0.0/8
+        || ip.is_private()                      // 10/8, 172.16/12, 192.168/16
+        || ip.is_link_local()                   // 169.254.0.0/16
+        || ip.is_broadcast()                    // 255.255.255.255
+        || ip.is_documentation()                // 192.0.2/24, 198.51.100/24, 203.0.113/24
+        || ip.is_multicast()                    // 224.0.0.0/4
+        || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT (shared)
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IETF protocol
+        || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18.0.0/15 benchmarking
+        || o[0] >= 240)                         // 240.0.0.0/4 reserved
+}
+
+fn ipv6_is_global(ip: &Ipv6Addr) -> bool {
+    // An IPv4-mapped (`::ffff:0:0/96`) OR IPv4-compatible (`::/96`, e.g.
+    // `::127.0.0.1`) address is only as global as the v4 it embeds. `to_ipv4`
+    // (unlike `to_ipv4_mapped`) covers BOTH forms — plus `::`/`::1` — so a
+    // private/loopback v4 can't slip through via IPv6 embedding.
+    if let Some(v4) = ip.to_ipv4() {
+        return ipv4_is_global(&v4);
+    }
+    let seg = ip.segments();
+    !(ip.is_unspecified()                    // ::
+        || ip.is_loopback()                  // ::1
+        || ip.is_multicast()                 // ff00::/8
+        || (seg[0] & 0xfe00) == 0xfc00       // fc00::/7 unique-local
+        || (seg[0] & 0xffc0) == 0xfe80       // fe80::/10 link-local unicast
+        || (seg[0] == 0x2001 && seg[1] == 0x0db8)) // 2001:db8::/32 documentation
+}
+
+/// Validate a user-supplied discovery URL against SSRF and return the parsed URL
+/// plus the socket addresses to PIN the client to. https only; every resolved
+/// address must be global. Async DNS (no blocking of the executor).
+async fn resolve_public_url(raw: &str) -> Result<(url::Url, Vec<SocketAddr>), String> {
+    let url = url::Url::parse(raw).map_err(|e| format!("invalid discovery URL {raw}: {e}"))?;
+    if url.scheme() != "https" {
+        return Err(format!(
+            "refusing to fetch {raw}: only https:// discovery targets are allowed (SSRF guard)"
+        ));
+    }
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<SocketAddr> = match url.host() {
+        Some(url::Host::Ipv4(v4)) => vec![SocketAddr::new(IpAddr::V4(v4), port)],
+        Some(url::Host::Ipv6(v6)) => vec![SocketAddr::new(IpAddr::V6(v6), port)],
+        Some(url::Host::Domain(host)) => tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| format!("could not resolve {host}: {e}"))?
+            .collect(),
+        None => return Err(format!("refusing to fetch {raw}: no host")),
+    };
+    if addrs.is_empty() {
+        return Err(format!("refusing to fetch {raw}: host did not resolve"));
+    }
+    if let Some(bad) = addrs.iter().find(|a| !ip_is_global(&a.ip())) {
+        return Err(format!(
+            "refusing to fetch {raw}: it resolves to a non-public address ({}) — discovery is \
+             restricted to public hosts (SSRF guard)",
+            bad.ip()
+        ));
+    }
+    Ok((url, addrs))
+}
+
+/// Whether a redirect hop is safe to follow — decided WITHOUT a DNS lookup (the
+/// reqwest redirect callback is synchronous, so resolving a fresh domain there
+/// would both block a worker thread and reopen a rebind TOCTOU on the redirect
+/// target). A hop is allowed only when it is https AND either (a) an IP literal
+/// that is globally routable, or (b) a SAME-HOST redirect — the host was already
+/// validated up front and, for the site client, pinned, so no new unvalidated
+/// destination is introduced. A redirect to a *different* domain is refused;
+/// discovery targets normally respond directly, so this trades that rare case for
+/// safety (a cross-host redirect would need its own validate+pin).
+fn redirect_hop_ok(next: &url::Url, prev_host: Option<&str>) -> bool {
+    if next.scheme() != "https" {
+        return false;
+    }
+    match next.host() {
+        Some(url::Host::Ipv4(v4)) => ip_is_global(&IpAddr::V4(v4)),
+        Some(url::Host::Ipv6(v6)) => ip_is_global(&IpAddr::V6(v6)),
+        Some(url::Host::Domain(h)) => prev_host == Some(h),
+        None => false,
+    }
+}
+
+/// Redirect policy shared by every discovery/dashboard client: follow only safe
+/// public https hops (bounded), and stop — rather than follow — an unsafe hop, so
+/// no request is ever issued to an internal host.
+fn ssrf_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let prev_host = attempt
+            .previous()
+            .last()
+            .and_then(|u| u.host_str())
+            .map(str::to_string);
+        if attempt.previous().len() >= 10 {
+            attempt.error("too many redirects")
+        } else if redirect_hop_ok(attempt.url(), prev_host.as_deref()) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+/// A client for fetching a user-supplied site: the SSRF redirect guard plus the
+/// host PINNED to the pre-validated public addresses, so no re-resolution can
+/// rebind the connection to an internal address between validation and connect.
+/// (Pinning only overrides this host; requests to other hosts — e.g. the
+/// dashboard — resolve normally, still under the redirect guard.)
+fn site_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent("ic-mcp-discover/0.1")
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(ssrf_redirect_policy())
+        .resolve_to_addrs(host, addrs)
+        .build()
+        .map_err(|e| format!("http client: {e}"))
+}
+
+// Response-size caps (CWE-770): a fully user-controlled discovery target could
+// stream an unbounded (or gzip-bomb-inflated) body and exhaust memory. reqwest's
+// `.text()`/`.bytes()` buffer the whole body with no ceiling, so we read chunk by
+// chunk and stop once the cap is hit. The connection is dropped when the response
+// is, so a truncated read cancels the transfer rather than draining it.
+const MAX_BODY_BYTES: usize = 2 * 1024 * 1024; // one document (HTML, one JS file)
+const MAX_ENV_JSON_BYTES: usize = 256 * 1024; // /env.json is tiny in practice
+const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024; // aggregate bundle text mined for ids
+
+/// Read up to `max` bytes of a response body, then stop — dropping the response
+/// (and so the connection) rather than draining the remainder. Best-effort: a
+/// mid-stream error just returns what we have (discovery is opportunistic).
+async fn read_capped(mut resp: reqwest::Response, max: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        if buf.len() >= max {
+            break;
+        }
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = (max - buf.len()).min(chunk.len());
+                buf.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    break; // hit the cap mid-chunk; stop (drops the connection)
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 fn add(found: &mut BTreeMap<String, Found>, id: &str, label: Option<String>, source: String) {
     // Drop false positives by validating as a real principal.
     if Principal::from_text(id).is_err() {
@@ -148,7 +329,13 @@ fn add(found: &mut BTreeMap<String, Found>, id: &str, label: Option<String>, sou
 
 pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
     let base = normalize(domain);
-    let client = http_client()?;
+    // SSRF guard (CWE-918): validate + resolve the fully user-controlled target
+    // to public addresses BEFORE any request, and pin them into the client so the
+    // connection can't rebind to an internal host. The pin only affects this site
+    // host, so the dashboard-enrichment calls below (different hosts) still work.
+    let (base_url, pinned) = resolve_public_url(&base).await?;
+    let host = base_url.host_str().unwrap_or_default().to_string();
+    let client = site_client(&host, &pinned)?;
 
     let mut found: BTreeMap<String, Found> = BTreeMap::new();
 
@@ -165,15 +352,14 @@ pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
     {
         add(&mut found, id, Some("frontend".into()), "header".into());
     }
-    let html = resp.text().await.unwrap_or_default();
+    let html = read_capped(resp, MAX_BODY_BYTES).await;
 
     // 2. Runtime config: /env.json with *canister_id* keys (e.g. Caffeine apps).
     if let Ok(resp) = client.get(format!("{base}/env.json")).send().await {
         if resp.status().is_success() {
-            if let Ok(text) = resp.text().await {
-                for (id, label) in canisters_from_env_json(&text) {
-                    add(&mut found, &id, Some(label), "env.json".into());
-                }
+            let text = read_capped(resp, MAX_ENV_JSON_BYTES).await;
+            for (id, label) in canisters_from_env_json(&text) {
+                add(&mut found, &id, Some(label), "env.json".into());
             }
         }
     }
@@ -188,11 +374,17 @@ pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
     scripts.sort();
     scripts.dedup();
     for s in scripts.iter().take(20) {
+        if blob.len() >= MAX_SCAN_BYTES {
+            break; // aggregate cap: stop mining once we've buffered enough text
+        }
         if let Ok(resp) = client.get(format!("{base}{s}")).send().await {
-            if let Ok(t) = resp.text().await {
-                blob.push('\n');
-                blob.push_str(&t);
-            }
+            // Push the separator first, then size the read against the space that
+            // remains — so the '\n' counts toward the cap and `blob` never exceeds
+            // MAX_SCAN_BYTES (loop guard guarantees room for the separator).
+            blob.push('\n');
+            let room = MAX_SCAN_BYTES.saturating_sub(blob.len());
+            let t = read_capped(resp, room.min(MAX_BODY_BYTES)).await;
+            blob.push_str(&t);
         }
     }
 
@@ -289,12 +481,16 @@ fn resolve_base(configured: Option<String>, default: &str) -> String {
     }
 }
 
-/// Shared HTTP client for discovery + dashboard calls. Short-ish timeout since
-/// these back interactive tools.
+/// Shared HTTP client for dashboard/registry calls (fixed public hosts) and the
+/// `lookup_canister` tool. Carries the SSRF redirect guard so a 3xx can never
+/// bounce a request onto an internal host. Short-ish timeout since these back
+/// interactive tools. (User-supplied *site* fetches use [`site_client`], which
+/// additionally pins the resolved address.)
 pub fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent("ic-mcp-discover/0.1")
         .timeout(std::time::Duration::from_secs(15))
+        .redirect(ssrf_redirect_policy())
         .build()
         .map_err(|e| format!("http client: {e}"))
 }
@@ -649,6 +845,64 @@ fn search_in(ledgers_json: &str, snses_json: &str, query: &str) -> Vec<Match> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // SSRF guard (CWE-918): global vs. non-global IP classification (offline).
+    #[test]
+    fn ip_globality_classification() {
+        let g = |s: &str| ip_is_global(&s.parse::<IpAddr>().unwrap());
+        // Publicly-routable addresses.
+        assert!(g("8.8.8.8"));
+        assert!(g("1.1.1.1"));
+        assert!(g("2606:4700:4700::1111"));
+        // Loopback / private / link-local / CGNAT / reserved / doc / bench, plus
+        // IPv4 embedded in IPv6 as MAPPED (::ffff:…) and COMPATIBLE (::…) forms.
+        for bad in [
+            "127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.1.1", "169.254.169.254",
+            "100.64.0.1", "0.0.0.0", "255.255.255.255", "192.0.2.1", "198.18.0.1", "240.0.0.1",
+            "::1", "::", "fc00::1", "fd12::1", "fe80::1", "2001:db8::1",
+            "::ffff:127.0.0.1", "::ffff:10.0.0.1", // IPv4-mapped private/loopback
+            "::127.0.0.1", "::192.168.1.1",        // IPv4-compatible private/loopback
+        ] {
+            assert!(!g(bad), "{bad} must be classified non-global");
+        }
+    }
+
+    // The exact vectors from the finding, plus https-to-internal, are refused
+    // (all offline: scheme check and IP literals need no DNS).
+    #[tokio::test]
+    async fn resolve_public_url_rejects_ssrf_targets() {
+        for bad in [
+            "http://169.254.169.254/latest/meta-data/", // http metadata
+            "http://127.0.0.1:6379/",                   // http plaintext port
+            "https://127.0.0.1:6379/",                  // https loopback
+            "https://10.0.0.1/",                        // private
+            "https://169.254.169.254/",                 // link-local metadata
+            "https://[::1]/",                           // loopback v6
+            "ftp://example.com/",                        // non-https scheme
+        ] {
+            assert!(resolve_public_url(bad).await.is_err(), "{bad} must be refused");
+        }
+        // A public IP literal is accepted and pinned to itself.
+        let (_, addrs) = resolve_public_url("https://8.8.8.8/").await.expect("public ip ok");
+        assert_eq!(addrs, vec!["8.8.8.8:443".parse().unwrap()]);
+    }
+
+    // Redirect hops: same-host or global-IP-literal https only; no DNS involved.
+    #[test]
+    fn redirect_hop_policy() {
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        // Same-host https redirect is allowed (host already validated / pinned).
+        assert!(redirect_hop_ok(&u("https://oisy.com/app"), Some("oisy.com")));
+        // A redirect to a DIFFERENT domain is refused (can't validate+pin here).
+        assert!(!redirect_hop_ok(&u("https://evil.example/x"), Some("oisy.com")));
+        // Global IP-literal hop allowed; internal IP-literal hops refused.
+        assert!(redirect_hop_ok(&u("https://8.8.8.8/x"), Some("oisy.com")));
+        assert!(!redirect_hop_ok(&u("https://127.0.0.1/x"), Some("oisy.com")));
+        assert!(!redirect_hop_ok(&u("https://169.254.169.254/x"), Some("oisy.com")));
+        assert!(!redirect_hop_ok(&u("https://[::1]/x"), Some("oisy.com")));
+        // Non-https refused even on the same host.
+        assert!(!redirect_hop_ok(&u("http://oisy.com/x"), Some("oisy.com")));
+    }
 
     // Live network test against a stable public IC app (OISY).
     #[tokio::test]

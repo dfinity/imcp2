@@ -660,6 +660,9 @@ fn parse_log_visibility(s: &str) -> Result<LogVisibility, String> {
 /// Encode a textual-Candid init/upgrade argument type-lessly (there is no
 /// service interface to coerce against at install time).
 fn encode_textual_arg(arg: &str) -> Result<Vec<u8>, String> {
+    // Bound size/nesting before parsing so untrusted input can't stack-overflow
+    // the process (CWE-674).
+    crate::calls::guard_candid_text("the install `arg`", arg)?;
     candid_parser::parse_idl_args(arg)
         .map_err(|e| format!("could not parse init arg `{arg}`: {e}"))?
         .to_bytes()

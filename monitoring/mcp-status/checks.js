@@ -532,7 +532,7 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
  * redirects — so there is no `Location` header to read and the probe could
  * never pass. Instead we resolve the origin (configured or naming-convention
  * derived); the II-health section below then checks that *resolved* origin is
- * reachable and has its `/mcp` delegation flow enabled. Note this does not
+ * reachable and serving its `/mcp` connect page. Note this does not
  * live-verify that the MCP server actually hands off to that II instance — the
  * pairing is inferred from config / the naming convention, not proven.
  *
@@ -559,7 +559,7 @@ export const checkLinkage = (mcpOrigin, configuredIi, iiOriginSource) => {
     id: "ii-target",
     label: "Linked Internet Identity instance",
     description:
-      "Identifies which Internet Identity instance this MCP server is paired with (explicitly configured, or derived from the naming convention — the pairing is inferred, not live-verified). The II-health section below then checks that resolved origin is reachable and has its /mcp delegation flow enabled.",
+      "Identifies which Internet Identity instance this MCP server is paired with (explicitly configured, or derived from the naming convention — the pairing is inferred, not live-verified). The II-health section below then checks that resolved origin is reachable and serving its /mcp connect page.",
     target: mcpOrigin,
     expected: "a resolvable II origin",
     status: iiOrigin ? "pass" : "fail",
@@ -661,50 +661,41 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
       : "no ic-certificate header (response not certified by the IC?)",
   });
 
-  // 3. /mcp delegation flow. Since dfinity/internet-identity#4052 the II no
-  //    longer has a global `mcp_server_origin`, and trust is per-user: each
-  //    identity adds the MCP server it trusts in II Settings, synced on-chain.
-  //    So there is no global, unauthenticated signal that names this specific
-  //    server — recognition is per-identity and not inspectable from here.
-  //    What IS instance-wide and inspectable is whether the `/mcp` connect page
-  //    is served and whether its CSP `form-action` is relaxed to allow posting
-  //    the delegation callback to an https MCP server (`'self' https:` on /mcp
-  //    paths, vs the tighter `'self' http://127.0.0.1:*` SPA-wide). That relaxed
-  //    form-action is what lets any https MCP server's connect callback POST
-  //    back, so it is the authoritative health signal for the delegation flow.
+  // 3. /mcp connect page. Since dfinity/internet-identity#4052 the II no longer
+  //    has a global `mcp_server_origin`, and trust is per-user: each identity
+  //    adds the MCP server it trusts in II Settings, synced on-chain. So there is
+  //    no global, unauthenticated signal that names this specific server —
+  //    recognition is per-identity and not inspectable from here.
+  //
+  //    There is also no instance-wide CSP signal to assert. The old delegation
+  //    flow form-POSTed the callback to the server, so a relaxed `form-action`
+  //    (`'self' https:`) was its precondition — but dfinity/internet-identity
+  //    #4086 retired that flow. The current connect flow never form-POSTs: the
+  //    key-request and completion callbacks are `fetch()` calls (governed by
+  //    `connect-src`, which allows the https origin) and the hand-back to
+  //    `finish_url` is a top-level navigation (not governed by `form-action`).
+  //    The tightened `form-action 'self' http://127.0.0.1:*` now on /mcp is for
+  //    the unrelated /cli loopback flow, not MCP. So the only meaningful
+  //    instance-wide health signal left is that the /mcp connect page is served.
   {
     const url = `${iiOrigin}/mcp`;
     const mr = await probe(url, { timeoutMs });
-    const mcpFormAction = parseCspDirective(
-      mr.headers.get("content-security-policy"),
-      "form-action",
-    );
-    facts.mcpFormAction = mcpFormAction;
-    // The callback is posted to an https origin, so the /mcp page's form-action
-    // must permit https: (the `https:` scheme source, or this exact origin).
-    const allowsHttpsPost =
-      !!mcpFormAction &&
-      (mcpFormAction.includes("https:") || mcpFormAction.includes(mcpOrigin));
     const served = mr.ok && mr.status === 200;
     checks.push({
       id: "ii-mcp-flow",
-      label: "II /mcp delegation flow enabled",
+      label: "II /mcp connect page served",
       description:
-        "Confirms the II serves its /mcp delegation page and that its CSP form-action is relaxed to allow posting the delegation callback to an https MCP server. Since #4052 trust is per-user (each identity adds its trusted server in II Settings, synced on-chain), so which servers a given identity trusts is not globally inspectable; this checks the instance-wide flow is enabled.",
-      target: `GET ${url} CSP form-action`,
-      expected: "200 and form-action allows https: (callback can post to https)",
-      status: served ? (allowsHttpsPost ? "pass" : "warn") : "fail",
+        "Confirms the II serves its /mcp connect page. The connect flow runs on fetch() callbacks (governed by CSP connect-src, which allows the https MCP origin) and a top-level navigation back to the server's finish_url — neither is gated by form-action — so serving the page is the health signal. Since #4052 trust is per-user (each identity adds its trusted server in II Settings, synced on-chain), which servers a given identity trusts is not globally inspectable; this checks the instance-wide flow is enabled.",
+      target: `GET ${url}`,
+      expected: "200 (connect page served)",
+      status: served ? "pass" : "fail",
       httpStatus: mr.status,
       latencyMs: mr.latencyMs,
       detail: mr.error
         ? `request failed: ${mr.error.message}`
-        : !served
-          ? `${mr.status}, /mcp delegation page not served`
-          : mcpFormAction
-            ? allowsHttpsPost
-              ? `form-action = [${mcpFormAction.join(", ")}] → can post the callback to https MCP servers`
-              : `form-action = [${mcpFormAction.join(", ")}] (does NOT allow https: — the callback to ${mcpOrigin} would be blocked)`
-            : "200 but no form-action directive in the /mcp CSP",
+        : served
+          ? `${mr.status}, /mcp connect page served`
+          : `${mr.status}, /mcp connect page not served`,
     });
   }
 
@@ -840,18 +831,9 @@ export const buildSuggestions = (sections, facts) => {
 
   if (checkById["ii-mcp-flow"]?.status === "fail") {
     suggestions.push(
-      "The linked II does not serve its /mcp delegation page. The MCP connect " +
+      "The linked II does not serve its /mcp connect page. The MCP connect " +
         "flow cannot run until an II build that includes the /mcp flow is " +
         "deployed at this origin.",
-    );
-  } else if (checkById["ii-mcp-flow"]?.status === "warn") {
-    suggestions.push(
-      "The II /mcp page is served but its CSP form-action does not allow " +
-        "https:, so it cannot post the delegation callback to an https MCP " +
-        "server. Note that since #4052 each user also adds the trusted MCP " +
-        "server in II Settings (synced on-chain): a connect only succeeds for " +
-        "servers the signed-in identity has trusted, which this dashboard " +
-        "cannot verify without authenticating.",
     );
   }
   if (checkById["mcp-challenge"]?.status !== "pass") {
