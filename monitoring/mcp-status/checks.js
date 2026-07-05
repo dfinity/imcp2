@@ -532,7 +532,7 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
  * redirects — so there is no `Location` header to read and the probe could
  * never pass. Instead we resolve the origin (configured or naming-convention
  * derived); the II-health section below then checks that *resolved* origin is
- * reachable and has its `/mcp` delegation flow enabled. Note this does not
+ * reachable and serving its `/mcp` connect page. Note this does not
  * live-verify that the MCP server actually hands off to that II instance — the
  * pairing is inferred from config / the naming convention, not proven.
  *
@@ -559,7 +559,7 @@ export const checkLinkage = (mcpOrigin, configuredIi, iiOriginSource) => {
     id: "ii-target",
     label: "Linked Internet Identity instance",
     description:
-      "Identifies which Internet Identity instance this MCP server is paired with (explicitly configured, or derived from the naming convention — the pairing is inferred, not live-verified). The II-health section below then checks that resolved origin is reachable and has its /mcp delegation flow enabled.",
+      "Identifies which Internet Identity instance this MCP server is paired with (explicitly configured, or derived from the naming convention — the pairing is inferred, not live-verified). The II-health section below then checks that resolved origin is reachable and serving its /mcp connect page.",
     target: mcpOrigin,
     expected: "a resolvable II origin",
     status: iiOrigin ? "pass" : "fail",
@@ -683,7 +683,7 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
     const served = mr.ok && mr.status === 200;
     checks.push({
       id: "ii-mcp-flow",
-      label: "II /mcp delegation flow enabled",
+      label: "II /mcp connect page served",
       description:
         "Confirms the II serves its /mcp connect page. The connect flow runs on fetch() callbacks (governed by CSP connect-src, which allows the https MCP origin) and a top-level navigation back to the server's finish_url — neither is gated by form-action — so serving the page is the health signal. Since #4052 trust is per-user (each identity adds its trusted server in II Settings, synced on-chain), which servers a given identity trusts is not globally inspectable; this checks the instance-wide flow is enabled.",
       target: `GET ${url}`,

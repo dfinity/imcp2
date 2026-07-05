@@ -14,10 +14,10 @@ It answers three questions and adds a few suggestions:
 2. **Which Internet Identity instance is it linked to?** — resolves the II
    origin (derived from the `mcp.<env>.id.ai` ↔ `<env>.id.ai` convention, or
    overridden explicitly). Question 3 then checks that resolved origin is
-   reachable and has its `/mcp` delegation flow enabled. The pairing itself is
+   reachable and serving its `/mcp` connect page. The pairing itself is
    inferred from config / the naming convention — the dashboard doesn't
    live-verify that the MCP server actually hands off to that II instance.
-3. **Is that II instance healthy and is its `/mcp` delegation flow enabled?** —
+3. **Is that II instance healthy and is its `/mcp` connect page served?** —
    checks the II frontend is reachable and IC-certified, reports its frontend
    canister id and related origins, confirms it serves its runtime config
    (textual Candid) at `/.config`, and verifies the `/mcp` connect page is
