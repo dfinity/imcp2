@@ -9,12 +9,7 @@
 // point that returns a fully structured, JSON-serialisable report.
 
 import tls from "node:tls";
-import {
-  commitUrl,
-  deriveIiOrigin,
-  isAllowedOrigin,
-  resolveConfig,
-} from "./config.js";
+import { commitUrl, deriveIiOrigin, resolveConfig } from "./config.js";
 
 /**
  * @typedef {"pass" | "warn" | "fail"} Status
@@ -529,99 +524,32 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
 // ---------------------------------------------------------------------------
 
 /**
- * Best-effort discovery of the II origin the MCP server redirects to during the
- * OAuth authorization flow. Registers a throwaway client and inspects the
- * `Location` header of `/oauth/authorize`. Returns `undefined` if the server
- * does not (yet) issue a cross-origin redirect we can read headlessly.
+ * Resolve which II instance the MCP server is paired with. We don't try to
+ * confirm the link by following `/oauth/authorize` headlessly: that endpoint
+ * issues a *script-initiated* navigation (an HTML page that calls
+ * `location.replace`), not an HTTP 3xx redirect — because the II `/mcp` URL
+ * carries its params in the fragment and form-action CSP is enforced across
+ * redirects — so there is no `Location` header to read and the probe could
+ * never pass. Instead we resolve the origin (configured or naming-convention
+ * derived); the II-health section below then checks that *resolved* origin is
+ * reachable and has its `/mcp` delegation flow enabled. Note this does not
+ * live-verify that the MCP server actually hands off to that II instance — the
+ * pairing is inferred from config / the naming convention, not proven.
  *
- * @param {string} mcpOrigin
- * @param {number} timeoutMs
- * @returns {Promise<{ iiOrigin?: string, detail: string }>}
- */
-export const discoverIiViaAuthorize = async (mcpOrigin, timeoutMs) => {
-  const redirectUri = "https://example.org/callback";
-  const reg = await probe(`${mcpOrigin}/oauth/register`, {
-    timeoutMs,
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      client_name: "imcp-status-dashboard",
-      redirect_uris: [redirectUri],
-      token_endpoint_auth_method: "none",
-      grant_types: ["authorization_code"],
-      response_types: ["code"],
-    }),
-  });
-  const client = tryJson(reg.bodyText);
-  if (!client?.client_id) {
-    return { detail: `client registration failed (HTTP ${reg.status})` };
-  }
-  const params = new URLSearchParams({
-    response_type: "code",
-    client_id: client.client_id,
-    redirect_uri: redirectUri,
-    code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
-    code_challenge_method: "S256",
-    state: "imcp-status-probe",
-  });
-  const r = await probe(`${mcpOrigin}/oauth/authorize?${params}`, {
-    timeoutMs,
-  });
-  const location = r.headers.get("location");
-  if (r.status >= 300 && r.status < 400 && location) {
-    try {
-      const target = new URL(location, mcpOrigin);
-      if (target.origin !== mcpOrigin) {
-        // Only adopt a discovered origin if it is on the allowlist; otherwise a
-        // monitored server could redirect us into probing an arbitrary host.
-        if (!isAllowedOrigin(target.origin)) {
-          return {
-            detail: `/oauth/authorize redirects to ${target.origin} (not on the allowlist; ignored)`,
-          };
-        }
-        return {
-          iiOrigin: target.origin,
-          detail: `/oauth/authorize redirects to ${target.origin}`,
-        };
-      }
-      return { detail: `/oauth/authorize redirects within ${mcpOrigin}` };
-    } catch {
-      return { detail: `unparseable redirect target: ${location}` };
-    }
-  }
-  return {
-    detail: `no cross-origin redirect from /oauth/authorize (HTTP ${r.status})`,
-  };
-};
-
-/**
  * @param {string} mcpOrigin
  * @param {string | undefined} configuredIi
  * @param {string} iiOriginSource
- * @param {number} timeoutMs
- * @returns {Promise<{ section: Section, iiOrigin: string | undefined, facts: Record<string, unknown> }>}
+ * @returns {{ section: Section, iiOrigin: string | undefined, facts: Record<string, unknown> }}
  */
-export const checkLinkage = async (
-  mcpOrigin,
-  configuredIi,
-  iiOriginSource,
-  timeoutMs,
-) => {
+export const checkLinkage = (mcpOrigin, configuredIi, iiOriginSource) => {
   /** @type {CheckResult[]} */
   const checks = [];
   /** @type {Record<string, unknown>} */
   const facts = {};
 
-  const discovery = await discoverIiViaAuthorize(mcpOrigin, timeoutMs);
-  facts.authorizeDiscovery = discovery;
-
-  // Resolve the II origin we will health-check: prefer a live-discovered one,
-  // then an explicitly configured one, then the naming-convention default.
-  const iiOrigin =
-    discovery.iiOrigin ?? configuredIi ?? deriveIiOrigin(mcpOrigin);
-  const resolvedSource = discovery.iiOrigin
-    ? "discovered via /oauth/authorize redirect"
-    : iiOriginSource === "explicit"
+  const iiOrigin = configuredIi ?? deriveIiOrigin(mcpOrigin);
+  const resolvedSource =
+    iiOriginSource === "explicit"
       ? "explicitly configured"
       : iiOriginSource === "derived"
         ? "derived from naming convention (mcp.<env>.id.ai → <env>.id.ai)"
@@ -631,7 +559,7 @@ export const checkLinkage = async (
     id: "ii-target",
     label: "Linked Internet Identity instance",
     description:
-      "Identifies which Internet Identity instance this MCP server is paired with (discovered live, explicitly configured, or derived from the naming convention).",
+      "Identifies which Internet Identity instance this MCP server is paired with (explicitly configured, or derived from the naming convention — the pairing is inferred, not live-verified). The II-health section below then checks that resolved origin is reachable and has its /mcp delegation flow enabled.",
     target: mcpOrigin,
     expected: "a resolvable II origin",
     status: iiOrigin ? "pass" : "fail",
@@ -640,21 +568,6 @@ export const checkLinkage = async (
     detail: iiOrigin
       ? `${iiOrigin} (${resolvedSource})`
       : "could not resolve a linked II origin",
-  });
-
-  checks.push({
-    id: "ii-discovery",
-    label: "Live link discovery via OAuth authorize",
-    description:
-      "Attempts to confirm the MCP→II pairing live by following the /oauth/authorize redirect to the II delegation page (informational: it only redirects after interactive client setup).",
-    target: `${mcpOrigin}/oauth/authorize`,
-    expected: "302 redirect to the II /mcp delegation page",
-    // Inconclusive discovery is informational, not a failure: the MCP server
-    // performs the redirect only after interactive client setup.
-    status: discovery.iiOrigin ? "pass" : "warn",
-    httpStatus: null,
-    latencyMs: null,
-    detail: discovery.detail,
   });
 
   return {
@@ -948,14 +861,6 @@ export const buildSuggestions = (sections, facts) => {
         "MCP clients rely on this header to discover the authorization server.",
     );
   }
-  if (checkById["ii-discovery"]?.status !== "pass") {
-    suggestions.push(
-      "The MCP→II link could not be confirmed live via /oauth/authorize " +
-        "(no readable cross-origin redirect headlessly). Consider exposing the " +
-        "configured II origin in the MCP server metadata so the pairing is " +
-        "independently verifiable, not just inferred by naming convention.",
-    );
-  }
   // The catch-all returns 401 for unknown paths, so uptime monitors can't use a
   // plain GET. Recommend a dedicated unauthenticated liveness endpoint.
   suggestions.push(
@@ -1003,12 +908,7 @@ export const runDashboard = async (overrides = {}) => {
   const cfg = resolveConfig(overrides);
 
   const endpoints = await checkMcpEndpoints(cfg.mcpOrigin, cfg.timeoutMs);
-  const linkage = await checkLinkage(
-    cfg.mcpOrigin,
-    cfg.iiOrigin,
-    cfg.iiOriginSource,
-    cfg.timeoutMs,
-  );
+  const linkage = checkLinkage(cfg.mcpOrigin, cfg.iiOrigin, cfg.iiOriginSource);
   const iiHealth = await checkIiHealth(
     linkage.iiOrigin,
     cfg.mcpOrigin,

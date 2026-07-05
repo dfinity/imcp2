@@ -12,6 +12,7 @@ import {
   worstStatus,
   parseCspDirective,
   checkMcpEndpoints,
+  checkLinkage,
   checkIiHealth,
   buildSuggestions,
 } from "./checks.js";
@@ -226,6 +227,20 @@ test("checkMcpEndpoints flags a missing OAuth challenge", async () => {
   } finally {
     restore();
   }
+});
+
+test("checkLinkage resolves the II origin without a live-discovery probe", () => {
+  const { section, iiOrigin } = checkLinkage(
+    "https://mcp.beta.test",
+    undefined,
+    "derived",
+  );
+  assert.equal(iiOrigin, "https://beta.test");
+  assert.equal(section.status, "pass");
+  // Only the target check remains; the obsolete live-discovery check is gone.
+  assert.equal(section.checks.length, 1);
+  assert.equal(section.checks[0].id, "ii-target");
+  assert.equal(byId(section, "ii-discovery"), undefined);
 });
 
 test("checkIiHealth verifies the /mcp delegation flow and config", async () => {

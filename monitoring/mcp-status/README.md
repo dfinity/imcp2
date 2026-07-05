@@ -12,9 +12,11 @@ It answers three questions and adds a few suggestions:
    unauthenticated `401` challenge, dynamic client registration, and the
    `/oauth/authorize` + `/oauth/token` endpoints, plus TLS certificate freshness.
 2. **Which Internet Identity instance is it linked to?** — resolves the II
-   origin (derived from the `mcp.<env>.id.ai` ↔ `<env>.id.ai` convention,
-   overridable, and confirmed live via the `/oauth/authorize` redirect when the
-   server exposes one).
+   origin (derived from the `mcp.<env>.id.ai` ↔ `<env>.id.ai` convention, or
+   overridden explicitly). Question 3 then checks that resolved origin is
+   reachable and has its `/mcp` delegation flow enabled. The pairing itself is
+   inferred from config / the naming convention — the dashboard doesn't
+   live-verify that the MCP server actually hands off to that II instance.
 3. **Is that II instance healthy and is its `/mcp` delegation flow enabled?** —
    checks the II frontend is reachable and IC-certified, reports its frontend
    canister id and related origins, confirms it serves its runtime config
@@ -120,7 +122,5 @@ linked II is `https://beta.id.ai` (frontend canister `gjxif-ryaaa-aaaad-ae4ka-ca
 backend `fgte5-ciaaa-aaaad-aaatq-cai`), whose `/mcp` delegation flow is enabled
 (its `/mcp` CSP `form-action` is relaxed to `'self' https:`, so the connect
 callback can post back). Whether a given identity trusts this MCP server is now
-per-user (set in II Settings, synced on-chain) and so is not asserted here. Live
-link discovery via `/oauth/authorize` is reported as a warning because the
-redirect to II only happens after interactive client setup and isn't readable
-headlessly — informational, not an outage.
+per-user (set in II Settings, synced on-chain) and so is not asserted here. With
+the linked II healthy, the dashboard reports all green.
