@@ -713,6 +713,11 @@ async fn cmc_icp_deposit(
              Send ICP to your management principal's default ICP-ledger account first.",
             balance.e8s, amount_e8s, ICP_TRANSFER_FEE_E8S
         ),
+        TransferError::BadFee { expected_fee } => format!(
+            "the ICP-ledger transfer fee has changed: the ledger expected {} e8s but we sent {} \
+             (the server's ICP_TRANSFER_FEE_E8S constant needs updating). No ICP was moved.",
+            expected_fee.e8s, ICP_TRANSFER_FEE_E8S
+        ),
         other => format!("ICP-ledger transfer failed: {other:?}"),
     })
 }
@@ -720,10 +725,13 @@ async fn cmc_icp_deposit(
 /// Message for a transport-level failure of the CMC notify AFTER the ICP transfer
 /// landed: the ICP is held by the CMC and is recoverable — do NOT blindly re-run.
 fn notify_failed_hint(method: &str, block: u64, e: &str) -> String {
+    // `e` already reads "<method> failed: …" (from `update_call`), so don't
+    // restate the method here.
     format!(
-        "ICP transfer succeeded (ICP-ledger block {block}) but the follow-up {method} failed: {e}. \
-         Your ICP is held by the CMC — recover it by calling {method} with block_index {block} \
-         (do NOT re-run this tool; that would transfer ICP again)."
+        "ICP transfer succeeded (ICP-ledger block {block}) but the follow-up CMC notify did not \
+         complete: {e}. Your ICP is held by the CMC — recover it by re-calling {method} for block \
+         {block} with the SAME arguments this call used (block_index alone is not enough). Do NOT \
+         re-run this tool; that would transfer ICP again."
     )
 }
 
@@ -740,8 +748,9 @@ fn notify_error_msg(method: &str, block: u64, e: NotifyError) -> String {
                 .unwrap_or_default()
         ),
         NotifyError::Processing => format!(
-            "the CMC is still processing the deposit. Finish by calling {method} with block_index \
-             {block} shortly (do NOT re-run this tool; that would transfer ICP again)."
+            "the CMC is still processing the deposit. Finish by re-calling {method} for block \
+             {block} shortly, with the SAME arguments this call used (block_index alone is not \
+             enough). Do NOT re-run this tool; that would transfer ICP again."
         ),
         NotifyError::TransactionTooOld(_) => format!(
             "the ICP transfer (block {block}) is too old for the CMC to accept — check your \
@@ -755,7 +764,8 @@ fn notify_error_msg(method: &str, block: u64, e: NotifyError) -> String {
             error_message,
         } => format!(
             "the CMC returned an error ({error_code}): {error_message}. If your ICP left your \
-             account, recover by calling {method} with block_index {block}."
+             account, recover by re-calling {method} for block {block} with the SAME arguments this \
+             call used (block_index alone is not enough)."
         ),
     }
 }
