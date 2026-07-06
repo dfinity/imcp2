@@ -764,18 +764,29 @@ struct IiDelegation {
     permissions: Option<String>,
 }
 
-/// Map II's on-the-wire permission text into `ic-agent`'s `DelegationPermissions`
-/// (which itself re-serializes to the same `"queries"`/`"all"` text, so the
-/// reconstructed delegation hashes to exactly what II signed). Matched
-/// case-sensitively against II's canonical values; an unknown/future value yields
-/// `None` — the closed `DelegationPermissions` enum can't represent it, and
-/// re-serializing a guessed value could break the hash, so we fall back to
-/// unrestricted (queries/all is the whole space today).
-fn permissions_from_text(s: &str) -> Option<DelegationPermissions> {
-    match s {
-        "queries" => Some(DelegationPermissions::Queries),
-        "all" => Some(DelegationPermissions::All),
-        _ => None,
+/// Map II's on-the-wire permission (`opt text`) into `ic-agent`'s
+/// `DelegationPermissions`, which re-serializes to the same `"queries"`/`"all"`
+/// text so the reconstructed delegation hashes to exactly what II signed.
+///
+/// - **Absent** (`None`) → `None` (unrestricted; hashes like a pre-permissions
+///   delegation).
+/// - **`"queries"` / `"all"`** → the matching variant.
+/// - **Present but unrecognized** → a hard error. The closed `DelegationPermissions`
+///   enum can't represent a new value, and since the canister signature COVERS
+///   this field, neither dropping nor guessing it could ever verify — it would
+///   resurface the same opaque "sig not found in the signature tree" replica
+///   error. Failing fast surfaces the real cause and forces a server update
+///   instead of silently regressing.
+fn permissions_from_text(permissions: Option<&str>) -> Result<Option<DelegationPermissions>, String> {
+    match permissions {
+        None => Ok(None),
+        Some("queries") => Ok(Some(DelegationPermissions::Queries)),
+        Some("all") => Ok(Some(DelegationPermissions::All)),
+        Some(other) => Err(format!(
+            "Internet Identity issued a delegation with an unrecognized permission {other:?}; \
+             this server can't represent it faithfully, so the delegation's signature would not \
+             verify. The server needs updating to handle this permission."
+        )),
     }
 }
 
@@ -802,8 +813,9 @@ impl IiSignedDelegation {
                 // reconstructed delegation hashes to exactly what II signed.
                 // II sends this as `opt text`; an absent permission (`None`)
                 // hashes identically to a pre-permissions delegation, so
-                // unrestricted sessions are unaffected.
-                permissions: self.delegation.permissions.as_deref().and_then(permissions_from_text),
+                // unrestricted sessions are unaffected. A present-but-unknown
+                // value is a hard error (see `permissions_from_text`).
+                permissions: permissions_from_text(self.delegation.permissions.as_deref())?,
             },
             signature: self.signature,
         })
@@ -1148,6 +1160,30 @@ mod tests {
             .into_agent(&app_key)
             .expect("into_agent");
         assert_eq!(kept.delegation.permissions, Some(DelegationPermissions::Queries));
+    }
+
+    // A present-but-unrecognized permission must FAIL FAST rather than silently
+    // drop to None — otherwise a future II permission string would produce a
+    // delegation whose signature can't verify, resurfacing the same opaque
+    // "sig not found" replica error the text decode was meant to end.
+    #[test]
+    fn unknown_permission_fails_fast_rather_than_silently_dropping() {
+        let app_key = vec![1u8, 2, 3, 4];
+        let bytes = Encode!(&WireSignedDelegation {
+            delegation: WireDelegation {
+                pubkey: app_key.clone(),
+                expiration: 42,
+                targets: None,
+                permissions: Some("write-only".to_string()), // not "queries"/"all"
+            },
+            signature: vec![9, 9, 9],
+        })
+        .expect("encode");
+        let err = Decode!(&bytes, IiSignedDelegation)
+            .expect("decode")
+            .into_agent(&app_key)
+            .expect_err("an unrecognized permission must error, not silently drop");
+        assert!(err.contains("unrecognized permission"), "got: {err}");
     }
 
     // End-to-end: a read-only (`queries`) delegation from II must survive our full
