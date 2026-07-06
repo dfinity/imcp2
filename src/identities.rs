@@ -752,30 +752,41 @@ struct IiDelegation {
     expiration: u64,
     targets: Option<Vec<Principal>>,
     /// Which request kinds this delegation authorizes — II's per-MCP-session
-    /// access, `opt Permissions` (`variant { queries; all }`). Absent/`None`
-    /// means unrestricted. Part of what II signs, so it must be forwarded
-    /// verbatim into the `ic-agent` delegation for the hash to match.
-    permissions: Option<IiPermissions>,
+    /// access. On the wire this is **`opt text`** ("queries" = read-only,
+    /// "all"/absent = unrestricted), NOT the `variant { queries; all }` named type
+    /// that also appears in II's `.did`. It MUST be decoded as `text`: because the
+    /// field is `opt`, decoding it as any other type triggers Candid's
+    /// opt-mismatch rule and silently drops it to `None`. That would then omit it
+    /// from the delegation we present, and the canister signature — which covers
+    /// this field — would no longer verify ("sig not found in the signature
+    /// tree"), breaking every read-only session. It is part of what II signs, so
+    /// it must be carried verbatim.
+    permissions: Option<String>,
 }
 
-/// II's `Permissions` variant on a delegation (`variant { queries; all }`),
-/// mirrored for Candid decoding since `ic-agent`'s `DelegationPermissions`
-/// isn't `CandidType`. Maps 1:1 into it, preserving the on-wire representation
-/// (`queries`/`all`) II hashed over.
-#[derive(CandidType, Deserialize)]
-enum IiPermissions {
-    #[serde(rename = "queries")]
-    Queries,
-    #[serde(rename = "all")]
-    All,
-}
-
-impl From<IiPermissions> for DelegationPermissions {
-    fn from(p: IiPermissions) -> Self {
-        match p {
-            IiPermissions::Queries => DelegationPermissions::Queries,
-            IiPermissions::All => DelegationPermissions::All,
-        }
+/// Map II's on-the-wire permission (`opt text`) into `ic-agent`'s
+/// `DelegationPermissions`, which re-serializes to the same `"queries"`/`"all"`
+/// text so the reconstructed delegation hashes to exactly what II signed.
+///
+/// - **Absent** (`None`) → `None` (unrestricted; hashes like a pre-permissions
+///   delegation).
+/// - **`"queries"` / `"all"`** → the matching variant.
+/// - **Present but unrecognized** → a hard error. The closed `DelegationPermissions`
+///   enum can't represent a new value, and since the canister signature COVERS
+///   this field, neither dropping nor guessing it could ever verify — it would
+///   resurface the same opaque "sig not found in the signature tree" replica
+///   error. Failing fast surfaces the real cause and forces a server update
+///   instead of silently regressing.
+fn permissions_from_text(permissions: Option<&str>) -> Result<Option<DelegationPermissions>, String> {
+    match permissions {
+        None => Ok(None),
+        Some("queries") => Ok(Some(DelegationPermissions::Queries)),
+        Some("all") => Ok(Some(DelegationPermissions::All)),
+        Some(other) => Err(format!(
+            "Internet Identity issued a delegation with an unrecognized permission {other:?}; \
+             this server can't represent it faithfully, so the delegation's signature would not \
+             verify. The server needs updating to handle this permission."
+        )),
     }
 }
 
@@ -800,9 +811,11 @@ impl IiSignedDelegation {
                 targets: self.delegation.targets,
                 // Forward II's per-MCP-session permission verbatim so the
                 // reconstructed delegation hashes to exactly what II signed.
-                // An absent permission (`None`) hashes identically to a
-                // pre-0.48 delegation, so unrestricted sessions are unaffected.
-                permissions: self.delegation.permissions.map(Into::into),
+                // II sends this as `opt text`; an absent permission (`None`)
+                // hashes identically to a pre-permissions delegation, so
+                // unrestricted sessions are unaffected. A present-but-unknown
+                // value is a hard error (see `permissions_from_text`).
+                permissions: permissions_from_text(self.delegation.permissions.as_deref())?,
             },
             signature: self.signature,
         })
@@ -995,22 +1008,19 @@ mod tests {
         assert_eq!(decoded[1].last_used, Some(123));
     }
 
-    // II's `SignedDelegation` / `Delegation` / `Permissions` Candid contract,
-    // mirrored so tests can encode a reply exactly as II would and then drive the
-    // real `Decode!` -> `into_agent` path over it.
-    #[derive(CandidType, Deserialize)]
-    enum WirePermissions {
-        #[serde(rename = "queries")]
-        Queries,
-        #[serde(rename = "all")]
-        All,
-    }
+    // II's `SignedDelegation` / `Delegation` Candid contract, mirrored so tests can
+    // encode a reply exactly as II sends it and drive the real `Decode!` ->
+    // `into_agent` path over it. II's `Delegation.permissions` is **`opt text`**
+    // ("queries" / "all"), NOT the `variant { queries; all }` named type that also
+    // appears in the `.did` — see `IiDelegation`. (An earlier version of this
+    // mirror used a variant, which encoded the wrong wire shape and hid the
+    // read-only decode bug.)
     #[derive(CandidType)]
     struct WireDelegation {
         pubkey: Vec<u8>,
         expiration: u64,
         targets: Option<Vec<Principal>>,
-        permissions: Option<WirePermissions>,
+        permissions: Option<String>,
     }
     #[derive(CandidType)]
     struct WireSignedDelegation {
@@ -1034,7 +1044,7 @@ mod tests {
     }
 
     // Lock in the mcp_get_delegation permission contract: II's `Delegation`
-    // carries `permissions: opt variant { queries; all }`, and it must round-trip
+    // carries `permissions: opt text` ("queries"/"all"), and it must round-trip
     // through `into_agent` onto the `ic-agent` delegation so the reconstructed
     // hash matches what II signed. An absent permission stays `None`.
     #[test]
@@ -1051,14 +1061,14 @@ mod tests {
             signature: vec![9, 9, 9],
         };
 
-        let bytes = Encode!(&make(Some(WirePermissions::Queries))).expect("encode");
+        let bytes = Encode!(&make(Some("queries".to_string()))).expect("encode");
         let agent = Decode!(&bytes, IiSignedDelegation)
             .expect("decode")
             .into_agent(&app_key)
             .expect("into_agent");
         assert_eq!(agent.delegation.permissions, Some(DelegationPermissions::Queries));
 
-        let bytes = Encode!(&make(Some(WirePermissions::All))).expect("encode");
+        let bytes = Encode!(&make(Some("all".to_string()))).expect("encode");
         let agent = Decode!(&bytes, IiSignedDelegation)
             .expect("decode")
             .into_agent(&app_key)
@@ -1091,6 +1101,89 @@ mod tests {
             .into_agent(&app_key)
             .expect("into_agent");
         assert_eq!(agent.delegation.permissions, None);
+    }
+
+    // Regression guard for the read-only outage: II sends `permissions` as
+    // `opt text`, so decoding it into an `opt variant { queries; all }` (which we
+    // mistakenly did) hits Candid's `opt`-mismatch rule and SILENTLY drops it to
+    // `None`. That omitted it from the presented delegation, so II's canister
+    // signature (which covers `permissions`) no longer verified and every
+    // read-only session failed with "sig not found in the signature tree". Prove
+    // both halves: the variant decode loses II's text, and our `text` decode keeps
+    // it — so nobody reintroduces the variant type.
+    #[test]
+    fn ii_opt_text_permissions_is_dropped_by_variant_decode_but_kept_by_text() {
+        // A binding that (wrongly) models II's `opt text` field as an `opt variant`.
+        #[derive(CandidType, Deserialize)]
+        enum VariantPermissions {
+            #[serde(rename = "queries")]
+            Queries,
+            #[serde(rename = "all")]
+            All,
+        }
+        #[derive(CandidType, Deserialize)]
+        struct VariantDelegation {
+            pubkey: Vec<u8>,
+            expiration: u64,
+            targets: Option<Vec<Principal>>,
+            permissions: Option<VariantPermissions>,
+        }
+        #[derive(CandidType, Deserialize)]
+        struct VariantSigned {
+            delegation: VariantDelegation,
+            signature: Vec<u8>,
+        }
+
+        let app_key = vec![1u8, 2, 3, 4];
+        // Encode II's ACTUAL wire shape: `permissions` as `opt text = "queries"`.
+        let bytes = Encode!(&WireSignedDelegation {
+            delegation: WireDelegation {
+                pubkey: app_key.clone(),
+                expiration: 42,
+                targets: None,
+                permissions: Some("queries".to_string()),
+            },
+            signature: vec![9, 9, 9],
+        })
+        .expect("encode II opt-text reply");
+
+        // Decoded as an `opt variant`, the text is silently dropped → None (the bug).
+        let dropped = Decode!(&bytes, VariantSigned).expect("decode as variant");
+        assert!(
+            dropped.delegation.permissions.is_none(),
+            "opt text must NOT survive an opt-variant decode — it silently drops to None"
+        );
+
+        // Decoded as `opt text` (our fix) and mapped, it is preserved end to end.
+        let kept = Decode!(&bytes, IiSignedDelegation)
+            .expect("decode as text")
+            .into_agent(&app_key)
+            .expect("into_agent");
+        assert_eq!(kept.delegation.permissions, Some(DelegationPermissions::Queries));
+    }
+
+    // A present-but-unrecognized permission must FAIL FAST rather than silently
+    // drop to None — otherwise a future II permission string would produce a
+    // delegation whose signature can't verify, resurfacing the same opaque
+    // "sig not found" replica error the text decode was meant to end.
+    #[test]
+    fn unknown_permission_fails_fast_rather_than_silently_dropping() {
+        let app_key = vec![1u8, 2, 3, 4];
+        let bytes = Encode!(&WireSignedDelegation {
+            delegation: WireDelegation {
+                pubkey: app_key.clone(),
+                expiration: 42,
+                targets: None,
+                permissions: Some("write-only".to_string()), // not "queries"/"all"
+            },
+            signature: vec![9, 9, 9],
+        })
+        .expect("encode");
+        let err = Decode!(&bytes, IiSignedDelegation)
+            .expect("decode")
+            .into_agent(&app_key)
+            .expect_err("an unrecognized permission must error, not silently drop");
+        assert!(err.contains("unrecognized permission"), "got: {err}");
     }
 
     // End-to-end: a read-only (`queries`) delegation from II must survive our full
@@ -1132,7 +1225,7 @@ mod tests {
                 pubkey: app_der.clone(),
                 expiration,
                 targets: None,
-                permissions: Some(WirePermissions::Queries),
+                permissions: Some("queries".to_string()),
             },
             signature,
         };
