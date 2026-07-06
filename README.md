@@ -28,12 +28,12 @@ results).
 | `list_ic_skills` | — | The official [IC skills](https://skills.internetcomputer.org) (Motoko, mops/icp CLIs, cycles, stable memory, security, …), grouped by category |
 | `get_ic_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `motoko`, `icp-cli`, `cycles-management`) |
 | `cycles_balance` | — | Your cycles-ledger balance (the funds `create_canister`/`top_up_canister` spend), as your standing II principal |
-| `create_canister` | `cycles?` / `icp?`, `controllers?`, `subnet?` | Create + fund a new canister from your cycles-ledger balance; returns the new canister id |
+| `create_canister` | `cycles?` / `icp?`, `controllers?`, `subnet?` | Create + fund a new canister — from your cycles-ledger balance (`cycles`) or by converting ICP from your ICP-ledger account via the CMC (`icp`); returns the new canister id |
 | `install_code` | `canister_id`, `wasm_base64` / `wasm_hex`, `mode?`, `arg?` | Install/reinstall/upgrade a Wasm module (single-shot, or via the chunk store for large modules) |
 | `canister_status` | `canister_id` | Run state, cycle balance, module hash, memory, controllers, allocations |
 | `update_canister_settings` | `canister_id`, `controllers?`, allocations, `freezing_threshold?`, `log_visibility?`, … | Update a canister's settings |
 | `start_canister` / `stop_canister` / `uninstall_code` / `delete_canister` | `canister_id` | Canister lifecycle |
-| `top_up_canister` | `canister_id`, `cycles?` / `icp?` | Add cycles to an existing canister from your cycles-ledger balance |
+| `top_up_canister` | `canister_id`, `cycles?` / `icp?` | Add cycles to an existing canister — from your cycles-ledger balance (`cycles`) or by converting ICP from your ICP-ledger account via the CMC (`icp`) |
 
 `discover_canisters` is the entry point when the user names a **website** instead
 of a canister id: frontend via the `x-ic-canister-id` header (authoritative),
@@ -90,10 +90,20 @@ references. Override the registry origin with `SKILLS_URL`.
 The management tools let the agent act **on chain as your standing Internet
 Identity principal** — a stable per-connection identity (the one returned when you
 authenticate). Because a user ingress message cannot attach cycles, creation and
-top-ups draw from your **cycles-ledger** balance (`um5iw-rqaaa-aaaaq-qaaba-cai`):
-fund that principal first (e.g. via the `icp` CLI / `cycles-management` skill),
-check it with `cycles_balance`, then `create_canister` (amount in `cycles`, or in
-`icp` converted at the CMC's current rate). Lifecycle calls
+top-ups fund the canister one of two ways, both keyed to that management principal
+(the one `cycles_balance` reports, default subaccount):
+
+- **`cycles`** — drawn from your **cycles-ledger** balance
+  (`um5iw-rqaaa-aaaaq-qaaba-cai`); fund it first (e.g. via the `icp` CLI /
+  `cycles-management` skill) and check it with `cycles_balance`.
+- **`icp`** — a decimal-ICP amount transferred from that principal's
+  **ICP-ledger** account (`ryjl3-tyaaa-aaaaa-aaaba-cai`, default subaccount) to
+  the **CMC**, which mints cycles into the canister (`notify_create_canister` /
+  `notify_top_up`). Best-effort, single attempt: if the transfer lands but the
+  mint fails, the error carries the ICP-ledger block index to recover with — the
+  call is **not** idempotent, so don't blindly re-run it.
+
+`cycles` takes precedence if both are given. Lifecycle calls
 (`install_code`, `canister_status`, `update_canister_settings`,
 `start`/`stop`/`uninstall`/`delete`) go to the management canister (`aaaaa-aa`)
 with the effective canister id set to the target. `install_code` takes the

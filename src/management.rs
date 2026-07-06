@@ -11,12 +11,16 @@
 //!     `aaaaa-aa`), as the boundary node requires, and is signed by a
 //!     controller (the management identity).
 //!
-//!   * The **cycles ledger** (`um5iw-rqaaa-aaaaq-qaaba-cai`) for funding: a user
-//!     ingress message cannot attach cycles, so `create_canister`/`top_up` draw
-//!     from the caller's existing cycles-ledger balance (the ledger, being a
-//!     canister, attaches the cycles). Amounts may be given directly in `cycles`
-//!     or expressed in `icp` and converted at the CMC's current rate (a
-//!     read-only query — no ICP is moved by this server).
+//!   * Funding, two ways (both as the management identity):
+//!       - **`cycles`** — draw from the caller's existing **cycles-ledger**
+//!         (`um5iw-rqaaa-aaaaq-qaaba-cai`) balance (a user ingress message can't
+//!         attach cycles, so the ledger, being a canister, attaches them).
+//!       - **`icp`** — transfer ICP from the caller's **ICP-ledger** account to
+//!         the **CMC** (memo-tagged deposit) and `notify_create_canister` /
+//!         `notify_top_up` to mint cycles. Best-effort, single attempt: if the
+//!         transfer lands but the notify fails, the ICP is held by the CMC and is
+//!         recoverable by re-notifying with the returned block index (we do NOT
+//!         retry, and the caller must NOT blindly re-run — that transfers again).
 //!
 //! Compiling Motoko/Rust to Wasm happens in the agent's own environment (guided
 //! by the IC skills); these tools take the already-built Wasm and put it on
@@ -36,8 +40,17 @@ use crate::identities::Identities;
 const IC_URL: &str = "https://icp-api.io";
 /// Cycles ledger — creates/funds canisters from a principal's cycles balance.
 const CYCLES_LEDGER: &str = "um5iw-rqaaa-aaaaq-qaaba-cai";
-/// Cycles Minting Canister — only its read-only ICP↔XDR rate query is used here.
+/// Cycles Minting Canister — mints cycles from ICP for the `icp` funding path
+/// (`notify_create_canister` / `notify_top_up`).
 const CMC: &str = "rkp4c-7iaaa-aaaaa-aaaca-cai";
+/// ICP ledger — the `icp` funding path transfers ICP from the caller's account here.
+const ICP_LEDGER: &str = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+/// Standard ICP-ledger transfer fee (0.0001 ICP), charged on top of the amount.
+const ICP_TRANSFER_FEE_E8S: u64 = 10_000;
+/// CMC deposit memos (ASCII, little-endian u64) that tag an ICP transfer with the
+/// operation it funds. Defined by the ICP ledger / cycles-minting canister.
+const MEMO_CREATE_CANISTER: u64 = 0x4145_5243; // 'CREA'
+const MEMO_TOP_UP_CANISTER: u64 = 0x5055_5054; // 'TPUP'
 /// 1 ICP = 100_000_000 e8s.
 const E8S_PER_ICP: u64 = 100_000_000;
 /// Above this, install via the chunk store rather than a single ingress message
@@ -53,12 +66,16 @@ const CHUNK_SIZE: usize = 1_000_000;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct CreateCanisterArgs {
-    /// Cycles to fund the new canister with (exact). Omit to use `icp` instead.
+    /// Cycles to fund the new canister with (exact), drawn from your
+    /// **cycles-ledger** balance (the principal `cycles_balance` reports). Omit to
+    /// use `icp` instead.
     #[serde(default)]
     pub cycles: Option<u64>,
-    /// ICP worth of cycles to fund the canister with, as a decimal string e.g.
-    /// "0.5" or "2". Converted to cycles at the network's current rate. Ignored
-    /// when `cycles` is set.
+    /// ICP to convert into the new canister's cycles, as a decimal string e.g.
+    /// "0.5" or "2". Transferred from your **ICP-ledger** account (same management
+    /// principal as `cycles_balance`, default subaccount) and minted to cycles via
+    /// the CMC — best-effort, single attempt, no retries. Ignored when `cycles` is
+    /// set.
     #[serde(default)]
     pub icp: Option<String>,
     /// Controller principals for the new canister. Defaults to [your principal].
@@ -74,10 +91,14 @@ pub struct CreateCanisterArgs {
 pub struct TopUpArgs {
     /// Canister to top up.
     pub canister_id: String,
-    /// Cycles to add (exact). Omit to use `icp` instead.
+    /// Cycles to add (exact), drawn from your **cycles-ledger** balance (the
+    /// principal `cycles_balance` reports). Omit to use `icp` instead.
     #[serde(default)]
     pub cycles: Option<u64>,
-    /// ICP worth of cycles to add, as a decimal string. Ignored when `cycles` is set.
+    /// ICP to convert into cycles for the top-up, as a decimal string. Transferred
+    /// from your **ICP-ledger** account (same management principal as
+    /// `cycles_balance`, default subaccount) and minted via the CMC — best-effort,
+    /// single attempt, no retries. Ignored when `cycles` is set.
     #[serde(default)]
     pub icp: Option<String>,
 }
@@ -177,22 +198,21 @@ impl CyclesBalance {
 pub struct CreatedCanister {
     /// The new canister's principal id — install code on it with install_code.
     pub canister_id: String,
-    /// Cycles the new canister was funded with, as a decimal string.
-    pub cycles: String,
-    /// Cycles-ledger block index of the funding transfer.
-    pub block_id: String,
     /// The canister's controller principals.
     pub controllers: Vec<String>,
+    /// How the canister was funded, human-readable: for the `cycles` path, the
+    /// cycle amount and cycles-ledger block; for the `icp` path, the ICP amount
+    /// the CMC converted and the ICP-ledger block index.
+    pub funding: String,
 }
 
 impl CreatedCanister {
     pub fn human(&self) -> String {
         format!(
-            "Created canister {} — funded with {} cycles (cycles-ledger block {}). Controllers: {}.\n\
+            "Created canister {} — {}. Controllers: {}.\n\
              Next: build your Wasm and install it with install_code.",
             self.canister_id,
-            self.cycles,
-            self.block_id,
+            self.funding,
             self.controllers.join(", ")
         )
     }
@@ -232,7 +252,8 @@ pub async fn cycles_balance(ids: &Identities, session_id: &str) -> Result<Cycles
     })
 }
 
-/// Create + fund a canister from your cycles-ledger balance.
+/// Create + fund a canister — from your cycles-ledger balance (`cycles`) or by
+/// converting ICP via the CMC (`icp`). `cycles` takes precedence when both given.
 pub async fn create_canister(
     ids: &Identities,
     session_id: &str,
@@ -240,7 +261,6 @@ pub async fn create_canister(
 ) -> Result<CreatedCanister, String> {
     ids.require_write(session_id).await?;
     let (agent, principal) = management_agent(ids, session_id).await?;
-    let cycles = resolve_cycles(&agent, args.icp.as_deref(), args.cycles).await?;
 
     let controllers = if args.controllers.is_empty() {
         vec![principal]
@@ -250,26 +270,64 @@ pub async fn create_canister(
             .map(|c| parse_principal(c))
             .collect::<Result<Vec<_>, _>>()?
     };
+    let controllers_text = || controllers.iter().map(Principal::to_text).collect::<Vec<_>>();
     let subnet_selection = match &args.subnet {
         Some(s) => Some(SubnetSelection::Subnet {
             subnet: parse_principal(s)?,
         }),
         None => None,
     };
-    let settings = CanisterSettings {
-        controllers: Some(controllers.clone()),
-        ..Default::default()
-    };
+
+    // ICP funding path: transfer ICP from your ICP-ledger account to the CMC
+    // (memo = CREATE, deposit sub-account derived from YOU, the payer/caller),
+    // then notify the CMC to mint cycles and create the canister. Best-effort.
+    if args.cycles.is_none() {
+        if let Some(icp) = args.icp.as_deref() {
+            let e8s = parse_icp_e8s_positive(icp)?;
+            let block = cmc_icp_deposit(&agent, &principal, MEMO_CREATE_CANISTER, e8s).await?;
+            let arg = NotifyCreateCanisterArg {
+                block_index: block,
+                controller: principal,
+                subnet_type: None,
+                subnet_selection: subnet_selection.clone(),
+                settings: Some(CanisterSettings {
+                    controllers: Some(controllers.clone()),
+                    ..Default::default()
+                }),
+            };
+            let bytes = Encode!(&arg).map_err(|e| format!("encode notify_create_canister: {e}"))?;
+            let reply = update_call(&agent, parse_principal(CMC)?, "notify_create_canister", bytes)
+                .await
+                .map_err(|e| notify_failed_hint("notify_create_canister", block, &e))?;
+            let result = Decode!(&reply, NotifyCreateResult)
+                .map_err(|e| format!("decode notify_create_canister reply: {e}"))?;
+            return match result {
+                Ok(canister_id) => Ok(CreatedCanister {
+                    canister_id: canister_id.to_text(),
+                    controllers: controllers_text(),
+                    funding: format!(
+                        "funded from {icp} ICP converted by the CMC (ICP-ledger block {block})"
+                    ),
+                }),
+                Err(e) => Err(notify_error_msg("notify_create_canister", block, e)),
+            };
+        }
+    }
+
+    // Cycles funding path: draw from your cycles-ledger balance.
+    let cycles = require_cycles(args.cycles)?;
     let create = CyclesCreateArg {
         from_subaccount: None,
         created_at_time: None,
         amount: Nat::from(cycles),
         creation_args: Some(CmcCreateCanisterArgs {
-            settings: Some(settings),
+            settings: Some(CanisterSettings {
+                controllers: Some(controllers.clone()),
+                ..Default::default()
+            }),
             subnet_selection,
         }),
     };
-
     let ledger = parse_principal(CYCLES_LEDGER)?;
     let arg = Encode!(&create).map_err(|e| format!("encode create_canister: {e}"))?;
     let reply = update_call(&agent, ledger, "create_canister", arg).await?;
@@ -278,15 +336,18 @@ pub async fn create_canister(
     match result {
         Ok(s) => Ok(CreatedCanister {
             canister_id: s.canister_id.to_text(),
-            cycles: cycles.to_string(),
-            block_id: s.block_id.to_string(),
-            controllers: controllers.iter().map(Principal::to_text).collect(),
+            controllers: controllers_text(),
+            funding: format!(
+                "funded with {cycles} cycles (cycles-ledger block {})",
+                s.block_id
+            ),
         }),
         Err(e) => Err(format!("cycles ledger refused create_canister: {e:?}")),
     }
 }
 
-/// Add cycles to an existing canister, paying from your cycles-ledger balance.
+/// Add cycles to an existing canister — from your cycles-ledger balance (`cycles`)
+/// or by converting ICP via the CMC (`icp`). `cycles` takes precedence.
 pub async fn top_up_canister(
     ids: &Identities,
     session_id: &str,
@@ -295,8 +356,35 @@ pub async fn top_up_canister(
     ids.require_write(session_id).await?;
     let target = parse_principal(&args.canister_id)?;
     let (agent, _) = management_agent(ids, session_id).await?;
-    let cycles = resolve_cycles(&agent, args.icp.as_deref(), args.cycles).await?;
 
+    // ICP funding path: transfer ICP to the CMC (memo = TOP_UP, deposit
+    // sub-account derived from the TARGET canister), then notify_top_up to mint
+    // cycles straight into it. Best-effort, single attempt.
+    if args.cycles.is_none() {
+        if let Some(icp) = args.icp.as_deref() {
+            let e8s = parse_icp_e8s_positive(icp)?;
+            let block = cmc_icp_deposit(&agent, &target, MEMO_TOP_UP_CANISTER, e8s).await?;
+            let arg = NotifyTopUpArg {
+                block_index: block,
+                canister_id: target,
+            };
+            let bytes = Encode!(&arg).map_err(|e| format!("encode notify_top_up: {e}"))?;
+            let reply = update_call(&agent, parse_principal(CMC)?, "notify_top_up", bytes)
+                .await
+                .map_err(|e| notify_failed_hint("notify_top_up", block, &e))?;
+            let result = Decode!(&reply, NotifyTopUpResult)
+                .map_err(|e| format!("decode notify_top_up reply: {e}"))?;
+            return match result {
+                Ok(cycles) => Ok(format!(
+                    "Topped up {target} with {cycles} cycles (converted from {icp} ICP; ICP-ledger block {block})."
+                )),
+                Err(e) => Err(notify_error_msg("notify_top_up", block, e)),
+            };
+        }
+    }
+
+    // Cycles funding path: draw from your cycles-ledger balance.
+    let cycles = require_cycles(args.cycles)?;
     let ledger = parse_principal(CYCLES_LEDGER)?;
     let withdraw = WithdrawArg {
         amount: Nat::from(cycles),
@@ -550,44 +638,126 @@ async fn install_chunked(
     Ok(())
 }
 
-/// Resolve a cycle amount from `cycles` (exact) or `icp` (converted via the CMC rate).
-async fn resolve_cycles(
-    agent: &Agent,
-    icp: Option<&str>,
-    cycles: Option<u64>,
-) -> Result<u128, String> {
-    if let Some(c) = cycles {
-        if c == 0 {
-            return Err("cycles amount must be greater than 0".into());
-        }
-        return Ok(c as u128);
+/// Validate the exact `cycles` amount for the cycles-ledger funding path (used
+/// when no `icp` was given).
+fn require_cycles(cycles: Option<u64>) -> Result<u128, String> {
+    match cycles {
+        Some(c) if c > 0 => Ok(c as u128),
+        Some(_) => Err("cycles amount must be greater than 0".into()),
+        None => Err("specify either `cycles` or `icp`".into()),
     }
-    if let Some(icp) = icp {
-        let e8s = parse_icp_to_e8s(icp)?;
-        if e8s == 0 {
-            return Err("ICP amount must be greater than 0".into());
-        }
-        let rate = icp_xdr_rate(agent).await?; // xdr_permyriad_per_icp
-        // cycles_per_icp = (xdr_permyriad_per_icp / 10_000) XDR * 1e12 cycles/XDR
-        //               = xdr_permyriad_per_icp * 1e8, so for `e8s` e8s of ICP:
-        // cycles = (e8s / 1e8) * xdr_permyriad_per_icp * 1e8 = e8s * xdr_permyriad_per_icp.
-        return Ok(e8s as u128 * rate as u128);
-    }
-    Err("specify either `cycles` or `icp`".into())
 }
 
-/// Read the CMC's current ICP→XDR rate (`xdr_permyriad_per_icp`).
-async fn icp_xdr_rate(agent: &Agent) -> Result<u64, String> {
-    let cmc = parse_principal(CMC)?;
-    let arg = Encode!().map_err(|e| format!("encode: {e}"))?;
-    let reply = agent
-        .query(&cmc, "get_icp_xdr_conversion_rate")
-        .with_arg(arg)
-        .call()
-        .await
-        .map_err(|e| format!("CMC rate query failed: {e}"))?;
-    let resp = Decode!(&reply, IcpXdrRateResponse).map_err(|e| format!("decode rate: {e}"))?;
-    Ok(resp.data.xdr_permyriad_per_icp)
+/// Parse a decimal-ICP string and require it to be > 0.
+fn parse_icp_e8s_positive(icp: &str) -> Result<u64, String> {
+    let e8s = parse_icp_to_e8s(icp)?;
+    if e8s == 0 {
+        return Err("ICP amount must be greater than 0".into());
+    }
+    Ok(e8s)
+}
+
+/// CMC deposit sub-account for a principal: a 32-byte array `[len][principal
+/// bytes][zero-pad]`. Matches `ic_ledger_types::Subaccount::from(principal)`.
+fn principal_subaccount(p: &Principal) -> [u8; 32] {
+    let mut sub = [0u8; 32];
+    let bytes = p.as_slice();
+    sub[0] = bytes.len() as u8;
+    sub[1..1 + bytes.len()].copy_from_slice(bytes);
+    sub
+}
+
+/// ICP-ledger AccountIdentifier (32 bytes): the big-endian CRC32 checksum of the
+/// SHA-224 of `"\x0Aaccount-id" ‖ owner ‖ subaccount`, prepended to that hash.
+fn account_identifier(owner: &Principal, subaccount: &[u8; 32]) -> Vec<u8> {
+    use sha2::{Digest, Sha224};
+    let mut hasher = Sha224::new();
+    hasher.update(b"\x0Aaccount-id");
+    hasher.update(owner.as_slice());
+    hasher.update(&subaccount[..]);
+    let hash = hasher.finalize(); // 28 bytes
+    let crc = crc32fast::hash(&hash).to_be_bytes();
+    let mut out = Vec::with_capacity(32);
+    out.extend_from_slice(&crc);
+    out.extend_from_slice(&hash);
+    out
+}
+
+/// Transfer ICP from your ICP-ledger account to the CMC's memo-tagged deposit
+/// account for `dest` (the payer for CREATE, the target canister for TOP_UP), and
+/// return the ICP-ledger block index. A failure here means no funds were moved.
+async fn cmc_icp_deposit(
+    agent: &Agent,
+    dest: &Principal,
+    memo: u64,
+    amount_e8s: u64,
+) -> Result<u64, String> {
+    let to = account_identifier(&parse_principal(CMC)?, &principal_subaccount(dest));
+    let args = TransferArgs {
+        memo,
+        amount: Tokens { e8s: amount_e8s },
+        fee: Tokens {
+            e8s: ICP_TRANSFER_FEE_E8S,
+        },
+        from_subaccount: None,
+        to,
+        created_at_time: None,
+    };
+    let bytes = Encode!(&args).map_err(|e| format!("encode ICP transfer: {e}"))?;
+    let reply = update_call(agent, parse_principal(ICP_LEDGER)?, "transfer", bytes).await?;
+    let result =
+        Decode!(&reply, TransferResult).map_err(|e| format!("decode ICP transfer reply: {e}"))?;
+    result.map_err(|e| match e {
+        TransferError::InsufficientFunds { balance } => format!(
+            "not enough ICP in your ICP-ledger account (balance {} e8s; need {} + {} fee). \
+             Send ICP to your management principal's default ICP-ledger account first.",
+            balance.e8s, amount_e8s, ICP_TRANSFER_FEE_E8S
+        ),
+        other => format!("ICP-ledger transfer failed: {other:?}"),
+    })
+}
+
+/// Message for a transport-level failure of the CMC notify AFTER the ICP transfer
+/// landed: the ICP is held by the CMC and is recoverable — do NOT blindly re-run.
+fn notify_failed_hint(method: &str, block: u64, e: &str) -> String {
+    format!(
+        "ICP transfer succeeded (ICP-ledger block {block}) but the follow-up {method} failed: {e}. \
+         Your ICP is held by the CMC — recover it by calling {method} with block_index {block} \
+         (do NOT re-run this tool; that would transfer ICP again)."
+    )
+}
+
+/// Actionable message for each `NotifyError` the CMC can return.
+fn notify_error_msg(method: &str, block: u64, e: NotifyError) -> String {
+    match e {
+        NotifyError::Refunded {
+            reason,
+            block_index,
+        } => format!(
+            "the CMC refunded your ICP ({reason}{}); no cycles were minted, so you can retry.",
+            block_index
+                .map(|b| format!("; refund block {b}"))
+                .unwrap_or_default()
+        ),
+        NotifyError::Processing => format!(
+            "the CMC is still processing the deposit. Finish by calling {method} with block_index \
+             {block} shortly (do NOT re-run this tool; that would transfer ICP again)."
+        ),
+        NotifyError::TransactionTooOld(_) => format!(
+            "the ICP transfer (block {block}) is too old for the CMC to accept — check your \
+             ICP-ledger / CMC balance before retrying."
+        ),
+        NotifyError::InvalidTransaction(m) => {
+            format!("the CMC rejected the deposit as invalid: {m}")
+        }
+        NotifyError::Other {
+            error_code,
+            error_message,
+        } => format!(
+            "the CMC returned an error ({error_code}): {error_message}. If your ICP left your \
+             account, recover by calling {method} with block_index {block}."
+        ),
+    }
 }
 
 /// Parse a decimal-ICP string ("0.5", "2", ".25") into e8s, rejecting >8 decimals.
@@ -758,7 +928,7 @@ struct CmcCreateCanisterArgs {
     subnet_selection: Option<SubnetSelection>,
 }
 
-#[derive(CandidType)]
+#[derive(CandidType, Clone)]
 enum SubnetSelection {
     Subnet { subnet: Principal },
 }
@@ -838,19 +1008,74 @@ enum LogVisibility {
     AllowedViewers(Vec<Principal>),
 }
 
-// ---- CMC (read-only rate query) ----
+// ---- ICP ledger (legacy `transfer`, for the ICP funding path) ----
 
-#[derive(CandidType, Deserialize)]
-struct IcpXdrRateResponse {
-    data: IcpXdrRate,
-    hash_tree: Vec<u8>,
-    certificate: Vec<u8>,
+#[derive(CandidType, Deserialize, Debug)]
+struct Tokens {
+    e8s: u64,
 }
-#[derive(CandidType, Deserialize)]
-struct IcpXdrRate {
-    timestamp_seconds: u64,
-    xdr_permyriad_per_icp: u64,
+
+#[derive(CandidType)]
+struct TimeStamp {
+    timestamp_nanos: u64,
 }
+
+#[derive(CandidType)]
+struct TransferArgs {
+    memo: u64,
+    amount: Tokens,
+    fee: Tokens,
+    from_subaccount: Option<Vec<u8>>,
+    /// AccountIdentifier — a 32-byte blob (`vec nat8`).
+    to: Vec<u8>,
+    created_at_time: Option<TimeStamp>,
+}
+
+#[derive(CandidType, Deserialize, Debug)]
+enum TransferError {
+    BadFee { expected_fee: Tokens },
+    InsufficientFunds { balance: Tokens },
+    TxTooOld { allowed_window_nanos: u64 },
+    TxCreatedInFuture,
+    TxDuplicate { duplicate_of: u64 },
+}
+type TransferResult = std::result::Result<u64, TransferError>;
+
+// ---- CMC (ICP → cycles: notify_create_canister / notify_top_up) ----
+
+#[derive(CandidType)]
+struct NotifyTopUpArg {
+    block_index: u64,
+    canister_id: Principal,
+}
+
+#[derive(CandidType)]
+struct NotifyCreateCanisterArg {
+    block_index: u64,
+    controller: Principal,
+    subnet_type: Option<String>,
+    subnet_selection: Option<SubnetSelection>,
+    settings: Option<CanisterSettings>,
+}
+
+#[derive(CandidType, Deserialize, Debug)]
+enum NotifyError {
+    Refunded {
+        reason: String,
+        block_index: Option<u64>,
+    },
+    Processing,
+    TransactionTooOld(u64),
+    InvalidTransaction(String),
+    Other {
+        error_code: u64,
+        error_message: String,
+    },
+}
+/// `notify_top_up` → `variant { Ok: nat (cycles); Err: NotifyError }`.
+type NotifyTopUpResult = std::result::Result<Nat, NotifyError>;
+/// `notify_create_canister` → `variant { Ok: principal; Err: NotifyError }`.
+type NotifyCreateResult = std::result::Result<Principal, NotifyError>;
 
 // ---- Management canister (aaaaa-aa) ----
 
@@ -977,13 +1202,102 @@ mod tests {
     }
 
     #[test]
-    fn icp_to_cycles_math() {
-        // xdr_permyriad_per_icp = 50_000 ⇒ 1 ICP = 5 XDR = 5e12 cycles.
-        let rate: u64 = 50_000;
-        let e8s = parse_icp_to_e8s("1").unwrap();
-        assert_eq!(e8s as u128 * rate as u128, 5_000_000_000_000u128);
-        let e8s_half = parse_icp_to_e8s("0.5").unwrap();
-        assert_eq!(e8s_half as u128 * rate as u128, 2_500_000_000_000u128);
+    fn require_cycles_validates() {
+        assert_eq!(require_cycles(Some(5)).unwrap(), 5u128);
+        assert!(require_cycles(Some(0)).is_err()); // zero rejected
+        assert!(require_cycles(None).is_err()); // neither cycles nor icp
+        assert!(parse_icp_e8s_positive("0").is_err()); // zero ICP rejected
+        assert_eq!(parse_icp_e8s_positive("0.5").unwrap(), 50_000_000);
+    }
+
+    // CMC deposit sub-account: [len][principal bytes][zero-pad] to 32 bytes.
+    #[test]
+    fn principal_subaccount_layout() {
+        // The management canister principal is the empty slice → all-zero sub-account.
+        assert_eq!(principal_subaccount(&Principal::management_canister()), [0u8; 32]);
+        // A real principal: byte 0 is the length, then the raw principal bytes.
+        let p = Principal::from_text("rkp4c-7iaaa-aaaaa-aaaca-cai").unwrap();
+        let sub = principal_subaccount(&p);
+        assert_eq!(sub[0] as usize, p.as_slice().len());
+        assert_eq!(&sub[1..1 + p.as_slice().len()], p.as_slice());
+        assert!(sub[1 + p.as_slice().len()..].iter().all(|&b| b == 0));
+    }
+
+    // AccountIdentifier is 32 bytes whose first 4 are the big-endian CRC32 of the
+    // remaining 28 — validate that self-consistency (guards the hashing wiring).
+    #[test]
+    fn account_identifier_is_crc_prefixed() {
+        let owner = Principal::from_text("rkp4c-7iaaa-aaaaa-aaaca-cai").unwrap();
+        let id = account_identifier(&owner, &principal_subaccount(&Principal::management_canister()));
+        assert_eq!(id.len(), 32);
+        let crc = crc32fast::hash(&id[4..]).to_be_bytes();
+        assert_eq!(&id[0..4], &crc[..], "first 4 bytes must be the CRC32 of the last 28");
+        // Deterministic: same inputs → same account id.
+        let id2 = account_identifier(&owner, &principal_subaccount(&Principal::management_canister()));
+        assert_eq!(id, id2);
+    }
+
+    // The ICP-ledger transfer args and both CMC notify args must encode — a bad
+    // field name/order would only surface on mainnet otherwise.
+    #[test]
+    fn icp_and_cmc_args_encode() {
+        let transfer = TransferArgs {
+            memo: MEMO_TOP_UP_CANISTER,
+            amount: Tokens { e8s: 100_000_000 },
+            fee: Tokens { e8s: ICP_TRANSFER_FEE_E8S },
+            from_subaccount: None,
+            to: account_identifier(
+                &parse_principal(CMC).unwrap(),
+                &principal_subaccount(&Principal::management_canister()),
+            ),
+            created_at_time: None,
+        };
+        assert!(Encode!(&transfer).is_ok());
+        assert!(Encode!(&NotifyTopUpArg {
+            block_index: 7,
+            canister_id: Principal::management_canister(),
+        })
+        .is_ok());
+        assert!(Encode!(&NotifyCreateCanisterArg {
+            block_index: 7,
+            controller: Principal::management_canister(),
+            subnet_type: None,
+            subnet_selection: Some(SubnetSelection::Subnet {
+                subnet: Principal::management_canister()
+            }),
+            settings: Some(CanisterSettings {
+                controllers: Some(vec![Principal::management_canister()]),
+                ..Default::default()
+            }),
+        })
+        .is_ok());
+    }
+
+    // Round-trip the reply enums so a variant rename/reshape fails at test time.
+    #[test]
+    fn notify_and_transfer_errors_round_trip() {
+        let bytes = Encode!(&NotifyTopUpResult::Err(NotifyError::Processing)).unwrap();
+        assert!(matches!(
+            Decode!(&bytes, NotifyTopUpResult).unwrap(),
+            Err(NotifyError::Processing)
+        ));
+        let refunded = NotifyError::Refunded {
+            reason: "x".into(),
+            block_index: Some(3),
+        };
+        let bytes = Encode!(&NotifyCreateResult::Err(refunded)).unwrap();
+        assert!(matches!(
+            Decode!(&bytes, NotifyCreateResult).unwrap(),
+            Err(NotifyError::Refunded { .. })
+        ));
+        let te = TransferResult::Err(TransferError::InsufficientFunds {
+            balance: Tokens { e8s: 1 },
+        });
+        let bytes = Encode!(&te).unwrap();
+        assert!(matches!(
+            Decode!(&bytes, TransferResult).unwrap(),
+            Err(TransferError::InsufficientFunds { .. })
+        ));
     }
 
     #[test]
