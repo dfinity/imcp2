@@ -434,7 +434,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Create and fund a NEW Internet Computer canister, paying from your cycles-ledger balance (as your Internet Identity). Specify the amount as `cycles` (exact) or `icp` (a decimal-ICP string like \"0.5\", converted to cycles at the network's current rate). Controllers default to your own principal. You must already hold cycles in the cycles ledger (check with cycles_balance; fund via the icp CLI / cycles-management skill). Returns the new canister id — then build your Wasm (see the motoko/icp-cli skills) and install it with install_code. Requires an authenticated session.",
+        description = "Create and fund a NEW Internet Computer canister (as your Internet Identity). Fund it EITHER with `cycles` (exact, drawn from your cycles-ledger balance) OR with `icp` (a decimal-ICP string like \"0.5\", transferred from your ICP-ledger account and converted to cycles via the CMC). BOTH accounts belong to your management principal — the same principal cycles_balance reports (its default subaccount); check/fund it before calling (cycles-ledger balance via cycles_balance, or hold ICP in that principal's ICP-ledger account). The ICP path is best-effort with no retries: if the ICP transfer lands but the mint fails, the error carries the block index to recover with — do not blindly re-run. `cycles` wins if both are given. Controllers default to your own principal. Returns the new canister id — then build your Wasm (see the motoko/icp-cli skills) and install it with install_code. Requires an authenticated session.",
         annotations(title = "Create a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CreatedCanister>(),
     )]
@@ -454,7 +454,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Add cycles to an existing canister, paying from your cycles-ledger balance. Specify `cycles` (exact) or `icp` (decimal-ICP string, converted at the current rate). Requires an authenticated session.",
+        description = "Add cycles to an existing canister (as your Internet Identity). Fund EITHER with `cycles` (exact, drawn from your cycles-ledger balance) OR with `icp` (a decimal-ICP string, transferred from your ICP-ledger account and converted via the CMC straight into the target canister). Both accounts belong to your management principal — the one cycles_balance reports (default subaccount). The ICP path is best-effort with no retries: if the transfer lands but the mint fails, the error carries the block index to recover with — do not blindly re-run. `cycles` wins if both are given. Requires an authenticated session.",
         annotations(title = "Top up a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
