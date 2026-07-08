@@ -59,7 +59,7 @@
 //! request per connect and never auto-retries (a retry then fails as "restart",
 //! never a takeover — the safe direction).
 //!
-//! ## Phase 2: the registration delegation (flag-gated, OFF by default)
+//! ## Phase 2: the registration delegation (per-instance; beta on, prod off)
 //!
 //! A successor connect flow (the "registration delegation" design) replaces the
 //! fetched-key registration — where II binds a key it was merely shown — with a
@@ -71,15 +71,23 @@
 //! subsumes `finish_secret` as the consenter proof; synchronous registration
 //! removes the `grant_is_live` probe and the `finishing_page` poll.
 //!
-//! This is gated behind [`registration_delegation_enabled`] (env
-//! `MCP_REGISTRATION_DELEGATION`) and is **OFF by default**: it depends on II
-//! canister methods (`mcp_register_v2`, `prepare_`/`get_mcp_registration_delegation`,
-//! the `mcp-registration` seed) that **do not exist yet**, so enabling it against
-//! today's II would break connects. When off, the entire v1 flow above is
-//! byte-for-byte unchanged. The fragment wire shape ([`RegDelegationDto`]) and the
-//! II link params (`regkey`, `flow`) are **PROVISIONAL** — the II frontend that
-//! produces them is not written yet — and must be reconciled with II before the
-//! flag is flipped.
+//! The server runs BOTH protocols side by side, selected **per II instance**
+//! ([`crate::identities::IiInstance::registration_delegation`]): the beta
+//! (staging) instance runs Phase 2 by default (`MCP_REGISTRATION_DELEGATION=0`
+//! to disable), the production instance stays pinned to v1
+//! (`MCP_REGISTRATION_DELEGATION_PROD=1` to opt in later). Enabling Phase 2 for
+//! an instance is **outbound-compatible with v1**: it adds `regkey`/`flow` to
+//! that instance's II link and turns on its pinned callback page + redeem
+//! endpoint, while every v1 handler (the callback POSTs, `/oauth/finish`) stays
+//! live — an II frontend that doesn't know the new flow ignores the extra params
+//! and completes v1 unchanged. So beta keeps connecting via v1 until beta II
+//! actually ships the new frontend and canister methods (`mcp_register_v2`,
+//! `prepare_`/`get_mcp_registration_delegation`, the `mcp-registration` seed —
+//! none exist yet), and switches over when it does. The fragment wire shape
+//! ([`RegDelegationDto`]), the link params (`regkey`, `flow`), and the
+//! `mcp_register_v2` candid are **PROVISIONAL** until reconciled with II's
+//! published `.did`. Retiring v1 for a Phase-2 instance (the design's "v1
+//! sunset") is a separate, later step — not this.
 
 use std::{
     collections::HashMap,
@@ -143,19 +151,6 @@ pub fn base_url() -> String {
     std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
 }
 
-/// Whether the **Phase-2 registration-delegation** connect flow is enabled (env
-/// `MCP_REGISTRATION_DELEGATION`; truthy = `1`/`true`/`yes`/`on`,
-/// case-insensitive). **OFF by default** — it requires Internet Identity methods
-/// (`mcp_register_v2`, the registration-delegation minting methods) that do not
-/// exist yet, so enabling it against today's II would break every connect. When
-/// off, [`authorize`] emits the v1 II link and the v1 flow is unchanged. Flip
-/// only once II ships those methods and the provisional wire shapes here have
-/// been reconciled against II's `.did`. See the module docs' "Phase 2" section.
-pub fn registration_delegation_enabled() -> bool {
-    std::env::var("MCP_REGISTRATION_DELEGATION")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-}
 
 /// A fresh consent secret: 256 bits from the OS CSPRNG, URL-safe (base64url, no
 /// pad) so it can ride in a query string. Well above the ≥128-bit floor (P5).
@@ -460,10 +455,12 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
         store.instance().oauth_prefix,
         CONNECT_TTL.as_secs(),
     );
-    // Phase 2 (flag on): mint this connect's registration key `X` and carry
-    // `pub(X)` in the II link so II certifies `P_reg -> X`. Off (default): the v1
-    // link, and the browser-binding cookie above still gates `/oauth/finish`.
-    let ii_url = if registration_delegation_enabled() {
+    // Phase 2 (per-instance): mint this connect's registration key `X` and carry
+    // `pub(X)` in the II link so II certifies `P_reg -> X`. An II frontend that
+    // doesn't know the new flow ignores the extra params and completes v1 (whose
+    // handlers are always live), so enabling this is outbound-compatible. A
+    // v1-pinned instance (prod) emits the unmodified v1 link.
+    let ii_url = if store.instance().registration_delegation {
         let reg_pubkey = store.identities.registration_pubkey_b64(&session_id).await;
         ii_mcp_url_v2(store.instance(), &session_id, &reg_pubkey)
     } else {
@@ -668,7 +665,8 @@ fn ii_mcp_url(inst: &crate::identities::IiInstance, session_id: &str) -> String 
     )
 }
 
-/// Build the **Phase-2** II `/mcp` link (flag on): the v1 fragment plus this
+/// Build the **Phase-2** II `/mcp` link (for a registration-delegation
+/// instance): the v1 fragment plus this
 /// connect's registration public key `pub(X)` (`regkey`), toward which II
 /// certifies the delegation `P_reg -> X`, and a `flow` marker selecting the
 /// registration-delegation path. II navigates the tab to the pinned `callback`
@@ -819,10 +817,10 @@ impl AuthStore {
 /// `location.hash` entirely client-side, POSTs it (with the connect cookie) to
 /// [`connect_redeem`], strips it from the address bar, then navigates to the
 /// redirect the backend returns. It never writes any fragment/query value into
-/// the DOM (no reflection), and ships a strict CSP. When the flag is OFF this
+/// the DOM (no reflection), and ships a strict CSP. On a v1-pinned instance this
 /// path has no page role (v1 uses only the POST handler below), so GET 404s.
 pub async fn connect_callback_page(State(store): State<AuthStore>) -> Response {
-    if !registration_delegation_enabled() {
+    if !store.instance().registration_delegation {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
     pinned_callback_page(store.instance().oauth_prefix)
@@ -1025,13 +1023,13 @@ async fn release_redemption(store: &AuthStore, state: &str) {
 /// which is BOTH the consenter proof (fragment-delivered only to the consenting
 /// browser) and proof of registration (synchronous, so no `grant_is_live` probe)
 /// — and mints the PKCE-bound authorization code, returning the client redirect
-/// for the page to navigate to. 404s when the flag is off.
+/// for the page to navigate to. 404s on a v1-pinned instance.
 pub async fn connect_redeem(
     State(store): State<AuthStore>,
     headers: axum::http::HeaderMap,
     Json(body): Json<RedeemBody>,
 ) -> Response {
-    if !registration_delegation_enabled() {
+    if !store.instance().registration_delegation {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))).into_response();
     }
     // Snapshot the pending connect without holding the lock across the network.
@@ -1539,8 +1537,18 @@ mod tests {
     }
 
     // Build an AuthStore over a dummy II instance (these tests never hit the
-    // network — the key-request path is pure-local crypto/state).
+    // network — the key-request path is pure-local crypto/state). v1-pinned;
+    // use `test_store_phase2` for a registration-delegation instance.
     fn test_store() -> super::AuthStore {
+        test_store_with(false)
+    }
+
+    // An AuthStore whose instance runs the Phase-2 registration-delegation flow.
+    fn test_store_phase2() -> super::AuthStore {
+        test_store_with(true)
+    }
+
+    fn test_store_with(registration_delegation: bool) -> super::AuthStore {
         use crate::identities::{Identities, IiInstance};
         use candid::Principal;
         let ids = Identities::new(IiInstance {
@@ -1549,6 +1557,7 @@ mod tests {
             ii_canister: Principal::anonymous(),
             oauth_prefix: "",
             mcp_path: "/mcp",
+            registration_delegation,
         });
         super::AuthStore::new(ids, super::SharedClients(std::sync::Arc::default()))
     }
@@ -1659,6 +1668,7 @@ mod tests {
             ii_canister: Principal::anonymous(),
             oauth_prefix: "",
             mcp_path: "/mcp",
+            registration_delegation: true,
         };
         let url = super::ii_mcp_url_v2(&inst, "sess-1", "PUBX");
         assert!(url.starts_with("https://ii.test/mcp#"), "everything rides the fragment: {url}");
@@ -1808,20 +1818,20 @@ mod tests {
         ));
     }
 
-    // With the flag OFF (the default — no env var in tests), the Phase-2 surface
-    // is absent: the GET callback page and the redeem endpoint both 404, so the
-    // v1 flow is provably unchanged.
+    // Dual-flow, per instance: on a v1-PINNED instance (prod) the Phase-2
+    // surface is absent — the GET callback page and the redeem endpoint both
+    // 404, so its v1 flow is provably unchanged — while a Phase-2 instance
+    // (beta) serves the pinned page from the same routes.
     #[tokio::test]
-    async fn phase2_routes_404_when_flag_off() {
+    async fn phase2_routes_are_per_instance() {
         use axum::extract::State;
-        let store = test_store();
-        assert!(!super::registration_delegation_enabled());
 
-        let page = super::connect_callback_page(State(store.clone())).await;
+        // v1-pinned instance: 404s.
+        let v1 = test_store();
+        let page = super::connect_callback_page(State(v1.clone())).await;
         assert_eq!(page.status(), axum::http::StatusCode::NOT_FOUND);
-
         let redeem = super::connect_redeem(
-            State(store),
+            State(v1),
             axum::http::HeaderMap::new(),
             axum::Json(super::RedeemBody {
                 state: "sess-x".into(),
@@ -1831,5 +1841,41 @@ mod tests {
         )
         .await;
         assert_eq!(redeem.status(), axum::http::StatusCode::NOT_FOUND);
+
+        // Phase-2 instance: the pinned page is served (with its CSP).
+        let v2 = test_store_phase2();
+        let page = super::connect_callback_page(State(v2.clone())).await;
+        assert_eq!(page.status(), axum::http::StatusCode::OK);
+        assert!(page.headers().contains_key(axum::http::header::CONTENT_SECURITY_POLICY));
+        // And its redeem endpoint is live (an unknown state is a 400, not a 404).
+        let redeem = super::connect_redeem(
+            State(v2),
+            axum::http::HeaderMap::new(),
+            axum::Json(super::RedeemBody {
+                state: "sess-x".into(),
+                user_key: String::new(),
+                delegation: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(redeem.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    // The v1 POST callback handlers stay live on a Phase-2 instance — that's what
+    // makes enabling Phase 2 outbound-compatible (an II frontend that doesn't
+    // know the new flow still completes v1 against the same instance).
+    #[tokio::test]
+    async fn v1_key_request_still_served_on_a_phase2_instance() {
+        use axum::extract::State;
+        use axum::Json;
+        let store = test_store_phase2();
+        seed_pending(&store, "sess-v1", "bind-v1").await;
+        let r = super::connect_callback(
+            State(store.clone()),
+            Json(super::ConnectCallback { state: "sess-v1".into(), expiration: None, permissions: None }),
+        )
+        .await;
+        assert_eq!(r.status(), axum::http::StatusCode::OK, "v1 key request must succeed");
+        assert!(store.authz.read().await.get("sess-v1").unwrap().finish_secret_hash.is_some());
     }
 }

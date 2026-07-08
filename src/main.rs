@@ -926,10 +926,15 @@ async fn main() -> anyhow::Result<()> {
     let inst_prod = identities::IiInstance::prod().map_err(anyhow::Error::msg)?;
     for inst in [&inst_beta, &inst_prod] {
         tracing::info!(
-            "II instance {}: {} ({}) at {}",
-            inst.name, inst.ii_url, inst.ii_canister, inst.mcp_path
+            "II instance {}: {} ({}) at {} — connect protocol: {}",
+            inst.name, inst.ii_url, inst.ii_canister, inst.mcp_path,
+            if inst.registration_delegation { "registration-delegation (v2-ready, v1 honored)" } else { "v1 (fetched key)" },
         );
     }
+    // Per-instance connect-protocol selection, surfaced on /version so operators
+    // can confirm which instance runs which flow without reading env vars.
+    let regdel_beta = inst_beta.registration_delegation;
+    let regdel_prod = inst_prod.registration_delegation;
     let ids_beta = Identities::new(inst_beta);
     let ids_prod = Identities::new(inst_prod);
     let skills = skills::SkillsCatalog::new();
@@ -1113,6 +1118,10 @@ async fn main() -> anyhow::Result<()> {
                     // Expected ~0; a sustained rise means II is re-issuing the key
                     // request (breaks connects under strict single-use), so alert on it.
                     "repeat_key_requests": auth::repeat_key_requests(),
+                    // Per-instance connect protocol: true = Phase-2 registration
+                    // delegation enabled (v1 still honored until that II switches),
+                    // false = pinned to the v1 fetched-key flow.
+                    "registration_delegation": { "beta": regdel_beta, "prod": regdel_prod },
                 }))
             }),
         )

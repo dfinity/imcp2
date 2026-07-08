@@ -104,10 +104,24 @@ pub struct IiInstance {
     pub oauth_prefix: &'static str,
     /// The MCP resource path this instance gates: "/mcp" or "/mcp-prod".
     pub mcp_path: &'static str,
+    /// Whether THIS instance runs the **Phase-2 registration-delegation**
+    /// connect flow (see `crate::auth`'s "Phase 2" module docs). Per-instance so
+    /// the server supports BOTH protocols side by side: staging II (beta) on the
+    /// new flow while production II stays on v1. Enabling is outbound-compatible:
+    /// it only adds the `regkey`/`flow` params to the II link and turns on the
+    /// pinned callback page + redeem endpoint — an II frontend that doesn't know
+    /// the new flow ignores the params and completes v1, which the server always
+    /// still serves. Disabled instances 404 the Phase-2 routes.
+    pub registration_delegation: bool,
 }
 
 impl IiInstance {
     /// The default instance: beta Internet Identity (`II_URL` / `II_CANISTER_ID`).
+    /// Runs the Phase-2 registration-delegation flow by DEFAULT (staging is where
+    /// the new protocol is exercised first); disable with
+    /// `MCP_REGISTRATION_DELEGATION=0`. Until beta II ships the new frontend and
+    /// canister methods, its v1 flow keeps completing unchanged (enabling is
+    /// outbound-compatible — see [`IiInstance::registration_delegation`]).
     pub fn beta() -> Result<Self, String> {
         Ok(Self {
             name: "beta",
@@ -115,11 +129,14 @@ impl IiInstance {
             ii_canister: env_principal("II_CANISTER_ID", II_CANISTER_ID_DEFAULT)?,
             oauth_prefix: "",
             mcp_path: "/mcp",
+            registration_delegation: env_flag("MCP_REGISTRATION_DELEGATION", true),
         })
     }
 
     /// The production instance (`II_URL_PROD` / `II_CANISTER_ID_PROD`). Only
-    /// useful once production II carries the #4086 MCP feature set.
+    /// useful once production II carries the #4086 MCP feature set. Stays on the
+    /// v1 (fetched-key) connect protocol by DEFAULT; opt in to Phase 2 with
+    /// `MCP_REGISTRATION_DELEGATION_PROD=1` once production II supports it.
     pub fn prod() -> Result<Self, String> {
         Ok(Self {
             name: "prod",
@@ -127,6 +144,7 @@ impl IiInstance {
             ii_canister: env_principal("II_CANISTER_ID_PROD", II_CANISTER_ID_PROD_DEFAULT)?,
             oauth_prefix: "/prod",
             mcp_path: "/mcp-prod",
+            registration_delegation: env_flag("MCP_REGISTRATION_DELEGATION_PROD", false),
         })
     }
 }
@@ -143,6 +161,16 @@ fn env_origin(var: &str, default: &str) -> String {
 fn env_principal(var: &str, default: &str) -> Result<Principal, String> {
     let raw = std::env::var(var).unwrap_or_else(|_| default.to_string());
     Principal::from_text(&raw).map_err(|e| format!("invalid {var} '{raw}': {e}"))
+}
+
+/// A boolean flag from the environment, with a default when unset. A SET value
+/// is truthy only for `1`/`true`/`yes`/`on` (case-insensitive) — so an explicit
+/// `VAR=0` turns a default-on flag off.
+fn env_flag(var: &str, default: bool) -> bool {
+    match std::env::var(var) {
+        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => default,
+    }
 }
 
 fn now_ns() -> u64 {
@@ -990,15 +1018,19 @@ mod tests {
     use super::*;
 
     /// The built-in instance defaults must parse (canister ids are compile-time
-    /// strings) and carry the expected paths/prefixes.
+    /// strings) and carry the expected paths/prefixes — and the expected default
+    /// connect protocols: beta (staging) on the Phase-2 registration delegation,
+    /// prod pinned to v1. (Env overrides could flip these outside the test env.)
     #[test]
     fn instance_defaults_are_valid() {
         let beta = IiInstance::beta().expect("beta defaults");
         assert_eq!(beta.oauth_prefix, "");
         assert_eq!(beta.mcp_path, "/mcp");
+        assert!(beta.registration_delegation, "beta defaults to the new protocol");
         let prod = IiInstance::prod().expect("prod defaults");
         assert_eq!(prod.oauth_prefix, "/prod");
         assert_eq!(prod.mcp_path, "/mcp-prod");
+        assert!(!prod.registration_delegation, "prod stays on v1 by default");
         assert_ne!(beta.ii_canister, prod.ii_canister);
     }
 
@@ -1069,6 +1101,7 @@ mod tests {
             ii_canister: Principal::anonymous(),
             oauth_prefix: "",
             mcp_path: "/mcp",
+            registration_delegation: false,
         })
     }
 

@@ -279,7 +279,7 @@ on-chain grant (P3).
 > hosted-redirect allow-listing — a product decision that trades only against open
 > DCR for hosted clients.
 
-### Registration delegation (Phase 2, flag-gated — OFF by default)
+### Registration delegation (Phase 2 — per-instance: beta on, prod on v1)
 
 A successor connect flow (the *registration delegation* design) removes the
 weakest link in v1: today II binds a session key it was merely **shown** (fetched
@@ -290,7 +290,22 @@ user's own authentication and delivers to a **pinned callback page** as a URL
 fragment; the backend redeems it by signing **one** `mcp_register_v2` call as `X`.
 II never again binds a bare key it was shown.
 
-Server side (all behind the `MCP_REGISTRATION_DELEGATION` flag):
+**The server runs both protocols side by side, selected per II instance:**
+
+- **beta / staging (`/mcp`, beta.id.ai)** — Phase 2 **on** by default (disable
+  with `MCP_REGISTRATION_DELEGATION=0`). Enabling is outbound-compatible with
+  v1: the II link gains `regkey`/`flow` params and the Phase-2 routes turn on,
+  while every v1 handler stays live — so beta keeps connecting via v1 until beta
+  II actually ships the new frontend + canister methods, and switches over when
+  it does.
+- **production (`/mcp-prod`, id.ai)** — **pinned to v1** by default (opt in
+  later with `MCP_REGISTRATION_DELEGATION_PROD=1`). Its II link, callback, and
+  finish flow are exactly the existing protocol; the Phase-2 routes `404`.
+
+`/version` reports which instance runs which protocol
+(`registration_delegation: {beta, prod}`).
+
+Server side (on a Phase-2 instance):
 
 - **`X`, a per-connect registration keypair** bound to the connect `sid`;
   `priv(X)` never leaves the backend, and `pub(X)` rides the II link (`regkey`).
@@ -306,16 +321,17 @@ Server side (all behind the `MCP_REGISTRATION_DELEGATION` flag):
   `finishing_page` poll. The read-only level comes back on the `mcp_register_v2`
   reply (feeding the same `require_write` guard as v1's completion POST).
 
-> **Gated on Internet Identity, hence OFF by default.** `mcp_register_v2` and the
-> delegation-minting methods (`prepare_`/`get_mcp_registration_delegation`, the
-> `mcp-registration` seed) **do not exist on II yet**, and the II frontend that
-> produces the fragment isn't written — so enabling the flag against today's II
-> would break connects, and the fragment wire shape (`RegDelegationDto`) plus the
-> link params (`regkey`, `flow`) and the `mcp_register_v2` candid are marked
-> **PROVISIONAL** in the code and must be reconciled against II's published `.did`
-> before the flag is flipped. When off, the entire v1 flow above is unchanged
-> (the `GET` callback page and the redeem route both `404`). This also relies on
-> **Phase 1** (full callback-URL pinning, an II-side change) as its precondition.
+> **Gated on Internet Identity.** `mcp_register_v2` and the delegation-minting
+> methods (`prepare_`/`get_mcp_registration_delegation`, the `mcp-registration`
+> seed) **do not exist on II yet**, and the II frontend that produces the
+> fragment isn't written — until they ship, a Phase-2 instance simply continues
+> to complete connects via v1 (see above). The fragment wire shape
+> (`RegDelegationDto`), the link params (`regkey`, `flow`), and the
+> `mcp_register_v2` candid are marked **PROVISIONAL** in the code and must be
+> reconciled against II's published `.did` when II ships. Retiring v1 on a
+> Phase-2 instance (the design's "v1 sunset") is a separate, later step. This
+> also relies on **Phase 1** (full callback-URL pinning, an II-side change) as
+> its security precondition.
 
 ### Read-only sessions
 
