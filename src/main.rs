@@ -1015,7 +1015,17 @@ async fn main() -> anyhow::Result<()> {
         axum::Router::new()
             .route("/oauth/authorize", axum::routing::get(auth::authorize))
             .route("/oauth/finish", axum::routing::get(auth::finish))
-            .route("/oauth/connect/callback", axum::routing::post(auth::connect_callback))
+            // The connect callback serves BOTH: v1's cross-origin JSON POSTs from
+            // II's frontend, and — behind the registration-delegation flag — the
+            // Phase-2 pinned callback PAGE on GET (the sole fragment reader). The
+            // GET 404s when the flag is off, so v1 is unaffected.
+            .route(
+                "/oauth/connect/callback",
+                axum::routing::post(auth::connect_callback).get(auth::connect_callback_page),
+            )
+            // Phase 2 only: the pinned page POSTs the fragment delegation here to
+            // be redeemed (404s when the flag is off).
+            .route("/oauth/connect/redeem", axum::routing::post(auth::connect_redeem))
             .route("/oauth/token", axum::routing::post(auth::token))
             .route("/oauth/register", axum::routing::post(auth::register))
             .with_state(store)

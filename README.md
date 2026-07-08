@@ -279,6 +279,44 @@ on-chain grant (P3).
 > hosted-redirect allow-listing — a product decision that trades only against open
 > DCR for hosted clients.
 
+### Registration delegation (Phase 2, flag-gated — OFF by default)
+
+A successor connect flow (the *registration delegation* design) removes the
+weakest link in v1: today II binds a session key it was merely **shown** (fetched
+from our callback), so any path on the trusted origin that can be made to echo an
+attacker's key lets II bind it. Phase 2 replaces the fetched key with a
+**single-use, canister-signed delegation `P_reg → X`** that II mints under the
+user's own authentication and delivers to a **pinned callback page** as a URL
+fragment; the backend redeems it by signing **one** `mcp_register_v2` call as `X`.
+II never again binds a bare key it was shown.
+
+Server side (all behind the `MCP_REGISTRATION_DELEGATION` flag):
+
+- **`X`, a per-connect registration keypair** bound to the connect `sid`;
+  `priv(X)` never leaves the backend, and `pub(X)` rides the II link (`regkey`).
+- **A pinned callback page** at `GET /oauth/connect/callback` — the *sole* reader
+  of the returned fragment. It reads `location.hash` client-side, POSTs it (with
+  the connect cookie) to `POST /oauth/connect/redeem`, and reflects nothing into
+  the DOM; it ships a strict CSP (`default-src 'none'`, a per-response script
+  nonce, `connect-src 'self'`).
+- **Redemption** builds a `DelegatedIdentity` from `priv(X)` + the delegation and
+  calls `mcp_register_v2` to bind the long-lived session key `S` to the anchor.
+  The fragment-delivered delegation subsumes `finish_secret` as the consenter
+  proof, and synchronous registration removes the `grant_is_live` probe and the
+  `finishing_page` poll. The read-only level comes back on the `mcp_register_v2`
+  reply (feeding the same `require_write` guard as v1's completion POST).
+
+> **Gated on Internet Identity, hence OFF by default.** `mcp_register_v2` and the
+> delegation-minting methods (`prepare_`/`get_mcp_registration_delegation`, the
+> `mcp-registration` seed) **do not exist on II yet**, and the II frontend that
+> produces the fragment isn't written — so enabling the flag against today's II
+> would break connects, and the fragment wire shape (`RegDelegationDto`) plus the
+> link params (`regkey`, `flow`) and the `mcp_register_v2` candid are marked
+> **PROVISIONAL** in the code and must be reconciled against II's published `.did`
+> before the flag is flipped. When off, the entire v1 flow above is unchanged
+> (the `GET` callback page and the redeem route both `404`). This also relies on
+> **Phase 1** (full callback-URL pinning, an II-side change) as its precondition.
+
 ### Read-only sessions
 
 II's consent screen **defaults to read-only** (opt-out). A user who just clicks
