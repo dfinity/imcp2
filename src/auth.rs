@@ -294,6 +294,14 @@ struct AuthzPending {
     finish_secret_hash: Option<[u8; 32]>,
     /// The authorization code minted once the grant is confirmed (idempotent finish).
     code: Option<String>,
+    /// Phase 2 single-flight marker: `true` while a redemption attempt (the
+    /// `mcp_register_v2` network call) is mid-flight for this connect, so a
+    /// concurrent double-submit can't fire a second one. Set atomically by
+    /// [`claim_redemption`], cleared on failure so a genuine retry can proceed
+    /// (a completed attempt leaves `code` set instead, the idempotent path).
+    /// Redemption is ALSO idempotent-on-`S` at II by design, so this is about
+    /// determinism and not double-spending update calls, not correctness.
+    redeeming: bool,
 }
 
 /// A minted authorization code awaiting exchange.
@@ -435,6 +443,7 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
             created: Instant::now(),
             finish_secret_hash: None,
             code: None,
+            redeeming: false,
         },
     );
 
@@ -819,6 +828,18 @@ pub async fn connect_callback_page(State(store): State<AuthStore>) -> Response {
     pinned_callback_page(store.instance().oauth_prefix)
 }
 
+/// A fresh CSP nonce: 128 bits from the OS CSPRNG, **standard** base64. CSP3's
+/// `base64-value` grammar also admits base64url, but CSP2's does not (`-`/`_`
+/// absent), so use the standard alphabet for maximum parser compatibility — a
+/// strict-CSP2 parser that rejected the nonce source would block the inline
+/// script and break the callback page. `+`/`/`/`=` are all safe where the nonce
+/// rides (a quoted HTML attribute and a header value).
+fn csp_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("getrandom");
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 /// The strict-CSP, non-reflecting pinned callback page. `nonce` is a fresh
 /// per-response value bound into BOTH the CSP header and the inline `<script>`,
 /// so no `'unsafe-inline'` is needed; `connect-src 'self'` limits the page's only
@@ -827,7 +848,7 @@ pub async fn connect_callback_page(State(store): State<AuthStore>) -> Response {
 /// is ever interpolated into the HTML — the fragment is read client-side and sent
 /// via `fetch`, never written to the DOM.
 fn pinned_callback_page(prefix: &str) -> Response {
-    let nonce = fresh_secret();
+    let nonce = csp_nonce();
     let redeem = js_escape(&format!("{prefix}/oauth/connect/redeem"));
     let html = format!(
         "<!DOCTYPE html><html><head><meta charset=utf-8>\
@@ -956,6 +977,48 @@ fn redeem_err(msg: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
 }
 
+/// Outcome of the atomic single-flight claim on a connect's redemption.
+enum RedeemClaim {
+    /// Won the claim: this request runs the (only) in-flight redemption attempt.
+    Claimed,
+    /// A previous attempt already finished — return its code again (idempotent).
+    Existing(String),
+    /// Another attempt is mid-flight right now (a double-submit lost the race).
+    InProgress,
+    /// The pending connect vanished (expiry sweep / restart).
+    Vanished,
+}
+
+/// Atomically claim the right to run this connect's redemption: under one write
+/// lock, return any already-minted code, refuse if an attempt is mid-flight, else
+/// mark the entry as redeeming. This serializes the `mcp_register_v2` call per
+/// connect — a page double-submit can't fire two concurrent redemptions (II's
+/// idempotency-on-`S` would tolerate it, but one deterministic attempt is
+/// strictly better than racing two).
+async fn claim_redemption(store: &AuthStore, state: &str) -> RedeemClaim {
+    let mut authz = store.authz.write().await;
+    let Some(a) = authz.get_mut(state) else {
+        return RedeemClaim::Vanished;
+    };
+    if let Some(code) = &a.code {
+        return RedeemClaim::Existing(code.clone());
+    }
+    if a.redeeming {
+        return RedeemClaim::InProgress;
+    }
+    a.redeeming = true;
+    RedeemClaim::Claimed
+}
+
+/// Release a failed redemption claim so a genuine retry can proceed. (A
+/// successful attempt leaves `code` set, which [`claim_redemption`] returns
+/// directly — the `redeeming` marker no longer matters then.)
+async fn release_redemption(store: &AuthStore, state: &str) {
+    if let Some(a) = store.authz.write().await.get_mut(state) {
+        a.redeeming = false;
+    }
+}
+
 /// POST /oauth/connect/redeem — the pinned page POSTs the fragment here (Phase 2
 /// only). Verifies the browser is the connect INITIATOR (the `sid` cookie), then
 /// redeems the delegation via [`Identities::redeem_registration_delegation`] —
@@ -1010,6 +1073,23 @@ pub async fn connect_redeem(
         Ok(v) => v,
         Err(e) => return redeem_err(&format!("malformed registration delegation: {e}")),
     };
+    // Single-flight: atomically claim this connect's redemption so a double-submit
+    // can't fire two concurrent mcp_register_v2 calls (and a request racing a
+    // just-finished attempt gets that attempt's code instead of redeeming again).
+    match claim_redemption(&store, &body.state).await {
+        RedeemClaim::Claimed => {}
+        RedeemClaim::Existing(code) => {
+            return Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state) }))
+                .into_response()
+        }
+        RedeemClaim::InProgress => {
+            return redeem_err(
+                "another redemption attempt for this connect is already in progress — \
+                 wait a moment; if it does not complete, restart from your client",
+            )
+        }
+        RedeemClaim::Vanished => return redeem_err("connect request vanished — restart from your client"),
+    }
     // Redeem: build a DelegatedIdentity from priv(X) + the chain and make one
     // authenticated mcp_register_v2 call. Success proves consent AND registration.
     match store
@@ -1025,7 +1105,11 @@ pub async fn connect_redeem(
                 "registration delegation redeemed"
             );
         }
-        Err(e) => return redeem_err(&e),
+        Err(e) => {
+            // Free the claim so a genuine retry can attempt redemption again.
+            release_redemption(&store, &body.state).await;
+            return redeem_err(&e);
+        }
     }
     // Mint the PKCE-bound code (idempotent), mirroring /oauth/finish's lock
     // discipline: reserve under the `authz` lock, insert into `codes` only after
@@ -1036,6 +1120,7 @@ pub async fn connect_redeem(
         let Some(a) = authz.get_mut(&body.state) else {
             return redeem_err("connect request vanished — restart from your client");
         };
+        a.redeeming = false;
         match &a.code {
             Some(existing) => (existing.clone(), false),
             None => {
@@ -1481,6 +1566,7 @@ mod tests {
                 created: std::time::Instant::now(),
                 finish_secret_hash: None,
                 code: None,
+                redeeming: false,
             },
         );
     }
@@ -1671,5 +1757,79 @@ mod tests {
         }))
         .unwrap());
         assert!(super::parse_registration_delegation(&b64(&[3u8]), &bad_exp).is_err());
+    }
+
+    // The CSP nonce must use the STANDARD base64 alphabet: CSP2's base64-value
+    // grammar has no `-`/`_`, so a base64url nonce risks a strict parser dropping
+    // the source and blocking the inline script (breaking the callback page).
+    #[test]
+    fn csp_nonce_is_standard_base64() {
+        for _ in 0..16 {
+            let n = super::csp_nonce();
+            assert!(
+                !n.contains('-') && !n.contains('_'),
+                "CSP nonce must not use base64url characters: {n}"
+            );
+            assert!(n.len() >= 22, "128-bit nonce floor: {n}");
+        }
+    }
+
+    // Redemption is SINGLE-FLIGHT per connect: the first claim wins, a concurrent
+    // claim is refused while mid-flight, a released (failed) claim can be retried,
+    // and once a code exists every later claim returns it (idempotent) instead of
+    // redeeming again.
+    #[tokio::test]
+    async fn redemption_claim_is_single_flight() {
+        let store = test_store();
+        seed_pending(&store, "sess-r", "bind-r").await;
+
+        // First claim wins; a concurrent second claim is refused.
+        assert!(matches!(super::claim_redemption(&store, "sess-r").await, super::RedeemClaim::Claimed));
+        assert!(matches!(
+            super::claim_redemption(&store, "sess-r").await,
+            super::RedeemClaim::InProgress
+        ));
+
+        // A failed attempt releases the claim, so a genuine retry proceeds.
+        super::release_redemption(&store, "sess-r").await;
+        assert!(matches!(super::claim_redemption(&store, "sess-r").await, super::RedeemClaim::Claimed));
+
+        // Once the code is minted, later claims return it rather than redeeming.
+        store.authz.write().await.get_mut("sess-r").unwrap().code = Some("mcp-code-x".into());
+        match super::claim_redemption(&store, "sess-r").await {
+            super::RedeemClaim::Existing(code) => assert_eq!(code, "mcp-code-x"),
+            _ => panic!("an existing code must be returned idempotently"),
+        }
+
+        // An unknown state is Vanished.
+        assert!(matches!(
+            super::claim_redemption(&store, "nope").await,
+            super::RedeemClaim::Vanished
+        ));
+    }
+
+    // With the flag OFF (the default — no env var in tests), the Phase-2 surface
+    // is absent: the GET callback page and the redeem endpoint both 404, so the
+    // v1 flow is provably unchanged.
+    #[tokio::test]
+    async fn phase2_routes_404_when_flag_off() {
+        use axum::extract::State;
+        let store = test_store();
+        assert!(!super::registration_delegation_enabled());
+
+        let page = super::connect_callback_page(State(store.clone())).await;
+        assert_eq!(page.status(), axum::http::StatusCode::NOT_FOUND);
+
+        let redeem = super::connect_redeem(
+            State(store),
+            axum::http::HeaderMap::new(),
+            axum::Json(super::RedeemBody {
+                state: "sess-x".into(),
+                user_key: String::new(),
+                delegation: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(redeem.status(), axum::http::StatusCode::NOT_FOUND);
     }
 }
