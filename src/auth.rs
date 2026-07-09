@@ -88,14 +88,17 @@
 //! actually ships the new frontend and canister methods, and switches over when
 //! it does.
 //!
-//! The wire shapes track Internet Identity's (not yet merged) implementation
-//! PRs and must be re-verified when those merge: the connect link carries
-//! `registration_key` = base64url(DER(`pub(X)`)) (#4093); II navigates back to
-//! the callback — validated against our [`AUTH_CALLBACKS_WELL_KNOWN`]
-//! allow-list (#4091) — with `#delegation=<DelegationChain JSON>&state=…`
-//! (#4093, parsed by [`parse_registration_delegation`]); and the backend
-//! redeems via `mcp_register_v2(session_key) -> record { expiration;
-//! permissions : variant { queries; all } }` (#4092). Retiring v1 for a
+//! The wire shapes track rev4 of the MCP server guide (II's implementation
+//! PRs are not merged yet — re-verify when they land): the connect link
+//! carries `registration_key` = base64url(DER(`pub(X)`)); II navigates back
+//! to the callback — validated against our [`AUTH_CALLBACKS_WELL_KNOWN`]
+//! allow-list — with `#delegation=<DelegationChain JSON>&state=…&anchor=…&
+//! permissions=…&ttl=…` (the chain plus the CONSENT TUPLE, parsed by
+//! [`parse_registration_delegation`] and [`parse_consent`]); and the backend
+//! redeems via `mcp_register_v2(anchor_number, session_key, opt permissions,
+//! opt max_ttl) -> record { expiration; permissions }`, echoing the tuple
+//! verbatim — consent is STATELESS at II, which re-derives `P_reg` from the
+//! echo and redeems only if it lands on `caller()`. Retiring v1 for a
 //! Phase-2 instance (the design's "v1 sunset") is a separate, later step — not
 //! this.
 
@@ -909,12 +912,19 @@ fn csp_nonce() -> String {
 /// `__REDEEM_URL__`, which sits inside a quoted JS string literal below.
 const PINNED_PAGE_JS: &str = r#"(function () {
   function show(t) { document.getElementById('m').textContent = t; }
-  // II delivers #delegation=<DelegationChain JSON>&state=<state>,
-  // percent-encoded by URLSearchParams — and decoded again by it here.
+  // II delivers #delegation=<chain JSON>&state=<state>&anchor=<number>
+  // &permissions=<queries|all>&ttl=<ns> — the chain plus the consent tuple,
+  // percent-encoded by URLSearchParams and decoded again by it here. The
+  // tuple is forwarded VERBATIM: the backend echoes it to Internet Identity,
+  // which re-derives the registration principal from it (editing it here
+  // would only make redemption fail).
   var params = new URLSearchParams(location.hash.slice(1));
   var body = JSON.stringify({
     state: params.get('state') || '',
-    delegation: params.get('delegation') || ''
+    delegation: params.get('delegation') || '',
+    anchor: params.get('anchor') || '',
+    permissions: params.get('permissions') || '',
+    ttl: params.get('ttl') || ''
   });
   // Scrub the delegation from the address bar, keeping the path and any query
   // string the declared callback carries. Best-effort: the POST below works
@@ -993,6 +1003,43 @@ pub struct RedeemBody {
     /// ([`JsonDelegationChain`]); `der(P_reg)` rides inside as `publicKey`.
     #[serde(default)]
     delegation: String,
+    /// The consent tuple (guide rev4), forwarded verbatim from the fragment
+    /// and echoed into `mcp_register_v2` — II re-derives `P_reg` from it, so
+    /// editing it can only make redemption fail. `anchor` is the user's II
+    /// anchor number (decimal; **user data** — kept out of logs), `permissions`
+    /// is `"queries"`/`"all"`, `ttl` is the consented grant lifetime in
+    /// NANOSECONDS (decimal — overflows 32-bit ints). Empty string = absent.
+    #[serde(default)]
+    anchor: String,
+    #[serde(default)]
+    permissions: String,
+    #[serde(default)]
+    ttl: String,
+}
+
+/// Parse the redeem body's consent tuple into typed form for the candid echo.
+/// `anchor` is required (II's `mcp_register_v2` takes `anchor_number : nat64`);
+/// `permissions`/`ttl` are optional (`opt` on the wire), with an empty string
+/// meaning absent. An unparseable value fails fast with a clear message — a
+/// mangled echo could never redeem anyway (it derives a different `P_reg`).
+fn parse_consent(body: &RedeemBody) -> Result<crate::identities::RegistrationConsent, String> {
+    let anchor = body
+        .anchor
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "consent anchor is missing or not a u64".to_string())?;
+    let permissions = match body.permissions.trim() {
+        "" => None,
+        p => Some(crate::identities::IiPermissions::from_text(p)?),
+    };
+    let max_ttl_ns = match body.ttl.trim() {
+        "" => None,
+        t => Some(
+            t.parse::<u64>()
+                .map_err(|_| "consent ttl is not a u64 (expected ns as a decimal string)".to_string())?,
+        ),
+    };
+    Ok(crate::identities::RegistrationConsent { anchor, permissions, max_ttl_ns })
 }
 
 /// Size cap for the redeem body's `delegation` JSON text, checked BEFORE
@@ -1115,9 +1162,10 @@ enum RedeemClaim {
 /// Atomically claim the right to run this connect's redemption: under one write
 /// lock, return any already-minted code, refuse if an attempt is mid-flight, else
 /// mark the entry as redeeming. This serializes the `mcp_register_v2` call per
-/// connect — a page double-submit can't fire two concurrent redemptions (II's
-/// idempotency-on-`S` would tolerate it, but one deterministic attempt is
-/// strictly better than racing two).
+/// connect — a page double-submit can't fire two concurrent redemptions. (II
+/// would tolerate the race — within its 5-minute lifetime the delegation
+/// redeems repeatedly, and a retry with the same `S` just re-binds it — but one
+/// deterministic attempt is strictly better than racing two.)
 async fn claim_redemption(store: &AuthStore, state: &str) -> RedeemClaim {
     let mut authz = store.authz.write().await;
     let Some(a) = authz.get_mut(state) else {
@@ -1191,10 +1239,16 @@ pub async fn connect_redeem(
     if let Some(code) = existing_code {
         return Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state) })).into_response();
     }
-    // Decode the fragment delegation (agent-js DelegationChain JSON, II #4093).
+    // Decode the fragment delegation (agent-js DelegationChain JSON, II #4093)
+    // and the consent tuple to echo (guide rev4) — both before claiming, so a
+    // malformed delivery never occupies the single-flight slot.
     let (user_key, chain) = match parse_registration_delegation(&body.delegation) {
         Ok(v) => v,
         Err(e) => return redeem_err(&format!("malformed registration delegation: {e}")),
+    };
+    let consent = match parse_consent(&body) {
+        Ok(c) => c,
+        Err(e) => return redeem_err(&format!("malformed consent tuple: {e}")),
     };
     // Single-flight: atomically claim this connect's redemption so a double-submit
     // can't fire two concurrent mcp_register_v2 calls (and a request racing a
@@ -1217,7 +1271,7 @@ pub async fn connect_redeem(
     // authenticated mcp_register_v2 call. Success proves consent AND registration.
     match store
         .identities
-        .redeem_registration_delegation(&body.state, user_key, chain)
+        .redeem_registration_delegation(&body.state, user_key, chain, consent)
         .await
     {
         Ok(outcome) => {
@@ -1729,6 +1783,41 @@ mod tests {
         assert_eq!(super::granted_grant_types(&g(&["client_credentials"])), None);
     }
 
+    /// The rev4 consent tuple parses into its typed echo: anchor required
+    /// (u64), permissions/ttl optional with empty-string-as-absent, and any
+    /// unparseable value fails fast (a mangled echo could never redeem — it
+    /// derives a different P_reg at II).
+    #[test]
+    fn parse_consent_requires_anchor_and_types_the_tuple() {
+        let body = |anchor: &str, permissions: &str, ttl: &str| super::RedeemBody {
+            state: "s".into(),
+            delegation: String::new(),
+            anchor: anchor.into(),
+            permissions: permissions.into(),
+            ttl: ttl.into(),
+        };
+
+        // Full tuple.
+        let c = super::parse_consent(&body("42", "queries", "2592000000000000")).expect("parse");
+        assert_eq!(c.anchor, 42);
+        assert_eq!(c.permissions, Some(crate::identities::IiPermissions::Queries));
+        assert_eq!(c.max_ttl_ns, Some(2_592_000_000_000_000));
+
+        // Optional fields absent (empty strings).
+        let c = super::parse_consent(&body("7", "", "")).expect("parse");
+        assert_eq!(c.anchor, 7);
+        assert_eq!(c.permissions, None);
+        assert_eq!(c.max_ttl_ns, None);
+
+        // Anchor is required; bad values fail fast with a clear message.
+        assert!(super::parse_consent(&body("", "all", "1")).is_err());
+        assert!(super::parse_consent(&body("not-a-number", "", "")).is_err());
+        let err = super::parse_consent(&body("1", "write-only", "")).expect_err("unknown level");
+        assert!(err.contains("unrecognized"), "got: {err}");
+        let err = super::parse_consent(&body("1", "", "soon")).expect_err("bad ttl");
+        assert!(err.contains("ttl"), "got: {err}");
+    }
+
     #[test]
     fn build_redirect_encodes_code_and_state() {
         let r = build_redirect("https://claude.ai/cb", "mcp-code-1", "abc/def");
@@ -1996,6 +2085,13 @@ mod tests {
         assert!(html.contains("location.hash"), "the page reads the fragment client-side");
         assert!(html.contains("/prod/oauth/connect/redeem"), "posts to the instance's redeem path");
         assert!(!html.contains("__REDEEM_URL__"), "the redeem-URL placeholder must be substituted");
+        // The rev4 consent tuple is read from the fragment and forwarded verbatim.
+        for param in ["anchor", "permissions", "ttl"] {
+            assert!(
+                html.contains(&format!("params.get('{param}')")),
+                "the page must forward the consent tuple's `{param}`"
+            );
+        }
     }
 
     // A well-formed fragment payload — agent-js `DelegationChain.toJSON()`
@@ -2182,6 +2278,9 @@ mod tests {
             axum::Json(super::RedeemBody {
                 state: "sess-x".into(),
                 delegation: String::new(),
+                anchor: String::new(),
+                permissions: String::new(),
+                ttl: String::new(),
             }),
         )
         .await;
@@ -2199,6 +2298,9 @@ mod tests {
             axum::Json(super::RedeemBody {
                 state: "sess-x".into(),
                 delegation: String::new(),
+                anchor: String::new(),
+                permissions: String::new(),
+                ttl: String::new(),
             }),
         )
         .await;

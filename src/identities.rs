@@ -12,7 +12,7 @@
 //!     under the user's own authentication; the server sees no delegation chain
 //!     at connect.
 //!   * **Phase 2 (registration delegation)**: the server also mints a
-//!     per-connect **registration key `X`**; II delivers a single-use,
+//!     per-connect **registration key `X`**; II delivers a short-lived,
 //!     TWO-hop chain `P_reg -> Y -> X` to the pinned callback page — the
 //!     canister-signed `P_reg -> Y` targets an ephemeral key `Y` held only by
 //!     II's frontend (so the piece that transits the IC is inert on its own),
@@ -601,26 +601,36 @@ impl Identities {
     /// targets it so the piece that transits the IC is inert on its own, and
     /// the browser-signed `Y -> X` hop completes the chain only in the
     /// consenting browser), build a `DelegatedIdentity` from `priv(X)` + that
-    /// chain and make ONE authenticated `mcp_register_v2` update. II verifies
-    /// `caller() == P_reg`, reads `{anchor, permissions}` from its own index
-    /// (never from arguments), binds this session's long-lived key `S` to the
-    /// anchor, and returns `{expiration, permissions}`. We record both, so the
-    /// grant-expiry check and the H2 read-only guard behave exactly as they do
-    /// off the v1 completion POST.
+    /// chain and make ONE authenticated `mcp_register_v2` update, echoing the
+    /// fragment's [`RegistrationConsent`] verbatim. **Consent is stateless at
+    /// II** (guide rev4): the canister stores nothing when the user consents —
+    /// it re-derives `P_reg` from the echoed `(anchor, permissions, max_ttl)`
+    /// plus the user's current trusted-server config, and redeems only if the
+    /// derivation lands exactly on `caller()`. The echo therefore grants us no
+    /// leverage (an altered value derives a different principal and gets a
+    /// clean `Err`), and a consent-time config change invalidates an in-flight
+    /// delegation. On `Ok` II binds this session's long-lived key `S` to the
+    /// anchor — replacing any previous grant for that identity — and returns
+    /// `{expiration, permissions}`; we record both, so the grant-expiry check
+    /// and the H2 read-only guard behave exactly as they do off the v1
+    /// completion POST. Within its 5-minute lifetime the delegation redeems
+    /// repeatedly (a retry with the same `S` just re-binds it), so boundary
+    /// timeouts are retry-safe.
     ///
     /// > **Gated on Internet Identity.** `mcp_register_v2` and the delegation-
     /// > minting methods do not exist on DEPLOYED II yet, so this path cannot be
     /// > exercised end-to-end until II ships them; until then a Phase-2 instance
     /// > completes connects via v1 (see `crate::auth`'s Phase-2 docs). The
     /// > `mcp_register_v2` argument/return candid ([`McpRegisterV2Ok`]) matches
-    /// > dfinity/internet-identity#4092 — re-verify against II's published
-    /// > `.did` when that PR merges. The read-only `opt text`/`variant` outage
-    /// > (#40) is the standing lesson against letting these shapes drift.
+    /// > rev4 of the MCP server guide — re-verify against II's published `.did`
+    /// > when the implementation PRs merge. The read-only `opt text`/`variant`
+    /// > outage (#40) is the standing lesson against letting these shapes drift.
     pub async fn redeem_registration_delegation(
         &self,
         session_id: &str,
         reg_user_key: Vec<u8>,
         chain: Vec<SignedDelegation>,
+        consent: RegistrationConsent,
     ) -> Result<RegistrationOutcome, String> {
         self.ensure_session(session_id).await;
         // priv(X) to sign the ingress as, and pub(S) to register.
@@ -647,10 +657,12 @@ impl Identities {
             .build()
             .map_err(|e| format!("could not build registration agent: {e}"))?;
 
-        // mcp_register_v2(session_key) -> variant { Ok : McpRegisterV2Ok; Err : text }
-        //   (PROVISIONAL — see the doc comment). `session_key` is `pub(S)`; the
-        //   anchor + permissions come from II's index, NOT from this argument.
-        let arg = Encode!(&session_der).map_err(|e| format!("could not encode mcp_register_v2 args: {e}"))?;
+        // mcp_register_v2(anchor_number, session_key, permissions, max_ttl)
+        //   -> variant { Ok : McpRegisterV2Ok; Err : text }
+        // `session_key` is `pub(S)`; the other three echo the fragment's consent
+        // tuple verbatim (folded into P_reg's derivation — see the doc comment).
+        let arg = Encode!(&consent.anchor, &session_der, &consent.permissions, &consent.max_ttl_ns)
+            .map_err(|e| format!("could not encode mcp_register_v2 args: {e}"))?;
         let reply = agent
             .update(&self.instance.ii_canister, "mcp_register_v2")
             .with_arg(arg)
@@ -939,11 +951,11 @@ type McpGetAccountsReply = std::result::Result<Vec<IiAccountInfo>, AccountDelega
 /// II's named `Permissions` type: `variant { queries; all }`. Distinct from the
 /// `Delegation` RECORD's `permissions : opt text` field (see
 /// [`IiDelegation::permissions`] and the #40 outage): the named type is a real
-/// candid variant, used by `mcp_register`'s argument and by
-/// `mcp_register_v2`'s reply. Decoded as a variant here — this is NOT the
-/// opt-text case, because the field it appears in is not `opt`.
-#[derive(CandidType, Deserialize, Debug)]
-enum IiPermissions {
+/// candid variant, used by `mcp_register_v2`'s echoed-consent argument and its
+/// reply. Decoded as a variant here — this is NOT the opt-text case, because
+/// the fields it appears in are not `opt text`.
+#[derive(CandidType, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IiPermissions {
     #[serde(rename = "queries")]
     Queries,
     #[serde(rename = "all")]
@@ -951,6 +963,20 @@ enum IiPermissions {
 }
 
 impl IiPermissions {
+    /// Parse the fragment's `permissions` value ("queries"/"all"). Anything
+    /// else FAILS FAST: the value must be echoed into `mcp_register_v2` as this
+    /// closed variant, so an unrecognized level can't be represented — and
+    /// guessing would just derive the wrong `P_reg` and fail opaquely at II.
+    pub fn from_text(s: &str) -> Result<Self, String> {
+        match s {
+            "queries" => Ok(IiPermissions::Queries),
+            "all" => Ok(IiPermissions::All),
+            other => Err(format!(
+                "unrecognized permissions level {other:?} in the consent tuple (expected \"queries\" or \"all\")"
+            )),
+        }
+    }
+
     /// The delegation-vocabulary text for this level ("queries"/"all"), as
     /// consumed by [`Identities::set_permissions`].
     fn as_text(&self) -> &'static str {
@@ -961,10 +987,28 @@ impl IiPermissions {
     }
 }
 
+/// The consent tuple II delivers in the callback fragment (guide rev4),
+/// echoed VERBATIM into `mcp_register_v2`. The echo is not trust: II stores
+/// nothing at consent and instead folds these values into `P_reg`'s
+/// derivation, so redemption succeeds only if the echoed tuple (and the
+/// user's current trusted-server config) re-derives exactly `caller()` —
+/// an altered echo derives a different principal and gets a clean `Err`.
+#[derive(Debug)]
+pub struct RegistrationConsent {
+    /// The user's II anchor number. **User data** — treat it like any user
+    /// identifier and keep it out of logs.
+    pub anchor: u64,
+    /// The consented access level, when present in the fragment.
+    pub permissions: Option<IiPermissions>,
+    /// The consented grant lifetime in NANOSECONDS, when present in the
+    /// fragment (a decimal string on the wire — it overflows 32-bit ints).
+    pub max_ttl_ns: Option<u64>,
+}
+
 /// `Ok` payload of `mcp_register_v2` (Phase 2) — `McpRegistrationV2` per
-/// dfinity/internet-identity#4092: `record { expiration : Timestamp;
-/// permissions : Permissions }`. That PR is not merged yet, so re-verify this
-/// against II's published `.did` when it lands. See
+/// rev4 of the MCP server guide: `record { expiration : Timestamp;
+/// permissions : Permissions }`. II's implementation PRs are not merged yet,
+/// so re-verify this against II's published `.did` when they land. See
 /// [`Identities::redeem_registration_delegation`].
 #[derive(CandidType, Deserialize)]
 struct McpRegisterV2Ok {
@@ -1576,6 +1620,45 @@ mod tests {
         assert_ne!(x1, s, "X (registration key) must differ from S (session key)");
     }
 
+    // Lock the rev4 mcp_register_v2 wire shape: the args encode as
+    // (anchor_number : nat64, session_key : blob, permissions : opt Permissions,
+    // max_ttl : opt nat64) and round-trip — including the named variant, whose
+    // lowercase labels must survive the candid encode (a mislabeled variant
+    // would fail II's decode, not silently drop).
+    #[test]
+    fn mcp_register_v2_args_encode_the_consent_echo() {
+        let consent = RegistrationConsent {
+            anchor: 42,
+            permissions: Some(IiPermissions::Queries),
+            max_ttl_ns: Some(2_592_000_000_000_000),
+        };
+        let session_der = vec![1u8, 2, 3];
+        let bytes = Encode!(&consent.anchor, &session_der, &consent.permissions, &consent.max_ttl_ns)
+            .expect("encode");
+        let (a, k, p, t) =
+            Decode!(&bytes, u64, Vec<u8>, Option<IiPermissions>, Option<u64>).expect("decode");
+        assert_eq!(a, 42);
+        assert_eq!(k, session_der);
+        assert_eq!(p, Some(IiPermissions::Queries));
+        assert_eq!(t, Some(2_592_000_000_000_000));
+    }
+
+    // The fragment's permissions value maps onto the closed variant, failing
+    // fast on anything else (guessing would derive the wrong P_reg at II).
+    #[test]
+    fn ii_permissions_from_text_maps_and_fails_fast() {
+        assert_eq!(IiPermissions::from_text("queries"), Ok(IiPermissions::Queries));
+        assert_eq!(IiPermissions::from_text("all"), Ok(IiPermissions::All));
+        let err = IiPermissions::from_text("write-only").expect_err("unknown level must fail");
+        assert!(err.contains("unrecognized"), "got: {err}");
+    }
+
+    // A consent tuple for tests (the values only matter to II's derivation,
+    // which no local test reaches).
+    fn test_consent() -> RegistrationConsent {
+        RegistrationConsent { anchor: 7, permissions: Some(IiPermissions::All), max_ttl_ns: Some(3_600_000_000_000) }
+    }
+
     // Redemption refuses a delegation that does NOT terminate at this connect's
     // registration key `X`: we hold `priv(X)` and can only sign the ingress that
     // delegation authorizes, so a mismatch is rejected locally, BEFORE any
@@ -1595,7 +1678,7 @@ mod tests {
             signature: vec![],
         };
         let err = ids
-            .redeem_registration_delegation("sess", vec![1, 2, 3], vec![wrong_target])
+            .redeem_registration_delegation("sess", vec![1, 2, 3], vec![wrong_target], test_consent())
             .await
             .expect_err("a delegation to the wrong key must be rejected");
         assert!(err.contains("does not delegate"), "got: {err}");
@@ -1663,7 +1746,7 @@ mod tests {
         let ids = test_ids();
         // No X minted yet: even a plausible user_key can't be redeemed.
         let err = ids
-            .redeem_registration_delegation("sess", vec![1], vec![])
+            .redeem_registration_delegation("sess", vec![1], vec![], test_consent())
             .await
             .expect_err("no registration key => error");
         assert!(err.contains("no registration key"), "got: {err}");
@@ -1671,7 +1754,7 @@ mod tests {
         // With X minted, an EMPTY chain is rejected (nothing to present to II).
         let _ = ids.registration_pubkey_b64("sess").await;
         let err = ids
-            .redeem_registration_delegation("sess", vec![1], vec![])
+            .redeem_registration_delegation("sess", vec![1], vec![], test_consent())
             .await
             .expect_err("empty chain => error");
         assert!(err.contains("chain is empty"), "got: {err}");
