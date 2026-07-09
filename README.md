@@ -303,10 +303,14 @@ A successor connect flow (the *registration delegation* design) removes the
 weakest link in v1: today II binds a session key it was merely **shown** (fetched
 from our callback), so any path on the trusted origin that can be made to echo an
 attacker's key lets II bind it. Phase 2 replaces the fetched key with a
-**single-use, canister-signed delegation `P_reg → X`** that II mints under the
-user's own authentication and delivers to a **pinned callback page** as a URL
-fragment; the backend redeems it by signing **one** `mcp_register_v2` call as `X`.
-II never again binds a bare key it was shown.
+**short-lived (~5 min), two-hop delegation chain `P_reg → Y → X`** delivered to a
+**pinned callback page** as a URL fragment: II's canister signs `P_reg → Y`
+toward an ephemeral key `Y` held only by II's frontend — so the piece that
+transits the IC (replicas, boundary nodes, the public state tree) is inert on
+its own — and the frontend extends it browser-side with a `Y`-signed hop to the
+server's registration key `X`, assembling the redeemable chain only in the
+consenting browser. The backend redeems it by signing **one** `mcp_register_v2`
+call as `X`. II never again binds a bare key it was shown.
 
 **The server runs both protocols side by side, selected per II instance:**
 
@@ -336,16 +340,24 @@ server serves it for both instances (one origin-global document listing each
 instance's `{prefix}/oauth/connect/callback`), built from the same helper that
 builds the II links' callback URLs so the two can never drift.
 
-The Phase-2 wire shapes track II's (not yet merged) implementation PRs and are
-re-verified when those merge: the connect link carries `registration_key` =
-base64url(DER(`pub(X)`))
-([#4093](https://github.com/dfinity/internet-identity/pull/4093)); II navigates
-back to the allow-listed callback with
-`#delegation=<DelegationChain JSON>&state=…` (#4093, agent-js
-`DelegationChain.toJSON()` — hex byte fields, hex-string expiration); and
-redemption calls `mcp_register_v2(session_key) -> record { expiration;
-permissions : variant { queries; all } }`
-([#4092](https://github.com/dfinity/internet-identity/pull/4092)).
+The Phase-2 wire shapes track **rev5 of the MCP server guide** (II's
+implementation PRs are not merged yet — re-verify when they land): the connect
+link carries `registration_key` = base64url(DER(`pub(X)`)); II navigates back
+to the allow-listed callback with the chain **plus the consent tuple** —
+`#delegation=<DelegationChain JSON>&state=…&permissions=<queries|all>&ttl=<ns>`
+(agent-js `DelegationChain.toJSON()` — hex byte fields, hex-string expiration);
+and redemption calls
+`mcp_register_v2(session_key, opt permissions, opt max_ttl)
+-> record { expiration; permissions }`, **echoing the consent verbatim**.
+Consent is *stateless* at II for the access level and lifetime: **no consent
+values are stored beyond the anchor mapping** — at consent II records only
+`P_reg -> anchor` (so it can recover the anchor at redemption), while
+`permissions`/`max_ttl` are re-derived, not stored. `P_reg` is re-derived from
+the echoed consent plus the user's current trusted-server config, so an altered
+echo (or a consent-time config change) derives a different principal and
+redemption fails cleanly. The anchor is **never sent by the server**: II
+recovers it from `caller() == P_reg`, so the anchor number never reaches — or
+is logged by — this server.
 
 Server side (on a Phase-2 instance):
 
@@ -358,7 +370,8 @@ Server side (on a Phase-2 instance):
   the DOM; it ships a strict CSP (`default-src 'none'`, a per-response script
   nonce, `connect-src 'self'`).
 - **Redemption** builds a `DelegatedIdentity` from `priv(X)` + the delegation and
-  calls `mcp_register_v2` to bind the long-lived session key `S` to the anchor.
+  calls `mcp_register_v2` to bind the long-lived session key `S` to the anchor
+  (which II recovers from `caller() == P_reg` — the server never names it).
   The fragment-delivered delegation subsumes `finish_secret` as the consenter
   proof, and synchronous registration removes the `grant_is_live` probe and the
   `finishing_page` poll. The read-only level comes back on the `mcp_register_v2`

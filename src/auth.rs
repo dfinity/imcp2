@@ -63,13 +63,17 @@
 //!
 //! A successor connect flow (the "registration delegation" design) replaces the
 //! fetched-key registration — where II binds a key it was merely shown — with a
-//! single-use, canister-signed delegation `P_reg -> X` that II mints under the
-//! user's own authentication and delivers to a **pinned callback page** as a URL
-//! fragment. The backend redeems it by signing ONE `mcp_register_v2` call as `X`
-//! (see [`Identities::redeem_registration_delegation`]). The delegation, being
-//! fragment-delivered only to the consenting browser and required to redeem,
-//! subsumes `finish_secret` as the consenter proof; synchronous registration
-//! removes the `grant_is_live` probe and the `finishing_page` poll.
+//! short-lived (≈5 min), TWO-hop delegation chain `P_reg -> Y -> X` delivered to
+//! a **pinned callback page** as a URL fragment: II's canister signs `P_reg -> Y`
+//! toward an ephemeral key `Y` held only by II's frontend (so the piece that
+//! transits the IC — replicas, boundary nodes, the public state tree — is inert
+//! on its own), and the frontend extends it browser-side with a `Y`-signed hop
+//! to our registration key `X`, assembling the redeemable chain only in the
+//! consenting browser. The backend redeems it by signing ONE `mcp_register_v2`
+//! call as `X` (see [`Identities::redeem_registration_delegation`]). The chain,
+//! being fragment-delivered only to the consenting browser and required to
+//! redeem, subsumes `finish_secret` as the consenter proof; synchronous
+//! registration removes the `grant_is_live` probe and the `finishing_page` poll.
 //!
 //! The server runs BOTH protocols side by side, selected **per II instance**
 //! ([`crate::identities::IiInstance::registration_delegation`]): the beta
@@ -84,16 +88,20 @@
 //! actually ships the new frontend and canister methods, and switches over when
 //! it does.
 //!
-//! The wire shapes track Internet Identity's (not yet merged) implementation
-//! PRs and must be re-verified when those merge: the connect link carries
-//! `registration_key` = base64url(DER(`pub(X)`)) (#4093); II navigates back to
-//! the callback — validated against our [`AUTH_CALLBACKS_WELL_KNOWN`]
-//! allow-list (#4091) — with `#delegation=<DelegationChain JSON>&state=…`
-//! (#4093, parsed by [`parse_registration_delegation`]); and the backend
-//! redeems via `mcp_register_v2(session_key) -> record { expiration;
-//! permissions : variant { queries; all } }` (#4092). Retiring v1 for a
-//! Phase-2 instance (the design's "v1 sunset") is a separate, later step — not
-//! this.
+//! The wire shapes track rev5 of the MCP server guide (II's implementation
+//! PRs are not merged yet — re-verify when they land): the connect link
+//! carries `registration_key` = base64url(DER(`pub(X)`)); II navigates back
+//! to the callback — validated against our [`AUTH_CALLBACKS_WELL_KNOWN`]
+//! allow-list — with `#delegation=<DelegationChain JSON>&state=…&permissions=…&
+//! ttl=…` (the chain plus the CONSENT values, parsed by
+//! [`parse_registration_delegation`] and [`parse_consent`]); and the backend
+//! redeems via `mcp_register_v2(session_key, opt permissions, opt max_ttl)
+//! -> record { expiration; permissions }`, echoing those values verbatim —
+//! consent is STATELESS at II, which re-derives `P_reg` from the echo and
+//! redeems only if it lands on `caller()`. The **anchor is never sent or
+//! seen** by the server: II recovers the user's identity number from
+//! `caller() == P_reg`. Retiring v1 for a Phase-2 instance (the design's "v1
+//! sunset") is a separate, later step — not this.
 
 use std::{
     collections::HashMap,
@@ -469,7 +477,8 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
         CONNECT_TTL.as_secs(),
     );
     // Phase 2 (per-instance): mint this connect's registration key `X` and carry
-    // `pub(X)` in the II link so II certifies `P_reg -> X`. An II frontend that
+    // `pub(X)` in the II link, toward which II builds the registration chain
+    // (`P_reg -> Y -> X`, the last hop browser-signed to `X`). An II frontend that
     // doesn't know the new flow ignores the extra params and completes v1 (whose
     // handlers are always live), so enabling this is outbound-compatible. A
     // v1-pinned instance (prod) emits the unmodified v1 link.
@@ -679,9 +688,9 @@ fn ii_mcp_url(inst: &crate::identities::IiInstance, session_id: &str) -> String 
 
 /// Build the **Phase-2** II `/mcp` link (for a registration-delegation
 /// instance): the v1 fragment plus `registration_key` — this connect's
-/// registration public key `pub(X)` (DER, base64url), toward which II certifies
-/// the delegation `P_reg -> X` (param name per dfinity/internet-identity#4093;
-/// its presence is what selects the registration-delegation flow). II navigates
+/// registration public key `pub(X)` (DER, base64url), toward which II builds
+/// the registration chain `P_reg -> Y -> X` (param name per
+/// dfinity/internet-identity#4093; its presence selects the flow). II navigates
 /// the tab back to `callback` — validated against our
 /// [`AUTH_CALLBACKS_WELL_KNOWN`] allow-list (#4091) — with the delegation in
 /// the fragment; that callback page is our sole fragment reader
@@ -897,29 +906,69 @@ fn csp_nonce() -> String {
 /// is ever interpolated into the HTML — the fragment is read client-side and sent
 /// via `fetch`, never written to the DOM.
 ///
-/// The fragment shape matches II's frontend (dfinity/internet-identity#4093):
-/// `#delegation=<JSON.stringify(DelegationChain.toJSON())>&state=<state>`,
-/// percent-encoded by `URLSearchParams` — so `p.get('delegation')` yields the
-/// chain's JSON text, forwarded to the redeem endpoint verbatim.
+/// The fragment shape matches II's frontend (guide rev5): the delegation chain
+/// plus the consent values —
+/// `#delegation=<JSON.stringify(DelegationChain.toJSON())>&state=<state>&permissions=<queries|all>&ttl=<ns>`,
+/// percent-encoded by `URLSearchParams`. The script reads each field and
+/// forwards them to the redeem endpoint verbatim (the chain's JSON text and the
+/// consent values II re-derives `P_reg` from — see [`parse_consent`]). There is
+/// no `anchor` in the fragment: II recovers the user's identity number from
+/// `caller() == P_reg`, so the server never sees it.
+///
+/// The pinned page's inline script, kept as a PLAIN string — not a `format!`
+/// template — so the JavaScript reads naturally (no doubled braces, room for
+/// comments). The one dynamic value, the redeem URL, is spliced in by replacing
+/// `__REDEEM_URL__`, which sits inside a quoted JS string literal below.
+const PINNED_PAGE_JS: &str = r#"(function () {
+  function show(t) { document.getElementById('m').textContent = t; }
+  // II delivers #delegation=<chain JSON>&state=<state>&permissions=<queries|all>
+  // &ttl=<ns> — the chain plus the consent values, percent-encoded by
+  // URLSearchParams and decoded again by it here. They are forwarded VERBATIM:
+  // the backend echoes them to Internet Identity, which re-derives the
+  // registration principal from them (editing them here would only make
+  // redemption fail). No anchor rides the fragment — II recovers it from
+  // caller().
+  var params = new URLSearchParams(location.hash.slice(1));
+  var body = JSON.stringify({
+    state: params.get('state') || '',
+    delegation: params.get('delegation') || '',
+    permissions: params.get('permissions') || '',
+    ttl: params.get('ttl') || ''
+  });
+  // Scrub the delegation from the address bar, keeping the path and any query
+  // string the declared callback carries. Best-effort: the POST below works
+  // even if a browser refuses the history call.
+  try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+  fetch("__REDEEM_URL__", {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    credentials: 'same-origin',
+    body: body
+  })
+    .then(function (r) { return r.json().catch(function () { return {}; }); })
+    .then(function (d) {
+      if (d && d.redirect) {
+        location.replace(d.redirect);
+      } else {
+        show((d && d.error) || 'Could not finish the connection — restart from your client.');
+      }
+    })
+    .catch(function () {
+      show('Could not reach the server — restart from your client.');
+    });
+})();"#;
+
 fn pinned_callback_page(prefix: &str) -> Response {
     let nonce = csp_nonce();
     let redeem = js_escape(&format!("{prefix}/oauth/connect/redeem"));
+    let script = PINNED_PAGE_JS.replace("__REDEEM_URL__", &redeem);
     let html = format!(
         "<!DOCTYPE html><html><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>Finishing sign-in…</title></head>\
          <body style=\"font-family:system-ui;max-width:32rem;margin:3rem auto\">\
          <p id=m>Finishing sign-in…</p>\
-         <script nonce=\"{nonce}\">(function(){{\
-         function show(t){{document.getElementById('m').textContent=t;}}\
-         var p=new URLSearchParams(location.hash.slice(1));\
-         var body=JSON.stringify({{state:p.get('state')||'',delegation:p.get('delegation')||''}});\
-         try{{history.replaceState(null,'',location.pathname);}}catch(e){{}}\
-         fetch(\"{redeem}\",{{method:'POST',headers:{{'content-type':'application/json'}},credentials:'same-origin',body:body}})\
-         .then(function(r){{return r.json().catch(function(){{return {{}};}});}})\
-         .then(function(d){{if(d&&d.redirect){{location.replace(d.redirect);}}else{{show((d&&d.error)||'Could not finish the connection — restart from your client.');}}}})\
-         .catch(function(){{show('Could not reach the server — restart from your client.');}});\
-         }})();</script></body></html>"
+         <script nonce=\"{nonce}\">{script}</script></body></html>"
     );
     // `frame-ancestors 'none'`: II reaches this page only by top-level
     // navigation, so framing is never legitimate — deny it outright so the
@@ -952,17 +1001,49 @@ fn pinned_callback_page(prefix: &str) -> Response {
 }
 
 /// POST /oauth/connect/redeem body — what [`pinned_callback_page`] sends after
-/// parsing the fragment: the `state` echo and the delegation chain's JSON text
+/// parsing the fragment: the `state` echo, the delegation chain's JSON text
 /// exactly as II's frontend put it in the fragment
-/// (`JSON.stringify(DelegationChain.toJSON())`, dfinity/internet-identity#4093).
-#[derive(Debug, Deserialize)]
+/// (`JSON.stringify(DelegationChain.toJSON())`, dfinity/internet-identity#4093),
+/// and the consent values (guide rev5). The **anchor is not carried** — II
+/// recovers it from `caller() == P_reg`, so the server never sees the user's
+/// identity number.
+#[derive(Deserialize)]
 pub struct RedeemBody {
     /// The single-use connect state (= session id), echoed by II.
     state: String,
-    /// The `P_reg -> X` chain as agent-js `DelegationChain` JSON
+    /// The two-hop `P_reg -> Y -> X` chain as agent-js `DelegationChain` JSON
     /// ([`JsonDelegationChain`]); `der(P_reg)` rides inside as `publicKey`.
     #[serde(default)]
     delegation: String,
+    /// The consent values (guide rev5), forwarded verbatim from the fragment
+    /// and echoed into `mcp_register_v2` — II re-derives `P_reg` from them, so
+    /// editing them can only make redemption fail. `permissions` is
+    /// `"queries"`/`"all"`, `ttl` is the consented grant lifetime in
+    /// NANOSECONDS (decimal — overflows 32-bit ints). Empty string = absent.
+    #[serde(default)]
+    permissions: String,
+    #[serde(default)]
+    ttl: String,
+}
+
+/// Parse the redeem body's consent values into typed form for the candid echo.
+/// Both `permissions` and `ttl` are optional (`opt` on the wire), with an empty
+/// string meaning absent. An unparseable value fails fast with a clear message
+/// — a mangled echo could never redeem anyway (it derives a different `P_reg`).
+/// No anchor: II recovers it from `caller()`, so the server never handles it.
+fn parse_consent(body: &RedeemBody) -> Result<crate::identities::RegistrationConsent, String> {
+    let permissions = match body.permissions.trim() {
+        "" => None,
+        p => Some(crate::identities::IiPermissions::from_text(p)?),
+    };
+    let max_ttl_ns = match body.ttl.trim() {
+        "" => None,
+        t => Some(
+            t.parse::<u64>()
+                .map_err(|_| "consent ttl is not a u64 (expected ns as a decimal string)".to_string())?,
+        ),
+    };
+    Ok(crate::identities::RegistrationConsent { permissions, max_ttl_ns })
 }
 
 /// Size cap for the redeem body's `delegation` JSON text, checked BEFORE
@@ -978,7 +1059,10 @@ const MAX_REG_DELEGATION_JSON: usize = 64 * 1024;
 /// in the callback fragment (dfinity/internet-identity#4093): byte fields are
 /// HEX strings, `expiration` is a HEX string of ns since the epoch
 /// (`BigInt.toString(16)`), `targets` are principal texts, and `publicKey` is
-/// the chain root `der(P_reg)`.
+/// the chain root `der(P_reg)`. `delegations` carries TWO hops — the
+/// canister-signed `P_reg -> Y` toward II's ephemeral browser-held `Y`, and
+/// the `Y`-signed `Y -> X` toward our registration key (the split keeps the
+/// canister-signed piece, which transits the IC, inert on its own).
 ///
 /// `deny_unknown_fields` on purpose: every field of a delegation is covered by
 /// its canister signature, so a field this parser does not carry (e.g. a future
@@ -1016,9 +1100,14 @@ fn hex_decode(field: &str, s: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Parse the fragment's `DelegationChain` JSON into `(der(P_reg), chain)` as
-/// `ic-agent` types. The chain carries no `permissions` field (the registration
-/// delegation's permission choice lives in II's server-side index, not in the
-/// delegation — and [`JsonDelegationChain`] fails fast if one ever appears).
+/// `ic-agent` types — hop count is preserved verbatim (two hops per rev3 of the
+/// guide; the redeem path only requires that the FINAL hop targets our `X`, and
+/// the replica verifies every hop authoritatively). The chain carries no
+/// `permissions` field: under rev5's stateless consent the access level isn't
+/// stored in the delegation at all — it rides the fragment's consent values
+/// (see [`parse_consent`]) and is echoed into `mcp_register_v2`. So a
+/// `permissions` field appearing here would be unexpected, and
+/// [`JsonDelegationChain`] fails fast if one ever does.
 fn parse_registration_delegation(delegation_json: &str) -> Result<(Vec<u8>, Vec<SignedDelegation>), String> {
     // Bound the size BEFORE parsing (see MAX_REG_DELEGATION_JSON): reject
     // oversized input without allocating for it. This also inherently bounds
@@ -1079,9 +1168,10 @@ enum RedeemClaim {
 /// Atomically claim the right to run this connect's redemption: under one write
 /// lock, return any already-minted code, refuse if an attempt is mid-flight, else
 /// mark the entry as redeeming. This serializes the `mcp_register_v2` call per
-/// connect — a page double-submit can't fire two concurrent redemptions (II's
-/// idempotency-on-`S` would tolerate it, but one deterministic attempt is
-/// strictly better than racing two).
+/// connect — a page double-submit can't fire two concurrent redemptions. (II
+/// would tolerate the race — within its 5-minute lifetime the delegation
+/// redeems repeatedly, and a retry with the same `S` just re-binds it — but one
+/// deterministic attempt is strictly better than racing two.)
 async fn claim_redemption(store: &AuthStore, state: &str) -> RedeemClaim {
     let mut authz = store.authz.write().await;
     let Some(a) = authz.get_mut(state) else {
@@ -1155,10 +1245,16 @@ pub async fn connect_redeem(
     if let Some(code) = existing_code {
         return Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state) })).into_response();
     }
-    // Decode the fragment delegation (agent-js DelegationChain JSON, II #4093).
+    // Decode the fragment delegation (agent-js DelegationChain JSON, II #4093)
+    // and the consent values to echo (guide rev5) — both before claiming, so a
+    // malformed delivery never occupies the single-flight slot.
     let (user_key, chain) = match parse_registration_delegation(&body.delegation) {
         Ok(v) => v,
         Err(e) => return redeem_err(&format!("malformed registration delegation: {e}")),
+    };
+    let consent = match parse_consent(&body) {
+        Ok(c) => c,
+        Err(e) => return redeem_err(&format!("malformed consent tuple: {e}")),
     };
     // Single-flight: atomically claim this connect's redemption so a double-submit
     // can't fire two concurrent mcp_register_v2 calls (and a request racing a
@@ -1181,7 +1277,7 @@ pub async fn connect_redeem(
     // authenticated mcp_register_v2 call. Success proves consent AND registration.
     match store
         .identities
-        .redeem_registration_delegation(&body.state, user_key, chain)
+        .redeem_registration_delegation(&body.state, user_key, chain, consent)
         .await
     {
         Ok(outcome) => {
@@ -1701,6 +1797,42 @@ mod tests {
         assert_eq!(super::granted_grant_types(&g(&["client_credentials"])), None);
     }
 
+    /// The rev5 consent parses into its typed echo: permissions/ttl optional
+    /// with empty-string-as-absent, no anchor carried, and any unparseable
+    /// value fails fast (a mangled echo could never redeem — it derives a
+    /// different P_reg at II).
+    #[test]
+    fn parse_consent_types_the_values_and_omits_the_anchor() {
+        let body = |permissions: &str, ttl: &str| super::RedeemBody {
+            state: "s".into(),
+            delegation: String::new(),
+            permissions: permissions.into(),
+            ttl: ttl.into(),
+        };
+
+        // Both values present.
+        let c = super::parse_consent(&body("queries", "2592000000000000")).expect("parse");
+        assert_eq!(c.permissions, Some(crate::identities::IiPermissions::Queries));
+        assert_eq!(c.max_ttl_ns, Some(2_592_000_000_000_000));
+
+        // Both absent (empty strings) — rev5 makes them `opt`, so this is valid.
+        let c = super::parse_consent(&body("", "")).expect("parse");
+        assert_eq!(c.permissions, None);
+        assert_eq!(c.max_ttl_ns, None);
+
+        // Bad values fail fast with a clear message. (`let-else` rather than
+        // `expect_err`, which would require the Ok type `RegistrationConsent`
+        // to be `Debug` — it deliberately isn't.)
+        let Err(err) = super::parse_consent(&body("write-only", "")) else {
+            panic!("an unknown permissions level must fail");
+        };
+        assert!(err.contains("unrecognized"), "got: {err}");
+        let Err(err) = super::parse_consent(&body("", "soon")) else {
+            panic!("a non-numeric ttl must fail");
+        };
+        assert!(err.contains("ttl"), "got: {err}");
+    }
+
     #[test]
     fn build_redirect_encodes_code_and_state() {
         let r = build_redirect("https://claude.ai/cb", "mcp-code-1", "abc/def");
@@ -1967,42 +2099,72 @@ mod tests {
         );
         assert!(html.contains("location.hash"), "the page reads the fragment client-side");
         assert!(html.contains("/prod/oauth/connect/redeem"), "posts to the instance's redeem path");
+        assert!(!html.contains("__REDEEM_URL__"), "the redeem-URL placeholder must be substituted");
+        // The rev5 consent values are read from the fragment and forwarded
+        // verbatim; the anchor is NOT read (II recovers it from caller()).
+        for param in ["permissions", "ttl"] {
+            assert!(
+                html.contains(&format!("params.get('{param}')")),
+                "the page must forward the consent value `{param}`"
+            );
+        }
+        assert!(!html.contains("params.get('anchor')"), "the page must not read an anchor (rev5)");
     }
 
     // A well-formed fragment payload — agent-js `DelegationChain.toJSON()`
     // exactly as II's #4093 frontend emits it (hex byte fields, HEX-string
-    // expiration, principal-text targets, top-level `publicKey` = der(P_reg))
-    // — decodes into `(der(P_reg), [P_reg -> X])` as ic-agent types.
+    // expiration, principal-text targets, top-level `publicKey` = der(P_reg)),
+    // carrying rev3's TWO hops (`P_reg -> Y` canister-signed, `Y -> X`
+    // browser-signed) — decodes into `(der(P_reg), [both hops in order])`.
     #[test]
-    fn parse_registration_delegation_round_trips() {
-        let der_x = vec![9u8, 8, 7, 6];
+    fn parse_registration_delegation_round_trips_two_hops() {
         let der_preg = vec![1u8, 2, 3];
-        let sig = vec![4u8, 5, 6];
+        let der_y = vec![7u8, 7, 7]; // II's ephemeral browser-held key
+        let der_x = vec![9u8, 8, 7, 6]; // our registration key
+        let sig_canister = vec![4u8, 5, 6];
+        let sig_y = vec![1u8, 9, 9];
         let chain_json = serde_json::json!({
-            "delegations": [{
-                "delegation": {
-                    "pubkey": hex::encode(&der_x),
-                    "expiration": format!("{:x}", 66_u64), // BigInt.toString(16)
-                    "targets": ["aaaaa-aa"],
+            "delegations": [
+                {
+                    "delegation": {
+                        "pubkey": hex::encode(&der_y),
+                        "expiration": format!("{:x}", 66_u64), // BigInt.toString(16)
+                        "targets": ["aaaaa-aa"],
+                    },
+                    "signature": hex::encode(&sig_canister),
                 },
-                "signature": hex::encode(&sig),
-            }],
+                {
+                    "delegation": {
+                        "pubkey": hex::encode(&der_x),
+                        "expiration": format!("{:x}", 66_u64),
+                    },
+                    "signature": hex::encode(&sig_y),
+                },
+            ],
             "publicKey": hex::encode(&der_preg),
         })
         .to_string();
         let (uk, chain) = super::parse_registration_delegation(&chain_json).expect("parse");
         assert_eq!(uk, der_preg);
-        assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].delegation.pubkey, der_x);
+        assert_eq!(chain.len(), 2, "both hops preserved, in order");
+        // Hop 1: canister-signed P_reg -> Y. Its `targets` round-trips from
+        // principal text (`aaaaa-aa` here as a stand-in; live chains carry the
+        // II canister id).
+        assert_eq!(chain[0].delegation.pubkey, der_y);
         assert_eq!(chain[0].delegation.expiration, 66);
-        // The registration delegation carries no permissions field — the
-        // permission choice lives in II's index, not in the delegation.
-        assert_eq!(chain[0].delegation.permissions, None);
-        assert_eq!(chain[0].signature, sig);
+        assert_eq!(chain[0].signature, sig_canister);
         assert_eq!(
             chain[0].delegation.targets.as_ref().unwrap()[0],
             candid::Principal::management_canister()
         );
+        // Hop 2: browser-signed Y -> X.
+        assert_eq!(chain[1].delegation.pubkey, der_x);
+        assert_eq!(chain[1].signature, sig_y);
+        assert_eq!(chain[1].delegation.targets, None);
+        // Neither hop carries a permissions field — under rev5 stateless
+        // consent the access level rides the fragment consent values (echoed
+        // into mcp_register_v2), not the delegations.
+        assert!(chain.iter().all(|d| d.delegation.permissions.is_none()));
     }
 
     // Malformed input fails with a clear error: non-JSON, bad hex, a
@@ -2134,6 +2296,8 @@ mod tests {
             axum::Json(super::RedeemBody {
                 state: "sess-x".into(),
                 delegation: String::new(),
+                permissions: String::new(),
+                ttl: String::new(),
             }),
         )
         .await;
@@ -2151,6 +2315,8 @@ mod tests {
             axum::Json(super::RedeemBody {
                 state: "sess-x".into(),
                 delegation: String::new(),
+                permissions: String::new(),
+                ttl: String::new(),
             }),
         )
         .await;
