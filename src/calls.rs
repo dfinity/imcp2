@@ -9,7 +9,11 @@
 //! agent, identities, and request context); this module owns their argument and
 //! output types plus the pure encode/decode/call helpers they delegate to.
 
-use candid::{types::value::IDLArgs, Principal};
+use candid::{
+    types::value::{IDLArgs, IDLField, IDLValue},
+    types::Label,
+    Principal,
+};
 use ic_agent::Agent;
 // rmcp re-exports schemars 1.x; the `#[tool]` output-schema machinery requires
 // THAT version's `JsonSchema`, so derive the MCP types against it.
@@ -47,6 +51,65 @@ pub struct OqlGuideOutput {
     /// The OQL usage guide (markdown): the `schema`/`execute` methods, the JSON
     /// query object, the predicate grammar, edges, and the result shape.
     pub content: String,
+}
+
+/// Arguments for `oql_query`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OqlQueryArgs {
+    /// Canister principal that exposes the OQL surface (get_candid reports
+    /// `oql: true`).
+    pub canister_id: String,
+    /// The OQL query as a JSON object string — passed straight to the canister's
+    /// `execute` method, so NO Candid escaping is needed (write plain JSON). E.g.
+    /// `{"start":"employee","where":{"icontains":{"field":"lastName","value":"smith"}},"select":["firstName","lastName"],"limit":10}`.
+    /// See get_oql_guide (or oql_schema) for the dialect and entity/field names.
+    pub query: String,
+    /// Application domain to query as, e.g. "oisy.com" — its account delegation is
+    /// derived on demand for this connection. Omit to query anonymously.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// Which of your accounts at `domain` to act as, by account name (see
+    /// list_accounts). Omit for that app's default account; ignored without `domain`.
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// Output of `oql_query`: the `execute` result decoded into a table.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct OqlQueryOutput {
+    /// The canister that was queried.
+    pub canister_id: String,
+    /// Column names, in order (the cell `name`s of the first row).
+    pub columns: Vec<String>,
+    /// Result rows, each aligned to `columns`, with cell values rendered as scalars.
+    pub rows: Vec<Vec<String>>,
+    /// True when more rows remain — re-query with a higher `offset` to page.
+    pub has_more: bool,
+}
+
+/// Arguments for `oql_schema`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OqlSchemaArgs {
+    /// Canister principal that exposes the OQL surface (get_candid reports
+    /// `oql: true`).
+    pub canister_id: String,
+    /// Application domain to read as, e.g. "oisy.com". Omit to read anonymously.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// Which of your accounts at `domain` to act as (see list_accounts). Ignored
+    /// without `domain`.
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// Output of `oql_schema`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct OqlSchemaOutput {
+    /// The canister whose schema was read.
+    pub canister_id: String,
+    /// The entity/field/edge catalogue returned by `schema` (JSON text,
+    /// pretty-printed when it parses).
+    pub schema: String,
 }
 
 /// Arguments for `call_canister`.
@@ -314,6 +377,268 @@ pub fn has_oql(did: &str) -> bool {
     env.get_method(&actor, "schema").is_ok() && env.get_method(&actor, "execute").is_ok()
 }
 
+// ===========================================================================
+// OQL execute/schema support (for the `oql_query` / `oql_schema` tools). The
+// server does not model the OQL query language — it wraps the JSON query as the
+// single `text` argument `execute` expects (so the model never hand-escapes
+// JSON inside a Candid text literal) and decodes the tabular reply.
+// ===========================================================================
+
+/// Validate that an OQL `query` is a JSON object and return it re-serialized
+/// compactly. `execute` takes one JSON object as text; validating here catches
+/// malformed input before the call and normalizes formatting.
+pub fn normalize_oql_query(query: &str) -> Result<String, String> {
+    if query.len() > MAX_CANDID_TEXT_BYTES {
+        return Err(format!(
+            "the OQL query is too large ({} bytes; limit {MAX_CANDID_TEXT_BYTES})",
+            query.len()
+        ));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(query).map_err(|e| format!("`query` must be valid JSON: {e}"))?;
+    if !value.is_object() {
+        return Err(
+            "`query` must be a JSON object, e.g. {\"start\":\"employee\",\"limit\":10}".to_string(),
+        );
+    }
+    Ok(value.to_string())
+}
+
+/// Encode a single `text` argument (the OQL query JSON) for `execute` — built as
+/// a typed Candid value, so there is no textual escaping to get wrong.
+pub fn encode_text_arg(text: &str) -> Result<Vec<u8>, String> {
+    IDLArgs::new(&[IDLValue::Text(text.to_string())])
+        .to_bytes()
+        .map_err(|e| format!("could not encode the query argument: {e}"))
+}
+
+/// Encode the empty argument tuple `()` for `schema`.
+pub fn encode_unit_arg() -> Result<Vec<u8>, String> {
+    IDLArgs::new(&[])
+        .to_bytes()
+        .map_err(|e| format!("could not encode arguments: {e}"))
+}
+
+/// The parsed outcome of an OQL `execute` reply.
+pub enum OqlResult {
+    /// A decoded table: column names, string-rendered rows, and the paging flag.
+    Table {
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+        has_more: bool,
+    },
+    /// The canister returned its error arm (e.g. `variant { err = "…" }`).
+    QueryError(String),
+    /// The reply didn't match a recognizable OQL result shape; carries the raw
+    /// decoded textual Candid so the caller can still surface the data.
+    Unrecognized(String),
+}
+
+/// Decode an `execute` reply into a table. `did` (the canister interface) is used
+/// to recover field names — without it the wire format hashes them and the shape
+/// generally can't be recognized, so we fall back to `Unrecognized` with the raw
+/// reply rather than guessing.
+pub fn parse_execute_reply(did: Option<&str>, reply: &[u8]) -> OqlResult {
+    let decoded = match did.and_then(|d| decode_args_with_did(d, "execute", reply)) {
+        Some(args) => args,
+        None => match IDLArgs::from_bytes(reply) {
+            Ok(args) => args,
+            Err(e) => return OqlResult::Unrecognized(format!("(undecodable reply: {e})")),
+        },
+    };
+    match decoded.args.into_iter().next() {
+        Some(val) => extract_oql(&val).unwrap_or_else(|| OqlResult::Unrecognized(val.to_string())),
+        None => OqlResult::Unrecognized("(empty reply)".to_string()),
+    }
+}
+
+/// Decode a `schema` reply — a single `text` (the JSON catalogue). Pretty-print
+/// it when it parses as JSON; otherwise return it as-is.
+pub fn decode_schema_reply(reply: &[u8]) -> String {
+    let text = match IDLArgs::from_bytes(reply) {
+        Ok(args) => match args.args.into_iter().next() {
+            Some(IDLValue::Text(s)) => s,
+            Some(other) => other.to_string(),
+            None => return "(empty reply)".to_string(),
+        },
+        Err(e) => return format!("(undecodable reply: {e})"),
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(text),
+        Err(_) => text,
+    }
+}
+
+/// Decode a reply against the declared return types of `method` in `did`,
+/// returning the structured `IDLArgs` (field names recovered). Guarded (CWE-674)
+/// like the rest of the decode path; None on any guard/parse/decode failure.
+fn decode_args_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<IDLArgs> {
+    guard_candid_text("the `candid` interface", did).ok()?;
+    let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
+    let actor = actor?;
+    let func = env.get_method(&actor, method).ok()?;
+    IDLArgs::from_bytes_with_types(bytes, &env, &func.rets).ok()
+}
+
+/// Recognize an OQL result value: a `record { hasMore; rows }`, optionally
+/// wrapped in a `variant { ok = … }` / `variant { err = … }`.
+fn extract_oql(val: &IDLValue) -> Option<OqlResult> {
+    match val {
+        IDLValue::Record(fields) => {
+            let rows_val = field_by_name(fields, "rows")?;
+            let has_more = matches!(field_by_name(fields, "hasMore"), Some(IDLValue::Bool(true)));
+            let (columns, rows) = rows_to_table(rows_val)?;
+            Some(OqlResult::Table {
+                columns,
+                rows,
+                has_more,
+            })
+        }
+        IDLValue::Variant(var) => {
+            let arm = &var.0;
+            let name = label_name(&arm.id);
+            if name.eq_ignore_ascii_case("ok") || name.eq_ignore_ascii_case("success") {
+                // Known success arm — descend into the wrapped record.
+                extract_oql(&arm.val)
+            } else if name.eq_ignore_ascii_case("err") || name.eq_ignore_ascii_case("error") {
+                Some(OqlResult::QueryError(cell_scalar(&arm.val)))
+            } else {
+                // Any other arm: don't assume it's an OQL result — fail closed to
+                // Unrecognized (the caller surfaces the raw reply) rather than
+                // recursing into an arbitrary variant.
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Turn the `rows : vec vec Cell` value into (columns, string rows). Columns are
+/// taken from the first row's cell names; every row is then aligned to them by
+/// name (per the primer: read cells by name, never by position).
+///
+/// Fail-closed: `None` (→ Unrecognized) if the value isn't a vec, if any row
+/// isn't a vec, or if the first row yields no named cells — so a malformed /
+/// non-OQL reply degrades to the raw Candid rather than a bogus "0 columns"
+/// table. An empty `rows` (a query that matched nothing) is the one legitimate
+/// zero-column case and returns an empty table.
+fn rows_to_table(rows_val: &IDLValue) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+    let IDLValue::Vec(rows) = rows_val else {
+        return None;
+    };
+    if rows.is_empty() {
+        return Some((Vec::new(), Vec::new()));
+    }
+    let mut columns: Vec<String> = Vec::new();
+    let mut out_rows: Vec<Vec<String>> = Vec::new();
+    for row in rows {
+        let IDLValue::Vec(cells) = row else {
+            return None;
+        };
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for cell in cells {
+            if let IDLValue::Record(cf) = cell {
+                let name = match field_by_name(cf, "name") {
+                    Some(IDLValue::Text(s)) => s.clone(),
+                    _ => continue,
+                };
+                let value = field_by_name(cf, "value").map(cell_scalar).unwrap_or_default();
+                pairs.push((name, value));
+            }
+        }
+        if columns.is_empty() {
+            if pairs.is_empty() {
+                // First row carried no named cells — not a recognizable OQL row.
+                return None;
+            }
+            columns = pairs.iter().map(|(n, _)| n.clone()).collect();
+        }
+        // Align this row to `columns` via a name→value map (first occurrence
+        // wins, matching a linear find) so wide tables stay O(cols), not O(cols²).
+        let mut by_name: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for (n, v) in &pairs {
+            by_name.entry(n.as_str()).or_insert(v.as_str());
+        }
+        let aligned = columns
+            .iter()
+            .map(|c| by_name.get(c.as_str()).copied().unwrap_or("").to_string())
+            .collect();
+        out_rows.push(aligned);
+    }
+    Some((columns, out_rows))
+}
+
+/// Render one OQL cell value as a scalar string. Cell values are wrapped in a
+/// `variant` (per the primer), so unwrap one level; text/principal are shown bare
+/// and everything else falls back to Candid's own `Display`.
+fn cell_scalar(v: &IDLValue) -> String {
+    match v {
+        IDLValue::Variant(var) => cell_scalar(&var.0.val),
+        IDLValue::Opt(inner) => cell_scalar(inner),
+        IDLValue::Text(s) => s.clone(),
+        IDLValue::Principal(p) => p.to_text(),
+        other => other.to_string(),
+    }
+}
+
+/// Look up a record field by its (named) label. Matches `Label::Named` directly
+/// so the hot decode loop doesn't allocate a `String` per field just to compare
+/// against a constant key. The typed decode path recovers `Label::Named` for the
+/// OQL fields we ask for ("rows", "hasMore", "name", "value"); a hashed
+/// (`Label::Id`) label never equals a non-numeric key anyway.
+fn field_by_name<'a>(fields: &'a [IDLField], name: &str) -> Option<&'a IDLValue> {
+    fields
+        .iter()
+        .find(|f| matches!(&f.id, Label::Named(n) if n == name))
+        .map(|f| &f.val)
+}
+
+fn label_name(l: &Label) -> String {
+    match l {
+        Label::Named(s) => s.clone(),
+        Label::Id(n) | Label::Unnamed(n) => n.to_string(),
+    }
+}
+
+/// Render a decoded OQL table as GitHub-flavored markdown, with a trailing
+/// row-count / paging note.
+pub fn render_table(columns: &[String], rows: &[Vec<String>], has_more: bool) -> String {
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('|', "\\|").replace('\n', " ");
+    if columns.is_empty() {
+        return format!(
+            "0 columns / {} row(s){}.",
+            rows.len(),
+            if has_more { " — more available" } else { "" }
+        );
+    }
+    let mut out = String::new();
+    out.push_str("| ");
+    out.push_str(&columns.iter().map(|c| esc(c)).collect::<Vec<_>>().join(" | "));
+    out.push_str(" |\n|");
+    for _ in columns {
+        out.push_str(" --- |");
+    }
+    out.push('\n');
+    for row in rows {
+        let cells: Vec<String> = (0..columns.len())
+            .map(|i| esc(row.get(i).map(String::as_str).unwrap_or("")))
+            .collect();
+        out.push_str("| ");
+        out.push_str(&cells.join(" | "));
+        out.push_str(" |\n");
+    }
+    out.push_str(&format!(
+        "\n{} row(s){}.",
+        rows.len(),
+        if has_more {
+            " — more available; re-query with a higher `offset` to page"
+        } else {
+            ""
+        }
+    ));
+    out
+}
+
 /// Perform a query or update call and return the raw Candid reply bytes.
 pub async fn raw_call(
     agent: &Agent,
@@ -423,5 +748,146 @@ mod tests {
         // not the interface shape.
         let shallow_twin = "service : { schema : () -> (nat) query; execute : (text) -> (text) query; }";
         assert!(has_oql(shallow_twin), "shallow twin should be detected — isolates the guard as the cause");
+    }
+
+    // Encode a Candid reply of `ty` from its textual form, so parse_execute_reply
+    // can be exercised end-to-end against a realistic `execute` return type.
+    #[cfg(test)]
+    fn encode_reply(did: &str, method: &str, textual: &str) -> Vec<u8> {
+        let (env, actor) = candid_parser::utils::CandidSource::Text(did)
+            .load()
+            .expect("parse did");
+        let actor = actor.expect("service");
+        let func = env.get_method(&actor, method).expect("method");
+        candid_parser::parse_idl_args(textual)
+            .expect("parse value")
+            .to_bytes_with_types(&env, &func.rets)
+            .expect("encode value")
+    }
+
+    // oql_query decoding: a `variant { ok = record { hasMore; rows } }` reply with
+    // variant-wrapped cell values decodes into ordered columns + string rows, the
+    // paging flag is read, an `err` arm surfaces as a QueryError, and a
+    // non-conforming reply degrades to Unrecognized (never a panic).
+    #[test]
+    fn parse_execute_reply_builds_table() {
+        use super::{parse_execute_reply, OqlResult};
+        let did = "service : { \
+            execute : (text) -> (variant { \
+                ok : record { hasMore : bool; rows : vec vec record { name : text; value : variant { text : text; num : int } } }; \
+                err : text \
+            }) query; \
+        }";
+
+        // A two-row, two-column result with hasMore = true.
+        let ok_reply = encode_reply(
+            did,
+            "execute",
+            "(variant { ok = record { \
+                hasMore = true; \
+                rows = vec { \
+                    vec { \
+                        record { name = \"firstName\"; value = variant { text = \"Ada\" } }; \
+                        record { name = \"lastName\"; value = variant { text = \"Lovelace\" } } \
+                    }; \
+                    vec { \
+                        record { name = \"firstName\"; value = variant { text = \"Alan\" } }; \
+                        record { name = \"lastName\"; value = variant { text = \"Turing\" } } \
+                    } \
+                } \
+            } })",
+        );
+        match parse_execute_reply(Some(did), &ok_reply) {
+            OqlResult::Table { columns, rows, has_more } => {
+                assert_eq!(columns, vec!["firstName", "lastName"]);
+                assert_eq!(rows, vec![
+                    vec!["Ada".to_string(), "Lovelace".to_string()],
+                    vec!["Alan".to_string(), "Turing".to_string()],
+                ]);
+                assert!(has_more, "hasMore = true must be read");
+            }
+            _ => panic!("expected a Table"),
+        }
+
+        // The error arm surfaces as QueryError.
+        let err_reply = encode_reply(did, "execute", "(variant { err = \"bad query\" })");
+        match parse_execute_reply(Some(did), &err_reply) {
+            OqlResult::QueryError(msg) => assert_eq!(msg, "bad query"),
+            _ => panic!("expected a QueryError"),
+        }
+
+        // Without the interface, field names are hashed on the wire, so the shape
+        // isn't recognized — degrade to Unrecognized rather than guess/panic.
+        assert!(matches!(
+            parse_execute_reply(None, &ok_reply),
+            OqlResult::Unrecognized(_)
+        ));
+
+        // A query that matched nothing (`rows = vec {}`) is a legitimate empty
+        // table, NOT an error or Unrecognized.
+        let empty = encode_reply(
+            did,
+            "execute",
+            "(variant { ok = record { hasMore = false; rows = vec {} } })",
+        );
+        match parse_execute_reply(Some(did), &empty) {
+            OqlResult::Table { columns, rows, has_more } => {
+                assert!(columns.is_empty() && rows.is_empty() && !has_more, "empty result is a 0-row table");
+            }
+            _ => panic!("empty rows should be a Table, not an error/Unrecognized"),
+        }
+    }
+
+    // Fail-closed decoding (per review): a variant reply whose arm is neither a
+    // known success nor error arm, and a record whose rows carry no named cells,
+    // both degrade to Unrecognized rather than being passed off as a table.
+    #[test]
+    fn parse_execute_reply_fails_closed_on_non_oql_shapes() {
+        use super::{parse_execute_reply, OqlResult};
+
+        // Unknown variant arm (not ok/success/err) → Unrecognized.
+        let weird_did = "service : { execute : (text) -> (variant { weird : text }) query; }";
+        let weird = encode_reply(weird_did, "execute", "(variant { weird = \"z\" })");
+        assert!(
+            matches!(parse_execute_reply(Some(weird_did), &weird), OqlResult::Unrecognized(_)),
+            "an unknown variant arm must not be treated as an OQL table"
+        );
+
+        // A record with `rows`, but rows whose cells have no `name` field → the
+        // first row yields no columns → Unrecognized (not a bogus 0-column table).
+        let noname_did = "service : { execute : (text) -> (record { hasMore : bool; rows : vec vec record { foo : text } }) query; }";
+        let noname = encode_reply(
+            noname_did,
+            "execute",
+            "(record { hasMore = false; rows = vec { vec { record { foo = \"x\" } } } })",
+        );
+        assert!(
+            matches!(parse_execute_reply(Some(noname_did), &noname), OqlResult::Unrecognized(_)),
+            "rows without named cells must degrade to Unrecognized"
+        );
+    }
+
+    // normalize_oql_query accepts a JSON object, rejects non-objects / invalid
+    // JSON / oversized input (so a bad query fails before the canister call).
+    #[test]
+    fn normalize_oql_query_validates() {
+        use super::{normalize_oql_query, MAX_CANDID_TEXT_BYTES};
+        assert!(normalize_oql_query(r#"{"start":"employee","limit":10}"#).is_ok());
+        assert!(normalize_oql_query(r#"["not","an","object"]"#).is_err(), "array is not an object");
+        assert!(normalize_oql_query("not json").is_err(), "invalid JSON is rejected");
+        let huge = format!("{{\"x\":\"{}\"}}", "a".repeat(MAX_CANDID_TEXT_BYTES));
+        assert!(normalize_oql_query(&huge).is_err(), "oversized query is rejected");
+    }
+
+    // schema decoding: the single `text` reply is returned, pretty-printed when
+    // it parses as JSON.
+    #[test]
+    fn decode_schema_reply_pretty_prints_json() {
+        use super::decode_schema_reply;
+        let did = "service : { schema : () -> (text) query; }";
+        let reply = encode_reply(did, "schema", "(\"{\\\"entities\\\":[]}\")");
+        let out = decode_schema_reply(&reply);
+        assert!(out.contains("\"entities\""), "schema JSON should be surfaced: {out}");
+        assert!(out.contains('\n'), "valid JSON should be pretty-printed: {out}");
     }
 }

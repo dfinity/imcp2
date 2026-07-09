@@ -134,11 +134,10 @@ impl IcTools {
                     if oql {
                         let note = format!(
                             "This canister exposes an OQL query surface (a JSON query language \
-                             over its `schema`/`execute` methods). Before querying it, load the \
-                             guide with get_oql_guide (or read the `{OQL_USAGE_URI}` resource), \
-                             then query via call_canister — OQL's `execute` is a query method by \
-                             convention, so use is_query=true (retry with is_query=false if the \
-                             canister declares it as an update)."
+                             over its data). Use oql_schema to see its entities and fields, then \
+                             oql_query with a JSON query to read data as a table — these wrap the \
+                             `schema`/`execute` methods for you (no Candid escaping). See \
+                             get_oql_guide (or the `{OQL_USAGE_URI}` resource) for the dialect."
                         );
                         Ok(ok_structured_blocks(vec![did, note], &output))
                     } else {
@@ -154,7 +153,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Load the OQL query-surface guide: how to query an OQL-capable canister — one whose Candid interface exposes a `schema` and an `execute` method (get_candid reports `oql: true` for it). OQL is a self-describing JSON query language (filters, aggregation, ordering, edge traversal) driven through call_canister (its `execute` is a query method by convention, so is_query=true). Call this before querying such a canister so you write correct `execute` queries instead of guessing bespoke methods.",
+        description = "Load the OQL query-surface guide: the JSON query dialect for canisters that expose OQL (get_candid reports `oql: true`) — entities/fields/edges via `schema`, and the `execute` query object (filters, aggregation, ordering, edge traversal, paging). Use the oql_schema and oql_query tools to run it (they wrap the underlying methods); read this first so you write correct queries instead of guessing bespoke methods.",
         annotations(title = "Get the OQL query guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
         output_schema = schema_for_output::<calls::OqlGuideOutput>(),
     )]
@@ -164,6 +163,135 @@ impl IcTools {
     ) -> Result<CallToolResult, McpError> {
         let output = calls::OqlGuideOutput { content: OQL_PRIMER_MD.to_string() };
         Ok(ok_structured(output.content.clone(), &output))
+    }
+
+    #[tool(
+        description = "Run an OQL query against a canister that exposes the OQL surface (get_candid reports `oql: true`). Pass the query as a JSON object string in `query` (see get_oql_guide / oql_schema for the dialect and field names) — it's sent to the canister's `execute` query method, so NO Candid escaping is needed. Returns the result decoded as `columns` + `rows` (rendered as a markdown table), with `has_more` for paging (re-query with a higher `offset`). Omit `domain` to query anonymously, or pass an application domain to query as your account there.",
+        annotations(title = "Run an OQL query", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<calls::OqlQueryOutput>(),
+    )]
+    async fn oql_query(
+        &self,
+        Parameters(calls::OqlQueryArgs { canister_id, query, domain, account }): Parameters<calls::OqlQueryArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let principal = match Principal::from_text(&canister_id) {
+            Ok(p) => p,
+            Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
+        };
+        // Validate the query is a JSON object and wrap it as `execute`'s single
+        // text arg — the model writes plain JSON, we do the Candid encoding.
+        let query_json = match calls::normalize_oql_query(&query) {
+            Ok(s) => s,
+            Err(e) => return Ok(err(e)),
+        };
+        let arg_bytes = match calls::encode_text_arg(&query_json) {
+            Ok(b) => b,
+            Err(e) => return Ok(err(e)),
+        };
+        let agent = match self
+            .resolve_agent(&ctx, domain.as_deref(), account.as_deref(), "querying")
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => return Ok(err(e)),
+        };
+        let reply = match calls::raw_call(&agent, principal, "execute", arg_bytes, true).await {
+            Ok(b) => b,
+            Err(e) => return Ok(err(format!("OQL execute failed: {e}"))),
+        };
+        // Decode the reply against the canister's interface so cell/field names
+        // are recovered (the wire format hashes them).
+        let did = calls::resolve_did(&agent, principal, None).await;
+        match calls::parse_execute_reply(did.as_deref(), &reply) {
+            calls::OqlResult::Table { columns, rows, has_more } => {
+                let text = calls::render_table(&columns, &rows, has_more);
+                let output = calls::OqlQueryOutput { canister_id, columns, rows, has_more };
+                Ok(ok_structured(text, &output))
+            }
+            calls::OqlResult::QueryError(msg) => {
+                Ok(err(format!("the canister returned an OQL error: {msg}")))
+            }
+            calls::OqlResult::Unrecognized(raw) => {
+                // Not a recognizable OQL result — hand back the raw decoded reply
+                // so the model still has the data (empty table in the structured form).
+                let output = calls::OqlQueryOutput {
+                    canister_id,
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    has_more: false,
+                };
+                Ok(ok_structured(
+                    format!("(Could not parse this as an OQL table; raw reply below.)\n\n{raw}"),
+                    &output,
+                ))
+            }
+        }
+    }
+
+    #[tool(
+        description = "Fetch the OQL schema catalogue of a canister that exposes the OQL surface (get_candid reports `oql: true`): its entities, their primary keys, fields, and edges, as JSON. Call this before oql_query so you know the queryable entities and exact field names. Omit `domain` to read anonymously, or pass an application domain to read as your account there.",
+        annotations(title = "Get the OQL schema", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<calls::OqlSchemaOutput>(),
+    )]
+    async fn oql_schema(
+        &self,
+        Parameters(calls::OqlSchemaArgs { canister_id, domain, account }): Parameters<calls::OqlSchemaArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let principal = match Principal::from_text(&canister_id) {
+            Ok(p) => p,
+            Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
+        };
+        let arg_bytes = match calls::encode_unit_arg() {
+            Ok(b) => b,
+            Err(e) => return Ok(err(e)),
+        };
+        let agent = match self
+            .resolve_agent(&ctx, domain.as_deref(), account.as_deref(), "reading the schema")
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => return Ok(err(e)),
+        };
+        let reply = match calls::raw_call(&agent, principal, "schema", arg_bytes, true).await {
+            Ok(b) => b,
+            Err(e) => return Ok(err(format!("OQL schema call failed: {e}"))),
+        };
+        let schema = calls::decode_schema_reply(&reply);
+        let output = calls::OqlSchemaOutput { canister_id, schema };
+        Ok(ok_structured(output.schema.clone(), &output))
+    }
+
+    /// The agent to sign calls with for a request: the shared anonymous agent
+    /// when no `domain` is given, else one backed by a short-lived account
+    /// delegation for that app derived on demand from the connection's standing
+    /// Internet Identity credential. `what` names the action for the
+    /// no-session error message. Shared by call_canister / oql_query / oql_schema.
+    async fn resolve_agent(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        domain: Option<&str>,
+        account: Option<&str>,
+        what: &str,
+    ) -> Result<Agent, String> {
+        match domain {
+            None => Ok(self.agent.clone()),
+            Some(domain) => {
+                let session_id = authed_session(ctx)
+                    .ok_or_else(|| format!("{what} as a domain needs an authenticated session"))?
+                    .session_id;
+                let delegated = self
+                    .identities
+                    .delegated_identity_for(&session_id, domain, account)
+                    .await?;
+                Agent::builder()
+                    .with_url(IC_URL)
+                    .with_identity(delegated)
+                    .build()
+                    .map_err(|e| format!("could not build agent: {e}"))
+            }
+        }
     }
 
     #[tool(
@@ -200,30 +328,14 @@ impl IcTools {
         // derives a short-lived account delegation for that app on demand and
         // builds an agent backed by it (the server signs as the user's account
         // for that app).
-        let reply = match domain {
-            None => calls::raw_call(&self.agent, principal, &method, arg_bytes, is_query).await,
-            Some(domain) => {
-                let session_id = match authed_session(&ctx) {
-                    Some(s) => s.session_id,
-                    None => return Ok(err("calling as a domain needs an authenticated session".into())),
-                };
-                let delegated = match self
-                    .identities
-                    .delegated_identity_for(&session_id, &domain, account.as_deref())
-                    .await
-                {
-                    Ok(d) => d,
-                    Err(e) => return Ok(err(e)),
-                };
-                let agent = match Agent::builder().with_url(IC_URL).with_identity(delegated).build() {
-                    Ok(a) => a,
-                    Err(e) => return Ok(err(format!("could not build agent: {e}"))),
-                };
-                calls::raw_call(&agent, principal, &method, arg_bytes, is_query).await
-            }
+        let agent = match self
+            .resolve_agent(&ctx, domain.as_deref(), account.as_deref(), "calling")
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => return Ok(err(e)),
         };
-
-        let reply_bytes = match reply {
+        let reply_bytes = match calls::raw_call(&agent, principal, &method, arg_bytes, is_query).await {
             Ok(b) => b,
             Err(e) => return Ok(err(format!("call failed: {e}"))),
         };
@@ -697,9 +809,9 @@ impl ServerHandler for IcTools {
              registries and get its canister id. `lookup_canister(id)` tells you what a bare \
              canister id IS (dashboard label, type, controllers, subnet). `get_candid` fetches a \
              canister's Candid interface; if it reports `oql: true`, the canister exposes an OQL \
-             query surface — call `get_oql_guide` (or read the `oql://usage` resource) to learn \
-             the JSON query dialect, then query it via `call_canister` (OQL's `execute` is a query \
-             method by convention, so is_query=true). \
+             query surface — read `get_oql_guide` for the dialect, then use `oql_schema` (entities \
+             and fields) and `oql_query` (run a JSON query, get a table back). Those two wrap the \
+             canister's `schema`/`execute` methods, so you don't hand-encode Candid for OQL. \
              `call_canister` calls a method with textual Candid \
              in/out: omit `domain` to call anonymously, or pass an application domain (e.g. \
              domain=\"oisy.com\") to call as your account at that app — a short-lived (<=5 min) \
@@ -961,7 +1073,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <p>MCP endpoints: <code>POST /mcp</code> (beta Internet Identity) · <code>POST /mcp-prod</code> (production Internet Identity)</p>
 <p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>find_canister</code> (name → canister ids), <code>lookup_canister</code> (id → dashboard identity), <code>get_candid</code>, <code>call_canister</code> (anonymously, or as your account at an application domain, derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (your principal at an application domain, no call), <code>list_accounts</code> (your Internet Identity accounts at an app domain). All speak textual Candid.</p>
 <p>Skills: <code>list_ic_skills</code> / <code>get_ic_skill</code> (the official IC how-to guides — Motoko, mops, icp CLI, cycles, …).</p>
-<p>OQL: <code>get_oql_guide</code> (query guide for canisters that expose an OQL <code>schema</code>/<code>execute</code> surface — <code>get_candid</code> reports <code>oql: true</code> for them).</p>
+<p>OQL: <code>get_oql_guide</code> (dialect), <code>oql_schema</code> (entities/fields), <code>oql_query</code> (run a JSON query, get a table) — for canisters that expose an OQL <code>schema</code>/<code>execute</code> surface (<code>get_candid</code> reports <code>oql: true</code>).</p>
 <p>Canister management (as your Internet Identity): <code>cycles_balance</code>, <code>create_canister</code>, <code>install_code</code>, <code>canister_status</code>, <code>update_canister_settings</code>, <code>start_canister</code>, <code>stop_canister</code>, <code>uninstall_code</code>, <code>delete_canister</code>, <code>top_up_canister</code>.</p>
 </body></html>"#;
 
@@ -1249,7 +1361,7 @@ mod tests {
     #[test]
     fn every_tool_has_correct_read_write_annotations() {
         let tools = super::IcTools::tool_router().list_all();
-        assert_eq!(tools.len(), 20, "expected 20 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 22, "expected 22 tools, got {}", tools.len());
         assert!(
             tools.iter().all(|t| t.annotations.is_some()),
             "every tool must carry annotations (else clients assume write/destructive)"
@@ -1268,8 +1380,8 @@ mod tests {
         // gate destructive on read_only can't mislabel them.
         for name in [
             "get_candid", "discover_canisters", "find_canister", "lookup_canister",
-            "list_ic_skills", "get_ic_skill", "get_oql_guide", "list_accounts", "cycles_balance",
-            "get_principal", "canister_status",
+            "list_ic_skills", "get_ic_skill", "get_oql_guide", "oql_query", "oql_schema",
+            "list_accounts", "cycles_balance", "get_principal", "canister_status",
         ] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");

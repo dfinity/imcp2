@@ -27,7 +27,9 @@ results).
 | `list_accounts` | `domain` | The user's Internet Identity accounts at an app — the default account (the anchor's current default at that origin) plus any named ones — with name, account number, and last-used time; name one via `account` in `call_canister`/`get_principal` |
 | `list_ic_skills` | — | The official [IC skills](https://skills.internetcomputer.org) (Motoko, mops/icp CLIs, cycles, stable memory, security, …), grouped by category |
 | `get_ic_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `motoko`, `icp-cli`, `cycles-management`) |
-| `get_oql_guide` | — | The OQL query-surface guide: how to query a canister whose interface exposes `schema`/`execute` (`get_candid` reports `oql: true`) via `call_canister` — the JSON query object, predicate grammar, edges, and paged result shape |
+| `get_oql_guide` | — | The OQL query-surface dialect guide (for canisters where `get_candid` reports `oql: true`): the JSON query object, predicate grammar, edges, and paged result shape |
+| `oql_schema` | `canister_id`, `domain?`, `account?` | The canister's OQL schema catalogue (entities, primary keys, fields, edges) as JSON — wraps its `schema` method |
+| `oql_query` | `canister_id`, `query` (JSON object string), `domain?`, `account?` | Runs an OQL query (wraps `execute`, no Candid escaping) and returns `columns` + `rows` (rendered as a table) with `has_more` for paging |
 | `cycles_balance` | — | Your cycles-ledger balance (the funds `create_canister`/`top_up_canister` spend), as your standing II principal |
 | `create_canister` | `cycles?` / `icp?`, `controllers?`, `subnet?` | Create + fund a new canister — from your cycles-ledger balance (`cycles`) or by converting ICP from your ICP-ledger account via the CMC (`icp`); returns the new canister id |
 | `install_code` | `canister_id`, `wasm_base64` / `wasm_hex`, `mode?`, `arg?` | Install/reinstall/upgrade a Wasm module (single-shot, or via the chunk store for large modules) |
@@ -97,11 +99,19 @@ interface behind the same CWE-674 guard the encode/decode path uses, so a
 malformed `.did` just fails closed to `false`). Rather than inline the whole
 dialect into every interface read, `get_candid` emits only that flag plus a
 one-line pointer; the full guide is served on demand by `get_oql_guide` and as
-the `oql://usage` MCP **resource**. Queries are then issued through the ordinary
-`call_canister` tool (`method = "execute"`, `is_query = true`) — the server
-carries no OQL-specific execution logic, only the detection and the guidance.
-This mirrors the reference IC connector's built-in OQL primer, adapted to this
-server's on-demand resource/tool conventions.
+the `oql://usage` MCP **resource**.
+
+Two dedicated tools drive the surface: **`oql_schema`** returns the entity/field
+catalogue, and **`oql_query`** takes the query as a plain JSON object string,
+wraps it as `execute`'s single `text` argument (so the model never hand-escapes
+JSON inside a Candid literal), and decodes the reply into `columns` + `rows` —
+rendered as a markdown table, with `has_more` for paging. Both accept an optional
+`domain`/`account` to query as the user's account (same on-demand delegation as
+`call_canister`). Detection stays name-based and the decode is fail-closed: a
+reply that isn't a recognizable OQL result degrades to the raw Candid rather than
+erroring. The design mirrors the reference IC connector's OQL primer (detect +
+teach), adding an ergonomic executor suited to this server's structured-output
+conventions.
 
 ### Creating & managing canisters
 
