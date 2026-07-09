@@ -136,7 +136,9 @@ impl IcTools {
                             "This canister exposes an OQL query surface (a JSON query language \
                              over its `schema`/`execute` methods). Before querying it, load the \
                              guide with get_oql_guide (or read the `{OQL_USAGE_URI}` resource), \
-                             then query via call_canister with is_query=true."
+                             then query via call_canister — OQL's `execute` is a query method by \
+                             convention, so use is_query=true (retry with is_query=false if the \
+                             canister declares it as an update)."
                         );
                         Ok(ok_structured_blocks(vec![did, note], &output))
                     } else {
@@ -152,7 +154,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Load the OQL query-surface guide: how to query an OQL-capable canister — one whose Candid interface exposes a `schema` and an `execute` method (get_candid reports `oql: true` for it). OQL is a self-describing JSON query language (filters, aggregation, ordering, edge traversal) driven through call_canister with is_query=true. Call this before querying such a canister so you write correct `execute` queries instead of guessing bespoke methods.",
+        description = "Load the OQL query-surface guide: how to query an OQL-capable canister — one whose Candid interface exposes a `schema` and an `execute` method (get_candid reports `oql: true` for it). OQL is a self-describing JSON query language (filters, aggregation, ordering, edge traversal) driven through call_canister (its `execute` is a query method by convention, so is_query=true). Call this before querying such a canister so you write correct `execute` queries instead of guessing bespoke methods.",
         annotations(title = "Get the OQL query guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
         output_schema = schema_for_output::<calls::OqlGuideOutput>(),
     )]
@@ -696,7 +698,8 @@ impl ServerHandler for IcTools {
              canister id IS (dashboard label, type, controllers, subnet). `get_candid` fetches a \
              canister's Candid interface; if it reports `oql: true`, the canister exposes an OQL \
              query surface — call `get_oql_guide` (or read the `oql://usage` resource) to learn \
-             the JSON query dialect, then query it via `call_canister` with is_query=true. \
+             the JSON query dialect, then query it via `call_canister` (OQL's `execute` is a query \
+             method by convention, so is_query=true). \
              `call_canister` calls a method with textual Candid \
              in/out: omit `domain` to call anonymously, or pass an application domain (e.g. \
              domain=\"oisy.com\") to call as your account at that app — a short-lived (<=5 min) \

@@ -15,9 +15,12 @@ rather than guessing bespoke per-question methods.
   `{"edge":{"to":"<entity>"}}` (a link/foreign key to another entity).
 
 - `execute : (text) -> (Result) query` — runs ONE JSON query object passed as
-  the single text argument:
+  the single text argument (`Result` is the paged rows record defined under
+  **Result shape** below):
   `{"start":"<entity>", "where":<pred>, "groupBy":["f"], "aggregate":[{"fn":"count|sum|avg|min|max", "field":"f", "as":"out"}], "orderBy":[{"field":"f", "dir":"asc|desc"}], "offset":N, "limit":N, "select":["f"]}`
-  Only `"start"` is required; a `count` aggregate needs no `"field"`.
+  Only `"start"` is required; a `count` aggregate needs no `"field"`. By
+  convention `execute` is a `query` method, so call it with `is_query=true`; if a
+  canister happens to declare it as an update, retry with `is_query=false`.
 
 ## Predicates
 
