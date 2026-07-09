@@ -390,10 +390,16 @@ principal (`self_authenticating(session_pubkey)`), which is exactly the identity
 the grant is bound to.
 
 **PKCE (S256)** is required for the authorization-code flow; auth codes live 120s,
-access tokens 1h (bounded by the II grant — refresh tokens are a deliberate
-non-goal, as they'd add no security over the grant and only pay off with
-server-side persistence). Treat any `Unauthorized` from II as "session over →
-reconnect": the server surfaces a reconnect message and does not retry.
+and the access token's lifetime **tracks the II grant** — it expires exactly when
+the grant does, so the session duration the user picks on II's consent screen (10
+minutes up to 30 days) is how long the client's token stays valid. Refresh tokens
+remain a deliberate non-goal: with the token matched to the grant there is nothing
+to refresh against — when the grant lapses, so does the token, and the client
+re-runs the authorization-code flow. (If the grant expiration isn't known at issue
+time — e.g. a dropped connect-completion POST — the token falls back to a 1h TTL;
+the grant is the hard ceiling at II either way.) Treat any `Unauthorized` from II
+as "session over → reconnect": the server surfaces a reconnect message and does
+not retry.
 
 Set the public base URL (used in the discovery docs, as the MCP origin, and as the
 management identity's derivation origin) with `PUBLIC_URL`. The Internet Identity
