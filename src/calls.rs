@@ -409,8 +409,19 @@ mod tests {
 
         // Fail-closed: an over-nested interface trips the CWE-674 guard BEFORE
         // parsing, so it degrades to `false` rather than aborting the process.
-        let over_deep = format!("service : {{ schema : () -> ({}nat{}); }}",
-            "vec ".repeat(5000), "");
+        // BOTH methods are present and the deep nesting is only in `schema`'s
+        // return type, so the guard is the ONLY reason this returns false — were
+        // the guard removed and parsing to succeed, detection would return true
+        // and this assertion would fail (it can't pass by "missing execute").
+        let over_deep = format!(
+            "service : {{ schema : () -> ({}nat) query; execute : (text) -> (text) query; }}",
+            "vec ".repeat(5000),
+        );
         assert!(!has_oql(&over_deep), "over-limit interface must fail closed to false");
+        // Positive control: the SAME two-method interface without the deep
+        // nesting IS detected, so the false above is provably the guard (depth),
+        // not the interface shape.
+        let shallow_twin = "service : { schema : () -> (nat) query; execute : (text) -> (text) query; }";
+        assert!(has_oql(shallow_twin), "shallow twin should be detected — isolates the guard as the cause");
     }
 }
