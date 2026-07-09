@@ -2159,8 +2159,9 @@ mod tests {
         assert_eq!(chain[1].delegation.pubkey, der_x);
         assert_eq!(chain[1].signature, sig_y);
         assert_eq!(chain[1].delegation.targets, None);
-        // Neither hop carries a permissions field — the permission choice
-        // lives in II's index, not in the delegations.
+        // Neither hop carries a permissions field — under rev4 stateless
+        // consent the access level rides the fragment consent tuple (echoed
+        // into mcp_register_v2), not the delegations.
         assert!(chain.iter().all(|d| d.delegation.permissions.is_none()));
     }
 
