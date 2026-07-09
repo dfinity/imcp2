@@ -76,18 +76,24 @@
 //! (staging) instance runs Phase 2 by default (`MCP_REGISTRATION_DELEGATION=0`
 //! to disable), the production instance stays pinned to v1
 //! (`MCP_REGISTRATION_DELEGATION_PROD=1` to opt in later). Enabling Phase 2 for
-//! an instance is **outbound-compatible with v1**: it adds `regkey`/`flow` to
-//! that instance's II link and turns on its pinned callback page + redeem
+//! an instance is **outbound-compatible with v1**: it adds `registration_key`
+//! to that instance's II link and turns on its pinned callback page + redeem
 //! endpoint, while every v1 handler (the callback POSTs, `/oauth/finish`) stays
-//! live — an II frontend that doesn't know the new flow ignores the extra params
+//! live — an II frontend that doesn't know the new flow ignores the extra param
 //! and completes v1 unchanged. So beta keeps connecting via v1 until beta II
-//! actually ships the new frontend and canister methods (`mcp_register_v2`,
-//! `prepare_`/`get_mcp_registration_delegation`, the `mcp-registration` seed —
-//! none exist yet), and switches over when it does. The fragment wire shape
-//! ([`RegDelegationDto`]), the link params (`regkey`, `flow`), and the
-//! `mcp_register_v2` candid are **PROVISIONAL** until reconciled with II's
-//! published `.did`. Retiring v1 for a Phase-2 instance (the design's "v1
-//! sunset") is a separate, later step — not this.
+//! actually ships the new frontend and canister methods, and switches over when
+//! it does.
+//!
+//! The wire shapes track Internet Identity's (not yet merged) implementation
+//! PRs and must be re-verified when those merge: the connect link carries
+//! `registration_key` = base64url(DER(`pub(X)`)) (#4093); II navigates back to
+//! the callback — validated against our [`AUTH_CALLBACKS_WELL_KNOWN`]
+//! allow-list (#4091) — with `#delegation=<DelegationChain JSON>&state=…`
+//! (#4093, parsed by [`parse_registration_delegation`]); and the backend
+//! redeems via `mcp_register_v2(session_key) -> record { expiration;
+//! permissions : variant { queries; all } }` (#4092). Retiring v1 for a
+//! Phase-2 instance (the design's "v1 sunset") is a separate, later step — not
+//! this.
 
 use std::{
     collections::HashMap,
@@ -655,31 +661,30 @@ fn build_redirect(redirect_uri: &str, code: &str, client_state: &str) -> String 
 /// origin, the single-use `state` (= session id), and the requested grant `ttl`
 /// in SECONDS. NO key material is put in the link.
 fn ii_mcp_url(inst: &crate::identities::IiInstance, session_id: &str) -> String {
-    let callback = format!("{}{}/oauth/connect/callback", base_url(), inst.oauth_prefix);
     format!(
         "{ii}/mcp#callback={cb}&state={st}&ttl={ttl}",
         ii = inst.ii_url,
-        cb = urlencoding::encode(&callback),
+        cb = urlencoding::encode(&connect_callback_url(inst)),
         st = urlencoding::encode(session_id),
         ttl = GRANT_TTL_SECS,
     )
 }
 
 /// Build the **Phase-2** II `/mcp` link (for a registration-delegation
-/// instance): the v1 fragment plus this
-/// connect's registration public key `pub(X)` (`regkey`), toward which II
-/// certifies the delegation `P_reg -> X`, and a `flow` marker selecting the
-/// registration-delegation path. II navigates the tab to the pinned `callback`
-/// with the delegation in the fragment; the callback is our sole fragment reader
-/// ([`pinned_callback_page`]). The `regkey`/`flow` param names are **PROVISIONAL**
-/// (the II frontend contract is not finalized). No `priv(X)` is ever put in the
-/// link — only its public half.
+/// instance): the v1 fragment plus `registration_key` — this connect's
+/// registration public key `pub(X)` (DER, base64url), toward which II certifies
+/// the delegation `P_reg -> X` (param name per dfinity/internet-identity#4093;
+/// its presence is what selects the registration-delegation flow). II navigates
+/// the tab back to `callback` — validated against our
+/// [`AUTH_CALLBACKS_WELL_KNOWN`] allow-list (#4091) — with the delegation in
+/// the fragment; that callback page is our sole fragment reader
+/// ([`pinned_callback_page`]). No `priv(X)` is ever put in the link — only its
+/// public half.
 fn ii_mcp_url_v2(inst: &crate::identities::IiInstance, session_id: &str, reg_pubkey_b64: &str) -> String {
-    let callback = format!("{}{}/oauth/connect/callback", base_url(), inst.oauth_prefix);
     format!(
-        "{ii}/mcp#callback={cb}&state={st}&ttl={ttl}&regkey={rk}&flow=registration_delegation",
+        "{ii}/mcp#callback={cb}&state={st}&ttl={ttl}&registration_key={rk}",
         ii = inst.ii_url,
-        cb = urlencoding::encode(&callback),
+        cb = urlencoding::encode(&connect_callback_url(inst)),
         st = urlencoding::encode(session_id),
         ttl = GRANT_TTL_SECS,
         rk = urlencoding::encode(reg_pubkey_b64),
@@ -809,55 +814,34 @@ impl AuthStore {
     }
 }
 
-// ---- Pinned connect endpoint (II #4091) ----------------------------------
+// ---- Callback allow-list (II #4091) ---------------------------------------
 
-/// The fixed, origin-global connect path Internet Identity pins the `/mcp`
-/// connect flow to (dfinity/internet-identity#4091): once that ships, II
-/// derives the connect endpoint as `<trusted origin>` + this path and ignores
-/// the fragment-provided callback path. Served here for BOTH instances (the
-/// path has no instance prefix): POST = II's v1 JSON POSTs, dispatched to the
-/// instance that owns the connect `state`; GET = the Phase-2 pinned page for
-/// the Phase-2-enabled instance(s). The per-instance
-/// `{prefix}/oauth/connect/callback` routes stay for pre-pinning II frontends,
-/// which use the link's callback verbatim.
-pub const MCP_CONNECT_WELL_KNOWN: &str = "/.well-known/ii-mcp-connect";
+/// The well-known path Internet Identity fetches a server's **auth-callback
+/// allow-list** from (dfinity/internet-identity#4091): before contacting the
+/// connect callback named in the (attacker-craftable) link fragment, II fetches
+/// `<callback origin>` + this path — `redirect: "error"`, no credentials,
+/// `no-store`, 8 KB cap, `application/json` required — and rejects the connect
+/// unless the callback URL is EXACTLY (string-equal) one of the declared
+/// entries. **Fail-closed**: a missing/unfetchable file fails every connect for
+/// this origin, so serving this document is mandatory once #4091 ships.
+pub const AUTH_CALLBACKS_WELL_KNOWN: &str = "/.well-known/ii-auth-callbacks";
 
-/// POST /.well-known/ii-mcp-connect — II's v1 connect POSTs at the pinned
-/// path. Dispatch to the instance whose store knows this pending connect's
-/// `state` (session ids are per-store UUIDs, so at most one matches); an
-/// unknown state falls through to the first instance, whose handler yields the
-/// correct semantics either way (403 for a key request, 204 for a completion).
-pub async fn well_known_connect_callback(
-    State(stores): State<Vec<AuthStore>>,
-    Json(body): Json<ConnectCallback>,
-) -> Response {
-    for store in &stores {
-        if store.authz_known(&body.state).await {
-            return connect_callback(State(store.clone()), Json(body)).await;
-        }
-    }
-    match stores.first() {
-        Some(store) => connect_callback(State(store.clone()), Json(body)).await,
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
+/// An instance's connect-callback URL — the single source of truth used BOTH in
+/// the II link fragment and in the [`auth_callbacks`] allow-list, so the two
+/// can never drift: II matches them by exact string equality (no
+/// normalization, no case/slash slack).
+fn connect_callback_url(inst: &crate::identities::IiInstance) -> String {
+    format!("{}{}/oauth/connect/callback", base_url(), inst.oauth_prefix)
 }
 
-/// GET /.well-known/ii-mcp-connect — the Phase-2 pinned page at the pinned
-/// path. The fragment (and therefore the instance) is invisible to the server,
-/// so the page is built with EVERY Phase-2-enabled instance's redeem endpoint
-/// and tries them in order client-side; the wrong instance rejects the state,
-/// and each instance's path-scoped connect cookie only rides to its own redeem
-/// path. 404 when no instance runs Phase 2.
-pub async fn well_known_connect_page(State(stores): State<Vec<AuthStore>>) -> Response {
-    let prefixes: Vec<&str> = stores
-        .iter()
-        .filter(|s| s.instance().registration_delegation)
-        .map(|s| s.instance().oauth_prefix)
-        .collect();
-    if prefixes.is_empty() {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
-    }
-    pinned_callback_page(&prefixes)
+/// GET /.well-known/ii-auth-callbacks — declare every instance's connect
+/// callback (II #4091 validates ALL connects against this list, v1 and Phase 2
+/// alike; the path is origin-global, so one document covers both instances).
+/// Served with CORS (II's frontend fetches it cross-origin) and well under
+/// II's 8 KB cap.
+pub async fn auth_callbacks(State(stores): State<Vec<AuthStore>>) -> Response {
+    let callbacks: Vec<String> = stores.iter().map(|s| connect_callback_url(s.instance())).collect();
+    Json(json!({ "callbacks": callbacks })).into_response()
 }
 
 // ---- Phase 2: registration delegation (flag-gated) ----------------------
@@ -874,7 +858,7 @@ pub async fn connect_callback_page(State(store): State<AuthStore>) -> Response {
     if !store.instance().registration_delegation {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    pinned_callback_page(&[store.instance().oauth_prefix])
+    pinned_callback_page(store.instance().oauth_prefix)
 }
 
 /// A fresh CSP nonce: 128 bits from the OS CSPRNG, **standard** base64. CSP3's
@@ -892,24 +876,18 @@ fn csp_nonce() -> String {
 /// The strict-CSP, non-reflecting pinned callback page. `nonce` is a fresh
 /// per-response value bound into BOTH the CSP header and the inline `<script>`,
 /// so no `'unsafe-inline'` is needed; `connect-src 'self'` limits the page's only
-/// network reach to the same-origin redeem endpoint(s), and `default-src 'none'`
+/// network reach to the same-origin redeem endpoint, and `default-src 'none'`
 /// forbids loading anything else. No attacker-supplied value (fragment, query)
 /// is ever interpolated into the HTML — the fragment is read client-side and sent
 /// via `fetch`, never written to the DOM.
 ///
-/// `prefixes` are the OAuth prefixes of the Phase-2 instance(s) this page may
-/// redeem against — one when served from an instance's own callback route, all
-/// enabled instances when served from the pinned [`MCP_CONNECT_WELL_KNOWN`]
-/// path (where the instance can't be known server-side: it's in the fragment).
-/// The script tries each same-origin redeem endpoint in order; the wrong
-/// instance rejects the unknown state (and its path-scoped connect cookie never
-/// rides there), the right one returns the redirect.
-fn pinned_callback_page(prefixes: &[&str]) -> Response {
+/// The fragment shape matches II's frontend (dfinity/internet-identity#4093):
+/// `#delegation=<JSON.stringify(DelegationChain.toJSON())>&state=<state>`,
+/// percent-encoded by `URLSearchParams` — so `p.get('delegation')` yields the
+/// chain's JSON text, forwarded to the redeem endpoint verbatim.
+fn pinned_callback_page(prefix: &str) -> Response {
     let nonce = csp_nonce();
-    let redeem_urls: Vec<String> = prefixes.iter().map(|p| format!("{p}/oauth/connect/redeem")).collect();
-    // Server-side constants only (never attacker input); JSON is a valid JS
-    // array literal, so this embeds safely inside the nonce'd script.
-    let urls_js = serde_json::to_string(&redeem_urls).expect("static strings serialize");
+    let redeem = js_escape(&format!("{prefix}/oauth/connect/redeem"));
     let html = format!(
         "<!DOCTYPE html><html><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
@@ -919,17 +897,12 @@ fn pinned_callback_page(prefixes: &[&str]) -> Response {
          <script nonce=\"{nonce}\">(function(){{\
          function show(t){{document.getElementById('m').textContent=t;}}\
          var p=new URLSearchParams(location.hash.slice(1));\
-         var body=JSON.stringify({{state:p.get('state')||'',user_key:p.get('user_key')||'',delegation:p.get('delegation')||''}});\
+         var body=JSON.stringify({{state:p.get('state')||'',delegation:p.get('delegation')||''}});\
          try{{history.replaceState(null,'',location.pathname);}}catch(e){{}}\
-         var urls={urls_js};\
-         function attempt(i,lastErr){{\
-         if(i>=urls.length){{show(lastErr||'Could not finish the connection — restart from your client.');return;}}\
-         fetch(urls[i],{{method:'POST',headers:{{'content-type':'application/json'}},credentials:'same-origin',body:body}})\
+         fetch(\"{redeem}\",{{method:'POST',headers:{{'content-type':'application/json'}},credentials:'same-origin',body:body}})\
          .then(function(r){{return r.json().catch(function(){{return {{}};}});}})\
-         .then(function(d){{if(d&&d.redirect){{location.replace(d.redirect);}}else{{attempt(i+1,(d&&d.error)||lastErr);}}}})\
-         .catch(function(){{attempt(i+1,'Could not reach the server — restart from your client.');}});\
-         }}\
-         attempt(0,null);\
+         .then(function(d){{if(d&&d.redirect){{location.replace(d.redirect);}}else{{show((d&&d.error)||'Could not finish the connection — restart from your client.');}}}})\
+         .catch(function(){{show('Could not reach the server — restart from your client.');}});\
          }})();</script></body></html>"
     );
     let csp = format!(
@@ -953,109 +926,111 @@ fn pinned_callback_page(prefixes: &[&str]) -> Response {
 }
 
 /// POST /oauth/connect/redeem body — what [`pinned_callback_page`] sends after
-/// parsing the fragment. `user_key` is base64url(DER(P_reg)); `delegation` is
-/// base64url(JSON [`RegDelegationDto`]). **PROVISIONAL** shape (see module docs).
+/// parsing the fragment: the `state` echo and the delegation chain's JSON text
+/// exactly as II's frontend put it in the fragment
+/// (`JSON.stringify(DelegationChain.toJSON())`, dfinity/internet-identity#4093).
 #[derive(Debug, Deserialize)]
 pub struct RedeemBody {
-    /// The single-use connect state (= session id).
+    /// The single-use connect state (= session id), echoed by II.
     state: String,
-    /// base64url(DER(P_reg)) — the delegation chain root.
-    #[serde(default)]
-    user_key: String,
-    /// base64url(JSON [`RegDelegationDto`]) — the `P_reg -> X` delegation.
+    /// The `P_reg -> X` chain as agent-js `DelegationChain` JSON
+    /// ([`JsonDelegationChain`]); `der(P_reg)` rides inside as `publicKey`.
     #[serde(default)]
     delegation: String,
 }
 
-/// The canister-signed `P_reg -> X` delegation carried in the callback fragment
-/// (base64url of this JSON). **PROVISIONAL** — the II frontend that produces it
-/// is not written yet; reconcile before enabling the flag. Byte fields are
-/// base64url; `expiration` is decimal ns as a string (u64 ns overflows JSON).
+/// Size cap for the redeem body's `delegation` JSON text, checked BEFORE
+/// parsing so oversized attacker-controlled input is rejected without large
+/// allocations (same posture as the discovery-buffering bound, CWE-770). A
+/// legitimate chain — one delegation plus a canister signature with its
+/// certificate — is a few KB of hex/JSON, so this is generous while staying
+/// far under axum's 2 MB body default. Defense-in-depth: the cookie gate
+/// already means only the connect's own initiator can reach the parse at all.
+const MAX_REG_DELEGATION_JSON: usize = 64 * 1024;
+
+/// agent-js `DelegationChain.toJSON()`, the wire shape II's frontend delivers
+/// in the callback fragment (dfinity/internet-identity#4093): byte fields are
+/// HEX strings, `expiration` is a HEX string of ns since the epoch
+/// (`BigInt.toString(16)`), `targets` are principal texts, and `publicKey` is
+/// the chain root `der(P_reg)`.
+///
+/// `deny_unknown_fields` on purpose: every field of a delegation is covered by
+/// its canister signature, so a field this parser does not carry (e.g. a future
+/// `permissions`) could never re-hash to what II signed — dropping it silently
+/// would resurface the opaque "sig not found in the signature tree" replica
+/// error (the #40 read-only outage). Failing fast names the real problem.
 #[derive(Debug, Deserialize)]
-struct RegDelegationDto {
-    /// base64url(DER(X)) — the delegate (this connect's registration key).
-    pubkey: String,
-    /// Decimal ns since the Unix epoch.
-    expiration: String,
-    /// Principal texts the delegation targets (the II canister), or absent.
-    #[serde(default)]
-    targets: Option<Vec<String>>,
-    /// `"queries"` (read-only) / `"all"` (full), or absent (unrestricted).
-    #[serde(default)]
-    permissions: Option<String>,
-    /// base64url(canister signature).
+#[serde(deny_unknown_fields)]
+struct JsonDelegationChain {
+    delegations: Vec<JsonSignedDelegation>,
+    #[serde(rename = "publicKey")]
+    public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonSignedDelegation {
+    delegation: JsonDelegation,
     signature: String,
 }
 
-/// Size caps (base64 text length) for the redeem body's fragment fields, checked
-/// BEFORE any decode/parse so oversized attacker-controlled input is rejected
-/// without large allocations (same posture as the discovery-buffering bound,
-/// CWE-770). Legitimate values are far smaller: `user_key` is a DER canister-sig
-/// public key (~100 bytes), and `delegation` wraps one delegation plus a
-/// canister signature with its certificate (a few KB) — so these caps are
-/// generous while staying orders of magnitude under axum's 2 MB body default.
-/// Defense-in-depth: the cookie gate already means only the connect's own
-/// initiator can reach the parse at all.
-const MAX_REG_USER_KEY_B64: usize = 4 * 1024;
-const MAX_REG_DELEGATION_B64: usize = 64 * 1024;
-
-/// Decode a base64url (no pad) string, trimming surrounding whitespace.
-fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(s.trim())
-        .map_err(|e| format!("not valid base64url: {e}"))
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonDelegation {
+    pubkey: String,
+    /// Hex string of ns since the Unix epoch (agent-js `BigInt.toString(16)`).
+    expiration: String,
+    #[serde(default)]
+    targets: Option<Vec<String>>,
 }
 
-/// Decode the fragment payload into `(der(P_reg), [P_reg -> X])` as `ic-agent`
-/// types, forwarding II's `permissions` verbatim so the reconstructed delegation
-/// hashes to exactly what II's canister signed (the same discipline as the
-/// account-delegation decode in `identities`). **PROVISIONAL** wire shape.
-fn parse_registration_delegation(
-    user_key_b64: &str,
-    delegation_b64: &str,
-) -> Result<(Vec<u8>, Vec<SignedDelegation>), String> {
-    // Bound sizes BEFORE decoding (see MAX_REG_* above): reject oversized input
-    // without allocating for it. The delegation cap also inherently bounds every
-    // field inside the decoded JSON (pubkey, signature, targets).
-    if user_key_b64.len() > MAX_REG_USER_KEY_B64 {
-        return Err(format!("user_key exceeds {MAX_REG_USER_KEY_B64} bytes"));
+/// Decode a hex string field of the chain JSON.
+fn hex_decode(field: &str, s: &str) -> Result<Vec<u8>, String> {
+    hex::decode(s.trim()).map_err(|e| format!("{field} is not valid hex: {e}"))
+}
+
+/// Parse the fragment's `DelegationChain` JSON into `(der(P_reg), chain)` as
+/// `ic-agent` types. The chain carries no `permissions` field (the registration
+/// delegation's permission choice lives in II's server-side index, not in the
+/// delegation — and [`JsonDelegationChain`] fails fast if one ever appears).
+fn parse_registration_delegation(delegation_json: &str) -> Result<(Vec<u8>, Vec<SignedDelegation>), String> {
+    // Bound the size BEFORE parsing (see MAX_REG_DELEGATION_JSON): reject
+    // oversized input without allocating for it. This also inherently bounds
+    // every field inside the JSON (pubkeys, signatures, targets).
+    if delegation_json.len() > MAX_REG_DELEGATION_JSON {
+        return Err(format!("delegation exceeds {MAX_REG_DELEGATION_JSON} bytes"));
     }
-    if delegation_b64.len() > MAX_REG_DELEGATION_B64 {
-        return Err(format!("delegation exceeds {MAX_REG_DELEGATION_B64} bytes"));
-    }
-    let user_key = b64url_decode(user_key_b64).map_err(|e| format!("user_key {e}"))?;
-    let dto_bytes = b64url_decode(delegation_b64).map_err(|e| format!("delegation {e}"))?;
-    let dto: RegDelegationDto =
-        serde_json::from_slice(&dto_bytes).map_err(|e| format!("delegation JSON: {e}"))?;
-    let pubkey = b64url_decode(&dto.pubkey).map_err(|e| format!("delegation pubkey {e}"))?;
-    let signature = b64url_decode(&dto.signature).map_err(|e| format!("delegation signature {e}"))?;
-    let expiration = dto
-        .expiration
-        .trim()
-        .parse::<u64>()
-        .map_err(|_| "delegation expiration is not a u64".to_string())?;
-    let targets = match &dto.targets {
-        None => None,
-        Some(ts) => Some(
-            ts.iter()
-                .map(|t| Principal::from_text(t.trim()).map_err(|e| format!("delegation target principal: {e}")))
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-    };
-    let signed = SignedDelegation {
-        delegation: Delegation {
-            pubkey,
-            expiration,
-            targets,
-            // Forward II's per-session permission verbatim (see the identical
-            // reasoning on `IiDelegation::permissions`): the canister signature
-            // covers this field, so an unrecognized value is a hard error rather
-            // than a silent drop that would fail signature verification.
-            permissions: crate::identities::permissions_from_text(dto.permissions.as_deref())?,
-        },
-        signature,
-    };
-    Ok((user_key, vec![signed]))
+    let chain: JsonDelegationChain =
+        serde_json::from_str(delegation_json).map_err(|e| format!("delegation JSON: {e}"))?;
+    let user_key = hex_decode("publicKey", &chain.public_key)?;
+    let delegations = chain
+        .delegations
+        .iter()
+        .map(|d| {
+            let targets = match &d.delegation.targets {
+                None => None,
+                Some(ts) => Some(
+                    ts.iter()
+                        .map(|t| {
+                            Principal::from_text(t.trim())
+                                .map_err(|e| format!("delegation target principal: {e}"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            };
+            Ok(SignedDelegation {
+                delegation: Delegation {
+                    pubkey: hex_decode("delegation pubkey", &d.delegation.pubkey)?,
+                    expiration: u64::from_str_radix(d.delegation.expiration.trim(), 16)
+                        .map_err(|_| "delegation expiration is not a hex u64".to_string())?,
+                    targets,
+                    permissions: None,
+                },
+                signature: hex_decode("delegation signature", &d.signature)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((user_key, delegations))
 }
 
 /// A JSON error the pinned page reads and displays.
@@ -1154,8 +1129,8 @@ pub async fn connect_redeem(
     if let Some(code) = existing_code {
         return Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state) })).into_response();
     }
-    // Decode the fragment delegation (PROVISIONAL wire shape).
-    let (user_key, chain) = match parse_registration_delegation(&body.user_key, &body.delegation) {
+    // Decode the fragment delegation (agent-js DelegationChain JSON, II #4093).
+    let (user_key, chain) = match parse_registration_delegation(&body.delegation) {
         Ok(v) => v,
         Err(e) => return redeem_err(&format!("malformed registration delegation: {e}")),
     };
@@ -1737,17 +1712,11 @@ mod tests {
 
     // ---- Phase 2: registration delegation (flag-gated) ----------------------
 
-    use base64::Engine as _;
-    use ic_agent::identity::DelegationPermissions;
-
-    fn b64(b: &[u8]) -> String {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
-    }
-
-    // The v2 II link carries `pub(X)` (`regkey`) and the flow marker in addition
-    // to the v1 callback/state/ttl fragment, all still in the URL fragment.
+    // The v2 II link carries `registration_key` = base64url(DER(pub(X))) (the
+    // param II's #4093 frontend parses; its presence selects the flow) in
+    // addition to the v1 callback/state/ttl fragment, all in the URL fragment.
     #[test]
-    fn v2_link_carries_regkey_and_flow() {
+    fn v2_link_carries_registration_key() {
         use crate::identities::IiInstance;
         use candid::Principal;
         let inst = IiInstance {
@@ -1761,9 +1730,72 @@ mod tests {
         let url = super::ii_mcp_url_v2(&inst, "sess-1", "PUBX");
         assert!(url.starts_with("https://ii.test/mcp#"), "everything rides the fragment: {url}");
         assert!(url.contains("state=sess-1"));
-        assert!(url.contains("regkey=PUBX"));
-        assert!(url.contains("flow=registration_delegation"));
+        assert!(url.contains("registration_key=PUBX"));
         assert!(url.contains("callback="));
+    }
+
+    // The allow-list invariant (II #4091 matches by EXACT string equality): the
+    // /.well-known/ii-auth-callbacks document must declare, verbatim, the same
+    // callback URLs the II links embed — for every instance. Built from one
+    // helper (`connect_callback_url`) so they cannot drift; this test locks
+    // that in end to end.
+    #[tokio::test]
+    async fn auth_callbacks_declares_link_callbacks_verbatim() {
+        use axum::extract::State;
+        use crate::identities::{Identities, IiInstance};
+        use candid::Principal;
+        let make = |prefix: &'static str, mcp_path: &'static str| {
+            super::AuthStore::new(
+                Identities::new(IiInstance {
+                    name: "t",
+                    ii_url: "https://ii.test".into(),
+                    ii_canister: Principal::anonymous(),
+                    oauth_prefix: prefix,
+                    mcp_path,
+                    registration_delegation: prefix.is_empty(), // beta-like on, prod-like off
+                }),
+                super::SharedClients(std::sync::Arc::default()),
+            )
+        };
+        let beta = make("", "/mcp");
+        let prod = make("/prod", "/mcp-prod");
+
+        let r = super::auth_callbacks(State(vec![beta.clone(), prod.clone()])).await;
+        assert_eq!(r.status(), axum::http::StatusCode::OK);
+        assert!(
+            r.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("application/json")),
+            "II requires an application/json content type"
+        );
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let declared: Vec<String> = v["callbacks"]
+            .as_array()
+            .expect("callbacks array")
+            .iter()
+            .map(|e| e.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(declared.len(), 2, "one entry per instance");
+
+        // Each declared entry must equal the callback embedded in that
+        // instance's II link — v1 and v2 — byte for byte.
+        for (store, link) in [
+            (&beta, super::ii_mcp_url_v2(beta.instance(), "s", "K")),
+            (&prod, super::ii_mcp_url(prod.instance(), "s")),
+        ] {
+            let expected = super::connect_callback_url(store.instance());
+            assert!(declared.contains(&expected), "{expected} must be declared: {declared:?}");
+            let encoded = format!("callback={}", urlencoding::encode(&expected));
+            assert!(link.contains(&encoded), "the II link must embed the declared URL: {link}");
+        }
+        // Both entries share the origin II fetches the document from, and no
+        // entry carries a fragment (II rejects both).
+        for d in &declared {
+            assert!(d.starts_with(&super::base_url()), "same-origin entries only: {d}");
+            assert!(!d.contains('#'), "no fragments in declared callbacks: {d}");
+        }
     }
 
     // The pinned page ships a strict CSP whose script nonce MATCHES the inline
@@ -1772,7 +1804,7 @@ mod tests {
     // `location.hash` and never writes it into the HTML).
     #[tokio::test]
     async fn pinned_page_has_strict_csp_matching_nonce_and_no_reflection() {
-        let resp = super::pinned_callback_page(&["/prod"]);
+        let resp = super::pinned_callback_page("/prod");
         let csp = resp
             .headers()
             .get(axum::http::header::CONTENT_SECURITY_POLICY)
@@ -1800,30 +1832,35 @@ mod tests {
         assert!(html.contains("/prod/oauth/connect/redeem"), "posts to the instance's redeem path");
     }
 
-    // A well-formed fragment payload decodes into `(der(P_reg), [P_reg -> X])`
-    // with the delegate key, expiration, target principal, and permissions all
-    // recovered — and the permission forwarded as the matching `ic-agent` variant
-    // so the reconstructed delegation hashes to what II signed.
+    // A well-formed fragment payload — agent-js `DelegationChain.toJSON()`
+    // exactly as II's #4093 frontend emits it (hex byte fields, HEX-string
+    // expiration, principal-text targets, top-level `publicKey` = der(P_reg))
+    // — decodes into `(der(P_reg), [P_reg -> X])` as ic-agent types.
     #[test]
     fn parse_registration_delegation_round_trips() {
         let der_x = vec![9u8, 8, 7, 6];
         let der_preg = vec![1u8, 2, 3];
         let sig = vec![4u8, 5, 6];
-        let dto = serde_json::json!({
-            "pubkey": b64(&der_x),
-            "expiration": "42",
-            "targets": ["aaaaa-aa"],
-            "permissions": "queries",
-            "signature": b64(&sig),
-        });
-        let delegation = b64(&serde_json::to_vec(&dto).unwrap());
-        let (uk, chain) =
-            super::parse_registration_delegation(&b64(&der_preg), &delegation).expect("parse");
+        let chain_json = serde_json::json!({
+            "delegations": [{
+                "delegation": {
+                    "pubkey": hex::encode(&der_x),
+                    "expiration": format!("{:x}", 66_u64), // BigInt.toString(16)
+                    "targets": ["aaaaa-aa"],
+                },
+                "signature": hex::encode(&sig),
+            }],
+            "publicKey": hex::encode(&der_preg),
+        })
+        .to_string();
+        let (uk, chain) = super::parse_registration_delegation(&chain_json).expect("parse");
         assert_eq!(uk, der_preg);
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].delegation.pubkey, der_x);
-        assert_eq!(chain[0].delegation.expiration, 42);
-        assert_eq!(chain[0].delegation.permissions, Some(DelegationPermissions::Queries));
+        assert_eq!(chain[0].delegation.expiration, 66);
+        // The registration delegation carries no permissions field — the
+        // permission choice lives in II's index, not in the delegation.
+        assert_eq!(chain[0].delegation.permissions, None);
         assert_eq!(chain[0].signature, sig);
         assert_eq!(
             chain[0].delegation.targets.as_ref().unwrap()[0],
@@ -1831,53 +1868,65 @@ mod tests {
         );
     }
 
-    // Malformed base64, an unknown permission (which would fail signature
-    // verification, so we fail fast), and a non-numeric expiration are rejected.
+    // Malformed input fails with a clear error: non-JSON, bad hex, a
+    // non-hex expiration — and, critically, an UNKNOWN field inside the
+    // delegation (deny_unknown_fields): every delegation field is covered by
+    // the canister signature, so silently dropping one could never re-hash to
+    // what II signed (the #40 outage class) — fail fast instead.
     #[test]
     fn parse_registration_delegation_rejects_bad_input() {
-        assert!(super::parse_registration_delegation("!!!", "@@@").is_err());
+        assert!(super::parse_registration_delegation("not json").is_err());
 
-        let unknown = b64(&serde_json::to_vec(&serde_json::json!({
-            "pubkey": b64(&[1u8]),
-            "expiration": "1",
-            "permissions": "write-only",
-            "signature": b64(&[2u8]),
-        }))
-        .unwrap());
-        let err = super::parse_registration_delegation(&b64(&[3u8]), &unknown)
-            .expect_err("unknown permission must fail fast");
-        assert!(err.contains("unrecognized permission"), "got: {err}");
+        let bad_hex = serde_json::json!({
+            "delegations": [{
+                "delegation": { "pubkey": "zz", "expiration": "1" },
+                "signature": "0102",
+            }],
+            "publicKey": "010203",
+        })
+        .to_string();
+        let err = super::parse_registration_delegation(&bad_hex).expect_err("bad hex must fail");
+        assert!(err.contains("not valid hex"), "got: {err}");
 
-        let bad_exp = b64(&serde_json::to_vec(&serde_json::json!({
-            "pubkey": b64(&[1u8]),
-            "expiration": "notnum",
-            "signature": b64(&[2u8]),
-        }))
-        .unwrap());
-        assert!(super::parse_registration_delegation(&b64(&[3u8]), &bad_exp).is_err());
+        let bad_exp = serde_json::json!({
+            "delegations": [{
+                "delegation": { "pubkey": "0102", "expiration": "not-hex" },
+                "signature": "0102",
+            }],
+            "publicKey": "010203",
+        })
+        .to_string();
+        let err = super::parse_registration_delegation(&bad_exp).expect_err("bad expiration must fail");
+        assert!(err.contains("expiration"), "got: {err}");
+
+        // A field this parser does not carry (e.g. a future `permissions`)
+        // must fail fast rather than be silently dropped.
+        let unknown_field = serde_json::json!({
+            "delegations": [{
+                "delegation": { "pubkey": "0102", "expiration": "1", "permissions": "queries" },
+                "signature": "0102",
+            }],
+            "publicKey": "010203",
+        })
+        .to_string();
+        let err = super::parse_registration_delegation(&unknown_field)
+            .expect_err("an unknown delegation field must fail fast, not silently drop");
+        assert!(err.contains("permissions"), "got: {err}");
     }
 
-    // CWE-770 guard: oversized fragment fields are rejected BEFORE any base64
-    // decode / JSON parse, so an attacker-sized payload can't force large
-    // allocations. Legit sizes (a DER key, a canister-sig delegation) are far
-    // below the caps, so the bound is invisible to the real flow.
+    // CWE-770 guard: an oversized delegation payload is rejected BEFORE any
+    // JSON parse, so an attacker-sized payload can't force large allocations.
+    // A legit chain is a few KB, far below the cap.
     #[test]
     fn parse_registration_delegation_bounds_input_size() {
-        let huge_key = "A".repeat(super::MAX_REG_USER_KEY_B64 + 1);
-        let err = super::parse_registration_delegation(&huge_key, "e30")
-            .expect_err("oversized user_key must be rejected");
+        let huge = "A".repeat(super::MAX_REG_DELEGATION_JSON + 1);
+        let err = super::parse_registration_delegation(&huge).expect_err("oversized delegation rejected");
         assert!(err.contains("exceeds"), "got: {err}");
 
-        let huge_delegation = "A".repeat(super::MAX_REG_DELEGATION_B64 + 1);
-        let err = super::parse_registration_delegation(&b64(&[1u8, 2, 3]), &huge_delegation)
-            .expect_err("oversized delegation must be rejected");
-        assert!(err.contains("exceeds"), "got: {err}");
-
-        // At-cap inputs proceed past the size check (and fail later on content,
+        // At-cap input proceeds past the size check (and fails on content,
         // not on size) — the bound doesn't clip legitimate-shaped requests.
-        let at_cap = "A".repeat(super::MAX_REG_USER_KEY_B64);
-        let err = super::parse_registration_delegation(&at_cap, "e30")
-            .expect_err("still fails on content, not size");
+        let at_cap = "A".repeat(super::MAX_REG_DELEGATION_JSON);
+        let err = super::parse_registration_delegation(&at_cap).expect_err("fails on content, not size");
         assert!(!err.contains("exceeds"), "at-cap input must pass the size check: {err}");
     }
 
@@ -1947,7 +1996,6 @@ mod tests {
             axum::http::HeaderMap::new(),
             axum::Json(super::RedeemBody {
                 state: "sess-x".into(),
-                user_key: String::new(),
                 delegation: String::new(),
             }),
         )
@@ -1965,77 +2013,11 @@ mod tests {
             axum::http::HeaderMap::new(),
             axum::Json(super::RedeemBody {
                 state: "sess-x".into(),
-                user_key: String::new(),
                 delegation: String::new(),
             }),
         )
         .await;
         assert_eq!(redeem.status(), axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    // The pinned well-known path (II #4091) is instance-less, so its POST
-    // handler dispatches by connect state: a state pending in the SECOND store
-    // must be served by that store (claiming its PA), and an unknown state must
-    // fall through to ordinary 403 key-request semantics.
-    #[tokio::test]
-    async fn well_known_callback_dispatches_by_state() {
-        use axum::extract::State;
-        use axum::Json;
-        let a = test_store();
-        let b = test_store_phase2();
-        seed_pending(&b, "sess-b", "bind-b").await;
-        let stores = vec![a.clone(), b.clone()];
-
-        let r = super::well_known_connect_callback(
-            State(stores.clone()),
-            Json(super::ConnectCallback { state: "sess-b".into(), expiration: None, permissions: None }),
-        )
-        .await;
-        assert_eq!(r.status(), axum::http::StatusCode::OK, "key request must reach the owning store");
-        assert!(
-            b.authz.read().await.get("sess-b").unwrap().finish_secret_hash.is_some(),
-            "the owning store's PA must be claimed"
-        );
-        assert!(a.authz.read().await.get("sess-b").is_none(), "the other store stays untouched");
-
-        // Unknown state: falls through to the first store's handler → 403.
-        let r = super::well_known_connect_callback(
-            State(stores),
-            Json(super::ConnectCallback { state: "nope".into(), expiration: None, permissions: None }),
-        )
-        .await;
-        assert_eq!(r.status(), axum::http::StatusCode::FORBIDDEN);
-    }
-
-    // The pinned well-known GET serves the Phase-2 page only when some instance
-    // runs Phase 2, and the page carries each enabled instance's redeem
-    // endpoint (the client tries them in order — the instance is only knowable
-    // from the fragment, which the server never sees).
-    #[tokio::test]
-    async fn well_known_page_gates_on_phase2_and_lists_enabled_redeems() {
-        use axum::extract::State;
-
-        // No Phase-2 instance → 404 (v1-only deployments expose no page).
-        let r = super::well_known_connect_page(State(vec![test_store()])).await;
-        assert_eq!(r.status(), axum::http::StatusCode::NOT_FOUND);
-
-        // One Phase-2 instance → 200 with that instance's redeem endpoint.
-        let r = super::well_known_connect_page(State(vec![test_store(), test_store_phase2()])).await;
-        assert_eq!(r.status(), axum::http::StatusCode::OK);
-        let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("\"/oauth/connect/redeem\""), "page must list the enabled redeem URL: {html}");
-    }
-
-    // With several Phase-2 instances the page lists every redeem endpoint, in
-    // order, as a JSON-embedded array the retry loop walks.
-    #[tokio::test]
-    async fn pinned_page_lists_multiple_redeem_endpoints_in_order() {
-        let resp = super::pinned_callback_page(&["", "/prod"]);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        let both = html.find("[\"/oauth/connect/redeem\",\"/prod/oauth/connect/redeem\"]");
-        assert!(both.is_some(), "page must embed both redeem URLs in order: {html}");
     }
 
     // The v1 POST callback handlers stay live on a Phase-2 instance — that's what

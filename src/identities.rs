@@ -584,15 +584,13 @@ impl Identities {
     /// the H2 read-only guard behave exactly as they do off the v1 completion POST.
     ///
     /// > **Gated on Internet Identity.** `mcp_register_v2` and the delegation-
-    /// > minting methods (`prepare_`/`get_mcp_registration_delegation`, the
-    /// > `mcp-registration` seed) do NOT yet exist on II, so this path is only
-    /// > reachable behind the off-by-default `MCP_REGISTRATION_DELEGATION` flag
-    /// > and cannot be exercised end-to-end until II ships them. The
-    /// > `mcp_register_v2` argument/return candid ([`McpRegisterV2Ok`]) is
-    /// > **PROVISIONAL** — modelled on the design sketch and on v1
-    /// > `mcp_register`'s shape — and MUST be reconciled against II's published
-    /// > `.did` before enabling. The read-only `opt text`/`variant` outage is the
-    /// > standing lesson against guessing II's wire types.
+    /// > minting methods do not exist on DEPLOYED II yet, so this path cannot be
+    /// > exercised end-to-end until II ships them; until then a Phase-2 instance
+    /// > completes connects via v1 (see `crate::auth`'s Phase-2 docs). The
+    /// > `mcp_register_v2` argument/return candid ([`McpRegisterV2Ok`]) matches
+    /// > dfinity/internet-identity#4092 — re-verify against II's published
+    /// > `.did` when that PR merges. The read-only `opt text`/`variant` outage
+    /// > (#40) is the standing lesson against letting these shapes drift.
     pub async fn redeem_registration_delegation(
         &self,
         session_id: &str,
@@ -658,13 +656,12 @@ impl Identities {
 
         // Record expiry + access level so the signer's expiry check and the H2
         // read-only guard work exactly as they do off the v1 completion POST.
+        let permissions = outcome.permissions.as_text();
         self.set_grant_expiration(session_id, outcome.expiration).await;
-        if let Some(p) = &outcome.permissions {
-            self.set_permissions(session_id, p).await;
-        }
+        self.set_permissions(session_id, permissions).await;
         Ok(RegistrationOutcome {
             expiration_ns: outcome.expiration,
-            permissions: outcome.permissions,
+            permissions,
         })
     }
 
@@ -871,9 +868,10 @@ fn map_delegation_error(e: AccountDelegationError) -> String {
 pub struct RegistrationOutcome {
     /// Grant expiration (ns since the Unix epoch).
     pub expiration_ns: u64,
-    /// The recorded access level, in the delegation vocabulary: `Some("queries")`
-    /// = read-only, `Some("all")` = full, `None` = unrestricted/unspecified.
-    pub permissions: Option<String>,
+    /// The recorded access level, in the delegation vocabulary: `"queries"` =
+    /// read-only, `"all"` = full (always present — `McpRegistrationV2`'s
+    /// `permissions` is non-optional).
+    pub permissions: &'static str,
 }
 
 // ---- II candid contract for the mcp_* delegation methods --------------------
@@ -904,23 +902,43 @@ type PrepareReply = std::result::Result<PreparedDelegation, AccountDelegationErr
 type GetReply = std::result::Result<IiSignedDelegation, AccountDelegationError>;
 type McpGetAccountsReply = std::result::Result<Vec<IiAccountInfo>, AccountDelegationError>;
 
-/// **PROVISIONAL** `Ok` payload of `mcp_register_v2` (Phase 2). Modelled on the
-/// design sketch — redemption "returns `{expiration, permissions}`" — and on v1
-/// `mcp_register`'s `variant { Ok; Err : text }` reply shape. This method does
-/// not yet exist on Internet Identity; the field names/types here are a best
-/// guess and MUST be reconciled against II's published `.did` before the
-/// `MCP_REGISTRATION_DELEGATION` flag is enabled. See
+/// II's named `Permissions` type: `variant { queries; all }`. Distinct from the
+/// `Delegation` RECORD's `permissions : opt text` field (see
+/// [`IiDelegation::permissions`] and the #40 outage): the named type is a real
+/// candid variant, used by `mcp_register`'s argument and by
+/// `mcp_register_v2`'s reply. Decoded as a variant here — this is NOT the
+/// opt-text case, because the field it appears in is not `opt`.
+#[derive(CandidType, Deserialize, Debug)]
+enum IiPermissions {
+    #[serde(rename = "queries")]
+    Queries,
+    #[serde(rename = "all")]
+    All,
+}
+
+impl IiPermissions {
+    /// The delegation-vocabulary text for this level ("queries"/"all"), as
+    /// consumed by [`Identities::set_permissions`].
+    fn as_text(&self) -> &'static str {
+        match self {
+            IiPermissions::Queries => "queries",
+            IiPermissions::All => "all",
+        }
+    }
+}
+
+/// `Ok` payload of `mcp_register_v2` (Phase 2) — `McpRegistrationV2` per
+/// dfinity/internet-identity#4092: `record { expiration : Timestamp;
+/// permissions : Permissions }`. That PR is not merged yet, so re-verify this
+/// against II's published `.did` when it lands. See
 /// [`Identities::redeem_registration_delegation`].
 #[derive(CandidType, Deserialize)]
 struct McpRegisterV2Ok {
     /// Grant expiration (ns since the Unix epoch).
     expiration: u64,
-    /// The recorded access level as `opt text`, SAME vocabulary as the
-    /// delegation's `permissions` ("queries" = read-only, "all" = full; absent =
-    /// unrestricted). Decoded as text for the exact reason documented on
-    /// [`IiDelegation::permissions`]: II sends these as `opt text`, and any other
-    /// `opt` shape triggers Candid's silent opt-mismatch drop.
-    permissions: Option<String>,
+    /// The recorded access level (from II's index, chosen at consent) — a
+    /// NON-optional named variant, unlike the delegation record's `opt text`.
+    permissions: IiPermissions,
 }
 /// `mcp_register_v2`'s reply — a `variant { Ok; Err : text }`, aliased so the
 /// `Decode!` macro doesn't choke on the comma inside the generic.

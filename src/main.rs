@@ -1086,23 +1086,20 @@ async fn main() -> anyhow::Result<()> {
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any);
-    // The pinned connect endpoint (II #4091): once II pins the connect flow to
-    // <origin>/.well-known/ii-mcp-connect, BOTH instances' connect traffic
-    // arrives at this one instance-less path. POST serves II's v1 JSON POSTs,
-    // dispatched to the instance that owns the connect state; GET serves the
-    // Phase-2 pinned page for the Phase-2-enabled instance(s). The
-    // per-instance callback routes above remain for pre-pinning II frontends.
-    let pinned_connect = axum::Router::new()
-        .route(
-            auth::MCP_CONNECT_WELL_KNOWN,
-            axum::routing::post(auth::well_known_connect_callback).get(auth::well_known_connect_page),
-        )
+    // The auth-callback allow-list (II #4091): before contacting the connect
+    // callback named in the link fragment, II fetches this origin-global
+    // document and requires the callback to be EXACTLY one of the declared
+    // entries — fail-closed, so serving it is mandatory once #4091 ships. One
+    // document declares both instances' callbacks (the path carries no
+    // instance prefix). CORS-open: II's frontend fetches it cross-origin.
+    let auth_callbacks = axum::Router::new()
+        .route(auth::AUTH_CALLBACKS_WELL_KNOWN, axum::routing::get(auth::auth_callbacks))
         .with_state(vec![store_beta.clone(), store_prod.clone()]);
     let oauth = discovery_beta
         .merge(discovery_prod)
         .merge(oauth_endpoints(store_beta.clone()))
         .nest("/prod", oauth_endpoints(store_prod.clone()))
-        .merge(pinned_connect)
+        .merge(auth_callbacks)
         .layer(cors);
 
     // When this process started — i.e. when the deployment last (re)started.
