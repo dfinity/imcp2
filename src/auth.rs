@@ -903,25 +903,53 @@ fn csp_nonce() -> String {
 /// `#delegation=<JSON.stringify(DelegationChain.toJSON())>&state=<state>`,
 /// percent-encoded by `URLSearchParams` — so `p.get('delegation')` yields the
 /// chain's JSON text, forwarded to the redeem endpoint verbatim.
+/// The pinned page's inline script, kept as a PLAIN string — not a `format!`
+/// template — so the JavaScript reads naturally (no doubled braces, room for
+/// comments). The one dynamic value, the redeem URL, is spliced in by replacing
+/// `__REDEEM_URL__`, which sits inside a quoted JS string literal below.
+const PINNED_PAGE_JS: &str = r#"(function () {
+  function show(t) { document.getElementById('m').textContent = t; }
+  // II delivers #delegation=<DelegationChain JSON>&state=<state>,
+  // percent-encoded by URLSearchParams — and decoded again by it here.
+  var params = new URLSearchParams(location.hash.slice(1));
+  var body = JSON.stringify({
+    state: params.get('state') || '',
+    delegation: params.get('delegation') || ''
+  });
+  // Scrub the delegation from the address bar, keeping the path and any query
+  // string the declared callback carries. Best-effort: the POST below works
+  // even if a browser refuses the history call.
+  try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+  fetch("__REDEEM_URL__", {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    credentials: 'same-origin',
+    body: body
+  })
+    .then(function (r) { return r.json().catch(function () { return {}; }); })
+    .then(function (d) {
+      if (d && d.redirect) {
+        location.replace(d.redirect);
+      } else {
+        show((d && d.error) || 'Could not finish the connection — restart from your client.');
+      }
+    })
+    .catch(function () {
+      show('Could not reach the server — restart from your client.');
+    });
+})();"#;
+
 fn pinned_callback_page(prefix: &str) -> Response {
     let nonce = csp_nonce();
     let redeem = js_escape(&format!("{prefix}/oauth/connect/redeem"));
+    let script = PINNED_PAGE_JS.replace("__REDEEM_URL__", &redeem);
     let html = format!(
         "<!DOCTYPE html><html><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>Finishing sign-in…</title></head>\
          <body style=\"font-family:system-ui;max-width:32rem;margin:3rem auto\">\
          <p id=m>Finishing sign-in…</p>\
-         <script nonce=\"{nonce}\">(function(){{\
-         function show(t){{document.getElementById('m').textContent=t;}}\
-         var p=new URLSearchParams(location.hash.slice(1));\
-         var body=JSON.stringify({{state:p.get('state')||'',delegation:p.get('delegation')||''}});\
-         try{{history.replaceState(null,'',location.pathname+location.search);}}catch(e){{}}\
-         fetch(\"{redeem}\",{{method:'POST',headers:{{'content-type':'application/json'}},credentials:'same-origin',body:body}})\
-         .then(function(r){{return r.json().catch(function(){{return {{}};}});}})\
-         .then(function(d){{if(d&&d.redirect){{location.replace(d.redirect);}}else{{show((d&&d.error)||'Could not finish the connection — restart from your client.');}}}})\
-         .catch(function(){{show('Could not reach the server — restart from your client.');}});\
-         }})();</script></body></html>"
+         <script nonce=\"{nonce}\">{script}</script></body></html>"
     );
     // `frame-ancestors 'none'`: II reaches this page only by top-level
     // navigation, so framing is never legitimate — deny it outright so the
@@ -1967,6 +1995,7 @@ mod tests {
         );
         assert!(html.contains("location.hash"), "the page reads the fragment client-side");
         assert!(html.contains("/prod/oauth/connect/redeem"), "posts to the instance's redeem path");
+        assert!(!html.contains("__REDEEM_URL__"), "the redeem-URL placeholder must be substituted");
     }
 
     // A well-formed fragment payload — agent-js `DelegationChain.toJSON()`
@@ -2005,7 +2034,9 @@ mod tests {
         let (uk, chain) = super::parse_registration_delegation(&chain_json).expect("parse");
         assert_eq!(uk, der_preg);
         assert_eq!(chain.len(), 2, "both hops preserved, in order");
-        // Hop 1: canister-signed P_reg -> Y, targeted at the II canister.
+        // Hop 1: canister-signed P_reg -> Y. Its `targets` round-trips from
+        // principal text (`aaaaa-aa` here as a stand-in; live chains carry the
+        // II canister id).
         assert_eq!(chain[0].delegation.pubkey, der_y);
         assert_eq!(chain[0].delegation.expiration, 66);
         assert_eq!(chain[0].signature, sig_canister);
