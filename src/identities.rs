@@ -13,9 +13,12 @@
 //!     at connect.
 //!   * **Phase 2 (registration delegation)**: the server also mints a
 //!     per-connect **registration key `X`**; II delivers a single-use,
-//!     canister-signed chain `P_reg -> X` to the pinned callback page, and the
-//!     server redeems it with ONE `mcp_register_v2(pub(S))` call signed as `X`
-//!     ([`Identities::redeem_registration_delegation`]).
+//!     TWO-hop chain `P_reg -> Y -> X` to the pinned callback page — the
+//!     canister-signed `P_reg -> Y` targets an ephemeral key `Y` held only by
+//!     II's frontend (so the piece that transits the IC is inert on its own),
+//!     and the browser-signed `Y -> X` extends it to our registration key —
+//!     and the server redeems it with ONE `mcp_register_v2(pub(S))` call
+//!     signed as `X` ([`Identities::redeem_registration_delegation`]).
 //!
 //! From registration on, the two are identical: the server signs II's `mcp_*`
 //! calls directly with `S` until the grant expires or is revoked.
@@ -591,15 +594,19 @@ impl Identities {
             .is_ok()
     }
 
-    /// **Phase 2 — redeem a registration delegation.** Given the canister-signed
-    /// delegation `P_reg -> X` that II delivered to the pinned callback (decoded
-    /// by `crate::auth` into `reg_user_key = der(P_reg)` and a one-link `chain`),
-    /// build a `DelegatedIdentity` from `priv(X)` + that chain and make ONE
-    /// authenticated `mcp_register_v2` update. II verifies `caller() == P_reg`,
-    /// reads `{anchor, permissions}` from its own index (never from arguments),
-    /// binds this session's long-lived key `S` to the anchor, and returns
-    /// `{expiration, permissions}`. We record both, so the grant-expiry check and
-    /// the H2 read-only guard behave exactly as they do off the v1 completion POST.
+    /// **Phase 2 — redeem a registration delegation.** Given the TWO-hop chain
+    /// `P_reg -> Y -> X` that II delivered to the pinned callback (decoded by
+    /// `crate::auth` into `reg_user_key = der(P_reg)` and `chain`; `Y` is an
+    /// ephemeral key held only by II's frontend — the canister-signed hop
+    /// targets it so the piece that transits the IC is inert on its own, and
+    /// the browser-signed `Y -> X` hop completes the chain only in the
+    /// consenting browser), build a `DelegatedIdentity` from `priv(X)` + that
+    /// chain and make ONE authenticated `mcp_register_v2` update. II verifies
+    /// `caller() == P_reg`, reads `{anchor, permissions}` from its own index
+    /// (never from arguments), binds this session's long-lived key `S` to the
+    /// anchor, and returns `{expiration, permissions}`. We record both, so the
+    /// grant-expiry check and the H2 read-only guard behave exactly as they do
+    /// off the v1 completion POST.
     ///
     /// > **Gated on Internet Identity.** `mcp_register_v2` and the delegation-
     /// > minting methods do not exist on DEPLOYED II yet, so this path cannot be
@@ -630,28 +637,10 @@ impl Identities {
             (reg_seed, reg_der, s.pubkey_der.clone())
         };
 
-        // The delegation must terminate at X (the key we hold `priv` for), else
-        // we cannot sign the ingress it authorizes. A mismatch means the fragment
-        // carried a delegation toward a different key — reject rather than sign.
-        match chain.last() {
-            Some(last) if last.delegation.pubkey == reg_der => {}
-            Some(_) => {
-                return Err("registration delegation does not delegate to this connect's \
-                            registration key"
-                    .to_string())
-            }
-            None => return Err("registration delegation chain is empty".to_string()),
-        }
-
-        // Sign `mcp_register_v2` AS X, presenting the `P_reg -> X` chain.
+        // Sign `mcp_register_v2` AS X, presenting the `P_reg -> Y -> X` chain.
         // `reg_user_key` is `der(P_reg)`: the chain root II recovers `caller() ==
         // P_reg` from.
-        let identity = DelegatedIdentity::new(
-            reg_user_key,
-            Box::new(BasicIdentity::from_raw_key(&reg_seed)),
-            chain,
-        )
-        .map_err(|e| format!("invalid registration delegation chain: {e}"))?;
+        let identity = registration_identity(reg_user_key, reg_seed, &reg_der, chain)?;
         let agent = Agent::builder()
             .with_url(IC_URL)
             .with_identity(identity)
@@ -861,6 +850,33 @@ fn build_identity(app: &AppDelegation) -> Result<DelegatedIdentity, String> {
     let key = BasicIdentity::from_raw_key(&app.app_key_seed);
     DelegatedIdentity::new(app.user_key.clone(), Box::new(key), app.chain.clone())
         .map_err(|e| format!("invalid delegation chain: {e}"))
+}
+
+/// Build the identity that redeems a registration delegation: `priv(X)` signing
+/// at the end of the delivered `P_reg -> Y -> X` chain, with `der(P_reg)` as
+/// the chain root. Guards locally that the chain is non-empty and its FINAL hop
+/// delegates to this connect's `X` — the only key we hold the private half of,
+/// so a chain toward any other key is rejected before signing anything. Length
+/// is otherwise not constrained here: the replica authoritatively verifies
+/// every hop (the canister signature on `P_reg -> Y`, the `Y` signature on
+/// `Y -> X`) at redemption.
+fn registration_identity(
+    reg_user_key: Vec<u8>,
+    reg_seed: [u8; 32],
+    reg_der: &[u8],
+    chain: Vec<SignedDelegation>,
+) -> Result<DelegatedIdentity, String> {
+    match chain.last() {
+        Some(last) if last.delegation.pubkey == reg_der => {}
+        Some(_) => {
+            return Err("registration delegation does not delegate to this connect's \
+                        registration key"
+                .to_string())
+        }
+        None => return Err("registration delegation chain is empty".to_string()),
+    }
+    DelegatedIdentity::new(reg_user_key, Box::new(BasicIdentity::from_raw_key(&reg_seed)), chain)
+        .map_err(|e| format!("invalid registration delegation chain: {e}"))
 }
 
 /// Render an `AccountDelegationError` as an actionable message. Any `Unauthorized`
@@ -1583,6 +1599,61 @@ mod tests {
             .await
             .expect_err("a delegation to the wrong key must be rejected");
         assert!(err.contains("does not delegate"), "got: {err}");
+    }
+
+    // The rev3 chain is TWO hops — canister-signed `P_reg -> Y` (Y held only by
+    // II's frontend) extended browser-side with `Y -> X`. Build the exact shape
+    // with Ed25519 stand-ins (the replica, not the client, verifies the real
+    // canister signature) and prove it yields a working signing identity whose
+    // requests carry BOTH hops in order.
+    #[test]
+    fn two_hop_registration_chain_builds_a_signing_identity() {
+        use ic_agent::agent::EnvelopeContent;
+
+        let (preg_seed, preg_der) = fresh_ed25519(); // stands in for P_reg
+        let (y_seed, y_der) = fresh_ed25519(); // II's ephemeral browser-held Y
+        let (x_seed, x_der) = fresh_ed25519(); // our registration key X
+        let exp = now_ns() + 300 * 1_000_000_000;
+
+        let hop = |signer_seed: &[u8; 32], to_der: &[u8]| {
+            let delegation = Delegation {
+                pubkey: to_der.to_vec(),
+                expiration: exp,
+                targets: None,
+                permissions: None,
+            };
+            let signature = BasicIdentity::from_raw_key(signer_seed)
+                .sign_delegation(&delegation)
+                .expect("sign delegation")
+                .signature
+                .expect("signature present");
+            SignedDelegation { delegation, signature }
+        };
+        let chain = vec![hop(&preg_seed, &y_der), hop(&y_seed, &x_der)];
+
+        let identity = registration_identity(preg_der.clone(), x_seed, &x_der, chain)
+            .expect("a two-hop chain ending at X must build");
+        let sender = identity.sender().expect("sender");
+        let content = EnvelopeContent::Call {
+            nonce: None,
+            ingress_expiry: exp,
+            sender,
+            canister_id: Principal::management_canister(),
+            method_name: "mcp_register_v2".to_string(),
+            arg: vec![],
+            sender_info: None,
+        };
+        let signed = identity.sign(&content).expect("sign");
+        let attached = signed.delegations.expect("chain attached to the request");
+        assert_eq!(attached.len(), 2, "both hops must ride the request");
+        assert_eq!(attached[0].delegation.pubkey, y_der, "hop 1 targets Y");
+        assert_eq!(attached[1].delegation.pubkey, x_der, "hop 2 targets X");
+
+        // A chain whose FINAL hop targets some other key is rejected before any
+        // signing — we don't hold that key's private half.
+        let (_, other_der) = fresh_ed25519();
+        let bad = vec![hop(&preg_seed, &y_der), hop(&y_seed, &other_der)];
+        assert!(registration_identity(preg_der, x_seed, &x_der, bad).is_err());
     }
 
     // Redemption with no registration key minted, or an empty chain, fails

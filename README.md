@@ -285,10 +285,14 @@ A successor connect flow (the *registration delegation* design) removes the
 weakest link in v1: today II binds a session key it was merely **shown** (fetched
 from our callback), so any path on the trusted origin that can be made to echo an
 attacker's key lets II bind it. Phase 2 replaces the fetched key with a
-**single-use, canister-signed delegation `P_reg → X`** that II mints under the
-user's own authentication and delivers to a **pinned callback page** as a URL
-fragment; the backend redeems it by signing **one** `mcp_register_v2` call as `X`.
-II never again binds a bare key it was shown.
+**single-use, two-hop delegation chain `P_reg → Y → X`** delivered to a
+**pinned callback page** as a URL fragment: II's canister signs `P_reg → Y`
+toward an ephemeral key `Y` held only by II's frontend — so the piece that
+transits the IC (replicas, boundary nodes, the public state tree) is inert on
+its own — and the frontend extends it browser-side with a `Y`-signed hop to the
+server's registration key `X`, assembling the redeemable chain only in the
+consenting browser. The backend redeems it by signing **one** `mcp_register_v2`
+call as `X`. II never again binds a bare key it was shown.
 
 **The server runs both protocols side by side, selected per II instance:**
 
