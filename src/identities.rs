@@ -1627,6 +1627,8 @@ mod tests {
     // would fail II's decode, not silently drop).
     #[test]
     fn mcp_register_v2_args_encode_the_consent_echo() {
+        use candid::types::value::IDLArgs;
+
         let consent = RegistrationConsent {
             anchor: 42,
             permissions: Some(IiPermissions::Queries),
@@ -1635,12 +1637,46 @@ mod tests {
         let session_der = vec![1u8, 2, 3];
         let bytes = Encode!(&consent.anchor, &session_der, &consent.permissions, &consent.max_ttl_ns)
             .expect("encode");
+
+        // Typed round-trip: the arg order/types, and that a decoder built from
+        // the same types recovers each value.
         let (a, k, p, t) =
             Decode!(&bytes, u64, Vec<u8>, Option<IiPermissions>, Option<u64>).expect("decode");
         assert_eq!(a, 42);
         assert_eq!(k, session_der);
         assert_eq!(p, Some(IiPermissions::Queries));
         assert_eq!(t, Some(2_592_000_000_000_000));
+
+        // Lock the ON-WIRE variant label independently of `IiPermissions`.
+        // Candid hashes variant labels one-way onto the wire, so the typed
+        // round-trip above cannot see a label regression: if the
+        // `queries`/`all` renames ever dropped to the Rust identifiers
+        // `Queries`/`All`, encode AND decode would shift together and still
+        // pass here — yet II (which expects `queries`/`all`) would reject the
+        // call. So compare a TYPELESS decode of the permissions arg against the
+        // same wire round-trip of a literal `variant { … }` parsed from text;
+        // the typeless form carries only the hashed label, so it matches only
+        // when the labels agree. `literal` reduces a bare `variant { v }`
+        // through encode → typeless-decode → text, exactly as arg[2] was.
+        let literal = |v: &str| {
+            let b = candid_parser::parse_idl_args(&format!("(opt variant {{ {v} }})"))
+                .expect("parse literal")
+                .to_bytes()
+                .expect("encode literal");
+            IDLArgs::from_bytes(&b).expect("typeless-decode literal").args[0].to_string()
+        };
+        let wire_perm = |arg_bytes: &[u8]| {
+            IDLArgs::from_bytes(arg_bytes).expect("typeless-decode args").args[2].to_string()
+        };
+        assert_eq!(wire_perm(&bytes), literal("queries"), "on-wire permissions must be `opt variant {{ queries }}`");
+        // Sanity: `all` hashes to a DIFFERENT wire label than `queries`, so the
+        // check above genuinely pins `queries` and isn't matching everything.
+        assert_ne!(wire_perm(&bytes), literal("all"));
+
+        // And `all` maps to its own wire label.
+        let all_bytes = Encode!(&consent.anchor, &session_der, &Some(IiPermissions::All), &consent.max_ttl_ns)
+            .expect("encode all");
+        assert_eq!(wire_perm(&all_bytes), literal("all"), "on-wire permissions must be `opt variant {{ all }}`");
     }
 
     // The fragment's permissions value maps onto the closed variant, failing
