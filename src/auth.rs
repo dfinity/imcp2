@@ -1399,20 +1399,23 @@ async fn token_authorization_code(store: AuthStore, req: TokenForm) -> Response 
     issue_token(&store, &grant.session_id).await
 }
 
-/// The access-token lifetime, matched to the II grant ("never issue a token that
-/// outlives the grant"): the token expires exactly when the grant does, so the
-/// session duration the user picks on II's consent screen (10 minutes up to 30
-/// days) is how long the client's token stays valid — there is no separate fixed
-/// cap. Keeping the client's view aligned with the grant means it re-auths right
-/// when the grant lapses (a 401 `invalid_token` + inline re-auth) instead of
-/// hitting opaque tool errors on a live-looking token, and an already-expired
-/// grant yields a zero TTL (the token is born invalid). When the expiration is
-/// unknown at issue time (e.g. the connect completion POST didn't land) we fall
-/// back to `default`; the grant is still the hard ceiling at II either way.
+/// The access-token lifetime. The II grant is the hard ceiling at II (a signed
+/// call 401s once it lapses), so this governs only the CLIENT's view, and it
+/// does so asymmetrically: a grant that outlasts the default may **extend** the
+/// token (a week-long session the user picked mints a week-long token — no fixed
+/// 1h cap), but the grant expiration may never **shorten** the token below
+/// `default`. That expiration arrives on the connect-completion POST, which is
+/// best-effort, unauthenticated, and races the token exchange; an
+/// at/near/behind-`now` value (clock skew, or a stale/dropped POST) would
+/// otherwise mint a token that is born invalid — surfaced by the client as a
+/// failed connection (it never leaves the OAuth callback), not the intended
+/// clean re-auth. Flooring at `default` keeps the token usable and leans on the
+/// grant's hard ceiling at II to drive the eventual 401 + inline re-auth. When
+/// the expiration is unknown at issue time we likewise fall back to `default`.
 fn token_ttl(default: Duration, grant_expiration_ns: Option<u64>, now_ns: u64) -> Duration {
     match grant_expiration_ns {
-        Some(exp_ns) => Duration::from_nanos(exp_ns.saturating_sub(now_ns)),
-        None => default,
+        Some(exp_ns) if exp_ns > now_ns => Duration::from_nanos(exp_ns - now_ns).max(default),
+        _ => default,
     }
 }
 
@@ -1745,35 +1748,36 @@ mod tests {
 
     /// Guide: "never issue a token that outlives the grant." The token TTL is
     /// the grant's remaining lifetime when known — so a long session (e.g. the
-    /// user picked a week) mints a correspondingly long token, with no fixed 1h
-    /// cap — falling back to the default only when the expiration is unknown; an
-    /// already-expired grant yields a zero TTL (the token is born invalid,
-    /// steering the client to re-auth).
+    /// user picked a week) EXTENDS the token beyond the default, with no fixed 1h
+    /// cap — but the grant (a best-effort, racy completion-POST hint) can never
+    /// SHORTEN the token below the default, so a token is never born invalid from
+    /// an at/near/behind-`now` expiration (clock skew, or a stale/dropped POST).
+    /// The grant stays the hard ceiling at II, which drives the eventual clean
+    /// re-auth. This floor is the fix for the production connector regression
+    /// where a zero-TTL token 401'd the client's first call and stuck the OAuth
+    /// callback.
     #[test]
-    fn token_ttl_tracks_grant_expiration() {
+    fn token_ttl_extends_for_long_grants_but_floors_at_default() {
         use std::time::Duration;
         let default = Duration::from_secs(3600);
         let now_ns: u64 = 1_000_000_000_000_000_000;
         // No known expiration → the fallback default.
         assert_eq!(super::token_ttl(default, None, now_ns), default);
-        // Grant known and longer than the default → the FULL remaining grant
-        // (the old fixed 1h cap is gone: a 1-day grant mints a 1-day token).
+        // Grant longer than the default → the FULL remaining grant (no 1h cap:
+        // a 1-day grant mints a 1-day token).
         let far = now_ns + 86_400 * 1_000_000_000;
         assert_eq!(
             super::token_ttl(default, Some(far), now_ns),
             Duration::from_secs(86_400)
         );
-        // Grant known and shorter than the default (user picked 10 min) → that.
+        // Grant shorter than the default → floored at the default, NOT the short
+        // remaining: a best-effort hint must never shorten the client's token.
         let soon = now_ns + 600 * 1_000_000_000;
-        assert_eq!(
-            super::token_ttl(default, Some(soon), now_ns),
-            Duration::from_secs(600)
-        );
-        // Grant already expired → zero (never a negative-wrap).
-        assert_eq!(
-            super::token_ttl(default, Some(now_ns - 1), now_ns),
-            Duration::ZERO
-        );
+        assert_eq!(super::token_ttl(default, Some(soon), now_ns), default);
+        // Expiration at or behind `now` (skew / stale POST) → the default, never
+        // a zero / born-invalid token. This is the regression this guards.
+        assert_eq!(super::token_ttl(default, Some(now_ns), now_ns), default);
+        assert_eq!(super::token_ttl(default, Some(now_ns - 1), now_ns), default);
     }
 
     /// RFC 7591 / guide: requested grant types are INTERSECTED with the
