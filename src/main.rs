@@ -124,24 +124,24 @@ impl IcTools {
         {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(did) => {
-                    // Signal an OQL query surface structurally (`oql: true`) and
-                    // with a one-line text pointer to the on-demand guide — the
-                    // full primer is NOT inlined here (see get_oql_guide /
-                    // OQL_USAGE_URI). The raw `.did` stays the structured `candid`
-                    // field, so the typed encode/decode path is unaffected.
+                    // Signal an OQL query surface structurally (`oql: true`). When
+                    // set, the guidance pointer is emitted as a SEPARATE content
+                    // block, so the first block stays the raw `.did` (still valid,
+                    // copy-pastable Candid) — the full primer is served on demand
+                    // (see get_oql_guide / OQL_USAGE_URI), never inlined.
                     let oql = calls::has_oql(&did);
-                    let text = if oql {
-                        format!(
-                            "{did}\n\nThis canister exposes an OQL query surface (a JSON query \
-                             language over its `schema`/`execute` methods). Before querying it, \
-                             load the guide with get_oql_guide (or read the `{OQL_USAGE_URI}` \
-                             resource), then query via call_canister with is_query=true."
-                        )
+                    let output = calls::GetCandidOutput { canister_id, candid: did.clone(), oql };
+                    if oql {
+                        let note = format!(
+                            "This canister exposes an OQL query surface (a JSON query language \
+                             over its `schema`/`execute` methods). Before querying it, load the \
+                             guide with get_oql_guide (or read the `{OQL_USAGE_URI}` resource), \
+                             then query via call_canister with is_query=true."
+                        );
+                        Ok(ok_structured_blocks(vec![did, note], &output))
                     } else {
-                        did.clone()
-                    };
-                    let output = calls::GetCandidOutput { canister_id, candid: did, oql };
-                    Ok(ok_structured(text, &output))
+                        Ok(ok_structured(did, &output))
+                    }
                 }
                 Err(e) => Ok(err(format!("metadata is not valid UTF-8: {e}"))),
             },
@@ -902,7 +902,19 @@ fn ok(text: String) -> CallToolResult {
 /// failure) falls back to text-only rather than emitting structured content
 /// that couldn't match the declared schema.
 fn ok_structured<T: serde::Serialize>(text: String, value: &T) -> CallToolResult {
-    let mut result = ok(text);
+    ok_structured_blocks(vec![text], value)
+}
+
+/// Like [`ok_structured`], but emits several text content blocks instead of one.
+/// The first block is the primary payload (e.g. a canister's raw `.did`); any
+/// further blocks are separate notes. Keeping them distinct means a consumer
+/// that copies the first block gets clean data (the `.did` stays valid,
+/// paste-able Candid), while the model still sees the trailing note(s) — used by
+/// `get_candid` to attach the OQL pointer without contaminating the interface
+/// text. The structured `value` is attached under the same object-rooted rule as
+/// [`ok_structured`].
+fn ok_structured_blocks<T: serde::Serialize>(texts: Vec<String>, value: &T) -> CallToolResult {
+    let mut result = CallToolResult::success(texts.into_iter().map(Content::text).collect());
     result.structured_content = match serde_json::to_value(value) {
         Ok(v @ serde_json::Value::Object(_)) => Some(v),
         _ => None,
