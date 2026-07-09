@@ -422,8 +422,9 @@ impl Identities {
 
     /// Ensure a **registration key `X`** exists for this connect and return its
     /// public key (base64url, no pad, DER). This is what the Phase-2 connect link
-    /// carries outbound to II (`pub(X)`); II certifies a delegation `P_reg -> X`
-    /// toward it. `priv(X)` never leaves the backend — only this public half is
+    /// carries outbound to II (`pub(X)`); II certifies a two-hop chain
+    /// `P_reg -> Y -> X` whose final hop targets it. `priv(X)` never leaves the
+    /// backend — only this public half is
     /// ever exposed. Minting is idempotent per session, so the same `X` is used
     /// for the whole connect (a re-issued link reuses it). See
     /// [`Self::redeem_registration_delegation`] for the redemption that consumes
@@ -1020,8 +1021,9 @@ pub(crate) struct RegistrationConsent {
 struct McpRegisterV2Ok {
     /// Grant expiration (ns since the Unix epoch).
     expiration: u64,
-    /// The recorded access level (from II's index, chosen at consent) — a
-    /// NON-optional named variant, unlike the delegation record's `opt text`.
+    /// The access level II confirms for the grant (the level chosen at consent,
+    /// which it re-derived from the echoed consent tuple) — a NON-optional named
+    /// variant, unlike the delegation record's `opt text`.
     permissions: IiPermissions,
 }
 /// `mcp_register_v2`'s reply — a `variant { Ok; Err : text }`, aliased so the
