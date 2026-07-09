@@ -128,7 +128,10 @@ use crate::identities::Identities;
 const CONNECT_TTL: Duration = Duration::from_secs(600);
 /// Lifetime of a minted authorization code.
 const CODE_TTL: Duration = Duration::from_secs(120);
-/// Access-token lifetime (also the II grant's default, 1h).
+/// Fallback access-token lifetime, used only when the II grant's expiration is
+/// unknown at issue time (e.g. the connect completion POST didn't land). In the
+/// normal flow the token's lifetime tracks the grant instead (see [`token_ttl`]),
+/// so the session duration the user picked on II's consent screen is honoured.
 const TOKEN_TTL: Duration = Duration::from_secs(3600);
 /// `ttl` (seconds) requested for the II grant. Clamped by II to [600, 2592000].
 const GRANT_TTL_SECS: u64 = 3600;
@@ -1300,23 +1303,25 @@ async fn token_authorization_code(store: AuthStore, req: TokenForm) -> Response 
     issue_token(&store, &grant.session_id).await
 }
 
-/// Bound a token's lifetime by the II grant ("never issue a token that
-/// outlives the grant"): the earlier of the standard [`TOKEN_TTL`] and the
-/// grant's expiration. The user can shorten the grant on II's consent screen
-/// (down to 10 minutes), so the fixed TTL alone can overshoot. An unknown
-/// expiration falls back to the default — the grant remains the hard ceiling
-/// at II either way; this cap is about the CLIENT's view, steering it to a
-/// 401 `invalid_token` + inline re-auth instead of opaque tool errors on a
-/// live-looking token once the grant lapses.
-fn capped_token_ttl(default: Duration, grant_expiration_ns: Option<u64>, now_ns: u64) -> Duration {
+/// The access-token lifetime, matched to the II grant ("never issue a token that
+/// outlives the grant"): the token expires exactly when the grant does, so the
+/// session duration the user picks on II's consent screen (10 minutes up to 30
+/// days) is how long the client's token stays valid — there is no separate fixed
+/// cap. Keeping the client's view aligned with the grant means it re-auths right
+/// when the grant lapses (a 401 `invalid_token` + inline re-auth) instead of
+/// hitting opaque tool errors on a live-looking token, and an already-expired
+/// grant yields a zero TTL (the token is born invalid). When the expiration is
+/// unknown at issue time (e.g. the connect completion POST didn't land) we fall
+/// back to `default`; the grant is still the hard ceiling at II either way.
+fn token_ttl(default: Duration, grant_expiration_ns: Option<u64>, now_ns: u64) -> Duration {
     match grant_expiration_ns {
-        Some(exp_ns) => default.min(Duration::from_nanos(exp_ns.saturating_sub(now_ns))),
+        Some(exp_ns) => Duration::from_nanos(exp_ns.saturating_sub(now_ns)),
         None => default,
     }
 }
 
 /// Mint + store an access token bound to the session key's principal, its
-/// lifetime capped by the II grant's expiration (see [`capped_token_ttl`]).
+/// lifetime matched to the II grant's expiration (see [`token_ttl`]).
 async fn issue_token(store: &AuthStore, session_id: &str) -> Response {
     let principal = store
         .identities
@@ -1327,7 +1332,7 @@ async fn issue_token(store: &AuthStore, session_id: &str) -> Response {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64;
-    let ttl = capped_token_ttl(
+    let ttl = token_ttl(
         TOKEN_TTL,
         store.identities.grant_expiration_ns(session_id).await,
         now_ns,
@@ -1643,28 +1648,34 @@ mod tests {
     }
 
     /// Guide: "never issue a token that outlives the grant." The token TTL is
-    /// the earlier of the default and the grant's remaining lifetime; unknown
-    /// expiration falls back to the default; an already-expired grant yields a
-    /// zero TTL (the token is born invalid, steering the client to re-auth).
+    /// the grant's remaining lifetime when known — so a long session (e.g. the
+    /// user picked a week) mints a correspondingly long token, with no fixed 1h
+    /// cap — falling back to the default only when the expiration is unknown; an
+    /// already-expired grant yields a zero TTL (the token is born invalid,
+    /// steering the client to re-auth).
     #[test]
-    fn token_ttl_is_capped_by_grant_expiration() {
+    fn token_ttl_tracks_grant_expiration() {
         use std::time::Duration;
         let default = Duration::from_secs(3600);
         let now_ns: u64 = 1_000_000_000_000_000_000;
-        // No known expiration → the default.
-        assert_eq!(super::capped_token_ttl(default, None, now_ns), default);
-        // Grant outlives the default → the default.
+        // No known expiration → the fallback default.
+        assert_eq!(super::token_ttl(default, None, now_ns), default);
+        // Grant known and longer than the default → the FULL remaining grant
+        // (the old fixed 1h cap is gone: a 1-day grant mints a 1-day token).
         let far = now_ns + 86_400 * 1_000_000_000;
-        assert_eq!(super::capped_token_ttl(default, Some(far), now_ns), default);
-        // Grant shorter than the default (user picked 10 min) → capped.
+        assert_eq!(
+            super::token_ttl(default, Some(far), now_ns),
+            Duration::from_secs(86_400)
+        );
+        // Grant known and shorter than the default (user picked 10 min) → that.
         let soon = now_ns + 600 * 1_000_000_000;
         assert_eq!(
-            super::capped_token_ttl(default, Some(soon), now_ns),
+            super::token_ttl(default, Some(soon), now_ns),
             Duration::from_secs(600)
         );
         // Grant already expired → zero (never a negative-wrap).
         assert_eq!(
-            super::capped_token_ttl(default, Some(now_ns - 1), now_ns),
+            super::token_ttl(default, Some(now_ns - 1), now_ns),
             Duration::ZERO
         );
     }

@@ -672,7 +672,8 @@ impl ServerHandler for IcTools {
              exposed here. If a principal, account, or balance doesn't match what the user sees in \
              their browser at that app, say so and offer to look up the app's ii-alternative-origins \
              (web search / fetch) and retry. The standing credential is obtained when you connect \
-             (authenticate via Internet Identity) and lasts ~60 minutes; reconnect when it expires. \
+             (authenticate via Internet Identity) and lasts for the session duration you choose when \
+             connecting (up to 30 days); reconnect when it expires. \
              The session may be READ-ONLY (Internet Identity's consent screen defaults to read-only): \
              reads work, but the canister-management tools below make update calls the network \
              rejects for a read-only session — if one fails that way, ask the user to reconnect with \
