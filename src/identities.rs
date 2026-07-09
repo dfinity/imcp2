@@ -17,8 +17,10 @@
 //!     canister-signed `P_reg -> Y` targets an ephemeral key `Y` held only by
 //!     II's frontend (so the piece that transits the IC is inert on its own),
 //!     and the browser-signed `Y -> X` extends it to our registration key —
-//!     and the server redeems it with ONE `mcp_register_v2(pub(S))` call
-//!     signed as `X` ([`Identities::redeem_registration_delegation`]).
+//!     and the server redeems it with ONE `mcp_register_v2(anchor,
+//!     pub(S), permissions, max_ttl)` call signed as `X`, echoing the
+//!     fragment's consent tuple (rev4 stateless consent)
+//!     ([`Identities::redeem_registration_delegation`]).
 //!
 //! From registration on, the two are identical: the server signs II's `mcp_*`
 //! calls directly with `S` until the grant expires or is revoked.
