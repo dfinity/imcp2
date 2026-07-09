@@ -46,6 +46,14 @@ const SKILL_URI_PREFIX: &str = "skill://";
 const CANDID_TEXTUAL_MD: &str = include_str!("../static/candid-textual-syntax.md");
 const CANDID_REFERENCE_MD: &str = include_str!("../static/candid-reference.md");
 
+/// The OQL query-surface usage guide. Served on demand (via the `get_oql_guide`
+/// tool and the `oql://usage` resource) rather than inlined into every
+/// `get_candid` reply: `get_candid` only signals `oql: true` plus a one-line
+/// pointer here, so the guidance is delivered once, when the model chooses to
+/// query, without bloating every interface read.
+const OQL_USAGE_URI: &str = "oql://usage";
+const OQL_PRIMER_MD: &str = include_str!("../static/oql-primer.md");
+
 /// Bind address. Honours `$PORT` (set by most PaaS), defaulting to 8000.
 fn bind_address() -> String {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8000".to_string());
@@ -116,8 +124,24 @@ impl IcTools {
         {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(did) => {
-                    let output = calls::GetCandidOutput { canister_id, candid: did };
-                    Ok(ok_structured(output.candid.clone(), &output))
+                    // Signal an OQL query surface structurally (`oql: true`) and
+                    // with a one-line text pointer to the on-demand guide — the
+                    // full primer is NOT inlined here (see get_oql_guide /
+                    // OQL_USAGE_URI). The raw `.did` stays the structured `candid`
+                    // field, so the typed encode/decode path is unaffected.
+                    let oql = calls::has_oql(&did);
+                    let text = if oql {
+                        format!(
+                            "{did}\n\nThis canister exposes an OQL query surface (a JSON query \
+                             language over its `schema`/`execute` methods). Before querying it, \
+                             load the guide with get_oql_guide (or read the `{OQL_USAGE_URI}` \
+                             resource), then query via call_canister with is_query=true."
+                        )
+                    } else {
+                        did.clone()
+                    };
+                    let output = calls::GetCandidOutput { canister_id, candid: did, oql };
+                    Ok(ok_structured(text, &output))
                 }
                 Err(e) => Ok(err(format!("metadata is not valid UTF-8: {e}"))),
             },
@@ -125,6 +149,19 @@ impl IcTools {
                 "could not read candid:service metadata: {e}"
             ))),
         }
+    }
+
+    #[tool(
+        description = "Load the OQL query-surface guide: how to query an OQL-capable canister — one whose Candid interface exposes a `schema` and an `execute` method (get_candid reports `oql: true` for it). OQL is a self-describing JSON query language (filters, aggregation, ordering, edge traversal) driven through call_canister with is_query=true. Call this before querying such a canister so you write correct `execute` queries instead of guessing bespoke methods.",
+        annotations(title = "Get the OQL query guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<calls::OqlGuideOutput>(),
+    )]
+    async fn get_oql_guide(
+        &self,
+        Parameters(_args): Parameters<management::NoArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let output = calls::OqlGuideOutput { content: OQL_PRIMER_MD.to_string() };
+        Ok(ok_structured(output.content.clone(), &output))
     }
 
     #[tool(
@@ -657,7 +694,10 @@ impl ServerHandler for IcTools {
              \"ckUSDC\"), use `find_canister` to look it up by name in the IC dashboard's \
              registries and get its canister id. `lookup_canister(id)` tells you what a bare \
              canister id IS (dashboard label, type, controllers, subnet). `get_candid` fetches a \
-             canister's Candid interface. `call_canister` calls a method with textual Candid \
+             canister's Candid interface; if it reports `oql: true`, the canister exposes an OQL \
+             query surface — call `get_oql_guide` (or read the `oql://usage` resource) to learn \
+             the JSON query dialect, then query it via `call_canister` with is_query=true. \
+             `call_canister` calls a method with textual Candid \
              in/out: omit `domain` to call anonymously, or pass an application domain (e.g. \
              domain=\"oisy.com\") to call as your account at that app — a short-lived (<=5 min) \
              account delegation for it is minted ON DEMAND from this connection's standing \
@@ -705,6 +745,8 @@ impl ServerHandler for IcTools {
                 .no_annotation(),
             RawResource::new(CANDID_REFERENCE_URI, "Candid type reference (full spec)")
                 .no_annotation(),
+            RawResource::new(OQL_USAGE_URI, "OQL query surface usage guide")
+                .no_annotation(),
         ];
         // Surface the IC skills as resources too (best-effort: if the registry is
         // unreachable, the candid resources above still list). Each `skill://<name>`
@@ -749,6 +791,7 @@ impl ServerHandler for IcTools {
         let body = match request.uri.as_str() {
             CANDID_TEXTUAL_URI => CANDID_TEXTUAL_MD,
             CANDID_REFERENCE_URI => CANDID_REFERENCE_MD,
+            OQL_USAGE_URI => OQL_PRIMER_MD,
             other => {
                 return Err(McpError::resource_not_found(
                     "resource_not_found",
@@ -902,6 +945,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <p>MCP endpoints: <code>POST /mcp</code> (beta Internet Identity) · <code>POST /mcp-prod</code> (production Internet Identity)</p>
 <p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>find_canister</code> (name → canister ids), <code>lookup_canister</code> (id → dashboard identity), <code>get_candid</code>, <code>call_canister</code> (anonymously, or as your account at an application domain, derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (your principal at an application domain, no call), <code>list_accounts</code> (your Internet Identity accounts at an app domain). All speak textual Candid.</p>
 <p>Skills: <code>list_ic_skills</code> / <code>get_ic_skill</code> (the official IC how-to guides — Motoko, mops, icp CLI, cycles, …).</p>
+<p>OQL: <code>get_oql_guide</code> (query guide for canisters that expose an OQL <code>schema</code>/<code>execute</code> surface — <code>get_candid</code> reports <code>oql: true</code> for them).</p>
 <p>Canister management (as your Internet Identity): <code>cycles_balance</code>, <code>create_canister</code>, <code>install_code</code>, <code>canister_status</code>, <code>update_canister_settings</code>, <code>start_canister</code>, <code>stop_canister</code>, <code>uninstall_code</code>, <code>delete_canister</code>, <code>top_up_canister</code>.</p>
 </body></html>"#;
 
@@ -1189,7 +1233,7 @@ mod tests {
     #[test]
     fn every_tool_has_correct_read_write_annotations() {
         let tools = super::IcTools::tool_router().list_all();
-        assert_eq!(tools.len(), 19, "expected 19 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 20, "expected 20 tools, got {}", tools.len());
         assert!(
             tools.iter().all(|t| t.annotations.is_some()),
             "every tool must carry annotations (else clients assume write/destructive)"
@@ -1208,7 +1252,7 @@ mod tests {
         // gate destructive on read_only can't mislabel them.
         for name in [
             "get_candid", "discover_canisters", "find_canister", "lookup_canister",
-            "list_ic_skills", "get_ic_skill", "list_accounts", "cycles_balance",
+            "list_ic_skills", "get_ic_skill", "get_oql_guide", "list_accounts", "cycles_balance",
             "get_principal", "canister_status",
         ] {
             let a = ann(name);

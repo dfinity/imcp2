@@ -35,6 +35,18 @@ pub struct GetCandidOutput {
     pub canister_id: String,
     /// The Candid (`.did`) interface text.
     pub candid: String,
+    /// True when the interface exposes the standard OQL query surface (both a
+    /// `schema` and an `execute` method). When set, load `get_oql_guide` (or the
+    /// `oql://usage` resource) to learn the JSON query dialect before querying.
+    pub oql: bool,
+}
+
+/// Output of `get_oql_guide`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct OqlGuideOutput {
+    /// The OQL usage guide (markdown): the `schema`/`execute` methods, the JSON
+    /// query object, the predicate grammar, edges, and the result shape.
+    pub content: String,
 }
 
 /// Arguments for `call_canister`.
@@ -280,6 +292,28 @@ pub fn decode_bytes_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<St
     Some(decoded.to_string())
 }
 
+/// True when `did` exposes the standard OQL query surface: BOTH a `schema` and
+/// an `execute` method. Detection is name-based, matching the reference IC
+/// connector — OQL is a recommended convention (not a hard contract), so a
+/// canister whose method signatures differ slightly should not be denied the
+/// guidance.
+///
+/// Fail-closed: the interface is untrusted, canister-supplied text, so it runs
+/// through [`guard_candid_text`] (CWE-674) BEFORE `candid_parser` parses it —
+/// exactly as [`decode_bytes_with_did`] does. Anything we cannot safely bound or
+/// parse yields `false`, never an error or a panic (a `.did` too large/nested to
+/// check simply doesn't advertise OQL — the same graceful degradation the decode
+/// path uses).
+pub fn has_oql(did: &str) -> bool {
+    if guard_candid_text("the `candid` interface", did).is_err() {
+        return false;
+    }
+    let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() else {
+        return false;
+    };
+    env.get_method(&actor, "schema").is_ok() && env.get_method(&actor, "execute").is_ok()
+}
+
 /// Perform a query or update call and return the raw Candid reply bytes.
 pub async fn raw_call(
     agent: &Agent,
@@ -334,5 +368,49 @@ mod tests {
         // SIBLING (non-nested) opts stay shallow.
         assert!(guard_candid_text("v", &format!("\"{}\"", "(".repeat(10_000))).is_ok());
         assert!(guard_candid_text("v", &format!("(record {{ {} }})", "a = opt 1; ".repeat(1000))).is_ok());
+    }
+
+    // OQL detection is name-based (both `schema` and `execute` must be present),
+    // fail-closed (unparseable / over-limit interfaces yield `false`, never a
+    // panic), so the untrusted candid:service text can't crash detection.
+    #[test]
+    fn has_oql_detects_schema_and_execute() {
+        use super::has_oql;
+        // Both methods present → OQL.
+        let oql = r#"
+            service : {
+                schema : () -> (text) query;
+                execute : (text) -> (variant { ok : text; err : text }) query;
+                unrelated : (nat) -> (nat) query;
+            }
+        "#;
+        assert!(has_oql(oql), "schema + execute should be detected as OQL");
+
+        // Missing `execute` → not OQL.
+        let only_schema = "service : { schema : () -> (text) query; }";
+        assert!(!has_oql(only_schema), "schema alone is not OQL");
+
+        // Missing `schema` → not OQL.
+        let only_execute = "service : { execute : (text) -> (text) query; }";
+        assert!(!has_oql(only_execute), "execute alone is not OQL");
+
+        // A plain canister with neither method → not OQL.
+        let plain = "service : { greet : (text) -> (text) query; }";
+        assert!(!has_oql(plain), "unrelated interface is not OQL");
+
+        // Name-based, not signature-based: differing arg/return types still count
+        // (matches the reference connector; OQL is a recommended convention).
+        let loose = "service : { schema : () -> (blob); execute : (blob) -> (nat); }";
+        assert!(has_oql(loose), "detection is by method name, not signature");
+
+        // Fail-closed: garbage / non-service text is not OQL (no panic).
+        assert!(!has_oql("not a candid interface at all"), "garbage is not OQL");
+        assert!(!has_oql(""), "empty is not OQL");
+
+        // Fail-closed: an over-nested interface trips the CWE-674 guard BEFORE
+        // parsing, so it degrades to `false` rather than aborting the process.
+        let over_deep = format!("service : {{ schema : () -> ({}nat{}); }}",
+            "vec ".repeat(5000), "");
+        assert!(!has_oql(&over_deep), "over-limit interface must fail closed to false");
     }
 }

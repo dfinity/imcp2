@@ -21,12 +21,13 @@ results).
 | `discover_canisters` | `domain` | Canister ids behind a web domain (frontend via `x-ic-canister-id`; backend via `/env.json` + JS-bundle mining), each with provenance and its IC dashboard label/type where known |
 | `find_canister` | `query` | Canister ids matching a name/symbol, searched in the IC dashboard's service registries — ICRC token ledgers (e.g. `ckUSDC`) and the SNS project catalog |
 | `lookup_canister` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
-| `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text) |
+| `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus an `oql` flag — `true` when it exposes an OQL query surface (a `schema` + `execute` pair), with a pointer to `get_oql_guide` |
 | `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `domain?`, `account?` | Reply as textual Candid; called anonymously (no `domain`) or as your account at an application domain, derived on demand (`account` names a non-default account there) |
 | `get_principal` | `domain`, `account?` | The principal you act as at an application domain (derives the delegation on demand, same as `call_canister`), without making a call |
 | `list_accounts` | `domain` | The user's Internet Identity accounts at an app — the default account (the anchor's current default at that origin) plus any named ones — with name, account number, and last-used time; name one via `account` in `call_canister`/`get_principal` |
 | `list_ic_skills` | — | The official [IC skills](https://skills.internetcomputer.org) (Motoko, mops/icp CLIs, cycles, stable memory, security, …), grouped by category |
 | `get_ic_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `motoko`, `icp-cli`, `cycles-management`) |
+| `get_oql_guide` | — | The OQL query-surface guide: how to query a canister whose interface exposes `schema`/`execute` (`get_candid` reports `oql: true`) via `call_canister` — the JSON query object, predicate grammar, edges, and paged result shape |
 | `cycles_balance` | — | Your cycles-ledger balance (the funds `create_canister`/`top_up_canister` spend), as your standing II principal |
 | `create_canister` | `cycles?` / `icp?`, `controllers?`, `subnet?` | Create + fund a new canister — from your cycles-ledger balance (`cycles`) or by converting ICP from your ICP-ledger account via the CMC (`icp`); returns the new canister id |
 | `install_code` | `canister_id`, `wasm_base64` / `wasm_hex`, `mode?`, `arg?` | Install/reinstall/upgrade a Wasm module (single-shot, or via the chunk store for large modules) |
@@ -84,6 +85,23 @@ auth, …). The catalogue is fetched live from the registry's manifest
 nothing is bundled, so the agent always sees the current skills. They are also
 listed as MCP **resources** (`skill://<name>`) alongside the `candid://`
 references. Override the registry origin with `SKILLS_URL`.
+
+### OQL query surfaces
+
+Some canisters expose **OQL** — a self-describing, agent-queryable surface over
+their data via two Candid query methods: `schema : () -> (text) query` (a JSON
+catalogue of entities, fields, and edges) and `execute : (text) -> (Result)
+query` (a JSON query language with filters, aggregation, ordering, and edge
+traversal). `get_candid` detects the pair and reports `oql: true` (parsing the
+interface behind the same CWE-674 guard the encode/decode path uses, so a
+malformed `.did` just fails closed to `false`). Rather than inline the whole
+dialect into every interface read, `get_candid` emits only that flag plus a
+one-line pointer; the full guide is served on demand by `get_oql_guide` and as
+the `oql://usage` MCP **resource**. Queries are then issued through the ordinary
+`call_canister` tool (`method = "execute"`, `is_query = true`) — the server
+carries no OQL-specific execution logic, only the detection and the guidance.
+This mirrors the reference IC connector's built-in OQL primer, adapted to this
+server's on-demand resource/tool conventions.
 
 ### Creating & managing canisters
 
