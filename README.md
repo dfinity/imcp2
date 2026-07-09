@@ -305,6 +305,19 @@ II never again binds a bare key it was shown.
 `/version` reports which instance runs which protocol
 (`registration_delegation: {beta, prod}`).
 
+**Pinned connect endpoint (`/.well-known/ii-mcp-connect`).** II is moving to
+*pin* the connect flow to a fixed path on the trusted origin instead of taking
+the callback path from the (attacker-craftable) link fragment
+([dfinity/internet-identity#4091](https://github.com/dfinity/internet-identity/pull/4091)).
+This server already serves that path — for **both** instances, since the path
+carries no instance prefix: `POST` accepts II's v1 connect POSTs and dispatches
+them to the instance that owns the connect `state`; `GET` serves the Phase-2
+pinned page, built with every Phase-2-enabled instance's redeem endpoint (the
+instance is only knowable from the fragment, so the page tries each same-origin
+redeem in order — the wrong instance rejects the state, and each instance's
+path-scoped connect cookie only rides to its own). The per-instance
+`{prefix}/oauth/connect/callback` routes remain for pre-pinning II frontends.
+
 Server side (on a Phase-2 instance):
 
 - **`X`, a per-connect registration keypair** bound to the connect `sid`;

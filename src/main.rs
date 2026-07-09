@@ -1086,10 +1086,23 @@ async fn main() -> anyhow::Result<()> {
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any);
+    // The pinned connect endpoint (II #4091): once II pins the connect flow to
+    // <origin>/.well-known/ii-mcp-connect, BOTH instances' connect traffic
+    // arrives at this one instance-less path. POST serves II's v1 JSON POSTs,
+    // dispatched to the instance that owns the connect state; GET serves the
+    // Phase-2 pinned page for the Phase-2-enabled instance(s). The
+    // per-instance callback routes above remain for pre-pinning II frontends.
+    let pinned_connect = axum::Router::new()
+        .route(
+            auth::MCP_CONNECT_WELL_KNOWN,
+            axum::routing::post(auth::well_known_connect_callback).get(auth::well_known_connect_page),
+        )
+        .with_state(vec![store_beta.clone(), store_prod.clone()]);
     let oauth = discovery_beta
         .merge(discovery_prod)
         .merge(oauth_endpoints(store_beta.clone()))
         .nest("/prod", oauth_endpoints(store_prod.clone()))
+        .merge(pinned_connect)
         .layer(cors);
 
     // When this process started — i.e. when the deployment last (re)started.

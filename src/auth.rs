@@ -809,6 +809,57 @@ impl AuthStore {
     }
 }
 
+// ---- Pinned connect endpoint (II #4091) ----------------------------------
+
+/// The fixed, origin-global connect path Internet Identity pins the `/mcp`
+/// connect flow to (dfinity/internet-identity#4091): once that ships, II
+/// derives the connect endpoint as `<trusted origin>` + this path and ignores
+/// the fragment-provided callback path. Served here for BOTH instances (the
+/// path has no instance prefix): POST = II's v1 JSON POSTs, dispatched to the
+/// instance that owns the connect `state`; GET = the Phase-2 pinned page for
+/// the Phase-2-enabled instance(s). The per-instance
+/// `{prefix}/oauth/connect/callback` routes stay for pre-pinning II frontends,
+/// which use the link's callback verbatim.
+pub const MCP_CONNECT_WELL_KNOWN: &str = "/.well-known/ii-mcp-connect";
+
+/// POST /.well-known/ii-mcp-connect — II's v1 connect POSTs at the pinned
+/// path. Dispatch to the instance whose store knows this pending connect's
+/// `state` (session ids are per-store UUIDs, so at most one matches); an
+/// unknown state falls through to the first instance, whose handler yields the
+/// correct semantics either way (403 for a key request, 204 for a completion).
+pub async fn well_known_connect_callback(
+    State(stores): State<Vec<AuthStore>>,
+    Json(body): Json<ConnectCallback>,
+) -> Response {
+    for store in &stores {
+        if store.authz_known(&body.state).await {
+            return connect_callback(State(store.clone()), Json(body)).await;
+        }
+    }
+    match stores.first() {
+        Some(store) => connect_callback(State(store.clone()), Json(body)).await,
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// GET /.well-known/ii-mcp-connect — the Phase-2 pinned page at the pinned
+/// path. The fragment (and therefore the instance) is invisible to the server,
+/// so the page is built with EVERY Phase-2-enabled instance's redeem endpoint
+/// and tries them in order client-side; the wrong instance rejects the state,
+/// and each instance's path-scoped connect cookie only rides to its own redeem
+/// path. 404 when no instance runs Phase 2.
+pub async fn well_known_connect_page(State(stores): State<Vec<AuthStore>>) -> Response {
+    let prefixes: Vec<&str> = stores
+        .iter()
+        .filter(|s| s.instance().registration_delegation)
+        .map(|s| s.instance().oauth_prefix)
+        .collect();
+    if prefixes.is_empty() {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    pinned_callback_page(&prefixes)
+}
+
 // ---- Phase 2: registration delegation (flag-gated) ----------------------
 
 /// GET /oauth/connect/callback — the **pinned callback page** (Phase 2 only).
@@ -823,7 +874,7 @@ pub async fn connect_callback_page(State(store): State<AuthStore>) -> Response {
     if !store.instance().registration_delegation {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    pinned_callback_page(store.instance().oauth_prefix)
+    pinned_callback_page(&[store.instance().oauth_prefix])
 }
 
 /// A fresh CSP nonce: 128 bits from the OS CSPRNG, **standard** base64. CSP3's
@@ -841,13 +892,24 @@ fn csp_nonce() -> String {
 /// The strict-CSP, non-reflecting pinned callback page. `nonce` is a fresh
 /// per-response value bound into BOTH the CSP header and the inline `<script>`,
 /// so no `'unsafe-inline'` is needed; `connect-src 'self'` limits the page's only
-/// network reach to the same-origin redeem endpoint, and `default-src 'none'`
+/// network reach to the same-origin redeem endpoint(s), and `default-src 'none'`
 /// forbids loading anything else. No attacker-supplied value (fragment, query)
 /// is ever interpolated into the HTML — the fragment is read client-side and sent
 /// via `fetch`, never written to the DOM.
-fn pinned_callback_page(prefix: &str) -> Response {
+///
+/// `prefixes` are the OAuth prefixes of the Phase-2 instance(s) this page may
+/// redeem against — one when served from an instance's own callback route, all
+/// enabled instances when served from the pinned [`MCP_CONNECT_WELL_KNOWN`]
+/// path (where the instance can't be known server-side: it's in the fragment).
+/// The script tries each same-origin redeem endpoint in order; the wrong
+/// instance rejects the unknown state (and its path-scoped connect cookie never
+/// rides there), the right one returns the redirect.
+fn pinned_callback_page(prefixes: &[&str]) -> Response {
     let nonce = csp_nonce();
-    let redeem = js_escape(&format!("{prefix}/oauth/connect/redeem"));
+    let redeem_urls: Vec<String> = prefixes.iter().map(|p| format!("{p}/oauth/connect/redeem")).collect();
+    // Server-side constants only (never attacker input); JSON is a valid JS
+    // array literal, so this embeds safely inside the nonce'd script.
+    let urls_js = serde_json::to_string(&redeem_urls).expect("static strings serialize");
     let html = format!(
         "<!DOCTYPE html><html><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
@@ -859,10 +921,15 @@ fn pinned_callback_page(prefix: &str) -> Response {
          var p=new URLSearchParams(location.hash.slice(1));\
          var body=JSON.stringify({{state:p.get('state')||'',user_key:p.get('user_key')||'',delegation:p.get('delegation')||''}});\
          try{{history.replaceState(null,'',location.pathname);}}catch(e){{}}\
-         fetch(\"{redeem}\",{{method:'POST',headers:{{'content-type':'application/json'}},credentials:'same-origin',body:body}})\
+         var urls={urls_js};\
+         function attempt(i,lastErr){{\
+         if(i>=urls.length){{show(lastErr||'Could not finish the connection — restart from your client.');return;}}\
+         fetch(urls[i],{{method:'POST',headers:{{'content-type':'application/json'}},credentials:'same-origin',body:body}})\
          .then(function(r){{return r.json().catch(function(){{return {{}};}});}})\
-         .then(function(d){{if(d&&d.redirect){{location.replace(d.redirect);}}else{{show((d&&d.error)||'Could not finish the connection — restart from your client.');}}}})\
-         .catch(function(){{show('Could not reach the server — restart from your client.');}});\
+         .then(function(d){{if(d&&d.redirect){{location.replace(d.redirect);}}else{{attempt(i+1,(d&&d.error)||lastErr);}}}})\
+         .catch(function(){{attempt(i+1,'Could not reach the server — restart from your client.');}});\
+         }}\
+         attempt(0,null);\
          }})();</script></body></html>"
     );
     let csp = format!(
@@ -1705,7 +1772,7 @@ mod tests {
     // `location.hash` and never writes it into the HTML).
     #[tokio::test]
     async fn pinned_page_has_strict_csp_matching_nonce_and_no_reflection() {
-        let resp = super::pinned_callback_page("/prod");
+        let resp = super::pinned_callback_page(&["/prod"]);
         let csp = resp
             .headers()
             .get(axum::http::header::CONTENT_SECURITY_POLICY)
@@ -1904,6 +1971,71 @@ mod tests {
         )
         .await;
         assert_eq!(redeem.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    // The pinned well-known path (II #4091) is instance-less, so its POST
+    // handler dispatches by connect state: a state pending in the SECOND store
+    // must be served by that store (claiming its PA), and an unknown state must
+    // fall through to ordinary 403 key-request semantics.
+    #[tokio::test]
+    async fn well_known_callback_dispatches_by_state() {
+        use axum::extract::State;
+        use axum::Json;
+        let a = test_store();
+        let b = test_store_phase2();
+        seed_pending(&b, "sess-b", "bind-b").await;
+        let stores = vec![a.clone(), b.clone()];
+
+        let r = super::well_known_connect_callback(
+            State(stores.clone()),
+            Json(super::ConnectCallback { state: "sess-b".into(), expiration: None, permissions: None }),
+        )
+        .await;
+        assert_eq!(r.status(), axum::http::StatusCode::OK, "key request must reach the owning store");
+        assert!(
+            b.authz.read().await.get("sess-b").unwrap().finish_secret_hash.is_some(),
+            "the owning store's PA must be claimed"
+        );
+        assert!(a.authz.read().await.get("sess-b").is_none(), "the other store stays untouched");
+
+        // Unknown state: falls through to the first store's handler → 403.
+        let r = super::well_known_connect_callback(
+            State(stores),
+            Json(super::ConnectCallback { state: "nope".into(), expiration: None, permissions: None }),
+        )
+        .await;
+        assert_eq!(r.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    // The pinned well-known GET serves the Phase-2 page only when some instance
+    // runs Phase 2, and the page carries each enabled instance's redeem
+    // endpoint (the client tries them in order — the instance is only knowable
+    // from the fragment, which the server never sees).
+    #[tokio::test]
+    async fn well_known_page_gates_on_phase2_and_lists_enabled_redeems() {
+        use axum::extract::State;
+
+        // No Phase-2 instance → 404 (v1-only deployments expose no page).
+        let r = super::well_known_connect_page(State(vec![test_store()])).await;
+        assert_eq!(r.status(), axum::http::StatusCode::NOT_FOUND);
+
+        // One Phase-2 instance → 200 with that instance's redeem endpoint.
+        let r = super::well_known_connect_page(State(vec![test_store(), test_store_phase2()])).await;
+        assert_eq!(r.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("\"/oauth/connect/redeem\""), "page must list the enabled redeem URL: {html}");
+    }
+
+    // With several Phase-2 instances the page lists every redeem endpoint, in
+    // order, as a JSON-embedded array the retry loop walks.
+    #[tokio::test]
+    async fn pinned_page_lists_multiple_redeem_endpoints_in_order() {
+        let resp = super::pinned_callback_page(&["", "/prod"]);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        let both = html.find("[\"/oauth/connect/redeem\",\"/prod/oauth/connect/redeem\"]");
+        assert!(both.is_some(), "page must embed both redeem URLs in order: {html}");
     }
 
     // The v1 POST callback handlers stay live on a Phase-2 instance — that's what
