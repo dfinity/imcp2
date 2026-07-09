@@ -331,12 +331,15 @@ to the allow-listed callback with the chain **plus the consent tuple** —
 and redemption calls
 `mcp_register_v2(session_key, opt permissions, opt max_ttl)
 -> record { expiration; permissions }`, **echoing the consent verbatim**.
-Consent is *stateless* at II: nothing is stored when the user consents —
-`P_reg` is re-derived from the echoed consent plus the user's current
-trusted-server config, so an altered echo (or a consent-time config change)
-derives a different principal and redemption fails cleanly. The anchor is
-**never sent by the server**: II recovers it from `caller() == P_reg`, so the
-anchor number never reaches — or is logged by — this server.
+Consent is *stateless* at II for the access level and lifetime: **no consent
+values are stored beyond the anchor mapping** — at consent II records only
+`P_reg -> anchor` (so it can recover the anchor at redemption), while
+`permissions`/`max_ttl` are re-derived, not stored. `P_reg` is re-derived from
+the echoed consent plus the user's current trusted-server config, so an altered
+echo (or a consent-time config change) derives a different principal and
+redemption fails cleanly. The anchor is **never sent by the server**: II
+recovers it from `caller() == P_reg`, so the anchor number never reaches — or
+is logged by — this server.
 
 Server side (on a Phase-2 instance):
 

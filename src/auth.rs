@@ -1100,8 +1100,8 @@ fn hex_decode(field: &str, s: &str) -> Result<Vec<u8>, String> {
 /// `ic-agent` types — hop count is preserved verbatim (two hops per rev3 of the
 /// guide; the redeem path only requires that the FINAL hop targets our `X`, and
 /// the replica verifies every hop authoritatively). The chain carries no
-/// `permissions` field: under rev4's stateless consent the access level isn't
-/// stored in the delegation at all — it rides the fragment's consent tuple
+/// `permissions` field: under rev5's stateless consent the access level isn't
+/// stored in the delegation at all — it rides the fragment's consent values
 /// (see [`parse_consent`]) and is echoed into `mcp_register_v2`. So a
 /// `permissions` field appearing here would be unexpected, and
 /// [`JsonDelegationChain`] fails fast if one ever does.
@@ -1243,7 +1243,7 @@ pub async fn connect_redeem(
         return Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state) })).into_response();
     }
     // Decode the fragment delegation (agent-js DelegationChain JSON, II #4093)
-    // and the consent tuple to echo (guide rev4) — both before claiming, so a
+    // and the consent values to echo (guide rev5) — both before claiming, so a
     // malformed delivery never occupies the single-flight slot.
     let (user_key, chain) = match parse_registration_delegation(&body.delegation) {
         Ok(v) => v,
@@ -2150,8 +2150,8 @@ mod tests {
         assert_eq!(chain[1].delegation.pubkey, der_x);
         assert_eq!(chain[1].signature, sig_y);
         assert_eq!(chain[1].delegation.targets, None);
-        // Neither hop carries a permissions field — under rev4 stateless
-        // consent the access level rides the fragment consent tuple (echoed
+        // Neither hop carries a permissions field — under rev5 stateless
+        // consent the access level rides the fragment consent values (echoed
         // into mcp_register_v2), not the delegations.
         assert!(chain.iter().all(|d| d.delegation.permissions.is_none()));
     }
