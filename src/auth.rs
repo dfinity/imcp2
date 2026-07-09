@@ -998,7 +998,11 @@ fn pinned_callback_page(prefix: &str) -> Response {
 /// parsing the fragment: the `state` echo and the delegation chain's JSON text
 /// exactly as II's frontend put it in the fragment
 /// (`JSON.stringify(DelegationChain.toJSON())`, dfinity/internet-identity#4093).
-#[derive(Debug, Deserialize)]
+///
+/// Deliberately NOT `Debug`: it carries the user's `anchor` (user data), so
+/// keeping it un-`{:?}`-able stops a future `?body` tracing call from logging
+/// the anchor by construction.
+#[derive(Deserialize)]
 pub struct RedeemBody {
     /// The single-use connect state (= session id), echoed by II.
     state: String,
@@ -1102,9 +1106,11 @@ fn hex_decode(field: &str, s: &str) -> Result<Vec<u8>, String> {
 /// `ic-agent` types — hop count is preserved verbatim (two hops per rev3 of the
 /// guide; the redeem path only requires that the FINAL hop targets our `X`, and
 /// the replica verifies every hop authoritatively). The chain carries no
-/// `permissions` field (the registration delegation's permission choice lives
-/// in II's server-side index, not in the delegation — and
-/// [`JsonDelegationChain`] fails fast if one ever appears).
+/// `permissions` field: under rev4's stateless consent the access level isn't
+/// stored in the delegation at all — it rides the fragment's consent tuple
+/// (see [`parse_consent`]) and is echoed into `mcp_register_v2`. So a
+/// `permissions` field appearing here would be unexpected, and
+/// [`JsonDelegationChain`] fails fast if one ever does.
 fn parse_registration_delegation(delegation_json: &str) -> Result<(Vec<u8>, Vec<SignedDelegation>), String> {
     // Bound the size BEFORE parsing (see MAX_REG_DELEGATION_JSON): reject
     // oversized input without allocating for it. This also inherently bounds
@@ -1813,11 +1819,17 @@ mod tests {
         assert_eq!(c.max_ttl_ns, None);
 
         // Anchor is required; bad values fail fast with a clear message.
+        // (`let-else` rather than `expect_err`, which would require the Ok type
+        // `RegistrationConsent` to be `Debug` — it deliberately isn't.)
         assert!(super::parse_consent(&body("", "all", "1")).is_err());
         assert!(super::parse_consent(&body("not-a-number", "", "")).is_err());
-        let err = super::parse_consent(&body("1", "write-only", "")).expect_err("unknown level");
+        let Err(err) = super::parse_consent(&body("1", "write-only", "")) else {
+            panic!("an unknown permissions level must fail");
+        };
         assert!(err.contains("unrecognized"), "got: {err}");
-        let err = super::parse_consent(&body("1", "", "soon")).expect_err("bad ttl");
+        let Err(err) = super::parse_consent(&body("1", "", "soon")) else {
+            panic!("a non-numeric ttl must fail");
+        };
         assert!(err.contains("ttl"), "got: {err}");
     }
 

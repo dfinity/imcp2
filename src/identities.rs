@@ -993,7 +993,10 @@ impl IiPermissions {
 /// derivation, so redemption succeeds only if the echoed tuple (and the
 /// user's current trusted-server config) re-derives exactly `caller()` —
 /// an altered echo derives a different principal and gets a clean `Err`.
-#[derive(Debug)]
+///
+/// Deliberately NOT `Debug`: it holds the user's anchor (user data), so making
+/// it un-`{:?}`-able keeps the anchor out of any future `?consent` tracing by
+/// construction.
 pub struct RegistrationConsent {
     /// The user's II anchor number. **User data** — treat it like any user
     /// identifier and keep it out of logs.
