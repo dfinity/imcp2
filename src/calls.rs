@@ -553,15 +553,15 @@ fn rows_to_table(rows_val: &IDLValue) -> Option<(Vec<String>, Vec<Vec<String>>)>
             }
             columns = pairs.iter().map(|(n, _)| n.clone()).collect();
         }
+        // Align this row to `columns` via a name→value map (first occurrence
+        // wins, matching a linear find) so wide tables stay O(cols), not O(cols²).
+        let mut by_name: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for (n, v) in &pairs {
+            by_name.entry(n.as_str()).or_insert(v.as_str());
+        }
         let aligned = columns
             .iter()
-            .map(|c| {
-                pairs
-                    .iter()
-                    .find(|(n, _)| n == c)
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_default()
-            })
+            .map(|c| by_name.get(c.as_str()).copied().unwrap_or("").to_string())
             .collect();
         out_rows.push(aligned);
     }
@@ -581,8 +581,16 @@ fn cell_scalar(v: &IDLValue) -> String {
     }
 }
 
+/// Look up a record field by its (named) label. Matches `Label::Named` directly
+/// so the hot decode loop doesn't allocate a `String` per field just to compare
+/// against a constant key. The typed decode path recovers `Label::Named` for the
+/// OQL fields we ask for ("rows", "hasMore", "name", "value"); a hashed
+/// (`Label::Id`) label never equals a non-numeric key anyway.
 fn field_by_name<'a>(fields: &'a [IDLField], name: &str) -> Option<&'a IDLValue> {
-    fields.iter().find(|f| label_name(&f.id) == name).map(|f| &f.val)
+    fields
+        .iter()
+        .find(|f| matches!(&f.id, Label::Named(n) if n == name))
+        .map(|f| &f.val)
 }
 
 fn label_name(l: &Label) -> String {
