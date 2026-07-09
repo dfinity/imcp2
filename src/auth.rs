@@ -902,10 +902,13 @@ fn csp_nonce() -> String {
 /// is ever interpolated into the HTML — the fragment is read client-side and sent
 /// via `fetch`, never written to the DOM.
 ///
-/// The fragment shape matches II's frontend (dfinity/internet-identity#4093):
-/// `#delegation=<JSON.stringify(DelegationChain.toJSON())>&state=<state>`,
-/// percent-encoded by `URLSearchParams` — so `p.get('delegation')` yields the
-/// chain's JSON text, forwarded to the redeem endpoint verbatim.
+/// The fragment shape matches II's frontend (guide rev4): the delegation chain
+/// plus the consent tuple —
+/// `#delegation=<JSON.stringify(DelegationChain.toJSON())>&state=<state>&anchor=<number>&permissions=<queries|all>&ttl=<ns>`,
+/// percent-encoded by `URLSearchParams`. The script reads each field and
+/// forwards them to the redeem endpoint verbatim (the chain's JSON text and the
+/// consent tuple II re-derives `P_reg` from — see [`parse_consent`]).
+///
 /// The pinned page's inline script, kept as a PLAIN string — not a `format!`
 /// template — so the JavaScript reads naturally (no doubled braces, room for
 /// comments). The one dynamic value, the redeem URL, is spliced in by replacing
