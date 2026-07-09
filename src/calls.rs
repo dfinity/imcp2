@@ -497,11 +497,16 @@ fn extract_oql(val: &IDLValue) -> Option<OqlResult> {
         IDLValue::Variant(var) => {
             let arm = &var.0;
             let name = label_name(&arm.id);
-            if name.eq_ignore_ascii_case("err") || name.eq_ignore_ascii_case("error") {
+            if name.eq_ignore_ascii_case("ok") || name.eq_ignore_ascii_case("success") {
+                // Known success arm — descend into the wrapped record.
+                extract_oql(&arm.val)
+            } else if name.eq_ignore_ascii_case("err") || name.eq_ignore_ascii_case("error") {
                 Some(OqlResult::QueryError(cell_scalar(&arm.val)))
             } else {
-                // An `ok`/success arm — descend into the wrapped record.
-                extract_oql(&arm.val)
+                // Any other arm: don't assume it's an OQL result — fail closed to
+                // Unrecognized (the caller surfaces the raw reply) rather than
+                // recursing into an arbitrary variant.
+                None
             }
         }
         _ => None,
@@ -511,14 +516,25 @@ fn extract_oql(val: &IDLValue) -> Option<OqlResult> {
 /// Turn the `rows : vec vec Cell` value into (columns, string rows). Columns are
 /// taken from the first row's cell names; every row is then aligned to them by
 /// name (per the primer: read cells by name, never by position).
+///
+/// Fail-closed: `None` (→ Unrecognized) if the value isn't a vec, if any row
+/// isn't a vec, or if the first row yields no named cells — so a malformed /
+/// non-OQL reply degrades to the raw Candid rather than a bogus "0 columns"
+/// table. An empty `rows` (a query that matched nothing) is the one legitimate
+/// zero-column case and returns an empty table.
 fn rows_to_table(rows_val: &IDLValue) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     let IDLValue::Vec(rows) = rows_val else {
         return None;
     };
+    if rows.is_empty() {
+        return Some((Vec::new(), Vec::new()));
+    }
     let mut columns: Vec<String> = Vec::new();
     let mut out_rows: Vec<Vec<String>> = Vec::new();
     for row in rows {
-        let IDLValue::Vec(cells) = row else { continue };
+        let IDLValue::Vec(cells) = row else {
+            return None;
+        };
         let mut pairs: Vec<(String, String)> = Vec::new();
         for cell in cells {
             if let IDLValue::Record(cf) = cell {
@@ -531,6 +547,10 @@ fn rows_to_table(rows_val: &IDLValue) -> Option<(Vec<String>, Vec<Vec<String>>)>
             }
         }
         if columns.is_empty() {
+            if pairs.is_empty() {
+                // First row carried no named cells — not a recognizable OQL row.
+                return None;
+            }
             columns = pairs.iter().map(|(n, _)| n.clone()).collect();
         }
         let aligned = columns
@@ -794,6 +814,49 @@ mod tests {
             parse_execute_reply(None, &ok_reply),
             OqlResult::Unrecognized(_)
         ));
+
+        // A query that matched nothing (`rows = vec {}`) is a legitimate empty
+        // table, NOT an error or Unrecognized.
+        let empty = encode_reply(
+            did,
+            "execute",
+            "(variant { ok = record { hasMore = false; rows = vec {} } })",
+        );
+        match parse_execute_reply(Some(did), &empty) {
+            OqlResult::Table { columns, rows, has_more } => {
+                assert!(columns.is_empty() && rows.is_empty() && !has_more, "empty result is a 0-row table");
+            }
+            _ => panic!("empty rows should be a Table, not an error/Unrecognized"),
+        }
+    }
+
+    // Fail-closed decoding (per review): a variant reply whose arm is neither a
+    // known success nor error arm, and a record whose rows carry no named cells,
+    // both degrade to Unrecognized rather than being passed off as a table.
+    #[test]
+    fn parse_execute_reply_fails_closed_on_non_oql_shapes() {
+        use super::{parse_execute_reply, OqlResult};
+
+        // Unknown variant arm (not ok/success/err) → Unrecognized.
+        let weird_did = "service : { execute : (text) -> (variant { weird : text }) query; }";
+        let weird = encode_reply(weird_did, "execute", "(variant { weird = \"z\" })");
+        assert!(
+            matches!(parse_execute_reply(Some(weird_did), &weird), OqlResult::Unrecognized(_)),
+            "an unknown variant arm must not be treated as an OQL table"
+        );
+
+        // A record with `rows`, but rows whose cells have no `name` field → the
+        // first row yields no columns → Unrecognized (not a bogus 0-column table).
+        let noname_did = "service : { execute : (text) -> (record { hasMore : bool; rows : vec vec record { foo : text } }) query; }";
+        let noname = encode_reply(
+            noname_did,
+            "execute",
+            "(record { hasMore = false; rows = vec { vec { record { foo = \"x\" } } } })",
+        );
+        assert!(
+            matches!(parse_execute_reply(Some(noname_did), &noname), OqlResult::Unrecognized(_)),
+            "rows without named cells must degrade to Unrecognized"
+        );
     }
 
     // normalize_oql_query accepts a JSON object, rejects non-objects / invalid
