@@ -426,7 +426,7 @@ impl Identities {
     /// for the whole connect (a re-issued link reuses it). See
     /// [`Self::redeem_registration_delegation`] for the redemption that consumes
     /// `priv(X)`.
-    pub async fn registration_pubkey_b64(&self, session_id: &str) -> String {
+    pub(crate) async fn registration_pubkey_b64(&self, session_id: &str) -> String {
         self.ensure_session(session_id).await;
         let mut sessions = self.sessions.write().await;
         let s = sessions.get_mut(session_id).expect("ensured session");
@@ -626,7 +626,7 @@ impl Identities {
     /// > rev4 of the MCP server guide — re-verify against II's published `.did`
     /// > when the implementation PRs merge. The read-only `opt text`/`variant`
     /// > outage (#40) is the standing lesson against letting these shapes drift.
-    pub async fn redeem_registration_delegation(
+    pub(crate) async fn redeem_registration_delegation(
         &self,
         session_id: &str,
         reg_user_key: Vec<u8>,
@@ -912,13 +912,13 @@ fn map_delegation_error(e: AccountDelegationError) -> String {
 /// what II returned from `mcp_register_v2`. Surfaced to the connect handler so
 /// it can log the access level; the values are also recorded on the session.
 #[derive(Debug)]
-pub struct RegistrationOutcome {
+pub(crate) struct RegistrationOutcome {
     /// Grant expiration (ns since the Unix epoch).
-    pub expiration_ns: u64,
+    pub(crate) expiration_ns: u64,
     /// The recorded access level, in the delegation vocabulary: `"queries"` =
     /// read-only, `"all"` = full (always present — `McpRegistrationV2`'s
     /// `permissions` is non-optional).
-    pub permissions: &'static str,
+    pub(crate) permissions: &'static str,
 }
 
 // ---- II candid contract for the mcp_* delegation methods --------------------
@@ -956,7 +956,7 @@ type McpGetAccountsReply = std::result::Result<Vec<IiAccountInfo>, AccountDelega
 /// reply. Decoded as a variant here — this is NOT the opt-text case, because
 /// the fields it appears in are not `opt text`.
 #[derive(CandidType, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IiPermissions {
+pub(crate) enum IiPermissions {
     #[serde(rename = "queries")]
     Queries,
     #[serde(rename = "all")]
@@ -968,7 +968,7 @@ impl IiPermissions {
     /// else FAILS FAST: the value must be echoed into `mcp_register_v2` as this
     /// closed variant, so an unrecognized level can't be represented — and
     /// guessing would just derive the wrong `P_reg` and fail opaquely at II.
-    pub fn from_text(s: &str) -> Result<Self, String> {
+    pub(crate) fn from_text(s: &str) -> Result<Self, String> {
         match s {
             "queries" => Ok(IiPermissions::Queries),
             "all" => Ok(IiPermissions::All),
@@ -998,15 +998,15 @@ impl IiPermissions {
 /// Deliberately NOT `Debug`: it holds the user's anchor (user data), so making
 /// it un-`{:?}`-able keeps the anchor out of any future `?consent` tracing by
 /// construction.
-pub struct RegistrationConsent {
+pub(crate) struct RegistrationConsent {
     /// The user's II anchor number. **User data** — treat it like any user
     /// identifier and keep it out of logs.
-    pub anchor: u64,
+    pub(crate) anchor: u64,
     /// The consented access level, when present in the fragment.
-    pub permissions: Option<IiPermissions>,
+    pub(crate) permissions: Option<IiPermissions>,
     /// The consented grant lifetime in NANOSECONDS, when present in the
     /// fragment (a decimal string on the wire — it overflows 32-bit ints).
-    pub max_ttl_ns: Option<u64>,
+    pub(crate) max_ttl_ns: Option<u64>,
 }
 
 /// `Ok` payload of `mcp_register_v2` (Phase 2) — `McpRegistrationV2` per
