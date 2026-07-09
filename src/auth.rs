@@ -2,8 +2,8 @@
 //! as the login mechanism, using II's session-key registration handshake.
 //!
 //! II's `/mcp` handshake registers the session key under the user's own auth and,
-//! if we ask, navigates the browser back to a `finish_url` on our origin (see
-//! `docs/mcp-server-guide.md` §2a/§2c / dfinity/internet-identity#4086). We drive
+//! if we ask, navigates the browser back to a `finish_url` on our origin (per the
+//! Internet Identity MCP server guide / dfinity/internet-identity#4086). We drive
 //! one flow — **authorization code + PKCE** — so any OAuth 2.1 client works:
 //!
 //!   * `/oauth/authorize` sets a browser-binding cookie (H3) and redirects to
@@ -101,7 +101,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -414,7 +414,11 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
         None => return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "response_type=code required"),
     }
     if !store.validate_client(&q.client_id, &q.redirect_uri).await {
-        return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "unknown client_id / redirect_uri");
+        // `invalid_client` (not `invalid_request`): the request is well-formed,
+        // it's the CLIENT identification that failed — the AS error code the
+        // MCP server guide (and RFC 6749's taxonomy) expects here. No redirect:
+        // an unvalidated redirect_uri must never receive an error response.
+        return oauth_err(StatusCode::BAD_REQUEST, "invalid_client", "unknown client_id / redirect_uri");
     }
     // OAuth 2.1: PKCE is required for public clients.
     let Some(code_challenge) = q.code_challenge.clone() else {
@@ -1277,13 +1281,38 @@ async fn token_authorization_code(store: AuthStore, req: TokenForm) -> Response 
     issue_token(&store, &grant.session_id).await
 }
 
-/// Mint + store an access token bound to the session key's principal.
+/// Bound a token's lifetime by the II grant ("never issue a token that
+/// outlives the grant"): the earlier of the standard [`TOKEN_TTL`] and the
+/// grant's expiration. The user can shorten the grant on II's consent screen
+/// (down to 10 minutes), so the fixed TTL alone can overshoot. An unknown
+/// expiration falls back to the default — the grant remains the hard ceiling
+/// at II either way; this cap is about the CLIENT's view, steering it to a
+/// 401 `invalid_token` + inline re-auth instead of opaque tool errors on a
+/// live-looking token once the grant lapses.
+fn capped_token_ttl(default: Duration, grant_expiration_ns: Option<u64>, now_ns: u64) -> Duration {
+    match grant_expiration_ns {
+        Some(exp_ns) => default.min(Duration::from_nanos(exp_ns.saturating_sub(now_ns))),
+        None => default,
+    }
+}
+
+/// Mint + store an access token bound to the session key's principal, its
+/// lifetime capped by the II grant's expiration (see [`capped_token_ttl`]).
 async fn issue_token(store: &AuthStore, session_id: &str) -> Response {
     let principal = store
         .identities
         .session_principal(session_id)
         .await
         .unwrap_or_else(|| "unknown".to_string());
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let ttl = capped_token_ttl(
+        TOKEN_TTL,
+        store.identities.grant_expiration_ns(session_id).await,
+        now_ns,
+    );
 
     let access_token = format!("mcp-token-{}", Uuid::new_v4());
     store.tokens.write().await.insert(
@@ -1292,15 +1321,15 @@ async fn issue_token(store: &AuthStore, session_id: &str) -> Response {
             principal: principal.clone(),
             session_id: session_id.to_string(),
             created: Instant::now(),
-            ttl: TOKEN_TTL,
+            ttl,
         },
     );
-    tracing::info!(%principal, "issued MCP access token");
+    tracing::info!(%principal, ttl_secs = ttl.as_secs(), "issued MCP access token");
 
     Json(json!({
         "access_token": access_token,
         "token_type": "Bearer",
-        "expires_in": TOKEN_TTL.as_secs(),
+        "expires_in": ttl.as_secs(),
     }))
     .into_response()
 }
@@ -1322,9 +1351,43 @@ pub struct RegisterRequest {
     grant_types: Vec<String>,
 }
 
+/// The grant types to register for a DCR request: the intersection of the
+/// requested types with what we implement, with an empty request defaulting to
+/// the full supported set (RFC 7591 makes the RESPONSE authoritative — a
+/// client that asked for `refresh_token` sees it wasn't granted). `None` means
+/// the intersection lost `authorization_code` — the only flow we run — so the
+/// registration must be refused with `invalid_client_metadata` rather than
+/// minting a client that could never complete any flow.
+fn granted_grant_types(requested: &[String]) -> Option<Vec<String>> {
+    const SUPPORTED: [&str; 1] = ["authorization_code"];
+    let granted: Vec<String> = if requested.is_empty() {
+        SUPPORTED.iter().map(|s| s.to_string()).collect()
+    } else {
+        let mut g: Vec<String> = requested
+            .iter()
+            .filter(|g| SUPPORTED.contains(&g.as_str()))
+            .cloned()
+            .collect();
+        g.dedup();
+        g
+    };
+    granted.iter().any(|g| g == "authorization_code").then_some(granted)
+}
+
 /// POST /oauth/register (RFC 7591). `redirect_uris` are stored for the auth-code
-/// flow — the only grant we support.
+/// flow — the only grant we support. Requested `grant_types` are intersected
+/// with the supported set ([`granted_grant_types`]); a request whose
+/// intersection loses `authorization_code` is refused with
+/// `invalid_client_metadata` BEFORE anything is stored.
 pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRequest>) -> Response {
+    let Some(granted) = granted_grant_types(&req.grant_types) else {
+        return oauth_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_metadata",
+            "this server only supports the authorization_code grant; request it (or omit grant_types)",
+        );
+    };
+
     let client_id = format!("client-{}", Uuid::new_v4());
     let snapshot = {
         let mut clients = store.clients.write().await;
@@ -1332,19 +1395,6 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
         clients.clone()
     };
     tokio::task::spawn_blocking(move || persist_clients(&snapshot)).await.ok();
-
-    // Honour the requested grant types (intersected with what we support); fall
-    // back to authorization_code if the client didn't ask for any.
-    let supported = ["authorization_code"];
-    let granted: Vec<String> = if req.grant_types.is_empty() {
-        supported.iter().map(|s| s.to_string()).collect()
-    } else {
-        req.grant_types
-            .iter()
-            .filter(|g| supported.contains(&g.as_str()))
-            .cloned()
-            .collect()
-    };
 
     // Public client (PKCE, no secret): OMIT client_secret entirely (returning
     // null breaks clients that validate it as a string).
@@ -1571,6 +1621,54 @@ mod tests {
         let mut h2 = HeaderMap::new();
         h2.insert(COOKIE, HeaderValue::from_static("session=abc"));
         assert_eq!(super::connect_cookie(&h2), None);
+    }
+
+    /// Guide: "never issue a token that outlives the grant." The token TTL is
+    /// the earlier of the default and the grant's remaining lifetime; unknown
+    /// expiration falls back to the default; an already-expired grant yields a
+    /// zero TTL (the token is born invalid, steering the client to re-auth).
+    #[test]
+    fn token_ttl_is_capped_by_grant_expiration() {
+        use std::time::Duration;
+        let default = Duration::from_secs(3600);
+        let now_ns: u64 = 1_000_000_000_000_000_000;
+        // No known expiration → the default.
+        assert_eq!(super::capped_token_ttl(default, None, now_ns), default);
+        // Grant outlives the default → the default.
+        let far = now_ns + 86_400 * 1_000_000_000;
+        assert_eq!(super::capped_token_ttl(default, Some(far), now_ns), default);
+        // Grant shorter than the default (user picked 10 min) → capped.
+        let soon = now_ns + 600 * 1_000_000_000;
+        assert_eq!(
+            super::capped_token_ttl(default, Some(soon), now_ns),
+            Duration::from_secs(600)
+        );
+        // Grant already expired → zero (never a negative-wrap).
+        assert_eq!(
+            super::capped_token_ttl(default, Some(now_ns - 1), now_ns),
+            Duration::ZERO
+        );
+    }
+
+    /// RFC 7591 / guide: requested grant types are INTERSECTED with the
+    /// supported set and the result returned (authoritative response); an empty
+    /// request defaults to authorization_code; an intersection that loses
+    /// authorization_code refuses the registration (None → the handler answers
+    /// invalid_client_metadata) instead of minting a client that can't run any
+    /// flow.
+    #[test]
+    fn granted_grant_types_intersects_and_refuses_codeless() {
+        let g = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Empty request → the supported default.
+        assert_eq!(super::granted_grant_types(&[]), Some(g(&["authorization_code"])));
+        // Optimistic request → intersected, refresh_token visibly not granted.
+        assert_eq!(
+            super::granted_grant_types(&g(&["authorization_code", "refresh_token"])),
+            Some(g(&["authorization_code"]))
+        );
+        // Requests whose intersection loses authorization_code are refused.
+        assert_eq!(super::granted_grant_types(&g(&["refresh_token"])), None);
+        assert_eq!(super::granted_grant_types(&g(&["client_credentials"])), None);
     }
 
     #[test]

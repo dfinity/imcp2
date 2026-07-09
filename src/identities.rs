@@ -1,14 +1,24 @@
-//! On-demand per-app delegated identities — **session-key registration model**.
+//! On-demand per-app delegated identities.
 //!
-//! Model (Internet Identity MCP connect, per `docs/mcp-server-guide.md` and
-//! dfinity/internet-identity#4086): at connect time the server generates a fresh
-//! Ed25519 **session key per user-connection** (inside the key-request callback)
-//! and returns only its public key to II's frontend, which registers it with the
-//! II canister via `mcp_register` — under the user's own authentication — as a
-//! time-boxed **grant** bound to the user's anchor. The server never handles a
-//! delegation chain that represents itself, and never calls `mcp_register`. The
-//! session key's principal `self_authenticating(session_pubkey)` IS the identity
-//! the grant is bound to.
+//! Session model (per the Internet Identity MCP server guide): at connect time
+//! the server generates a fresh Ed25519 **session key `S` per user-connection**,
+//! and II binds a time-boxed **grant** for it to the user's anchor — the session
+//! key's principal `self_authenticating(session_pubkey)` IS the identity the
+//! grant is bound to. HOW it gets bound depends on the instance's connect
+//! protocol (see `crate::auth`):
+//!
+//!   * **v1 (fetched key, dfinity/internet-identity#4086)**: II's frontend
+//!     fetches `pub(S)` from the key-request callback and calls `mcp_register`
+//!     under the user's own authentication; the server sees no delegation chain
+//!     at connect.
+//!   * **Phase 2 (registration delegation)**: the server also mints a
+//!     per-connect **registration key `X`**; II delivers a single-use,
+//!     canister-signed chain `P_reg -> X` to the pinned callback page, and the
+//!     server redeems it with ONE `mcp_register_v2(pub(S))` call signed as `X`
+//!     ([`Identities::redeem_registration_delegation`]).
+//!
+//! From registration on, the two are identical: the server signs II's `mcp_*`
+//! calls directly with `S` until the grant expires or is revoked.
 //!
 //! To call a canister as the user's account for a given app (e.g. `oisy.com`)
 //! the server mints a **short-lived per-app account delegation ON DEMAND**:
@@ -463,6 +473,14 @@ impl Identities {
         if let Some(s) = sessions.get_mut(session_id) {
             s.read_only = level;
         }
+    }
+
+    /// The session's recorded grant expiration (ns since the epoch), if known —
+    /// authoritative when set by `mcp_register_v2`'s reply (Phase 2), a
+    /// best-effort hint when set by v1's completion POST. Used to bound the
+    /// OAuth access-token lifetime so a token never outlives the grant.
+    pub async fn grant_expiration_ns(&self, session_id: &str) -> Option<u64> {
+        self.sessions.read().await.get(session_id).and_then(|s| s.grant_expiration_ns)
     }
 
     /// This session's known access level: `Some(true)` = read-only, `Some(false)`

@@ -279,7 +279,12 @@ fn site_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, Stri
 // `.text()`/`.bytes()` buffer the whole body with no ceiling, so we read chunk by
 // chunk and stop once the cap is hit. The connection is dropped when the response
 // is, so a truncated read cancels the transfer rather than draining it.
-const MAX_BODY_BYTES: usize = 2 * 1024 * 1024; // one document (HTML, one JS file)
+// The per-file cap must comfortably exceed real-world app bundles: OISY's main
+// chunks are ~3 MiB, with labelled canister ids sitting past the 2 MiB mark —
+// a 2 MiB cap silently truncated them away. Memory stays bounded by the
+// AGGREGATE cap regardless (each read is sized to the remaining room), so the
+// per-file value only decides how deep into one file we can see.
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024; // one document (HTML, one JS file)
 const MAX_ENV_JSON_BYTES: usize = 256 * 1024; // /env.json is tiny in practice
 const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024; // aggregate bundle text mined for ids
 
@@ -904,19 +909,33 @@ mod tests {
         assert!(!redirect_hop_ok(&u("http://oisy.com/x"), Some("oisy.com")));
     }
 
-    // Live network test against a stable public IC app (OISY).
+    // Live network test against a stable public IC app (OISY). Bundle mining
+    // streams multi-MB chunks from a live CDN, and `read_capped` deliberately
+    // treats a mid-stream error as end-of-body (discovery is opportunistic) —
+    // so a transient reset can truncate a chunk before the labelled id. Retry
+    // the whole discovery a few times before declaring failure, so the test
+    // asserts the mining logic rather than one fetch's luck.
     #[tokio::test]
     async fn discovers_oisy_frontend_and_backend() {
-        let found = discover("oisy.com").await.expect("discover");
-        let ids: Vec<&str> = found.iter().map(|f| f.canister_id.as_str()).collect();
+        let mut ids: Vec<String> = Vec::new();
+        for attempt in 1..=3 {
+            let found = discover("oisy.com").await.expect("discover");
+            ids = found.iter().map(|f| f.canister_id.clone()).collect();
+            if ids.iter().any(|i| i == "cha4i-riaaa-aaaan-qeccq-cai")
+                && ids.iter().any(|i| i == "doked-biaaa-aaaar-qag2a-cai")
+            {
+                return;
+            }
+            eprintln!("attempt {attempt}: incomplete discovery, retrying: {ids:?}");
+        }
         // Frontend from the gateway header.
         assert!(
-            ids.contains(&"cha4i-riaaa-aaaan-qeccq-cai"),
+            ids.iter().any(|i| i == "cha4i-riaaa-aaaan-qeccq-cai"),
             "frontend not found: {ids:?}"
         );
         // Backend from the labelled bundle constant (IC_BACKEND_CANISTER_ID).
         assert!(
-            ids.contains(&"doked-biaaa-aaaar-qag2a-cai"),
+            ids.iter().any(|i| i == "doked-biaaa-aaaar-qag2a-cai"),
             "backend not found: {ids:?}"
         );
     }
