@@ -926,10 +926,15 @@ async fn main() -> anyhow::Result<()> {
     let inst_prod = identities::IiInstance::prod().map_err(anyhow::Error::msg)?;
     for inst in [&inst_beta, &inst_prod] {
         tracing::info!(
-            "II instance {}: {} ({}) at {}",
-            inst.name, inst.ii_url, inst.ii_canister, inst.mcp_path
+            "II instance {}: {} ({}) at {} — connect protocol: {}",
+            inst.name, inst.ii_url, inst.ii_canister, inst.mcp_path,
+            if inst.registration_delegation { "registration-delegation (v2-ready, v1 honored)" } else { "v1 (fetched key)" },
         );
     }
+    // Per-instance connect-protocol selection, surfaced on /version so operators
+    // can confirm which instance runs which flow without reading env vars.
+    let regdel_beta = inst_beta.registration_delegation;
+    let regdel_prod = inst_prod.registration_delegation;
     let ids_beta = Identities::new(inst_beta);
     let ids_prod = Identities::new(inst_prod);
     let skills = skills::SkillsCatalog::new();
@@ -1015,7 +1020,17 @@ async fn main() -> anyhow::Result<()> {
         axum::Router::new()
             .route("/oauth/authorize", axum::routing::get(auth::authorize))
             .route("/oauth/finish", axum::routing::get(auth::finish))
-            .route("/oauth/connect/callback", axum::routing::post(auth::connect_callback))
+            // The connect callback serves BOTH: v1's cross-origin JSON POSTs from
+            // II's frontend, and — behind the registration-delegation flag — the
+            // Phase-2 pinned callback PAGE on GET (the sole fragment reader). The
+            // GET 404s when the flag is off, so v1 is unaffected.
+            .route(
+                "/oauth/connect/callback",
+                axum::routing::post(auth::connect_callback).get(auth::connect_callback_page),
+            )
+            // Phase 2 only: the pinned page POSTs the fragment delegation here to
+            // be redeemed (404s when the flag is off).
+            .route("/oauth/connect/redeem", axum::routing::post(auth::connect_redeem))
             .route("/oauth/token", axum::routing::post(auth::token))
             .route("/oauth/register", axum::routing::post(auth::register))
             .with_state(store)
@@ -1071,10 +1086,20 @@ async fn main() -> anyhow::Result<()> {
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any);
+    // The auth-callback allow-list (II #4091): before contacting the connect
+    // callback named in the link fragment, II fetches this origin-global
+    // document and requires the callback to be EXACTLY one of the declared
+    // entries — fail-closed, so serving it is mandatory once #4091 ships. One
+    // document declares both instances' callbacks (the path carries no
+    // instance prefix). CORS-open: II's frontend fetches it cross-origin.
+    let auth_callbacks = axum::Router::new()
+        .route(auth::AUTH_CALLBACKS_WELL_KNOWN, axum::routing::get(auth::auth_callbacks))
+        .with_state(vec![store_beta.clone(), store_prod.clone()]);
     let oauth = discovery_beta
         .merge(discovery_prod)
         .merge(oauth_endpoints(store_beta.clone()))
         .nest("/prod", oauth_endpoints(store_prod.clone()))
+        .merge(auth_callbacks)
         .layer(cors);
 
     // When this process started — i.e. when the deployment last (re)started.
@@ -1103,6 +1128,10 @@ async fn main() -> anyhow::Result<()> {
                     // Expected ~0; a sustained rise means II is re-issuing the key
                     // request (breaks connects under strict single-use), so alert on it.
                     "repeat_key_requests": auth::repeat_key_requests(),
+                    // Per-instance connect protocol: true = Phase-2 registration
+                    // delegation enabled (v1 still honored until that II switches),
+                    // false = pinned to the v1 fetched-key flow.
+                    "registration_delegation": { "beta": regdel_beta, "prod": regdel_prod },
                 }))
             }),
         )

@@ -279,6 +279,87 @@ on-chain grant (P3).
 > hosted-redirect allow-listing — a product decision that trades only against open
 > DCR for hosted clients.
 
+### Registration delegation (Phase 2 — per-instance: beta on, prod on v1)
+
+A successor connect flow (the *registration delegation* design) removes the
+weakest link in v1: today II binds a session key it was merely **shown** (fetched
+from our callback), so any path on the trusted origin that can be made to echo an
+attacker's key lets II bind it. Phase 2 replaces the fetched key with a
+**single-use, canister-signed delegation `P_reg → X`** that II mints under the
+user's own authentication and delivers to a **pinned callback page** as a URL
+fragment; the backend redeems it by signing **one** `mcp_register_v2` call as `X`.
+II never again binds a bare key it was shown.
+
+**The server runs both protocols side by side, selected per II instance:**
+
+- **beta / staging (`/mcp`, beta.id.ai)** — Phase 2 **on** by default (disable
+  with `MCP_REGISTRATION_DELEGATION=0`). Enabling is outbound-compatible with
+  v1: the II link gains the `registration_key` param and the Phase-2 routes turn on,
+  while every v1 handler stays live — so beta keeps connecting via v1 until beta
+  II actually ships the new frontend + canister methods, and switches over when
+  it does.
+- **production (`/mcp-prod`, id.ai)** — **pinned to v1** by default (opt in
+  later with `MCP_REGISTRATION_DELEGATION_PROD=1`). Its II link, callback, and
+  finish flow are exactly the existing protocol; the Phase-2 routes `404`.
+
+`/version` reports which instance runs which protocol
+(`registration_delegation: {beta, prod}`).
+
+**Callback allow-list (`/.well-known/ii-auth-callbacks`).** II is moving to
+validate the connect callback named in the (attacker-craftable) link fragment
+against a **server-declared allow-list**
+([dfinity/internet-identity#4091](https://github.com/dfinity/internet-identity/pull/4091)):
+before contacting the callback, II fetches
+`<callback origin>/.well-known/ii-auth-callbacks` (`redirect: "error"`, no
+credentials, `no-store`, 8 KB cap, `application/json` required) and requires the
+callback URL to be **exactly** (string-equal) one of the declared entries —
+**fail-closed**, so serving this document is mandatory once #4091 ships. This
+server serves it for both instances (one origin-global document listing each
+instance's `{prefix}/oauth/connect/callback`), built from the same helper that
+builds the II links' callback URLs so the two can never drift.
+
+The Phase-2 wire shapes track II's (not yet merged) implementation PRs and are
+re-verified when those merge: the connect link carries `registration_key` =
+base64url(DER(`pub(X)`))
+([#4093](https://github.com/dfinity/internet-identity/pull/4093)); II navigates
+back to the allow-listed callback with
+`#delegation=<DelegationChain JSON>&state=…` (#4093, agent-js
+`DelegationChain.toJSON()` — hex byte fields, hex-string expiration); and
+redemption calls `mcp_register_v2(session_key) -> record { expiration;
+permissions : variant { queries; all } }`
+([#4092](https://github.com/dfinity/internet-identity/pull/4092)).
+
+Server side (on a Phase-2 instance):
+
+- **`X`, a per-connect registration keypair** bound to the connect `sid`;
+  `priv(X)` never leaves the backend, and `pub(X)` rides the II link
+  (`registration_key`, base64url DER).
+- **A pinned callback page** at `GET /oauth/connect/callback` — the *sole* reader
+  of the returned fragment. It reads `location.hash` client-side, POSTs it (with
+  the connect cookie) to `POST /oauth/connect/redeem`, and reflects nothing into
+  the DOM; it ships a strict CSP (`default-src 'none'`, a per-response script
+  nonce, `connect-src 'self'`).
+- **Redemption** builds a `DelegatedIdentity` from `priv(X)` + the delegation and
+  calls `mcp_register_v2` to bind the long-lived session key `S` to the anchor.
+  The fragment-delivered delegation subsumes `finish_secret` as the consenter
+  proof, and synchronous registration removes the `grant_is_live` probe and the
+  `finishing_page` poll. The read-only level comes back on the `mcp_register_v2`
+  reply (feeding the same `require_write` guard as v1's completion POST).
+
+> **Gated on Internet Identity.** `mcp_register_v2` and the delegation-minting
+> methods (`prepare_`/`get_mcp_registration_delegation`, the `mcp-registration`
+> seed) are not on **deployed** II yet — until they ship, a Phase-2 instance
+> simply continues to complete connects via v1 (see above). The wire shapes
+> (link param, fragment `DelegationChain` JSON, `mcp_register_v2` candid, and
+> the callback allow-list) match II's implementation PRs
+> [#4091](https://github.com/dfinity/internet-identity/pull/4091) /
+> [#4092](https://github.com/dfinity/internet-identity/pull/4092) /
+> [#4093](https://github.com/dfinity/internet-identity/pull/4093), which are
+> not merged yet — re-verify against II's published `.did` and frontend when
+> they land. Retiring v1 on a Phase-2 instance (the design's "v1 sunset") is a
+> separate, later step. This also relies on **Phase 1** (the callback
+> allow-list, an II-side validation) as its security precondition.
+
 ### Read-only sessions
 
 II's consent screen **defaults to read-only** (opt-out). A user who just clicks
