@@ -845,7 +845,16 @@ fn connect_callback_url(inst: &crate::identities::IiInstance) -> String {
 /// II's 8 KB cap.
 pub async fn auth_callbacks(State(stores): State<Vec<AuthStore>>) -> Response {
     let callbacks: Vec<String> = stores.iter().map(|s| connect_callback_url(s.instance())).collect();
-    Json(json!({ "callbacks": callbacks })).into_response()
+    let mut resp = Json(json!({ "callbacks": callbacks })).into_response();
+    // Fail-closed, exact-match infrastructure must never be served stale: II's
+    // fetch is `cache: no-store` on ITS side, but an intermediary (CDN/proxy)
+    // could still cache our response — after a callback-path change that would
+    // break every connect until the cache expired. Forbid caching explicitly.
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    resp
 }
 
 // ---- Phase 2: registration delegation (flag-gated) ----------------------
@@ -909,8 +918,14 @@ fn pinned_callback_page(prefix: &str) -> Response {
          .catch(function(){{show('Could not reach the server — restart from your client.');}});\
          }})();</script></body></html>"
     );
+    // `frame-ancestors 'none'`: II reaches this page only by top-level
+    // navigation, so framing is never legitimate — deny it outright so the
+    // delegation-bearing page can't be embedded for UI redress. X-Frame-Options
+    // covers legacy browsers that predate CSP2 (modern ones ignore it when
+    // frame-ancestors is present).
     let csp = format!(
-        "default-src 'none'; script-src 'nonce-{nonce}'; connect-src 'self'; base-uri 'none'; form-action 'none'"
+        "default-src 'none'; script-src 'nonce-{nonce}'; connect-src 'self'; base-uri 'none'; \
+         form-action 'none'; frame-ancestors 'none'"
     );
     let mut resp = Html(html).into_response();
     let h = resp.headers_mut();
@@ -925,6 +940,10 @@ fn pinned_callback_page(prefix: &str) -> Response {
     h.insert(
         axum::http::header::X_CONTENT_TYPE_OPTIONS,
         axum::http::HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
     );
     resp
 }
@@ -1867,6 +1886,13 @@ mod tests {
                 .is_some_and(|ct| ct.starts_with("application/json")),
             "II requires an application/json content type"
         );
+        // Fail-closed infrastructure must not be servable stale by an
+        // intermediary cache: the response itself forbids storing.
+        assert_eq!(
+            r.headers().get(axum::http::header::CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "the allow-list must be non-cacheable"
+        );
         let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let declared: Vec<String> = v["callbacks"]
@@ -1912,6 +1938,8 @@ mod tests {
             .to_string();
         assert!(csp.contains("default-src 'none'"), "{csp}");
         assert!(csp.contains("connect-src 'self'"), "{csp}");
+        // Never legitimately framed (II top-level-navigates here): deny UI redress.
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
         // Pull the nonce out of the CSP and confirm the inline <script> uses it.
         let nonce = csp
             .split("'nonce-")
