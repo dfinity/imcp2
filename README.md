@@ -285,7 +285,7 @@ A successor connect flow (the *registration delegation* design) removes the
 weakest link in v1: today II binds a session key it was merely **shown** (fetched
 from our callback), so any path on the trusted origin that can be made to echo an
 attacker's key lets II bind it. Phase 2 replaces the fetched key with a
-**single-use, two-hop delegation chain `P_reg → Y → X`** delivered to a
+**short-lived (~5 min), two-hop delegation chain `P_reg → Y → X`** delivered to a
 **pinned callback page** as a URL fragment: II's canister signs `P_reg → Y`
 toward an ephemeral key `Y` held only by II's frontend — so the piece that
 transits the IC (replicas, boundary nodes, the public state tree) is inert on

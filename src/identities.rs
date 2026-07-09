@@ -236,9 +236,10 @@ struct Session {
     /// (see the `registration delegation` design and `crate::auth`'s Phase-2
     /// section). Minted once per connect, bound to this session (which is keyed
     /// by the connect `sid`); its private half NEVER leaves the backend. II
-    /// certifies a single-use delegation `P_reg -> X`, and the backend redeems it
-    /// by signing an `mcp_register_v2` ingress AS `X` while presenting that
-    /// delegation. `None` until [`Identities::registration_pubkey_b64`] mints it;
+    /// certifies a short-lived, two-hop chain (`P_reg -> Y -> X`) whose final hop
+    /// targets it, and the backend redeems it by signing an `mcp_register_v2`
+    /// ingress AS `X` while presenting that
+    /// chain. `None` until [`Identities::registration_pubkey_b64`] mints it;
     /// absent entirely in the v1 (fetched-key) flow. Distinct from the long-lived
     /// **session key `S`** (`key_seed`/`pubkey_der`), which is what `v2` registers.
     reg_key_seed: Option<[u8; 32]>,

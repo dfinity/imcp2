@@ -63,8 +63,8 @@
 //!
 //! A successor connect flow (the "registration delegation" design) replaces the
 //! fetched-key registration — where II binds a key it was merely shown — with a
-//! single-use, TWO-hop delegation chain `P_reg -> Y -> X` delivered to a
-//! **pinned callback page** as a URL fragment: II's canister signs `P_reg -> Y`
+//! short-lived (≈5 min), TWO-hop delegation chain `P_reg -> Y -> X` delivered to
+//! a **pinned callback page** as a URL fragment: II's canister signs `P_reg -> Y`
 //! toward an ephemeral key `Y` held only by II's frontend (so the piece that
 //! transits the IC — replicas, boundary nodes, the public state tree — is inert
 //! on its own), and the frontend extends it browser-side with a `Y`-signed hop
