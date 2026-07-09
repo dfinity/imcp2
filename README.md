@@ -322,20 +322,21 @@ server serves it for both instances (one origin-global document listing each
 instance's `{prefix}/oauth/connect/callback`), built from the same helper that
 builds the II links' callback URLs so the two can never drift.
 
-The Phase-2 wire shapes track **rev4 of the MCP server guide** (II's
+The Phase-2 wire shapes track **rev5 of the MCP server guide** (II's
 implementation PRs are not merged yet — re-verify when they land): the connect
 link carries `registration_key` = base64url(DER(`pub(X)`)); II navigates back
 to the allow-listed callback with the chain **plus the consent tuple** —
-`#delegation=<DelegationChain JSON>&state=…&anchor=<number>&permissions=<queries|all>&ttl=<ns>`
+`#delegation=<DelegationChain JSON>&state=…&permissions=<queries|all>&ttl=<ns>`
 (agent-js `DelegationChain.toJSON()` — hex byte fields, hex-string expiration);
 and redemption calls
-`mcp_register_v2(anchor_number, session_key, opt permissions, opt max_ttl)
--> record { expiration; permissions }`, **echoing the tuple verbatim**.
+`mcp_register_v2(session_key, opt permissions, opt max_ttl)
+-> record { expiration; permissions }`, **echoing the consent verbatim**.
 Consent is *stateless* at II: nothing is stored when the user consents —
-`P_reg` is re-derived from the echoed tuple plus the user's current
+`P_reg` is re-derived from the echoed consent plus the user's current
 trusted-server config, so an altered echo (or a consent-time config change)
-derives a different principal and redemption fails cleanly. The anchor number
-is user data and is kept out of server logs.
+derives a different principal and redemption fails cleanly. The anchor is
+**never sent by the server**: II recovers it from `caller() == P_reg`, so the
+anchor number never reaches — or is logged by — this server.
 
 Server side (on a Phase-2 instance):
 
@@ -348,7 +349,8 @@ Server side (on a Phase-2 instance):
   the DOM; it ships a strict CSP (`default-src 'none'`, a per-response script
   nonce, `connect-src 'self'`).
 - **Redemption** builds a `DelegatedIdentity` from `priv(X)` + the delegation and
-  calls `mcp_register_v2` to bind the long-lived session key `S` to the anchor.
+  calls `mcp_register_v2` to bind the long-lived session key `S` to the anchor
+  (which II recovers from `caller() == P_reg` — the server never names it).
   The fragment-delivered delegation subsumes `finish_secret` as the consenter
   proof, and synchronous registration removes the `grant_is_live` probe and the
   `finishing_page` poll. The read-only level comes back on the `mcp_register_v2`

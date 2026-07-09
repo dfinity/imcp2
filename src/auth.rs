@@ -88,19 +88,20 @@
 //! actually ships the new frontend and canister methods, and switches over when
 //! it does.
 //!
-//! The wire shapes track rev4 of the MCP server guide (II's implementation
+//! The wire shapes track rev5 of the MCP server guide (II's implementation
 //! PRs are not merged yet — re-verify when they land): the connect link
 //! carries `registration_key` = base64url(DER(`pub(X)`)); II navigates back
 //! to the callback — validated against our [`AUTH_CALLBACKS_WELL_KNOWN`]
-//! allow-list — with `#delegation=<DelegationChain JSON>&state=…&anchor=…&
-//! permissions=…&ttl=…` (the chain plus the CONSENT TUPLE, parsed by
+//! allow-list — with `#delegation=<DelegationChain JSON>&state=…&permissions=…&
+//! ttl=…` (the chain plus the CONSENT values, parsed by
 //! [`parse_registration_delegation`] and [`parse_consent`]); and the backend
-//! redeems via `mcp_register_v2(anchor_number, session_key, opt permissions,
-//! opt max_ttl) -> record { expiration; permissions }`, echoing the tuple
-//! verbatim — consent is STATELESS at II, which re-derives `P_reg` from the
-//! echo and redeems only if it lands on `caller()`. Retiring v1 for a
-//! Phase-2 instance (the design's "v1 sunset") is a separate, later step — not
-//! this.
+//! redeems via `mcp_register_v2(session_key, opt permissions, opt max_ttl)
+//! -> record { expiration; permissions }`, echoing those values verbatim —
+//! consent is STATELESS at II, which re-derives `P_reg` from the echo and
+//! redeems only if it lands on `caller()`. The **anchor is never sent or
+//! seen** by the server: II recovers the user's identity number from
+//! `caller() == P_reg`. Retiring v1 for a Phase-2 instance (the design's "v1
+//! sunset") is a separate, later step — not this.
 
 use std::{
     collections::HashMap,
@@ -902,12 +903,14 @@ fn csp_nonce() -> String {
 /// is ever interpolated into the HTML — the fragment is read client-side and sent
 /// via `fetch`, never written to the DOM.
 ///
-/// The fragment shape matches II's frontend (guide rev4): the delegation chain
-/// plus the consent tuple —
-/// `#delegation=<JSON.stringify(DelegationChain.toJSON())>&state=<state>&anchor=<number>&permissions=<queries|all>&ttl=<ns>`,
+/// The fragment shape matches II's frontend (guide rev5): the delegation chain
+/// plus the consent values —
+/// `#delegation=<JSON.stringify(DelegationChain.toJSON())>&state=<state>&permissions=<queries|all>&ttl=<ns>`,
 /// percent-encoded by `URLSearchParams`. The script reads each field and
 /// forwards them to the redeem endpoint verbatim (the chain's JSON text and the
-/// consent tuple II re-derives `P_reg` from — see [`parse_consent`]).
+/// consent values II re-derives `P_reg` from — see [`parse_consent`]). There is
+/// no `anchor` in the fragment: II recovers the user's identity number from
+/// `caller() == P_reg`, so the server never sees it.
 ///
 /// The pinned page's inline script, kept as a PLAIN string — not a `format!`
 /// template — so the JavaScript reads naturally (no doubled braces, room for
@@ -915,17 +918,17 @@ fn csp_nonce() -> String {
 /// `__REDEEM_URL__`, which sits inside a quoted JS string literal below.
 const PINNED_PAGE_JS: &str = r#"(function () {
   function show(t) { document.getElementById('m').textContent = t; }
-  // II delivers #delegation=<chain JSON>&state=<state>&anchor=<number>
-  // &permissions=<queries|all>&ttl=<ns> — the chain plus the consent tuple,
-  // percent-encoded by URLSearchParams and decoded again by it here. The
-  // tuple is forwarded VERBATIM: the backend echoes it to Internet Identity,
-  // which re-derives the registration principal from it (editing it here
-  // would only make redemption fail).
+  // II delivers #delegation=<chain JSON>&state=<state>&permissions=<queries|all>
+  // &ttl=<ns> — the chain plus the consent values, percent-encoded by
+  // URLSearchParams and decoded again by it here. They are forwarded VERBATIM:
+  // the backend echoes them to Internet Identity, which re-derives the
+  // registration principal from them (editing them here would only make
+  // redemption fail). No anchor rides the fragment — II recovers it from
+  // caller().
   var params = new URLSearchParams(location.hash.slice(1));
   var body = JSON.stringify({
     state: params.get('state') || '',
     delegation: params.get('delegation') || '',
-    anchor: params.get('anchor') || '',
     permissions: params.get('permissions') || '',
     ttl: params.get('ttl') || ''
   });
@@ -995,13 +998,12 @@ fn pinned_callback_page(prefix: &str) -> Response {
 }
 
 /// POST /oauth/connect/redeem body — what [`pinned_callback_page`] sends after
-/// parsing the fragment: the `state` echo and the delegation chain's JSON text
+/// parsing the fragment: the `state` echo, the delegation chain's JSON text
 /// exactly as II's frontend put it in the fragment
-/// (`JSON.stringify(DelegationChain.toJSON())`, dfinity/internet-identity#4093).
-///
-/// Deliberately NOT `Debug`: it carries the user's `anchor` (user data), so
-/// keeping it un-`{:?}`-able stops a future `?body` tracing call from logging
-/// the anchor by construction.
+/// (`JSON.stringify(DelegationChain.toJSON())`, dfinity/internet-identity#4093),
+/// and the consent values (guide rev5). The **anchor is not carried** — II
+/// recovers it from `caller() == P_reg`, so the server never sees the user's
+/// identity number.
 #[derive(Deserialize)]
 pub struct RedeemBody {
     /// The single-use connect state (= session id), echoed by II.
@@ -1010,31 +1012,23 @@ pub struct RedeemBody {
     /// ([`JsonDelegationChain`]); `der(P_reg)` rides inside as `publicKey`.
     #[serde(default)]
     delegation: String,
-    /// The consent tuple (guide rev4), forwarded verbatim from the fragment
-    /// and echoed into `mcp_register_v2` — II re-derives `P_reg` from it, so
-    /// editing it can only make redemption fail. `anchor` is the user's II
-    /// anchor number (decimal; **user data** — kept out of logs), `permissions`
-    /// is `"queries"`/`"all"`, `ttl` is the consented grant lifetime in
+    /// The consent values (guide rev5), forwarded verbatim from the fragment
+    /// and echoed into `mcp_register_v2` — II re-derives `P_reg` from them, so
+    /// editing them can only make redemption fail. `permissions` is
+    /// `"queries"`/`"all"`, `ttl` is the consented grant lifetime in
     /// NANOSECONDS (decimal — overflows 32-bit ints). Empty string = absent.
-    #[serde(default)]
-    anchor: String,
     #[serde(default)]
     permissions: String,
     #[serde(default)]
     ttl: String,
 }
 
-/// Parse the redeem body's consent tuple into typed form for the candid echo.
-/// `anchor` is required (II's `mcp_register_v2` takes `anchor_number : nat64`);
-/// `permissions`/`ttl` are optional (`opt` on the wire), with an empty string
-/// meaning absent. An unparseable value fails fast with a clear message — a
-/// mangled echo could never redeem anyway (it derives a different `P_reg`).
+/// Parse the redeem body's consent values into typed form for the candid echo.
+/// Both `permissions` and `ttl` are optional (`opt` on the wire), with an empty
+/// string meaning absent. An unparseable value fails fast with a clear message
+/// — a mangled echo could never redeem anyway (it derives a different `P_reg`).
+/// No anchor: II recovers it from `caller()`, so the server never handles it.
 fn parse_consent(body: &RedeemBody) -> Result<crate::identities::RegistrationConsent, String> {
-    let anchor = body
-        .anchor
-        .trim()
-        .parse::<u64>()
-        .map_err(|_| "consent anchor is missing or not a u64".to_string())?;
     let permissions = match body.permissions.trim() {
         "" => None,
         p => Some(crate::identities::IiPermissions::from_text(p)?),
@@ -1046,7 +1040,7 @@ fn parse_consent(body: &RedeemBody) -> Result<crate::identities::RegistrationCon
                 .map_err(|_| "consent ttl is not a u64 (expected ns as a decimal string)".to_string())?,
         ),
     };
-    Ok(crate::identities::RegistrationConsent { anchor, permissions, max_ttl_ns })
+    Ok(crate::identities::RegistrationConsent { permissions, max_ttl_ns })
 }
 
 /// Size cap for the redeem body's `delegation` JSON text, checked BEFORE
@@ -1792,42 +1786,37 @@ mod tests {
         assert_eq!(super::granted_grant_types(&g(&["client_credentials"])), None);
     }
 
-    /// The rev4 consent tuple parses into its typed echo: anchor required
-    /// (u64), permissions/ttl optional with empty-string-as-absent, and any
-    /// unparseable value fails fast (a mangled echo could never redeem — it
-    /// derives a different P_reg at II).
+    /// The rev5 consent parses into its typed echo: permissions/ttl optional
+    /// with empty-string-as-absent, no anchor carried, and any unparseable
+    /// value fails fast (a mangled echo could never redeem — it derives a
+    /// different P_reg at II).
     #[test]
-    fn parse_consent_requires_anchor_and_types_the_tuple() {
-        let body = |anchor: &str, permissions: &str, ttl: &str| super::RedeemBody {
+    fn parse_consent_types_the_values_and_omits_the_anchor() {
+        let body = |permissions: &str, ttl: &str| super::RedeemBody {
             state: "s".into(),
             delegation: String::new(),
-            anchor: anchor.into(),
             permissions: permissions.into(),
             ttl: ttl.into(),
         };
 
-        // Full tuple.
-        let c = super::parse_consent(&body("42", "queries", "2592000000000000")).expect("parse");
-        assert_eq!(c.anchor, 42);
+        // Both values present.
+        let c = super::parse_consent(&body("queries", "2592000000000000")).expect("parse");
         assert_eq!(c.permissions, Some(crate::identities::IiPermissions::Queries));
         assert_eq!(c.max_ttl_ns, Some(2_592_000_000_000_000));
 
-        // Optional fields absent (empty strings).
-        let c = super::parse_consent(&body("7", "", "")).expect("parse");
-        assert_eq!(c.anchor, 7);
+        // Both absent (empty strings) — rev5 makes them `opt`, so this is valid.
+        let c = super::parse_consent(&body("", "")).expect("parse");
         assert_eq!(c.permissions, None);
         assert_eq!(c.max_ttl_ns, None);
 
-        // Anchor is required; bad values fail fast with a clear message.
-        // (`let-else` rather than `expect_err`, which would require the Ok type
-        // `RegistrationConsent` to be `Debug` — it deliberately isn't.)
-        assert!(super::parse_consent(&body("", "all", "1")).is_err());
-        assert!(super::parse_consent(&body("not-a-number", "", "")).is_err());
-        let Err(err) = super::parse_consent(&body("1", "write-only", "")) else {
+        // Bad values fail fast with a clear message. (`let-else` rather than
+        // `expect_err`, which would require the Ok type `RegistrationConsent`
+        // to be `Debug` — it deliberately isn't.)
+        let Err(err) = super::parse_consent(&body("write-only", "")) else {
             panic!("an unknown permissions level must fail");
         };
         assert!(err.contains("unrecognized"), "got: {err}");
-        let Err(err) = super::parse_consent(&body("1", "", "soon")) else {
+        let Err(err) = super::parse_consent(&body("", "soon")) else {
             panic!("a non-numeric ttl must fail");
         };
         assert!(err.contains("ttl"), "got: {err}");
@@ -2100,13 +2089,15 @@ mod tests {
         assert!(html.contains("location.hash"), "the page reads the fragment client-side");
         assert!(html.contains("/prod/oauth/connect/redeem"), "posts to the instance's redeem path");
         assert!(!html.contains("__REDEEM_URL__"), "the redeem-URL placeholder must be substituted");
-        // The rev4 consent tuple is read from the fragment and forwarded verbatim.
-        for param in ["anchor", "permissions", "ttl"] {
+        // The rev5 consent values are read from the fragment and forwarded
+        // verbatim; the anchor is NOT read (II recovers it from caller()).
+        for param in ["permissions", "ttl"] {
             assert!(
                 html.contains(&format!("params.get('{param}')")),
-                "the page must forward the consent tuple's `{param}`"
+                "the page must forward the consent value `{param}`"
             );
         }
+        assert!(!html.contains("params.get('anchor')"), "the page must not read an anchor (rev5)");
     }
 
     // A well-formed fragment payload — agent-js `DelegationChain.toJSON()`
@@ -2294,7 +2285,6 @@ mod tests {
             axum::Json(super::RedeemBody {
                 state: "sess-x".into(),
                 delegation: String::new(),
-                anchor: String::new(),
                 permissions: String::new(),
                 ttl: String::new(),
             }),
@@ -2314,7 +2304,6 @@ mod tests {
             axum::Json(super::RedeemBody {
                 state: "sess-x".into(),
                 delegation: String::new(),
-                anchor: String::new(),
                 permissions: String::new(),
                 ttl: String::new(),
             }),
