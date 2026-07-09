@@ -920,6 +920,18 @@ struct RegDelegationDto {
     signature: String,
 }
 
+/// Size caps (base64 text length) for the redeem body's fragment fields, checked
+/// BEFORE any decode/parse so oversized attacker-controlled input is rejected
+/// without large allocations (same posture as the discovery-buffering bound,
+/// CWE-770). Legitimate values are far smaller: `user_key` is a DER canister-sig
+/// public key (~100 bytes), and `delegation` wraps one delegation plus a
+/// canister signature with its certificate (a few KB) — so these caps are
+/// generous while staying orders of magnitude under axum's 2 MB body default.
+/// Defense-in-depth: the cookie gate already means only the connect's own
+/// initiator can reach the parse at all.
+const MAX_REG_USER_KEY_B64: usize = 4 * 1024;
+const MAX_REG_DELEGATION_B64: usize = 64 * 1024;
+
 /// Decode a base64url (no pad) string, trimming surrounding whitespace.
 fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -935,6 +947,15 @@ fn parse_registration_delegation(
     user_key_b64: &str,
     delegation_b64: &str,
 ) -> Result<(Vec<u8>, Vec<SignedDelegation>), String> {
+    // Bound sizes BEFORE decoding (see MAX_REG_* above): reject oversized input
+    // without allocating for it. The delegation cap also inherently bounds every
+    // field inside the decoded JSON (pubkey, signature, targets).
+    if user_key_b64.len() > MAX_REG_USER_KEY_B64 {
+        return Err(format!("user_key exceeds {MAX_REG_USER_KEY_B64} bytes"));
+    }
+    if delegation_b64.len() > MAX_REG_DELEGATION_B64 {
+        return Err(format!("delegation exceeds {MAX_REG_DELEGATION_B64} bytes"));
+    }
     let user_key = b64url_decode(user_key_b64).map_err(|e| format!("user_key {e}"))?;
     let dto_bytes = b64url_decode(delegation_b64).map_err(|e| format!("delegation {e}"))?;
     let dto: RegDelegationDto =
@@ -1767,6 +1788,30 @@ mod tests {
         }))
         .unwrap());
         assert!(super::parse_registration_delegation(&b64(&[3u8]), &bad_exp).is_err());
+    }
+
+    // CWE-770 guard: oversized fragment fields are rejected BEFORE any base64
+    // decode / JSON parse, so an attacker-sized payload can't force large
+    // allocations. Legit sizes (a DER key, a canister-sig delegation) are far
+    // below the caps, so the bound is invisible to the real flow.
+    #[test]
+    fn parse_registration_delegation_bounds_input_size() {
+        let huge_key = "A".repeat(super::MAX_REG_USER_KEY_B64 + 1);
+        let err = super::parse_registration_delegation(&huge_key, "e30")
+            .expect_err("oversized user_key must be rejected");
+        assert!(err.contains("exceeds"), "got: {err}");
+
+        let huge_delegation = "A".repeat(super::MAX_REG_DELEGATION_B64 + 1);
+        let err = super::parse_registration_delegation(&b64(&[1u8, 2, 3]), &huge_delegation)
+            .expect_err("oversized delegation must be rejected");
+        assert!(err.contains("exceeds"), "got: {err}");
+
+        // At-cap inputs proceed past the size check (and fail later on content,
+        // not on size) — the bound doesn't clip legitimate-shaped requests.
+        let at_cap = "A".repeat(super::MAX_REG_USER_KEY_B64);
+        let err = super::parse_registration_delegation(&at_cap, "e30")
+            .expect_err("still fails on content, not size");
+        assert!(!err.contains("exceeds"), "at-cap input must pass the size check: {err}");
     }
 
     // The CSP nonce must use the STANDARD base64 alphabet: CSP2's base64-value
