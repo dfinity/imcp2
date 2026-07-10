@@ -451,7 +451,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). Returns every canister id found, with provenance: the `x-ic-canister-id` header (the frontend/asset canister — authoritative), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. There is no authoritative reverse lookup for a site's backend, so results from env.json/bundle are candidates: pick by label (prefer production/IC ids) and confirm with get_candid before calling.",
+        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). Returns every canister id found, with provenance, most authoritative first: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's MAIN backend) and the app's own /.well-known/ic-app.json manifest (ALL its canisters, with roles) — then the `x-ic-canister-id` header (the frontend/asset canister), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json/bundle entries are mined candidates: pick by label (prefer production/IC ids) and confirm with get_candid before calling.",
         annotations(title = "Discover canisters behind a domain", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::DiscoverOutput>(),
     )]
@@ -478,11 +478,13 @@ impl IcTools {
                     ));
                 }
                 out.push_str(
-                    "\nThe `header` (x-ic-canister-id) entry is the frontend/asset canister and is \
-                     authoritative. Others come from env.json or the JS bundle and may include \
-                     multiple environments (prefer the production/IC ids). A «name» (type) is the \
-                     IC dashboard's label for that id. No authoritative reverse lookup exists — \
-                     confirm an interface with get_candid before calling.",
+                    "\n`ai-connect.html` and `ic-app.json` entries are DECLARED by the app itself \
+                     (its main backend, and its own canister manifest with roles) — treat them as \
+                     the app's claim about its composition. The `header` (x-ic-canister-id) entry \
+                     is the frontend/asset canister. Others come from env.json or the JS bundle \
+                     and may include multiple environments (prefer the production/IC ids). A \
+                     «name» (type) is the IC dashboard's label for that id. Confirm an interface \
+                     with get_candid before calling.",
                 );
                 let output = discover::DiscoverOutput::from((domain, found));
                 Ok(ok_structured(out, &output))
@@ -842,8 +844,10 @@ impl ServerHandler for IcTools {
              the binary form. Before writing Candid args, consult the `candid://textual-syntax` \
              resource (the value syntax these tools use); `candid://reference` has the full type \
              reference. When the user names a website/domain instead of a canister id, use \
-             `discover_canisters` to find the canister(s) behind it (frontend via header, \
-             backend via env.json/JS bundle). When they name a TOKEN, PROJECT or SERVICE (e.g. \
+             `discover_canisters` to find the canister(s) behind it — app-declared App Connect \
+             metadata (/ai-connect.html meta, /.well-known/ic-app.json manifest) first, then the \
+             frontend via header and backend candidates via env.json/JS bundle. When they name a \
+             TOKEN, PROJECT or SERVICE (e.g. \
              \"ckUSDC\"), use `find_canister` to look it up by name in the IC dashboard's \
              registries and get its canister id. `lookup_canister(id)` tells you what a bare \
              canister id IS (dashboard label, type, controllers, subnet). `get_candid` fetches a \

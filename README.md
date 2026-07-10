@@ -18,7 +18,7 @@ results).
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `discover_canisters` | `domain` | Canister ids behind a web domain (frontend via `x-ic-canister-id`; backend via `/env.json` + JS-bundle mining), each with provenance and its IC dashboard label/type where known |
+| `discover_canisters` | `domain` | Canister ids behind a web domain — app-declared App Connect metadata first (`/ai-connect.html`'s `ic:canister-id` meta, `/.well-known/ic-app.json` manifest), then the frontend via `x-ic-canister-id` and backend candidates via `/env.json` + JS-bundle mining — each with provenance and its IC dashboard label/type where known |
 | `find_canister` | `query` | Canister ids matching a name/symbol, searched in the IC dashboard's service registries — ICRC token ledgers (e.g. `ckUSDC`) and the SNS project catalog |
 | `lookup_canister` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
 | `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus an `oql` flag — `true` when it exposes an OQL query surface (a `schema` + `execute` pair), with a pointer to `get_oql_guide` |
@@ -40,9 +40,39 @@ results).
 | `top_up_canister` | `canister_id`, `cycles?` / `icp?` | Add cycles to an existing canister — from your cycles-ledger balance (`cycles`) or by converting ICP from your ICP-ledger account via the CMC (`icp`) |
 
 `discover_canisters` is the entry point when the user names a **website** instead
-of a canister id: frontend via the `x-ic-canister-id` header (authoritative),
-backend candidates mined from `/env.json` + the JS bundle (pick by label, prefer
-production/`IC_` ids, confirm with `get_candid`).
+of a canister id. Sources, most authoritative first: **app-declared metadata**
+(below), the frontend via the `x-ic-canister-id` header, and backend candidates
+mined from `/env.json` + the JS bundle (pick by label, prefer production/`IC_`
+ids, confirm with `get_candid`).
+
+### App-declared canister metadata (App Connect)
+
+Apps that adopt **Internet Computer App Connect** serve a bridge page at
+`/ai-connect.html` whose `<meta name="ic:canister-id">` declares the app's
+**main backend** canister (spec §4.7/§6.1). Discovery reads that meta from the
+raw served markup (no JavaScript is executed) and reports it as the
+top-priority finding, labelled `main backend (App Connect)`.
+
+The App Connect spec **defers** multi-canister enumeration (§6.3: how an app
+lists *all* the canisters it comprises, with roles). To fill that gap, this
+server also reads a proposed convention: a `/.well-known/ic-app.json` manifest
+the app serves itself —
+
+```json
+{
+  "canisters": [
+    { "id": "aaaaa-…-cai", "role": "backend", "description": "orders + inventory API" },
+    { "id": "bbbbb-…-cai", "role": "ledger" }
+  ]
+}
+```
+
+Each entry needs an `id` (a canister principal); `role` and `description` are
+optional and become the finding's label (`role — description`). Unknown fields
+are ignored, so the format can grow. Both sources are the app's own claim about
+its composition — stronger than anything mined from client code — but an
+SPA catch-all serving HTML at these paths simply yields no findings (no meta
+tag; JSON parse fails), and every id is still validated as a principal.
 
 When the user names a **token, project, or service** (e.g. `ckUSDC`) rather than a
 website or id, `find_canister` resolves it via
