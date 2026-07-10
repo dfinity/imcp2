@@ -135,13 +135,22 @@ fn canisters_from_env_json(text: &str) -> Vec<(String, String)> {
 /// page and parse it, never executing its JavaScript (spec §6.1). Tolerates
 /// attribute order and single or double quotes.
 fn parse_meta(html: &str, name: &str) -> Option<String> {
-    let mut rest = html;
-    while let Some(i) = rest.find("<meta") {
-        rest = &rest[i + 5..];
-        // Tag-name boundary: `<metadata …` (or any longer name) is not <meta>.
-        if !rest.starts_with([' ', '\t', '\n', '\r', '/', '>']) {
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    while i + 5 <= bytes.len() {
+        // Find the next `<meta` — tag names are ASCII-case-insensitive in HTML,
+        // so `<META`/`<Meta` count too.
+        if bytes[i] != b'<' || !bytes[i + 1..i + 5].eq_ignore_ascii_case(b"meta") {
+            i += 1;
             continue;
         }
+        let after = i + 5;
+        // Tag-name boundary: `<metadata …` (or any longer name) is not <meta>.
+        if !matches!(bytes.get(after), Some(b' ' | b'\t' | b'\n' | b'\r' | b'/' | b'>')) {
+            i = after;
+            continue;
+        }
+        let rest = &html[after..];
         let Some(end) = rest.find('>') else {
             // No '>' anywhere in the remainder — no complete tag can follow.
             break;
@@ -152,7 +161,7 @@ fn parse_meta(html: &str, name: &str) -> Option<String> {
                 return Some(content);
             }
         }
-        rest = &rest[end..];
+        i = after + end;
     }
     None
 }
@@ -161,8 +170,8 @@ fn parse_meta(html: &str, name: &str) -> Option<String> {
 /// tag left-to-right as a sequence of attributes, consuming each quoted value
 /// whole — so a key can never be matched inside another attribute's VALUE
 /// (e.g. `data="… name='x' …"`), `data-name` can never match `name` (names
-/// compare exactly), and whitespace is tolerated around the `=`. Only quoted
-/// values are returned.
+/// compare whole, ASCII-case-insensitively per HTML), and whitespace is
+/// tolerated around the `=`. Only quoted values are returned.
 fn attr(tag: &str, key: &str) -> Option<String> {
     let bytes = tag.as_bytes();
     let mut i = 0;
@@ -205,7 +214,7 @@ fn attr(tag: &str, key: &str) -> Option<String> {
                 if j >= bytes.len() {
                     return None; // unterminated quote — malformed tag, bail
                 }
-                if name == key {
+                if name.eq_ignore_ascii_case(key) {
                     return Some(tag[vstart..j].to_string());
                 }
                 i = j + 1;
@@ -1309,6 +1318,12 @@ mod tests {
         let embedded = r#"<meta data="junk name='ic:canister-id' content='evil'" name="viewport" content="w">"#;
         assert_eq!(parse_meta(embedded, "ic:canister-id"), None, "key inside a value must not match");
         assert_eq!(attr(r#"data="x name='inner' y" name="real""#, "name").as_deref(), Some("real"));
+        // HTML tag and attribute names are ASCII-case-insensitive (per review):
+        // <META NAME=… CONTENT=…> parses; a mixed-case <MetaData> still doesn't.
+        let upper = r#"<META NAME="ic:canister-id" CONTENT="aaaaa-aa">"#;
+        assert_eq!(parse_meta(upper, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
+        let mixed_decoy = r#"<MetaData name="ic:canister-id" content="evil">"#;
+        assert_eq!(parse_meta(mixed_decoy, "ic:canister-id"), None, "<MetaData> must not match");
     }
 
     // App-declared labels must win over the header's generic "frontend" for the
