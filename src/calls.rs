@@ -472,16 +472,20 @@ pub fn parse_execute_reply(did: Option<&str>, reply: &[u8]) -> OqlResult {
 }
 
 /// Decode a reply that is a single `text` value (e.g. `schema` or the API-doc
-/// method). Falls back to the type-less rendering of a non-text value, or an
-/// explanatory string when the reply can't be decoded at all.
+/// method): the bare string. A non-text single value falls back to its type-less
+/// rendering; a reply with MORE than one value renders the whole `IDLArgs` tuple
+/// (so nothing is silently dropped, even though these methods return one value by
+/// contract); an undecodable reply yields an explanatory string.
 pub fn decode_text_reply(reply: &[u8]) -> String {
-    match IDLArgs::from_bytes(reply) {
-        Ok(args) => match args.args.into_iter().next() {
-            Some(IDLValue::Text(s)) => s,
-            Some(other) => other.to_string(),
-            None => "(empty reply)".to_string(),
-        },
-        Err(e) => format!("(undecodable reply: {e})"),
+    let args = match IDLArgs::from_bytes(reply) {
+        Ok(a) => a,
+        Err(e) => return format!("(undecodable reply: {e})"),
+    };
+    match args.args.as_slice() {
+        [] => "(empty reply)".to_string(),
+        [IDLValue::Text(s)] => s.clone(),
+        [single] => single.to_string(),
+        _ => args.to_string(),
     }
 }
 
@@ -958,5 +962,12 @@ mod tests {
         let did = "service : { getApiDoc : () -> (text) query; }";
         let reply = encode_reply(did, "getApiDoc", "(\"# API\\nHow this app behaves.\")");
         assert_eq!(decode_text_reply(&reply), "# API\nHow this app behaves.");
+
+        // A multi-value reply keeps ALL values (renders the tuple) instead of
+        // silently dropping the tail.
+        let multi_did = "service : { foo : () -> (text, nat) query; }";
+        let multi = encode_reply(multi_did, "foo", "(\"a\", 5 : nat)");
+        let out = decode_text_reply(&multi);
+        assert!(out.contains("a") && out.contains('5'), "multi-value reply keeps all values: {out}");
     }
 }
