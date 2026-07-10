@@ -157,37 +157,69 @@ fn parse_meta(html: &str, name: &str) -> Option<String> {
     None
 }
 
-/// A `key="value"` (or `key='value'`) attribute inside a tag body. The key
-/// must sit on an attribute boundary (start-of-tag or preceding whitespace,
-/// so `data-name` can never match `name`), and whitespace is tolerated
-/// around the `=`.
+/// A `key="value"` (or `key='value'`) attribute inside a tag body. Scans the
+/// tag left-to-right as a sequence of attributes, consuming each quoted value
+/// whole — so a key can never be matched inside another attribute's VALUE
+/// (e.g. `data="… name='x' …"`), `data-name` can never match `name` (names
+/// compare exactly), and whitespace is tolerated around the `=`. Only quoted
+/// values are returned.
 fn attr(tag: &str, key: &str) -> Option<String> {
     let bytes = tag.as_bytes();
-    let mut from = 0;
-    while let Some(off) = tag[from..].find(key) {
-        let i = from + off;
-        from = i + key.len();
-        if i > 0 && !bytes[i - 1].is_ascii_whitespace() {
-            continue; // mid-word match (e.g. `data-name`) — not this attribute
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip whitespace between attributes.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
         }
-        let mut j = i + key.len();
-        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-            j += 1;
+        if i >= bytes.len() {
+            break;
         }
-        if j >= bytes.len() || bytes[j] != b'=' {
-            continue; // a bare/valueless attribute, or another word entirely
+        // Read one attribute name (stop at whitespace, '=', or a quote).
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'"'
+            && bytes[i] != b'\''
+        {
+            i += 1;
         }
-        j += 1;
-        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-            j += 1;
+        let name = &tag[name_start..i];
+        // Optional `= value`, with whitespace tolerated around the '='.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
         }
-        if j >= bytes.len() || (bytes[j] != b'"' && bytes[j] != b'\'') {
-            continue; // unquoted value — not the shape we accept
+        if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                // Quoted value: consume it whole (to the matching quote).
+                let quote = bytes[i];
+                let vstart = i + 1;
+                let mut j = vstart;
+                while j < bytes.len() && bytes[j] != quote {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    return None; // unterminated quote — malformed tag, bail
+                }
+                if name == key {
+                    return Some(tag[vstart..j].to_string());
+                }
+                i = j + 1;
+            } else {
+                // Unquoted value: consume the token; never returned.
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+            }
         }
-        let quote = bytes[j] as char;
-        let rest = &tag[j + 1..];
-        let k = rest.find(quote)?;
-        return Some(rest[..k].to_string());
+        // Guarantee progress on stray bytes (e.g. a bare quote at name position).
+        if i == name_start {
+            i += 1;
+        }
     }
     None
 }
@@ -1271,6 +1303,12 @@ mod tests {
         // A malformed, never-closed `<meta` can't panic or loop; it just ends
         // the scan (no '>' remains, so no complete tag can follow anyway).
         assert_eq!(parse_meta("<meta name=\"ic:canister-id\" content=\"x\"", "ic:canister-id"), None);
+        // A key inside another attribute's quoted VALUE must not match (per
+        // review): the tokenizer consumes values whole, so `name=…` embedded in
+        // `data="…"` is invisible, and the tag's REAL name attribute is used.
+        let embedded = r#"<meta data="junk name='ic:canister-id' content='evil'" name="viewport" content="w">"#;
+        assert_eq!(parse_meta(embedded, "ic:canister-id"), None, "key inside a value must not match");
+        assert_eq!(attr(r#"data="x name='inner' y" name="real""#, "name").as_deref(), Some("real"));
     }
 
     // App-declared labels must win over the header's generic "frontend" for the
