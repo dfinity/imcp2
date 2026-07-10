@@ -1042,20 +1042,23 @@ impl ServerHandler for IcTools {
              `oql_schema` (entities and fields) and `oql_query` (run a JSON query, get a table \
              back). Those two wrap the canister's `schema`/`execute` methods, so you don't \
              hand-encode Candid for OQL. `call_canister` calls a method with textual Candid \
-             in/out: omit `domain` to call anonymously, or pass an application domain (e.g. \
-             domain=\"oisy.com\") to call as your account at that app — a short-lived (<=5 min) \
-             account delegation for it is minted ON DEMAND from this connection's standing \
-             Internet Identity credential, no extra sign-in. `get_principal` returns the principal \
-             you act as at an application `domain` without making a call (e.g. to look up a \
-             balance or account). A user may hold several accounts at an app (a default one plus \
-             named ones); `list_accounts(domain)` lists them, and call_canister/get_principal take \
-             an optional `account` (a name from that list) to act as a specific one — omit it for \
-             the default account. The per-app principal is derived from the app's DOMAIN — usually, \
-             but NOT always, the same identity a browser sign-in to that app would use: some apps \
-             declare a custom derivation origin (via /.well-known/ii-alternative-origins) not \
-             exposed here. If a principal, account, or balance doesn't match what the user sees in \
-             their browser at that app, say so and offer to look up the app's ii-alternative-origins \
-             (web search / fetch) and retry. The standing credential is obtained when you connect \
+             in/out: omit the identity args to call anonymously, or act AS your account at an app. \
+             To act as an app account, identify the app by its `derivation_origin` — the EXACT \
+             canonical origin Internet Identity derives its principal from, which is NOT \
+             necessarily the visible website URL and must NEVER be inferred from an \
+             ii-alternative-origins list — or by `app_url`, which the connector resolves (use \
+             `resolve_app` to see what an app URL resolves to). A short-lived (<=5 min) account \
+             delegation is minted ON DEMAND from this connection's standing credential, no extra \
+             sign-in. `get_principal` returns the principal without a call; `list_accounts` lists \
+             the user's accounts (a default one plus any named ones), and call_canister / \
+             get_principal take an optional `account` (a name from that list) — omit it for the \
+             default. Every identity result echoes `derived_for_origin` (the origin actually used), \
+             `requested` (what you passed), and `derivation_origin_source`: if the source is \
+             \"app_url_default\", the app declared no derivation origin and the app URL was ASSUMED \
+             to be it — correct only if the app has no custom derivation origin. If a principal, \
+             account, or balance doesn't match what the user sees in their browser, the derivation \
+             origin is wrong: pass the app's canonical `derivation_origin` explicitly. The standing \
+             credential is obtained when you connect \
              (authenticate via Internet Identity) and lasts for the session duration you choose when \
              connecting (up to 30 days); reconnect when it expires. \
              The session may be READ-ONLY (Internet Identity's consent screen defaults to read-only): \
@@ -1310,7 +1313,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
 <h1>Internet Computer MCP PoC</h1>
 <p>MCP endpoints: <code>POST /mcp</code> (beta Internet Identity) · <code>POST /mcp-prod</code> (production Internet Identity)</p>
-<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>find_canister</code> (name → canister ids), <code>lookup_canister</code> (id → dashboard identity), <code>get_candid</code>, <code>call_canister</code> (anonymously, or as your account at an application domain, derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (your principal at an application domain, no call), <code>list_accounts</code> (your Internet Identity accounts at an app domain). All speak textual Candid.</p>
+<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>find_canister</code> (name → canister ids), <code>lookup_canister</code> (id → dashboard identity), <code>get_candid</code>, <code>call_canister</code> (anonymously, or as your account at an app — identified by its <code>derivation_origin</code> or <code>app_url</code>, delegation minted on demand), <code>get_principal</code> (your principal at an app, no call), <code>list_accounts</code> (your Internet Identity accounts at an app), <code>resolve_app</code> (app URL → its Internet Identity derivation origin + principal). Identity results echo <code>derived_for_origin</code>/<code>requested</code> so an origin mismatch is visible. All speak textual Candid.</p>
 <p>Skills: <code>list_ic_skills</code> / <code>get_ic_skill</code> (the official IC how-to guides — Motoko, mops, icp CLI, cycles, …).</p>
 <p>App docs: <code>get_api_doc</code> (a canister's own "how this app behaves" guide, if it exposes <code>getApiDoc</code>/<code>get_api_doc</code>).</p>
 <p>OQL: <code>get_oql_guide</code> (dialect), <code>oql_schema</code> (entities/fields), <code>oql_query</code> (run a JSON query, get a table) — for canisters that expose an OQL <code>schema</code>/<code>execute</code> surface (<code>get_candid</code> reports <code>oql: true</code>).</p>
