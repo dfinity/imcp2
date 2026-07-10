@@ -381,24 +381,21 @@ server serves it for both instances (one origin-global document listing each
 instance's `{prefix}/oauth/connect/callback`), built from the same helper that
 builds the II links' callback URLs so the two can never drift.
 
-The Phase-2 wire shapes track **rev5 of the MCP server guide** (II's
-implementation PRs are not merged yet — re-verify when they land): the connect
+The Phase-2 wire shapes match the **merged II contract** (verified against the
+beta II canister's live `.did`, `fgte5-ciaaa-aaaad-aaatq-cai`): the connect
 link carries `registration_key` = base64url(DER(`pub(X)`)); II navigates back
-to the allow-listed callback with the chain **plus the consent tuple** —
-`#delegation=<DelegationChain JSON>&state=…&permissions=<queries|all>&ttl=<ns>`
-(agent-js `DelegationChain.toJSON()` — hex byte fields, hex-string expiration);
-and redemption calls
-`mcp_register_v2(session_key, opt permissions, opt max_ttl)
--> record { expiration; permissions }`, **echoing the consent verbatim**.
-Consent is *stateless* at II for the access level and lifetime: **no consent
-values are stored beyond the anchor mapping** — at consent II records only
-`P_reg -> anchor` (so it can recover the anchor at redemption), while
-`permissions`/`max_ttl` are re-derived, not stored. `P_reg` is re-derived from
-the echoed consent plus the user's current trusted-server config, so an altered
-echo (or a consent-time config change) derives a different principal and
-redemption fails cleanly. The anchor is **never sent by the server**: II
-recovers it from `caller() == P_reg`, so the anchor number never reaches — or
-is logged by — this server.
+to the allow-listed callback with the chain **plus the connect state**:
+`#delegation=<DelegationChain JSON>&state=…`
+(agent-js `DelegationChain.toJSON()`: hex byte fields, hex-string expiration);
+and redemption calls `mcp_register_v2(session_key)
+-> record { expiration; permissions }`. The access level and lifetime are
+**not sent by the server**: the user chose them at consent, and II stored them at
+`prepare_mcp_registration_delegation` on an index keyed by `P_reg`, so
+`mcp_register_v2` recovers both the consent and the anchor from
+`caller() == P_reg`. The server therefore sends only `pub(S)` and can alter
+neither the anchor, the permissions, nor the TTL; the anchor number never
+reaches (or is logged by) this server. (The chosen access level does come
+*back* on the reply, feeding the read-only guard.)
 
 Server side (on a Phase-2 instance):
 
@@ -418,19 +415,21 @@ Server side (on a Phase-2 instance):
   `finishing_page` poll. The read-only level comes back on the `mcp_register_v2`
   reply (feeding the same `require_write` guard as v1's completion POST).
 
-> **Gated on Internet Identity.** `mcp_register_v2` and the delegation-minting
-> methods (`prepare_`/`get_mcp_registration_delegation`, the `mcp-registration`
-> seed) are not on **deployed** II yet — until they ship, a Phase-2 instance
-> simply continues to complete connects via v1 (see above). The wire shapes
-> (link param, fragment `DelegationChain` JSON, `mcp_register_v2` candid, and
-> the callback allow-list) match II's implementation PRs
+> **Verified against deployed beta II.** `mcp_register_v2` and the
+> delegation-minting methods (`prepare_mcp_registration_delegation`,
+> `get_mcp_registration_delegation`) are **live on the beta II canister**
+> (`fgte5-ciaaa-aaaad-aaatq-cai`); the shapes here (link param, fragment
+> `DelegationChain` JSON, the one-argument `mcp_register_v2` candid, and the
+> callback allow-list) match its published `.did`; re-verify if it ever moves.
+> The design tracked II's implementation PRs
 > [#4091](https://github.com/dfinity/internet-identity/pull/4091) /
 > [#4092](https://github.com/dfinity/internet-identity/pull/4092) /
-> [#4093](https://github.com/dfinity/internet-identity/pull/4093), which are
-> not merged yet — re-verify against II's published `.did` and frontend when
-> they land. Retiring v1 on a Phase-2 instance (the design's "v1 sunset") is a
-> separate, later step. This also relies on **Phase 1** (the callback
-> allow-list, an II-side validation) as its security precondition.
+> [#4093](https://github.com/dfinity/internet-identity/pull/4093) through to
+> this merged shape. Production II (`rdmx6-…`) keeps `registration_delegation`
+> **off** (v1 flow) until it ships these methods. Retiring v1 on a Phase-2
+> instance (the design's "v1 sunset") is a separate, later step. This also
+> relies on **Phase 1** (the callback allow-list, an II-side validation) as its
+> security precondition.
 
 ### Read-only sessions
 

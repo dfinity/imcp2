@@ -84,24 +84,22 @@
 //! to that instance's II link and turns on its pinned callback page + redeem
 //! endpoint, while every v1 handler (the callback POSTs, `/oauth/finish`) stays
 //! live — an II frontend that doesn't know the new flow ignores the extra param
-//! and completes v1 unchanged. So beta keeps connecting via v1 until beta II
-//! actually ships the new frontend and canister methods, and switches over when
-//! it does.
+//! and completes v1 unchanged. So beta connected via v1 until beta II shipped
+//! the new frontend and canister methods; now that it has, beta runs Phase 2.
 //!
-//! The wire shapes track rev5 of the MCP server guide (II's implementation
-//! PRs are not merged yet — re-verify when they land): the connect link
-//! carries `registration_key` = base64url(DER(`pub(X)`)); II navigates back
-//! to the callback — validated against our [`AUTH_CALLBACKS_WELL_KNOWN`]
-//! allow-list — with `#delegation=<DelegationChain JSON>&state=…&permissions=…&
-//! ttl=…` (the chain plus the CONSENT values, parsed by
-//! [`parse_registration_delegation`] and [`parse_consent`]); and the backend
-//! redeems via `mcp_register_v2(session_key, opt permissions, opt max_ttl)
-//! -> record { expiration; permissions }`, echoing those values verbatim —
-//! consent is STATELESS at II, which re-derives `P_reg` from the echo and
-//! redeems only if it lands on `caller()`. The **anchor is never sent or
-//! seen** by the server: II recovers the user's identity number from
-//! `caller() == P_reg`. Retiring v1 for a Phase-2 instance (the design's "v1
-//! sunset") is a separate, later step — not this.
+//! The wire shapes match the merged II contract (verified against the beta II
+//! canister's live `.did`, `fgte5-ciaaa-aaaad-aaatq-cai`): the connect link
+//! carries `registration_key` = base64url(DER(`pub(X)`)); II navigates back to
+//! the callback (validated against our [`AUTH_CALLBACKS_WELL_KNOWN`] allow-list)
+//! with `#delegation=<DelegationChain JSON>&state=…` (the chain plus the
+//! connect state, parsed by [`parse_registration_delegation`]); and the backend
+//! redeems via `mcp_register_v2(session_key) -> record { expiration;
+//! permissions }`. Consent (permissions, max_ttl) is NOT echoed: the user chose
+//! it earlier at `prepare_mcp_registration_delegation`, which stored it keyed by
+//! `P_reg`, so II recovers it (and the user's identity number) from
+//! `caller() == P_reg`, and the server sends and sees neither. Retiring v1 for a
+//! Phase-2 instance (the design's "v1 sunset") is a separate, later step, not
+//! this.
 
 use std::{
     collections::HashMap,
@@ -640,12 +638,18 @@ fn finishing_page(prefix: &str, id: &str, fs: &str, next_try: u32) -> Response {
         urlencoding::encode(fs),
         next_try
     ));
+    // Shares the connect pages' look (centered card + spinner + dark mode). This
+    // page sets no CSP, so a plain `<style>`/`<script>` is fine.
+    let css = CONNECT_PAGE_CSS;
     let mut resp = Html(format!(
-        "<!DOCTYPE html><meta charset=utf-8><title>Finishing…</title>\
+        "<!DOCTYPE html><html lang=en><head><meta charset=utf-8><title>Finishing…</title>\
+         <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <meta name=referrer content=no-referrer>\
-         <body style=\"font-family:system-ui;max-width:32rem;margin:3rem auto\">\
-         <p>Finishing sign-in…</p>\
-         <script>setTimeout(function(){{location.replace(\"{url}\")}},1200)</script></body>"
+         <style>{css}</style></head>\
+         <body><main class=card role=status aria-live=polite>\
+         <div class=spinner aria-hidden=true></div>\
+         <p>Finishing sign-in…</p></main>\
+         <script>setTimeout(function(){{location.replace(\"{url}\")}},1200)</script></body></html>"
     ))
     .into_response();
     resp.headers_mut()
@@ -898,42 +902,99 @@ fn csp_nonce() -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// Shared styling for the connect interstitial/error pages: a vertically- and
+/// horizontally-centered card with a system font, an accessible status line, a
+/// CSS-only spinner (disabled under `prefers-reduced-motion`), and light/dark
+/// theming via `prefers-color-scheme`. Fully self-contained (no external fonts,
+/// images, or stylesheets), so it renders identically under the pinned page's
+/// strict `default-src 'none'` CSP. The pinned page serves it in a
+/// `<style nonce>` block (with `style-src 'nonce-…'` added to its CSP so the
+/// block is allowed WITHOUT `'unsafe-inline'`); the sibling pages, which set no
+/// CSP, use a plain `<style>`. The `.error` modifier hides the spinner once a
+/// terminal message is shown.
+const CONNECT_PAGE_CSS: &str = r#":root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  background: #f6f7f9;
+  color: #1a1a1c;
+}
+.card {
+  width: 100%;
+  max-width: 22rem;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.1rem;
+}
+.card h1 { margin: 0; font-size: 1.15rem; font-weight: 600; }
+.card p { margin: 0; font-size: 1.02rem; }
+.card .hint { font-size: 0.9rem; opacity: 0.65; }
+.spinner {
+  width: 2.1rem;
+  height: 2.1rem;
+  border-radius: 50%;
+  border: 3px solid rgba(130, 130, 140, 0.25);
+  border-top-color: currentColor;
+  animation: connect-spin 0.8s linear infinite;
+}
+.card.error .spinner { display: none; }
+@keyframes connect-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+@media (prefers-color-scheme: dark) { body { background: #161719; color: #ececed; } }
+"#;
+
 /// The strict-CSP, non-reflecting pinned callback page. `nonce` is a fresh
-/// per-response value bound into BOTH the CSP header and the inline `<script>`,
-/// so no `'unsafe-inline'` is needed; `connect-src 'self'` limits the page's only
-/// network reach to the same-origin redeem endpoint, and `default-src 'none'`
-/// forbids loading anything else. No attacker-supplied value (fragment, query)
-/// is ever interpolated into the HTML — the fragment is read client-side and sent
-/// via `fetch`, never written to the DOM.
+/// per-response value bound into the CSP header and BOTH the inline `<script>`
+/// and `<style>`, so no `'unsafe-inline'` is needed; `connect-src 'self'` limits
+/// the page's only network reach to the same-origin redeem endpoint, and
+/// `default-src 'none'` forbids loading anything else (all styling is inline and
+/// self-contained; see [`CONNECT_PAGE_CSS`]). No attacker-supplied value
+/// (fragment, query) is ever interpolated into the HTML; the fragment is read
+/// client-side and sent via `fetch`, never written to the DOM.
 ///
-/// The fragment shape matches II's frontend (guide rev5): the delegation chain
-/// plus the consent values —
-/// `#delegation=<JSON.stringify(DelegationChain.toJSON())>&state=<state>&permissions=<queries|all>&ttl=<ns>`,
-/// percent-encoded by `URLSearchParams`. The script reads each field and
-/// forwards them to the redeem endpoint verbatim (the chain's JSON text and the
-/// consent values II re-derives `P_reg` from — see [`parse_consent`]). There is
-/// no `anchor` in the fragment: II recovers the user's identity number from
-/// `caller() == P_reg`, so the server never sees it.
+/// The fragment shape matches II's frontend (merged contract): the delegation
+/// chain plus the connect state only:
+/// `#delegation=<JSON.stringify(DelegationChain.toJSON())>&state=<state>`,
+/// percent-encoded by `URLSearchParams`. The script reads both fields and
+/// forwards them to the redeem endpoint (the chain's JSON text and the state
+/// echo). There is no `anchor`, and no `permissions`/`ttl`, in the fragment:
+/// the consent was captured earlier at `prepare_mcp_registration_delegation`
+/// (keyed by `P_reg`), and II recovers it (and the user's identity number)
+/// from `caller() == P_reg`, so the server sees none of them.
 ///
-/// The pinned page's inline script, kept as a PLAIN string — not a `format!`
-/// template — so the JavaScript reads naturally (no doubled braces, room for
-/// comments). The one dynamic value, the redeem URL, is spliced in by replacing
-/// `__REDEEM_URL__`, which sits inside a quoted JS string literal below.
+/// The pinned page's inline script and stylesheet are kept as PLAIN strings,
+/// not `format!` templates, so they read naturally (no doubled braces, room for
+/// comments). The one dynamic value in the script, the redeem URL, is spliced in
+/// by replacing `__REDEEM_URL__`, which sits inside a quoted JS string literal
+/// below.
 const PINNED_PAGE_JS: &str = r#"(function () {
-  function show(t) { document.getElementById('m').textContent = t; }
-  // II delivers #delegation=<chain JSON>&state=<state>&permissions=<queries|all>
-  // &ttl=<ns> — the chain plus the consent values, percent-encoded by
-  // URLSearchParams and decoded again by it here. They are forwarded VERBATIM:
-  // the backend echoes them to Internet Identity, which re-derives the
-  // registration principal from them (editing them here would only make
-  // redemption fail). No anchor rides the fragment — II recovers it from
-  // caller().
+  function show(t, err) {
+    document.getElementById('m').textContent = t;
+    if (err) {
+      var c = document.querySelector('.card');
+      if (c) { c.classList.add('error'); }
+    }
+  }
+  // II delivers #delegation=<chain JSON>&state=<state>: the two-hop chain plus
+  // the connect state, percent-encoded by URLSearchParams and decoded again by
+  // it here. Consent (permissions, max_ttl) is NOT in the fragment: the user
+  // chose it earlier at II's prepare step, which stored it keyed by P_reg, and
+  // mcp_register_v2 recovers it server-side. So the page forwards only the chain
+  // and the state; the backend redeems with mcp_register_v2(session_key).
   var params = new URLSearchParams(location.hash.slice(1));
   var body = JSON.stringify({
     state: params.get('state') || '',
-    delegation: params.get('delegation') || '',
-    permissions: params.get('permissions') || '',
-    ttl: params.get('ttl') || ''
+    delegation: params.get('delegation') || ''
   });
   // Scrub the delegation from the address bar, keeping the path and any query
   // string the declared callback carries. Best-effort: the POST below works
@@ -950,11 +1011,11 @@ const PINNED_PAGE_JS: &str = r#"(function () {
       if (d && d.redirect) {
         location.replace(d.redirect);
       } else {
-        show((d && d.error) || 'Could not finish the connection — restart from your client.');
+        show((d && d.error) || 'Could not finish the connection. Restart from your client.', true);
       }
     })
     .catch(function () {
-      show('Could not reach the server — restart from your client.');
+      show('Could not reach the server. Restart from your client.', true);
     });
 })();"#;
 
@@ -962,22 +1023,32 @@ fn pinned_callback_page(prefix: &str) -> Response {
     let nonce = csp_nonce();
     let redeem = js_escape(&format!("{prefix}/oauth/connect/redeem"));
     let script = PINNED_PAGE_JS.replace("__REDEEM_URL__", &redeem);
+    let css = CONNECT_PAGE_CSS;
+    // The status line is a `role=status` / `aria-live=polite` region so screen
+    // readers announce both "Finishing sign-in…" and any terminal error the
+    // script swaps in. The spinner is decorative (`aria-hidden`).
     let html = format!(
-        "<!DOCTYPE html><html><head><meta charset=utf-8>\
+        "<!DOCTYPE html><html lang=en><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
-         <title>Finishing sign-in…</title></head>\
-         <body style=\"font-family:system-ui;max-width:32rem;margin:3rem auto\">\
-         <p id=m>Finishing sign-in…</p>\
+         <title>Finishing sign-in…</title>\
+         <style nonce=\"{nonce}\">{css}</style></head>\
+         <body><main class=card role=status aria-live=polite>\
+         <div class=spinner aria-hidden=true></div>\
+         <p id=m>Finishing sign-in…</p></main>\
          <script nonce=\"{nonce}\">{script}</script></body></html>"
     );
+    // `style-src 'nonce-{nonce}'` admits ONLY the nonce'd `<style>` block above
+    // (no `'unsafe-inline'`, so an injected `style=` attribute or stray `<style>`
+    // still can't apply). Without it the block falls back to `default-src
+    // 'none'` and the page renders unstyled.
     // `frame-ancestors 'none'`: II reaches this page only by top-level
     // navigation, so framing is never legitimate — deny it outright so the
     // delegation-bearing page can't be embedded for UI redress. X-Frame-Options
     // covers legacy browsers that predate CSP2 (modern ones ignore it when
     // frame-ancestors is present).
     let csp = format!(
-        "default-src 'none'; script-src 'nonce-{nonce}'; connect-src 'self'; base-uri 'none'; \
-         form-action 'none'; frame-ancestors 'none'"
+        "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; \
+         connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     );
     let mut resp = Html(html).into_response();
     let h = resp.headers_mut();
@@ -1001,12 +1072,13 @@ fn pinned_callback_page(prefix: &str) -> Response {
 }
 
 /// POST /oauth/connect/redeem body — what [`pinned_callback_page`] sends after
-/// parsing the fragment: the `state` echo, the delegation chain's JSON text
+/// parsing the fragment: the `state` echo and the delegation chain's JSON text
 /// exactly as II's frontend put it in the fragment
-/// (`JSON.stringify(DelegationChain.toJSON())`, dfinity/internet-identity#4093),
-/// and the consent values (guide rev5). The **anchor is not carried** — II
-/// recovers it from `caller() == P_reg`, so the server never sees the user's
-/// identity number.
+/// (`JSON.stringify(DelegationChain.toJSON())`, dfinity/internet-identity#4093).
+/// **No consent values and no anchor are carried**: the user's chosen
+/// permissions/TTL were captured earlier at `prepare_mcp_registration_delegation`
+/// (keyed by `P_reg`), and II recovers them, and the user's identity number,
+/// from `caller() == P_reg`, so the server never sees any of them.
 #[derive(Deserialize)]
 pub struct RedeemBody {
     /// The single-use connect state (= session id), echoed by II.
@@ -1015,35 +1087,6 @@ pub struct RedeemBody {
     /// ([`JsonDelegationChain`]); `der(P_reg)` rides inside as `publicKey`.
     #[serde(default)]
     delegation: String,
-    /// The consent values (guide rev5), forwarded verbatim from the fragment
-    /// and echoed into `mcp_register_v2` — II re-derives `P_reg` from them, so
-    /// editing them can only make redemption fail. `permissions` is
-    /// `"queries"`/`"all"`, `ttl` is the consented grant lifetime in
-    /// NANOSECONDS (decimal — overflows 32-bit ints). Empty string = absent.
-    #[serde(default)]
-    permissions: String,
-    #[serde(default)]
-    ttl: String,
-}
-
-/// Parse the redeem body's consent values into typed form for the candid echo.
-/// Both `permissions` and `ttl` are optional (`opt` on the wire), with an empty
-/// string meaning absent. An unparseable value fails fast with a clear message
-/// — a mangled echo could never redeem anyway (it derives a different `P_reg`).
-/// No anchor: II recovers it from `caller()`, so the server never handles it.
-fn parse_consent(body: &RedeemBody) -> Result<crate::identities::RegistrationConsent, String> {
-    let permissions = match body.permissions.trim() {
-        "" => None,
-        p => Some(crate::identities::IiPermissions::from_text(p)?),
-    };
-    let max_ttl_ns = match body.ttl.trim() {
-        "" => None,
-        t => Some(
-            t.parse::<u64>()
-                .map_err(|_| "consent ttl is not a u64 (expected ns as a decimal string)".to_string())?,
-        ),
-    };
-    Ok(crate::identities::RegistrationConsent { permissions, max_ttl_ns })
 }
 
 /// Size cap for the redeem body's `delegation` JSON text, checked BEFORE
@@ -1103,9 +1146,9 @@ fn hex_decode(field: &str, s: &str) -> Result<Vec<u8>, String> {
 /// `ic-agent` types — hop count is preserved verbatim (two hops per rev3 of the
 /// guide; the redeem path only requires that the FINAL hop targets our `X`, and
 /// the replica verifies every hop authoritatively). The chain carries no
-/// `permissions` field: under rev5's stateless consent the access level isn't
-/// stored in the delegation at all — it rides the fragment's consent values
-/// (see [`parse_consent`]) and is echoed into `mcp_register_v2`. So a
+/// `permissions` field: the access level isn't stored in the delegation at all.
+/// The user chose it at consent, II stored it under `P_reg` at
+/// `prepare_mcp_registration_delegation`, and it never touches the server. So a
 /// `permissions` field appearing here would be unexpected, and
 /// [`JsonDelegationChain`] fails fast if one ever does.
 fn parse_registration_delegation(delegation_json: &str) -> Result<(Vec<u8>, Vec<SignedDelegation>), String> {
@@ -1246,15 +1289,12 @@ pub async fn connect_redeem(
         return Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state) })).into_response();
     }
     // Decode the fragment delegation (agent-js DelegationChain JSON, II #4093)
-    // and the consent values to echo (guide rev5) — both before claiming, so a
-    // malformed delivery never occupies the single-flight slot.
+    // before claiming, so a malformed delivery never occupies the single-flight
+    // slot. No consent values are parsed: they're not in the fragment (II
+    // captured them at prepare and recovers them from caller() == P_reg).
     let (user_key, chain) = match parse_registration_delegation(&body.delegation) {
         Ok(v) => v,
         Err(e) => return redeem_err(&format!("malformed registration delegation: {e}")),
-    };
-    let consent = match parse_consent(&body) {
-        Ok(c) => c,
-        Err(e) => return redeem_err(&format!("malformed consent tuple: {e}")),
     };
     // Single-flight: atomically claim this connect's redemption so a double-submit
     // can't fire two concurrent mcp_register_v2 calls (and a request racing a
@@ -1277,7 +1317,7 @@ pub async fn connect_redeem(
     // authenticated mcp_register_v2 call. Success proves consent AND registration.
     match store
         .identities
-        .redeem_registration_delegation(&body.state, user_key, chain, consent)
+        .redeem_registration_delegation(&body.state, user_key, chain)
         .await
     {
         Ok(outcome) => {
@@ -1345,10 +1385,17 @@ fn js_escape(s: &str) -> String {
 
 fn connect_error(message: &str) -> Response {
     let safe = message.replace('<', "&lt;");
+    // Shares the connect pages' look via the `.error` modifier (no spinner). No
+    // CSP here, so a plain `<style>` is fine.
+    let css = CONNECT_PAGE_CSS;
     (
         StatusCode::BAD_REQUEST,
         Html(format!(
-            "<!DOCTYPE html><meta charset=utf-8><body style=\"font-family:system-ui;max-width:32rem;margin:3rem auto\"><h1>Could not connect</h1><p>{safe}</p></body>"
+            "<!DOCTYPE html><html lang=en><head><meta charset=utf-8>\
+             <meta name=viewport content=\"width=device-width,initial-scale=1\">\
+             <title>Could not connect</title><style>{css}</style></head>\
+             <body><main class=\"card error\"><h1>Could not connect</h1>\
+             <p>{safe}</p><p class=hint>Restart the connection from your client.</p></main></body></html>"
         )),
     )
         .into_response()
@@ -1797,42 +1844,6 @@ mod tests {
         assert_eq!(super::granted_grant_types(&g(&["client_credentials"])), None);
     }
 
-    /// The rev5 consent parses into its typed echo: permissions/ttl optional
-    /// with empty-string-as-absent, no anchor carried, and any unparseable
-    /// value fails fast (a mangled echo could never redeem — it derives a
-    /// different P_reg at II).
-    #[test]
-    fn parse_consent_types_the_values_and_omits_the_anchor() {
-        let body = |permissions: &str, ttl: &str| super::RedeemBody {
-            state: "s".into(),
-            delegation: String::new(),
-            permissions: permissions.into(),
-            ttl: ttl.into(),
-        };
-
-        // Both values present.
-        let c = super::parse_consent(&body("queries", "2592000000000000")).expect("parse");
-        assert_eq!(c.permissions, Some(crate::identities::IiPermissions::Queries));
-        assert_eq!(c.max_ttl_ns, Some(2_592_000_000_000_000));
-
-        // Both absent (empty strings) — rev5 makes them `opt`, so this is valid.
-        let c = super::parse_consent(&body("", "")).expect("parse");
-        assert_eq!(c.permissions, None);
-        assert_eq!(c.max_ttl_ns, None);
-
-        // Bad values fail fast with a clear message. (`let-else` rather than
-        // `expect_err`, which would require the Ok type `RegistrationConsent`
-        // to be `Debug` — it deliberately isn't.)
-        let Err(err) = super::parse_consent(&body("write-only", "")) else {
-            panic!("an unknown permissions level must fail");
-        };
-        assert!(err.contains("unrecognized"), "got: {err}");
-        let Err(err) = super::parse_consent(&body("", "soon")) else {
-            panic!("a non-numeric ttl must fail");
-        };
-        assert!(err.contains("ttl"), "got: {err}");
-    }
-
     #[test]
     fn build_redirect_encodes_code_and_state() {
         let r = build_redirect("https://claude.ai/cb", "mcp-code-1", "abc/def");
@@ -2097,18 +2108,35 @@ mod tests {
             html.contains(&format!("<script nonce=\"{nonce}\">")),
             "the inline script nonce must match the CSP nonce"
         );
+        // The stylesheet is nonce'd too, and the CSP admits it via style-src;
+        // without it the strict `default-src 'none'` would drop the styles and
+        // the page would render unstyled (the bug that motivated this work).
+        assert!(
+            csp.contains(&format!("style-src 'nonce-{nonce}'")),
+            "style-src must carry the same nonce: {csp}"
+        );
+        assert!(
+            html.contains(&format!("<style nonce=\"{nonce}\">")),
+            "the inline style nonce must match the CSP nonce"
+        );
         assert!(html.contains("location.hash"), "the page reads the fragment client-side");
         assert!(html.contains("/prod/oauth/connect/redeem"), "posts to the instance's redeem path");
         assert!(!html.contains("__REDEEM_URL__"), "the redeem-URL placeholder must be substituted");
-        // The rev5 consent values are read from the fragment and forwarded
-        // verbatim; the anchor is NOT read (II recovers it from caller()).
-        for param in ["permissions", "ttl"] {
+        // Merged contract: the page forwards ONLY the chain and the connect
+        // state. It reads neither the consent values (captured earlier at
+        // prepare, recovered by II from caller() == P_reg) nor an anchor.
+        for param in ["state", "delegation"] {
             assert!(
                 html.contains(&format!("params.get('{param}')")),
-                "the page must forward the consent value `{param}`"
+                "the page must forward `{param}`"
             );
         }
-        assert!(!html.contains("params.get('anchor')"), "the page must not read an anchor (rev5)");
+        for param in ["permissions", "ttl", "anchor"] {
+            assert!(
+                !html.contains(&format!("params.get('{param}')")),
+                "the page must NOT read `{param}` from the fragment (merged contract)"
+            );
+        }
     }
 
     // A well-formed fragment payload — agent-js `DelegationChain.toJSON()`
@@ -2161,9 +2189,9 @@ mod tests {
         assert_eq!(chain[1].delegation.pubkey, der_x);
         assert_eq!(chain[1].signature, sig_y);
         assert_eq!(chain[1].delegation.targets, None);
-        // Neither hop carries a permissions field — under rev5 stateless
-        // consent the access level rides the fragment consent values (echoed
-        // into mcp_register_v2), not the delegations.
+        // Neither hop carries a permissions field; the access level was chosen
+        // at consent and stored by II under P_reg (recovered from caller()), so
+        // it never rides the delegation or the fragment.
         assert!(chain.iter().all(|d| d.delegation.permissions.is_none()));
     }
 
@@ -2296,8 +2324,6 @@ mod tests {
             axum::Json(super::RedeemBody {
                 state: "sess-x".into(),
                 delegation: String::new(),
-                permissions: String::new(),
-                ttl: String::new(),
             }),
         )
         .await;
@@ -2315,8 +2341,6 @@ mod tests {
             axum::Json(super::RedeemBody {
                 state: "sess-x".into(),
                 delegation: String::new(),
-                permissions: String::new(),
-                ttl: String::new(),
             }),
         )
         .await;
