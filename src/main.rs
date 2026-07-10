@@ -1320,12 +1320,44 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("listening on http://{bind}  (MCP at /mcp, OAuth at /oauth/*)");
     axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            ct.cancel();
-        })
+        .with_graceful_shutdown(shutdown_signal(ct))
         .await?;
     Ok(())
+}
+
+/// Resolves when the process is asked to stop, so `axum` drains in-flight
+/// requests (and the MCP services' cancellation token fires) before exit rather
+/// than being cut mid-response.
+///
+/// Handles BOTH signals: an interactive run is stopped with `SIGINT` (Ctrl-C),
+/// but `systemctl stop`/`restart` sends **`SIGTERM`** — which this previously did
+/// not catch, so a redeploy killed the process abruptly and severed in-flight
+/// requests. We now wait on either.
+async fn shutdown_signal(ct: tokio_util::sync::CancellationToken) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // If the SIGTERM handler can't be installed, fall back to SIGINT only
+        // rather than aborting startup.
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!("could not install SIGTERM handler ({e}); draining on SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    tracing::info!("shutdown signal received; draining in-flight requests");
+    ct.cancel();
 }
 
 #[cfg(test)]

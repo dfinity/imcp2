@@ -19,6 +19,11 @@ ExecStart=/opt/imcp2/mcp-poc
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
+# Graceful stop: systemd sends SIGTERM (the app drains in-flight requests on it),
+# then waits up to TimeoutStopSec before escalating to SIGKILL. Ample for our
+# short request handlers; keeps a `restart` from cutting live requests.
+KillSignal=SIGTERM
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target
