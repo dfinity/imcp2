@@ -138,7 +138,14 @@ fn parse_meta(html: &str, name: &str) -> Option<String> {
     let mut rest = html;
     while let Some(i) = rest.find("<meta") {
         rest = &rest[i + 5..];
-        let end = rest.find('>')?;
+        // Tag-name boundary: `<metadata …` (or any longer name) is not <meta>.
+        if !rest.starts_with([' ', '\t', '\n', '\r', '/', '>']) {
+            continue;
+        }
+        let Some(end) = rest.find('>') else {
+            // No '>' anywhere in the remainder — no complete tag can follow.
+            break;
+        };
         let tag = &rest[..end];
         if attr(tag, "name").as_deref() == Some(name) {
             if let Some(content) = attr(tag, "content") {
@@ -476,6 +483,11 @@ pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
     let (base_url, pinned) = resolve_public_url(&base).await?;
     let host = base_url.host_str().unwrap_or_default().to_string();
     let client = site_client(&host, &pinned)?;
+    // Well-known paths and root-relative script paths live at the ORIGIN, not
+    // under whatever path the caller's URL carried (e.g. https://x.com/app must
+    // probe https://x.com/ai-connect.html) — only the initial page fetch below
+    // uses the URL as given.
+    let origin = base_url.origin().ascii_serialization();
 
     let mut found: BTreeMap<String, Found> = BTreeMap::new();
 
@@ -491,7 +503,7 @@ pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
     //   b. /.well-known/ic-app.json: the app's own canister manifest with
     //      roles (proposed convention for the spec's deferred §6.3). A
     //      catch-all HTML response fails JSON parsing → no findings.
-    if let Ok(resp) = client.get(format!("{base}/ai-connect.html")).send().await {
+    if let Ok(resp) = client.get(format!("{origin}/ai-connect.html")).send().await {
         if resp.status().is_success() {
             let page = read_capped(resp, MAX_META_BYTES).await;
             if let Some(id) = parse_meta(&page, "ic:canister-id") {
@@ -504,7 +516,7 @@ pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
             }
         }
     }
-    if let Ok(resp) = client.get(format!("{base}/.well-known/ic-app.json")).send().await {
+    if let Ok(resp) = client.get(format!("{origin}/.well-known/ic-app.json")).send().await {
         if resp.status().is_success() {
             let text = read_capped(resp, MAX_META_BYTES).await;
             for (id, label) in canisters_from_app_manifest(&text) {
@@ -531,7 +543,7 @@ pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
     let html = read_capped(resp, MAX_BODY_BYTES).await;
 
     // 3. Runtime config: /env.json with *canister_id* keys (e.g. Caffeine apps).
-    if let Ok(resp) = client.get(format!("{base}/env.json")).send().await {
+    if let Ok(resp) = client.get(format!("{origin}/env.json")).send().await {
         if resp.status().is_success() {
             let text = read_capped(resp, MAX_ENV_JSON_BYTES).await;
             for (id, label) in canisters_from_env_json(&text) {
@@ -553,7 +565,7 @@ pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
         if blob.len() >= MAX_SCAN_BYTES {
             break; // aggregate cap: stop mining once we've buffered enough text
         }
-        if let Ok(resp) = client.get(format!("{base}{s}")).send().await {
+        if let Ok(resp) = client.get(format!("{origin}{s}")).send().await {
             // Push the separator first, then size the read against the space that
             // remains — so the '\n' counts toward the cap and `blob` never exceeds
             // MAX_SCAN_BYTES (loop guard guarantees room for the separator).
@@ -1250,6 +1262,15 @@ mod tests {
         assert_eq!(parse_meta(both, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
         // An unquoted value is not accepted (we only read the quoted shape).
         assert_eq!(attr("name=bare content=\"x\"", "name"), None);
+        // Tag-name boundary (per review): `<metadata …>` is not a <meta> tag,
+        // and must not shadow a real meta that follows it.
+        let metadata = r#"<metadata name="ic:canister-id" content="evil-id">"#;
+        assert_eq!(parse_meta(metadata, "ic:canister-id"), None, "<metadata> must not match");
+        let after = format!("{metadata}\n<meta name=\"ic:canister-id\" content=\"aaaaa-aa\">");
+        assert_eq!(parse_meta(&after, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
+        // A malformed, never-closed `<meta` can't panic or loop; it just ends
+        // the scan (no '>' remains, so no complete tag can follow anyway).
+        assert_eq!(parse_meta("<meta name=\"ic:canister-id\" content=\"x\"", "ic:canister-id"), None);
     }
 
     // App-declared labels must win over the header's generic "frontend" for the
