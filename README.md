@@ -22,6 +22,7 @@ results).
 | `find_canister` | `query` | Canister ids matching a name/symbol, searched in the IC dashboard's service registries — ICRC token ledgers (e.g. `ckUSDC`) and the SNS project catalog |
 | `lookup_canister` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
 | `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus an `oql` flag — `true` when it exposes an OQL query surface (a `schema` + `execute` pair), with a pointer to `get_oql_guide` |
+| `get_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), read from its `getApiDoc`/`get_api_doc` method if present. Call first for an unfamiliar app |
 | `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `domain?`, `account?` | Reply as textual Candid; called anonymously (no `domain`) or as your account at an application domain, derived on demand (`account` names a non-default account there) |
 | `get_principal` | `domain`, `account?` | The principal you act as at an application domain (derives the delegation on demand, same as `call_canister`), without making a call |
 | `list_accounts` | `domain` | The user's Internet Identity accounts at an app — the default account (the anchor's current default at that origin) plus any named ones — with name, account number, and last-used time; name one via `account` in `call_canister`/`get_principal` |

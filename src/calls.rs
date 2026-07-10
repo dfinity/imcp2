@@ -112,6 +112,25 @@ pub struct OqlSchemaOutput {
     pub schema: String,
 }
 
+/// Arguments for `get_api_doc`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ApiDocArgs {
+    /// Canister principal to read the API documentation from.
+    pub canister_id: String,
+}
+
+/// Output of `get_api_doc`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ApiDocOutput {
+    /// The canister the doc came from.
+    pub canister_id: String,
+    /// The method the doc was read from (`getApiDoc` or `get_api_doc`).
+    pub method: String,
+    /// The API documentation (markdown): how the app behaves — units, auth,
+    /// lifecycle, non-obvious semantics, mutation safety, polling rules, gotchas.
+    pub doc: String,
+}
+
 /// Arguments for `call_canister`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CallCanisterArgs {
@@ -452,21 +471,48 @@ pub fn parse_execute_reply(did: Option<&str>, reply: &[u8]) -> OqlResult {
     }
 }
 
+/// Decode a reply that is a single `text` value (e.g. `schema` or the API-doc
+/// method): the bare string. A non-text single value falls back to its type-less
+/// rendering; a reply with MORE than one value renders the whole `IDLArgs` tuple
+/// (so nothing is silently dropped, even though these methods return one value by
+/// contract); an undecodable reply yields an explanatory string.
+pub fn decode_text_reply(reply: &[u8]) -> String {
+    let args = match IDLArgs::from_bytes(reply) {
+        Ok(a) => a,
+        Err(e) => return format!("(undecodable reply: {e})"),
+    };
+    match args.args.as_slice() {
+        [] => "(empty reply)".to_string(),
+        [IDLValue::Text(s)] => s.clone(),
+        [single] => single.to_string(),
+        _ => args.to_string(),
+    }
+}
+
 /// Decode a `schema` reply — a single `text` (the JSON catalogue). Pretty-print
 /// it when it parses as JSON; otherwise return it as-is.
 pub fn decode_schema_reply(reply: &[u8]) -> String {
-    let text = match IDLArgs::from_bytes(reply) {
-        Ok(args) => match args.args.into_iter().next() {
-            Some(IDLValue::Text(s)) => s,
-            Some(other) => other.to_string(),
-            None => return "(empty reply)".to_string(),
-        },
-        Err(e) => return format!("(undecodable reply: {e})"),
-    };
+    let text = decode_text_reply(reply);
     match serde_json::from_str::<serde_json::Value>(&text) {
         Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(text),
         Err(_) => text,
     }
+}
+
+/// The canister's API-documentation method name, if it declares one — `getApiDoc`
+/// or `get_api_doc`, checked in that order (a canister uses one naming style).
+/// Guarded (CWE-674) and fail-closed like the OQL detection: `None` if the
+/// interface can't be parsed or declares neither.
+pub fn api_doc_method(did: &str) -> Option<&'static str> {
+    if guard_candid_text("the `candid` interface", did).is_err() {
+        return None;
+    }
+    let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() else {
+        return None;
+    };
+    ["getApiDoc", "get_api_doc"]
+        .into_iter()
+        .find(|m| env.get_method(&actor, m).is_ok())
 }
 
 /// Decode a reply against the declared return types of `method` in `did`,
@@ -889,5 +935,39 @@ mod tests {
         let out = decode_schema_reply(&reply);
         assert!(out.contains("\"entities\""), "schema JSON should be surfaced: {out}");
         assert!(out.contains('\n'), "valid JSON should be pretty-printed: {out}");
+    }
+
+    // api_doc_method finds either naming (getApiDoc / get_api_doc), prefers
+    // getApiDoc when both exist, and is None for a canister that has neither /
+    // an unparseable interface (fail-closed, like has_oql).
+    #[test]
+    fn api_doc_method_detection() {
+        use super::api_doc_method;
+        assert_eq!(api_doc_method("service : { getApiDoc : () -> (text) query; }"), Some("getApiDoc"));
+        assert_eq!(api_doc_method("service : { get_api_doc : () -> (text) query; }"), Some("get_api_doc"));
+        assert_eq!(
+            api_doc_method("service : { getApiDoc : () -> (text) query; get_api_doc : () -> (text) query; }"),
+            Some("getApiDoc"),
+            "prefers getApiDoc when both are declared"
+        );
+        assert_eq!(api_doc_method("service : { greet : (text) -> (text) query; }"), None);
+        assert_eq!(api_doc_method("not a candid interface"), None);
+    }
+
+    // decode_text_reply returns the single `text` value verbatim (markdown doc),
+    // without the JSON pretty-printing that decode_schema_reply layers on.
+    #[test]
+    fn decode_text_reply_returns_text_verbatim() {
+        use super::decode_text_reply;
+        let did = "service : { getApiDoc : () -> (text) query; }";
+        let reply = encode_reply(did, "getApiDoc", "(\"# API\\nHow this app behaves.\")");
+        assert_eq!(decode_text_reply(&reply), "# API\nHow this app behaves.");
+
+        // A multi-value reply keeps ALL values (renders the tuple) instead of
+        // silently dropping the tail.
+        let multi_did = "service : { foo : () -> (text, nat) query; }";
+        let multi = encode_reply(multi_did, "foo", "(\"a\", 5 : nat)");
+        let out = decode_text_reply(&multi);
+        assert!(out.contains("a") && out.contains('5'), "multi-value reply keeps all values: {out}");
     }
 }
