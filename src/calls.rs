@@ -64,12 +64,13 @@ pub struct OqlQueryArgs {
     /// `{"start":"employee","where":{"icontains":{"field":"lastName","value":"smith"}},"select":["firstName","lastName"],"limit":10}`.
     /// See get_oql_guide (or oql_schema) for the dialect and entity/field names.
     pub query: String,
-    /// Application domain to query as, e.g. "oisy.com" — its account delegation is
-    /// derived on demand for this connection. Omit to query anonymously.
-    #[serde(default)]
-    pub domain: Option<String>,
-    /// Which of your accounts at `domain` to act as, by account name (see
-    /// list_accounts). Omit for that app's default account; ignored without `domain`.
+    /// Query AS the user's account at an app, given its canonical Internet
+    /// Identity derivation origin (not necessarily the visible URL). Accepts the
+    /// legacy name `domain`. Omit to query anonymously.
+    #[serde(default, alias = "domain")]
+    pub derivation_origin: Option<String>,
+    /// Which of your accounts to act as, by account name (see list_accounts).
+    /// Omit for that app's default account; ignored when querying anonymously.
     #[serde(default)]
     pub account: Option<String>,
 }
@@ -93,11 +94,13 @@ pub struct OqlSchemaArgs {
     /// Canister principal that exposes the OQL surface (get_candid reports
     /// `oql: true`).
     pub canister_id: String,
-    /// Application domain to read as, e.g. "oisy.com". Omit to read anonymously.
-    #[serde(default)]
-    pub domain: Option<String>,
-    /// Which of your accounts at `domain` to act as (see list_accounts). Ignored
-    /// without `domain`.
+    /// Read AS the user's account at an app, given its canonical Internet
+    /// Identity derivation origin (not necessarily the visible URL). Accepts the
+    /// legacy name `domain`. Omit to read anonymously.
+    #[serde(default, alias = "domain")]
+    pub derivation_origin: Option<String>,
+    /// Which of your accounts to act as (see list_accounts). Ignored when reading
+    /// anonymously.
     #[serde(default)]
     pub account: Option<String>,
 }
@@ -144,13 +147,22 @@ pub struct CallCanisterArgs {
     /// If true, perform a read-only `query` call; otherwise an `update` call.
     #[serde(default)]
     pub is_query: bool,
-    /// Application domain to call as, e.g. "oisy.com" — its account delegation is
-    /// derived on demand for this connection. Omit to call anonymously.
+    /// Call AS the user's account at an app, identified by its exact canonical
+    /// Internet Identity derivation origin — NOT necessarily the visible URL. For
+    /// an app with a custom derivation origin, pass that canonical origin (do not
+    /// infer it from an alternativeOrigins list). Accepts the legacy name
+    /// `domain`. Omit both this and `app_url` to call anonymously; provide at most
+    /// one. The account delegation is derived on demand for this connection.
+    #[serde(default, alias = "domain")]
+    pub derivation_origin: Option<String>,
+    /// Call AS the user's account at an app, identified by its URL; the connector
+    /// resolves the derivation origin (declared one if the app publishes it, else
+    /// the application origin — see the result's `derivation_origin_source`).
+    /// Alternative to `derivation_origin`.
     #[serde(default)]
-    pub domain: Option<String>,
-    /// Which of your accounts at `domain` to act as, by account name (see
-    /// list_accounts). Omit to use that app's default account. Ignored when
-    /// `domain` is omitted (anonymous calls have no account).
+    pub app_url: Option<String>,
+    /// Which of your accounts to act as, by account name (see list_accounts).
+    /// Omit to use that app's default account. Ignored for anonymous calls.
     #[serde(default)]
     pub account: Option<String>,
     /// Optional Candid service definition (`.did` text) for the canister. Used to
@@ -172,6 +184,18 @@ pub struct CallCanisterOutput {
     pub is_query: bool,
     /// The decoded reply in textual Candid.
     pub reply: String,
+    /// The principal the call was signed as — null for an anonymous call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acted_as_principal: Option<String>,
+    /// When called as an app account: the effective Internet Identity derivation
+    /// origin used (after canonicalization). Null for anonymous calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_for_origin: Option<String>,
+    /// When called as an app account: exactly what you supplied
+    /// (`derivation_origin` or `app_url`), echoed so a mismatch with
+    /// `derived_for_origin` is visible. Null for anonymous calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<String>,
 }
 
 pub fn default_args() -> String {

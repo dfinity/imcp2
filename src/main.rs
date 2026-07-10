@@ -166,13 +166,13 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Run an OQL query against a canister that exposes the OQL surface (get_candid reports `oql: true`). Pass the query as a JSON object string in `query` (see get_oql_guide / oql_schema for the dialect and field names) — it's sent to the canister's `execute` query method, so NO Candid escaping is needed. Returns the result decoded as `columns` + `rows` (rendered as a markdown table), with `has_more` for paging (re-query with a higher `offset`). Omit `domain` to query anonymously, or pass an application domain to query as your account there.",
+        description = "Run an OQL query against a canister that exposes the OQL surface (get_candid reports `oql: true`). Pass the query as a JSON object string in `query` (see get_oql_guide / oql_schema for the dialect and field names) — it's sent to the canister's `execute` query method, so NO Candid escaping is needed. Returns the result decoded as `columns` + `rows` (rendered as a markdown table), with `has_more` for paging (re-query with a higher `offset`). Omit `derivation_origin` to query anonymously, or pass the app's canonical Internet Identity derivation origin to query as your account there.",
         annotations(title = "Run an OQL query", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::OqlQueryOutput>(),
     )]
     async fn oql_query(
         &self,
-        Parameters(calls::OqlQueryArgs { canister_id, query, domain, account }): Parameters<calls::OqlQueryArgs>,
+        Parameters(calls::OqlQueryArgs { canister_id, query, derivation_origin, account }): Parameters<calls::OqlQueryArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let principal = match Principal::from_text(&canister_id) {
@@ -189,8 +189,8 @@ impl IcTools {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
         };
-        let agent = match self
-            .resolve_agent(&ctx, domain.as_deref(), account.as_deref(), "querying")
+        let (agent, _acted_as) = match self
+            .resolve_agent(&ctx, derivation_origin.as_deref(), account.as_deref(), "querying")
             .await
         {
             Ok(a) => a,
@@ -236,7 +236,7 @@ impl IcTools {
     )]
     async fn oql_schema(
         &self,
-        Parameters(calls::OqlSchemaArgs { canister_id, domain, account }): Parameters<calls::OqlSchemaArgs>,
+        Parameters(calls::OqlSchemaArgs { canister_id, derivation_origin, account }): Parameters<calls::OqlSchemaArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let principal = match Principal::from_text(&canister_id) {
@@ -247,8 +247,8 @@ impl IcTools {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
         };
-        let agent = match self
-            .resolve_agent(&ctx, domain.as_deref(), account.as_deref(), "reading the schema")
+        let (agent, _acted_as) = match self
+            .resolve_agent(&ctx, derivation_origin.as_deref(), account.as_deref(), "reading the schema")
             .await
         {
             Ok(a) => a,
@@ -302,39 +302,43 @@ impl IcTools {
         Ok(ok_structured(output.doc.clone(), &output))
     }
 
-    /// The agent to sign calls with for a request: the shared anonymous agent
-    /// when no `domain` is given, else one backed by a short-lived account
-    /// delegation for that app derived on demand from the connection's standing
-    /// Internet Identity credential. `what` names the action for the
-    /// no-session error message. Shared by call_canister / oql_query / oql_schema.
+    /// The agent to sign calls with for a request, and the principal it signs as:
+    /// the shared anonymous agent (principal `None`) when `origin` is `None`, else
+    /// one backed by a short-lived account delegation for that Internet Identity
+    /// derivation `origin`, derived on demand from this connection's standing
+    /// credential. `origin` is the ALREADY-effective (canonical) derivation origin
+    /// — resolve it with [`resolve_identity_target`] first. `what` names the action
+    /// for the no-session error. Shared by call_canister / oql_query / oql_schema.
     async fn resolve_agent(
         &self,
         ctx: &RequestContext<RoleServer>,
-        domain: Option<&str>,
+        origin: Option<&str>,
         account: Option<&str>,
         what: &str,
-    ) -> Result<Agent, String> {
-        match domain {
-            None => Ok(self.agent.clone()),
-            Some(domain) => {
+    ) -> Result<(Agent, Option<String>), String> {
+        match origin {
+            None => Ok((self.agent.clone(), None)),
+            Some(origin) => {
                 let session_id = authed_session(ctx)
-                    .ok_or_else(|| format!("{what} as a domain needs an authenticated session"))?
+                    .ok_or_else(|| format!("{what} as an app needs an authenticated session"))?
                     .session_id;
                 let delegated = self
                     .identities
-                    .delegated_identity_for(&session_id, domain, account)
+                    .delegated_identity_for(&session_id, origin, account)
                     .await?;
-                Agent::builder()
+                let principal = delegated.sender().ok().map(|p| p.to_text());
+                let agent = Agent::builder()
                     .with_url(IC_URL)
                     .with_identity(delegated)
                     .build()
-                    .map_err(|e| format!("could not build agent: {e}"))
+                    .map_err(|e| format!("could not build agent: {e}"))?;
+                Ok((agent, principal))
             }
         }
     }
 
     #[tool(
-        description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `domain` to call anonymously, or pass an application domain (e.g. \"oisy.com\") to call as your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. By default this uses the app's default account; pass `account` (an account name from list_accounts) to act as a specific named account there. Set is_query=true for read-only query calls. If get_candid couldn't fetch the interface, pass the `.did` text as `candid` (e.g. ask the user for it) so args/replies are still typed.",
+        description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit both `derivation_origin` and `app_url` to call anonymously; provide one to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins); `app_url` lets the connector resolve it. By default this uses the app's default account; pass `account` (a name from list_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. Set is_query=true for read-only query calls. If get_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
         annotations(title = "Call a canister method", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CallCanisterOutput>(),
     )]
@@ -345,7 +349,8 @@ impl IcTools {
             method,
             args,
             is_query,
-            domain,
+            derivation_origin,
+            app_url,
             account,
             candid,
         }): Parameters<calls::CallCanisterArgs>,
@@ -363,12 +368,19 @@ impl IcTools {
             Err(e) => return Ok(err(e)),
         };
 
-        // Pick the agent: no domain uses the shared anonymous agent; a domain
-        // derives a short-lived account delegation for that app on demand and
-        // builds an agent backed by it (the server signs as the user's account
-        // for that app).
-        let agent = match self
-            .resolve_agent(&ctx, domain.as_deref(), account.as_deref(), "calling")
+        // Resolve which principal to act as: none = anonymous; else the app's
+        // effective (canonical) II derivation origin, from an explicit
+        // `derivation_origin` or resolved from `app_url`.
+        let target = match resolve_identity_target(derivation_origin, app_url).await {
+            Ok(t) => t,
+            Err(e) => return Ok(err(e)),
+        };
+        // Pick the agent: no target uses the shared anonymous agent; a target
+        // derives a short-lived account delegation for that origin on demand and
+        // builds an agent backed by it (the server signs as the user's account).
+        let origin = target.as_ref().map(|t| t.origin.as_str());
+        let (agent, acted_as_principal) = match self
+            .resolve_agent(&ctx, origin, account.as_deref(), "calling")
             .await
         {
             Ok(a) => a,
@@ -380,74 +392,191 @@ impl IcTools {
         };
         // Decode against the Candid interface so field names are recovered.
         let reply = calls::decode_reply(did.as_deref(), &method, &reply_bytes);
-        let output = calls::CallCanisterOutput { canister_id, method, is_query, reply };
-        Ok(ok_structured(output.reply.clone(), &output))
+        let (derived_for_origin, requested) = match &target {
+            Some(t) => (Some(t.origin.clone()), Some(t.requested.clone())),
+            None => (None, None),
+        };
+        // A short identity note so a wrong-principal is visible in the text too.
+        let mut text = reply.clone();
+        if let Some(t) = &target {
+            text.push_str(&format!("\n\n[signed as {} — derived for {}",
+                acted_as_principal.as_deref().unwrap_or("<unknown>"), t.origin));
+            if t.source == "app_url_default" {
+                text.push_str(&format!(
+                    "; assumed from app_url {} (app declares no derivation origin — if this \
+                     principal looks wrong, pass the app's canonical derivation_origin)",
+                    t.requested
+                ));
+            }
+            text.push(']');
+        }
+        let output = calls::CallCanisterOutput {
+            canister_id, method, is_query, reply,
+            acted_as_principal, derived_for_origin, requested,
+        };
+        Ok(ok_structured(text, &output))
     }
 
     #[tool(
-        description = "Get the Internet Computer principal you act as at a given application `domain` (e.g. \"oisy.com\"), without making a canister call. The app's account delegation is derived on demand (same as call_canister) from this connection's standing Internet Identity credential, and its principal is returned. By default this resolves the app's default account; pass `account` (an account name from list_accounts) for a specific named account there. Use this when a flow needs the principal itself (e.g. to look up a balance or account) rather than to invoke a method. NOTE: the principal is derived from the app's DOMAIN, which is usually — but not always — the identity a browser sign-in to that app would use. Some apps declare a CUSTOM derivation origin (via /.well-known/ii-alternative-origins) that isn't exposed here; if the returned principal (or an account/balance) doesn't match what the user sees in their browser at that app, tell them so and offer to look up the app's ii-alternative-origins (web search / fetch) and retry.",
+        description = "Get the Internet Computer principal you act as at an app, without making a canister call. Identify the app by `derivation_origin` (its EXACT canonical Internet Identity derivation origin — NOT necessarily the visible website URL, and never inferred from an alternativeOrigins list) OR by `app_url` (the connector resolves the derivation origin). The account delegation is derived on demand from this connection's standing Internet Identity credential. By default this resolves the app's default account; pass `account` (a name from list_accounts) for a specific one. The result returns the `principal` plus `derived_for_origin`, `requested`, and `derivation_origin_source` — compare the first two to catch an origin mismatch (a valid but WRONG principal). If `derivation_origin_source` is \"app_url_default\", the app declares no derivation origin and this assumed the app URL is the derivation origin; if the principal looks wrong for an app with a custom derivation origin, pass that canonical origin as `derivation_origin`.",
         annotations(title = "Get your principal at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::PrincipalOutput>(),
     )]
     async fn get_principal(
         &self,
-        Parameters(identities::GetPrincipalArgs { domain, account }): Parameters<identities::GetPrincipalArgs>,
+        Parameters(identities::GetPrincipalArgs { derivation_origin, app_url, account }): Parameters<identities::GetPrincipalArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session_id = match authed_session(&ctx) {
             Some(s) => s.session_id,
-            None => return Ok(err("getting a domain principal needs an authenticated session".into())),
+            None => return Ok(err("getting an app principal needs an authenticated session".into())),
+        };
+        let target = match resolve_identity_target(derivation_origin, app_url).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return Ok(err("provide `derivation_origin` or `app_url` to identify the app".into())),
+            Err(e) => return Ok(err(e)),
         };
         let delegated = match self
             .identities
-            .delegated_identity_for(&session_id, &domain, account.as_deref())
+            .delegated_identity_for(&session_id, &target.origin, account.as_deref())
             .await
         {
             Ok(d) => d,
             Err(e) => return Ok(err(e)),
         };
-        match delegated.sender() {
-            Ok(p) => {
-                // Surface a read-only session (H2) so the LLM won't attempt (and
-                // have the IC reject at ingress) canister-management updates.
-                let read_only = self.identities.is_read_only(&session_id).await == Some(true);
-                let mut out = p.to_text();
-                if read_only {
-                    out.push_str(
-                        "\n\n(This Internet Identity session is READ-ONLY: reads work, but canister \
-                         management — create/install/start/stop/delete, and canister_status — needs \
-                         update access. Ask the user to reconnect with the read-only option turned OFF.)",
-                    );
-                }
-                let output = identities::PrincipalOutput { domain, account, principal: p.to_text(), read_only };
-                Ok(ok_structured(out, &output))
-            }
-            Err(e) => Ok(err(format!("could not derive principal for '{domain}': {e}"))),
+        let principal = match delegated.sender() {
+            Ok(p) => p.to_text(),
+            Err(e) => return Ok(err(format!("could not derive principal for {}: {e}", target.origin))),
+        };
+        // Surface a read-only session (H2) so the LLM won't attempt (and have the
+        // IC reject at ingress) canister-management updates.
+        let read_only = self.identities.is_read_only(&session_id).await == Some(true);
+        let mut text = format!("{principal}\n\n[derived for {}", target.origin);
+        if target.source == "app_url_default" {
+            text.push_str(&format!(
+                "; assumed from app_url {} — the app declares no derivation origin, so if this \
+                 principal looks wrong, pass the app's canonical derivation_origin",
+                target.requested
+            ));
         }
+        text.push(']');
+        if read_only {
+            text.push_str(
+                "\n\n(This Internet Identity session is READ-ONLY: reads work, but canister \
+                 management — create/install/start/stop/delete, and canister_status — needs \
+                 update access. Ask the user to reconnect with the read-only option turned OFF.)",
+            );
+        }
+        let output = identities::PrincipalOutput {
+            derived_for_origin: target.origin,
+            requested: target.requested,
+            derivation_origin_source: target.source,
+            account,
+            principal,
+            read_only,
+        };
+        Ok(ok_structured(text, &output))
     }
 
     #[tool(
-        description = "List the user's Internet Identity accounts at an application `domain` (e.g. \"oisy.com\"). Internet Identity gives the user a distinct principal per app (derived from the app's domain), and within an app they may hold several accounts: a default account everyone gets automatically (the anchor's current, user-controllable default at that origin), plus any named accounts they created. Use this before acting on the user's behalf at an app: if there's only the default account, just proceed (call_canister/get_principal with no `account`); if there are several, pick one with the user (or act on each) by passing its name as `account`. Returns each account's name (the default has none), account number, and last-used time. If these accounts don't match what the user sees in their browser at this app, it may use a custom derivation origin not exposed here (offer to look up its ii-alternative-origins and retry). Requires an authenticated session.",
+        description = "List the user's Internet Identity accounts at an app. Identify the app by `derivation_origin` (its EXACT canonical II derivation origin — not necessarily the visible URL) OR by `app_url` (resolved by the connector). Internet Identity gives the user a distinct principal per derivation origin, and within it they may hold several accounts: a default account everyone gets automatically (the anchor's current, user-controllable default there), plus any named accounts they created. Use this before acting on the user's behalf: if there's only the default account, just proceed (call_canister/get_principal with no `account`); if there are several, pick one with the user by passing its name as `account`. Returns each account's name (the default has none), number, and last-used time, plus `derived_for_origin`/`requested`/`derivation_origin_source` — if these accounts don't match what the user sees in their browser, the derivation origin is likely wrong (pass the app's canonical `derivation_origin`). Requires an authenticated session.",
         annotations(title = "List your accounts at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::AccountsOutput>(),
     )]
     async fn list_accounts(
         &self,
-        Parameters(identities::ListAccountsArgs { domain }): Parameters<identities::ListAccountsArgs>,
+        Parameters(identities::ListAccountsArgs { derivation_origin, app_url }): Parameters<identities::ListAccountsArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session_id = match authed_session(&ctx) {
             Some(s) => s.session_id,
             None => return Ok(err("listing your accounts needs an authenticated session".into())),
         };
-        match self.identities.list_accounts(&session_id, &domain).await {
+        let target = match resolve_identity_target(derivation_origin, app_url).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return Ok(err("provide `derivation_origin` or `app_url` to identify the app".into())),
+            Err(e) => return Ok(err(e)),
+        };
+        match self.identities.list_accounts(&session_id, &target.origin).await {
             Ok(accounts) => {
-                let text = format_accounts(&domain, &accounts);
-                let output = identities::AccountsOutput::from((domain, accounts));
+                let text = format_accounts(&target, &accounts);
+                let output = identities::AccountsOutput {
+                    derived_for_origin: target.origin,
+                    requested: target.requested,
+                    derivation_origin_source: target.source,
+                    accounts: accounts.iter().map(identities::AccountEntry::from).collect(),
+                };
                 Ok(ok_structured(text, &output))
             }
             Err(e) => Ok(err(e)),
         }
+    }
+
+    #[tool(
+        description = "Resolve an application URL to its Internet Identity derivation context, so you don't have to figure out the derivation origin yourself. Returns the `application_origin`, the `derivation_origin` to pass to the identity tools, how it was determined (`derivation_origin_source`: \"declared\" — the app published it in /.well-known/ic-app.json, authoritative; or \"app_url_default\" — assumed equal to the application origin, correct only if the app has no custom derivation origin, which cannot be verified), the app's `alternative_origins` (informational — the INVERSE relation, never use it to infer the derivation origin), and — if you're authenticated — the `principal` you'd act as there. Use this first when you only know an app's URL; then call get_principal/call_canister with the returned `derivation_origin`.",
+        annotations(title = "Resolve an app's derivation origin", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<identities::ResolveAppOutput>(),
+    )]
+    async fn resolve_app(
+        &self,
+        Parameters(identities::ResolveAppArgs { app_url }): Parameters<identities::ResolveAppArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let resolved = match discover::resolve_app_identity(&app_url).await {
+            Ok(r) => r,
+            Err(e) => return Ok(err(e)),
+        };
+        let effective = identities::target_origin(&resolved.derivation_origin);
+        let declared = resolved.derivation_origin_source == discover::DerivationSource::Declared;
+
+        // If authenticated, resolve the principal for the effective origin too.
+        let principal = match authed_session(&ctx) {
+            Some(s) => match self
+                .identities
+                .delegated_identity_for(&s.session_id, &effective, None)
+                .await
+            {
+                Ok(d) => d.sender().ok().map(|p| p.to_text()),
+                Err(_) => None,
+            },
+            None => None,
+        };
+
+        let note = if declared {
+            None
+        } else {
+            Some(format!(
+                "No derivation origin declared by the app (no /.well-known/ic-app.json \
+                 `derivation_origin`); assumed to equal the application origin {}. If this app \
+                 uses a custom derivation origin, that assumption yields a WRONG principal — supply \
+                 the canonical origin explicitly.",
+                resolved.application_origin
+            ))
+        };
+        let mut text = format!(
+            "application_origin: {}\nderivation_origin: {} ({})\n",
+            resolved.application_origin, effective, resolved.derivation_origin_source.as_str()
+        );
+        if let Some(p) = &principal {
+            text.push_str(&format!("principal: {p}\n"));
+        } else {
+            text.push_str("principal: (authenticate to resolve)\n");
+        }
+        if !resolved.alternative_origins.is_empty() {
+            text.push_str(&format!("alternative_origins: {}\n", resolved.alternative_origins.join(", ")));
+        }
+        if let Some(n) = &note {
+            text.push_str(&format!("\nNOTE: {n}"));
+        }
+        let output = identities::ResolveAppOutput {
+            application_origin: resolved.application_origin,
+            derivation_origin: effective,
+            derivation_origin_source: resolved.derivation_origin_source.as_str().to_string(),
+            alternative_origins: resolved.alternative_origins,
+            principal,
+            note,
+        };
+        Ok(ok_structured(text, &output))
     }
 
     #[tool(
@@ -811,6 +940,60 @@ fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<auth::AuthedSessio
         .cloned()
 }
 
+/// Which app principal an identity-bearing tool should act as, resolved from the
+/// caller's `derivation_origin` and/or `app_url`.
+struct IdentityTarget {
+    /// The EFFECTIVE (canonical) Internet Identity derivation origin to feed the
+    /// delegation layer — echoed to the caller as `derived_for_origin`.
+    origin: String,
+    /// Exactly what the caller supplied (a `derivation_origin` or an `app_url`).
+    requested: String,
+    /// How `origin` was determined: "explicit" | "declared" | "app_url_default".
+    source: String,
+    /// The application origin, when the caller passed `app_url`.
+    application_origin: Option<String>,
+}
+
+/// Resolve the caller's `derivation_origin` / `app_url` into an [`IdentityTarget`]
+/// (or `None` when neither is given — an anonymous call). An explicit
+/// `derivation_origin` is canonicalized and used verbatim; an `app_url` is
+/// resolved to the app's DECLARED derivation origin when it publishes one, else
+/// defaulted to the application origin (flagged `app_url_default`). Both routes
+/// pass through the same canonicalizer the delegation path uses, so the echoed
+/// `origin` is exactly what Internet Identity derives against.
+async fn resolve_identity_target(
+    derivation_origin: Option<String>,
+    app_url: Option<String>,
+) -> Result<Option<IdentityTarget>, String> {
+    match (derivation_origin, app_url) {
+        (Some(_), Some(_)) => {
+            Err("provide either `derivation_origin` or `app_url`, not both".to_string())
+        }
+        (Some(d), None) => {
+            let d = d.trim();
+            if d.is_empty() {
+                return Err("`derivation_origin` must not be empty".to_string());
+            }
+            Ok(Some(IdentityTarget {
+                origin: identities::target_origin(d),
+                requested: d.to_string(),
+                source: "explicit".to_string(),
+                application_origin: None,
+            }))
+        }
+        (None, Some(u)) => {
+            let resolved = discover::resolve_app_identity(&u).await?;
+            Ok(Some(IdentityTarget {
+                origin: identities::target_origin(&resolved.derivation_origin),
+                requested: u,
+                source: resolved.derivation_origin_source.as_str().to_string(),
+                application_origin: Some(resolved.application_origin),
+            }))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
 /// Log each inbound request: method, path, response status, and latency — gives
 /// visibility into what external MCP clients probe (discovery URLs, unknown
 /// paths) at `RUST_LOG=info`. The query string is never logged — keeping the
@@ -999,11 +1182,21 @@ fn format_canister_info(info: &discover::CanisterInfo) -> String {
 
 /// Render the user's accounts at an app (from `Identities::list_accounts`) as
 /// readable text for the `list_accounts` tool.
-fn format_accounts(domain: &str, accounts: &[identities::AccountInfo]) -> String {
-    if accounts.is_empty() {
-        return format!("No Internet Identity accounts found at {domain}.");
+fn format_accounts(target: &IdentityTarget, accounts: &[identities::AccountInfo]) -> String {
+    let origin = &target.origin;
+    // A one-line derivation-origin header so a wrong origin is visible.
+    let mut header = format!("Accounts derived for {origin}");
+    if target.source == "app_url_default" {
+        header.push_str(&format!(
+            " (assumed from app_url {} — the app declares no derivation origin; if these accounts \
+             don't match the user's browser, pass the app's canonical derivation_origin)",
+            target.requested
+        ));
     }
-    let mut out = format!("Your accounts at {domain}:\n");
+    if accounts.is_empty() {
+        return format!("{header}\n\nNo Internet Identity accounts found there.");
+    }
+    let mut out = format!("{header}\n\nYour accounts:\n");
     for a in accounts {
         // The default account (anchor's current default) has no name/number.
         let label = match &a.name {
@@ -1023,7 +1216,7 @@ fn format_accounts(domain: &str, accounts: &[identities::AccountInfo]) -> String
     if accounts.len() == 1 {
         out.push_str(
             "\nOnly the default account exists here — act on the user's behalf directly: \
-             call_canister(domain) / get_principal(domain) with no `account`.",
+             call_canister / get_principal with no `account`.",
         );
     } else {
         out.push_str(
@@ -1451,7 +1644,7 @@ mod tests {
     #[test]
     fn every_tool_has_correct_read_write_annotations() {
         let tools = super::IcTools::tool_router().list_all();
-        assert_eq!(tools.len(), 23, "expected 23 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 24, "expected 24 tools, got {}", tools.len());
         assert!(
             tools.iter().all(|t| t.annotations.is_some()),
             "every tool must carry annotations (else clients assume write/destructive)"
@@ -1471,7 +1664,7 @@ mod tests {
         for name in [
             "get_candid", "discover_canisters", "find_canister", "lookup_canister",
             "list_ic_skills", "get_ic_skill", "get_oql_guide", "oql_query", "oql_schema",
-            "get_api_doc", "list_accounts", "cycles_balance", "get_principal", "canister_status",
+            "get_api_doc", "resolve_app", "list_accounts", "cycles_balance", "get_principal", "canister_status",
         ] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");

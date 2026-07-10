@@ -245,14 +245,26 @@ const MAX_MANIFEST_CANISTERS: usize = 100;
 /// dropped downstream by `add`.
 ///
 /// ```json
-/// { "canisters": [
+/// { "derivation_origin": "https://<frontend-canister>.icp0.io",
+///   "canisters": [
 ///     { "id": "aaaaa-…-cai", "role": "backend", "description": "orders API" },
 ///     { "id": "bbbbb-…-cai", "role": "ledger" } ] }
 /// ```
+///
+/// The optional top-level `derivation_origin` is the app's own declaration of
+/// the Internet Identity derivation origin its frontends pin (via
+/// `derivationOrigin` + `/.well-known/ii-alternative-origins`). It is the ONLY
+/// authoritative way to learn a custom derivation origin: there is no reverse
+/// lookup from an app URL to it (the app's own alternative-origins file lists
+/// the inverse relation, and the frontend's `derivationOrigin` config is
+/// typically minified out of reach). When absent, a consumer must fall back to
+/// the application origin and say so.
 #[derive(Deserialize)]
 struct AppManifest {
     #[serde(default)]
     canisters: Vec<AppManifestEntry>,
+    #[serde(default)]
+    derivation_origin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -287,6 +299,133 @@ fn canisters_from_app_manifest(text: &str) -> Vec<(String, Option<String>)> {
             (e.id.trim().to_string(), label)
         })
         .collect()
+}
+
+/// The app's declared Internet Identity derivation origin, from the manifest's
+/// optional top-level `derivation_origin`, reduced to a bare `scheme://host[:port]`
+/// origin. `None` if absent, blank, or not a parseable http(s) URL.
+fn declared_derivation_origin(manifest_text: &str) -> Option<String> {
+    let m = serde_json::from_str::<AppManifest>(manifest_text).ok()?;
+    let raw = m.derivation_origin?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let url = url::Url::parse(raw).ok()?;
+    if url.scheme() != "https" && url.scheme() != "http" {
+        return None;
+    }
+    let origin = url.origin();
+    if !origin.is_tuple() {
+        return None;
+    }
+    Some(origin.ascii_serialization())
+}
+
+/// Which origins Internet Identity permits to derive from this origin, from its
+/// `/.well-known/ii-alternative-origins` (`{ "alternativeOrigins": [...] }`).
+/// Purely informational — this is the INVERSE of "what derivation origin does
+/// this app use", so it must NOT be used to infer the derivation origin.
+#[derive(Deserialize)]
+struct AltOrigins {
+    #[serde(default, rename = "alternativeOrigins")]
+    alternative_origins: Vec<String>,
+}
+
+fn parse_alternative_origins(text: &str) -> Vec<String> {
+    serde_json::from_str::<AltOrigins>(text)
+        .map(|a| {
+            a.alternative_origins
+                .into_iter()
+                .map(|s| clean_label(&s))
+                .filter(|s| !s.is_empty())
+                .take(MAX_MANIFEST_CANISTERS)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Where a resolved derivation origin came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DerivationSource {
+    /// The app declared it in `/.well-known/ic-app.json` (`derivation_origin`).
+    Declared,
+    /// No declaration found — defaulted to the application origin (an
+    /// ASSUMPTION, correct only for apps without a custom derivation origin).
+    AppUrlDefault,
+}
+
+impl DerivationSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DerivationSource::Declared => "declared",
+            DerivationSource::AppUrlDefault => "app_url_default",
+        }
+    }
+}
+
+/// The Internet Identity derivation context an app URL resolves to. See
+/// [`resolve_app_identity`].
+pub struct AppIdentity {
+    /// The normalized application origin (`scheme://host[:port]`) of `app_url`.
+    pub application_origin: String,
+    /// The derivation origin to feed Internet Identity: the declared one when
+    /// present, else the application origin.
+    pub derivation_origin: String,
+    /// Whether `derivation_origin` was declared or defaulted.
+    pub derivation_origin_source: DerivationSource,
+    /// The application origin's own `ii-alternative-origins` list (informational).
+    pub alternative_origins: Vec<String>,
+}
+
+/// Resolve an app URL to its Internet Identity derivation context, WITHOUT
+/// guessing: the derivation origin is the app's declared one
+/// (`/.well-known/ic-app.json` → `derivation_origin`) if present, else the
+/// application origin (a clearly-flagged default). Uses the same SSRF-pinned
+/// client and capped reads as `discover`; the app URL is user-controlled.
+pub async fn resolve_app_identity(app_url: &str) -> Result<AppIdentity, String> {
+    let base = normalize(app_url);
+    let (base_url, pinned) = resolve_public_url(&base).await?;
+    let host = base_url.host_str().unwrap_or_default().to_string();
+    let client = site_client(&host, &pinned)?;
+    let application_origin = base_url.origin().ascii_serialization();
+
+    // Declared derivation origin (authoritative) from the app's manifest.
+    let mut derivation_origin = application_origin.clone();
+    let mut derivation_origin_source = DerivationSource::AppUrlDefault;
+    if let Ok(resp) = client
+        .get(format!("{application_origin}/.well-known/ic-app.json"))
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            let text = read_capped(resp, MAX_META_BYTES).await;
+            if let Some(declared) = declared_derivation_origin(&text) {
+                derivation_origin = declared;
+                derivation_origin_source = DerivationSource::Declared;
+            }
+        }
+    }
+
+    // The app origin's alternative-origins list (informational only).
+    let mut alternative_origins = Vec::new();
+    if let Ok(resp) = client
+        .get(format!("{application_origin}/.well-known/ii-alternative-origins"))
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            let text = read_capped(resp, MAX_META_BYTES).await;
+            alternative_origins = parse_alternative_origins(&text);
+        }
+    }
+
+    Ok(AppIdentity {
+        application_origin,
+        derivation_origin,
+        derivation_origin_source,
+        alternative_origins,
+    })
 }
 
 /// Tidy an app-supplied label for display: control characters (ANSI escapes,
@@ -1387,5 +1526,37 @@ mod tests {
         assert!(!label.chars().any(char::is_control), "control chars must be gone: {label:?}");
         let long = format!(r#"{{"canisters":[{{"id":"aaaaa-aa","role":"{}"}}]}}"#, "x".repeat(1000));
         assert!(canisters_from_app_manifest(&long)[0].1.as_deref().unwrap().len() <= 120);
+    }
+
+    // The manifest's optional declared derivation origin is read and reduced to a
+    // bare origin; absent / blank / non-http values yield None (fail-closed).
+    #[test]
+    fn declared_derivation_origin_parses_and_fails_closed() {
+        let declared = r#"{"derivation_origin":"https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io","canisters":[]}"#;
+        assert_eq!(
+            declared_derivation_origin(declared).as_deref(),
+            Some("https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io")
+        );
+        // Reduced to a bare origin (path/query/trailing slash dropped).
+        let with_path = r#"{"derivation_origin":"https://app.example.com/x?y=1"}"#;
+        assert_eq!(declared_derivation_origin(with_path).as_deref(), Some("https://app.example.com"));
+        // Absent, blank, non-http, or non-JSON → None.
+        assert_eq!(declared_derivation_origin(r#"{"canisters":[]}"#), None);
+        assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"  "}"#), None);
+        assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"ftp://x/"}"#), None);
+        assert_eq!(declared_derivation_origin("<!doctype html>"), None);
+    }
+
+    // ii-alternative-origins parsing is tolerant and bounded, and sanitizes
+    // entries; a non-conforming body yields an empty list.
+    #[test]
+    fn parse_alternative_origins_reads_the_list() {
+        let body = r#"{"alternativeOrigins":["https://multidex.ai","https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io"]}"#;
+        assert_eq!(
+            parse_alternative_origins(body),
+            vec!["https://multidex.ai", "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io"]
+        );
+        assert!(parse_alternative_origins("<!doctype html>").is_empty());
+        assert!(parse_alternative_origins(r#"{"other":1}"#).is_empty());
     }
 }
