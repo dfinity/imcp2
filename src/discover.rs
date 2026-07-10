@@ -150,16 +150,37 @@ fn parse_meta(html: &str, name: &str) -> Option<String> {
     None
 }
 
-/// A `key="value"` (or `key='value'`) attribute inside a tag body.
+/// A `key="value"` (or `key='value'`) attribute inside a tag body. The key
+/// must sit on an attribute boundary (start-of-tag or preceding whitespace,
+/// so `data-name` can never match `name`), and whitespace is tolerated
+/// around the `=`.
 fn attr(tag: &str, key: &str) -> Option<String> {
-    for quote in ['"', '\''] {
-        let pat = format!("{key}={quote}");
-        if let Some(i) = tag.find(&pat) {
-            let rest = &tag[i + pat.len()..];
-            if let Some(j) = rest.find(quote) {
-                return Some(rest[..j].to_string());
-            }
+    let bytes = tag.as_bytes();
+    let mut from = 0;
+    while let Some(off) = tag[from..].find(key) {
+        let i = from + off;
+        from = i + key.len();
+        if i > 0 && !bytes[i - 1].is_ascii_whitespace() {
+            continue; // mid-word match (e.g. `data-name`) — not this attribute
         }
+        let mut j = i + key.len();
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'=' {
+            continue; // a bare/valueless attribute, or another word entirely
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || (bytes[j] != b'"' && bytes[j] != b'\'') {
+            continue; // unquoted value — not the shape we accept
+        }
+        let quote = bytes[j] as char;
+        let rest = &tag[j + 1..];
+        let k = rest.find(quote)?;
+        return Some(rest[..k].to_string());
     }
     None
 }
@@ -458,23 +479,11 @@ pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
 
     let mut found: BTreeMap<String, Found> = BTreeMap::new();
 
-    // 1. Frontend via the gateway header (and keep the HTML for bundle mining).
-    let resp = client
-        .get(&base)
-        .send()
-        .await
-        .map_err(|e| format!("could not reach {base}: {e}"))?;
-    if let Some(id) = resp
-        .headers()
-        .get("x-ic-canister-id")
-        .and_then(|v| v.to_str().ok())
-    {
-        add(&mut found, id, Some("frontend".into()), "header".into());
-    }
-    let html = read_capped(resp, MAX_BODY_BYTES).await;
-
-    // 2. App-declared metadata — the app saying, in bytes it serves itself,
-    // which canisters it comprises. Most authoritative of all sources.
+    // 1. App-declared metadata — the app saying, in bytes it serves itself,
+    // which canisters it comprises. Most authoritative of all sources, and
+    // probed FIRST so its labels win `add`'s first-label-wins rule (a
+    // single-canister app's id would otherwise keep the header's generic
+    // "frontend" label instead of the declared one).
     //   a. The App Connect bridge page's ic:canister-id meta: the app's MAIN
     //      backend (spec §4.7/§6.1). Read from raw markup, no JS execution.
     //      An SPA catch-all serving index.html here fails closed: no such
@@ -503,6 +512,23 @@ pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
             }
         }
     }
+
+    // 2. Frontend via the gateway header (and keep the HTML for bundle mining).
+    // This is also the reachability gate: the two probes above are best-effort,
+    // but an unreachable base is a hard error.
+    let resp = client
+        .get(&base)
+        .send()
+        .await
+        .map_err(|e| format!("could not reach {base}: {e}"))?;
+    if let Some(id) = resp
+        .headers()
+        .get("x-ic-canister-id")
+        .and_then(|v| v.to_str().ok())
+    {
+        add(&mut found, id, Some("frontend".into()), "header".into());
+    }
+    let html = read_capped(resp, MAX_BODY_BYTES).await;
 
     // 3. Runtime config: /env.json with *canister_id* keys (e.g. Caffeine apps).
     if let Ok(resp) = client.get(format!("{base}/env.json")).send().await {
@@ -1213,6 +1239,32 @@ mod tests {
         let multi = format!("{other}\n<meta name=\"ic:network\" content=\"ic\">\n{flipped}");
         assert_eq!(parse_meta(&multi, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
         assert_eq!(parse_meta(&multi, "ic:network").as_deref(), Some("ic"));
+        // Attribute boundaries (per review): `data-name` must NOT match `name`,
+        // and whitespace around `=` is legal HTML that must still parse.
+        let trap = r#"<meta data-name="ic:canister-id" content="evil-id">"#;
+        assert_eq!(parse_meta(trap, "ic:canister-id"), None, "data-name must not match name");
+        let spaced = r#"<meta name = "ic:canister-id" content =  "aaaaa-aa">"#;
+        assert_eq!(parse_meta(spaced, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
+        // Both shapes on one tag: the boundary-checked real `name` wins.
+        let both = r#"<meta data-name="decoy" name="ic:canister-id" content="aaaaa-aa">"#;
+        assert_eq!(parse_meta(both, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
+        // An unquoted value is not accepted (we only read the quoted shape).
+        assert_eq!(attr("name=bare content=\"x\"", "name"), None);
+    }
+
+    // App-declared labels must win over the header's generic "frontend" for the
+    // SAME canister (single-canister apps): `add` keeps the FIRST label, so
+    // discover() probes the declared metadata before the header. This pins the
+    // first-label-wins semantics that ordering relies on.
+    #[test]
+    fn add_keeps_first_label_so_declared_probes_run_first() {
+        let mut found = BTreeMap::new();
+        let id = "dmp3l-2yaaa-aaaae-aamva-cai";
+        add(&mut found, id, Some("main backend (App Connect)".into()), "ai-connect.html".into());
+        add(&mut found, id, Some("frontend".into()), "header".into());
+        let f = &found[id];
+        assert_eq!(f.label.as_deref(), Some("main backend (App Connect)"));
+        assert_eq!(f.sources, vec!["ai-connect.html", "header"], "both provenances kept");
     }
 
     // The proposed /.well-known/ic-app.json manifest: entries yield (id, label)
