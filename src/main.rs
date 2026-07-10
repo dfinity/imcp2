@@ -1320,20 +1320,29 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("listening on http://{bind}  (MCP at /mcp, OAuth at /oauth/*)");
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(ct))
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
+    // Drain-then-cancel ordering matters. `axum` has now stopped accepting new
+    // connections and awaited the in-flight ones. Only NOW cancel the rmcp
+    // services' token: it's `with_cancellation_token(ct.child_token())`, and
+    // cancelling it asks rmcp to terminate active sessions — doing that before
+    // the drain would cut the very in-flight MCP requests we want to finish.
+    // After the drain there's nothing left to cut; this is just a clean stop
+    // signal to the (stateless, no long-lived SSE) services before exit.
+    ct.cancel();
     Ok(())
 }
 
 /// Resolves when the process is asked to stop, so `axum` drains in-flight
-/// requests (and the MCP services' cancellation token fires) before exit rather
-/// than being cut mid-response.
+/// requests before exit rather than being cut mid-response. The rmcp
+/// cancellation token is cancelled by the caller *after* the drain completes,
+/// not here (see the call site).
 ///
 /// Handles BOTH signals: an interactive run is stopped with `SIGINT` (Ctrl-C),
 /// but `systemctl stop`/`restart` sends **`SIGTERM`** — which this previously did
 /// not catch, so a redeploy killed the process abruptly and severed in-flight
 /// requests. We now wait on either.
-async fn shutdown_signal(ct: tokio_util::sync::CancellationToken) {
+async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -1357,7 +1366,6 @@ async fn shutdown_signal(ct: tokio_util::sync::CancellationToken) {
         let _ = tokio::signal::ctrl_c().await;
     }
     tracing::info!("shutdown signal received; draining in-flight requests");
-    ct.cancel();
 }
 
 #[cfg(test)]
