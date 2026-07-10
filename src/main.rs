@@ -1319,17 +1319,20 @@ async fn main() -> anyhow::Result<()> {
     let bind = bind_address();
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("listening on http://{bind}  (MCP at /mcp, OAuth at /oauth/*)");
-    axum::serve(listener, app)
+    // Drain-then-cancel, on ALL exit paths. `with_graceful_shutdown` stops
+    // accepting new connections and drains the in-flight ones first; only then
+    // do we cancel the rmcp services' token. Ordering matters: the token is
+    // `with_cancellation_token(ct.child_token())`, and cancelling it asks rmcp
+    // to terminate active sessions, so cancelling before the drain would cut the
+    // very in-flight MCP requests we want to finish. Capturing the result rather
+    // than `?`-ing it means an unexpected serve error (accept failure, etc.)
+    // still cancels the token before the error propagates. (Stateless, no
+    // long-lived SSE, so there's nothing for the token to cut post-drain.)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    // Drain-then-cancel ordering matters. `axum` has now stopped accepting new
-    // connections and awaited the in-flight ones. Only NOW cancel the rmcp
-    // services' token: it's `with_cancellation_token(ct.child_token())`, and
-    // cancelling it asks rmcp to terminate active sessions — doing that before
-    // the drain would cut the very in-flight MCP requests we want to finish.
-    // After the drain there's nothing left to cut; this is just a clean stop
-    // signal to the (stateless, no long-lived SSE) services before exit.
+        .await;
     ct.cancel();
+    serve_result?;
     Ok(())
 }
 
