@@ -392,9 +392,9 @@ impl IcTools {
         };
         // Decode against the Candid interface so field names are recovered.
         let reply = calls::decode_reply(did.as_deref(), &method, &reply_bytes);
-        let (derived_for_origin, requested) = match &target {
-            Some(t) => (Some(t.origin.clone()), Some(t.requested.clone())),
-            None => (None, None),
+        let (derived_for_origin, requested, derivation_origin_source) = match &target {
+            Some(t) => (Some(t.origin.clone()), Some(t.requested.clone()), Some(t.source.clone())),
+            None => (None, None, None),
         };
         // A short identity note so a wrong-principal is visible in the text too.
         let mut text = reply.clone();
@@ -412,7 +412,7 @@ impl IcTools {
         }
         let output = calls::CallCanisterOutput {
             canister_id, method, is_query, reply,
-            acted_as_principal, derived_for_origin, requested,
+            acted_as_principal, derived_for_origin, requested, derivation_origin_source,
         };
         Ok(ok_structured(text, &output))
     }
@@ -530,16 +530,21 @@ impl IcTools {
         let declared = resolved.derivation_origin_source == discover::DerivationSource::Declared;
 
         // If authenticated, resolve the principal for the effective origin too.
-        let principal = match authed_session(&ctx) {
+        // Track WHY it's absent so the text doesn't tell a signed-in user to
+        // authenticate when the real cause is a derivation failure.
+        let (principal, principal_absent_reason) = match authed_session(&ctx) {
             Some(s) => match self
                 .identities
                 .delegated_identity_for(&s.session_id, &effective, None)
                 .await
             {
-                Ok(d) => d.sender().ok().map(|p| p.to_text()),
-                Err(_) => None,
+                Ok(d) => match d.sender().ok().map(|p| p.to_text()) {
+                    Some(p) => (Some(p), None),
+                    None => (None, Some("(signed in, but the delegation carries no principal)")),
+                },
+                Err(_) => (None, Some("(signed in, but could not derive a principal for this origin)")),
             },
-            None => None,
+            None => (None, Some("(authenticate to resolve)")),
         };
 
         let note = if declared {
@@ -559,8 +564,8 @@ impl IcTools {
         );
         if let Some(p) = &principal {
             text.push_str(&format!("principal: {p}\n"));
-        } else {
-            text.push_str("principal: (authenticate to resolve)\n");
+        } else if let Some(reason) = principal_absent_reason {
+            text.push_str(&format!("principal: {reason}\n"));
         }
         if !resolved.alternative_origins.is_empty() {
             text.push_str(&format!("alternative_origins: {}\n", resolved.alternative_origins.join(", ")));
@@ -942,6 +947,7 @@ fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<auth::AuthedSessio
 
 /// Which app principal an identity-bearing tool should act as, resolved from the
 /// caller's `derivation_origin` and/or `app_url`.
+#[derive(Debug)]
 struct IdentityTarget {
     /// The EFFECTIVE (canonical) Internet Identity derivation origin to feed the
     /// delegation layer — echoed to the caller as `derived_for_origin`.
@@ -1789,5 +1795,53 @@ mod tests {
             Some(&serde_json::json!("xevnm-gaaaa-aaaar-qafnq-cai"))
         );
         assert_eq!(matches[0].get("kind"), Some(&serde_json::json!("token")));
+    }
+
+    // resolve_identity_target's precedence/validation rules are part of the tool
+    // contract; cover the offline branches (the `app_url` branch needs the
+    // network and is exercised separately). Supplying both args must be rejected.
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_both_args() {
+        let err = super::resolve_identity_target(
+            Some("https://a.example".to_string()),
+            Some("https://b.example".to_string()),
+        )
+        .await
+        .expect_err("both args must be an error");
+        assert!(err.contains("not both"), "unexpected message: {err}");
+    }
+
+    // A whitespace-only `derivation_origin` is empty after trimming and must be
+    // rejected rather than canonicalized into a bogus origin.
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_blank_derivation_origin() {
+        let err = super::resolve_identity_target(Some("   ".to_string()), None)
+            .await
+            .expect_err("blank derivation_origin must be an error");
+        assert!(err.contains("must not be empty"), "unexpected message: {err}");
+    }
+
+    // `derivation_origin` is trimmed before canonicalization, so surrounding
+    // whitespace never leaks into either the echoed `requested` or the effective
+    // `origin` fed to the delegation path.
+    #[tokio::test]
+    async fn resolve_identity_target_trims_derivation_origin() {
+        let target = super::resolve_identity_target(Some("  https://example.com  ".to_string()), None)
+            .await
+            .expect("valid derivation_origin resolves")
+            .expect("an explicit derivation_origin yields a target");
+        assert_eq!(target.requested, "https://example.com", "requested must be trimmed");
+        assert_eq!(target.origin, "https://example.com", "origin must be the canonical trimmed form");
+        assert_eq!(target.source, "explicit");
+        assert!(target.application_origin.is_none());
+    }
+
+    // Neither arg is the anonymous path: no target, no error.
+    #[tokio::test]
+    async fn resolve_identity_target_none_is_anonymous() {
+        let target = super::resolve_identity_target(None, None)
+            .await
+            .expect("neither arg is valid (anonymous)");
+        assert!(target.is_none(), "neither arg must yield no target");
     }
 }
