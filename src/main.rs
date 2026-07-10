@@ -263,6 +263,45 @@ impl IcTools {
         Ok(ok_structured(output.schema.clone(), &output))
     }
 
+    #[tool(
+        description = "Read a canister's own API documentation — a prose \"how this app behaves\" guide covering units, auth, lifecycle, non-obvious semantics, mutation safety, polling rules, and gotchas — if it exposes a `getApiDoc` or `get_api_doc` method. Call this FIRST when working with an unfamiliar app: it explains behavior the Candid types alone don't (get_candid still gives the exact method signatures). Returns the doc as markdown.",
+        annotations(title = "Get a canister's API documentation", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<calls::ApiDocOutput>(),
+    )]
+    async fn get_api_doc(
+        &self,
+        Parameters(calls::ApiDocArgs { canister_id }): Parameters<calls::ApiDocArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let principal = match Principal::from_text(&canister_id) {
+            Ok(p) => p,
+            Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
+        };
+        // Read the interface to learn which naming the canister uses
+        // (getApiDoc vs get_api_doc); the doc is public, so call anonymously.
+        let did = calls::candid_service(&self.agent, principal).await;
+        let method = match did.as_deref().and_then(calls::api_doc_method) {
+            Some(m) => m,
+            None => {
+                return Ok(err(
+                    "this canister doesn't expose a `getApiDoc`/`get_api_doc` method (or its \
+                     Candid interface couldn't be read). Use get_candid for the raw interface."
+                        .into(),
+                ))
+            }
+        };
+        let arg_bytes = match calls::encode_unit_arg() {
+            Ok(b) => b,
+            Err(e) => return Ok(err(e)),
+        };
+        let reply = match calls::raw_call(&self.agent, principal, method, arg_bytes, true).await {
+            Ok(b) => b,
+            Err(e) => return Ok(err(format!("{method} call failed: {e}"))),
+        };
+        let doc = calls::decode_text_reply(&reply);
+        let output = calls::ApiDocOutput { canister_id, method: method.to_string(), doc };
+        Ok(ok_structured(output.doc.clone(), &output))
+    }
+
     /// The agent to sign calls with for a request: the shared anonymous agent
     /// when no `domain` is given, else one backed by a short-lived account
     /// delegation for that app derived on demand from the connection's standing
@@ -808,11 +847,14 @@ impl ServerHandler for IcTools {
              \"ckUSDC\"), use `find_canister` to look it up by name in the IC dashboard's \
              registries and get its canister id. `lookup_canister(id)` tells you what a bare \
              canister id IS (dashboard label, type, controllers, subnet). `get_candid` fetches a \
-             canister's Candid interface; if it reports `oql: true`, the canister exposes an OQL \
-             query surface — read `get_oql_guide` for the dialect, then use `oql_schema` (entities \
-             and fields) and `oql_query` (run a JSON query, get a table back). Those two wrap the \
-             canister's `schema`/`execute` methods, so you don't hand-encode Candid for OQL. \
-             `call_canister` calls a method with textual Candid \
+             canister's Candid interface. For an unfamiliar app, try `get_api_doc` FIRST: if the \
+             canister exposes a `getApiDoc`/`get_api_doc` method it returns a prose guide to how \
+             the app behaves (units, auth, lifecycle, mutation safety, polling, gotchas) that the \
+             Candid types alone don't convey. If `get_candid` reports `oql: true`, the canister \
+             exposes an OQL query surface — read `get_oql_guide` for the dialect, then use \
+             `oql_schema` (entities and fields) and `oql_query` (run a JSON query, get a table \
+             back). Those two wrap the canister's `schema`/`execute` methods, so you don't \
+             hand-encode Candid for OQL. `call_canister` calls a method with textual Candid \
              in/out: omit `domain` to call anonymously, or pass an application domain (e.g. \
              domain=\"oisy.com\") to call as your account at that app — a short-lived (<=5 min) \
              account delegation for it is minted ON DEMAND from this connection's standing \
@@ -1073,6 +1115,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <p>MCP endpoints: <code>POST /mcp</code> (beta Internet Identity) · <code>POST /mcp-prod</code> (production Internet Identity)</p>
 <p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>find_canister</code> (name → canister ids), <code>lookup_canister</code> (id → dashboard identity), <code>get_candid</code>, <code>call_canister</code> (anonymously, or as your account at an application domain, derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (your principal at an application domain, no call), <code>list_accounts</code> (your Internet Identity accounts at an app domain). All speak textual Candid.</p>
 <p>Skills: <code>list_ic_skills</code> / <code>get_ic_skill</code> (the official IC how-to guides — Motoko, mops, icp CLI, cycles, …).</p>
+<p>App docs: <code>get_api_doc</code> (a canister's own "how this app behaves" guide, if it exposes <code>getApiDoc</code>/<code>get_api_doc</code>).</p>
 <p>OQL: <code>get_oql_guide</code> (dialect), <code>oql_schema</code> (entities/fields), <code>oql_query</code> (run a JSON query, get a table) — for canisters that expose an OQL <code>schema</code>/<code>execute</code> surface (<code>get_candid</code> reports <code>oql: true</code>).</p>
 <p>Canister management (as your Internet Identity): <code>cycles_balance</code>, <code>create_canister</code>, <code>install_code</code>, <code>canister_status</code>, <code>update_canister_settings</code>, <code>start_canister</code>, <code>stop_canister</code>, <code>uninstall_code</code>, <code>delete_canister</code>, <code>top_up_canister</code>.</p>
 </body></html>"#;
@@ -1361,7 +1404,7 @@ mod tests {
     #[test]
     fn every_tool_has_correct_read_write_annotations() {
         let tools = super::IcTools::tool_router().list_all();
-        assert_eq!(tools.len(), 22, "expected 22 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 23, "expected 23 tools, got {}", tools.len());
         assert!(
             tools.iter().all(|t| t.annotations.is_some()),
             "every tool must carry annotations (else clients assume write/destructive)"
@@ -1381,7 +1424,7 @@ mod tests {
         for name in [
             "get_candid", "discover_canisters", "find_canister", "lookup_canister",
             "list_ic_skills", "get_ic_skill", "get_oql_guide", "oql_query", "oql_schema",
-            "list_accounts", "cycles_balance", "get_principal", "canister_status",
+            "get_api_doc", "list_accounts", "cycles_balance", "get_principal", "canister_status",
         ] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");
