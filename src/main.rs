@@ -1362,13 +1362,56 @@ async fn main() -> anyhow::Result<()> {
     let bind = bind_address();
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("listening on http://{bind}  (MCP at /mcp, OAuth at /oauth/*)");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            ct.cancel();
-        })
-        .await?;
+    // Drain-then-cancel, on ALL exit paths. `with_graceful_shutdown` stops
+    // accepting new connections and drains the in-flight ones first; only then
+    // do we cancel the rmcp services' token. Ordering matters: the token is
+    // `with_cancellation_token(ct.child_token())`, and cancelling it asks rmcp
+    // to terminate active sessions, so cancelling before the drain would cut the
+    // very in-flight MCP requests we want to finish. Capturing the result rather
+    // than `?`-ing it means an unexpected serve error (accept failure, etc.)
+    // still cancels the token before the error propagates. (Stateless, no
+    // long-lived SSE, so there's nothing for the token to cut post-drain.)
+    let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+    ct.cancel();
+    serve_result?;
     Ok(())
+}
+
+/// Resolves when the process is asked to stop, so `axum` drains in-flight
+/// requests before exit rather than being cut mid-response. The rmcp
+/// cancellation token is cancelled by the caller *after* the drain completes,
+/// not here (see the call site).
+///
+/// Handles BOTH signals: an interactive run is stopped with `SIGINT` (Ctrl-C),
+/// but `systemctl stop`/`restart` sends **`SIGTERM`** — which this previously did
+/// not catch, so a redeploy killed the process abruptly and severed in-flight
+/// requests. We now wait on either.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // If the SIGTERM handler can't be installed, fall back to SIGINT only
+        // rather than aborting startup.
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!("could not install SIGTERM handler ({e}); draining on SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    tracing::info!("shutdown signal received; draining in-flight requests");
 }
 
 #[cfg(test)]
