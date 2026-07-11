@@ -625,9 +625,11 @@ impl Identities {
     /// timeouts are retry-safe.
     ///
     /// > **Verified against deployed beta II.** The `mcp_register_v2` argument
-    /// > and return candid ([`McpRegisterV2Ok`]) match the beta II canister's
-    /// > live `.did` (`fgte5-ciaaa-aaaad-aaatq-cai`): one `session_key : blob`
-    /// > in, `record { expiration; permissions }` out. Production II (`rdmx6-…`)
+    /// > and return candid match the beta II canister's live `.did`
+    /// > (`fgte5-ciaaa-aaaad-aaatq-cai`): one `session_key : blob` in, and
+    /// > `variant { Ok : record { expiration; permissions }; Err : text }` out
+    /// > (decoded as [`McpRegisterV2Reply`]; [`McpRegisterV2Ok`] is the `Ok`
+    /// > payload). Production II (`rdmx6-…`)
     /// > keeps `registration_delegation` off (v1 flow) until it ships these
     /// > methods. Re-verify the shapes if II's `.did` ever moves; the read-only
     /// > `opt text`/`variant` outage (#40) is the standing lesson against drift.

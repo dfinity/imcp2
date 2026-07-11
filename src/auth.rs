@@ -649,11 +649,11 @@ fn finishing_page(prefix: &str, id: &str, fs: &str, next_try: u32) -> Response {
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <meta name=referrer content=no-referrer>\
          <style>{css}</style></head>\
-         <body><main class=card role=status aria-live=polite>\
+         <body><main class=card>\
          {logo}\
          <p class=eyebrow>Internet Identity</p>\
          <div class=spinner aria-hidden=true></div>\
-         <p class=msg>Finishing sign-in…</p></main>\
+         <p class=msg role=status aria-live=polite>Finishing sign-in…</p></main>\
          <script>setTimeout(function(){{location.replace(\"{url}\")}},1200)</script></body></html>"
     ))
     .into_response();
@@ -1014,11 +1014,11 @@ fn pinned_callback_page(prefix: &str) -> Response {
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>Finishing sign-in…</title>\
          <style nonce=\"{nonce}\">{css}</style></head>\
-         <body><main class=card role=status aria-live=polite>\
+         <body><main class=card>\
          {logo}\
          <p class=eyebrow>Internet Identity</p>\
          <div class=spinner aria-hidden=true></div>\
-         <p id=m class=msg>Finishing sign-in…</p></main>\
+         <p id=m class=msg role=status aria-live=polite>Finishing sign-in…</p></main>\
          <script nonce=\"{nonce}\">{script}</script></body></html>"
     );
     // `style-src 'nonce-{nonce}'` admits ONLY the nonce'd `<style>` block above
