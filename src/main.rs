@@ -538,11 +538,11 @@ impl IcTools {
                 .delegated_identity_for(&s.session_id, &effective, None)
                 .await
             {
-                Ok(d) => match d.sender().ok().map(|p| p.to_text()) {
-                    Some(p) => (Some(p), None),
-                    None => (None, Some("(signed in, but the delegation carries no principal)")),
+                Ok(d) => match d.sender() {
+                    Ok(p) => (Some(p.to_text()), None),
+                    Err(_) => (None, Some("(signed in, but the delegation's principal could not be read)")),
                 },
-                Err(_) => (None, Some("(signed in, but could not derive a principal for this origin)")),
+                Err(_) => (None, Some("(signed in, but could not derive a delegation for this origin)")),
             },
             None => (None, Some("(authenticate to resolve)")),
         };
@@ -976,18 +976,25 @@ async fn resolve_identity_target(
             Err("provide either `derivation_origin` or `app_url`, not both".to_string())
         }
         (Some(d), None) => {
-            let d = d.trim();
-            if d.is_empty() {
-                return Err("`derivation_origin` must not be empty".to_string());
+            let d = clean_identity_arg("derivation_origin", &d)?;
+            let origin = identities::target_origin(&d);
+            // `target_origin` reduces the input to `https://<host>`; reject one that
+            // carries no host (e.g. "https://"), which would otherwise derive against
+            // — and echo back — an empty origin.
+            if origin.strip_prefix("https://").map_or(true, str::is_empty) {
+                return Err(
+                    "`derivation_origin` must include a host (e.g. https://app.example.com)".to_string(),
+                );
             }
             Ok(Some(IdentityTarget {
-                origin: identities::target_origin(d),
-                requested: d.to_string(),
+                origin,
+                requested: d,
                 source: "explicit".to_string(),
                 application_origin: None,
             }))
         }
         (None, Some(u)) => {
+            let u = clean_identity_arg("app_url", &u)?;
             let resolved = discover::resolve_app_identity(&u).await?;
             Ok(Some(IdentityTarget {
                 origin: identities::target_origin(&resolved.derivation_origin),
@@ -998,6 +1005,23 @@ async fn resolve_identity_target(
         }
         (None, None) => Ok(None),
     }
+}
+
+/// Validate a user-supplied identity argument (`derivation_origin` / `app_url`):
+/// trim surrounding whitespace, reject an empty/whitespace-only value, and reject
+/// ASCII/Unicode control characters. Both fields are echoed back verbatim (as
+/// `requested` / `derived_for_origin`) and `derivation_origin` feeds the delegation
+/// origin, so a stray control char could corrupt a log line or the origin string —
+/// fail closed rather than pass it through.
+fn clean_identity_arg(field: &str, raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if v.is_empty() {
+        return Err(format!("`{field}` must not be empty"));
+    }
+    if v.chars().any(char::is_control) {
+        return Err(format!("`{field}` must not contain control characters"));
+    }
+    Ok(v.to_string())
 }
 
 /// Log each inbound request: method, path, response status, and latency — gives
@@ -1843,5 +1867,35 @@ mod tests {
             .await
             .expect("neither arg is valid (anonymous)");
         assert!(target.is_none(), "neither arg must yield no target");
+    }
+
+    // A control character in either identity arg is rejected up front (it would
+    // otherwise be echoed back verbatim / corrupt the delegation origin).
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_control_chars() {
+        let err = super::resolve_identity_target(Some("https://ex\u{7}ample.com".to_string()), None)
+            .await
+            .expect_err("control chars must be rejected");
+        assert!(err.contains("control characters"), "unexpected message: {err}");
+    }
+
+    // A `derivation_origin` with no host (e.g. "https://") reduces to an empty
+    // origin and must be rejected rather than derived against.
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_hostless_derivation_origin() {
+        let err = super::resolve_identity_target(Some("https://".to_string()), None)
+            .await
+            .expect_err("host-less derivation_origin must be rejected");
+        assert!(err.contains("must include a host"), "unexpected message: {err}");
+    }
+
+    // A whitespace-only `app_url` is rejected before any network resolution, so
+    // the caller gets a clear error instead of a confusing downstream URL failure.
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_blank_app_url() {
+        let err = super::resolve_identity_target(None, Some("   ".to_string()))
+            .await
+            .expect_err("blank app_url must be rejected");
+        assert!(err.contains("must not be empty"), "unexpected message: {err}");
     }
 }
