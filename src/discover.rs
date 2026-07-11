@@ -301,12 +301,10 @@ fn canisters_from_app_manifest(text: &str) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
-/// The app's declared Internet Identity derivation origin, from the manifest's
-/// optional top-level `derivation_origin`, reduced to a bare `scheme://host[:port]`
-/// origin. `None` if absent, blank, or not a parseable http(s) URL.
-fn declared_derivation_origin(manifest_text: &str) -> Option<String> {
-    let m = serde_json::from_str::<AppManifest>(manifest_text).ok()?;
-    let raw = m.derivation_origin?;
+/// Reduce a raw origin string to a canonical bare `scheme://host[:port]` origin,
+/// accepting ONLY http(s) with a real (tuple) host. `None` for anything else —
+/// blank, non-http(s), path/opaque-only, or unparseable — so callers fail closed.
+fn normalize_origin(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
@@ -322,6 +320,14 @@ fn declared_derivation_origin(manifest_text: &str) -> Option<String> {
     Some(origin.ascii_serialization())
 }
 
+/// The app's declared Internet Identity derivation origin, from the manifest's
+/// optional top-level `derivation_origin`, reduced to a bare `scheme://host[:port]`
+/// origin. `None` if absent, blank, or not a parseable http(s) URL.
+fn declared_derivation_origin(manifest_text: &str) -> Option<String> {
+    let m = serde_json::from_str::<AppManifest>(manifest_text).ok()?;
+    normalize_origin(m.derivation_origin?.as_str())
+}
+
 /// Which origins Internet Identity permits to derive from this origin, from its
 /// `/.well-known/ii-alternative-origins` (`{ "alternativeOrigins": [...] }`).
 /// Purely informational — this is the INVERSE of "what derivation origin does
@@ -335,10 +341,12 @@ struct AltOrigins {
 fn parse_alternative_origins(text: &str) -> Vec<String> {
     serde_json::from_str::<AltOrigins>(text)
         .map(|a| {
+            // Fail-closed: normalize each entry to a bare origin (as the doc
+            // promises) and drop anything that isn't a valid http(s) origin,
+            // rather than surfacing arbitrary sanitized strings.
             a.alternative_origins
-                .into_iter()
-                .map(|s| clean_label(&s))
-                .filter(|s| !s.is_empty())
+                .iter()
+                .filter_map(|s| normalize_origin(s))
                 .take(MAX_MANIFEST_CANISTERS)
                 .collect()
         })
@@ -1568,5 +1576,13 @@ mod tests {
         );
         assert!(parse_alternative_origins("<!doctype html>").is_empty());
         assert!(parse_alternative_origins(r#"{"other":1}"#).is_empty());
+        // Fail-closed + normalize: a path is reduced to the bare origin, and a
+        // non-http(s) / unparseable entry is dropped rather than surfaced.
+        assert_eq!(
+            parse_alternative_origins(
+                r#"{"alternativeOrigins":["https://a.example/some/path","ftp://x","not a url"]}"#
+            ),
+            vec!["https://a.example"]
+        );
     }
 }

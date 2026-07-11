@@ -314,12 +314,14 @@ impl IcTools {
     /// the shared anonymous agent (principal `None`) when `origin` is `None`, else
     /// one backed by a short-lived account delegation for that Internet Identity
     /// derivation `origin`, derived on demand from this connection's standing
-    /// credential. `origin` must be a VALIDATED derivation origin: call_canister /
-    /// get_principal / list_accounts pass the canonical one from
-    /// [`resolve_identity_target`]; oql_query / oql_schema pass one validated by
-    /// [`clean_derivation_origin`]. `Identities::delegated_identity_for`
-    /// re-canonicalizes internally (idempotent), so passing an already-canonical
-    /// origin is fine. `what` names the action for the no-session error.
+    /// credential. `origin` must be a VALIDATED derivation origin: call_canister
+    /// passes the canonical one from [`resolve_identity_target`]; oql_query /
+    /// oql_schema pass one validated by [`clean_derivation_origin`]. (get_principal
+    /// and list_accounts don't use this helper — they call
+    /// `Identities::delegated_identity_for` / `list_accounts` directly with a
+    /// `resolve_identity_target` origin.) `delegated_identity_for` re-canonicalizes
+    /// internally (idempotent), so an already-canonical origin is fine. `what`
+    /// names the action for the no-session error.
     async fn resolve_agent(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -552,10 +554,11 @@ impl IcTools {
             None
         } else {
             Some(format!(
-                "No derivation origin declared by the app (no /.well-known/ic-app.json \
-                 `derivation_origin`); assumed to equal the application origin {}. If this app \
-                 uses a custom derivation origin, that assumption yields a WRONG principal — supply \
-                 the canonical origin explicitly.",
+                "No derivation origin could be found for this app — its /.well-known/ic-app.json \
+                 either declares no `derivation_origin` or couldn't be fetched (DNS/timeout/TLS/\
+                 redirect) — so this assumed the application origin {}. If this app uses a custom \
+                 derivation origin, that assumption yields a WRONG principal — supply the canonical \
+                 origin explicitly.",
                 resolved.application_origin
             ))
         };
