@@ -388,7 +388,9 @@ to the allow-listed callback with the chain **plus the connect state**:
 `#delegation=<DelegationChain JSON>&state=…`
 (agent-js `DelegationChain.toJSON()`: hex byte fields, hex-string expiration);
 and redemption calls `mcp_register_v2(session_key)
--> record { expiration; permissions }`. The access level and lifetime are
+-> variant { Ok : record { expiration; permissions }; Err : text }` (the server
+decodes the outer `variant`; the `Ok` payload carries the grant expiry and the
+access level). The access level and lifetime are
 **not sent by the server**: the user chose them at consent, and II stored them at
 `prepare_mcp_registration_delegation` on an index keyed by `P_reg`, so
 `mcp_register_v2` recovers both the consent and the anchor from
