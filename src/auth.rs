@@ -638,17 +638,21 @@ fn finishing_page(prefix: &str, id: &str, fs: &str, next_try: u32) -> Response {
         urlencoding::encode(fs),
         next_try
     ));
-    // Shares the connect pages' look (centered card + spinner + dark mode). This
-    // page sets no CSP, so a plain `<style>`/`<script>` is fine.
+    // Shares the connect pages' DFINITY-branded look (logo, centered card,
+    // spinner, dark mode). This page sets no CSP, so a plain `<style>`/`<script>`
+    // is fine.
     let css = CONNECT_PAGE_CSS;
+    let logo = CONNECT_LOGO_SVG;
     let mut resp = Html(format!(
         "<!DOCTYPE html><html lang=en><head><meta charset=utf-8><title>Finishing…</title>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <meta name=referrer content=no-referrer>\
          <style>{css}</style></head>\
          <body><main class=card role=status aria-live=polite>\
+         {logo}\
+         <p class=eyebrow>Internet Identity</p>\
          <div class=spinner aria-hidden=true></div>\
-         <p>Finishing sign-in…</p></main>\
+         <p class=msg>Finishing sign-in…</p></main>\
          <script>setTimeout(function(){{location.replace(\"{url}\")}},1200)</script></body></html>"
     ))
     .into_response();
@@ -902,17 +906,41 @@ fn csp_nonce() -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Shared styling for the connect interstitial/error pages: a vertically- and
-/// horizontally-centered card with a system font, an accessible status line, a
-/// CSS-only spinner (disabled under `prefers-reduced-motion`), and light/dark
-/// theming via `prefers-color-scheme`. Fully self-contained (no external fonts,
-/// images, or stylesheets), so it renders identically under the pinned page's
-/// strict `default-src 'none'` CSP. The pinned page serves it in a
-/// `<style nonce>` block (with `style-src 'nonce-…'` added to its CSP so the
-/// block is allowed WITHOUT `'unsafe-inline'`); the sibling pages, which set no
-/// CSP, use a plain `<style>`. The `.error` modifier hides the spinner once a
-/// terminal message is shown.
-const CONNECT_PAGE_CSS: &str = r#":root { color-scheme: light dark; }
+/// Shared styling for the connect interstitial/error pages, following the
+/// DFINITY brand guidelines (Parchment/Ink/Rust palette, an editorial serif
+/// display over a UI sans, a grid-paper surface, and the official gradient-
+/// infinity logo). A centered card with the DFINITY mark, an accessible status
+/// line, and a CSS-only spinner (disabled under `prefers-reduced-motion`);
+/// light/dark theming via `prefers-color-scheme` with a `data-theme` override,
+/// using the brand's Bark/Bone/Ember dark palette. Fully self-contained (no
+/// external fonts, images, or stylesheets; the logo is inline SVG), so it
+/// renders identically under the pinned page's strict `default-src 'none'` CSP.
+/// The pinned page serves the stylesheet in a `<style nonce>` block (with
+/// `style-src 'nonce-...'` added to its CSP so the block is allowed WITHOUT
+/// `'unsafe-inline'`); the sibling pages, which set no CSP, use a plain
+/// `<style>`. The `.error` modifier hides the spinner once a terminal message
+/// is shown.
+const CONNECT_PAGE_CSS: &str = r##":root {
+  color-scheme: light dark;
+  --bg: #faf9f5;
+  --surface: #ffffff;
+  --ink: #1a1a1a;
+  --secondary: #4b4943;
+  --muted: #868078;
+  --accent: #a8482b;
+  --hairline: #e7e3da;
+  --grid: rgba(26, 26, 26, 0.04);
+  --font-display: ui-serif, "Iowan Old Style", Georgia, Cambria, "Times New Roman", serif;
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+:root[data-theme="dark"] {
+  --bg: #14110d; --surface: #1c1813; --ink: #f0ebe0; --secondary: #cfc7b8;
+  --muted: #9a9384; --accent: #c25a37; --hairline: #342e25; --grid: rgba(240, 235, 224, 0.05);
+}
+:root[data-theme="light"] {
+  --bg: #faf9f5; --surface: #ffffff; --ink: #1a1a1a; --secondary: #4b4943;
+  --muted: #868078; --accent: #a8482b; --hairline: #e7e3da; --grid: rgba(26, 26, 26, 0.04);
+}
 * { box-sizing: border-box; }
 html, body { height: 100%; }
 body {
@@ -922,36 +950,73 @@ body {
   align-items: center;
   justify-content: center;
   padding: 1.5rem;
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family: var(--font-ui);
   line-height: 1.5;
-  background: #f6f7f9;
-  color: #1a1a1c;
+  background-color: var(--bg);
+  color: var(--ink);
+  background-image:
+    linear-gradient(to right, var(--grid) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid) 1px, transparent 1px);
+  background-size: 24px 24px;
 }
 .card {
   width: 100%;
-  max-width: 22rem;
+  max-width: 24rem;
+  padding: 2.25rem 2rem;
   text-align: center;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 1.1rem;
+  gap: 1.15rem;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 16px;
+  box-shadow: 0 1px 2px rgba(26, 26, 26, 0.04), 0 10px 30px rgba(26, 26, 26, 0.06);
 }
-.card h1 { margin: 0; font-size: 1.15rem; font-weight: 600; }
-.card p { margin: 0; font-size: 1.02rem; }
-.card .hint { font-size: 0.9rem; opacity: 0.65; }
+.dfinity-logo { height: 1.75rem; width: auto; color: var(--ink); }
+.eyebrow {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--muted);
+}
+.msg {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 1.35rem;
+  letter-spacing: -0.015em;
+  color: var(--ink);
+}
+.detail { margin: 0; font-size: 1rem; color: var(--secondary); }
+.hint { margin: 0; font-size: 0.9rem; color: var(--muted); }
 .spinner {
-  width: 2.1rem;
-  height: 2.1rem;
+  width: 1.9rem;
+  height: 1.9rem;
   border-radius: 50%;
-  border: 3px solid rgba(130, 130, 140, 0.25);
-  border-top-color: currentColor;
+  border: 3px solid var(--hairline);
+  border-top-color: var(--accent);
   animation: connect-spin 0.8s linear infinite;
 }
 .card.error .spinner { display: none; }
 @keyframes connect-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
-@media (prefers-color-scheme: dark) { body { background: #161719; color: #ececed; } }
-"#;
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14110d; --surface: #1c1813; --ink: #f0ebe0; --secondary: #cfc7b8;
+    --muted: #9a9384; --accent: #c25a37; --hairline: #342e25; --grid: rgba(240, 235, 224, 0.05);
+  }
+}
+"##;
+
+/// The official DFINITY logo (gradient-infinity mark + wordmark), taken from
+/// dfinity.org and inlined so it needs no external fetch under the pinned
+/// page's strict CSP. The infinity keeps the brand gradients; the wordmark is
+/// set to `currentColor` so it follows the page's Ink/Bone text color across
+/// light and dark themes.
+const CONNECT_LOGO_SVG: &str = r##"<svg viewBox="0 0 201 28" fill="none" class="dfinity-logo" role="img" aria-label="DFINITY" xmlns="http://www.w3.org/2000/svg"><path d="M41.7054 0.5C38.6285 0.5 35.2721 2.13912 31.7293 5.37053C30.0511 6.89259 28.5827 8.53171 27.5105 9.84301C27.5105 9.84301 29.2353 11.7865 31.1233 13.8706C32.1489 12.6061 33.6173 10.8967 35.3187 9.35127C38.4653 6.47109 40.5163 5.8857 41.7054 5.8857C46.1337 5.8857 49.7232 9.51515 49.7232 14.0111C49.7232 18.4602 46.1337 22.0895 41.7054 22.1364C41.4952 22.1364 41.2388 22.113 40.9359 22.0428C42.2177 22.6282 43.6163 23.0497 44.9217 23.0497C53.0327 23.0497 54.6174 17.5703 54.7107 17.1721C54.9437 16.1653 55.0839 15.1116 55.0839 14.0345C55.0605 6.56473 49.0705 0.5 41.7054 0.5Z" fill="url(#paint0_linear_31_8726)"></path><path d="M13.3788 27.5001C16.4555 27.5001 19.8117 25.8609 23.3545 22.6296C25.0327 21.1074 26.5011 19.4684 27.5733 18.157C27.5733 18.157 25.8485 16.2135 23.9606 14.1295C22.935 15.394 21.4666 17.1033 19.7651 18.6488C16.6186 21.5056 14.5441 22.1144 13.3788 22.1144C8.95023 22.1144 5.3608 18.4849 5.3608 13.989C5.3608 9.53995 8.95023 5.91051 13.3788 5.86366C13.5885 5.86366 13.8448 5.88706 14.1479 5.9573C12.866 5.37192 11.4675 4.95044 10.1623 4.95044C2.05109 4.95044 0.466125 10.4298 0.372924 10.8279C0.13986 11.8348 0 12.8885 0 13.9656C0 21.4354 5.99014 27.5001 13.3788 27.5001Z" fill="url(#paint1_linear_31_8726)"></path><path fill-rule="evenodd" clip-rule="evenodd" d="M19.5459 9.46836C18.6603 8.62535 14.325 5.1832 10.1762 5.06612C2.78267 4.88441 0.609276 10.1453 0.42189 10.8238C1.83809 4.92444 7.11701 0.523351 13.3927 0.5C18.5088 0.5 23.6788 5.40995 27.4987 9.84115C27.505 9.8337 27.5109 9.82645 27.5169 9.81947C27.5169 9.81947 29.2415 11.763 31.1295 13.847C31.1295 13.847 33.2738 16.3292 35.558 18.5068C36.4438 19.3498 40.7556 22.7451 44.9044 22.8623C52.503 23.073 54.6008 17.5234 54.717 17.1018C53.319 23.0262 48.0279 27.4517 41.7345 27.4751C36.6169 27.4751 31.445 22.5619 27.609 18.1296C27.6014 18.1386 27.5941 18.1474 27.5872 18.1558C27.5872 18.1558 25.8625 16.2122 23.9745 14.1282C23.9745 14.1282 21.8301 11.646 19.5459 9.46836Z" fill="#29ABE2"></path><g fill="currentColor"><path d="M199.595 7.29012C199.992 7.29012 200.268 7.44923 200.428 7.72789C200.507 7.88699 200.624 8.20537 200.309 8.64313L195.714 15.6477V20.4234C195.714 21.0601 195.318 21.458 194.683 21.458H194.05C193.416 21.458 193.019 21.0601 193.019 20.4234V15.6477L188.384 8.64313C188.108 8.16565 188.185 7.84727 188.265 7.68801C188.384 7.40951 188.702 7.25024 189.099 7.25024H189.93C190.445 7.25024 190.8 7.44923 191.038 7.88699L194.326 13.1802L197.655 7.88699C197.892 7.48911 198.248 7.29012 198.763 7.29012H199.595Z"></path><path d="M106.551 7.29126H99.3408C98.7071 7.29126 98.3113 7.68923 98.3113 8.32596V20.4643C98.3113 21.1011 98.7071 21.4991 99.3408 21.4991H99.9745C100.609 21.4991 101.005 21.1011 101.005 20.4643V15.6884H105.719C106.353 15.6884 106.749 15.2508 106.749 14.6538V14.3752C106.749 13.7384 106.353 13.3404 105.719 13.3404H101.005V9.59946H106.551C107.184 9.59946 107.581 9.2015 107.581 8.56476V8.28617C107.581 7.68921 107.184 7.29126 106.551 7.29126Z"></path><path fill-rule="evenodd" clip-rule="evenodd" d="M81.0289 7.29272H77.345C76.7105 7.29272 76.3146 7.69068 76.3146 8.32743V20.4658C76.3146 21.1025 76.7105 21.5006 77.345 21.5006H81.068C85.3466 21.5006 88.3179 18.5954 88.3179 14.4166C88.278 10.2378 85.3067 7.29272 81.0289 7.29272ZM85.5445 14.3767C85.5445 17.1625 83.6825 19.1127 80.9891 19.1127H79.0082V9.60092H80.9891C83.6825 9.6408 85.5445 11.5909 85.5445 14.3767Z"></path><path d="M120.183 7.29126H120.818C121.451 7.29126 121.847 7.68923 121.847 8.32596V20.4643C121.847 21.1011 121.451 21.4991 120.818 21.4991H120.183C119.549 21.4991 119.154 21.1011 119.154 20.4643V8.32596C119.154 7.68923 119.549 7.29126 120.183 7.29126Z"></path><path d="M143.648 7.29272H143.015C142.381 7.29272 141.984 7.6907 141.984 8.32743V16.4063L135.686 7.8498C135.409 7.45183 135.052 7.29272 134.576 7.29272H134.3C133.666 7.29272 133.269 7.6907 133.269 8.32743V20.4658C133.269 21.1025 133.666 21.5006 134.3 21.5006H134.933C135.567 21.5006 135.964 21.1025 135.964 20.4658V12.347L142.262 20.9435C142.539 21.3412 142.896 21.5006 143.371 21.5006H143.648C144.282 21.5006 144.679 21.1025 144.679 20.4658V8.32743C144.679 7.6907 144.282 7.29272 143.648 7.29272Z"></path><path d="M157.116 7.29126H157.75C158.345 7.29126 158.781 7.68923 158.781 8.32596V20.4643C158.781 21.1011 158.384 21.4991 157.75 21.4991H157.116C156.484 21.4991 156.086 21.1011 156.086 20.4643V8.32596C156.086 7.68923 156.484 7.29126 157.116 7.29126Z"></path><path d="M179.702 7.29126H170.194C169.601 7.29126 169.165 7.68923 169.165 8.32596V8.60455C169.165 9.2015 169.56 9.63927 170.194 9.63927H173.602V20.4643C173.602 21.1011 173.997 21.4991 174.631 21.4991H175.265C175.899 21.4991 176.295 21.1011 176.295 20.4643V9.63927H179.702C180.336 9.63927 180.731 9.24129 180.731 8.60455V8.32596C180.731 7.68923 180.336 7.29126 179.702 7.29126Z"></path></g><defs><linearGradient id="paint0_linear_31_8726" x1="34.6882" y1="5.54181" x2="50.0467" y2="21.3569" gradientUnits="userSpaceOnUse"><stop offset="0.21" stop-color="#F15A24"></stop><stop offset="0.6841" stop-color="#FBB03B"></stop></linearGradient><linearGradient id="paint1_linear_31_8726" x1="20.3806" y1="22.4515" x2="5.02205" y2="6.6364" gradientUnits="userSpaceOnUse"><stop offset="0.21" stop-color="#ED1E79"></stop><stop offset="0.8929" stop-color="#522785"></stop></linearGradient></defs></svg>"##;
 
 /// The strict-CSP, non-reflecting pinned callback page. `nonce` is a fresh
 /// per-response value bound into the CSP header and BOTH the inline `<script>`
@@ -1024,17 +1089,21 @@ fn pinned_callback_page(prefix: &str) -> Response {
     let redeem = js_escape(&format!("{prefix}/oauth/connect/redeem"));
     let script = PINNED_PAGE_JS.replace("__REDEEM_URL__", &redeem);
     let css = CONNECT_PAGE_CSS;
+    let logo = CONNECT_LOGO_SVG;
     // The status line is a `role=status` / `aria-live=polite` region so screen
     // readers announce both "Finishing sign-in…" and any terminal error the
-    // script swaps in. The spinner is decorative (`aria-hidden`).
+    // script swaps in. The DFINITY logo carries its own `aria-label`; the spinner
+    // is decorative (`aria-hidden`).
     let html = format!(
         "<!DOCTYPE html><html lang=en><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>Finishing sign-in…</title>\
          <style nonce=\"{nonce}\">{css}</style></head>\
          <body><main class=card role=status aria-live=polite>\
+         {logo}\
+         <p class=eyebrow>Internet Identity</p>\
          <div class=spinner aria-hidden=true></div>\
-         <p id=m>Finishing sign-in…</p></main>\
+         <p id=m class=msg>Finishing sign-in…</p></main>\
          <script nonce=\"{nonce}\">{script}</script></body></html>"
     );
     // `style-src 'nonce-{nonce}'` admits ONLY the nonce'd `<style>` block above
@@ -1042,7 +1111,7 @@ fn pinned_callback_page(prefix: &str) -> Response {
     // still can't apply). Without it the block falls back to `default-src
     // 'none'` and the page renders unstyled.
     // `frame-ancestors 'none'`: II reaches this page only by top-level
-    // navigation, so framing is never legitimate — deny it outright so the
+    // navigation, so framing is never legitimate: deny it outright so the
     // delegation-bearing page can't be embedded for UI redress. X-Frame-Options
     // covers legacy browsers that predate CSP2 (modern ones ignore it when
     // frame-ancestors is present).
@@ -1385,17 +1454,20 @@ fn js_escape(s: &str) -> String {
 
 fn connect_error(message: &str) -> Response {
     let safe = message.replace('<', "&lt;");
-    // Shares the connect pages' look via the `.error` modifier (no spinner). No
-    // CSP here, so a plain `<style>` is fine.
+    // Shares the connect pages' DFINITY-branded look via the `.error` modifier
+    // (logo shown, spinner hidden). No CSP here, so a plain `<style>` is fine.
     let css = CONNECT_PAGE_CSS;
+    let logo = CONNECT_LOGO_SVG;
     (
         StatusCode::BAD_REQUEST,
         Html(format!(
             "<!DOCTYPE html><html lang=en><head><meta charset=utf-8>\
              <meta name=viewport content=\"width=device-width,initial-scale=1\">\
              <title>Could not connect</title><style>{css}</style></head>\
-             <body><main class=\"card error\"><h1>Could not connect</h1>\
-             <p>{safe}</p><p class=hint>Restart the connection from your client.</p></main></body></html>"
+             <body><main class=\"card error\">{logo}\
+             <p class=eyebrow>Internet Identity</p><h1 class=msg>Could not connect</h1>\
+             <p class=detail>{safe}</p>\
+             <p class=hint>Restart the connection from your client.</p></main></body></html>"
         )),
     )
         .into_response()
