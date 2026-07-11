@@ -537,7 +537,9 @@ impl IcTools {
             Ok(u) => u,
             Err(e) => return Ok(err(e)),
         };
-        let resolved = match discover::resolve_app_identity(&app_url).await {
+        // This tool surfaces `alternative_origins`, so fetch them (unlike the
+        // identity hot path in resolve_identity_target).
+        let resolved = match discover::resolve_app_identity(&app_url, true).await {
             Ok(r) => r,
             Err(e) => return Ok(err(e)),
         };
@@ -1002,7 +1004,9 @@ async fn resolve_identity_target(
         }
         (None, Some(u)) => {
             let u = clean_identity_arg("app_url", &u)?;
-            let resolved = discover::resolve_app_identity(&u).await?;
+            // Identity hot path: we only need the derivation origin, not the
+            // informational alternative-origins list — skip that extra fetch.
+            let resolved = discover::resolve_app_identity(&u, false).await?;
             Ok(Some(IdentityTarget {
                 origin: identities::target_origin(&resolved.derivation_origin),
                 requested: u,
@@ -1036,11 +1040,27 @@ fn clean_identity_arg(field: &str, raw: &str) -> Result<String, String> {
 /// "https://" → `https://`) — which would otherwise derive against, and echo back,
 /// an empty origin.
 fn canonicalize_derivation_origin(cleaned: &str) -> Result<String, String> {
+    let invalid = || {
+        "`derivation_origin` must be an https origin with a host \
+         (e.g. https://app.example.com)"
+            .to_string()
+    };
+    // `target_origin` only strips a leading http(s):// (else it prepends https://),
+    // so a non-HTTP scheme like `ftp://x` would be mangled into a bogus `https://…`
+    // rather than rejected — reject any explicit non-http(s) scheme up front.
+    if let Some((scheme, _)) = cleaned.split_once("://") {
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+            return Err(invalid());
+        }
+    }
     let origin = identities::target_origin(cleaned);
-    if origin.strip_prefix("https://").map_or(true, str::is_empty) {
-        return Err(
-            "`derivation_origin` must include a host (e.g. https://app.example.com)".to_string(),
-        );
+    // Require the canonical origin to parse as an https URL with a real host — this
+    // also rejects a host-less input ("https://") and embedded spaces/invalid chars.
+    let valid = url::Url::parse(&origin).ok().map_or(false, |u| {
+        u.scheme() == "https" && u.host_str().map_or(false, |h| !h.is_empty())
+    });
+    if !valid {
+        return Err(invalid());
     }
     Ok(origin)
 }
@@ -1922,7 +1942,16 @@ mod tests {
         let err = super::resolve_identity_target(Some("https://".to_string()), None)
             .await
             .expect_err("host-less derivation_origin must be rejected");
-        assert!(err.contains("must include a host"), "unexpected message: {err}");
+        assert!(err.contains("with a host"), "unexpected message: {err}");
+    }
+
+    // A non-http(s) scheme must be rejected, not mangled into a bogus https origin.
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_non_http_scheme() {
+        let err = super::resolve_identity_target(Some("ftp://example.com".to_string()), None)
+            .await
+            .expect_err("ftp:// must be rejected");
+        assert!(err.contains("https origin"), "unexpected message: {err}");
     }
 
     // A whitespace-only `app_url` is rejected before any network resolution, so
@@ -1949,6 +1978,14 @@ mod tests {
         assert!(
             super::clean_derivation_origin(Some("https://".to_string())).is_err(),
             "host-less rejected"
+        );
+        assert!(
+            super::clean_derivation_origin(Some("ftp://example.com".to_string())).is_err(),
+            "non-http(s) scheme rejected"
+        );
+        assert!(
+            super::clean_derivation_origin(Some("https://ex ample.com".to_string())).is_err(),
+            "embedded space rejected"
         );
         assert_eq!(
             super::clean_derivation_origin(Some("  https://example.com  ".to_string())).unwrap(),

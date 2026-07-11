@@ -383,7 +383,13 @@ pub struct AppIdentity {
 /// (`/.well-known/ic-app.json` → `derivation_origin`) if present, else the
 /// application origin (a clearly-flagged default). Uses the same SSRF-pinned
 /// client and capped reads as `discover`; the app URL is user-controlled.
-pub async fn resolve_app_identity(app_url: &str) -> Result<AppIdentity, String> {
+///
+/// `want_alt_origins` controls whether the app's informational
+/// `ii-alternative-origins` list is fetched: the `resolve_app` tool surfaces it, so
+/// it passes `true`; identity-bearing tools that resolve an `app_url` only to derive
+/// against it pass `false`, avoiding a second network round-trip per call (the list
+/// never affects the resolved derivation origin — it's the inverse relation).
+pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Result<AppIdentity, String> {
     let base = normalize(app_url);
     let (base_url, pinned) = resolve_public_url(&base).await?;
     let host = base_url.host_str().unwrap_or_default().to_string();
@@ -407,16 +413,20 @@ pub async fn resolve_app_identity(app_url: &str) -> Result<AppIdentity, String> 
         }
     }
 
-    // The app origin's alternative-origins list (informational only).
+    // The app origin's alternative-origins list (informational only) — fetched only
+    // when the caller will surface it, so the identity hot path doesn't pay for a
+    // second round-trip it never reads.
     let mut alternative_origins = Vec::new();
-    if let Ok(resp) = client
-        .get(format!("{application_origin}/.well-known/ii-alternative-origins"))
-        .send()
-        .await
-    {
-        if resp.status().is_success() {
-            let text = read_capped(resp, MAX_META_BYTES).await;
-            alternative_origins = parse_alternative_origins(&text);
+    if want_alt_origins {
+        if let Ok(resp) = client
+            .get(format!("{application_origin}/.well-known/ii-alternative-origins"))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                let text = read_capped(resp, MAX_META_BYTES).await;
+                alternative_origins = parse_alternative_origins(&text);
+            }
         }
     }
 
