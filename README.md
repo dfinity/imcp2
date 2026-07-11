@@ -100,10 +100,12 @@ Identity session key (see [Domain identities](#domain-identities-on-demand)) —
 there is no per-app sign-in step. `get_principal` returns that account's principal
 without a call. A user may hold several accounts at an app — a default account
 everyone gets automatically (the anchor's current, user-controllable default at
-that origin), plus any they have named — so `list_accounts(domain)` lists them
-(via II's `get_accounts`), and `call_canister`/`get_principal` take an optional
-`account` (a name from that list) to act as a specific one; omit it for the
-default account. All these tools require a bearer token (see Auth).
+that origin), plus any they have named — so `list_accounts` lists them (via II's
+`get_accounts`), and `call_canister`/`get_principal`/`list_accounts` identify the
+app by its `derivation_origin` (or an `app_url` the connector resolves — see the
+note below), and take an optional `account` (a name from that list) to act as a
+specific one; omit it for the default account. All these tools require a bearer
+token (see Auth).
 
 > **The derivation origin is explicit — and echoed.** Internet Identity derives
 > the per-app principal from a **derivation origin**, which is *usually* but **not

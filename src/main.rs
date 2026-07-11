@@ -189,8 +189,12 @@ impl IcTools {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
         };
+        let origin = match clean_derivation_origin(derivation_origin) {
+            Ok(o) => o,
+            Err(e) => return Ok(err(e)),
+        };
         let (agent, _acted_as) = match self
-            .resolve_agent(&ctx, derivation_origin.as_deref(), account.as_deref(), "querying")
+            .resolve_agent(&ctx, origin.as_deref(), account.as_deref(), "querying")
             .await
         {
             Ok(a) => a,
@@ -230,7 +234,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Fetch the OQL schema catalogue of a canister that exposes the OQL surface (get_candid reports `oql: true`): its entities, their primary keys, fields, and edges, as JSON. Call this before oql_query so you know the queryable entities and exact field names. Omit `domain` to read anonymously, or pass an application domain to read as your account there.",
+        description = "Fetch the OQL schema catalogue of a canister that exposes the OQL surface (get_candid reports `oql: true`): its entities, their primary keys, fields, and edges, as JSON. Call this before oql_query so you know the queryable entities and exact field names. Omit `derivation_origin` to read anonymously, or pass the app's canonical Internet Identity derivation origin to read as your account there.",
         annotations(title = "Get the OQL schema", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::OqlSchemaOutput>(),
     )]
@@ -247,8 +251,12 @@ impl IcTools {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
         };
+        let origin = match clean_derivation_origin(derivation_origin) {
+            Ok(o) => o,
+            Err(e) => return Ok(err(e)),
+        };
         let (agent, _acted_as) = match self
-            .resolve_agent(&ctx, derivation_origin.as_deref(), account.as_deref(), "reading the schema")
+            .resolve_agent(&ctx, origin.as_deref(), account.as_deref(), "reading the schema")
             .await
         {
             Ok(a) => a,
@@ -306,9 +314,12 @@ impl IcTools {
     /// the shared anonymous agent (principal `None`) when `origin` is `None`, else
     /// one backed by a short-lived account delegation for that Internet Identity
     /// derivation `origin`, derived on demand from this connection's standing
-    /// credential. `origin` is the ALREADY-effective (canonical) derivation origin
-    /// — resolve it with [`resolve_identity_target`] first. `what` names the action
-    /// for the no-session error. Shared by call_canister / oql_query / oql_schema.
+    /// credential. `origin` must be a VALIDATED derivation origin: call_canister /
+    /// get_principal / list_accounts pass the canonical one from
+    /// [`resolve_identity_target`]; oql_query / oql_schema pass one validated by
+    /// [`clean_derivation_origin`]. `Identities::delegated_identity_for`
+    /// re-canonicalizes internally (idempotent), so passing an already-canonical
+    /// origin is fine. `what` names the action for the no-session error.
     async fn resolve_agent(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -522,6 +533,10 @@ impl IcTools {
         Parameters(identities::ResolveAppArgs { app_url }): Parameters<identities::ResolveAppArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        let app_url = match clean_identity_arg("app_url", &app_url) {
+            Ok(u) => u,
+            Err(e) => return Ok(err(e)),
+        };
         let resolved = match discover::resolve_app_identity(&app_url).await {
             Ok(r) => r,
             Err(e) => return Ok(err(e)),
@@ -977,15 +992,7 @@ async fn resolve_identity_target(
         }
         (Some(d), None) => {
             let d = clean_identity_arg("derivation_origin", &d)?;
-            let origin = identities::target_origin(&d);
-            // `target_origin` reduces the input to `https://<host>`; reject one that
-            // carries no host (e.g. "https://"), which would otherwise derive against
-            // — and echo back — an empty origin.
-            if origin.strip_prefix("https://").map_or(true, str::is_empty) {
-                return Err(
-                    "`derivation_origin` must include a host (e.g. https://app.example.com)".to_string(),
-                );
-            }
+            let origin = canonicalize_derivation_origin(&d)?;
             Ok(Some(IdentityTarget {
                 origin,
                 requested: d,
@@ -1022,6 +1029,35 @@ fn clean_identity_arg(field: &str, raw: &str) -> Result<String, String> {
         return Err(format!("`{field}` must not contain control characters"));
     }
     Ok(v.to_string())
+}
+
+/// Canonicalize a cleaned `derivation_origin` to the effective origin the delegation
+/// path derives against (`target_origin`), rejecting one that carries no host (e.g.
+/// "https://" → `https://`) — which would otherwise derive against, and echo back,
+/// an empty origin.
+fn canonicalize_derivation_origin(cleaned: &str) -> Result<String, String> {
+    let origin = identities::target_origin(cleaned);
+    if origin.strip_prefix("https://").map_or(true, str::is_empty) {
+        return Err(
+            "`derivation_origin` must include a host (e.g. https://app.example.com)".to_string(),
+        );
+    }
+    Ok(origin)
+}
+
+/// Validate + canonicalize the optional `derivation_origin` taken by the tools that
+/// accept ONLY that (oql_query / oql_schema): `None` stays `None` (anonymous); `Some`
+/// is cleaned (trim / non-empty / no control chars) and canonicalized, so these paths
+/// fail closed on the same bad input as `resolve_identity_target` instead of deriving
+/// a valid-but-wrong principal from a blank/hostless origin.
+fn clean_derivation_origin(derivation_origin: Option<String>) -> Result<Option<String>, String> {
+    match derivation_origin {
+        None => Ok(None),
+        Some(d) => {
+            let d = clean_identity_arg("derivation_origin", &d)?;
+            Ok(Some(canonicalize_derivation_origin(&d)?))
+        }
+    }
 }
 
 /// Log each inbound request: method, path, response status, and latency — gives
@@ -1897,5 +1933,27 @@ mod tests {
             .await
             .expect_err("blank app_url must be rejected");
         assert!(err.contains("must not be empty"), "unexpected message: {err}");
+    }
+
+    // The OQL tools' derivation-origin path (oql_query / oql_schema) must fail
+    // closed on the same bad input as resolve_identity_target: None stays anonymous,
+    // control chars and host-less origins are rejected, and a valid one canonicalizes.
+    #[test]
+    fn clean_derivation_origin_validates_and_canonicalizes() {
+        assert_eq!(super::clean_derivation_origin(None).unwrap(), None);
+        assert!(super::clean_derivation_origin(Some("   ".to_string())).is_err(), "blank rejected");
+        assert!(
+            super::clean_derivation_origin(Some("https://a\u{7}b.com".to_string())).is_err(),
+            "control chars rejected"
+        );
+        assert!(
+            super::clean_derivation_origin(Some("https://".to_string())).is_err(),
+            "host-less rejected"
+        );
+        assert_eq!(
+            super::clean_derivation_origin(Some("  https://example.com  ".to_string())).unwrap(),
+            Some("https://example.com".to_string()),
+            "valid input trims + canonicalizes"
+        );
     }
 }
