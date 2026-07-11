@@ -410,16 +410,8 @@ impl IcTools {
         // A short identity note so a wrong-principal is visible in the text too.
         let mut text = reply.clone();
         if let Some(t) = &target {
-            text.push_str(&format!("\n\n[signed as {} — derived for {}",
-                acted_as_principal.as_deref().unwrap_or("<unknown>"), t.origin));
-            if t.source == "app_url_default" {
-                text.push_str(&format!(
-                    "; assumed from app_url {} (app declares no derivation origin — if this \
-                     principal looks wrong, pass the app's canonical derivation_origin)",
-                    t.requested
-                ));
-            }
-            text.push(']');
+            let acted = acted_as_principal.as_deref().unwrap_or("<unknown>");
+            text.push_str(&format!("\n\n[{}]", identity_annotation(t, Some(acted))));
         }
         let output = calls::CallCanisterOutput {
             canister_id, method, is_query, reply,
@@ -462,15 +454,7 @@ impl IcTools {
         // Surface a read-only session (H2) so the LLM won't attempt (and have the
         // IC reject at ingress) canister-management updates.
         let read_only = self.identities.is_read_only(&session_id).await == Some(true);
-        let mut text = format!("{principal}\n\n[derived for {}", target.origin);
-        if target.source == "app_url_default" {
-            text.push_str(&format!(
-                "; assumed from app_url {} — the app declares no derivation origin, so if this \
-                 principal looks wrong, pass the app's canonical derivation_origin",
-                target.requested
-            ));
-        }
-        text.push(']');
+        let mut text = format!("{principal}\n\n[{}]", identity_annotation(&target, None));
         if read_only {
             text.push_str(
                 "\n\n(This Internet Identity session is READ-ONLY: reads work, but canister \
@@ -1098,6 +1082,31 @@ fn clean_app_url(raw: &str) -> Result<String, String> {
     Ok(u)
 }
 
+/// A one-line identity annotation for the human-readable `text` (which text-only
+/// clients see instead of the structured output): the origin II derived against,
+/// how it was determined (`source`), and — whenever it differs from the derived
+/// origin (canonicalization, http→https, a stripped path, or `app_url` defaulting)
+/// — the caller's `requested` value. Echoing `requested` on ANY mismatch (not only
+/// `app_url_default`) is what keeps a requested≠derived mismatch visible in every
+/// client. `acted_as` prefixes the signed-as principal when known.
+fn identity_annotation(target: &IdentityTarget, acted_as: Option<&str>) -> String {
+    let mut s = String::new();
+    if let Some(p) = acted_as {
+        s.push_str(&format!("signed as {p} — "));
+    }
+    s.push_str(&format!("derived for {} (source: {})", target.origin, target.source));
+    if target.requested != target.origin {
+        s.push_str(&format!("; requested {}", target.requested));
+    }
+    if target.source == "app_url_default" {
+        s.push_str(
+            " — the app declares no derivation origin, so this ASSUMES the app origin; \
+             if the principal looks wrong, pass the app's canonical derivation_origin",
+        );
+    }
+    s
+}
+
 /// Log each inbound request: method, path, response status, and latency — gives
 /// visibility into what external MCP clients probe (discovery URLs, unknown
 /// paths) at `RUST_LOG=info`. The query string is never logged — keeping the
@@ -1290,16 +1299,9 @@ fn format_canister_info(info: &discover::CanisterInfo) -> String {
 /// Render the user's accounts at an app (from `Identities::list_accounts`) as
 /// readable text for the `list_accounts` tool.
 fn format_accounts(target: &IdentityTarget, accounts: &[identities::AccountInfo]) -> String {
-    let origin = &target.origin;
-    // A one-line derivation-origin header so a wrong origin is visible.
-    let mut header = format!("Accounts derived for {origin}");
-    if target.source == "app_url_default" {
-        header.push_str(&format!(
-            " (assumed from app_url {} — the app declares no derivation origin; if these accounts \
-             don't match the user's browser, pass the app's canonical derivation_origin)",
-            target.requested
-        ));
-    }
+    // A one-line derivation-origin header so a wrong origin (or requested≠derived
+    // mismatch) is visible even to text-only clients.
+    let header = format!("Accounts {}", identity_annotation(target, None));
     if accounts.is_empty() {
         return format!("{header}\n\nNo Internet Identity accounts found there.");
     }
@@ -1990,6 +1992,44 @@ mod tests {
             .await
             .expect_err("http:// app_url must be rejected");
         assert!(err.contains("https URL"), "unexpected message: {err}");
+    }
+
+    // The human-readable identity annotation must surface a requested≠derived
+    // mismatch (and the source) in ALL clients, not only for app_url_default.
+    #[test]
+    fn identity_annotation_surfaces_mismatch_and_source() {
+        // requested == origin: origin + source, but no redundant `requested` echo.
+        let t = super::IdentityTarget {
+            origin: "https://nns.ic0.app".to_string(),
+            requested: "https://nns.ic0.app".to_string(),
+            source: "explicit".to_string(),
+            application_origin: None,
+        };
+        let a = super::identity_annotation(&t, None);
+        assert!(a.contains("derived for https://nns.ic0.app"), "{a}");
+        assert!(a.contains("source: explicit"), "{a}");
+        assert!(!a.contains("requested"), "no mismatch must not echo requested: {a}");
+
+        // requested != origin (e.g. a stripped path): the mismatch is surfaced.
+        let t2 = super::IdentityTarget {
+            origin: "https://app.example.com".to_string(),
+            requested: "https://app.example.com/some/path".to_string(),
+            source: "explicit".to_string(),
+            application_origin: None,
+        };
+        let a2 = super::identity_annotation(&t2, Some("aaaaa-aa"));
+        assert!(a2.contains("signed as aaaaa-aa"), "{a2}");
+        assert!(a2.contains("requested https://app.example.com/some/path"), "{a2}");
+
+        // app_url_default keeps its explicit "assumed" guidance.
+        let t3 = super::IdentityTarget {
+            origin: "https://example.com".to_string(),
+            requested: "https://example.com".to_string(),
+            source: "app_url_default".to_string(),
+            application_origin: Some("https://example.com".to_string()),
+        };
+        let a3 = super::identity_annotation(&t3, None);
+        assert!(a3.contains("ASSUMES the app origin"), "{a3}");
     }
 
     // The OQL tools' derivation-origin path (oql_query / oql_schema) must fail
