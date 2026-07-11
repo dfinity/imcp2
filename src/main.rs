@@ -533,7 +533,7 @@ impl IcTools {
         Parameters(identities::ResolveAppArgs { app_url }): Parameters<identities::ResolveAppArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let app_url = match clean_identity_arg("app_url", &app_url) {
+        let app_url = match clean_app_url(&app_url) {
             Ok(u) => u,
             Err(e) => return Ok(err(e)),
         };
@@ -1003,7 +1003,7 @@ async fn resolve_identity_target(
             }))
         }
         (None, Some(u)) => {
-            let u = clean_identity_arg("app_url", &u)?;
+            let u = clean_app_url(&u)?;
             // Identity hot path: we only need the derivation origin, not the
             // informational alternative-origins list — skip that extra fetch.
             let resolved = discover::resolve_app_identity(&u, false).await?;
@@ -1078,6 +1078,24 @@ fn clean_derivation_origin(derivation_origin: Option<String>) -> Result<Option<S
             Ok(Some(canonicalize_derivation_origin(&d)?))
         }
     }
+}
+
+/// Clean a user-supplied `app_url`: the shared identity-arg checks, plus reject an
+/// explicit non-https scheme up front. The connector only ever fetches https
+/// discovery targets (the SSRF guard refuses anything else), so an `http://` URL
+/// would otherwise fail with a late, indirect error — reject it here with a clear
+/// message. A bare host (no scheme) is fine; `resolve_app_identity` prepends https.
+fn clean_app_url(raw: &str) -> Result<String, String> {
+    let u = clean_identity_arg("app_url", raw)?;
+    if let Some((scheme, _)) = u.split_once("://") {
+        if !scheme.eq_ignore_ascii_case("https") {
+            return Err(
+                "`app_url` must be an https URL or a bare host (the connector only fetches https origins)"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(u)
 }
 
 /// Log each inbound request: method, path, response status, and latency — gives
@@ -1962,6 +1980,16 @@ mod tests {
             .await
             .expect_err("blank app_url must be rejected");
         assert!(err.contains("must not be empty"), "unexpected message: {err}");
+    }
+
+    // A non-https `app_url` scheme is rejected early with a clear message rather
+    // than failing later in the SSRF guard.
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_http_app_url() {
+        let err = super::resolve_identity_target(None, Some("http://example.com".to_string()))
+            .await
+            .expect_err("http:// app_url must be rejected");
+        assert!(err.contains("https URL"), "unexpected message: {err}");
     }
 
     // The OQL tools' derivation-origin path (oql_query / oql_schema) must fail
