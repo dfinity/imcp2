@@ -301,16 +301,19 @@ fn canisters_from_app_manifest(text: &str) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
-/// Reduce a raw origin string to a canonical bare `scheme://host[:port]` origin,
-/// accepting ONLY http(s) with a real (tuple) host. `None` for anything else —
-/// blank, non-http(s), path/opaque-only, or unparseable — so callers fail closed.
+/// Reduce a raw origin string to a canonical bare `https://host[:port]` origin,
+/// accepting ONLY https with a real (tuple) host and no user-info. `None` for
+/// anything else — blank, non-https (incl. `http://`, which `target_origin` would
+/// silently upgrade downstream, masking a wrong origin), user-info, path/opaque, or
+/// unparseable — so callers fail closed with no hidden scheme rewrite. Keeping this
+/// https-only matches `canonicalize_derivation_origin`'s contract.
 fn normalize_origin(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
     }
     let url = url::Url::parse(raw).ok()?;
-    if url.scheme() != "https" && url.scheme() != "http" {
+    if url.scheme() != "https" {
         return None;
     }
     // Reject user-info: `url.origin()` silently drops it, so `https://user@host` and
@@ -328,7 +331,7 @@ fn normalize_origin(raw: &str) -> Option<String> {
 
 /// The app's declared Internet Identity derivation origin, from the manifest's
 /// optional top-level `derivation_origin`, reduced to a bare `scheme://host[:port]`
-/// origin. `None` if absent, blank, or not a parseable http(s) URL.
+/// origin. `None` if absent, blank, non-https, or not a parseable URL.
 fn declared_derivation_origin(manifest_text: &str) -> Option<String> {
     let m = serde_json::from_str::<AppManifest>(manifest_text).ok()?;
     normalize_origin(m.derivation_origin?.as_str())
@@ -1568,6 +1571,9 @@ mod tests {
         assert_eq!(declared_derivation_origin(r#"{"canisters":[]}"#), None);
         assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"  "}"#), None);
         assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"ftp://x/"}"#), None);
+        // Non-https is rejected (https-only; else target_origin would silently
+        // upgrade an http:// declaration while still reporting source=declared).
+        assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"http://example.com"}"#), None);
         // User-info is rejected (url.origin() would silently drop it).
         assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"https://u:p@example.com"}"#), None);
         assert_eq!(declared_derivation_origin("<!doctype html>"), None);
@@ -1588,8 +1594,9 @@ mod tests {
         // non-http(s) / unparseable entry is dropped rather than surfaced.
         assert_eq!(
             parse_alternative_origins(
-                r#"{"alternativeOrigins":["https://a.example/some/path","ftp://x","not a url"]}"#
+                r#"{"alternativeOrigins":["https://a.example/some/path","http://insecure.example","ftp://x","not a url"]}"#
             ),
+            // Path reduced to bare origin; http:// / non-http(s) / unparseable dropped.
             vec!["https://a.example"]
         );
     }
