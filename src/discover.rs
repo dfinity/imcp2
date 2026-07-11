@@ -313,6 +313,12 @@ fn normalize_origin(raw: &str) -> Option<String> {
     if url.scheme() != "https" && url.scheme() != "http" {
         return None;
     }
+    // Reject user-info: `url.origin()` silently drops it, so `https://user@host` and
+    // `https://host` would collapse to the same origin — fail closed instead of
+    // masking the difference (consistent with the derivation-origin validation).
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
     let origin = url.origin();
     if !origin.is_tuple() {
         return None;
@@ -1562,6 +1568,8 @@ mod tests {
         assert_eq!(declared_derivation_origin(r#"{"canisters":[]}"#), None);
         assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"  "}"#), None);
         assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"ftp://x/"}"#), None);
+        // User-info is rejected (url.origin() would silently drop it).
+        assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"https://u:p@example.com"}"#), None);
         assert_eq!(declared_derivation_origin("<!doctype html>"), None);
     }
 

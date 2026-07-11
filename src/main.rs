@@ -1032,11 +1032,13 @@ fn canonicalize_derivation_origin(cleaned: &str) -> Result<String, String> {
          (e.g. https://app.example.com)"
             .to_string()
     };
-    // `target_origin` only strips a leading http(s):// (else it prepends https://),
-    // so a non-HTTP scheme like `ftp://x` would be mangled into a bogus `https://…`
-    // rather than rejected — reject any explicit non-http(s) scheme up front.
+    // Reject any explicit scheme other than https (a bare host with no scheme is
+    // fine — target_origin prepends https). Without this, target_origin would
+    // rewrite a non-https scheme into a different origin than requested — `ftp://x`
+    // mangled into a bogus `https://…`, or `http://x` silently upgraded to
+    // `https://x` — contradicting the https-only contract and confusing debugging.
     if let Some((scheme, _)) = cleaned.split_once("://") {
-        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        if !scheme.eq_ignore_ascii_case("https") {
             return Err(invalid());
         }
     }
@@ -2067,6 +2069,10 @@ mod tests {
         assert!(
             super::clean_derivation_origin(Some("https://user@example.com".to_string())).is_err(),
             "user-info rejected (would derive a different principal than the bare origin)"
+        );
+        assert!(
+            super::clean_derivation_origin(Some("http://example.com".to_string())).is_err(),
+            "explicit http:// rejected (https-only contract; target_origin would silently upgrade it)"
         );
         assert_eq!(
             super::clean_derivation_origin(Some("  https://example.com  ".to_string())).unwrap(),
