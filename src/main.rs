@@ -1028,7 +1028,7 @@ fn clean_identity_arg(field: &str, raw: &str) -> Result<String, String> {
 /// an empty origin.
 fn canonicalize_derivation_origin(cleaned: &str) -> Result<String, String> {
     let invalid = || {
-        "`derivation_origin` must be an https origin with a host \
+        "`derivation_origin` must be a bare https origin — scheme + host, no user-info \
          (e.g. https://app.example.com)"
             .to_string()
     };
@@ -1041,10 +1041,16 @@ fn canonicalize_derivation_origin(cleaned: &str) -> Result<String, String> {
         }
     }
     let origin = identities::target_origin(cleaned);
-    // Require the canonical origin to parse as an https URL with a real host — this
+    // Require the canonical origin to parse as an https URL with a real host and NO
+    // user-info. `target_origin` keeps any `user@` prefix, but a browser origin never
+    // has one, so `https://user@host` would derive a different principal than
+    // `https://host` while `requested == derived_for_origin` hides the mismatch. This
     // also rejects a host-less input ("https://") and embedded spaces/invalid chars.
     let valid = url::Url::parse(&origin).ok().map_or(false, |u| {
-        u.scheme() == "https" && u.host_str().map_or(false, |h| !h.is_empty())
+        u.scheme() == "https"
+            && u.host_str().map_or(false, |h| !h.is_empty())
+            && u.username().is_empty()
+            && u.password().is_none()
     });
     if !valid {
         return Err(invalid());
@@ -1965,7 +1971,7 @@ mod tests {
         let err = super::resolve_identity_target(Some("https://".to_string()), None)
             .await
             .expect_err("host-less derivation_origin must be rejected");
-        assert!(err.contains("with a host"), "unexpected message: {err}");
+        assert!(err.contains("host"), "unexpected message: {err}");
     }
 
     // A non-http(s) scheme must be rejected, not mangled into a bogus https origin.
@@ -2057,6 +2063,10 @@ mod tests {
         assert!(
             super::clean_derivation_origin(Some("https://ex ample.com".to_string())).is_err(),
             "embedded space rejected"
+        );
+        assert!(
+            super::clean_derivation_origin(Some("https://user@example.com".to_string())).is_err(),
+            "user-info rejected (would derive a different principal than the bare origin)"
         );
         assert_eq!(
             super::clean_derivation_origin(Some("  https://example.com  ".to_string())).unwrap(),
