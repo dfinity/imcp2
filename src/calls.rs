@@ -197,10 +197,10 @@ pub struct CallCanisterOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
     /// When called as an app account: how `derived_for_origin` was determined
-    /// (`explicit` | `declared` | `app_url_default`) — matches the other identity
-    /// tools. `app_url_default` means the app declares no derivation origin and the
-    /// app URL was assumed, so the principal is wrong for an app with a custom one.
-    /// Null for anonymous calls.
+    /// (`explicit` | `declared` | `known` | `app_url_default`) — matches the other
+    /// identity tools. `app_url_default` means the app declares no derivation origin
+    /// (and isn't a known app) and the app URL was assumed, so the principal is
+    /// wrong for an app with a custom one. Null for anonymous calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derivation_origin_source: Option<String>,
 }

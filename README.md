@@ -116,9 +116,13 @@ token (see Auth).
 > alternative-origins list, which is the *inverse* relation), or an `app_url` the
 > connector resolves. There is **no reverse lookup** from an app URL to a custom
 > derivation origin, so `app_url` resolves to the app's **declared** origin
-> (`/.well-known/ic-app.json` → `derivation_origin`) when present, else it
-> *assumes* the app origin — flagged in every result as `derivation_origin_source`
-> (`explicit` / `declared` / `app_url_default`). Every identity result also echoes
+> (`/.well-known/ic-app.json` → `derivation_origin`) when present, else a built-in
+> **known-app** value for a few apps that pin a custom origin without declaring it
+> (NNS → `https://nns.ic0.app`, Oisy → `https://oisy.com`, MULTI/DEX →
+> `https://hcv4s-…icp0.io`, ICPSwap → `https://app.icpswap.com`; an app's own
+> declaration always overrides this), else it *assumes* the app origin — flagged in
+> every result as `derivation_origin_source`
+> (`explicit` / `declared` / `known` / `app_url_default`). Every identity result also echoes
 > `derived_for_origin` (the origin actually used) alongside `requested` (what you
 > passed), so a valid-but-wrong principal is **immediately visible** instead of
 > silent. Use `resolve_app(app_url)` to see the resolution (and the app's

@@ -510,7 +510,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Resolve an application URL to its Internet Identity derivation context, so you don't have to figure out the derivation origin yourself. Returns the `application_origin`, the `derivation_origin` to pass to the identity tools, how it was determined (`derivation_origin_source`: \"declared\" — the app published it in /.well-known/ic-app.json, authoritative; or \"app_url_default\" — assumed equal to the application origin, correct only if the app has no custom derivation origin, which cannot be verified), the app's `alternative_origins` (informational — the INVERSE relation, never use it to infer the derivation origin), and — if you're authenticated — the `principal` you'd act as there. Use this first when you only know an app's URL; then call get_principal/call_canister with the returned `derivation_origin`.",
+        description = "Resolve an application URL to its Internet Identity derivation context, so you don't have to figure out the derivation origin yourself. Returns the `application_origin`, the `derivation_origin` to pass to the identity tools, how it was determined (`derivation_origin_source`: \"declared\" — the app published it in /.well-known/ic-app.json, authoritative; \"known\" — from the connector's built-in registry of well-known custom-derivation-origin apps (e.g. NNS, Oisy, MULTI/DEX), used only when the app declares none; or \"app_url_default\" — assumed equal to the application origin, correct only if the app has no custom derivation origin, which cannot be verified), the app's `alternative_origins` (informational — the INVERSE relation, never use it to infer the derivation origin), and — if you're authenticated — the `principal` you'd act as there. Use this first when you only know an app's URL; then call get_principal/call_canister with the returned `derivation_origin`.",
         annotations(title = "Resolve an app's derivation origin", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::ResolveAppOutput>(),
     )]
@@ -530,7 +530,6 @@ impl IcTools {
             Err(e) => return Ok(err(e)),
         };
         let effective = identities::target_origin(&resolved.derivation_origin);
-        let declared = resolved.derivation_origin_source == discover::DerivationSource::Declared;
 
         // If authenticated, resolve the principal for the effective origin too.
         // Track WHY it's absent so the text doesn't tell a signed-in user to
@@ -550,17 +549,21 @@ impl IcTools {
             None => (None, Some("(authenticate to resolve)")),
         };
 
-        let note = if declared {
-            None
-        } else {
-            Some(format!(
+        let note = match resolved.derivation_origin_source {
+            discover::DerivationSource::Declared => None,
+            discover::DerivationSource::Known => Some(format!(
+                "This app didn't declare a derivation origin in /.well-known/ic-app.json, but it's \
+                 a known app that pins a custom one, so this used the built-in value {effective}. \
+                 The app's own declaration, if it ships one, would override this."
+            )),
+            discover::DerivationSource::AppUrlDefault => Some(format!(
                 "No derivation origin could be found for this app — its /.well-known/ic-app.json \
                  either declares no `derivation_origin` or couldn't be fetched (DNS/timeout/TLS/\
-                 redirect) — so this assumed the application origin {}. If this app uses a custom \
-                 derivation origin, that assumption yields a WRONG principal — supply the canonical \
-                 origin explicitly.",
+                 redirect), and it's not a known app — so this assumed the application origin {}. \
+                 If this app uses a custom derivation origin, that assumption yields a WRONG \
+                 principal — supply the canonical origin explicitly.",
                 resolved.application_origin
-            ))
+            )),
         };
         let mut text = format!(
             "application_origin: {}\nderivation_origin: {} ({})\n",
@@ -958,7 +961,7 @@ struct IdentityTarget {
     origin: String,
     /// Exactly what the caller supplied (a `derivation_origin` or an `app_url`).
     requested: String,
-    /// How `origin` was determined: "explicit" | "declared" | "app_url_default".
+    /// How `origin` was determined: "explicit" | "declared" | "known" | "app_url_default".
     source: String,
     /// The application origin, when the caller passed `app_url`.
     application_origin: Option<String>,

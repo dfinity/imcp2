@@ -367,8 +367,11 @@ fn parse_alternative_origins(text: &str) -> Vec<String> {
 pub enum DerivationSource {
     /// The app declared it in `/.well-known/ic-app.json` (`derivation_origin`).
     Declared,
-    /// No declaration found — defaulted to the application origin (an
-    /// ASSUMPTION, correct only for apps without a custom derivation origin).
+    /// Not declared by the app, but the app is in the built-in registry of
+    /// well-known custom-derivation-origin apps ([`KNOWN_DERIVATION_ORIGINS`]).
+    Known,
+    /// No declaration found and not a known app — defaulted to the application
+    /// origin (an ASSUMPTION, correct only for apps without a custom origin).
     AppUrlDefault,
 }
 
@@ -376,9 +379,50 @@ impl DerivationSource {
     pub fn as_str(self) -> &'static str {
         match self {
             DerivationSource::Declared => "declared",
+            DerivationSource::Known => "known",
             DerivationSource::AppUrlDefault => "app_url_default",
         }
     }
+}
+
+/// Built-in derivation origins for well-known apps that pin a CUSTOM Internet
+/// Identity derivation origin (so the visible URL is NOT what II derives against)
+/// but don't yet declare it in `/.well-known/ic-app.json`. Verified from each app's
+/// frontend `derivationOrigin` and the derivation origin's own
+/// `/.well-known/ii-alternative-origins`. This is a stopgap so an agent gets the
+/// right principal from the app URL alone; an app's own manifest declaration ALWAYS
+/// takes precedence (a table entry is superseded the moment the app ships a
+/// declaration). Keyed by application host (lowercased, no port).
+///
+/// NOTE (MULTI/DEX): its frontend pins the gateway-domain canister origin, and
+/// `identities::target_origin` remaps `*.icp0.io`/`*.icp.net` → `*.ic0.app` before
+/// deriving. Whether Internet Identity derives the SAME principal for those gateway
+/// variants (vs the literal pinned string) has not been confirmed against a live
+/// authenticated derivation; if II keys on the literal origin, this entry (and the
+/// remap) would need revisiting. NNS/Oisy/ICPSwap use plain domains and are exact.
+const KNOWN_DERIVATION_ORIGINS: &[(&str, &str)] = &[
+    // NNS dapp: served at nns.internetcomputer.org (canister mc7vh-…) but pins the
+    // classic https://nns.ic0.app (canister qoctq-…) as its derivation origin; that
+    // origin's ii-alternative-origins lists nns.internetcomputer.org + beta + sns.
+    ("nns.internetcomputer.org", "https://nns.ic0.app"),
+    ("nns.ic0.app", "https://nns.ic0.app"),
+    // Oisy: oisy.com is its own derivation-origin hub (its ii-alternative-origins
+    // lists beta + canister + signer subdomains, all deriving against oisy.com).
+    ("oisy.com", "https://oisy.com"),
+    // MULTI/DEX: frontend pins its frontend-canister origin (see NOTE above).
+    ("multidex.ai", "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io"),
+    // ICPSwap: app.icpswap.com uses NO custom derivation origin (default = app
+    // origin) — listed so resolution reports it as verified rather than assumed.
+    ("app.icpswap.com", "https://app.icpswap.com"),
+];
+
+/// The built-in derivation origin for a well-known app host, if any (see
+/// [`KNOWN_DERIVATION_ORIGINS`]). `host` must be the lowercased host (no port).
+fn known_derivation_origin(host: &str) -> Option<&'static str> {
+    KNOWN_DERIVATION_ORIGINS
+        .iter()
+        .find(|(h, _)| *h == host)
+        .map(|(_, origin)| *origin)
 }
 
 /// The Internet Identity derivation context an app URL resolves to. See
@@ -386,10 +430,11 @@ impl DerivationSource {
 pub struct AppIdentity {
     /// The normalized application origin (`scheme://host[:port]`) of `app_url`.
     pub application_origin: String,
-    /// The derivation origin to feed Internet Identity: the declared one when
-    /// present, else the application origin.
+    /// The derivation origin to feed Internet Identity: the app-declared one when
+    /// present, else a built-in known-app origin, else the application origin.
     pub derivation_origin: String,
-    /// Whether `derivation_origin` was declared or defaulted.
+    /// Whether `derivation_origin` was declared, from the known-app registry, or
+    /// defaulted.
     pub derivation_origin_source: DerivationSource,
     /// The application origin's own `ii-alternative-origins` list (informational).
     pub alternative_origins: Vec<String>,
@@ -397,8 +442,9 @@ pub struct AppIdentity {
 
 /// Resolve an app URL to its Internet Identity derivation context, WITHOUT
 /// guessing: the derivation origin is the app's declared one
-/// (`/.well-known/ic-app.json` → `derivation_origin`) if present, else the
-/// application origin (a clearly-flagged default). Uses the same SSRF-pinned
+/// (`/.well-known/ic-app.json` → `derivation_origin`) if present, else a built-in
+/// known-app registry entry ([`KNOWN_DERIVATION_ORIGINS`]) if the app is one, else
+/// the application origin (a clearly-flagged default). Uses the same SSRF-pinned
 /// client and capped reads as `discover`; the app URL is user-controlled.
 ///
 /// `want_alt_origins` controls whether the app's informational
@@ -427,6 +473,16 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
                 derivation_origin = declared;
                 derivation_origin_source = DerivationSource::Declared;
             }
+        }
+    }
+
+    // If the app didn't declare one, fall back to the built-in registry of
+    // well-known custom-derivation-origin apps (the app's own declaration always
+    // wins, so this only fills the gap for apps that haven't shipped one yet).
+    if derivation_origin_source == DerivationSource::AppUrlDefault {
+        if let Some(known) = known_derivation_origin(&host) {
+            derivation_origin = known.to_string();
+            derivation_origin_source = DerivationSource::Known;
         }
     }
 
@@ -1599,5 +1655,30 @@ mod tests {
             // Path reduced to bare origin; http:// / non-https / unparseable dropped.
             vec!["https://a.example"]
         );
+    }
+
+    // The built-in registry maps each special-cased app host to its custom
+    // derivation origin; unknown hosts fall through (to app_url_default), and every
+    // registered value is already a canonical bare https origin.
+    #[test]
+    fn known_derivation_origin_maps_special_cased_apps() {
+        assert_eq!(known_derivation_origin("nns.internetcomputer.org"), Some("https://nns.ic0.app"));
+        assert_eq!(known_derivation_origin("nns.ic0.app"), Some("https://nns.ic0.app"));
+        assert_eq!(known_derivation_origin("oisy.com"), Some("https://oisy.com"));
+        assert_eq!(
+            known_derivation_origin("multidex.ai"),
+            Some("https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io")
+        );
+        assert_eq!(known_derivation_origin("app.icpswap.com"), Some("https://app.icpswap.com"));
+        assert_eq!(known_derivation_origin("example.com"), None);
+        // Invariant: each registry origin round-trips through normalize_origin
+        // unchanged (i.e. it's already a canonical bare https origin).
+        for (host, origin) in KNOWN_DERIVATION_ORIGINS {
+            assert_eq!(
+                normalize_origin(origin).as_deref(),
+                Some(*origin),
+                "registry origin for {host} must be a canonical bare https origin"
+            );
+        }
     }
 }

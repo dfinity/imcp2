@@ -329,9 +329,10 @@ pub struct PrincipalOutput {
     /// mismatch with `derived_for_origin` is immediately visible.
     pub requested: String,
     /// How `derived_for_origin` was determined: "explicit" (you passed
-    /// `derivation_origin`), "declared" (the app declared it), or
-    /// "app_url_default" (assumed from the app URL — correct only if the app has
-    /// no custom derivation origin).
+    /// `derivation_origin`), "declared" (the app declared it in
+    /// /.well-known/ic-app.json), "known" (from the connector's built-in registry
+    /// of well-known custom-derivation-origin apps), or "app_url_default" (assumed
+    /// from the app URL — correct only if the app has no custom derivation origin).
     pub derivation_origin_source: String,
     /// The account name resolved, or null for the app's default account.
     pub account: Option<String>,
@@ -387,8 +388,8 @@ pub struct AccountsOutput {
     /// Exactly what you supplied (`derivation_origin` or `app_url`), echoed so a
     /// mismatch with `derived_for_origin` is immediately visible.
     pub requested: String,
-    /// How `derived_for_origin` was determined: "explicit", "declared", or
-    /// "app_url_default".
+    /// How `derived_for_origin` was determined: "explicit", "declared", "known"
+    /// (built-in known-app registry), or "app_url_default".
     pub derivation_origin_source: String,
     /// The user's accounts at that origin (empty if none).
     pub accounts: Vec<AccountEntry>,
@@ -410,9 +411,11 @@ pub struct ResolveAppOutput {
     /// as `derivation_origin` to the identity tools.
     pub derivation_origin: String,
     /// How `derivation_origin` was determined: "declared" (the app declared it
-    /// in /.well-known/ic-app.json — authoritative) or "app_url_default"
-    /// (assumed to equal the application origin — correct only if the app has no
-    /// custom derivation origin, which this connector cannot verify).
+    /// in /.well-known/ic-app.json — authoritative), "known" (from the connector's
+    /// built-in registry of well-known custom-derivation-origin apps, used only
+    /// when the app declares none), or "app_url_default" (assumed to equal the
+    /// application origin — correct only if the app has no custom derivation
+    /// origin, which this connector cannot verify).
     pub derivation_origin_source: String,
     /// Origins the application origin's `/.well-known/ii-alternative-origins`
     /// permits to derive from it. Informational only — this is the INVERSE of
