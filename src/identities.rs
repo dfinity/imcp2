@@ -532,9 +532,11 @@ impl Identities {
     /// opened" lines. Sessions with no recorded expiry (`None`) are KEPT: that
     /// covers a session still mid-connect (evicting it would strand the
     /// registration key `X` that II already certified) and a v1 session whose
-    /// best-effort POST never arrived. Returns how many were reaped. Also bounds
-    /// the session map, which otherwise only ever grows. Called on a timer from
-    /// `main`.
+    /// best-effort POST never arrived. Returns how many were reaped. This caps
+    /// the map's growth from expired-grant sessions (the common case: every
+    /// authenticated session eventually expires); it does NOT bound no-expiry
+    /// (`None`) sessions, which persist until they gain and then outlive a grant.
+    /// Called on a timer from `main`.
     pub async fn reap_expired_sessions(&self) -> usize {
         let now = now_ns();
         let mut closed = Vec::new();
