@@ -380,10 +380,12 @@ curl -s https://<host>/version | jq '.live_sessions'
 Sessions are also traceable in the logs (unit `mcp-poc`): a session logs
 `session opened` (with `instance` and `session_id`) when its grant goes live,
 and `session closed` when the grant expires and the per-instance reaper (60s
-cadence) evicts it, so the gauge and the journal reconcile (`opened` minus
-`closed` tracks the live count). A session still mid-connect, or a v1 session
-whose best-effort completion POST never delivered an expiry, counts as neither
-live nor opened until a grant expiry is recorded for it.
+cadence) evicts it. So `opened` minus `closed` tracks the live count, lagging
+the `/version` gauge by up to one reaper interval on the close side: the gauge
+stops counting an expired session immediately, while its `session closed` line
+lands on the next sweep (within 60s). A session still mid-connect, or a v1
+session whose best-effort completion POST never delivered an expiry, counts as
+neither live nor opened until a grant expiry is recorded for it.
 
 **Callback allow-list (`/.well-known/ii-auth-callbacks`).** II is moving to
 validate the connect callback named in the (attacker-craftable) link fragment

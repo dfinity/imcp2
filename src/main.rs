@@ -1195,6 +1195,10 @@ async fn main() -> anyhow::Result<()> {
         let reap_ct = ct.child_token();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            // Skip missed ticks rather than the default Burst: if the runtime
+            // stalls, resume with a single sweep at the next slot instead of
+            // firing several back-to-back catch-up sweeps.
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = reap_ct.cancelled() => break,
