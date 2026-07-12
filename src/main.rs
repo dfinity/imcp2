@@ -1028,8 +1028,8 @@ fn clean_identity_arg(field: &str, raw: &str) -> Result<String, String> {
 /// an empty origin.
 fn canonicalize_derivation_origin(cleaned: &str) -> Result<String, String> {
     let invalid = || {
-        "`derivation_origin` must be a bare https origin — scheme + host, no user-info \
-         (e.g. https://app.example.com)"
+        "`derivation_origin` must be an https origin or a bare host, with no user-info \
+         (e.g. https://app.example.com or app.example.com)"
             .to_string()
     };
     // Reject any explicit scheme other than https (a bare host with no scheme is

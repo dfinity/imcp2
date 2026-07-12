@@ -124,7 +124,9 @@ token (see Auth).
 > silent. Use `resolve_app(app_url)` to see the resolution (and the app's
 > `alternative_origins`) before acting. Under the hood both routes go through the
 > same origin canonicalizer the delegation path uses (bare `https://<host>`, with
-> the `*.icp0.io`/`*.icp.net` → `*.ic0.app` gateway remap below).
+> the `*.icp0.io`/`*.icp.net` → `*.ic0.app` gateway remap below). For backward
+> compatibility the identity tools still accept the legacy parameter name `domain`
+> as an alias for `derivation_origin`, so existing callers keep working unchanged.
 
 ### Skills awareness
 
