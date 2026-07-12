@@ -459,22 +459,30 @@ impl Identities {
         // and "is it now live" checks use a single consistent instant and we
         // don't hold the write lock across a syscall.
         let now = now_ns();
-        let mut sessions = self.sessions.write().await;
-        if let Some(s) = sessions.get_mut(session_id) {
-            // Emit "session opened" only on a genuine not-live -> live transition,
-            // so it pairs 1:1 with the reaper's "session closed" and the two
-            // reconcile in the journal. A re-bind of an already-live grant (a
-            // redeem retry within the delegation's lifetime) is not a new open.
-            let was_live = s.grant_expiration_ns.is_some_and(|e| e > now);
-            s.grant_expiration_ns = Some(expiration_ns);
-            if !was_live && expiration_ns > now {
-                tracing::info!(
-                    instance = self.instance.name,
-                    session_id = %session_id,
-                    expiration_ns,
-                    "session opened"
-                );
+        // Record whether this is a genuine not-live -> live transition inside the
+        // lock, then log AFTER releasing it: a slow log sink must not stall other
+        // readers/writers of the session map.
+        let opened = {
+            let mut sessions = self.sessions.write().await;
+            match sessions.get_mut(session_id) {
+                Some(s) => {
+                    let was_live = s.grant_expiration_ns.is_some_and(|e| e > now);
+                    s.grant_expiration_ns = Some(expiration_ns);
+                    !was_live && expiration_ns > now
+                }
+                None => false,
             }
+        };
+        // "session opened" pairs 1:1 with the reaper's "session closed", so the
+        // two reconcile in the journal. A re-bind of an already-live grant (a
+        // redeem retry within the delegation's lifetime) is not a new open.
+        if opened {
+            tracing::info!(
+                instance = self.instance.name,
+                session_id = %session_id,
+                expiration_ns,
+                "session opened"
+            );
         }
     }
 

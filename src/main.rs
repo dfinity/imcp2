@@ -1181,14 +1181,16 @@ async fn main() -> anyhow::Result<()> {
     let mcp_beta = make_mcp(ids_beta.clone());
     let mcp_prod = make_mcp(ids_prod.clone());
 
-    // Session reaper, one task per instance. Every 60s it evicts expired-grant
-    // sessions (emitting a "session closed" log each) and gives the journal a
-    // close event to reconcile against "session opened". This caps growth from
-    // expired grants (the common case: every authenticated session eventually
-    // expires); sessions with no recorded expiry (mid-connect, or a v1 session
-    // whose completion POST never arrived) are deliberately kept and so are NOT
-    // bounded by this. Tied to the shutdown token so the tasks stop cleanly on
-    // drain.
+    // Session reaper, one task per instance. It sweeps once shortly after
+    // startup and then every 60s (tokio's interval fires its first tick
+    // immediately; the startup sweep is harmless, the map is empty then),
+    // evicting expired-grant sessions (emitting a "session closed" log each) and
+    // giving the journal a close event to reconcile against "session opened".
+    // This caps growth from expired grants (the common case: every
+    // authenticated session eventually expires); sessions with no recorded
+    // expiry (mid-connect, or a v1 session whose completion POST never arrived)
+    // are deliberately kept and so are NOT bounded by this. Tied to the shutdown
+    // token so the tasks stop cleanly on drain.
     for ids in [ids_beta.clone(), ids_prod.clone()] {
         let reap_ct = ct.child_token();
         tokio::spawn(async move {
