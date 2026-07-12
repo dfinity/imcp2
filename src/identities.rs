@@ -455,15 +455,19 @@ impl Identities {
     /// epoch (a decimal string on the wire, parsed before it reaches here).
     pub async fn set_grant_expiration(&self, session_id: &str, expiration_ns: u64) {
         self.ensure_session(session_id).await;
+        // Read the clock once (before taking the lock), so the "was it live"
+        // and "is it now live" checks use a single consistent instant and we
+        // don't hold the write lock across a syscall.
+        let now = now_ns();
         let mut sessions = self.sessions.write().await;
         if let Some(s) = sessions.get_mut(session_id) {
             // Emit "session opened" only on a genuine not-live -> live transition,
             // so it pairs 1:1 with the reaper's "session closed" and the two
             // reconcile in the journal. A re-bind of an already-live grant (a
             // redeem retry within the delegation's lifetime) is not a new open.
-            let was_live = s.grant_expiration_ns.is_some_and(|e| e > now_ns());
+            let was_live = s.grant_expiration_ns.is_some_and(|e| e > now);
             s.grant_expiration_ns = Some(expiration_ns);
-            if !was_live && expiration_ns > now_ns() {
+            if !was_live && expiration_ns > now {
                 tracing::info!(
                     instance = self.instance.name,
                     session_id = %session_id,
@@ -533,15 +537,19 @@ impl Identities {
     /// `main`.
     pub async fn reap_expired_sessions(&self) -> usize {
         let now = now_ns();
-        let mut sessions = self.sessions.write().await;
         let mut closed = Vec::new();
-        sessions.retain(|sid, s| match s.grant_expiration_ns {
-            Some(exp) if exp <= now => {
-                closed.push(sid.clone());
-                false
-            }
-            _ => true,
-        });
+        // Scope the write lock to the mutation only: release it BEFORE logging so
+        // a slow log sink can't block other readers/writers of the session map.
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.retain(|sid, s| match s.grant_expiration_ns {
+                Some(exp) if exp <= now => {
+                    closed.push(sid.clone());
+                    false
+                }
+                _ => true,
+            });
+        }
         for sid in &closed {
             tracing::info!(instance = self.instance.name, session_id = %sid, "session closed");
         }
