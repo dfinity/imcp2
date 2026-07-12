@@ -457,7 +457,20 @@ impl Identities {
         self.ensure_session(session_id).await;
         let mut sessions = self.sessions.write().await;
         if let Some(s) = sessions.get_mut(session_id) {
+            // Emit "session opened" only on a genuine not-live -> live transition,
+            // so it pairs 1:1 with the reaper's "session closed" and the two
+            // reconcile in the journal. A re-bind of an already-live grant (a
+            // redeem retry within the delegation's lifetime) is not a new open.
+            let was_live = s.grant_expiration_ns.is_some_and(|e| e > now_ns());
             s.grant_expiration_ns = Some(expiration_ns);
+            if !was_live && expiration_ns > now_ns() {
+                tracing::info!(
+                    instance = self.instance.name,
+                    session_id = %session_id,
+                    expiration_ns,
+                    "session opened"
+                );
+            }
         }
     }
 
@@ -490,6 +503,49 @@ impl Identities {
     /// OAuth access-token lifetime so a token never outlives the grant.
     pub async fn grant_expiration_ns(&self, session_id: &str) -> Option<u64> {
         self.sessions.read().await.get(session_id).and_then(|s| s.grant_expiration_ns)
+    }
+
+    /// Number of live sessions on this instance: those holding a currently-valid
+    /// grant (a recorded `grant_expiration_ns` still in the future). This is the
+    /// gauge surfaced on `/version`. Sessions still mid-connect, and v1 sessions
+    /// whose best-effort completion POST never delivered an expiry (`None`), are
+    /// deliberately NOT counted, since a missing expiry is "unknown", not "live" (see
+    /// `Session::grant_expiration_ns`). A cheap read-lock snapshot; the count is
+    /// eventually consistent with the "session opened"/"session closed" logs
+    /// (an expired grant stops counting here immediately, and the reaper emits
+    /// its "session closed" line on the next sweep).
+    pub async fn live_session_count(&self) -> usize {
+        let now = now_ns();
+        let sessions = self.sessions.read().await;
+        sessions
+            .values()
+            .filter(|s| s.grant_expiration_ns.is_some_and(|e| e > now))
+            .count()
+    }
+
+    /// Evict sessions whose grant has expired, emitting a "session closed" log
+    /// per eviction so the journal can reconcile closes against the "session
+    /// opened" lines. Sessions with no recorded expiry (`None`) are KEPT: that
+    /// covers a session still mid-connect (evicting it would strand the
+    /// registration key `X` that II already certified) and a v1 session whose
+    /// best-effort POST never arrived. Returns how many were reaped. Also bounds
+    /// the session map, which otherwise only ever grows. Called on a timer from
+    /// `main`.
+    pub async fn reap_expired_sessions(&self) -> usize {
+        let now = now_ns();
+        let mut sessions = self.sessions.write().await;
+        let mut closed = Vec::new();
+        sessions.retain(|sid, s| match s.grant_expiration_ns {
+            Some(exp) if exp <= now => {
+                closed.push(sid.clone());
+                false
+            }
+            _ => true,
+        });
+        for sid in &closed {
+            tracing::info!(instance = self.instance.name, session_id = %sid, "session closed");
+        }
+        closed.len()
     }
 
     /// This session's known access level: `Some(true)` = read-only, `Some(false)`
@@ -1246,6 +1302,48 @@ mod tests {
         ids.set_grant_expiration("sess", now_ns().saturating_sub(1)).await;
         // A past grant expiration short-circuits to the reconnect message.
         assert!(ids.session_signer("sess").await.is_err());
+    }
+
+    // The /version live-session gauge counts only sessions with a still-valid
+    // grant: a future expiry counts, a past expiry does not, and a session that
+    // never recorded an expiry (mid-connect / no completion POST) does not.
+    #[tokio::test]
+    async fn live_session_count_counts_only_valid_grants() {
+        let ids = test_ids();
+        assert_eq!(ids.live_session_count().await, 0);
+
+        // Two live grants (well into the future).
+        let future = now_ns() + 3_600_000_000_000;
+        ids.set_grant_expiration("live1", future).await;
+        ids.set_grant_expiration("live2", future).await;
+        // An expired grant.
+        ids.set_grant_expiration("expired", now_ns().saturating_sub(1)).await;
+        // A session with no recorded expiry.
+        ids.ensure_session("pending").await;
+
+        assert_eq!(ids.live_session_count().await, 2);
+    }
+
+    // The reaper drops expired-grant sessions (returning how many), and leaves
+    // valid grants and no-expiry sessions in place.
+    #[tokio::test]
+    async fn reap_expired_sessions_evicts_expired_only() {
+        let ids = test_ids();
+        let future = now_ns() + 3_600_000_000_000;
+        ids.set_grant_expiration("live", future).await;
+        ids.set_grant_expiration("expired", now_ns().saturating_sub(1)).await;
+        ids.ensure_session("pending").await;
+
+        assert_eq!(ids.reap_expired_sessions().await, 1);
+        // The expired one is gone; the live and no-expiry ones remain.
+        let sessions = ids.sessions.read().await;
+        assert!(sessions.contains_key("live"));
+        assert!(sessions.contains_key("pending"));
+        assert!(!sessions.contains_key("expired"));
+        drop(sessions);
+        // Idempotent: a second sweep finds nothing new to reap.
+        assert_eq!(ids.reap_expired_sessions().await, 0);
+        assert_eq!(ids.live_session_count().await, 1);
     }
 
     // Lock in the mcp_get_accounts Candid contract: a `vec AccountInfo` (with the

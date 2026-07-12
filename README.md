@@ -365,8 +365,25 @@ call as `X`. II never again binds a bare key it was shown.
   later with `MCP_REGISTRATION_DELEGATION_PROD=1`). Its II link, callback, and
   finish flow are exactly the existing protocol; the Phase-2 routes `404`.
 
-`/version` reports which instance runs which protocol
-(`registration_delegation: {beta, prod}`).
+`/version` is the unauthenticated operations probe. It reports the running
+build (`version`, `commit`, `built_at`, `started_at`), the H3/P1
+`repeat_key_requests` health counter, which instance runs which protocol
+(`registration_delegation: {beta, prod}`), and a real-time **live-session
+gauge** (`live_sessions: {beta, prod}`) counting the sessions that currently
+hold a valid grant on each instance:
+
+```bash
+curl -s https://<host>/version | jq '.live_sessions'
+# => { "beta": 0, "prod": 1 }
+```
+
+Sessions are also traceable in the logs (unit `mcp-poc`): a session logs
+`session opened` (with `instance` and `session_id`) when its grant goes live,
+and `session closed` when the grant expires and the per-instance reaper (60s
+cadence) evicts it, so the gauge and the journal reconcile (`opened` minus
+`closed` tracks the live count). A session still mid-connect, or a v1 session
+whose best-effort completion POST never delivered an expiry, counts as neither
+live nor opened until a grant expiry is recorded for it.
 
 **Callback allow-list (`/.well-known/ii-auth-callbacks`).** II is moving to
 validate the connect callback named in the (attacker-craftable) link fragment
