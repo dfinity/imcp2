@@ -351,7 +351,7 @@ fn parse_alternative_origins(text: &str) -> Vec<String> {
     serde_json::from_str::<AltOrigins>(text)
         .map(|a| {
             // Fail-closed: normalize each entry to a bare origin (as the doc
-            // promises) and drop anything that isn't a valid http(s) origin,
+            // promises) and drop anything that isn't a valid https origin,
             // rather than surfacing arbitrary sanitized strings.
             a.alternative_origins
                 .iter()
@@ -1591,12 +1591,12 @@ mod tests {
         assert!(parse_alternative_origins("<!doctype html>").is_empty());
         assert!(parse_alternative_origins(r#"{"other":1}"#).is_empty());
         // Fail-closed + normalize: a path is reduced to the bare origin, and a
-        // non-http(s) / unparseable entry is dropped rather than surfaced.
+        // non-https / unparseable entry is dropped rather than surfaced.
         assert_eq!(
             parse_alternative_origins(
                 r#"{"alternativeOrigins":["https://a.example/some/path","http://insecure.example","ftp://x","not a url"]}"#
             ),
-            // Path reduced to bare origin; http:// / non-http(s) / unparseable dropped.
+            // Path reduced to bare origin; http:// / non-https / unparseable dropped.
             vec!["https://a.example"]
         );
     }
