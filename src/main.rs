@@ -1093,6 +1093,26 @@ fn clean_app_url(raw: &str) -> Result<String, String> {
             );
         }
     }
+    // Require a real host and NO user-info, matching `canonicalize_derivation_origin`.
+    // `resolve_app_identity` prepends https to a bare host and derives the application
+    // origin via `Url::origin()`, which silently DROPS any `user:pass@` — so
+    // `https://user@host` would resolve to `https://host` (differing from what the
+    // caller supplied) and `https://` would yield no host. Reject both up front with a
+    // clear message instead of a late, indirect downstream failure.
+    let candidate = if u.contains("://") { u.clone() } else { format!("https://{u}") };
+    let valid = url::Url::parse(&candidate).ok().map_or(false, |parsed| {
+        parsed.scheme() == "https"
+            && parsed.host_str().map_or(false, |h| !h.is_empty())
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+    });
+    if !valid {
+        return Err(
+            "`app_url` must be an https URL or bare host with a real host and no user-info \
+             (e.g. https://app.example.com or app.example.com)"
+                .to_string(),
+        );
+    }
     Ok(u)
 }
 
@@ -2006,6 +2026,27 @@ mod tests {
             .await
             .expect_err("http:// app_url must be rejected");
         assert!(err.contains("https URL"), "unexpected message: {err}");
+    }
+
+    // User-info in an app_url is silently dropped by `Url::origin()` downstream, so
+    // `https://user@host` would resolve to `https://host` — a value the caller never
+    // supplied. Reject it up front (consistent with derivation_origin validation).
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_userinfo_app_url() {
+        let err = super::resolve_identity_target(None, Some("https://user:pass@example.com".to_string()))
+            .await
+            .expect_err("app_url with user-info must be rejected");
+        assert!(err.contains("user-info"), "unexpected message: {err}");
+    }
+
+    // A host-less app_url ("https://") has no origin to derive against and must be
+    // rejected here rather than failing later in URL parsing / the SSRF guard.
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_hostless_app_url() {
+        let err = super::resolve_identity_target(None, Some("https://".to_string()))
+            .await
+            .expect_err("host-less app_url must be rejected");
+        assert!(err.contains("real host"), "unexpected message: {err}");
     }
 
     // The human-readable identity annotation must surface a requested≠derived
