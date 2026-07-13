@@ -1382,14 +1382,19 @@ fn connect_error(message: &str) -> Response {
         .replace('>', "&gt;");
     // Shares the connect pages' DFINITY-branded look via the `.error` modifier
     // (spinner tile hidden, message carries the state), same foot-of-page "Hosted
-    // by" mark. No CSP here, so a plain `<style>` is fine.
+    // by" mark. No CSP here, so a plain `<style>` is fine. Sets `Referrer-Policy:
+    // no-referrer` (plus the `<meta>` fallback) like the sibling finish pages:
+    // this page can be served from `/oauth/finish`, whose URL carries the
+    // one-time `finish_secret` in its query, so the Referer must not leak it if
+    // the user navigates away (P2).
     let css = CONNECT_PAGE_CSS;
     let logo = CONNECT_LOGO_SVG;
-    (
+    let mut resp = (
         StatusCode::BAD_REQUEST,
         Html(format!(
             "<!DOCTYPE html><html lang=en><head><meta charset=utf-8>\
              <meta name=viewport content=\"width=device-width,initial-scale=1\">\
+             <meta name=referrer content=no-referrer>\
              <title>Could not connect</title><style>{css}</style></head>\
              <body><main class=\"screen error\">\
              <div class=stage>\
@@ -1401,7 +1406,12 @@ fn connect_error(message: &str) -> Response {
              <span class=hosted-logo>{logo}</span></footer></main></body></html>"
         )),
     )
-        .into_response()
+        .into_response();
+    resp.headers_mut().insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    resp
 }
 
 // ---- Token: exchange an authorization code ------------------------------
