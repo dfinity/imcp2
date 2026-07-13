@@ -715,6 +715,27 @@ impl IcTools {
     }
 
     #[tool(
+        description = "Find a well-known Internet Computer APP by NAME and get its front-end URL and Internet Identity derivation origin — the missing name→app step (discovery otherwise needs a URL). Covers only a small built-in set (NNS, Oisy, MULTI/DEX, ICPSwap). For ANY other app there is NO on-chain name→URL directory, so the result's `note` directs you to WEB SEARCH the app's official URL and then use resolve_app / discover_app_canisters. Returns `matches` (each with `app_url` + `derivation_origin`) — usually one, or none. This is name→app; for a token/service→canister-id use icp_find_canister_by_name, and for a URL→canisters use discover_app_canisters.",
+        annotations(title = "Find a well-known app by name", read_only_hint = true, destructive_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<discover::FindAppOutput>(),
+    )]
+    async fn icp_find_app_by_name(
+        &self,
+        Parameters(discover::FindAppArgs { name }): Parameters<discover::FindAppArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let output = discover::find_app_by_name(&name);
+        let mut text = String::new();
+        for m in &output.matches {
+            text.push_str(&format!(
+                "{} — {} (derivation_origin: {})\n",
+                m.name, m.app_url, m.derivation_origin
+            ));
+        }
+        text.push_str(&output.note);
+        Ok(ok_structured(text, &output))
+    }
+
+    #[tool(
         description = "Identify what an Internet Computer canister IS, from the IC dashboard: its label/name (e.g. \"ICP Ledger\"), type (e.g. \"ledger\"), controllers, hosting subnet, module hash, language, and latest upgrade proposal. Use this to make sense of a bare canister id — e.g. one returned by discover_app_canisters.",
         annotations(title = "Identify a canister", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::CanisterIdentityOutput>(),
@@ -1270,9 +1291,11 @@ impl ServerHandler for IcTools {
              reads work, but the canister-management tools below make update calls the network \
              rejects for a read-only session — if one fails that way, ask the user to reconnect with \
              the read-only option turned OFF.\n\n\
-             Typical flow (acting FOR THE USER at an app): (0) get the app URL from the user — no \
-             tool maps an app NAME to a URL (`icp_find_canister_by_name` searches the token/SNS \
-             registries for canister ids, not front-ends), so take it from the user or ask; (1) \
+             Typical flow (acting FOR THE USER at an app): (0) get the app URL — for a well-known \
+             app (NNS, Oisy, MULTI/DEX, ICPSwap) `icp_find_app_by_name` maps the NAME to its URL + \
+             derivation origin; otherwise take the URL from the user or web-search it (there is no \
+             on-chain name→URL directory; `icp_find_canister_by_name` finds token/SNS canister ids, \
+             not front-ends); (1) \
              `resolve_app(url)` gives the `derivation_origin`, and concurrently (2) \
              `discover_app_canisters(url)` gives the backend canister id; (3) `list_app_accounts` — \
              if there is more than one account, ask which to use and remember it; (4) \
@@ -1527,7 +1550,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
 <h1>Internet Computer MCP PoC</h1>
 <p>MCP endpoints: <code>POST /mcp</code> (beta Internet Identity) · <code>POST /mcp-prod</code> (production Internet Identity)</p>
-<p>Tools: <code>discover_app_canisters</code> (domain → canister ids), <code>icp_find_canister_by_name</code> (name → canister ids), <code>icp_lookup_canister_info_by_id</code> (id → dashboard identity), <code>get_canister_candid</code>, <code>call_canister</code> (anonymously, or as your account at an app — identified by its <code>derivation_origin</code> or <code>app_url</code>, delegation minted on demand), <code>get_app_principal</code> (your principal at an app, no call), <code>list_app_accounts</code> (your Internet Identity accounts at an app), <code>resolve_app</code> (app URL → its Internet Identity derivation origin; no principal — pick an account via <code>get_app_principal</code>). Identity results echo <code>derived_for_origin</code>/<code>requested</code> so an origin mismatch is visible. All speak textual Candid.</p>
+<p>Tools: <code>discover_app_canisters</code> (domain → canister ids), <code>icp_find_canister_by_name</code> (name → canister ids), <code>icp_find_app_by_name</code> (well-known app name → URL + derivation origin), <code>icp_lookup_canister_info_by_id</code> (id → dashboard identity), <code>get_canister_candid</code>, <code>call_canister</code> (anonymously, or as your account at an app — identified by its <code>derivation_origin</code> or <code>app_url</code>, delegation minted on demand), <code>get_app_principal</code> (your principal at an app, no call), <code>list_app_accounts</code> (your Internet Identity accounts at an app), <code>resolve_app</code> (app URL → its Internet Identity derivation origin; no principal — pick an account via <code>get_app_principal</code>). Identity results echo <code>derived_for_origin</code>/<code>requested</code> so an origin mismatch is visible. All speak textual Candid.</p>
 <p>Skills: <code>icp_list_skills</code> / <code>icp_get_skill</code> (the official IC how-to guides — Motoko, mops, icp CLI, cycles, …).</p>
 <p>App docs: <code>get_canister_api_doc</code> (a canister's own "how this app behaves" guide, if it exposes <code>getApiDoc</code>/<code>get_api_doc</code>).</p>
 <p>OQL: <code>icp_oql_guide</code> (dialect), <code>get_canister_oql_schema</code> (entities/fields), <code>run_canister_oql_query</code> (run a JSON query, get a table) — for canisters that expose an OQL <code>schema</code>/<code>execute</code> surface (<code>get_canister_candid</code> reports <code>oql: true</code>).</p>
@@ -1912,7 +1935,7 @@ mod tests {
     #[test]
     fn every_tool_has_correct_read_write_annotations() {
         let tools = super::IcTools::tool_router().list_all();
-        assert_eq!(tools.len(), 24, "expected 24 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 25, "expected 25 tools, got {}", tools.len());
         assert!(
             tools.iter().all(|t| t.annotations.is_some()),
             "every tool must carry annotations (else clients assume write/destructive)"
@@ -1930,7 +1953,7 @@ mod tests {
         // AND set destructive_hint=false explicitly so a naive client that doesn't
         // gate destructive on read_only can't mislabel them.
         for name in [
-            "get_canister_candid", "discover_app_canisters", "icp_find_canister_by_name", "icp_lookup_canister_info_by_id",
+            "get_canister_candid", "discover_app_canisters", "icp_find_canister_by_name", "icp_find_app_by_name", "icp_lookup_canister_info_by_id",
             "icp_list_skills", "icp_get_skill", "icp_oql_guide", "run_canister_oql_query", "get_canister_oql_schema",
             "get_canister_api_doc", "resolve_app", "list_app_accounts", "icp_cycles_balance", "get_app_principal", "icp_canister_status",
         ] {

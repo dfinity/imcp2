@@ -20,6 +20,7 @@ results).
 |------|------|---------|
 | `discover_app_canisters` | `domain` | Canister ids behind a web domain — app-declared App Connect metadata first (`/ai-connect.html`'s `ic:canister-id` meta, `/.well-known/ic-app.json` manifest), then the frontend via `x-ic-canister-id` and backend candidates via `/env.json` + JS-bundle mining — each with provenance and its IC dashboard label/type where known |
 | `icp_find_canister_by_name` | `query` | Canister ids matching a name/symbol, searched in the IC dashboard's service registries — ICRC token ledgers (e.g. `ckUSDC`) and the SNS project catalog |
+| `icp_find_app_by_name` | `name` | A well-known app's front-end URL + `derivation_origin`, for a small built-in set (NNS, Oisy, MULTI/DEX, ICPSwap). Any other name returns no match and a `note` directing a web search for the app's URL (there's no on-chain name→URL directory) |
 | `icp_lookup_canister_info_by_id` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
 | `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus an `oql` flag — `true` when it exposes an OQL query surface (a `schema` + `execute` pair), with a pointer to `icp_oql_guide` |
 | `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), read from its `getApiDoc`/`get_api_doc` method if present. Call first for an unfamiliar app |
@@ -50,9 +51,10 @@ ids, confirm with `get_canister_candid`).
 
 Acting **for the user** at an app:
 
-0. **Get the app URL from the user.** No tool maps an app *name* → URL
-   (`icp_find_canister_by_name` searches the token/SNS registries for canister ids,
-   not front-ends), so take the URL from the user or ask.
+0. **Get the app URL.** For a well-known app (NNS, Oisy, MULTI/DEX, ICPSwap),
+   **`icp_find_app_by_name`** maps the *name* → its URL + `derivation_origin`. For any
+   other app there's no on-chain name→URL directory (`icp_find_canister_by_name` finds
+   token/SNS canister ids, not front-ends), so take the URL from the user or web-search it.
 1. **`resolve_app(url)`** → the app's `derivation_origin` — concurrently with
 2. **`discover_app_canisters(url)`** → the backend canister id.
 3. **`list_app_accounts`** — if there's more than one account, ask which to use (and
