@@ -487,7 +487,16 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
     } else {
         ii_mcp_url(store.instance(), &session_id)
     };
-    let mut resp = js_redirect(&ii_url);
+    // Redirect the consenting browser to the II connect link with a real HTTP
+    // 302 (`Location`). The link's params ride in the URL fragment
+    // (`#callback=…&state=…&registration_key=…`); modern browsers preserve a
+    // fragment present in a `Location` header (RFC 9110 §10.2.2), and the fragment
+    // never goes on the wire, so beta II's frontend still reads it from
+    // `location.hash` exactly as before, with one fewer interposition point than
+    // a script-driven hop, and it works with JS disabled. `redirect_302` also
+    // sets `Referrer-Policy: no-referrer` (the authorize query carries only
+    // non-secret OAuth params, so that is tidiness, not a leak fix).
+    let mut resp = redirect_302(&ii_url);
     resp.headers_mut().insert(
         axum::http::header::SET_COOKIE,
         axum::http::HeaderValue::from_str(&set_cookie).expect("valid cookie"),
@@ -655,9 +664,13 @@ fn finishing_page(prefix: &str, id: &str, fs: &str, next_try: u32) -> Response {
     resp
 }
 
-/// A 302 to an absolute URL (used for the top-level hop back to the OAuth client).
-/// Sets `Referrer-Policy: no-referrer` so the `finish_secret` in this request's URL
-/// (query) is not leaked to `redirect_uri` via the `Referer` header (P2).
+/// A 302 to an absolute URL, for the two top-level hops in the connect flow: the
+/// browser out to the II link (`authorize`) and back to the OAuth client
+/// (`finish`). A `Location` fragment (the II link's `#callback=…`) is preserved
+/// by modern browsers (RFC 9110 §10.2.2) and never sent on the wire, so II reads
+/// it from `location.hash`. Sets `Referrer-Policy: no-referrer` so any secret in
+/// this request's URL query (the client hop's `finish_secret`, P2) is not leaked
+/// to the target via the `Referer` header.
 fn redirect_302(url: &str) -> Response {
     let mut resp = (StatusCode::FOUND, [(axum::http::header::LOCATION, url.to_string())]).into_response();
     resp.headers_mut()
@@ -1351,17 +1364,6 @@ pub async fn connect_redeem(
     }
     tracing::info!(session_id = %body.state, "grant confirmed via registration delegation; issued authorization code");
     Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state) })).into_response()
-}
-
-/// Top-level redirect via a script-initiated navigation (`location.replace`)
-/// rather than an HTTP `Location` header, so the II `/mcp` URL's fragment (`#…`)
-/// is preserved (a `Location` redirect drops it in some clients).
-fn js_redirect(url: &str) -> Response {
-    Html(format!(
-        "<!DOCTYPE html><meta charset=utf-8><script>location.replace(\"{}\")</script>",
-        js_escape(url)
-    ))
-    .into_response()
 }
 
 /// Escape a string for embedding inside a double-quoted JS string literal.
@@ -2074,6 +2076,54 @@ mod tests {
             assert!(d.starts_with(&super::base_url()), "same-origin entries only: {d}");
             assert!(!d.contains('#'), "no fragments in declared callbacks: {d}");
         }
+    }
+
+    // /oauth/authorize hands the browser to II with a real HTTP 302 (not a 200 +
+    // JS page): lock in the status, the `Location` (the II link with its fragment
+    // params intact), `Referrer-Policy: no-referrer`, and the binding cookie, so a
+    // regression to a script-driven hop or a dropped header is caught.
+    #[tokio::test]
+    async fn authorize_redirects_302_with_fragment_cookie_and_no_referrer() {
+        use axum::extract::{Query, State};
+        let store = test_store_phase2();
+        // Register a client so `validate_client` passes and we reach the redirect.
+        store.clients.write().await.insert(
+            "client-x".into(),
+            super::ClientReg { redirect_uris: vec!["https://app.example/cb".into()] },
+        );
+        let resp = super::authorize(
+            State(store.clone()),
+            Query(super::AuthorizeQuery {
+                response_type: Some("code".into()),
+                client_id: "client-x".into(),
+                redirect_uri: "https://app.example/cb".into(),
+                state: Some("xyz".into()),
+                code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+                code_challenge_method: Some("S256".into()),
+                scope: None,
+                resource: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.status(), axum::http::StatusCode::FOUND, "authorize must 302, not render a page");
+        let h = resp.headers();
+        let location = h.get(axum::http::header::LOCATION).unwrap().to_str().unwrap();
+        // The II link, with the connect params carried in the URL FRAGMENT.
+        assert!(location.starts_with("https://ii.test/mcp#"), "redirects to the II /mcp link: {location}");
+        for needle in ["callback=", "state=", "registration_key="] {
+            assert!(location.contains(needle), "fragment must carry `{needle}`: {location}");
+        }
+        assert_eq!(
+            h.get(axum::http::header::REFERRER_POLICY).unwrap().to_str().unwrap(),
+            "no-referrer",
+            "the redirect must set Referrer-Policy: no-referrer"
+        );
+        let cookie = h.get(axum::http::header::SET_COOKIE).unwrap().to_str().unwrap();
+        assert!(
+            cookie.contains(&format!("{}=", super::CONNECT_COOKIE)),
+            "the binding cookie must be set: {cookie}"
+        );
     }
 
     // The pinned page ships a strict CSP whose script nonce MATCHES the inline
