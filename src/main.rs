@@ -564,44 +564,28 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Resolve an application URL to its Internet Identity derivation context, so you don't have to figure out the derivation origin yourself. Returns the `application_origin`, the `derivation_origin` to pass to the identity tools, how it was determined (`derivation_origin_source`: \"declared\" — the app published it in /.well-known/ic-app.json, authoritative; \"known\" — from the connector's built-in registry of well-known custom-derivation-origin apps (e.g. NNS, Oisy, MULTI/DEX), used only when the app declares none; or \"app_url_default\" — assumed equal to the application origin, correct only if the app has no custom derivation origin, which cannot be verified), the app's `alternative_origins` (informational — the INVERSE relation, never use it to infer the derivation origin), and — if you're authenticated — the `principal` you'd act as there. Use this first when you only know an app's URL; then call get_app_principal/call_canister with the returned `derivation_origin`.",
+        description = "Resolve an application URL to its Internet Identity derivation context, so you don't have to figure out the derivation origin yourself. Returns the `application_origin`, the `derivation_origin` to pass to the identity tools, how it was determined (`derivation_origin_source`: \"declared\" — the app published it in /.well-known/ic-app.json, authoritative; \"known\" — from the connector's built-in registry of well-known custom-derivation-origin apps (e.g. NNS, Oisy, MULTI/DEX), used only when the app declares none; or \"app_url_default\" — assumed equal to the application origin, correct only if the app has no custom derivation origin, which cannot be verified), and the app's `alternative_origins` (informational — the INVERSE relation, never use it to infer the derivation origin). This does NOT return a principal — it resolves the origin only, since you haven't picked an account; to get the principal you act as, pass the returned `derivation_origin` to get_app_principal (choosing an `account`) or list_app_accounts. Use this first when you only know an app's URL; no authenticated session is required.",
         annotations(title = "Resolve an app's derivation origin", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::ResolveAppOutput>(),
     )]
     async fn resolve_app(
         &self,
         Parameters(identities::ResolveAppArgs { app_url }): Parameters<identities::ResolveAppArgs>,
-        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let app_url = match clean_app_url(&app_url) {
             Ok(u) => u,
             Err(e) => return Ok(err(e)),
         };
         // This tool surfaces `alternative_origins`, so fetch them (unlike the
-        // identity hot path in resolve_identity_target).
+        // identity hot path in resolve_identity_target). It resolves the derivation
+        // origin ONLY — no principal is derived here, because the caller hasn't
+        // chosen an account; that's get_app_principal / list_app_accounts' job. So
+        // this needs no authenticated session.
         let resolved = match discover::resolve_app_identity(&app_url, true).await {
             Ok(r) => r,
             Err(e) => return Ok(err(e)),
         };
         let effective = identities::target_origin(&resolved.derivation_origin);
-
-        // If authenticated, resolve the principal for the effective origin too.
-        // Track WHY it's absent so the text doesn't tell a signed-in user to
-        // authenticate when the real cause is a derivation failure.
-        let (principal, principal_absent_reason) = match authed_session(&ctx) {
-            Some(s) => match self
-                .identities
-                .delegated_identity_for(&s.session_id, &effective, None)
-                .await
-            {
-                Ok(d) => match d.sender() {
-                    Ok(p) => (Some(p.to_text()), None),
-                    Err(_) => (None, Some("(signed in, but the delegation's principal could not be read)")),
-                },
-                Err(_) => (None, Some("(signed in, but could not derive a delegation for this origin)")),
-            },
-            None => (None, Some("(authenticate to resolve)")),
-        };
 
         let note = match resolved.derivation_origin_source {
             discover::DerivationSource::Declared => None,
@@ -623,11 +607,6 @@ impl IcTools {
             "application_origin: {}\nderivation_origin: {} ({})\n",
             resolved.application_origin, effective, resolved.derivation_origin_source.as_str()
         );
-        if let Some(p) = &principal {
-            text.push_str(&format!("principal: {p}\n"));
-        } else if let Some(reason) = principal_absent_reason {
-            text.push_str(&format!("principal: {reason}\n"));
-        }
         if !resolved.alternative_origins.is_empty() {
             text.push_str(&format!("alternative_origins: {}\n", resolved.alternative_origins.join(", ")));
         }
@@ -639,7 +618,6 @@ impl IcTools {
             derivation_origin: effective,
             derivation_origin_source: resolved.derivation_origin_source.as_str().to_string(),
             alternative_origins: resolved.alternative_origins,
-            principal,
             note,
         };
         Ok(ok_structured(text, &output))
@@ -1522,7 +1500,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
 <h1>Internet Computer MCP PoC</h1>
 <p>MCP endpoints: <code>POST /mcp</code> (beta Internet Identity) · <code>POST /mcp-prod</code> (production Internet Identity)</p>
-<p>Tools: <code>discover_app_canisters</code> (domain → canister ids), <code>icp_find_canister_by_name</code> (name → canister ids), <code>icp_lookup_canister_info_by_id</code> (id → dashboard identity), <code>get_canister_candid</code>, <code>call_canister</code> (anonymously, or as your account at an app — identified by its <code>derivation_origin</code> or <code>app_url</code>, delegation minted on demand), <code>get_app_principal</code> (your principal at an app, no call), <code>list_app_accounts</code> (your Internet Identity accounts at an app), <code>resolve_app</code> (app URL → its Internet Identity derivation origin + principal). Identity results echo <code>derived_for_origin</code>/<code>requested</code> so an origin mismatch is visible. All speak textual Candid.</p>
+<p>Tools: <code>discover_app_canisters</code> (domain → canister ids), <code>icp_find_canister_by_name</code> (name → canister ids), <code>icp_lookup_canister_info_by_id</code> (id → dashboard identity), <code>get_canister_candid</code>, <code>call_canister</code> (anonymously, or as your account at an app — identified by its <code>derivation_origin</code> or <code>app_url</code>, delegation minted on demand), <code>get_app_principal</code> (your principal at an app, no call), <code>list_app_accounts</code> (your Internet Identity accounts at an app), <code>resolve_app</code> (app URL → its Internet Identity derivation origin; no principal — pick an account via <code>get_app_principal</code>). Identity results echo <code>derived_for_origin</code>/<code>requested</code> so an origin mismatch is visible. All speak textual Candid.</p>
 <p>Skills: <code>icp_list_skills</code> / <code>icp_get_skill</code> (the official IC how-to guides — Motoko, mops, icp CLI, cycles, …).</p>
 <p>App docs: <code>get_canister_api_doc</code> (a canister's own "how this app behaves" guide, if it exposes <code>getApiDoc</code>/<code>get_api_doc</code>).</p>
 <p>OQL: <code>icp_oql_guide</code> (dialect), <code>get_canister_oql_schema</code> (entities/fields), <code>run_canister_oql_query</code> (run a JSON query, get a table) — for canisters that expose an OQL <code>schema</code>/<code>execute</code> surface (<code>get_canister_candid</code> reports <code>oql: true</code>).</p>

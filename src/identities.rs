@@ -425,10 +425,11 @@ pub struct ResolveAppOutput {
     /// "which derivation origin the app uses", so do not infer the derivation
     /// origin from it.
     pub alternative_origins: Vec<String>,
-    /// The principal you would act as at `derivation_origin`, if an
-    /// authenticated session is present; otherwise null.
-    pub principal: Option<String>,
     /// A human note, e.g. flagging that the derivation origin was assumed.
+    /// This tool deliberately does NOT return a principal: it resolves the
+    /// derivation origin only, since the caller hasn't chosen an account. Get the
+    /// principal with `get_app_principal` (or `list_app_accounts`) for a specific
+    /// account, passing this `derivation_origin`.
     pub note: Option<String>,
 }
 
