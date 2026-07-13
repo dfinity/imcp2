@@ -509,12 +509,21 @@ fn find_known_app(query: &str) -> Option<&'static KnownApp> {
     if tokens.is_empty() {
         return None;
     }
-    let joined = tokens.concat();
-    KNOWN_APPS.iter().find(|app| {
-        app.aliases
-            .iter()
-            .any(|a| *a == joined.as_str() || tokens.iter().any(|t| t.as_str() == *a))
-    })
+    // Concatenate every CONTIGUOUS window of tokens, so a multi-word name matches
+    // anywhere in a phrase ("use the multi dex app" → the window "multi"+"dex" =
+    // "multidex"). Windows are built from whole tokens, so boundaries are preserved
+    // and a substring inside a single token never matches (e.g. "oisy" in "noisy").
+    let mut windows: Vec<String> = Vec::new();
+    for start in 0..tokens.len() {
+        let mut acc = String::new();
+        for t in &tokens[start..] {
+            acc.push_str(t);
+            windows.push(acc.clone());
+        }
+    }
+    KNOWN_APPS
+        .iter()
+        .find(|app| app.aliases.iter().any(|a| windows.iter().any(|w| w.as_str() == *a)))
 }
 
 /// The Internet Identity derivation context an app URL resolves to. See
@@ -1909,8 +1918,9 @@ mod tests {
     // known app's derivation origin must agree with KNOWN_DERIVATION_ORIGINS.
     #[test]
     fn find_app_by_name_resolves_known_apps_and_directs_others() {
-        // MULTI/DEX matches regardless of punctuation/casing/spacing.
-        for q in ["MULTI/DEX", "multidex", "multi dex", "Use the MULTIDEX app"] {
+        // MULTI/DEX matches regardless of punctuation/casing/spacing, including when
+        // the name is split across tokens inside a longer phrase.
+        for q in ["MULTI/DEX", "multidex", "multi dex", "Use the MULTIDEX app", "Use the MULTI DEX app"] {
             let out = find_app_by_name(q);
             assert_eq!(out.matches.len(), 1, "{q:?} should match one app");
             assert_eq!(out.matches[0].app_url, "https://multidex.ai");

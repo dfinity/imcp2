@@ -55,7 +55,8 @@ Acting **for the user** at an app:
    **`icp_find_app_by_name`** maps the *name* → its URL + `derivation_origin`. For any
    other app there's no on-chain name→URL directory (`icp_find_canister_by_name` finds
    token/SNS canister ids, not front-ends), so take the URL from the user or web-search it.
-1. **`resolve_app(url)`** → the app's `derivation_origin` — concurrently with
+1. **`resolve_app(url)`** → the app's `derivation_origin` — **skip this if step 0's
+   `icp_find_app_by_name` already returned it** — concurrently with
 2. **`discover_app_canisters(url)`** → the backend canister id.
 3. **`list_app_accounts`** — if there's more than one account, ask which to use (and
    remember it).

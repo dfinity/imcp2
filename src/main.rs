@@ -1296,7 +1296,8 @@ impl ServerHandler for IcTools {
              derivation origin; otherwise take the URL from the user or web-search it (there is no \
              on-chain name→URL directory; `icp_find_canister_by_name` finds token/SNS canister ids, \
              not front-ends); (1) \
-             `resolve_app(url)` gives the `derivation_origin`, and concurrently (2) \
+             unless step 0 already returned the `derivation_origin`, `resolve_app(url)` gives it; \
+             concurrently (2) \
              `discover_app_canisters(url)` gives the backend canister id; (3) `list_app_accounts` — \
              if there is more than one account, ask which to use and remember it; (4) \
              `get_app_principal` ONLY when you need the principal value itself (`call_canister` / \
