@@ -2115,12 +2115,15 @@ mod tests {
             assert!(location.contains(needle), "fragment must carry `{needle}`: {location}");
         }
         assert_eq!(
-            h.get(axum::http::header::REFERRER_POLICY).unwrap(),
+            h.get(axum::http::header::REFERRER_POLICY).unwrap().to_str().unwrap(),
             "no-referrer",
             "the redirect must set Referrer-Policy: no-referrer"
         );
         let cookie = h.get(axum::http::header::SET_COOKIE).unwrap().to_str().unwrap();
-        assert!(cookie.contains("mcp_connect="), "the binding cookie must be set: {cookie}");
+        assert!(
+            cookie.contains(&format!("{}=", super::CONNECT_COOKIE)),
+            "the binding cookie must be set: {cookie}"
+        );
     }
 
     // The pinned page ships a strict CSP whose script nonce MATCHES the inline
