@@ -292,7 +292,7 @@ pub struct AccountInfo {
     pub last_used: Option<u64>,
 }
 
-/// Arguments for `get_principal`. Identify the app EITHER by its canonical
+/// Arguments for `get_app_principal`. Identify the app EITHER by its canonical
 /// derivation origin (`derivation_origin`) OR by its URL (`app_url`); provide
 /// exactly one.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -312,13 +312,13 @@ pub struct GetPrincipalArgs {
     /// `derivation_origin_source`). Provide this OR `derivation_origin`.
     #[serde(default)]
     pub app_url: Option<String>,
-    /// Which of your accounts to resolve, by account name (see list_accounts).
+    /// Which of your accounts to resolve, by account name (see list_app_accounts).
     /// Omit to use that app's default account.
     #[serde(default)]
     pub account: Option<String>,
 }
 
-/// Structured output of `get_principal`.
+/// Structured output of `get_app_principal`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct PrincipalOutput {
     /// The effective Internet Identity derivation origin the principal was
@@ -343,7 +343,7 @@ pub struct PrincipalOutput {
     pub read_only: bool,
 }
 
-/// Arguments for `list_accounts`. Identify the app by `derivation_origin` OR
+/// Arguments for `list_app_accounts`. Identify the app by `derivation_origin` OR
 /// `app_url` (exactly one).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListAccountsArgs {
@@ -353,12 +353,12 @@ pub struct ListAccountsArgs {
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
     /// The application's URL; the connector resolves its derivation origin (see
-    /// `get_principal`). Provide this OR `derivation_origin`.
+    /// `get_app_principal`). Provide this OR `derivation_origin`.
     #[serde(default)]
     pub app_url: Option<String>,
 }
 
-/// One account in the `list_accounts` MCP output (a serialization mirror of
+/// One account in the `list_app_accounts` MCP output (a serialization mirror of
 /// [`AccountInfo`]).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct AccountEntry {
@@ -380,7 +380,7 @@ impl From<&AccountInfo> for AccountEntry {
     }
 }
 
-/// Structured output of `list_accounts`.
+/// Structured output of `list_app_accounts`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct AccountsOutput {
     /// The effective Internet Identity derivation origin the accounts belong to.
@@ -555,7 +555,7 @@ impl Identities {
 
     /// This session's known access level: `Some(true)` = read-only, `Some(false)`
     /// = full, `None` = not yet learned (the best-effort completion POST didn't
-    /// arrive). Surfaced by `get_principal` so the agent can set expectations.
+    /// arrive). Surfaced by `get_app_principal` so the agent can set expectations.
     pub async fn is_read_only(&self, session_id: &str) -> Option<bool> {
         let sessions = self.sessions.read().await;
         sessions.get(session_id).and_then(|s| s.read_only)
@@ -772,7 +772,7 @@ impl Identities {
         let mut matching = accounts.iter().filter(|a| a.name.as_deref() == Some(name));
         match (matching.next(), matching.next()) {
             (None, _) => Err(format!(
-                "no account named \"{name}\" at {domain} — call list_accounts(domain) to see your \
+                "no account named \"{name}\" at {domain} — call list_app_accounts(domain) to see your \
                  accounts there, or omit `account` to use the default one"
             )),
             (Some(a), None) => Ok(a.account_number),

@@ -18,7 +18,7 @@
 //! There is NO authoritative reverse lookup for "this site's backend" — (1)
 //! is declared by the app itself and (2) is certain for the frontend; (3) and
 //! (4) are mined from client code, so each result carries its provenance and
-//! the caller decides (and should confirm with `get_candid`).
+//! the caller decides (and should confirm with `get_canister_candid`).
 
 use std::{
     collections::BTreeMap,
@@ -51,7 +51,7 @@ pub struct Found {
     pub kind: Option<String>,
 }
 
-/// One canister discovered behind a web domain — the `discover_canisters` MCP
+/// One canister discovered behind a web domain — the `discover_app_canisters` MCP
 /// output shape (a serialization mirror of [`Found`]).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DiscoveredCanister {
@@ -83,14 +83,14 @@ impl From<&Found> for DiscoveredCanister {
     }
 }
 
-/// Arguments for `discover_canisters`.
+/// Arguments for `discover_app_canisters`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DiscoverCanistersArgs {
     /// A web domain or URL served from the IC, e.g. "oisy.com".
     pub domain: String,
 }
 
-/// Structured output of `discover_canisters`.
+/// Structured output of `discover_app_canisters`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DiscoverOutput {
     /// The domain that was probed.
@@ -100,7 +100,7 @@ pub struct DiscoverOutput {
 }
 
 impl From<(String, Vec<Found>)> for DiscoverOutput {
-    /// `(domain, found)` → the structured `discover_canisters` reply.
+    /// `(domain, found)` → the structured `discover_app_canisters` reply.
     fn from((domain, found): (String, Vec<Found>)) -> Self {
         Self {
             domain,
@@ -938,7 +938,7 @@ fn resolve_base(configured: Option<String>, default: &str) -> String {
 }
 
 /// Shared HTTP client for dashboard/registry calls (fixed public hosts) and the
-/// `lookup_canister` tool. Carries the SSRF redirect guard so a 3xx can never
+/// `icp_lookup_canister_info_by_id` tool. Carries the SSRF redirect guard so a 3xx can never
 /// bounce a request onto an internal host. Short-ish timeout since these back
 /// interactive tools. (User-supplied *site* fetches use [`site_client`], which
 /// additionally pins the resolved address.)
@@ -967,14 +967,14 @@ pub struct CanisterInfo {
     pub latest_upgrade_proposal: Option<u64>,
 }
 
-/// Arguments for `lookup_canister`.
+/// Arguments for `icp_lookup_canister_info_by_id`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LookupCanisterArgs {
     /// Canister principal to identify, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai".
     pub canister_id: String,
 }
 
-/// The `lookup_canister` MCP output shape — the IC dashboard's identity for a
+/// The `icp_lookup_canister_info_by_id` MCP output shape — the IC dashboard's identity for a
 /// canister id (a serialization mirror of [`CanisterInfo`]).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CanisterIdentityOutput {
@@ -1108,7 +1108,7 @@ pub struct Match {
     pub note: Option<String>,
 }
 
-/// One canister matched by `find_canister` — the MCP output shape (a
+/// One canister matched by `icp_find_canister_by_name` — the MCP output shape (a
 /// serialization mirror of [`Match`]).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct FoundCanister {
@@ -1133,7 +1133,7 @@ impl From<&Match> for FoundCanister {
     }
 }
 
-/// Arguments for `find_canister`.
+/// Arguments for `icp_find_canister_by_name`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FindCanisterArgs {
     /// A name, token symbol, or project to search for, e.g. "ckUSDC", "ICP",
@@ -1141,7 +1141,7 @@ pub struct FindCanisterArgs {
     pub query: String,
 }
 
-/// Structured output of `find_canister`.
+/// Structured output of `icp_find_canister_by_name`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct FindCanisterOutput {
     /// The name, token symbol, or project that was searched for.
@@ -1152,7 +1152,7 @@ pub struct FindCanisterOutput {
 }
 
 impl From<(String, Vec<Match>)> for FindCanisterOutput {
-    /// `(query, matches)` → the structured `find_canister` reply.
+    /// `(query, matches)` → the structured `icp_find_canister_by_name` reply.
     fn from((query, matches): (String, Vec<Match>)) -> Self {
         Self {
             query,
@@ -1285,7 +1285,7 @@ fn search_in(ledgers_json: &str, snses_json: &str, query: &str) -> Vec<Match> {
                     name,
                     kind: "sns".into(),
                     note: Some(
-                        "SNS project root — lookup_canister (or the SNS detail API) expands it \
+                        "SNS project root — icp_lookup_canister_info_by_id (or the SNS detail API) expands it \
                          to governance/ledger/swap/index"
                             .into(),
                     ),

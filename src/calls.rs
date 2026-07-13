@@ -1,4 +1,4 @@
-//! The direct canister-call layer: `get_candid` (read a canister's Candid
+//! The direct canister-call layer: `get_canister_candid` (read a canister's Candid
 //! interface) and `call_canister` (invoke a method with textual Candid in and
 //! out). The LLM only ever deals with textual Candid — the binary
 //! encoding/decoding against a method's declared types happens here, and the
@@ -25,14 +25,14 @@ use serde::{Deserialize, Serialize};
 // never touches binary Candid).
 // ===========================================================================
 
-/// Arguments for `get_candid`.
+/// Arguments for `get_canister_candid`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetCandidArgs {
     /// Canister principal, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai" (the ICP ledger).
     pub canister_id: String,
 }
 
-/// Output of `get_candid`.
+/// Output of `get_canister_candid`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct GetCandidOutput {
     /// The canister whose interface was read.
@@ -53,29 +53,29 @@ pub struct OqlGuideOutput {
     pub content: String,
 }
 
-/// Arguments for `oql_query`.
+/// Arguments for `run_canister_oql_query`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OqlQueryArgs {
-    /// Canister principal that exposes the OQL surface (get_candid reports
+    /// Canister principal that exposes the OQL surface (get_canister_candid reports
     /// `oql: true`).
     pub canister_id: String,
     /// The OQL query as a JSON object string — passed straight to the canister's
     /// `execute` method, so NO Candid escaping is needed (write plain JSON). E.g.
     /// `{"start":"employee","where":{"icontains":{"field":"lastName","value":"smith"}},"select":["firstName","lastName"],"limit":10}`.
-    /// See get_oql_guide (or oql_schema) for the dialect and entity/field names.
+    /// See get_oql_guide (or get_canister_oql_schema) for the dialect and entity/field names.
     pub query: String,
     /// Query AS the user's account at an app, given its canonical Internet
     /// Identity derivation origin (not necessarily the visible URL). Accepts the
     /// legacy name `domain`. Omit to query anonymously.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
-    /// Which of your accounts to act as, by account name (see list_accounts).
+    /// Which of your accounts to act as, by account name (see list_app_accounts).
     /// Omit for that app's default account; ignored when querying anonymously.
     #[serde(default)]
     pub account: Option<String>,
 }
 
-/// Output of `oql_query`: the `execute` result decoded into a table.
+/// Output of `run_canister_oql_query`: the `execute` result decoded into a table.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct OqlQueryOutput {
     /// The canister that was queried.
@@ -88,10 +88,10 @@ pub struct OqlQueryOutput {
     pub has_more: bool,
 }
 
-/// Arguments for `oql_schema`.
+/// Arguments for `get_canister_oql_schema`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OqlSchemaArgs {
-    /// Canister principal that exposes the OQL surface (get_candid reports
+    /// Canister principal that exposes the OQL surface (get_canister_candid reports
     /// `oql: true`).
     pub canister_id: String,
     /// Read AS the user's account at an app, given its canonical Internet
@@ -99,13 +99,13 @@ pub struct OqlSchemaArgs {
     /// legacy name `domain`. Omit to read anonymously.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
-    /// Which of your accounts to act as (see list_accounts). Ignored when reading
+    /// Which of your accounts to act as (see list_app_accounts). Ignored when reading
     /// anonymously.
     #[serde(default)]
     pub account: Option<String>,
 }
 
-/// Output of `oql_schema`.
+/// Output of `get_canister_oql_schema`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct OqlSchemaOutput {
     /// The canister whose schema was read.
@@ -161,14 +161,14 @@ pub struct CallCanisterArgs {
     /// Alternative to `derivation_origin`.
     #[serde(default)]
     pub app_url: Option<String>,
-    /// Which of your accounts to act as, by account name (see list_accounts).
+    /// Which of your accounts to act as, by account name (see list_app_accounts).
     /// Omit to use that app's default account. Ignored for anonymous calls.
     #[serde(default)]
     pub account: Option<String>,
     /// Optional Candid service definition (`.did` text) for the canister. Used to
     /// encode the args to the method's declared types and decode the reply, for
     /// when the canister's own `candid:service` metadata can't be read (e.g.
-    /// access-restricted) — get it from get_candid, or ask the user for it.
+    /// access-restricted) — get it from get_canister_candid, or ask the user for it.
     #[serde(default)]
     pub candid: Option<String>,
 }
@@ -428,7 +428,7 @@ pub fn has_oql(did: &str) -> bool {
 }
 
 // ===========================================================================
-// OQL execute/schema support (for the `oql_query` / `oql_schema` tools). The
+// OQL execute/schema support (for the `run_canister_oql_query` / `get_canister_oql_schema` tools). The
 // server does not model the OQL query language — it wraps the JSON query as the
 // single `text` argument `execute` expects (so the model never hand-escapes
 // JSON inside a Candid text literal) and decodes the tabular reply.
@@ -842,7 +842,7 @@ mod tests {
             .expect("encode value")
     }
 
-    // oql_query decoding: a `variant { ok = record { hasMore; rows } }` reply with
+    // run_canister_oql_query decoding: a `variant { ok = record { hasMore; rows } }` reply with
     // variant-wrapped cell values decodes into ordered columns + string rows, the
     // paging flag is read, an `err` arm surfaces as a QueryError, and a
     // non-conforming reply degrades to Unrecognized (never a panic).

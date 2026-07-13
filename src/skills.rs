@@ -90,18 +90,18 @@ pub struct SkillUrls {
     pub markdown: String,
 }
 
-/// Arguments for `get_ic_skill`.
+/// Arguments for `icp_get_skill`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetSkillArgs {
     /// Skill name, e.g. "motoko", "icp-cli", "cycles-management".
     pub name: String,
 }
 
-/// One skill in the `list_ic_skills` MCP output (the catalogue-facing subset of
+/// One skill in the `icp_list_skills` MCP output (the catalogue-facing subset of
 /// [`SkillEntry`] — the internal fetch `urls` are intentionally omitted).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct SkillSummary {
-    /// The skill name to pass to get_ic_skill, e.g. "motoko".
+    /// The skill name to pass to icp_get_skill, e.g. "motoko".
     pub name: String,
     /// The skill's human title.
     pub title: String,
@@ -122,7 +122,7 @@ impl From<&SkillEntry> for SkillSummary {
     }
 }
 
-/// Structured output of `list_ic_skills`.
+/// Structured output of `icp_list_skills`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct SkillsOutput {
     /// The available IC skills.
@@ -137,7 +137,7 @@ impl From<Vec<SkillEntry>> for SkillsOutput {
     }
 }
 
-/// Structured output of `get_ic_skill`.
+/// Structured output of `icp_get_skill`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct SkillOutput {
     /// The skill name.
@@ -209,7 +209,7 @@ impl SkillsCatalog {
         let entry = skills.iter().find(|s| s.name.eq_ignore_ascii_case(name));
         if entry.is_none() {
             return Err(format!(
-                "no skill named `{name}` — call list_ic_skills to see the available skills"
+                "no skill named `{name}` — call icp_list_skills to see the available skills"
             ));
         }
         // Use the manifest's markdown URL only when it stays on the configured
@@ -232,7 +232,7 @@ impl SkillsCatalog {
             .map_err(|e| format!("reading skill `{name}`: {e}"))
     }
 
-    /// Render the catalogue grouped by category for the `list_ic_skills` tool.
+    /// Render the catalogue grouped by category for the `icp_list_skills` tool.
     pub fn format_list(skills: &[SkillEntry]) -> String {
         use std::collections::BTreeMap;
         let mut by_cat: BTreeMap<&str, Vec<&SkillEntry>> = BTreeMap::new();
@@ -246,7 +246,7 @@ impl SkillsCatalog {
         }
         let mut out = String::from(
             "Internet Computer skills — authoritative how-to guides. Load one with \
-             get_ic_skill(name).\n",
+             icp_get_skill(name).\n",
         );
         for (cat, mut items) in by_cat {
             items.sort_by(|a, b| a.name.cmp(&b.name));
