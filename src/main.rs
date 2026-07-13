@@ -1098,16 +1098,20 @@ fn canonicalize_derivation_origin(cleaned: &str) -> Result<String, String> {
     // has one, so `https://user@host` would derive a different principal than
     // `https://host` while `requested == derived_for_origin` hides the mismatch. This
     // also rejects a host-less input ("https://") and embedded spaces/invalid chars.
-    let valid = url::Url::parse(&origin).ok().map_or(false, |u| {
+    let parsed = url::Url::parse(&origin).ok().filter(|u| {
         u.scheme() == "https"
             && u.host_str().map_or(false, |h| !h.is_empty())
             && u.username().is_empty()
             && u.password().is_none()
     });
-    if !valid {
-        return Err(invalid());
+    match parsed {
+        // Reserialize to a canonical ASCII origin (lowercased host, no path/user-info),
+        // exactly like the `app_url` path (`Url::origin().ascii_serialization()`), so a
+        // mixed-case host echoes identically and hits the same delegation-cache key
+        // instead of forking `https://Example.com` vs `https://example.com`.
+        Some(u) if u.origin().is_tuple() => Ok(u.origin().ascii_serialization()),
+        _ => Err(invalid()),
     }
-    Ok(origin)
 }
 
 /// Validate + canonicalize the optional `derivation_origin` taken by the tools that
@@ -2069,6 +2073,18 @@ mod tests {
             .expect("uppercase https scheme must be accepted")
             .expect("a derivation_origin yields a target");
         assert_eq!(t.origin, "https://example.com", "unexpected origin: {}", t.origin);
+    }
+
+    // A mixed-case HOST is canonicalized to lowercase, so the echoed origin and the
+    // delegation-cache key match the app_url path (which serializes via Url::origin())
+    // instead of forking `https://Example.COM` from `https://example.com`.
+    #[tokio::test]
+    async fn resolve_identity_target_lowercases_host() {
+        let t = super::resolve_identity_target(Some("https://Example.COM".to_string()), None)
+            .await
+            .expect("mixed-case host must be accepted")
+            .expect("a derivation_origin yields a target");
+        assert_eq!(t.origin, "https://example.com", "host must be lowercased: {}", t.origin);
     }
 
     // A `derivation_origin` with no host (e.g. "https://") reduces to an empty
