@@ -139,14 +139,14 @@ pub struct OqlSchemaOutput {
     pub requested: Option<String>,
 }
 
-/// Arguments for `get_api_doc`.
+/// Arguments for `get_canister_api_doc`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ApiDocArgs {
     /// Canister principal to read the API documentation from.
     pub canister_id: String,
 }
 
-/// Output of `get_api_doc`.
+/// Output of `get_canister_api_doc`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ApiDocOutput {
     /// The canister the doc came from.
