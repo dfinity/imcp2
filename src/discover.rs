@@ -457,6 +457,99 @@ fn known_derivation_origin(host: &str) -> Option<&'static str> {
         .map(|(_, origin)| *origin)
 }
 
+/// A well-known IC app, for NAME → app resolution by the `icp_find_app_by_name`
+/// tool. There is no on-chain directory mapping an app name to its front-end URL,
+/// so this covers only a small curated set; anything else is directed to a web
+/// lookup. The derivation origin is NOT stored here — it's derived from the single
+/// source of truth [`KNOWN_DERIVATION_ORIGINS`] via the `app_url`'s host, so the two
+/// can't drift. (Every `app_url` host is a registry key — asserted by test.)
+struct KnownApp {
+    /// Display name.
+    name: &'static str,
+    /// Aliases (lowercase, no separators) matched by [`find_known_app`] against the
+    /// concatenation of any contiguous run of query tokens — an alias equals a whole
+    /// token (e.g. "oisy" in "the oisy wallet") or adjacent tokens joined (e.g.
+    /// "multi dex" / "MULTI/DEX" → "multidex").
+    aliases: &'static [&'static str],
+    /// The app's canonical front-end URL (feed to `discover_app_canisters` /
+    /// `resolve_app`). Its host keys the derivation origin in [`KNOWN_DERIVATION_ORIGINS`].
+    app_url: &'static str,
+}
+
+const KNOWN_APPS: &[KnownApp] = &[
+    KnownApp { name: "NNS", aliases: &["nns", "nnsdapp"], app_url: "https://nns.internetcomputer.org" },
+    KnownApp { name: "Oisy", aliases: &["oisy", "oisywallet"], app_url: "https://oisy.com" },
+    KnownApp { name: "MULTI/DEX", aliases: &["multidex"], app_url: "https://multidex.ai" },
+    KnownApp { name: "ICPSwap", aliases: &["icpswap"], app_url: "https://app.icpswap.com" },
+];
+
+/// The derivation origin for a well-known app, from the single source of truth
+/// [`KNOWN_DERIVATION_ORIGINS`] (keyed by the `app_url`'s host). Falls back to the
+/// app URL itself only if the host somehow isn't registered (a test rules that out
+/// for every [`KNOWN_APPS`] entry).
+fn known_app_derivation_origin(app: &KnownApp) -> &'static str {
+    url::Url::parse(app.app_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .and_then(|h| known_derivation_origin(&h))
+        .unwrap_or(app.app_url)
+}
+
+/// Find a well-known app by name. The query is split into lowercase alphanumeric
+/// TOKENS (on any non-alphanumeric boundary); an alias matches if it equals the
+/// concatenation of any contiguous run of tokens — a single token (e.g. "oisy" in
+/// "the oisy wallet") or adjacent tokens joined (e.g. "multi dex" / "MULTI/DEX" /
+/// "use the multi dex app" → "multidex"). Matching on whole-token boundaries — not
+/// substrings — avoids false positives like "noisy" resolving to "oisy" while still
+/// tolerating punctuation/spacing/casing variants.
+fn find_known_app(query: &str) -> Option<&'static KnownApp> {
+    // Reject an implausibly long query up front — O(1), before any allocation — so a
+    // pathological input can't be copied into `tokens`/`acc` at all. A real app name
+    // (even inside a short phrase) is well under this; anything larger isn't one.
+    const MAX_QUERY_BYTES: usize = 256;
+    if query.len() > MAX_QUERY_BYTES {
+        return None;
+    }
+    // Cap the token count so a pathologically long query can't drive quadratic work;
+    // an app name won't be buried past a handful of tokens.
+    const MAX_TOKENS: usize = 64;
+    let tokens: Vec<String> = query
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .take(MAX_TOKENS)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    // Match an alias against the concatenation of any CONTIGUOUS token window, so a
+    // multi-word name matches anywhere in a phrase ("use the multi dex app" → the
+    // window "multi"+"dex" = "multidex"). Windows are built from whole tokens, so
+    // boundaries are preserved and a substring inside one token never matches (e.g.
+    // "oisy" in "noisy"). Bounded: a window is abandoned once it grows past the
+    // longest alias (it — and every longer window — can't match), and it's checked
+    // in place rather than materializing every window.
+    let max_alias = KNOWN_APPS
+        .iter()
+        .flat_map(|app| app.aliases.iter())
+        .map(|a| a.len())
+        .max()
+        .unwrap_or(0);
+    for start in 0..tokens.len() {
+        let mut acc = String::new();
+        for t in &tokens[start..] {
+            acc.push_str(t);
+            if acc.len() > max_alias {
+                break;
+            }
+            if let Some(app) = KNOWN_APPS.iter().find(|app| app.aliases.contains(&acc.as_str())) {
+                return Some(app);
+            }
+        }
+    }
+    None
+}
+
 /// The Internet Identity derivation context an app URL resolves to. See
 /// [`resolve_app_identity`].
 pub struct AppIdentity {
@@ -1220,6 +1313,78 @@ impl From<(String, Vec<Match>)> for FindCanisterOutput {
     }
 }
 
+/// Arguments for `icp_find_app_by_name`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FindAppArgs {
+    /// The app name to look up, e.g. "Oisy", "NNS", "MULTI/DEX", "ICPSwap".
+    pub name: String,
+}
+
+/// One well-known app matched by `icp_find_app_by_name`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct AppMatch {
+    /// The app's display name.
+    pub name: String,
+    /// The app's canonical front-end URL — feed it to `discover_app_canisters` /
+    /// `resolve_app`.
+    pub app_url: String,
+    /// The app's Internet Identity derivation origin (lets you skip `resolve_app`).
+    pub derivation_origin: String,
+}
+
+/// Structured output of `icp_find_app_by_name`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct FindAppOutput {
+    /// The name that was looked up.
+    pub query: String,
+    /// Matching well-known apps (usually zero or one). Empty when the app isn't in
+    /// the connector's built-in set.
+    pub matches: Vec<AppMatch>,
+    /// Next-step guidance: how to proceed on a match, or an instruction to web-search
+    /// the app's URL when there's no match.
+    pub note: String,
+}
+
+/// Resolve an app NAME against the built-in set of well-known apps
+/// ([`KNOWN_APPS`]). Pure/offline — there is no on-chain directory mapping an app
+/// name to its front-end URL, so an unknown name yields no match and a `note`
+/// directing the agent to do a web search for the official URL.
+pub fn find_app_by_name(query: &str) -> FindAppOutput {
+    match find_known_app(query) {
+        Some(app) => {
+            let derivation_origin = known_app_derivation_origin(app);
+            FindAppOutput {
+                query: query.to_string(),
+                matches: vec![AppMatch {
+                    name: app.name.to_string(),
+                    app_url: app.app_url.to_string(),
+                    derivation_origin: derivation_origin.to_string(),
+                }],
+                note: format!(
+                    "Well-known app. Use discover_app_canisters(\"{}\") to find its canisters; its \
+                     derivation origin is already {} (no resolve_app needed).",
+                    app.app_url, derivation_origin
+                ),
+            }
+        }
+        None => {
+            // Build the known-app list from KNOWN_APPS (the source of truth) so this
+            // message can't drift when the set changes.
+            let known = KNOWN_APPS.iter().map(|a| a.name).collect::<Vec<_>>().join(", ");
+            FindAppOutput {
+                query: query.to_string(),
+                matches: Vec::new(),
+                note: format!(
+                    "\"{query}\" is not in the connector's small built-in set of well-known apps \
+                     ({known}). There is no on-chain directory mapping an app NAME to its URL, so \
+                     do a WEB SEARCH for the app's official front-end URL, then call resolve_app / \
+                     discover_app_canisters with that URL."
+                ),
+            }
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct LedgersResp {
     #[serde(default)]
@@ -1773,6 +1938,59 @@ mod tests {
                 known_derivation_origin(&d_host),
                 Some(*origin),
                 "derivation origin {origin} (from entry {host}) must itself be a registry key mapping to itself",
+            );
+        }
+    }
+
+    // icp_find_app_by_name maps a well-known app NAME (in various forms) to its URL +
+    // derivation origin; an unknown name yields no match and a web-lookup note. Each
+    // known app's derivation origin must agree with KNOWN_DERIVATION_ORIGINS.
+    #[test]
+    fn find_app_by_name_resolves_known_apps_and_directs_others() {
+        // MULTI/DEX matches regardless of punctuation/casing/spacing, including when
+        // the name is split across tokens inside a longer phrase.
+        for q in ["MULTI/DEX", "multidex", "multi dex", "Use the MULTIDEX app", "Use the MULTI DEX app"] {
+            let out = find_app_by_name(q);
+            assert_eq!(out.matches.len(), 1, "{q:?} should match one app");
+            assert_eq!(out.matches[0].app_url, "https://multidex.ai");
+            // Derive the expected origin from the registry (single source of truth),
+            // don't re-hard-code it.
+            assert_eq!(
+                out.matches[0].derivation_origin,
+                known_derivation_origin("multidex.ai").unwrap(),
+            );
+        }
+        assert_eq!(find_app_by_name("Oisy").matches[0].app_url, "https://oisy.com");
+        assert_eq!(find_app_by_name("nns").matches[0].app_url, "https://nns.internetcomputer.org");
+        assert_eq!(find_app_by_name("ICPSwap").matches[0].app_url, "https://app.icpswap.com");
+
+        // The derivation origin is DERIVED from KNOWN_DERIVATION_ORIGINS (single
+        // source of truth), so every app_url host must be a registry key — otherwise
+        // known_app_derivation_origin would silently fall back to the app URL.
+        for app in KNOWN_APPS {
+            let host = url::Url::parse(app.app_url).unwrap().host_str().unwrap().to_ascii_lowercase();
+            assert!(
+                known_derivation_origin(&host).is_some(),
+                "{}'s app_url host {host} must be a key in KNOWN_DERIVATION_ORIGINS \
+                 (the derivation origin is derived from it, not stored)",
+                app.name,
+            );
+            // And the derived origin is exactly the registry value.
+            assert_eq!(known_app_derivation_origin(app), known_derivation_origin(&host).unwrap());
+        }
+
+        // An unknown app: no match, and the note points to a web search.
+        let unknown = find_app_by_name("Totally Unknown DApp");
+        assert!(unknown.matches.is_empty());
+        assert!(unknown.note.to_lowercase().contains("web search"), "note: {}", unknown.note);
+        // Blank / punctuation-only input doesn't match anything.
+        assert!(find_app_by_name("   /  ").matches.is_empty());
+        // Token-boundary matching: a word that merely CONTAINS an alias as a
+        // substring must NOT match (these all would have under the old contains rule).
+        for q in ["noisy", "a noisy afternoon", "annoisyance", "icpswapper", "multidexchange"] {
+            assert!(
+                find_app_by_name(q).matches.is_empty(),
+                "{q:?} must not match a known app (substring false positive)",
             );
         }
     }
