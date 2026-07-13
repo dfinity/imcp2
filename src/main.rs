@@ -166,7 +166,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Run an OQL query against a canister that exposes the OQL surface (get_canister_candid reports `oql: true`). Pass the query as a JSON object string in `query` (see get_oql_guide / get_canister_oql_schema for the dialect and field names) — it's sent to the canister's `execute` query method, so NO Candid escaping is needed. Returns the result decoded as `columns` + `rows` (rendered as a markdown table), with `has_more` for paging (re-query with a higher `offset`). Omit `derivation_origin` to query anonymously, or pass the app's canonical Internet Identity derivation origin to query as your account there.",
+        description = "Run an OQL query against a canister that exposes the OQL surface (get_canister_candid reports `oql: true`). Pass the query as a JSON object string in `query` (see get_oql_guide / get_canister_oql_schema for the dialect and field names) — it's sent to the canister's `execute` query method, so NO Candid escaping is needed. Returns the result decoded as `columns` + `rows` (rendered as a markdown table), with `has_more` for paging (re-query with a higher `offset`). Omit `derivation_origin` to query anonymously, or pass the app's canonical Internet Identity derivation origin to query as your account there — the result then echoes `derived_for_origin` / `requested` / `acted_as_principal` so an origin mismatch is visible.",
         annotations(title = "Run an OQL query", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::OqlQueryOutput>(),
     )]
@@ -189,17 +189,31 @@ impl IcTools {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
         };
+        // Echo the effective derivation origin + acted-as principal (like
+        // call_canister) so a canonicalization / wrong-origin mismatch is visible
+        // even to text-only clients. `requested` is what the caller supplied
+        // (trimmed); `derived_for_origin` is the canonical origin actually used.
+        let requested = derivation_origin.as_ref().map(|s| s.trim().to_string());
         let origin = match clean_derivation_origin(derivation_origin) {
             Ok(o) => o,
             Err(e) => return Ok(err(e)),
         };
-        let (agent, _acted_as) = match self
+        let (agent, acted_as) = match self
             .resolve_agent(&ctx, origin.as_deref(), account.as_deref(), "querying")
             .await
         {
             Ok(a) => a,
             Err(e) => return Ok(err(e)),
         };
+        let identity_note = origin.as_ref().map(|o| {
+            let target = IdentityTarget {
+                origin: o.clone(),
+                requested: requested.clone().unwrap_or_else(|| o.clone()),
+                source: "explicit".to_string(),
+                application_origin: None,
+            };
+            identity_annotation(&target, acted_as.as_deref())
+        });
         let reply = match calls::raw_call(&agent, principal, "execute", arg_bytes, true).await {
             Ok(b) => b,
             Err(e) => return Ok(err(format!("OQL execute failed: {e}"))),
@@ -209,8 +223,19 @@ impl IcTools {
         let did = calls::resolve_did(&agent, principal, None).await;
         match calls::parse_execute_reply(did.as_deref(), &reply) {
             calls::OqlResult::Table { columns, rows, has_more } => {
-                let text = calls::render_table(&columns, &rows, has_more);
-                let output = calls::OqlQueryOutput { canister_id, columns, rows, has_more };
+                let mut text = calls::render_table(&columns, &rows, has_more);
+                if let Some(note) = &identity_note {
+                    text.push_str(&format!("\n\n{note}"));
+                }
+                let output = calls::OqlQueryOutput {
+                    canister_id,
+                    columns,
+                    rows,
+                    has_more,
+                    acted_as_principal: acted_as,
+                    derived_for_origin: origin,
+                    requested,
+                };
                 Ok(ok_structured(text, &output))
             }
             calls::OqlResult::QueryError(msg) => {
@@ -219,22 +244,27 @@ impl IcTools {
             calls::OqlResult::Unrecognized(raw) => {
                 // Not a recognizable OQL result — hand back the raw decoded reply
                 // so the model still has the data (empty table in the structured form).
+                let mut text =
+                    format!("(Could not parse this as an OQL table; raw reply below.)\n\n{raw}");
+                if let Some(note) = &identity_note {
+                    text.push_str(&format!("\n\n{note}"));
+                }
                 let output = calls::OqlQueryOutput {
                     canister_id,
                     columns: Vec::new(),
                     rows: Vec::new(),
                     has_more: false,
+                    acted_as_principal: acted_as,
+                    derived_for_origin: origin,
+                    requested,
                 };
-                Ok(ok_structured(
-                    format!("(Could not parse this as an OQL table; raw reply below.)\n\n{raw}"),
-                    &output,
-                ))
+                Ok(ok_structured(text, &output))
             }
         }
     }
 
     #[tool(
-        description = "Fetch the OQL schema catalogue of a canister that exposes the OQL surface (get_canister_candid reports `oql: true`): its entities, their primary keys, fields, and edges, as JSON. Call this before run_canister_oql_query so you know the queryable entities and exact field names. Omit `derivation_origin` to read anonymously, or pass the app's canonical Internet Identity derivation origin to read as your account there.",
+        description = "Fetch the OQL schema catalogue of a canister that exposes the OQL surface (get_canister_candid reports `oql: true`): its entities, their primary keys, fields, and edges, as JSON. Call this before run_canister_oql_query so you know the queryable entities and exact field names. Omit `derivation_origin` to read anonymously, or pass the app's canonical Internet Identity derivation origin to read as your account there — the result then echoes `derived_for_origin` / `requested` / `acted_as_principal` so an origin mismatch is visible.",
         annotations(title = "Get the OQL schema", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::OqlSchemaOutput>(),
     )]
@@ -251,11 +281,12 @@ impl IcTools {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
         };
+        let requested = derivation_origin.as_ref().map(|s| s.trim().to_string());
         let origin = match clean_derivation_origin(derivation_origin) {
             Ok(o) => o,
             Err(e) => return Ok(err(e)),
         };
-        let (agent, _acted_as) = match self
+        let (agent, acted_as) = match self
             .resolve_agent(&ctx, origin.as_deref(), account.as_deref(), "reading the schema")
             .await
         {
@@ -267,8 +298,26 @@ impl IcTools {
             Err(e) => return Ok(err(format!("OQL schema call failed: {e}"))),
         };
         let schema = calls::decode_schema_reply(&reply);
-        let output = calls::OqlSchemaOutput { canister_id, schema };
-        Ok(ok_structured(output.schema.clone(), &output))
+        // Echo the effective derivation origin + acted-as principal (like the other
+        // identity tools), so a mismatch is visible even to text-only clients.
+        let mut text = schema.clone();
+        if let Some(o) = origin.as_ref() {
+            let target = IdentityTarget {
+                origin: o.clone(),
+                requested: requested.clone().unwrap_or_else(|| o.clone()),
+                source: "explicit".to_string(),
+                application_origin: None,
+            };
+            text.push_str(&format!("\n\n{}", identity_annotation(&target, acted_as.as_deref())));
+        }
+        let output = calls::OqlSchemaOutput {
+            canister_id,
+            schema,
+            acted_as_principal: acted_as,
+            derived_for_origin: origin,
+            requested,
+        };
+        Ok(ok_structured(text, &output))
     }
 
     #[tool(
@@ -969,11 +1018,15 @@ struct IdentityTarget {
 
 /// Resolve the caller's `derivation_origin` / `app_url` into an [`IdentityTarget`]
 /// (or `None` when neither is given — an anonymous call). An explicit
-/// `derivation_origin` is canonicalized and used verbatim; an `app_url` is
-/// resolved to the app's DECLARED derivation origin when it publishes one, else
-/// defaulted to the application origin (flagged `app_url_default`). Both routes
-/// pass through the same canonicalizer the delegation path uses, so the echoed
-/// `origin` is exactly what Internet Identity derives against.
+/// `derivation_origin` is canonicalized and used verbatim (source `explicit`); an
+/// `app_url` is resolved by [`discover::resolve_app_identity`] with precedence
+/// DECLARED (the app's `/.well-known/ic-app.json`) > KNOWN (the built-in
+/// `KNOWN_DERIVATION_ORIGINS` registry of well-known custom-origin apps) > the
+/// application origin (flagged `app_url_default`) — so the source can be
+/// `declared`, `known`, or
+/// `app_url_default`. Both routes pass through the same canonicalizer the
+/// delegation path uses, so the echoed `origin` is exactly what Internet Identity
+/// derives against.
 async fn resolve_identity_target(
     derivation_origin: Option<String>,
     app_url: Option<String>,

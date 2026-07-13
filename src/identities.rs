@@ -307,9 +307,12 @@ pub struct GetPrincipalArgs {
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
     /// The application's URL (e.g. "https://oisy.com"). The connector resolves
-    /// its derivation origin: the app's declared one (`/.well-known/ic-app.json`)
-    /// if present, else the application origin (an assumption — see the result's
-    /// `derivation_origin_source`). Provide this OR `derivation_origin`.
+    /// its derivation origin, precedence: the app's declared one
+    /// (`/.well-known/ic-app.json`) if present (`derivation_origin_source` =
+    /// "declared"), else a built-in known-app value for a few apps that pin a
+    /// custom origin without declaring it ("known"), else the application origin
+    /// (an assumption — "app_url_default"). See the result's
+    /// `derivation_origin_source`. Provide this OR `derivation_origin`.
     #[serde(default)]
     pub app_url: Option<String>,
     /// Which of your accounts to resolve, by account name (see list_app_accounts).

@@ -86,6 +86,18 @@ pub struct OqlQueryOutput {
     pub rows: Vec<Vec<String>>,
     /// True when more rows remain — re-query with a higher `offset` to page.
     pub has_more: bool,
+    /// The principal the query was signed as — null for an anonymous query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acted_as_principal: Option<String>,
+    /// When querying as an app account: the effective Internet Identity derivation
+    /// origin used (after canonicalization). Null for anonymous queries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_for_origin: Option<String>,
+    /// When querying as an app account: exactly what you supplied as
+    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` (from
+    /// canonicalization) is visible. Null for anonymous queries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<String>,
 }
 
 /// Arguments for `get_canister_oql_schema`.
@@ -113,6 +125,18 @@ pub struct OqlSchemaOutput {
     /// The entity/field/edge catalogue returned by `schema` (JSON text,
     /// pretty-printed when it parses).
     pub schema: String,
+    /// The principal the read was signed as — null for an anonymous read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acted_as_principal: Option<String>,
+    /// When reading as an app account: the effective Internet Identity derivation
+    /// origin used (after canonicalization). Null for anonymous reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_for_origin: Option<String>,
+    /// When reading as an app account: exactly what you supplied as
+    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` (from
+    /// canonicalization) is visible. Null for anonymous reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<String>,
 }
 
 /// Arguments for `get_api_doc`.

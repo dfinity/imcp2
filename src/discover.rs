@@ -302,17 +302,28 @@ fn canisters_from_app_manifest(text: &str) -> Vec<(String, Option<String>)> {
 }
 
 /// Reduce a raw origin string to a canonical bare `https://host[:port]` origin,
-/// accepting ONLY https with a real (tuple) host and no user-info. `None` for
-/// anything else — blank, non-https (incl. `http://`, which `target_origin` would
-/// silently upgrade downstream, masking a wrong origin), user-info, path/opaque, or
-/// unparseable — so callers fail closed with no hidden scheme rewrite. Keeping this
-/// https-only matches `canonicalize_derivation_origin`'s contract.
+/// accepting https with a real (tuple) host and no user-info. A scheme-less value
+/// is treated as a bare host and gets `https://` prepended (so a good-faith
+/// bare-host declaration resolves rather than being dropped) — this matches
+/// `canonicalize_derivation_origin`, which the interactive `derivation_origin`
+/// param uses. `None` for anything else — blank, an explicit non-https scheme
+/// (incl. `http://`, which `target_origin` would silently upgrade downstream,
+/// masking a wrong origin), user-info, host-less, or unparseable — so callers fail
+/// closed with no hidden scheme rewrite.
 fn normalize_origin(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
     }
-    let url = url::Url::parse(raw).ok()?;
+    // Reject an explicit non-https scheme up front (a scheme-less bare host is fine —
+    // https is prepended below). Without this, `http://x` would be silently upgraded.
+    if let Some((scheme, _)) = raw.split_once("://") {
+        if !scheme.eq_ignore_ascii_case("https") {
+            return None;
+        }
+    }
+    let candidate = if raw.contains("://") { raw.to_string() } else { format!("https://{raw}") };
+    let url = url::Url::parse(&candidate).ok()?;
     if url.scheme() != "https" {
         return None;
     }
@@ -330,8 +341,9 @@ fn normalize_origin(raw: &str) -> Option<String> {
 }
 
 /// The app's declared Internet Identity derivation origin, from the manifest's
-/// optional top-level `derivation_origin`, reduced to a bare `scheme://host[:port]`
-/// origin. `None` if absent, blank, non-https, or not a parseable URL.
+/// optional top-level `derivation_origin`, reduced to a bare `https://host[:port]`
+/// origin (a scheme-less bare host is accepted and gets `https://`). `None` if
+/// absent, blank, an explicit non-https scheme, user-info, or not a parseable URL.
 fn declared_derivation_origin(manifest_text: &str) -> Option<String> {
     let m = serde_json::from_str::<AppManifest>(manifest_text).ok()?;
     normalize_origin(m.derivation_origin?.as_str())
@@ -1627,6 +1639,11 @@ mod tests {
         // Reduced to a bare origin (path/query/trailing slash dropped).
         let with_path = r#"{"derivation_origin":"https://app.example.com/x?y=1"}"#;
         assert_eq!(declared_derivation_origin(with_path).as_deref(), Some("https://app.example.com"));
+        // A scheme-less bare host is accepted (https assumed), matching the
+        // interactive `derivation_origin` param, so a good-faith bare-host
+        // declaration resolves instead of being silently dropped.
+        let bare = r#"{"derivation_origin":"app.example.com"}"#;
+        assert_eq!(declared_derivation_origin(bare).as_deref(), Some("https://app.example.com"));
         // Absent, blank, non-http, or non-JSON → None.
         assert_eq!(declared_derivation_origin(r#"{"canisters":[]}"#), None);
         assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"  "}"#), None);
