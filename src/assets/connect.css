@@ -108,7 +108,7 @@ body {
 .dfinity-logo { height: 1.1rem; width: auto; color: var(--ink); }
 /* Terminal error: the spinner tile is dropped and the message carries the state.
    The pinned page's script adds `.error` to `.screen`; the error page ships it. */
-.error .spinner-tile { display: none; }
+.screen.error .spinner-tile { display: none; }
 @keyframes connect-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
 @media (prefers-color-scheme: dark) {
