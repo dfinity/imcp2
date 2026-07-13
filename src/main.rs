@@ -46,7 +46,7 @@ const SKILL_URI_PREFIX: &str = "skill://";
 const CANDID_TEXTUAL_MD: &str = include_str!("../static/candid-textual-syntax.md");
 const CANDID_REFERENCE_MD: &str = include_str!("../static/candid-reference.md");
 
-/// The OQL query-surface usage guide. Served on demand (via the `get_oql_guide`
+/// The OQL query-surface usage guide. Served on demand (via the `icp_oql_guide`
 /// tool and the `oql://usage` resource) rather than inlined into every
 /// `get_canister_candid` reply: `get_canister_candid` only signals `oql: true` plus a one-line
 /// pointer here, so the guidance is delivered once, when the model chooses to
@@ -128,7 +128,7 @@ impl IcTools {
                     // set, the guidance pointer is emitted as a SEPARATE content
                     // block, so the first block stays the raw `.did` (still valid,
                     // copy-pastable Candid) — the full primer is served on demand
-                    // (see get_oql_guide / OQL_USAGE_URI), never inlined.
+                    // (see icp_oql_guide / OQL_USAGE_URI), never inlined.
                     let oql = calls::has_oql(&did);
                     let output = calls::GetCandidOutput { canister_id, candid: did.clone(), oql };
                     if oql {
@@ -137,7 +137,7 @@ impl IcTools {
                              over its data). Use get_canister_oql_schema to see its entities and fields, then \
                              run_canister_oql_query with a JSON query to read data as a table — these wrap the \
                              `schema`/`execute` methods for you (no Candid escaping). See \
-                             get_oql_guide (or the `{OQL_USAGE_URI}` resource) for the dialect."
+                             icp_oql_guide (or the `{OQL_USAGE_URI}` resource) for the dialect."
                         );
                         Ok(ok_structured_blocks(vec![did, note], &output))
                     } else {
@@ -157,7 +157,7 @@ impl IcTools {
         annotations(title = "Get the OQL query guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
         output_schema = schema_for_output::<calls::OqlGuideOutput>(),
     )]
-    async fn get_oql_guide(
+    async fn icp_oql_guide(
         &self,
         Parameters(_args): Parameters<management::NoArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -166,7 +166,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Run an OQL query against a canister that exposes the OQL surface (get_canister_candid reports `oql: true`). Pass the query as a JSON object string in `query` (see get_oql_guide / get_canister_oql_schema for the dialect and field names) — it's sent to the canister's `execute` query method, so NO Candid escaping is needed. Returns the result decoded as `columns` + `rows` (rendered as a markdown table), with `has_more` for paging (re-query with a higher `offset`). Omit `derivation_origin` to query anonymously, or pass the app's canonical Internet Identity derivation origin to query as your account there — the result then echoes `derived_for_origin` / `requested` / `acted_as_principal` so an origin mismatch is visible.",
+        description = "Run an OQL query against a canister that exposes the OQL surface (get_canister_candid reports `oql: true`). Pass the query as a JSON object string in `query` (see icp_oql_guide / get_canister_oql_schema for the dialect and field names) — it's sent to the canister's `execute` query method, so NO Candid escaping is needed. Returns the result decoded as `columns` + `rows` (rendered as a markdown table), with `has_more` for paging (re-query with a higher `offset`). Omit `derivation_origin` to query anonymously, or pass the app's canonical Internet Identity derivation origin to query as your account there — the result then echoes `derived_for_origin` / `requested` / `acted_as_principal` so an origin mismatch is visible.",
         annotations(title = "Run an OQL query", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::OqlQueryOutput>(),
     )]
@@ -1254,7 +1254,7 @@ impl ServerHandler for IcTools {
              canister exposes a `getApiDoc`/`get_api_doc` method it returns a prose guide to how \
              the app behaves (units, auth, lifecycle, mutation safety, polling, gotchas) that the \
              Candid types alone don't convey. If `get_canister_candid` reports `oql: true`, the canister \
-             exposes an OQL query surface — read `get_oql_guide` for the dialect, then use \
+             exposes an OQL query surface — read `icp_oql_guide` for the dialect, then use \
              `get_canister_oql_schema` (entities and fields) and `run_canister_oql_query` (run a JSON query, get a table \
              back). Those two wrap the canister's `schema`/`execute` methods, so you don't \
              hand-encode Candid for OQL. `call_canister` calls a method with textual Candid \
@@ -1525,7 +1525,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <p>Tools: <code>discover_app_canisters</code> (domain → canister ids), <code>icp_find_canister_by_name</code> (name → canister ids), <code>icp_lookup_canister_info_by_id</code> (id → dashboard identity), <code>get_canister_candid</code>, <code>call_canister</code> (anonymously, or as your account at an app — identified by its <code>derivation_origin</code> or <code>app_url</code>, delegation minted on demand), <code>get_app_principal</code> (your principal at an app, no call), <code>list_app_accounts</code> (your Internet Identity accounts at an app), <code>resolve_app</code> (app URL → its Internet Identity derivation origin + principal). Identity results echo <code>derived_for_origin</code>/<code>requested</code> so an origin mismatch is visible. All speak textual Candid.</p>
 <p>Skills: <code>icp_list_skills</code> / <code>icp_get_skill</code> (the official IC how-to guides — Motoko, mops, icp CLI, cycles, …).</p>
 <p>App docs: <code>get_canister_api_doc</code> (a canister's own "how this app behaves" guide, if it exposes <code>getApiDoc</code>/<code>get_api_doc</code>).</p>
-<p>OQL: <code>get_oql_guide</code> (dialect), <code>get_canister_oql_schema</code> (entities/fields), <code>run_canister_oql_query</code> (run a JSON query, get a table) — for canisters that expose an OQL <code>schema</code>/<code>execute</code> surface (<code>get_canister_candid</code> reports <code>oql: true</code>).</p>
+<p>OQL: <code>icp_oql_guide</code> (dialect), <code>get_canister_oql_schema</code> (entities/fields), <code>run_canister_oql_query</code> (run a JSON query, get a table) — for canisters that expose an OQL <code>schema</code>/<code>execute</code> surface (<code>get_canister_candid</code> reports <code>oql: true</code>).</p>
 <p>Canister management (as your Internet Identity): <code>icp_cycles_balance</code>, <code>icp_create_canister</code>, <code>icp_install_code</code>, <code>icp_canister_status</code>, <code>icp_update_canister_settings</code>, <code>icp_start_canister</code>, <code>icp_stop_canister</code>, <code>icp_uninstall_code</code>, <code>icp_delete_canister</code>, <code>icp_top_up_canister</code>.</p>
 </body></html>"#;
 
@@ -1875,7 +1875,7 @@ mod tests {
         // gate destructive on read_only can't mislabel them.
         for name in [
             "get_canister_candid", "discover_app_canisters", "icp_find_canister_by_name", "icp_lookup_canister_info_by_id",
-            "icp_list_skills", "icp_get_skill", "get_oql_guide", "run_canister_oql_query", "get_canister_oql_schema",
+            "icp_list_skills", "icp_get_skill", "icp_oql_guide", "run_canister_oql_query", "get_canister_oql_schema",
             "get_canister_api_doc", "resolve_app", "list_app_accounts", "icp_cycles_balance", "get_app_principal", "icp_canister_status",
         ] {
             let a = ann(name);

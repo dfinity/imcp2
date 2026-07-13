@@ -21,7 +21,7 @@ results).
 | `discover_app_canisters` | `domain` | Canister ids behind a web domain — app-declared App Connect metadata first (`/ai-connect.html`'s `ic:canister-id` meta, `/.well-known/ic-app.json` manifest), then the frontend via `x-ic-canister-id` and backend candidates via `/env.json` + JS-bundle mining — each with provenance and its IC dashboard label/type where known |
 | `icp_find_canister_by_name` | `query` | Canister ids matching a name/symbol, searched in the IC dashboard's service registries — ICRC token ledgers (e.g. `ckUSDC`) and the SNS project catalog |
 | `icp_lookup_canister_info_by_id` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
-| `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus an `oql` flag — `true` when it exposes an OQL query surface (a `schema` + `execute` pair), with a pointer to `get_oql_guide` |
+| `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus an `oql` flag — `true` when it exposes an OQL query surface (a `schema` + `execute` pair), with a pointer to `icp_oql_guide` |
 | `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), read from its `getApiDoc`/`get_api_doc` method if present. Call first for an unfamiliar app |
 | `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `derivation_origin?` / `app_url?`, `account?` | Reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, or an `app_url` the connector resolves). Echoes `derived_for_origin` / `requested` / `derivation_origin_source` / `acted_as_principal` |
 | `get_app_principal` | `derivation_origin?` / `app_url?`, `account?` | The principal you act as at an app, without a call. Echoes `derived_for_origin` / `requested` / `derivation_origin_source` so an origin mismatch is visible |
@@ -29,7 +29,7 @@ results).
 | `resolve_app` | `app_url` | Resolve an app URL to its Internet Identity derivation context: `application_origin`, the `derivation_origin` to use (declared in `/.well-known/ic-app.json`, else a built-in known-app value, else assumed = app origin — flagged via `derivation_origin_source`: `declared`/`known`/`app_url_default`), the app's `alternative_origins` (informational), and — if authenticated — the `principal` |
 | `icp_list_skills` | — | The official [IC skills](https://skills.internetcomputer.org) (Motoko, mops/icp CLIs, cycles, stable memory, security, …), grouped by category |
 | `icp_get_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `motoko`, `icp-cli`, `cycles-management`) |
-| `get_oql_guide` | — | The OQL query-surface dialect guide (for canisters where `get_canister_candid` reports `oql: true`): the JSON query object, predicate grammar, edges, and paged result shape |
+| `icp_oql_guide` | — | The OQL query-surface dialect guide (for canisters where `get_canister_candid` reports `oql: true`): the JSON query object, predicate grammar, edges, and paged result shape |
 | `get_canister_oql_schema` | `canister_id`, `derivation_origin?`, `account?` | The canister's OQL schema catalogue (entities, primary keys, fields, edges) as JSON — wraps its `schema` method |
 | `run_canister_oql_query` | `canister_id`, `query` (JSON object string), `derivation_origin?`, `account?` | Runs an OQL query (wraps `execute`, no Candid escaping) and returns `columns` + `rows` (rendered as a table) with `has_more` for paging |
 | `icp_cycles_balance` | — | Your cycles-ledger balance (the funds `icp_create_canister`/`icp_top_up_canister` spend), as your standing II principal |
@@ -155,7 +155,7 @@ traversal). `get_canister_candid` detects the pair and reports `oql: true` (pars
 interface behind the same CWE-674 guard the encode/decode path uses, so a
 malformed `.did` just fails closed to `false`). Rather than inline the whole
 dialect into every interface read, `get_canister_candid` emits only that flag plus a
-one-line pointer; the full guide is served on demand by `get_oql_guide` and as
+one-line pointer; the full guide is served on demand by `icp_oql_guide` and as
 the `oql://usage` MCP **resource**.
 
 Two dedicated tools drive the surface: **`get_canister_oql_schema`** returns the entity/field

@@ -40,12 +40,12 @@ pub struct GetCandidOutput {
     /// The Candid (`.did`) interface text.
     pub candid: String,
     /// True when the interface exposes the standard OQL query surface (both a
-    /// `schema` and an `execute` method). When set, load `get_oql_guide` (or the
+    /// `schema` and an `execute` method). When set, load `icp_oql_guide` (or the
     /// `oql://usage` resource) to learn the JSON query dialect before querying.
     pub oql: bool,
 }
 
-/// Output of `get_oql_guide`.
+/// Output of `icp_oql_guide`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct OqlGuideOutput {
     /// The OQL usage guide (markdown): the `schema`/`execute` methods, the JSON
@@ -62,7 +62,7 @@ pub struct OqlQueryArgs {
     /// The OQL query as a JSON object string — passed straight to the canister's
     /// `execute` method, so NO Candid escaping is needed (write plain JSON). E.g.
     /// `{"start":"employee","where":{"icontains":{"field":"lastName","value":"smith"}},"select":["firstName","lastName"],"limit":10}`.
-    /// See get_oql_guide (or get_canister_oql_schema) for the dialect and entity/field names.
+    /// See icp_oql_guide (or get_canister_oql_schema) for the dialect and entity/field names.
     pub query: String,
     /// Query AS the user's account at an app, given its canonical Internet
     /// Identity derivation origin (not necessarily the visible URL). Accepts the
