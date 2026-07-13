@@ -490,7 +490,7 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
     // Redirect the consenting browser to the II connect link with a real HTTP
     // 302 (`Location`). The link's params ride in the URL fragment
     // (`#callback=…&state=…&registration_key=…`); modern browsers preserve a
-    // fragment present in a `Location` header (RFC 7231 §7.1.2), and the fragment
+    // fragment present in a `Location` header (RFC 9110 §10.2.2), and the fragment
     // never goes on the wire, so beta II's frontend still reads it from
     // `location.hash` exactly as before, with one fewer interposition point than
     // a script-driven hop, and it works with JS disabled. `redirect_302` also
@@ -667,7 +667,7 @@ fn finishing_page(prefix: &str, id: &str, fs: &str, next_try: u32) -> Response {
 /// A 302 to an absolute URL, for the two top-level hops in the connect flow: the
 /// browser out to the II link (`authorize`) and back to the OAuth client
 /// (`finish`). A `Location` fragment (the II link's `#callback=…`) is preserved
-/// by modern browsers (RFC 7231 §7.1.2) and never sent on the wire, so II reads
+/// by modern browsers (RFC 9110 §10.2.2) and never sent on the wire, so II reads
 /// it from `location.hash`. Sets `Referrer-Policy: no-referrer` so any secret in
 /// this request's URL query (the client hop's `finish_secret`, P2) is not leaked
 /// to the target via the `Referer` header.
@@ -2076,6 +2076,51 @@ mod tests {
             assert!(d.starts_with(&super::base_url()), "same-origin entries only: {d}");
             assert!(!d.contains('#'), "no fragments in declared callbacks: {d}");
         }
+    }
+
+    // /oauth/authorize hands the browser to II with a real HTTP 302 (not a 200 +
+    // JS page): lock in the status, the `Location` (the II link with its fragment
+    // params intact), `Referrer-Policy: no-referrer`, and the binding cookie, so a
+    // regression to a script-driven hop or a dropped header is caught.
+    #[tokio::test]
+    async fn authorize_redirects_302_with_fragment_cookie_and_no_referrer() {
+        use axum::extract::{Query, State};
+        let store = test_store_phase2();
+        // Register a client so `validate_client` passes and we reach the redirect.
+        store.clients.write().await.insert(
+            "client-x".into(),
+            super::ClientReg { redirect_uris: vec!["https://app.example/cb".into()] },
+        );
+        let resp = super::authorize(
+            State(store.clone()),
+            Query(super::AuthorizeQuery {
+                response_type: Some("code".into()),
+                client_id: "client-x".into(),
+                redirect_uri: "https://app.example/cb".into(),
+                state: Some("xyz".into()),
+                code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+                code_challenge_method: Some("S256".into()),
+                scope: None,
+                resource: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.status(), axum::http::StatusCode::FOUND, "authorize must 302, not render a page");
+        let h = resp.headers();
+        let location = h.get(axum::http::header::LOCATION).unwrap().to_str().unwrap();
+        // The II link, with the connect params carried in the URL FRAGMENT.
+        assert!(location.starts_with("https://ii.test/mcp#"), "redirects to the II /mcp link: {location}");
+        for needle in ["callback=", "state=", "registration_key="] {
+            assert!(location.contains(needle), "fragment must carry `{needle}`: {location}");
+        }
+        assert_eq!(
+            h.get(axum::http::header::REFERRER_POLICY).unwrap(),
+            "no-referrer",
+            "the redirect must set Referrer-Policy: no-referrer"
+        );
+        let cookie = h.get(axum::http::header::SET_COOKIE).unwrap().to_str().unwrap();
+        assert!(cookie.contains("mcp_connect="), "the binding cookie must be set: {cookie}");
     }
 
     // The pinned page ships a strict CSP whose script nonce MATCHES the inline
