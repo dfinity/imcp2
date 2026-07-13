@@ -464,8 +464,9 @@ fn known_derivation_origin(host: &str) -> Option<&'static str> {
 struct KnownApp {
     /// Display name.
     name: &'static str,
-    /// Aliases matched against the normalized query (already lowercased and
-    /// ASCII-alphanumeric-only — see [`normalize_app_query`]).
+    /// Aliases (lowercase, no separators) matched by [`find_known_app`] against the
+    /// query's tokens or their joined form — an alias equals a whole token (e.g.
+    /// "oisy") or the tokens joined (e.g. "multi dex" → "multidex").
     aliases: &'static [&'static str],
     /// The app's canonical front-end URL (feed to `discover_app_canisters` / `resolve_app`).
     app_url: &'static str,
@@ -500,23 +501,27 @@ const KNOWN_APPS: &[KnownApp] = &[
     },
 ];
 
-/// Normalize an app-name query for matching: lowercase and keep only ASCII
-/// alphanumerics, so "MULTI/DEX", "multi dex", and "MultiDex" all become "multidex".
-fn normalize_app_query(q: &str) -> String {
-    q.chars().filter(char::is_ascii_alphanumeric).flat_map(char::to_lowercase).collect()
-}
-
-/// Find a well-known app by name: the normalized query must equal an alias, or
-/// contain one that is at least 4 chars long (so a distinctive alias still matches
-/// inside a phrase like "the oisy wallet", while short aliases don't over-match).
+/// Find a well-known app by name. The query is split into lowercase alphanumeric
+/// TOKENS (on any non-alphanumeric boundary); an alias matches if it equals a whole
+/// token (e.g. "oisy" in "the oisy wallet") or the tokens joined (e.g. "multi dex"
+/// / "MULTI/DEX" → "multidex"). Matching on token boundaries — not substrings —
+/// avoids false positives like "noisy" resolving to "oisy" while still tolerating
+/// punctuation/spacing/casing variants.
 fn find_known_app(query: &str) -> Option<&'static KnownApp> {
-    let q = normalize_app_query(query);
-    if q.is_empty() {
+    let tokens: Vec<String> = query
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if tokens.is_empty() {
         return None;
     }
-    KNOWN_APPS
-        .iter()
-        .find(|app| app.aliases.iter().any(|a| q == *a || (a.len() >= 4 && q.contains(a))))
+    let joined = tokens.concat();
+    KNOWN_APPS.iter().find(|app| {
+        app.aliases
+            .iter()
+            .any(|a| *a == joined.as_str() || tokens.iter().any(|t| t.as_str() == *a))
+    })
 }
 
 /// The Internet Identity derivation context an app URL resolves to. See
@@ -1936,6 +1941,14 @@ mod tests {
         assert!(unknown.note.to_lowercase().contains("web search"), "note: {}", unknown.note);
         // Blank / punctuation-only input doesn't match anything.
         assert!(find_app_by_name("   /  ").matches.is_empty());
+        // Token-boundary matching: a word that merely CONTAINS an alias as a
+        // substring must NOT match (these all would have under the old contains rule).
+        for q in ["noisy", "a noisy afternoon", "annoisyance", "icpswapper", "multidexchange"] {
+            assert!(
+                find_app_by_name(q).matches.is_empty(),
+                "{q:?} must not match a known app (substring false positive)",
+            );
+        }
     }
 
     // Consistency (networked): every origin in a known app's LIVE
