@@ -1,4 +1,4 @@
-//! The direct canister-call layer: `get_candid` (read a canister's Candid
+//! The direct canister-call layer: `get_canister_candid` (read a canister's Candid
 //! interface) and `call_canister` (invoke a method with textual Candid in and
 //! out). The LLM only ever deals with textual Candid — the binary
 //! encoding/decoding against a method's declared types happens here, and the
@@ -25,14 +25,14 @@ use serde::{Deserialize, Serialize};
 // never touches binary Candid).
 // ===========================================================================
 
-/// Arguments for `get_candid`.
+/// Arguments for `get_canister_candid`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetCandidArgs {
     /// Canister principal, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai" (the ICP ledger).
     pub canister_id: String,
 }
 
-/// Output of `get_candid`.
+/// Output of `get_canister_candid`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct GetCandidOutput {
     /// The canister whose interface was read.
@@ -40,12 +40,12 @@ pub struct GetCandidOutput {
     /// The Candid (`.did`) interface text.
     pub candid: String,
     /// True when the interface exposes the standard OQL query surface (both a
-    /// `schema` and an `execute` method). When set, load `get_oql_guide` (or the
+    /// `schema` and an `execute` method). When set, load `icp_oql_guide` (or the
     /// `oql://usage` resource) to learn the JSON query dialect before querying.
     pub oql: bool,
 }
 
-/// Output of `get_oql_guide`.
+/// Output of `icp_oql_guide`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct OqlGuideOutput {
     /// The OQL usage guide (markdown): the `schema`/`execute` methods, the JSON
@@ -53,28 +53,29 @@ pub struct OqlGuideOutput {
     pub content: String,
 }
 
-/// Arguments for `oql_query`.
+/// Arguments for `run_canister_oql_query`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OqlQueryArgs {
-    /// Canister principal that exposes the OQL surface (get_candid reports
+    /// Canister principal that exposes the OQL surface (get_canister_candid reports
     /// `oql: true`).
     pub canister_id: String,
     /// The OQL query as a JSON object string — passed straight to the canister's
     /// `execute` method, so NO Candid escaping is needed (write plain JSON). E.g.
     /// `{"start":"employee","where":{"icontains":{"field":"lastName","value":"smith"}},"select":["firstName","lastName"],"limit":10}`.
-    /// See get_oql_guide (or oql_schema) for the dialect and entity/field names.
+    /// See icp_oql_guide (or get_canister_oql_schema) for the dialect and entity/field names.
     pub query: String,
-    /// Application domain to query as, e.g. "oisy.com" — its account delegation is
-    /// derived on demand for this connection. Omit to query anonymously.
-    #[serde(default)]
-    pub domain: Option<String>,
-    /// Which of your accounts at `domain` to act as, by account name (see
-    /// list_accounts). Omit for that app's default account; ignored without `domain`.
+    /// Query AS the user's account at an app, given its canonical Internet
+    /// Identity derivation origin (not necessarily the visible URL). Accepts the
+    /// legacy name `domain`. Omit to query anonymously.
+    #[serde(default, alias = "domain")]
+    pub derivation_origin: Option<String>,
+    /// Which of your accounts to act as, by account name (see list_app_accounts).
+    /// Omit for that app's default account; ignored when querying anonymously.
     #[serde(default)]
     pub account: Option<String>,
 }
 
-/// Output of `oql_query`: the `execute` result decoded into a table.
+/// Output of `run_canister_oql_query`: the `execute` result decoded into a table.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct OqlQueryOutput {
     /// The canister that was queried.
@@ -85,24 +86,38 @@ pub struct OqlQueryOutput {
     pub rows: Vec<Vec<String>>,
     /// True when more rows remain — re-query with a higher `offset` to page.
     pub has_more: bool,
+    /// The principal the query was signed as — null for an anonymous query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acted_as_principal: Option<String>,
+    /// When querying as an app account: the effective Internet Identity derivation
+    /// origin used (after canonicalization). Null for anonymous queries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_for_origin: Option<String>,
+    /// When querying as an app account: exactly what you supplied as
+    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` (from
+    /// canonicalization) is visible. Null for anonymous queries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<String>,
 }
 
-/// Arguments for `oql_schema`.
+/// Arguments for `get_canister_oql_schema`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OqlSchemaArgs {
-    /// Canister principal that exposes the OQL surface (get_candid reports
+    /// Canister principal that exposes the OQL surface (get_canister_candid reports
     /// `oql: true`).
     pub canister_id: String,
-    /// Application domain to read as, e.g. "oisy.com". Omit to read anonymously.
-    #[serde(default)]
-    pub domain: Option<String>,
-    /// Which of your accounts at `domain` to act as (see list_accounts). Ignored
-    /// without `domain`.
+    /// Read AS the user's account at an app, given its canonical Internet
+    /// Identity derivation origin (not necessarily the visible URL). Accepts the
+    /// legacy name `domain`. Omit to read anonymously.
+    #[serde(default, alias = "domain")]
+    pub derivation_origin: Option<String>,
+    /// Which of your accounts to act as (see list_app_accounts). Ignored when reading
+    /// anonymously.
     #[serde(default)]
     pub account: Option<String>,
 }
 
-/// Output of `oql_schema`.
+/// Output of `get_canister_oql_schema`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct OqlSchemaOutput {
     /// The canister whose schema was read.
@@ -110,16 +125,28 @@ pub struct OqlSchemaOutput {
     /// The entity/field/edge catalogue returned by `schema` (JSON text,
     /// pretty-printed when it parses).
     pub schema: String,
+    /// The principal the read was signed as — null for an anonymous read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acted_as_principal: Option<String>,
+    /// When reading as an app account: the effective Internet Identity derivation
+    /// origin used (after canonicalization). Null for anonymous reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_for_origin: Option<String>,
+    /// When reading as an app account: exactly what you supplied as
+    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` (from
+    /// canonicalization) is visible. Null for anonymous reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<String>,
 }
 
-/// Arguments for `get_api_doc`.
+/// Arguments for `get_canister_api_doc`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ApiDocArgs {
     /// Canister principal to read the API documentation from.
     pub canister_id: String,
 }
 
-/// Output of `get_api_doc`.
+/// Output of `get_canister_api_doc`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ApiDocOutput {
     /// The canister the doc came from.
@@ -144,19 +171,29 @@ pub struct CallCanisterArgs {
     /// If true, perform a read-only `query` call; otherwise an `update` call.
     #[serde(default)]
     pub is_query: bool,
-    /// Application domain to call as, e.g. "oisy.com" — its account delegation is
-    /// derived on demand for this connection. Omit to call anonymously.
+    /// Call AS the user's account at an app, identified by its exact canonical
+    /// Internet Identity derivation origin — NOT necessarily the visible URL. For
+    /// an app with a custom derivation origin, pass that canonical origin (do not
+    /// infer it from an alternativeOrigins list). Accepts the legacy name
+    /// `domain`. Omit both this and `app_url` to call anonymously; provide at most
+    /// one. The account delegation is derived on demand for this connection.
+    #[serde(default, alias = "domain")]
+    pub derivation_origin: Option<String>,
+    /// Call AS the user's account at an app, identified by its URL; the connector
+    /// resolves the derivation origin — the app's declared one if it publishes it
+    /// (`derivation_origin_source` = "declared"), else a built-in known-app value
+    /// ("known"), else the application origin ("app_url_default"). See the result's
+    /// `derivation_origin_source`. Alternative to `derivation_origin`.
     #[serde(default)]
-    pub domain: Option<String>,
-    /// Which of your accounts at `domain` to act as, by account name (see
-    /// list_accounts). Omit to use that app's default account. Ignored when
-    /// `domain` is omitted (anonymous calls have no account).
+    pub app_url: Option<String>,
+    /// Which of your accounts to act as, by account name (see list_app_accounts).
+    /// Omit to use that app's default account. Ignored for anonymous calls.
     #[serde(default)]
     pub account: Option<String>,
     /// Optional Candid service definition (`.did` text) for the canister. Used to
     /// encode the args to the method's declared types and decode the reply, for
     /// when the canister's own `candid:service` metadata can't be read (e.g.
-    /// access-restricted) — get it from get_candid, or ask the user for it.
+    /// access-restricted) — get it from get_canister_candid, or ask the user for it.
     #[serde(default)]
     pub candid: Option<String>,
 }
@@ -172,6 +209,25 @@ pub struct CallCanisterOutput {
     pub is_query: bool,
     /// The decoded reply in textual Candid.
     pub reply: String,
+    /// The principal the call was signed as — null for an anonymous call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acted_as_principal: Option<String>,
+    /// When called as an app account: the effective Internet Identity derivation
+    /// origin used (after canonicalization). Null for anonymous calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_for_origin: Option<String>,
+    /// When called as an app account: exactly what you supplied
+    /// (`derivation_origin` or `app_url`), echoed so a mismatch with
+    /// `derived_for_origin` is visible. Null for anonymous calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<String>,
+    /// When called as an app account: how `derived_for_origin` was determined
+    /// (`explicit` | `declared` | `known` | `app_url_default`) — matches the other
+    /// identity tools. `app_url_default` means the app declares no derivation origin
+    /// (and isn't a known app) and the app URL was assumed, so the principal is
+    /// wrong for an app with a custom one. Null for anonymous calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derivation_origin_source: Option<String>,
 }
 
 pub fn default_args() -> String {
@@ -397,7 +453,7 @@ pub fn has_oql(did: &str) -> bool {
 }
 
 // ===========================================================================
-// OQL execute/schema support (for the `oql_query` / `oql_schema` tools). The
+// OQL execute/schema support (for the `run_canister_oql_query` / `get_canister_oql_schema` tools). The
 // server does not model the OQL query language — it wraps the JSON query as the
 // single `text` argument `execute` expects (so the model never hand-escapes
 // JSON inside a Candid text literal) and decodes the tabular reply.
@@ -811,7 +867,7 @@ mod tests {
             .expect("encode value")
     }
 
-    // oql_query decoding: a `variant { ok = record { hasMore; rows } }` reply with
+    // run_canister_oql_query decoding: a `variant { ok = record { hasMore; rows } }` reply with
     // variant-wrapped cell values decodes into ordered columns + string rows, the
     // paging flag is read, an `err` arm surfaces as a QueryError, and a
     // non-conforming reply degrades to Unrecognized (never a panic).

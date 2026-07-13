@@ -18,32 +18,59 @@ results).
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `discover_canisters` | `domain` | Canister ids behind a web domain — app-declared App Connect metadata first (`/ai-connect.html`'s `ic:canister-id` meta, `/.well-known/ic-app.json` manifest), then the frontend via `x-ic-canister-id` and backend candidates via `/env.json` + JS-bundle mining — each with provenance and its IC dashboard label/type where known |
-| `find_canister` | `query` | Canister ids matching a name/symbol, searched in the IC dashboard's service registries — ICRC token ledgers (e.g. `ckUSDC`) and the SNS project catalog |
-| `lookup_canister` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
-| `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus an `oql` flag — `true` when it exposes an OQL query surface (a `schema` + `execute` pair), with a pointer to `get_oql_guide` |
-| `get_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), read from its `getApiDoc`/`get_api_doc` method if present. Call first for an unfamiliar app |
-| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `domain?`, `account?` | Reply as textual Candid; called anonymously (no `domain`) or as your account at an application domain, derived on demand (`account` names a non-default account there) |
-| `get_principal` | `domain`, `account?` | The principal you act as at an application domain (derives the delegation on demand, same as `call_canister`), without making a call |
-| `list_accounts` | `domain` | The user's Internet Identity accounts at an app — the default account (the anchor's current default at that origin) plus any named ones — with name, account number, and last-used time; name one via `account` in `call_canister`/`get_principal` |
-| `list_ic_skills` | — | The official [IC skills](https://skills.internetcomputer.org) (Motoko, mops/icp CLIs, cycles, stable memory, security, …), grouped by category |
-| `get_ic_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `motoko`, `icp-cli`, `cycles-management`) |
-| `get_oql_guide` | — | The OQL query-surface dialect guide (for canisters where `get_candid` reports `oql: true`): the JSON query object, predicate grammar, edges, and paged result shape |
-| `oql_schema` | `canister_id`, `domain?`, `account?` | The canister's OQL schema catalogue (entities, primary keys, fields, edges) as JSON — wraps its `schema` method |
-| `oql_query` | `canister_id`, `query` (JSON object string), `domain?`, `account?` | Runs an OQL query (wraps `execute`, no Candid escaping) and returns `columns` + `rows` (rendered as a table) with `has_more` for paging |
-| `cycles_balance` | — | Your cycles-ledger balance (the funds `create_canister`/`top_up_canister` spend), as your standing II principal |
-| `create_canister` | `cycles?` / `icp?`, `controllers?`, `subnet?` | Create + fund a new canister — from your cycles-ledger balance (`cycles`) or by converting ICP from your ICP-ledger account via the CMC (`icp`); returns the new canister id |
-| `install_code` | `canister_id`, `wasm_base64` / `wasm_hex`, `mode?`, `arg?` | Install/reinstall/upgrade a Wasm module (single-shot, or via the chunk store for large modules) |
-| `canister_status` | `canister_id` | Run state, cycle balance, module hash, memory, controllers, allocations |
-| `update_canister_settings` | `canister_id`, `controllers?`, allocations, `freezing_threshold?`, `log_visibility?`, … | Update a canister's settings |
-| `start_canister` / `stop_canister` / `uninstall_code` / `delete_canister` | `canister_id` | Canister lifecycle |
-| `top_up_canister` | `canister_id`, `cycles?` / `icp?` | Add cycles to an existing canister — from your cycles-ledger balance (`cycles`) or by converting ICP from your ICP-ledger account via the CMC (`icp`) |
+| `discover_app_canisters` | `domain` | Canister ids behind a web domain — app-declared App Connect metadata first (`/ai-connect.html`'s `ic:canister-id` meta, `/.well-known/ic-app.json` manifest), then the frontend via `x-ic-canister-id` and backend candidates via `/env.json` + JS-bundle mining — each with provenance and its IC dashboard label/type where known |
+| `icp_find_canister_by_name` | `query` | Canister ids matching a name/symbol, searched in the IC dashboard's service registries — ICRC token ledgers (e.g. `ckUSDC`) and the SNS project catalog |
+| `icp_lookup_canister_info_by_id` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
+| `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus an `oql` flag — `true` when it exposes an OQL query surface (a `schema` + `execute` pair), with a pointer to `icp_oql_guide` |
+| `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), read from its `getApiDoc`/`get_api_doc` method if present. Call first for an unfamiliar app |
+| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `derivation_origin?` / `app_url?`, `account?` | Reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, or an `app_url` the connector resolves). Echoes `derived_for_origin` / `requested` / `derivation_origin_source` / `acted_as_principal` |
+| `get_app_principal` | `derivation_origin?` / `app_url?`, `account?` | The principal you act as at an app, without a call. Echoes `derived_for_origin` / `requested` / `derivation_origin_source` so an origin mismatch is visible |
+| `list_app_accounts` | `derivation_origin?` / `app_url?` | The user's Internet Identity accounts at an app — the default account plus any named ones — with name, number, last-used, and the derivation origin they were listed for |
+| `resolve_app` | `app_url` | Resolve an app URL to its Internet Identity derivation context: `application_origin`, the `derivation_origin` to use (declared in `/.well-known/ic-app.json`, else a built-in known-app value, else assumed = app origin — flagged via `derivation_origin_source`: `declared`/`known`/`app_url_default`), and the app's `alternative_origins` (informational). Does not return a principal (no account chosen) or require auth — pass the `derivation_origin` to `get_app_principal`/`list_app_accounts` |
+| `icp_list_skills` | — | The official [IC skills](https://skills.internetcomputer.org) (Motoko, mops/icp CLIs, cycles, stable memory, security, …), grouped by category |
+| `icp_get_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `motoko`, `icp-cli`, `cycles-management`) |
+| `icp_oql_guide` | — | The OQL query-surface dialect guide (for canisters where `get_canister_candid` reports `oql: true`): the JSON query object, predicate grammar, edges, and paged result shape |
+| `get_canister_oql_schema` | `canister_id`, `derivation_origin?`, `account?` | The canister's OQL schema catalogue (entities, primary keys, fields, edges) as JSON — wraps its `schema` method |
+| `run_canister_oql_query` | `canister_id`, `query` (JSON object string), `derivation_origin?`, `account?` | Runs an OQL query (wraps `execute`, no Candid escaping) and returns `columns` + `rows` (rendered as a table) with `has_more` for paging |
+| `icp_cycles_balance` | — | Your cycles-ledger balance (the funds `icp_create_canister`/`icp_top_up_canister` spend), as your standing II principal |
+| `icp_create_canister` | `cycles?` / `icp?`, `controllers?`, `subnet?` | Create + fund a new canister — from your cycles-ledger balance (`cycles`) or by converting ICP from your ICP-ledger account via the CMC (`icp`); returns the new canister id |
+| `icp_install_code` | `canister_id`, `wasm_base64` / `wasm_hex`, `mode?`, `arg?` | Install/reinstall/upgrade a Wasm module (single-shot, or via the chunk store for large modules) |
+| `icp_canister_status` | `canister_id` | Run state, cycle balance, module hash, memory, controllers, allocations |
+| `icp_update_canister_settings` | `canister_id`, `controllers?`, allocations, `freezing_threshold?`, `log_visibility?`, … | Update a canister's settings |
+| `icp_start_canister` / `icp_stop_canister` / `icp_uninstall_code` / `icp_delete_canister` | `canister_id` | Canister lifecycle |
+| `icp_top_up_canister` | `canister_id`, `cycles?` / `icp?` | Add cycles to an existing canister — from your cycles-ledger balance (`cycles`) or by converting ICP from your ICP-ledger account via the CMC (`icp`) |
 
-`discover_canisters` is the entry point when the user names a **website** instead
+`discover_app_canisters` is the entry point when the user names a **website** instead
 of a canister id. Sources, most authoritative first: **app-declared metadata**
 (below), the frontend via the `x-ic-canister-id` header, and backend candidates
 mined from `/env.json` + the JS bundle (pick by label, prefer production/`IC_`
-ids, confirm with `get_candid`).
+ids, confirm with `get_canister_candid`).
+
+### Typical flow
+
+Acting **for the user** at an app:
+
+0. **Get the app URL from the user.** No tool maps an app *name* → URL
+   (`icp_find_canister_by_name` searches the token/SNS registries for canister ids,
+   not front-ends), so take the URL from the user or ask.
+1. **`resolve_app(url)`** → the app's `derivation_origin` — concurrently with
+2. **`discover_app_canisters(url)`** → the backend canister id.
+3. **`list_app_accounts`** — if there's more than one account, ask which to use (and
+   remember it).
+4. **`get_app_principal`** — only when you need the principal *value* itself;
+   `call_canister` / `run_canister_oql_query` act as the account without pre-fetching it.
+5. **`get_canister_candid`** (and **`get_canister_api_doc`** if the canister exposes
+   one) to learn the interface — the `oql: true` flag says whether OQL is available.
+6. **Read** with `run_canister_oql_query` when OQL is available, else `call_canister`
+   with `is_query=true`.
+7. **Act** with `call_canister` update calls, passing `derivation_origin` + `account`
+   to act as the user.
+
+Public/anonymous reads skip steps 1/3/4. The per-canister inspection (5) is
+independent of the identity steps (1/3/4), so they can run in parallel. Managing your
+**own** canisters (the `icp_*` create/install/status/… tools) acts as your standing
+**management principal** at this server's origin — a *different* identity than the
+per-app principals above.
 
 ### App-declared canister metadata (App Connect)
 
@@ -60,6 +87,7 @@ the app serves itself —
 
 ```json
 {
+  "derivation_origin": "https://<frontend-canister>.icp0.io",
   "canisters": [
     { "id": "aaaaa-…-cai", "role": "backend", "description": "orders + inventory API" },
     { "id": "bbbbb-…-cai", "role": "ledger" }
@@ -74,42 +102,66 @@ its composition — stronger than anything mined from client code — but an
 SPA catch-all serving HTML at these paths simply yields no findings (no meta
 tag; JSON parse fails), and every id is still validated as a principal.
 
+The optional top-level **`derivation_origin`** is the app's declaration of the
+Internet Identity derivation origin its frontends pin (see the identity section
+above). It is the only authoritative way for `resolve_app` / `app_url` to learn a
+**custom** derivation origin — there is no reverse lookup from an app URL to it —
+so an app that uses one should declare it here; otherwise the connector assumes
+the derivation origin equals the application origin and flags that assumption.
+
 When the user names a **token, project, or service** (e.g. `ckUSDC`) rather than a
-website or id, `find_canister` resolves it via
+website or id, `icp_find_canister_by_name` resolves it via
 [`dashboard.internetcomputer.org`](https://dashboard.internetcomputer.org)'s public
 APIs — the ICRC token registry and the SNS catalog — to the matching canister id(s).
-`lookup_canister` goes the other way: given a bare id, it returns the dashboard's
+`icp_lookup_canister_info_by_id` goes the other way: given a bare id, it returns the dashboard's
 label, type, controllers, subnet, and module hash, so a raw principal becomes an
-identified service. (`discover_canisters` results are annotated with these labels
-inline.) There is no public name-search over arbitrary canisters, so `find_canister`
+identified service. (`discover_app_canisters` results are annotated with these labels
+inline.) There is no public name-search over arbitrary canisters, so `icp_find_canister_by_name`
 covers the IC's labelled services, which is where the meaningful ones live.
 
-`call_canister` runs anonymously by default; pass a `domain` (e.g. `oisy.com`) to
-call as your account at that app. For a domain, the server mints a **short-lived
-account delegation on demand** using the connection's registered Internet
-Identity session key (see [Domain identities](#domain-identities-on-demand)) —
-there is no per-app sign-in step. `get_principal` returns that account's principal
+`call_canister` runs anonymously by default; pass a `derivation_origin` (or an
+`app_url` like `https://oisy.com` that the connector resolves) to call as your
+account at that app. The server mints a **short-lived account delegation on
+demand** using the connection's registered Internet Identity session key (see
+[Domain identities](#domain-identities-on-demand)) — there is no per-app sign-in
+step. `get_app_principal` returns that account's principal
 without a call. A user may hold several accounts at an app — a default account
 everyone gets automatically (the anchor's current, user-controllable default at
-that origin), plus any they have named — so `list_accounts(domain)` lists them
-(via II's `get_accounts`), and `call_canister`/`get_principal` take an optional
-`account` (a name from that list) to act as a specific one; omit it for the
-default account. All these tools require a bearer token (see Auth).
+that origin), plus any they have named — so `list_app_accounts` lists them (via II's
+`get_accounts`), and `call_canister`/`get_app_principal`/`list_app_accounts` identify the
+app by its `derivation_origin` (or an `app_url` the connector resolves — see the
+note below), and take an optional `account` (a name from that list) to act as a
+specific one; omit it for the default account. All these tools require a bearer
+token (see Auth).
 
-> **Derivation is domain-based — not guaranteed to equal a browser sign-in.** II
-> derives the per-app principal from the app's **domain**, which this server
-> normalizes to a bare `https://<host>` (with the gateway remap below). That is
-> usually the same identity a browser sign-in to the app would use, but **not
-> always**: an app can declare a *custom derivation origin* via
-> `/.well-known/ii-alternative-origins`, which browsers honour but the `mcp_*`
-> methods don't expose — so from the domain alone the server derives a different
-> principal, silently. If a principal, account, or balance doesn't match what the
-> user sees in their browser at that app, that's the likely cause; the tools tell
-> the agent to offer looking up the app's `ii-alternative-origins` and retrying.
+> **The derivation origin is explicit — and echoed.** Internet Identity derives
+> the per-app principal from a **derivation origin**, which is *usually* but **not
+> always** the visible website URL: an app can pin a *custom* derivation origin
+> (via `derivationOrigin` + `/.well-known/ii-alternative-origins`) that browsers
+> honour. The identity tools therefore take the derivation origin **explicitly**
+> as `derivation_origin` (the exact canonical origin — never inferred from an
+> alternative-origins list, which is the *inverse* relation), or an `app_url` the
+> connector resolves. There is **no reverse lookup** from an app URL to a custom
+> derivation origin, so `app_url` resolves to the app's **declared** origin
+> (`/.well-known/ic-app.json` → `derivation_origin`) when present, else a built-in
+> **known-app** value for a few apps that pin a custom origin without declaring it
+> (NNS → `https://nns.ic0.app`, Oisy → `https://oisy.com`, MULTI/DEX →
+> `https://hcv4s-…icp0.io`, ICPSwap → `https://app.icpswap.com`; an app's own
+> declaration always overrides this), else it *assumes* the app origin — flagged in
+> every result as `derivation_origin_source`
+> (`explicit` / `declared` / `known` / `app_url_default`). Every identity result also echoes
+> `derived_for_origin` (the origin actually used) alongside `requested` (what you
+> passed), so a valid-but-wrong principal is **immediately visible** instead of
+> silent. Use `resolve_app(app_url)` to see the resolution (and the app's
+> `alternative_origins`) before acting. Under the hood both routes go through the
+> same origin canonicalizer the delegation path uses (bare `https://<host>`, with
+> the `*.icp0.io`/`*.icp.net` → `*.ic0.app` gateway remap below). For backward
+> compatibility the identity tools still accept the legacy parameter name `domain`
+> as an alias for `derivation_origin`, so existing callers keep working unchanged.
 
 ### Skills awareness
 
-`list_ic_skills` / `get_ic_skill` expose the official Internet Computer
+`icp_list_skills` / `icp_get_skill` expose the official Internet Computer
 [skills](https://skills.internetcomputer.org) — authoritative, current how-to
 guides for authoring and shipping IC apps (the Motoko language, the `mops` and
 `icp` CLIs, cycles management, stable memory & upgrades, canister security, DeFi,
@@ -125,20 +177,20 @@ Some canisters expose **OQL** — a self-describing, agent-queryable surface ove
 their data via two Candid query methods: `schema : () -> (text) query` (a JSON
 catalogue of entities, fields, and edges) and `execute : (text) -> (Result)
 query` (a JSON query language with filters, aggregation, ordering, and edge
-traversal). `get_candid` detects the pair and reports `oql: true` (parsing the
+traversal). `get_canister_candid` detects the pair and reports `oql: true` (parsing the
 interface behind the same CWE-674 guard the encode/decode path uses, so a
 malformed `.did` just fails closed to `false`). Rather than inline the whole
-dialect into every interface read, `get_candid` emits only that flag plus a
-one-line pointer; the full guide is served on demand by `get_oql_guide` and as
+dialect into every interface read, `get_canister_candid` emits only that flag plus a
+one-line pointer; the full guide is served on demand by `icp_oql_guide` and as
 the `oql://usage` MCP **resource**.
 
-Two dedicated tools drive the surface: **`oql_schema`** returns the entity/field
-catalogue, and **`oql_query`** takes the query as a plain JSON object string,
+Two dedicated tools drive the surface: **`get_canister_oql_schema`** returns the entity/field
+catalogue, and **`run_canister_oql_query`** takes the query as a plain JSON object string,
 wraps it as `execute`'s single `text` argument (so the model never hand-escapes
 JSON inside a Candid literal), and decodes the reply into `columns` + `rows` —
 rendered as a markdown table, with `has_more` for paging. Both accept an optional
-`domain`/`account` to query as the user's account (same on-demand delegation as
-`call_canister`). Detection stays name-based and the decode is fail-closed: a
+`derivation_origin`/`account` to query as the user's account (same on-demand
+delegation as `call_canister`). Detection stays name-based and the decode is fail-closed: a
 reply that isn't a recognizable OQL result degrades to the raw Candid rather than
 erroring. The design mirrors the reference IC connector's OQL primer (detect +
 teach), adding an ergonomic executor suited to this server's structured-output
@@ -150,11 +202,11 @@ The management tools let the agent act **on chain as your standing Internet
 Identity principal** — a stable per-connection identity (the one returned when you
 authenticate). Because a user ingress message cannot attach cycles, creation and
 top-ups fund the canister one of two ways, both keyed to that management principal
-(the one `cycles_balance` reports, default subaccount):
+(the one `icp_cycles_balance` reports, default subaccount):
 
 - **`cycles`** — drawn from your **cycles-ledger** balance
   (`um5iw-rqaaa-aaaaq-qaaba-cai`); fund it first (e.g. via the `icp` CLI /
-  `cycles-management` skill) and check it with `cycles_balance`.
+  `cycles-management` skill) and check it with `icp_cycles_balance`.
 - **`icp`** — a decimal-ICP amount transferred from that principal's
   **ICP-ledger** account (`ryjl3-tyaaa-aaaaa-aaaba-cai`, default subaccount) to
   the **CMC**, which mints cycles into the canister (`notify_create_canister` /
@@ -163,16 +215,16 @@ top-ups fund the canister one of two ways, both keyed to that management princip
   call is **not** idempotent, so don't blindly re-run it.
 
 `cycles` takes precedence if both are given. Lifecycle calls
-(`install_code`, `canister_status`, `update_canister_settings`,
+(`icp_install_code`, `icp_canister_status`, `icp_update_canister_settings`,
 `start`/`stop`/`uninstall`/`delete`) go to the management canister (`aaaaa-aa`)
-with the effective canister id set to the target. `install_code` takes the
+with the effective canister id set to the target. `icp_install_code` takes the
 compiled Wasm as base64/hex and uploads it via the chunk store automatically when
 it exceeds the single-message limit.
 
 Together these make the end-to-end flow work: *"create a Motoko canister that does
 X and deploy a new canister with Y ICP worth of cycles"* → the agent reads the
 relevant skills, writes and **builds** the Wasm in its own environment, then
-`create_canister(icp = Y)` and `install_code`. (Compiling Motoko/Rust to Wasm
+`icp_create_canister(icp = Y)` and `icp_install_code`. (Compiling Motoko/Rust to Wasm
 happens in the agent's environment, not in this server.)
 
 ## Connect from an MCP client
@@ -463,7 +515,7 @@ II's consent screen **defaults to read-only** (opt-out). A user who just clicks
 "Allow" gets a session whose per-app delegations are `permissions = "queries"`,
 and the IC **rejects update calls made through them at ingress**. That makes the
 entire canister-management surface inert — `create`/`install`/`start`/`stop`/
-`uninstall`/`delete`, and even `canister_status`, are update calls. To handle this
+`uninstall`/`delete`, and even `icp_canister_status`, are update calls. To handle this
 without opaque low-level errors:
 
 - The completion POST now carries `permissions: "queries" | "all"` (§0), so the
@@ -473,7 +525,7 @@ without opaque low-level errors:
   fallback signal.
 - Management tools check it up front and, for a *known* read-only session, return
   an actionable *"reconnect with read-only off"* message instead of an ingress error.
-- `get_principal` reflects a read-only session in its output, so the agent won't
+- `get_app_principal` reflects a read-only session in its output, so the agent won't
   attempt updates it can't make.
 
 **The server is passive during the handshake and holds no key at link time.** On
@@ -532,8 +584,8 @@ There is no per-app browser sign-in. Instead the model is:
   it as a time-boxed grant bound to your anchor. The backend signs II's `mcp_*`
   calls directly with that key (its principal `self_authenticating(session_pubkey)`
   is what the grant is bound to). Reconnect when the grant expires or is revoked.
-- **App delegations minted on demand.** When `call_canister` (or `get_principal`)
-  is invoked with a `domain` (e.g. `oisy.com`), the backend mints a **short-lived
+- **App delegations minted on demand.** When `call_canister` (or `get_app_principal`)
+  is invoked with a `derivation_origin` (or an `app_url` like `https://oisy.com`), the backend mints a **short-lived
   per-app account delegation on demand**: signing *as the session key*, it calls
   Internet Identity's account-derivation methods directly — no browser round-trip
   — with the app's target origin and a fresh **per-app key** as `session_key`.
@@ -577,7 +629,7 @@ mcp_get_delegation :
   `II_URL` (default `https://beta.id.ai`) is the browser login origin and
   `II_CANISTER_ID` (default `fgte5-ciaaa-aaaad-aaatq-cai`, that instance's
   canister) is the canister these calls target, over `https://icp-api.io`.
-- Derived delegations are cached per `(session, domain, account_number)` and
+- Derived delegations are cached per `(session, derivation_origin, account_number)` and
   reused until they near expiry, then re-derived.
 
 ### Listing accounts
@@ -586,7 +638,7 @@ A user can hold several accounts at one app: a default account everyone gets
 automatically (the anchor's current, user-controllable default at that origin),
 plus any **named** accounts they created there. Each account is a **distinct
 per-origin principal** — the app never sees a global, cross-app identity.
-`list_accounts(domain)` returns them by calling II's
+`list_app_accounts(derivation_origin)` returns them by calling II's
 
 ```candid
 mcp_get_accounts : (target_origin: text)
@@ -599,7 +651,7 @@ type AccountInfo = record {
 signed as the session key. Like the delegation methods, II **recovers the anchor
 from the caller** (the registered session-key principal), so no anchor number is
 needed. To act as a non-default account, pass its `name` to
-`call_canister`/`get_principal` as `account`; the server resolves the name to its
+`call_canister`/`get_app_principal` as `account`; the server resolves the name to its
 `account_number` via `mcp_get_accounts` and threads that into the on-demand
 delegation. Omitting `account` uses the default account.
 
@@ -617,7 +669,7 @@ delegation. Omitting `account` uses the default account.
 
 ## Roadmap
 
-- [x] Candid tools over MCP streamable-HTTP; `discover_canisters`; Candid
+- [x] Candid tools over MCP streamable-HTTP; `discover_app_canisters`; Candid
       reference resources.
 - [x] OAuth 2.1 auth (authorization-code + PKCE): II's `/mcp` handshake registers
       the connection's session key (two JSON callback POSTs, no delegation chain),
@@ -627,9 +679,9 @@ delegation. Omitting `account` uses the default account.
       hosted-redirect allow-listing — see Auth.)
 - [x] On-demand **domain identities**: the registered session key mints per-app
       account delegations directly via II canister methods
-      (`call_canister`/`get_principal` `domain`); no per-app browser flow.
-- [x] **Per-app accounts**: `list_accounts(domain)` lists the user's accounts at
-      an app (via `mcp_get_accounts`), and `call_canister`/`get_principal` take an
+      (`call_canister`/`get_app_principal` `derivation_origin`); no per-app browser flow.
+- [x] **Per-app accounts**: `list_app_accounts(derivation_origin)` lists the user's accounts at
+      an app (via `mcp_get_accounts`), and `call_canister`/`get_app_principal` take an
       `account` name to act as a specific (non-default) account.
 - [ ] Deploy the `mcp_register` + `mcp_get_accounts` + `mcp_prepare_delegation` +
       `mcp_get_delegation` canister methods (server is built against #4086's candid

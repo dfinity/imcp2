@@ -67,13 +67,13 @@ const CHUNK_SIZE: usize = 1_000_000;
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct CreateCanisterArgs {
     /// Cycles to fund the new canister with (exact), drawn from your
-    /// **cycles-ledger** balance (the principal `cycles_balance` reports). Omit to
+    /// **cycles-ledger** balance (the principal `icp_cycles_balance` reports). Omit to
     /// use `icp` instead.
     #[serde(default)]
     pub cycles: Option<u64>,
     /// ICP to convert into the new canister's cycles, as a decimal string e.g.
     /// "0.5" or "2". Transferred from your **ICP-ledger** account (same management
-    /// principal as `cycles_balance`, default subaccount) and minted to cycles via
+    /// principal as `icp_cycles_balance`, default subaccount) and minted to cycles via
     /// the CMC — best-effort, single attempt, no retries. Ignored when `cycles` is
     /// set.
     #[serde(default)]
@@ -92,12 +92,12 @@ pub struct TopUpArgs {
     /// Canister to top up.
     pub canister_id: String,
     /// Cycles to add (exact), drawn from your **cycles-ledger** balance (the
-    /// principal `cycles_balance` reports). Omit to use `icp` instead.
+    /// principal `icp_cycles_balance` reports). Omit to use `icp` instead.
     #[serde(default)]
     pub cycles: Option<u64>,
     /// ICP to convert into cycles for the top-up, as a decimal string. Transferred
     /// from your **ICP-ledger** account (same management principal as
-    /// `cycles_balance`, default subaccount) and minted via the CMC — best-effort,
+    /// `icp_cycles_balance`, default subaccount) and minted via the CMC — best-effort,
     /// single attempt, no retries. Ignored when `cycles` is set.
     #[serde(default)]
     pub icp: Option<String>,
@@ -164,9 +164,9 @@ pub struct NoArgs {}
 // ===========================================================================
 
 /// Structured result of the lifecycle/action tools that confirm an operation on
-/// a specific canister (`canister_status`, `install_code`,
-/// `update_canister_settings`, `top_up_canister`, `start_canister`,
-/// `stop_canister`, `uninstall_code`, `delete_canister`).
+/// a specific canister (`icp_canister_status`, `icp_install_code`,
+/// `icp_update_canister_settings`, `icp_top_up_canister`, `icp_start_canister`,
+/// `icp_stop_canister`, `icp_uninstall_code`, `icp_delete_canister`).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CanisterActionOutput {
     /// The canister the action targeted.
@@ -175,7 +175,7 @@ pub struct CanisterActionOutput {
     pub message: String,
 }
 
-/// Structured result of `cycles_balance`.
+/// Structured result of `icp_cycles_balance`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CyclesBalance {
     /// Your Internet Identity principal — the cycles-ledger account owner.
@@ -193,10 +193,10 @@ impl CyclesBalance {
     }
 }
 
-/// Structured result of `create_canister`.
+/// Structured result of `icp_create_canister`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CreatedCanister {
-    /// The new canister's principal id — install code on it with install_code.
+    /// The new canister's principal id — install code on it with icp_install_code.
     pub canister_id: String,
     /// The canister's controller principals.
     pub controllers: Vec<String>,
@@ -210,7 +210,7 @@ impl CreatedCanister {
     pub fn human(&self) -> String {
         format!(
             "Created canister {} — {}. Controllers: {}.\n\
-             Next: build your Wasm and install it with install_code.",
+             Next: build your Wasm and install it with icp_install_code.",
             self.canister_id,
             self.funding,
             self.controllers.join(", ")
@@ -230,7 +230,7 @@ fn default_init_arg() -> String {
 // testable without an IcTools and main.rs stays thin.
 // ===========================================================================
 
-/// Your cycles-ledger balance (the funds `create_canister`/`top_up_canister` spend).
+/// Your cycles-ledger balance (the funds `icp_create_canister`/`icp_top_up_canister` spend).
 pub async fn cycles_balance(ids: &Identities, session_id: &str) -> Result<CyclesBalance, String> {
     let (agent, principal) = management_agent(ids, session_id).await?;
     let ledger = parse_principal(CYCLES_LEDGER)?;

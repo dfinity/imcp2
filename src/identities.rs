@@ -219,7 +219,7 @@ const LIVE_SESSION_IDLE_WINDOW_NS: u64 = 5 * 60 * 1_000_000_000;
 /// DIFFERENT principal (H1). Note this only replicates II's *domain-based*
 /// derivation — a dapp declaring a custom derivation origin via
 /// `/.well-known/ii-alternative-origins` is NOT handled here (a known limitation).
-fn target_origin(domain: &str) -> String {
+pub(crate) fn target_origin(domain: &str) -> String {
     let host = domain
         .trim()
         .trim_start_matches("https://")
@@ -313,24 +313,51 @@ pub struct AccountInfo {
     pub last_used: Option<u64>,
 }
 
-/// Arguments for `get_principal`.
+/// Arguments for `get_app_principal`. Identify the app EITHER by its canonical
+/// derivation origin (`derivation_origin`) OR by its URL (`app_url`); provide
+/// exactly one.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetPrincipalArgs {
-    /// The application domain to resolve, e.g. "oisy.com". Returns the principal
-    /// you act as at that app — its account delegation is derived on demand (same
-    /// as call_canister) and its principal returned.
-    pub domain: String,
-    /// Which of your accounts at `domain` to resolve, by account name (see
-    /// list_accounts). Omit to use that app's default account.
+    /// The exact canonical origin Internet Identity uses to derive this app's
+    /// principal — NOT necessarily the website's visible URL. For an app that
+    /// pins a custom derivation origin (via `derivationOrigin` +
+    /// `/.well-known/ii-alternative-origins`), pass that canonical origin here
+    /// (e.g. "https://<frontend-canister>.icp0.io"). Do NOT infer it from an
+    /// alternativeOrigins list. Accepts the legacy name `domain`. Provide this
+    /// OR `app_url`, not both.
+    #[serde(default, alias = "domain")]
+    pub derivation_origin: Option<String>,
+    /// The application's URL (e.g. "https://oisy.com"). The connector resolves
+    /// its derivation origin, precedence: the app's declared one
+    /// (`/.well-known/ic-app.json`) if present (`derivation_origin_source` =
+    /// "declared"), else a built-in known-app value for a few apps that pin a
+    /// custom origin without declaring it ("known"), else the application origin
+    /// (an assumption — "app_url_default"). See the result's
+    /// `derivation_origin_source`. Provide this OR `derivation_origin`.
+    #[serde(default)]
+    pub app_url: Option<String>,
+    /// Which of your accounts to resolve, by account name (see list_app_accounts).
+    /// Omit to use that app's default account.
     #[serde(default)]
     pub account: Option<String>,
 }
 
-/// Structured output of `get_principal`.
+/// Structured output of `get_app_principal`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct PrincipalOutput {
-    /// The application domain the principal was derived for.
-    pub domain: String,
+    /// The effective Internet Identity derivation origin the principal was
+    /// derived for (after canonicalization). Compare against `requested` to spot
+    /// an origin mismatch.
+    pub derived_for_origin: String,
+    /// Exactly what you supplied (`derivation_origin` or `app_url`), echoed so a
+    /// mismatch with `derived_for_origin` is immediately visible.
+    pub requested: String,
+    /// How `derived_for_origin` was determined: "explicit" (you passed
+    /// `derivation_origin`), "declared" (the app declared it in
+    /// /.well-known/ic-app.json), "known" (from the connector's built-in registry
+    /// of well-known custom-derivation-origin apps), or "app_url_default" (assumed
+    /// from the app URL — correct only if the app has no custom derivation origin).
+    pub derivation_origin_source: String,
     /// The account name resolved, or null for the app's default account.
     pub account: Option<String>,
     /// The principal you act as at that app.
@@ -340,14 +367,22 @@ pub struct PrincipalOutput {
     pub read_only: bool,
 }
 
-/// Arguments for `list_accounts`.
+/// Arguments for `list_app_accounts`. Identify the app by `derivation_origin` OR
+/// `app_url` (exactly one).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListAccountsArgs {
-    /// The application domain whose accounts to list, e.g. "oisy.com".
-    pub domain: String,
+    /// The exact canonical Internet Identity derivation origin (NOT necessarily
+    /// the visible URL). Accepts the legacy name `domain`. Provide this OR
+    /// `app_url`.
+    #[serde(default, alias = "domain")]
+    pub derivation_origin: Option<String>,
+    /// The application's URL; the connector resolves its derivation origin (see
+    /// `get_app_principal`). Provide this OR `derivation_origin`.
+    #[serde(default)]
+    pub app_url: Option<String>,
 }
 
-/// One account in the `list_accounts` MCP output (a serialization mirror of
+/// One account in the `list_app_accounts` MCP output (a serialization mirror of
 /// [`AccountInfo`]).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct AccountEntry {
@@ -369,23 +404,54 @@ impl From<&AccountInfo> for AccountEntry {
     }
 }
 
-/// Structured output of `list_accounts`.
+/// Structured output of `list_app_accounts`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct AccountsOutput {
-    /// The application domain the accounts belong to.
-    pub domain: String,
-    /// The user's accounts at that app (empty if none).
+    /// The effective Internet Identity derivation origin the accounts belong to.
+    pub derived_for_origin: String,
+    /// Exactly what you supplied (`derivation_origin` or `app_url`), echoed so a
+    /// mismatch with `derived_for_origin` is immediately visible.
+    pub requested: String,
+    /// How `derived_for_origin` was determined: "explicit", "declared", "known"
+    /// (built-in known-app registry), or "app_url_default".
+    pub derivation_origin_source: String,
+    /// The user's accounts at that origin (empty if none).
     pub accounts: Vec<AccountEntry>,
 }
 
-impl From<(String, Vec<AccountInfo>)> for AccountsOutput {
-    /// `(domain, accounts)` → the structured `list_accounts` reply.
-    fn from((domain, accounts): (String, Vec<AccountInfo>)) -> Self {
-        Self {
-            domain,
-            accounts: accounts.iter().map(AccountEntry::from).collect(),
-        }
-    }
+/// Arguments for `resolve_app`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ResolveAppArgs {
+    /// The application's URL, e.g. "https://oisy.com".
+    pub app_url: String,
+}
+
+/// Structured output of `resolve_app`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ResolveAppOutput {
+    /// The normalized application origin of `app_url`.
+    pub application_origin: String,
+    /// The Internet Identity derivation origin to use for this app — pass this
+    /// as `derivation_origin` to the identity tools.
+    pub derivation_origin: String,
+    /// How `derivation_origin` was determined: "declared" (the app declared it
+    /// in /.well-known/ic-app.json — authoritative), "known" (from the connector's
+    /// built-in registry of well-known custom-derivation-origin apps, used only
+    /// when the app declares none), or "app_url_default" (assumed to equal the
+    /// application origin — correct only if the app has no custom derivation
+    /// origin, which this connector cannot verify).
+    pub derivation_origin_source: String,
+    /// Origins the application origin's `/.well-known/ii-alternative-origins`
+    /// permits to derive from it. Informational only — this is the INVERSE of
+    /// "which derivation origin the app uses", so do not infer the derivation
+    /// origin from it.
+    pub alternative_origins: Vec<String>,
+    /// A human note, e.g. flagging that the derivation origin was assumed.
+    /// This tool deliberately does NOT return a principal: it resolves the
+    /// derivation origin only, since the caller hasn't chosen an account. Get the
+    /// principal with `get_app_principal` (or `list_app_accounts`) for a specific
+    /// account, passing this `derivation_origin`.
+    pub note: Option<String>,
 }
 
 #[derive(Clone)]
@@ -618,7 +684,7 @@ impl Identities {
 
     /// This session's known access level: `Some(true)` = read-only, `Some(false)`
     /// = full, `None` = not yet learned (the best-effort completion POST didn't
-    /// arrive). Surfaced by `get_principal` so the agent can set expectations.
+    /// arrive). Surfaced by `get_app_principal` so the agent can set expectations.
     pub async fn is_read_only(&self, session_id: &str) -> Option<bool> {
         let sessions = self.sessions.read().await;
         sessions.get(session_id).and_then(|s| s.read_only)
@@ -834,8 +900,9 @@ impl Identities {
         let mut matching = accounts.iter().filter(|a| a.name.as_deref() == Some(name));
         match (matching.next(), matching.next()) {
             (None, _) => Err(format!(
-                "no account named \"{name}\" at {domain} — call list_accounts(domain) to see your \
-                 accounts there, or omit `account` to use the default one"
+                "no account named \"{name}\" at {domain} — call `list_app_accounts` (with this app's \
+                 `derivation_origin` or `app_url`) to see your accounts there, or omit `account` to \
+                 use the default one"
             )),
             (Some(a), None) => Ok(a.account_number),
             (Some(_), Some(_)) => Err(format!(

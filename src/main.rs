@@ -1,8 +1,8 @@
 //! Minimal MCP PoC: an MCP server exposing tools over streamable HTTP that talk
 //! to the Internet Computer via ic-agent.
 //!
-//!   1. `get_candid`   — fetch a canister's Candid interface (`candid:service` metadata).
-//!   2. `discover_canisters` — find the canisters behind a web domain.
+//!   1. `get_canister_candid`   — fetch a canister's Candid interface (`candid:service` metadata).
+//!   2. `discover_app_canisters` — find the canisters behind a web domain.
 //!   3. `call_canister` — call any method with textual Candid in, textual Candid out,
 //!      as `anonymous` or as a domain identity derived ON DEMAND.
 //!
@@ -46,9 +46,9 @@ const SKILL_URI_PREFIX: &str = "skill://";
 const CANDID_TEXTUAL_MD: &str = include_str!("../static/candid-textual-syntax.md");
 const CANDID_REFERENCE_MD: &str = include_str!("../static/candid-reference.md");
 
-/// The OQL query-surface usage guide. Served on demand (via the `get_oql_guide`
+/// The OQL query-surface usage guide. Served on demand (via the `icp_oql_guide`
 /// tool and the `oql://usage` resource) rather than inlined into every
-/// `get_candid` reply: `get_candid` only signals `oql: true` plus a one-line
+/// `get_canister_candid` reply: `get_canister_candid` only signals `oql: true` plus a one-line
 /// pointer here, so the guidance is delivered once, when the model chooses to
 /// query, without bloating every interface read.
 const OQL_USAGE_URI: &str = "oql://usage";
@@ -82,7 +82,7 @@ fn allowed_hosts() -> Vec<String> {
 }
 
 // Per-tool argument and output types live in the module that implements the
-// tool: `calls` (get_candid, call_canister), `discover`, `identities`,
+// tool: `calls` (get_canister_candid, call_canister), `discover`, `identities`,
 // `skills`, `management`. main.rs only wires the tools together.
 
 #[derive(Clone)]
@@ -109,7 +109,7 @@ impl IcTools {
         annotations(title = "Get Candid interface", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::GetCandidOutput>(),
     )]
-    async fn get_candid(
+    async fn get_canister_candid(
         &self,
         Parameters(calls::GetCandidArgs { canister_id }): Parameters<calls::GetCandidArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -128,16 +128,16 @@ impl IcTools {
                     // set, the guidance pointer is emitted as a SEPARATE content
                     // block, so the first block stays the raw `.did` (still valid,
                     // copy-pastable Candid) — the full primer is served on demand
-                    // (see get_oql_guide / OQL_USAGE_URI), never inlined.
+                    // (see icp_oql_guide / OQL_USAGE_URI), never inlined.
                     let oql = calls::has_oql(&did);
                     let output = calls::GetCandidOutput { canister_id, candid: did.clone(), oql };
                     if oql {
                         let note = format!(
                             "This canister exposes an OQL query surface (a JSON query language \
-                             over its data). Use oql_schema to see its entities and fields, then \
-                             oql_query with a JSON query to read data as a table — these wrap the \
+                             over its data). Use get_canister_oql_schema to see its entities and fields, then \
+                             run_canister_oql_query with a JSON query to read data as a table — these wrap the \
                              `schema`/`execute` methods for you (no Candid escaping). See \
-                             get_oql_guide (or the `{OQL_USAGE_URI}` resource) for the dialect."
+                             icp_oql_guide (or the `{OQL_USAGE_URI}` resource) for the dialect."
                         );
                         Ok(ok_structured_blocks(vec![did, note], &output))
                     } else {
@@ -153,11 +153,11 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Load the OQL query-surface guide: the JSON query dialect for canisters that expose OQL (get_candid reports `oql: true`) — entities/fields/edges via `schema`, and the `execute` query object (filters, aggregation, ordering, edge traversal, paging). Use the oql_schema and oql_query tools to run it (they wrap the underlying methods); read this first so you write correct queries instead of guessing bespoke methods.",
+        description = "Load the OQL query-surface guide: the JSON query dialect for canisters that expose OQL (get_canister_candid reports `oql: true`) — entities/fields/edges via `schema`, and the `execute` query object (filters, aggregation, ordering, edge traversal, paging). Use the get_canister_oql_schema and run_canister_oql_query tools to run it (they wrap the underlying methods); read this first so you write correct queries instead of guessing bespoke methods.",
         annotations(title = "Get the OQL query guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
         output_schema = schema_for_output::<calls::OqlGuideOutput>(),
     )]
-    async fn get_oql_guide(
+    async fn icp_oql_guide(
         &self,
         Parameters(_args): Parameters<management::NoArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -166,13 +166,13 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Run an OQL query against a canister that exposes the OQL surface (get_candid reports `oql: true`). Pass the query as a JSON object string in `query` (see get_oql_guide / oql_schema for the dialect and field names) — it's sent to the canister's `execute` query method, so NO Candid escaping is needed. Returns the result decoded as `columns` + `rows` (rendered as a markdown table), with `has_more` for paging (re-query with a higher `offset`). Omit `domain` to query anonymously, or pass an application domain to query as your account there.",
+        description = "Run an OQL query against a canister that exposes the OQL surface (get_canister_candid reports `oql: true`). Pass the query as a JSON object string in `query` (see icp_oql_guide / get_canister_oql_schema for the dialect and field names) — it's sent to the canister's `execute` query method, so NO Candid escaping is needed. Returns the result decoded as `columns` + `rows` (rendered as a markdown table), with `has_more` for paging (re-query with a higher `offset`). Omit `derivation_origin` to query anonymously, or pass the app's canonical Internet Identity derivation origin to query as your account there — the result then echoes `derived_for_origin` / `requested` / `acted_as_principal` so an origin mismatch is visible.",
         annotations(title = "Run an OQL query", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::OqlQueryOutput>(),
     )]
-    async fn oql_query(
+    async fn run_canister_oql_query(
         &self,
-        Parameters(calls::OqlQueryArgs { canister_id, query, domain, account }): Parameters<calls::OqlQueryArgs>,
+        Parameters(calls::OqlQueryArgs { canister_id, query, derivation_origin, account }): Parameters<calls::OqlQueryArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let principal = match Principal::from_text(&canister_id) {
@@ -189,13 +189,31 @@ impl IcTools {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
         };
-        let agent = match self
-            .resolve_agent(&ctx, domain.as_deref(), account.as_deref(), "querying")
+        // Echo the effective derivation origin + acted-as principal (like
+        // call_canister) so a canonicalization / wrong-origin mismatch is visible
+        // even to text-only clients. `requested` is what the caller supplied
+        // (trimmed); `derived_for_origin` is the canonical origin actually used.
+        let requested = derivation_origin.as_ref().map(|s| s.trim().to_string());
+        let origin = match clean_derivation_origin(derivation_origin) {
+            Ok(o) => o,
+            Err(e) => return Ok(err(e)),
+        };
+        let (agent, acted_as) = match self
+            .resolve_agent(&ctx, origin.as_deref(), account.as_deref(), "querying")
             .await
         {
             Ok(a) => a,
             Err(e) => return Ok(err(e)),
         };
+        let identity_note = origin.as_ref().map(|o| {
+            let target = IdentityTarget {
+                origin: o.clone(),
+                requested: requested.clone().unwrap_or_else(|| o.clone()),
+                source: "explicit".to_string(),
+                application_origin: None,
+            };
+            format!("[{}]", identity_annotation(&target, acted_as.as_deref()))
+        });
         let reply = match calls::raw_call(&agent, principal, "execute", arg_bytes, true).await {
             Ok(b) => b,
             Err(e) => return Ok(err(format!("OQL execute failed: {e}"))),
@@ -205,9 +223,22 @@ impl IcTools {
         let did = calls::resolve_did(&agent, principal, None).await;
         match calls::parse_execute_reply(did.as_deref(), &reply) {
             calls::OqlResult::Table { columns, rows, has_more } => {
-                let text = calls::render_table(&columns, &rows, has_more);
-                let output = calls::OqlQueryOutput { canister_id, columns, rows, has_more };
-                Ok(ok_structured(text, &output))
+                // Primary block: the rendered table. Identity note (if any) is a
+                // separate block so the table stays clean.
+                let mut blocks = vec![calls::render_table(&columns, &rows, has_more)];
+                if let Some(note) = &identity_note {
+                    blocks.push(note.clone());
+                }
+                let output = calls::OqlQueryOutput {
+                    canister_id,
+                    columns,
+                    rows,
+                    has_more,
+                    acted_as_principal: acted_as,
+                    derived_for_origin: origin,
+                    requested,
+                };
+                Ok(ok_structured_blocks(blocks, &output))
             }
             calls::OqlResult::QueryError(msg) => {
                 Ok(err(format!("the canister returned an OQL error: {msg}")))
@@ -215,28 +246,33 @@ impl IcTools {
             calls::OqlResult::Unrecognized(raw) => {
                 // Not a recognizable OQL result — hand back the raw decoded reply
                 // so the model still has the data (empty table in the structured form).
+                let mut blocks =
+                    vec![format!("(Could not parse this as an OQL table; raw reply below.)\n\n{raw}")];
+                if let Some(note) = &identity_note {
+                    blocks.push(note.clone());
+                }
                 let output = calls::OqlQueryOutput {
                     canister_id,
                     columns: Vec::new(),
                     rows: Vec::new(),
                     has_more: false,
+                    acted_as_principal: acted_as,
+                    derived_for_origin: origin,
+                    requested,
                 };
-                Ok(ok_structured(
-                    format!("(Could not parse this as an OQL table; raw reply below.)\n\n{raw}"),
-                    &output,
-                ))
+                Ok(ok_structured_blocks(blocks, &output))
             }
         }
     }
 
     #[tool(
-        description = "Fetch the OQL schema catalogue of a canister that exposes the OQL surface (get_candid reports `oql: true`): its entities, their primary keys, fields, and edges, as JSON. Call this before oql_query so you know the queryable entities and exact field names. Omit `domain` to read anonymously, or pass an application domain to read as your account there.",
+        description = "Fetch the OQL schema catalogue of a canister that exposes the OQL surface (get_canister_candid reports `oql: true`): its entities, their primary keys, fields, and edges, as JSON. Call this before run_canister_oql_query so you know the queryable entities and exact field names. Omit `derivation_origin` to read anonymously, or pass the app's canonical Internet Identity derivation origin to read as your account there — the result then echoes `derived_for_origin` / `requested` / `acted_as_principal` so an origin mismatch is visible.",
         annotations(title = "Get the OQL schema", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::OqlSchemaOutput>(),
     )]
-    async fn oql_schema(
+    async fn get_canister_oql_schema(
         &self,
-        Parameters(calls::OqlSchemaArgs { canister_id, domain, account }): Parameters<calls::OqlSchemaArgs>,
+        Parameters(calls::OqlSchemaArgs { canister_id, derivation_origin, account }): Parameters<calls::OqlSchemaArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let principal = match Principal::from_text(&canister_id) {
@@ -247,8 +283,13 @@ impl IcTools {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
         };
-        let agent = match self
-            .resolve_agent(&ctx, domain.as_deref(), account.as_deref(), "reading the schema")
+        let requested = derivation_origin.as_ref().map(|s| s.trim().to_string());
+        let origin = match clean_derivation_origin(derivation_origin) {
+            Ok(o) => o,
+            Err(e) => return Ok(err(e)),
+        };
+        let (agent, acted_as) = match self
+            .resolve_agent(&ctx, origin.as_deref(), account.as_deref(), "reading the schema")
             .await
         {
             Ok(a) => a,
@@ -259,16 +300,35 @@ impl IcTools {
             Err(e) => return Ok(err(format!("OQL schema call failed: {e}"))),
         };
         let schema = calls::decode_schema_reply(&reply);
-        let output = calls::OqlSchemaOutput { canister_id, schema };
-        Ok(ok_structured(output.schema.clone(), &output))
+        // Keep the primary block as the raw schema JSON (paste-able); surface the
+        // identity note (like the other identity tools) as a SEPARATE block so a
+        // mismatch is visible to text-only clients without breaking the JSON.
+        let mut blocks = vec![schema.clone()];
+        if let Some(o) = origin.as_ref() {
+            let target = IdentityTarget {
+                origin: o.clone(),
+                requested: requested.clone().unwrap_or_else(|| o.clone()),
+                source: "explicit".to_string(),
+                application_origin: None,
+            };
+            blocks.push(format!("[{}]", identity_annotation(&target, acted_as.as_deref())));
+        }
+        let output = calls::OqlSchemaOutput {
+            canister_id,
+            schema,
+            acted_as_principal: acted_as,
+            derived_for_origin: origin,
+            requested,
+        };
+        Ok(ok_structured_blocks(blocks, &output))
     }
 
     #[tool(
-        description = "Read a canister's own API documentation — a prose \"how this app behaves\" guide covering units, auth, lifecycle, non-obvious semantics, mutation safety, polling rules, and gotchas — if it exposes a `getApiDoc` or `get_api_doc` method. Call this FIRST when working with an unfamiliar app: it explains behavior the Candid types alone don't (get_candid still gives the exact method signatures). Returns the doc as markdown.",
+        description = "Read a canister's own API documentation — a prose \"how this app behaves\" guide covering units, auth, lifecycle, non-obvious semantics, mutation safety, polling rules, and gotchas — if it exposes a `getApiDoc` or `get_api_doc` method. Call this FIRST when working with an unfamiliar app: it explains behavior the Candid types alone don't (get_canister_candid still gives the exact method signatures). Returns the doc as markdown.",
         annotations(title = "Get a canister's API documentation", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::ApiDocOutput>(),
     )]
-    async fn get_api_doc(
+    async fn get_canister_api_doc(
         &self,
         Parameters(calls::ApiDocArgs { canister_id }): Parameters<calls::ApiDocArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -284,7 +344,7 @@ impl IcTools {
             None => {
                 return Ok(err(
                     "this canister doesn't expose a `getApiDoc`/`get_api_doc` method (or its \
-                     Candid interface couldn't be read). Use get_candid for the raw interface."
+                     Candid interface couldn't be read). Use get_canister_candid for the raw interface."
                         .into(),
                 ))
             }
@@ -302,39 +362,48 @@ impl IcTools {
         Ok(ok_structured(output.doc.clone(), &output))
     }
 
-    /// The agent to sign calls with for a request: the shared anonymous agent
-    /// when no `domain` is given, else one backed by a short-lived account
-    /// delegation for that app derived on demand from the connection's standing
-    /// Internet Identity credential. `what` names the action for the
-    /// no-session error message. Shared by call_canister / oql_query / oql_schema.
+    /// The agent to sign calls with for a request, and the principal it signs as:
+    /// the shared anonymous agent (principal `None`) when `origin` is `None`, else
+    /// one backed by a short-lived account delegation for that Internet Identity
+    /// derivation `origin`, derived on demand from this connection's standing
+    /// credential. `origin` must be a VALIDATED derivation origin: call_canister
+    /// passes the canonical one from [`resolve_identity_target`]; run_canister_oql_query /
+    /// get_canister_oql_schema pass one validated by [`clean_derivation_origin`]. (get_app_principal
+    /// and list_app_accounts don't use this helper — they call
+    /// `Identities::delegated_identity_for` / `list_accounts` directly with a
+    /// `resolve_identity_target` origin.) `delegated_identity_for` re-canonicalizes
+    /// internally (idempotent), so an already-canonical origin is fine. `what`
+    /// names the action for the no-session error.
     async fn resolve_agent(
         &self,
         ctx: &RequestContext<RoleServer>,
-        domain: Option<&str>,
+        origin: Option<&str>,
         account: Option<&str>,
         what: &str,
-    ) -> Result<Agent, String> {
-        match domain {
-            None => Ok(self.agent.clone()),
-            Some(domain) => {
+    ) -> Result<(Agent, Option<String>), String> {
+        match origin {
+            None => Ok((self.agent.clone(), None)),
+            Some(origin) => {
                 let session_id = authed_session(ctx)
-                    .ok_or_else(|| format!("{what} as a domain needs an authenticated session"))?
+                    .ok_or_else(|| format!("{what} as an app needs an authenticated session"))?
                     .session_id;
                 let delegated = self
                     .identities
-                    .delegated_identity_for(&session_id, domain, account)
+                    .delegated_identity_for(&session_id, origin, account)
                     .await?;
-                Agent::builder()
+                let principal = delegated.sender().ok().map(|p| p.to_text());
+                let agent = Agent::builder()
                     .with_url(IC_URL)
                     .with_identity(delegated)
                     .build()
-                    .map_err(|e| format!("could not build agent: {e}"))
+                    .map_err(|e| format!("could not build agent: {e}"))?;
+                Ok((agent, principal))
             }
         }
     }
 
     #[tool(
-        description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `domain` to call anonymously, or pass an application domain (e.g. \"oisy.com\") to call as your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. By default this uses the app's default account; pass `account` (an account name from list_accounts) to act as a specific named account there. Set is_query=true for read-only query calls. If get_candid couldn't fetch the interface, pass the `.did` text as `candid` (e.g. ask the user for it) so args/replies are still typed.",
+        description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit both `derivation_origin` and `app_url` to call anonymously; provide one to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins); `app_url` lets the connector resolve it. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. Set is_query=true for read-only query calls. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
         annotations(title = "Call a canister method", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CallCanisterOutput>(),
     )]
@@ -345,7 +414,8 @@ impl IcTools {
             method,
             args,
             is_query,
-            domain,
+            derivation_origin,
+            app_url,
             account,
             candid,
         }): Parameters<calls::CallCanisterArgs>,
@@ -363,12 +433,19 @@ impl IcTools {
             Err(e) => return Ok(err(e)),
         };
 
-        // Pick the agent: no domain uses the shared anonymous agent; a domain
-        // derives a short-lived account delegation for that app on demand and
-        // builds an agent backed by it (the server signs as the user's account
-        // for that app).
-        let agent = match self
-            .resolve_agent(&ctx, domain.as_deref(), account.as_deref(), "calling")
+        // Resolve which principal to act as: none = anonymous; else the app's
+        // effective (canonical) II derivation origin, from an explicit
+        // `derivation_origin` or resolved from `app_url`.
+        let target = match resolve_identity_target(derivation_origin, app_url).await {
+            Ok(t) => t,
+            Err(e) => return Ok(err(e)),
+        };
+        // Pick the agent: no target uses the shared anonymous agent; a target
+        // derives a short-lived account delegation for that origin on demand and
+        // builds an agent backed by it (the server signs as the user's account).
+        let origin = target.as_ref().map(|t| t.origin.as_str());
+        let (agent, acted_as_principal) = match self
+            .resolve_agent(&ctx, origin, account.as_deref(), "calling")
             .await
         {
             Ok(a) => a,
@@ -380,70 +457,106 @@ impl IcTools {
         };
         // Decode against the Candid interface so field names are recovered.
         let reply = calls::decode_reply(did.as_deref(), &method, &reply_bytes);
-        let output = calls::CallCanisterOutput { canister_id, method, is_query, reply };
-        Ok(ok_structured(output.reply.clone(), &output))
+        let (derived_for_origin, requested, derivation_origin_source) = match &target {
+            Some(t) => (Some(t.origin.clone()), Some(t.requested.clone()), Some(t.source.clone())),
+            None => (None, None, None),
+        };
+        // Keep the primary text block pure textual Candid (paste-able); surface the
+        // identity note (so a wrong-principal is visible to text-only clients) as a
+        // SEPARATE block rather than contaminating the reply.
+        let mut blocks = vec![reply.clone()];
+        if let Some(t) = &target {
+            let acted = acted_as_principal.as_deref().unwrap_or("<unknown>");
+            blocks.push(format!("[{}]", identity_annotation(t, Some(acted))));
+        }
+        let output = calls::CallCanisterOutput {
+            canister_id, method, is_query, reply,
+            acted_as_principal, derived_for_origin, requested, derivation_origin_source,
+        };
+        Ok(ok_structured_blocks(blocks, &output))
     }
 
     #[tool(
-        description = "Get the Internet Computer principal you act as at a given application `domain` (e.g. \"oisy.com\"), without making a canister call. The app's account delegation is derived on demand (same as call_canister) from this connection's standing Internet Identity credential, and its principal is returned. By default this resolves the app's default account; pass `account` (an account name from list_accounts) for a specific named account there. Use this when a flow needs the principal itself (e.g. to look up a balance or account) rather than to invoke a method. NOTE: the principal is derived from the app's DOMAIN, which is usually — but not always — the identity a browser sign-in to that app would use. Some apps declare a CUSTOM derivation origin (via /.well-known/ii-alternative-origins) that isn't exposed here; if the returned principal (or an account/balance) doesn't match what the user sees in their browser at that app, tell them so and offer to look up the app's ii-alternative-origins (web search / fetch) and retry.",
+        description = "Get the Internet Computer principal you act as at an app, without making a canister call. Identify the app by `derivation_origin` (its EXACT canonical Internet Identity derivation origin — NOT necessarily the visible website URL, and never inferred from an alternativeOrigins list) OR by `app_url` (the connector resolves the derivation origin). The account delegation is derived on demand from this connection's standing Internet Identity credential. By default this resolves the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result returns the `principal` plus `derived_for_origin`, `requested`, and `derivation_origin_source` — compare the first two to catch an origin mismatch (a valid but WRONG principal). If `derivation_origin_source` is \"app_url_default\", the app declares no derivation origin and this assumed the app URL is the derivation origin; if the principal looks wrong for an app with a custom derivation origin, pass that canonical origin as `derivation_origin`.",
         annotations(title = "Get your principal at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::PrincipalOutput>(),
     )]
-    async fn get_principal(
+    async fn get_app_principal(
         &self,
-        Parameters(identities::GetPrincipalArgs { domain, account }): Parameters<identities::GetPrincipalArgs>,
+        Parameters(identities::GetPrincipalArgs { derivation_origin, app_url, account }): Parameters<identities::GetPrincipalArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session_id = match authed_session(&ctx) {
             Some(s) => s.session_id,
-            None => return Ok(err("getting a domain principal needs an authenticated session".into())),
+            None => return Ok(err("getting an app principal needs an authenticated session".into())),
+        };
+        let target = match resolve_identity_target(derivation_origin, app_url).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return Ok(err("provide `derivation_origin` or `app_url` to identify the app".into())),
+            Err(e) => return Ok(err(e)),
         };
         let delegated = match self
             .identities
-            .delegated_identity_for(&session_id, &domain, account.as_deref())
+            .delegated_identity_for(&session_id, &target.origin, account.as_deref())
             .await
         {
             Ok(d) => d,
             Err(e) => return Ok(err(e)),
         };
-        match delegated.sender() {
-            Ok(p) => {
-                // Surface a read-only session (H2) so the LLM won't attempt (and
-                // have the IC reject at ingress) canister-management updates.
-                let read_only = self.identities.is_read_only(&session_id).await == Some(true);
-                let mut out = p.to_text();
-                if read_only {
-                    out.push_str(
-                        "\n\n(This Internet Identity session is READ-ONLY: reads work, but canister \
-                         management — create/install/start/stop/delete, and canister_status — needs \
-                         update access. Ask the user to reconnect with the read-only option turned OFF.)",
-                    );
-                }
-                let output = identities::PrincipalOutput { domain, account, principal: p.to_text(), read_only };
-                Ok(ok_structured(out, &output))
-            }
-            Err(e) => Ok(err(format!("could not derive principal for '{domain}': {e}"))),
+        let principal = match delegated.sender() {
+            Ok(p) => p.to_text(),
+            Err(e) => return Ok(err(format!("could not derive principal for {}: {e}", target.origin))),
+        };
+        // Surface a read-only session (H2) so the LLM won't attempt (and have the
+        // IC reject at ingress) canister-management updates.
+        let read_only = self.identities.is_read_only(&session_id).await == Some(true);
+        let mut text = format!("{principal}\n\n[{}]", identity_annotation(&target, None));
+        if read_only {
+            text.push_str(
+                "\n\n(This Internet Identity session is READ-ONLY: reads work, but canister \
+                 management — create/install/start/stop/delete, and icp_canister_status — needs \
+                 update access. Ask the user to reconnect with the read-only option turned OFF.)",
+            );
         }
+        let output = identities::PrincipalOutput {
+            derived_for_origin: target.origin,
+            requested: target.requested,
+            derivation_origin_source: target.source,
+            account,
+            principal,
+            read_only,
+        };
+        Ok(ok_structured(text, &output))
     }
 
     #[tool(
-        description = "List the user's Internet Identity accounts at an application `domain` (e.g. \"oisy.com\"). Internet Identity gives the user a distinct principal per app (derived from the app's domain), and within an app they may hold several accounts: a default account everyone gets automatically (the anchor's current, user-controllable default at that origin), plus any named accounts they created. Use this before acting on the user's behalf at an app: if there's only the default account, just proceed (call_canister/get_principal with no `account`); if there are several, pick one with the user (or act on each) by passing its name as `account`. Returns each account's name (the default has none), account number, and last-used time. If these accounts don't match what the user sees in their browser at this app, it may use a custom derivation origin not exposed here (offer to look up its ii-alternative-origins and retry). Requires an authenticated session.",
+        description = "List the user's Internet Identity accounts at an app. Identify the app by `derivation_origin` (its EXACT canonical II derivation origin — not necessarily the visible URL) OR by `app_url` (resolved by the connector). Internet Identity gives the user a distinct principal per derivation origin, and within it they may hold several accounts: a default account everyone gets automatically (the anchor's current, user-controllable default there), plus any named accounts they created. Use this before acting on the user's behalf: if there's only the default account, just proceed (call_canister/get_app_principal with no `account`); if there are several, pick one with the user by passing its name as `account`. Returns each account's name (the default has none), number, and last-used time, plus `derived_for_origin`/`requested`/`derivation_origin_source` — if these accounts don't match what the user sees in their browser, the derivation origin is likely wrong (pass the app's canonical `derivation_origin`). Requires an authenticated session.",
         annotations(title = "List your accounts at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::AccountsOutput>(),
     )]
-    async fn list_accounts(
+    async fn list_app_accounts(
         &self,
-        Parameters(identities::ListAccountsArgs { domain }): Parameters<identities::ListAccountsArgs>,
+        Parameters(identities::ListAccountsArgs { derivation_origin, app_url }): Parameters<identities::ListAccountsArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session_id = match authed_session(&ctx) {
             Some(s) => s.session_id,
             None => return Ok(err("listing your accounts needs an authenticated session".into())),
         };
-        match self.identities.list_accounts(&session_id, &domain).await {
+        let target = match resolve_identity_target(derivation_origin, app_url).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return Ok(err("provide `derivation_origin` or `app_url` to identify the app".into())),
+            Err(e) => return Ok(err(e)),
+        };
+        match self.identities.list_accounts(&session_id, &target.origin).await {
             Ok(accounts) => {
-                let text = format_accounts(&domain, &accounts);
-                let output = identities::AccountsOutput::from((domain, accounts));
+                let text = format_accounts(&target, &accounts);
+                let output = identities::AccountsOutput {
+                    derived_for_origin: target.origin,
+                    requested: target.requested,
+                    derivation_origin_source: target.source,
+                    accounts: accounts.iter().map(identities::AccountEntry::from).collect(),
+                };
                 Ok(ok_structured(text, &output))
             }
             Err(e) => Ok(err(e)),
@@ -451,11 +564,71 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). Returns every canister id found, with provenance, most authoritative first: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's MAIN backend) and the app's own /.well-known/ic-app.json manifest (ALL its canisters, with roles) — then the `x-ic-canister-id` header (the frontend/asset canister), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json/bundle entries are mined candidates: pick by label (prefer production/IC ids) and confirm with get_candid before calling.",
+        description = "Resolve an application URL to its Internet Identity derivation context, so you don't have to figure out the derivation origin yourself. Returns the `application_origin`, the `derivation_origin` to pass to the identity tools, how it was determined (`derivation_origin_source`: \"declared\" — the app published it in /.well-known/ic-app.json, authoritative; \"known\" — from the connector's built-in registry of well-known custom-derivation-origin apps (e.g. NNS, Oisy, MULTI/DEX), used only when the app declares none; or \"app_url_default\" — assumed equal to the application origin, correct only if the app has no custom derivation origin, which cannot be verified), and the app's `alternative_origins` (informational — the INVERSE relation, never use it to infer the derivation origin). This does NOT return a principal — it resolves the origin only, since you haven't picked an account; to get the principal you act as, pass the returned `derivation_origin` to get_app_principal (choosing an `account`) or list_app_accounts. Use this first when you only know an app's URL; no authenticated session is required.",
+        annotations(title = "Resolve an app's derivation origin", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<identities::ResolveAppOutput>(),
+    )]
+    async fn resolve_app(
+        &self,
+        Parameters(identities::ResolveAppArgs { app_url }): Parameters<identities::ResolveAppArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let app_url = match clean_app_url(&app_url) {
+            Ok(u) => u,
+            Err(e) => return Ok(err(e)),
+        };
+        // This tool surfaces `alternative_origins`, so fetch them (unlike the
+        // identity hot path in resolve_identity_target). It resolves the derivation
+        // origin ONLY — no principal is derived here, because the caller hasn't
+        // chosen an account; that's get_app_principal / list_app_accounts' job. So
+        // this needs no authenticated session.
+        let resolved = match discover::resolve_app_identity(&app_url, true).await {
+            Ok(r) => r,
+            Err(e) => return Ok(err(e)),
+        };
+        let effective = identities::target_origin(&resolved.derivation_origin);
+
+        let note = match resolved.derivation_origin_source {
+            discover::DerivationSource::Declared => None,
+            discover::DerivationSource::Known => Some(format!(
+                "This app didn't declare a derivation origin in /.well-known/ic-app.json, but it's \
+                 a known app that pins a custom one, so this used the built-in value {effective}. \
+                 The app's own declaration, if it ships one, would override this."
+            )),
+            discover::DerivationSource::AppUrlDefault => Some(format!(
+                "No derivation origin could be found for this app — its /.well-known/ic-app.json \
+                 either declares no `derivation_origin` or couldn't be fetched (DNS/timeout/TLS/\
+                 redirect), and it's not a known app — so this assumed the application origin, \
+                 canonicalized to {effective} (what II derives against). If this app uses a custom \
+                 derivation origin, that assumption yields a WRONG principal — supply the canonical \
+                 origin explicitly."
+            )),
+        };
+        let mut text = format!(
+            "application_origin: {}\nderivation_origin: {} ({})\n",
+            resolved.application_origin, effective, resolved.derivation_origin_source.as_str()
+        );
+        if !resolved.alternative_origins.is_empty() {
+            text.push_str(&format!("alternative_origins: {}\n", resolved.alternative_origins.join(", ")));
+        }
+        if let Some(n) = &note {
+            text.push_str(&format!("\nNOTE: {n}"));
+        }
+        let output = identities::ResolveAppOutput {
+            application_origin: resolved.application_origin,
+            derivation_origin: effective,
+            derivation_origin_source: resolved.derivation_origin_source.as_str().to_string(),
+            alternative_origins: resolved.alternative_origins,
+            note,
+        };
+        Ok(ok_structured(text, &output))
+    }
+
+    #[tool(
+        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). Returns every canister id found, with provenance, most authoritative first: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's MAIN backend) and the app's own /.well-known/ic-app.json manifest (ALL its canisters, with roles) — then the `x-ic-canister-id` header (the frontend/asset canister), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json/bundle entries are mined candidates: pick by label (prefer production/IC ids) and confirm with get_canister_candid before calling.",
         annotations(title = "Discover canisters behind a domain", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::DiscoverOutput>(),
     )]
-    async fn discover_canisters(
+    async fn discover_app_canisters(
         &self,
         Parameters(discover::DiscoverCanistersArgs { domain }): Parameters<discover::DiscoverCanistersArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -484,7 +657,7 @@ impl IcTools {
                      is the frontend/asset canister. Others come from env.json or the JS bundle \
                      and may include multiple environments (prefer the production/IC ids). A \
                      «name» (type) is the IC dashboard's label for that id. Confirm an interface \
-                     with get_candid before calling.",
+                     with get_canister_candid before calling.",
                 );
                 let output = discover::DiscoverOutput::from((domain, found));
                 Ok(ok_structured(out, &output))
@@ -500,11 +673,11 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Find Internet Computer canisters by NAME. Searches the IC dashboard's service registries — the ICRC token ledgers (e.g. ckBTC, ckETH, ckUSDC, SNS tokens) by symbol/name, and the SNS project catalog by name — and returns matching canister ids. Use this when the user names a token, project, or service (e.g. \"ckUSDC\") rather than a canister id; then confirm with get_candid and call methods with call_canister. (No public name-search exists over arbitrary canisters; this covers the IC's labelled services.)",
+        description = "Find Internet Computer canisters by NAME. Searches the IC dashboard's service registries — the ICRC token ledgers (e.g. ckBTC, ckETH, ckUSDC, SNS tokens) by symbol/name, and the SNS project catalog by name — and returns matching canister ids. Use this when the user names a token, project, or service (e.g. \"ckUSDC\") rather than a canister id; then confirm with get_canister_candid and call methods with call_canister. (No public name-search exists over arbitrary canisters; this covers the IC's labelled services.)",
         annotations(title = "Find canisters by name", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::FindCanisterOutput>(),
     )]
-    async fn find_canister(
+    async fn icp_find_canister_by_name(
         &self,
         Parameters(discover::FindCanisterArgs { query }): Parameters<discover::FindCanisterArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -521,8 +694,8 @@ impl IcTools {
                     ));
                 }
                 out.push_str(
-                    "\nConfirm an interface with get_candid, then call methods with call_canister. \
-                     For an SNS match the id is the project root — lookup_canister it to learn more.",
+                    "\nConfirm an interface with get_canister_candid, then call methods with call_canister. \
+                     For an SNS match the id is the project root — icp_lookup_canister_info_by_id it to learn more.",
                 );
                 let output = discover::FindCanisterOutput::from((query, matches));
                 Ok(ok_structured(out, &output))
@@ -531,8 +704,8 @@ impl IcTools {
                 let text = format!(
                     "No named canisters found matching \"{query}\". This searches known tokens (ICRC \
                      ledgers) and SNS projects, so an arbitrary canister won't appear unless it's a \
-                     labelled service. If you have a website, try discover_canisters; if you already \
-                     have a canister id, try lookup_canister or get_candid."
+                     labelled service. If you have a website, try discover_app_canisters; if you already \
+                     have a canister id, try icp_lookup_canister_info_by_id or get_canister_candid."
                 );
                 let output = discover::FindCanisterOutput::from((query, Vec::new()));
                 Ok(ok_structured(text, &output))
@@ -542,11 +715,11 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Identify what an Internet Computer canister IS, from the IC dashboard: its label/name (e.g. \"ICP Ledger\"), type (e.g. \"ledger\"), controllers, hosting subnet, module hash, language, and latest upgrade proposal. Use this to make sense of a bare canister id — e.g. one returned by discover_canisters.",
+        description = "Identify what an Internet Computer canister IS, from the IC dashboard: its label/name (e.g. \"ICP Ledger\"), type (e.g. \"ledger\"), controllers, hosting subnet, module hash, language, and latest upgrade proposal. Use this to make sense of a bare canister id — e.g. one returned by discover_app_canisters.",
         annotations(title = "Identify a canister", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::CanisterIdentityOutput>(),
     )]
-    async fn lookup_canister(
+    async fn icp_lookup_canister_info_by_id(
         &self,
         Parameters(discover::LookupCanisterArgs { canister_id }): Parameters<discover::LookupCanisterArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -567,11 +740,11 @@ impl IcTools {
     // ---- ICP skills awareness ----------------------------------------------
 
     #[tool(
-        description = "List the official Internet Computer skills — authoritative how-to guides for authoring and shipping IC apps (Motoko language, mops/icp CLIs, cycles management, stable memory & upgrades, security, DeFi, auth, …). Returns each skill's name and a one-line description. Load a skill's full instructions with get_ic_skill(name). Consult these BEFORE writing Motoko/Rust canister code, building, or deploying.",
+        description = "List the official Internet Computer skills — authoritative how-to guides for authoring and shipping IC apps (Motoko language, mops/icp CLIs, cycles management, stable memory & upgrades, security, DeFi, auth, …). Returns each skill's name and a one-line description. Load a skill's full instructions with icp_get_skill(name). Consult these BEFORE writing Motoko/Rust canister code, building, or deploying.",
         annotations(title = "List Internet Computer skills", read_only_hint = true, destructive_hint = false, open_world_hint = false),
         output_schema = schema_for_output::<skills::SkillsOutput>(),
     )]
-    async fn list_ic_skills(
+    async fn icp_list_skills(
         &self,
         Parameters(_args): Parameters<management::NoArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -586,11 +759,11 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Fetch the full instructions (SKILL.md) of one Internet Computer skill by name (e.g. \"motoko\", \"icp-cli\", \"mops-cli\", \"cycles-management\", \"stable-memory\", \"canister-security\"). Call list_ic_skills first to see the available names. Use this to learn the exact, current way to do an IC task before doing it.",
+        description = "Fetch the full instructions (SKILL.md) of one Internet Computer skill by name (e.g. \"motoko\", \"icp-cli\", \"mops-cli\", \"cycles-management\", \"stable-memory\", \"canister-security\"). Call icp_list_skills first to see the available names. Use this to learn the exact, current way to do an IC task before doing it.",
         annotations(title = "Get an Internet Computer skill", read_only_hint = true, destructive_hint = false, open_world_hint = false),
         output_schema = schema_for_output::<skills::SkillOutput>(),
     )]
-    async fn get_ic_skill(
+    async fn icp_get_skill(
         &self,
         Parameters(skills::GetSkillArgs { name }): Parameters<skills::GetSkillArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -606,11 +779,11 @@ impl IcTools {
     // ---- Canister creation & management (as your standing II principal) -----
 
     #[tool(
-        description = "Your cycles-ledger balance — the cycles that create_canister and top_up_canister spend. Acts as your Internet Identity principal (also printed). If it's empty, fund it first (e.g. via the icp CLI / cycles-management skill). Requires an authenticated session.",
+        description = "Your cycles-ledger balance — the cycles that icp_create_canister and icp_top_up_canister spend. Acts as your Internet Identity principal (also printed). If it's empty, fund it first (e.g. via the icp CLI / cycles-management skill). Requires an authenticated session.",
         annotations(title = "Check your cycles balance", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CyclesBalance>(),
     )]
-    async fn cycles_balance(
+    async fn icp_cycles_balance(
         &self,
         Parameters(_args): Parameters<management::NoArgs>,
         ctx: RequestContext<RoleServer>,
@@ -626,11 +799,11 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Create and fund a NEW Internet Computer canister (as your Internet Identity). Fund it EITHER with `cycles` (exact, drawn from your cycles-ledger balance) OR with `icp` (a decimal-ICP string like \"0.5\", transferred from your ICP-ledger account and converted to cycles via the CMC). BOTH accounts belong to your management principal — the same principal cycles_balance reports (its default subaccount); check/fund it before calling (cycles-ledger balance via cycles_balance, or hold ICP in that principal's ICP-ledger account). The ICP path is best-effort with no retries: if the ICP transfer lands but the mint fails, the error carries the block index to recover with — do not blindly re-run. `cycles` wins if both are given. Controllers default to your own principal. Returns the new canister id — then build your Wasm (see the motoko/icp-cli skills) and install it with install_code. Requires an authenticated session.",
+        description = "Create and fund a NEW Internet Computer canister (as your Internet Identity). Fund it EITHER with `cycles` (exact, drawn from your cycles-ledger balance) OR with `icp` (a decimal-ICP string like \"0.5\", transferred from your ICP-ledger account and converted to cycles via the CMC). BOTH accounts belong to your management principal — the same principal icp_cycles_balance reports (its default subaccount); check/fund it before calling (cycles-ledger balance via icp_cycles_balance, or hold ICP in that principal's ICP-ledger account). The ICP path is best-effort with no retries: if the ICP transfer lands but the mint fails, the error carries the block index to recover with — do not blindly re-run. `cycles` wins if both are given. Controllers default to your own principal. Returns the new canister id — then build your Wasm (see the motoko/icp-cli skills) and install it with icp_install_code. Requires an authenticated session.",
         annotations(title = "Create a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CreatedCanister>(),
     )]
-    async fn create_canister(
+    async fn icp_create_canister(
         &self,
         Parameters(args): Parameters<management::CreateCanisterArgs>,
         ctx: RequestContext<RoleServer>,
@@ -646,11 +819,11 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Add cycles to an existing canister (as your Internet Identity). Fund EITHER with `cycles` (exact, drawn from your cycles-ledger balance) OR with `icp` (a decimal-ICP string, transferred from your ICP-ledger account and converted via the CMC straight into the target canister). Both accounts belong to your management principal — the one cycles_balance reports (default subaccount). The ICP path is best-effort with no retries: if the transfer lands but the mint fails, the error carries the block index to recover with — do not blindly re-run. `cycles` wins if both are given. Requires an authenticated session.",
+        description = "Add cycles to an existing canister (as your Internet Identity). Fund EITHER with `cycles` (exact, drawn from your cycles-ledger balance) OR with `icp` (a decimal-ICP string, transferred from your ICP-ledger account and converted via the CMC straight into the target canister). Both accounts belong to your management principal — the one icp_cycles_balance reports (default subaccount). The ICP path is best-effort with no retries: if the transfer lands but the mint fails, the error carries the block index to recover with — do not blindly re-run. `cycles` wins if both are given. Requires an authenticated session.",
         annotations(title = "Top up a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
-    async fn top_up_canister(
+    async fn icp_top_up_canister(
         &self,
         Parameters(args): Parameters<management::TopUpArgs>,
         ctx: RequestContext<RoleServer>,
@@ -671,7 +844,7 @@ impl IcTools {
         annotations(title = "Install code on a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
-    async fn install_code(
+    async fn icp_install_code(
         &self,
         Parameters(args): Parameters<management::InstallCodeArgs>,
         ctx: RequestContext<RoleServer>,
@@ -692,7 +865,7 @@ impl IcTools {
         annotations(title = "Get canister status", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
-    async fn canister_status(
+    async fn icp_canister_status(
         &self,
         Parameters(args): Parameters<management::CanisterRefArgs>,
         ctx: RequestContext<RoleServer>,
@@ -713,7 +886,7 @@ impl IcTools {
         annotations(title = "Update canister settings", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
-    async fn update_canister_settings(
+    async fn icp_update_canister_settings(
         &self,
         Parameters(args): Parameters<management::UpdateSettingsArgs>,
         ctx: RequestContext<RoleServer>,
@@ -734,7 +907,7 @@ impl IcTools {
         annotations(title = "Start a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
-    async fn start_canister(
+    async fn icp_start_canister(
         &self,
         Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
         ctx: RequestContext<RoleServer>,
@@ -752,7 +925,7 @@ impl IcTools {
         annotations(title = "Stop a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
-    async fn stop_canister(
+    async fn icp_stop_canister(
         &self,
         Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
         ctx: RequestContext<RoleServer>,
@@ -770,7 +943,7 @@ impl IcTools {
         annotations(title = "Uninstall code from a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
-    async fn uninstall_code(
+    async fn icp_uninstall_code(
         &self,
         Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
         ctx: RequestContext<RoleServer>,
@@ -788,7 +961,7 @@ impl IcTools {
         annotations(title = "Delete a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
-    async fn delete_canister(
+    async fn icp_delete_canister(
         &self,
         Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
         ctx: RequestContext<RoleServer>,
@@ -809,6 +982,214 @@ fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<auth::AuthedSessio
         .get::<axum::http::request::Parts>()
         .and_then(|parts| parts.extensions.get::<auth::AuthedSession>())
         .cloned()
+}
+
+/// Which app principal an identity-bearing tool should act as, resolved from the
+/// caller's `derivation_origin` and/or `app_url`.
+#[derive(Debug)]
+struct IdentityTarget {
+    /// The EFFECTIVE (canonical) Internet Identity derivation origin to feed the
+    /// delegation layer — echoed to the caller as `derived_for_origin`.
+    origin: String,
+    /// Exactly what the caller supplied (a `derivation_origin` or an `app_url`).
+    requested: String,
+    /// How `origin` was determined: "explicit" | "declared" | "known" | "app_url_default".
+    source: String,
+    /// The application origin, when the caller passed `app_url`.
+    application_origin: Option<String>,
+}
+
+/// Resolve the caller's `derivation_origin` / `app_url` into an [`IdentityTarget`]
+/// (or `None` when neither is given — an anonymous call). An explicit
+/// `derivation_origin` is canonicalized and used verbatim (source `explicit`); an
+/// `app_url` is resolved by [`discover::resolve_app_identity`] with precedence
+/// DECLARED (the app's `/.well-known/ic-app.json`) > KNOWN (the built-in
+/// `KNOWN_DERIVATION_ORIGINS` registry of well-known custom-origin apps) > the
+/// application origin (flagged `app_url_default`) — so the source can be
+/// `declared`, `known`, or
+/// `app_url_default`. Both routes pass through the same canonicalizer the
+/// delegation path uses, so the echoed `origin` is exactly what Internet Identity
+/// derives against.
+async fn resolve_identity_target(
+    derivation_origin: Option<String>,
+    app_url: Option<String>,
+) -> Result<Option<IdentityTarget>, String> {
+    match (derivation_origin, app_url) {
+        (Some(_), Some(_)) => {
+            Err("provide either `derivation_origin` or `app_url`, not both".to_string())
+        }
+        (Some(d), None) => {
+            let d = clean_identity_arg("derivation_origin", &d)?;
+            let origin = canonicalize_derivation_origin(&d)?;
+            Ok(Some(IdentityTarget {
+                origin,
+                requested: d,
+                source: "explicit".to_string(),
+                application_origin: None,
+            }))
+        }
+        (None, Some(u)) => {
+            let u = clean_app_url(&u)?;
+            // Identity hot path: we only need the derivation origin, not the
+            // informational alternative-origins list — skip that extra fetch.
+            let resolved = discover::resolve_app_identity(&u, false).await?;
+            Ok(Some(IdentityTarget {
+                origin: identities::target_origin(&resolved.derivation_origin),
+                requested: u,
+                source: resolved.derivation_origin_source.as_str().to_string(),
+                application_origin: Some(resolved.application_origin),
+            }))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// Validate a user-supplied identity argument (`derivation_origin` / `app_url`):
+/// trim surrounding whitespace, reject an empty/whitespace-only value, and reject
+/// ASCII/Unicode control characters. Both fields are echoed back verbatim (as
+/// `requested` / `derived_for_origin`) and `derivation_origin` feeds the delegation
+/// origin, so a stray control char could corrupt a log line or the origin string —
+/// fail closed rather than pass it through.
+fn clean_identity_arg(field: &str, raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if v.is_empty() {
+        return Err(format!("`{field}` must not be empty"));
+    }
+    if v.chars().any(char::is_control) {
+        return Err(format!("`{field}` must not contain control characters"));
+    }
+    Ok(v.to_string())
+}
+
+/// Canonicalize a cleaned `derivation_origin` to the effective origin the delegation
+/// path derives against (`target_origin`), rejecting one that carries no host (e.g.
+/// "https://" → `https://`) — which would otherwise derive against, and echo back,
+/// an empty origin.
+fn canonicalize_derivation_origin(cleaned: &str) -> Result<String, String> {
+    let invalid = || {
+        "`derivation_origin` must be an https origin or a bare host, with no user-info \
+         (e.g. https://app.example.com or app.example.com)"
+            .to_string()
+    };
+    // Reject any explicit scheme other than https (a bare host with no scheme is
+    // fine — target_origin prepends https). Without this, target_origin would
+    // rewrite a non-https scheme into a different origin than requested — `ftp://x`
+    // mangled into a bogus `https://…`, or `http://x` silently upgraded to
+    // `https://x` — contradicting the https-only contract and confusing debugging.
+    // A bare host with no scheme is fine — target_origin prepends https. An explicit
+    // scheme must be https, and we lowercase it before handing off: target_origin strips
+    // only a lowercase `https://`, so an uppercase `HTTPS://` would otherwise survive
+    // into the host and mangle the origin (e.g. `https://HTTPS:`), turning a valid input
+    // into a rejection or a bogus origin. Rejecting a non-https scheme here also stops
+    // target_origin from silently rewriting it (`ftp://x` → bogus `https://…`, `http://x`
+    // → `https://x`), contradicting the https-only contract.
+    let normalized = match cleaned.split_once("://") {
+        Some((scheme, rest)) => {
+            if !scheme.eq_ignore_ascii_case("https") {
+                return Err(invalid());
+            }
+            format!("https://{rest}")
+        }
+        None => cleaned.to_string(),
+    };
+    let origin = identities::target_origin(&normalized);
+    // Require the canonical origin to parse as an https URL with a real host and NO
+    // user-info. `target_origin` keeps any `user@` prefix, but a browser origin never
+    // has one, so `https://user@host` would derive a different principal than
+    // `https://host` while `requested == derived_for_origin` hides the mismatch. This
+    // also rejects a host-less input ("https://") and embedded spaces/invalid chars.
+    let parsed = url::Url::parse(&origin).ok().filter(|u| {
+        u.scheme() == "https"
+            && u.host_str().map_or(false, |h| !h.is_empty())
+            && u.username().is_empty()
+            && u.password().is_none()
+    });
+    match parsed {
+        // Reserialize to a canonical ASCII origin (lowercased host, no path/user-info),
+        // exactly like the `app_url` path (`Url::origin().ascii_serialization()`), so a
+        // mixed-case host echoes identically and hits the same delegation-cache key
+        // instead of forking `https://Example.com` vs `https://example.com`.
+        Some(u) if u.origin().is_tuple() => Ok(u.origin().ascii_serialization()),
+        _ => Err(invalid()),
+    }
+}
+
+/// Validate + canonicalize the optional `derivation_origin` taken by the tools that
+/// accept ONLY that (run_canister_oql_query / get_canister_oql_schema): `None` stays `None` (anonymous); `Some`
+/// is cleaned (trim / non-empty / no control chars) and canonicalized, so these paths
+/// fail closed on the same bad input as `resolve_identity_target` instead of deriving
+/// a valid-but-wrong principal from a blank/hostless origin.
+fn clean_derivation_origin(derivation_origin: Option<String>) -> Result<Option<String>, String> {
+    match derivation_origin {
+        None => Ok(None),
+        Some(d) => {
+            let d = clean_identity_arg("derivation_origin", &d)?;
+            Ok(Some(canonicalize_derivation_origin(&d)?))
+        }
+    }
+}
+
+/// Clean a user-supplied `app_url`: the shared identity-arg checks, plus reject an
+/// explicit non-https scheme up front. The connector only ever fetches https
+/// discovery targets (the SSRF guard refuses anything else), so an `http://` URL
+/// would otherwise fail with a late, indirect error — reject it here with a clear
+/// message. A bare host (no scheme) is fine; `resolve_app_identity` prepends https.
+fn clean_app_url(raw: &str) -> Result<String, String> {
+    let u = clean_identity_arg("app_url", raw)?;
+    if let Some((scheme, _)) = u.split_once("://") {
+        if !scheme.eq_ignore_ascii_case("https") {
+            return Err(
+                "`app_url` must be an https URL or a bare host (the connector only fetches https origins)"
+                    .to_string(),
+            );
+        }
+    }
+    // Require a real host and NO user-info, matching `canonicalize_derivation_origin`.
+    // `resolve_app_identity` prepends https to a bare host and derives the application
+    // origin via `Url::origin()`, which silently DROPS any `user:pass@` — so
+    // `https://user@host` would resolve to `https://host` (differing from what the
+    // caller supplied) and `https://` would yield no host. Reject both up front with a
+    // clear message instead of a late, indirect downstream failure.
+    let candidate = if u.contains("://") { u.clone() } else { format!("https://{u}") };
+    let valid = url::Url::parse(&candidate).ok().map_or(false, |parsed| {
+        parsed.scheme() == "https"
+            && parsed.host_str().map_or(false, |h| !h.is_empty())
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+    });
+    if !valid {
+        return Err(
+            "`app_url` must be an https URL or bare host with a real host and no user-info \
+             (e.g. https://app.example.com or app.example.com)"
+                .to_string(),
+        );
+    }
+    Ok(u)
+}
+
+/// A one-line identity annotation for the human-readable `text` (which text-only
+/// clients see instead of the structured output): the origin II derived against,
+/// how it was determined (`source`), and — whenever it differs from the derived
+/// origin (canonicalization, http→https, a stripped path, or `app_url` defaulting)
+/// — the caller's `requested` value. Echoing `requested` on ANY mismatch (not only
+/// `app_url_default`) is what keeps a requested≠derived mismatch visible in every
+/// client. `acted_as` prefixes the signed-as principal when known.
+fn identity_annotation(target: &IdentityTarget, acted_as: Option<&str>) -> String {
+    let mut s = String::new();
+    if let Some(p) = acted_as {
+        s.push_str(&format!("signed as {p} — "));
+    }
+    s.push_str(&format!("derived for {} (source: {})", target.origin, target.source));
+    if target.requested != target.origin {
+        s.push_str(&format!("; requested {}", target.requested));
+    }
+    if target.source == "app_url_default" {
+        s.push_str(
+            " — the app declares no derivation origin, so this ASSUMES the app origin; \
+             if the principal looks wrong, pass the app's canonical derivation_origin",
+        );
+    }
+    s
 }
 
 /// Log each inbound request: method, path, response status, and latency — gives
@@ -841,58 +1222,84 @@ impl ServerHandler for IcTools {
         .with_instructions(
             "Internet Computer tools. Every tool speaks TEXTUAL Candid — the `(...)` value \
              syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`, never \
-             the binary form. Before writing Candid args, consult the `candid://textual-syntax` \
+             the binary form. Tool names signal SCOPE: an `icp_` prefix marks IC protocol / \
+             meta-level tools (dashboard name/id lookups, the official IC skills, the OQL dialect \
+             guide, and canister creation/management); `…_app…` names \
+             (`discover_app_canisters`, `get_app_principal`, `list_app_accounts`, `resolve_app`) \
+             act on a whole APP, keyed by its Internet Identity derivation origin or app URL; and \
+             `…canister…` names (`get_canister_candid`, `get_canister_api_doc`, \
+             `get_canister_oql_schema`, `run_canister_oql_query`, `call_canister`) act on ONE \
+             specific canister. Before writing Candid args, consult the `candid://textual-syntax` \
              resource (the value syntax these tools use); `candid://reference` has the full type \
              reference. When the user names a website/domain instead of a canister id, use \
-             `discover_canisters` to find the canister(s) behind it — app-declared App Connect \
+             `discover_app_canisters` to find the canister(s) behind it — app-declared App Connect \
              metadata (/ai-connect.html meta, /.well-known/ic-app.json manifest) first, then the \
              frontend via header and backend candidates via env.json/JS bundle. When they name a \
              TOKEN, PROJECT or SERVICE (e.g. \
-             \"ckUSDC\"), use `find_canister` to look it up by name in the IC dashboard's \
-             registries and get its canister id. `lookup_canister(id)` tells you what a bare \
-             canister id IS (dashboard label, type, controllers, subnet). `get_candid` fetches a \
-             canister's Candid interface. For an unfamiliar app, try `get_api_doc` FIRST: if the \
+             \"ckUSDC\"), use `icp_find_canister_by_name` to look it up by name in the IC dashboard's \
+             registries and get its canister id. `icp_lookup_canister_info_by_id(id)` tells you what a bare \
+             canister id IS (dashboard label, type, controllers, subnet). `get_canister_candid` fetches a \
+             canister's Candid interface. For an unfamiliar app, try `get_canister_api_doc` FIRST: if the \
              canister exposes a `getApiDoc`/`get_api_doc` method it returns a prose guide to how \
              the app behaves (units, auth, lifecycle, mutation safety, polling, gotchas) that the \
-             Candid types alone don't convey. If `get_candid` reports `oql: true`, the canister \
-             exposes an OQL query surface — read `get_oql_guide` for the dialect, then use \
-             `oql_schema` (entities and fields) and `oql_query` (run a JSON query, get a table \
+             Candid types alone don't convey. If `get_canister_candid` reports `oql: true`, the canister \
+             exposes an OQL query surface — read `icp_oql_guide` for the dialect, then use \
+             `get_canister_oql_schema` (entities and fields) and `run_canister_oql_query` (run a JSON query, get a table \
              back). Those two wrap the canister's `schema`/`execute` methods, so you don't \
              hand-encode Candid for OQL. `call_canister` calls a method with textual Candid \
-             in/out: omit `domain` to call anonymously, or pass an application domain (e.g. \
-             domain=\"oisy.com\") to call as your account at that app — a short-lived (<=5 min) \
-             account delegation for it is minted ON DEMAND from this connection's standing \
-             Internet Identity credential, no extra sign-in. `get_principal` returns the principal \
-             you act as at an application `domain` without making a call (e.g. to look up a \
-             balance or account). A user may hold several accounts at an app (a default one plus \
-             named ones); `list_accounts(domain)` lists them, and call_canister/get_principal take \
-             an optional `account` (a name from that list) to act as a specific one — omit it for \
-             the default account. The per-app principal is derived from the app's DOMAIN — usually, \
-             but NOT always, the same identity a browser sign-in to that app would use: some apps \
-             declare a custom derivation origin (via /.well-known/ii-alternative-origins) not \
-             exposed here. If a principal, account, or balance doesn't match what the user sees in \
-             their browser at that app, say so and offer to look up the app's ii-alternative-origins \
-             (web search / fetch) and retry. The standing credential is obtained when you connect \
+             in/out: omit the identity args to call anonymously, or act AS your account at an app. \
+             To act as an app account, identify the app by its `derivation_origin` — the EXACT \
+             canonical origin Internet Identity derives its principal from, which is NOT \
+             necessarily the visible website URL and must NEVER be inferred from an \
+             ii-alternative-origins list — or by `app_url`, which the connector resolves (use \
+             `resolve_app` to see what an app URL resolves to). A short-lived (<=5 min) account \
+             delegation is minted ON DEMAND from this connection's standing credential, no extra \
+             sign-in. `get_app_principal` returns the principal without a call; `list_app_accounts` lists \
+             the user's accounts (a default one plus any named ones), and call_canister / \
+             get_app_principal take an optional `account` (a name from that list) — omit it for the \
+             default. Every identity result echoes `derived_for_origin` (the origin actually used), \
+             `requested` (what you passed), and `derivation_origin_source`: if the source is \
+             \"app_url_default\", the app declared no derivation origin and the app URL was ASSUMED \
+             to be it — correct only if the app has no custom derivation origin. If a principal, \
+             account, or balance doesn't match what the user sees in their browser, the derivation \
+             origin is wrong: pass the app's canonical `derivation_origin` explicitly. The standing \
+             credential is obtained when you connect \
              (authenticate via Internet Identity) and lasts for the session duration you choose when \
              connecting (up to 30 days); reconnect when it expires. \
              The session may be READ-ONLY (Internet Identity's consent screen defaults to read-only): \
              reads work, but the canister-management tools below make update calls the network \
              rejects for a read-only session — if one fails that way, ask the user to reconnect with \
              the read-only option turned OFF.\n\n\
+             Typical flow (acting FOR THE USER at an app): (0) get the app URL from the user — no \
+             tool maps an app NAME to a URL (`icp_find_canister_by_name` searches the token/SNS \
+             registries for canister ids, not front-ends), so take it from the user or ask; (1) \
+             `resolve_app(url)` gives the `derivation_origin`, and concurrently (2) \
+             `discover_app_canisters(url)` gives the backend canister id; (3) `list_app_accounts` — \
+             if there is more than one account, ask which to use and remember it; (4) \
+             `get_app_principal` ONLY when you need the principal value itself (`call_canister` / \
+             `run_canister_oql_query` act as the account without pre-fetching it); (5) inspect the \
+             canister with `get_canister_candid` (and `get_canister_api_doc` if it exposes one) — its \
+             `oql: true` flag says whether OQL is available; (6) READ with `run_canister_oql_query` \
+             when OQL is available, else `call_canister` with is_query=true; (7) ACT with \
+             `call_canister` update calls, passing `derivation_origin` + `account` to act as the \
+             user. Public/anonymous reads skip 1/3/4. The per-canister inspection (5) is independent \
+             of the identity steps (1/3/4), so they can run in parallel. Managing your OWN canisters \
+             (the `icp_` create/install/status/… tools) acts as your standing MANAGEMENT principal at \
+             this server's origin — a DIFFERENT identity than the per-app principals above.\n\n\
              To AUTHOR, BUILD and DEPLOY IC code, first consult the official IC skills: \
-             `list_ic_skills` lists them and `get_ic_skill(name)` loads one. Especially `motoko` \
+             `icp_list_skills` lists them and `icp_get_skill(name)` loads one. Especially `motoko` \
              (language), `mops-cli` (deps/build), `icp-cli` (build & deploy), `cycles-management` \
              (ICP↔cycles & funding), `stable-memory` (upgrades) and `canister-security`. Compiling \
              Motoko/Rust to Wasm happens in YOUR environment (guided by these skills); these tools \
              then put it on chain. To CREATE and MANAGE canisters as your Internet Identity, use: \
-             `cycles_balance` (your cycles-ledger balance), `create_canister` (create + fund from \
-             that balance — amount in `cycles` or `icp`), `install_code` (install your compiled \
-             Wasm — base64 — single-shot or chunked), `canister_status`, `update_canister_settings`, \
-             `start_canister`/`stop_canister`/`uninstall_code`/`delete_canister`, and \
-             `top_up_canister`. These act as your standing II principal, which must hold cycles in \
+             `icp_cycles_balance` (your cycles-ledger balance), `icp_create_canister` (create + fund from \
+             that balance — amount in `cycles` or `icp`), `icp_install_code` (install your compiled \
+             Wasm — base64 — single-shot or chunked), `icp_canister_status`, `icp_update_canister_settings`, \
+             `icp_start_canister`/`icp_stop_canister`/`icp_uninstall_code`/`icp_delete_canister`, and \
+             `icp_top_up_canister`. These act as your standing II principal, which must hold cycles in \
              the cycles ledger first (fund it via the icp CLI / cycles-management skill). So to \
              \"build X and deploy a canister with Y ICP worth of cycles\": read the relevant skills, \
-             write & build the Wasm locally, `create_canister(icp=Y)`, then `install_code`."
+             write & build the Wasm locally, `icp_create_canister(icp=Y)`, then `icp_install_code`."
                 .to_string(),
         )
     }
@@ -968,7 +1375,7 @@ impl ServerHandler for IcTools {
     }
 }
 
-/// Render an IC dashboard canister identity as readable text for lookup_canister.
+/// Render an IC dashboard canister identity as readable text for icp_lookup_canister_info_by_id.
 fn format_canister_info(info: &discover::CanisterInfo) -> String {
     let mut s = format!("Canister {}\n", info.canister_id);
     s.push_str(&format!(
@@ -993,17 +1400,20 @@ fn format_canister_info(info: &discover::CanisterInfo) -> String {
     if let Some(p) = info.latest_upgrade_proposal {
         s.push_str(&format!("- latest upgrade: NNS proposal {p}\n"));
     }
-    s.push_str("\nFetch its interface with get_candid, then call methods with call_canister.");
+    s.push_str("\nFetch its interface with get_canister_candid, then call methods with call_canister.");
     s
 }
 
 /// Render the user's accounts at an app (from `Identities::list_accounts`) as
-/// readable text for the `list_accounts` tool.
-fn format_accounts(domain: &str, accounts: &[identities::AccountInfo]) -> String {
+/// readable text for the `list_app_accounts` tool.
+fn format_accounts(target: &IdentityTarget, accounts: &[identities::AccountInfo]) -> String {
+    // A one-line derivation-origin header so a wrong origin (or requested≠derived
+    // mismatch) is visible even to text-only clients.
+    let header = format!("Accounts {}", identity_annotation(target, None));
     if accounts.is_empty() {
-        return format!("No Internet Identity accounts found at {domain}.");
+        return format!("{header}\n\nNo Internet Identity accounts found there.");
     }
-    let mut out = format!("Your accounts at {domain}:\n");
+    let mut out = format!("{header}\n\nYour accounts:\n");
     for a in accounts {
         // The default account (anchor's current default) has no name/number.
         let label = match &a.name {
@@ -1023,12 +1433,12 @@ fn format_accounts(domain: &str, accounts: &[identities::AccountInfo]) -> String
     if accounts.len() == 1 {
         out.push_str(
             "\nOnly the default account exists here — act on the user's behalf directly: \
-             call_canister(domain) / get_principal(domain) with no `account`.",
+             call_canister / get_app_principal with no `account`.",
         );
     } else {
         out.push_str(
             "\nThere are multiple accounts here. Confirm which one the user means (or act on each), \
-             then pass its name as `account` to call_canister / get_principal. Omit `account` for \
+             then pass its name as `account` to call_canister / get_app_principal. Omit `account` for \
              the default one.",
         );
     }
@@ -1072,7 +1482,7 @@ fn ok_structured<T: serde::Serialize>(text: String, value: &T) -> CallToolResult
 /// further blocks are separate notes. Keeping them distinct means a consumer
 /// that copies the first block gets clean data (the `.did` stays valid,
 /// paste-able Candid), while the model still sees the trailing note(s) — used by
-/// `get_candid` to attach the OQL pointer without contaminating the interface
+/// `get_canister_candid` to attach the OQL pointer without contaminating the interface
 /// text. The structured `value` is attached under the same object-rooted rule as
 /// [`ok_structured`].
 fn ok_structured_blocks<T: serde::Serialize>(texts: Vec<String>, value: &T) -> CallToolResult {
@@ -1117,11 +1527,11 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
 <h1>Internet Computer MCP PoC</h1>
 <p>MCP endpoints: <code>POST /mcp</code> (beta Internet Identity) · <code>POST /mcp-prod</code> (production Internet Identity)</p>
-<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>find_canister</code> (name → canister ids), <code>lookup_canister</code> (id → dashboard identity), <code>get_candid</code>, <code>call_canister</code> (anonymously, or as your account at an application domain, derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (your principal at an application domain, no call), <code>list_accounts</code> (your Internet Identity accounts at an app domain). All speak textual Candid.</p>
-<p>Skills: <code>list_ic_skills</code> / <code>get_ic_skill</code> (the official IC how-to guides — Motoko, mops, icp CLI, cycles, …).</p>
-<p>App docs: <code>get_api_doc</code> (a canister's own "how this app behaves" guide, if it exposes <code>getApiDoc</code>/<code>get_api_doc</code>).</p>
-<p>OQL: <code>get_oql_guide</code> (dialect), <code>oql_schema</code> (entities/fields), <code>oql_query</code> (run a JSON query, get a table) — for canisters that expose an OQL <code>schema</code>/<code>execute</code> surface (<code>get_candid</code> reports <code>oql: true</code>).</p>
-<p>Canister management (as your Internet Identity): <code>cycles_balance</code>, <code>create_canister</code>, <code>install_code</code>, <code>canister_status</code>, <code>update_canister_settings</code>, <code>start_canister</code>, <code>stop_canister</code>, <code>uninstall_code</code>, <code>delete_canister</code>, <code>top_up_canister</code>.</p>
+<p>Tools: <code>discover_app_canisters</code> (domain → canister ids), <code>icp_find_canister_by_name</code> (name → canister ids), <code>icp_lookup_canister_info_by_id</code> (id → dashboard identity), <code>get_canister_candid</code>, <code>call_canister</code> (anonymously, or as your account at an app — identified by its <code>derivation_origin</code> or <code>app_url</code>, delegation minted on demand), <code>get_app_principal</code> (your principal at an app, no call), <code>list_app_accounts</code> (your Internet Identity accounts at an app), <code>resolve_app</code> (app URL → its Internet Identity derivation origin; no principal — pick an account via <code>get_app_principal</code>). Identity results echo <code>derived_for_origin</code>/<code>requested</code> so an origin mismatch is visible. All speak textual Candid.</p>
+<p>Skills: <code>icp_list_skills</code> / <code>icp_get_skill</code> (the official IC how-to guides — Motoko, mops, icp CLI, cycles, …).</p>
+<p>App docs: <code>get_canister_api_doc</code> (a canister's own "how this app behaves" guide, if it exposes <code>getApiDoc</code>/<code>get_api_doc</code>).</p>
+<p>OQL: <code>icp_oql_guide</code> (dialect), <code>get_canister_oql_schema</code> (entities/fields), <code>run_canister_oql_query</code> (run a JSON query, get a table) — for canisters that expose an OQL <code>schema</code>/<code>execute</code> surface (<code>get_canister_candid</code> reports <code>oql: true</code>).</p>
+<p>Canister management (as your Internet Identity): <code>icp_cycles_balance</code>, <code>icp_create_canister</code>, <code>icp_install_code</code>, <code>icp_canister_status</code>, <code>icp_update_canister_settings</code>, <code>icp_start_canister</code>, <code>icp_stop_canister</code>, <code>icp_uninstall_code</code>, <code>icp_delete_canister</code>, <code>icp_top_up_canister</code>.</p>
 </body></html>"#;
 
 #[tokio::main]
@@ -1498,11 +1908,11 @@ mod tests {
 
     // Every tool must carry MCP annotations, else clients fall back to the unsafe
     // defaults (readOnly=false, destructive=true) and mislabel reads like
-    // get_candid as destructive. Assert the read/write classification serializes.
+    // get_canister_candid as destructive. Assert the read/write classification serializes.
     #[test]
     fn every_tool_has_correct_read_write_annotations() {
         let tools = super::IcTools::tool_router().list_all();
-        assert_eq!(tools.len(), 23, "expected 23 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 24, "expected 24 tools, got {}", tools.len());
         assert!(
             tools.iter().all(|t| t.annotations.is_some()),
             "every tool must carry annotations (else clients assume write/destructive)"
@@ -1520,22 +1930,22 @@ mod tests {
         // AND set destructive_hint=false explicitly so a naive client that doesn't
         // gate destructive on read_only can't mislabel them.
         for name in [
-            "get_candid", "discover_canisters", "find_canister", "lookup_canister",
-            "list_ic_skills", "get_ic_skill", "get_oql_guide", "oql_query", "oql_schema",
-            "get_api_doc", "list_accounts", "cycles_balance", "get_principal", "canister_status",
+            "get_canister_candid", "discover_app_canisters", "icp_find_canister_by_name", "icp_lookup_canister_info_by_id",
+            "icp_list_skills", "icp_get_skill", "icp_oql_guide", "run_canister_oql_query", "get_canister_oql_schema",
+            "get_canister_api_doc", "resolve_app", "list_app_accounts", "icp_cycles_balance", "get_app_principal", "icp_canister_status",
         ] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");
             assert_eq!(a.destructive_hint, Some(false), "{name} should set destructive=false explicitly");
         }
         // Destructive writes: not read-only, destructive.
-        for name in ["delete_canister", "uninstall_code", "install_code", "update_canister_settings"] {
+        for name in ["icp_delete_canister", "icp_uninstall_code", "icp_install_code", "icp_update_canister_settings"] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(false), "{name} should not be read-only");
             assert_eq!(a.destructive_hint, Some(true), "{name} should be destructive");
         }
         // Additive/reversible writes: not read-only, not destructive.
-        for name in ["create_canister", "top_up_canister", "start_canister", "stop_canister"] {
+        for name in ["icp_create_canister", "icp_top_up_canister", "icp_start_canister", "icp_stop_canister"] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(false), "{name} should not be read-only");
             assert_eq!(a.destructive_hint, Some(false), "{name} should not be destructive");
@@ -1566,18 +1976,18 @@ mod tests {
         }
     }
 
-    // Spot-check find_canister's schema lists the expected properties.
+    // Spot-check icp_find_canister_by_name's schema lists the expected properties.
     #[test]
     fn find_canister_declares_output_schema() {
         let tools = super::IcTools::tool_router().list_all();
         let tool = tools
             .iter()
-            .find(|t| &*t.name == "find_canister")
-            .expect("find_canister tool not found");
+            .find(|t| &*t.name == "icp_find_canister_by_name")
+            .expect("icp_find_canister_by_name tool not found");
         let schema = tool
             .output_schema
             .as_ref()
-            .expect("find_canister must declare an output schema");
+            .expect("icp_find_canister_by_name must declare an output schema");
         let props = schema
             .get("properties")
             .and_then(|v| v.as_object())
@@ -1618,7 +2028,7 @@ mod tests {
         );
     }
 
-    // A structured find_canister reply must round-trip through the declared
+    // A structured icp_find_canister_by_name reply must round-trip through the declared
     // schema shape: text for humans, plus a machine-readable object with a
     // `matches` array carrying each match's fields.
     #[test]
@@ -1644,5 +2054,223 @@ mod tests {
             Some(&serde_json::json!("xevnm-gaaaa-aaaar-qafnq-cai"))
         );
         assert_eq!(matches[0].get("kind"), Some(&serde_json::json!("token")));
+    }
+
+    // resolve_identity_target's precedence/validation rules are part of the tool
+    // contract; cover the offline branches (the `app_url` branch needs the
+    // network and is exercised separately). Supplying both args must be rejected.
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_both_args() {
+        let err = super::resolve_identity_target(
+            Some("https://a.example".to_string()),
+            Some("https://b.example".to_string()),
+        )
+        .await
+        .expect_err("both args must be an error");
+        assert!(err.contains("not both"), "unexpected message: {err}");
+    }
+
+    // A whitespace-only `derivation_origin` is empty after trimming and must be
+    // rejected rather than canonicalized into a bogus origin.
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_blank_derivation_origin() {
+        let err = super::resolve_identity_target(Some("   ".to_string()), None)
+            .await
+            .expect_err("blank derivation_origin must be an error");
+        assert!(err.contains("must not be empty"), "unexpected message: {err}");
+    }
+
+    // `derivation_origin` is trimmed before canonicalization, so surrounding
+    // whitespace never leaks into either the echoed `requested` or the effective
+    // `origin` fed to the delegation path.
+    #[tokio::test]
+    async fn resolve_identity_target_trims_derivation_origin() {
+        let target = super::resolve_identity_target(Some("  https://example.com  ".to_string()), None)
+            .await
+            .expect("valid derivation_origin resolves")
+            .expect("an explicit derivation_origin yields a target");
+        assert_eq!(target.requested, "https://example.com", "requested must be trimmed");
+        assert_eq!(target.origin, "https://example.com", "origin must be the canonical trimmed form");
+        assert_eq!(target.source, "explicit");
+        assert!(target.application_origin.is_none());
+    }
+
+    // Neither arg is the anonymous path: no target, no error.
+    #[tokio::test]
+    async fn resolve_identity_target_none_is_anonymous() {
+        let target = super::resolve_identity_target(None, None)
+            .await
+            .expect("neither arg is valid (anonymous)");
+        assert!(target.is_none(), "neither arg must yield no target");
+    }
+
+    // A control character in either identity arg is rejected up front (it would
+    // otherwise be echoed back verbatim / corrupt the delegation origin).
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_control_chars() {
+        let err = super::resolve_identity_target(Some("https://ex\u{7}ample.com".to_string()), None)
+            .await
+            .expect_err("control chars must be rejected");
+        assert!(err.contains("control characters"), "unexpected message: {err}");
+    }
+
+    // An uppercase scheme must canonicalize the same as lowercase — `target_origin`
+    // strips only a lowercase `https://`, so without normalization `HTTPS://` would
+    // survive into the host and mangle the origin instead of yielding `https://host`.
+    #[tokio::test]
+    async fn resolve_identity_target_normalizes_uppercase_scheme() {
+        let t = super::resolve_identity_target(Some("HTTPS://example.com".to_string()), None)
+            .await
+            .expect("uppercase https scheme must be accepted")
+            .expect("a derivation_origin yields a target");
+        assert_eq!(t.origin, "https://example.com", "unexpected origin: {}", t.origin);
+    }
+
+    // A mixed-case HOST is canonicalized to lowercase, so the echoed origin and the
+    // delegation-cache key match the app_url path (which serializes via Url::origin())
+    // instead of forking `https://Example.COM` from `https://example.com`.
+    #[tokio::test]
+    async fn resolve_identity_target_lowercases_host() {
+        let t = super::resolve_identity_target(Some("https://Example.COM".to_string()), None)
+            .await
+            .expect("mixed-case host must be accepted")
+            .expect("a derivation_origin yields a target");
+        assert_eq!(t.origin, "https://example.com", "host must be lowercased: {}", t.origin);
+    }
+
+    // A `derivation_origin` with no host (e.g. "https://") reduces to an empty
+    // origin and must be rejected rather than derived against.
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_hostless_derivation_origin() {
+        let err = super::resolve_identity_target(Some("https://".to_string()), None)
+            .await
+            .expect_err("host-less derivation_origin must be rejected");
+        assert!(err.contains("host"), "unexpected message: {err}");
+    }
+
+    // A non-http(s) scheme must be rejected, not mangled into a bogus https origin.
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_non_http_scheme() {
+        let err = super::resolve_identity_target(Some("ftp://example.com".to_string()), None)
+            .await
+            .expect_err("ftp:// must be rejected");
+        assert!(err.contains("https origin"), "unexpected message: {err}");
+    }
+
+    // A whitespace-only `app_url` is rejected before any network resolution, so
+    // the caller gets a clear error instead of a confusing downstream URL failure.
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_blank_app_url() {
+        let err = super::resolve_identity_target(None, Some("   ".to_string()))
+            .await
+            .expect_err("blank app_url must be rejected");
+        assert!(err.contains("must not be empty"), "unexpected message: {err}");
+    }
+
+    // A non-https `app_url` scheme is rejected early with a clear message rather
+    // than failing later in the SSRF guard.
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_http_app_url() {
+        let err = super::resolve_identity_target(None, Some("http://example.com".to_string()))
+            .await
+            .expect_err("http:// app_url must be rejected");
+        assert!(err.contains("https URL"), "unexpected message: {err}");
+    }
+
+    // User-info in an app_url is silently dropped by `Url::origin()` downstream, so
+    // `https://user@host` would resolve to `https://host` — a value the caller never
+    // supplied. Reject it up front (consistent with derivation_origin validation).
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_userinfo_app_url() {
+        let err = super::resolve_identity_target(None, Some("https://user:pass@example.com".to_string()))
+            .await
+            .expect_err("app_url with user-info must be rejected");
+        assert!(err.contains("user-info"), "unexpected message: {err}");
+    }
+
+    // A host-less app_url ("https://") has no origin to derive against and must be
+    // rejected here rather than failing later in URL parsing / the SSRF guard.
+    #[tokio::test]
+    async fn resolve_identity_target_rejects_hostless_app_url() {
+        let err = super::resolve_identity_target(None, Some("https://".to_string()))
+            .await
+            .expect_err("host-less app_url must be rejected");
+        assert!(err.contains("real host"), "unexpected message: {err}");
+    }
+
+    // The human-readable identity annotation must surface a requested≠derived
+    // mismatch (and the source) in ALL clients, not only for app_url_default.
+    #[test]
+    fn identity_annotation_surfaces_mismatch_and_source() {
+        // requested == origin: origin + source, but no redundant `requested` echo.
+        let t = super::IdentityTarget {
+            origin: "https://nns.ic0.app".to_string(),
+            requested: "https://nns.ic0.app".to_string(),
+            source: "explicit".to_string(),
+            application_origin: None,
+        };
+        let a = super::identity_annotation(&t, None);
+        assert!(a.contains("derived for https://nns.ic0.app"), "{a}");
+        assert!(a.contains("source: explicit"), "{a}");
+        assert!(!a.contains("requested"), "no mismatch must not echo requested: {a}");
+
+        // requested != origin (e.g. a stripped path): the mismatch is surfaced.
+        let t2 = super::IdentityTarget {
+            origin: "https://app.example.com".to_string(),
+            requested: "https://app.example.com/some/path".to_string(),
+            source: "explicit".to_string(),
+            application_origin: None,
+        };
+        let a2 = super::identity_annotation(&t2, Some("aaaaa-aa"));
+        assert!(a2.contains("signed as aaaaa-aa"), "{a2}");
+        assert!(a2.contains("requested https://app.example.com/some/path"), "{a2}");
+
+        // app_url_default keeps its explicit "assumed" guidance.
+        let t3 = super::IdentityTarget {
+            origin: "https://example.com".to_string(),
+            requested: "https://example.com".to_string(),
+            source: "app_url_default".to_string(),
+            application_origin: Some("https://example.com".to_string()),
+        };
+        let a3 = super::identity_annotation(&t3, None);
+        assert!(a3.contains("ASSUMES the app origin"), "{a3}");
+    }
+
+    // The OQL tools' derivation-origin path (run_canister_oql_query / get_canister_oql_schema) must fail
+    // closed on the same bad input as resolve_identity_target: None stays anonymous,
+    // control chars and host-less origins are rejected, and a valid one canonicalizes.
+    #[test]
+    fn clean_derivation_origin_validates_and_canonicalizes() {
+        assert_eq!(super::clean_derivation_origin(None).unwrap(), None);
+        assert!(super::clean_derivation_origin(Some("   ".to_string())).is_err(), "blank rejected");
+        assert!(
+            super::clean_derivation_origin(Some("https://a\u{7}b.com".to_string())).is_err(),
+            "control chars rejected"
+        );
+        assert!(
+            super::clean_derivation_origin(Some("https://".to_string())).is_err(),
+            "host-less rejected"
+        );
+        assert!(
+            super::clean_derivation_origin(Some("ftp://example.com".to_string())).is_err(),
+            "non-http(s) scheme rejected"
+        );
+        assert!(
+            super::clean_derivation_origin(Some("https://ex ample.com".to_string())).is_err(),
+            "embedded space rejected"
+        );
+        assert!(
+            super::clean_derivation_origin(Some("https://user@example.com".to_string())).is_err(),
+            "user-info rejected (would derive a different principal than the bare origin)"
+        );
+        assert!(
+            super::clean_derivation_origin(Some("http://example.com".to_string())).is_err(),
+            "explicit http:// rejected (https-only contract; target_origin would silently upgrade it)"
+        );
+        assert_eq!(
+            super::clean_derivation_origin(Some("  https://example.com  ".to_string())).unwrap(),
+            Some("https://example.com".to_string()),
+            "valid input trims + canonicalizes"
+        );
     }
 }

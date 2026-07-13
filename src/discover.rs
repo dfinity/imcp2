@@ -18,7 +18,7 @@
 //! There is NO authoritative reverse lookup for "this site's backend" — (1)
 //! is declared by the app itself and (2) is certain for the frontend; (3) and
 //! (4) are mined from client code, so each result carries its provenance and
-//! the caller decides (and should confirm with `get_candid`).
+//! the caller decides (and should confirm with `get_canister_candid`).
 
 use std::{
     collections::BTreeMap,
@@ -51,7 +51,7 @@ pub struct Found {
     pub kind: Option<String>,
 }
 
-/// One canister discovered behind a web domain — the `discover_canisters` MCP
+/// One canister discovered behind a web domain — the `discover_app_canisters` MCP
 /// output shape (a serialization mirror of [`Found`]).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DiscoveredCanister {
@@ -83,14 +83,14 @@ impl From<&Found> for DiscoveredCanister {
     }
 }
 
-/// Arguments for `discover_canisters`.
+/// Arguments for `discover_app_canisters`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DiscoverCanistersArgs {
     /// A web domain or URL served from the IC, e.g. "oisy.com".
     pub domain: String,
 }
 
-/// Structured output of `discover_canisters`.
+/// Structured output of `discover_app_canisters`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DiscoverOutput {
     /// The domain that was probed.
@@ -100,7 +100,7 @@ pub struct DiscoverOutput {
 }
 
 impl From<(String, Vec<Found>)> for DiscoverOutput {
-    /// `(domain, found)` → the structured `discover_canisters` reply.
+    /// `(domain, found)` → the structured `discover_app_canisters` reply.
     fn from((domain, found): (String, Vec<Found>)) -> Self {
         Self {
             domain,
@@ -245,14 +245,26 @@ const MAX_MANIFEST_CANISTERS: usize = 100;
 /// dropped downstream by `add`.
 ///
 /// ```json
-/// { "canisters": [
+/// { "derivation_origin": "https://<frontend-canister>.icp0.io",
+///   "canisters": [
 ///     { "id": "aaaaa-…-cai", "role": "backend", "description": "orders API" },
 ///     { "id": "bbbbb-…-cai", "role": "ledger" } ] }
 /// ```
+///
+/// The optional top-level `derivation_origin` is the app's own declaration of
+/// the Internet Identity derivation origin its frontends pin (via
+/// `derivationOrigin` + `/.well-known/ii-alternative-origins`). It is the ONLY
+/// authoritative way to learn a custom derivation origin: there is no reverse
+/// lookup from an app URL to it (the app's own alternative-origins file lists
+/// the inverse relation, and the frontend's `derivationOrigin` config is
+/// typically minified out of reach). When absent, a consumer must fall back to
+/// the application origin and say so.
 #[derive(Deserialize)]
 struct AppManifest {
     #[serde(default)]
     canisters: Vec<AppManifestEntry>,
+    #[serde(default)]
+    derivation_origin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -289,6 +301,271 @@ fn canisters_from_app_manifest(text: &str) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
+/// Reduce a raw origin string to a canonical bare `https://host[:port]` origin,
+/// accepting https with a real (tuple) host and no user-info. A scheme-less value
+/// is treated as a bare host and gets `https://` prepended (so a good-faith
+/// bare-host declaration resolves rather than being dropped) — this matches
+/// `canonicalize_derivation_origin`, which the interactive `derivation_origin`
+/// param uses. `None` for anything else — blank, an explicit non-https scheme
+/// (incl. `http://`, which `target_origin` would silently upgrade downstream,
+/// masking a wrong origin), user-info, host-less, or unparseable — so callers fail
+/// closed with no hidden scheme rewrite.
+fn normalize_origin(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Reject an explicit non-https scheme up front (a scheme-less bare host is fine —
+    // https is prepended below). Without this, `http://x` would be silently upgraded.
+    if let Some((scheme, _)) = raw.split_once("://") {
+        if !scheme.eq_ignore_ascii_case("https") {
+            return None;
+        }
+    }
+    let candidate = if raw.contains("://") { raw.to_string() } else { format!("https://{raw}") };
+    let url = url::Url::parse(&candidate).ok()?;
+    if url.scheme() != "https" {
+        return None;
+    }
+    // Reject user-info: `url.origin()` silently drops it, so `https://user@host` and
+    // `https://host` would collapse to the same origin — fail closed instead of
+    // masking the difference (consistent with the derivation-origin validation).
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    let origin = url.origin();
+    if !origin.is_tuple() {
+        return None;
+    }
+    Some(origin.ascii_serialization())
+}
+
+/// The app's declared Internet Identity derivation origin, from the manifest's
+/// optional top-level `derivation_origin`, reduced to a bare `https://host[:port]`
+/// origin (a scheme-less bare host is accepted and gets `https://`). `None` if
+/// absent, blank, an explicit non-https scheme, user-info, or not a parseable URL.
+fn declared_derivation_origin(manifest_text: &str) -> Option<String> {
+    let m = serde_json::from_str::<AppManifest>(manifest_text).ok()?;
+    normalize_origin(m.derivation_origin?.as_str())
+}
+
+/// Which origins Internet Identity permits to derive from this origin, from its
+/// `/.well-known/ii-alternative-origins` (`{ "alternativeOrigins": [...] }`).
+/// Purely informational — this is the INVERSE of "what derivation origin does
+/// this app use", so it must NOT be used to infer the derivation origin.
+#[derive(Deserialize)]
+struct AltOrigins {
+    #[serde(default, rename = "alternativeOrigins")]
+    alternative_origins: Vec<String>,
+}
+
+fn parse_alternative_origins(text: &str) -> Vec<String> {
+    serde_json::from_str::<AltOrigins>(text)
+        .map(|a| {
+            // Fail-closed: normalize each entry to a bare origin (as the doc
+            // promises) and drop anything that isn't a valid https origin,
+            // rather than surfacing arbitrary sanitized strings.
+            a.alternative_origins
+                .iter()
+                .filter_map(|s| normalize_origin(s))
+                .take(MAX_MANIFEST_CANISTERS)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Where a resolved derivation origin came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DerivationSource {
+    /// The app declared it in `/.well-known/ic-app.json` (`derivation_origin`).
+    Declared,
+    /// Not declared by the app, but the app is in the built-in registry of
+    /// well-known custom-derivation-origin apps ([`KNOWN_DERIVATION_ORIGINS`]).
+    Known,
+    /// No declaration found and not a known app — defaulted to the application
+    /// origin (an ASSUMPTION, correct only for apps without a custom origin).
+    AppUrlDefault,
+}
+
+impl DerivationSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DerivationSource::Declared => "declared",
+            DerivationSource::Known => "known",
+            DerivationSource::AppUrlDefault => "app_url_default",
+        }
+    }
+}
+
+/// Built-in derivation origins for well-known apps that pin a CUSTOM Internet
+/// Identity derivation origin (so the visible URL is NOT what II derives against)
+/// but don't yet declare it in `/.well-known/ic-app.json`. Verified from each app's
+/// frontend `derivationOrigin` and the derivation origin's own
+/// `/.well-known/ii-alternative-origins`. This is a stopgap so an agent gets the
+/// right principal from the app URL alone; an app's own manifest declaration ALWAYS
+/// takes precedence (a table entry is superseded the moment the app ships a
+/// declaration). Keyed by application host (lowercased, no port).
+///
+/// NOTE (MULTI/DEX): its frontend pins the gateway-domain canister origin, and
+/// `identities::target_origin` remaps `*.icp0.io`/`*.icp.net` → `*.ic0.app` before
+/// deriving. Whether Internet Identity derives the SAME principal for those gateway
+/// variants (vs the literal pinned string) has not been confirmed against a live
+/// authenticated derivation; if II keys on the literal origin, this entry (and the
+/// remap) would need revisiting. NNS/Oisy/ICPSwap use plain domains and are exact.
+///
+/// Each app's ENTIRE set of frontends — the derivation origin plus every origin in
+/// that origin's `/.well-known/ii-alternative-origins` — is listed, all mapping to
+/// the SAME derivation origin, so `resolve_app` yields the same result for any of an
+/// app's origins (not just its primary host). `known_apps_are_closed_over_their_alt_origins`
+/// verifies this against the live lists (and flags drift when an app adds one).
+const KNOWN_DERIVATION_ORIGINS: &[(&str, &str)] = &[
+    // NNS dapp: served at nns.internetcomputer.org (canister mc7vh-…) but pins the
+    // classic https://nns.ic0.app (canister qoctq-…) as its derivation origin. The
+    // rest are nns.ic0.app's ii-alternative-origins.
+    ("nns.ic0.app", "https://nns.ic0.app"),
+    ("nns.internetcomputer.org", "https://nns.ic0.app"),
+    ("beta.nns.internetcomputer.org", "https://nns.ic0.app"),
+    ("beta.nns.ic0.app", "https://nns.ic0.app"),
+    ("sns.internetcomputer.org", "https://nns.ic0.app"),
+    // Oisy: oisy.com is its own derivation-origin hub; the rest are its
+    // ii-alternative-origins (beta + canister + signer subdomains).
+    ("oisy.com", "https://oisy.com"),
+    ("beta.oisy.com", "https://oisy.com"),
+    ("v7iq7-yiaaa-aaaan-qmrtq-cai.icp0.io", "https://oisy.com"),
+    ("cha4i-riaaa-aaaan-qeccq-cai.icp0.io", "https://oisy.com"),
+    ("signer.oisy.com", "https://oisy.com"),
+    ("legacy-signer.oisy.com", "https://oisy.com"),
+    ("beta.signer.oisy.com", "https://oisy.com"),
+    ("beta.legacy-signer.oisy.com", "https://oisy.com"),
+    // MULTI/DEX: frontend pins its frontend-canister origin (see NOTE above); the
+    // gateway variants (.icp.net / .icp0.io) and multidex.ai all derive against it.
+    ("multidex.ai", "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io"),
+    ("hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io", "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io"),
+    ("hcv4s-uaaaa-aaabq-qaaba-cai.icp.net", "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io"),
+    // ICPSwap: app.icpswap.com uses NO custom derivation origin (default = app
+    // origin) — listed so resolution reports it as verified rather than assumed. It
+    // serves no ii-alternative-origins, so there are no further origins to map.
+    ("app.icpswap.com", "https://app.icpswap.com"),
+];
+
+/// The built-in derivation origin for a well-known app host, if any (see
+/// [`KNOWN_DERIVATION_ORIGINS`]). `host` must be the lowercased host (no port).
+fn known_derivation_origin(host: &str) -> Option<&'static str> {
+    KNOWN_DERIVATION_ORIGINS
+        .iter()
+        .find(|(h, _)| *h == host)
+        .map(|(_, origin)| *origin)
+}
+
+/// The Internet Identity derivation context an app URL resolves to. See
+/// [`resolve_app_identity`].
+pub struct AppIdentity {
+    /// The normalized application origin (`scheme://host[:port]`) of `app_url`.
+    pub application_origin: String,
+    /// The derivation origin to feed Internet Identity: the app-declared one when
+    /// present, else a built-in known-app origin, else the application origin.
+    pub derivation_origin: String,
+    /// Whether `derivation_origin` was declared, from the known-app registry, or
+    /// defaulted.
+    pub derivation_origin_source: DerivationSource,
+    /// The derivation origin's `ii-alternative-origins` list — the frontends
+    /// allowed to derive against it (informational; the INVERSE relation).
+    pub alternative_origins: Vec<String>,
+}
+
+/// Fetch and parse an origin's `/.well-known/ii-alternative-origins`, using an
+/// SSRF-pinned client for THAT origin's own host (the origin is resolved and
+/// address-pinned independently, since it may be a different host than the app
+/// URL). Empty on any failure (unreachable, non-success, unparseable, or SSRF
+/// refusal) — this list is informational, so it fails soft.
+async fn fetch_alternative_origins(origin: &str) -> Vec<String> {
+    let (url, pinned) = match resolve_public_url(origin).await {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let client = match site_client(&host, &pinned) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let origin = url.origin().ascii_serialization();
+    match client.get(format!("{origin}/.well-known/ii-alternative-origins")).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            parse_alternative_origins(&read_capped(resp, MAX_META_BYTES).await)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Resolve an app URL to its Internet Identity derivation context, WITHOUT
+/// guessing: the derivation origin is the app's declared one
+/// (`/.well-known/ic-app.json` → `derivation_origin`) if present, else a built-in
+/// known-app registry entry ([`KNOWN_DERIVATION_ORIGINS`]) if the app is one, else
+/// the application origin (a clearly-flagged default). Uses the same SSRF-pinned
+/// client and capped reads as `discover`; the app URL is user-controlled.
+///
+/// `want_alt_origins` controls whether the app's informational
+/// `ii-alternative-origins` list is fetched: the `resolve_app` tool surfaces it, so
+/// it passes `true`; identity-bearing tools that resolve an `app_url` only to derive
+/// against it pass `false`, avoiding a second network round-trip per call (the list
+/// never affects the resolved derivation origin — it's the inverse relation).
+pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Result<AppIdentity, String> {
+    let base = normalize(app_url);
+    let (base_url, pinned) = resolve_public_url(&base).await?;
+    // Lowercase the host: the known-app registry is keyed by lowercased host, and
+    // hosts are case-insensitive anyway. (The url crate already lowercases https
+    // hosts, but do it explicitly so the registry lookup can't silently miss.)
+    let host = base_url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let client = site_client(&host, &pinned)?;
+    let application_origin = base_url.origin().ascii_serialization();
+
+    // Declared derivation origin (authoritative) from the app's manifest.
+    let mut derivation_origin = application_origin.clone();
+    let mut derivation_origin_source = DerivationSource::AppUrlDefault;
+    if let Ok(resp) = client
+        .get(format!("{application_origin}/.well-known/ic-app.json"))
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            let text = read_capped(resp, MAX_META_BYTES).await;
+            if let Some(declared) = declared_derivation_origin(&text) {
+                derivation_origin = declared;
+                derivation_origin_source = DerivationSource::Declared;
+            }
+        }
+    }
+
+    // If the app didn't declare one, fall back to the built-in registry of
+    // well-known custom-derivation-origin apps (the app's own declaration always
+    // wins, so this only fills the gap for apps that haven't shipped one yet).
+    if derivation_origin_source == DerivationSource::AppUrlDefault {
+        if let Some(known) = known_derivation_origin(&host) {
+            derivation_origin = known.to_string();
+            derivation_origin_source = DerivationSource::Known;
+        }
+    }
+
+    // The alternative-origins list (informational only) — fetched only when the
+    // caller will surface it, so the identity hot path doesn't pay for a round-trip
+    // it never reads. It's authoritative at the DERIVATION ORIGIN (which declares the
+    // frontends allowed to derive against it), NOT the app URL — so fetch it there.
+    // This also makes the list identical for every frontend of the same app, since
+    // they all resolve to the same derivation origin.
+    let alternative_origins = if want_alt_origins {
+        fetch_alternative_origins(&derivation_origin).await
+    } else {
+        Vec::new()
+    };
+
+    Ok(AppIdentity {
+        application_origin,
+        derivation_origin,
+        derivation_origin_source,
+        alternative_origins,
+    })
+}
+
 /// Tidy an app-supplied label for display: control characters (ANSI escapes,
 /// CR/LF tricks) become spaces, then trim and cap — manifest roles and
 /// descriptions are untrusted server text (CWE-150).
@@ -304,7 +581,11 @@ fn clean_label(s: &str) -> String {
 
 fn normalize(domain: &str) -> String {
     let d = domain.trim().trim_end_matches('/');
-    if d.starts_with("http://") || d.starts_with("https://") {
+    // Case-insensitive scheme check: an already-schemed URL (any case — url parsing
+    // lowercases the scheme downstream) is left as-is; a bare host gets https. Matching
+    // only lowercase here would turn a validated `HTTPS://host` into `https://HTTPS://host`.
+    let lower = d.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
         d.to_string()
     } else {
         format!("https://{d}")
@@ -716,7 +997,7 @@ fn resolve_base(configured: Option<String>, default: &str) -> String {
 }
 
 /// Shared HTTP client for dashboard/registry calls (fixed public hosts) and the
-/// `lookup_canister` tool. Carries the SSRF redirect guard so a 3xx can never
+/// `icp_lookup_canister_info_by_id` tool. Carries the SSRF redirect guard so a 3xx can never
 /// bounce a request onto an internal host. Short-ish timeout since these back
 /// interactive tools. (User-supplied *site* fetches use [`site_client`], which
 /// additionally pins the resolved address.)
@@ -745,14 +1026,14 @@ pub struct CanisterInfo {
     pub latest_upgrade_proposal: Option<u64>,
 }
 
-/// Arguments for `lookup_canister`.
+/// Arguments for `icp_lookup_canister_info_by_id`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LookupCanisterArgs {
     /// Canister principal to identify, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai".
     pub canister_id: String,
 }
 
-/// The `lookup_canister` MCP output shape — the IC dashboard's identity for a
+/// The `icp_lookup_canister_info_by_id` MCP output shape — the IC dashboard's identity for a
 /// canister id (a serialization mirror of [`CanisterInfo`]).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CanisterIdentityOutput {
@@ -886,7 +1167,7 @@ pub struct Match {
     pub note: Option<String>,
 }
 
-/// One canister matched by `find_canister` — the MCP output shape (a
+/// One canister matched by `icp_find_canister_by_name` — the MCP output shape (a
 /// serialization mirror of [`Match`]).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct FoundCanister {
@@ -911,7 +1192,7 @@ impl From<&Match> for FoundCanister {
     }
 }
 
-/// Arguments for `find_canister`.
+/// Arguments for `icp_find_canister_by_name`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FindCanisterArgs {
     /// A name, token symbol, or project to search for, e.g. "ckUSDC", "ICP",
@@ -919,7 +1200,7 @@ pub struct FindCanisterArgs {
     pub query: String,
 }
 
-/// Structured output of `find_canister`.
+/// Structured output of `icp_find_canister_by_name`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct FindCanisterOutput {
     /// The name, token symbol, or project that was searched for.
@@ -930,7 +1211,7 @@ pub struct FindCanisterOutput {
 }
 
 impl From<(String, Vec<Match>)> for FindCanisterOutput {
-    /// `(query, matches)` → the structured `find_canister` reply.
+    /// `(query, matches)` → the structured `icp_find_canister_by_name` reply.
     fn from((query, matches): (String, Vec<Match>)) -> Self {
         Self {
             query,
@@ -1063,7 +1344,7 @@ fn search_in(ledgers_json: &str, snses_json: &str, query: &str) -> Vec<Match> {
                     name,
                     kind: "sns".into(),
                     note: Some(
-                        "SNS project root — lookup_canister (or the SNS detail API) expands it \
+                        "SNS project root — icp_lookup_canister_info_by_id (or the SNS detail API) expands it \
                          to governance/ledger/swap/index"
                             .into(),
                     ),
@@ -1387,5 +1668,143 @@ mod tests {
         assert!(!label.chars().any(char::is_control), "control chars must be gone: {label:?}");
         let long = format!(r#"{{"canisters":[{{"id":"aaaaa-aa","role":"{}"}}]}}"#, "x".repeat(1000));
         assert!(canisters_from_app_manifest(&long)[0].1.as_deref().unwrap().len() <= 120);
+    }
+
+    // The manifest's optional declared derivation origin is read and reduced to a
+    // bare origin; absent / blank / non-http values yield None (fail-closed).
+    #[test]
+    fn declared_derivation_origin_parses_and_fails_closed() {
+        let declared = r#"{"derivation_origin":"https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io","canisters":[]}"#;
+        assert_eq!(
+            declared_derivation_origin(declared).as_deref(),
+            Some("https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io")
+        );
+        // Reduced to a bare origin (path/query/trailing slash dropped).
+        let with_path = r#"{"derivation_origin":"https://app.example.com/x?y=1"}"#;
+        assert_eq!(declared_derivation_origin(with_path).as_deref(), Some("https://app.example.com"));
+        // A scheme-less bare host is accepted (https assumed), matching the
+        // interactive `derivation_origin` param, so a good-faith bare-host
+        // declaration resolves instead of being silently dropped.
+        let bare = r#"{"derivation_origin":"app.example.com"}"#;
+        assert_eq!(declared_derivation_origin(bare).as_deref(), Some("https://app.example.com"));
+        // Absent, blank, non-http, or non-JSON → None.
+        assert_eq!(declared_derivation_origin(r#"{"canisters":[]}"#), None);
+        assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"  "}"#), None);
+        assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"ftp://x/"}"#), None);
+        // Non-https is rejected (https-only; else target_origin would silently
+        // upgrade an http:// declaration while still reporting source=declared).
+        assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"http://example.com"}"#), None);
+        // User-info is rejected (url.origin() would silently drop it).
+        assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"https://u:p@example.com"}"#), None);
+        assert_eq!(declared_derivation_origin("<!doctype html>"), None);
+    }
+
+    // ii-alternative-origins parsing is tolerant and bounded, and sanitizes
+    // entries; a non-conforming body yields an empty list.
+    #[test]
+    fn parse_alternative_origins_reads_the_list() {
+        let body = r#"{"alternativeOrigins":["https://multidex.ai","https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io"]}"#;
+        assert_eq!(
+            parse_alternative_origins(body),
+            vec!["https://multidex.ai", "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io"]
+        );
+        assert!(parse_alternative_origins("<!doctype html>").is_empty());
+        assert!(parse_alternative_origins(r#"{"other":1}"#).is_empty());
+        // Fail-closed + normalize: a path is reduced to the bare origin, and a
+        // non-https / unparseable entry is dropped rather than surfaced.
+        assert_eq!(
+            parse_alternative_origins(
+                r#"{"alternativeOrigins":["https://a.example/some/path","http://insecure.example","ftp://x","not a url"]}"#
+            ),
+            // Path reduced to bare origin; http:// / non-https / unparseable dropped.
+            vec!["https://a.example"]
+        );
+    }
+
+    // `normalize` prepends https to a bare host but leaves an already-schemed URL
+    // (ANY scheme case) untouched — matching only lowercase would double-prefix a
+    // validated `HTTPS://host` into `https://HTTPS://host` and break URL parsing.
+    #[test]
+    fn normalize_is_scheme_case_insensitive() {
+        assert_eq!(normalize("example.com"), "https://example.com");
+        assert_eq!(normalize("https://example.com/"), "https://example.com");
+        assert_eq!(normalize("HTTPS://example.com"), "HTTPS://example.com");
+        // The uppercase-scheme result parses cleanly (url lowercases the scheme),
+        // rather than becoming a double-prefixed `https://HTTPS://example.com`.
+        assert_eq!(
+            url::Url::parse(&normalize("HTTPS://example.com")).unwrap().scheme(),
+            "https"
+        );
+    }
+
+    // The built-in registry maps each special-cased app host to its custom
+    // derivation origin; unknown hosts fall through (to app_url_default), and every
+    // registered value is already a canonical bare https origin.
+    #[test]
+    fn known_derivation_origin_maps_special_cased_apps() {
+        assert_eq!(known_derivation_origin("nns.internetcomputer.org"), Some("https://nns.ic0.app"));
+        assert_eq!(known_derivation_origin("nns.ic0.app"), Some("https://nns.ic0.app"));
+        assert_eq!(known_derivation_origin("oisy.com"), Some("https://oisy.com"));
+        assert_eq!(
+            known_derivation_origin("multidex.ai"),
+            Some("https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io")
+        );
+        assert_eq!(known_derivation_origin("app.icpswap.com"), Some("https://app.icpswap.com"));
+        assert_eq!(known_derivation_origin("example.com"), None);
+        // Invariant: each registry origin round-trips through normalize_origin
+        // unchanged (i.e. it's already a canonical bare https origin).
+        for (host, origin) in KNOWN_DERIVATION_ORIGINS {
+            assert_eq!(
+                normalize_origin(origin).as_deref(),
+                Some(*origin),
+                "registry origin for {host} must be a canonical bare https origin"
+            );
+        }
+    }
+
+    // Closure (offline): every derivation-origin VALUE in the registry is itself a
+    // key mapping to itself — so resolving a known app's derivation origin returns
+    // that same origin (source `known`), i.e. resolve_app is idempotent on it.
+    #[test]
+    fn registry_is_closed_under_its_derivation_origins() {
+        for (host, origin) in KNOWN_DERIVATION_ORIGINS {
+            let d_host = url::Url::parse(origin).unwrap().host_str().unwrap().to_ascii_lowercase();
+            assert_eq!(
+                known_derivation_origin(&d_host),
+                Some(*origin),
+                "derivation origin {origin} (from entry {host}) must itself be a registry key mapping to itself",
+            );
+        }
+    }
+
+    // Consistency (networked): every origin in a known app's LIVE
+    // ii-alternative-origins must map, in the registry, to the SAME derivation
+    // origin — so resolve_app yields the same result for any of an app's frontends,
+    // not just its primary host. A failure flags registry drift (the app added a new
+    // alternative origin we should include). Best-effort on fetch: an unreachable /
+    // offline endpoint (empty list) is skipped so a network blip doesn't fail CI.
+    #[tokio::test]
+    async fn known_apps_are_closed_over_their_alt_origins() {
+        for d in [
+            "https://nns.ic0.app",
+            "https://oisy.com",
+            "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io",
+        ] {
+            let d_host = url::Url::parse(d).unwrap().host_str().unwrap().to_ascii_lowercase();
+            let expected = known_derivation_origin(&d_host)
+                .unwrap_or_else(|| panic!("{d_host} must be a registry key"));
+            let alts = fetch_alternative_origins(d).await;
+            if alts.is_empty() {
+                continue; // unreachable / offline — don't fail CI on a network blip
+            }
+            for o in &alts {
+                let h = url::Url::parse(o).unwrap().host_str().unwrap().to_ascii_lowercase();
+                assert_eq!(
+                    known_derivation_origin(&h),
+                    Some(expected),
+                    "alt-origin {o} of {d} is not mapped to {expected} in the registry (drift?)",
+                );
+            }
+        }
     }
 }
