@@ -639,24 +639,17 @@ fn finishing_page(prefix: &str, id: &str, fs: &str, next_try: u32) -> Response {
         urlencoding::encode(fs),
         next_try
     ));
-    // Shares the connect pages' DFINITY-branded look (logo, centered card,
-    // spinner, dark mode). This page sets no CSP, so a plain `<style>`/`<script>`
-    // is fine.
-    let css = CONNECT_PAGE_CSS;
-    let logo = CONNECT_LOGO_SVG;
-    let mut resp = Html(format!(
-        "<!DOCTYPE html><html lang=en><head><meta charset=utf-8><title>Finishing…</title>\
-         <meta name=viewport content=\"width=device-width,initial-scale=1\">\
-         <meta name=referrer content=no-referrer>\
-         <style>{css}</style></head>\
-         <body><main class=card>\
-         {logo}\
-         <p class=eyebrow>Internet Identity</p>\
-         <div class=spinner aria-hidden=true></div>\
-         <p class=msg role=status aria-live=polite>Finishing sign-in…</p></main>\
-         <script>setTimeout(function(){{location.replace(\"{url}\")}},1200)</script></body></html>"
-    ))
-    .into_response();
+    // Shares the connect pages' DFINITY-branded look (full-bleed grid, spinner
+    // tile, editorial serif headline, foot-of-page "Hosted by" mark, dark mode).
+    // The markup lives in `assets/connect-finishing.html` (include_str!); we
+    // splice in the stylesheet, logo, and the bounded-reload URL. `__URL__` last,
+    // so a URL that ever contained another token can't clobber css/logo. This
+    // page sets no CSP, so a plain `<style>`/`<script>` is fine.
+    let html = FINISHING_PAGE_HTML
+        .replace("__CSS__", CONNECT_PAGE_CSS)
+        .replace("__LOGO__", CONNECT_LOGO_SVG)
+        .replace("__URL__", &url);
+    let mut resp = Html(html).into_response();
     resp.headers_mut()
         .insert(axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer"));
     resp
@@ -910,19 +903,21 @@ fn csp_nonce() -> String {
 /// Shared styling for the connect interstitial/error pages, following the
 /// DFINITY brand guidelines (Parchment/Ink/Rust palette, an editorial serif
 /// display over a UI sans, a grid-paper surface, and the official gradient-
-/// infinity logo). A centered card with the DFINITY mark, an accessible status
-/// line, and a CSS-only spinner (disabled under `prefers-reduced-motion`);
-/// light/dark theming via `prefers-color-scheme` with a `data-theme` override,
-/// using the brand's Bark/Bone/Ember dark palette. Fully self-contained (no
-/// external fonts, images, or stylesheets; the logo is inlined into the served
-/// HTML), so it renders identically under the pinned page's strict
-/// `default-src 'none'` CSP. The stylesheet lives in `assets/connect.css` and is
-/// compiled into the binary via `include_str!` (no runtime file I/O), so it is
-/// authored as a real `.css` file rather than a Rust string literal. The pinned
-/// page serves it in a `<style nonce>` block (with `style-src 'nonce-...'` added
-/// to its CSP so the block is allowed WITHOUT `'unsafe-inline'`); the sibling
-/// pages, which set no CSP, use a plain `<style>`. The `.error` modifier hides
-/// the spinner once a terminal message is shown.
+/// infinity logo). A full-bleed screen: the status stage (a spinner on a soft
+/// elevated tile plus an accessible serif headline) fills and centres the
+/// viewport, with a foot-of-page "Hosted by" mark; the spinner is CSS-only
+/// (disabled under `prefers-reduced-motion`). Light/dark theming via
+/// `prefers-color-scheme` with a `data-theme` override, using the brand's
+/// Bark/Bone/Ember dark palette. Fully self-contained (no external fonts,
+/// images, or stylesheets; the logo is inlined into the served HTML), so it
+/// renders identically under the pinned page's strict `default-src 'none'` CSP.
+/// The stylesheet lives in `assets/connect.css` and is compiled into the binary
+/// via `include_str!` (no runtime file I/O), so it is authored as a real `.css`
+/// file rather than a Rust string literal. The pinned page serves it in a
+/// `<style nonce>` block (with `style-src 'nonce-...'` added to its CSP so the
+/// block is allowed WITHOUT `'unsafe-inline'`); the sibling pages, which set no
+/// CSP, use a plain `<style>`. The `.error` modifier (added to `.screen`) hides
+/// the spinner tile once a terminal message is shown.
 const CONNECT_PAGE_CSS: &str = include_str!("assets/connect.css");
 
 /// The official DFINITY logo (gradient-infinity mark + wordmark), taken from
@@ -932,6 +927,18 @@ const CONNECT_PAGE_CSS: &str = include_str!("assets/connect.css");
 /// brand gradients; the wordmark is set to `currentColor` so it follows the
 /// page's Ink/Bone text color across light and dark themes.
 const CONNECT_LOGO_SVG: &str = include_str!("assets/dfinity-logo.svg");
+
+/// HTML templates for the three connect pages, kept as real `.html` asset files
+/// (compiled in via `include_str!`, no runtime file I/O) rather than inline Rust
+/// string literals, so the markup reads and diffs as HTML. Each is a self-
+/// contained document with `__TOKEN__` placeholders spliced in at render time
+/// (the stylesheet `__CSS__`, the logo `__LOGO__`, and per-page dynamics: the
+/// bounded-reload `__URL__`, the pinned page's `__NONCE__`/`__SCRIPT__`, the
+/// error page's `__MESSAGE__`). User-influenced values (`__URL__`, `__MESSAGE__`)
+/// are substituted LAST so they cannot clobber an earlier token.
+const FINISHING_PAGE_HTML: &str = include_str!("assets/connect-finishing.html");
+const PINNED_PAGE_HTML: &str = include_str!("assets/connect-callback.html");
+const CONNECT_ERROR_HTML: &str = include_str!("assets/connect-error.html");
 
 /// The strict-CSP, non-reflecting pinned callback page. `nonce` is a fresh
 /// per-response value bound into the CSP header and BOTH the inline `<script>`
@@ -961,7 +968,7 @@ const PINNED_PAGE_JS: &str = r#"(function () {
   function show(t, err) {
     document.getElementById('m').textContent = t;
     if (err) {
-      var c = document.querySelector('.card');
+      var c = document.querySelector('.screen');
       if (c) { c.classList.add('error'); }
     }
   }
@@ -1003,24 +1010,19 @@ fn pinned_callback_page(prefix: &str) -> Response {
     let nonce = csp_nonce();
     let redeem = js_escape(&format!("{prefix}/oauth/connect/redeem"));
     let script = PINNED_PAGE_JS.replace("__REDEEM_URL__", &redeem);
-    let css = CONNECT_PAGE_CSS;
-    let logo = CONNECT_LOGO_SVG;
-    // The status line is a `role=status` / `aria-live=polite` region so screen
-    // readers announce both "Finishing sign-in…" and any terminal error the
-    // script swaps in. The DFINITY logo carries its own `aria-label`; the spinner
-    // is decorative (`aria-hidden`).
-    let html = format!(
-        "<!DOCTYPE html><html lang=en><head><meta charset=utf-8>\
-         <meta name=viewport content=\"width=device-width,initial-scale=1\">\
-         <title>Finishing sign-in…</title>\
-         <style nonce=\"{nonce}\">{css}</style></head>\
-         <body><main class=card>\
-         {logo}\
-         <p class=eyebrow>Internet Identity</p>\
-         <div class=spinner aria-hidden=true></div>\
-         <p id=m class=msg role=status aria-live=polite>Finishing sign-in…</p></main>\
-         <script nonce=\"{nonce}\">{script}</script></body></html>"
-    );
+    // The markup lives in `assets/connect-callback.html` (include_str!). The
+    // status line is a `role=status` / `aria-live=polite` region so screen
+    // readers announce both "Connecting agent to Internet Identity…" and any
+    // terminal error the script swaps in. The DFINITY logo carries its own
+    // `aria-label`; the spinner is decorative (`aria-hidden`). `__NONCE__` (both
+    // the `<style>` and `<script>` tags), then the self-contained stylesheet,
+    // logo, and redeem script are spliced in; none of those values contains a
+    // placeholder token, so the order is immaterial.
+    let html = PINNED_PAGE_HTML
+        .replace("__NONCE__", &nonce)
+        .replace("__CSS__", CONNECT_PAGE_CSS)
+        .replace("__LOGO__", CONNECT_LOGO_SVG)
+        .replace("__SCRIPT__", &script);
     // `style-src 'nonce-{nonce}'` admits ONLY the nonce'd `<style>` block above
     // (no `'unsafe-inline'`, so an injected `style=` attribute or stray `<style>`
     // still can't apply). Without it the block falls back to `default-src
@@ -1375,22 +1377,24 @@ fn connect_error(message: &str) -> Response {
         .replace('<', "&lt;")
         .replace('>', "&gt;");
     // Shares the connect pages' DFINITY-branded look via the `.error` modifier
-    // (logo shown, spinner hidden). No CSP here, so a plain `<style>` is fine.
-    let css = CONNECT_PAGE_CSS;
-    let logo = CONNECT_LOGO_SVG;
-    (
-        StatusCode::BAD_REQUEST,
-        Html(format!(
-            "<!DOCTYPE html><html lang=en><head><meta charset=utf-8>\
-             <meta name=viewport content=\"width=device-width,initial-scale=1\">\
-             <title>Could not connect</title><style>{css}</style></head>\
-             <body><main class=\"card error\">{logo}\
-             <p class=eyebrow>Internet Identity</p><h1 class=msg>Could not connect</h1>\
-             <p class=detail>{safe}</p>\
-             <p class=hint>Restart the connection from your client.</p></main></body></html>"
-        )),
-    )
-        .into_response()
+    // (spinner tile hidden, message carries the state), same foot-of-page "Hosted
+    // by" mark; markup in `assets/connect-error.html` (include_str!). No CSP here,
+    // so a plain `<style>` is fine. Sets `Referrer-Policy: no-referrer` (plus the
+    // `<meta>` fallback) like the sibling finish pages: this page can be served
+    // from `/oauth/finish`, whose URL carries the one-time `finish_secret` in its
+    // query, so the Referer must not leak it if the user navigates away (P2).
+    // `__MESSAGE__` (the escaped, caller-supplied text) is substituted LAST so it
+    // cannot clobber the `__CSS__`/`__LOGO__` tokens.
+    let html = CONNECT_ERROR_HTML
+        .replace("__CSS__", CONNECT_PAGE_CSS)
+        .replace("__LOGO__", CONNECT_LOGO_SVG)
+        .replace("__MESSAGE__", &safe);
+    let mut resp = (StatusCode::BAD_REQUEST, Html(html)).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    resp
 }
 
 // ---- Token: exchange an authorization code ------------------------------
