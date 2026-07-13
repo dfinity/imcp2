@@ -412,19 +412,39 @@ impl DerivationSource {
 /// variants (vs the literal pinned string) has not been confirmed against a live
 /// authenticated derivation; if II keys on the literal origin, this entry (and the
 /// remap) would need revisiting. NNS/Oisy/ICPSwap use plain domains and are exact.
+///
+/// Each app's ENTIRE set of frontends — the derivation origin plus every origin in
+/// that origin's `/.well-known/ii-alternative-origins` — is listed, all mapping to
+/// the SAME derivation origin, so `resolve_app` yields the same result for any of an
+/// app's origins (not just its primary host). `known_apps_are_closed_over_their_alt_origins`
+/// verifies this against the live lists (and flags drift when an app adds one).
 const KNOWN_DERIVATION_ORIGINS: &[(&str, &str)] = &[
     // NNS dapp: served at nns.internetcomputer.org (canister mc7vh-…) but pins the
-    // classic https://nns.ic0.app (canister qoctq-…) as its derivation origin; that
-    // origin's ii-alternative-origins lists nns.internetcomputer.org + beta + sns.
-    ("nns.internetcomputer.org", "https://nns.ic0.app"),
+    // classic https://nns.ic0.app (canister qoctq-…) as its derivation origin. The
+    // rest are nns.ic0.app's ii-alternative-origins.
     ("nns.ic0.app", "https://nns.ic0.app"),
-    // Oisy: oisy.com is its own derivation-origin hub (its ii-alternative-origins
-    // lists beta + canister + signer subdomains, all deriving against oisy.com).
+    ("nns.internetcomputer.org", "https://nns.ic0.app"),
+    ("beta.nns.internetcomputer.org", "https://nns.ic0.app"),
+    ("beta.nns.ic0.app", "https://nns.ic0.app"),
+    ("sns.internetcomputer.org", "https://nns.ic0.app"),
+    // Oisy: oisy.com is its own derivation-origin hub; the rest are its
+    // ii-alternative-origins (beta + canister + signer subdomains).
     ("oisy.com", "https://oisy.com"),
-    // MULTI/DEX: frontend pins its frontend-canister origin (see NOTE above).
+    ("beta.oisy.com", "https://oisy.com"),
+    ("v7iq7-yiaaa-aaaan-qmrtq-cai.icp0.io", "https://oisy.com"),
+    ("cha4i-riaaa-aaaan-qeccq-cai.icp0.io", "https://oisy.com"),
+    ("signer.oisy.com", "https://oisy.com"),
+    ("legacy-signer.oisy.com", "https://oisy.com"),
+    ("beta.signer.oisy.com", "https://oisy.com"),
+    ("beta.legacy-signer.oisy.com", "https://oisy.com"),
+    // MULTI/DEX: frontend pins its frontend-canister origin (see NOTE above); the
+    // gateway variants (.icp.net / .icp0.io) and multidex.ai all derive against it.
     ("multidex.ai", "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io"),
+    ("hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io", "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io"),
+    ("hcv4s-uaaaa-aaabq-qaaba-cai.icp.net", "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io"),
     // ICPSwap: app.icpswap.com uses NO custom derivation origin (default = app
-    // origin) — listed so resolution reports it as verified rather than assumed.
+    // origin) — listed so resolution reports it as verified rather than assumed. It
+    // serves no ii-alternative-origins, so there are no further origins to map.
     ("app.icpswap.com", "https://app.icpswap.com"),
 ];
 
@@ -448,8 +468,33 @@ pub struct AppIdentity {
     /// Whether `derivation_origin` was declared, from the known-app registry, or
     /// defaulted.
     pub derivation_origin_source: DerivationSource,
-    /// The application origin's own `ii-alternative-origins` list (informational).
+    /// The derivation origin's `ii-alternative-origins` list — the frontends
+    /// allowed to derive against it (informational; the INVERSE relation).
     pub alternative_origins: Vec<String>,
+}
+
+/// Fetch and parse an origin's `/.well-known/ii-alternative-origins`, using an
+/// SSRF-pinned client for THAT origin's own host (the origin is resolved and
+/// address-pinned independently, since it may be a different host than the app
+/// URL). Empty on any failure (unreachable, non-success, unparseable, or SSRF
+/// refusal) — this list is informational, so it fails soft.
+async fn fetch_alternative_origins(origin: &str) -> Vec<String> {
+    let (url, pinned) = match resolve_public_url(origin).await {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let client = match site_client(&host, &pinned) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let origin = url.origin().ascii_serialization();
+    match client.get(format!("{origin}/.well-known/ii-alternative-origins")).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            parse_alternative_origins(&read_capped(resp, MAX_META_BYTES).await)
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Resolve an app URL to its Internet Identity derivation context, WITHOUT
@@ -501,22 +546,17 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
         }
     }
 
-    // The app origin's alternative-origins list (informational only) — fetched only
-    // when the caller will surface it, so the identity hot path doesn't pay for a
-    // second round-trip it never reads.
-    let mut alternative_origins = Vec::new();
-    if want_alt_origins {
-        if let Ok(resp) = client
-            .get(format!("{application_origin}/.well-known/ii-alternative-origins"))
-            .send()
-            .await
-        {
-            if resp.status().is_success() {
-                let text = read_capped(resp, MAX_META_BYTES).await;
-                alternative_origins = parse_alternative_origins(&text);
-            }
-        }
-    }
+    // The alternative-origins list (informational only) — fetched only when the
+    // caller will surface it, so the identity hot path doesn't pay for a round-trip
+    // it never reads. It's authoritative at the DERIVATION ORIGIN (which declares the
+    // frontends allowed to derive against it), NOT the app URL — so fetch it there.
+    // This also makes the list identical for every frontend of the same app, since
+    // they all resolve to the same derivation origin.
+    let alternative_origins = if want_alt_origins {
+        fetch_alternative_origins(&derivation_origin).await
+    } else {
+        Vec::new()
+    };
 
     Ok(AppIdentity {
         application_origin,
@@ -1719,6 +1759,52 @@ mod tests {
                 Some(*origin),
                 "registry origin for {host} must be a canonical bare https origin"
             );
+        }
+    }
+
+    // Closure (offline): every derivation-origin VALUE in the registry is itself a
+    // key mapping to itself — so resolving a known app's derivation origin returns
+    // that same origin (source `known`), i.e. resolve_app is idempotent on it.
+    #[test]
+    fn registry_is_closed_under_its_derivation_origins() {
+        for (host, origin) in KNOWN_DERIVATION_ORIGINS {
+            let d_host = url::Url::parse(origin).unwrap().host_str().unwrap().to_ascii_lowercase();
+            assert_eq!(
+                known_derivation_origin(&d_host),
+                Some(*origin),
+                "derivation origin {origin} (from entry {host}) must itself be a registry key mapping to itself",
+            );
+        }
+    }
+
+    // Consistency (networked): every origin in a known app's LIVE
+    // ii-alternative-origins must map, in the registry, to the SAME derivation
+    // origin — so resolve_app yields the same result for any of an app's frontends,
+    // not just its primary host. A failure flags registry drift (the app added a new
+    // alternative origin we should include). Best-effort on fetch: an unreachable /
+    // offline endpoint (empty list) is skipped so a network blip doesn't fail CI.
+    #[tokio::test]
+    async fn known_apps_are_closed_over_their_alt_origins() {
+        for d in [
+            "https://nns.ic0.app",
+            "https://oisy.com",
+            "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io",
+        ] {
+            let d_host = url::Url::parse(d).unwrap().host_str().unwrap().to_ascii_lowercase();
+            let expected = known_derivation_origin(&d_host)
+                .unwrap_or_else(|| panic!("{d_host} must be a registry key"));
+            let alts = fetch_alternative_origins(d).await;
+            if alts.is_empty() {
+                continue; // unreachable / offline — don't fail CI on a network blip
+            }
+            for o in &alts {
+                let h = url::Url::parse(o).unwrap().host_str().unwrap().to_ascii_lowercase();
+                assert_eq!(
+                    known_derivation_origin(&h),
+                    Some(expected),
+                    "alt-origin {o} of {d} is not mapped to {expected} in the registry (drift?)",
+                );
+            }
         }
     }
 }
