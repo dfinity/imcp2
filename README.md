@@ -369,23 +369,28 @@ call as `X`. II never again binds a bare key it was shown.
 build (`version`, `commit`, `built_at`, `started_at`), the H3/P1
 `repeat_key_requests` health counter, which instance runs which protocol
 (`registration_delegation: {beta, prod}`), and a real-time **live-session
-gauge** (`live_sessions: {beta, prod}`) counting the sessions that currently
-hold a valid grant on each instance:
+gauge** (`live_sessions: {beta, prod}`) counting, per instance, the
+authenticated sessions that are both non-expired and active within the last 5
+minutes:
 
 ```bash
 curl -s https://<host>/version | jq '.live_sessions'
 # => { "beta": 0, "prod": 1 }
 ```
 
-Sessions are also traceable in the logs (unit `mcp-poc`): a session logs
-`session opened` (with `instance` and `session_id`) when its grant goes live,
-and `session closed` when the grant expires and the per-instance reaper (60s
-cadence) evicts it. So `opened` minus `closed` tracks the live count, lagging
-the `/version` gauge by up to one reaper interval on the close side: the gauge
-stops counting an expired session immediately, while its `session closed` line
-lands on the next sweep (within 60s). A session still mid-connect, or a v1
-session whose best-effort completion POST never delivered an expiry, counts as
-neither live nor opened until a grant expiry is recorded for it.
+The activity window is what makes a disconnected client fall off the gauge: the
+server runs MCP statelessly, so a disconnect produces no server-side event, and
+liveness is inferred from recent requests rather than connection state. A client
+that stops sending requests drops off the gauge about 5 minutes later; its grant
+stays valid so it can return and resume, it just no longer counts as *live*.
+
+Session grants are separately traceable in the logs (unit `mcp-poc`): a session
+logs `session opened` (with `instance` and `session_id`) when its grant goes
+live, and `session closed` when the grant expires and the per-instance reaper
+(60s cadence) evicts it. These track the grant lifecycle, which is distinct from
+the activity gauge: a disconnected client leaves the gauge after the idle window
+but stays `opened` in the logs until its grant actually expires. So `opened`
+minus `closed` is the number of open grants, not the live-session gauge.
 
 **Callback allow-list (`/.well-known/ii-auth-callbacks`).** II is moving to
 validate the connect callback named in the (attacker-craftable) link fragment
