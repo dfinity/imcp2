@@ -501,29 +501,44 @@ fn known_app_derivation_origin(app: &KnownApp) -> &'static str {
 /// avoids false positives like "noisy" resolving to "oisy" while still tolerating
 /// punctuation/spacing/casing variants.
 fn find_known_app(query: &str) -> Option<&'static KnownApp> {
+    // Cap the token count so a pathologically long query can't drive quadratic work;
+    // an app name won't be buried past a handful of tokens.
+    const MAX_TOKENS: usize = 64;
     let tokens: Vec<String> = query
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|t| !t.is_empty())
+        .take(MAX_TOKENS)
         .map(str::to_ascii_lowercase)
         .collect();
     if tokens.is_empty() {
         return None;
     }
-    // Concatenate every CONTIGUOUS window of tokens, so a multi-word name matches
-    // anywhere in a phrase ("use the multi dex app" → the window "multi"+"dex" =
-    // "multidex"). Windows are built from whole tokens, so boundaries are preserved
-    // and a substring inside a single token never matches (e.g. "oisy" in "noisy").
-    let mut windows: Vec<String> = Vec::new();
+    // Match an alias against the concatenation of any CONTIGUOUS token window, so a
+    // multi-word name matches anywhere in a phrase ("use the multi dex app" → the
+    // window "multi"+"dex" = "multidex"). Windows are built from whole tokens, so
+    // boundaries are preserved and a substring inside one token never matches (e.g.
+    // "oisy" in "noisy"). Bounded: a window is abandoned once it grows past the
+    // longest alias (it — and every longer window — can't match), and it's checked
+    // in place rather than materializing every window.
+    let max_alias = KNOWN_APPS
+        .iter()
+        .flat_map(|app| app.aliases.iter())
+        .map(|a| a.len())
+        .max()
+        .unwrap_or(0);
     for start in 0..tokens.len() {
         let mut acc = String::new();
         for t in &tokens[start..] {
             acc.push_str(t);
-            windows.push(acc.clone());
+            if acc.len() > max_alias {
+                break;
+            }
+            if let Some(app) = KNOWN_APPS.iter().find(|app| app.aliases.contains(&acc.as_str())) {
+                return Some(app);
+            }
         }
     }
-    KNOWN_APPS
-        .iter()
-        .find(|app| app.aliases.iter().any(|a| windows.iter().any(|w| w.as_str() == *a)))
+    None
 }
 
 /// The Internet Identity derivation context an app URL resolves to. See
@@ -1924,7 +1939,12 @@ mod tests {
             let out = find_app_by_name(q);
             assert_eq!(out.matches.len(), 1, "{q:?} should match one app");
             assert_eq!(out.matches[0].app_url, "https://multidex.ai");
-            assert_eq!(out.matches[0].derivation_origin, "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io");
+            // Derive the expected origin from the registry (single source of truth),
+            // don't re-hard-code it.
+            assert_eq!(
+                out.matches[0].derivation_origin,
+                known_derivation_origin("multidex.ai").unwrap(),
+            );
         }
         assert_eq!(find_app_by_name("Oisy").matches[0].app_url, "https://oisy.com");
         assert_eq!(find_app_by_name("nns").matches[0].app_url, "https://nns.internetcomputer.org");
