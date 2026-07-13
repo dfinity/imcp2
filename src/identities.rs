@@ -772,8 +772,9 @@ impl Identities {
         let mut matching = accounts.iter().filter(|a| a.name.as_deref() == Some(name));
         match (matching.next(), matching.next()) {
             (None, _) => Err(format!(
-                "no account named \"{name}\" at {domain} — call list_app_accounts(domain) to see your \
-                 accounts there, or omit `account` to use the default one"
+                "no account named \"{name}\" at {domain} — call `list_app_accounts` (with this app's \
+                 `derivation_origin` or `app_url`) to see your accounts there, or omit `account` to \
+                 use the default one"
             )),
             (Some(a), None) => Ok(a.account_number),
             (Some(_), Some(_)) => Err(format!(

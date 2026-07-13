@@ -1040,12 +1040,23 @@ fn canonicalize_derivation_origin(cleaned: &str) -> Result<String, String> {
     // rewrite a non-https scheme into a different origin than requested — `ftp://x`
     // mangled into a bogus `https://…`, or `http://x` silently upgraded to
     // `https://x` — contradicting the https-only contract and confusing debugging.
-    if let Some((scheme, _)) = cleaned.split_once("://") {
-        if !scheme.eq_ignore_ascii_case("https") {
-            return Err(invalid());
+    // A bare host with no scheme is fine — target_origin prepends https. An explicit
+    // scheme must be https, and we lowercase it before handing off: target_origin strips
+    // only a lowercase `https://`, so an uppercase `HTTPS://` would otherwise survive
+    // into the host and mangle the origin (e.g. `https://HTTPS:`), turning a valid input
+    // into a rejection or a bogus origin. Rejecting a non-https scheme here also stops
+    // target_origin from silently rewriting it (`ftp://x` → bogus `https://…`, `http://x`
+    // → `https://x`), contradicting the https-only contract.
+    let normalized = match cleaned.split_once("://") {
+        Some((scheme, rest)) => {
+            if !scheme.eq_ignore_ascii_case("https") {
+                return Err(invalid());
+            }
+            format!("https://{rest}")
         }
-    }
-    let origin = identities::target_origin(cleaned);
+        None => cleaned.to_string(),
+    };
+    let origin = identities::target_origin(&normalized);
     // Require the canonical origin to parse as an https URL with a real host and NO
     // user-info. `target_origin` keeps any `user@` prefix, but a browser origin never
     // has one, so `https://user@host` would derive a different principal than
@@ -1987,6 +1998,18 @@ mod tests {
             .await
             .expect_err("control chars must be rejected");
         assert!(err.contains("control characters"), "unexpected message: {err}");
+    }
+
+    // An uppercase scheme must canonicalize the same as lowercase — `target_origin`
+    // strips only a lowercase `https://`, so without normalization `HTTPS://` would
+    // survive into the host and mangle the origin instead of yielding `https://host`.
+    #[tokio::test]
+    async fn resolve_identity_target_normalizes_uppercase_scheme() {
+        let t = super::resolve_identity_target(Some("HTTPS://example.com".to_string()), None)
+            .await
+            .expect("uppercase https scheme must be accepted")
+            .expect("a derivation_origin yields a target");
+        assert_eq!(t.origin, "https://example.com", "unexpected origin: {}", t.origin);
     }
 
     // A `derivation_origin` with no host (e.g. "https://") reduces to an empty
