@@ -1358,16 +1358,21 @@ pub fn find_app_by_name(query: &str) -> FindAppOutput {
                 ),
             }
         }
-        None => FindAppOutput {
-            query: query.to_string(),
-            matches: Vec::new(),
-            note: format!(
-                "\"{query}\" is not in the connector's small built-in set of well-known apps \
-                 (NNS, Oisy, MULTI/DEX, ICPSwap). There is no on-chain directory mapping an app \
-                 NAME to its URL, so do a WEB SEARCH for the app's official front-end URL, then \
-                 call resolve_app / discover_app_canisters with that URL."
-            ),
-        },
+        None => {
+            // Build the known-app list from KNOWN_APPS (the source of truth) so this
+            // message can't drift when the set changes.
+            let known = KNOWN_APPS.iter().map(|a| a.name).collect::<Vec<_>>().join(", ");
+            FindAppOutput {
+                query: query.to_string(),
+                matches: Vec::new(),
+                note: format!(
+                    "\"{query}\" is not in the connector's small built-in set of well-known apps \
+                     ({known}). There is no on-chain directory mapping an app NAME to its URL, so \
+                     do a WEB SEARCH for the app's official front-end URL, then call resolve_app / \
+                     discover_app_canisters with that URL."
+                ),
+            }
+        }
     }
 }
 
