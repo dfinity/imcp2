@@ -1266,6 +1266,22 @@ impl ServerHandler for IcTools {
              reads work, but the canister-management tools below make update calls the network \
              rejects for a read-only session — if one fails that way, ask the user to reconnect with \
              the read-only option turned OFF.\n\n\
+             Typical flow (acting FOR THE USER at an app): (0) get the app URL from the user — no \
+             tool maps an app NAME to a URL (`icp_find_canister_by_name` searches the token/SNS \
+             registries for canister ids, not front-ends), so take it from the user or ask; (1) \
+             `resolve_app(url)` gives the `derivation_origin`, and concurrently (2) \
+             `discover_app_canisters(url)` gives the backend canister id; (3) `list_app_accounts` — \
+             if there is more than one account, ask which to use and remember it; (4) \
+             `get_app_principal` ONLY when you need the principal value itself (`call_canister` / \
+             `run_canister_oql_query` act as the account without pre-fetching it); (5) inspect the \
+             canister with `get_canister_candid` (and `get_canister_api_doc` if it exposes one) — its \
+             `oql: true` flag says whether OQL is available; (6) READ with `run_canister_oql_query` \
+             when OQL is available, else `call_canister` with is_query=true; (7) ACT with \
+             `call_canister` update calls, passing `derivation_origin` + `account` to act as the \
+             user. Public/anonymous reads skip 1/3/4. The per-canister inspection (5) is independent \
+             of the identity steps (1/3/4), so they can run in parallel. Managing your OWN canisters \
+             (the `icp_` create/install/status/… tools) acts as your standing MANAGEMENT principal at \
+             this server's origin — a DIFFERENT identity than the per-app principals above.\n\n\
              To AUTHOR, BUILD and DEPLOY IC code, first consult the official IC skills: \
              `icp_list_skills` lists them and `icp_get_skill(name)` loads one. Especially `motoko` \
              (language), `mops-cli` (deps/build), `icp-cli` (build & deploy), `cycles-management` \

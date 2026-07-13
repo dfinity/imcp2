@@ -46,6 +46,32 @@ of a canister id. Sources, most authoritative first: **app-declared metadata**
 mined from `/env.json` + the JS bundle (pick by label, prefer production/`IC_`
 ids, confirm with `get_canister_candid`).
 
+### Typical flow
+
+Acting **for the user** at an app:
+
+0. **Get the app URL from the user.** No tool maps an app *name* → URL
+   (`icp_find_canister_by_name` searches the token/SNS registries for canister ids,
+   not front-ends), so take the URL from the user or ask.
+1. **`resolve_app(url)`** → the app's `derivation_origin` — concurrently with
+2. **`discover_app_canisters(url)`** → the backend canister id.
+3. **`list_app_accounts`** — if there's more than one account, ask which to use (and
+   remember it).
+4. **`get_app_principal`** — only when you need the principal *value* itself;
+   `call_canister` / `run_canister_oql_query` act as the account without pre-fetching it.
+5. **`get_canister_candid`** (and **`get_canister_api_doc`** if the canister exposes
+   one) to learn the interface — the `oql: true` flag says whether OQL is available.
+6. **Read** with `run_canister_oql_query` when OQL is available, else `call_canister`
+   with `is_query=true`.
+7. **Act** with `call_canister` update calls, passing `derivation_origin` + `account`
+   to act as the user.
+
+Public/anonymous reads skip steps 1/3/4. The per-canister inspection (5) is
+independent of the identity steps (1/3/4), so they can run in parallel. Managing your
+**own** canisters (the `icp_*` create/install/status/… tools) acts as your standing
+**management principal** at this server's origin — a *different* identity than the
+per-app principals above.
+
 ### App-declared canister metadata (App Connect)
 
 Apps that adopt **Internet Computer App Connect** serve a bridge page at
