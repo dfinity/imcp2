@@ -1218,7 +1218,14 @@ impl ServerHandler for IcTools {
         .with_instructions(
             "Internet Computer tools. Every tool speaks TEXTUAL Candid — the `(...)` value \
              syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`, never \
-             the binary form. Before writing Candid args, consult the `candid://textual-syntax` \
+             the binary form. Tool names signal SCOPE: an `icp_` prefix marks IC protocol / \
+             meta-level tools (dashboard name/id lookups, the official IC skills, the OQL dialect \
+             guide, and canister creation/management); `…_app…` names \
+             (`discover_app_canisters`, `get_app_principal`, `list_app_accounts`, `resolve_app`) \
+             act on a whole APP, keyed by its Internet Identity derivation origin or app URL; and \
+             `…canister…` names (`get_canister_candid`, `get_canister_api_doc`, \
+             `get_canister_oql_schema`, `run_canister_oql_query`, `call_canister`) act on ONE \
+             specific canister. Before writing Candid args, consult the `candid://textual-syntax` \
              resource (the value syntax these tools use); `candid://reference` has the full type \
              reference. When the user names a website/domain instead of a canister id, use \
              `discover_app_canisters` to find the canister(s) behind it — app-declared App Connect \
