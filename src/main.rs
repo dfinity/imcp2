@@ -212,7 +212,7 @@ impl IcTools {
                 source: "explicit".to_string(),
                 application_origin: None,
             };
-            identity_annotation(&target, acted_as.as_deref())
+            format!("[{}]", identity_annotation(&target, acted_as.as_deref()))
         });
         let reply = match calls::raw_call(&agent, principal, "execute", arg_bytes, true).await {
             Ok(b) => b,
@@ -223,9 +223,11 @@ impl IcTools {
         let did = calls::resolve_did(&agent, principal, None).await;
         match calls::parse_execute_reply(did.as_deref(), &reply) {
             calls::OqlResult::Table { columns, rows, has_more } => {
-                let mut text = calls::render_table(&columns, &rows, has_more);
+                // Primary block: the rendered table. Identity note (if any) is a
+                // separate block so the table stays clean.
+                let mut blocks = vec![calls::render_table(&columns, &rows, has_more)];
                 if let Some(note) = &identity_note {
-                    text.push_str(&format!("\n\n{note}"));
+                    blocks.push(note.clone());
                 }
                 let output = calls::OqlQueryOutput {
                     canister_id,
@@ -236,7 +238,7 @@ impl IcTools {
                     derived_for_origin: origin,
                     requested,
                 };
-                Ok(ok_structured(text, &output))
+                Ok(ok_structured_blocks(blocks, &output))
             }
             calls::OqlResult::QueryError(msg) => {
                 Ok(err(format!("the canister returned an OQL error: {msg}")))
@@ -244,10 +246,10 @@ impl IcTools {
             calls::OqlResult::Unrecognized(raw) => {
                 // Not a recognizable OQL result — hand back the raw decoded reply
                 // so the model still has the data (empty table in the structured form).
-                let mut text =
-                    format!("(Could not parse this as an OQL table; raw reply below.)\n\n{raw}");
+                let mut blocks =
+                    vec![format!("(Could not parse this as an OQL table; raw reply below.)\n\n{raw}")];
                 if let Some(note) = &identity_note {
-                    text.push_str(&format!("\n\n{note}"));
+                    blocks.push(note.clone());
                 }
                 let output = calls::OqlQueryOutput {
                     canister_id,
@@ -258,7 +260,7 @@ impl IcTools {
                     derived_for_origin: origin,
                     requested,
                 };
-                Ok(ok_structured(text, &output))
+                Ok(ok_structured_blocks(blocks, &output))
             }
         }
     }
@@ -298,9 +300,10 @@ impl IcTools {
             Err(e) => return Ok(err(format!("OQL schema call failed: {e}"))),
         };
         let schema = calls::decode_schema_reply(&reply);
-        // Echo the effective derivation origin + acted-as principal (like the other
-        // identity tools), so a mismatch is visible even to text-only clients.
-        let mut text = schema.clone();
+        // Keep the primary block as the raw schema JSON (paste-able); surface the
+        // identity note (like the other identity tools) as a SEPARATE block so a
+        // mismatch is visible to text-only clients without breaking the JSON.
+        let mut blocks = vec![schema.clone()];
         if let Some(o) = origin.as_ref() {
             let target = IdentityTarget {
                 origin: o.clone(),
@@ -308,7 +311,7 @@ impl IcTools {
                 source: "explicit".to_string(),
                 application_origin: None,
             };
-            text.push_str(&format!("\n\n{}", identity_annotation(&target, acted_as.as_deref())));
+            blocks.push(format!("[{}]", identity_annotation(&target, acted_as.as_deref())));
         }
         let output = calls::OqlSchemaOutput {
             canister_id,
@@ -317,7 +320,7 @@ impl IcTools {
             derived_for_origin: origin,
             requested,
         };
-        Ok(ok_structured(text, &output))
+        Ok(ok_structured_blocks(blocks, &output))
     }
 
     #[tool(
@@ -458,17 +461,19 @@ impl IcTools {
             Some(t) => (Some(t.origin.clone()), Some(t.requested.clone()), Some(t.source.clone())),
             None => (None, None, None),
         };
-        // A short identity note so a wrong-principal is visible in the text too.
-        let mut text = reply.clone();
+        // Keep the primary text block pure textual Candid (paste-able); surface the
+        // identity note (so a wrong-principal is visible to text-only clients) as a
+        // SEPARATE block rather than contaminating the reply.
+        let mut blocks = vec![reply.clone()];
         if let Some(t) = &target {
             let acted = acted_as_principal.as_deref().unwrap_or("<unknown>");
-            text.push_str(&format!("\n\n[{}]", identity_annotation(t, Some(acted))));
+            blocks.push(format!("[{}]", identity_annotation(t, Some(acted))));
         }
         let output = calls::CallCanisterOutput {
             canister_id, method, is_query, reply,
             acted_as_principal, derived_for_origin, requested, derivation_origin_source,
         };
-        Ok(ok_structured(text, &output))
+        Ok(ok_structured_blocks(blocks, &output))
     }
 
     #[tool(
