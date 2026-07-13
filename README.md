@@ -30,8 +30,8 @@ results).
 | `icp_list_skills` | — | The official [IC skills](https://skills.internetcomputer.org) (Motoko, mops/icp CLIs, cycles, stable memory, security, …), grouped by category |
 | `icp_get_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `motoko`, `icp-cli`, `cycles-management`) |
 | `get_oql_guide` | — | The OQL query-surface dialect guide (for canisters where `get_canister_candid` reports `oql: true`): the JSON query object, predicate grammar, edges, and paged result shape |
-| `get_canister_oql_schema` | `canister_id`, `domain?`, `account?` | The canister's OQL schema catalogue (entities, primary keys, fields, edges) as JSON — wraps its `schema` method |
-| `run_canister_oql_query` | `canister_id`, `query` (JSON object string), `domain?`, `account?` | Runs an OQL query (wraps `execute`, no Candid escaping) and returns `columns` + `rows` (rendered as a table) with `has_more` for paging |
+| `get_canister_oql_schema` | `canister_id`, `derivation_origin?`, `account?` | The canister's OQL schema catalogue (entities, primary keys, fields, edges) as JSON — wraps its `schema` method |
+| `run_canister_oql_query` | `canister_id`, `query` (JSON object string), `derivation_origin?`, `account?` | Runs an OQL query (wraps `execute`, no Candid escaping) and returns `columns` + `rows` (rendered as a table) with `has_more` for paging |
 | `icp_cycles_balance` | — | Your cycles-ledger balance (the funds `icp_create_canister`/`icp_top_up_canister` spend), as your standing II principal |
 | `icp_create_canister` | `cycles?` / `icp?`, `controllers?`, `subnet?` | Create + fund a new canister — from your cycles-ledger balance (`cycles`) or by converting ICP from your ICP-ledger account via the CMC (`icp`); returns the new canister id |
 | `icp_install_code` | `canister_id`, `wasm_base64` / `wasm_hex`, `mode?`, `arg?` | Install/reinstall/upgrade a Wasm module (single-shot, or via the chunk store for large modules) |
@@ -93,11 +93,12 @@ identified service. (`discover_app_canisters` results are annotated with these l
 inline.) There is no public name-search over arbitrary canisters, so `icp_find_canister_by_name`
 covers the IC's labelled services, which is where the meaningful ones live.
 
-`call_canister` runs anonymously by default; pass a `domain` (e.g. `oisy.com`) to
-call as your account at that app. For a domain, the server mints a **short-lived
-account delegation on demand** using the connection's registered Internet
-Identity session key (see [Domain identities](#domain-identities-on-demand)) —
-there is no per-app sign-in step. `get_app_principal` returns that account's principal
+`call_canister` runs anonymously by default; pass a `derivation_origin` (or an
+`app_url` like `https://oisy.com` that the connector resolves) to call as your
+account at that app. The server mints a **short-lived account delegation on
+demand** using the connection's registered Internet Identity session key (see
+[Domain identities](#domain-identities-on-demand)) — there is no per-app sign-in
+step. `get_app_principal` returns that account's principal
 without a call. A user may hold several accounts at an app — a default account
 everyone gets automatically (the anchor's current, user-controllable default at
 that origin), plus any they have named — so `list_app_accounts` lists them (via II's
@@ -162,8 +163,8 @@ catalogue, and **`run_canister_oql_query`** takes the query as a plain JSON obje
 wraps it as `execute`'s single `text` argument (so the model never hand-escapes
 JSON inside a Candid literal), and decodes the reply into `columns` + `rows` —
 rendered as a markdown table, with `has_more` for paging. Both accept an optional
-`domain`/`account` to query as the user's account (same on-demand delegation as
-`call_canister`). Detection stays name-based and the decode is fail-closed: a
+`derivation_origin`/`account` to query as the user's account (same on-demand
+delegation as `call_canister`). Detection stays name-based and the decode is fail-closed: a
 reply that isn't a recognizable OQL result degrades to the raw Candid rather than
 erroring. The design mirrors the reference IC connector's OQL primer (detect +
 teach), adding an ergonomic executor suited to this server's structured-output
@@ -533,7 +534,7 @@ There is no per-app browser sign-in. Instead the model is:
   calls directly with that key (its principal `self_authenticating(session_pubkey)`
   is what the grant is bound to). Reconnect when the grant expires or is revoked.
 - **App delegations minted on demand.** When `call_canister` (or `get_app_principal`)
-  is invoked with a `domain` (e.g. `oisy.com`), the backend mints a **short-lived
+  is invoked with a `derivation_origin` (or an `app_url` like `https://oisy.com`), the backend mints a **short-lived
   per-app account delegation on demand**: signing *as the session key*, it calls
   Internet Identity's account-derivation methods directly — no browser round-trip
   — with the app's target origin and a fresh **per-app key** as `session_key`.
@@ -577,7 +578,7 @@ mcp_get_delegation :
   `II_URL` (default `https://beta.id.ai`) is the browser login origin and
   `II_CANISTER_ID` (default `fgte5-ciaaa-aaaad-aaatq-cai`, that instance's
   canister) is the canister these calls target, over `https://icp-api.io`.
-- Derived delegations are cached per `(session, domain, account_number)` and
+- Derived delegations are cached per `(session, derivation_origin, account_number)` and
   reused until they near expiry, then re-derived.
 
 ### Listing accounts
@@ -586,7 +587,7 @@ A user can hold several accounts at one app: a default account everyone gets
 automatically (the anchor's current, user-controllable default at that origin),
 plus any **named** accounts they created there. Each account is a **distinct
 per-origin principal** — the app never sees a global, cross-app identity.
-`list_app_accounts(domain)` returns them by calling II's
+`list_app_accounts(derivation_origin)` returns them by calling II's
 
 ```candid
 mcp_get_accounts : (target_origin: text)
@@ -627,8 +628,8 @@ delegation. Omitting `account` uses the default account.
       hosted-redirect allow-listing — see Auth.)
 - [x] On-demand **domain identities**: the registered session key mints per-app
       account delegations directly via II canister methods
-      (`call_canister`/`get_app_principal` `domain`); no per-app browser flow.
-- [x] **Per-app accounts**: `list_app_accounts(domain)` lists the user's accounts at
+      (`call_canister`/`get_app_principal` `derivation_origin`); no per-app browser flow.
+- [x] **Per-app accounts**: `list_app_accounts(derivation_origin)` lists the user's accounts at
       an app (via `mcp_get_accounts`), and `call_canister`/`get_app_principal` take an
       `account` name to act as a specific (non-default) account.
 - [ ] Deploy the `mcp_register` + `mcp_get_accounts` + `mcp_prepare_delegation` +
