@@ -503,6 +503,13 @@ fn known_app_derivation_origin(app: &KnownApp) -> &'static str {
 /// substrings — avoids false positives like "noisy" resolving to "oisy" while still
 /// tolerating punctuation/spacing/casing variants.
 fn find_known_app(query: &str) -> Option<&'static KnownApp> {
+    // Reject an implausibly long query up front — O(1), before any allocation — so a
+    // pathological input can't be copied into `tokens`/`acc` at all. A real app name
+    // (even inside a short phrase) is well under this; anything larger isn't one.
+    const MAX_QUERY_BYTES: usize = 256;
+    if query.len() > MAX_QUERY_BYTES {
+        return None;
+    }
     // Cap the token count so a pathologically long query can't drive quadratic work;
     // an app name won't be buried past a handful of tokens.
     const MAX_TOKENS: usize = 64;
