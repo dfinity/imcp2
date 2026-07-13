@@ -467,8 +467,9 @@ struct KnownApp {
     /// Display name.
     name: &'static str,
     /// Aliases (lowercase, no separators) matched by [`find_known_app`] against the
-    /// query's tokens or their joined form — an alias equals a whole token (e.g.
-    /// "oisy") or the tokens joined (e.g. "multi dex" → "multidex").
+    /// concatenation of any contiguous run of query tokens — an alias equals a whole
+    /// token (e.g. "oisy" in "the oisy wallet") or adjacent tokens joined (e.g.
+    /// "multi dex" / "MULTI/DEX" → "multidex").
     aliases: &'static [&'static str],
     /// The app's canonical front-end URL (feed to `discover_app_canisters` /
     /// `resolve_app`). Its host keys the derivation origin in [`KNOWN_DERIVATION_ORIGINS`].
@@ -495,11 +496,12 @@ fn known_app_derivation_origin(app: &KnownApp) -> &'static str {
 }
 
 /// Find a well-known app by name. The query is split into lowercase alphanumeric
-/// TOKENS (on any non-alphanumeric boundary); an alias matches if it equals a whole
-/// token (e.g. "oisy" in "the oisy wallet") or the tokens joined (e.g. "multi dex"
-/// / "MULTI/DEX" → "multidex"). Matching on token boundaries — not substrings —
-/// avoids false positives like "noisy" resolving to "oisy" while still tolerating
-/// punctuation/spacing/casing variants.
+/// TOKENS (on any non-alphanumeric boundary); an alias matches if it equals the
+/// concatenation of any contiguous run of tokens — a single token (e.g. "oisy" in
+/// "the oisy wallet") or adjacent tokens joined (e.g. "multi dex" / "MULTI/DEX" /
+/// "use the multi dex app" → "multidex"). Matching on whole-token boundaries — not
+/// substrings — avoids false positives like "noisy" resolving to "oisy" while still
+/// tolerating punctuation/spacing/casing variants.
 fn find_known_app(query: &str) -> Option<&'static KnownApp> {
     // Cap the token count so a pathologically long query can't drive quadratic work;
     // an app name won't be buried past a handful of tokens.
