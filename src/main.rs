@@ -1181,6 +1181,35 @@ async fn main() -> anyhow::Result<()> {
     let mcp_beta = make_mcp(ids_beta.clone());
     let mcp_prod = make_mcp(ids_prod.clone());
 
+    // Session reaper, one task per instance. It sweeps once shortly after
+    // startup and then every 60s (tokio's interval fires its first tick
+    // immediately; the startup sweep is harmless, the map is empty then),
+    // evicting expired-grant sessions (emitting a "session closed" log each) and
+    // giving the journal a close event to reconcile against "session opened".
+    // This caps growth from expired grants (the common case: every
+    // authenticated session eventually expires); sessions with no recorded
+    // expiry (mid-connect, or a v1 session whose completion POST never arrived)
+    // are deliberately kept and so are NOT bounded by this. Tied to the shutdown
+    // token so the tasks stop cleanly on drain.
+    for ids in [ids_beta.clone(), ids_prod.clone()] {
+        let reap_ct = ct.child_token();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            // Skip missed ticks rather than the default Burst: if the runtime
+            // stalls, resume with a single sweep at the next slot instead of
+            // firing several back-to-back catch-up sweeps.
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = reap_ct.cancelled() => break,
+                    _ = tick.tick() => {
+                        ids.reap_expired_sessions().await;
+                    }
+                }
+            }
+        });
+    }
+
     // Dynamic client registrations are II-agnostic (redirect allow-list only),
     // so both instances share one store — and one persisted snapshot.
     let clients = auth::load_shared_clients();
@@ -1328,6 +1357,11 @@ async fn main() -> anyhow::Result<()> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    // Per-instance handles for the /version live-session gauge (Arc-backed, so
+    // cloning shares the same session maps the tools mutate).
+    let ver_ids_beta = ids_beta.clone();
+    let ver_ids_prod = ids_prod.clone();
+
     let app = axum::Router::new()
         .route("/", axum::routing::get(|| async { axum::response::Html(INDEX_HTML) }))
         // Unauthenticated build/version probe so operators and the status
@@ -1337,21 +1371,38 @@ async fn main() -> anyhow::Result<()> {
         // Timestamps are Unix epoch seconds (or null when unknown).
         .route(
             "/version",
-            axum::routing::get(move || async move {
-                axum::Json(serde_json::json!({
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "commit": option_env!("GIT_SHA").unwrap_or("unknown"),
-                    "built_at": option_env!("BUILD_TIME").and_then(|s| s.parse::<u64>().ok()),
-                    "started_at": started_at,
-                    // H3/P1 health: repeat key requests on a consumed connect_state.
-                    // Expected ~0; a sustained rise means II is re-issuing the key
-                    // request (breaks connects under strict single-use), so alert on it.
-                    "repeat_key_requests": auth::repeat_key_requests(),
-                    // Per-instance connect protocol: true = Phase-2 registration
-                    // delegation enabled (v1 still honored until that II switches),
-                    // false = pinned to the v1 fetched-key flow.
-                    "registration_delegation": { "beta": regdel_beta, "prod": regdel_prod },
-                }))
+            axum::routing::get(move || {
+                // Clone the Arc-backed handles per request so the handler stays
+                // `Fn` (reusable across requests) while the async body owns them.
+                let ver_ids_beta = ver_ids_beta.clone();
+                let ver_ids_prod = ver_ids_prod.clone();
+                async move {
+                    // Live sessions per instance: authenticated, non-expired
+                    // sessions that made a request within the activity window, so
+                    // a disconnected/idle client drops off (see
+                    // `Identities::live_session_count`).
+                    let live_beta = ver_ids_beta.live_session_count().await;
+                    let live_prod = ver_ids_prod.live_session_count().await;
+                    axum::Json(serde_json::json!({
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "commit": option_env!("GIT_SHA").unwrap_or("unknown"),
+                        "built_at": option_env!("BUILD_TIME").and_then(|s| s.parse::<u64>().ok()),
+                        "started_at": started_at,
+                        // H3/P1 health: repeat key requests on a consumed connect_state.
+                        // Expected ~0; a sustained rise means II is re-issuing the key
+                        // request (breaks connects under strict single-use), so alert on it.
+                        "repeat_key_requests": auth::repeat_key_requests(),
+                        // Per-instance connect protocol: true = Phase-2 registration
+                        // delegation enabled (v1 still honored until that II switches),
+                        // false = pinned to the v1 fetched-key flow.
+                        "registration_delegation": { "beta": regdel_beta, "prod": regdel_prod },
+                        // Per-instance count of live sessions: authenticated,
+                        // non-expired, and active within the last few minutes.
+                        // A client that disconnects or goes idle drops off after
+                        // the activity window.
+                        "live_sessions": { "beta": live_beta, "prod": live_prod },
+                    }))
+                }
             }),
         )
         .merge(oauth)
