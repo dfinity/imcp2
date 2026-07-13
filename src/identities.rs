@@ -546,9 +546,13 @@ impl Identities {
     /// `last_seen_ns` is atomic, so this stays cheap on the per-request hot path.
     /// A no-op if the session is unknown (it will be created on first use).
     pub async fn touch_session(&self, session_id: &str) {
+        // Read the clock BEFORE taking the lock: even a read lock blocks writers
+        // (set_grant_expiration, the reaper), so keep the syscall off the lock on
+        // this per-request hot path.
+        let now = now_ns();
         let sessions = self.sessions.read().await;
         if let Some(s) = sessions.get(session_id) {
-            s.last_seen_ns.store(now_ns(), Ordering::Relaxed);
+            s.last_seen_ns.store(now, Ordering::Relaxed);
         }
     }
 
