@@ -526,7 +526,11 @@ fn clean_label(s: &str) -> String {
 
 fn normalize(domain: &str) -> String {
     let d = domain.trim().trim_end_matches('/');
-    if d.starts_with("http://") || d.starts_with("https://") {
+    // Case-insensitive scheme check: an already-schemed URL (any case — url parsing
+    // lowercases the scheme downstream) is left as-is; a bare host gets https. Matching
+    // only lowercase here would turn a validated `HTTPS://host` into `https://HTTPS://host`.
+    let lower = d.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
         d.to_string()
     } else {
         format!("https://{d}")
@@ -1654,6 +1658,22 @@ mod tests {
             ),
             // Path reduced to bare origin; http:// / non-https / unparseable dropped.
             vec!["https://a.example"]
+        );
+    }
+
+    // `normalize` prepends https to a bare host but leaves an already-schemed URL
+    // (ANY scheme case) untouched — matching only lowercase would double-prefix a
+    // validated `HTTPS://host` into `https://HTTPS://host` and break URL parsing.
+    #[test]
+    fn normalize_is_scheme_case_insensitive() {
+        assert_eq!(normalize("example.com"), "https://example.com");
+        assert_eq!(normalize("https://example.com/"), "https://example.com");
+        assert_eq!(normalize("HTTPS://example.com"), "HTTPS://example.com");
+        // The uppercase-scheme result parses cleanly (url lowercases the scheme),
+        // rather than becoming a double-prefixed `https://HTTPS://example.com`.
+        assert_eq!(
+            url::Url::parse(&normalize("HTTPS://example.com")).unwrap().scheme(),
+            "https"
         );
     }
 
