@@ -460,7 +460,9 @@ fn known_derivation_origin(host: &str) -> Option<&'static str> {
 /// A well-known IC app, for NAME → app resolution by the `icp_find_app_by_name`
 /// tool. There is no on-chain directory mapping an app name to its front-end URL,
 /// so this covers only a small curated set; anything else is directed to a web
-/// lookup. Keep the `derivation_origin`s consistent with [`KNOWN_DERIVATION_ORIGINS`].
+/// lookup. The derivation origin is NOT stored here — it's derived from the single
+/// source of truth [`KNOWN_DERIVATION_ORIGINS`] via the `app_url`'s host, so the two
+/// can't drift. (Every `app_url` host is a registry key — asserted by test.)
 struct KnownApp {
     /// Display name.
     name: &'static str,
@@ -468,38 +470,29 @@ struct KnownApp {
     /// query's tokens or their joined form — an alias equals a whole token (e.g.
     /// "oisy") or the tokens joined (e.g. "multi dex" → "multidex").
     aliases: &'static [&'static str],
-    /// The app's canonical front-end URL (feed to `discover_app_canisters` / `resolve_app`).
+    /// The app's canonical front-end URL (feed to `discover_app_canisters` /
+    /// `resolve_app`). Its host keys the derivation origin in [`KNOWN_DERIVATION_ORIGINS`].
     app_url: &'static str,
-    /// The app's Internet Identity derivation origin.
-    derivation_origin: &'static str,
 }
 
 const KNOWN_APPS: &[KnownApp] = &[
-    KnownApp {
-        name: "NNS",
-        aliases: &["nns", "nnsdapp"],
-        app_url: "https://nns.internetcomputer.org",
-        derivation_origin: "https://nns.ic0.app",
-    },
-    KnownApp {
-        name: "Oisy",
-        aliases: &["oisy", "oisywallet"],
-        app_url: "https://oisy.com",
-        derivation_origin: "https://oisy.com",
-    },
-    KnownApp {
-        name: "MULTI/DEX",
-        aliases: &["multidex"],
-        app_url: "https://multidex.ai",
-        derivation_origin: "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io",
-    },
-    KnownApp {
-        name: "ICPSwap",
-        aliases: &["icpswap"],
-        app_url: "https://app.icpswap.com",
-        derivation_origin: "https://app.icpswap.com",
-    },
+    KnownApp { name: "NNS", aliases: &["nns", "nnsdapp"], app_url: "https://nns.internetcomputer.org" },
+    KnownApp { name: "Oisy", aliases: &["oisy", "oisywallet"], app_url: "https://oisy.com" },
+    KnownApp { name: "MULTI/DEX", aliases: &["multidex"], app_url: "https://multidex.ai" },
+    KnownApp { name: "ICPSwap", aliases: &["icpswap"], app_url: "https://app.icpswap.com" },
 ];
+
+/// The derivation origin for a well-known app, from the single source of truth
+/// [`KNOWN_DERIVATION_ORIGINS`] (keyed by the `app_url`'s host). Falls back to the
+/// app URL itself only if the host somehow isn't registered (a test rules that out
+/// for every [`KNOWN_APPS`] entry).
+fn known_app_derivation_origin(app: &KnownApp) -> &'static str {
+    url::Url::parse(app.app_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .and_then(|h| known_derivation_origin(&h))
+        .unwrap_or(app.app_url)
+}
 
 /// Find a well-known app by name. The query is split into lowercase alphanumeric
 /// TOKENS (on any non-alphanumeric boundary); an alias matches if it equals a whole
@@ -1325,19 +1318,22 @@ pub struct FindAppOutput {
 /// directing the agent to do a web search for the official URL.
 pub fn find_app_by_name(query: &str) -> FindAppOutput {
     match find_known_app(query) {
-        Some(app) => FindAppOutput {
-            query: query.to_string(),
-            matches: vec![AppMatch {
-                name: app.name.to_string(),
-                app_url: app.app_url.to_string(),
-                derivation_origin: app.derivation_origin.to_string(),
-            }],
-            note: format!(
-                "Well-known app. Use discover_app_canisters(\"{}\") to find its canisters; its \
-                 derivation origin is already {} (no resolve_app needed).",
-                app.app_url, app.derivation_origin
-            ),
-        },
+        Some(app) => {
+            let derivation_origin = known_app_derivation_origin(app);
+            FindAppOutput {
+                query: query.to_string(),
+                matches: vec![AppMatch {
+                    name: app.name.to_string(),
+                    app_url: app.app_url.to_string(),
+                    derivation_origin: derivation_origin.to_string(),
+                }],
+                note: format!(
+                    "Well-known app. Use discover_app_canisters(\"{}\") to find its canisters; its \
+                     derivation origin is already {} (no resolve_app needed).",
+                    app.app_url, derivation_origin
+                ),
+            }
+        }
         None => FindAppOutput {
             query: query.to_string(),
             matches: Vec::new(),
@@ -1924,15 +1920,19 @@ mod tests {
         assert_eq!(find_app_by_name("nns").matches[0].app_url, "https://nns.internetcomputer.org");
         assert_eq!(find_app_by_name("ICPSwap").matches[0].app_url, "https://app.icpswap.com");
 
-        // Every match's derivation origin agrees with the host-keyed registry.
+        // The derivation origin is DERIVED from KNOWN_DERIVATION_ORIGINS (single
+        // source of truth), so every app_url host must be a registry key — otherwise
+        // known_app_derivation_origin would silently fall back to the app URL.
         for app in KNOWN_APPS {
             let host = url::Url::parse(app.app_url).unwrap().host_str().unwrap().to_ascii_lowercase();
-            assert_eq!(
-                known_derivation_origin(&host),
-                Some(app.derivation_origin),
-                "{}'s app_url host must map to its derivation origin in KNOWN_DERIVATION_ORIGINS",
+            assert!(
+                known_derivation_origin(&host).is_some(),
+                "{}'s app_url host {host} must be a key in KNOWN_DERIVATION_ORIGINS \
+                 (the derivation origin is derived from it, not stored)",
                 app.name,
             );
+            // And the derived origin is exactly the registry value.
+            assert_eq!(known_app_derivation_origin(app), known_derivation_origin(&host).unwrap());
         }
 
         // An unknown app: no match, and the note points to a web search.
