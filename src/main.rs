@@ -608,10 +608,10 @@ impl IcTools {
             discover::DerivationSource::AppUrlDefault => Some(format!(
                 "No derivation origin could be found for this app — its /.well-known/ic-app.json \
                  either declares no `derivation_origin` or couldn't be fetched (DNS/timeout/TLS/\
-                 redirect), and it's not a known app — so this assumed the application origin {}. \
-                 If this app uses a custom derivation origin, that assumption yields a WRONG \
-                 principal — supply the canonical origin explicitly.",
-                resolved.application_origin
+                 redirect), and it's not a known app — so this assumed the application origin, \
+                 canonicalized to {effective} (what II derives against). If this app uses a custom \
+                 derivation origin, that assumption yields a WRONG principal — supply the canonical \
+                 origin explicitly."
             )),
         };
         let mut text = format!(

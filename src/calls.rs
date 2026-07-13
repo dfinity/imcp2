@@ -180,9 +180,10 @@ pub struct CallCanisterArgs {
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
     /// Call AS the user's account at an app, identified by its URL; the connector
-    /// resolves the derivation origin (declared one if the app publishes it, else
-    /// the application origin — see the result's `derivation_origin_source`).
-    /// Alternative to `derivation_origin`.
+    /// resolves the derivation origin — the app's declared one if it publishes it
+    /// (`derivation_origin_source` = "declared"), else a built-in known-app value
+    /// ("known"), else the application origin ("app_url_default"). See the result's
+    /// `derivation_origin_source`. Alternative to `derivation_origin`.
     #[serde(default)]
     pub app_url: Option<String>,
     /// Which of your accounts to act as, by account name (see list_app_accounts).

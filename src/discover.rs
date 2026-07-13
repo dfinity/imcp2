@@ -467,7 +467,10 @@ pub struct AppIdentity {
 pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Result<AppIdentity, String> {
     let base = normalize(app_url);
     let (base_url, pinned) = resolve_public_url(&base).await?;
-    let host = base_url.host_str().unwrap_or_default().to_string();
+    // Lowercase the host: the known-app registry is keyed by lowercased host, and
+    // hosts are case-insensitive anyway. (The url crate already lowercases https
+    // hosts, but do it explicitly so the registry lookup can't silently miss.)
+    let host = base_url.host_str().unwrap_or_default().to_ascii_lowercase();
     let client = site_client(&host, &pinned)?;
     let application_origin = base_url.origin().ascii_serialization();
 
