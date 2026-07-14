@@ -1811,9 +1811,9 @@ async fn main() -> anyhow::Result<()> {
                 let ver_ids_beta = ver_ids_beta.clone();
                 let ver_ids_prod = ver_ids_prod.clone();
                 async move {
-                    // Live sessions per instance: authenticated, non-expired
-                    // sessions that made a request within the activity window, so
-                    // a disconnected/idle client drops off (see
+                    // Live sessions per instance: authenticated sessions whose II
+                    // grant has not yet expired. Tracks the grant lifecycle — an
+                    // idle session still counts; only expiry removes it (see
                     // `Identities::live_session_count`).
                     let live_beta = ver_ids_beta.live_session_count().await;
                     let live_prod = ver_ids_prod.live_session_count().await;
@@ -1830,10 +1830,9 @@ async fn main() -> anyhow::Result<()> {
                         // delegation enabled (v1 still honored until that II switches),
                         // false = pinned to the v1 fetched-key flow.
                         "registration_delegation": { "beta": regdel_beta, "prod": regdel_prod },
-                        // Per-instance count of live sessions: authenticated,
-                        // non-expired, and active within the last few minutes.
-                        // A client that disconnects or goes idle drops off after
-                        // the activity window.
+                        // Per-instance count of live sessions: authenticated
+                        // sessions with a non-expired II grant. A session counts
+                        // from connect until its grant expires, idle or not.
                         "live_sessions": { "beta": live_beta, "prod": live_prod },
                     }))
                 }

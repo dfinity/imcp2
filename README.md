@@ -425,27 +425,29 @@ build (`version`, `commit`, `built_at`, `started_at`), the H3/P1
 `repeat_key_requests` health counter, which instance runs which protocol
 (`registration_delegation: {beta, prod}`), and a real-time **live-session
 gauge** (`live_sessions: {beta, prod}`) counting, per instance, the
-authenticated sessions that are both non-expired and active within the last 5
-minutes:
+authenticated sessions whose II grant has not yet expired:
 
 ```bash
 curl -s https://<host>/version | jq '.live_sessions'
 # => { "beta": 0, "prod": 1 }
 ```
 
-The activity window is what makes a disconnected client fall off the gauge: the
-server runs MCP statelessly, so a disconnect produces no server-side event, and
-liveness is inferred from recent requests rather than connection state. A client
-that stops sending requests drops off the gauge about 5 minutes later; its grant
-stays valid so it can return and resume, it just no longer counts as *live*.
+The gauge tracks the grant lifecycle: a session is counted from the moment its
+grant is redeemed until the grant expires, and sitting idle does not remove it —
+an ongoing MCP session is often quiet for long stretches between tool calls and
+is still a live session the whole time. The flip side: the server runs MCP
+statelessly, so a client that disconnects for good produces no server-side
+event, and its session keeps counting until the grant expires (the session
+duration is what the user picked on II's consent screen, 10 minutes up to 30
+days).
 
-Session grants are separately traceable in the logs (unit `mcp-poc`): a session
-logs `session opened` (with `instance` and `session_id`) when its grant goes
-live, and `session closed` when the grant expires and the per-instance reaper
-(60s cadence) evicts it. These track the grant lifecycle, which is distinct from
-the activity gauge: a disconnected client leaves the gauge after the idle window
-but stays `opened` in the logs until its grant actually expires. So `opened`
-minus `closed` is the number of open grants, not the live-session gauge.
+Session grants are also traceable in the logs (unit `mcp-poc`): a session logs
+`session opened` (with `instance` and `session_id`) when its grant goes live,
+and `session closed` when the grant expires and the per-instance reaper (60s
+cadence) evicts it. These bracket exactly what the gauge counts, so `opened`
+minus `closed` reconciles with `live_sessions` — the gauge drops at the expiry
+instant itself, while the paired `closed` log lands on the reaper's next sweep,
+up to 60s later.
 
 **Callback allow-list (`/.well-known/ii-auth-callbacks`).** II is moving to
 validate the connect callback named in the (attacker-craftable) link fragment
