@@ -97,8 +97,12 @@ pub struct DiscoverOutput {
     pub domain: String,
     /// Canisters found behind the domain (empty if none).
     pub canisters: Vec<DiscoveredCanister>,
-    /// How many additional findings were dropped by the output caps (mostly
-    /// unlabelled JS-bundle literals; see [`bound_findings`]). 0 = nothing cut.
+    /// How many additional findings were dropped by the output caps (see
+    /// [`bound_findings`]). The list is authority-ordered and the cut takes the
+    /// tail, so the dropped entries are always the least authoritative present:
+    /// in practice unlabelled JS-bundle literals, though with a very large
+    /// declared manifest the global cap can trim labelled entries too.
+    /// 0 = nothing cut.
     pub omitted: usize,
 }
 

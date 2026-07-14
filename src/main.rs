@@ -652,8 +652,8 @@ impl IcTools {
                 }
                 if d.omitted > 0 {
                     out.push_str(&format!(
-                        "(+{} more dropped by the output cap, mostly unlabelled bundle literals; \
-                         the labelled entries above are the meaningful ones)\n",
+                        "(+{} more findings dropped by the output cap; the list is \
+                         authority-ordered, so the least authoritative entries were cut first)\n",
                         d.omitted
                     ));
                 }
