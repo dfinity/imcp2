@@ -1,0 +1,262 @@
+/* Landing page for the Internet Computer MCP server.
+   Shares the connect flow's ICP look — parchment ground, 24px grid, editorial
+   serif headlines, rust accent, 1px hairlines, foot-of-page "Hosted by" mark —
+   so the root page and the connect screens read as one product. Self-contained:
+   no external fonts, scripts, or images (the DFINITY mark is inlined SVG). */
+:root {
+  color-scheme: light dark;
+  --bg: #faf9f5;
+  --surface: #ffffff;
+  --sunk: #f3f1ea;
+  --ink: #1a1a1a;
+  --secondary: #4b4943;
+  --muted: #868078;
+  --accent: #a8482b;
+  --accent-hover: #8e3b22;
+  /* Accent tuned for small text: on white it must clear WCAG AA (4.5:1) at the
+     0.9rem tool-name / verb size, where the display accent alone would not. */
+  --accent-text: #a8482b;
+  --accent-dim: rgba(168, 72, 43, 0.10);
+  --hairline: #e7e3da;
+  --grid: rgba(26, 26, 26, 0.04);
+  /* Section coding: one hue per tool category, carried by the card's top stripe. */
+  --cat-discovery: #1c3d5a;
+  --cat-identity: #0b5e5c;
+  --cat-oql: #14938e;
+  --cat-actions: #a8482b;
+  --cat-skills: #a86e2c;
+  --font-display: ui-serif, "Iowan Old Style", "Newsreader", Georgia, Cambria, "Times New Roman", serif;
+  --font-ui: system-ui, -apple-system, "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+}
+:root[data-theme="dark"] {
+  --bg: #14110d; --surface: #1c1813; --sunk: #17130e; --ink: #f0ebe0; --secondary: #cfc7b8;
+  --muted: #9a9384; --accent: #c25a37; --accent-hover: #d06c47; --accent-text: #d06c47; --accent-dim: rgba(194, 90, 55, 0.14);
+  --hairline: #342e25; --grid: rgba(240, 235, 224, 0.05);
+  --cat-discovery: #4a7ba6; --cat-identity: #2f8f8b; --cat-oql: #34b3ad;
+  --cat-actions: #c25a37; --cat-skills: #c99447;
+}
+:root[data-theme="light"] {
+  --bg: #faf9f5; --surface: #ffffff; --sunk: #f3f1ea; --ink: #1a1a1a; --secondary: #4b4943;
+  --muted: #868078; --accent: #a8482b; --accent-hover: #8e3b22; --accent-text: #a8482b; --accent-dim: rgba(168, 72, 43, 0.10);
+  --hairline: #e7e3da; --grid: rgba(26, 26, 26, 0.04);
+  --cat-discovery: #1c3d5a; --cat-identity: #0b5e5c; --cat-oql: #14938e;
+  --cat-actions: #a8482b; --cat-skills: #a86e2c;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14110d; --surface: #1c1813; --sunk: #17130e; --ink: #f0ebe0; --secondary: #cfc7b8;
+    --muted: #9a9384; --accent: #c25a37; --accent-hover: #d06c47; --accent-text: #d06c47; --accent-dim: rgba(194, 90, 55, 0.14);
+    --hairline: #342e25; --grid: rgba(240, 235, 224, 0.05);
+    --cat-discovery: #4a7ba6; --cat-identity: #2f8f8b; --cat-oql: #34b3ad;
+    --cat-actions: #c25a37; --cat-skills: #c99447;
+  }
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: var(--font-ui);
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--ink);
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(to right, var(--grid) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid) 1px, transparent 1px);
+  background-size: 24px 24px;
+  -webkit-font-smoothing: antialiased;
+}
+.page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.wrap {
+  width: 100%;
+  max-width: 47rem;
+  padding: 0 1.5rem;
+}
+
+/* ---- Hero ---------------------------------------------------------------- */
+.hero {
+  padding: clamp(3rem, 9vw, 6rem) 0 2.5rem;
+  border-bottom: 1px solid var(--hairline);
+}
+.eyebrow {
+  margin: 0 0 1.1rem;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--secondary);
+}
+h1 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 420;
+  font-size: clamp(2.1rem, 6.5vw, 3.35rem);
+  line-height: 1.08;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}
+h1 em { font-style: italic; color: var(--accent); }
+.lede {
+  margin: 1.35rem 0 0;
+  max-width: 40ch;
+  font-size: 1.12rem;
+  line-height: 1.5;
+  color: var(--secondary);
+}
+/* Endpoint readout: monospace rows with a hairline frame. */
+.endpoints {
+  margin: 2rem 0 0;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.endpoint {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.9rem;
+  padding: 0.85rem 1.1rem;
+}
+.endpoint + .endpoint { border-top: 1px solid var(--hairline); }
+.endpoint code {
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--ink);
+}
+.endpoint .verb { color: var(--accent-text); }
+.endpoint span { font-size: 0.88rem; color: var(--secondary); }
+
+/* ---- Category sections --------------------------------------------------- */
+.categories {
+  padding: 2.75rem 0 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+.cat {
+  position: relative;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-top: 3px solid var(--stripe, var(--accent));
+  border-radius: 0 0 14px 14px;
+  padding: 1.6rem 1.5rem 1.75rem;
+}
+.cat[data-cat="discovery"] { --stripe: var(--cat-discovery); }
+.cat[data-cat="identity"]  { --stripe: var(--cat-identity); }
+.cat[data-cat="oql"]       { --stripe: var(--cat-oql); }
+.cat[data-cat="actions"]   { --stripe: var(--cat-actions); }
+.cat[data-cat="skills"]    { --stripe: var(--cat-skills); }
+
+.cat-head { margin-bottom: 1.4rem; }
+.cat-eyebrow {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  margin: 0 0 0.5rem;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--secondary);
+}
+/* The § marker inherits the eyebrow's accessible --secondary; the mono face
+   sets it apart. Category color coding lives in the card's 3px top stripe (a
+   graphical element), so no small text depends on a low-contrast hue. */
+.cat-num { font-family: var(--font-mono); font-weight: 500; }
+.cat-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 440;
+  font-size: 1.5rem;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+.cat-note { margin: 0.45rem 0 0; font-size: 0.98rem; color: var(--secondary); }
+
+/* Tool rows: mono name in a left rail, prose description alongside. */
+.tools { display: flex; flex-direction: column; }
+.tool {
+  display: grid;
+  grid-template-columns: 16.5rem 1fr;
+  gap: 0.35rem 1.5rem;
+  padding: 0.85rem 0;
+  border-top: 1px solid var(--hairline);
+}
+.tool:first-child { border-top: 0; padding-top: 0.25rem; }
+.tool-name {
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--accent-text);
+  word-break: break-word;
+  line-height: 1.5;
+}
+.tool-desc { margin: 0; font-size: 0.97rem; color: var(--secondary); }
+.tool-desc code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  padding: 0.05em 0.3em;
+  border-radius: 5px;
+  background: var(--sunk);
+  color: var(--ink);
+}
+
+/* ---- Candid note --------------------------------------------------------- */
+.note {
+  margin: 1.75rem 0 0;
+  padding: 1rem 1.2rem;
+  border-left: 3px solid var(--accent);
+  background: var(--accent-dim);
+  border-radius: 0 10px 10px 0;
+  font-size: 0.97rem;
+  color: var(--secondary);
+}
+.note code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  color: var(--ink);
+}
+
+/* ---- Footer -------------------------------------------------------------- */
+main { flex: 1 0 auto; }
+.hosted {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  padding: 3rem 0 2.75rem;
+  margin-top: 2.5rem;
+  border-top: 1px solid var(--hairline);
+}
+.hosted-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--secondary);
+}
+.hosted-logo {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.5rem 0.9rem;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+}
+.dfinity-logo { height: 1.1rem; width: auto; color: var(--ink); }
+
+/* ---- Narrow viewports ---------------------------------------------------- */
+@media (max-width: 34rem) {
+  .tool { grid-template-columns: 1fr; gap: 0.2rem; }
+  .tool-name { color: var(--accent-text); }
+}
