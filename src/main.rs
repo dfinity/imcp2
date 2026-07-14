@@ -564,7 +564,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Resolve an application URL to its Internet Identity derivation context, so you don't have to figure out the derivation origin yourself. Returns the `application_origin`, the `derivation_origin` to pass to the identity tools, how it was determined (`derivation_origin_source`: \"declared\" — the app published it in /.well-known/ic-app.json, authoritative; \"known\" — from the connector's built-in registry of well-known custom-derivation-origin apps (e.g. NNS, Oisy, MULTI/DEX), used only when the app declares none; or \"app_url_default\" — assumed equal to the application origin, correct only if the app has no custom derivation origin, which cannot be verified), and the app's `alternative_origins` (informational — the INVERSE relation, never use it to infer the derivation origin). This does NOT return a principal — it resolves the origin only, since you haven't picked an account; to get the principal you act as, pass the returned `derivation_origin` to get_app_principal (choosing an `account`) or list_app_accounts. Use this first when you only know an app's URL; no authenticated session is required.",
+        description = "Resolve an application URL to its Internet Identity derivation context, so you don't have to figure out the derivation origin yourself. `app_url` must be a URL you actually HAVE — from the user, from icp_find_app_by_name, or from a web search of the app's official site. NEVER guess or fabricate a domain from an app's name (when you only know a NAME, call icp_find_app_by_name first): a lookalike domain is an unrelated or squatted site, and this tool REFUSES to resolve an origin that shows no evidence of being an Internet Computer app rather than hand back a wrong identity. Returns the `application_origin`, the `derivation_origin` to pass to the identity tools, how it was determined (`derivation_origin_source`: \"declared\" — the app published it in /.well-known/ic-app.json, authoritative; \"known\" — from the connector's built-in registry of well-known custom-derivation-origin apps (e.g. NNS, Oisy, MULTI/DEX), used only when the app declares none; or \"app_url_default\" — the origin IS IC-served but declares nothing, so it was assumed to be its own derivation origin, correct only if the app has no custom one), and the app's `alternative_origins` (informational — the INVERSE relation, never use it to infer the derivation origin). This does NOT return a principal — it resolves the origin only, since you haven't picked an account; to get the principal you act as, pass the returned `derivation_origin` to get_app_principal (choosing an `account`) or list_app_accounts. Use this first when you only know an app's URL; no authenticated session is required.",
         annotations(title = "Resolve an app's derivation origin", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::ResolveAppOutput>(),
     )]
@@ -583,9 +583,31 @@ impl IcTools {
         // this needs no authenticated session.
         let resolved = match discover::resolve_app_identity(&app_url, true).await {
             Ok(r) => r,
-            Err(e) => return Ok(err(e)),
+            Err(e) => return Ok(err(app_url_error_with_guidance(&app_url, e))),
         };
+        // A guessed/lookalike domain fails HARD instead of resolving to a
+        // plausible-but-wrong identity: no declared origin, not a known app, and
+        // no sign the origin is even served from the IC. The error carries the
+        // "did you mean" repair and the legitimate ways to obtain the URL.
+        if resolved.derivation_origin_source == discover::DerivationSource::AppUrlDefault
+            && resolved.application_is_ic == Some(false)
+        {
+            return Ok(err(unverified_app_url_error(&resolved.application_origin)));
+        }
         let effective = identities::target_origin(&resolved.derivation_origin);
+
+        // Even an IC-served origin can be a lookalike of a well-known app (e.g. an
+        // IC-hosted squat of a wallet's name) — caution the caller when the host
+        // resembles a known app's name but isn't one of its real hosts.
+        let lookalike = discover::similar_known_app(&resolved.application_origin).map(|m| {
+            format!(
+                " CAUTION: this host RESEMBLES the well-known app {} but is not one of its real \
+                 origins — {}'s URL is {} (derivation origin {}). If you meant {}, use that URL; \
+                 if you guessed this URL from the app's name, use icp_find_app_by_name instead of \
+                 guessing.",
+                m.name, m.name, m.app_url, m.derivation_origin, m.name
+            )
+        });
 
         let note = match resolved.derivation_origin_source {
             discover::DerivationSource::Declared => None,
@@ -595,12 +617,13 @@ impl IcTools {
                  The app's own declaration, if it ships one, would override this."
             )),
             discover::DerivationSource::AppUrlDefault => Some(format!(
-                "No derivation origin could be found for this app — its /.well-known/ic-app.json \
-                 either declares no `derivation_origin` or couldn't be fetched (DNS/timeout/TLS/\
-                 redirect), and it's not a known app — so this assumed the application origin, \
-                 canonicalized to {effective} (what II derives against). If this app uses a custom \
-                 derivation origin, that assumption yields a WRONG principal — supply the canonical \
-                 origin explicitly."
+                "This origin IS served from the Internet Computer, but it declares no \
+                 `derivation_origin` in /.well-known/ic-app.json and isn't in the built-in \
+                 known-app registry — so this ASSUMED the application origin, canonicalized to \
+                 {effective} (what II derives against). That is correct for apps without a custom \
+                 derivation origin; if this app pins a custom one, the assumption yields a WRONG \
+                 principal — supply the canonical origin explicitly.{}",
+                lookalike.as_deref().unwrap_or_default()
             )),
         };
         let mut text = format!(
@@ -618,13 +641,14 @@ impl IcTools {
             derivation_origin: effective,
             derivation_origin_source: resolved.derivation_origin_source.as_str().to_string(),
             alternative_origins: resolved.alternative_origins,
+            application_is_ic: resolved.application_is_ic,
             note,
         };
         Ok(ok_structured(text, &output))
     }
 
     #[tool(
-        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). Returns every canister id found, with provenance, most authoritative first: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's MAIN backend) and the app's own /.well-known/ic-app.json manifest (ALL its canisters, with roles) — then the `x-ic-canister-id` header (the frontend/asset canister), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json/bundle entries are mined candidates: pick by label (prefer production/IC ids) and confirm with get_canister_candid before calling.",
+        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). The domain must be one you actually have (from the user, icp_find_app_by_name, or a web search) — NEVER a domain guessed from an app's name; when you only know a NAME, call icp_find_app_by_name first. Returns every canister id found, with provenance, most authoritative first: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's MAIN backend) and the app's own /.well-known/ic-app.json manifest (ALL its canisters, with roles) — then the `x-ic-canister-id` header (the frontend/asset canister), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json/bundle entries are mined candidates: pick by label (prefer production/IC ids) and confirm with get_canister_candid before calling.",
         annotations(title = "Discover canisters behind a domain", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::DiscoverOutput>(),
     )]
@@ -663,8 +687,19 @@ impl IcTools {
                 Ok(ok_structured(out, &output))
             }
             Ok(_) => {
-                let text =
+                let mut text =
                     format!("No IC canisters found for {domain} — is it served from the Internet Computer?");
+                if let Some(m) = discover::similar_known_app(&domain) {
+                    text.push_str(&format!(
+                        " DID YOU MEAN {}? Its real URL is {} (derivation origin {}).",
+                        m.name, m.app_url, m.derivation_origin
+                    ));
+                }
+                text.push_str(
+                    " If you GUESSED this domain from an app name, don't guess again: call \
+                     icp_find_app_by_name with the name, or WEB SEARCH the app's official URL, \
+                     or ask the user for it.",
+                );
                 let output = discover::DiscoverOutput::from((domain, Vec::new()));
                 Ok(ok_structured(text, &output))
             }
@@ -715,7 +750,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Find a well-known Internet Computer APP by NAME and get its front-end URL and Internet Identity derivation origin — the missing name→app step (discovery otherwise needs a URL). Covers only a small built-in set (NNS, Oisy, MULTI/DEX, ICPSwap). For ANY other app there is NO on-chain name→URL directory, so the result's `note` directs you to WEB SEARCH the app's official URL and then use resolve_app / discover_app_canisters. Returns `matches` (each with `app_url` + `derivation_origin`) — usually one, or none. This is name→app; for a token/service→canister-id use icp_find_canister_by_name, and for a URL→canisters use discover_app_canisters.",
+        description = "Find a well-known Internet Computer APP by NAME and get its front-end URL and Internet Identity derivation origin — the missing name→app step (discovery otherwise needs a URL). ALWAYS call this FIRST when the user names an app and you don't have its URL — NEVER guess a domain from the name (lookalike domains like <name>.com/.app are unrelated or squatted sites, and the URL-taking tools refuse origins with no IC evidence). Offline and instant. Covers only a small built-in set (NNS, Oisy, MULTI/DEX, ICPSwap). For ANY other app there is NO on-chain name→URL directory, so the result's `note` directs you to WEB SEARCH the app's official URL (or ask the user) and then use resolve_app / discover_app_canisters. Returns `matches` (each with `app_url` + `derivation_origin`) — usually one, or none. This is name→app; for a token/service→canister-id use icp_find_canister_by_name, and for a URL→canisters use discover_app_canisters.",
         annotations(title = "Find a well-known app by name", read_only_hint = true, destructive_hint = false, open_world_hint = false),
         output_schema = schema_for_output::<discover::FindAppOutput>(),
     )]
@@ -1053,7 +1088,21 @@ async fn resolve_identity_target(
             let u = clean_app_url(&u)?;
             // Identity hot path: we only need the derivation origin, not the
             // informational alternative-origins list — skip that extra fetch.
-            let resolved = discover::resolve_app_identity(&u, false).await?;
+            let resolved = discover::resolve_app_identity(&u, false)
+                .await
+                .map_err(|e| app_url_error_with_guidance(&u, e))?;
+            // Refuse to derive an identity at an origin that was ASSUMED to be its
+            // own derivation origin but shows no evidence of being an IC app: that
+            // combination is the signature of a domain GUESSED from an app name,
+            // and the derived principal would be valid-looking but wrong (or, on a
+            // squatted lookalike domain, attacker-chosen). The error tells the
+            // caller how to find the real app instead — and deliberate use of a
+            // non-IC-hosted II origin stays possible via explicit `derivation_origin`.
+            if resolved.derivation_origin_source == discover::DerivationSource::AppUrlDefault
+                && resolved.application_is_ic == Some(false)
+            {
+                return Err(unverified_app_url_error(&resolved.application_origin));
+            }
             Ok(Some(IdentityTarget {
                 origin: identities::target_origin(&resolved.derivation_origin),
                 requested: u,
@@ -1063,6 +1112,58 @@ async fn resolve_identity_target(
         }
         (None, None) => Ok(None),
     }
+}
+
+/// Append guess-repair guidance to an `app_url` resolution failure (DNS, TLS,
+/// timeout, SSRF refusal): a fetch error on a domain FABRICATED from an app name
+/// (e.g. "multi.dex") must redirect the caller to the name→URL tools — the same
+/// way the no-IC-evidence refusal does — rather than read as a transient error
+/// inviting the next guess.
+fn app_url_error_with_guidance(app_url: &str, e: String) -> String {
+    let mut msg = e;
+    if let Some(m) = discover::similar_known_app(app_url) {
+        msg.push_str(&format!(
+            " DID YOU MEAN {}? Its real URL is {} (derivation origin {}).",
+            m.name, m.app_url, m.derivation_origin
+        ));
+    }
+    msg.push_str(
+        " If you arrived at this URL by guessing from an app name, don't guess again — call \
+         icp_find_app_by_name with the name, WEB SEARCH the app's official URL, or ask the user.",
+    );
+    msg
+}
+
+/// The refusal text for an `app_url` that resolved to `app_url_default` with NO
+/// evidence of being served from the Internet Computer — almost always a domain
+/// GUESSED from an app name (e.g. "multidex.com" for MULTI/DEX, whose real URL is
+/// multidex.ai). Rather than resolving the guess to a plausible-but-wrong identity,
+/// tools return this error, which (a) names the failure, (b) suggests the
+/// well-known app the host resembles when there is one ("did you mean …"), and
+/// (c) spells out the legitimate ways to obtain the URL — so the caller converges
+/// on the real app instead of guessing again.
+fn unverified_app_url_error(application_origin: &str) -> String {
+    let mut msg = format!(
+        "{application_origin} is reachable but shows NO evidence of being an Internet Computer \
+         app (no `x-ic-canister-id` gateway header, no usable /.well-known/ic-app.json), and it \
+         declares no Internet Identity derivation origin — refusing to treat it as an app. "
+    );
+    if let Some(m) = discover::similar_known_app(application_origin) {
+        msg.push_str(&format!(
+            "DID YOU MEAN {}? Its real URL is {} (derivation origin {}) — use that instead. ",
+            m.name, m.app_url, m.derivation_origin
+        ));
+    }
+    msg.push_str(
+        "If you arrived at this URL by GUESSING from an app name, stop guessing — a lookalike \
+         domain is an unrelated or squatted site, and an identity derived there is wrong: \
+         (1) call icp_find_app_by_name with the app's name (well-known apps resolve offline); \
+         (2) if it's not known, WEB SEARCH the app's official URL; (3) or ask the user for it. \
+         If this origin genuinely IS the app's canonical Internet Identity origin (e.g. a \
+         non-IC-hosted app the user pointed you at), pass it explicitly as `derivation_origin` \
+         to proceed deliberately.",
+    );
+    msg
 }
 
 /// Validate a user-supplied identity argument (`derivation_origin` / `app_url`):
@@ -1267,7 +1368,13 @@ impl ServerHandler for IcTools {
              exposes an OQL query surface — read `icp_oql_guide` for the dialect, then use \
              `get_canister_oql_schema` (entities and fields) and `run_canister_oql_query` (run a JSON query, get a table \
              back). Those two wrap the canister's `schema`/`execute` methods, so you don't \
-             hand-encode Candid for OQL. `call_canister` calls a method with textual Candid \
+             hand-encode Candid for OQL. RULE — names are not URLs: when the user names an APP \
+             without giving its URL, resolve the NAME first with `icp_find_app_by_name` (offline, \
+             instant); if it isn't known, WEB SEARCH the app's official URL or ask the user. NEVER \
+             guess or fabricate a domain from an app's name (e.g. <name>.com/.app): lookalike \
+             domains are unrelated or squatted sites, and every URL-taking tool REFUSES an origin \
+             that shows no evidence of being an Internet Computer app instead of resolving it to a \
+             wrong identity. `call_canister` calls a method with textual Candid \
              in/out: omit the identity args to call anonymously, or act AS your account at an app. \
              To act as an app account, identify the app by its `derivation_origin` — the EXACT \
              canonical origin Internet Identity derives its principal from, which is NOT \
@@ -1291,10 +1398,12 @@ impl ServerHandler for IcTools {
              reads work, but the canister-management tools below make update calls the network \
              rejects for a read-only session — if one fails that way, ask the user to reconnect with \
              the read-only option turned OFF.\n\n\
-             Typical flow (acting FOR THE USER at an app): (0) get the app URL — for a well-known \
-             app (NNS, Oisy, MULTI/DEX, ICPSwap) `icp_find_app_by_name` maps the NAME to its URL + \
-             derivation origin; otherwise take the URL from the user or web-search it (there is no \
-             on-chain name→URL directory; `icp_find_canister_by_name` finds token/SNS canister ids, \
+             Typical flow (acting FOR THE USER at an app): (0) get the app URL — when you only \
+             have a NAME, ALWAYS `icp_find_app_by_name` FIRST (well-known apps — NNS, Oisy, \
+             MULTI/DEX, ICPSwap — resolve offline to their URL + derivation origin); otherwise \
+             take the URL from the user or WEB SEARCH the official one, NEVER guessing a domain \
+             from the name (there is no on-chain name→URL directory; \
+             `icp_find_canister_by_name` finds token/SNS canister ids, \
              not front-ends); (1) \
              unless step 0 already returned the `derivation_origin`, `resolve_app(url)` gives it; \
              concurrently (2) \
@@ -2220,6 +2329,59 @@ mod tests {
             .await
             .expect_err("host-less app_url must be rejected");
         assert!(err.contains("real host"), "unexpected message: {err}");
+    }
+
+    // The guessed-domain refusal (offline): the message must name the failure,
+    // redirect to the legitimate name→URL steps, carry the "did you mean" repair
+    // when the host resembles a well-known app, and keep the deliberate
+    // `derivation_origin` escape hatch — that combination is what turns a guessing
+    // loop into a one-step correction.
+    #[test]
+    fn unverified_app_url_error_redirects_and_repairs() {
+        // The exact wild-observed guess: multidex.com for MULTI/DEX (multidex.ai).
+        let msg = super::unverified_app_url_error("https://multidex.com");
+        assert!(msg.contains("NO evidence"), "{msg}");
+        assert!(msg.contains("icp_find_app_by_name"), "{msg}");
+        assert!(msg.contains("WEB SEARCH"), "{msg}");
+        assert!(msg.contains("DID YOU MEAN MULTI/DEX"), "{msg}");
+        assert!(msg.contains("https://multidex.ai"), "{msg}");
+        assert!(msg.contains("`derivation_origin`"), "escape hatch missing: {msg}");
+        // A host resembling no known app still gets the redirect, just no repair.
+        let plain = super::unverified_app_url_error("https://example.com");
+        assert!(plain.contains("icp_find_app_by_name"), "{plain}");
+        assert!(!plain.contains("DID YOU MEAN"), "{plain}");
+    }
+
+    // A fetch failure on a guessed domain (offline: the DNS-dead "multi.dex" guess)
+    // carries the same repair, so it reads as "wrong URL — here's the real one"
+    // rather than a transient error inviting the next guess.
+    #[test]
+    fn app_url_fetch_errors_carry_guess_guidance() {
+        let msg = super::app_url_error_with_guidance(
+            "multi.dex",
+            "could not resolve multi.dex: no such host".to_string(),
+        );
+        assert!(msg.contains("could not resolve"), "{msg}");
+        assert!(msg.contains("DID YOU MEAN MULTI/DEX"), "{msg}");
+        assert!(msg.contains("https://multidex.ai"), "{msg}");
+        assert!(msg.contains("icp_find_app_by_name"), "{msg}");
+        // Unrelated hosts: guidance without a bogus suggestion.
+        let plain = super::app_url_error_with_guidance("example.com", "timeout".to_string());
+        assert!(!plain.contains("DID YOU MEAN"), "{plain}");
+        assert!(plain.contains("icp_find_app_by_name"), "{plain}");
+    }
+
+    // Live network: deriving an identity via a guessed non-IC `app_url` is REFUSED
+    // (app_url_default + no IC evidence), with the corrective guidance — instead of
+    // minting a valid-looking principal for a lookalike origin. example.com is
+    // IANA-reserved, stable, and never IC-served.
+    #[tokio::test]
+    async fn resolve_identity_target_refuses_unverified_non_ic_app_url() {
+        let err = super::resolve_identity_target(None, Some("example.com".to_string()))
+            .await
+            .expect_err("a non-IC app_url must be refused");
+        assert!(err.contains("NO evidence"), "unexpected message: {err}");
+        assert!(err.contains("icp_find_app_by_name"), "unexpected message: {err}");
     }
 
     // The human-readable identity annotation must surface a requested≠derived

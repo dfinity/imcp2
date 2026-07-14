@@ -564,6 +564,14 @@ pub struct AppIdentity {
     /// The derivation origin's `ii-alternative-origins` list — the frontends
     /// allowed to derive against it (informational; the INVERSE relation).
     pub alternative_origins: Vec<String>,
+    /// Whether the application origin showed evidence of being served from the
+    /// Internet Computer (the HTTP gateway's `x-ic-canister-id` response header).
+    /// Probed only when the derivation origin had to be ASSUMED
+    /// ([`DerivationSource::AppUrlDefault`]) — that assumption is only plausible
+    /// for a real IC app, and `Some(false)` is the signature of a domain GUESSED
+    /// from an app name (a lookalike/squatted site). `None` when the probe wasn't
+    /// needed (a declared or known derivation origin).
+    pub application_is_ic: Option<bool>,
 }
 
 /// Fetch and parse an origin's `/.well-known/ii-alternative-origins`, using an
@@ -612,14 +620,19 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
     let client = site_client(&host, &pinned)?;
     let application_origin = base_url.origin().ascii_serialization();
 
-    // Declared derivation origin (authoritative) from the app's manifest.
+    // Declared derivation origin (authoritative) from the app's manifest. The
+    // manifest response also doubles as IC-ness evidence: the IC HTTP gateway
+    // stamps `x-ic-canister-id` on every response it serves (including 404s), so
+    // capture it here before any fallback decision.
     let mut derivation_origin = application_origin.clone();
     let mut derivation_origin_source = DerivationSource::AppUrlDefault;
+    let mut ic_evidence = false;
     if let Ok(resp) = client
         .get(format!("{application_origin}/.well-known/ic-app.json"))
         .send()
         .await
     {
+        ic_evidence = resp.headers().contains_key("x-ic-canister-id");
         if resp.status().is_success() {
             let text = read_capped(resp, MAX_META_BYTES).await;
             if let Some(declared) = declared_derivation_origin(&text) {
@@ -639,6 +652,24 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
         }
     }
 
+    // When the derivation origin had to be ASSUMED, decide whether that assumption
+    // even makes sense: a real IC app's origin carries the gateway's
+    // `x-ic-canister-id` header. If the manifest probe didn't already show it
+    // (e.g. a non-IC CDN 404s that path without the header), fetch the app URL
+    // itself and check its headers (the body is dropped unread). `Some(false)`
+    // marks the origin as showing NO IC evidence — callers refuse to treat it as
+    // an app rather than resolving a guessed lookalike domain to a wrong identity.
+    let application_is_ic = if derivation_origin_source == DerivationSource::AppUrlDefault {
+        if !ic_evidence {
+            if let Ok(resp) = client.get(base_url.clone()).send().await {
+                ic_evidence = resp.headers().contains_key("x-ic-canister-id");
+            }
+        }
+        Some(ic_evidence)
+    } else {
+        None
+    };
+
     // The alternative-origins list (informational only) — fetched only when the
     // caller will surface it, so the identity hot path doesn't pay for a round-trip
     // it never reads. It's authoritative at the DERIVATION ORIGIN (which declares the
@@ -656,6 +687,34 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
         derivation_origin,
         derivation_origin_source,
         alternative_origins,
+        application_is_ic,
+    })
+}
+
+/// The well-known app whose NAME a (typically guessed) app URL's host resembles,
+/// when the host is NOT one of that app's real registered hosts — e.g.
+/// "multidex.com", "multidex.app", or "multi.dex" all resemble MULTI/DEX, whose
+/// real URL is https://multidex.ai. Used to attach a "did you mean …" repair to
+/// refusals and warnings, so an agent that fabricated a domain from an app name
+/// converges on the real app in one step instead of guessing again. `None` when
+/// the host IS a registered known-app host (nothing to repair) or resembles no
+/// known app. Offline (registry lookup only).
+pub fn similar_known_app(app_url: &str) -> Option<AppMatch> {
+    let host = url::Url::parse(&normalize(app_url))
+        .ok()?
+        .host_str()?
+        .to_ascii_lowercase();
+    if known_derivation_origin(&host).is_some() {
+        return None; // a real known-app host — not a lookalike
+    }
+    // Token-window alias matching (see find_known_app): "multidex.com" tokenizes
+    // to ["multidex","com"] and "multi.dex" to ["multi","dex"] — both match the
+    // "multidex" alias on whole-token boundaries, while "noisy.com" matches nothing.
+    let app = find_known_app(&host)?;
+    Some(AppMatch {
+        name: app.name.to_string(),
+        app_url: app.app_url.to_string(),
+        derivation_origin: known_app_derivation_origin(app).to_string(),
     })
 }
 
@@ -1377,8 +1436,11 @@ pub fn find_app_by_name(query: &str) -> FindAppOutput {
                 note: format!(
                     "\"{query}\" is not in the connector's small built-in set of well-known apps \
                      ({known}). There is no on-chain directory mapping an app NAME to its URL, so \
-                     do a WEB SEARCH for the app's official front-end URL, then call resolve_app / \
-                     discover_app_canisters with that URL."
+                     do a WEB SEARCH for the app's official front-end URL (or ask the user for it), \
+                     then call resolve_app / discover_app_canisters with that URL. Do NOT guess or \
+                     fabricate a domain from the name — a lookalike domain (e.g. <name>.com/.app) is \
+                     typically an unrelated or squatted site, and an identity derived there would be \
+                     wrong."
                 ),
             }
         }
@@ -1993,6 +2055,50 @@ mod tests {
                 "{q:?} must not match a known app (substring false positive)",
             );
         }
+    }
+
+    // "Did you mean" repair: a host FABRICATED from a well-known app's name (the
+    // guessed-domain failure mode) maps back to the real app; real registered
+    // hosts and unrelated hosts don't trigger it.
+    #[test]
+    fn similar_known_app_repairs_guessed_domains() {
+        // The exact guesses observed in the wild for MULTI/DEX (real URL multidex.ai).
+        for guess in ["multidex.com", "https://multidex.app", "multi.dex", "www.multidex.io"] {
+            let m = similar_known_app(guess)
+                .unwrap_or_else(|| panic!("{guess} should suggest MULTI/DEX"));
+            assert_eq!(m.name, "MULTI/DEX");
+            assert_eq!(m.app_url, "https://multidex.ai");
+            assert_eq!(m.derivation_origin, known_derivation_origin("multidex.ai").unwrap());
+        }
+        assert_eq!(similar_known_app("icpswap.com").map(|m| m.app_url).as_deref(), Some("https://app.icpswap.com"));
+        assert_eq!(similar_known_app("oisy.org").map(|m| m.name).as_deref(), Some("Oisy"));
+        // A REAL known-app host is not a lookalike — nothing to repair.
+        for real in ["multidex.ai", "https://oisy.com", "app.icpswap.com", "nns.internetcomputer.org"] {
+            assert!(similar_known_app(real).is_none(), "{real} is a real host, no suggestion");
+        }
+        // Token boundaries hold (no substring false positives), and unrelated or
+        // unparseable inputs yield nothing.
+        for other in ["noisy.com", "multidexchange.org", "example.com", ""] {
+            assert!(similar_known_app(other).is_none(), "{other:?} must not match");
+        }
+    }
+
+    // Live network: a reachable NON-IC origin resolves to app_url_default with
+    // application_is_ic = Some(false) — the signature callers refuse on. example.com
+    // is IANA-reserved and stable, and will never be served from the IC.
+    #[tokio::test]
+    async fn resolve_app_identity_flags_non_ic_origin() {
+        let r = resolve_app_identity("example.com", false).await.expect("resolve");
+        assert_eq!(r.derivation_origin_source, DerivationSource::AppUrlDefault);
+        assert_eq!(r.application_is_ic, Some(false), "example.com must show no IC evidence");
+    }
+
+    // Live network: a KNOWN app skips the IC probe entirely (the registry answers).
+    #[tokio::test]
+    async fn resolve_app_identity_skips_probe_for_known_apps() {
+        let r = resolve_app_identity("oisy.com", false).await.expect("resolve");
+        assert_eq!(r.derivation_origin_source, DerivationSource::Known);
+        assert_eq!(r.application_is_ic, None, "known apps are not probed");
     }
 
     // Consistency (networked): every origin in a known app's LIVE
