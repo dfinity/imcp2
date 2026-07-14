@@ -1148,8 +1148,9 @@ fn app_url_error_with_guidance(app_url: &str, e: String) -> String {
 fn unverified_app_url_error(application_origin: &str) -> String {
     let mut msg = format!(
         "{application_origin} is reachable but shows NO evidence of being an Internet Computer \
-         app (no `x-ic-canister-id` gateway header, no usable /.well-known/ic-app.json), and it \
-         declares no Internet Identity derivation origin — refusing to treat it as an app. "
+         app — no valid `x-ic-canister-id` gateway header (the IC HTTP gateway sets one on every \
+         response) — and its /.well-known/ic-app.json, if served at all, declares no Internet \
+         Identity derivation origin. Refusing to treat it as an app. "
     );
     if let Some(m) = discover::similar_known_app(application_origin) {
         msg.push_str(&format!(
