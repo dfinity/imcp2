@@ -1023,7 +1023,7 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
     // siblings), then header (frontend), env.json, labelled bundle, bare.
     let mut out: Vec<Found> = found.into_values().collect();
     out.sort_by_key(|f| {
-        if f.sources.iter().any(|s| s == "ai-connect.html") {
+        let rank = if f.sources.iter().any(|s| s == "ai-connect.html") {
             0
         } else if f.sources.iter().any(|s| s == "ic-app.json") {
             1
@@ -1035,7 +1035,10 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
             4
         } else {
             5
-        }
+        };
+        // Tiebreak by canister_id so which entries survive the cap in
+        // bound_findings is stable across builds (sort_by_key is unstable).
+        (rank, f.canister_id.clone())
     });
 
     // Bound the result BEFORE enrichment, so every kept entry gets a dashboard
