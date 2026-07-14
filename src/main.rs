@@ -633,9 +633,9 @@ impl IcTools {
         Parameters(discover::DiscoverCanistersArgs { domain }): Parameters<discover::DiscoverCanistersArgs>,
     ) -> Result<CallToolResult, McpError> {
         match discover::discover(&domain).await {
-            Ok(found) if !found.is_empty() => {
+            Ok(d) if !d.canisters.is_empty() => {
                 let mut out = format!("Canisters discovered for {domain}:\n");
-                for f in &found {
+                for f in &d.canisters {
                     // Dashboard identity (name/type), filled in during discovery.
                     let identity = match (&f.name, &f.kind) {
                         (Some(n), Some(k)) => format!("  «{n}» ({k})"),
@@ -650,6 +650,13 @@ impl IcTools {
                         f.sources.join(", "),
                     ));
                 }
+                if d.omitted > 0 {
+                    out.push_str(&format!(
+                        "(+{} more dropped by the output cap, mostly unlabelled bundle literals; \
+                         the labelled entries above are the meaningful ones)\n",
+                        d.omitted
+                    ));
+                }
                 out.push_str(
                     "\n`ai-connect.html` and `ic-app.json` entries are DECLARED by the app itself \
                      (its main backend, and its own canister manifest with roles) — treat them as \
@@ -659,13 +666,13 @@ impl IcTools {
                      «name» (type) is the IC dashboard's label for that id. Confirm an interface \
                      with get_canister_candid before calling.",
                 );
-                let output = discover::DiscoverOutput::from((domain, found));
+                let output = discover::DiscoverOutput::from((domain, d));
                 Ok(ok_structured(out, &output))
             }
-            Ok(_) => {
+            Ok(d) => {
                 let text =
                     format!("No IC canisters found for {domain} — is it served from the Internet Computer?");
-                let output = discover::DiscoverOutput::from((domain, Vec::new()));
+                let output = discover::DiscoverOutput::from((domain, d));
                 Ok(ok_structured(text, &output))
             }
             Err(e) => Ok(err(e)),
