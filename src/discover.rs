@@ -1036,8 +1036,9 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
         } else {
             5
         };
-        // Tiebreak by canister_id so which entries survive the cap in
-        // bound_findings is stable across builds (sort_by_key is unstable).
+        // Tiebreak by canister_id so the subset that survives the cap in
+        // bound_findings follows an explicit order, rather than depending on
+        // the source BTreeMap order that the stable sort would carry through.
         (rank, f.canister_id.clone())
     });
 
