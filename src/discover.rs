@@ -569,8 +569,10 @@ pub struct AppIdentity {
     /// Probed only when the derivation origin had to be ASSUMED
     /// ([`DerivationSource::AppUrlDefault`]) — that assumption is only plausible
     /// for a real IC app, and `Some(false)` is the signature of a domain GUESSED
-    /// from an app name (a lookalike/squatted site). `None` when the probe wasn't
-    /// needed (a declared or known derivation origin).
+    /// from an app name (a lookalike/squatted site). `Some(false)` is concluded
+    /// only from a successful exchange with the origin — an unreachable origin is
+    /// an `Err` from [`resolve_app_identity`], never a misclassification. `None`
+    /// when the probe wasn't needed (a declared or known derivation origin).
     pub application_is_ic: Option<bool>,
 }
 
@@ -654,16 +656,24 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
 
     // When the derivation origin had to be ASSUMED, decide whether that assumption
     // even makes sense: a real IC app's origin carries the gateway's
-    // `x-ic-canister-id` header. If the manifest probe didn't already show it
-    // (e.g. a non-IC CDN 404s that path without the header), fetch the app URL
-    // itself and check its headers (the body is dropped unread). `Some(false)`
-    // marks the origin as showing NO IC evidence — callers refuse to treat it as
-    // an app rather than resolving a guessed lookalike domain to a wrong identity.
+    // `x-ic-canister-id` header on every response. If the manifest response didn't
+    // already show it (e.g. a non-IC CDN 404s that path without the header),
+    // confirm against the ORIGIN ROOT — not the caller's full URL, whose arbitrary
+    // path could point at a huge resource — reading headers only (the body is
+    // dropped unread, aborting the transfer). `Some(false)` is concluded ONLY from
+    // a successful exchange with the origin; a fetch error (timeout/TLS/connect)
+    // propagates as an error instead, so an unreachable-but-real IC app is
+    // reported as unreachable rather than misclassified as a reachable non-IC
+    // site. Callers refuse the `Some(false)` case rather than resolving a guessed
+    // lookalike domain to a wrong identity.
     let application_is_ic = if derivation_origin_source == DerivationSource::AppUrlDefault {
         if !ic_evidence {
-            if let Ok(resp) = client.get(base_url.clone()).send().await {
-                ic_evidence = resp.headers().contains_key("x-ic-canister-id");
-            }
+            let resp = client
+                .get(format!("{application_origin}/"))
+                .send()
+                .await
+                .map_err(|e| format!("could not reach {application_origin}: {e}"))?;
+            ic_evidence = resp.headers().contains_key("x-ic-canister-id");
         }
         Some(ic_evidence)
     } else {

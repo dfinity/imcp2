@@ -703,7 +703,10 @@ impl IcTools {
                 let output = discover::DiscoverOutput::from((domain, Vec::new()));
                 Ok(ok_structured(text, &output))
             }
-            Err(e) => Ok(err(e)),
+            // A fetch failure on a guessed domain (DNS-dead lookalikes like
+            // "multi.dex") carries the same repair as the identity routes, so it
+            // reads as "wrong URL — here's the real one", not a transient error.
+            Err(e) => Ok(err(app_url_error_with_guidance(&domain, e))),
         }
     }
 
