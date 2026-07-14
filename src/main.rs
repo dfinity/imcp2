@@ -617,12 +617,13 @@ impl IcTools {
                  The app's own declaration, if it ships one, would override this."
             )),
             discover::DerivationSource::AppUrlDefault => Some(format!(
-                "This origin IS served from the Internet Computer, but it declares no \
-                 `derivation_origin` in /.well-known/ic-app.json and isn't in the built-in \
-                 known-app registry — so this ASSUMED the application origin, canonicalized to \
-                 {effective} (what II derives against). That is correct for apps without a custom \
-                 derivation origin; if this app pins a custom one, the assumption yields a WRONG \
-                 principal — supply the canonical origin explicitly.{}",
+                "This origin showed evidence of being served from the Internet Computer (its \
+                 responses carry the gateway's `x-ic-canister-id` header), but its \
+                 /.well-known/ic-app.json couldn't be fetched or declares no `derivation_origin`, \
+                 and it isn't in the built-in known-app registry — so this ASSUMED the application \
+                 origin, canonicalized to {effective} (what II derives against). That is correct \
+                 for apps without a custom derivation origin; if this app pins a custom one, the \
+                 assumption yields a WRONG principal — supply the canonical origin explicitly.{}",
                 lookalike.as_deref().unwrap_or_default()
             )),
         };
@@ -1149,7 +1150,7 @@ fn unverified_app_url_error(application_origin: &str) -> String {
     let mut msg = format!(
         "{application_origin} is reachable but shows NO evidence of being an Internet Computer \
          app — no valid `x-ic-canister-id` gateway header (the IC HTTP gateway sets one on every \
-         response) — and its /.well-known/ic-app.json, if served at all, declares no Internet \
+         response) — and its /.well-known/ic-app.json couldn't be fetched or declares no Internet \
          Identity derivation origin. Refusing to treat it as an app. "
     );
     if let Some(m) = discover::similar_known_app(application_origin) {
