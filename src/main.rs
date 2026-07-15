@@ -624,10 +624,10 @@ impl IcTools {
         // context stands regardless of discovery. Collect the concurrent discovery
         // now, keeping a FAILURE distinct from "found nothing" (a JoinError — i.e. a
         // panic — is treated as a discovery failure, never a hard error).
-        let (canisters, discovery_error) = match discovery.await {
-            Ok(Ok(c)) => (c, None),
-            Ok(Err(e)) => (Vec::new(), Some(e)),
-            Err(join_err) => (Vec::new(), Some(format!("discovery task error: {join_err}"))),
+        let (canisters, omitted, discovery_error) = match discovery.await {
+            Ok(Ok(d)) => (d.canisters, d.omitted, None),
+            Ok(Err(e)) => (Vec::new(), 0, Some(e)),
+            Err(join_err) => (Vec::new(), 0, Some(format!("discovery task error: {join_err}"))),
         };
 
         let mut text = format!(
@@ -661,6 +661,12 @@ impl IcTools {
                     f.sources.join(", "),
                 ));
             }
+            if omitted > 0 {
+                text.push_str(&format!(
+                    "(+{omitted} more findings dropped by the output cap; the list is \
+                     authority-ordered, so the least authoritative entries were cut first)\n"
+                ));
+            }
         }
         if let Some(n) = &note {
             text.push_str(&format!("\nNOTE: {n}"));
@@ -680,6 +686,7 @@ impl IcTools {
             alternative_origins: resolved.alternative_origins,
             application_is_ic: resolved.application_is_ic,
             canisters: canisters.iter().map(discover::DiscoveredCanister::from).collect(),
+            omitted,
             discovery_error,
             note,
         };
@@ -750,9 +757,9 @@ impl IcTools {
         Parameters(discover::DiscoverCanistersArgs { domain }): Parameters<discover::DiscoverCanistersArgs>,
     ) -> Result<CallToolResult, McpError> {
         match discover::discover(&domain).await {
-            Ok(found) if !found.is_empty() => {
+            Ok(d) if !d.canisters.is_empty() => {
                 let mut out = format!("Canisters discovered for {domain}:\n");
-                for f in &found {
+                for f in &d.canisters {
                     // Dashboard identity (name/type), filled in during discovery.
                     let identity = match (&f.name, &f.kind) {
                         (Some(n), Some(k)) => format!("  «{n}» ({k})"),
@@ -767,6 +774,13 @@ impl IcTools {
                         f.sources.join(", "),
                     ));
                 }
+                if d.omitted > 0 {
+                    out.push_str(&format!(
+                        "(+{} more findings dropped by the output cap; the list is \
+                         authority-ordered, so the least authoritative entries were cut first)\n",
+                        d.omitted
+                    ));
+                }
                 out.push_str(
                     "\n`ai-connect.html` and `ic-app.json` entries are DECLARED by the app itself \
                      (its main backend, and its own canister manifest with roles) — treat them as \
@@ -776,10 +790,10 @@ impl IcTools {
                      «name» (type) is the IC dashboard's label for that id. Confirm an interface \
                      with get_canister_candid before calling.",
                 );
-                let output = discover::DiscoverOutput::from((domain, found));
+                let output = discover::DiscoverOutput::from((domain, d));
                 Ok(ok_structured(out, &output))
             }
-            Ok(_) => {
+            Ok(d) => {
                 let mut text =
                     format!("No IC canisters found for {domain} — is it served from the Internet Computer?");
                 if let Some(m) = discover::similar_known_app(&domain) {
@@ -793,7 +807,7 @@ impl IcTools {
                      icp_find_app_by_name with the name, or WEB SEARCH the app's official URL, \
                      or ask the user for it.",
                 );
-                let output = discover::DiscoverOutput::from((domain, Vec::new()));
+                let output = discover::DiscoverOutput::from((domain, d));
                 Ok(ok_structured(text, &output))
             }
             // A fetch failure on a guessed domain (DNS-dead lookalikes like
@@ -1790,17 +1804,27 @@ fn err(text: String) -> CallToolResult {
     CallToolResult::error(vec![Content::text(text)])
 }
 
-const INDEX_HTML: &str = r#"<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>IC MCP PoC</title></head>
-<body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
-<h1>Internet Computer MCP PoC</h1>
-<p>MCP endpoints: <code>POST /mcp</code> (beta Internet Identity) · <code>POST /mcp-prod</code> (production Internet Identity)</p>
-<p>Tools: <code>discover_app_canisters</code> (domain → canister ids), <code>icp_find_canister_by_name</code> (name → canister ids), <code>icp_find_app_by_name</code> (well-known app name → URL + derivation origin), <code>icp_lookup_canister_info_by_id</code> (id → dashboard identity), <code>get_canister_candid</code>, <code>call_canister</code> (anonymously, or as your account at an app — identified by its <code>derivation_origin</code> or <code>app_url</code>, delegation minted on demand), <code>get_app_principal</code> (your principal at an app, no call), <code>list_app_accounts</code> (your Internet Identity accounts at an app), <code>resolve_app</code> (app URL → its Internet Identity derivation origin; no principal — pick an account via <code>get_app_principal</code>). Identity results echo <code>derived_for_origin</code>/<code>requested</code> so an origin mismatch is visible. All speak textual Candid.</p>
-<p>Skills: <code>icp_list_skills</code> / <code>icp_get_skill</code> (the official IC how-to guides — Motoko, mops, icp CLI, cycles, …).</p>
-<p>App docs: <code>get_canister_api_doc</code> (a canister's own "how this app behaves" guide, if it exposes <code>getApiDoc</code>/<code>get_api_doc</code>).</p>
-<p>OQL: <code>icp_oql_guide</code> (dialect), <code>get_canister_oql_schema</code> (entities/fields), <code>run_canister_oql_query</code> (run a JSON query, get a table) — for canisters that expose an OQL <code>schema</code>/<code>execute</code> surface (<code>get_canister_candid</code> reports <code>oql: true</code>).</p>
-<p>Canister management (as your Internet Identity): <code>icp_cycles_balance</code>, <code>icp_create_canister</code>, <code>icp_install_code</code>, <code>icp_canister_status</code>, <code>icp_update_canister_settings</code>, <code>icp_start_canister</code>, <code>icp_stop_canister</code>, <code>icp_uninstall_code</code>, <code>icp_delete_canister</code>, <code>icp_top_up_canister</code>.</p>
-</body></html>"#;
+/// The landing page served at `/`. Markup, stylesheet, and the DFINITY mark
+/// live in `assets/` (compiled in via `include_str!`, no runtime file I/O) so
+/// the page is fully self-contained: no external fonts, scripts, or images.
+/// It shares the connect flow's ICP look (parchment grid, editorial serif,
+/// rust accent, foot-of-page "Hosted by" mark) so the root page and the connect
+/// screens read as one product. Tools are grouped by what they do: service
+/// discovery, user identity, OQL, actions, and skills.
+const INDEX_HTML_TEMPLATE: &str = include_str!("assets/index.html");
+const INDEX_PAGE_CSS: &str = include_str!("assets/index.css");
+const DFINITY_LOGO_SVG: &str = include_str!("assets/dfinity-logo.svg");
+
+/// The rendered landing page, built once on first request. Splicing the
+/// stylesheet and logo into the template is a couple of string replacements;
+/// doing it lazily keeps it off the hot path and out of a `const` (which can't
+/// call `.replace`). `__CSS__`/`__LOGO__` are the same placeholder convention
+/// the connect pages use; the sources carry no such tokens, so no ordering hazard.
+static INDEX_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    INDEX_HTML_TEMPLATE
+        .replace("__CSS__", INDEX_PAGE_CSS)
+        .replace("__LOGO__", DFINITY_LOGO_SVG)
+});
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -2041,7 +2065,7 @@ async fn main() -> anyhow::Result<()> {
     let ver_ids_prod = ids_prod.clone();
 
     let app = axum::Router::new()
-        .route("/", axum::routing::get(|| async { axum::response::Html(INDEX_HTML) }))
+        .route("/", axum::routing::get(|| async { axum::response::Html(INDEX_HTML.as_str()) }))
         // Unauthenticated build/version probe so operators and the status
         // dashboard can confirm exactly which deployment is live: the running
         // commit (baked in at build time via GIT_SHA), the build time

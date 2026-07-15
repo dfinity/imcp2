@@ -1,0 +1,102 @@
+<!DOCTYPE html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<meta name=description content="A Model Context Protocol server for the Internet Computer: discover canisters, resolve your Internet Identity, query with OQL, call methods, and manage canisters.">
+<title>Internet Computer MCP</title>
+<style>__CSS__</style></head>
+<body><div class=page>
+
+<header class=hero><div class=wrap>
+<p class=eyebrow>Model Context Protocol</p>
+<h1>The Internet Computer,<br>as tools your <em>agent</em> can call.</h1>
+<p class=lede>An MCP server that lets an agent explore canisters, act as its Internet Identity, query on-chain data, and manage canisters. Everything speaks textual Candid.</p>
+<div class=endpoints>
+<div class=endpoint><code><span class=verb>POST</span> /mcp</code><span>Beta Internet Identity</span></div>
+<div class=endpoint><code><span class=verb>POST</span> /mcp-prod</code><span>Production Internet Identity</span></div>
+</div>
+</div></header>
+
+<main class=wrap><section class=categories>
+
+<article class=cat data-cat=discovery>
+<div class=cat-head>
+<p class=cat-eyebrow><span class=cat-num>&sect; 01</span> Service discovery</p>
+<h2 class=cat-title>Find canisters and learn what they are</h2>
+<p class=cat-note>Turn a domain, a name, or a bare id into something you can call.</p>
+</div>
+<div class=tools>
+<div class=tool><div class=tool-name>discover_app_canisters</div><p class=tool-desc>Map a domain or app URL to the canister ids it runs on.</p></div>
+<div class=tool><div class=tool-name>icp_find_canister_by_name</div><p class=tool-desc>Look up canister ids by a well-known name (e.g. <code>ckUSDC</code>, <code>ICP Ledger</code>).</p></div>
+<div class=tool><div class=tool-name>icp_find_app_by_name</div><p class=tool-desc>Resolve a well-known app name to its URL and Internet Identity derivation origin.</p></div>
+<div class=tool><div class=tool-name>icp_lookup_canister_info_by_id</div><p class=tool-desc>Identify a bare canister id: label, type, controllers, subnet, and module hash.</p></div>
+<div class=tool><div class=tool-name>get_canister_candid</div><p class=tool-desc>Read a canister's Candid (<code>.did</code>) interface from its public metadata.</p></div>
+<div class=tool><div class=tool-name>get_canister_api_doc</div><p class=tool-desc>Read a canister's own "how this app behaves" guide, when it publishes one.</p></div>
+</div>
+</article>
+
+<article class=cat data-cat=identity>
+<div class=cat-head>
+<p class=cat-eyebrow><span class=cat-num>&sect; 02</span> User identity</p>
+<h2 class=cat-title>Act as your Internet Identity at an app</h2>
+<p class=cat-note>Delegations are minted on demand. Results echo the origin they were derived for, so a mismatch is always visible.</p>
+</div>
+<div class=tools>
+<div class=tool><div class=tool-name>list_app_accounts</div><p class=tool-desc>List your Internet Identity accounts at a given app.</p></div>
+<div class=tool><div class=tool-name>get_app_principal</div><p class=tool-desc>Get your principal at an app, without making a call.</p></div>
+<div class=tool><div class=tool-name>resolve_app</div><p class=tool-desc>Resolve an app URL to its Internet Identity derivation origin.</p></div>
+</div>
+</article>
+
+<article class=cat data-cat=oql>
+<div class=cat-head>
+<p class=cat-eyebrow><span class=cat-num>&sect; 03</span> OQL</p>
+<h2 class=cat-title>Query canisters that expose an OQL surface</h2>
+<p class=cat-note>For canisters where <code>get_canister_candid</code> reports <code>oql: true</code>.</p>
+</div>
+<div class=tools>
+<div class=tool><div class=tool-name>icp_oql_guide</div><p class=tool-desc>Load the OQL query dialect guide. Read this first so queries are correct.</p></div>
+<div class=tool><div class=tool-name>get_canister_oql_schema</div><p class=tool-desc>Inspect a canister's OQL entities, fields, and edges.</p></div>
+<div class=tool><div class=tool-name>run_canister_oql_query</div><p class=tool-desc>Run a JSON OQL query and get a table back.</p></div>
+</div>
+</article>
+
+<article class=cat data-cat=actions>
+<div class=cat-head>
+<p class=cat-eyebrow><span class=cat-num>&sect; 04</span> Actions</p>
+<h2 class=cat-title>Call methods and manage canisters</h2>
+<p class=cat-note>Anonymously, or as your Internet Identity. Management calls need an authenticated session.</p>
+</div>
+<div class=tools>
+<div class=tool><div class=tool-name>call_canister</div><p class=tool-desc>Call any canister method, anonymously or as your account at an app.</p></div>
+<div class=tool><div class=tool-name>icp_cycles_balance</div><p class=tool-desc>Check your cycles-ledger balance, the cycles that create and top-up spend.</p></div>
+<div class=tool><div class=tool-name>icp_create_canister</div><p class=tool-desc>Create a new canister, funded from your cycles balance.</p></div>
+<div class=tool><div class=tool-name>icp_top_up_canister</div><p class=tool-desc>Add cycles to a canister.</p></div>
+<div class=tool><div class=tool-name>icp_install_code</div><p class=tool-desc>Install, reinstall, or upgrade a canister's Wasm module.</p></div>
+<div class=tool><div class=tool-name>icp_canister_status</div><p class=tool-desc>Report a canister's run state, cycles, memory, and controllers.</p></div>
+<div class=tool><div class=tool-name>icp_update_canister_settings</div><p class=tool-desc>Change controllers, allocations, thresholds, or log visibility.</p></div>
+<div class=tool><div class=tool-name>icp_start_canister</div><p class=tool-desc>Start a stopped canister you control.</p></div>
+<div class=tool><div class=tool-name>icp_stop_canister</div><p class=tool-desc>Stop a running canister, required before deleting it.</p></div>
+<div class=tool><div class=tool-name>icp_uninstall_code</div><p class=tool-desc>Remove a canister's code and state, keeping its id and cycles.</p></div>
+<div class=tool><div class=tool-name>icp_delete_canister</div><p class=tool-desc>Delete a canister permanently. Stop it first; remaining cycles are burned.</p></div>
+</div>
+</article>
+
+<article class=cat data-cat=skills>
+<div class=cat-head>
+<p class=cat-eyebrow><span class=cat-num>&sect; 05</span> Skills</p>
+<h2 class=cat-title>Official Internet Computer how-to guides</h2>
+<p class=cat-note>Authoritative guides for building and shipping IC apps. Consult these before writing canister code or deploying.</p>
+</div>
+<div class=tools>
+<div class=tool><div class=tool-name>icp_list_skills</div><p class=tool-desc>List the official IC skills: Motoko, mops, the icp CLI, cycles, security, and more.</p></div>
+<div class=tool><div class=tool-name>icp_get_skill</div><p class=tool-desc>Fetch one skill's full instructions by name.</p></div>
+</div>
+</article>
+
+<p class=note>Every tool speaks <strong>textual Candid</strong>. The server handles all encoding and decoding, so an agent only ever reads and writes Candid text. Identity results include <code>derived_for_origin</code> and <code>requested</code> so an origin mismatch stays visible.</p>
+
+</section></main>
+
+<footer class="wrap foot"><div class=hosted><span class=hosted-label>Hosted by</span>
+<span class=hosted-logo>__LOGO__</span></div></footer>
+
+</div></body></html>
