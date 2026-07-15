@@ -636,19 +636,18 @@ fn header_is_ic_principal(headers: &reqwest::header::HeaderMap) -> bool {
         .map_or(false, |v| Principal::from_text(v).is_ok())
 }
 
-/// Whether `resp` is evidence that `expected_host` itself is IC-served: it carries a
-/// valid `x-ic-canister-id` (see [`header_is_ic_principal`]) AND the response came
-/// from `expected_host`, not a redirect target. The host check matters because the
-/// shared SSRF redirect policy permits hops to global IP literals, so without it a
-/// non-IC origin could 302 to another public host/IP that echoes the header and
-/// borrow its IC-ness — the gate must attribute evidence to the ORIGIN it probed.
-/// (`expected_host` is the lowercased application host; hosts compare case-insensitively.)
-fn ic_evidence_from(resp: &reqwest::Response, expected_host: &str) -> bool {
+/// Whether `resp` is evidence that `expected_origin` itself is IC-served: it carries a
+/// valid `x-ic-canister-id` (see [`header_is_ic_principal`]) AND the response came from
+/// `expected_origin`, not a redirect target. The origin check matters because the
+/// shared SSRF redirect policy permits hops to global IP literals AND same-host
+/// different-PORT redirects, so without it a non-IC origin could redirect to a
+/// *different* origin that echoes the header and borrow its IC-ness — the gate must
+/// attribute evidence to the exact origin (scheme + host + port) it probed. Both sides
+/// are canonical `Url::origin().ascii_serialization()` forms, so the compare is exact
+/// (host case- and default-port-normalized) rather than a host-only match.
+fn ic_evidence_from(resp: &reqwest::Response, expected_origin: &str) -> bool {
     header_is_ic_principal(resp.headers())
-        && resp
-            .url()
-            .host_str()
-            .map_or(false, |h| h.eq_ignore_ascii_case(expected_host))
+        && resp.url().origin().ascii_serialization() == expected_origin
 }
 
 /// Resolve an app URL to its Internet Identity derivation context, WITHOUT
@@ -686,7 +685,7 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
         .send()
         .await
     {
-        ic_evidence = ic_evidence_from(&resp, &host);
+        ic_evidence = ic_evidence_from(&resp, &application_origin);
         if resp.status().is_success() {
             let text = read_capped(resp, MAX_META_BYTES).await;
             if let Some(declared) = declared_derivation_origin(&text) {
@@ -726,7 +725,7 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
                 .send()
                 .await
                 .map_err(|e| format!("could not reach {application_origin}: {e}"))?;
-            ic_evidence = ic_evidence_from(&resp, &host);
+            ic_evidence = ic_evidence_from(&resp, &application_origin);
         }
         Some(ic_evidence)
     } else {
