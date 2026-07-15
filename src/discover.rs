@@ -97,14 +97,30 @@ pub struct DiscoverOutput {
     pub domain: String,
     /// Canisters found behind the domain (empty if none).
     pub canisters: Vec<DiscoveredCanister>,
+    /// How many additional findings were dropped by the output caps (see
+    /// [`bound_findings`]). The list is authority-ordered and the cut takes the
+    /// tail, so the dropped entries are always the least authoritative present:
+    /// in practice unlabelled JS-bundle literals, though with a very large
+    /// declared manifest the global cap can trim labelled entries too.
+    /// 0 = nothing cut.
+    pub omitted: usize,
 }
 
-impl From<(String, Vec<Found>)> for DiscoverOutput {
-    /// `(domain, found)` → the structured `discover_app_canisters` reply.
-    fn from((domain, found): (String, Vec<Found>)) -> Self {
+/// The bounded result of [`discover`]: the canisters kept (authority-ordered)
+/// plus how many findings the output caps dropped.
+#[derive(Debug)]
+pub struct Discovery {
+    pub canisters: Vec<Found>,
+    pub omitted: usize,
+}
+
+impl From<(String, Discovery)> for DiscoverOutput {
+    /// `(domain, discovery)` → the structured `discover_app_canisters` reply.
+    fn from((domain, d): (String, Discovery)) -> Self {
         Self {
             domain,
-            canisters: found.iter().map(DiscoveredCanister::from).collect(),
+            canisters: d.canisters.iter().map(DiscoveredCanister::from).collect(),
+            omitted: d.omitted,
         }
     }
 }
@@ -889,7 +905,7 @@ fn add(found: &mut BTreeMap<String, Found>, id: &str, label: Option<String>, sou
     }
 }
 
-pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
+pub async fn discover(domain: &str) -> Result<Discovery, String> {
     let base = normalize(domain);
     // SSRF guard (CWE-918): validate + resolve the fully user-controlled target
     // to public addresses BEFORE any request, and pin them into the client so the
@@ -1007,7 +1023,7 @@ pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
     // siblings), then header (frontend), env.json, labelled bundle, bare.
     let mut out: Vec<Found> = found.into_values().collect();
     out.sort_by_key(|f| {
-        if f.sources.iter().any(|s| s == "ai-connect.html") {
+        let rank = if f.sources.iter().any(|s| s == "ai-connect.html") {
             0
         } else if f.sources.iter().any(|s| s == "ic-app.json") {
             1
@@ -1019,14 +1035,49 @@ pub async fn discover(domain: &str) -> Result<Vec<Found>, String> {
             4
         } else {
             5
-        }
+        };
+        // Tiebreak by canister_id so the subset that survives the cap in
+        // bound_findings follows an explicit order, rather than depending on
+        // the source BTreeMap order that the stable sort would carry through.
+        (rank, f.canister_id.clone())
     });
 
+    // Bound the result BEFORE enrichment, so every kept entry gets a dashboard
+    // lookup and dropped ones cost nothing.
+    let mut bounded = bound_findings(out);
     // Annotate each id with its IC dashboard identity (name/type) where known,
     // so a bare principal becomes an identified service. Best-effort.
-    enrich_with_dashboard(&client, &mut out).await;
+    enrich_with_dashboard(&client, &mut bounded.canisters).await;
 
-    Ok(out)
+    Ok(bounded)
+}
+
+/// Bound a sorted findings list so one discovery can't overwhelm an MCP
+/// client's context window: a token-wallet's JS bundle can embed the canister
+/// ids of every ledger/index it supports, and each lands here as a bare
+/// `bundle` literal (a multi-hundred-entry, ~100+ KB tool reply in the wild).
+/// Bare literals are the least meaningful tier (unlabelled, not app-declared),
+/// so they're capped hardest; a global cap backstops the labelled tiers too.
+/// Assumes authority order (bare literals sort last), so the cut always drops
+/// the least authoritative tail. The number dropped is REPORTED via
+/// [`Discovery::omitted`], never silently.
+fn bound_findings(mut out: Vec<Found>) -> Discovery {
+    const MAX_BARE_BUNDLE: usize = 20;
+    const MAX_CANISTERS: usize = 50;
+    let total = out.len();
+    let mut bare_seen = 0usize;
+    out.retain(|f| {
+        // A bare literal's ONLY source is "bundle"; an id that also appeared in
+        // any labelled/declared source is never dropped by this tier cap.
+        if f.sources.iter().all(|s| s == "bundle") {
+            bare_seen += 1;
+            bare_seen <= MAX_BARE_BUNDLE
+        } else {
+            true
+        }
+    });
+    out.truncate(MAX_CANISTERS);
+    Discovery { omitted: total - out.len(), canisters: out }
 }
 
 /// Annotate found canisters with their dashboard label/type, concurrently and
@@ -1584,6 +1635,48 @@ mod tests {
         assert!(!redirect_hop_ok(&u("http://oisy.com/x"), Some("oisy.com")));
     }
 
+    // The output caps drop unlabelled bundle literals past their tier cap (and
+    // report the count), while every labelled/declared finding survives: the
+    // wild case is a wallet bundle embedding hundreds of token-ledger ids,
+    // which used to produce a ~140 KB tool reply.
+    #[test]
+    fn bound_findings_caps_bare_literals_and_reports_omitted() {
+        let mk = |id: usize, label: Option<&str>, source: &str| Found {
+            canister_id: format!("id-{id:03}"),
+            label: label.map(String::from),
+            sources: vec![source.to_string()],
+            name: None,
+            kind: None,
+        };
+        // Authority-ordered, as discover() produces: labelled tiers first, then
+        // a long tail of bare bundle literals.
+        let mut found = vec![
+            mk(0, Some("main backend (App Connect)"), "ai-connect.html"),
+            mk(1, Some("frontend"), "header"),
+            mk(2, Some("IC_BACKEND_CANISTER_ID"), "bundle:IC_BACKEND_CANISTER_ID"),
+        ];
+        found.extend((3..40).map(|i| mk(i, None, "bundle")));
+
+        let d = bound_findings(found);
+        // All 3 labelled kept; bare capped at 20; 37 - 20 = 17 omitted.
+        assert_eq!(d.canisters.len(), 23, "3 labelled + 20 bare");
+        assert_eq!(d.omitted, 17);
+        assert!(d.canisters.iter().take(3).all(|f| f.label.is_some()), "labelled entries survive");
+        // The kept bare literals are the FIRST 20 (authority order preserved).
+        assert_eq!(d.canisters[3].canister_id, "id-003");
+        assert_eq!(d.canisters[22].canister_id, "id-022");
+
+        // The global cap backstops labelled tiers too, and still reports.
+        let many_labelled: Vec<Found> = (0..60).map(|i| mk(i, Some("x"), "ic-app.json")).collect();
+        let d = bound_findings(many_labelled);
+        assert_eq!(d.canisters.len(), 50);
+        assert_eq!(d.omitted, 10);
+
+        // Nothing to cut: nothing reported.
+        let d = bound_findings(vec![mk(0, Some("frontend"), "header")]);
+        assert_eq!((d.canisters.len(), d.omitted), (1, 0));
+    }
+
     // Live network test against a stable public IC app (OISY). Bundle mining
     // streams multi-MB chunks from a live CDN, and `read_capped` deliberately
     // treats a mid-stream error as end-of-body (discovery is opportunistic) —
@@ -1595,7 +1688,7 @@ mod tests {
         let mut ids: Vec<String> = Vec::new();
         for attempt in 1..=3 {
             let found = discover("oisy.com").await.expect("discover");
-            ids = found.iter().map(|f| f.canister_id.clone()).collect();
+            ids = found.canisters.iter().map(|f| f.canister_id.clone()).collect();
             if ids.iter().any(|i| i == "cha4i-riaaa-aaaan-qeccq-cai")
                 && ids.iter().any(|i| i == "doked-biaaa-aaaar-qag2a-cai")
             {
