@@ -595,10 +595,15 @@ impl IcTools {
             Err(e) => return Ok(err(e)),
         };
         // Resolve (the gating step) and discover (canisters) run CONCURRENTLY so the
-        // happy path doesn't pay for discovery sequentially. But discovery is spawned
-        // so it can be ABORTED the moment resolution fails or the IC-evidence gate
-        // refuses — a refused/guessed origin then returns promptly instead of waiting
-        // out discovery's timeout and crawling a site we're about to reject.
+        // happy path doesn't pay for discovery sequentially. Discovery is spawned so it
+        // can be ABORTED the moment resolution fails or the IC-evidence gate refuses:
+        // that makes a refused/guessed origin return PROMPTLY (no waiting out
+        // discovery's timeout) and cancels the REST of the crawl. It does not prevent
+        // discovery from starting — because it runs concurrently with the gate, a few
+        // requests may already be in flight before abort() — but those are bounded by
+        // discover's own size/count caps, and the common (accepted) case keeps the
+        // full concurrency win. Gating before starting discovery would eliminate that
+        // residual I/O only by serializing the two, which the happy path pays for.
         let discovery = tokio::spawn({
             let url = app_url.clone();
             async move { discover::discover(&url).await }
