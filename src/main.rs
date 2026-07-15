@@ -572,55 +572,62 @@ impl IcTools {
         &self,
         Parameters(discover::OpenAppArgs { app }): Parameters<discover::OpenAppArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let query = app.trim();
-        if query.is_empty() {
-            return Ok(err(
-                "`app` must not be empty — pass an app name (e.g. \"MULTI/DEX\") or a URL (e.g. \"https://oisy.com\")".into(),
-            ));
-        }
+        // Clean the query like every other identity input: trim, reject empty, and
+        // reject control chars — otherwise they'd be echoed into the UnknownName
+        // error via find_app_by_name's note (the rest of the surface avoids this).
+        let query = match clean_identity_arg("app", &app) {
+            Ok(q) => q,
+            Err(e) => return Ok(err(e)),
+        };
         // Disambiguate name vs URL, repairing a known app's name/wrong-TLD to its
         // canonical URL and refusing a bare unknown name rather than guessing.
-        let (app_url, app_url_source) = match discover::classify_app_query(query) {
+        let (app_url, app_url_source) = match discover::classify_app_query(&query) {
             discover::AppQuery::Known(m) => (m.app_url, "known_app_registry"),
             discover::AppQuery::Url(u) => (u, "as_provided"),
             discover::AppQuery::UnknownName => {
                 // Echo find_app_by_name's web-search/ask guidance (it builds the
                 // "not a known app; don't guess a domain" note from the registry).
-                return Ok(err(discover::find_app_by_name(query).note));
+                return Ok(err(discover::find_app_by_name(&query).note));
             }
         };
         let app_url = match clean_app_url(&app_url) {
             Ok(u) => u,
             Err(e) => return Ok(err(e)),
         };
-        // Resolve (origin + IC-evidence gate + alt-origins) and discover (canisters)
-        // concurrently — both take the app URL and neither depends on the other, so
-        // this is the concurrent resolve+discover the flow recommends, in one tool.
-        let (resolved, found) = tokio::join!(
-            discover::resolve_app_identity(&app_url, true),
-            discover::discover(&app_url),
-        );
-        let resolved = match resolved {
+        // Resolve (the gating step) and discover (canisters) run CONCURRENTLY so the
+        // happy path doesn't pay for discovery sequentially. But discovery is spawned
+        // so it can be ABORTED the moment resolution fails or the IC-evidence gate
+        // refuses — a refused/guessed origin then returns promptly instead of waiting
+        // out discovery's timeout and crawling a site we're about to reject.
+        let discovery = tokio::spawn({
+            let url = app_url.clone();
+            async move { discover::discover(&url).await }
+        });
+        let resolved = match discover::resolve_app_identity(&app_url, true).await {
             Ok(r) => r,
-            Err(e) => return Ok(err(app_url_error_with_guidance(&app_url, e))),
+            Err(e) => {
+                discovery.abort();
+                return Ok(err(app_url_error_with_guidance(&app_url, e)));
+            }
         };
         // The same guessed-domain gate as resolve_app / the identity routes: an
         // assumed origin with no IC evidence is refused, not resolved.
         if resolved.derivation_origin_source == discover::DerivationSource::AppUrlDefault
             && resolved.application_is_ic == Some(false)
         {
+            discovery.abort();
             return Ok(err(unverified_app_url_error(&resolved.application_origin)));
         }
         let effective = identities::target_origin(&resolved.derivation_origin);
         let note = resolution_note(&resolved, &effective);
-        // Discovery is best-effort — a failure or empty result still leaves a valid
-        // derivation context (origin resolution already succeeded and passed the IC
-        // gate), so surface what we have rather than failing the call. But keep a
-        // discovery ERROR distinct from "found nothing" so the caller can tell a
-        // transient/unreachable discovery failure from an app that declares none.
-        let (canisters, discovery_error) = match found {
-            Ok(c) => (c, None),
-            Err(e) => (Vec::new(), Some(e)),
+        // Origin resolution succeeded and passed the IC gate, so the derivation
+        // context stands regardless of discovery. Collect the concurrent discovery
+        // now, keeping a FAILURE distinct from "found nothing" (a JoinError — i.e. a
+        // panic — is treated as a discovery failure, never a hard error).
+        let (canisters, discovery_error) = match discovery.await {
+            Ok(Ok(c)) => (c, None),
+            Ok(Err(e)) => (Vec::new(), Some(e)),
+            Err(join_err) => (Vec::new(), Some(format!("discovery task error: {join_err}"))),
         };
 
         let mut text = format!(
