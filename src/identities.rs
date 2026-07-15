@@ -1524,14 +1524,23 @@ mod tests {
         let ids = test_ids();
         let future = now_ns() + 3_600_000_000_000;
         ids.set_grant_expiration("idle", future).await;
-        // "idle" never makes a request after connect, yet it stays counted below:
-        // live_session_count ignores activity entirely, keying only on the grant.
-        ids.set_grant_expiration("expired", now_ns().saturating_sub(1)).await;
-        // The expired grant has already left the gauge (dropped at its expiry
-        // instant), while the valid one remains — inactivity never decremented it.
+        // Backdate "idle" far past the activity window — it has not made a request
+        // in ages. This is the regression guard: live_session_count must STILL
+        // count it (the old activity-windowed gauge would have dropped it here).
+        {
+            let stale = now_ns().saturating_sub(ACTIVE_SESSION_WINDOW_NS + 3_600_000_000_000);
+            let sessions = ids.sessions.read().await;
+            sessions.get("idle").unwrap().last_seen_ns.store(stale, Ordering::Relaxed);
+        }
+        // Live keys only on the grant, so the long-idle session counts; active
+        // keys on the window, so it does not — the whole point of the split.
         assert_eq!(ids.live_session_count().await, 1);
-        // The drop happens at the expiry instant, not at eviction: the expired
-        // session is still in the map until the reaper sweeps (and logs) it.
+        assert_eq!(ids.active_session_count().await, 0);
+
+        // A grant in the past has already left the gauge (dropped at its expiry
+        // instant), even though it stays in the map until the reaper sweeps it.
+        ids.set_grant_expiration("expired", now_ns().saturating_sub(1)).await;
+        assert_eq!(ids.live_session_count().await, 1);
         assert!(ids.sessions.read().await.contains_key("expired"));
         assert_eq!(ids.reap_expired_sessions().await, 1);
         assert_eq!(ids.live_session_count().await, 1);
