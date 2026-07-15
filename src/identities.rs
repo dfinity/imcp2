@@ -198,7 +198,11 @@ fn now_ns() -> u64 {
 }
 
 /// A session counts as *active* on the `/version` `active_sessions` gauge if it
-/// made an authenticated request within this window. Unlike `live_sessions`
+/// showed activity within this window. Activity is any authenticated MCP request
+/// (bumped via [`Identities::touch_session`]) plus the connect that redeems the
+/// grant (`set_grant_expiration` stamps the same field — note the v1 completion
+/// POST is itself unauthenticated), so a freshly-connected session is active
+/// from the start, before its first tool call. Unlike `live_sessions`
 /// (open grants), this tracks who is USING the server right now, so operators
 /// can time a redeploy for a low-traffic moment: a restart wipes the in-memory
 /// session/token maps and forces every currently-connected client to reconnect,
