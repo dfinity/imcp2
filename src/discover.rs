@@ -750,6 +750,56 @@ pub fn similar_known_app(app_url: &str) -> Option<AppMatch> {
     })
 }
 
+/// How a free-form `open_app` query (a NAME or a URL) was interpreted — the
+/// one-tool entry point's disambiguation, kept here beside the registry it
+/// consults so name-matching and URL-detection stay in one place.
+pub enum AppQuery {
+    /// The query matched the built-in known-app registry (by name, or by a bare
+    /// host whose tokens contain a known alias — so a wrong-TLD guess like
+    /// "multidex.com" repairs to the canonical app). Carries the canonical match.
+    Known(AppMatch),
+    /// The query is (or looks like) a URL/host to resolve AS GIVEN — an explicit
+    /// `scheme://…`, or a dotted host that matched no known app. The caller is
+    /// asserting a specific origin; the IC-evidence gate still applies downstream.
+    Url(String),
+    /// A bare word (no scheme, no dot) that matched no known app — there is no way
+    /// to turn a NAME into a URL without guessing, so the caller must supply one.
+    UnknownName,
+}
+
+/// Classify an `open_app` query as a known app, a URL to resolve, or an unknown
+/// bare name. Precedence: an explicit `scheme://` is honoured verbatim as a URL
+/// (the caller is asserting that exact origin — validated, never registry-
+/// overridden); otherwise the registry is tried first (so "multidex", "multi dex",
+/// and the wrong-TLD "multidex.com" all repair to the canonical known app); a
+/// remaining dotted host is a URL to resolve as given, and a remaining bare word
+/// is an unknown NAME. Offline (registry + string inspection only).
+pub fn classify_app_query(query: &str) -> AppQuery {
+    let q = query.trim();
+    // An explicit scheme is an assertion of a specific origin — honour it as a URL
+    // rather than letting the registry rewrite it, so a caller who deliberately
+    // types `https://multidex.com` gets the gate's refuse+repair on THAT origin.
+    if q.contains("://") {
+        return AppQuery::Url(q.to_string());
+    }
+    // Bare name or host: the registry wins first, repairing wrong-TLD guesses to
+    // the canonical app (find_known_app tokenizes, so "multidex.com" → MULTI/DEX).
+    if let Some(app) = find_known_app(q) {
+        return AppQuery::Known(AppMatch {
+            name: app.name.to_string(),
+            app_url: app.app_url.to_string(),
+            derivation_origin: known_app_derivation_origin(app).to_string(),
+        });
+    }
+    // No registry match: a dotted host is a URL to resolve; a bare word is a NAME
+    // we refuse to fabricate a domain for.
+    if q.contains('.') {
+        AppQuery::Url(q.to_string())
+    } else {
+        AppQuery::UnknownName
+    }
+}
+
 /// Tidy an app-supplied label for display: control characters (ANSI escapes,
 /// CR/LF tricks) become spaces, then trim and cap — manifest roles and
 /// descriptions are untrusted server text (CWE-150).
@@ -1434,6 +1484,54 @@ pub struct FindAppOutput {
     /// Next-step guidance: how to proceed on a match, or an instruction to web-search
     /// the app's URL when there's no match.
     pub note: String,
+}
+
+/// Arguments for `open_app`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OpenAppArgs {
+    /// An app NAME (e.g. "MULTI/DEX", "Oisy", "NNS") OR its URL (e.g.
+    /// "https://oisy.com"). A name — or a bare host — is matched against the
+    /// built-in known-app registry first, so a wrong-TLD guess like "multidex.com"
+    /// repairs to the canonical URL; an explicit `https://…` URL is resolved as
+    /// given. NEVER pass a domain you fabricated from a name: an unknown bare name
+    /// is refused with instructions to find the real URL, and a URL with no
+    /// Internet-Computer evidence is refused — both instead of guessing.
+    pub app: String,
+}
+
+/// Structured output of `open_app` — an app's whole context in one shot: its
+/// Internet Identity derivation origin (as `resolve_app`) plus the canisters
+/// behind it (as `discover_app_canisters`).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct OpenAppOutput {
+    /// The app URL that was used — the canonical registry URL when the query
+    /// matched a known app, else the URL you supplied.
+    pub app_url: String,
+    /// How `app_url` was obtained: "known_app_registry" (a name/bare host matched
+    /// the built-in registry) or "as_provided" (the URL you supplied was used).
+    pub app_url_source: String,
+    /// The normalized application origin of `app_url`.
+    pub application_origin: String,
+    /// The Internet Identity derivation origin to use — pass this (or `app_url`)
+    /// to get_app_principal / list_app_accounts / call_canister.
+    pub derivation_origin: String,
+    /// How `derivation_origin` was determined: "declared", "known", or
+    /// "app_url_default" (see resolve_app).
+    pub derivation_origin_source: String,
+    /// Origins the derivation origin's `ii-alternative-origins` permits to derive
+    /// from it. Informational only — the INVERSE relation; never infer the
+    /// derivation origin from it.
+    pub alternative_origins: Vec<String>,
+    /// Whether the origin showed Internet-Computer evidence (gateway
+    /// `x-ic-canister-id`); null unless the derivation origin was assumed. See
+    /// resolve_app's field of the same name.
+    pub application_is_ic: Option<bool>,
+    /// The canisters discovered behind the app, most authoritative first (same
+    /// shape/provenance as discover_app_canisters). May be empty when discovery
+    /// found none or was unreachable — the derivation context above is still valid.
+    pub canisters: Vec<DiscoveredCanister>,
+    /// A human note — the derivation-origin caveat and any lookalike caution.
+    pub note: Option<String>,
 }
 
 /// Resolve an app NAME against the built-in set of well-known apps
@@ -2135,6 +2233,52 @@ mod tests {
         // unparseable inputs yield nothing.
         for other in ["noisy.com", "multidexchange.org", "example.com", ""] {
             assert!(similar_known_app(other).is_none(), "{other:?} must not match");
+        }
+    }
+
+    // open_app's query classifier: a bare name / wrong-TLD guess repairs to the
+    // canonical known app; an explicit https:// URL is honoured verbatim (so the
+    // gate refuses it if it's a guess); a dotted non-known host is a URL to
+    // resolve; a bare unknown word is refused rather than turned into a domain.
+    #[test]
+    fn classify_app_query_routes_names_urls_and_guesses() {
+        use AppQuery::*;
+        let known = |q: &str, want: &str| match classify_app_query(q) {
+            Known(m) => assert_eq!(m.app_url, want, "{q:?}"),
+            other => panic!("{q:?} should be a Known match, got {:?}", DebugQ(&other)),
+        };
+        // Names, spaced/cased/punctuated names, and wrong-TLD guesses all repair to
+        // the canonical known-app URL.
+        known("MULTI/DEX", "https://multidex.ai");
+        known("multi dex", "https://multidex.ai");
+        known("multidex.com", "https://multidex.ai"); // wrong-TLD guess, no scheme
+        known("Oisy", "https://oisy.com");
+        known("nns", "https://nns.internetcomputer.org");
+        // An explicit scheme is honoured as a URL (NOT registry-rewritten) — so a
+        // deliberately-typed guess reaches the IC-evidence gate on that origin.
+        match classify_app_query("https://multidex.com") {
+            Url(u) => assert_eq!(u, "https://multidex.com"),
+            other => panic!("explicit scheme must be a Url, got {:?}", DebugQ(&other)),
+        }
+        // A dotted host that matches no known app is a URL to resolve as given.
+        match classify_app_query("coolapp.io") {
+            Url(u) => assert_eq!(u, "coolapp.io"),
+            other => panic!("unknown dotted host must be a Url, got {:?}", DebugQ(&other)),
+        }
+        // A bare unknown word is an unknown NAME — refused, never fabricated into a host.
+        assert!(matches!(classify_app_query("totallyunknownapp"), UnknownName));
+        assert!(matches!(classify_app_query("   "), UnknownName));
+    }
+
+    // Tiny Debug shim so the assertions above can name the variant they got.
+    struct DebugQ<'a>(&'a AppQuery);
+    impl std::fmt::Debug for DebugQ<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self.0 {
+                AppQuery::Known(m) => write!(f, "Known({})", m.app_url),
+                AppQuery::Url(u) => write!(f, "Url({u})"),
+                AppQuery::UnknownName => write!(f, "UnknownName"),
+            }
         }
     }
 

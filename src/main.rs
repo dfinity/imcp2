@@ -564,6 +564,108 @@ impl IcTools {
     }
 
     #[tool(
+        description = "Open an Internet Computer app in ONE call, given its NAME or its URL — the recommended entry point when a user names an app. It resolves the app's Internet Identity derivation origin (like resolve_app) AND discovers the canisters behind it (like discover_app_canisters) together, so you don't chain those yourself. Pass a NAME (e.g. \"MULTI/DEX\", \"Oisy\", \"NNS\") or a URL (e.g. \"https://oisy.com\"): a name or bare host is matched to the built-in known-app registry FIRST (so even a wrong-TLD guess like \"multidex.com\" repairs to the canonical URL), and an explicit https:// URL is resolved as given. NEVER fabricate a domain from a name — an unknown bare name is refused with instructions to find the real URL (web search / ask the user), and a URL with no Internet-Computer evidence is refused, both instead of guessing a wrong identity. Returns `app_url` (the one used), `derivation_origin` (+ its source) to act with, `alternative_origins`, and the discovered `canisters` (with provenance/labels). No authenticated session required (no principal is derived here). Next: inspect a canister with get_canister_candid, then act with call_canister passing `app_url` (or `derivation_origin`). Narrower tools remain for single steps: icp_find_app_by_name (name→URL only), resolve_app (origin only), discover_app_canisters (canisters only).",
+        annotations(title = "Open an app (resolve origin + discover canisters)", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<discover::OpenAppOutput>(),
+    )]
+    async fn open_app(
+        &self,
+        Parameters(discover::OpenAppArgs { app }): Parameters<discover::OpenAppArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let query = app.trim();
+        if query.is_empty() {
+            return Ok(err(
+                "`app` must not be empty — pass an app name (e.g. \"MULTI/DEX\") or a URL (e.g. \"https://oisy.com\")".into(),
+            ));
+        }
+        // Disambiguate name vs URL, repairing a known app's name/wrong-TLD to its
+        // canonical URL and refusing a bare unknown name rather than guessing.
+        let (app_url, app_url_source) = match discover::classify_app_query(query) {
+            discover::AppQuery::Known(m) => (m.app_url, "known_app_registry"),
+            discover::AppQuery::Url(u) => (u, "as_provided"),
+            discover::AppQuery::UnknownName => {
+                // Echo find_app_by_name's web-search/ask guidance (it builds the
+                // "not a known app; don't guess a domain" note from the registry).
+                return Ok(err(discover::find_app_by_name(query).note));
+            }
+        };
+        let app_url = match clean_app_url(&app_url) {
+            Ok(u) => u,
+            Err(e) => return Ok(err(e)),
+        };
+        // Resolve (origin + IC-evidence gate + alt-origins) and discover (canisters)
+        // concurrently — both take the app URL and neither depends on the other, so
+        // this is the concurrent resolve+discover the flow recommends, in one tool.
+        let (resolved, found) = tokio::join!(
+            discover::resolve_app_identity(&app_url, true),
+            discover::discover(&app_url),
+        );
+        let resolved = match resolved {
+            Ok(r) => r,
+            Err(e) => return Ok(err(app_url_error_with_guidance(&app_url, e))),
+        };
+        // The same guessed-domain gate as resolve_app / the identity routes: an
+        // assumed origin with no IC evidence is refused, not resolved.
+        if resolved.derivation_origin_source == discover::DerivationSource::AppUrlDefault
+            && resolved.application_is_ic == Some(false)
+        {
+            return Ok(err(unverified_app_url_error(&resolved.application_origin)));
+        }
+        let effective = identities::target_origin(&resolved.derivation_origin);
+        let note = resolution_note(&resolved, &effective);
+        // Discovery is best-effort: an error or empty result still leaves a valid
+        // derivation context, so surface what we have rather than failing the call.
+        let canisters = found.unwrap_or_default();
+
+        let mut text = format!(
+            "app_url: {app_url} ({app_url_source})\nderivation_origin: {effective} ({})\n",
+            resolved.derivation_origin_source.as_str()
+        );
+        if !resolved.alternative_origins.is_empty() {
+            text.push_str(&format!("alternative_origins: {}\n", resolved.alternative_origins.join(", ")));
+        }
+        if canisters.is_empty() {
+            text.push_str("\nNo canisters discovered (the app may declare none, or discovery was unreachable).\n");
+        } else {
+            text.push_str("\nCanisters:\n");
+            for f in &canisters {
+                let identity = match (&f.name, &f.kind) {
+                    (Some(n), Some(k)) => format!("  «{n}» ({k})"),
+                    (Some(n), None) => format!("  «{n}»"),
+                    _ => String::new(),
+                };
+                text.push_str(&format!(
+                    "- {}{}{} [{}]\n",
+                    f.canister_id,
+                    f.label.as_deref().map(|l| format!("  — {l}")).unwrap_or_default(),
+                    identity,
+                    f.sources.join(", "),
+                ));
+            }
+        }
+        if let Some(n) = &note {
+            text.push_str(&format!("\nNOTE: {n}"));
+        }
+        text.push_str(
+            "\n\nNext: inspect a canister with get_canister_candid (and get_canister_api_doc if it \
+             has one); to act as the user, call_canister / run_canister_oql_query passing app_url \
+             (or the derivation_origin above) and an optional account from list_app_accounts.",
+        );
+        let output = discover::OpenAppOutput {
+            app_url,
+            app_url_source: app_url_source.to_string(),
+            application_origin: resolved.application_origin,
+            derivation_origin: effective,
+            derivation_origin_source: resolved.derivation_origin_source.as_str().to_string(),
+            alternative_origins: resolved.alternative_origins,
+            application_is_ic: resolved.application_is_ic,
+            canisters: canisters.iter().map(discover::DiscoveredCanister::from).collect(),
+            note,
+        };
+        Ok(ok_structured(text, &output))
+    }
+
+    #[tool(
         description = "Resolve an application URL to its Internet Identity derivation context, so you don't have to figure out the derivation origin yourself. `app_url` must be a URL you actually HAVE — from the user, from icp_find_app_by_name, or from a web search of the app's official site. NEVER guess or fabricate a domain from an app's name (when you only know a NAME, call icp_find_app_by_name first): a lookalike domain is an unrelated or squatted site, and this tool REFUSES to resolve an origin that shows no evidence of being an Internet Computer app rather than hand back a wrong identity. Returns the `application_origin`, the `derivation_origin` to pass to the identity tools, how it was determined (`derivation_origin_source`: \"declared\" — the app published it in /.well-known/ic-app.json, authoritative; \"known\" — from the connector's built-in registry of well-known custom-derivation-origin apps (e.g. NNS, Oisy, MULTI/DEX), used only when the app declares none; or \"app_url_default\" — the origin IS IC-served but declares nothing, so it was assumed to be its own derivation origin, correct only if the app has no custom one), and the app's `alternative_origins` (informational — the INVERSE relation, never use it to infer the derivation origin). This does NOT return a principal — it resolves the origin only, since you haven't picked an account; to get the principal you act as, pass the returned `derivation_origin` to get_app_principal (choosing an `account`) or list_app_accounts. Use this first when you only know an app's URL; no authenticated session is required.",
         annotations(title = "Resolve an app's derivation origin", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::ResolveAppOutput>(),
@@ -595,38 +697,7 @@ impl IcTools {
             return Ok(err(unverified_app_url_error(&resolved.application_origin)));
         }
         let effective = identities::target_origin(&resolved.derivation_origin);
-
-        // Even an IC-served origin can be a lookalike of a well-known app (e.g. an
-        // IC-hosted squat of a wallet's name) — caution the caller when the host
-        // resembles a known app's name but isn't one of its real hosts.
-        let lookalike = discover::similar_known_app(&resolved.application_origin).map(|m| {
-            format!(
-                " CAUTION: this host RESEMBLES the well-known app {} but is not one of its real \
-                 origins — {}'s URL is {} (derivation origin {}). If you meant {}, use that URL; \
-                 if you guessed this URL from the app's name, use icp_find_app_by_name instead of \
-                 guessing.",
-                m.name, m.name, m.app_url, m.derivation_origin, m.name
-            )
-        });
-
-        let note = match resolved.derivation_origin_source {
-            discover::DerivationSource::Declared => None,
-            discover::DerivationSource::Known => Some(format!(
-                "This app didn't declare a derivation origin in /.well-known/ic-app.json, but it's \
-                 a known app that pins a custom one, so this used the built-in value {effective}. \
-                 The app's own declaration, if it ships one, would override this."
-            )),
-            discover::DerivationSource::AppUrlDefault => Some(format!(
-                "This origin showed evidence of being served from the Internet Computer (its \
-                 responses carry the gateway's `x-ic-canister-id` header), but its \
-                 /.well-known/ic-app.json couldn't be fetched or declares no `derivation_origin`, \
-                 and it isn't in the built-in known-app registry — so this ASSUMED the application \
-                 origin, canonicalized to {effective} (what II derives against). That is correct \
-                 for apps without a custom derivation origin; if this app pins a custom one, the \
-                 assumption yields a WRONG principal — supply the canonical origin explicitly.{}",
-                lookalike.as_deref().unwrap_or_default()
-            )),
-        };
+        let note = resolution_note(&resolved, &effective);
         let mut text = format!(
             "application_origin: {}\nderivation_origin: {} ({})\n",
             resolved.application_origin, effective, resolved.derivation_origin_source.as_str()
@@ -1171,6 +1242,43 @@ fn unverified_app_url_error(application_origin: &str) -> String {
     msg
 }
 
+/// The human `note` explaining how a resolved derivation origin was determined,
+/// shared by `resolve_app` and `open_app` so the two stay in lock-step. `None` for
+/// a Declared origin (self-evident); a Known origin explains the built-in registry;
+/// an AppUrlDefault origin flags the assumption and, when the host resembles a
+/// well-known app, appends a lookalike CAUTION (an IC-hosted squat can pass the
+/// evidence gate yet still not be the app it mimics). `effective` is the
+/// canonicalized derivation origin (`target_origin`).
+fn resolution_note(resolved: &discover::AppIdentity, effective: &str) -> Option<String> {
+    let lookalike = discover::similar_known_app(&resolved.application_origin).map(|m| {
+        format!(
+            " CAUTION: this host RESEMBLES the well-known app {} but is not one of its real \
+             origins — {}'s URL is {} (derivation origin {}). If you meant {}, use that URL; \
+             if you guessed this URL from the app's name, use icp_find_app_by_name instead of \
+             guessing.",
+            m.name, m.name, m.app_url, m.derivation_origin, m.name
+        )
+    });
+    match resolved.derivation_origin_source {
+        discover::DerivationSource::Declared => None,
+        discover::DerivationSource::Known => Some(format!(
+            "This app didn't declare a derivation origin in /.well-known/ic-app.json, but it's \
+             a known app that pins a custom one, so this used the built-in value {effective}. \
+             The app's own declaration, if it ships one, would override this."
+        )),
+        discover::DerivationSource::AppUrlDefault => Some(format!(
+            "This origin showed evidence of being served from the Internet Computer (its \
+             responses carry the gateway's `x-ic-canister-id` header), but its \
+             /.well-known/ic-app.json couldn't be fetched or declares no `derivation_origin`, \
+             and it isn't in the built-in known-app registry — so this ASSUMED the application \
+             origin, canonicalized to {effective} (what II derives against). That is correct \
+             for apps without a custom derivation origin; if this app pins a custom one, the \
+             assumption yields a WRONG principal — supply the canonical origin explicitly.{}",
+            lookalike.as_deref().unwrap_or_default()
+        )),
+    }
+}
+
 /// Validate a user-supplied identity argument (`derivation_origin` / `app_url`):
 /// trim surrounding whitespace, reject an empty/whitespace-only value, and reject
 /// ASCII/Unicode control characters. Both fields are echoed back verbatim (as
@@ -1373,13 +1481,17 @@ impl ServerHandler for IcTools {
              exposes an OQL query surface — read `icp_oql_guide` for the dialect, then use \
              `get_canister_oql_schema` (entities and fields) and `run_canister_oql_query` (run a JSON query, get a table \
              back). Those two wrap the canister's `schema`/`execute` methods, so you don't \
-             hand-encode Candid for OQL. RULE — names are not URLs: when the user names an APP \
-             without giving its URL, resolve the NAME first with `icp_find_app_by_name` (offline, \
-             instant); if it isn't known, WEB SEARCH the app's official URL or ask the user. NEVER \
-             guess or fabricate a domain from an app's name (e.g. <name>.com/.app): lookalike \
-             domains are unrelated or squatted sites, and every URL-taking tool REFUSES an origin \
-             that shows no evidence of being an Internet Computer app instead of resolving it to a \
-             wrong identity. `call_canister` calls a method with textual Candid \
+             hand-encode Candid for OQL. When the user names or links an APP, the one-call entry \
+             point is `open_app(name-or-URL)`: it takes an app NAME (e.g. \"MULTI/DEX\") or a URL, \
+             resolves the derivation origin AND discovers the canisters together, and repairs a \
+             wrong-TLD guess to the canonical known-app URL. RULE — names are not URLs: NEVER guess \
+             or fabricate a domain from an app's name (e.g. <name>.com/.app); pass the NAME to \
+             `open_app` (or `icp_find_app_by_name`) and let the connector resolve it, WEB SEARCH \
+             the official URL, or ask the user. Lookalike domains are unrelated or squatted sites, \
+             and open_app / every URL-taking tool REFUSES an origin that shows no evidence of being \
+             an Internet Computer app instead of resolving it to a wrong identity. (open_app bundles \
+             `resolve_app` + `discover_app_canisters`; use those directly for a single step.) \
+             `call_canister` calls a method with textual Candid \
              in/out: omit the identity args to call anonymously, or act AS your account at an app. \
              To act as an app account, identify the app by its `derivation_origin` — the EXACT \
              canonical origin Internet Identity derives its principal from, which is NOT \
@@ -1403,16 +1515,13 @@ impl ServerHandler for IcTools {
              reads work, but the canister-management tools below make update calls the network \
              rejects for a read-only session — if one fails that way, ask the user to reconnect with \
              the read-only option turned OFF.\n\n\
-             Typical flow (acting FOR THE USER at an app): (0) get the app URL — when you only \
-             have a NAME, ALWAYS `icp_find_app_by_name` FIRST (well-known apps — NNS, Oisy, \
-             MULTI/DEX, ICPSwap — resolve offline to their URL + derivation origin); otherwise \
-             take the URL from the user or WEB SEARCH the official one, NEVER guessing a domain \
-             from the name (there is no on-chain name→URL directory; \
-             `icp_find_canister_by_name` finds token/SNS canister ids, \
-             not front-ends); (1) \
-             unless step 0 already returned the `derivation_origin`, `resolve_app(url)` gives it; \
-             concurrently (2) \
-             `discover_app_canisters(url)` gives the backend canister id; (3) `list_app_accounts` — \
+             Typical flow (acting FOR THE USER at an app): (0-2) `open_app(name-or-URL)` in ONE \
+             call gives the `derivation_origin` AND the app's canisters — pass the NAME the user \
+             said (well-known apps NNS/Oisy/MULTI/DEX/ICPSwap resolve offline) or a URL you have, \
+             NEVER a domain guessed from the name (there is no on-chain name→URL directory; \
+             `icp_find_canister_by_name` finds token/SNS canister ids, not front-ends). If you \
+             want just one part, `icp_find_app_by_name` does name→URL, `resolve_app(url)` the \
+             origin, `discover_app_canisters(url)` the canisters; (3) `list_app_accounts` — \
              if there is more than one account, ask which to use and remember it; (4) \
              `get_app_principal` ONLY when you need the principal value itself (`call_canister` / \
              `run_canister_oql_query` act as the account without pre-fetching it); (5) inspect the \
@@ -2050,7 +2159,7 @@ mod tests {
     #[test]
     fn every_tool_has_correct_read_write_annotations() {
         let tools = super::IcTools::tool_router().list_all();
-        assert_eq!(tools.len(), 25, "expected 25 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 26, "expected 26 tools, got {}", tools.len());
         assert!(
             tools.iter().all(|t| t.annotations.is_some()),
             "every tool must carry annotations (else clients assume write/destructive)"
@@ -2070,7 +2179,7 @@ mod tests {
         for name in [
             "get_canister_candid", "discover_app_canisters", "icp_find_canister_by_name", "icp_find_app_by_name", "icp_lookup_canister_info_by_id",
             "icp_list_skills", "icp_get_skill", "icp_oql_guide", "run_canister_oql_query", "get_canister_oql_schema",
-            "get_canister_api_doc", "resolve_app", "list_app_accounts", "icp_cycles_balance", "get_app_principal", "icp_canister_status",
+            "get_canister_api_doc", "open_app", "resolve_app", "list_app_accounts", "icp_cycles_balance", "get_app_principal", "icp_canister_status",
         ] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");

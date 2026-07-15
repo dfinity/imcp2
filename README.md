@@ -18,6 +18,7 @@ results).
 
 | Tool | Args | Returns |
 |------|------|---------|
+| `open_app` | `app` (name **or** URL) | **One-call entry point** when a user names/links an app: resolves the Internet Identity `derivation_origin` *and* discovers the canisters behind it, together. A name or bare host is matched to the known-app registry first (so a wrong-TLD guess like `multidex.com` repairs to the canonical URL); an explicit `https://` URL is resolved as given. An unknown bare name, or a URL with no IC evidence, is *refused* (never guessed). Wraps `resolve_app` + `discover_app_canisters`; no auth |
 | `discover_app_canisters` | `domain` | Canister ids behind a web domain — app-declared App Connect metadata first (`/ai-connect.html`'s `ic:canister-id` meta, `/.well-known/ic-app.json` manifest), then the frontend via `x-ic-canister-id` and backend candidates via `/env.json` + JS-bundle mining — each with provenance and its IC dashboard label/type where known |
 | `icp_find_canister_by_name` | `query` | Canister ids matching a name/symbol, searched in the IC dashboard's service registries — ICRC token ledgers (e.g. `ckUSDC`) and the SNS project catalog |
 | `icp_find_app_by_name` | `name` | A well-known app's front-end URL + `derivation_origin`, for a small built-in set (NNS, Oisy, MULTI/DEX, ICPSwap). The **first stop** whenever only an app *name* is known — never guess a domain from a name. Any other name returns no match and a `note` directing a web search for the app's URL (there's no on-chain name→URL directory) |
@@ -51,20 +52,19 @@ ids, confirm with `get_canister_candid`).
 
 Acting **for the user** at an app:
 
-0. **Get the app URL.** When only a *name* is known, **`icp_find_app_by_name`** comes
-   first: for a well-known app (NNS, Oisy, MULTI/DEX, ICPSwap) it maps the name → its
-   URL + `derivation_origin`, offline. For any other app there's no on-chain name→URL
-   directory (`icp_find_canister_by_name` finds token/SNS canister ids, not
-   front-ends), so take the URL from the user or web-search it — **never guess a
-   domain from the name** (a lookalike like `<name>.com` is an unrelated or squatted
-   site). The URL-taking tools enforce this: an origin that resolves to
-   `app_url_default` while showing **no IC evidence** (no `x-ic-canister-id` gateway
-   header, no usable `ic-app.json`) is *refused*, and when the guessed host resembles
-   a well-known app's name the error says which one and gives its real URL
-   ("did you mean MULTI/DEX → `https://multidex.ai`").
-1. **`resolve_app(url)`** → the app's `derivation_origin` — **skip this if step 0's
-   `icp_find_app_by_name` already returned it** — concurrently with
-2. **`discover_app_canisters(url)`** → the backend canister id.
+0–2. **`open_app(name-or-URL)`** — the one-call entry point. Pass the *name* the user
+   said (well-known apps NNS/Oisy/MULTI/DEX/ICPSwap resolve offline) or a URL you
+   have; it returns the `derivation_origin` **and** the app's canisters in one shot
+   (it runs `resolve_app` + `discover_app_canisters` concurrently under the hood).
+   **Never guess a domain from a name** — a lookalike like `<name>.com` is an
+   unrelated or squatted site. The tool enforces this: a bare *unknown* name is
+   refused (find the real URL — web-search or ask the user), and a URL that resolves
+   to `app_url_default` while showing **no IC evidence** (no valid `x-ic-canister-id`
+   gateway header, no `ic-app.json` derivation origin) is refused too; when the host
+   resembles a known app the error names it and gives the real URL ("did you mean
+   MULTI/DEX → `https://multidex.ai`"). For a single step, the narrower tools remain:
+   **`icp_find_app_by_name`** (name→URL only), **`resolve_app(url)`** (origin only),
+   **`discover_app_canisters(url)`** (canisters only).
 3. **`list_app_accounts`** — if there's more than one account, ask which to use (and
    remember it).
 4. **`get_app_principal`** — only when you need the principal *value* itself;
@@ -76,8 +76,8 @@ Acting **for the user** at an app:
 7. **Act** with `call_canister` update calls, passing `derivation_origin` + `account`
    to act as the user.
 
-Public/anonymous reads skip steps 1/3/4. The per-canister inspection (5) is
-independent of the identity steps (1/3/4), so they can run in parallel. Managing your
+Public/anonymous reads skip steps 3/4. The per-canister inspection (5) is
+independent of the identity steps (3/4), so they can run in parallel. Managing your
 **own** canisters (the `icp_*` create/install/status/… tools) acts as your standing
 **management principal** at this server's origin — a *different* identity than the
 per-app principals above.
