@@ -458,9 +458,11 @@ pub fn has_oql(did: &str) -> bool {
 /// call should be redirected, or `None` when the call may proceed.
 ///
 /// Only *query* calls are redirected — OQL is read-only, so update calls
-/// (`is_query == false`) always belong to `call_canister` and pass through. A
-/// canister whose interface can't be read (`did == None`) can't be detected as
-/// OQL, so it passes through too (fail open: never block a call we can't classify).
+/// (`is_query == false`) always belong to `call_canister` and pass through. When
+/// no interface text is available (`did == None` — neither the canister's own
+/// `candid:service` metadata nor a caller-supplied `candid`), OQL can't be
+/// detected, so the call passes through too (fail open: never block a call we
+/// can't classify).
 pub fn oql_query_redirect(did: Option<&str>, is_query: bool) -> Option<String> {
     if is_query && did.is_some_and(has_oql) {
         Some(
