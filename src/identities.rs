@@ -218,12 +218,12 @@ const ACTIVE_SESSION_WINDOW_NS: u64 = 15 * 60 * 1_000_000_000;
 /// [`Identities::session_gauges`] so a scrape locks and iterates the session map
 /// once and reports a consistent `active <= live` pair.
 #[derive(Debug, Clone, Copy)]
-pub struct SessionGauges {
+pub(crate) struct SessionGauges {
     /// Sessions holding a currently-valid II grant (the `live_sessions` gauge).
-    pub live: usize,
+    pub(crate) live: usize,
     /// The subset also active within [`ACTIVE_SESSION_WINDOW_NS`] (the
     /// `active_sessions` gauge). Always `<= live`.
-    pub active: usize,
+    pub(crate) active: usize,
 }
 
 /// Remap a domain to the `target_origin` II expects for account derivation.
@@ -672,7 +672,7 @@ impl Identities {
     /// reported pair is consistent (`active <= live`) — two separate reads could
     /// straddle a grant expiry and momentarily report `active > live`. A cheap
     /// read-lock snapshot.
-    pub async fn session_gauges(&self) -> SessionGauges {
+    pub(crate) async fn session_gauges(&self) -> SessionGauges {
         let now = now_ns();
         let sessions = self.sessions.read().await;
         let mut g = SessionGauges { live: 0, active: 0 };
