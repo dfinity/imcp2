@@ -214,6 +214,18 @@ fn now_ns() -> u64 {
 /// unobservable, so activity is the only available proxy for "still here".
 const ACTIVE_SESSION_WINDOW_NS: u64 = 15 * 60 * 1_000_000_000;
 
+/// The two `/version` session gauges, returned together by
+/// [`Identities::session_gauges`] so a scrape locks and iterates the session map
+/// once and reports a consistent `active <= live` pair.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionGauges {
+    /// Sessions holding a currently-valid II grant (the `live_sessions` gauge).
+    pub live: usize,
+    /// The subset also active within [`ACTIVE_SESSION_WINDOW_NS`] (the
+    /// `active_sessions` gauge). Always `<= live`.
+    pub active: usize,
+}
+
 /// Remap a domain to the `target_origin` II expects for account derivation.
 /// IC gateway domains (`*.icp0.io`, `*.icp.net`) map to the canonical
 /// `*.ic0.app` origin; any other domain is passed through as `https://<host>`.
@@ -619,7 +631,8 @@ impl Identities {
     /// Record that `session_id` just made an authenticated request, refreshing
     /// its activity window for the `/version` `active_sessions` gauge. Read-lock
     /// only: `last_seen_ns` is atomic, so this stays cheap on the per-request hot
-    /// path. A no-op if the session is unknown (it will be created on first use).
+    /// path. A no-op for an unknown session — this never creates one
+    /// (`ensure_session` does that on the connect path).
     pub async fn touch_session(&self, session_id: &str) {
         // Read the clock BEFORE taking the lock: even a read lock blocks writers
         // (set_grant_expiration, the reaper), so keep the syscall off the lock on
@@ -631,53 +644,62 @@ impl Identities {
         }
     }
 
-    /// Number of live sessions on this instance: those holding a currently-valid
-    /// grant (`grant_expiration_ns` in the future). This is the `live_sessions`
-    /// gauge surfaced on `/version`, and it tracks the GRANT lifecycle: a session
-    /// counts from the moment its grant is redeemed ("session opened") until that
-    /// grant expires, no matter how long it sits quiet in between — an ongoing MCP
-    /// session is often idle between tool calls, and it is still a live session
-    /// the whole time. The flip side: MCP runs statelessly here, so a client that
-    /// disconnects for good produces no server-side event and keeps counting until
-    /// its grant expires (use [`Self::active_session_count`] for who is actually
-    /// requesting right now — e.g. to time a redeploy). Sessions mid-connect, and
-    /// v1 sessions whose completion POST never delivered an expiry (`None`), are
-    /// not counted (no valid grant). A cheap read-lock snapshot. This gauge
-    /// brackets the "session opened"/"session closed" lifecycle logs, modulo the
-    /// reaper's cadence: the count drops the instant a grant expires, whereas the
-    /// paired "closed" log lands on the reaper's next sweep (up to 60s later), so
-    /// `opened - closed` can momentarily exceed the gauge by the sessions expired
-    /// since that last sweep.
-    pub async fn live_session_count(&self) -> usize {
+    /// Both `/version` session gauges from a SINGLE lock + iteration:
+    ///
+    /// - **`live`**: sessions holding a currently-valid grant
+    ///   (`grant_expiration_ns` in the future). Tracks the GRANT lifecycle — a
+    ///   session counts from the moment its grant is redeemed ("session opened")
+    ///   until it expires, no matter how long it sits quiet in between (an ongoing
+    ///   MCP session is often idle between tool calls, and is still live the whole
+    ///   time). The flip side: MCP runs statelessly here, so a client that
+    ///   disconnects for good produces no server-side event and keeps counting
+    ///   until its grant expires. Sessions mid-connect, and v1 sessions whose
+    ///   completion POST never delivered an expiry (`None`), are not counted.
+    ///   Brackets the "session opened"/"session closed" lifecycle logs modulo the
+    ///   reaper's cadence: the count drops the instant a grant expires, whereas
+    ///   the paired "closed" log lands on the reaper's next sweep (up to 60s
+    ///   later), so `opened - closed` can momentarily exceed `live` by the
+    ///   sessions expired since that last sweep.
+    /// - **`active`**: the subset of `live` also seen making a request within
+    ///   [`ACTIVE_SESSION_WINDOW_NS`] — a ballpark of who is working right now, so
+    ///   a redeploy (which wipes the in-memory session/token maps and forces every
+    ///   connected client to reconnect) can be timed for a quiet moment. Being
+    ///   activity-based, it's a point-in-time reading; sample it over time (or read
+    ///   request rate from the logs) to find a low-traffic window.
+    ///
+    /// Computing both in one pass keeps `/version` scrapes O(N) rather than 2·O(N)
+    /// and, because both come from the same locked snapshot, guarantees the
+    /// reported pair is consistent (`active <= live`) — two separate reads could
+    /// straddle a grant expiry and momentarily report `active > live`. A cheap
+    /// read-lock snapshot.
+    pub async fn session_gauges(&self) -> SessionGauges {
         let now = now_ns();
         let sessions = self.sessions.read().await;
-        sessions
-            .values()
-            .filter(|s| s.grant_expiration_ns.is_some_and(|e| e > now))
-            .count()
+        let mut g = SessionGauges { live: 0, active: 0 };
+        for s in sessions.values() {
+            if s.grant_expiration_ns.is_some_and(|e| e > now) {
+                g.live += 1;
+                if now.saturating_sub(s.last_seen_ns.load(Ordering::Relaxed))
+                    <= ACTIVE_SESSION_WINDOW_NS
+                {
+                    g.active += 1;
+                }
+            }
+        }
+        g
     }
 
-    /// Number of *active* sessions on this instance: those holding a valid grant
-    /// AND seen making an authenticated request within [`ACTIVE_SESSION_WINDOW_NS`].
-    /// This is the `active_sessions` gauge on `/version` — a ballpark of users
-    /// working right now, so a redeploy (which wipes the in-memory session/token
-    /// maps and forces every connected client to reconnect) can be timed for a
-    /// quiet moment. Always a subset of [`Self::live_session_count`]: a session
-    /// gone quiet past the window drops off here but stays counted as live until
-    /// its grant expires. Being activity-based and instantaneous, this is a
-    /// point-in-time reading; sample it over time (or read request rate from the
-    /// logs) to find a low-traffic window. A cheap read-lock snapshot.
+    /// Single-gauge test conveniences over [`Self::session_gauges`] (which is what
+    /// `/version` uses — it needs both counts, so production has no caller for
+    /// these). Kept test-only so the non-test build doesn't flag them as dead.
+    #[cfg(test)]
+    pub async fn live_session_count(&self) -> usize {
+        self.session_gauges().await.live
+    }
+
+    #[cfg(test)]
     pub async fn active_session_count(&self) -> usize {
-        let now = now_ns();
-        let sessions = self.sessions.read().await;
-        sessions
-            .values()
-            .filter(|s| {
-                s.grant_expiration_ns.is_some_and(|e| e > now)
-                    && now.saturating_sub(s.last_seen_ns.load(Ordering::Relaxed))
-                        <= ACTIVE_SESSION_WINDOW_NS
-            })
-            .count()
+        self.session_gauges().await.active
     }
 
     /// Evict sessions whose grant has expired, emitting a "session closed" log
@@ -1571,6 +1593,9 @@ mod tests {
         // Dropped from active, still on live (active ⊆ live).
         assert_eq!(ids.active_session_count().await, 1);
         assert_eq!(ids.live_session_count().await, 2);
+        // session_gauges reports the same pair from one snapshot (what /version uses).
+        let g = ids.session_gauges().await;
+        assert_eq!((g.live, g.active), (2, 1));
 
         // A fresh authenticated request brings it back onto the active gauge.
         ids.touch_session("quiet").await;
