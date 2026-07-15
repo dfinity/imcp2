@@ -423,16 +423,17 @@ call as `X`. II never again binds a bare key it was shown.
 `/version` is the unauthenticated operations probe. It reports the running
 build (`version`, `commit`, `built_at`, `started_at`), the H3/P1
 `repeat_key_requests` health counter, which instance runs which protocol
-(`registration_delegation: {beta, prod}`), and a real-time **live-session
-gauge** (`live_sessions: {beta, prod}`) counting, per instance, the
-authenticated sessions whose II grant has not yet expired:
+(`registration_delegation: {beta, prod}`), and two real-time per-instance
+**session gauges** — `live_sessions` (open grants) and `active_sessions` (a
+subset: those also requesting recently):
 
 ```bash
-curl -s https://<host>/version | jq '.live_sessions'
-# => { "beta": 0, "prod": 1 }
+curl -s https://<host>/version | jq '{live: .live_sessions, active: .active_sessions}'
+# => { "live": { "beta": 0, "prod": 3 }, "active": { "beta": 0, "prod": 1 } }
 ```
 
-The gauge tracks the grant lifecycle: a session is counted from the moment its
+**`live_sessions`** counts authenticated sessions whose II grant has not yet
+expired. It tracks the grant lifecycle: a session is counted from the moment its
 grant is redeemed until the grant expires, and sitting idle does not remove it —
 an ongoing MCP session is often quiet for long stretches between tool calls and
 is still a live session the whole time. The flip side: the server runs MCP
@@ -441,13 +442,29 @@ event, and its session keeps counting until the grant expires (the session
 duration is what the user picked on II's consent screen, 10 minutes up to 30
 days).
 
+**`active_sessions`** is the subset of live sessions that also made a request
+within the last ~15 minutes — a ballpark of who is actually using the server
+right now. Prefer it for **timing a redeploy**: a restart wipes the in-memory
+session and token maps, forcing every connected client to reconnect, so the
+disruption falls on whoever is active at that moment, not on long-idle grants.
+Because it is activity-based, a single reading is a point-in-time snapshot;
+sample it over time (scrape `/version` on a schedule, or read request rate from
+the request logs below) to find a genuinely low-traffic window before deploying.
+`active_sessions ≤ live_sessions` always.
+
+```bash
+curl -s https://<host>/version | jq '.active_sessions'
+# => { "beta": 0, "prod": 1 }
+```
+
 Session grants are also traceable in the logs (unit `mcp-poc`): a session logs
 `session opened` (with `instance` and `session_id`) when its grant goes live,
 and `session closed` when the grant expires and the per-instance reaper (60s
-cadence) evicts it. These bracket exactly what the gauge counts, so `opened`
-minus `closed` reconciles with `live_sessions` — the gauge drops at the expiry
-instant itself, while the paired `closed` log lands on the reaper's next sweep,
-up to 60s later.
+cadence) evicts it. These bracket what `live_sessions` counts, modulo the
+reaper's cadence: the gauge drops the instant a grant expires, while the paired
+`closed` log lands on the reaper's next sweep (up to 60s later), so `opened`
+minus `closed` can momentarily exceed the gauge by the sessions expired since
+that sweep.
 
 **Callback allow-list (`/.well-known/ii-auth-callbacks`).** II is moving to
 validate the connect callback named in the (attacker-craftable) link fragment

@@ -1811,12 +1811,18 @@ async fn main() -> anyhow::Result<()> {
                 let ver_ids_beta = ver_ids_beta.clone();
                 let ver_ids_prod = ver_ids_prod.clone();
                 async move {
-                    // Live sessions per instance: authenticated sessions whose II
-                    // grant has not yet expired. Tracks the grant lifecycle — an
-                    // idle session still counts; only expiry removes it (see
-                    // `Identities::live_session_count`).
+                    // Two per-instance session gauges (see the respective methods
+                    // on `Identities`):
+                    // - live_sessions: authenticated sessions whose II grant has
+                    //   not yet expired. Tracks the grant lifecycle — an idle
+                    //   session still counts; only expiry removes it.
+                    // - active_sessions: the subset also seen requesting within the
+                    //   activity window (~15 min) — a ballpark of who is working
+                    //   right now, for timing a low-disruption redeploy.
                     let live_beta = ver_ids_beta.live_session_count().await;
                     let live_prod = ver_ids_prod.live_session_count().await;
+                    let active_beta = ver_ids_beta.active_session_count().await;
+                    let active_prod = ver_ids_prod.active_session_count().await;
                     axum::Json(serde_json::json!({
                         "version": env!("CARGO_PKG_VERSION"),
                         "commit": option_env!("GIT_SHA").unwrap_or("unknown"),
@@ -1832,8 +1838,13 @@ async fn main() -> anyhow::Result<()> {
                         "registration_delegation": { "beta": regdel_beta, "prod": regdel_prod },
                         // Per-instance count of live sessions: authenticated
                         // sessions with a non-expired II grant. A session counts
-                        // from connect until its grant expires, idle or not.
+                        // from grant redemption until its grant expires, idle or not.
                         "live_sessions": { "beta": live_beta, "prod": live_prod },
+                        // Per-instance count of active sessions: the subset of live
+                        // sessions that also made a request within the ~15-min
+                        // activity window. Use this (not live_sessions) to time a
+                        // redeploy for minimal disruption.
+                        "active_sessions": { "beta": active_beta, "prod": active_prod },
                     }))
                 }
             }),
