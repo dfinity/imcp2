@@ -442,11 +442,14 @@ event, and its session keeps counting until the grant expires (the session
 duration is what the user picked on II's consent screen, 10 minutes up to 30
 days).
 
-**`active_sessions`** is the subset of live sessions that also made a request
-within the last ~15 minutes — a ballpark of who is actually using the server
-right now. Prefer it for **timing a redeploy**: a restart wipes the in-memory
-session and token maps, forcing every connected client to reconnect, so the
-disruption falls on whoever is active at that moment, not on long-idle grants.
+**`active_sessions`** is the subset of live sessions seen active within the last
+~15 minutes — a ballpark of who is actually using the server right now. "Active"
+means an authenticated request in that window, and also the connect that redeems
+the grant (which is itself treated as activity) — so a freshly-connected session
+counts immediately, before its first tool call; it is not strictly "made an
+authenticated request". Prefer it for **timing a redeploy**: a restart wipes the
+in-memory session and token maps, forcing every connected client to reconnect, so
+the disruption falls on whoever is active at that moment, not on long-idle grants.
 Because it is activity-based, a single reading is a point-in-time snapshot;
 sample it over time (scrape `/version` on a schedule, or read request rate from
 the request logs below) to find a genuinely low-traffic window before deploying.
