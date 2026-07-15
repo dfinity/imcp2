@@ -182,8 +182,10 @@ pub struct CallCanisterArgs {
     /// Call AS the user's account at an app, identified by its URL; the connector
     /// resolves the derivation origin — the app's declared one if it publishes it
     /// (`derivation_origin_source` = "declared"), else a built-in known-app value
-    /// ("known"), else the application origin ("app_url_default"). See the result's
-    /// `derivation_origin_source`. Alternative to `derivation_origin`.
+    /// ("known"), else the application origin ("app_url_default"). Must be a URL
+    /// you actually have — NEVER a domain guessed from an app's name (use
+    /// icp_find_app_by_name for names; a non-IC origin is refused). See the
+    /// result's `derivation_origin_source`. Alternative to `derivation_origin`.
     #[serde(default)]
     pub app_url: Option<String>,
     /// Which of your accounts to act as, by account name (see list_app_accounts).

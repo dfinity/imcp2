@@ -347,12 +347,14 @@ pub struct GetPrincipalArgs {
     /// OR `app_url`, not both.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
-    /// The application's URL (e.g. "https://oisy.com"). The connector resolves
-    /// its derivation origin, precedence: the app's declared one
-    /// (`/.well-known/ic-app.json`) if present (`derivation_origin_source` =
-    /// "declared"), else a built-in known-app value for a few apps that pin a
-    /// custom origin without declaring it ("known"), else the application origin
-    /// (an assumption — "app_url_default"). See the result's
+    /// The application's URL (e.g. "https://oisy.com"). Must be a URL you actually
+    /// have (from the user, icp_find_app_by_name, or a web search) — NEVER a domain
+    /// guessed from an app's name; an origin with no evidence of being an IC app is
+    /// refused rather than resolved. The connector resolves its derivation origin,
+    /// precedence: the app's declared one (`/.well-known/ic-app.json`) if present
+    /// (`derivation_origin_source` = "declared"), else a built-in known-app value
+    /// for a few apps that pin a custom origin without declaring it ("known"), else
+    /// the application origin (an assumption — "app_url_default"). See the result's
     /// `derivation_origin_source`. Provide this OR `derivation_origin`.
     #[serde(default)]
     pub app_url: Option<String>,
@@ -397,7 +399,9 @@ pub struct ListAccountsArgs {
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
     /// The application's URL; the connector resolves its derivation origin (see
-    /// `get_app_principal`). Provide this OR `derivation_origin`.
+    /// `get_app_principal`). Must be a URL you actually have — NEVER a domain
+    /// guessed from an app's name (use icp_find_app_by_name for names; a non-IC
+    /// origin is refused). Provide this OR `derivation_origin`.
     #[serde(default)]
     pub app_url: Option<String>,
 }
@@ -442,7 +446,11 @@ pub struct AccountsOutput {
 /// Arguments for `resolve_app`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ResolveAppArgs {
-    /// The application's URL, e.g. "https://oisy.com".
+    /// The application's URL, e.g. "https://oisy.com". Must be a URL you actually
+    /// have — given by the user, returned by `icp_find_app_by_name`, or found by a
+    /// web search of the app's official site. NEVER a domain guessed from an app's
+    /// name (guessed lookalike domains are unrelated or squatted sites and are
+    /// refused).
     pub app_url: String,
 }
 
@@ -466,6 +474,12 @@ pub struct ResolveAppOutput {
     /// "which derivation origin the app uses", so do not infer the derivation
     /// origin from it.
     pub alternative_origins: Vec<String>,
+    /// Whether the application origin showed evidence of being served from the
+    /// Internet Computer (the gateway's `x-ic-canister-id` header). Only probed
+    /// when `derivation_origin_source` is "app_url_default" (and then always
+    /// true here — an origin with NO IC evidence is refused instead of resolved);
+    /// null when the probe wasn't needed (declared/known origins).
+    pub application_is_ic: Option<bool>,
     /// A human note, e.g. flagging that the derivation origin was assumed.
     /// This tool deliberately does NOT return a principal: it resolves the
     /// derivation origin only, since the caller hasn't chosen an account. Get the
