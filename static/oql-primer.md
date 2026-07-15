@@ -21,8 +21,8 @@ the dialect they speak.
   **Result shape** below):
   `{"start":"<entity>", "where":<pred>, "groupBy":["f"], "aggregate":[{"fn":"count|sum|avg|min|max", "field":"f", "as":"out"}], "orderBy":[{"field":"f", "dir":"asc|desc"}], "offset":N, "limit":N, "select":["f"]}`
   Only `"start"` is required; a `count` aggregate needs no `"field"`. `run_canister_oql_query`
-  sends this as a query call for you; if you instead drive `execute` through
-  `call_canister`, it's a `query` method by convention (`is_query=true`).
+  sends this as a query call for you — it is the way to reach `execute`, since raw
+  `call_canister` query calls are rejected on a canister that exposes OQL.
 
 ## Predicates
 
@@ -62,6 +62,6 @@ their first and last names, call `run_canister_oql_query` with:
 - `query` (plain JSON — no Candid escaping):
   `{"start":"employee","where":{"icontains":{"field":"lastName","value":"smith"}},"select":["firstName","lastName"],"limit":10}`
 
-`run_canister_oql_query` returns the rows as a `firstName` / `lastName` table. (The equivalent
-low-level call is `call_canister` with `method="execute"`, `is_query=true`, and
-that JSON escaped into a Candid text arg — `run_canister_oql_query` saves you the escaping.)
+`run_canister_oql_query` returns the rows as a `firstName` / `lastName` table — it wraps the
+`execute` query method and does the Candid text-arg escaping for you. (Reaching `execute`
+through raw `call_canister` query calls is rejected on an OQL canister, so use this tool.)

@@ -452,6 +452,32 @@ pub fn has_oql(did: &str) -> bool {
     env.get_method(&actor, "schema").is_ok() && env.get_method(&actor, "execute").is_ok()
 }
 
+/// Enforce "prefer OQL": when a canister exposes an OQL query surface, its data
+/// must be READ through the dedicated OQL tools, not raw `call_canister` query
+/// calls. Returns the guidance message to hand back to the caller when a query
+/// call should be redirected, or `None` when the call may proceed.
+///
+/// Only *query* calls are redirected — OQL is read-only, so update calls
+/// (`is_query == false`) always belong to `call_canister` and pass through. When
+/// no interface text is available (`did == None` — neither the canister's own
+/// `candid:service` metadata nor a caller-supplied `candid`), OQL can't be
+/// detected, so the call passes through too (fail open: never block a call we
+/// can't classify).
+pub fn oql_query_redirect(did: Option<&str>, is_query: bool) -> Option<String> {
+    if is_query && did.is_some_and(has_oql) {
+        Some(
+            "this canister exposes an OQL query surface, so its data is READ through the \
+             dedicated OQL tools rather than raw `call_canister` query calls: use \
+             `run_canister_oql_query` to query it (call `get_canister_oql_schema` first for the \
+             entity and field names), and `get_canister_api_doc` for its behavioral docs. Only \
+             update calls (state changes) go through `call_canister`, with `is_query=false`."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 // ===========================================================================
 // OQL execute/schema support (for the `run_canister_oql_query` / `get_canister_oql_schema` tools). The
 // server does not model the OQL query language — it wraps the JSON query as the
@@ -850,6 +876,30 @@ mod tests {
         // not the interface shape.
         let shallow_twin = "service : { schema : () -> (nat) query; execute : (text) -> (text) query; }";
         assert!(has_oql(shallow_twin), "shallow twin should be detected — isolates the guard as the cause");
+    }
+
+    // "Prefer OQL": call_canister must reject QUERY calls on an OQL canister (so
+    // reads go through the dedicated OQL tools) while letting UPDATE calls and any
+    // call on a non-OQL / unreadable interface pass through.
+    #[test]
+    fn oql_query_redirect_blocks_only_query_calls_on_oql_canisters() {
+        use super::oql_query_redirect;
+        let oql = "service : { schema : () -> (text) query; execute : (text) -> (text) query; }";
+        let plain = "service : { stats : () -> (text) query; }";
+
+        // Query call on an OQL canister → redirected, and the message names the tools.
+        let msg = oql_query_redirect(Some(oql), true).expect("query on OQL canister must be redirected");
+        assert!(msg.contains("run_canister_oql_query"), "message must point to the OQL query tool: {msg}");
+        assert!(msg.contains("get_canister_oql_schema"), "message must point to the OQL schema tool: {msg}");
+
+        // Update call on the SAME canister proceeds (OQL is read-only).
+        assert!(oql_query_redirect(Some(oql), false).is_none(), "update calls must pass through");
+
+        // Query call on a non-OQL canister proceeds.
+        assert!(oql_query_redirect(Some(plain), true).is_none(), "non-OQL query must pass through");
+
+        // Unknown / unreadable interface can't be classified → fail open (no block).
+        assert!(oql_query_redirect(None, true).is_none(), "unreadable interface must not block");
     }
 
     // Encode a Candid reply of `ty` from its textual form, so parse_execute_reply
