@@ -197,15 +197,34 @@ fn now_ns() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
 }
 
-/// A session counts as "live" on the `/version` gauge only if it made an
-/// authenticated request within this window. Long enough to ride out normal
-/// gaps between a client's requests, short enough that a client that
-/// disconnects (or goes idle) drops off the gauge promptly. The grant can
-/// outlive this: an idle session stays valid and usable if the client returns
-/// (in stateless mode a "disconnect" is unobservable, so liveness is inferred
-/// from recent activity, not connection state). This only bounds what the
-/// *live* gauge counts, not when a session is reaped.
-const LIVE_SESSION_IDLE_WINDOW_NS: u64 = 5 * 60 * 1_000_000_000;
+/// A session counts as *active* on the `/version` `active_sessions` gauge if it
+/// showed activity within this window. Activity is any authenticated MCP request
+/// (bumped via [`Identities::touch_session`]) plus the connect that redeems the
+/// grant (`set_grant_expiration` stamps the same field — note the v1 completion
+/// POST is itself unauthenticated), so a freshly-connected session is active
+/// from the start, before its first tool call. Unlike `live_sessions`
+/// (open grants), this tracks who is USING the server right now, so operators
+/// can time a redeploy for a low-traffic moment: a restart wipes the in-memory
+/// session/token maps and forces every currently-connected client to reconnect,
+/// so the disruption falls on whoever is active around the deploy. 15 minutes is
+/// long enough to ride out the idle gaps between an agent's tool calls (so a
+/// user mid-task doesn't flicker off — the bug that motivated splitting this
+/// from `live_sessions`), short enough that a client gone quiet drops off well
+/// before it would matter for deploy timing. In stateless mode a disconnect is
+/// unobservable, so activity is the only available proxy for "still here".
+const ACTIVE_SESSION_WINDOW_NS: u64 = 15 * 60 * 1_000_000_000;
+
+/// The two `/version` session gauges, returned together by
+/// [`Identities::session_gauges`] so a scrape locks and iterates the session map
+/// once and reports a consistent `active <= live` pair.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SessionGauges {
+    /// Sessions holding a currently-valid II grant (the `live_sessions` gauge).
+    pub(crate) live: usize,
+    /// The subset also active within [`ACTIVE_SESSION_WINDOW_NS`] (the
+    /// `active_sessions` gauge). Always `<= live`.
+    pub(crate) active: usize,
+}
 
 /// Remap a domain to the `target_origin` II expects for account derivation.
 /// IC gateway domains (`*.icp0.io`, `*.icp.net`) map to the canonical
@@ -250,11 +269,12 @@ struct Session {
     /// signal.
     grant_expiration_ns: Option<u64>,
     /// Wall-clock (ns since the epoch) of this session's most recent
-    /// authenticated request, bumped per request via [`Identities::touch_session`].
-    /// Drives the `/version` live gauge's activity window: a session that goes
-    /// quiet (client disconnected or idle) stops counting as live once it exceeds
-    /// [`LIVE_SESSION_IDLE_WINDOW_NS`], even while its grant is still valid.
-    /// Atomic so the per-request touch needs only a read lock on the session map.
+    /// authenticated request, bumped per request via [`Identities::touch_session`]
+    /// (and on connect). Drives ONLY the `/version` `active_sessions` gauge's
+    /// activity window ([`ACTIVE_SESSION_WINDOW_NS`]): a session that goes quiet
+    /// stops counting as *active* once it exceeds the window, even while its grant
+    /// stays valid (so it still counts as *live*). Atomic so the per-request touch
+    /// needs only a read lock on the session map.
     last_seen_ns: AtomicU64,
     /// **Registration keypair `X`** for the Phase-2 registration-delegation flow
     /// (see the `registration delegation` design and `crate::auth`'s Phase-2
@@ -555,8 +575,9 @@ impl Identities {
                 Some(s) => {
                     let was_live = s.grant_expiration_ns.is_some_and(|e| e > now);
                     s.grant_expiration_ns = Some(expiration_ns);
-                    // Redeeming a grant is itself activity, so the freshly-opened
-                    // session counts as live immediately (before its first tool call).
+                    // Redeeming a grant is itself activity, so a freshly-opened
+                    // session counts as active immediately (before its first tool
+                    // call) on the `active_sessions` gauge.
                     s.last_seen_ns.store(now, Ordering::Relaxed);
                     !was_live && expiration_ns > now
                 }
@@ -608,9 +629,10 @@ impl Identities {
     }
 
     /// Record that `session_id` just made an authenticated request, refreshing
-    /// its activity window for the `/version` live gauge. Read-lock only:
-    /// `last_seen_ns` is atomic, so this stays cheap on the per-request hot path.
-    /// A no-op if the session is unknown (it will be created on first use).
+    /// its activity window for the `/version` `active_sessions` gauge. Read-lock
+    /// only: `last_seen_ns` is atomic, so this stays cheap on the per-request hot
+    /// path. A no-op for an unknown session — this never creates one
+    /// (`ensure_session` does that on the connect path).
     pub async fn touch_session(&self, session_id: &str) {
         // Read the clock BEFORE taking the lock: even a read lock blocks writers
         // (set_grant_expiration, the reaper), so keep the syscall off the lock on
@@ -622,38 +644,70 @@ impl Identities {
         }
     }
 
-    /// Number of live sessions on this instance: those that both hold a
-    /// currently-valid grant (`grant_expiration_ns` in the future) AND made an
-    /// authenticated request within [`LIVE_SESSION_IDLE_WINDOW_NS`]. This is the
-    /// gauge surfaced on `/version`. The activity window is what makes a
-    /// disconnected client drop off: in stateless mode a disconnect is
-    /// unobservable, so we treat "no request for a while" as no longer live,
-    /// while leaving the grant itself intact so the client can return. Sessions
-    /// mid-connect, and v1 sessions whose completion POST never delivered an
-    /// expiry (`None`), are not counted (no valid grant). A cheap read-lock
-    /// snapshot. Note this gauge is activity-based and so does NOT equal
-    /// "session opened" minus "session closed": those logs track the grant
-    /// lifecycle, which outlives the activity window (a disconnected client
-    /// leaves the gauge but its grant stays open until it expires).
-    pub async fn live_session_count(&self) -> usize {
+    /// Both `/version` session gauges from a SINGLE lock + iteration:
+    ///
+    /// - **`live`**: sessions holding a currently-valid grant
+    ///   (`grant_expiration_ns` in the future). Tracks the GRANT lifecycle — a
+    ///   session counts from the moment its grant is redeemed ("session opened")
+    ///   until it expires, no matter how long it sits quiet in between (an ongoing
+    ///   MCP session is often idle between tool calls, and is still live the whole
+    ///   time). The flip side: MCP runs statelessly here, so a client that
+    ///   disconnects for good produces no server-side event and keeps counting
+    ///   until its grant expires. Sessions mid-connect, and v1 sessions whose
+    ///   completion POST never delivered an expiry (`None`), are not counted.
+    ///   Brackets the "session opened"/"session closed" lifecycle logs modulo the
+    ///   reaper's cadence: the count drops the instant a grant expires, whereas
+    ///   the paired "closed" log lands on the reaper's next sweep (up to 60s
+    ///   later), so `opened - closed` can momentarily exceed `live` by the
+    ///   sessions expired since that last sweep.
+    /// - **`active`**: the subset of `live` also seen making a request within
+    ///   [`ACTIVE_SESSION_WINDOW_NS`] — a ballpark of who is working right now, so
+    ///   a redeploy (which wipes the in-memory session/token maps and forces every
+    ///   connected client to reconnect) can be timed for a quiet moment. Being
+    ///   activity-based, it's a point-in-time reading; sample it over time (or read
+    ///   request rate from the logs) to find a low-traffic window.
+    ///
+    /// Computing both in one pass keeps `/version` scrapes O(N) rather than 2·O(N)
+    /// and, because both come from the same locked snapshot, guarantees the
+    /// reported pair is consistent (`active <= live`) — two separate reads could
+    /// straddle a grant expiry and momentarily report `active > live`. A cheap
+    /// read-lock snapshot.
+    pub(crate) async fn session_gauges(&self) -> SessionGauges {
         let now = now_ns();
         let sessions = self.sessions.read().await;
-        sessions
-            .values()
-            .filter(|s| {
-                s.grant_expiration_ns.is_some_and(|e| e > now)
-                    && now.saturating_sub(s.last_seen_ns.load(Ordering::Relaxed))
-                        <= LIVE_SESSION_IDLE_WINDOW_NS
-            })
-            .count()
+        let mut g = SessionGauges { live: 0, active: 0 };
+        for s in sessions.values() {
+            if s.grant_expiration_ns.is_some_and(|e| e > now) {
+                g.live += 1;
+                if now.saturating_sub(s.last_seen_ns.load(Ordering::Relaxed))
+                    <= ACTIVE_SESSION_WINDOW_NS
+                {
+                    g.active += 1;
+                }
+            }
+        }
+        g
+    }
+
+    /// Single-gauge test conveniences over [`Self::session_gauges`] (which is what
+    /// `/version` uses — it needs both counts, so production has no caller for
+    /// these). Kept test-only so the non-test build doesn't flag them as dead.
+    #[cfg(test)]
+    pub async fn live_session_count(&self) -> usize {
+        self.session_gauges().await.live
+    }
+
+    #[cfg(test)]
+    pub async fn active_session_count(&self) -> usize {
+        self.session_gauges().await.active
     }
 
     /// Evict sessions whose grant has expired, emitting a "session closed" log
     /// per eviction so the journal has a grant-lifecycle close event to pair with
-    /// "session opened". Eviction keys on grant EXPIRY, not activity: a merely
-    /// idle (but still valid) session is KEPT, since its token is still good and
-    /// the client may return and reuse it (it has already dropped off the live
-    /// gauge via the activity window). Sessions with no recorded expiry (`None`)
+    /// "session opened". Eviction keys on grant EXPIRY, the same criterion as the
+    /// live gauge: a merely idle (but still valid) session is KEPT — its token is
+    /// still good, the client may return and reuse it, and it still counts as
+    /// live meanwhile. Sessions with no recorded expiry (`None`)
     /// are also KEPT: that covers a session still mid-connect (evicting it would
     /// strand the registration key `X` that II already certified) and a v1
     /// session whose best-effort POST never arrived. Returns how many were
@@ -1481,32 +1535,77 @@ mod tests {
         assert_eq!(ids.live_session_count().await, 1);
     }
 
-    // The live gauge is activity-windowed: a session with a valid grant but no
-    // request within the idle window drops off (a disconnected/idle client), and
-    // a touch brings it back. Its grant stays valid throughout, so the reaper
-    // does NOT evict it (the client may return and reuse its token).
+    // The live gauge tracks the grant lifecycle, NOT request activity: a session
+    // that goes quiet keeps counting for as long as its grant is valid (an
+    // ongoing MCP session is often idle between tool calls), and it leaves the
+    // gauge exactly when its grant expires — before the reaper has swept it out.
+    // Deterministic (no wall-clock sleep): the already-past grant stands in for
+    // "after expiry", so the test can't flake under load or a clock shift.
     #[tokio::test]
-    async fn live_session_count_excludes_idle_sessions() {
+    async fn live_session_count_keeps_idle_sessions_until_grant_expiry() {
         let ids = test_ids();
         let future = now_ns() + 3_600_000_000_000;
-        ids.set_grant_expiration("active", future).await;
         ids.set_grant_expiration("idle", future).await;
-        // Both grants are valid and just-touched, so both count initially.
-        assert_eq!(ids.live_session_count().await, 2);
-
-        // Backdate "idle" past the activity window (a client gone quiet), leaving
-        // its grant untouched.
+        // Backdate "idle" far past the activity window — it has not made a request
+        // in ages. This is the regression guard: live_session_count must STILL
+        // count it (the old activity-windowed gauge would have dropped it here).
         {
-            let stale = now_ns().saturating_sub(LIVE_SESSION_IDLE_WINDOW_NS + 1_000_000_000);
+            let stale = now_ns().saturating_sub(ACTIVE_SESSION_WINDOW_NS + 3_600_000_000_000);
             let sessions = ids.sessions.read().await;
             sessions.get("idle").unwrap().last_seen_ns.store(stale, Ordering::Relaxed);
         }
+        // Live keys only on the grant, so the long-idle session counts; active
+        // keys on the window, so it does not — the whole point of the split.
         assert_eq!(ids.live_session_count().await, 1);
-        // Its grant is still valid, so the reaper keeps it (the client may return).
-        assert_eq!(ids.reap_expired_sessions().await, 0);
-        assert!(ids.sessions.read().await.contains_key("idle"));
-        // A fresh authenticated request (touch) brings it back onto the gauge.
-        ids.touch_session("idle").await;
+        assert_eq!(ids.active_session_count().await, 0);
+
+        // A grant in the past has already left the gauge (dropped at its expiry
+        // instant), even though it stays in the map until the reaper sweeps it.
+        ids.set_grant_expiration("expired", now_ns().saturating_sub(1)).await;
+        assert_eq!(ids.live_session_count().await, 1);
+        assert!(ids.sessions.read().await.contains_key("expired"));
+        assert_eq!(ids.reap_expired_sessions().await, 1);
+        assert_eq!(ids.live_session_count().await, 1);
+    }
+
+    // The active gauge is a SUBSET of the live gauge: it counts sessions with a
+    // valid grant that were also seen requesting within the activity window. A
+    // session gone quiet past the window drops off `active` but stays on `live`
+    // (its grant is untouched); a fresh request (touch) brings it back. An
+    // expired grant counts on neither, even with recent activity (grant gate).
+    #[tokio::test]
+    async fn active_session_count_tracks_the_activity_window() {
+        let ids = test_ids();
+        let future = now_ns() + 3_600_000_000_000;
+        ids.set_grant_expiration("active", future).await;
+        ids.set_grant_expiration("quiet", future).await;
+        // Both just connected (set_grant_expiration stamps last_seen), so both are
+        // active and live.
+        assert_eq!(ids.active_session_count().await, 2);
+        assert_eq!(ids.live_session_count().await, 2);
+
+        // Backdate "quiet" past the activity window, leaving its grant untouched.
+        {
+            let stale = now_ns().saturating_sub(ACTIVE_SESSION_WINDOW_NS + 1_000_000_000);
+            let sessions = ids.sessions.read().await;
+            sessions.get("quiet").unwrap().last_seen_ns.store(stale, Ordering::Relaxed);
+        }
+        // Dropped from active, still on live (active ⊆ live).
+        assert_eq!(ids.active_session_count().await, 1);
+        assert_eq!(ids.live_session_count().await, 2);
+        // session_gauges reports the same pair from one snapshot (what /version uses).
+        let g = ids.session_gauges().await;
+        assert_eq!((g.live, g.active), (2, 1));
+
+        // A fresh authenticated request brings it back onto the active gauge.
+        ids.touch_session("quiet").await;
+        assert_eq!(ids.active_session_count().await, 2);
+
+        // A recently-active session whose grant has expired counts on neither
+        // gauge: the grant gate excludes it despite the fresh last_seen.
+        ids.set_grant_expiration("expired", now_ns().saturating_sub(1)).await;
+        ids.touch_session("expired").await;
+        assert_eq!(ids.active_session_count().await, 2);
         assert_eq!(ids.live_session_count().await, 2);
     }
 

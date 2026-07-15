@@ -1639,9 +1639,11 @@ pub async fn require_token(State(store): State<AuthStore>, mut request: Request<
     match session {
         Some((principal, session_id)) => {
             tracing::debug!(%principal, %session_id, "authenticated MCP request");
-            // Refresh the session's activity window so it counts as live on
-            // /version; a client that stops sending requests drops off after the
-            // idle window (the only way to reflect a disconnect in stateless mode).
+            // Refresh the session's activity window so it counts on /version's
+            // `active_sessions` gauge; a client that stops sending requests drops
+            // off after the activity window (the only proxy for a disconnect in
+            // stateless mode). This does NOT affect `live_sessions`, which tracks
+            // the grant lifecycle independently of activity.
             store.identities.touch_session(&session_id).await;
             request.extensions_mut().insert(AuthedSession { session_id });
             next.run(request).await
