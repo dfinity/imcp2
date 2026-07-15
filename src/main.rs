@@ -613,9 +613,15 @@ impl IcTools {
         }
         let effective = identities::target_origin(&resolved.derivation_origin);
         let note = resolution_note(&resolved, &effective);
-        // Discovery is best-effort: an error or empty result still leaves a valid
-        // derivation context, so surface what we have rather than failing the call.
-        let canisters = found.unwrap_or_default();
+        // Discovery is best-effort — a failure or empty result still leaves a valid
+        // derivation context (origin resolution already succeeded and passed the IC
+        // gate), so surface what we have rather than failing the call. But keep a
+        // discovery ERROR distinct from "found nothing" so the caller can tell a
+        // transient/unreachable discovery failure from an app that declares none.
+        let (canisters, discovery_error) = match found {
+            Ok(c) => (c, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
 
         let mut text = format!(
             "app_url: {app_url} ({app_url_source})\nderivation_origin: {effective} ({})\n",
@@ -624,8 +630,14 @@ impl IcTools {
         if !resolved.alternative_origins.is_empty() {
             text.push_str(&format!("alternative_origins: {}\n", resolved.alternative_origins.join(", ")));
         }
-        if canisters.is_empty() {
-            text.push_str("\nNo canisters discovered (the app may declare none, or discovery was unreachable).\n");
+        if let Some(e) = &discovery_error {
+            text.push_str(&format!(
+                "\nCanister discovery FAILED ({e}) — this is NOT \"the app has no canisters\"; the \
+                 derivation origin above is still valid. Retry discover_app_canisters, or proceed \
+                 with a canister id you already have.\n"
+            ));
+        } else if canisters.is_empty() {
+            text.push_str("\nNo canisters discovered — the app appears to declare none.\n");
         } else {
             text.push_str("\nCanisters:\n");
             for f in &canisters {
@@ -660,6 +672,7 @@ impl IcTools {
             alternative_origins: resolved.alternative_origins,
             application_is_ic: resolved.application_is_ic,
             canisters: canisters.iter().map(discover::DiscoveredCanister::from).collect(),
+            discovery_error,
             note,
         };
         Ok(ok_structured(text, &output))

@@ -1527,9 +1527,15 @@ pub struct OpenAppOutput {
     /// resolve_app's field of the same name.
     pub application_is_ic: Option<bool>,
     /// The canisters discovered behind the app, most authoritative first (same
-    /// shape/provenance as discover_app_canisters). May be empty when discovery
-    /// found none or was unreachable — the derivation context above is still valid.
+    /// shape/provenance as discover_app_canisters). Empty when the app declares
+    /// none OR when discovery failed — disambiguated by `discovery_error`.
     pub canisters: Vec<DiscoveredCanister>,
+    /// If canister discovery FAILED (DNS/TLS/SSRF refusal/timeout) rather than
+    /// merely finding nothing, the error string — so an empty `canisters` meaning
+    /// "the app declares none" is distinguishable from "discovery didn't run".
+    /// null when discovery succeeded (whether or not it found anything). The
+    /// derivation context is valid regardless (origin resolution succeeded first).
+    pub discovery_error: Option<String>,
     /// A human note — the derivation-origin caveat and any lookalike caution.
     pub note: Option<String>,
 }
