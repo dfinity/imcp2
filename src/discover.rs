@@ -602,8 +602,8 @@ async fn fetch_alternative_origins(origin: &str) -> Vec<String> {
     }
 }
 
-/// Whether a response carries the IC HTTP gateway's `x-ic-canister-id` header with
-/// a value that PARSES AS A CANISTER PRINCIPAL. Presence of the header name is not
+/// Whether a header map carries the IC HTTP gateway's `x-ic-canister-id` with a
+/// value that PARSES AS A CANISTER PRINCIPAL. Presence of the header name is not
 /// enough evidence of IC hosting: any server can echo an arbitrary header, so a
 /// lookalike/attacker-controlled origin could set an empty or junk `x-ic-canister-id`
 /// to fake it. Requiring the value to be a real principal (the gateway always sets a
@@ -612,12 +612,27 @@ async fn fetch_alternative_origins(origin: &str) -> Vec<String> {
 /// determined attacker can still serve a valid principal; the explicit
 /// `derivation_origin` escape hatch and the fundamentally forgeable nature of
 /// response headers mean this only has to defeat accidental and lazy false positives.)
-fn has_ic_gateway_header(headers: &reqwest::header::HeaderMap) -> bool {
+fn header_is_ic_principal(headers: &reqwest::header::HeaderMap) -> bool {
     headers
         .get("x-ic-canister-id")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .map_or(false, |v| Principal::from_text(v).is_ok())
+}
+
+/// Whether `resp` is evidence that `expected_host` itself is IC-served: it carries a
+/// valid `x-ic-canister-id` (see [`header_is_ic_principal`]) AND the response came
+/// from `expected_host`, not a redirect target. The host check matters because the
+/// shared SSRF redirect policy permits hops to global IP literals, so without it a
+/// non-IC origin could 302 to another public host/IP that echoes the header and
+/// borrow its IC-ness — the gate must attribute evidence to the ORIGIN it probed.
+/// (`expected_host` is the lowercased application host; hosts compare case-insensitively.)
+fn ic_evidence_from(resp: &reqwest::Response, expected_host: &str) -> bool {
+    header_is_ic_principal(resp.headers())
+        && resp
+            .url()
+            .host_str()
+            .map_or(false, |h| h.eq_ignore_ascii_case(expected_host))
 }
 
 /// Resolve an app URL to its Internet Identity derivation context, WITHOUT
@@ -645,8 +660,8 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
     // Declared derivation origin (authoritative) from the app's manifest. The
     // manifest response also doubles as IC-ness evidence: the IC HTTP gateway
     // stamps `x-ic-canister-id` (a canister principal) on every response it serves
-    // (including 404s), so capture it here — value-validated, not just present —
-    // before any fallback decision.
+    // (including 404s), so capture it here — value-validated AND attributed to this
+    // origin (not a redirect target), not just present — before any fallback decision.
     let mut derivation_origin = application_origin.clone();
     let mut derivation_origin_source = DerivationSource::AppUrlDefault;
     let mut ic_evidence = false;
@@ -655,7 +670,7 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
         .send()
         .await
     {
-        ic_evidence = has_ic_gateway_header(resp.headers());
+        ic_evidence = ic_evidence_from(&resp, &host);
         if resp.status().is_success() {
             let text = read_capped(resp, MAX_META_BYTES).await;
             if let Some(declared) = declared_derivation_origin(&text) {
@@ -695,7 +710,7 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
                 .send()
                 .await
                 .map_err(|e| format!("could not reach {application_origin}: {e}"))?;
-            ic_evidence = has_ic_gateway_header(resp.headers());
+            ic_evidence = ic_evidence_from(&resp, &host);
         }
         Some(ic_evidence)
     } else {
@@ -2195,14 +2210,16 @@ mod tests {
 
     // IC evidence requires a VALID canister-principal value, not just header
     // presence — so an unrelated site echoing an empty/junk `x-ic-canister-id`
-    // can't fake IC hosting and slip past the guessed-domain guard.
+    // can't fake IC hosting and slip past the guessed-domain guard. (The
+    // same-host attribution in ic_evidence_from — evidence must come from the
+    // probed origin, not a redirect target — is exercised by the live tests.)
     #[test]
     fn ic_gateway_header_requires_valid_principal_value() {
         use reqwest::header::{HeaderMap, HeaderValue};
         let with = |v: &str| {
             let mut h = HeaderMap::new();
             h.insert("x-ic-canister-id", HeaderValue::from_str(v).unwrap());
-            has_ic_gateway_header(&h)
+            header_is_ic_principal(&h)
         };
         // Real canister ids (gateway form + the management canister) count.
         assert!(with("ryjl3-tyaaa-aaaaa-aaaba-cai"));
@@ -2213,7 +2230,7 @@ mod tests {
         assert!(!with("true"));
         assert!(!with("not-a-principal"));
         // Absent header: no evidence.
-        assert!(!has_ic_gateway_header(&HeaderMap::new()));
+        assert!(!header_is_ic_principal(&HeaderMap::new()));
     }
 
     // "Did you mean" repair: a host FABRICATED from a well-known app's name (the

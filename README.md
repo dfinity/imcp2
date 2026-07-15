@@ -163,8 +163,9 @@ token (see Auth).
 > `derived_for_origin` (the origin actually used) alongside `requested` (what you
 > passed), so a valid-but-wrong principal is **immediately visible** instead of
 > silent. The `app_url_default` assumption is additionally **gated on IC evidence**:
-> if the origin doesn't carry the gateway's `x-ic-canister-id` header (checked on
-> the manifest response, else on the app URL itself), the `app_url` routes *refuse*
+> if the origin doesn't carry the gateway's `x-ic-canister-id` header (a valid
+> canister principal, from the origin itself — not a redirect target — checked on
+> the manifest response, else on the origin root), the `app_url` routes *refuse*
 > to derive — that combination is the signature of a domain **guessed** from an app
 > name (a lookalike/squatted site), and the refusal names the well-known app the
 > host resembles when there is one. A genuinely non-IC-hosted app that uses
