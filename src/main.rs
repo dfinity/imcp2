@@ -667,8 +667,9 @@ impl IcTools {
         }
         text.push_str(
             "\n\nNext: inspect a canister with get_canister_candid (and get_canister_api_doc if it \
-             has one); to act as the user, call_canister / run_canister_oql_query passing app_url \
-             (or the derivation_origin above) and an optional account from list_app_accounts.",
+             has one); to act as the user, call_canister accepts app_url OR the derivation_origin \
+             above, while run_canister_oql_query / get_canister_oql_schema take the \
+             derivation_origin — plus an optional account from list_app_accounts.",
         );
         let output = discover::OpenAppOutput {
             app_url,
