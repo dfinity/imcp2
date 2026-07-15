@@ -24,7 +24,7 @@ results).
 | `icp_lookup_canister_info_by_id` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
 | `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus an `oql` flag — `true` when it exposes an OQL query surface (a `schema` + `execute` pair), with a pointer to `icp_oql_guide` |
 | `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), read from its `getApiDoc`/`get_api_doc` method if present. Call first for an unfamiliar app |
-| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `derivation_origin?` / `app_url?`, `account?` | Reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, or an `app_url` the connector resolves). Echoes `derived_for_origin` / `requested` / `derivation_origin_source` / `acted_as_principal` |
+| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `derivation_origin?` / `app_url?`, `account?` | Reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, or an `app_url` the connector resolves). Echoes `derived_for_origin` / `requested` / `derivation_origin_source` / `acted_as_principal`. Query calls are rejected on an OQL canister — read it via the OQL tools |
 | `get_app_principal` | `derivation_origin?` / `app_url?`, `account?` | The principal you act as at an app, without a call. Echoes `derived_for_origin` / `requested` / `derivation_origin_source` so an origin mismatch is visible |
 | `list_app_accounts` | `derivation_origin?` / `app_url?` | The user's Internet Identity accounts at an app — the default account plus any named ones — with name, number, last-used, and the derivation origin they were listed for |
 | `resolve_app` | `app_url` | Resolve an app URL to its Internet Identity derivation context: `application_origin`, the `derivation_origin` to use (declared in `/.well-known/ic-app.json`, else a built-in known-app value, else assumed = app origin — flagged via `derivation_origin_source`: `declared`/`known`/`app_url_default`), and the app's `alternative_origins` (informational). Does not return a principal (no account chosen) or require auth — pass the `derivation_origin` to `get_app_principal`/`list_app_accounts` |
@@ -64,8 +64,9 @@ Acting **for the user** at an app:
    `call_canister` / `run_canister_oql_query` act as the account without pre-fetching it.
 5. **`get_canister_candid`** (and **`get_canister_api_doc`** if the canister exposes
    one) to learn the interface — the `oql: true` flag says whether OQL is available.
-6. **Read** with `run_canister_oql_query` when OQL is available, else `call_canister`
-   with `is_query=true`.
+6. **Read** with `run_canister_oql_query` when OQL is available (for an OQL canister
+   raw `call_canister` query calls are rejected — use the OQL tools), else
+   `call_canister` with `is_query=true`.
 7. **Act** with `call_canister` update calls, passing `derivation_origin` + `account`
    to act as the user.
 
@@ -193,7 +194,10 @@ wraps it as `execute`'s single `text` argument (so the model never hand-escapes
 JSON inside a Candid literal), and decodes the reply into `columns` + `rows` —
 rendered as a markdown table, with `has_more` for paging. Both accept an optional
 `derivation_origin`/`account` to query as the user's account (same on-demand
-delegation as `call_canister`). Detection stays name-based and the decode is fail-closed: a
+delegation as `call_canister`). Because OQL is the preferred read path when a
+canister offers it, raw `call_canister` **query** calls are rejected on an OQL
+canister (the tool returns a pointer to these two tools); `call_canister` then
+handles only that canister's update calls. Detection stays name-based and the decode is fail-closed: a
 reply that isn't a recognizable OQL result degrades to the raw Candid rather than
 erroring. The design mirrors the reference IC connector's OQL primer (detect +
 teach), adding an ergonomic executor suited to this server's structured-output

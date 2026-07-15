@@ -403,7 +403,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit both `derivation_origin` and `app_url` to call anonymously; provide one to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins); `app_url` lets the connector resolve it. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. Set is_query=true for read-only query calls. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
+        description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit both `derivation_origin` and `app_url` to call anonymously; provide one to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins); `app_url` lets the connector resolve it. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. Set is_query=true for read-only query calls. NOTE: if the canister exposes an OQL query surface (get_canister_candid reports `oql: true`), query calls are REJECTED here — read its data with run_canister_oql_query / get_canister_oql_schema instead; call_canister then handles only its update calls. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
         annotations(title = "Call a canister method", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CallCanisterOutput>(),
     )]
@@ -428,6 +428,12 @@ impl IcTools {
         // The interface to encode/decode against: the canister's own
         // candid:service if exposed, else the caller-supplied `candid`.
         let did = calls::resolve_did(&self.agent, principal, candid.as_deref()).await;
+        // Prefer OQL: a canister that exposes an OQL query surface must be READ
+        // through the dedicated OQL tools, so reject raw query calls here (update
+        // calls still go through call_canister). Fail fast, before encoding args.
+        if let Some(msg) = calls::oql_query_redirect(did.as_deref(), is_query) {
+            return Ok(err(msg));
+        }
         let arg_bytes = match calls::encode_args(did.as_deref(), &method, &args) {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
@@ -1311,7 +1317,8 @@ impl ServerHandler for IcTools {
              `run_canister_oql_query` act as the account without pre-fetching it); (5) inspect the \
              canister with `get_canister_candid` (and `get_canister_api_doc` if it exposes one) — its \
              `oql: true` flag says whether OQL is available; (6) READ with `run_canister_oql_query` \
-             when OQL is available, else `call_canister` with is_query=true; (7) ACT with \
+             when OQL is available (for an OQL canister `call_canister` query calls are REJECTED — \
+             use the OQL tools), else `call_canister` with is_query=true; (7) ACT with \
              `call_canister` update calls, passing `derivation_origin` + `account` to act as the \
              user. Public/anonymous reads skip 1/3/4. The per-canister inspection (5) is independent \
              of the identity steps (1/3/4), so they can run in parallel. Managing your OWN canisters \
