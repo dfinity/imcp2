@@ -338,9 +338,8 @@ pub struct AccountInfo {
     pub last_used: Option<u64>,
 }
 
-/// Arguments for `get_app_principal`. Identify the app EITHER by its canonical
-/// derivation origin (`derivation_origin`) OR by its URL (`app_url`); provide
-/// exactly one.
+/// Arguments for `get_app_principal`. Identify the app by its canonical derivation
+/// origin (`derivation_origin`), obtained from `open_app` / `resolve_app`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetPrincipalArgs {
     /// The exact canonical origin Internet Identity uses to derive this app's
@@ -348,21 +347,12 @@ pub struct GetPrincipalArgs {
     /// pins a custom derivation origin (via `derivationOrigin` +
     /// `/.well-known/ii-alternative-origins`), pass that canonical origin here
     /// (e.g. "https://<frontend-canister>.icp0.io"). Do NOT infer it from an
-    /// alternativeOrigins list. Accepts the legacy name `domain`. Provide this
-    /// OR `app_url`, not both.
+    /// alternativeOrigins list, and do NOT pass a raw website URL — get the
+    /// derivation origin from open_app / resolve_app (which resolve an app name or
+    /// URL to it under the guessed-domain gate) and reuse it. Accepts the legacy
+    /// name `domain`. Required to identify the app.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
-    /// The application's URL (e.g. "https://oisy.com"). Must be a URL you actually
-    /// have (from the user, icp_find_app_by_name, or a web search) — NEVER a domain
-    /// guessed from an app's name; an origin with no evidence of being an IC app is
-    /// refused rather than resolved. The connector resolves its derivation origin,
-    /// precedence: the app's declared one (`/.well-known/ic-app.json`) if present
-    /// (`derivation_origin_source` = "declared"), else a built-in known-app value
-    /// for a few apps that pin a custom origin without declaring it ("known"), else
-    /// the application origin (an assumption — "app_url_default"). See the result's
-    /// `derivation_origin_source`. Provide this OR `derivation_origin`.
-    #[serde(default)]
-    pub app_url: Option<String>,
     /// Which of your accounts to resolve, by account name (see list_app_accounts).
     /// Omit to use that app's default account.
     #[serde(default)]
@@ -376,14 +366,13 @@ pub struct PrincipalOutput {
     /// derived for (after canonicalization). Compare against `requested` to spot
     /// an origin mismatch.
     pub derived_for_origin: String,
-    /// Exactly what you supplied (`derivation_origin` or `app_url`), echoed so a
-    /// mismatch with `derived_for_origin` is immediately visible.
+    /// Exactly what you supplied as `derivation_origin`, echoed so a mismatch with
+    /// `derived_for_origin` (from canonicalization) is immediately visible.
     pub requested: String,
-    /// How `derived_for_origin` was determined: "explicit" (you passed
-    /// `derivation_origin`), "declared" (the app declared it in
-    /// /.well-known/ic-app.json), "known" (from the connector's built-in registry
-    /// of well-known custom-derivation-origin apps), or "app_url_default" (assumed
-    /// from the app URL — correct only if the app has no custom derivation origin).
+    /// How `derived_for_origin` was determined — always "explicit" here, since this
+    /// tool takes the canonical derivation origin directly. (The "declared" /
+    /// "known" / "app_url_default" sources are reported by the resolver tools
+    /// open_app / resolve_app, which turn a URL into a derivation origin.)
     pub derivation_origin_source: String,
     /// The account name resolved, or null for the app's default account.
     pub account: Option<String>,
@@ -394,21 +383,17 @@ pub struct PrincipalOutput {
     pub read_only: bool,
 }
 
-/// Arguments for `list_app_accounts`. Identify the app by `derivation_origin` OR
-/// `app_url` (exactly one).
+/// Arguments for `list_app_accounts`. Identify the app by its canonical derivation
+/// origin (`derivation_origin`), obtained from `open_app` / `resolve_app`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListAccountsArgs {
-    /// The exact canonical Internet Identity derivation origin (NOT necessarily
-    /// the visible URL). Accepts the legacy name `domain`. Provide this OR
-    /// `app_url`.
+    /// The exact canonical Internet Identity derivation origin (NOT necessarily the
+    /// visible URL). Do NOT pass a raw website URL — get the derivation origin from
+    /// open_app / resolve_app (which resolve an app name or URL to it under the
+    /// guessed-domain gate) and reuse it. Accepts the legacy name `domain`. Required
+    /// to identify the app.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
-    /// The application's URL; the connector resolves its derivation origin (see
-    /// `get_app_principal`). Must be a URL you actually have — NEVER a domain
-    /// guessed from an app's name (use icp_find_app_by_name for names; a non-IC
-    /// origin is refused). Provide this OR `derivation_origin`.
-    #[serde(default)]
-    pub app_url: Option<String>,
 }
 
 /// One account in the `list_app_accounts` MCP output (a serialization mirror of
@@ -438,11 +423,12 @@ impl From<&AccountInfo> for AccountEntry {
 pub struct AccountsOutput {
     /// The effective Internet Identity derivation origin the accounts belong to.
     pub derived_for_origin: String,
-    /// Exactly what you supplied (`derivation_origin` or `app_url`), echoed so a
-    /// mismatch with `derived_for_origin` is immediately visible.
+    /// Exactly what you supplied as `derivation_origin`, echoed so a mismatch with
+    /// `derived_for_origin` (from canonicalization) is immediately visible.
     pub requested: String,
-    /// How `derived_for_origin` was determined: "explicit", "declared", "known"
-    /// (built-in known-app registry), or "app_url_default".
+    /// How `derived_for_origin` was determined — always "explicit" here, since this
+    /// tool takes the canonical derivation origin directly. (The "declared" /
+    /// "known" / "app_url_default" sources are reported by open_app / resolve_app.)
     pub derivation_origin_source: String,
     /// The user's accounts at that origin (empty if none).
     pub accounts: Vec<AccountEntry>,

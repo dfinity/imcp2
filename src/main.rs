@@ -210,7 +210,6 @@ impl IcTools {
                 origin: o.clone(),
                 requested: requested.clone().unwrap_or_else(|| o.clone()),
                 source: "explicit".to_string(),
-                application_origin: None,
             };
             format!("[{}]", identity_annotation(&target, acted_as.as_deref()))
         });
@@ -309,7 +308,6 @@ impl IcTools {
                 origin: o.clone(),
                 requested: requested.clone().unwrap_or_else(|| o.clone()),
                 source: "explicit".to_string(),
-                application_origin: None,
             };
             blocks.push(format!("[{}]", identity_annotation(&target, acted_as.as_deref())));
         }
@@ -403,7 +401,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit both `derivation_origin` and `app_url` to call anonymously; provide one to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins); `app_url` lets the connector resolve it. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. Set is_query=true for read-only query calls. NOTE: if the canister exposes an OQL query surface (get_canister_candid reports `oql: true`), query calls are REJECTED here — read its data with run_canister_oql_query / get_canister_oql_schema instead; call_canister then handles only its update calls. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
+        description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. Set is_query=true for read-only query calls. NOTE: if the canister exposes an OQL query surface (get_canister_candid reports `oql: true`), query calls are REJECTED here — read its data with run_canister_oql_query / get_canister_oql_schema instead; call_canister then handles only its update calls. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
         annotations(title = "Call a canister method", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CallCanisterOutput>(),
     )]
@@ -415,7 +413,6 @@ impl IcTools {
             args,
             is_query,
             derivation_origin,
-            app_url,
             account,
             candid,
         }): Parameters<calls::CallCanisterArgs>,
@@ -440,9 +437,9 @@ impl IcTools {
         };
 
         // Resolve which principal to act as: none = anonymous; else the app's
-        // effective (canonical) II derivation origin, from an explicit
-        // `derivation_origin` or resolved from `app_url`.
-        let target = match resolve_identity_target(derivation_origin, app_url).await {
+        // effective (canonical) II derivation origin, from the caller's explicit
+        // `derivation_origin` (obtained once via open_app / resolve_app).
+        let target = match resolve_identity_target(derivation_origin) {
             Ok(t) => t,
             Err(e) => return Ok(err(e)),
         };
@@ -483,22 +480,22 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Get the Internet Computer principal you act as at an app, without making a canister call. Identify the app by `derivation_origin` (its EXACT canonical Internet Identity derivation origin — NOT necessarily the visible website URL, and never inferred from an alternativeOrigins list) OR by `app_url` (the connector resolves the derivation origin). The account delegation is derived on demand from this connection's standing Internet Identity credential. By default this resolves the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result returns the `principal` plus `derived_for_origin`, `requested`, and `derivation_origin_source` — compare the first two to catch an origin mismatch (a valid but WRONG principal). If `derivation_origin_source` is \"app_url_default\", the app declares no derivation origin and this assumed the app URL is the derivation origin; if the principal looks wrong for an app with a custom derivation origin, pass that canonical origin as `derivation_origin`.",
+        description = "Get the Internet Computer principal you act as at an app, without making a canister call. Identify the app by `derivation_origin` — its EXACT canonical Internet Identity derivation origin (NOT necessarily the visible website URL, and never inferred from an alternativeOrigins list). Get it from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate); this tool does NOT accept a raw website URL. The account delegation is derived on demand from this connection's standing Internet Identity credential. By default this resolves the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result returns the `principal` plus `derived_for_origin` and `requested` — compare them to catch a canonicalization surprise. If the principal looks wrong, the derivation origin is wrong: re-resolve the app with open_app / resolve_app rather than guessing an origin.",
         annotations(title = "Get your principal at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::PrincipalOutput>(),
     )]
     async fn get_app_principal(
         &self,
-        Parameters(identities::GetPrincipalArgs { derivation_origin, app_url, account }): Parameters<identities::GetPrincipalArgs>,
+        Parameters(identities::GetPrincipalArgs { derivation_origin, account }): Parameters<identities::GetPrincipalArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session_id = match authed_session(&ctx) {
             Some(s) => s.session_id,
             None => return Ok(err("getting an app principal needs an authenticated session".into())),
         };
-        let target = match resolve_identity_target(derivation_origin, app_url).await {
+        let target = match resolve_identity_target(derivation_origin) {
             Ok(Some(t)) => t,
-            Ok(None) => return Ok(err("provide `derivation_origin` or `app_url` to identify the app".into())),
+            Ok(None) => return Ok(err("provide `derivation_origin` to identify the app (get it from open_app / resolve_app)".into())),
             Err(e) => return Ok(err(e)),
         };
         let delegated = match self
@@ -536,22 +533,22 @@ impl IcTools {
     }
 
     #[tool(
-        description = "List the user's Internet Identity accounts at an app. Identify the app by `derivation_origin` (its EXACT canonical II derivation origin — not necessarily the visible URL) OR by `app_url` (resolved by the connector). Internet Identity gives the user a distinct principal per derivation origin, and within it they may hold several accounts: a default account everyone gets automatically (the anchor's current, user-controllable default there), plus any named accounts they created. Use this before acting on the user's behalf: if there's only the default account, just proceed (call_canister/get_app_principal with no `account`); if there are several, pick one with the user by passing its name as `account`. Returns each account's name (the default has none), number, and last-used time, plus `derived_for_origin`/`requested`/`derivation_origin_source` — if these accounts don't match what the user sees in their browser, the derivation origin is likely wrong (pass the app's canonical `derivation_origin`). Requires an authenticated session.",
+        description = "List the user's Internet Identity accounts at an app. Identify the app by `derivation_origin` — its EXACT canonical II derivation origin (not necessarily the visible URL). Get it from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate); this tool does NOT accept a raw website URL. Internet Identity gives the user a distinct principal per derivation origin, and within it they may hold several accounts: a default account everyone gets automatically (the anchor's current, user-controllable default there), plus any named accounts they created. Use this before acting on the user's behalf: if there's only the default account, just proceed (call_canister/get_app_principal with no `account`); if there are several, pick one with the user by passing its name as `account`. Returns each account's name (the default has none), number, and last-used time, plus `derived_for_origin`/`requested` — if these accounts don't match what the user sees in their browser, the derivation origin is wrong (re-resolve the app rather than guessing). Requires an authenticated session.",
         annotations(title = "List your accounts at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::AccountsOutput>(),
     )]
     async fn list_app_accounts(
         &self,
-        Parameters(identities::ListAccountsArgs { derivation_origin, app_url }): Parameters<identities::ListAccountsArgs>,
+        Parameters(identities::ListAccountsArgs { derivation_origin }): Parameters<identities::ListAccountsArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session_id = match authed_session(&ctx) {
             Some(s) => s.session_id,
             None => return Ok(err("listing your accounts needs an authenticated session".into())),
         };
-        let target = match resolve_identity_target(derivation_origin, app_url).await {
+        let target = match resolve_identity_target(derivation_origin) {
             Ok(Some(t)) => t,
-            Ok(None) => return Ok(err("provide `derivation_origin` or `app_url` to identify the app".into())),
+            Ok(None) => return Ok(err("provide `derivation_origin` to identify the app (get it from open_app / resolve_app)".into())),
             Err(e) => return Ok(err(e)),
         };
         match self.identities.list_accounts(&session_id, &target.origin).await {
@@ -1162,76 +1159,45 @@ fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<auth::AuthedSessio
 }
 
 /// Which app principal an identity-bearing tool should act as, resolved from the
-/// caller's `derivation_origin` and/or `app_url`.
+/// caller's `derivation_origin`.
 #[derive(Debug)]
 struct IdentityTarget {
     /// The EFFECTIVE (canonical) Internet Identity derivation origin to feed the
     /// delegation layer — echoed to the caller as `derived_for_origin`.
     origin: String,
-    /// Exactly what the caller supplied (a `derivation_origin` or an `app_url`).
+    /// Exactly what the caller supplied as `derivation_origin`.
     requested: String,
-    /// How `origin` was determined: "explicit" | "declared" | "known" | "app_url_default".
+    /// How `origin` was determined. Always "explicit" here: the identity-bearing
+    /// tools take the canonical derivation origin DIRECTLY (they no longer accept an
+    /// `app_url` to resolve). The "declared"/"known"/"app_url_default" sources come
+    /// from the resolver tools (`open_app` / `resolve_app`), where a URL is turned
+    /// into a derivation origin under the guessed-domain gate; feed their result
+    /// here. Kept for parity with those tools' echoed `derivation_origin_source`.
     source: String,
-    /// The application origin, when the caller passed `app_url`.
-    application_origin: Option<String>,
 }
 
-/// Resolve the caller's `derivation_origin` / `app_url` into an [`IdentityTarget`]
-/// (or `None` when neither is given — an anonymous call). An explicit
-/// `derivation_origin` is canonicalized and used verbatim (source `explicit`); an
-/// `app_url` is resolved by [`discover::resolve_app_identity`] with precedence
-/// DECLARED (the app's `/.well-known/ic-app.json`) > KNOWN (the built-in
-/// `KNOWN_DERIVATION_ORIGINS` registry of well-known custom-origin apps) > the
-/// application origin (flagged `app_url_default`) — so the source can be
-/// `declared`, `known`, or
-/// `app_url_default`. Both routes pass through the same canonicalizer the
-/// delegation path uses, so the echoed `origin` is exactly what Internet Identity
-/// derives against.
-async fn resolve_identity_target(
+/// Resolve the caller's `derivation_origin` into an [`IdentityTarget`] (or `None`
+/// when it's absent — an anonymous call). The origin is canonicalized and used
+/// VERBATIM (source `explicit`): these tools trust the caller to supply the exact
+/// canonical origin Internet Identity derives against. There is deliberately no
+/// `app_url` here — a derivation origin is a stable per-app value, so it's resolved
+/// ONCE via `open_app` / `resolve_app` (which run the guessed-domain gate and return
+/// it) and then reused across calls, rather than re-resolved on every invocation
+/// against this stateless server.
+fn resolve_identity_target(
     derivation_origin: Option<String>,
-    app_url: Option<String>,
 ) -> Result<Option<IdentityTarget>, String> {
-    match (derivation_origin, app_url) {
-        (Some(_), Some(_)) => {
-            Err("provide either `derivation_origin` or `app_url`, not both".to_string())
-        }
-        (Some(d), None) => {
+    match derivation_origin {
+        None => Ok(None),
+        Some(d) => {
             let d = clean_identity_arg("derivation_origin", &d)?;
             let origin = canonicalize_derivation_origin(&d)?;
             Ok(Some(IdentityTarget {
                 origin,
                 requested: d,
                 source: "explicit".to_string(),
-                application_origin: None,
             }))
         }
-        (None, Some(u)) => {
-            let u = clean_app_url(&u)?;
-            // Identity hot path: we only need the derivation origin, not the
-            // informational alternative-origins list — skip that extra fetch.
-            let resolved = discover::resolve_app_identity(&u, false)
-                .await
-                .map_err(|e| app_url_error_with_guidance(&u, e))?;
-            // Refuse to derive an identity at an origin that was ASSUMED to be its
-            // own derivation origin but shows no evidence of being an IC app: that
-            // combination is the signature of a domain GUESSED from an app name,
-            // and the derived principal would be valid-looking but wrong (or, on a
-            // squatted lookalike domain, attacker-chosen). The error tells the
-            // caller how to find the real app instead — and deliberate use of a
-            // non-IC-hosted II origin stays possible via explicit `derivation_origin`.
-            if resolved.derivation_origin_source == discover::DerivationSource::AppUrlDefault
-                && resolved.application_is_ic == Some(false)
-            {
-                return Err(unverified_app_url_error(&resolved.application_origin));
-            }
-            Ok(Some(IdentityTarget {
-                origin: identities::target_origin(&resolved.derivation_origin),
-                requested: u,
-                source: resolved.derivation_origin_source.as_str().to_string(),
-                application_origin: Some(resolved.application_origin),
-            }))
-        }
-        (None, None) => Ok(None),
     }
 }
 
@@ -1450,11 +1416,11 @@ fn clean_app_url(raw: &str) -> Result<String, String> {
 
 /// A one-line identity annotation for the human-readable `text` (which text-only
 /// clients see instead of the structured output): the origin II derived against,
-/// how it was determined (`source`), and — whenever it differs from the derived
-/// origin (canonicalization, http→https, a stripped path, or `app_url` defaulting)
-/// — the caller's `requested` value. Echoing `requested` on ANY mismatch (not only
-/// `app_url_default`) is what keeps a requested≠derived mismatch visible in every
-/// client. `acted_as` prefixes the signed-as principal when known.
+/// how it was determined (`source`, always "explicit" for the identity-bearing
+/// tools now that they take the canonical origin directly), and — whenever it
+/// differs from the derived origin (canonicalization, http→https, a stripped path)
+/// — the caller's `requested` value, so a requested≠derived mismatch stays visible
+/// in every client. `acted_as` prefixes the signed-as principal when known.
 fn identity_annotation(target: &IdentityTarget, acted_as: Option<&str>) -> String {
     let mut s = String::new();
     if let Some(p) = acted_as {
@@ -1463,12 +1429,6 @@ fn identity_annotation(target: &IdentityTarget, acted_as: Option<&str>) -> Strin
     s.push_str(&format!("derived for {} (source: {})", target.origin, target.source));
     if target.requested != target.origin {
         s.push_str(&format!("; requested {}", target.requested));
-    }
-    if target.source == "app_url_default" {
-        s.push_str(
-            " — the app declares no derivation origin, so this ASSUMES the app origin; \
-             if the principal looks wrong, pass the app's canonical derivation_origin",
-        );
     }
     s
 }
@@ -1542,18 +1502,20 @@ impl ServerHandler for IcTools {
              To act as an app account, identify the app by its `derivation_origin` — the EXACT \
              canonical origin Internet Identity derives its principal from, which is NOT \
              necessarily the visible website URL and must NEVER be inferred from an \
-             ii-alternative-origins list — or by `app_url`, which the connector resolves (use \
-             `resolve_app` to see what an app URL resolves to). A short-lived (<=5 min) account \
+             ii-alternative-origins list. The identity-bearing tools (call_canister, \
+             get_app_principal, list_app_accounts, run_canister_oql_query, get_canister_oql_schema) \
+             take ONLY `derivation_origin`, NOT a website URL: a derivation origin is a stable \
+             per-app value, so RESOLVE IT ONCE with `open_app` (or `resolve_app`) — which turn an \
+             app name/URL into it under the guessed-domain gate — and reuse it across calls, rather \
+             than re-resolving a URL every time on this stateless server. A short-lived (<=5 min) account \
              delegation is minted ON DEMAND from this connection's standing credential, no extra \
              sign-in. `get_app_principal` returns the principal without a call; `list_app_accounts` lists \
              the user's accounts (a default one plus any named ones), and call_canister / \
              get_app_principal take an optional `account` (a name from that list) — omit it for the \
-             default. Every identity result echoes `derived_for_origin` (the origin actually used), \
-             `requested` (what you passed), and `derivation_origin_source`: if the source is \
-             \"app_url_default\", the app declared no derivation origin and the app URL was ASSUMED \
-             to be it — correct only if the app has no custom derivation origin. If a principal, \
+             default. Every identity result echoes `derived_for_origin` (the origin actually used) and \
+             `requested` (what you passed), so a canonicalization mismatch is visible. If a principal, \
              account, or balance doesn't match what the user sees in their browser, the derivation \
-             origin is wrong: pass the app's canonical `derivation_origin` explicitly. The standing \
+             origin is wrong: re-resolve the app with `open_app`/`resolve_app` (don't guess an origin). The standing \
              credential is obtained when you connect \
              (authenticate via Internet Identity) and lasts for the session duration you choose when \
              connecting (up to 30 days); reconnect when it expires. \
@@ -2368,26 +2330,15 @@ mod tests {
         assert_eq!(matches[0].get("kind"), Some(&serde_json::json!("token")));
     }
 
-    // resolve_identity_target's precedence/validation rules are part of the tool
-    // contract; cover the offline branches (the `app_url` branch needs the
-    // network and is exercised separately). Supplying both args must be rejected.
-    #[tokio::test]
-    async fn resolve_identity_target_rejects_both_args() {
-        let err = super::resolve_identity_target(
-            Some("https://a.example".to_string()),
-            Some("https://b.example".to_string()),
-        )
-        .await
-        .expect_err("both args must be an error");
-        assert!(err.contains("not both"), "unexpected message: {err}");
-    }
+    // resolve_identity_target's validation rules are part of the tool contract. It
+    // takes ONLY `derivation_origin` now (the identity-bearing tools no longer
+    // accept an app_url to resolve — see clean_app_url tests for URL validation).
 
     // A whitespace-only `derivation_origin` is empty after trimming and must be
     // rejected rather than canonicalized into a bogus origin.
-    #[tokio::test]
-    async fn resolve_identity_target_rejects_blank_derivation_origin() {
-        let err = super::resolve_identity_target(Some("   ".to_string()), None)
-            .await
+    #[test]
+    fn resolve_identity_target_rejects_blank_derivation_origin() {
+        let err = super::resolve_identity_target(Some("   ".to_string()))
             .expect_err("blank derivation_origin must be an error");
         assert!(err.contains("must not be empty"), "unexpected message: {err}");
     }
@@ -2395,33 +2346,28 @@ mod tests {
     // `derivation_origin` is trimmed before canonicalization, so surrounding
     // whitespace never leaks into either the echoed `requested` or the effective
     // `origin` fed to the delegation path.
-    #[tokio::test]
-    async fn resolve_identity_target_trims_derivation_origin() {
-        let target = super::resolve_identity_target(Some("  https://example.com  ".to_string()), None)
-            .await
+    #[test]
+    fn resolve_identity_target_trims_derivation_origin() {
+        let target = super::resolve_identity_target(Some("  https://example.com  ".to_string()))
             .expect("valid derivation_origin resolves")
             .expect("an explicit derivation_origin yields a target");
         assert_eq!(target.requested, "https://example.com", "requested must be trimmed");
         assert_eq!(target.origin, "https://example.com", "origin must be the canonical trimmed form");
         assert_eq!(target.source, "explicit");
-        assert!(target.application_origin.is_none());
     }
 
-    // Neither arg is the anonymous path: no target, no error.
-    #[tokio::test]
-    async fn resolve_identity_target_none_is_anonymous() {
-        let target = super::resolve_identity_target(None, None)
-            .await
-            .expect("neither arg is valid (anonymous)");
-        assert!(target.is_none(), "neither arg must yield no target");
+    // No `derivation_origin` is the anonymous path: no target, no error.
+    #[test]
+    fn resolve_identity_target_none_is_anonymous() {
+        let target = super::resolve_identity_target(None).expect("None is anonymous");
+        assert!(target.is_none(), "None must yield no target");
     }
 
-    // A control character in either identity arg is rejected up front (it would
-    // otherwise be echoed back verbatim / corrupt the delegation origin).
-    #[tokio::test]
-    async fn resolve_identity_target_rejects_control_chars() {
-        let err = super::resolve_identity_target(Some("https://ex\u{7}ample.com".to_string()), None)
-            .await
+    // A control character is rejected up front (it would otherwise be echoed back
+    // verbatim / corrupt the delegation origin).
+    #[test]
+    fn resolve_identity_target_rejects_control_chars() {
+        let err = super::resolve_identity_target(Some("https://ex\u{7}ample.com".to_string()))
             .expect_err("control chars must be rejected");
         assert!(err.contains("control characters"), "unexpected message: {err}");
     }
@@ -2429,22 +2375,20 @@ mod tests {
     // An uppercase scheme must canonicalize the same as lowercase — `target_origin`
     // strips only a lowercase `https://`, so without normalization `HTTPS://` would
     // survive into the host and mangle the origin instead of yielding `https://host`.
-    #[tokio::test]
-    async fn resolve_identity_target_normalizes_uppercase_scheme() {
-        let t = super::resolve_identity_target(Some("HTTPS://example.com".to_string()), None)
-            .await
+    #[test]
+    fn resolve_identity_target_normalizes_uppercase_scheme() {
+        let t = super::resolve_identity_target(Some("HTTPS://example.com".to_string()))
             .expect("uppercase https scheme must be accepted")
             .expect("a derivation_origin yields a target");
         assert_eq!(t.origin, "https://example.com", "unexpected origin: {}", t.origin);
     }
 
     // A mixed-case HOST is canonicalized to lowercase, so the echoed origin and the
-    // delegation-cache key match the app_url path (which serializes via Url::origin())
+    // delegation-cache key match the resolver path (which serializes via Url::origin())
     // instead of forking `https://Example.COM` from `https://example.com`.
-    #[tokio::test]
-    async fn resolve_identity_target_lowercases_host() {
-        let t = super::resolve_identity_target(Some("https://Example.COM".to_string()), None)
-            .await
+    #[test]
+    fn resolve_identity_target_lowercases_host() {
+        let t = super::resolve_identity_target(Some("https://Example.COM".to_string()))
             .expect("mixed-case host must be accepted")
             .expect("a derivation_origin yields a target");
         assert_eq!(t.origin, "https://example.com", "host must be lowercased: {}", t.origin);
@@ -2452,62 +2396,38 @@ mod tests {
 
     // A `derivation_origin` with no host (e.g. "https://") reduces to an empty
     // origin and must be rejected rather than derived against.
-    #[tokio::test]
-    async fn resolve_identity_target_rejects_hostless_derivation_origin() {
-        let err = super::resolve_identity_target(Some("https://".to_string()), None)
-            .await
+    #[test]
+    fn resolve_identity_target_rejects_hostless_derivation_origin() {
+        let err = super::resolve_identity_target(Some("https://".to_string()))
             .expect_err("host-less derivation_origin must be rejected");
         assert!(err.contains("host"), "unexpected message: {err}");
     }
 
     // A non-http(s) scheme must be rejected, not mangled into a bogus https origin.
-    #[tokio::test]
-    async fn resolve_identity_target_rejects_non_http_scheme() {
-        let err = super::resolve_identity_target(Some("ftp://example.com".to_string()), None)
-            .await
+    #[test]
+    fn resolve_identity_target_rejects_non_http_scheme() {
+        let err = super::resolve_identity_target(Some("ftp://example.com".to_string()))
             .expect_err("ftp:// must be rejected");
         assert!(err.contains("https origin"), "unexpected message: {err}");
     }
 
-    // A whitespace-only `app_url` is rejected before any network resolution, so
-    // the caller gets a clear error instead of a confusing downstream URL failure.
-    #[tokio::test]
-    async fn resolve_identity_target_rejects_blank_app_url() {
-        let err = super::resolve_identity_target(None, Some("   ".to_string()))
-            .await
-            .expect_err("blank app_url must be rejected");
-        assert!(err.contains("must not be empty"), "unexpected message: {err}");
-    }
-
-    // A non-https `app_url` scheme is rejected early with a clear message rather
-    // than failing later in the SSRF guard.
-    #[tokio::test]
-    async fn resolve_identity_target_rejects_http_app_url() {
-        let err = super::resolve_identity_target(None, Some("http://example.com".to_string()))
-            .await
-            .expect_err("http:// app_url must be rejected");
-        assert!(err.contains("https URL"), "unexpected message: {err}");
-    }
-
-    // User-info in an app_url is silently dropped by `Url::origin()` downstream, so
-    // `https://user@host` would resolve to `https://host` — a value the caller never
-    // supplied. Reject it up front (consistent with derivation_origin validation).
-    #[tokio::test]
-    async fn resolve_identity_target_rejects_userinfo_app_url() {
-        let err = super::resolve_identity_target(None, Some("https://user:pass@example.com".to_string()))
-            .await
-            .expect_err("app_url with user-info must be rejected");
-        assert!(err.contains("user-info"), "unexpected message: {err}");
-    }
-
-    // A host-less app_url ("https://") has no origin to derive against and must be
-    // rejected here rather than failing later in URL parsing / the SSRF guard.
-    #[tokio::test]
-    async fn resolve_identity_target_rejects_hostless_app_url() {
-        let err = super::resolve_identity_target(None, Some("https://".to_string()))
-            .await
-            .expect_err("host-less app_url must be rejected");
-        assert!(err.contains("real host"), "unexpected message: {err}");
+    // `clean_app_url` (used by the resolver tools open_app / resolve_app) fails
+    // closed on bad URLs up front, so a caller gets a clear error instead of a late
+    // SSRF-guard/URL-parse failure. (The identity-bearing tools no longer take an
+    // app_url; the resolvers do.)
+    #[test]
+    fn clean_app_url_rejects_bad_urls() {
+        assert!(super::clean_app_url("   ").expect_err("blank").contains("must not be empty"));
+        assert!(super::clean_app_url("http://example.com").expect_err("http").contains("https"));
+        assert!(
+            super::clean_app_url("https://user:pass@example.com")
+                .expect_err("user-info")
+                .contains("user-info")
+        );
+        assert!(super::clean_app_url("https://").expect_err("host-less").contains("real host"));
+        // A good bare host / https URL passes through.
+        assert_eq!(super::clean_app_url("oisy.com").unwrap(), "oisy.com");
+        assert_eq!(super::clean_app_url("https://oisy.com").unwrap(), "https://oisy.com");
     }
 
     // The guessed-domain refusal (offline): the message must name the failure,
@@ -2550,21 +2470,8 @@ mod tests {
         assert!(plain.contains("icp_find_app_by_name"), "{plain}");
     }
 
-    // Live network: deriving an identity via a guessed non-IC `app_url` is REFUSED
-    // (app_url_default + no IC evidence), with the corrective guidance — instead of
-    // minting a valid-looking principal for a lookalike origin. example.com is
-    // IANA-reserved, stable, and never IC-served.
-    #[tokio::test]
-    async fn resolve_identity_target_refuses_unverified_non_ic_app_url() {
-        let err = super::resolve_identity_target(None, Some("example.com".to_string()))
-            .await
-            .expect_err("a non-IC app_url must be refused");
-        assert!(err.contains("NO evidence"), "unexpected message: {err}");
-        assert!(err.contains("icp_find_app_by_name"), "unexpected message: {err}");
-    }
-
     // The human-readable identity annotation must surface a requested≠derived
-    // mismatch (and the source) in ALL clients, not only for app_url_default.
+    // mismatch (and the source) in ALL clients.
     #[test]
     fn identity_annotation_surfaces_mismatch_and_source() {
         // requested == origin: origin + source, but no redundant `requested` echo.
@@ -2572,7 +2479,6 @@ mod tests {
             origin: "https://nns.ic0.app".to_string(),
             requested: "https://nns.ic0.app".to_string(),
             source: "explicit".to_string(),
-            application_origin: None,
         };
         let a = super::identity_annotation(&t, None);
         assert!(a.contains("derived for https://nns.ic0.app"), "{a}");
@@ -2584,21 +2490,10 @@ mod tests {
             origin: "https://app.example.com".to_string(),
             requested: "https://app.example.com/some/path".to_string(),
             source: "explicit".to_string(),
-            application_origin: None,
         };
         let a2 = super::identity_annotation(&t2, Some("aaaaa-aa"));
         assert!(a2.contains("signed as aaaaa-aa"), "{a2}");
         assert!(a2.contains("requested https://app.example.com/some/path"), "{a2}");
-
-        // app_url_default keeps its explicit "assumed" guidance.
-        let t3 = super::IdentityTarget {
-            origin: "https://example.com".to_string(),
-            requested: "https://example.com".to_string(),
-            source: "app_url_default".to_string(),
-            application_origin: Some("https://example.com".to_string()),
-        };
-        let a3 = super::identity_annotation(&t3, None);
-        assert!(a3.contains("ASSUMES the app origin"), "{a3}");
     }
 
     // The OQL tools' derivation-origin path (run_canister_oql_query / get_canister_oql_schema) must fail

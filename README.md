@@ -25,9 +25,9 @@ results).
 | `icp_lookup_canister_info_by_id` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
 | `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus an `oql` flag — `true` when it exposes an OQL query surface (a `schema` + `execute` pair), with a pointer to `icp_oql_guide` |
 | `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), read from its `getApiDoc`/`get_api_doc` method if present. Call first for an unfamiliar app |
-| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `derivation_origin?` / `app_url?`, `account?` | Reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, or an `app_url` the connector resolves). Echoes `derived_for_origin` / `requested` / `derivation_origin_source` / `acted_as_principal`. Query calls are rejected on an OQL canister — read it via the OQL tools |
-| `get_app_principal` | `derivation_origin?` / `app_url?`, `account?` | The principal you act as at an app, without a call. Echoes `derived_for_origin` / `requested` / `derivation_origin_source` so an origin mismatch is visible |
-| `list_app_accounts` | `derivation_origin?` / `app_url?` | The user's Internet Identity accounts at an app — the default account plus any named ones — with name, number, last-used, and the derivation origin they were listed for |
+| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `derivation_origin?`, `account?` | Reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`/`resolve_app`). Echoes `derived_for_origin` / `requested` / `acted_as_principal`. Query calls are rejected on an OQL canister — read it via the OQL tools |
+| `get_app_principal` | `derivation_origin`, `account?` | The principal you act as at an app, without a call. Identify the app by its `derivation_origin` (from `open_app`/`resolve_app`). Echoes `derived_for_origin` / `requested` so an origin mismatch is visible |
+| `list_app_accounts` | `derivation_origin` | The user's Internet Identity accounts at an app — the default account plus any named ones — with name, number, last-used, and the derivation origin they were listed for. Identify the app by its `derivation_origin` (from `open_app`/`resolve_app`) |
 | `resolve_app` | `app_url` | Resolve an app URL to its Internet Identity derivation context: `application_origin`, the `derivation_origin` to use (declared in `/.well-known/ic-app.json`, else a built-in known-app value, else assumed = app origin — flagged via `derivation_origin_source`: `declared`/`known`/`app_url_default`, with `application_is_ic` echoing the gateway evidence), and the app's `alternative_origins` (informational). An origin with **no IC evidence** that would need the `app_url_default` assumption is **refused** (guessed-domain guard, with a "did you mean" repair when the host resembles a well-known app). Does not return a principal (no account chosen) or require auth — pass the `derivation_origin` to `get_app_principal`/`list_app_accounts` |
 | `icp_list_skills` | — | The official [IC skills](https://skills.internetcomputer.org) (Motoko, mops/icp CLIs, cycles, stable memory, security, …), grouped by category |
 | `icp_get_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `motoko`, `icp-cli`, `cycles-management`) |
@@ -115,8 +115,8 @@ tag; JSON parse fails), and every id is still validated as a principal.
 
 The optional top-level **`derivation_origin`** is the app's declaration of the
 Internet Identity derivation origin its frontends pin (see the identity section
-above). It is the only authoritative way for `resolve_app` / `app_url` to learn a
-**custom** derivation origin — there is no reverse lookup from an app URL to it —
+above). It is the only authoritative way for `open_app` / `resolve_app` to learn a
+**custom** derivation origin from an app URL — there is no reverse lookup from an app URL to it —
 so an app that uses one should declare it here; otherwise the connector assumes
 the derivation origin equals the application origin and flags that assumption.
 
@@ -130,9 +130,8 @@ identified service. (`discover_app_canisters` results are annotated with these l
 inline.) There is no public name-search over arbitrary canisters, so `icp_find_canister_by_name`
 covers the IC's labelled services, which is where the meaningful ones live.
 
-`call_canister` runs anonymously by default; pass a `derivation_origin` (or an
-`app_url` like `https://oisy.com` that the connector resolves) to call as your
-account at that app. The server mints a **short-lived account delegation on
+`call_canister` runs anonymously by default; pass a `derivation_origin` to call as
+your account at that app. The server mints a **short-lived account delegation on
 demand** using the connection's registered Internet Identity session key (see
 [Domain identities](#domain-identities-on-demand)) — there is no per-app sign-in
 step. `get_app_principal` returns that account's principal
@@ -140,7 +139,7 @@ without a call. A user may hold several accounts at an app — a default account
 everyone gets automatically (the anchor's current, user-controllable default at
 that origin), plus any they have named — so `list_app_accounts` lists them (via II's
 `get_accounts`), and `call_canister`/`get_app_principal`/`list_app_accounts` identify the
-app by its `derivation_origin` (or an `app_url` the connector resolves — see the
+app by its `derivation_origin` (obtained once from `open_app`/`resolve_app` — see the
 note below), and take an optional `account` (a name from that list) to act as a
 specific one; omit it for the default account. All these tools require a bearer
 token (see Auth).
@@ -149,34 +148,40 @@ token (see Auth).
 > the per-app principal from a **derivation origin**, which is *usually* but **not
 > always** the visible website URL: an app can pin a *custom* derivation origin
 > (via `derivationOrigin` + `/.well-known/ii-alternative-origins`) that browsers
-> honour. The identity tools therefore take the derivation origin **explicitly**
-> as `derivation_origin` (the exact canonical origin — never inferred from an
-> alternative-origins list, which is the *inverse* relation), or an `app_url` the
-> connector resolves. There is **no reverse lookup** from an app URL to a custom
-> derivation origin, so `app_url` resolves to the app's **declared** origin
-> (`/.well-known/ic-app.json` → `derivation_origin`) when present, else a built-in
-> **known-app** value for a few apps that pin a custom origin without declaring it
-> (NNS → `https://nns.ic0.app`, Oisy → `https://oisy.com`, MULTI/DEX →
+> honour. The identity-bearing tools (`call_canister`, `get_app_principal`,
+> `list_app_accounts`, `run_canister_oql_query`, `get_canister_oql_schema`)
+> therefore take the derivation origin **explicitly** as `derivation_origin` (the
+> exact canonical origin — never inferred from an alternative-origins list, which is
+> the *inverse* relation), and **only** that — they do **not** accept a raw website
+> URL. A derivation origin is a *stable per-app value*, so you **resolve it once**
+> and reuse it: `open_app` (or `resolve_app`) turns an app name/URL into it and
+> reports how — `derivation_origin_source`: **declared**
+> (`/.well-known/ic-app.json` → `derivation_origin`), else a built-in **known-app**
+> value for a few apps that pin a custom origin without declaring it (NNS →
+> `https://nns.ic0.app`, Oisy → `https://oisy.com`, MULTI/DEX →
 > `https://hcv4s-…icp0.io`, ICPSwap → `https://app.icpswap.com`; an app's own
-> declaration always overrides this), else it *assumes* the app origin — flagged in
-> every result as `derivation_origin_source`
-> (`explicit` / `declared` / `known` / `app_url_default`). Every identity result also echoes
+> declaration always overrides this), else the app origin *assumed*
+> (**app_url_default**). Feeding that resolved origin to an identity tool records
+> `derivation_origin_source` = **explicit**. Every identity result echoes
 > `derived_for_origin` (the origin actually used) alongside `requested` (what you
-> passed), so a valid-but-wrong principal is **immediately visible** instead of
-> silent. The `app_url_default` assumption is additionally **gated on IC evidence**:
-> if the origin doesn't carry the gateway's `x-ic-canister-id` header (a valid
-> canister principal, from the origin itself — not a redirect target — checked on
-> the manifest response, else on the origin root), the `app_url` routes *refuse*
-> to derive — that combination is the signature of a domain **guessed** from an app
-> name (a lookalike/squatted site), and the refusal names the well-known app the
-> host resembles when there is one. A genuinely non-IC-hosted app that uses
-> Internet Identity can still be targeted deliberately by passing its origin as
-> `derivation_origin` explicitly. Use `resolve_app(app_url)` to see the resolution (and the app's
-> `alternative_origins`) before acting. Under the hood both routes go through the
-> same origin canonicalizer the delegation path uses (bare `https://<host>`, with
-> the `*.icp0.io`/`*.icp.net` → `*.ic0.app` gateway remap below). For backward
-> compatibility the identity tools still accept the legacy parameter name `domain`
-> as an alias for `derivation_origin`, so existing callers keep working unchanged.
+> passed), so a canonicalization mismatch is **immediately visible**. Why not accept
+> a URL directly on every tool? Because the server is **stateless** — resolving a
+> URL costs a network round-trip each call, and the derivation origin never changes
+> per-app; forcing a single up-front `open_app`/`resolve_app` avoids re-resolving on
+> every invocation and gives the agent **one** way to identify an app. The
+> **guessed-domain gate** lives at that resolution step: `open_app`/`resolve_app`
+> *refuse* an `app_url` whose `app_url_default` assumption would apply while the
+> origin shows **no IC evidence** — the gateway's `x-ic-canister-id` header (a valid
+> canister principal, from the origin itself, not a redirect target; checked on the
+> manifest response, else the origin root) — since that's the signature of a domain
+> **guessed** from an app name (a lookalike/squatted site), and the refusal names
+> the well-known app the host resembles when there is one. A genuinely non-IC-hosted
+> app that uses Internet Identity can still be targeted deliberately by passing its
+> origin as `derivation_origin` (which is trusted verbatim, ungated). Under the hood
+> the origin goes through the same canonicalizer the delegation path uses (bare
+> `https://<host>`, with the `*.icp0.io`/`*.icp.net` → `*.ic0.app` gateway remap
+> below). For backward compatibility the identity tools still accept the legacy
+> parameter name `domain` as an alias for `derivation_origin`.
 
 ### Skills awareness
 
@@ -632,7 +637,7 @@ There is no per-app browser sign-in. Instead the model is:
   calls directly with that key (its principal `self_authenticating(session_pubkey)`
   is what the grant is bound to). Reconnect when the grant expires or is revoked.
 - **App delegations minted on demand.** When `call_canister` (or `get_app_principal`)
-  is invoked with a `derivation_origin` (or an `app_url` like `https://oisy.com`), the backend mints a **short-lived
+  is invoked with a `derivation_origin` (resolved once via `open_app`/`resolve_app`), the backend mints a **short-lived
   per-app account delegation on demand**: signing *as the session key*, it calls
   Internet Identity's account-derivation methods directly — no browser round-trip
   — with the app's target origin and a fresh **per-app key** as `session_key`.
