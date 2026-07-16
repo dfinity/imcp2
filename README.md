@@ -412,7 +412,7 @@ on-chain grant (P3).
 > hosted-redirect allow-listing — a product decision that trades only against open
 > DCR for hosted clients.
 
-### Registration delegation (Phase 2 — per-instance: beta on, prod on v1)
+### Registration delegation (Phase 2 — per-instance: beta on, prod on)
 
 A successor connect flow (the *registration delegation* design) removes the
 weakest link in v1: today II binds a session key it was merely **shown** (fetched
@@ -435,9 +435,12 @@ call as `X`. II never again binds a bare key it was shown.
   while every v1 handler stays live — so beta keeps connecting via v1 until beta
   II actually ships the new frontend + canister methods, and switches over when
   it does.
-- **production (`/mcp-prod`, id.ai)** — **pinned to v1** by default (opt in
-  later with `MCP_REGISTRATION_DELEGATION_PROD=1`). Its II link, callback, and
-  finish flow are exactly the existing protocol; the Phase-2 routes `404`.
+- **production (`/mcp-prod`, id.ai)** — Phase 2 **on** by default, the same as
+  beta (disable with `MCP_REGISTRATION_DELEGATION_PROD=0`). Enabling is
+  outbound-compatible in exactly the same way: the II link gains the
+  `registration_key` param and the Phase-2 routes turn on, while every v1
+  handler stays live, so production keeps connecting via v1 until production II
+  ships the new frontend + canister methods, and switches over when it does.
 
 `/version` is the unauthenticated operations probe. It reports the running
 build (`version`, `commit`, `built_at`, `started_at`), the H3/P1

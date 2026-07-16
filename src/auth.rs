@@ -59,7 +59,7 @@
 //! request per connect and never auto-retries (a retry then fails as "restart",
 //! never a takeover — the safe direction).
 //!
-//! ## Phase 2: the registration delegation (per-instance; beta on, prod off)
+//! ## Phase 2: the registration delegation (per-instance; beta on, prod on)
 //!
 //! A successor connect flow (the "registration delegation" design) replaces the
 //! fetched-key registration — where II binds a key it was merely shown — with a
@@ -76,16 +76,16 @@
 //! registration removes the `grant_is_live` probe and the `finishing_page` poll.
 //!
 //! The server runs BOTH protocols side by side, selected **per II instance**
-//! ([`crate::identities::IiInstance::registration_delegation`]): the beta
-//! (staging) instance runs Phase 2 by default (`MCP_REGISTRATION_DELEGATION=0`
-//! to disable), the production instance stays pinned to v1
-//! (`MCP_REGISTRATION_DELEGATION_PROD=1` to opt in later). Enabling Phase 2 for
-//! an instance is **outbound-compatible with v1**: it adds `registration_key`
-//! to that instance's II link and turns on its pinned callback page + redeem
-//! endpoint, while every v1 handler (the callback POSTs, `/oauth/finish`) stays
-//! live — an II frontend that doesn't know the new flow ignores the extra param
-//! and completes v1 unchanged. So beta connected via v1 until beta II shipped
-//! the new frontend and canister methods; now that it has, beta runs Phase 2.
+//! ([`crate::identities::IiInstance::registration_delegation`]): both the beta
+//! (staging) and the production instance run Phase 2 by default
+//! (`MCP_REGISTRATION_DELEGATION=0` / `MCP_REGISTRATION_DELEGATION_PROD=0` to
+//! disable per instance). Enabling Phase 2 for an instance is
+//! **outbound-compatible with v1**: it adds `registration_key` to that
+//! instance's II link and turns on its pinned callback page + redeem endpoint,
+//! while every v1 handler (the callback POSTs, `/oauth/finish`) stays live — an
+//! II frontend that doesn't know the new flow ignores the extra param and
+//! completes v1 unchanged. So each instance connected via v1 until its II
+//! shipped the new frontend and canister methods, and switches over when it does.
 //!
 //! The wire shapes match the merged II contract (verified against the beta II
 //! canister's live `.did`, `fgte5-ciaaa-aaaad-aaatq-cai`): the connect link
@@ -480,7 +480,8 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
     // (`P_reg -> Y -> X`, the last hop browser-signed to `X`). An II frontend that
     // doesn't know the new flow ignores the extra params and completes v1 (whose
     // handlers are always live), so enabling this is outbound-compatible. A
-    // v1-pinned instance (prod) emits the unmodified v1 link.
+    // v1-pinned instance (one with `registration_delegation` disabled) emits the
+    // unmodified v1 link.
     let ii_url = if store.instance().registration_delegation {
         let reg_pubkey = store.identities.registration_pubkey_b64(&session_id).await;
         ii_mcp_url_v2(store.instance(), &session_id, &reg_pubkey)
@@ -2027,7 +2028,7 @@ mod tests {
                     ii_canister: Principal::anonymous(),
                     oauth_prefix: prefix,
                     mcp_path,
-                    registration_delegation: prefix.is_empty(), // beta-like on, prod-like off
+                    registration_delegation: prefix.is_empty(), // two instances, one per protocol
                 }),
                 super::SharedClients(std::sync::Arc::default()),
             )
@@ -2358,10 +2359,11 @@ mod tests {
         ));
     }
 
-    // Dual-flow, per instance: on a v1-PINNED instance (prod) the Phase-2
-    // surface is absent — the GET callback page and the redeem endpoint both
-    // 404, so its v1 flow is provably unchanged — while a Phase-2 instance
-    // (beta) serves the pinned page from the same routes.
+    // Dual-flow, per instance: on a v1-PINNED instance (registration_delegation
+    // off) the Phase-2 surface is absent — the GET callback page and the redeem
+    // endpoint both 404, so its v1 flow is provably unchanged — while a Phase-2
+    // instance (registration_delegation on) serves the pinned page from the same
+    // routes.
     #[tokio::test]
     async fn phase2_routes_are_per_instance() {
         use axum::extract::State;
