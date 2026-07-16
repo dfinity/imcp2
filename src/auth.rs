@@ -2020,7 +2020,7 @@ mod tests {
         use axum::extract::State;
         use crate::identities::{Identities, IiInstance};
         use candid::Principal;
-        let make = |prefix: &'static str, mcp_path: &'static str| {
+        let make = |prefix: &'static str, mcp_path: &'static str, registration_delegation: bool| {
             super::AuthStore::new(
                 Identities::new(IiInstance {
                     name: "t",
@@ -2028,13 +2028,16 @@ mod tests {
                     ii_canister: Principal::anonymous(),
                     oauth_prefix: prefix,
                     mcp_path,
-                    registration_delegation: prefix.is_empty(), // two instances, one per protocol
+                    registration_delegation,
                 }),
                 super::SharedClients(std::sync::Arc::default()),
             )
         };
-        let beta = make("", "/mcp");
-        let prod = make("/prod", "/mcp-prod");
+        // Cover both protocols explicitly: one Phase-2 (v2) instance and one v1
+        // instance. The flag is independent of the prefix — the allow-list
+        // document is prefix-derived, so this test holds regardless of it.
+        let beta = make("", "/mcp", true);
+        let prod = make("/prod", "/mcp-prod", false);
 
         let r = super::auth_callbacks(State(vec![beta.clone(), prod.clone()])).await;
         assert_eq!(r.status(), axum::http::StatusCode::OK);
