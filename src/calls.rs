@@ -724,9 +724,10 @@ pub fn oql_query_examples(
 /// Whether a decoded textual-Candid `reply` LOOKS empty — used only to attach the
 /// #1 anonymous-read auth hint to a `call_canister` query result, so it must be
 /// conservative (a false "empty" would raise a spurious auth hint). Recognizes the
-/// unambiguous empties: the unit tuple `()`, an empty/none `opt` (`(null)`), an
-/// empty vector (`(vec {})`), and the common "not found" variant arms
-/// (`variant { none }` / `err`-style). Anything with real content returns false.
+/// unambiguous empties only: the unit tuple `()`, an empty/none `opt` (`(null)`),
+/// an empty vector (`(vec {})` / `(opt vec {})`), and a `variant { none }` arm.
+/// Anything else — including an explicit `variant { err = … }` (which is a real
+/// error, not "empty") or any reply with content — returns false.
 pub fn candid_reply_is_empty(reply: &str) -> bool {
     let t = reply.trim();
     // Unit / empty tuple.
@@ -1467,5 +1468,9 @@ mod tests {
         assert!(!candid_reply_is_empty("(record { balance = 5 : nat })"));
         assert!(!candid_reply_is_empty("(opt record { a = 1 })"));
         assert!(!candid_reply_is_empty("(\"some text\")"));
+        // An explicit error variant is a real error, NOT "empty" — so it must not
+        // trip the anonymous-read auth hint (only `variant { none }` counts).
+        assert!(!candid_reply_is_empty("(variant { err = \"not found\" })"));
+        assert!(!candid_reply_is_empty("(variant { error = \"nope\" })"));
     }
 }

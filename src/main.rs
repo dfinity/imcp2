@@ -254,8 +254,10 @@ impl IcTools {
             Err(e) => {
                 // A trap is the OTHER way an invalid `start` shows up (#7): validate
                 // it against the schema for THIS principal and fold the repair into
-                // the error, so the agent doesn't re-guess blindly.
-                let d = diagnose_empty_oql(&agent, principal, &query_json, is_anonymous).await;
+                // the error, so the agent doesn't re-guess blindly. Failed context:
+                // only the unknown-`start` repair is appended, never a "came back
+                // empty" note (which would contradict the trap message).
+                let d = diagnose_empty_oql(&agent, principal, &query_json, is_anonymous, EmptyContext::Failed).await;
                 let mut msg = format!("OQL execute failed: {e}");
                 if let Some(note) = d.note {
                     msg.push_str(&format!("\n\n{note}"));
@@ -273,7 +275,7 @@ impl IcTools {
                 // repair, or a benign "0 rows for this account" — never by probing
                 // others.
                 let mut diag = if rows.is_empty() {
-                    diagnose_empty_oql(&agent, principal, &query_json, is_anonymous).await
+                    diagnose_empty_oql(&agent, principal, &query_json, is_anonymous, EmptyContext::EmptyResult).await
                 } else {
                     OqlEmptyDiagnosis::none()
                 };
@@ -315,8 +317,9 @@ impl IcTools {
             }
             calls::OqlResult::QueryError(msg) => {
                 // The canister returned its error arm. An invalid `start` can land
-                // here too, so enrich with the schema-based repair (#7).
-                let d = diagnose_empty_oql(&agent, principal, &query_json, is_anonymous).await;
+                // here too, so enrich with the schema-based repair (#7). Failed
+                // context: only the unknown-`start` repair is appended.
+                let d = diagnose_empty_oql(&agent, principal, &query_json, is_anonymous, EmptyContext::Failed).await;
                 let mut text = format!("the canister returned an OQL error: {msg}");
                 if let Some(note) = d.note {
                     text.push_str(&format!("\n\n{note}"));
@@ -325,9 +328,17 @@ impl IcTools {
             }
             calls::OqlResult::Unrecognized(raw) => {
                 // Not a recognizable OQL result — hand back the raw decoded reply
-                // so the model still has the data (empty table in the structured form).
-                let mut blocks =
-                    vec![format!("(Could not parse this as an OQL table; raw reply below.)\n\n{raw}")];
+                // so the model still has the data. The structured columns/rows are
+                // empty here, so carry a `note` too (rather than null) — otherwise a
+                // structured-only consumer would misread this as "no data" when the
+                // reply actually carried content (it's in the text block).
+                let unparsed_note =
+                    "This reply couldn't be parsed as an OQL table; the raw decoded reply is in the \
+                     text block. This is NOT an empty result — read the raw reply for the data."
+                        .to_string();
+                let mut blocks = vec![format!(
+                    "(Could not parse this as an OQL table; raw reply below.)\n\n{raw}"
+                )];
                 if let Some(note) = &identity_note {
                     blocks.push(note.clone());
                 }
@@ -340,7 +351,7 @@ impl IcTools {
                     derived_for_origin: origin,
                     requested,
                     is_anonymous,
-                    note: None,
+                    note: Some(unparsed_note),
                     valid_entities: None,
                     did_you_mean: None,
                 };
@@ -790,7 +801,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Open an Internet Computer app in ONE call, given its NAME or its URL — the recommended entry point when a user names an app. It resolves the app's Internet Identity derivation origin (like resolve_app) AND discovers the canisters behind it (like discover_app_canisters) together, so you don't chain those yourself. Pass a NAME (e.g. \"MULTI/DEX\", \"Oisy\", \"NNS\") or a URL (e.g. \"https://oisy.com\"): a name or bare host is matched to the built-in known-app registry FIRST (so even a wrong-TLD guess like \"multidex.com\" repairs to the canonical URL), and an explicit https:// URL is resolved as given. NEVER fabricate a domain from a name — an unknown bare name is refused with instructions to find the real URL (web search / ask the user), and a URL with no Internet-Computer evidence is refused, both instead of guessing a wrong identity. Returns `app_url` (the one used), `derivation_origin` (+ its source) to act with, `alternative_origins`, and the discovered `canisters` (with provenance/labels AND per-canister `oql`/`api_doc_available` capability flags, from a one-shot Candid probe of the app's own canisters). A canister flagged `oql` holds the app's data, GATED BY THE CALLER's principal: to read the USER's own data (\"my …\", \"our …\") pass the returned `derivation_origin` (or `app_url`) to get_canister_oql_schema / run_canister_oql_query — an anonymous read comes back empty. No authenticated session required for open_app itself (no principal is derived here). Narrower tools remain for single steps: icp_find_app_by_name (name→URL only), resolve_app (origin only), discover_app_canisters (canisters only).",
+        description = "Open an Internet Computer app in ONE call, given its NAME or its URL — the recommended entry point when a user names an app. It resolves the app's Internet Identity derivation origin (like resolve_app) AND discovers the canisters behind it (like discover_app_canisters) together, so you don't chain those yourself. Pass a NAME (e.g. \"MULTI/DEX\", \"Oisy\", \"NNS\") or a URL (e.g. \"https://oisy.com\"): a name or bare host is matched to the built-in known-app registry FIRST (so even a wrong-TLD guess like \"multidex.com\" repairs to the canonical URL), and an explicit https:// URL is resolved as given. NEVER fabricate a domain from a name — an unknown bare name is refused with instructions to find the real URL (web search / ask the user), and a URL with no Internet-Computer evidence is refused, both instead of guessing a wrong identity. Returns `app_url` (the one used), `derivation_origin` (+ its source) to act with, `alternative_origins`, and the discovered `canisters` (with provenance/labels AND per-canister `oql`/`api_doc_available` capability flags, from a one-shot Candid probe of the app's own canisters). A canister flagged `oql` holds the app's data, GATED BY THE CALLER's principal: to read the USER's own data (\"my …\", \"our …\") pass the returned `derivation_origin` to get_canister_oql_schema / run_canister_oql_query (those OQL tools take `derivation_origin`, not `app_url`) — an anonymous read comes back empty. No authenticated session required for open_app itself (no principal is derived here). Narrower tools remain for single steps: icp_find_app_by_name (name→URL only), resolve_app (origin only), discover_app_canisters (canisters only).",
         annotations(title = "Open an app (resolve origin + discover canisters)", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::OpenAppOutput>(),
     )]
@@ -868,8 +879,11 @@ impl IcTools {
         self.enrich_capabilities(&mut discovered).await;
         // The ready-to-use data-access handle: the resolved origin, scoped (by
         // is_app_data_candidate) to the app's own OQL canisters — never a guessed
-        // origin, never II/NNS/ledger/frontend.
-        let handle = format!("derivation_origin=\"{effective}\" (or app_url=\"{app_url}\")");
+        // origin, never II/NNS/ledger/frontend. `derivation_origin` only: the
+        // data-access note names the OQL read tools, which take `derivation_origin`
+        // (not `app_url` — that's call_canister's), so offering app_url here would
+        // send the agent to a param those tools silently ignore.
+        let handle = format!("derivation_origin=\"{effective}\"");
 
         let mut text = format!(
             "app_url: {app_url} ({app_url_source})\nderivation_origin: {effective} ({})\n",
@@ -1403,70 +1417,103 @@ impl OqlEmptyDiagnosis {
     }
 }
 
-/// Diagnose why an OQL read came back EMPTY (0 rows) or TRAPPED, using ONLY facts
-/// gathered from the SAME agent/principal that ran the query — never probing
-/// whether some OTHER principal would see data (no leak). This is validate-on-empty,
-/// not an unconditional preflight: it runs a single extra `schema` read for this
-/// principal and hard-validates the query's `start` entity (only `start` — field
-/// and dotted-edge paths are treated advisorily by the caller).
+/// Why `diagnose_empty_oql` was called — a genuinely EMPTY result (0-row table)
+/// vs. a FAILED one (trap / OQL error arm). The `start`-entity repair applies to
+/// both, but the "came back empty ⇒ likely not authenticated" / "no entities here"
+/// notes describe an EMPTY result and would misdescribe a failure that already
+/// carries its own error message, so they are emitted for `EmptyResult` only.
+#[derive(Clone, Copy, PartialEq)]
+enum EmptyContext {
+    EmptyResult,
+    Failed,
+}
+
+/// Diagnose why an OQL read came back EMPTY (0 rows) or FAILED (trap / error arm),
+/// using ONLY facts gathered from the SAME agent/principal that ran the query —
+/// never probing whether some OTHER principal would see data (no leak). This is
+/// validate-on-empty, not an unconditional preflight: it runs a single extra
+/// `schema` read for this principal and hard-validates the query's `start` entity
+/// (only `start` — field and dotted-edge paths are treated advisorily by the caller).
 ///
-///  - Anonymous + no entities visible → the #1 auth remediation (empty is almost
-///    certainly "not authenticated as your account", not "no data").
-///  - Authenticated + no entities visible → this account sees no entities here.
 ///  - `start` isn't one of the visible entities → the #7 unknown-entity repair
-///    (valid entities + a "did you mean?" near match).
-///  - `start` valid but 0 rows → anonymous gets the auth hint; authenticated gets a
-///    plain "matched 0 rows for this account".
+///    (valid entities + a "did you mean?" near match). Emitted in BOTH contexts —
+///    an unknown `start` is the common reason a query traps.
+///  - The notes below describe an EMPTY RESULT and are emitted for `EmptyResult`
+///    only (a `Failed` result keeps its own error message; "came back empty" would
+///    misdescribe it):
+///     - Anonymous + empty → the #1 auth remediation (empty is almost certainly
+///       "not authenticated as your account", not "no data").
+///     - Authenticated + the schema read SUCCEEDED and shows no entities → this
+///       account sees no entities here. (A schema read that FAILED is left
+///       undiagnosed — the caller falls back to a benign "0 rows" note — rather
+///       than mislabeled "no entities".)
+///     - `start` valid but 0 rows → authenticated gets no note here (the caller
+///       adds the benign "0 rows"); anonymous still gets the auth hint.
 async fn diagnose_empty_oql(
     agent: &Agent,
     principal: Principal,
     query_json: &str,
     is_anonymous: bool,
+    ctx: EmptyContext,
 ) -> OqlEmptyDiagnosis {
     // The derivation_origin the caller would ADD to authenticate — a placeholder we
     // never fill with a guessed origin (#1).
     const ADD_HINT: &str = "the app's `derivation_origin` (its canonical Internet Identity origin)";
-    // Re-read the schema for THIS principal (same agent). A failure just yields no
-    // entities — the anonymous branch still fires, so the auth hint isn't lost.
-    let entities = match calls::encode_unit_arg() {
+    // Re-read the schema for THIS principal (same agent). `None` = the read FAILED
+    // (unknown, not "empty"); `Some(vec)` = it succeeded (possibly with no entities).
+    // Keeping the two apart stops a transient schema failure from being mislabeled
+    // "this account sees no entities".
+    let entities: Option<Vec<String>> = match calls::encode_unit_arg() {
         Ok(arg) => match calls::raw_call(agent, principal, "schema", arg, true).await {
-            Ok(reply) => calls::oql_entity_names(&calls::decode_schema_reply(&reply)),
-            Err(_) => Vec::new(),
+            Ok(reply) => Some(calls::oql_entity_names(&calls::decode_schema_reply(&reply))),
+            Err(_) => None,
         },
-        Err(_) => Vec::new(),
+        Err(_) => None,
     };
     let start = calls::oql_query_start(query_json);
     let mut d = OqlEmptyDiagnosis::none();
-    if entities.is_empty() {
-        d.note = Some(if is_anonymous {
-            calls::anonymous_empty_note("this query", ADD_HINT)
-        } else {
+
+    // #7 unknown-`start` repair — needs a successful, non-empty schema. Applies in
+    // BOTH contexts (an unknown entity is exactly what makes a query trap).
+    if let Some(ents) = entities.as_ref().filter(|e| !e.is_empty()) {
+        if let Some(s) = start.as_deref().filter(|s| !ents.iter().any(|e| e == s)) {
+            d.did_you_mean = calls::closest_entity(s, ents);
+            let dym = d
+                .did_you_mean
+                .as_deref()
+                .map(|m| format!(" Did you mean \"{m}\"?"))
+                .unwrap_or_default();
+            d.note = Some(format!(
+                "`start`: \"{s}\" is not a queryable entity on this canister. Valid entities \
+                 (visible to this caller): {}.{dym}",
+                ents.join(", ")
+            ));
+            d.valid_entities = Some(ents.clone());
+            return d;
+        }
+    }
+
+    // The remaining notes describe an EMPTY result — skip them on a failure, whose
+    // own error message stands, and appending "came back empty" would contradict it.
+    if ctx == EmptyContext::Failed {
+        return d;
+    }
+
+    if is_anonymous {
+        // Anonymous + empty (schema empty, unreadable, or `start` valid) → auth hint.
+        d.note = Some(calls::anonymous_empty_note("this query", ADD_HINT));
+    } else if matches!(entities.as_deref(), Some([])) {
+        // Authenticated AND the schema read SUCCEEDED with no entities — a genuine
+        // "nothing visible here" (not a failed re-read mislabeled as empty).
+        d.note = Some(
             "This account sees no OQL entities on this canister, so there is nothing to query as \
              it — confirm the derivation_origin/account are the ones the user uses in their browser."
-                .to_string()
-        });
-    } else if let Some(s) = start.as_deref().filter(|s| !entities.iter().any(|e| e == s)) {
-        // #7: `start` isn't a queryable entity for this caller — repair, don't re-guess.
-        d.did_you_mean = calls::closest_entity(s, &entities);
-        let dym = d
-            .did_you_mean
-            .as_deref()
-            .map(|m| format!(" Did you mean \"{m}\"?"))
-            .unwrap_or_default();
-        d.note = Some(format!(
-            "`start`: \"{s}\" is not a queryable entity on this canister. Valid entities (visible \
-             to this caller): {}.{dym}",
-            entities.join(", ")
-        ));
-        d.valid_entities = Some(entities);
-    } else if is_anonymous {
-        // `start` valid (or absent) but empty AND anonymous → still most likely auth.
-        d.note = Some(calls::anonymous_empty_note("this query", ADD_HINT));
+                .to_string(),
+        );
     }
-    // `start` valid AND authenticated: NO actionable diagnosis here — leave `note`
-    // None. The caller decides: an empty *table* gets a benign "0 rows for this
-    // account" note; a trap / OQL-error path appends nothing (a "0 rows" note would
-    // misdescribe a failure that never returned rows).
+    // Otherwise (authenticated: `start` valid, OR the schema read failed): no
+    // actionable diagnosis — leave `note` None so the caller adds the benign
+    // "0 rows for this account" on an empty table.
     d
 }
 
@@ -1841,7 +1888,9 @@ impl ServerHandler for IcTools {
              \"MY / OUR …\" IS AN AUTHENTICATED READ. A question about the USER's OWN data in an app \
              (\"who am I meeting with…\", \"my bookings\", \"our balance\") reads data the app gates \
              by the CALLER's principal. To read it as the user, pass the app's `derivation_origin` \
-             (from open_app / resolve_app) — or `app_url` — to the read tools. An ANONYMOUS per-app \
+             (from open_app / resolve_app) to the read tools — the OQL tools \
+             (get_canister_oql_schema / run_canister_oql_query) take `derivation_origin`; \
+             call_canister also accepts `app_url`. An ANONYMOUS per-app \
              read (no origin) is signed as principal 2vxsx-fae and USUALLY COMES BACK EMPTY: treat an \
              empty per-app read as \"not authenticated as your account\", NOT \"no data\", and re-run \
              the same call WITH the origin (the read tools say so in their reply when this happens). \
