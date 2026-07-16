@@ -126,12 +126,13 @@ pub struct IiInstance {
     pub mcp_path: &'static str,
     /// Whether THIS instance runs the **Phase-2 registration-delegation**
     /// connect flow (see `crate::auth`'s "Phase 2" module docs). Per-instance so
-    /// the server supports BOTH protocols side by side: staging II (beta) on the
-    /// new flow while production II stays on v1. Enabling is outbound-compatible:
-    /// it only adds the `regkey`/`flow` params to the II link and turns on the
-    /// pinned callback page + redeem endpoint — an II frontend that doesn't know
-    /// the new flow ignores the params and completes v1, which the server always
-    /// still serves. Disabled instances 404 the Phase-2 routes.
+    /// the server supports BOTH protocols side by side and each instance can be
+    /// toggled independently — both beta and prod default to the new flow.
+    /// Enabling is outbound-compatible: it only adds the `registration_key` param
+    /// to the II link and turns on the pinned callback page + redeem endpoint — an
+    /// II frontend that doesn't know the new flow ignores the param and completes
+    /// v1, which the server always still serves. Disabled instances 404 the
+    /// Phase-2 routes.
     pub registration_delegation: bool,
 }
 
@@ -153,10 +154,14 @@ impl IiInstance {
         })
     }
 
-    /// The production instance (`II_URL_PROD` / `II_CANISTER_ID_PROD`). Only
-    /// useful once production II carries the #4086 MCP feature set. Stays on the
-    /// v1 (fetched-key) connect protocol by DEFAULT; opt in to Phase 2 with
-    /// `MCP_REGISTRATION_DELEGATION_PROD=1` once production II supports it.
+    /// The production instance (`II_URL_PROD` / `II_CANISTER_ID_PROD`). Runs the
+    /// Phase-2 registration-delegation flow by DEFAULT, the same as beta, now that
+    /// production II carries the merged MCP feature set; fall back to the v1
+    /// (fetched-key) protocol with `MCP_REGISTRATION_DELEGATION_PROD=0`. Enabling
+    /// is outbound-compatible with v1 (it only adds the `registration_key` link
+    /// param and turns on the Phase-2 routes, leaving every v1 handler live — see
+    /// [`IiInstance::registration_delegation`]), so a production II frontend that
+    /// has not yet shipped the new flow still completes v1 unchanged.
     pub fn prod() -> Result<Self, String> {
         Ok(Self {
             name: "prod",
@@ -164,7 +169,7 @@ impl IiInstance {
             ii_canister: env_principal("II_CANISTER_ID_PROD", II_CANISTER_ID_PROD_DEFAULT)?,
             oauth_prefix: "/prod",
             mcp_path: "/mcp-prod",
-            registration_delegation: env_flag("MCP_REGISTRATION_DELEGATION_PROD", false),
+            registration_delegation: env_flag("MCP_REGISTRATION_DELEGATION_PROD", true),
         })
     }
 }
@@ -1355,8 +1360,8 @@ mod tests {
 
     /// The built-in instance defaults must parse (canister ids are compile-time
     /// strings) and carry the expected paths/prefixes — and the expected default
-    /// connect protocols: beta (staging) on the Phase-2 registration delegation,
-    /// prod pinned to v1. (Env overrides could flip these outside the test env.)
+    /// connect protocol: both beta (staging) and prod on the Phase-2 registration
+    /// delegation. (Env overrides could flip these outside the test env.)
     #[test]
     fn instance_defaults_are_valid() {
         let beta = IiInstance::beta().expect("beta defaults");
@@ -1366,7 +1371,7 @@ mod tests {
         let prod = IiInstance::prod().expect("prod defaults");
         assert_eq!(prod.oauth_prefix, "/prod");
         assert_eq!(prod.mcp_path, "/mcp-prod");
-        assert!(!prod.registration_delegation, "prod stays on v1 by default");
+        assert!(prod.registration_delegation, "prod defaults to the new protocol");
         assert_ne!(beta.ii_canister, prod.ii_canister);
     }
 
