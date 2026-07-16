@@ -43,6 +43,12 @@ pub struct GetCandidOutput {
     /// `schema` and an `execute` method). When set, load `icp_oql_guide` (or the
     /// `oql://usage` resource) to learn the JSON query dialect before querying.
     pub oql: bool,
+    /// True when the canister declares an API-documentation method
+    /// (`getApiDoc`/`get_api_doc`) — computed with the SAME predicate
+    /// get_canister_api_doc uses, so it tells you up front whether that call will
+    /// return anything. Only call get_canister_api_doc when this is true; when it's
+    /// false the canister has no prose doc and the Candid types here are the interface.
+    pub api_doc_available: bool,
 }
 
 /// Output of `icp_oql_guide`.
@@ -98,6 +104,25 @@ pub struct OqlQueryOutput {
     /// canonicalization) is visible. Null for anonymous queries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
+    /// True when the query ran as the ANONYMOUS principal (no `derivation_origin`).
+    /// Always present so a text-only client can tell an anonymous read from an
+    /// authenticated one even on an empty result — per-app data is caller-gated,
+    /// so an anonymous empty result usually means "not authenticated", not "no data".
+    pub is_anonymous: bool,
+    /// A diagnostic note for an EMPTY result (0 rows): the anonymous-read auth
+    /// remediation (#1), an unknown-`start` repair (#7), or a note that the query
+    /// matched nothing for the authenticated principal. Null when rows were returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// When an empty result was diagnosed as an unknown `start` entity: the entities
+    /// actually visible to this caller (validated against the schema for the SAME
+    /// principal). Null unless that diagnosis fired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_entities: Option<Vec<String>>,
+    /// The closest valid entity to an unknown `start` (e.g. "booking" → "bookings").
+    /// Null unless an unknown-`start` diagnosis found a near match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub did_you_mean: Option<String>,
 }
 
 /// Arguments for `get_canister_oql_schema`.
@@ -137,6 +162,22 @@ pub struct OqlSchemaOutput {
     /// canonicalization) is visible. Null for anonymous reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
+    /// True when the schema was read as the ANONYMOUS principal (no
+    /// `derivation_origin`). Always present: the schema is itself caller-gated, so
+    /// an anonymous read commonly returns NO entities — which means "not
+    /// authenticated as your account", not "the app has no data model".
+    pub is_anonymous: bool,
+    /// A note when the schema came back with NO entities: the anonymous-read auth
+    /// remediation (#1) when anonymous, else a note that this principal can see no
+    /// entities here. Null when entities were returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// One ready-to-run `run_canister_oql_query` invocation per entity — a COMPLETE
+    /// call (canister_id + a minimal `{start, limit}` query) that PRESERVES the
+    /// identity this schema was read under (same `derivation_origin`/`account`), so
+    /// copying an example doesn't silently drop back to anonymous. Read-only. Empty
+    /// when the schema exposes no entities.
+    pub example_queries: Vec<String>,
 }
 
 /// Arguments for `get_canister_api_doc`.
@@ -146,16 +187,37 @@ pub struct ApiDocArgs {
     pub canister_id: String,
 }
 
-/// Output of `get_canister_api_doc`.
+/// Output of `get_canister_api_doc` — a STRUCTURED result in every case (not an
+/// error when the doc simply isn't there), so the agent can distinguish "this app
+/// has no prose doc" (expected, don't retry) from "couldn't reach it" (retry).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ApiDocOutput {
-    /// The canister the doc came from.
+    /// The canister the doc was requested from.
     pub canister_id: String,
-    /// The method the doc was read from (`getApiDoc` or `get_api_doc`).
-    pub method: String,
+    /// True when an API-doc method was found and returned a doc (`doc` is set).
+    pub available: bool,
+    /// The method the doc was read from (`getApiDoc`/`get_api_doc`) — null when
+    /// unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
     /// The API documentation (markdown): how the app behaves — units, auth,
     /// lifecycle, non-obvious semantics, mutation safety, polling rules, gotchas.
-    pub doc: String,
+    /// Null when unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+    /// When `available` is false: whether absence is EXPECTED — the interface read
+    /// fine and the canister simply declares no api-doc method (most canisters
+    /// don't). True on the normal "no such method" path; false when we couldn't tell
+    /// (interface unreadable / the call failed). Meaningless when `available`.
+    pub expected: bool,
+    /// When `available` is false: whether retrying might help. False when the method
+    /// genuinely isn't declared (retrying won't conjure one); true for a transient
+    /// failure (interface/method call unreachable). Meaningless when `available`.
+    pub retry: bool,
+    /// What to do next — e.g. "use get_canister_candid for the interface" when there
+    /// is no doc, or "retry" on a transient failure. Null when `available`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 /// Arguments for `call_canister`.
@@ -230,6 +292,16 @@ pub struct CallCanisterOutput {
     /// wrong for an app with a custom one. Null for anonymous calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derivation_origin_source: Option<String>,
+    /// True when the call ran as the ANONYMOUS principal (no `derivation_origin` /
+    /// `app_url`). Always present so a text-only client can tell an anonymous read
+    /// from an authenticated one — a per-app read that gates data by caller
+    /// principal returns empty when anonymous, which is an auth artifact, not "no data".
+    pub is_anonymous: bool,
+    /// A note for a query call whose reply looks EMPTY while anonymous: the
+    /// caller-gated auth remediation (#1). Computed only from local facts (anonymous
+    /// + empty-looking reply); null otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 pub fn default_args() -> String {
@@ -469,14 +541,213 @@ pub fn oql_query_redirect(did: Option<&str>, is_query: bool) -> Option<String> {
     if is_query && did.is_some_and(has_oql) {
         Some(
             "this canister exposes an OQL query surface, so its data is READ through the \
-             dedicated OQL tools rather than raw `call_canister` query calls: use \
-             `run_canister_oql_query` to query it (call `get_canister_oql_schema` first for the \
-             entity and field names), and `get_canister_api_doc` for its behavioral docs. Only \
-             update calls (state changes) go through `call_canister`, with `is_query=false`."
+             dedicated OQL tools, NOT raw `call_canister` query calls. Do this instead, in order: \
+             (1) `icp_oql_guide` for the JSON dialect (once), (2) `get_canister_oql_schema` for the \
+             entity and field names, (3) `run_canister_oql_query` to run the query. If the request \
+             is about the USER's own data (\"my …\", \"our …\"), pass the app's `derivation_origin` \
+             to steps 2 and 3 — this canister gates data by caller principal, so an anonymous read \
+             comes back empty (an auth artifact, not \"no data\"). Only UPDATE calls (state changes) \
+             go through `call_canister`, with `is_query=false`."
                 .to_string(),
         )
     } else {
         None
+    }
+}
+
+// ===========================================================================
+// Empty-read auth signal (#1) + OQL `start` validation (#7) + per-entity
+// examples (#8). Per-app data is gated by the CALLER's principal, so a read made
+// anonymously usually returns empty — with no signal that authentication is the
+// missing ingredient. These helpers turn a silent empty into an actionable one,
+// computed ONLY from local facts (anonymous + empty), never by probing whether
+// authenticated data exists.
+// ===========================================================================
+
+/// The most examples/entities we enumerate in `get_canister_oql_schema` (#8) and
+/// in the `valid_entities` list (#7) — a schema with a huge entity count would
+/// otherwise bloat the reply.
+pub(crate) const MAX_OQL_ENTITIES: usize = 40;
+
+/// The #1 remediation note for a per-app read that came back EMPTY while
+/// ANONYMOUS. Empty almost always means "not authenticated as your account", not
+/// "no data", because the canister gates data by caller principal. `what` names
+/// the empty thing ("the schema", "this query", "this query call"); `add_hint`
+/// names the argument to add (a placeholder the agent fills — we NEVER bake in an
+/// origin the tool guessed via app_url_default).
+pub fn anonymous_empty_note(what: &str, add_hint: &str) -> String {
+    format!(
+        "Read anonymously (as principal 2vxsx-fae) and {what} came back empty. This canister \
+         gates data by the CALLER's principal, so empty here most likely means \"not authenticated \
+         as your account\", NOT \"no data\". Re-run this exact call adding {add_hint} to read as \
+         your account — if you don't have it yet, open_app / resolve_app resolves it from the app's \
+         URL or name."
+    )
+}
+
+/// Whether a decoded OQL `schema` JSON exposes NO entities — the caller-gated
+/// "empty schema" an anonymous read yields when the app shows a principal only the
+/// entities it may see. Conservative: a schema that doesn't parse as the expected
+/// `{"entities":[...]}` shape is NOT treated as empty (so we never raise a false
+/// auth hint on an unrecognized shape).
+pub fn oql_schema_is_empty(schema_json: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(schema_json) {
+        Ok(v) => v
+            .get("entities")
+            .and_then(|e| e.as_array())
+            .is_some_and(|a| a.is_empty()),
+        Err(_) => false,
+    }
+}
+
+/// The entity names declared in a decoded OQL `schema` JSON (the `name` of each
+/// `entities[]` element, in order, de-duplicated, capped at [`MAX_OQL_ENTITIES`]).
+/// Empty when the schema is absent/unparseable or lists none — used to validate a
+/// query's `start` (#7) and to build per-entity examples (#8).
+pub fn oql_entity_names(schema_json: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(schema_json) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.get("entities").and_then(|e| e.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for e in arr {
+        if let Some(name) = e.get("name").and_then(|n| n.as_str()) {
+            if !out.iter().any(|n| n == name) {
+                out.push(name.to_string());
+                if out.len() >= MAX_OQL_ENTITIES {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The `start` entity of a normalized OQL query JSON, if present. Used to
+/// hard-validate `start` (only) against the schema on an empty result (#7).
+pub fn oql_query_start(query_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(query_json)
+        .ok()
+        .and_then(|v| v.get("start").and_then(|s| s.as_str()).map(str::to_string))
+}
+
+/// The closest entity name to `start`, for a "did you mean?" repair — a
+/// case-insensitive exact match first, then a plural/singular flip
+/// (`booking`↔`bookings`), then the smallest Levenshtein distance within a small
+/// length-scaled threshold. `None` when nothing is close enough (so we never
+/// suggest an unrelated entity).
+pub fn closest_entity(start: &str, entities: &[String]) -> Option<String> {
+    let lc = start.to_lowercase();
+    // Exact, case-insensitive.
+    if let Some(e) = entities.iter().find(|e| e.to_lowercase() == lc) {
+        return Some((*e).clone());
+    }
+    // Plural/singular flip.
+    if let Some(e) = entities.iter().find(|e| {
+        let el = e.to_lowercase();
+        el == format!("{lc}s") || format!("{el}s") == lc
+    }) {
+        return Some((*e).clone());
+    }
+    // Small edit distance, scaled to the shorter of the two names so short names
+    // demand a tighter match. Pick the nearest; ties keep the first (schema order).
+    let mut best: Option<(usize, &String)> = None;
+    for e in entities {
+        let el = e.to_lowercase();
+        let d = levenshtein(&lc, &el);
+        let bound = (lc.len().min(el.len()) / 3).clamp(1, 3);
+        if d <= bound && best.map_or(true, |(bd, _)| d < bd) {
+            best = Some((d, e));
+        }
+    }
+    best.map(|(_, e)| e.clone())
+}
+
+/// Levenshtein edit distance (two-row DP). Small helper for [`closest_entity`];
+/// inputs are short entity names, so the O(mn) cost is trivial.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// One ready-to-run `run_canister_oql_query` invocation per entity (#8) — a
+/// COMPLETE call (canister_id + a minimal `{"start":<entity>,"limit":10}` query)
+/// that PRESERVES the identity the schema was read under (the same
+/// `derivation_origin` / `account`), so copying an example doesn't silently drop
+/// back to anonymous. Read-only. Empty when the schema exposes no entities. Each
+/// line is `run_canister_oql_query <compact-json-args>`.
+pub fn oql_query_examples(
+    canister_id: &str,
+    schema_json: &str,
+    derivation_origin: Option<&str>,
+    account: Option<&str>,
+) -> Vec<String> {
+    oql_entity_names(schema_json)
+        .into_iter()
+        .map(|entity| {
+            let mut args = serde_json::Map::new();
+            args.insert("canister_id".into(), serde_json::Value::String(canister_id.to_string()));
+            // `query` is a JSON-object STRING (that's what the tool takes), so the
+            // example shows the escaped-string form the agent actually passes.
+            let query = format!("{{\"start\":\"{entity}\",\"limit\":10}}");
+            args.insert("query".into(), serde_json::Value::String(query));
+            if let Some(o) = derivation_origin {
+                args.insert("derivation_origin".into(), serde_json::Value::String(o.to_string()));
+            }
+            if let Some(a) = account {
+                args.insert("account".into(), serde_json::Value::String(a.to_string()));
+            }
+            format!("run_canister_oql_query {}", serde_json::Value::Object(args))
+        })
+        .collect()
+}
+
+/// Whether a decoded textual-Candid `reply` LOOKS empty — used only to attach the
+/// #1 anonymous-read auth hint to a `call_canister` query result, so it must be
+/// conservative (a false "empty" would raise a spurious auth hint). Recognizes the
+/// unambiguous empties: the unit tuple `()`, an empty/none `opt` (`(null)`), an
+/// empty vector (`(vec {})`), and the common "not found" variant arms
+/// (`variant { none }` / `err`-style). Anything with real content returns false.
+pub fn candid_reply_is_empty(reply: &str) -> bool {
+    let t = reply.trim();
+    // Unit / empty tuple.
+    if t == "()" {
+        return true;
+    }
+    // Strip one layer of the outer `( … )` tuple wrapper if present.
+    let inner = t
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .map(str::trim)
+        .unwrap_or(t);
+    match inner {
+        "" | "null" | "none" => true,
+        _ => {
+            // Whitespace-insensitive matches for the common empty shapes: an empty
+            // vector `vec {}`, an opt wrapping one `opt vec {}`, and a "none" variant.
+            let no_ws: String = inner.chars().filter(|c| !c.is_whitespace()).collect();
+            matches!(no_ws.as_str(), "vec{}" | "optvec{}")
+                || no_ws.eq_ignore_ascii_case("variant{none}")
+        }
     }
 }
 
@@ -889,10 +1160,13 @@ mod tests {
         let oql = "service : { schema : () -> (text) query; execute : (text) -> (text) query; }";
         let plain = "service : { stats : () -> (text) query; }";
 
-        // Query call on an OQL canister → redirected, and the message names the tools.
+        // Query call on an OQL canister → redirected, and the message names the
+        // full guide→schema→query path (#5) plus the auth hint.
         let msg = oql_query_redirect(Some(oql), true).expect("query on OQL canister must be redirected");
-        assert!(msg.contains("run_canister_oql_query"), "message must point to the OQL query tool: {msg}");
+        assert!(msg.contains("icp_oql_guide"), "message must point to the OQL guide: {msg}");
         assert!(msg.contains("get_canister_oql_schema"), "message must point to the OQL schema tool: {msg}");
+        assert!(msg.contains("run_canister_oql_query"), "message must point to the OQL query tool: {msg}");
+        assert!(msg.contains("derivation_origin"), "message must carry the auth hint (pass the origin): {msg}");
 
         // Update call on the SAME canister proceeds (OQL is read-only).
         assert!(oql_query_redirect(Some(oql), false).is_none(), "update calls must pass through");
@@ -1077,5 +1351,121 @@ mod tests {
         let multi = encode_reply(multi_did, "foo", "(\"a\", 5 : nat)");
         let out = decode_text_reply(&multi);
         assert!(out.contains("a") && out.contains('5'), "multi-value reply keeps all values: {out}");
+    }
+
+    // #1: the anonymous-empty auth note names the missing-auth diagnosis and the
+    // fix (add the origin), carries the `add_hint` verbatim, and does NOT bake in a
+    // concrete origin the tool guessed — it stays a placeholder the agent fills.
+    #[test]
+    fn anonymous_empty_note_is_actionable_and_origin_free() {
+        use super::anonymous_empty_note;
+        let note = anonymous_empty_note("this query", "the app's `derivation_origin`");
+        assert!(note.contains("anonymous"), "must name the anonymous read: {note}");
+        assert!(note.to_lowercase().contains("not authenticated"), "must name the likely cause: {note}");
+        assert!(note.contains("this query"), "must echo `what`: {note}");
+        assert!(note.contains("the app's `derivation_origin`"), "must echo `add_hint`: {note}");
+        // Never a fabricated origin — only the placeholder hint.
+        assert!(!note.contains("https://"), "must not bake in a concrete origin: {note}");
+    }
+
+    // #1: an anonymous OQL schema with no entities is recognized as empty (an auth
+    // artifact), while a populated schema and an unrecognizable shape are NOT (so we
+    // never raise a false auth hint).
+    #[test]
+    fn oql_schema_is_empty_detects_only_empty_entities() {
+        use super::oql_schema_is_empty;
+        assert!(oql_schema_is_empty(r#"{"entities":[]}"#), "empty entities → empty");
+        assert!(
+            oql_schema_is_empty("{\n  \"entities\": []\n}"),
+            "pretty-printed empty entities → empty"
+        );
+        assert!(!oql_schema_is_empty(r#"{"entities":[{"name":"bookings"}]}"#), "populated → not empty");
+        assert!(!oql_schema_is_empty("not json"), "unparseable → not treated as empty");
+        assert!(!oql_schema_is_empty("{}"), "no entities key → not treated as empty");
+    }
+
+    // #7/#8: entity names are extracted in order, de-duplicated, and capped; a
+    // missing/garbage schema yields none.
+    #[test]
+    fn oql_entity_names_extracts_dedups_and_caps() {
+        use super::{oql_entity_names, MAX_OQL_ENTITIES};
+        let names = oql_entity_names(
+            r#"{"entities":[{"name":"bookings"},{"name":"users"},{"name":"bookings"}]}"#,
+        );
+        assert_eq!(names, vec!["bookings", "users"], "in order, de-duplicated");
+        assert!(oql_entity_names("garbage").is_empty(), "garbage → none");
+        assert!(oql_entity_names("{}").is_empty(), "no entities → none");
+        // Cap: a schema with more entities than the cap is trimmed.
+        let many: String = (0..(MAX_OQL_ENTITIES + 10))
+            .map(|i| format!("{{\"name\":\"e{i}\"}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let capped = oql_entity_names(&format!("{{\"entities\":[{many}]}}"));
+        assert_eq!(capped.len(), MAX_OQL_ENTITIES, "entity list is capped");
+    }
+
+    // #7: the query's `start` entity is extracted for validation.
+    #[test]
+    fn oql_query_start_extracts_start() {
+        use super::oql_query_start;
+        assert_eq!(oql_query_start(r#"{"start":"bookings","limit":10}"#).as_deref(), Some("bookings"));
+        assert_eq!(oql_query_start(r#"{"limit":10}"#), None, "no start → None");
+        assert_eq!(oql_query_start("not json"), None, "garbage → None");
+    }
+
+    // #7: "did you mean?" resolves case, plural/singular, and small typos — and
+    // refuses to suggest an unrelated entity.
+    #[test]
+    fn closest_entity_repairs_near_misses_only() {
+        use super::closest_entity;
+        let entities = vec!["bookings".to_string(), "users".to_string(), "appointments".to_string()];
+        // The motivating case: singular guess → plural entity.
+        assert_eq!(closest_entity("booking", &entities).as_deref(), Some("bookings"));
+        // Case-insensitive exact.
+        assert_eq!(closest_entity("Users", &entities).as_deref(), Some("users"));
+        // Small typo within threshold.
+        assert_eq!(closest_entity("userz", &entities).as_deref(), Some("users"));
+        // Nothing close → no suggestion (don't send the agent to a wrong entity).
+        assert_eq!(closest_entity("invoices", &entities), None);
+    }
+
+    // #8: one COMPLETE run_canister_oql_query per entity, each preserving the
+    // identity the schema was read under (derivation_origin + account), so copying
+    // an example doesn't silently drop back to anonymous.
+    #[test]
+    fn oql_query_examples_are_complete_and_preserve_identity() {
+        use super::oql_query_examples;
+        let schema = r#"{"entities":[{"name":"bookings"},{"name":"users"}]}"#;
+        let ex = oql_query_examples("aaaaa-aa", schema, Some("https://app.example.com"), Some("work"));
+        assert_eq!(ex.len(), 2, "one example per entity");
+        assert!(ex[0].starts_with("run_canister_oql_query "), "names the tool: {}", ex[0]);
+        assert!(ex[0].contains("aaaaa-aa"), "carries the canister id: {}", ex[0]);
+        assert!(ex[0].contains("bookings"), "uses the entity as start: {}", ex[0]);
+        assert!(ex[0].contains("https://app.example.com"), "preserves derivation_origin: {}", ex[0]);
+        assert!(ex[0].contains("work"), "preserves account: {}", ex[0]);
+        // Anonymous schema read → examples carry no identity args (stay anonymous).
+        let anon = oql_query_examples("aaaaa-aa", schema, None, None);
+        assert!(!anon[0].contains("derivation_origin"), "no origin when read anonymously: {}", anon[0]);
+        // No entities → no examples.
+        assert!(oql_query_examples("aaaaa-aa", "{}", None, None).is_empty());
+    }
+
+    // #1: the conservative empty-reply detector recognizes the unambiguous empties
+    // (used only to attach the anonymous-read auth hint on a call_canister query),
+    // and never flags a reply with real content.
+    #[test]
+    fn candid_reply_is_empty_is_conservative() {
+        use super::candid_reply_is_empty;
+        assert!(candid_reply_is_empty("()"));
+        assert!(candid_reply_is_empty("(null)"));
+        assert!(candid_reply_is_empty("(vec {})"));
+        assert!(candid_reply_is_empty("(vec{})"));
+        assert!(candid_reply_is_empty("(opt vec {})"));
+        assert!(candid_reply_is_empty("(variant { none })"));
+        // Real content is never "empty".
+        assert!(!candid_reply_is_empty("(vec { record { id = 1 } })"));
+        assert!(!candid_reply_is_empty("(record { balance = 5 : nat })"));
+        assert!(!candid_reply_is_empty("(opt record { a = 1 })"));
+        assert!(!candid_reply_is_empty("(\"some text\")"));
     }
 }
