@@ -1439,10 +1439,9 @@ fn identity_annotation(target: &IdentityTarget, acted_as: Option<&str>) -> Strin
 
 /// Log each inbound request: method, path, response status, and latency — gives
 /// visibility into what external MCP clients probe (discovery URLs, unknown
-/// paths) at `RUST_LOG=info`. The query string is never logged — keeping the
-/// single-use `?code=` / `?id=` and, critically, `/oauth/finish`'s one-time
-/// `?fs=` (the `finish_secret`, H3/P2) out of logs — and request bodies are never
-/// logged (the connect callback carries the connection-scoped `state`).
+/// paths) at `RUST_LOG=info`. The query string is never logged (defense in depth,
+/// keeping any single-use `?code=` out of logs) — and request bodies are never
+/// logged (the redeem POST carries the connection-scoped `state` and delegation).
 async fn log_request(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
@@ -1825,15 +1824,10 @@ async fn main() -> anyhow::Result<()> {
     let inst_prod = identities::IiInstance::prod().map_err(anyhow::Error::msg)?;
     for inst in [&inst_beta, &inst_prod] {
         tracing::info!(
-            "II instance {}: {} ({}) at {} — connect protocol: {}",
+            "II instance {}: {} ({}) at {}",
             inst.name, inst.ii_url, inst.ii_canister, inst.mcp_path,
-            if inst.registration_delegation { "registration-delegation (v2-ready, v1 honored)" } else { "v1 (fetched key)" },
         );
     }
-    // Per-instance connect-protocol selection, surfaced on /version so operators
-    // can confirm which instance runs which flow without reading env vars.
-    let regdel_beta = inst_beta.registration_delegation;
-    let regdel_prod = inst_prod.registration_delegation;
     let ids_beta = Identities::new(inst_beta);
     let ids_prod = Identities::new(inst_prod);
     let skills = skills::SkillsCatalog::new();
@@ -1868,9 +1862,8 @@ async fn main() -> anyhow::Result<()> {
     // giving the journal a close event to reconcile against "session opened".
     // This caps growth from expired grants (the common case: every
     // authenticated session eventually expires); sessions with no recorded
-    // expiry (mid-connect, or a v1 session whose completion POST never arrived)
-    // are deliberately kept and so are NOT bounded by this. Tied to the shutdown
-    // token so the tasks stop cleanly on drain.
+    // expiry (mid-connect) are deliberately kept and so are NOT bounded by this.
+    // Tied to the shutdown token so the tasks stop cleanly on drain.
     for ids in [ids_beta.clone(), ids_prod.clone()] {
         let reap_ct = ct.child_token();
         tokio::spawn(async move {
@@ -1947,17 +1940,11 @@ async fn main() -> anyhow::Result<()> {
     fn oauth_endpoints(store: auth::AuthStore) -> axum::Router {
         axum::Router::new()
             .route("/oauth/authorize", axum::routing::get(auth::authorize))
-            .route("/oauth/finish", axum::routing::get(auth::finish))
-            // The connect callback serves BOTH: v1's cross-origin JSON POSTs from
-            // II's frontend, and — behind the registration-delegation flag — the
-            // Phase-2 pinned callback PAGE on GET (the sole fragment reader). The
-            // GET 404s when the flag is off, so v1 is unaffected.
-            .route(
-                "/oauth/connect/callback",
-                axum::routing::post(auth::connect_callback).get(auth::connect_callback_page),
-            )
-            // Phase 2 only: the pinned page POSTs the fragment delegation here to
-            // be redeemed (404s when the flag is off).
+            // The pinned callback PAGE (GET): II navigates the consenting browser
+            // here with the delegation in the URL fragment; the page is the sole
+            // fragment reader.
+            .route("/oauth/connect/callback", axum::routing::get(auth::connect_callback_page))
+            // The pinned page POSTs the fragment delegation here to be redeemed.
             .route("/oauth/connect/redeem", axum::routing::post(auth::connect_redeem))
             .route("/oauth/token", axum::routing::post(auth::token))
             .route("/oauth/register", axum::routing::post(auth::register))
@@ -2072,14 +2059,6 @@ async fn main() -> anyhow::Result<()> {
                         "commit": option_env!("GIT_SHA").unwrap_or("unknown"),
                         "built_at": option_env!("BUILD_TIME").and_then(|s| s.parse::<u64>().ok()),
                         "started_at": started_at,
-                        // H3/P1 health: repeat key requests on a consumed connect_state.
-                        // Expected ~0; a sustained rise means II is re-issuing the key
-                        // request (breaks connects under strict single-use), so alert on it.
-                        "repeat_key_requests": auth::repeat_key_requests(),
-                        // Per-instance connect protocol: true = Phase-2 registration
-                        // delegation enabled (v1 still honored until that II switches),
-                        // false = pinned to the v1 fetched-key flow.
-                        "registration_delegation": { "beta": regdel_beta, "prod": regdel_prod },
                         // Per-instance count of live sessions: authenticated
                         // sessions with a non-expired II grant. A session counts
                         // from grant redemption until its grant expires, idle or not.

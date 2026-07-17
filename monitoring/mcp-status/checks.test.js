@@ -314,8 +314,8 @@ test("checkIiHealth passes on a served /mcp even with loopback-only form-action"
       headers: { "content-security-policy": `form-action 'self'` },
     }),
     // /mcp is served but its form-action only allows loopback (that entry is for
-    // the unrelated /cli flow). Since II #4086 the MCP connect flow uses fetch()
-    // (connect-src) + a top-level navigation to finish_url, not a form POST, so a
+    // the unrelated /cli flow). The MCP connect flow uses a top-level navigation
+    // to the pinned callback page + a fetch() (connect-src), not a form POST, so a
     // tightened form-action must NOT warn — a served page is healthy.
     [`GET ${ii}/mcp`]: resp(200, {
       headers: {
