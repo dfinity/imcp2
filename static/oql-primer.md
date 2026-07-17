@@ -14,7 +14,20 @@ the dialect they speak.
   once before querying:
   `{"entities":[{"name":..., "primaryKey":..., "fields":[{"name":..., "typeName":..., "role":...}]}]}`
   A field's `role` is either `"payload"` (a plain data column) or
-  `{"edge":{"to":"<entity>"}}` (a link/foreign key to another entity).
+  `{"edge":{"to":"<entity>"}}` (a link/foreign key to another entity). Use the
+  entity `name`s here verbatim as your query's `"start"` — they are the schema's
+  own names and are often PLURAL and different from the Candid types/methods (e.g.
+  entity `bookings`, not a `Booking` type or a `getBookings` method). Don't guess
+  them from the Candid interface.
+
+> **Authentication.** Both `schema` and `execute` are gated by the CALLER's
+> principal: an app shows a principal only the entities and rows it may see. So
+> `get_canister_oql_schema` and `run_canister_oql_query` **require** the app's
+> canonical `derivation_origin` (from `open_app` / `resolve_app`) — an anonymous
+> per-app read is disabled for now and is **rejected** with guidance to pass the
+> origin, rather than silently returning an empty schema or zero rows. Passing the
+> origin never hurts a public read either (the canister serves the request
+> regardless of principal), so always pass it for app data.
 
 - `execute : (text) -> (Result) query` — runs ONE JSON query object passed as
   the single text argument (`Result` is the paged rows record defined under

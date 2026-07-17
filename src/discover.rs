@@ -69,6 +69,19 @@ pub struct DiscoveredCanister {
     /// "header", "env.json", "bundle:<LABEL>", or "bundle". The first two are
     /// declared by the app itself and are the most authoritative.
     pub sources: Vec<String>,
+    /// Whether this canister exposes the OQL query surface — filled in for the
+    /// app's OWN data canisters by a single Candid fetch during open_app /
+    /// discover_app_canisters (#3). null when not probed (e.g. the frontend or a
+    /// shared system canister) or the interface couldn't be read. When true, this
+    /// is a caller-gated data backend: read it with the OQL tools, passing the app's
+    /// derivation_origin to read as the user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oql: Option<bool>,
+    /// Whether this canister declares an API-doc method (`getApiDoc`/`get_api_doc`),
+    /// from the same probe as `oql`. null when not probed / unreadable. When true,
+    /// get_canister_api_doc returns a prose behavior guide.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_doc_available: Option<bool>,
 }
 
 impl From<&Found> for DiscoveredCanister {
@@ -79,8 +92,35 @@ impl From<&Found> for DiscoveredCanister {
             name: f.name.clone(),
             kind: f.kind.clone(),
             sources: f.sources.clone(),
+            // Capability flags are filled in post-discovery by enrich_capabilities.
+            oql: None,
+            api_doc_available: None,
         }
     }
+}
+
+/// Whether a discovered canister is one of the APP's OWN data canisters — an
+/// app-declared or app-mined backend — as opposed to the gateway frontend / asset
+/// canister or a shared system canister (a ledger, II, NNS…). Scopes the
+/// per-canister capability probe and the caller-gated data-access handle (#3) so
+/// they never attach to II/NNS/ledger/frontend, per the security guardrail.
+pub fn is_app_data_candidate(c: &DiscoveredCanister) -> bool {
+    // Declared or mined as the app's own backend (not merely the gateway header).
+    let app_owned = c.sources.iter().any(|s| {
+        s == "ai-connect.html" || s == "ic-app.json" || s == "env.json" || s.starts_with("bundle")
+    });
+    // The frontend / asset canister: an explicit "frontend" label, or found ONLY
+    // via the gateway `x-ic-canister-id` header.
+    let is_frontend =
+        c.label.as_deref() == Some("frontend") || c.sources == ["header"];
+    // A dashboard-classified shared system canister (ledger, governance, …).
+    let is_system = c.kind.as_deref().is_some_and(|k| {
+        let k = k.to_ascii_lowercase();
+        ["ledger", "governance", "index", "archive", "root", "sns", "nns", "cycles", "cmc"]
+            .iter()
+            .any(|s| k.contains(s))
+    });
+    app_owned && !is_frontend && !is_system
 }
 
 /// Arguments for `discover_app_canisters`.
@@ -2447,5 +2487,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    // #3: the capability probe + data-access handle attach ONLY to the app's own
+    // data canisters — never the gateway frontend or a shared system canister
+    // (ledger/II/NNS), per the security guardrail.
+    #[test]
+    fn is_app_data_candidate_scopes_to_app_backends() {
+        let dc = |label: Option<&str>, sources: &[&str], kind: Option<&str>| DiscoveredCanister {
+            canister_id: "aaaaa-aa".to_string(),
+            label: label.map(str::to_string),
+            name: None,
+            kind: kind.map(str::to_string),
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+            oql: None,
+            api_doc_available: None,
+        };
+        // App-declared / app-mined backends → candidates.
+        assert!(is_app_data_candidate(&dc(None, &["ai-connect.html"], None)));
+        assert!(is_app_data_candidate(&dc(Some("backend"), &["ic-app.json"], None)));
+        assert!(is_app_data_candidate(&dc(Some("backend_canister_id"), &["env.json"], None)));
+        assert!(is_app_data_candidate(&dc(Some("BACKEND"), &["bundle:BACKEND"], None)));
+        // The frontend / asset canister → NOT a candidate.
+        assert!(!is_app_data_candidate(&dc(Some("frontend"), &["ic-app.json"], None)));
+        assert!(!is_app_data_candidate(&dc(None, &["header"], None)));
+        // A shared system canister (dashboard-classified) → NOT a candidate, even
+        // if it slipped in via a bundle literal.
+        assert!(!is_app_data_candidate(&dc(None, &["bundle"], Some("ledger"))));
+        assert!(!is_app_data_candidate(&dc(None, &["ic-app.json"], Some("governance"))));
     }
 }

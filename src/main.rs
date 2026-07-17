@@ -36,6 +36,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// Public IC API boundary node. Anonymous queries/updates go here.
 const IC_URL: &str = "https://icp-api.io";
 
+/// Cap on the per-canister Candid probes open_app / discover_app_canisters run to
+/// fill in OQL / api-doc capability flags (#3). Discovery output is already bounded,
+/// but a large declared manifest could still list many ids — probe only the most
+/// authoritative handful so the extra fan-out stays small.
+const MAX_CAPABILITY_PROBES: usize = 8;
+
 /// Candid references exposed as MCP resources so the client writes correct
 /// textual Candid. The textual-syntax cheat sheet is emphasised because every
 /// tool here speaks textual Candid; the full type reference backs it up.
@@ -105,7 +111,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Fetch the Candid (.did) interface definition of an Internet Computer canister, read from its public `candid:service` metadata.",
+        description = "Fetch the Candid (.did) interface definition of an Internet Computer canister, read from its public `candid:service` metadata. Also reports two capability flags: `oql` (the canister exposes the OQL query surface — READ it via icp_oql_guide → get_canister_oql_schema → run_canister_oql_query, since raw call_canister query calls are then rejected) and `api_doc_available` (a `getApiDoc`/`get_api_doc` method exists — call get_canister_api_doc for a prose behavior guide; skip that call when this is false).",
         annotations(title = "Get Candid interface", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::GetCandidOutput>(),
     )]
@@ -130,19 +136,46 @@ impl IcTools {
                     // copy-pastable Candid) — the full primer is served on demand
                     // (see icp_oql_guide / OQL_USAGE_URI), never inlined.
                     let oql = calls::has_oql(&did);
-                    let output = calls::GetCandidOutput { canister_id, candid: did.clone(), oql };
+                    // Same predicate get_canister_api_doc uses, so the flag gates that
+                    // call: true means a `getApiDoc`/`get_api_doc` method exists.
+                    let api_doc_available = calls::api_doc_method(&did).is_some();
+                    let output = calls::GetCandidOutput {
+                        canister_id,
+                        candid: did.clone(),
+                        oql,
+                        api_doc_available,
+                    };
+                    // Assemble any capability notes as separate blocks so the first
+                    // block stays the raw, paste-able `.did`.
+                    let mut notes = Vec::new();
                     if oql {
-                        let note = format!(
+                        notes.push(format!(
                             "This canister exposes an OQL query surface (a JSON query language \
-                             over its data). Use get_canister_oql_schema to see its entities and fields, then \
-                             run_canister_oql_query with a JSON query to read data as a table — these wrap the \
-                             `schema`/`execute` methods for you (no Candid escaping). See \
-                             icp_oql_guide (or the `{OQL_USAGE_URI}` resource) for the dialect."
-                        );
-                        Ok(ok_structured_blocks(vec![did, note], &output))
-                    } else {
-                        Ok(ok_structured(did, &output))
+                             over its data), so READ it through the OQL tools — raw call_canister \
+                             query calls are rejected here. Order: icp_oql_guide (dialect, once) → \
+                             get_canister_oql_schema (entities/fields) → run_canister_oql_query \
+                             (run a JSON query, get a table). Those wrap the `schema`/`execute` \
+                             methods (no Candid escaping). Per-app data is caller-gated, so the OQL \
+                             read tools REQUIRE the app's derivation_origin — an anonymous OQL read \
+                             is rejected (for now), not silently empty; pass the derivation_origin \
+                             from open_app / resolve_app. See icp_oql_guide (or the \
+                             `{OQL_USAGE_URI}` resource) for the dialect. call_canister then handles \
+                             UPDATE calls only."
+                        ));
                     }
+                    notes.push(if api_doc_available {
+                        "This canister exposes an API-doc method (api_doc_available=true): call \
+                         get_canister_api_doc for a prose \"how this app behaves\" guide (units, \
+                         auth, lifecycle, gotchas)."
+                            .to_string()
+                    } else {
+                        "This canister declares no API-doc method (api_doc_available=false) — don't \
+                         call get_canister_api_doc; the Candid types above are the interface."
+                            .to_string()
+                    });
+                    let mut blocks = vec![did];
+                    blocks.extend(notes);
+                    Ok(ok_structured_blocks(blocks, &output))
                 }
                 Err(e) => Ok(err(format!("metadata is not valid UTF-8: {e}"))),
             },
@@ -153,7 +186,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Load the OQL query-surface guide: the JSON query dialect for canisters that expose OQL (get_canister_candid reports `oql: true`) — entities/fields/edges via `schema`, and the `execute` query object (filters, aggregation, ordering, edge traversal, paging). Use the get_canister_oql_schema and run_canister_oql_query tools to run it (they wrap the underlying methods); read this first so you write correct queries instead of guessing bespoke methods.",
+        description = "Load the OQL query-surface guide: the JSON query dialect for canisters that expose OQL (get_canister_candid reports `oql: true`) — entities/fields/edges via `schema`, and the `execute` query object (filters, aggregation, ordering, edge traversal, paging). This is step ONE of the fixed sequence guide→schema→query: read this once, then `get_canister_oql_schema` for the exact entity/field names (they are the schema's own — often PLURAL and unlike the Candid types/methods, e.g. `bookings` not `Booking`/`getBookings`), then `run_canister_oql_query`. Never guess bespoke per-question methods. The schema/query tools REQUIRE the app's `derivation_origin` (from open_app / resolve_app) — anonymous per-app reads are disabled for now and are rejected with guidance. The two tools wrap the `schema`/`execute` methods, so you write plain JSON — no Candid escaping.",
         annotations(title = "Get the OQL query guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
         output_schema = schema_for_output::<calls::OqlGuideOutput>(),
     )]
@@ -166,7 +199,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Run an OQL query against a canister that exposes the OQL surface (get_canister_candid reports `oql: true`). Pass the query as a JSON object string in `query` (see icp_oql_guide / get_canister_oql_schema for the dialect and field names) — it's sent to the canister's `execute` query method, so NO Candid escaping is needed. Returns the result decoded as `columns` + `rows` (rendered as a markdown table), with `has_more` for paging (re-query with a higher `offset`). Omit `derivation_origin` to query anonymously, or pass the app's canonical Internet Identity derivation origin to query as your account there — the result then echoes `derived_for_origin` / `requested` / `acted_as_principal` so an origin mismatch is visible.",
+        description = "Run an OQL query against a canister that exposes the OQL surface (get_canister_candid reports `oql: true`). This is the LAST step of guide→schema→query: read `icp_oql_guide` for the dialect (once), call `get_canister_oql_schema` for the exact entity/field names, THEN query — don't guess names. Entity names are the SCHEMA's, which are often PLURAL and differ from the Candid method/type names (e.g. entity `bookings`, not the `Booking` type or a `getBookings` method). Pass the query as a JSON object string in `query` (e.g. `{\"start\":\"bookings\",\"limit\":10}`) — it's sent to the canister's `execute` query method, so NO Candid escaping is needed. Returns `columns` + `rows` (rendered as a markdown table), with `has_more` for paging (re-query with a higher `offset`). AUTH: `derivation_origin` is REQUIRED — this reads per-app data gated by the caller's principal, so a query with no origin is REJECTED (anonymous per-app reads are disabled for now) with guidance to pass it, rather than silently returning empty. Pass the app's canonical `derivation_origin` (from open_app / resolve_app) to query as your account; the reply echoes `derived_for_origin` / `acted_as_principal`. On an empty result the reply validates your `start` against the schema for this principal (with a \"did you mean?\" repair for a wrong entity name).",
         annotations(title = "Run an OQL query", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::OqlQueryOutput>(),
     )]
@@ -198,6 +231,12 @@ impl IcTools {
             Ok(o) => o,
             Err(e) => return Ok(err(e)),
         };
+        // Anonymous per-app reads are disabled for now (this canister gates data by
+        // the caller's principal, so an anonymous query returns nothing useful):
+        // reject with guidance instead of silently coming back empty.
+        if origin.is_none() {
+            return Ok(err(oql_needs_origin_error("Running an OQL query")));
+        }
         let (agent, acted_as) = match self
             .resolve_agent(&ctx, origin.as_deref(), account.as_deref(), "querying")
             .await
@@ -213,18 +252,57 @@ impl IcTools {
             };
             format!("[{}]", identity_annotation(&target, acted_as.as_deref()))
         });
+        // Anonymous == no derivation origin was supplied (2vxsx-fae). Always echoed
+        // so an empty result reads as an auth artifact, not "no data" (#1).
+        let is_anonymous = origin.is_none();
         let reply = match calls::raw_call(&agent, principal, "execute", arg_bytes, true).await {
             Ok(b) => b,
-            Err(e) => return Ok(err(format!("OQL execute failed: {e}"))),
+            Err(e) => {
+                // A trap is the OTHER way an invalid `start` shows up (#7): validate
+                // it against the schema for THIS principal and fold the repair into
+                // the error, so the agent doesn't re-guess blindly. Failed context:
+                // only the unknown-`start` repair is appended, never a "came back
+                // empty" note (which would contradict the trap message).
+                let d = diagnose_empty_oql(&agent, principal, &query_json, is_anonymous, EmptyContext::Failed).await;
+                let mut msg = format!("OQL execute failed: {e}");
+                if let Some(note) = d.note {
+                    msg.push_str(&format!("\n\n{note}"));
+                }
+                return Ok(err(msg));
+            }
         };
         // Decode the reply against the canister's interface so cell/field names
         // are recovered (the wire format hashes them).
         let did = calls::resolve_did(&agent, principal, None).await;
         match calls::parse_execute_reply(did.as_deref(), &reply) {
             calls::OqlResult::Table { columns, rows, has_more } => {
-                // Primary block: the rendered table. Identity note (if any) is a
-                // separate block so the table stays clean.
+                // Validate-on-empty (#1/#7): a 0-row result is diagnosed with facts
+                // from the SAME principal — anonymous-read auth hint, unknown-`start`
+                // repair, or a benign "0 rows for this account" — never by probing
+                // others.
+                let mut diag = if rows.is_empty() {
+                    diagnose_empty_oql(&agent, principal, &query_json, is_anonymous, EmptyContext::EmptyResult).await
+                } else {
+                    OqlEmptyDiagnosis::none()
+                };
+                // A genuine empty table for an AUTHENTICATED, valid `start` gets no
+                // diagnosis above — fill in the benign note (only ever on a real
+                // 0-row result, never on a trap/OQL-error path).
+                if rows.is_empty() && diag.note.is_none() {
+                    diag.note = Some(format!(
+                        "Query matched 0 rows for this account{}.",
+                        calls::oql_query_start(&query_json)
+                            .map(|s| format!(" (start: \"{s}\")"))
+                            .unwrap_or_default()
+                    ));
+                }
+                // Primary block: the rendered table. The empty-diagnosis note and
+                // the identity note (if any) follow as separate blocks so the table
+                // stays clean.
                 let mut blocks = vec![calls::render_table(&columns, &rows, has_more)];
+                if let Some(note) = &diag.note {
+                    blocks.push(note.clone());
+                }
                 if let Some(note) = &identity_note {
                     blocks.push(note.clone());
                 }
@@ -236,17 +314,37 @@ impl IcTools {
                     acted_as_principal: acted_as,
                     derived_for_origin: origin,
                     requested,
+                    is_anonymous,
+                    note: diag.note,
+                    valid_entities: diag.valid_entities,
+                    did_you_mean: diag.did_you_mean,
                 };
                 Ok(ok_structured_blocks(blocks, &output))
             }
             calls::OqlResult::QueryError(msg) => {
-                Ok(err(format!("the canister returned an OQL error: {msg}")))
+                // The canister returned its error arm. An invalid `start` can land
+                // here too, so enrich with the schema-based repair (#7). Failed
+                // context: only the unknown-`start` repair is appended.
+                let d = diagnose_empty_oql(&agent, principal, &query_json, is_anonymous, EmptyContext::Failed).await;
+                let mut text = format!("the canister returned an OQL error: {msg}");
+                if let Some(note) = d.note {
+                    text.push_str(&format!("\n\n{note}"));
+                }
+                Ok(err(text))
             }
             calls::OqlResult::Unrecognized(raw) => {
                 // Not a recognizable OQL result — hand back the raw decoded reply
-                // so the model still has the data (empty table in the structured form).
-                let mut blocks =
-                    vec![format!("(Could not parse this as an OQL table; raw reply below.)\n\n{raw}")];
+                // so the model still has the data. The structured columns/rows are
+                // empty here, so carry a `note` too (rather than null) — otherwise a
+                // structured-only consumer would misread this as "no data" when the
+                // reply actually carried content (it's in the text block).
+                let unparsed_note =
+                    "This reply couldn't be parsed as an OQL table; the raw decoded reply is in the \
+                     text block. This is NOT an empty result — read the raw reply for the data."
+                        .to_string();
+                let mut blocks = vec![format!(
+                    "(Could not parse this as an OQL table; raw reply below.)\n\n{raw}"
+                )];
                 if let Some(note) = &identity_note {
                     blocks.push(note.clone());
                 }
@@ -258,6 +356,10 @@ impl IcTools {
                     acted_as_principal: acted_as,
                     derived_for_origin: origin,
                     requested,
+                    is_anonymous,
+                    note: Some(unparsed_note),
+                    valid_entities: None,
+                    did_you_mean: None,
                 };
                 Ok(ok_structured_blocks(blocks, &output))
             }
@@ -265,7 +367,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Fetch the OQL schema catalogue of a canister that exposes the OQL surface (get_canister_candid reports `oql: true`): its entities, their primary keys, fields, and edges, as JSON. Call this before run_canister_oql_query so you know the queryable entities and exact field names. Omit `derivation_origin` to read anonymously, or pass the app's canonical Internet Identity derivation origin to read as your account there — the result then echoes `derived_for_origin` / `requested` / `acted_as_principal` so an origin mismatch is visible.",
+        description = "Fetch the OQL schema catalogue of a canister that exposes the OQL surface (get_canister_candid reports `oql: true`): its entities, their primary keys, fields, and edges, as JSON. The MIDDLE step of guide→schema→query: read `icp_oql_guide` once, then call THIS before run_canister_oql_query so you use the exact entity/field names instead of guessing. Entity names are the schema's own — often PLURAL and different from the Candid types/methods (e.g. `bookings`, not `Booking`/`getBookings`). Returns the schema plus a ready-to-run `run_canister_oql_query` example per entity (each preserving this call's identity). AUTH: `derivation_origin` is REQUIRED — the schema itself is gated by the caller's principal, so a read with no origin is REJECTED (anonymous per-app reads are disabled for now) with guidance to pass it, rather than returning an empty entity list you'd misread as \"the app has no data model\". Pass the app's canonical `derivation_origin` (from open_app / resolve_app) to read the entities visible to the USER; the reply echoes `derived_for_origin` / `acted_as_principal`.",
         annotations(title = "Get the OQL schema", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::OqlSchemaOutput>(),
     )]
@@ -287,6 +389,12 @@ impl IcTools {
             Ok(o) => o,
             Err(e) => return Ok(err(e)),
         };
+        // Anonymous per-app reads are disabled for now (the schema is itself gated by
+        // the caller's principal): reject with guidance instead of returning an empty
+        // entity list an agent would misread as "the app has no data model".
+        if origin.is_none() {
+            return Ok(err(oql_needs_origin_error("Reading the OQL schema")));
+        }
         let (agent, acted_as) = match self
             .resolve_agent(&ctx, origin.as_deref(), account.as_deref(), "reading the schema")
             .await
@@ -299,10 +407,40 @@ impl IcTools {
             Err(e) => return Ok(err(format!("OQL schema call failed: {e}"))),
         };
         let schema = calls::decode_schema_reply(&reply);
+        let is_anonymous = origin.is_none();
+        // #8: a COMPLETE run_canister_oql_query per entity, carrying the SAME
+        // identity this schema was read under (so copying one doesn't drop to anon).
+        let example_queries =
+            calls::oql_query_examples(&canister_id, &schema, origin.as_deref(), account.as_deref());
+        // #1: an EMPTY schema (no visible entities) read anonymously is an auth
+        // artifact, not "the app has no data model" — computed only from local facts.
+        let empty_note = if calls::oql_schema_is_empty(&schema) {
+            Some(if is_anonymous {
+                calls::anonymous_empty_note(
+                    "the schema",
+                    "the app's `derivation_origin` (its canonical Internet Identity origin)",
+                )
+            } else {
+                "This account sees no OQL entities on this canister — confirm the \
+                 derivation_origin/account are the ones the user uses in their browser."
+                    .to_string()
+            })
+        } else {
+            None
+        };
         // Keep the primary block as the raw schema JSON (paste-able); surface the
-        // identity note (like the other identity tools) as a SEPARATE block so a
-        // mismatch is visible to text-only clients without breaking the JSON.
+        // empty-note, the ready-to-run examples, and the identity note as SEPARATE
+        // blocks so none of them break the JSON for a copy-paste consumer.
         let mut blocks = vec![schema.clone()];
+        if let Some(note) = &empty_note {
+            blocks.push(note.clone());
+        }
+        if !example_queries.is_empty() {
+            blocks.push(format!(
+                "Ready-to-run queries (read-only; each preserves this identity):\n{}",
+                example_queries.join("\n")
+            ));
+        }
         if let Some(o) = origin.as_ref() {
             let target = IdentityTarget {
                 origin: o.clone(),
@@ -317,12 +455,15 @@ impl IcTools {
             acted_as_principal: acted_as,
             derived_for_origin: origin,
             requested,
+            is_anonymous,
+            note: empty_note,
+            example_queries,
         };
         Ok(ok_structured_blocks(blocks, &output))
     }
 
     #[tool(
-        description = "Read a canister's own API documentation — a prose \"how this app behaves\" guide covering units, auth, lifecycle, non-obvious semantics, mutation safety, polling rules, and gotchas — if it exposes a `getApiDoc` or `get_api_doc` method. Call this FIRST when working with an unfamiliar app: it explains behavior the Candid types alone don't (get_canister_candid still gives the exact method signatures). Returns the doc as markdown.",
+        description = "Read a canister's own API documentation — a prose \"how this app behaves\" guide covering units, auth, lifecycle, non-obvious semantics, mutation safety, polling rules, and gotchas — if it exposes a `getApiDoc`/`get_api_doc` method. Call this ONLY when get_canister_candid (or open_app) reports `api_doc_available: true`; most canisters have no such doc, and then the Candid types ARE the interface. Returns a STRUCTURED result in every case (never a bare error): on success `available: true` + the doc markdown; otherwise `available: false` with `expected` (true = interface read fine, no such method — don't retry) and `retry` (true = a transient/unreachable failure — retry) plus a `next` hint, so you can tell \"no doc here\" from \"couldn't reach it\".",
         annotations(title = "Get a canister's API documentation", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::ApiDocOutput>(),
     )]
@@ -337,14 +478,45 @@ impl IcTools {
         // Read the interface to learn which naming the canister uses
         // (getApiDoc vs get_api_doc); the doc is public, so call anonymously.
         let did = calls::candid_service(&self.agent, principal).await;
-        let method = match did.as_deref().and_then(calls::api_doc_method) {
+        // A structured "not available" (#6) so the agent can tell an EXPECTED
+        // absence (interface read fine, no api-doc method — don't retry) from an
+        // UNREACHABLE canister (couldn't read the interface / the call trapped —
+        // retry) instead of getting one opaque error for both.
+        let unavailable = |expected: bool, retry: bool, next: &str| {
+            let output = calls::ApiDocOutput {
+                canister_id: canister_id.clone(),
+                available: false,
+                method: None,
+                doc: None,
+                expected,
+                retry,
+                next: Some(next.to_string()),
+            };
+            ok_structured(next.to_string(), &output)
+        };
+        let Some(did) = did.as_deref() else {
+            // Interface unreadable: can't tell whether an api-doc method exists, and
+            // this is often transient (or access-restricted) — flag it retryable.
+            return Ok(unavailable(
+                false,
+                true,
+                "Couldn't read this canister's Candid interface, so its API-doc method (if any) is \
+                 unknown — this may be transient. Retry, or read the interface with \
+                 get_canister_candid.",
+            ));
+        };
+        let method = match calls::api_doc_method(did) {
             Some(m) => m,
             None => {
-                return Ok(err(
-                    "this canister doesn't expose a `getApiDoc`/`get_api_doc` method (or its \
-                     Candid interface couldn't be read). Use get_canister_candid for the raw interface."
-                        .into(),
-                ))
+                // Interface read fine; the canister simply declares no api-doc method
+                // — expected for most canisters, and retrying won't change it.
+                return Ok(unavailable(
+                    true,
+                    false,
+                    "This canister declares no `getApiDoc`/`get_api_doc` method — most canisters \
+                     don't. Use get_canister_candid for the interface; its api_doc_available flag \
+                     mirrors this.",
+                ));
             }
         };
         let arg_bytes = match calls::encode_unit_arg() {
@@ -353,11 +525,27 @@ impl IcTools {
         };
         let reply = match calls::raw_call(&self.agent, principal, method, arg_bytes, true).await {
             Ok(b) => b,
-            Err(e) => return Ok(err(format!("{method} call failed: {e}"))),
+            Err(e) => {
+                // The method exists but the call failed — a transient/network issue,
+                // so retryable (distinct from the "no such method" case above).
+                return Ok(unavailable(
+                    false,
+                    true,
+                    &format!("The {method} call failed ({e}); this is likely transient — retry."),
+                ));
+            }
         };
         let doc = calls::decode_text_reply(&reply);
-        let output = calls::ApiDocOutput { canister_id, method: method.to_string(), doc };
-        Ok(ok_structured(output.doc.clone(), &output))
+        let output = calls::ApiDocOutput {
+            canister_id,
+            available: true,
+            method: Some(method.to_string()),
+            doc: Some(doc.clone()),
+            expected: false,
+            retry: false,
+            next: None,
+        };
+        Ok(ok_structured(doc, &output))
     }
 
     /// The agent to sign calls with for a request, and the principal it signs as:
@@ -396,6 +584,46 @@ impl IcTools {
                     .build()
                     .map_err(|e| format!("could not build agent: {e}"))?;
                 Ok((agent, principal))
+            }
+        }
+    }
+
+    /// Probe the app's OWN data canisters once (#3): fetch each candidate's Candid
+    /// anonymously (the interface is public) and record its OQL / api-doc capability
+    /// flags on the `DiscoveredCanister`. Only app-owned data candidates are probed
+    /// — never the frontend or a shared system canister (ledger/II/NNS) — so the
+    /// caller-gated data-access handle the flags feed stays correctly scoped. Probes
+    /// run CONCURRENTLY and fail soft: an unreadable interface just leaves the flags
+    /// null. Bounded by `MAX_CAPABILITY_PROBES` so a large manifest can't fan out
+    /// unboundedly.
+    async fn enrich_capabilities(&self, canisters: &mut [discover::DiscoveredCanister]) {
+        let targets: Vec<(usize, Principal)> = canisters
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| discover::is_app_data_candidate(c))
+            .filter_map(|(i, c)| Principal::from_text(&c.canister_id).ok().map(|p| (i, p)))
+            .take(MAX_CAPABILITY_PROBES)
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for (i, principal) in targets {
+            let agent = self.agent.clone();
+            set.spawn(async move {
+                let did = calls::candid_service(&agent, principal).await;
+                // Only conclude flags when the interface was actually read; a failed
+                // read leaves them null (unknown), not a misleading `false`.
+                let flags = did
+                    .as_deref()
+                    .map(|d| (calls::has_oql(d), calls::api_doc_method(d).is_some()));
+                (i, flags)
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            if let Ok((i, Some((oql, api_doc)))) = res {
+                canisters[i].oql = Some(oql);
+                canisters[i].api_doc_available = Some(api_doc);
             }
         }
     }
@@ -464,10 +692,25 @@ impl IcTools {
             Some(t) => (Some(t.origin.clone()), Some(t.requested.clone()), Some(t.source.clone())),
             None => (None, None, None),
         };
+        let is_anonymous = target.is_none();
+        // #1: an anonymous query whose reply LOOKS empty is most likely an auth
+        // artifact (per-app data is caller-gated), not "no data". Computed only from
+        // local facts (anonymous + query + empty-looking reply); conservative, so a
+        // reply with real content never trips it.
+        let note = (is_anonymous && is_query && calls::candid_reply_is_empty(&reply))
+            .then(|| {
+                calls::anonymous_empty_note(
+                    "this query call",
+                    "the app's canonical `derivation_origin` (from open_app / resolve_app)",
+                )
+            });
         // Keep the primary text block pure textual Candid (paste-able); surface the
-        // identity note (so a wrong-principal is visible to text-only clients) as a
-        // SEPARATE block rather than contaminating the reply.
+        // identity note (so a wrong-principal is visible to text-only clients) and
+        // any empty-read auth note as SEPARATE blocks rather than contaminating the reply.
         let mut blocks = vec![reply.clone()];
+        if let Some(n) = &note {
+            blocks.push(n.clone());
+        }
         if let Some(t) = &target {
             let acted = acted_as_principal.as_deref().unwrap_or("<unknown>");
             blocks.push(format!("[{}]", identity_annotation(t, Some(acted))));
@@ -475,6 +718,7 @@ impl IcTools {
         let output = calls::CallCanisterOutput {
             canister_id, method, is_query, reply,
             acted_as_principal, derived_for_origin, requested, derivation_origin_source,
+            is_anonymous, note,
         };
         Ok(ok_structured_blocks(blocks, &output))
     }
@@ -571,7 +815,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Open an Internet Computer app in ONE call, given its NAME or its URL — the recommended entry point when a user names an app. It resolves the app's Internet Identity derivation origin (like resolve_app) AND discovers the canisters behind it (like discover_app_canisters) together, so you don't chain those yourself. Pass a NAME (e.g. \"MULTI/DEX\", \"Oisy\", \"NNS\") or a URL (e.g. \"https://oisy.com\"): a name or bare host is matched to the built-in known-app registry FIRST (so even a wrong-TLD guess like \"multidex.com\" repairs to the canonical URL), and an explicit https:// URL is resolved as given. NEVER fabricate a domain from a name — an unknown bare name is refused with instructions to find the real URL (web search / ask the user), and a URL with no Internet-Computer evidence is refused, both instead of guessing a wrong identity. Returns `app_url` (the one used), `derivation_origin` (+ its source) to act with, `alternative_origins`, and the discovered `canisters` (with provenance/labels). No authenticated session required (no principal is derived here). Next: inspect a canister with get_canister_candid, then act with call_canister passing `app_url` (or `derivation_origin`). Narrower tools remain for single steps: icp_find_app_by_name (name→URL only), resolve_app (origin only), discover_app_canisters (canisters only).",
+        description = "Open an Internet Computer app in ONE call, given its NAME or its URL — the recommended entry point when a user names an app. It resolves the app's Internet Identity derivation origin (like resolve_app) AND discovers the canisters behind it (like discover_app_canisters) together, so you don't chain those yourself. Pass a NAME (e.g. \"MULTI/DEX\", \"Oisy\", \"NNS\") or a URL (e.g. \"https://oisy.com\"): a name or bare host is matched to the built-in known-app registry FIRST (so even a wrong-TLD guess like \"multidex.com\" repairs to the canonical URL), and an explicit https:// URL is resolved as given. NEVER fabricate a domain from a name — an unknown bare name is refused with instructions to find the real URL (web search / ask the user), and a URL with no Internet-Computer evidence is refused, both instead of guessing a wrong identity. Returns `app_url` (the one used), `derivation_origin` (+ its source) to act with, `alternative_origins`, and the discovered `canisters` (with provenance/labels AND per-canister `oql`/`api_doc_available` capability flags, from a one-shot Candid probe of the app's own canisters). A canister flagged `oql` holds the app's data, GATED BY THE CALLER's principal: to read the USER's own data (\"my …\", \"our …\") pass the returned `derivation_origin` to get_canister_oql_schema / run_canister_oql_query (those OQL tools REQUIRE `derivation_origin` — not `app_url` — and reject an anonymous read for now). No authenticated session required for open_app itself (no principal is derived here). Narrower tools remain for single steps: icp_find_app_by_name (name→URL only), resolve_app (origin only), discover_app_canisters (canisters only).",
         annotations(title = "Open an app (resolve origin + discover canisters)", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::OpenAppOutput>(),
     )]
@@ -641,6 +885,19 @@ impl IcTools {
             Ok(Err(e)) => (Vec::new(), 0, Some(e)),
             Err(join_err) => (Vec::new(), 0, Some(format!("discovery task error: {join_err}"))),
         };
+        // Enrich the app's OWN data canisters with OQL / api-doc capability flags
+        // (#3), so open_app hands back a ready-to-use handle: which canister holds
+        // the (caller-gated) data, and the origin to read it as the user.
+        let mut discovered: Vec<discover::DiscoveredCanister> =
+            canisters.iter().map(discover::DiscoveredCanister::from).collect();
+        self.enrich_capabilities(&mut discovered).await;
+        // The ready-to-use data-access handle: the resolved origin, scoped (by
+        // is_app_data_candidate) to the app's own OQL canisters — never a guessed
+        // origin, never II/NNS/ledger/frontend. `derivation_origin` only: the
+        // data-access note names the OQL read tools, which take `derivation_origin`
+        // (not `app_url` — that's call_canister's), so offering app_url here would
+        // send the agent to a param those tools silently ignore.
+        let handle = format!("derivation_origin=\"{effective}\"");
 
         let mut text = format!(
             "app_url: {app_url} ({app_url_source})\nderivation_origin: {effective} ({})\n",
@@ -655,23 +912,12 @@ impl IcTools {
                  derivation origin above is still valid. Retry discover_app_canisters, or proceed \
                  with a canister id you already have.\n"
             ));
-        } else if canisters.is_empty() {
+        } else if discovered.is_empty() {
             text.push_str("\nNo canisters discovered — the app appears to declare none.\n");
         } else {
             text.push_str("\nCanisters:\n");
-            for f in &canisters {
-                let identity = match (&f.name, &f.kind) {
-                    (Some(n), Some(k)) => format!("  «{n}» ({k})"),
-                    (Some(n), None) => format!("  «{n}»"),
-                    _ => String::new(),
-                };
-                text.push_str(&format!(
-                    "- {}{}{} [{}]\n",
-                    f.canister_id,
-                    f.label.as_deref().map(|l| format!("  — {l}")).unwrap_or_default(),
-                    identity,
-                    f.sources.join(", "),
-                ));
+            for c in &discovered {
+                text.push_str(&render_canister_line(c));
             }
             if omitted > 0 {
                 text.push_str(&format!(
@@ -683,11 +929,16 @@ impl IcTools {
         if let Some(n) = &note {
             text.push_str(&format!("\nNOTE: {n}"));
         }
+        if let Some(access) = data_access_note(&discovered, Some(&handle)) {
+            text.push_str(&format!("\n\n{access}"));
+        }
         text.push_str(
-            "\n\nNext: inspect a canister with get_canister_candid (and get_canister_api_doc if it \
-             has one); to act as the user, call_canister accepts app_url OR the derivation_origin \
-             above, while run_canister_oql_query / get_canister_oql_schema take the \
-             derivation_origin — plus an optional account from list_app_accounts.",
+            "\n\nNext: inspect a canister with get_canister_candid — its oql / api_doc_available \
+             flags say whether to use the OQL tools and whether get_canister_api_doc has a doc \
+             (only call it when api_doc_available). To act as the user, pass the derivation_origin \
+             above to call_canister and to run_canister_oql_query / get_canister_oql_schema — plus \
+             an optional account from list_app_accounts. A \"my/our…\" question is an AUTHENTICATED \
+             read: pass the origin.",
         );
         let output = discover::OpenAppOutput {
             app_url,
@@ -697,7 +948,7 @@ impl IcTools {
             derivation_origin_source: resolved.derivation_origin_source.as_str().to_string(),
             alternative_origins: resolved.alternative_origins,
             application_is_ic: resolved.application_is_ic,
-            canisters: canisters.iter().map(discover::DiscoveredCanister::from).collect(),
+            canisters: discovered,
             omitted,
             discovery_error,
             note,
@@ -770,21 +1021,15 @@ impl IcTools {
     ) -> Result<CallToolResult, McpError> {
         match discover::discover(&domain).await {
             Ok(d) if !d.canisters.is_empty() => {
+                // Probe the app's own data canisters for OQL / api-doc capabilities
+                // (#3), mirroring open_app. discover_app_canisters resolves no origin,
+                // so the data-access note points at resolve_app / open_app for it.
+                let mut discovered: Vec<discover::DiscoveredCanister> =
+                    d.canisters.iter().map(discover::DiscoveredCanister::from).collect();
+                self.enrich_capabilities(&mut discovered).await;
                 let mut out = format!("Canisters discovered for {domain}:\n");
-                for f in &d.canisters {
-                    // Dashboard identity (name/type), filled in during discovery.
-                    let identity = match (&f.name, &f.kind) {
-                        (Some(n), Some(k)) => format!("  «{n}» ({k})"),
-                        (Some(n), None) => format!("  «{n}»"),
-                        _ => String::new(),
-                    };
-                    out.push_str(&format!(
-                        "- {}{}{} [{}]\n",
-                        f.canister_id,
-                        f.label.as_deref().map(|l| format!("  — {l}")).unwrap_or_default(),
-                        identity,
-                        f.sources.join(", "),
-                    ));
+                for c in &discovered {
+                    out.push_str(&render_canister_line(c));
                 }
                 if d.omitted > 0 {
                     out.push_str(&format!(
@@ -799,10 +1044,18 @@ impl IcTools {
                      the app's claim about its composition. The `header` (x-ic-canister-id) entry \
                      is the frontend/asset canister. Others come from env.json or the JS bundle \
                      and may include multiple environments (prefer the production/IC ids). A \
-                     «name» (type) is the IC dashboard's label for that id. Confirm an interface \
+                     «name» (type) is the IC dashboard's label for that id. `[oql]`/`[api-doc]` \
+                     flags are from a Candid probe of the app's own canisters. Confirm an interface \
                      with get_canister_candid before calling.",
                 );
-                let output = discover::DiscoverOutput::from((domain, d));
+                if let Some(access) = data_access_note(&discovered, None) {
+                    out.push_str(&format!("\n\n{access}"));
+                }
+                let output = discover::DiscoverOutput {
+                    domain,
+                    canisters: discovered,
+                    omitted: d.omitted,
+                };
                 Ok(ok_structured(out, &output))
             }
             Ok(d) => {
@@ -1162,6 +1415,138 @@ fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<auth::AuthedSessio
         .cloned()
 }
 
+/// The rejection for an OQL read tool (`get_canister_oql_schema` /
+/// `run_canister_oql_query`) called with NO derivation origin. These tools read
+/// per-app data gated by the caller's principal, so an anonymous read is signed as
+/// 2vxsx-fae and returns nothing useful — so, for the time being, we reject it
+/// outright rather than let it silently come back empty. `what` names the action.
+/// Points at open_app / resolve_app so the agent recovers the origin in one step.
+fn oql_needs_origin_error(what: &str) -> String {
+    format!(
+        "{what} reads per-app data that this canister gates by the CALLER's principal, so it \
+         cannot be done anonymously — pass `derivation_origin`, the app's canonical Internet \
+         Identity origin, to read as your account. If you don't have it, resolve it from the \
+         app's URL or name with open_app / resolve_app, then retry. (Anonymous per-app reads are \
+         disabled for now; public metadata such as get_canister_candid still works without an origin.)"
+    )
+}
+
+/// The diagnosis attached to an EMPTY / trapped OQL query result (#1 + #7).
+struct OqlEmptyDiagnosis {
+    /// The human-readable explanation of the empty result, if one applies.
+    note: Option<String>,
+    /// The entities visible to this caller, when an unknown-`start` diagnosis fired.
+    valid_entities: Option<Vec<String>>,
+    /// The nearest valid entity to an unknown `start` (`booking` → `bookings`).
+    did_you_mean: Option<String>,
+}
+
+impl OqlEmptyDiagnosis {
+    fn none() -> Self {
+        Self { note: None, valid_entities: None, did_you_mean: None }
+    }
+}
+
+/// Why `diagnose_empty_oql` was called — a genuinely EMPTY result (0-row table)
+/// vs. a FAILED one (trap / OQL error arm). The `start`-entity repair applies to
+/// both, but the "came back empty ⇒ likely not authenticated" / "no entities here"
+/// notes describe an EMPTY result and would misdescribe a failure that already
+/// carries its own error message, so they are emitted for `EmptyResult` only.
+#[derive(Clone, Copy, PartialEq)]
+enum EmptyContext {
+    EmptyResult,
+    Failed,
+}
+
+/// Diagnose why an OQL read came back EMPTY (0 rows) or FAILED (trap / error arm),
+/// using ONLY facts gathered from the SAME agent/principal that ran the query —
+/// never probing whether some OTHER principal would see data (no leak). This is
+/// validate-on-empty, not an unconditional preflight: it runs a single extra
+/// `schema` read for this principal and hard-validates the query's `start` entity
+/// (only `start` — field and dotted-edge paths are treated advisorily by the caller).
+///
+///  - `start` isn't one of the visible entities → the #7 unknown-entity repair
+///    (valid entities + a "did you mean?" near match). Emitted in BOTH contexts —
+///    an unknown `start` is the common reason a query traps.
+///  - The notes below describe an EMPTY RESULT and are emitted for `EmptyResult`
+///    only (a `Failed` result keeps its own error message; "came back empty" would
+///    misdescribe it):
+///     - Anonymous + empty → the #1 auth remediation (empty is almost certainly
+///       "not authenticated as your account", not "no data").
+///     - Authenticated + the schema read SUCCEEDED and shows no entities → this
+///       account sees no entities here. (A schema read that FAILED is left
+///       undiagnosed — the caller falls back to a benign "0 rows" note — rather
+///       than mislabeled "no entities".)
+///     - `start` valid but 0 rows → authenticated gets no note here (the caller
+///       adds the benign "0 rows"); anonymous still gets the auth hint.
+async fn diagnose_empty_oql(
+    agent: &Agent,
+    principal: Principal,
+    query_json: &str,
+    is_anonymous: bool,
+    ctx: EmptyContext,
+) -> OqlEmptyDiagnosis {
+    // The derivation_origin the caller would ADD to authenticate — a placeholder we
+    // never fill with a guessed origin (#1).
+    const ADD_HINT: &str = "the app's `derivation_origin` (its canonical Internet Identity origin)";
+    // Re-read the schema for THIS principal (same agent). `None` = the read FAILED
+    // (unknown, not "empty"); `Some(vec)` = it succeeded (possibly with no entities).
+    // Keeping the two apart stops a transient schema failure from being mislabeled
+    // "this account sees no entities".
+    let entities: Option<Vec<String>> = match calls::encode_unit_arg() {
+        Ok(arg) => match calls::raw_call(agent, principal, "schema", arg, true).await {
+            Ok(reply) => Some(calls::oql_entity_names(&calls::decode_schema_reply(&reply))),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    let start = calls::oql_query_start(query_json);
+    let mut d = OqlEmptyDiagnosis::none();
+
+    // #7 unknown-`start` repair — needs a successful, non-empty schema. Applies in
+    // BOTH contexts (an unknown entity is exactly what makes a query trap).
+    if let Some(ents) = entities.as_ref().filter(|e| !e.is_empty()) {
+        if let Some(s) = start.as_deref().filter(|s| !ents.iter().any(|e| e == s)) {
+            d.did_you_mean = calls::closest_entity(s, ents);
+            let dym = d
+                .did_you_mean
+                .as_deref()
+                .map(|m| format!(" Did you mean \"{m}\"?"))
+                .unwrap_or_default();
+            d.note = Some(format!(
+                "`start`: \"{s}\" is not a queryable entity on this canister. Valid entities \
+                 (visible to this caller): {}.{dym}",
+                ents.join(", ")
+            ));
+            d.valid_entities = Some(ents.clone());
+            return d;
+        }
+    }
+
+    // The remaining notes describe an EMPTY result — skip them on a failure, whose
+    // own error message stands, and appending "came back empty" would contradict it.
+    if ctx == EmptyContext::Failed {
+        return d;
+    }
+
+    if is_anonymous {
+        // Anonymous + empty (schema empty, unreadable, or `start` valid) → auth hint.
+        d.note = Some(calls::anonymous_empty_note("this query", ADD_HINT));
+    } else if matches!(entities.as_deref(), Some([])) {
+        // Authenticated AND the schema read SUCCEEDED with no entities — a genuine
+        // "nothing visible here" (not a failed re-read mislabeled as empty).
+        d.note = Some(
+            "This account sees no OQL entities on this canister, so there is nothing to query as \
+             it — confirm the derivation_origin/account are the ones the user uses in their browser."
+                .to_string(),
+        );
+    }
+    // Otherwise (authenticated: `start` valid, OR the schema read failed): no
+    // actionable diagnosis — leave `note` None so the caller adds the benign
+    // "0 rows for this account" on an empty table.
+    d
+}
+
 /// Which app principal an identity-bearing tool should act as, resolved from the
 /// caller's `derivation_origin`.
 #[derive(Debug)]
@@ -1469,37 +1854,49 @@ impl ServerHandler for IcTools {
              the binary form. Tool names signal SCOPE: an `icp_` prefix marks IC protocol / \
              meta-level tools (dashboard name/id lookups, the official IC skills, the OQL dialect \
              guide, and canister creation/management); `…_app…` names \
-             (`discover_app_canisters`, `get_app_principal`, `list_app_accounts`, `resolve_app`) \
+             (`open_app`, `discover_app_canisters`, `get_app_principal`, `list_app_accounts`, `resolve_app`) \
              act on a whole APP, keyed by its Internet Identity derivation origin or app URL; and \
              `…canister…` names (`get_canister_candid`, `get_canister_api_doc`, \
              `get_canister_oql_schema`, `run_canister_oql_query`, `call_canister`) act on ONE \
              specific canister. Before writing Candid args, consult the `candid://textual-syntax` \
              resource (the value syntax these tools use); `candid://reference` has the full type \
-             reference. When the user names a website/domain instead of a canister id, use \
-             `discover_app_canisters` to find the canister(s) behind it — app-declared App Connect \
-             metadata (/ai-connect.html meta, /.well-known/ic-app.json manifest) first, then the \
-             frontend via header and backend candidates via env.json/JS bundle. When they name a \
-             TOKEN, PROJECT or SERVICE (e.g. \
-             \"ckUSDC\"), use `icp_find_canister_by_name` to look it up by name in the IC dashboard's \
-             registries and get its canister id. `icp_lookup_canister_info_by_id(id)` tells you what a bare \
-             canister id IS (dashboard label, type, controllers, subnet). `get_canister_candid` fetches a \
-             canister's Candid interface. For an unfamiliar app, try `get_canister_api_doc` FIRST: if the \
-             canister exposes a `getApiDoc`/`get_api_doc` method it returns a prose guide to how \
-             the app behaves (units, auth, lifecycle, mutation safety, polling, gotchas) that the \
-             Candid types alone don't convey. If `get_canister_candid` reports `oql: true`, the canister \
-             exposes an OQL query surface — read `icp_oql_guide` for the dialect, then use \
-             `get_canister_oql_schema` (entities and fields) and `run_canister_oql_query` (run a JSON query, get a table \
-             back). Those two wrap the canister's `schema`/`execute` methods, so you don't \
-             hand-encode Candid for OQL. When the user names or links an APP, the one-call entry \
-             point is `open_app(name-or-URL)`: it takes an app NAME (e.g. \"MULTI/DEX\") or a URL, \
-             resolves the derivation origin AND discovers the canisters together, and repairs a \
-             wrong-TLD guess to the canonical known-app URL. RULE — names are not URLs: NEVER guess \
-             or fabricate a domain from an app's name (e.g. <name>.com/.app); pass the NAME to \
-             `open_app` (or `icp_find_app_by_name`) and let the connector resolve it, WEB SEARCH \
-             the official URL, or ask the user. Lookalike domains are unrelated or squatted sites, \
-             and open_app / every URL-taking tool REFUSES an origin that shows no evidence of being \
-             an Internet Computer app instead of resolving it to a wrong identity. (open_app bundles \
-             `resolve_app` + `discover_app_canisters`; use those directly for a single step.) \
+             reference.\n\n\
+             START WITH open_app WHEN THE USER NAMES OR LINKS AN APP. `open_app(name-or-URL)` is the \
+             one-call entry point: it takes an app NAME (e.g. \"MULTI/DEX\", \"Oisy\", \"NNS\") or a \
+             URL, resolves the Internet Identity derivation origin AND discovers the canisters \
+             together, probes the app's own canisters for their `oql`/`api_doc_available` \
+             capabilities, and repairs a wrong-TLD guess to the canonical known-app URL — so you do \
+             NOT chain resolve_app + discover_app_canisters yourself, and you do NOT start from \
+             discover_app_canisters. (open_app bundles `resolve_app` + `discover_app_canisters`; use \
+             those directly only for a single step.) RULE — names are not URLs: NEVER guess or \
+             fabricate a domain from an app's name (e.g. <name>.com/.app); pass the NAME to open_app \
+             (or `icp_find_app_by_name`) and let the connector resolve it, WEB SEARCH the official \
+             URL, or ask the user. Lookalike domains are unrelated or squatted sites, and open_app / \
+             every URL-taking tool REFUSES an origin that shows no evidence of being an Internet \
+             Computer app instead of resolving it to a wrong identity. When the user names a TOKEN, \
+             PROJECT or SERVICE (e.g. \"ckUSDC\"), use `icp_find_canister_by_name` for its canister \
+             id; `icp_lookup_canister_info_by_id(id)` tells you what a bare canister id IS (dashboard \
+             label, type, controllers, subnet).\n\n\
+             \"MY / OUR …\" IS AN AUTHENTICATED READ. A question about the USER's OWN data in an app \
+             (\"who am I meeting with…\", \"my bookings\", \"our balance\") reads data the app gates \
+             by the CALLER's principal. The OQL read tools (get_canister_oql_schema / \
+             run_canister_oql_query) REQUIRE the app's `derivation_origin` (from open_app / \
+             resolve_app) — anonymous per-app reads are disabled for now, so a call with no origin \
+             is REJECTED with guidance to pass it, rather than silently returning empty. \
+             Authenticating never hurts a public read either — the canister serves the request \
+             regardless of principal — so always pass the origin for app data. (call_canister can \
+             still be called anonymously for genuinely public canisters like ledgers.)\n\n\
+             INSPECTING A CANISTER. `get_canister_candid` fetches the interface and reports two \
+             capability flags: `oql` and `api_doc_available` (open_app reports the same per \
+             canister). If `oql: true`, READ the canister through the OQL tools, in order: \
+             `icp_oql_guide` (the JSON dialect, once) → `get_canister_oql_schema` (entities and \
+             fields) → `run_canister_oql_query` (run a JSON query, get a table). Those wrap the \
+             canister's `schema`/`execute` methods, so you never hand-encode Candid for OQL — and on \
+             an OQL canister raw `call_canister` query calls are REJECTED (it handles UPDATES only). \
+             Call `get_canister_api_doc` ONLY when `api_doc_available` is true: then it returns a \
+             prose \"how this app behaves\" guide (units, auth, lifecycle, mutation safety, polling, \
+             gotchas) the Candid types don't convey; when the flag is false the canister has no such \
+             doc and the Candid types ARE the interface — don't call it.\n\n\
              `call_canister` calls a method with textual Candid \
              in/out: omit the identity args to call anonymously, or act AS your account at an app. \
              To act as an app account, identify the app by its `derivation_origin` — the EXACT \
@@ -1527,22 +1924,26 @@ impl ServerHandler for IcTools {
              rejects for a read-only session — if one fails that way, ask the user to reconnect with \
              the read-only option turned OFF.\n\n\
              Typical flow (acting FOR THE USER at an app): (0-2) `open_app(name-or-URL)` in ONE \
-             call gives the `derivation_origin` AND the app's canisters — pass the NAME the user \
-             said (well-known apps NNS/Oisy/MULTI/DEX/ICPSwap resolve offline) or a URL you have, \
-             NEVER a domain guessed from the name (there is no on-chain name→URL directory; \
-             `icp_find_canister_by_name` finds token/SNS canister ids, not front-ends). If you \
-             want just one part, `icp_find_app_by_name` does name→URL, `resolve_app(url)` the \
-             origin, `discover_app_canisters(url)` the canisters; (3) `list_app_accounts` — \
-             if there is more than one account, ask which to use and remember it; (4) \
-             `get_app_principal` ONLY when you need the principal value itself (`call_canister` / \
+             call gives the `derivation_origin` AND the app's canisters (with `oql`/`api_doc_available` \
+             flags) — pass the NAME the user said (well-known apps NNS/Oisy/MULTI/DEX/ICPSwap resolve \
+             offline) or a URL you have, NEVER a domain guessed from the name (there is no on-chain \
+             name→URL directory; `icp_find_canister_by_name` finds token/SNS canister ids, not \
+             front-ends). If you want just one part, `icp_find_app_by_name` does name→URL, \
+             `resolve_app(url)` the origin, `discover_app_canisters(url)` the canisters; (3) \
+             `list_app_accounts` — if there is more than one account, ask which to use and remember \
+             it; (4) `get_app_principal` ONLY when you need the principal value itself (`call_canister` / \
              `run_canister_oql_query` act as the account without pre-fetching it); (5) inspect the \
-             canister with `get_canister_candid` (and `get_canister_api_doc` if it exposes one) — its \
-             `oql: true` flag says whether OQL is available; (6) READ with `run_canister_oql_query` \
-             when OQL is available (for an OQL canister `call_canister` query calls are REJECTED — \
-             use the OQL tools), else `call_canister` with is_query=true; (7) ACT with \
+             canister with `get_canister_candid` — its `oql` flag says whether to use the OQL tools, \
+             its `api_doc_available` flag whether `get_canister_api_doc` has a doc; (6) READ as the \
+             user, passing the `derivation_origin` (REQUIRED for the OQL tools): \
+             `run_canister_oql_query` when `oql: true` (the OQL read tools reject an anonymous call \
+             for now, and for an OQL canister `call_canister` query calls are REJECTED — so use the \
+             OQL tools with the origin), else `call_canister` with is_query=true; (7) ACT with \
              `call_canister` update calls, passing `derivation_origin` + `account` to act as the \
-             user. Public/anonymous reads skip 1/3/4. The per-canister inspection (5) is independent \
-             of the identity steps (1/3/4), so they can run in parallel. Managing your OWN canisters \
+             user. Public metadata (get_canister_candid, discover_app_canisters) and public \
+             call_canister queries need no origin; the OQL read tools always require one. The \
+             per-canister inspection (5) is independent of the identity steps (1/3/4), so they can \
+             run in parallel. Managing your OWN canisters \
              (the `icp_` create/install/status/… tools) acts as your standing MANAGEMENT principal at \
              this server's origin — a DIFFERENT identity than the per-app principals above.\n\n\
              To AUTHOR, BUILD and DEPLOY IC code, first consult the official IC skills: \
@@ -1632,6 +2033,59 @@ impl ServerHandler for IcTools {
             request.uri,
         )]))
     }
+}
+
+/// One canister line for the open_app / discover_app_canisters text output: id,
+/// discovery label, dashboard «name» (type), sources, and any capability flags
+/// (`[oql]` / `[api-doc]`) filled in by [`IcTools::enrich_capabilities`]. Shared by
+/// both tools so their listings stay identical.
+fn render_canister_line(c: &discover::DiscoveredCanister) -> String {
+    let identity = match (&c.name, &c.kind) {
+        (Some(n), Some(k)) => format!("  «{n}» ({k})"),
+        (Some(n), None) => format!("  «{n}»"),
+        _ => String::new(),
+    };
+    let mut caps = String::new();
+    if c.oql == Some(true) {
+        caps.push_str(" [oql]");
+    }
+    if c.api_doc_available == Some(true) {
+        caps.push_str(" [api-doc]");
+    }
+    format!(
+        "- {}{}{} [{}]{}\n",
+        c.canister_id,
+        c.label.as_deref().map(|l| format!("  — {l}")).unwrap_or_default(),
+        identity,
+        c.sources.join(", "),
+        caps,
+    )
+}
+
+/// The caller-gated data-access note (#3): when discovery surfaced OQL data
+/// canister(s), spell out that their data is gated by the CALLER's principal (the
+/// OQL read tools require the origin — an anonymous read is rejected for now) and
+/// how to read as the user. `handle` is the ready-to-use origin clause when the
+/// origin is already resolved (open_app), or `None` when it isn't
+/// (discover_app_canisters), in which case the note points at resolve_app /
+/// open_app to obtain it.
+fn data_access_note(canisters: &[discover::DiscoveredCanister], handle: Option<&str>) -> Option<String> {
+    if !canisters.iter().any(|c| c.oql == Some(true)) {
+        return None;
+    }
+    let how = match handle {
+        Some(clause) => format!(
+            "To read it as the user, pass {clause} to get_canister_oql_schema / \
+             run_canister_oql_query (plus an optional account from list_app_accounts)."
+        ),
+        None => "Resolve the app's derivation_origin (resolve_app / open_app) and pass it to \
+                 get_canister_oql_schema / run_canister_oql_query to read as the user."
+            .to_string(),
+    };
+    Some(format!(
+        "Data access: the canister(s) flagged [oql] hold this app's data, gated by the CALLER's \
+         principal — the OQL read tools REQUIRE the origin (an anonymous read is rejected for now). {how}"
+    ))
 }
 
 /// Render an IC dashboard canister identity as readable text for icp_lookup_canister_info_by_id.
@@ -2141,6 +2595,24 @@ mod tests {
     use super::calls::decode_bytes_with_did;
     use candid::types::value::IDLArgs;
     use candid_parser::parse_idl_args;
+
+    // Anonymous per-app reads are disabled for now: the OQL read tools reject a
+    // call with no origin, and the rejection must name what to pass and how to get
+    // it (so the agent recovers in one step) — not just say "no".
+    #[test]
+    fn oql_needs_origin_error_is_actionable() {
+        let msg = super::oql_needs_origin_error("Running an OQL query");
+        assert!(msg.contains("Running an OQL query"), "echoes the action: {msg}");
+        assert!(msg.contains("derivation_origin"), "names the arg to pass: {msg}");
+        assert!(
+            msg.contains("open_app") && msg.contains("resolve_app"),
+            "names how to get the origin: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("anonymous"),
+            "explains anonymous is disabled: {msg}"
+        );
+    }
 
     // Field names are hashed on the Candid wire; decoding against the method's
     // declared return type must recover them (type-less decoding shows hashes).
