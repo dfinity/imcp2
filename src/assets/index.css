@@ -138,9 +138,9 @@ h1 em { font-style: italic; color: var(--accent); }
 
 /* ---- Setup / getting started --------------------------------------------- */
 /* The "connect your AI" card leads the page. It reuses the tool-card shell
-   (.cat) but takes the rust accent stripe and adds numbered steps. Per-client
-   instructions and the beta/prod note collapse into native <details>, so the
-   page stays one screen tall without any script. */
+   (.cat) but takes the rust accent stripe and adds numbered steps. The
+   per-client instructions collapse into native <details>, so the page stays
+   one screen tall without any script. */
 .setup-card { margin: 2.75rem 0 1.5rem; }
 .cat[data-cat="setup"] { --stripe: var(--accent); }
 
@@ -215,7 +215,7 @@ h1 em { font-style: italic; color: var(--accent); }
   color: var(--ink);
 }
 
-/* Collapsibles: per-client setup (nested in step 3) and the beta/prod note. */
+/* Collapsibles: the per-client setup instructions nested in step 2. */
 .setup-card details {
   margin-top: 0.6rem;
   border: 1px solid var(--hairline);
