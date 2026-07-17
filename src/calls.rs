@@ -172,22 +172,15 @@ pub struct CallCanisterArgs {
     #[serde(default)]
     pub is_query: bool,
     /// Call AS the user's account at an app, identified by its exact canonical
-    /// Internet Identity derivation origin — NOT necessarily the visible URL. For
-    /// an app with a custom derivation origin, pass that canonical origin (do not
-    /// infer it from an alternativeOrigins list). Accepts the legacy name
-    /// `domain`. Omit both this and `app_url` to call anonymously; provide at most
-    /// one. The account delegation is derived on demand for this connection.
+    /// Internet Identity derivation origin — NOT necessarily the visible URL (do
+    /// not infer it from an alternativeOrigins list). Get it from open_app /
+    /// resolve_app, which resolve an app NAME or URL to the derivation origin under
+    /// the guessed-domain gate; then reuse it here. This does NOT accept a raw
+    /// website URL — a derivation origin is a stable per-app value, resolved once
+    /// and reused. Accepts the legacy name `domain`. Omit to call anonymously. The
+    /// account delegation is derived on demand for this connection.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
-    /// Call AS the user's account at an app, identified by its URL; the connector
-    /// resolves the derivation origin — the app's declared one if it publishes it
-    /// (`derivation_origin_source` = "declared"), else a built-in known-app value
-    /// ("known"), else the application origin ("app_url_default"). Must be a URL
-    /// you actually have — NEVER a domain guessed from an app's name (use
-    /// icp_find_app_by_name for names; a non-IC origin is refused). See the
-    /// result's `derivation_origin_source`. Alternative to `derivation_origin`.
-    #[serde(default)]
-    pub app_url: Option<String>,
     /// Which of your accounts to act as, by account name (see list_app_accounts).
     /// Omit to use that app's default account. Ignored for anonymous calls.
     #[serde(default)]
@@ -218,16 +211,16 @@ pub struct CallCanisterOutput {
     /// origin used (after canonicalization). Null for anonymous calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_for_origin: Option<String>,
-    /// When called as an app account: exactly what you supplied
-    /// (`derivation_origin` or `app_url`), echoed so a mismatch with
-    /// `derived_for_origin` is visible. Null for anonymous calls.
+    /// When called as an app account: exactly what you supplied as
+    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` (from
+    /// canonicalization) is visible. Null for anonymous calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
-    /// When called as an app account: how `derived_for_origin` was determined
-    /// (`explicit` | `declared` | `known` | `app_url_default`) — matches the other
-    /// identity tools. `app_url_default` means the app declares no derivation origin
-    /// (and isn't a known app) and the app URL was assumed, so the principal is
-    /// wrong for an app with a custom one. Null for anonymous calls.
+    /// When called as an app account: how `derived_for_origin` was determined —
+    /// always "explicit" here, since this tool takes the canonical derivation origin
+    /// directly. (The "declared"/"known"/"app_url_default" sources are reported by
+    /// the resolver tools open_app / resolve_app, which turn a URL into an origin.)
+    /// Null for anonymous calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derivation_origin_source: Option<String>,
 }
