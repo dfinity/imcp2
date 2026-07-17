@@ -15,7 +15,66 @@
 </div>
 </div></header>
 
-<main class=wrap><section class=categories>
+<main class=wrap>
+
+<article class="cat setup-card" data-cat=setup>
+<div class=cat-head>
+<p class=cat-eyebrow>Get started</p>
+<h2 class=cat-title>Connect your AI chat to the Internet Computer</h2>
+<p class=cat-note>Point Claude, ChatGPT, or any MCP-capable app at this server and work with the IC in plain language — no code. You sign in with your Internet Identity, and the agent acts as you, with only the access you grant.</p>
+</div>
+
+<div class=setup-url>
+<span class=setup-url-label>Connector URL</span>
+<code><span class=verb>Beta</span>https://mcp.beta.id.ai/mcp</code>
+<code><span class=verb>Prod</span>https://mcp.beta.id.ai/mcp-prod</code>
+</div>
+
+<ol class=steps>
+
+<li class=step>
+<h3>Sign in with Internet Identity</h3>
+<p>Open <a href="https://beta.id.ai" target=_blank rel="noopener noreferrer">beta.id.ai</a> (for <code>/mcp</code>) or <a href="https://id.ai" target=_blank rel="noopener noreferrer">id.ai</a> (for <code>/mcp-prod</code>) and sign in to the identity you want the agent to act as.</p>
+</li>
+
+<li class=step>
+<h3>Trust this MCP server</h3>
+<p>In your Internet Identity settings — <a href="https://beta.id.ai/manage/settings" target=_blank rel="noopener noreferrer">beta.id.ai/manage/settings</a>, or <a href="https://id.ai/manage/settings" target=_blank rel="noopener noreferrer">id.ai/manage/settings</a> for production — add the connector URL above under <em>Trusted MCP servers</em>.</p>
+</li>
+
+<li class=step>
+<h3>Add the same URL to your AI app</h3>
+<p>Paste the connector URL as a custom connector or MCP server. Where to find it:</p>
+<details>
+<summary>Claude — Desktop or claude.ai</summary>
+<div class=details-body>Settings &rarr; Connectors &rarr; <b>Add custom connector</b>, then paste the URL. Set <b>Read-only tools</b> and <b>Write/delete tools</b> to <b>Always allow</b>, or you'll be answering an authorization prompt for every step the agent takes.</div>
+</details>
+<details>
+<summary>ChatGPT — chatgpt.com</summary>
+<div class=details-body>Settings &rarr; <b>Apps</b> (called Connectors or Plugins on some plans). Enable <b>Developer mode</b> under Advanced settings first — despite the name, no coding is involved — then press <b>Create app</b> and paste the URL.</div>
+</details>
+<details>
+<summary>Any other app</summary>
+<div class=details-body>Look for <b>MCP</b>, <b>connectors</b>, or <b>plugins</b> in the app's settings, then add the URL as a new server.</div>
+</details>
+</li>
+
+<li class=step>
+<h3>Authorize, then talk</h3>
+<p>Your app sends you to Internet Identity to grant access. Pick the identity and how long the grant lasts; leave <em>read-only</em> off if you want the agent to act — call methods, create and manage canisters — and not just read. Grants expire by design, so re-approving later is normal, not a fresh setup.</p>
+<p class=try>Then try: <i>"What canisters run multidex.ai?"</i> &middot; <i>"Look up the ckUSDC ledger"</i> &middot; <i>"What's my cycles balance?"</i> &middot; <i>"Show my accounts at the NNS"</i></p>
+</li>
+
+</ol>
+
+<details class=net-note>
+<summary>Beta or production? Which endpoint to use</summary>
+<div class=details-body><code>/mcp</code> signs you in through <b>beta.id.ai</b>, the beta Internet Identity network — best for trying things out. <code>/mcp-prod</code> uses the production network at <b>id.ai</b>, where your real identities and balances live. The two are separate: an identity, its accounts, and its cycles on one network don't carry over to the other. Pick the one your identity is on, and use the matching settings page in step 2.</div>
+</details>
+
+</article>
+
+<section class=categories>
 
 <article class=cat data-cat=discovery>
 <div class=cat-head>

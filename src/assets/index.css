@@ -136,9 +136,137 @@ h1 em { font-style: italic; color: var(--accent); }
 .endpoint .verb { color: var(--accent-text); }
 .endpoint span { font-size: 0.88rem; color: var(--secondary); }
 
+/* ---- Setup / getting started --------------------------------------------- */
+/* The "connect your AI" card leads the page. It reuses the tool-card shell
+   (.cat) but takes the rust accent stripe and adds numbered steps. Per-client
+   instructions and the beta/prod note collapse into native <details>, so the
+   page stays one screen tall without any script. */
+.setup-card { margin: 2.75rem 0 1.5rem; }
+.cat[data-cat="setup"] { --stripe: var(--accent); }
+
+.setup-url {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  margin: 0 0 1.6rem;
+  padding: 0.85rem 1.1rem;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: var(--sunk);
+}
+.setup-url-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--secondary);
+}
+.setup-url code {
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--ink);
+}
+.setup-url .verb { color: var(--accent-text); margin-right: 0.55rem; }
+
+/* Numbered steps: a monospace badge in the left rail, prose alongside. */
+.steps { list-style: none; margin: 0; padding: 0; counter-reset: step; }
+.step {
+  counter-increment: step;
+  position: relative;
+  padding: 1rem 0 1rem 3rem;
+  border-top: 1px solid var(--hairline);
+}
+.step:first-child { border-top: 0; padding-top: 0.25rem; }
+.step:first-child::before { top: 0.25rem; }
+.step::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: 1rem;
+  width: 1.9rem;
+  height: 1.9rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--accent-text);
+  background: var(--accent-dim);
+  border-radius: 999px;
+}
+.step h3 {
+  margin: 0 0 0.25rem;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+.step p { margin: 0.25rem 0 0; font-size: 0.97rem; color: var(--secondary); }
+.step p.try { margin-top: 0.65rem; }
+.step .try i { font-style: italic; color: var(--ink); }
+.step code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  padding: 0.05em 0.3em;
+  border-radius: 5px;
+  background: var(--sunk);
+  color: var(--ink);
+}
+
+/* Collapsibles: per-client setup (nested in step 3) and the beta/prod note. */
+.setup details {
+  margin-top: 0.6rem;
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.step details:first-of-type { margin-top: 0.85rem; }
+.setup summary {
+  cursor: pointer;
+  padding: 0.7rem 1rem;
+  font-size: 0.94rem;
+  font-weight: 600;
+  color: var(--ink);
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.setup summary::-webkit-details-marker { display: none; }
+.setup summary::before {
+  content: "";
+  flex: none;
+  width: 0.45rem;
+  height: 0.45rem;
+  border-right: 2px solid var(--muted);
+  border-bottom: 2px solid var(--muted);
+  transform: translateY(-1px) rotate(-45deg);
+  transition: transform 0.15s ease;
+}
+.setup details[open] summary::before { transform: translateY(-2px) rotate(45deg); }
+.setup summary:hover { color: var(--accent-text); }
+.details-body {
+  padding: 0 1rem 0.85rem;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  color: var(--secondary);
+}
+.details-body code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  padding: 0.05em 0.3em;
+  border-radius: 5px;
+  background: var(--sunk);
+  color: var(--ink);
+}
+.net-note { margin-top: 1.3rem; }
+
 /* ---- Category sections --------------------------------------------------- */
 .categories {
-  padding: 2.75rem 0 1rem;
+  padding: 0 0 1rem;
   display: flex;
   flex-direction: column;
   gap: 1.5rem;
