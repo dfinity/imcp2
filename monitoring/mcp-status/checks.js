@@ -667,16 +667,17 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
   //    no global, unauthenticated signal that names this specific server —
   //    recognition is per-identity and not inspectable from here.
   //
-  //    There is also no instance-wide CSP signal to assert. The old delegation
+  //    There is also no instance-wide CSP signal to assert. An older delegation
   //    flow form-POSTed the callback to the server, so a relaxed `form-action`
   //    (`'self' https:`) was its precondition — but dfinity/internet-identity
-  //    #4086 retired that flow. The current connect flow never form-POSTs: the
-  //    key-request and completion callbacks are `fetch()` calls (governed by
-  //    `connect-src`, which allows the https origin) and the hand-back to
-  //    `finish_url` is a top-level navigation (not governed by `form-action`).
-  //    The tightened `form-action 'self' http://127.0.0.1:*` now on /mcp is for
-  //    the unrelated /cli loopback flow, not MCP. So the only meaningful
-  //    instance-wide health signal left is that the /mcp connect page is served.
+  //    #4086 retired that flow. The current connect flow never form-POSTs: II
+  //    hands the browser back to the server's pinned callback page by top-level
+  //    navigation (not governed by `form-action`), and that page redeems the
+  //    delegation with a `fetch()` to the server (governed by `connect-src`,
+  //    which allows the https origin). The tightened
+  //    `form-action 'self' http://127.0.0.1:*` now on /mcp is for the unrelated
+  //    /cli loopback flow, not MCP. So the only meaningful instance-wide health
+  //    signal left is that the /mcp connect page is served.
   {
     const url = `${iiOrigin}/mcp`;
     const mr = await probe(url, { timeoutMs });
@@ -685,7 +686,7 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
       id: "ii-mcp-flow",
       label: "II /mcp connect page served",
       description:
-        "Confirms the II serves its /mcp connect page. The connect flow runs on fetch() callbacks (governed by CSP connect-src, which allows the https MCP origin) and a top-level navigation back to the server's finish_url — neither is gated by form-action — so serving the page is the health signal. Since #4052 trust is per-user (each identity adds its trusted server in II Settings, synced on-chain), which servers a given identity trusts is not globally inspectable; this checks the instance-wide flow is enabled.",
+        "Confirms the II serves its /mcp connect page. The connect flow runs on a top-level navigation back to the server's pinned callback page and a fetch() from that page to the server (governed by CSP connect-src, which allows the https MCP origin) — neither is gated by form-action — so serving the page is the health signal. Since #4052 trust is per-user (each identity adds its trusted server in II Settings, synced on-chain), which servers a given identity trusts is not globally inspectable; this checks the instance-wide flow is enabled.",
       target: `GET ${url}`,
       expected: "200 (connect page served)",
       status: served ? "pass" : "fail",
