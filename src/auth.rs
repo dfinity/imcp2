@@ -395,8 +395,9 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
     // (`#callback=…&state=…&registration_key=…`); modern browsers preserve a
     // fragment present in a `Location` header (RFC 9110 §10.2.2), and the fragment
     // never goes on the wire, so II's frontend reads it from `location.hash`, with
-    // one fewer interposition point than a script-driven hop, and it works with JS
-    // disabled. `redirect_302` also sets `Referrer-Policy: no-referrer` (the
+    // one fewer interposition point than a script-driven hop, and this outbound 302
+    // hop to II needs no JS (the pinned callback page that later reads the fragment
+    // does). `redirect_302` also sets `Referrer-Policy: no-referrer` (the
     // authorize query carries only non-secret OAuth params, so that is tidiness,
     // not a leak fix).
     let mut resp = redirect_302(&ii_url);
