@@ -706,9 +706,11 @@ pub fn oql_query_examples(
         .map(|entity| {
             let mut args = serde_json::Map::new();
             args.insert("canister_id".into(), serde_json::Value::String(canister_id.to_string()));
-            // `query` is a JSON-object STRING (that's what the tool takes), so the
-            // example shows the escaped-string form the agent actually passes.
-            let query = format!("{{\"start\":\"{entity}\",\"limit\":10}}");
+            // `query` is a JSON-object STRING (that's what the tool takes). Build it
+            // via serde_json (not format!) so an entity name containing a quote or
+            // backslash — the schema is canister-supplied, hence untrusted — is
+            // escaped and the example stays valid JSON.
+            let query = serde_json::json!({ "start": entity, "limit": 10 }).to_string();
             args.insert("query".into(), serde_json::Value::String(query));
             if let Some(o) = derivation_origin {
                 args.insert("derivation_origin".into(), serde_json::Value::String(o.to_string()));
@@ -1449,6 +1451,19 @@ mod tests {
         assert!(!anon[0].contains("derivation_origin"), "no origin when read anonymously: {}", anon[0]);
         // No entities → no examples.
         assert!(oql_query_examples("aaaaa-aa", "{}", None, None).is_empty());
+
+        // Escaping: an entity name with a quote/backslash (the schema is
+        // canister-supplied, hence untrusted) must still yield a VALID-JSON example.
+        // The example line is `run_canister_oql_query <json-args>`; the `query` arg
+        // is itself a JSON-object string — both must parse.
+        let weird = r#"{"entities":[{"name":"we\"ird"}]}"#;
+        let wex = oql_query_examples("aaaaa-aa", weird, None, None);
+        assert_eq!(wex.len(), 1);
+        let args_json = wex[0].strip_prefix("run_canister_oql_query ").expect("tool prefix");
+        let args: serde_json::Value = serde_json::from_str(args_json).expect("args must be valid JSON");
+        let query = args.get("query").and_then(|q| q.as_str()).expect("query string");
+        let parsed: serde_json::Value = serde_json::from_str(query).expect("query must be valid JSON");
+        assert_eq!(parsed.get("start").and_then(|s| s.as_str()), Some("we\"ird"), "entity name round-trips");
     }
 
     // #1: the conservative empty-reply detector recognizes the unambiguous empties
