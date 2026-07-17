@@ -21,11 +21,12 @@ It answers three questions and adds a few suggestions:
    checks the II frontend is reachable and IC-certified, reports its frontend
    canister id and related origins, confirms it serves its runtime config
    (textual Candid) at `/.config`, and verifies the `/mcp` connect page is
-   served. The connect flow runs on `fetch()` callbacks (governed by CSP
-   `connect-src`, which allows the https MCP origin) and a top-level navigation
-   back to the server's `finish_url` — neither is gated by `form-action` — so a
-   served page is the health signal. (The old delegation flow form-POSTed the
-   callback, which needed a relaxed `form-action`; that flow was retired in
+   served. The connect flow runs on a top-level navigation back to the server's
+   pinned callback page and a `fetch()` from that page to the server (governed by
+   CSP `connect-src`, which allows the https MCP origin) — neither is gated by
+   `form-action` — so a served page is the health signal. (An older delegation flow
+   form-POSTed the callback, which needed a relaxed `form-action`; that flow was
+   retired in
    [internet-identity#4086](https://github.com/dfinity/internet-identity/pull/4086),
    and the `'self' http://127.0.0.1:*` `form-action` now on `/mcp` is for the
    unrelated `/cli` loopback flow.) Since

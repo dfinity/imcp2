@@ -1,91 +1,56 @@
 //! OAuth 2.1 authorization server for the MCP endpoint, with **Internet Identity**
-//! as the login mechanism, using II's session-key registration handshake.
+//! as the login mechanism, using II's **registration-delegation** connect handshake.
 //!
-//! II's `/mcp` handshake registers the session key under the user's own auth and,
-//! if we ask, navigates the browser back to a `finish_url` on our origin (per the
-//! Internet Identity MCP server guide / dfinity/internet-identity#4086). We drive
-//! one flow — **authorization code + PKCE** — so any OAuth 2.1 client works:
+//! We drive one flow — **authorization code + PKCE** — so any OAuth 2.1 client works:
 //!
-//!   * `/oauth/authorize` sets a browser-binding cookie (H3) and redirects to
-//!     II's handshake; the key-request response carries a `finish_url`, so after
-//!     `mcp_register` II navigates the browser to `/oauth/finish`, which requires
-//!     that cookie, confirms registration, mints a PKCE-bound code, and 302s to
-//!     the client's `redirect_uri`.
+//!   * `/oauth/authorize` sets a browser-binding cookie (the `sid` cookie) and
+//!     redirects the browser to this instance's II `/mcp` handshake, carrying this
+//!     connect's registration public key `pub(X)` in the link fragment.
+//!   * II certifies a short-lived, two-hop delegation chain and navigates the
+//!     browser back to our **pinned callback page** (`/oauth/connect/callback`,
+//!     GET) with the chain in the URL fragment.
+//!   * That page — the sole reader of the fragment — POSTs the chain (with the
+//!     binding cookie) to `/oauth/connect/redeem`, which redeems it, mints a
+//!     PKCE-bound code, and returns the client `redirect_uri` the page navigates to.
 //!
 //! The RFC 8628 device grant was dropped (no listed client uses it, and it adds a
 //! device-code phishing surface with none of the PKCE binding the rest of the flow
 //! relies on).
 //!
-//! Connect handshake (Phase 1b): `/oauth/connect/callback` serves the two
-//! cross-origin JSON POSTs II makes — a key request `{state}` → `{public_key,
-//! finish_url}` (a fresh session keypair minted per connection) and a completion
-//! notification `{state, expiration, permissions}` → mark the grant live and
-//! record the session's access level. We never receive or verify a delegation
-//! chain, and never call `mcp_register` (II's frontend does, under the user's own
-//! authentication).
-//!
 //! Implemented: dynamic client registration, PKCE (S256) enforced, short-lived
-//! codes, 1h access tokens, session-key-bound principal.
+//! codes, access tokens whose lifetime tracks the II grant, session-key-bound
+//! principal.
 //!
-//! ## H3: Consent-Bound Completion (closes the split-browser code injection)
+//! ## The registration delegation handshake
 //!
-//! `/oauth/finish` mints a code only when the requesting browser proves it is BOTH
-//! the **initiator** and the **consenter**:
+//! Instead of II binding a session key it was merely SHOWN, the connect delivers a
+//! short-lived (≈5 min), TWO-hop delegation chain `P_reg -> Y -> X` to the pinned
+//! callback page as a URL fragment: II's canister signs `P_reg -> Y` toward an
+//! ephemeral key `Y` held only by II's frontend (so the piece that transits the IC
+//! — replicas, boundary nodes, the public state tree — is inert on its own), and
+//! the frontend extends it browser-side with a `Y`-signed hop to our registration
+//! key `X`, assembling the redeemable chain only in the consenting browser. The
+//! backend redeems it by signing ONE `mcp_register_v2` call as `X` (see
+//! [`Identities::redeem_registration_delegation`]), binding the long-lived session
+//! key `S` to the anchor. II never binds a bare key it was shown.
+//!
+//! `/oauth/connect/redeem` mints a code only when the requesting browser proves it
+//! is BOTH the **initiator** and the **consenter**:
 //!   1. *initiator* — the `sid` cookie ([`CONNECT_COOKIE`]) set at `/oauth/authorize`;
-//!   2. *consenter* — a one-time `finish_secret` (≥128-bit) minted at the **single-use
-//!      key request** and disclosed only in that response (embedded in `finish_url`),
-//!      so only the browser that drove the II handshake holds it;
-//!   3. plus a *proven* registration — a signed `mcp_get_accounts` returning `Ok`
-//!      (not a bare, unauthenticated completion POST).
+//!   2. *consenter* — the delegation chain itself, fragment-delivered only to the
+//!      consenting browser and required to redeem, so only the browser that drove
+//!      the II consent holds it;
+//!   3. plus a *proven* registration — redemption is a signed `mcp_register_v2`
+//!      that succeeds synchronously, so no separate liveness probe is needed.
 //!
-//! Because the key request is strictly single-use per `connect_state` (an atomic
-//! compare-and-set) and delivers BOTH `finish_secret` and the `public_key` a victim
-//! would register, the two proofs can co-reside in one browser only in the
-//! legitimate same-browser flow — so an attacker who initiates and then phishes the
-//! II link to a victim cannot obtain a code (they hold `sid` but never
-//! `finish_secret`; the victim holds `finish_secret` but never `sid`). This closes
-//! the split-browser injection for all transports incl. loopback (a loopback
-//! redirect resolves on the consenter's own machine).
-//!
-//! Not closed here (companion control): the *same-browser* variant where a victim
-//! is socially engineered into running the whole flow toward an attacker-registered
+//! In the confused-deputy path the delegation lands in the honest page in the
+//! VICTIM's browser, whose cookie does not match the one `X` was bound to, so the
+//! redeem aborts. This closes the split-browser injection for all transports incl.
+//! loopback (a loopback redirect resolves on the consenter's own machine). Not
+//! closed here (companion control): the *same-browser* variant where a victim is
+//! socially engineered into running the whole flow toward an attacker-registered
 //! **hosted** `redirect_uri`; that needs hosted-redirect allow-listing (loopback is
-//! safe either way). "H3 fully closed" = Consent-Bound Completion + that allow-list.
-//!
-//! Load-bearing (see the `P?` markers below): the key request is single-use and
-//! atomic (P1); `finish_secret` is disclosed only via `finish_url`'s query, never
-//! logged, no `Referer` leak (P2); `registered` reflects a real grant, never a bare
-//! completion POST (P3). P1 also assumes II's frontend issues exactly one key
-//! request per connect and never auto-retries (a retry then fails as "restart",
-//! never a takeover — the safe direction).
-//!
-//! ## Phase 2: the registration delegation (per-instance; beta on, prod on)
-//!
-//! A successor connect flow (the "registration delegation" design) replaces the
-//! fetched-key registration — where II binds a key it was merely shown — with a
-//! short-lived (≈5 min), TWO-hop delegation chain `P_reg -> Y -> X` delivered to
-//! a **pinned callback page** as a URL fragment: II's canister signs `P_reg -> Y`
-//! toward an ephemeral key `Y` held only by II's frontend (so the piece that
-//! transits the IC — replicas, boundary nodes, the public state tree — is inert
-//! on its own), and the frontend extends it browser-side with a `Y`-signed hop
-//! to our registration key `X`, assembling the redeemable chain only in the
-//! consenting browser. The backend redeems it by signing ONE `mcp_register_v2`
-//! call as `X` (see [`Identities::redeem_registration_delegation`]). The chain,
-//! being fragment-delivered only to the consenting browser and required to
-//! redeem, subsumes `finish_secret` as the consenter proof; synchronous
-//! registration removes the `grant_is_live` probe and the `finishing_page` poll.
-//!
-//! The server runs BOTH protocols side by side, selected **per II instance**
-//! ([`crate::identities::IiInstance::registration_delegation`]): both the beta
-//! (staging) and the production instance run Phase 2 by default
-//! (`MCP_REGISTRATION_DELEGATION=0` / `MCP_REGISTRATION_DELEGATION_PROD=0` to
-//! disable per instance). Enabling Phase 2 for an instance is
-//! **outbound-compatible with v1**: it adds `registration_key` to that
-//! instance's II link and turns on its pinned callback page + redeem endpoint,
-//! while every v1 handler (the callback POSTs, `/oauth/finish`) stays live — an
-//! II frontend that doesn't know the new flow ignores the extra param and
-//! completes v1 unchanged. So each instance connected via v1 until its II
-//! shipped the new frontend and canister methods, and switches over when it does.
+//! safe either way).
 //!
 //! The wire shapes match the merged II contract (verified against the beta II
 //! canister's live `.did`, `fgte5-ciaaa-aaaad-aaatq-cai`): the connect link
@@ -98,16 +63,11 @@
 //! expiry and access level). Consent (permissions, max_ttl) is NOT echoed: the user chose
 //! it earlier at `prepare_mcp_registration_delegation`, which stored it keyed by
 //! `P_reg`, so II recovers it (and the user's identity number) from
-//! `caller() == P_reg`, and the server sends and sees neither. Retiring v1 for a
-//! Phase-2 instance (the design's "v1 sunset") is a separate, later step, not
-//! this.
+//! `caller() == P_reg`, and the server sends and sees neither.
 
 use std::{
     collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -136,62 +96,20 @@ const CONNECT_TTL: Duration = Duration::from_secs(600);
 /// Lifetime of a minted authorization code.
 const CODE_TTL: Duration = Duration::from_secs(120);
 /// Fallback access-token lifetime, used only when the II grant's expiration is
-/// unknown at issue time (e.g. the connect completion POST didn't land). In the
-/// normal flow the token's lifetime tracks the grant instead (see [`token_ttl`]),
-/// so the session duration the user picked on II's consent screen is honoured.
+/// unknown at issue time. In the normal flow the token's lifetime tracks the grant
+/// instead (see [`token_ttl`]), so the session duration the user picked on II's
+/// consent screen is honoured.
 const TOKEN_TTL: Duration = Duration::from_secs(3600);
 /// `ttl` (seconds) requested for the II grant. Clamped by II to [600, 2592000].
 const GRANT_TTL_SECS: u64 = 3600;
 
 /// Name of the browser-session cookie that binds `/oauth/authorize` to
-/// `/oauth/finish` (H3): only the browser that started the flow can complete it.
+/// `/oauth/connect/redeem`: only the browser that started the flow can complete it.
 const CONNECT_COOKIE: &str = "mcp_connect";
-
-/// Observability for the single-use key request (P1): number of key requests that
-/// hit a still-valid but ALREADY-CONSUMED `connect_state` — i.e. a *repeat* key
-/// request. Under strict single-use these are expected to be ~zero. An isolated
-/// hit is a stray replay / attacker probe (harmless — it 403s); a sustained rise
-/// means II's frontend started re-issuing the key request, which strict single-use
-/// turns into failed connects (a benign-but-breaking regression to fix upstream —
-/// never a takeover). Warn-logged with the instance name and surfaced on `/version`
-/// so a silent regression is caught without log scraping. Process-wide.
-static REPEAT_KEY_REQUESTS: AtomicU64 = AtomicU64::new(0);
-
-/// Current value of the repeat-key-request counter (for the `/version` probe).
-pub fn repeat_key_requests() -> u64 {
-    REPEAT_KEY_REQUESTS.load(Ordering::Relaxed)
-}
 
 /// Public base URL clients use to reach this server. Override with PUBLIC_URL.
 pub fn base_url() -> String {
     std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
-}
-
-
-/// A fresh consent secret: 256 bits from the OS CSPRNG, URL-safe (base64url, no
-/// pad) so it can ride in a query string. Well above the ≥128-bit floor (P5).
-fn fresh_secret() -> String {
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).expect("getrandom");
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-/// SHA-256 digest of `s` (used to store `finish_secret` hashed at rest — P5).
-fn sha256(s: &str) -> [u8; 32] {
-    Sha256::digest(s.as_bytes()).into()
-}
-
-/// Constant-time equality for two byte slices (P5) — no early-out on the first
-/// differing byte, so a compare doesn't leak how much of a secret matched.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// A registered OAuth client (RFC 7591): the redirect URIs it declared. The
@@ -289,21 +207,14 @@ struct AuthzPending {
     /// The OAuth client's own `state`, echoed back on the final redirect.
     client_state: String,
     code_challenge: Option<String>,
-    /// H3 clause 1 (*initiator* proof): unguessable value set as the `sid` browser
-    /// cookie at `/oauth/authorize` and matched at `/oauth/finish` — only the
-    /// browser that STARTED this flow presents it. On its own the cookie is a
-    /// partial mitigation; combined with `finish_secret_hash` (the *consenter*
-    /// proof) it closes the split-browser injection (see the module docs).
+    /// *Initiator* proof: unguessable value set as the `sid` browser cookie at
+    /// `/oauth/authorize` and matched at `/oauth/connect/redeem` — only the browser
+    /// that STARTED this flow presents it. Combined with the fragment-delivered
+    /// delegation (the *consenter* proof) it closes the split-browser injection
+    /// (see the module docs).
     cookie: String,
     created: Instant,
-    /// H3 clause 2 (*consenter* proof), and the single-use marker for the key
-    /// request (P1/P3): `None` until the FIRST key request for this connect
-    /// atomically claims it and stores `H(finish_secret)`; any later key request
-    /// then 403s. `/oauth/finish` requires a `finish_secret` hashing to this. Its
-    /// presence also means "the key request happened" — the only way `registered`
-    /// can legitimately become provable — so no alternate path materializes it.
-    finish_secret_hash: Option<[u8; 32]>,
-    /// The authorization code minted once the grant is confirmed (idempotent finish).
+    /// The authorization code minted once the grant is confirmed (idempotent redeem).
     code: Option<String>,
     /// Phase 2 single-flight marker: `true` while a redemption attempt (the
     /// `mcp_register_v2` network call) is mid-flight for this connect, so a
@@ -415,7 +326,7 @@ pub struct AuthorizeQuery {
 
 /// GET /oauth/authorize — the redirect-based entry point. Validates the client
 /// and PKCE, records a pending connect, and redirects the browser to II's `/mcp`
-/// handshake; II navigates back to our `finish_url` once it registers the key.
+/// handshake; II navigates back to our pinned callback page with the delegation.
 pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<AuthorizeQuery>) -> Response {
     // Only the authorization-code response type is supported.
     match q.response_type.as_deref() {
@@ -441,11 +352,11 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
     }
 
     let session_id = format!("sess-{}", Uuid::new_v4());
-    // H3 clause 1: bind this browser to the flow (the `sid` cookie, set now and
-    // required at /oauth/finish). The `state` alone can't prove the finishing
+    // Bind this browser to the flow (the `sid` cookie, set now and required at
+    // `/oauth/connect/redeem`). The `state` alone can't prove the redeeming
     // browser is the initiator (it's echoed to the client). The cookie proves
-    // *initiator*; the `finish_secret` minted at the key request proves
-    // *consenter*; requiring both closes the split-browser injection.
+    // *initiator*; the fragment-delivered delegation proves *consenter*; requiring
+    // both closes the split-browser injection.
     let cookie = format!("bind-{}", Uuid::new_v4());
     store.authz.write().await.insert(
         session_id.clone(),
@@ -456,47 +367,39 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
             code_challenge: Some(code_challenge),
             cookie: cookie.clone(),
             created: Instant::now(),
-            finish_secret_hash: None,
             code: None,
             redeeming: false,
         },
     );
 
     // Redirect the browser to this instance's II handshake, setting the binding
-    // cookie. II navigates back to our `finish_url` (from the key-request
-    // response) once it registers; SameSite=Lax lets the cookie ride that
-    // top-level cross-site GET back to us. Scoped to this instance's OAuth prefix.
-    // `Secure` only when served over HTTPS (production always is): a `Secure`
-    // cookie is dropped by browsers over plain HTTP, which would break the
-    // initiator check for local `http://localhost` development.
+    // cookie. II navigates back to our pinned callback page once it certifies the
+    // delegation; SameSite=Lax lets the cookie ride that top-level cross-site GET
+    // back to us. Scoped to this instance's OAuth prefix. `Secure` only when served
+    // over HTTPS (production always is): a `Secure` cookie is dropped by browsers
+    // over plain HTTP, which would break the initiator check for local
+    // `http://localhost` development.
     let secure = if base_url().starts_with("https://") { "; Secure" } else { "" };
     let set_cookie = format!(
         "{CONNECT_COOKIE}={cookie}; Path={}/oauth; Max-Age={}; HttpOnly{secure}; SameSite=Lax",
         store.instance().oauth_prefix,
         CONNECT_TTL.as_secs(),
     );
-    // Phase 2 (per-instance): mint this connect's registration key `X` and carry
-    // `pub(X)` in the II link, toward which II builds the registration chain
-    // (`P_reg -> Y -> X`, the last hop browser-signed to `X`). An II frontend that
-    // doesn't know the new flow ignores the extra params and completes v1 (whose
-    // handlers are always live), so enabling this is outbound-compatible. A
-    // v1-pinned instance (one with `registration_delegation` disabled) emits the
-    // unmodified v1 link.
-    let ii_url = if store.instance().registration_delegation {
-        let reg_pubkey = store.identities.registration_pubkey_b64(&session_id).await;
-        ii_mcp_url_v2(store.instance(), &session_id, &reg_pubkey)
-    } else {
-        ii_mcp_url(store.instance(), &session_id)
-    };
+    // Mint this connect's registration key `X` and carry `pub(X)` in the II link,
+    // toward which II builds the registration chain (`P_reg -> Y -> X`, the last
+    // hop browser-signed to `X`).
+    let reg_pubkey = store.identities.registration_pubkey_b64(&session_id).await;
+    let ii_url = ii_mcp_url(store.instance(), &session_id, &reg_pubkey);
     // Redirect the consenting browser to the II connect link with a real HTTP
     // 302 (`Location`). The link's params ride in the URL fragment
     // (`#callback=…&state=…&registration_key=…`); modern browsers preserve a
     // fragment present in a `Location` header (RFC 9110 §10.2.2), and the fragment
-    // never goes on the wire, so beta II's frontend still reads it from
-    // `location.hash` exactly as before, with one fewer interposition point than
-    // a script-driven hop, and it works with JS disabled. `redirect_302` also
-    // sets `Referrer-Policy: no-referrer` (the authorize query carries only
-    // non-secret OAuth params, so that is tidiness, not a leak fix).
+    // never goes on the wire, so II's frontend reads it from `location.hash`, with
+    // one fewer interposition point than a script-driven hop, and this outbound 302
+    // hop to II needs no JS (the pinned callback page that later reads the fragment
+    // does). `redirect_302` also sets `Referrer-Policy: no-referrer` (the
+    // authorize query carries only non-secret OAuth params, so that is tidiness,
+    // not a leak fix).
     let mut resp = redirect_302(&ii_url);
     resp.headers_mut().insert(
         axum::http::header::SET_COOKIE,
@@ -514,164 +417,11 @@ fn connect_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
-#[derive(Debug, Deserialize)]
-pub struct FinishQuery {
-    /// The pending-auth id (= session id) carried by `finish_url`.
-    id: String,
-    /// H3 clause 2: the one-time `finish_secret`, carried in `finish_url`'s QUERY
-    /// (not a path segment) so path-only access logs don't capture it (P2).
-    #[serde(default)]
-    fs: Option<String>,
-    /// Retry counter, so the "finishing" reload is bounded.
-    #[serde(default)]
-    r: u32,
-}
-
-/// GET /oauth/finish — II navigates the CONSENTING browser here after registering
-/// the session key (this is the `finish_url` returned in the key-request response,
-/// carrying the one-time `finish_secret` in its query). Mints a code only if all of
-/// H3's predicate holds — (1) the `sid` cookie resolves to this PA, (2) `finish_secret`
-/// matches, (3) registration is *proven* by a signed `mcp_get_accounts` that returns
-/// `Ok`, (4) not expired / not already completed — then 302s to the client's
-/// `redirect_uri` with `code` + the client's `state`.
-pub async fn finish(
-    State(store): State<AuthStore>,
-    headers: axum::http::HeaderMap,
-    Query(q): Query<FinishQuery>,
-) -> Response {
-    // Snapshot without holding the lock across the network probe.
-    let snap = {
-        let authz = store.authz.read().await;
-        authz.get(&q.id).map(|a| {
-            (
-                a.created.elapsed() >= CONNECT_TTL,
-                a.finish_secret_hash,
-                a.code.clone(),
-                a.client_id.clone(),
-                a.redirect_uri.clone(),
-                a.client_state.clone(),
-                a.code_challenge.clone(),
-                a.cookie.clone(),
-            )
-        })
-    };
-    let Some((expired, finish_secret_hash, existing_code, client_id, redirect_uri, client_state, code_challenge, cookie)) =
-        snap
-    else {
-        return connect_error("unknown or already-used connect request — restart from your client");
-    };
-    if expired {
-        return connect_error("connect request expired — restart from your client");
-    }
-    // H3 clause 1 (initiator): only the browser that STARTED this flow (holding the
-    // `sid` cookie) may complete it.
-    if connect_cookie(&headers).as_deref() != Some(cookie.as_str()) {
-        return connect_error(
-            "this sign-in was started in a different browser session — restart the connection from your client",
-        );
-    }
-    // H3 clause 2 (consenter): the one-time `finish_secret`, disclosed only in the
-    // single-use key-request response, proves this browser drove the II consent.
-    // Requiring BOTH proofs forces initiator == consenter, closing the
-    // split-browser injection. `finish_secret_hash` is `Some` only after the key
-    // request ran (so this also gates on "the handshake happened"). Constant-time
-    // compare of the hashes (P5).
-    let secret_ok = match (q.fs.as_deref(), finish_secret_hash) {
-        (Some(fs), Some(hash)) => ct_eq(&sha256(fs), &hash),
-        _ => false,
-    };
-    if !secret_ok {
-        return connect_error(
-            "this sign-in can't be completed in this browser — restart the connection from your client",
-        );
-    }
-    let fs = q.fs.as_deref().unwrap_or_default();
-    // Idempotent: if the code was already minted, just redirect again.
-    if let Some(code) = existing_code {
-        return redirect_302(&build_redirect(&redirect_uri, &code, &client_state));
-    }
-    // H3 clause 3 (proven registration, P3): confirm the session key is actually
-    // registered on-chain via a signed `mcp_get_accounts` returning `Ok` — NOT a
-    // bare completion POST (which any `connect_state`-knower could forge). No lock
-    // held across the network call. If not yet visible (a race with II's
-    // registration/propagation), reload shortly — bounded so we don't loop forever.
-    if !store.identities.grant_is_live(&q.id).await {
-        if q.r >= 8 {
-            return connect_error(&format!(
-                "could not confirm the connection with Internet Identity ({}) — it may not support \
-                 MCP connect yet; reconnect and try again",
-                store.instance().ii_url
-            ));
-        }
-        return finishing_page(store.instance().oauth_prefix, &q.id, fs, q.r + 1);
-    }
-
-    // Reserve the code under the `authz` lock, then insert into `codes` AFTER
-    // releasing it — never hold one map's lock while awaiting the other's, so the
-    // lock order is consistent with `token_authorization_code` (no deadlock).
-    let fresh = format!("mcp-code-{}", Uuid::new_v4());
-    let (code, newly_minted) = {
-        let mut authz = store.authz.write().await;
-        let Some(a) = authz.get_mut(&q.id) else {
-            return connect_error("connect request vanished — restart from your client");
-        };
-        match &a.code {
-            Some(existing) => (existing.clone(), false),
-            None => {
-                a.code = Some(fresh.clone());
-                (fresh, true)
-            }
-        }
-    };
-    if newly_minted {
-        store.codes.write().await.insert(
-            code.clone(),
-            CodeGrant {
-                client_id,
-                code_challenge,
-                session_id: q.id.clone(),
-                created: Instant::now(),
-            },
-        );
-    }
-    tracing::info!(session_id = %q.id, "grant confirmed; issued authorization code");
-    redirect_302(&build_redirect(&redirect_uri, &code, &client_state))
-}
-
-/// A tiny self-reloading page shown while we wait for II's registration to become
-/// confirmable, then it re-hits this instance's `/oauth/finish` (bounded by the
-/// retry counter). Carries `finish_secret` across the reload (P6) and sets
-/// `Referrer-Policy: no-referrer` so the secret-bearing URL never rides a `Referer`.
-fn finishing_page(prefix: &str, id: &str, fs: &str, next_try: u32) -> Response {
-    let url = js_escape(&format!(
-        "{prefix}/oauth/finish?id={}&fs={}&r={}",
-        urlencoding::encode(id),
-        urlencoding::encode(fs),
-        next_try
-    ));
-    // Shares the connect pages' DFINITY-branded look (full-bleed grid, spinner
-    // tile, editorial serif headline, foot-of-page "Hosted by" mark, dark mode).
-    // The markup lives in `assets/connect-finishing.html` (include_str!); we
-    // splice in the stylesheet, logo, and the bounded-reload URL. `__URL__` last,
-    // so a URL that ever contained another token can't clobber css/logo. This
-    // page sets no CSP, so a plain `<style>`/`<script>` is fine.
-    let html = FINISHING_PAGE_HTML
-        .replace("__CSS__", CONNECT_PAGE_CSS)
-        .replace("__LOGO__", CONNECT_LOGO_SVG)
-        .replace("__URL__", &url);
-    let mut resp = Html(html).into_response();
-    resp.headers_mut()
-        .insert(axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer"));
-    resp
-}
-
-/// A 302 to an absolute URL, for the two top-level hops in the connect flow: the
-/// browser out to the II link (`authorize`) and back to the OAuth client
-/// (`finish`). A `Location` fragment (the II link's `#callback=…`) is preserved
-/// by modern browsers (RFC 9110 §10.2.2) and never sent on the wire, so II reads
-/// it from `location.hash`. Sets `Referrer-Policy: no-referrer` so any secret in
-/// this request's URL query (the client hop's `finish_secret`, P2) is not leaked
-/// to the target via the `Referer` header.
+/// A 302 to the II connect link — the outbound top-level hop from `authorize`. A
+/// `Location` fragment (the link's `#callback=…`) is preserved by modern browsers
+/// (RFC 9110 §10.2.2) and never sent on the wire, so II reads it from
+/// `location.hash`. Sets `Referrer-Policy: no-referrer` (tidiness — the authorize
+/// query carries only non-secret OAuth params).
 fn redirect_302(url: &str) -> Response {
     let mut resp = (StatusCode::FOUND, [(axum::http::header::LOCATION, url.to_string())]).into_response();
     resp.headers_mut()
@@ -688,31 +438,18 @@ fn build_redirect(redirect_uri: &str, code: &str, client_state: &str) -> String 
     r
 }
 
-/// Build an instance's II `/mcp` handshake URL for a connection. Everything is in
+/// Build an instance's II `/mcp` connect link for a connection. Everything is in
 /// the URL fragment (never sent to II's servers): this instance's callback on our
-/// origin, the single-use `state` (= session id), and the requested grant `ttl`
-/// in SECONDS. NO key material is put in the link.
-fn ii_mcp_url(inst: &crate::identities::IiInstance, session_id: &str) -> String {
-    format!(
-        "{ii}/mcp#callback={cb}&state={st}&ttl={ttl}",
-        ii = inst.ii_url,
-        cb = urlencoding::encode(&connect_callback_url(inst)),
-        st = urlencoding::encode(session_id),
-        ttl = GRANT_TTL_SECS,
-    )
-}
-
-/// Build the **Phase-2** II `/mcp` link (for a registration-delegation
-/// instance): the v1 fragment plus `registration_key` — this connect's
-/// registration public key `pub(X)` (DER, base64url), toward which II builds
-/// the registration chain `P_reg -> Y -> X` (param name per
-/// dfinity/internet-identity#4093; its presence selects the flow). II navigates
-/// the tab back to `callback` — validated against our
-/// [`AUTH_CALLBACKS_WELL_KNOWN`] allow-list (#4091) — with the delegation in
-/// the fragment; that callback page is our sole fragment reader
-/// ([`pinned_callback_page`]). No `priv(X)` is ever put in the link — only its
+/// origin, the single-use `state` (= session id), the requested grant `ttl` in
+/// SECONDS, and `registration_key` — this connect's registration public key
+/// `pub(X)` (DER, base64url), toward which II builds the registration chain
+/// `P_reg -> Y -> X` (param name per dfinity/internet-identity#4093; its presence
+/// selects the connect flow). II navigates the tab back to `callback` — validated
+/// against our [`AUTH_CALLBACKS_WELL_KNOWN`] allow-list (#4091) — with the
+/// delegation in the fragment; that callback page is our sole fragment reader
+/// ([`connect_callback_page`]). No `priv(X)` is ever put in the link — only its
 /// public half.
-fn ii_mcp_url_v2(inst: &crate::identities::IiInstance, session_id: &str, reg_pubkey_b64: &str) -> String {
+fn ii_mcp_url(inst: &crate::identities::IiInstance, session_id: &str, reg_pubkey_b64: &str) -> String {
     format!(
         "{ii}/mcp#callback={cb}&state={st}&ttl={ttl}&registration_key={rk}",
         ii = inst.ii_url,
@@ -722,130 +459,6 @@ fn ii_mcp_url_v2(inst: &crate::identities::IiInstance, session_id: &str, reg_pub
         rk = urlencoding::encode(reg_pubkey_b64),
     )
 }
-
-// ---- Connect callback: II's two cross-origin JSON POSTs -----------------
-
-#[derive(Debug, Deserialize)]
-pub struct ConnectCallback {
-    /// The single-use connect state (= session id).
-    state: String,
-    /// Present only on the completion notification; a decimal string of ns since
-    /// the epoch (u64 ns overflows JSON numbers, so it is a string on the wire).
-    #[serde(default)]
-    expiration: Option<String>,
-    /// Present on the completion notification (§0): `"queries"` = read-only
-    /// session, `"all"` = full access. Lets us learn the access level at connect
-    /// without minting a probe delegation; best-effort like the rest of the POST.
-    #[serde(default)]
-    permissions: Option<String>,
-}
-
-/// Outcome of the atomic single-use claim on a key request's `connect_state`.
-enum KeyClaim {
-    /// Won the claim: mint the keypair + `finish_secret`.
-    Claimed,
-    /// Known + unexpired but already claimed — a repeat key request (observed).
-    RepeatConsumed,
-    /// Unknown or expired — an ordinary rejected replay/stale link.
-    Reject,
-}
-
-/// POST /oauth/connect/callback — II's frontend makes TWO cross-origin JSON
-/// POSTs here, distinguished by the `expiration` field:
-///   (a) key request `{state}` → 200 `{public_key, finish_url}` (fresh keypair +
-///       one-time `finish_secret` embedded in `finish_url`; STRICTLY single-use);
-///   (b) completion `{state, expiration, permissions}` → record expiry + access
-///       level only (a latency hint; never sets `registered`); any 2xx.
-/// Never returns a redirect (the response is consumed by `fetch()`), and never
-/// receives or verifies a delegation chain.
-pub async fn connect_callback(State(store): State<AuthStore>, Json(body): Json<ConnectCallback>) -> Response {
-    match &body.expiration {
-        // (a) Key request — STRICTLY single-use per `connect_state` (P1). Atomically
-        // (under one lock) require the PA is known/unexpired AND not yet claimed,
-        // then claim it by storing `H(finish_secret)`; any later or racing key
-        // request 403s (no keypair, no secret). This atomic compare-and-set is what
-        // makes secret-disclosure and victim-registration mutually exclusive.
-        None => {
-            let secret = fresh_secret();
-            let claim = {
-                let mut authz = store.authz.write().await;
-                match authz.get_mut(&body.state) {
-                    // Known, unexpired, not yet claimed: win the single-use claim.
-                    Some(a) if a.created.elapsed() < CONNECT_TTL && a.finish_secret_hash.is_none() => {
-                        a.finish_secret_hash = Some(sha256(&secret));
-                        KeyClaim::Claimed
-                    }
-                    // Known, unexpired, ALREADY claimed: a repeat key request — the
-                    // signal we watch (II retry regression, or a stray probe).
-                    Some(a) if a.created.elapsed() < CONNECT_TTL => KeyClaim::RepeatConsumed,
-                    // Unknown or expired: an ordinary rejected replay/stale link.
-                    _ => KeyClaim::Reject,
-                }
-            };
-            match claim {
-                KeyClaim::Claimed => {}
-                KeyClaim::RepeatConsumed => {
-                    let total = REPEAT_KEY_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
-                    tracing::warn!(
-                        instance = store.instance().name,
-                        total,
-                        "repeat key request on a consumed connect_state (single-use, P1) — \
-                         a sustained rise means II is re-issuing the key request; an isolated hit \
-                         is a stray replay/probe"
-                    );
-                    return (StatusCode::FORBIDDEN, Json(json!({ "error": "invalid_state" }))).into_response();
-                }
-                KeyClaim::Reject => {
-                    return (StatusCode::FORBIDDEN, Json(json!({ "error": "invalid_state" }))).into_response();
-                }
-            }
-            // Only the single winner mints the session keypair and gets the secret.
-            let public_key = store.identities.session_pubkey_b64(&body.state).await;
-            // `finish_secret` rides in the QUERY (P2): path-only access logs won't
-            // capture it, and /oauth/finish sends no `Referer`. It reaches only this
-            // (the consenting) browser, which II then navigates to `finish_url`.
-            let finish_url = format!(
-                "{}{}/oauth/finish?id={}&fs={}",
-                base_url(),
-                store.instance().oauth_prefix,
-                urlencoding::encode(&body.state),
-                urlencoding::encode(&secret),
-            );
-            (StatusCode::OK, Json(json!({ "public_key": public_key, "finish_url": finish_url }))).into_response()
-        }
-        // (b) Completion notification — a best-effort LATENCY HINT only (P3). Record
-        // the grant expiration and access level (`permissions`, §0/H2) if the PA is
-        // known, but NEVER set `registered`: this POST is unauthenticated (any
-        // `connect_state`-knower can send it), so registration is proven separately
-        // at /oauth/finish by a signed `mcp_get_accounts`. Tolerate a missing/expired
-        // state with a 2xx so a late POST doesn't fail an otherwise-good connect.
-        Some(exp) => {
-            if store.authz_known(&body.state).await {
-                match exp.trim().parse::<u64>() {
-                    Ok(exp_ns) => store.identities.set_grant_expiration(&body.state, exp_ns).await,
-                    Err(_) => tracing::warn!("connect completion had unparseable expiration"),
-                }
-                if let Some(permissions) = &body.permissions {
-                    store.identities.set_permissions(&body.state, permissions).await;
-                }
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
-    }
-}
-
-impl AuthStore {
-    /// Whether `state` names a known, unexpired pending connect (read-only; used by
-    /// the completion POST to decide whether to record its expiry/permissions hint).
-    async fn authz_known(&self, state: &str) -> bool {
-        self.authz
-            .read()
-            .await
-            .get(state)
-            .is_some_and(|a| a.created.elapsed() < CONNECT_TTL)
-    }
-}
-
 // ---- Callback allow-list (II #4091) ---------------------------------------
 
 /// The well-known path Internet Identity fetches a server's **auth-callback
@@ -867,8 +480,8 @@ fn connect_callback_url(inst: &crate::identities::IiInstance) -> String {
 }
 
 /// GET /.well-known/ii-auth-callbacks — declare every instance's connect
-/// callback (II #4091 validates ALL connects against this list, v1 and Phase 2
-/// alike; the path is origin-global, so one document covers both instances).
+/// callback (II #4091 validates every connect against this list; the path is
+/// origin-global, so one document covers both instances).
 /// Served with CORS (II's frontend fetches it cross-origin) and well under
 /// II's 8 KB cap.
 pub async fn auth_callbacks(State(stores): State<Vec<AuthStore>>) -> Response {
@@ -885,20 +498,16 @@ pub async fn auth_callbacks(State(stores): State<Vec<AuthStore>>) -> Response {
     resp
 }
 
-// ---- Phase 2: registration delegation (flag-gated) ----------------------
+// ---- Connect callback page + redeem -------------------------------------
 
-/// GET /oauth/connect/callback — the **pinned callback page** (Phase 2 only).
-/// II navigates the consenting browser here with the canister-signed delegation
-/// in the URL fragment. This page is the SOLE reader of that fragment: it reads
+/// GET /oauth/connect/callback — the **pinned callback page**. II navigates the
+/// consenting browser here with the canister-signed delegation in the URL
+/// fragment. This page is the SOLE reader of that fragment: it reads
 /// `location.hash` entirely client-side, POSTs it (with the connect cookie) to
 /// [`connect_redeem`], strips it from the address bar, then navigates to the
 /// redirect the backend returns. It never writes any fragment/query value into
-/// the DOM (no reflection), and ships a strict CSP. On a v1-pinned instance this
-/// path has no page role (v1 uses only the POST handler below), so GET 404s.
+/// the DOM (no reflection), and ships a strict CSP.
 pub async fn connect_callback_page(State(store): State<AuthStore>) -> Response {
-    if !store.instance().registration_delegation {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
-    }
     pinned_callback_page(store.instance().oauth_prefix)
 }
 
@@ -914,24 +523,23 @@ fn csp_nonce() -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Shared styling for the connect interstitial/error pages, following the
-/// DFINITY brand guidelines (Parchment/Ink/Rust palette, an editorial serif
-/// display over a UI sans, a grid-paper surface, and the official gradient-
-/// infinity logo). A full-bleed screen: the status stage (a spinner on a soft
-/// elevated tile plus an accessible serif headline) fills and centres the
-/// viewport, with a foot-of-page "Hosted by" mark; the spinner is CSS-only
-/// (disabled under `prefers-reduced-motion`). Light/dark theming via
-/// `prefers-color-scheme` with a `data-theme` override, using the brand's
-/// Bark/Bone/Ember dark palette. Fully self-contained (no external fonts,
-/// images, or stylesheets; the logo is inlined into the served HTML), so it
-/// renders identically under the pinned page's strict `default-src 'none'` CSP.
-/// The stylesheet lives in `assets/connect.css` and is compiled into the binary
-/// via `include_str!` (no runtime file I/O), so it is authored as a real `.css`
-/// file rather than a Rust string literal. The pinned page serves it in a
-/// `<style nonce>` block (with `style-src 'nonce-...'` added to its CSP so the
-/// block is allowed WITHOUT `'unsafe-inline'`); the sibling pages, which set no
-/// CSP, use a plain `<style>`. The `.error` modifier (added to `.screen`) hides
-/// the spinner tile once a terminal message is shown.
+/// Styling for the pinned callback page, following the DFINITY brand guidelines
+/// (Parchment/Ink/Rust palette, an editorial serif display over a UI sans, a
+/// grid-paper surface, and the official gradient-infinity logo). A full-bleed
+/// screen: the status stage (a spinner on a soft elevated tile plus an accessible
+/// serif headline) fills and centres the viewport, with a foot-of-page "Hosted
+/// by" mark; the spinner is CSS-only (disabled under `prefers-reduced-motion`).
+/// Light/dark theming via `prefers-color-scheme` with a `data-theme` override,
+/// using the brand's Bark/Bone/Ember dark palette. Fully self-contained (no
+/// external fonts, images, or stylesheets; the logo is inlined into the served
+/// HTML), so it renders identically under the pinned page's strict
+/// `default-src 'none'` CSP. The stylesheet lives in `assets/connect.css` and is
+/// compiled into the binary via `include_str!` (no runtime file I/O), so it is
+/// authored as a real `.css` file rather than a Rust string literal. The pinned
+/// page serves it in a `<style nonce>` block (with `style-src 'nonce-...'` added
+/// to its CSP so the block is allowed WITHOUT `'unsafe-inline'`). The `.error`
+/// modifier (added to `.screen` client-side) hides the spinner tile once a
+/// terminal message is shown.
 const CONNECT_PAGE_CSS: &str = include_str!("assets/connect.css");
 
 /// The official DFINITY logo (gradient-infinity mark + wordmark), taken from
@@ -942,17 +550,13 @@ const CONNECT_PAGE_CSS: &str = include_str!("assets/connect.css");
 /// page's Ink/Bone text color across light and dark themes.
 const CONNECT_LOGO_SVG: &str = include_str!("assets/dfinity-logo.svg");
 
-/// HTML templates for the three connect pages, kept as real `.html` asset files
-/// (compiled in via `include_str!`, no runtime file I/O) rather than inline Rust
-/// string literals, so the markup reads and diffs as HTML. Each is a self-
+/// HTML template for the pinned callback page, kept as a real `.html` asset file
+/// (compiled in via `include_str!`, no runtime file I/O) rather than an inline
+/// Rust string literal, so the markup reads and diffs as HTML. It is a self-
 /// contained document with `__TOKEN__` placeholders spliced in at render time
-/// (the stylesheet `__CSS__`, the logo `__LOGO__`, and per-page dynamics: the
-/// bounded-reload `__URL__`, the pinned page's `__NONCE__`/`__SCRIPT__`, the
-/// error page's `__MESSAGE__`). User-influenced values (`__URL__`, `__MESSAGE__`)
-/// are substituted LAST so they cannot clobber an earlier token.
-const FINISHING_PAGE_HTML: &str = include_str!("assets/connect-finishing.html");
+/// (the stylesheet `__CSS__`, the logo `__LOGO__`, and the per-response
+/// `__NONCE__`/`__SCRIPT__`). No user-influenced value is ever interpolated.
 const PINNED_PAGE_HTML: &str = include_str!("assets/connect-callback.html");
-const CONNECT_ERROR_HTML: &str = include_str!("assets/connect-error.html");
 
 /// The strict-CSP, non-reflecting pinned callback page. `nonce` is a fresh
 /// per-response value bound into the CSP header and BOTH the inline `<script>`
@@ -1239,21 +843,18 @@ async fn release_redemption(store: &AuthStore, state: &str) {
     }
 }
 
-/// POST /oauth/connect/redeem — the pinned page POSTs the fragment here (Phase 2
-/// only). Verifies the browser is the connect INITIATOR (the `sid` cookie), then
-/// redeems the delegation via [`Identities::redeem_registration_delegation`] —
-/// which is BOTH the consenter proof (fragment-delivered only to the consenting
-/// browser) and proof of registration (synchronous, so no `grant_is_live` probe)
-/// — and mints the PKCE-bound authorization code, returning the client redirect
-/// for the page to navigate to. 404s on a v1-pinned instance.
+/// POST /oauth/connect/redeem — the pinned page POSTs the fragment here. Verifies
+/// the browser is the connect INITIATOR (the `sid` cookie), then redeems the
+/// delegation via [`Identities::redeem_registration_delegation`] — which is BOTH
+/// the consenter proof (fragment-delivered only to the consenting browser) and
+/// proof of registration (synchronous, so no separate liveness probe is needed) —
+/// and mints the PKCE-bound authorization code, returning the client redirect for
+/// the page to navigate to.
 pub async fn connect_redeem(
     State(store): State<AuthStore>,
     headers: axum::http::HeaderMap,
     Json(body): Json<RedeemBody>,
 ) -> Response {
-    if !store.instance().registration_delegation {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))).into_response();
-    }
     // Snapshot the pending connect without holding the lock across the network.
     let snap = {
         let authz = store.authz.read().await;
@@ -1334,9 +935,9 @@ pub async fn connect_redeem(
             return redeem_err(&e);
         }
     }
-    // Mint the PKCE-bound code (idempotent), mirroring /oauth/finish's lock
-    // discipline: reserve under the `authz` lock, insert into `codes` only after
-    // releasing it (consistent lock order with `token_authorization_code`).
+    // Mint the PKCE-bound code (idempotent): reserve under the `authz` lock,
+    // insert into `codes` only after releasing it (consistent lock order with
+    // `token_authorization_code`).
     let fresh = format!("mcp-code-{}", Uuid::new_v4());
     let (code, newly_minted) = {
         let mut authz = store.authz.write().await;
@@ -1370,34 +971,6 @@ pub async fn connect_redeem(
 /// Escape a string for embedding inside a double-quoted JS string literal.
 fn js_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('<', "\\x3c")
-}
-
-fn connect_error(message: &str) -> Response {
-    // Escape `&` FIRST (so the entities we introduce below are not re-escaped),
-    // then `<` and `>`, before interpolating the message into the HTML body.
-    let safe = message
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    // Shares the connect pages' DFINITY-branded look via the `.error` modifier
-    // (spinner tile hidden, message carries the state), same foot-of-page "Hosted
-    // by" mark; markup in `assets/connect-error.html` (include_str!). No CSP here,
-    // so a plain `<style>` is fine. Sets `Referrer-Policy: no-referrer` (plus the
-    // `<meta>` fallback) like the sibling finish pages: this page can be served
-    // from `/oauth/finish`, whose URL carries the one-time `finish_secret` in its
-    // query, so the Referer must not leak it if the user navigates away (P2).
-    // `__MESSAGE__` (the escaped, caller-supplied text) is substituted LAST so it
-    // cannot clobber the `__CSS__`/`__LOGO__` tokens.
-    let html = CONNECT_ERROR_HTML
-        .replace("__CSS__", CONNECT_PAGE_CSS)
-        .replace("__LOGO__", CONNECT_LOGO_SVG)
-        .replace("__MESSAGE__", &safe);
-    let mut resp = (StatusCode::BAD_REQUEST, Html(html)).into_response();
-    resp.headers_mut().insert(
-        axum::http::header::REFERRER_POLICY,
-        axum::http::HeaderValue::from_static("no-referrer"),
-    );
-    resp
 }
 
 // ---- Token: exchange an authorization code ------------------------------
@@ -1858,36 +1431,9 @@ mod tests {
         assert_eq!(r2, "https://x.test/cb?foo=1&code=c");
     }
 
-    /// H3/P5: `finish_secret` hygiene helpers. `fresh_secret` is high-entropy and
-    /// unique; `sha256` is deterministic; `ct_eq` matches equal inputs and rejects
-    /// unequal ones (and differing lengths) without early-out.
-    #[test]
-    fn secret_helpers_behave() {
-        let s1 = super::fresh_secret();
-        let s2 = super::fresh_secret();
-        assert_ne!(s1, s2, "secrets must be unique");
-        assert!(s1.len() >= 43, "256-bit base64url is 43 chars (>=128-bit floor): {}", s1.len());
-        // Deterministic hash; constant-time compare of equal vs. unequal.
-        assert_eq!(super::sha256(&s1), super::sha256(&s1));
-        assert!(super::ct_eq(&super::sha256(&s1), &super::sha256(&s1)));
-        assert!(!super::ct_eq(&super::sha256(&s1), &super::sha256(&s2)));
-        assert!(!super::ct_eq(b"abc", b"abcd"));
-        assert!(super::ct_eq(b"", b""));
-    }
-
     // Build an AuthStore over a dummy II instance (these tests never hit the
-    // network — the key-request path is pure-local crypto/state). v1-pinned;
-    // use `test_store_phase2` for a registration-delegation instance.
+    // network — the connect paths are pure-local crypto/state).
     fn test_store() -> super::AuthStore {
-        test_store_with(false)
-    }
-
-    // An AuthStore whose instance runs the Phase-2 registration-delegation flow.
-    fn test_store_phase2() -> super::AuthStore {
-        test_store_with(true)
-    }
-
-    fn test_store_with(registration_delegation: bool) -> super::AuthStore {
         use crate::identities::{Identities, IiInstance};
         use candid::Principal;
         let ids = Identities::new(IiInstance {
@@ -1896,7 +1442,6 @@ mod tests {
             ii_canister: Principal::anonymous(),
             oauth_prefix: "",
             mcp_path: "/mcp",
-            registration_delegation,
         });
         super::AuthStore::new(ids, super::SharedClients(std::sync::Arc::default()))
     }
@@ -1912,85 +1457,17 @@ mod tests {
                 code_challenge: Some("cc".into()),
                 cookie: cookie.into(),
                 created: std::time::Instant::now(),
-                finish_secret_hash: None,
                 code: None,
                 redeeming: false,
             },
         );
     }
 
-    /// H3/P1: the key request is STRICTLY single-use per `connect_state`. The first
-    /// mints the keypair + `finish_secret` (embedded in `finish_url`'s query) and
-    /// claims the PA (`finish_secret_hash` set); a second one 403s — no keypair, no
-    /// secret. This is the atomic claim that makes secret-disclosure and
-    /// victim-registration mutually exclusive.
-    #[tokio::test]
-    async fn key_request_is_single_use_and_mints_finish_secret() {
-        use axum::extract::State;
-        use axum::Json;
-        let store = test_store();
-        seed_pending(&store, "sess-x", "bind-1").await;
+    // ---- Connect: link + redeem ---------------------------------------------
 
-        let r1 = super::connect_callback(
-            State(store.clone()),
-            Json(super::ConnectCallback { state: "sess-x".into(), expiration: None, permissions: None }),
-        )
-        .await;
-        assert_eq!(r1.status(), axum::http::StatusCode::OK);
-        assert!(
-            store.authz.read().await.get("sess-x").unwrap().finish_secret_hash.is_some(),
-            "first key request must claim the PA"
-        );
-        let body = axum::body::to_bytes(r1.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let finish_url = v["finish_url"].as_str().unwrap();
-        assert!(finish_url.contains("&fs="), "finish_url must carry the secret in the query: {finish_url}");
-        assert!(!finish_url.contains("/fs/"), "secret must not be a path segment (P2)");
-        assert!(v["public_key"].as_str().is_some());
-
-        // Second key request for the same state (attacker race / replay) => 403,
-        // and it bumps the repeat-key-request observability counter (P1 health).
-        let before = super::repeat_key_requests();
-        let r2 = super::connect_callback(
-            State(store.clone()),
-            Json(super::ConnectCallback { state: "sess-x".into(), expiration: None, permissions: None }),
-        )
-        .await;
-        assert_eq!(r2.status(), axum::http::StatusCode::FORBIDDEN, "single-use: replay must 403");
-        assert!(
-            super::repeat_key_requests() > before,
-            "a repeat key request on a consumed connect_state must be counted"
-        );
-    }
-
-    /// P3: a completion POST must NOT materialize the connection — with no prior
-    /// key request it records nothing that could let `/oauth/finish` proceed (it
-    /// never sets a `finish_secret`, so the consenter proof can't be satisfied).
-    #[tokio::test]
-    async fn completion_post_does_not_materialize_finish_secret() {
-        use axum::extract::State;
-        use axum::Json;
-        let store = test_store();
-        seed_pending(&store, "sess-y", "bind-2").await;
-        let r = super::connect_callback(
-            State(store.clone()),
-            Json(super::ConnectCallback {
-                state: "sess-y".into(),
-                expiration: Some("1000".into()),
-                permissions: Some("all".into()),
-            }),
-        )
-        .await;
-        assert_eq!(r.status(), axum::http::StatusCode::NO_CONTENT);
-        // No key request ran, so no finish_secret exists => finish can never pass clause 2.
-        assert!(store.authz.read().await.get("sess-y").unwrap().finish_secret_hash.is_none());
-    }
-
-    // ---- Phase 2: registration delegation (flag-gated) ----------------------
-
-    // The v2 II link carries `registration_key` = base64url(DER(pub(X))) (the
+    // The II link carries `registration_key` = base64url(DER(pub(X))) (the
     // param II's #4093 frontend parses; its presence selects the flow) in
-    // addition to the v1 callback/state/ttl fragment, all in the URL fragment.
+    // addition to the callback/state/ttl fragment, all in the URL fragment.
     #[test]
     fn v2_link_carries_registration_key() {
         use crate::identities::IiInstance;
@@ -2001,9 +1478,8 @@ mod tests {
             ii_canister: Principal::anonymous(),
             oauth_prefix: "",
             mcp_path: "/mcp",
-            registration_delegation: true,
         };
-        let url = super::ii_mcp_url_v2(&inst, "sess-1", "PUBX");
+        let url = super::ii_mcp_url(&inst, "sess-1", "PUBX");
         assert!(url.starts_with("https://ii.test/mcp#"), "everything rides the fragment: {url}");
         assert!(url.contains("state=sess-1"));
         assert!(url.contains("registration_key=PUBX"));
@@ -2020,7 +1496,7 @@ mod tests {
         use axum::extract::State;
         use crate::identities::{Identities, IiInstance};
         use candid::Principal;
-        let make = |prefix: &'static str, mcp_path: &'static str, registration_delegation: bool| {
+        let make = |prefix: &'static str, mcp_path: &'static str| {
             super::AuthStore::new(
                 Identities::new(IiInstance {
                     name: "t",
@@ -2028,16 +1504,13 @@ mod tests {
                     ii_canister: Principal::anonymous(),
                     oauth_prefix: prefix,
                     mcp_path,
-                    registration_delegation,
                 }),
                 super::SharedClients(std::sync::Arc::default()),
             )
         };
-        // Cover both protocols explicitly: one Phase-2 (v2) instance and one v1
-        // instance. The flag is independent of the prefix — the allow-list
-        // document is prefix-derived, so this test holds regardless of it.
-        let beta = make("", "/mcp", true);
-        let prod = make("/prod", "/mcp-prod", false);
+        // Both instances, so the allow-list covers each prefix.
+        let beta = make("", "/mcp");
+        let prod = make("/prod", "/mcp-prod");
 
         let r = super::auth_callbacks(State(vec![beta.clone(), prod.clone()])).await;
         assert_eq!(r.status(), axum::http::StatusCode::OK);
@@ -2066,10 +1539,10 @@ mod tests {
         assert_eq!(declared.len(), 2, "one entry per instance");
 
         // Each declared entry must equal the callback embedded in that
-        // instance's II link — v1 and v2 — byte for byte.
+        // instance's II link, byte for byte.
         for (store, link) in [
-            (&beta, super::ii_mcp_url_v2(beta.instance(), "s", "K")),
-            (&prod, super::ii_mcp_url(prod.instance(), "s")),
+            (&beta, super::ii_mcp_url(beta.instance(), "s", "K")),
+            (&prod, super::ii_mcp_url(prod.instance(), "s", "K")),
         ] {
             let expected = super::connect_callback_url(store.instance());
             assert!(declared.contains(&expected), "{expected} must be declared: {declared:?}");
@@ -2091,7 +1564,7 @@ mod tests {
     #[tokio::test]
     async fn authorize_redirects_302_with_fragment_cookie_and_no_referrer() {
         use axum::extract::{Query, State};
-        let store = test_store_phase2();
+        let store = test_store();
         // Register a client so `validate_client` passes and we reach the redirect.
         store.clients.write().await.insert(
             "client-x".into(),
@@ -2362,38 +1835,19 @@ mod tests {
         ));
     }
 
-    // Dual-flow, per instance: on a v1-PINNED instance (registration_delegation
-    // off) the Phase-2 surface is absent — the GET callback page and the redeem
-    // endpoint both 404, so its v1 flow is provably unchanged — while a Phase-2
-    // instance (registration_delegation on) serves the pinned page from the same
-    // routes.
+    // The pinned callback page is served (with its strict CSP) and the redeem
+    // endpoint is live.
     #[tokio::test]
-    async fn phase2_routes_are_per_instance() {
+    async fn connect_routes_are_served() {
         use axum::extract::State;
 
-        // v1-pinned instance: 404s.
-        let v1 = test_store();
-        let page = super::connect_callback_page(State(v1.clone())).await;
-        assert_eq!(page.status(), axum::http::StatusCode::NOT_FOUND);
-        let redeem = super::connect_redeem(
-            State(v1),
-            axum::http::HeaderMap::new(),
-            axum::Json(super::RedeemBody {
-                state: "sess-x".into(),
-                delegation: String::new(),
-            }),
-        )
-        .await;
-        assert_eq!(redeem.status(), axum::http::StatusCode::NOT_FOUND);
-
-        // Phase-2 instance: the pinned page is served (with its CSP).
-        let v2 = test_store_phase2();
-        let page = super::connect_callback_page(State(v2.clone())).await;
+        let store = test_store();
+        let page = super::connect_callback_page(State(store.clone())).await;
         assert_eq!(page.status(), axum::http::StatusCode::OK);
         assert!(page.headers().contains_key(axum::http::header::CONTENT_SECURITY_POLICY));
-        // And its redeem endpoint is live (an unknown state is a 400, not a 404).
+        // The redeem endpoint is live: an unknown state is a 400, not a 404.
         let redeem = super::connect_redeem(
-            State(v2),
+            State(store),
             axum::http::HeaderMap::new(),
             axum::Json(super::RedeemBody {
                 state: "sess-x".into(),
@@ -2402,23 +1856,5 @@ mod tests {
         )
         .await;
         assert_eq!(redeem.status(), axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    // The v1 POST callback handlers stay live on a Phase-2 instance — that's what
-    // makes enabling Phase 2 outbound-compatible (an II frontend that doesn't
-    // know the new flow still completes v1 against the same instance).
-    #[tokio::test]
-    async fn v1_key_request_still_served_on_a_phase2_instance() {
-        use axum::extract::State;
-        use axum::Json;
-        let store = test_store_phase2();
-        seed_pending(&store, "sess-v1", "bind-v1").await;
-        let r = super::connect_callback(
-            State(store.clone()),
-            Json(super::ConnectCallback { state: "sess-v1".into(), expiration: None, permissions: None }),
-        )
-        .await;
-        assert_eq!(r.status(), axum::http::StatusCode::OK, "v1 key request must succeed");
-        assert!(store.authz.read().await.get("sess-v1").unwrap().finish_secret_hash.is_some());
     }
 }

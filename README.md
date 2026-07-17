@@ -321,19 +321,21 @@ curl -s "${H[@]}" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"n
 
 ## Auth (OAuth 2.1, login via Internet Identity)
 
-`/mcp` is gated by a bearer token. II's `/mcp` handshake has **no redirect back
-to this server** — the II tab makes two background `fetch()` POSTs to our
-callback and then finishes on its own — so a classic authorization-code
-`redirect_uri` can't be delivered *by II*. We bridge that gap with a single
-**authorization-code + PKCE** flow, so any OAuth 2.1 client works:
+`/mcp` is gated by a bearer token, with login via Internet Identity's
+**registration-delegation** connect handshake. II's `/mcp` handshake logs the user
+in and navigates the browser back to a **pinned callback page** on our origin,
+carrying a canister-signed delegation in the URL fragment. We bridge that to a
+single **authorization-code + PKCE** flow, so any OAuth 2.1 client works:
 
 - `/oauth/authorize` validates the client + redirect and PKCE, sets a
-  **browser-binding cookie** (see below), and redirects to II's handshake. The
-  key-request response carries a `finish_url` on our origin (with a one-time
-  `finish_secret`), so after `mcp_register` II navigates the browser to
-  `/oauth/finish`, which requires the cookie **and** the secret, confirms
-  registration, mints a PKCE-bound code, and 302s to the client's
-  `redirect_uri?code=…&state=…`.
+  **browser-binding cookie** (see below), and redirects to II's handshake, carrying
+  this connect's registration public key `pub(X)` in the link fragment
+  (`registration_key`). II certifies a short-lived, two-hop delegation chain and
+  navigates the browser back to our pinned callback page (`GET
+  /oauth/connect/callback`) with the chain in the fragment. That page POSTs the
+  chain (with the cookie) to `/oauth/connect/redeem`, which redeems it (one
+  `mcp_register_v2` call), mints a PKCE-bound code, and returns the client
+  `redirect_uri?code=…&state=…` for the page to navigate to.
 
 The **RFC 8628 device grant was dropped**: no listed MCP client uses it, and it
 adds a device-code phishing surface with none of the PKCE binding the rest of the
@@ -348,111 +350,81 @@ Endpoints:
   are stored and persisted to `OAUTH_CLIENTS_FILE`; requested `grant_types` are
   honoured (intersected with `authorization_code`)
 - `GET  /oauth/authorize` — validates the client + redirect, requires PKCE, sets
-  the binding cookie, then redirects to II's handshake
-- `GET  /oauth/finish` — II navigates here after registration; requires the
-  binding cookie **and** the one-time `finish_secret`, confirms the grant is
-  registered (proven, see below), then 302s to `redirect_uri?code=…&state=…`
-- `POST /oauth/connect/callback` — serves II's **two cross-origin JSON POSTs**:
-  a **single-use** key request `{state}` → `{public_key, finish_url}` (a fresh
-  session keypair + one-time `finish_secret` embedded in `finish_url`; any later
-  key request for the same `state` gets `403`), and a completion notification
-  `{state, expiration, permissions}` → record the grant expiry + access level (a
-  best-effort latency hint only)
+  the binding cookie, then redirects to II's handshake (with `registration_key`)
+- `GET  /oauth/connect/callback` — the **pinned callback page**: II navigates here
+  with the delegation in the URL fragment; the page reads it client-side and POSTs
+  it to the redeem endpoint (it is the sole fragment reader and reflects nothing
+  into the DOM)
+- `POST /oauth/connect/redeem` — redeems the fragment delegation (requires the
+  binding cookie), binds the session key via `mcp_register_v2`, mints a PKCE-bound
+  code, and returns the client `redirect_uri?code=…&state=…`
 - `POST /oauth/token` — exchanges an authorization `code` (PKCE) for the access token
 
-"Registered" is proven by a signed `mcp_get_accounts` that returns `Ok` under the
-minted session key — **not** by the completion POST, which is unauthenticated and
-therefore only a latency hint. Unauthenticated `/mcp` requests get `401` with a
+Registration is **proven synchronously**: redemption is a signed `mcp_register_v2`
+that must return `Ok`. Unauthenticated `/mcp` requests get `401` with a
 `WWW-Authenticate` header pointing at the resource metadata, as the MCP spec expects.
 
-### Consent-Bound Completion (`/oauth/authorize` → `/oauth/finish`)
+### Consent-Bound Completion (split-browser injection defense)
 
 The `state` in the II connect link is echoed back to the client in the final
-redirect, so it **cannot by itself prove** that the browser finishing at
-`/oauth/finish` is the one that started at `/oauth/authorize` — nor that it is the
-one that actually **consented** at II. Without a binding there's a session-fixation
-takeover: an attacker registers a client (open DCR) with their own `redirect_uri` +
-PKCE challenge, calls `/oauth/authorize`, reads the II connect link from the 302,
-and phishes it to a victim who already trusts this origin in II Settings (II's
-consent screen names only the *origin*, never the OAuth client, so nothing warns the
-victim). The victim consents; the attacker completes the flow and redeems the code
-with their own PKCE verifier — a token acting as the victim. (An initiator-only
-cookie does *not* close this: the attacker is the initiator, so it holds the cookie.)
+redirect, so it **cannot by itself prove** that the browser redeeming at
+`/oauth/connect/redeem` is the one that started at `/oauth/authorize` — nor that it
+is the one that actually **consented** at II. Without a binding there's a
+session-fixation takeover: an attacker registers a client (open DCR) with their own
+`redirect_uri` + PKCE challenge, calls `/oauth/authorize`, reads the II connect link
+from the 302, and phishes it to a victim who already trusts this origin in II
+Settings (II's consent screen names only the *origin*, never the OAuth client, so
+nothing warns the victim). The victim consents; the attacker completes the flow and
+redeems the code with their own PKCE verifier — a token acting as the victim. (An
+initiator-only cookie does *not* close this: the attacker is the initiator, so it
+holds the cookie.)
 
-**The fix — Consent-Bound Completion.** `/oauth/finish` mints a code only when the
-requesting browser presents **both** proofs, which can co-reside in one browser
-only in the legitimate same-browser flow:
+**The fix.** `/oauth/connect/redeem` mints a code only when the requesting browser
+presents **both** proofs, which can co-reside in one browser only in the legitimate
+same-browser flow:
 
 1. **initiator** — an unguessable `HttpOnly; Secure; SameSite=Lax` `sid` cookie
    (scoped to the instance's `…/oauth` path) set at `/oauth/authorize`;
-2. **consenter** — a one-time `finish_secret` (≥128-bit) minted at the **single-use**
-   key request and disclosed *only* in that response (embedded in `finish_url`), so
-   only the browser that drove the II handshake holds it;
-3. plus **proven** registration (signed `mcp_get_accounts` = `Ok`), not a bare
-   completion POST.
+2. **consenter** — the canister-signed delegation chain, delivered by II *only* to
+   the consenting browser as a URL fragment and *required* to redeem, so only the
+   browser that drove the II consent holds it;
+3. plus **proven** registration — redemption is a signed `mcp_register_v2` that
+   must return `Ok`, so it is synchronous and on-chain, never a bare notification.
 
-Because the single-use key request delivers *both* the `finish_secret` and the
-`public_key` a victim would register, the party that can register as the victim is
-exactly the party that gets the secret — and the `sid` cookie pins the finisher to
-the initiator. An attacker who initiates then phishes the II link holds `sid` but
-never the secret (the victim's key request consumes it); the victim holds the secret
-but never `sid`. Neither can finish. This closes the split-browser injection for
-**all transports incl. loopback** (a loopback redirect resolves on the consenter's
-own machine). `SameSite=Lax` still rides the top-level cross-site GET II uses to
-navigate back to `finish_url`.
-
-Load-bearing invariants (enforced in code): the key request is a single **atomic**
-compare-and-set (P1) and II's frontend issues exactly one per connect (a retry
-fails as "restart", never a takeover); `finish_secret` rides in the **query** (not a
-path segment), is kept out of logs, and `/oauth/finish` sends `Referrer-Policy:
-no-referrer` so it can't leak via `Referer` (P2); `registered` reflects a real
-on-chain grant (P3).
+In the confused-deputy path the delegation lands in the honest pinned page in the
+**victim's** browser, whose `sid` cookie does not match the one the connect (and its
+registration key `X`) was bound to, so the redeem aborts. An attacker who initiates
+then phishes the II link holds `sid` but never the delegation (it reaches only the
+consenting victim's browser); the victim holds the delegation but never `sid`.
+Neither can redeem. This closes the split-browser injection for **all transports
+incl. loopback** (a loopback redirect resolves on the consenter's own machine).
+`SameSite=Lax` still rides the top-level cross-site GET II uses to navigate back to
+the callback page.
 
 > **Companion control (not in this change).** The *same-browser* variant — a victim
 > socially engineered into running the whole flow toward an attacker-registered
-> **hosted** `redirect_uri` — is not closed by Consent-Bound Completion (the
-> victim's browser legitimately holds both proofs). It needs **hosted-redirect
-> allow-listing**; loopback/native clients are safe either way (the code resolves on
-> the consenter's own machine). So "H3 fully closed" = Consent-Bound Completion +
-> hosted-redirect allow-listing — a product decision that trades only against open
-> DCR for hosted clients.
+> **hosted** `redirect_uri` — is not closed by this (the victim's browser
+> legitimately holds both proofs). It needs **hosted-redirect allow-listing**;
+> loopback/native clients are safe either way (the code resolves on the consenter's
+> own machine).
 
-### Registration delegation (Phase 2 — per-instance: beta on, prod on)
+### The registration-delegation connect handshake
 
-A successor connect flow (the *registration delegation* design) removes the
-weakest link in v1: today II binds a session key it was merely **shown** (fetched
-from our callback), so any path on the trusted origin that can be made to echo an
-attacker's key lets II bind it. Phase 2 replaces the fetched key with a
-**short-lived (~5 min), two-hop delegation chain `P_reg → Y → X`** delivered to a
-**pinned callback page** as a URL fragment: II's canister signs `P_reg → Y`
-toward an ephemeral key `Y` held only by II's frontend — so the piece that
-transits the IC (replicas, boundary nodes, the public state tree) is inert on
+The connect flow never lets II bind a session key it was merely **shown**. Instead
+it uses a **short-lived (~5 min), two-hop delegation chain `P_reg → Y → X`**
+delivered to a **pinned callback page** as a URL fragment: II's canister signs
+`P_reg → Y` toward an ephemeral key `Y` held only by II's frontend — so the piece
+that transits the IC (replicas, boundary nodes, the public state tree) is inert on
 its own — and the frontend extends it browser-side with a `Y`-signed hop to the
 server's registration key `X`, assembling the redeemable chain only in the
 consenting browser. The backend redeems it by signing **one** `mcp_register_v2`
-call as `X`. II never again binds a bare key it was shown.
-
-**The server runs both protocols side by side, selected per II instance:**
-
-- **beta / staging (`/mcp`, beta.id.ai)** — Phase 2 **on** by default (disable
-  with `MCP_REGISTRATION_DELEGATION=0`). Enabling is outbound-compatible with
-  v1: the II link gains the `registration_key` param and the Phase-2 routes turn on,
-  while every v1 handler stays live — so beta keeps connecting via v1 until beta
-  II actually ships the new frontend + canister methods, and switches over when
-  it does.
-- **production (`/mcp-prod`, id.ai)** — Phase 2 **on** by default, the same as
-  beta (disable with `MCP_REGISTRATION_DELEGATION_PROD=0`). Enabling is
-  outbound-compatible in exactly the same way: the II link gains the
-  `registration_key` param and the Phase-2 routes turn on, while every v1
-  handler stays live, so production keeps connecting via v1 until production II
-  ships the new frontend + canister methods, and switches over when it does.
+call as `X`, binding the long-lived session key `S` to the anchor. II never binds a
+bare key it was shown.
 
 `/version` is the unauthenticated operations probe. It reports the running
-build (`version`, `commit`, `built_at`, `started_at`), the H3/P1
-`repeat_key_requests` health counter, which instance runs which protocol
-(`registration_delegation: {beta, prod}`), and two real-time per-instance
-**session gauges** — `live_sessions` (open grants) and `active_sessions` (a
-subset: those also requesting recently):
+build (`version`, `commit`, `built_at`, `started_at`) and two real-time
+per-instance **session gauges** — `live_sessions` (open grants) and
+`active_sessions` (a subset: those also requesting recently):
 
 ```bash
 curl -s https://<host>/version | jq '{live: .live_sessions, active: .active_sessions}'
@@ -509,7 +481,7 @@ server serves it for both instances (one origin-global document listing each
 instance's `{prefix}/oauth/connect/callback`), built from the same helper that
 builds the II links' callback URLs so the two can never drift.
 
-The Phase-2 wire shapes match the **merged II contract** (verified against the
+The wire shapes match the **merged II contract** (verified against the
 beta II canister's live `.did`, `fgte5-ciaaa-aaaad-aaatq-cai`): the connect
 link carries `registration_key` = base64url(DER(`pub(X)`)); II navigates back
 to the allow-listed callback with the chain **plus the connect state**:
@@ -527,7 +499,7 @@ neither the anchor, the permissions, nor the TTL; the anchor number never
 reaches (or is logged by) this server. (The chosen access level does come
 *back* on the reply, feeding the read-only guard.)
 
-Server side (on a Phase-2 instance):
+Server side:
 
 - **`X`, a per-connect registration keypair** bound to the connect `sid`;
   `priv(X)` never leaves the backend, and `pub(X)` rides the II link
@@ -540,10 +512,9 @@ Server side (on a Phase-2 instance):
 - **Redemption** builds a `DelegatedIdentity` from `priv(X)` + the delegation and
   calls `mcp_register_v2` to bind the long-lived session key `S` to the anchor
   (which II recovers from `caller() == P_reg` — the server never names it).
-  The fragment-delivered delegation subsumes `finish_secret` as the consenter
-  proof, and synchronous registration removes the `grant_is_live` probe and the
-  `finishing_page` poll. The read-only level comes back on the `mcp_register_v2`
-  reply (feeding the same `require_write` guard as v1's completion POST).
+  Registration is synchronous, so there is no separate liveness probe or polling
+  page. The read-only level comes back on the `mcp_register_v2` reply (feeding the
+  `require_write` guard).
 
 > **Verified against deployed beta II.** `mcp_register_v2` and the
 > delegation-minting methods (`prepare_mcp_registration_delegation`,
@@ -555,11 +526,8 @@ Server side (on a Phase-2 instance):
 > [#4091](https://github.com/dfinity/internet-identity/pull/4091) /
 > [#4092](https://github.com/dfinity/internet-identity/pull/4092) /
 > [#4093](https://github.com/dfinity/internet-identity/pull/4093) through to
-> this merged shape. Production II (`rdmx6-…`) keeps `registration_delegation`
-> **off** (v1 flow) until it ships these methods. Retiring v1 on a Phase-2
-> instance (the design's "v1 sunset") is a separate, later step. This also
-> relies on **Phase 1** (the callback allow-list, an II-side validation) as its
-> security precondition.
+> this merged shape. This also relies on the callback allow-list (an II-side
+> validation) as its security precondition.
 
 ### Read-only sessions
 
@@ -570,7 +538,7 @@ entire canister-management surface inert — `create`/`install`/`start`/`stop`/
 `uninstall`/`delete`, and even `icp_canister_status`, are update calls. To handle this
 without opaque low-level errors:
 
-- The completion POST now carries `permissions: "queries" | "all"` (§0), so the
+- The `mcp_register_v2` reply carries `permissions: "queries" | "all"`, so the
   server learns the level at connect without minting a probe delegation. A
   missing or unrecognized value leaves the level **unknown** (not assumed
   writable): the update is attempted and the IC's ingress rejection is the
@@ -580,15 +548,13 @@ without opaque low-level errors:
 - `get_app_principal` reflects a read-only session in its output, so the agent won't
   attempt updates it can't make.
 
-**The server is passive during the handshake and holds no key at link time.** On
-the key-request POST it generates a fresh per-connection Ed25519 keypair and
-returns only its **public** key (base64url, unpadded, DER). II's *frontend*
-registers that key with the II canister (`mcp_register`, under the user's own
-authentication) as a time-boxed grant bound to the user's anchor. **The server
-never receives or verifies a delegation chain that represents itself, and never
-calls `mcp_register`.** The issued access token is bound to the session key's
-principal (`self_authenticating(session_pubkey)`), which is exactly the identity
-the grant is bound to.
+**The server generates a fresh per-connection Ed25519 session key `S` and binds it
+itself.** At connect redemption it signs one `mcp_register_v2(pub(S))` call as the
+registration key `X` (see the handshake above), which binds `S` to the user's
+anchor as a time-boxed grant. `priv(S)` never leaves the backend. The issued access
+token is bound to the session key's principal
+(`self_authenticating(session_pubkey)`), which is exactly the identity the grant is
+bound to.
 
 **PKCE (S256)** is required for the authorization-code flow; auth codes live 120s,
 and the access token's lifetime **tracks the II grant** — it expires exactly when
@@ -597,8 +563,8 @@ minutes up to 30 days) is how long the client's token stays valid. Refresh token
 remain a deliberate non-goal: with the token matched to the grant there is nothing
 to refresh against — when the grant lapses, so does the token, and the client
 re-runs the authorization-code flow. (If the grant expiration isn't known at issue
-time — e.g. a dropped connect-completion POST — the token falls back to a 1h TTL;
-the grant is the hard ceiling at II either way.) Treat any `Unauthorized` from II
+time, the token falls back to a 1h TTL; the grant is the hard ceiling at II either
+way.) Treat any `Unauthorized` from II
 as "session over → reconnect": the server surfaces a reconnect message and does
 not retry.
 
@@ -707,7 +673,7 @@ needed. To act as a non-default account, pass its `name` to
 `account_number` via `mcp_get_accounts` and threads that into the on-demand
 delegation. Omitting `account` uses the default account.
 
-> **Status:** the connect handshake and the `mcp_register` / `mcp_get_accounts` /
+> **Status:** the connect handshake and the `mcp_register_v2` / `mcp_get_accounts` /
 > `mcp_prepare_delegation` / `mcp_get_delegation` canister methods are the
 > session-key registration model from
 > [dfinity/internet-identity#4086](https://github.com/dfinity/internet-identity/pull/4086)
@@ -723,20 +689,20 @@ delegation. Omitting `account` uses the default account.
 
 - [x] Candid tools over MCP streamable-HTTP; `discover_app_canisters`; Candid
       reference resources.
-- [x] OAuth 2.1 auth (authorization-code + PKCE): II's `/mcp` handshake registers
-      the connection's session key (two JSON callback POSTs, no delegation chain),
-      with **Consent-Bound Completion** binding `/oauth/finish` to both the initiator
-      (`sid` cookie) and the consenter (one-time `finish_secret`); expiring tokens.
-      (The RFC 8628 device grant was dropped. Same-browser-variant closure needs
-      hosted-redirect allow-listing — see Auth.)
+- [x] OAuth 2.1 auth (authorization-code + PKCE): II's `/mcp` **registration-delegation**
+      handshake binds the connection's session key (a fragment-delivered, canister-signed
+      delegation redeemed via `mcp_register_v2`), with **Consent-Bound Completion** binding
+      `/oauth/connect/redeem` to both the initiator (`sid` cookie) and the consenter (the
+      fragment delegation); expiring tokens. (The RFC 8628 device grant was dropped.
+      Same-browser-variant closure needs hosted-redirect allow-listing — see Auth.)
 - [x] On-demand **domain identities**: the registered session key mints per-app
       account delegations directly via II canister methods
       (`call_canister`/`get_app_principal` `derivation_origin`); no per-app browser flow.
 - [x] **Per-app accounts**: `list_app_accounts(derivation_origin)` lists the user's accounts at
       an app (via `mcp_get_accounts`), and `call_canister`/`get_app_principal` take an
       `account` name to act as a specific (non-default) account.
-- [ ] Deploy the `mcp_register` + `mcp_get_accounts` + `mcp_prepare_delegation` +
-      `mcp_get_delegation` canister methods (server is built against #4086's candid
-      contract; the live round-trip lands with the II side).
+- [ ] Deploy the `mcp_register_v2` + `mcp_get_accounts` + `mcp_prepare_delegation` +
+      `mcp_get_delegation` canister methods (server is built against the merged II
+      candid contract; the live round-trip lands with the II side).
 - [ ] Persist sessions/delegations (currently in-memory, lost on restart).
 - [ ] Scoped delegations / per-call confirmation for sensitive methods.

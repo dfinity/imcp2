@@ -4,28 +4,21 @@
 //! the server generates a fresh Ed25519 **session key `S` per user-connection**,
 //! and II binds a time-boxed **grant** for it to the user's anchor — the session
 //! key's principal `self_authenticating(session_pubkey)` IS the identity the
-//! grant is bound to. HOW it gets bound depends on the instance's connect
-//! protocol (see `crate::auth`):
+//! grant is bound to. It gets bound via the **registration-delegation** connect
+//! flow (see `crate::auth`): the server also mints a per-connect **registration
+//! key `X`**; II delivers a short-lived, TWO-hop chain `P_reg -> Y -> X` to the
+//! pinned callback page — the canister-signed `P_reg -> Y` targets an ephemeral
+//! key `Y` held only by II's frontend (so the piece that transits the IC is inert
+//! on its own), and the browser-signed `Y -> X` extends it to our registration
+//! key — and the server redeems it with ONE `mcp_register_v2(pub(S))` call signed
+//! as `X`. The anchor and the consent values (permissions, max_ttl) are NOT sent:
+//! the consent was captured earlier by II's frontend at
+//! `prepare_mcp_registration_delegation` and stored server-side keyed by `P_reg`,
+//! and II recovers both it and the anchor from `caller() == P_reg`
+//! ([`Identities::redeem_registration_delegation`]).
 //!
-//!   * **v1 (fetched key, dfinity/internet-identity#4086)**: II's frontend
-//!     fetches `pub(S)` from the key-request callback and calls `mcp_register`
-//!     under the user's own authentication; the server sees no delegation chain
-//!     at connect.
-//!   * **Phase 2 (registration delegation)**: the server also mints a
-//!     per-connect **registration key `X`**; II delivers a short-lived,
-//!     TWO-hop chain `P_reg -> Y -> X` to the pinned callback page — the
-//!     canister-signed `P_reg -> Y` targets an ephemeral key `Y` held only by
-//!     II's frontend (so the piece that transits the IC is inert on its own),
-//!     and the browser-signed `Y -> X` extends it to our registration key —
-//!     and the server redeems it with ONE `mcp_register_v2(pub(S))` call signed
-//!     as `X`. The anchor and the consent values (permissions, max_ttl) are NOT
-//!     sent: the consent was captured earlier by II's frontend at
-//!     `prepare_mcp_registration_delegation` and stored server-side keyed by
-//!     `P_reg`, and II recovers both it and the anchor from `caller() == P_reg`
-//!     ([`Identities::redeem_registration_delegation`]).
-//!
-//! From registration on, the two are identical: the server signs II's `mcp_*`
-//! calls directly with `S` until the grant expires or is revoked.
+//! From registration on, the server signs II's `mcp_*` calls directly with `S`
+//! until the grant expires or is revoked.
 //!
 //! To call a canister as the user's account for a given app (e.g. `oisy.com`)
 //! the server mints a **short-lived per-app account delegation ON DEMAND**:
@@ -124,25 +117,10 @@ pub struct IiInstance {
     pub oauth_prefix: &'static str,
     /// The MCP resource path this instance gates: "/mcp" or "/mcp-prod".
     pub mcp_path: &'static str,
-    /// Whether THIS instance runs the **Phase-2 registration-delegation**
-    /// connect flow (see `crate::auth`'s "Phase 2" module docs). Per-instance so
-    /// the server supports BOTH protocols side by side and each instance can be
-    /// toggled independently — both beta and prod default to the new flow.
-    /// Enabling is outbound-compatible: it only adds the `registration_key` param
-    /// to the II link and turns on the pinned callback page + redeem endpoint — an
-    /// II frontend that doesn't know the new flow ignores the param and completes
-    /// v1, which the server always still serves. Disabled instances 404 the
-    /// Phase-2 routes.
-    pub registration_delegation: bool,
 }
 
 impl IiInstance {
     /// The default instance: beta Internet Identity (`II_URL` / `II_CANISTER_ID`).
-    /// Runs the Phase-2 registration-delegation flow by DEFAULT (staging is where
-    /// the new protocol is exercised first); disable with
-    /// `MCP_REGISTRATION_DELEGATION=0`. Until beta II ships the new frontend and
-    /// canister methods, its v1 flow keeps completing unchanged (enabling is
-    /// outbound-compatible — see [`IiInstance::registration_delegation`]).
     pub fn beta() -> Result<Self, String> {
         Ok(Self {
             name: "beta",
@@ -150,18 +128,10 @@ impl IiInstance {
             ii_canister: env_principal("II_CANISTER_ID", II_CANISTER_ID_DEFAULT)?,
             oauth_prefix: "",
             mcp_path: "/mcp",
-            registration_delegation: env_flag("MCP_REGISTRATION_DELEGATION", true),
         })
     }
 
-    /// The production instance (`II_URL_PROD` / `II_CANISTER_ID_PROD`). Runs the
-    /// Phase-2 registration-delegation flow by DEFAULT, the same as beta, now that
-    /// production II carries the merged MCP feature set; fall back to the v1
-    /// (fetched-key) protocol with `MCP_REGISTRATION_DELEGATION_PROD=0`. Enabling
-    /// is outbound-compatible with v1 (it only adds the `registration_key` link
-    /// param and turns on the Phase-2 routes, leaving every v1 handler live — see
-    /// [`IiInstance::registration_delegation`]), so a production II frontend that
-    /// has not yet shipped the new flow still completes v1 unchanged.
+    /// The production instance (`II_URL_PROD` / `II_CANISTER_ID_PROD`).
     pub fn prod() -> Result<Self, String> {
         Ok(Self {
             name: "prod",
@@ -169,7 +139,6 @@ impl IiInstance {
             ii_canister: env_principal("II_CANISTER_ID_PROD", II_CANISTER_ID_PROD_DEFAULT)?,
             oauth_prefix: "/prod",
             mcp_path: "/mcp-prod",
-            registration_delegation: env_flag("MCP_REGISTRATION_DELEGATION_PROD", true),
         })
     }
 }
@@ -188,16 +157,6 @@ fn env_principal(var: &str, default: &str) -> Result<Principal, String> {
     Principal::from_text(&raw).map_err(|e| format!("invalid {var} '{raw}': {e}"))
 }
 
-/// A boolean flag from the environment, with a default when unset. A SET value
-/// is truthy only for `1`/`true`/`yes`/`on` (case-insensitive) — so an explicit
-/// `VAR=0` turns a default-on flag off.
-fn env_flag(var: &str, default: bool) -> bool {
-    match std::env::var(var) {
-        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
-        Err(_) => default,
-    }
-}
-
 fn now_ns() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
 }
@@ -205,9 +164,8 @@ fn now_ns() -> u64 {
 /// A session counts as *active* on the `/version` `active_sessions` gauge if it
 /// showed activity within this window. Activity is any authenticated MCP request
 /// (bumped via [`Identities::touch_session`]) plus the connect that redeems the
-/// grant (`set_grant_expiration` stamps the same field — note the v1 completion
-/// POST is itself unauthenticated), so a freshly-connected session is active
-/// from the start, before its first tool call. Unlike `live_sessions`
+/// grant (`set_grant_expiration` stamps the same field), so a freshly-connected
+/// session is active from the start, before its first tool call. Unlike `live_sessions`
 /// (open grants), this tracks who is USING the server right now, so operators
 /// can time a redeploy for a low-traffic moment: a restart wipes the in-memory
 /// session/token maps and forces every currently-connected client to reconnect,
@@ -260,18 +218,17 @@ pub(crate) fn target_origin(domain: &str) -> String {
 
 struct Session {
     /// Ed25519 session-key seed; rebuild a `BasicIdentity` from it on demand.
-    /// This is the key generated for this connection and registered with II (via
-    /// the frontend's `mcp_register`); the server signs II's `mcp_*` calls
-    /// directly with it. Its private half never leaves the backend — only its
-    /// public key is ever sent to II.
+    /// This is the key generated for this connection and bound to the anchor by
+    /// `mcp_register_v2` (which the backend signs during connect redemption); the
+    /// server signs II's `mcp_*` calls directly with it. Its private half never
+    /// leaves the backend — only its public key is ever sent to II.
     key_seed: [u8; 32],
     /// DER public key of the session key.
     pubkey_der: Vec<u8>,
-    /// The grant's expiration (ns since the Unix epoch), as reported by the
-    /// completion-notification callback POST. `None` until (or unless) that
-    /// best-effort POST arrives; a missing value is not treated as expired — an
-    /// `Unauthorized` from a signed call is the authoritative "session over"
-    /// signal.
+    /// The grant's expiration (ns since the Unix epoch), from the `mcp_register_v2`
+    /// reply recorded at connect redemption. `None` until redemption records it;
+    /// a missing value is not treated as expired — an `Unauthorized` from a signed
+    /// call is the authoritative "session over" signal.
     grant_expiration_ns: Option<u64>,
     /// Wall-clock (ns since the epoch) of this session's most recent
     /// authenticated request, bumped per request via [`Identities::touch_session`]
@@ -281,24 +238,23 @@ struct Session {
     /// stays valid (so it still counts as *live*). Atomic so the per-request touch
     /// needs only a read lock on the session map.
     last_seen_ns: AtomicU64,
-    /// **Registration keypair `X`** for the Phase-2 registration-delegation flow
-    /// (see the `registration delegation` design and `crate::auth`'s Phase-2
-    /// section). Minted once per connect, bound to this session (which is keyed
-    /// by the connect `sid`); its private half NEVER leaves the backend. II
-    /// certifies a short-lived, two-hop chain (`P_reg -> Y -> X`) whose final hop
-    /// targets it, and the backend redeems it by signing an `mcp_register_v2`
-    /// ingress AS `X` while presenting that
-    /// chain. `None` until [`Identities::registration_pubkey_b64`] mints it;
-    /// absent entirely in the v1 (fetched-key) flow. Distinct from the long-lived
-    /// **session key `S`** (`key_seed`/`pubkey_der`), which is what `v2` registers.
+    /// **Registration keypair `X`** for the registration-delegation connect flow
+    /// (see `crate::auth`). Minted once per connect, bound to this session (which
+    /// is keyed by the connect `sid`); its private half NEVER leaves the backend.
+    /// II certifies a short-lived, two-hop chain (`P_reg -> Y -> X`) whose final
+    /// hop targets it, and the backend redeems it by signing an `mcp_register_v2`
+    /// ingress AS `X` while presenting that chain. `None` until
+    /// [`Identities::registration_pubkey_b64`] mints it. Distinct from the
+    /// long-lived **session key `S`** (`key_seed`/`pubkey_der`), which is what
+    /// `mcp_register_v2` registers.
     reg_key_seed: Option<[u8; 32]>,
     /// DER public key of the registration key `X` (mirrors `pubkey_der` for `S`).
     reg_pubkey_der: Option<Vec<u8>>,
-    /// The session's access level from the completion POST's `permissions` field
-    /// (§0/H2): `Some(true)` = read-only (`"queries"`), `Some(false)` = full
-    /// (`"all"`), `None` = not yet learned (the best-effort POST didn't arrive).
-    /// Update calls are rejected by the IC at ingress under a read-only session,
-    /// so tools consult this to fail early with an actionable message.
+    /// The session's access level from the `mcp_register_v2` reply's `permissions`
+    /// field: `Some(true)` = read-only (`"queries"`), `Some(false)` = full
+    /// (`"all"`), `None` = not yet learned. Update calls are rejected by the IC at
+    /// ingress under a read-only session, so tools consult this to fail early with
+    /// an actionable message.
     read_only: Option<bool>,
     /// `(domain, account_number)` -> most recently derived per-app delegation.
     /// Keyed by account too, since each account at an origin signs as a distinct
@@ -523,19 +479,8 @@ impl Identities {
         Some((s.key_seed, s.pubkey_der.clone()))
     }
 
-    /// Ensure a session exists and return its session **public** key (base64url,
-    /// no pad, DER). This is what the key-request callback POST returns to II's
-    /// frontend, which registers it as the grant. Its private half never leaves
-    /// the backend.
-    pub async fn session_pubkey_b64(&self, session_id: &str) -> String {
-        self.ensure_session(session_id).await;
-        let sessions = self.sessions.read().await;
-        let der = &sessions.get(session_id).expect("ensured session").pubkey_der;
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(der)
-    }
-
     /// Ensure a **registration key `X`** exists for this connect and return its
-    /// public key (base64url, no pad, DER). This is what the Phase-2 connect link
+    /// public key (base64url, no pad, DER). This is what the connect link
     /// carries outbound to II (`pub(X)`); II certifies a two-hop chain
     /// `P_reg -> Y -> X` whose final hop targets it. `priv(X)` never leaves the
     /// backend — only this public half is
@@ -562,9 +507,8 @@ impl Identities {
         Some(Principal::self_authenticating(&der).to_text())
     }
 
-    /// Record the grant's expiration reported by the completion-notification
-    /// callback POST (`{state, expiration}`). The value is nanoseconds since the
-    /// epoch (a decimal string on the wire, parsed before it reaches here).
+    /// Record the grant's expiration from the `mcp_register_v2` reply, at connect
+    /// redemption. The value is nanoseconds since the epoch.
     pub async fn set_grant_expiration(&self, session_id: &str, expiration_ns: u64) {
         self.ensure_session(session_id).await;
         // Read the clock once (before taking the lock), so the "was it live"
@@ -602,19 +546,18 @@ impl Identities {
         }
     }
 
-    /// Record the session's access level from the completion POST's `permissions`
-    /// field (§0/H2), using the same vocabulary as the delegation's `permissions`:
-    /// `"queries"` = read-only, `"all"` = full access (both case-insensitive). Any
-    /// UNRECOGNIZED value leaves the level `None` (unknown) rather than assuming
-    /// full access — so an unexpected/future value falls through to the ingress
-    /// rejection fallback instead of the server wrongly considering the session
-    /// writable.
+    /// Record the session's access level from the `mcp_register_v2` reply's
+    /// `permissions` field: `"queries"` = read-only, `"all"` = full access (both
+    /// case-insensitive). Any UNRECOGNIZED value leaves the level `None` (unknown)
+    /// rather than assuming full access — so an unexpected/future value falls
+    /// through to the ingress rejection fallback instead of the server wrongly
+    /// considering the session writable.
     pub async fn set_permissions(&self, session_id: &str, permissions: &str) {
         let level = match permissions.trim().to_ascii_lowercase().as_str() {
             "queries" => Some(true),
             "all" => Some(false),
             other => {
-                tracing::warn!("connect completion had unrecognized permissions {other:?}; access level left unknown");
+                tracing::warn!("mcp_register_v2 reply had unrecognized permissions {other:?}; access level left unknown");
                 return;
             }
         };
@@ -626,9 +569,9 @@ impl Identities {
     }
 
     /// The session's recorded grant expiration (ns since the epoch), if known —
-    /// authoritative when set by `mcp_register_v2`'s reply (Phase 2), a
-    /// best-effort hint when set by v1's completion POST. Used to bound the
-    /// OAuth access-token lifetime so a token never outlives the grant.
+    /// set authoritatively from the `mcp_register_v2` reply at connect redemption.
+    /// Used to bound the OAuth access-token lifetime so a token never outlives the
+    /// grant.
     pub async fn grant_expiration_ns(&self, session_id: &str) -> Option<u64> {
         self.sessions.read().await.get(session_id).and_then(|s| s.grant_expiration_ns)
     }
@@ -839,17 +782,7 @@ impl Identities {
             .collect())
     }
 
-    /// Whether the grant is currently usable: a signed `mcp_get_accounts` for the
-    /// MCP origin succeeds. A best-effort fallback used at `/oauth/finish` to
-    /// confirm the user has finished connecting, since the completion-notification
-    /// POST (which also confirms this) is best-effort and may never arrive.
-    pub async fn grant_is_live(&self, session_id: &str) -> bool {
-        self.list_accounts(session_id, &crate::auth::base_url())
-            .await
-            .is_ok()
-    }
-
-    /// **Phase 2 — redeem a registration delegation.** Given the TWO-hop chain
+    /// **Redeem a registration delegation.** Given the TWO-hop chain
     /// `P_reg -> Y -> X` that II delivered to the pinned callback (decoded by
     /// `crate::auth` into `reg_user_key = der(P_reg)` and `chain`; `Y` is an
     /// ephemeral key held only by II's frontend — the canister-signed hop
@@ -868,19 +801,16 @@ impl Identities {
     /// identity number itself. On `Ok` II binds this session's long-lived key `S`
     /// to the anchor (replacing any previous grant for that identity) and
     /// returns `{expiration, permissions}`; we record both, so the grant-expiry
-    /// check and the H2 read-only guard behave exactly as they do off the v1
-    /// completion POST. Within its 5-minute lifetime the delegation redeems
-    /// repeatedly (a retry with the same `S` just re-binds it), so boundary
-    /// timeouts are retry-safe.
+    /// check and the read-only guard have what they need. Within its 5-minute
+    /// lifetime the delegation redeems repeatedly (a retry with the same `S` just
+    /// re-binds it), so boundary timeouts are retry-safe.
     ///
     /// > **Verified against deployed beta II.** The `mcp_register_v2` argument
     /// > and return candid match the beta II canister's live `.did`
     /// > (`fgte5-ciaaa-aaaad-aaatq-cai`): one `session_key : blob` in, and
     /// > `variant { Ok : record { expiration; permissions }; Err : text }` out
     /// > (decoded as [`McpRegisterV2Reply`]; [`McpRegisterV2Ok`] is the `Ok`
-    /// > payload). Production II (`rdmx6-…`)
-    /// > keeps `registration_delegation` off (v1 flow) until it ships these
-    /// > methods. Re-verify the shapes if II's `.did` ever moves; the read-only
+    /// > payload). Re-verify the shapes if II's `.did` ever moves; the read-only
     /// > `opt text`/`variant` outage (#40) is the standing lesson against drift.
     pub(crate) async fn redeem_registration_delegation(
         &self,
@@ -931,8 +861,8 @@ impl Identities {
             .map_err(|e| format!("could not decode mcp_register_v2 reply: {e}"))?
             .map_err(|e| format!("Internet Identity rejected registration: {e}"))?;
 
-        // Record expiry + access level so the signer's expiry check and the H2
-        // read-only guard work exactly as they do off the v1 completion POST.
+        // Record expiry + access level so the signer's expiry check and the
+        // read-only guard have what they need.
         let permissions = outcome.permissions.as_text();
         self.set_grant_expiration(session_id, outcome.expiration).await;
         self.set_permissions(session_id, permissions).await;
@@ -1345,19 +1275,15 @@ mod tests {
     use super::*;
 
     /// The built-in instance defaults must parse (canister ids are compile-time
-    /// strings) and carry the expected paths/prefixes — and the expected default
-    /// connect protocol: both beta (staging) and prod on the Phase-2 registration
-    /// delegation. (Env overrides could flip these outside the test env.)
+    /// strings) and carry the expected paths/prefixes.
     #[test]
     fn instance_defaults_are_valid() {
         let beta = IiInstance::beta().expect("beta defaults");
         assert_eq!(beta.oauth_prefix, "");
         assert_eq!(beta.mcp_path, "/mcp");
-        assert!(beta.registration_delegation, "beta defaults to the new protocol");
         let prod = IiInstance::prod().expect("prod defaults");
         assert_eq!(prod.oauth_prefix, "/prod");
         assert_eq!(prod.mcp_path, "/mcp-prod");
-        assert!(prod.registration_delegation, "prod defaults to the new protocol");
         assert_ne!(beta.ii_canister, prod.ii_canister);
     }
 
@@ -1428,7 +1354,6 @@ mod tests {
             ii_canister: Principal::anonymous(),
             oauth_prefix: "",
             mcp_path: "/mcp",
-            registration_delegation: false,
         })
     }
 
@@ -1963,8 +1888,13 @@ mod tests {
         let x1 = ids.registration_pubkey_b64("sess").await;
         let x2 = ids.registration_pubkey_b64("sess").await;
         assert_eq!(x1, x2, "the registration key is stable across a connect");
-        let s = ids.session_pubkey_b64("sess").await;
-        assert_ne!(x1, s, "X (registration key) must differ from S (session key)");
+        // X's key material must differ from the session key S.
+        let (s_der, x_der) = {
+            let sessions = ids.sessions.read().await;
+            let s = sessions.get("sess").expect("session");
+            (s.pubkey_der.clone(), s.reg_pubkey_der.clone().expect("reg key minted"))
+        };
+        assert_ne!(x_der, s_der, "X (registration key) must differ from S (session key)");
     }
 
     // Lock the merged mcp_register_v2 arg shape: EXACTLY ONE argument,
