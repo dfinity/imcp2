@@ -493,9 +493,11 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("getting an app principal needs an authenticated session".into())),
         };
-        let target = match resolve_identity_target(derivation_origin) {
+        // `derivation_origin` is a required String here, so this always yields a
+        // target (never the anonymous None) unless it fails validation.
+        let target = match resolve_identity_target(Some(derivation_origin)) {
             Ok(Some(t)) => t,
-            Ok(None) => return Ok(err("provide `derivation_origin` to identify the app (get it from open_app / resolve_app)".into())),
+            Ok(None) => return Ok(err("`derivation_origin` must not be empty".into())),
             Err(e) => return Ok(err(e)),
         };
         let delegated = match self
@@ -546,9 +548,11 @@ impl IcTools {
             Some(s) => s.session_id,
             None => return Ok(err("listing your accounts needs an authenticated session".into())),
         };
-        let target = match resolve_identity_target(derivation_origin) {
+        // `derivation_origin` is a required String here, so this always yields a
+        // target (never the anonymous None) unless it fails validation.
+        let target = match resolve_identity_target(Some(derivation_origin)) {
             Ok(Some(t)) => t,
-            Ok(None) => return Ok(err("provide `derivation_origin` to identify the app (get it from open_app / resolve_app)".into())),
+            Ok(None) => return Ok(err("`derivation_origin` must not be empty".into())),
             Err(e) => return Ok(err(e)),
         };
         match self.identities.list_accounts(&session_id, &target.origin).await {

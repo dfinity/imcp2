@@ -350,9 +350,9 @@ pub struct GetPrincipalArgs {
     /// alternativeOrigins list, and do NOT pass a raw website URL — get the
     /// derivation origin from open_app / resolve_app (which resolve an app name or
     /// URL to it under the guessed-domain gate) and reuse it. Accepts the legacy
-    /// name `domain`. Required to identify the app.
-    #[serde(default, alias = "domain")]
-    pub derivation_origin: Option<String>,
+    /// name `domain`. Required — this tool always acts as an app account.
+    #[serde(alias = "domain")]
+    pub derivation_origin: String,
     /// Which of your accounts to resolve, by account name (see list_app_accounts).
     /// Omit to use that app's default account.
     #[serde(default)]
@@ -392,8 +392,8 @@ pub struct ListAccountsArgs {
     /// open_app / resolve_app (which resolve an app name or URL to it under the
     /// guessed-domain gate) and reuse it. Accepts the legacy name `domain`. Required
     /// to identify the app.
-    #[serde(default, alias = "domain")]
-    pub derivation_origin: Option<String>,
+    #[serde(alias = "domain")]
+    pub derivation_origin: String,
 }
 
 /// One account in the `list_app_accounts` MCP output (a serialization mirror of
