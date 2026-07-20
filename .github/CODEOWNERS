@@ -6,4 +6,4 @@
 # once the repo is moved under the `dfinity` organization, and restrict admin +
 # write access to that team (four-eyes principle on all merges).
 
-* @dfinity/REPLACE-WITH-OWNING-TEAM
+* @dfinity/identity
