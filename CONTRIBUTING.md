@@ -1,9 +1,18 @@
 # Contributing
 
-Thanks for your interest in contributing! This document explains how to build,
-test, and propose changes to this project.
+Thanks for your interest! This document explains how to build and test the
+project and how contributions are handled.
 
 By participating, you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Contribution mode
+
+This repository is **public but closed to external code contributions**. Pull
+requests opened by people outside the DFINITY organization are not merged and
+may be closed automatically. **Bug reports and suggestions are always welcome.**
+
+If the repository is later opened to external code contributions, contributors
+will be required to sign the [DFINITY CLA](https://github.com/dfinity/cla/).
 
 ## Ways to contribute
 
@@ -12,7 +21,9 @@ By participating, you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md
   duplicates.
 - **Report a security vulnerability** privately — do **not** open a public
   issue. See [SECURITY.md](SECURITY.md).
-- **Submit a change** via a pull request, following the workflow below.
+
+The build/test workflow below is for maintainers (the owning DFINITY team) and,
+should the repository be opened to them, approved external contributors.
 
 ## Development setup
 
