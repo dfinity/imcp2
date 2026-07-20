@@ -2,6 +2,11 @@
 name = "mcp-poc"
 version = "0.1.0"
 edition = "2021"
+description = "Minimal MCP server that bridges an LLM to the Internet Computer, speaking textual Candid."
+license = "Apache-2.0"
+readme = "README.md"
+# Internal binary crate — not intended for crates.io.
+publish = false
 
 [dependencies]
 rmcp = { version = "1.7", features = [

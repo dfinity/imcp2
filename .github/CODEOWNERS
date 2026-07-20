@@ -1,0 +1,8 @@
+# Code owners are automatically requested for review on pull requests.
+# See https://docs.github.com/articles/about-code-owners
+#
+# TODO (before/after moving to the DFINITY org): replace the owner below with
+# the appropriate DFINITY GitHub team (e.g. `@dfinity/<team>`) so reviews route
+# to the maintaining team rather than an individual.
+
+* @aterga

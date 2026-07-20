@@ -713,3 +713,22 @@ delegation. Omitting `account` uses the default account.
       candid contract; the live round-trip lands with the II side).
 - [ ] Persist sessions/delegations (currently in-memory, lost on restart).
 - [ ] Scoped delegations / per-call confirmation for sensitive methods.
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for how to
+build, test, and open a pull request. Participation is governed by our
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Security
+
+Please report security vulnerabilities privately rather than opening a public
+issue. See [SECURITY.md](SECURITY.md) for how to disclose responsibly.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you shall be licensed as above, without any
+additional terms or conditions.
