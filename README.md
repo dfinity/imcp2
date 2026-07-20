@@ -713,3 +713,24 @@ delegation. Omitting `account` uses the default account.
       candid contract; the live round-trip lands with the II side).
 - [ ] Persist sessions/delegations (currently in-memory, lost on restart).
 - [ ] Scoped delegations / per-call confirmation for sensitive methods.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+Copyright © DFINITY Stiftung.
+
+## Contribution mode
+
+This repository is **public but closed to external code contributions**: pull
+requests from outside the DFINITY organization are not merged (and may be closed
+automatically). **Bug reports and suggestions are welcome** — please open an
+[issue](../../issues).
+
+If this repository is later opened to external contributions, contributors will
+be required to sign the [DFINITY CLA](https://github.com/dfinity/cla/), and this
+section will be updated accordingly.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build and test the project, and
+[SECURITY.md](SECURITY.md) for reporting security vulnerabilities. Participation
+is governed by our [Code of Conduct](CODE_OF_CONDUCT.md).
