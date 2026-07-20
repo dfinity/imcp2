@@ -355,7 +355,10 @@ Endpoints:
 - `GET /.well-known/oauth-protected-resource` — points clients at the AS
 - `POST /oauth/register` — dynamic client registration (RFC 7591); `redirect_uris`
   are stored and persisted to `OAUTH_CLIENTS_FILE`; requested `grant_types` are
-  honoured (intersected with `authorization_code`)
+  honoured (intersected with `authorization_code`). A **hosted** `redirect_uri` is
+  rejected unless its host is on the allow-list (see the Companion-control note
+  below); loopback redirects are always accepted
+
 - `GET  /oauth/authorize` — validates the client + redirect, requires PKCE, sets
   the binding cookie, then redirects to II's handshake (with `registration_key`)
 - `GET  /oauth/connect/callback` — the **pinned callback page**: II navigates here
@@ -408,12 +411,17 @@ incl. loopback** (a loopback redirect resolves on the consenter's own machine).
 `SameSite=Lax` still rides the top-level cross-site GET II uses to navigate back to
 the callback page.
 
-> **Companion control (not in this change).** The *same-browser* variant — a victim
-> socially engineered into running the whole flow toward an attacker-registered
-> **hosted** `redirect_uri` — is not closed by this (the victim's browser
-> legitimately holds both proofs). It needs **hosted-redirect allow-listing**;
-> loopback/native clients are safe either way (the code resolves on the consenter's
-> own machine).
+> **Companion control: the hosted-redirect allow-list.** The *same-browser* variant
+> (a victim socially engineered into running the whole flow toward an
+> attacker-registered **hosted** `redirect_uri`) is not closed by Consent-Bound
+> Completion alone, since the victim's browser legitimately holds both proofs. It
+> **is** closed by a **hosted-redirect allow-list**: dynamic client registration
+> accepts only a loopback redirect, or a hosted redirect whose host is (a subdomain
+> of) an allow-listed registrable domain, so an attacker cannot register a hosted
+> destination it controls. The list is seeded with the known MCP connector vendors
+> and widened per deployment with `OAUTH_ALLOWED_REDIRECT_DOMAINS` (additive);
+> loopback/native clients are exempt (the code resolves on the consenter's own
+> machine). Enforced at both `/oauth/register` and `/oauth/authorize`.
 
 ### The registration-delegation connect handshake
 
@@ -701,7 +709,7 @@ delegation. Omitting `account` uses the default account.
       delegation redeemed via `mcp_register_v2`), with **Consent-Bound Completion** binding
       `/oauth/connect/redeem` to both the initiator (`sid` cookie) and the consenter (the
       fragment delegation); expiring tokens. (The RFC 8628 device grant was dropped.
-      Same-browser-variant closure needs hosted-redirect allow-listing — see Auth.)
+      The same-browser variant is closed by the hosted-redirect allow-list, see Auth.)
 - [x] On-demand **domain identities**: the registered session key mints per-app
       account delegations directly via II canister methods
       (`call_canister`/`get_app_principal` `derivation_origin`); no per-app browser flow.

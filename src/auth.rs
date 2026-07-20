@@ -46,11 +46,12 @@
 //! In the confused-deputy path the delegation lands in the honest page in the
 //! VICTIM's browser, whose cookie does not match the one `X` was bound to, so the
 //! redeem aborts. This closes the split-browser injection for all transports incl.
-//! loopback (a loopback redirect resolves on the consenter's own machine). Not
-//! closed here (companion control): the *same-browser* variant where a victim is
-//! socially engineered into running the whole flow toward an attacker-registered
-//! **hosted** `redirect_uri`; that needs hosted-redirect allow-listing (loopback is
-//! safe either way).
+//! loopback (a loopback redirect resolves on the consenter's own machine). The
+//! *same-browser* variant (a victim socially engineered into running the whole
+//! flow toward an attacker-registered **hosted** `redirect_uri`) is closed by a
+//! **hosted-redirect allow-list** ([`redirect_uri_permitted`]): open DCR may
+//! register only loopback or allow-listed-domain hosted redirects, so an attacker
+//! cannot register a hosted destination it controls (loopback is safe either way).
 //!
 //! The wire shapes match the merged II contract (verified against the beta II
 //! canister's live `.did`, `fgte5-ciaaa-aaaad-aaatq-cai`): the connect link
@@ -157,15 +158,89 @@ fn persist_clients(clients: &HashMap<String, ClientReg>) {
     }
 }
 
+/// Registrable domains whose hosts (and subdomains) may register a **hosted**
+/// (non-loopback) OAuth `redirect_uri`. Dynamic client registration is open, so
+/// without this an attacker could register a client with a hosted redirect it
+/// controls and phish an authorization code to it (the same-browser variant that
+/// Consent-Bound Completion does not close). Loopback redirects are exempt (a
+/// loopback code resolves on the consenter's own machine), so native/CLI clients
+/// need no entry. Seeded with the MCP connector vendors seen in practice; widen
+/// at deploy time with `OAUTH_ALLOWED_REDIRECT_DOMAINS` (comma/space-separated,
+/// additive) without a rebuild.
+const DEFAULT_ALLOWED_REDIRECT_DOMAINS: &[&str] = &[
+    "antigravity.google", // Google Antigravity
+    "chatgpt.com",        // OpenAI ChatGPT connectors
+    "claude.ai",          // Anthropic Claude
+    "grok.com",           // xAI Grok
+    "perplexity.ai",      // Perplexity (any subdomain)
+    "perplexity.com",     // Perplexity (any subdomain)
+];
+
+/// The effective hosted-redirect allow-list: the compiled-in defaults plus any
+/// entries in `OAUTH_ALLOWED_REDIRECT_DOMAINS`. Each env entry may be a bare
+/// domain or an `https://…` origin (scheme/port/path are stripped to the host).
+/// Additive: the shipped binary is safe by default and ops can only widen the
+/// set, never accidentally drop a known vendor.
+fn allowed_redirect_domains() -> Vec<String> {
+    let mut domains: Vec<String> =
+        DEFAULT_ALLOWED_REDIRECT_DOMAINS.iter().map(|d| d.to_string()).collect();
+    if let Ok(extra) = std::env::var("OAUTH_ALLOWED_REDIRECT_DOMAINS") {
+        for raw in extra.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
+            let host = raw
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or(raw)
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            if !host.is_empty() {
+                domains.push(host);
+            }
+        }
+    }
+    domains
+}
+
+/// Whether a `redirect_uri` may be registered or receive an authorization code.
+/// Loopback (`http://localhost` / `127.0.0.1` / `[::1]`, any port) is always
+/// allowed. A hosted redirect must be `https` and its host must equal, or be a
+/// subdomain of, an allow-listed registrable domain. The host is read from the
+/// PARSED URL, not the raw string, so authority tricks such as
+/// `https://claude.ai@evil.com` or `https://claude.ai.evil.com` resolve to their
+/// real host and are refused.
+fn redirect_uri_permitted(redirect_uri: &str) -> bool {
+    if is_loopback_redirect(redirect_uri) {
+        return true;
+    }
+    let Ok(url) = url::Url::parse(redirect_uri) else {
+        return false;
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    allowed_redirect_domains()
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
 /// Acceptance rule for a redirect (OAuth 2.1): the client must be REGISTERED,
-/// and the requested redirect must either exactly match a registered URI, or be
-/// a loopback URI matching a registered loopback URI on everything but the
-/// port. RFC 8252 §7.3 requires the any-port latitude — native clients bind an
-/// ephemeral loopback port at runtime, so the exact port can't be registered —
-/// but registration itself is still required, so every client that can receive
-/// a code is on record (DCR is open, so this is an audit trail, not vetting).
+/// the redirect must pass the hosted-redirect allow-list
+/// ([`redirect_uri_permitted`]), and it must either exactly match a registered
+/// URI or be a loopback URI matching a registered loopback URI on everything but
+/// the port. RFC 8252 §7.3 requires the any-port latitude, since native clients
+/// bind an ephemeral loopback port at runtime, so the exact port can't be
+/// registered. The allow-list is re-checked here (not only at registration) so a
+/// pre-existing registration whose domain is no longer allowed can't be used.
 fn redirect_allowed(reg: Option<&ClientReg>, redirect_uri: &str) -> bool {
     let Some(reg) = reg else { return false };
+    if !redirect_uri_permitted(redirect_uri) {
+        return false;
+    }
     reg.redirect_uris
         .iter()
         .any(|u| u == redirect_uri || loopback_match(u, redirect_uri))
@@ -1127,6 +1202,20 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
         );
     };
 
+    // Hosted-redirect allow-list (auth-code phishing, same-browser variant):
+    // open DCR must not let a caller register a hosted redirect it controls.
+    // Loopback is exempt. Reject BEFORE anything is stored.
+    if let Some(bad) = req.redirect_uris.iter().find(|u| !redirect_uri_permitted(u.as_str())) {
+        return oauth_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_redirect_uri",
+            &format!(
+                "redirect_uri {bad} is not permitted: a hosted redirect must be https on an \
+                 allow-listed domain (loopback redirects are always allowed)"
+            ),
+        );
+    }
+
     let client_id = format!("client-{}", Uuid::new_v4());
     let snapshot = {
         let mut clients = store.clients.write().await;
@@ -1274,7 +1363,10 @@ pub type _JsonValue = Value;
 
 #[cfg(test)]
 mod tests {
-    use super::{build_redirect, is_loopback_redirect, pkce_s256, redirect_allowed, ClientReg};
+    use super::{
+        build_redirect, is_loopback_redirect, pkce_s256, redirect_allowed, redirect_uri_permitted,
+        ClientReg,
+    };
 
     /// RFC 7636 Appendix B test vector.
     #[test]
@@ -1296,6 +1388,37 @@ mod tests {
         assert!(!redirect_allowed(None, "https://claude.ai/api/mcp/auth_callback"));
         assert!(!redirect_allowed(None, "http://127.0.0.1:51000/callback"));
         assert!(!redirect_allowed(None, "http://[::1]:8080/cb"));
+    }
+
+    /// Hosted-redirect allow-list (auth-code phishing, same-browser variant):
+    /// allow-listed vendor domains and their subdomains pass; loopback always
+    /// passes; everything else, including authority-trick look-alikes, is refused.
+    #[test]
+    fn hosted_redirect_allow_list() {
+        // Allow-listed vendor registrable domains and their subdomains.
+        assert!(redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback"));
+        assert!(redirect_uri_permitted("https://chatgpt.com/connector/oauth/abc"));
+        assert!(redirect_uri_permitted("https://grok.com/mcp/callback"));
+        assert!(redirect_uri_permitted("https://www.perplexity.ai/rest/connections/oauth_callback"));
+        assert!(redirect_uri_permitted("https://staging.perplexity.com/x"));
+        assert!(redirect_uri_permitted("https://antigravity.google/oauth-callback"));
+        // Loopback is always allowed (any port), no allow-list entry needed.
+        assert!(redirect_uri_permitted("http://127.0.0.1:6112/cb"));
+        assert!(redirect_uri_permitted("http://localhost/callback"));
+        assert!(redirect_uri_permitted("http://[::1]:8080/cb"));
+        // Attacker-controlled hosted redirects: refused (the finding's payloads).
+        assert!(!redirect_uri_permitted("https://example.com/cb"));
+        assert!(!redirect_uri_permitted("https://attacker.example/cb"));
+        // Look-alikes and authority tricks resolve to the real (non-allowed) host.
+        assert!(!redirect_uri_permitted("https://claude.ai.evil.com/cb")); // subdomain of evil.com
+        assert!(!redirect_uri_permitted("https://evilclaude.ai/cb")); // no dot boundary
+        assert!(!redirect_uri_permitted("https://claude.ai@evil.com/cb")); // userinfo -> evil.com
+        // A hosted redirect must be https even to an allowed domain.
+        assert!(!redirect_uri_permitted("http://claude.ai/cb"));
+        // Defense in depth: a client registered before the allow-list (or via a
+        // now-removed domain) still can't receive a code at /oauth/authorize.
+        let junk = ClientReg { redirect_uris: vec!["https://example.com/cb".to_string()] };
+        assert!(!redirect_allowed(Some(&junk), "https://example.com/cb"));
     }
 
     /// A registered loopback redirect matches at ANY port (RFC 8252 §7.3 — the
@@ -1568,14 +1691,14 @@ mod tests {
         // Register a client so `validate_client` passes and we reach the redirect.
         store.clients.write().await.insert(
             "client-x".into(),
-            super::ClientReg { redirect_uris: vec!["https://app.example/cb".into()] },
+            super::ClientReg { redirect_uris: vec!["https://claude.ai/api/mcp/auth_callback".into()] },
         );
         let resp = super::authorize(
             State(store.clone()),
             Query(super::AuthorizeQuery {
                 response_type: Some("code".into()),
                 client_id: "client-x".into(),
-                redirect_uri: "https://app.example/cb".into(),
+                redirect_uri: "https://claude.ai/api/mcp/auth_callback".into(),
                 state: Some("xyz".into()),
                 code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
                 code_challenge_method: Some("S256".into()),
