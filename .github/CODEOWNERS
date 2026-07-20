@@ -2,8 +2,7 @@
 # See https://docs.github.com/articles/about-code-owners
 #
 # DFINITY publishing policy: a repository must be owned by a TEAM, not an
-# individual. Replace the placeholder below with the owning DFINITY GitHub team
-# once the repo is moved under the `dfinity` organization, and restrict admin +
-# write access to that team (four-eyes principle on all merges).
+# individual. Restrict admin + write access to the owning team and enforce the
+# four-eyes principle on all merges.
 
 * @dfinity/identity
