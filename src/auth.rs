@@ -186,15 +186,17 @@ fn allowed_redirect_domains() -> Vec<String> {
         DEFAULT_ALLOWED_REDIRECT_DOMAINS.iter().map(|d| d.to_string()).collect();
     if let Ok(extra) = std::env::var("OAUTH_ALLOWED_REDIRECT_DOMAINS") {
         for raw in extra.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
-            let host = raw
-                .trim_start_matches("https://")
-                .trim_start_matches("http://")
-                .split('/')
-                .next()
-                .unwrap_or(raw)
-                .trim_end_matches('.')
-                .to_ascii_lowercase();
-            if !host.is_empty() {
+            // Parse as a URL to robustly reduce an entry to its bare host, stripping
+            // scheme, userinfo, port, and path alike. Bare domains have no scheme, so
+            // give them one first (`vendor.example` / `vendor.example:8443` -> host
+            // `vendor.example`), matching what `Url::host_str()` yields at match time.
+            let candidate =
+                if raw.contains("://") { raw.to_string() } else { format!("https://{raw}") };
+            let host = url::Url::parse(&candidate)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase()))
+                .filter(|h| !h.is_empty());
+            if let Some(host) = host {
                 domains.push(host);
             }
         }

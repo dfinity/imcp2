@@ -357,7 +357,7 @@ Endpoints:
   are stored and persisted to `OAUTH_CLIENTS_FILE`; requested `grant_types` are
   honoured (intersected with `authorization_code`). A **hosted** `redirect_uri` is
   rejected unless its host is on the allow-list (see the Companion-control note
-  below); loopback redirects are always accepted
+  below); loopback redirects are always accepted.
 
 - `GET  /oauth/authorize` — validates the client + redirect, requires PKCE, sets
   the binding cookie, then redirects to II's handshake (with `registration_key`)
@@ -708,8 +708,8 @@ delegation. Omitting `account` uses the default account.
       handshake binds the connection's session key (a fragment-delivered, canister-signed
       delegation redeemed via `mcp_register_v2`), with **Consent-Bound Completion** binding
       `/oauth/connect/redeem` to both the initiator (`sid` cookie) and the consenter (the
-      fragment delegation); expiring tokens. (The RFC 8628 device grant was dropped.
-      The same-browser variant is closed by the hosted-redirect allow-list, see Auth.)
+      fragment delegation); expiring tokens. The same-browser phishing variant is closed
+      by a hosted-redirect allow-list (see Auth). (The RFC 8628 device grant was dropped.)
 - [x] On-demand **domain identities**: the registered session key mints per-app
       account delegations directly via II canister methods
       (`call_canister`/`get_app_principal` `derivation_origin`); no per-app browser flow.
