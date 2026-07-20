@@ -79,6 +79,14 @@ cat > /etc/systemd/system/caddy.service <<'UNIT'
 $caddy_unit
 UNIT
 
+# One-time migration off the pre-rename unit: imcp2.service replaces
+# mcp-poc.service. Stop, disable, and remove the old unit (if present) so the
+# two don't contend for :8000 on hosts first deployed before the rename.
+if systemctl cat mcp-poc.service >/dev/null 2>&1; then
+  systemctl disable --now mcp-poc.service || true
+  rm -f /etc/systemd/system/mcp-poc.service
+fi
+
 systemctl daemon-reload
 systemctl enable imcp2 caddy
 systemctl restart imcp2
