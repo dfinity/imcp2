@@ -1,4 +1,4 @@
-# mcp-poc
+# IMCP2
 
 Minimal MCP server that bridges an LLM to the Internet Computer.
 
@@ -466,7 +466,7 @@ curl -s https://<host>/version | jq '.active_sessions'
 # => { "beta": 0, "prod": 1 }
 ```
 
-Session grants are also traceable in the logs (unit `mcp-poc`): a session logs
+Session grants are also traceable in the logs (unit `imcp2`): a session logs
 `session opened` (with `instance` and `session_id`) when its grant goes live,
 and `session closed` when the grant expires and the per-instance reaper (60s
 cadence) evicts it. These bracket what `live_sessions` counts, modulo the

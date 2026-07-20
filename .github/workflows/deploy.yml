@@ -1,4 +1,4 @@
-# Auto-redeploy mcp-poc on every push to main.
+# Auto-redeploy imcp2 on every push to main.
 #
 # Reuses the existing native (Docker-free) deploy under deploy/native: cross-builds
 # the linux/arm64 binary, then ships it + static/ over SSH and (re)starts the systemd

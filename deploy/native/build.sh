@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Cross-build the mcp-poc binary for linux/arm64 (AWS Graviton) without needing a
+# Cross-build the imcp2 binary for linux/arm64 (AWS Graviton) without needing a
 # local Rust cross-toolchain. Compiles inside a throwaway linux/arm64 container and
-# exports just the binary to ./build-out/mcp-poc.
+# exports just the binary to ./build-out/imcp2.
 #
 # We build against bullseye (glibc 2.31) on purpose: a binary linked against an
 # older glibc runs on newer ones, so it works on Amazon Linux 2023 (glibc 2.34).
 # Building against bookworm (2.36) would NOT run on AL2023.
 #
 # Usage:  deploy/native/build.sh
-# Output: build-out/mcp-poc  (linux/arm64 ELF)
+# Output: build-out/imcp2  (linux/arm64 ELF)
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -20,7 +20,7 @@ cd "$repo_root"
 GIT_SHA="${GIT_SHA:-$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo unknown)}"
 BUILD_TIME="${BUILD_TIME:-$(date +%s)}"
 
-echo ">> building linux/arm64 binary (bullseye/glibc 2.31) -> build-out/mcp-poc (commit ${GIT_SHA})"
+echo ">> building linux/arm64 binary (bullseye/glibc 2.31) -> build-out/imcp2 (commit ${GIT_SHA})"
 docker buildx build --platform linux/arm64 --target bin \
   --build-arg GIT_SHA="$GIT_SHA" \
   --build-arg BUILD_TIME="$BUILD_TIME" \
@@ -41,8 +41,8 @@ COPY src ./src
 COPY static ./static
 RUN cargo build --release
 FROM scratch AS bin
-COPY --from=build /app/target/release/mcp-poc /mcp-poc
+COPY --from=build /app/target/release/imcp2 /imcp2
 DOCKERFILE
 
-file build-out/mcp-poc
+file build-out/imcp2
 echo ">> done"

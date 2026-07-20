@@ -1,5 +1,5 @@
 [Unit]
-Description=imcp2 MCP server (mcp-poc)
+Description=IMCP2 MCP server
 After=network-online.target
 Wants=network-online.target
 
@@ -15,7 +15,7 @@ Environment=RUST_LOG=info
 # created service-owned and survives restarts; /opt/imcp2 is replaced each deploy.
 StateDirectory=imcp2
 Environment=OAUTH_CLIENTS_FILE=%S/imcp2/oauth-clients.json
-ExecStart=/opt/imcp2/mcp-poc
+ExecStart=/opt/imcp2/imcp2
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
