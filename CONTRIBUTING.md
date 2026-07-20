@@ -22,8 +22,9 @@ will be required to sign the [DFINITY CLA](https://github.com/dfinity/cla/).
 - **Report a security vulnerability** privately — do **not** open a public
   issue. See [SECURITY.md](SECURITY.md).
 
-The build/test workflow below is for maintainers (the owning DFINITY team) and,
-should the repository be opened to them, approved external contributors.
+The build and test instructions below are aimed at maintainers (the owning
+DFINITY team). If the repository is later opened to external contributions, they
+apply to approved contributors as well.
 
 ## Development setup
 
