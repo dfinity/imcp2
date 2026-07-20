@@ -62,7 +62,8 @@ instructions.
 
 ## Pull request workflow
 
-1. Fork the repository and create a topic branch from `main`.
+1. Create a topic branch from `main` (maintainers work in-repo; external code
+   contributions are not currently accepted — see Contribution mode above).
 2. Make your change. Keep commits focused and write clear commit messages.
 3. Before opening a PR, make sure the checks that CI runs pass locally:
    - `cargo build --locked --all-targets`

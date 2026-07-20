@@ -1,5 +1,9 @@
+# Issue template chooser configuration.
+# https://docs.github.com/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository
+#
+# No security-advisory contact link is set here on purpose: a contact_link URL
+# must be absolute, which would hardcode the current owner/repo and break after
+# an org move or rename. GitHub surfaces SECURITY.md automatically on the
+# new-issue page, and the Security tab exposes "Report a vulnerability" once
+# private vulnerability reporting is enabled.
 blank_issues_enabled: true
-contact_links:
-  - name: Security vulnerability
-    url: https://github.com/aterga/imcp2/security/advisories/new
-    about: Please report security vulnerabilities privately, not as a public issue. See SECURITY.md.
