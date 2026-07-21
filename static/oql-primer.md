@@ -3,11 +3,10 @@
 Some Internet Computer canisters expose **OQL** — a standard, self-describing,
 agent-queryable surface over their data, carried by just two Candid **query**
 methods that speak JSON-in-text. When `get_canister_candid` reports `oql: true` for a
-canister, get its schema from **`get_canister_candid`** (called with the app's
-`derivation_origin`) and run queries with **`canister_query`** (its `oql` argument)
-rather than guessing bespoke per-question methods. These wrap the two methods
-below, so you pass plain JSON (no Candid escaping); this guide explains the dialect
-they speak.
+canister, use the **`get_canister_oql_schema`** and **`canister_query`** (its `oql`
+argument) tools to explore and query it rather than guessing bespoke per-question
+methods. These wrap the two methods below, so you pass plain JSON (no Candid
+escaping); this guide explains the dialect they speak.
 
 ## The two methods
 
@@ -23,8 +22,7 @@ they speak.
 
 > **Authentication.** Both `schema` and `execute` are gated by the CALLER's
 > principal: an app shows a principal only the entities and rows it may see. So
-> the schema read (`get_canister_candid` with an origin) and `canister_query`'s
-> `oql` path both **require** the app's
+> `get_canister_oql_schema` and `canister_query`'s `oql` path both **require** the app's
 > canonical `derivation_origin` (from `open_app` / `resolve_app`) — an anonymous
 > per-app read is disabled for now and is **rejected** with guidance to pass the
 > origin, rather than silently returning an empty schema or zero rows. Passing the

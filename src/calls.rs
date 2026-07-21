@@ -1,5 +1,5 @@
 //! The direct canister-call layer: `get_canister_candid` (read a canister's Candid
-//! interface, and — for an OQL canister read with an origin — its OQL schema),
+//! interface), `get_canister_oql_schema` (its OQL entity/field catalogue),
 //! `canister_query` (a read: a Candid query method OR an OQL query), and
 //! `canister_update_call` (invoke an update method). The LLM only ever deals with
 //! textual Candid — the binary encoding/decoding against a method's declared types
@@ -31,18 +31,6 @@ use serde::{Deserialize, Serialize};
 pub struct GetCandidArgs {
     /// Canister principal, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai" (the ICP ledger).
     pub canister_id: String,
-    /// Optional: when the canister exposes an OQL query surface, pass the app's
-    /// canonical Internet Identity derivation origin to ALSO read its OQL schema
-    /// (entities/fields/edges) as your account — the schema is caller-gated, so it
-    /// can only be read with an origin. Get it from open_app / resolve_app. Accepts
-    /// the legacy name `domain`. Omit to just read the public interface (no schema).
-    #[serde(default, alias = "domain")]
-    pub derivation_origin: Option<String>,
-    /// Which of your accounts to act as when reading the OQL schema, by account name
-    /// (see list_app_accounts). Omit for that app's default account; ignored when no
-    /// `derivation_origin` is given.
-    #[serde(default)]
-    pub account: Option<String>,
 }
 
 /// Output of `get_canister_candid`.
@@ -54,9 +42,9 @@ pub struct GetCandidOutput {
     pub candid: String,
     /// True when the interface exposes the standard OQL query surface (both a
     /// `schema` and an `execute` method). When set, load `icp_oql_guide` (or the
-    /// `oql://usage` resource) to learn the JSON query dialect, then run the query
-    /// with `canister_query` (its `oql` argument). Pass `derivation_origin` HERE to
-    /// also get the `oql_schema` (the entity/field names to query).
+    /// `oql://usage` resource) to learn the JSON query dialect, then call
+    /// `get_canister_oql_schema` for the entity/field names and `canister_query`
+    /// (its `oql` argument) to run the query.
     pub oql: bool,
     /// True when the canister declares an API-documentation method
     /// (`getApiDoc`/`get_api_doc`) — computed with the SAME predicate
@@ -64,33 +52,53 @@ pub struct GetCandidOutput {
     /// return anything. Only call get_canister_api_doc when this is true; when it's
     /// false the canister has no prose doc and the Candid types here are the interface.
     pub api_doc_available: bool,
-    /// The canister's OQL schema catalogue, present ONLY when `oql` is true AND a
-    /// `derivation_origin` was supplied to read it as your account (the schema is
-    /// caller-gated). Null otherwise — including when `oql` is true but no origin was
-    /// given (re-call with `derivation_origin` to get it), or when the read failed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub oql_schema: Option<OqlSchemaInfo>,
 }
 
-/// The OQL schema catalogue, folded into `get_canister_candid`'s output when the
-/// canister exposes OQL and a `derivation_origin` was supplied to read it as the
-/// user. (Replaces the former standalone `get_canister_oql_schema` tool.)
+/// Arguments for `get_canister_oql_schema`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OqlSchemaArgs {
+    /// Canister principal that exposes the OQL surface (get_canister_candid reports
+    /// `oql: true`).
+    pub canister_id: String,
+    /// Read AS the user's account at an app, given its canonical Internet
+    /// Identity derivation origin (not necessarily the visible URL). Accepts the
+    /// legacy name `domain`. Omit to read anonymously.
+    #[serde(default, alias = "domain")]
+    pub derivation_origin: Option<String>,
+    /// Which of your accounts to act as (see list_app_accounts). Ignored when reading
+    /// anonymously.
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// Output of `get_canister_oql_schema`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct OqlSchemaInfo {
+pub struct OqlSchemaOutput {
+    /// The canister whose schema was read.
+    pub canister_id: String,
     /// The entity/field/edge catalogue returned by `schema` (JSON text,
     /// pretty-printed when it parses).
     pub schema: String,
-    /// The principal the schema read was signed as.
+    /// The principal the read was signed as — null for an anonymous read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acted_as_principal: Option<String>,
-    /// The effective Internet Identity derivation origin used (after canonicalization).
-    pub derived_for_origin: String,
-    /// Exactly what you supplied as `derivation_origin`, echoed so a mismatch with
-    /// `derived_for_origin` (from canonicalization) is visible.
-    pub requested: String,
-    /// A note when the schema came back with NO entities: this principal can see no
-    /// entities here (confirm the derivation_origin/account). Null when entities were
-    /// returned.
+    /// When reading as an app account: the effective Internet Identity derivation
+    /// origin used (after canonicalization). Null for anonymous reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_for_origin: Option<String>,
+    /// When reading as an app account: exactly what you supplied as
+    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` (from
+    /// canonicalization) is visible. Null for anonymous reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<String>,
+    /// True when the schema was read as the ANONYMOUS principal (no
+    /// `derivation_origin`). Always present: the schema is itself caller-gated, so
+    /// an anonymous read commonly returns NO entities — which means "not
+    /// authenticated as your account", not "the app has no data model".
+    pub is_anonymous: bool,
+    /// A note when the schema came back with NO entities: the anonymous-read auth
+    /// remediation (#1) when anonymous, else a note that this principal can see no
+    /// entities here. Null when entities were returned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// One ready-to-run `canister_query` invocation per entity — a COMPLETE call
@@ -237,7 +245,7 @@ pub struct CanisterQueryArgs {
     /// `execute` method, so NO Candid escaping is needed (write plain JSON). E.g.
     /// `{"start":"employee","where":{"icontains":{"field":"lastName","value":"smith"}},"select":["firstName","lastName"],"limit":10}`.
     /// Provide EITHER `oql` OR `method` — not both. See icp_oql_guide for the dialect
-    /// and get_canister_candid (with `derivation_origin`) for the entity/field names.
+    /// and get_canister_oql_schema for the entity/field names.
     /// The OQL path REQUIRES `derivation_origin` (anonymous per-app reads are disabled).
     #[serde(default)]
     pub oql: Option<String>,
@@ -562,11 +570,10 @@ pub fn oql_query_redirect(did: Option<&str>) -> Option<String> {
         Some(
             "this canister exposes an OQL query surface, so its data is READ with an OQL query, \
              NOT a raw Candid `method` query call. Do this instead, in order: (1) `icp_oql_guide` \
-             for the JSON dialect (once), (2) `get_canister_candid` WITH the app's \
-             `derivation_origin` for the entity and field names (its `oql_schema`), (3) call \
-             `canister_query` again with the `oql` argument (a JSON query object) instead of \
-             `method`. This canister gates data by the caller's principal, so pass the app's \
-             `derivation_origin` (from open_app / resolve_app) — an anonymous read is rejected. \
+             for the JSON dialect (once), (2) `get_canister_oql_schema` for the entity and field \
+             names, (3) call `canister_query` again with the `oql` argument (a JSON query object) \
+             instead of `method`. This canister gates data by the caller's principal, so pass the \
+             app's `derivation_origin` (from open_app / resolve_app) — an anonymous read is rejected. \
              UPDATE calls (state changes) go through `canister_update_call`."
                 .to_string(),
         )
@@ -584,9 +591,9 @@ pub fn oql_query_redirect(did: Option<&str>) -> Option<String> {
 // authenticated data exists.
 // ===========================================================================
 
-/// The most examples/entities we enumerate in `get_canister_candid`'s `oql_schema`
-/// (#8) and in the `valid_entities` list (#7) — a schema with a huge entity count
-/// would otherwise bloat the reply.
+/// The most examples/entities we enumerate in `get_canister_oql_schema` (#8) and
+/// in the `valid_entities` list (#7) — a schema with a huge entity count would
+/// otherwise bloat the reply.
 pub(crate) const MAX_OQL_ENTITIES: usize = 40;
 
 /// The #1 remediation note for a per-app read that came back EMPTY while
@@ -775,8 +782,8 @@ pub fn candid_reply_is_empty(reply: &str) -> bool {
 }
 
 // ===========================================================================
-// OQL execute/schema support (for `canister_query`'s `oql` path and the `oql_schema`
-// that get_canister_candid folds in). The server does not model the OQL query
+// OQL execute/schema support (for `canister_query`'s `oql` path and the
+// `get_canister_oql_schema` tool). The server does not model the OQL query
 // language — it wraps the JSON query as the single `text` argument `execute`
 // expects (so the model never hand-escapes JSON inside a Candid text literal) and
 // decodes the tabular reply.
@@ -1189,7 +1196,7 @@ mod tests {
         // names the full guide→schema→query path (#5) plus the auth hint.
         let msg = oql_query_redirect(Some(oql)).expect("query on OQL canister must be redirected");
         assert!(msg.contains("icp_oql_guide"), "message must point to the OQL guide: {msg}");
-        assert!(msg.contains("get_canister_candid"), "message must point to get_canister_candid for the schema: {msg}");
+        assert!(msg.contains("get_canister_oql_schema"), "message must point to the OQL schema tool: {msg}");
         assert!(msg.contains("canister_query"), "message must point to canister_query's oql path: {msg}");
         assert!(msg.contains("`oql`"), "message must name the oql argument: {msg}");
         assert!(msg.contains("derivation_origin"), "message must carry the auth hint (pass the origin): {msg}");
