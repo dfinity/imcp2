@@ -541,7 +541,6 @@ pub struct AuthorizeQuery {
     state: Option<String>,
     #[serde(default)]
     code_challenge: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     code_challenge_method: Option<String>,
     #[allow(dead_code)]
@@ -632,11 +631,16 @@ pub async fn authorize(
             "Your MCP client's request was missing a required security check (PKCE). The client may \
              be out of date. Try updating it. If that doesn't help, remove the connector and add it again.");
     };
-    if let Some(m) = &q.code_challenge_method {
-        if m != "S256" {
-            return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
-                "only code_challenge_method=S256 is supported", SIGNIN_HEADLINE, MALFORMED_DIAGNOSTIC);
-        }
+    // `token` only ever verifies S256, so require the method to say so
+    // EXPLICITLY. Per RFC 7636 an *omitted* method defaults to `plain` —
+    // accepting the omission and then verifying as S256 would hand a
+    // spec-strict `plain` client a code it can never exchange.
+    if q.code_challenge_method.as_deref() != Some("S256") {
+        return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
+            "code_challenge_method=S256 is required", SIGNIN_HEADLINE,
+            "Your MCP client's request used an unsupported PKCE method (only S256 is supported). \
+             The client may be out of date. Try updating it. If that doesn't help, remove the \
+             connector and add it again.");
     }
 
     let session_id = format!("sess-{}", Uuid::new_v4());
@@ -2011,6 +2015,10 @@ mod tests {
     fn test_store() -> super::AuthStore {
         use crate::identities::{Identities, IiInstance};
         use candid::Principal;
+        let agent = crate::Agent::builder()
+            .with_url("https://ii.test")
+            .build()
+            .expect("test agent");
         let ids = Identities::new(
             IiInstance {
                 name: "test",
@@ -2018,6 +2026,7 @@ mod tests {
                 ii_canister: Principal::anonymous(),
             },
             "https://mcp.test".into(),
+            agent,
         );
         super::AuthStore::new(
             ids,
@@ -2093,6 +2102,10 @@ mod tests {
         use crate::identities::{Identities, IiInstance};
         use candid::Principal;
         let make = |mcp_path: &'static str| {
+            let agent = crate::Agent::builder()
+                .with_url("https://ii.test")
+                .build()
+                .expect("test agent");
             super::AuthStore::new(
                 Identities::new(
                     IiInstance {
@@ -2101,6 +2114,7 @@ mod tests {
                         ii_canister: Principal::anonymous(),
                     },
                     "https://mcp.test".into(),
+                    agent,
                 ),
                 super::SharedClients(std::sync::Arc::default()),
                 "https://mcp.test".into(),

@@ -54,9 +54,6 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-/// Public IC API boundary node the II canister calls are made against.
-const IC_URL: &str = "https://icp-api.io";
-
 /// Re-derive once the cached delegation is within this margin of expiry, so a
 /// call never goes out with an about-to-expire delegation.
 const REDERIVE_MARGIN_NS: u64 = 30 * 1_000_000_000;
@@ -436,16 +433,31 @@ pub struct Identities {
     /// bare origin either way). Injected by the embedding application, never
     /// read from the environment here.
     public_url: String,
+    /// The injected base agent (see `McpConfig::agent`). Every identity-bearing
+    /// agent is a clone of it with the identity swapped, so delegated and II
+    /// calls inherit the host's boundary-node routing and transport.
+    agent: Agent,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
 }
 
 impl Identities {
-    pub fn new(instance: IiInstance, public_url: String) -> Self {
+    pub fn new(instance: IiInstance, public_url: String, agent: Agent) -> Self {
         Self {
             instance,
             public_url,
+            agent,
             sessions: Arc::default(),
         }
+    }
+
+    /// The injected base agent with `identity` swapped in: a clone shares the
+    /// transport, route provider, and root key, so calls signed as `identity`
+    /// go through the embedding application's boundary-node routing — never a
+    /// second, hard-coded endpoint.
+    pub(crate) fn agent_as<I: ic_agent::Identity + 'static>(&self, identity: I) -> Agent {
+        let mut agent = self.agent.clone();
+        agent.set_identity(identity);
+        agent
     }
 
     /// The II instance this store connects against.
@@ -723,11 +735,7 @@ impl Identities {
     /// key. This is the caller II recovers the anchor from for the `mcp_*` calls.
     async fn session_agent(&self, session_id: &str) -> Result<Agent, String> {
         let signer = self.session_signer(session_id).await?;
-        Agent::builder()
-            .with_url(IC_URL)
-            .with_identity(signer)
-            .build()
-            .map_err(|e| format!("could not build II agent: {e}"))
+        Ok(self.agent_as(signer))
     }
 
     /// A stable per-user identity for the canister-management tools — the user's
@@ -835,11 +843,7 @@ impl Identities {
         // `reg_user_key` is `der(P_reg)`: the chain root II recovers `caller() ==
         // P_reg` from.
         let identity = registration_identity(reg_user_key, reg_seed, &reg_der, chain)?;
-        let agent = Agent::builder()
-            .with_url(IC_URL)
-            .with_identity(identity)
-            .build()
-            .map_err(|e| format!("could not build registration agent: {e}"))?;
+        let agent = self.agent_as(identity);
 
         // mcp_register_v2(session_key) -> variant { Ok : McpRegisterV2Ok; Err : text }
         // The ONLY argument is `session_key` (= `pub(S)`). Consent (permissions,
@@ -1343,6 +1347,10 @@ mod tests {
 
     // An Identities store over a dummy II instance (tests never hit the network).
     fn test_ids() -> Identities {
+        let agent = Agent::builder()
+            .with_url("https://ii.test")
+            .build()
+            .expect("test agent");
         Identities::new(
             IiInstance {
                 name: "test",
@@ -1350,6 +1358,7 @@ mod tests {
                 ii_canister: Principal::anonymous(),
             },
             "https://mcp.test".into(),
+            agent,
         )
     }
 

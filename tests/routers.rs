@@ -228,6 +228,22 @@ async fn authorize_validates_its_inputs() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // An omitted code_challenge_method defaults to `plain` per RFC 7636, which
+    // this server does not support — rejected up front rather than handing out
+    // a code the token endpoint (S256-only) could never redeem.
+    let resp = app()
+        .oneshot(
+            Request::get(
+                "/mcp/oauth/authorize?response_type=code&client_id=unknown\
+                 &redirect_uri=http://127.0.0.1:4321/cb&code_challenge=abc",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

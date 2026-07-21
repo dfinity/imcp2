@@ -142,7 +142,8 @@ impl McpServer {
     pub fn new(config: McpConfig) -> Self {
         let public_url = config.public_url.trim_end_matches('/').to_string();
         let mcp_path = normalize_mount_path(&config.mcp_path);
-        let identities = identities::Identities::new(config.instance, public_url.clone());
+        let identities =
+            identities::Identities::new(config.instance, public_url.clone(), config.agent.clone());
         let store = auth::AuthStore::new(
             identities.clone(),
             config.clients,
@@ -371,24 +372,41 @@ impl McpServer {
     /// every request via the public URL is rejected before the bearer token is
     /// even checked.
     fn allowed_hosts(&self) -> Vec<String> {
-        let mut hosts = vec![
-            "localhost".to_string(),
-            "127.0.0.1".to_string(),
-            "::1".to_string(),
-        ];
-        if let Some(host) = self
-            .public_url
-            .split("://")
-            .nth(1)
-            .and_then(|rest| rest.split('/').next())
-        {
-            let host = host.trim();
-            if !host.is_empty() {
+        allowed_hosts_for(&self.public_url)
+    }
+}
+
+/// The `Host`-header allow-list derived from `public_url`: loopback (local
+/// dev) plus the public host, in both its bare and `host:port` forms — clients
+/// send whichever their URL implies. Parsed as a URL (assuming an `https`
+/// scheme when none is given) rather than string-split, so a bare host, an
+/// explicit port, or an IPv6 literal all land correctly — a mis-parse here
+/// would reject every public request before the bearer token is even checked.
+fn allowed_hosts_for(public_url: &str) -> Vec<String> {
+    let mut hosts = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    let public_url = public_url.trim();
+    let candidate = if public_url.contains("://") {
+        public_url.to_string()
+    } else {
+        format!("https://{public_url}")
+    };
+    if let Ok(url) = url::Url::parse(&candidate) {
+        // `host_str` keeps IPv6 brackets ("[::1]"), matching the Host header's
+        // own serialization.
+        if let Some(host) = url.host_str() {
+            if !hosts.iter().any(|h| h == host) {
                 hosts.push(host.to_string());
             }
+            if let Some(port) = url.port() {
+                hosts.push(format!("{host}:{port}"));
+            }
         }
-        hosts
     }
+    hosts
 }
 
 /// The origin-global II **auth-callback allow-list** (II #4091): before
@@ -432,7 +450,7 @@ fn normalize_mount_path(path: &str) -> String {
 
 #[cfg(test)]
 mod lib_tests {
-    use super::normalize_mount_path;
+    use super::{allowed_hosts_for, normalize_mount_path};
 
     #[test]
     fn mount_paths_are_normalized() {
@@ -442,5 +460,36 @@ mod lib_tests {
         assert_eq!(normalize_mount_path("/api/v1/mcp"), "/api/v1/mcp");
         assert_eq!(normalize_mount_path("/"), "");
         assert_eq!(normalize_mount_path(""), "");
+    }
+
+    /// The DNS-rebinding allow-list must survive every plausible `public_url`
+    /// shape: with/without a scheme, with an explicit port (the Host header
+    /// then carries `host:port`), and IPv6 literals (bracketed, as in the Host
+    /// header). A mis-parse would reject all public traffic pre-auth.
+    #[test]
+    fn allowed_hosts_cover_public_url_shapes() {
+        let has = |hosts: &[String], h: &str| hosts.iter().any(|x| x == h);
+
+        let hosts = allowed_hosts_for("https://mcp.example.com");
+        assert!(has(&hosts, "mcp.example.com"), "{hosts:?}");
+        assert!(has(&hosts, "localhost") && has(&hosts, "127.0.0.1") && has(&hosts, "::1"));
+
+        // Explicit port: both forms are allowed (the Host header carries the
+        // port for non-default ports).
+        let hosts = allowed_hosts_for("https://mcp.example.com:8443");
+        assert!(has(&hosts, "mcp.example.com") && has(&hosts, "mcp.example.com:8443"), "{hosts:?}");
+
+        // Scheme-less input (the old string-split produced nothing here).
+        let hosts = allowed_hosts_for("mcp.example.com");
+        assert!(has(&hosts, "mcp.example.com"), "{hosts:?}");
+
+        // IPv6 literal, bracketed like the Host header serializes it.
+        let hosts = allowed_hosts_for("http://[2001:db8::1]:8080");
+        assert!(has(&hosts, "[2001:db8::1]") && has(&hosts, "[2001:db8::1]:8080"), "{hosts:?}");
+
+        // The local-dev default: no duplicate entry for an already-loopback host.
+        let hosts = allowed_hosts_for("http://localhost:8000");
+        assert_eq!(hosts.iter().filter(|h| *h == "localhost").count(), 1);
+        assert!(has(&hosts, "localhost:8000"), "{hosts:?}");
     }
 }

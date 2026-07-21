@@ -17,7 +17,7 @@ use rmcp::{
     schemars, ErrorData as McpError, RoleServer, ServerHandler,
 };
 
-use crate::{auth, calls, discover, identities, identities::Identities, management, skills, IC_URL};
+use crate::{auth, calls, discover, identities, identities::Identities, management, skills};
 
 /// Cap on the per-canister Candid probes open_app / discover_app_canisters run to
 /// fill in OQL / api-doc capability flags (#3). Discovery output is already bounded,
@@ -358,11 +358,11 @@ impl IcTools {
                     .delegated_identity_for(&session_id, origin, account)
                     .await?;
                 let principal = delegated.sender().ok().map(|p| p.to_text());
-                let agent = Agent::builder()
-                    .with_url(IC_URL)
-                    .with_identity(delegated)
-                    .build()
-                    .map_err(|e| format!("could not build agent: {e}"))?;
+                // Clone the injected agent and swap in the delegated identity:
+                // authenticated calls ride the host's boundary-node routing,
+                // never a second hard-coded endpoint.
+                let mut agent = self.agent.clone();
+                agent.set_identity(delegated);
                 Ok((agent, principal))
             }
         }
