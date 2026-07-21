@@ -1,18 +1,18 @@
-# Native (Docker-free) deploy of mcp-poc
+# Native (Docker-free) deploy of imcp2
 
-Run `mcp-poc` directly on an **existing** Amazon Linux 2023 (arm64) host as native
+Run `imcp2` directly on an **existing** Amazon Linux 2023 (arm64) host as native
 `systemd` services — no Docker on the box. Useful when the instance already exists
 (e.g. in a managed VPC) and you just want to put the app on it. The repo's
 [`Dockerfile`](../../Dockerfile) remains the container-based alternative.
 
 ```
-   build.sh  ─────►  build-out/mcp-poc        (cross-built linux/arm64 binary)
-   deploy.sh ─────►  /opt/imcp2/{mcp-poc,static}   + systemd: mcp-poc.service
+   build.sh  ─────►  build-out/imcp2        (cross-built linux/arm64 binary)
+   deploy.sh ─────►  /opt/imcp2/{imcp2,static}   + systemd: imcp2.service
                      /opt/imcp2/monitoring         + systemd: imcp-status.service (dashboard)
                      /usr/local/bin/caddy          + systemd: caddy.service (TLS)
 ```
 
-`mcp-poc` listens on `127.0.0.1:8000`/`0.0.0.0:8000`; **Caddy** terminates HTTPS for
+`imcp2` listens on `127.0.0.1:8000`/`0.0.0.0:8000`; **Caddy** terminates HTTPS for
 your domain and reverse-proxies to it, obtaining a Let's Encrypt cert automatically.
 
 The **status dashboard** (`monitoring/mcp-status`) is also shipped and run as a
@@ -33,7 +33,7 @@ HOST=ec2-user@<host> DOMAIN=mcp.example.com ACME_EMAIL=you@example.com \
   deploy/native/deploy.sh
 ```
 
-`deploy.sh` is idempotent — re-run it to push a new build (it restarts `mcp-poc`).
+`deploy.sh` is idempotent — re-run it to push a new build (it restarts `imcp2`).
 
 ## Why cross-build against bullseye
 
@@ -81,7 +81,7 @@ being able to `ssh` in does not mean 80/443 are reachable from the internet.
 
 **Prompt (box already publicly reachable):**
 
-> Do a native (no-Docker) deploy of `mcp-poc` to my EC2 instance using `deploy/native`.
+> Do a native (no-Docker) deploy of `imcp2` to my EC2 instance using `deploy/native`.
 > - Repo: `/path/to/imcp2`
 > - Host: `ec2-user@<ip-or-fqdn>` — I have SSH key trust, sudo works
 > - Domain: `mcp.example.com`, with `A`/`AAAA` already pointing at the host
@@ -130,8 +130,8 @@ You can also scope the environment's secrets/branches there if you'd rather not 
 
 ```sh
 ssh <host>
-sudo systemctl status mcp-poc caddy imcp-status
-sudo journalctl -u mcp-poc -f      # app logs
+sudo systemctl status imcp2 caddy imcp-status
+sudo journalctl -u imcp2 -f      # app logs
 sudo journalctl -u caddy -f        # TLS / cert logs
 sudo journalctl -u imcp-status -f  # status dashboard logs
 ```
@@ -144,9 +144,9 @@ extend its SSRF allowlist, edit `Environment=`/`ExecStart=` in
 
 | File | Purpose |
 |---|---|
-| `build.sh` | Cross-build `build-out/mcp-poc` (linux/arm64, bullseye glibc) |
+| `build.sh` | Cross-build `build-out/imcp2` (linux/arm64, bullseye glibc) |
 | `deploy.sh` | Ship binary + `static/` + `monitoring/`, render & install units/Caddyfile, (re)start services |
-| `mcp-poc.service` | systemd unit for the app (`__PUBLIC_URL__` substituted at deploy) |
+| `imcp2.service` | systemd unit for the app (`__PUBLIC_URL__` substituted at deploy) |
 | `imcp-status.service` | systemd unit for the status dashboard (`__DOMAIN__`, `__ALLOWED_HOSTS__` substituted at deploy) |
 | `caddy.service` | systemd unit for Caddy |
 | `Caddyfile` | Caddy config (`__DOMAIN__`, `__ACME_EMAIL__` substituted at deploy) |

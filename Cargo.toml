@@ -1,5 +1,5 @@
 [package]
-name = "mcp-poc"
+name = "imcp2"
 version = "0.1.0"
 edition = "2021"
 description = "Minimal MCP server that bridges an LLM to the Internet Computer, speaking textual Candid."

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Deploy mcp-poc to an existing Amazon Linux 2023 (arm64) host WITHOUT Docker on the
+# Deploy imcp2 to an existing Amazon Linux 2023 (arm64) host WITHOUT Docker on the
 # box: ships the prebuilt binary + static assets, then runs the app and Caddy as
 # native systemd services. Re-runnable (idempotent) — also use it to push updates.
 #
 # Prereqs:
-#   - deploy/native/build.sh has produced build-out/mcp-poc
+#   - deploy/native/build.sh has produced build-out/imcp2
 #   - SSH access to the host as a sudo-capable user
 #   - DNS A/AAAA for $DOMAIN points at the host's public address(es)
 #   - Security group allows inbound 80 + 443 from the internet (ACME + HTTPS)
@@ -23,19 +23,19 @@ SSH="ssh -o BatchMode=yes -o ConnectTimeout=20 $HOST"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$here/../.." && pwd)"
 
-[ -x "$repo_root/build-out/mcp-poc" ] || { echo "build-out/mcp-poc missing — run deploy/native/build.sh first"; exit 1; }
+[ -x "$repo_root/build-out/imcp2" ] || { echo "build-out/imcp2 missing — run deploy/native/build.sh first"; exit 1; }
 
 echo ">> staging $REMOTE_DIR"
 $SSH "sudo install -d -o \$(id -un) -g \$(id -gn) $REMOTE_DIR"
 
 echo ">> shipping binary + static assets"
-tar -C "$repo_root/build-out" -cf - mcp-poc | $SSH "tar -C $REMOTE_DIR -xf - && chmod +x $REMOTE_DIR/mcp-poc"
+tar -C "$repo_root/build-out" -cf - imcp2 | $SSH "tar -C $REMOTE_DIR -xf - && chmod +x $REMOTE_DIR/imcp2"
 tar -C "$repo_root" -cf - static | $SSH "tar -C $REMOTE_DIR -xf -"
 # Status dashboard (Node tool): shipped as source — it has no build step.
 tar -C "$repo_root" -cf - monitoring | $SSH "tar -C $REMOTE_DIR -xf -"
 
 echo ">> rendering + installing units and Caddyfile, then (re)starting services"
-unit_mcp="$(sed "s#__PUBLIC_URL__#https://$DOMAIN#g" "$here/mcp-poc.service")"
+unit_mcp="$(sed "s#__PUBLIC_URL__#https://$DOMAIN#g" "$here/imcp2.service")"
 caddyfile="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__ACME_EMAIL__#$ACME_EMAIL#g" "$here/Caddyfile")"
 caddy_unit="$(cat "$here/caddy.service")"
 # Pin the dashboard's SSRF allowlist to the deployment's parent domain so it
@@ -49,7 +49,7 @@ set -e
 command -v update-ca-trust >/dev/null && dnf install -y -q ca-certificates >/dev/null 2>&1 || true
 
 # --- app service ---
-cat > /etc/systemd/system/mcp-poc.service <<'UNIT'
+cat > /etc/systemd/system/imcp2.service <<'UNIT'
 $unit_mcp
 UNIT
 
@@ -79,9 +79,17 @@ cat > /etc/systemd/system/caddy.service <<'UNIT'
 $caddy_unit
 UNIT
 
+# One-time migration off the pre-rename unit: imcp2.service replaces
+# mcp-poc.service. Stop, disable, and remove the old unit (if present) so the
+# two don't contend for :8000 on hosts first deployed before the rename.
+if systemctl cat mcp-poc.service >/dev/null 2>&1; then
+  systemctl disable --now mcp-poc.service || true
+  rm -f /etc/systemd/system/mcp-poc.service
+fi
+
 systemctl daemon-reload
-systemctl enable mcp-poc caddy
-systemctl restart mcp-poc
+systemctl enable imcp2 caddy
+systemctl restart imcp2
 systemctl restart caddy
 if command -v node >/dev/null 2>&1; then
   systemctl enable imcp-status
@@ -93,7 +101,7 @@ EOF
 
 echo ">> deployed. Verifying..."
 sleep 6
-$SSH "systemctl is-active mcp-poc caddy imcp-status; ss -tlnp 2>/dev/null | grep -E ':(80|443|8000|8137)\b' || true"
+$SSH "systemctl is-active imcp2 caddy imcp-status; ss -tlnp 2>/dev/null | grep -E ':(80|443|8000|8137)\b' || true"
 echo ">> external check:"
 curl -sS -o /dev/null -w "https://$DOMAIN/ -> HTTP %{http_code} (TLS verify %{ssl_verify_result})\n" "https://$DOMAIN/" || true
 curl -sS -o /dev/null -w "https://$DOMAIN/status/ -> HTTP %{http_code}\n" "https://$DOMAIN/status/" || true
