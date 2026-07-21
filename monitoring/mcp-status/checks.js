@@ -382,7 +382,10 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
     });
   }
 
-  // 5. Dynamic Client Registration (RFC 7591) must mint a client_id.
+  // 5. Dynamic Client Registration (RFC 7591) must mint a client_id. Registered
+  //    with a LOOPBACK redirect: loopback is always permitted (the hosted-redirect
+  //    allow-list exempts it), so this is the dependency-free way to confirm a
+  //    client can self-register without manual approval, which is what DCR is for.
   {
     const url = `${mcpOrigin}/oauth/register`;
     const r = await probe(url, {
@@ -391,7 +394,7 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         client_name: "imcp-status-dashboard",
-        redirect_uris: ["https://example.org/callback"],
+        redirect_uris: ["http://127.0.0.1:8765/callback"],
         token_endpoint_auth_method: "none",
         grant_types: ["authorization_code"],
         response_types: ["code"],
@@ -406,7 +409,7 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
       id: "oauth-register",
       label: "OAuth Dynamic Client Registration",
       description:
-        "Confirms Dynamic Client Registration (RFC 7591) issues a client_id, so MCP clients can self-register without manual setup.",
+        "Confirms Dynamic Client Registration (RFC 7591) issues a client_id for a loopback client, so native/CLI MCP clients can self-register without manual setup.",
       target: `POST ${url}`,
       expected: "200/201 JSON with client_id",
       status: pass ? "pass" : "fail",
@@ -417,6 +420,47 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
         : pass
           ? `registered client_id=${json.client_id}`
           : `${r.status}, body: ${r.bodyText.slice(0, 120)}`,
+    });
+  }
+
+  // 5b. The hosted-redirect allow-list must REJECT a hosted redirect_uri on a
+  //     domain that isn't approved (CWE-601 auth-code phishing guard). A
+  //     non-allow-listed hosted redirect is refused with 400 invalid_redirect_uri
+  //     before any client_id is issued; loopback (above) stays exempt. The probe
+  //     uses a reserved `.invalid` host (RFC 2606) that can never be legitimately
+  //     allow-listed by a deployment, so this can't false-alert if the allow-list
+  //     is widened via OAUTH_ALLOWED_REDIRECT_DOMAINS.
+  {
+    const url = `${mcpOrigin}/oauth/register`;
+    const r = await probe(url, {
+      timeoutMs,
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_name: "imcp-status-dashboard-probe",
+        redirect_uris: ["https://not-allowlisted.invalid/callback"],
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code"],
+        response_types: ["code"],
+      }),
+    });
+    const json = tryJson(r.bodyText);
+    const pass = r.status === 400 && json && json.error === "invalid_redirect_uri";
+    checks.push({
+      id: "oauth-register-allowlist",
+      label: "OAuth redirect allow-list enforced",
+      description:
+        "Confirms a hosted redirect_uri on a non-allow-listed domain is rejected (400 invalid_redirect_uri), closing the open-registration auth-code phishing vector (CWE-601). Loopback redirects stay exempt.",
+      target: `POST ${url}`,
+      expected: "400 invalid_redirect_uri",
+      status: pass ? "pass" : "fail",
+      httpStatus: r.status,
+      latencyMs: r.latencyMs,
+      detail: r.error
+        ? `request failed: ${r.error.message}`
+        : pass
+          ? "rejected non-allow-listed hosted redirect_uri"
+          : `expected 400 invalid_redirect_uri, got ${r.status}: ${r.bodyText.slice(0, 120)}`,
     });
   }
 
