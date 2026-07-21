@@ -175,9 +175,11 @@ const DEFAULT_ALLOWED_REDIRECT_DOMAINS: &[&str] = &[
     "antigravity.google", // Google Antigravity
     "chatgpt.com",        // OpenAI ChatGPT connectors
     "claude.ai",          // Anthropic Claude
+    "cursor.com",         // Cursor
     "grok.com",           // xAI Grok
     "perplexity.ai",      // Perplexity (any subdomain)
     "perplexity.com",     // Perplexity (any subdomain)
+    "vscode.dev",         // Visual Studio Code (any subdomain, e.g. insiders.)
 ];
 
 /// The effective hosted-redirect allow-list: the compiled-in defaults plus any
@@ -1472,6 +1474,9 @@ mod tests {
         assert!(redirect_uri_permitted("https://www.perplexity.ai/rest/connections/oauth_callback"));
         assert!(redirect_uri_permitted("https://staging.perplexity.com/x"));
         assert!(redirect_uri_permitted("https://antigravity.google/oauth-callback"));
+        assert!(redirect_uri_permitted("https://cursor.com/oauth/callback"));
+        assert!(redirect_uri_permitted("https://vscode.dev/redirect"));
+        assert!(redirect_uri_permitted("https://insiders.vscode.dev/redirect")); // subdomain
         // Loopback is always allowed (any port), no allow-list entry needed.
         assert!(redirect_uri_permitted("http://127.0.0.1:6112/cb"));
         assert!(redirect_uri_permitted("http://localhost/callback"));
