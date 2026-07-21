@@ -598,6 +598,23 @@ impl IcTools {
         if let Some(msg) = calls::oql_query_redirect(did.as_deref()) {
             return Ok(err(msg));
         }
+        // Read/write split: a query call to an UPDATE method is rejected by the
+        // replica at runtime, so when the interface is readable and `method` is
+        // declared as an update (not a query), fail fast with a clear pointer to
+        // canister_update_call instead of an opaque failure. Fail OPEN when the
+        // interface can't be read or the method isn't declared (is_query_method →
+        // None): the IC then decides, matching the old permissive behavior. (The
+        // reverse — a query method called as an update — is valid on the IC, so
+        // canister_update_call stays permissive.)
+        if let Some(did_text) = did.as_deref() {
+            if calls::is_query_method(did_text, &method) == Some(false) {
+                return Ok(err(format!(
+                    "`{method}` is not a `query` method on this canister — its Candid signature is \
+                     an update method, which the replica refuses to run as a query. Call it with \
+                     canister_update_call instead (a state-changing update call)."
+                )));
+            }
+        }
         let arg_bytes = match calls::encode_args(did.as_deref(), &method, &args) {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),

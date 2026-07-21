@@ -554,6 +554,27 @@ pub fn has_oql(did: &str) -> bool {
     env.get_method(&actor, "schema").is_ok() && env.get_method(&actor, "execute").is_ok()
 }
 
+/// Whether `method` is callable as a Candid `query` in `did`: `Some(true)` for a
+/// query (or composite-query) method, `Some(false)` for an update method, `None`
+/// when the interface can't be parsed or the method isn't declared. Used by
+/// `canister_query` to reject a Candid `method` query on an UPDATE method up front
+/// (the replica rejects a query call to a non-query method) with a clear pointer to
+/// `canister_update_call`, instead of an opaque runtime error.
+///
+/// `None` means "can't tell" — the caller fails OPEN (proceeds and lets the IC
+/// decide), so an unreadable/over-limit interface never blocks a call. Guarded
+/// (CWE-674) and fail-closed like [`has_oql`]: untrusted `.did` text runs through
+/// [`guard_candid_text`] before `candid_parser` parses it.
+pub fn is_query_method(did: &str, method: &str) -> Option<bool> {
+    if guard_candid_text("the `candid` interface", did).is_err() {
+        return None;
+    }
+    let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
+    let actor = actor?;
+    let func = env.get_method(&actor, method).ok()?;
+    Some(func.is_query())
+}
+
 /// Enforce "prefer OQL": when a canister exposes an OQL query surface, its data
 /// must be READ with an OQL query (`canister_query`'s `oql` argument), not a raw
 /// Candid `method` query call. Returns the guidance message to hand back when a
@@ -1180,6 +1201,28 @@ mod tests {
         // not the interface shape.
         let shallow_twin = "service : { schema : () -> (nat) query; execute : (text) -> (text) query; }";
         assert!(has_oql(shallow_twin), "shallow twin should be detected — isolates the guard as the cause");
+    }
+
+    // is_query_method classifies a method by its Candid mode so canister_query can
+    // reject a query call to an UPDATE method up front: Some(true) for a query AND a
+    // composite_query, Some(false) for an update, None when the method isn't declared
+    // or the interface can't be parsed (fail-open, like has_oql).
+    #[test]
+    fn is_query_method_classifies_by_candid_mode() {
+        use super::is_query_method;
+        let did = "service : { \
+            balance : (principal) -> (nat) query; \
+            stats : () -> (text) composite_query; \
+            transfer : (principal, nat) -> (nat); \
+        }";
+        assert_eq!(is_query_method(did, "balance"), Some(true), "query method → Some(true)");
+        assert_eq!(is_query_method(did, "stats"), Some(true), "composite_query → Some(true)");
+        assert_eq!(is_query_method(did, "transfer"), Some(false), "update method → Some(false)");
+        assert_eq!(is_query_method(did, "missing"), None, "undeclared method → None (fail open)");
+        assert_eq!(is_query_method("not a candid interface", "x"), None, "unparseable → None (fail open)");
+        // Fail-open on an over-limit interface (CWE-674 guard), like has_oql.
+        let over_deep = format!("service : {{ f : () -> ({}nat) query; }}", "vec ".repeat(5000));
+        assert_eq!(is_query_method(&over_deep, "f"), None, "over-limit interface → None (fail open)");
     }
 
     // "Prefer OQL": canister_query must reject a Candid `method` query on an OQL
