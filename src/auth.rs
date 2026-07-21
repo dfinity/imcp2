@@ -212,11 +212,13 @@ fn allowed_redirect_domains() -> Vec<String> {
 
 /// Whether a `redirect_uri` may be registered or receive an authorization code.
 /// Loopback (`http://localhost` / `127.0.0.1` / `[::1]`, any port) is always
-/// allowed. A hosted redirect must be `https` and its host must equal, or be a
-/// subdomain of, an allow-listed registrable domain. The host is read from the
-/// PARSED URL, not the raw string, so authority tricks such as
+/// allowed. A hosted redirect must be `https`, carry no userinfo, and its host
+/// must equal, or be a subdomain of, an allow-listed registrable domain. The host
+/// is read from the PARSED URL, not the raw string, so authority tricks such as
 /// `https://claude.ai@evil.com` or `https://claude.ai.evil.com` resolve to their
-/// real host and are refused.
+/// real host and are refused; a bare `https://user@claude.ai` is refused too
+/// (userinfo serves no purpose in a redirect target, only muddies which host is
+/// addressed, and loopback already rejects it).
 fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     if is_loopback_redirect(redirect_uri) {
         return true;
@@ -224,16 +226,19 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     let Ok(url) = url::Url::parse(redirect_uri) else {
         return false;
     };
-    if url.scheme() != "https" {
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
         return false;
     }
     let Some(host) = url.host_str() else {
         return false;
     };
     let host = host.trim_end_matches('.').to_ascii_lowercase();
+    // host == domain, or host is a dot-boundary subdomain of it. `strip_suffix`
+    // keeps the same semantics as `ends_with(format!(".{d}"))` without allocating
+    // a string per candidate on every register/authorize validation.
     allowed_redirect_domains()
         .iter()
-        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+        .any(|d| host == *d || host.strip_suffix(d.as_str()).is_some_and(|p| p.ends_with('.')))
 }
 
 /// Acceptance rule for a redirect (OAuth 2.1): the client must be REGISTERED,
@@ -1488,6 +1493,9 @@ mod tests {
         assert!(!redirect_uri_permitted("https://claude.ai.evil.com/cb")); // subdomain of evil.com
         assert!(!redirect_uri_permitted("https://evilclaude.ai/cb")); // no dot boundary
         assert!(!redirect_uri_permitted("https://claude.ai@evil.com/cb")); // userinfo -> evil.com
+        // Userinfo is refused even when the host itself is allow-listed.
+        assert!(!redirect_uri_permitted("https://user@claude.ai/cb"));
+        assert!(!redirect_uri_permitted("https://user:pass@claude.ai/cb"));
         // A hosted redirect must be https even to an allowed domain.
         assert!(!redirect_uri_permitted("http://claude.ai/cb"));
         // Defense in depth: a client registered before the allow-list (or via a
