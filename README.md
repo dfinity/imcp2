@@ -23,17 +23,16 @@ results).
 | `icp_find_canister_by_name` | `query` | Canister ids matching a name/symbol, searched in the IC dashboard's service registries — ICRC token ledgers (e.g. `ckUSDC`) and the SNS project catalog |
 | `icp_find_app_by_name` | `name` | A well-known app's front-end URL + `derivation_origin`, for a small built-in set (NNS, Oisy, MULTI/DEX, ICPSwap). The **first stop** whenever only an app *name* is known — never guess a domain from a name. Any other name returns no match and a `note` directing a web search for the app's URL (there's no on-chain name→URL directory) |
 | `icp_lookup_canister_info_by_id` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
-| `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus two capability flags: `oql` (`true` when it exposes an OQL query surface — a `schema` + `execute` pair — with a pointer to `icp_oql_guide`) and `api_doc_available` (`true` when it declares a `getApiDoc`/`get_api_doc` method, gating `get_canister_api_doc`) |
+| `get_canister_candid` | `canister_id`, `derivation_origin?`, `account?` | The canister's `candid:service` interface (`.did` text), plus two capability flags: `oql` (`true` when it exposes an OQL query surface — a `schema` + `execute` pair — with a pointer to `icp_oql_guide`) and `api_doc_available` (`true` when it declares a `getApiDoc`/`get_api_doc` method, gating `get_canister_api_doc`). When `oql` is true and a `derivation_origin` is supplied, also returns `oql_schema` — the entity/field/edge catalogue read as your account (the schema is caller-gated), plus ready-to-run `canister_query` examples per entity |
 | `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), from its `getApiDoc`/`get_api_doc` method. Call **only** when `get_canister_candid`/`open_app` report `api_doc_available`. Returns a **structured** result in every case — `available` + the doc on success, else `available:false` with `expected`/`retry`/`next` so an expected absence is distinct from an unreachable canister |
-| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `derivation_origin?`, `account?` | Reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`/`resolve_app`). Echoes `derived_for_origin` / `requested` / `acted_as_principal`. Query calls are rejected on an OQL canister — read it via the OQL tools |
+| `canister_query` | `canister_id`, `method?` **or** `oql?`, `args?` (textual Candid), `derivation_origin?`, `account?` | READ a canister — provide EITHER a Candid `query` `method` (with `args`) OR an `oql` query (a JSON object string, run against `execute`). A Candid `method` query may be anonymous or as your account and returns textual Candid; an `oql` query **requires** `derivation_origin` and returns `columns` + `rows` (a table) with `has_more`, validating `start` against the schema on an empty result. On an OQL canister a Candid `method` query is rejected — use `oql`. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
+| `canister_update_call` | `canister_id`, `method`, `args` (textual Candid), `derivation_origin?`, `account?` | Make an UPDATE (state-changing) call; reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`/`resolve_app`). Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
 | `get_app_principal` | `derivation_origin`, `account?` | The principal you act as at an app, without a call. Identify the app by its `derivation_origin` (from `open_app`/`resolve_app`). Echoes `derived_for_origin` / `requested` so an origin mismatch is visible |
 | `list_app_accounts` | `derivation_origin` | The user's Internet Identity accounts at an app — the default account plus any named ones — with name, number, last-used, and the derivation origin they were listed for. Identify the app by its `derivation_origin` (from `open_app`/`resolve_app`) |
 | `resolve_app` | `app_url` | Resolve an app URL to its Internet Identity derivation context: `application_origin`, the `derivation_origin` to use (declared in `/.well-known/ic-app.json`, else a built-in known-app value, else assumed = app origin — flagged via `derivation_origin_source`: `declared`/`known`/`app_url_default`, with `application_is_ic` echoing the gateway evidence), and the app's `alternative_origins` (informational). An origin with **no IC evidence** that would need the `app_url_default` assumption is **refused** (guessed-domain guard, with a "did you mean" repair when the host resembles a well-known app). Does not return a principal (no account chosen) or require auth — pass the `derivation_origin` to `get_app_principal`/`list_app_accounts` |
 | `icp_list_skills` | — | The official [IC skills](https://skills.internetcomputer.org) (Motoko, mops/icp CLIs, cycles, stable memory, security, …), grouped by category |
 | `icp_get_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `motoko`, `icp-cli`, `cycles-management`) |
-| `icp_oql_guide` | — | The OQL query-surface dialect guide (for canisters where `get_canister_candid` reports `oql: true`): the JSON query object, predicate grammar, edges, and paged result shape |
-| `get_canister_oql_schema` | `canister_id`, `derivation_origin`, `account?` | The canister's OQL schema catalogue (entities, primary keys, fields, edges) as JSON — wraps its `schema` method — plus a ready-to-run `run_canister_oql_query` example per entity. **`derivation_origin` is required**: the schema is caller-gated, so an anonymous read is rejected (for now) with guidance, rather than returning an empty list |
-| `run_canister_oql_query` | `canister_id`, `query` (JSON object string), `derivation_origin`, `account?` | Runs an OQL query (wraps `execute`, no Candid escaping) and returns `columns` + `rows` (rendered as a table) with `has_more` for paging. **`derivation_origin` is required** — an anonymous per-app query is rejected (for now). On an empty result it validates the query's `start` against the schema and returns `valid_entities` + a `did_you_mean` repair |
+| `icp_oql_guide` | — | The OQL query-surface dialect guide (for canisters where `get_canister_candid` reports `oql: true`): the JSON query object, predicate grammar, edges, and paged result shape. The schema comes from `get_canister_candid` (with an origin) and queries run through `canister_query` (the `oql` argument) |
 | `icp_cycles_balance` | — | Your cycles-ledger balance (the funds `icp_create_canister`/`icp_top_up_canister` spend), as your standing II principal |
 | `icp_create_canister` | `cycles?` / `icp?`, `controllers?`, `subnet?` | Create + fund a new canister — from your cycles-ledger balance (`cycles`) or by converting ICP from your ICP-ledger account via the CMC (`icp`); returns the new canister id |
 | `icp_install_code` | `canister_id`, `wasm_base64` / `wasm_hex`, `mode?`, `arg?` | Install/reinstall/upgrade a Wasm module (single-shot, or via the chunk store for large modules) |
@@ -68,20 +67,21 @@ Acting **for the user** at an app:
 3. **`list_app_accounts`** — if there's more than one account, ask which to use (and
    remember it).
 4. **`get_app_principal`** — only when you need the principal *value* itself;
-   `call_canister` / `run_canister_oql_query` act as the account without pre-fetching it.
+   `canister_query` / `canister_update_call` act as the account without pre-fetching it.
 5. **`get_canister_candid`** to learn the interface — its `oql` flag says whether OQL
    is available, its `api_doc_available` flag whether to call **`get_canister_api_doc`**
-   (call it only when that's true).
-6. **Read** with `run_canister_oql_query` when OQL is available, passing the
-   `derivation_origin` — the OQL read tools **require** it (an anonymous per-app read
-   is rejected for now, and raw `call_canister` query calls are rejected on an OQL
-   canister). Otherwise `call_canister` with `is_query=true`.
-7. **Act** with `call_canister` update calls, passing `derivation_origin` + `account`
+   (call it only when that's true). For an OQL canister, call it **with** the
+   `derivation_origin` to also get the `oql_schema` (the entity/field names to query).
+6. **Read** with `canister_query`: use the `oql` argument when OQL is available,
+   passing the `derivation_origin` — an OQL read **requires** it (an anonymous per-app
+   read is rejected for now, and a Candid `method` query is rejected on an OQL
+   canister). Otherwise pass a Candid `method`.
+7. **Act** with `canister_update_call`, passing `derivation_origin` + `account`
    to act as the user.
 
-Genuinely public reads via `call_canister` or the public-metadata tools
-(`get_canister_candid`, `discover_app_canisters`) skip steps 3/4 and need no origin;
-the OQL read tools always require one. The per-canister inspection (5) is
+Genuinely public reads via a `canister_query` Candid `method` query or the
+public-metadata tools (`get_canister_candid`, `discover_app_canisters`) skip steps
+3/4 and need no origin; OQL reads always require one. The per-canister inspection (5) is
 independent of the identity steps (3/4), so they can run in parallel. Managing your
 **own** canisters (the `icp_*` create/install/status/… tools) acts as your standing
 **management principal** at this server's origin — a *different* identity than the
@@ -134,7 +134,8 @@ identified service. (`discover_app_canisters` results are annotated with these l
 inline.) There is no public name-search over arbitrary canisters, so `icp_find_canister_by_name`
 covers the IC's labelled services, which is where the meaningful ones live.
 
-`call_canister` runs anonymously by default; pass a `derivation_origin` to call as
+`canister_query` and `canister_update_call` run anonymously by default; pass a
+`derivation_origin` to call as
 your account at that app. The server mints a **short-lived account delegation on
 demand** using the connection's registered Internet Identity session key (see
 [Domain identities](#domain-identities-on-demand)) — there is no per-app sign-in
@@ -142,7 +143,7 @@ step. `get_app_principal` returns that account's principal
 without a call. A user may hold several accounts at an app — a default account
 everyone gets automatically (the anchor's current, user-controllable default at
 that origin), plus any they have named — so `list_app_accounts` lists them (via II's
-`get_accounts`), and `call_canister`/`get_app_principal`/`list_app_accounts` identify the
+`get_accounts`), and `canister_query`/`canister_update_call`/`get_app_principal`/`list_app_accounts` identify the
 app by its `derivation_origin` (obtained once from `open_app`/`resolve_app` — see the
 note below), and take an optional `account` (a name from that list) to act as a
 specific one; omit it for the default account. All these tools require a bearer
@@ -152,8 +153,8 @@ token (see Auth).
 > the per-app principal from a **derivation origin**, which is *usually* but **not
 > always** the visible website URL: an app can pin a *custom* derivation origin
 > (via `derivationOrigin` + `/.well-known/ii-alternative-origins`) that browsers
-> honour. The identity-bearing tools (`call_canister`, `get_app_principal`,
-> `list_app_accounts`, `run_canister_oql_query`, `get_canister_oql_schema`)
+> honour. The identity-bearing tools (`canister_query`, `canister_update_call`,
+> `get_app_principal`, `list_app_accounts`)
 > therefore take the derivation origin **explicitly** as `derivation_origin` (the
 > exact canonical origin — never inferred from an alternative-origins list, which is
 > the *inverse* relation), and **only** that — they do **not** accept a raw website
@@ -212,19 +213,22 @@ dialect into every interface read, `get_canister_candid` emits only that flag pl
 one-line pointer; the full guide is served on demand by `icp_oql_guide` and as
 the `oql://usage` MCP **resource**.
 
-Two dedicated tools drive the surface: **`get_canister_oql_schema`** returns the entity/field
-catalogue, and **`run_canister_oql_query`** takes the query as a plain JSON object string,
-wraps it as `execute`'s single `text` argument (so the model never hand-escapes
-JSON inside a Candid literal), and decodes the reply into `columns` + `rows` —
-rendered as a markdown table, with `has_more` for paging. Both **require** a
+Two entry points drive the surface: **`get_canister_candid`** — called **with** a
+`derivation_origin` — returns the entity/field catalogue (its `oql_schema`, wrapping
+the `schema` method; folded in from the former standalone schema tool), and
+**`canister_query`** takes the query in its `oql` argument as a plain JSON object
+string, wraps it as `execute`'s single `text` argument (so the model never
+hand-escapes JSON inside a Candid literal), and decodes the reply into `columns` +
+`rows` — rendered as a markdown table, with `has_more` for paging. Both **require** a
 `derivation_origin` (with an optional `account`) to query as the user's account —
 the schema and rows are caller-gated, so an anonymous per-app read is **rejected**
 (for now) with guidance to pass the origin rather than silently returning empty
-(same on-demand delegation as `call_canister`, which itself stays permissive so
-genuinely public canisters can still be read anonymously). Because OQL is the preferred read path when a
-canister offers it, raw `call_canister` **query** calls are rejected on an OQL
-canister (the tool returns a pointer to these two tools); `call_canister` then
-handles only that canister's update calls. Detection stays name-based and the decode is fail-closed: a
+(same on-demand delegation as a `canister_query` Candid `method` query, which stays
+permissive so genuinely public canisters can still be read anonymously). Because OQL
+is the preferred read path when a canister offers it, a Candid `method` **query**
+through `canister_query` is rejected on an OQL canister (it returns a pointer to the
+`oql` argument); `canister_update_call` then handles that canister's update calls.
+Detection stays name-based and the decode is fail-closed: a
 reply that isn't a recognizable OQL result degrades to the raw Candid rather than
 erroring. The design mirrors the reference IC connector's OQL primer (detect +
 teach), adding an ergonomic executor suited to this server's structured-output
@@ -320,8 +324,8 @@ SID=$(curl -s -D - -o /dev/null \
 H=(-H "Accept: application/json, text/event-stream" -H "Content-Type: application/json" -H "Mcp-Session-Id: $SID")
 curl -s "${H[@]}" -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' http://127.0.0.1:8000/mcp >/dev/null
 
-# 2. call a real mainnet canister (ICP ledger)
-curl -s "${H[@]}" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"call_canister","arguments":{"canister_id":"ryjl3-tyaaa-aaaaa-aaaba-cai","method":"icrc1_name","args":"()","is_query":true}}}' \
+# 2. query a real mainnet canister (ICP ledger)
+curl -s "${H[@]}" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"canister_query","arguments":{"canister_id":"ryjl3-tyaaa-aaaaa-aaaba-cai","method":"icrc1_name","args":"()"}}}' \
   http://127.0.0.1:8000/mcp | grep '^data: {' | sed 's/^data: //' | jq -r '.result.content[0].text'
 # => ("Internet Computer")
 ```
@@ -609,7 +613,7 @@ There is no per-app browser sign-in. Instead the model is:
   it as a time-boxed grant bound to your anchor. The backend signs II's `mcp_*`
   calls directly with that key (its principal `self_authenticating(session_pubkey)`
   is what the grant is bound to). Reconnect when the grant expires or is revoked.
-- **App delegations minted on demand.** When `call_canister` (or `get_app_principal`)
+- **App delegations minted on demand.** When `canister_query` / `canister_update_call` (or `get_app_principal`)
   is invoked with a `derivation_origin` (resolved once via `open_app`/`resolve_app`), the backend mints a **short-lived
   per-app account delegation on demand**: signing *as the session key*, it calls
   Internet Identity's account-derivation methods directly — no browser round-trip
@@ -676,7 +680,7 @@ type AccountInfo = record {
 signed as the session key. Like the delegation methods, II **recovers the anchor
 from the caller** (the registered session-key principal), so no anchor number is
 needed. To act as a non-default account, pass its `name` to
-`call_canister`/`get_app_principal` as `account`; the server resolves the name to its
+`canister_query`/`canister_update_call`/`get_app_principal` as `account`; the server resolves the name to its
 `account_number` via `mcp_get_accounts` and threads that into the on-demand
 delegation. Omitting `account` uses the default account.
 
@@ -704,9 +708,9 @@ delegation. Omitting `account` uses the default account.
       Same-browser-variant closure needs hosted-redirect allow-listing — see Auth.)
 - [x] On-demand **domain identities**: the registered session key mints per-app
       account delegations directly via II canister methods
-      (`call_canister`/`get_app_principal` `derivation_origin`); no per-app browser flow.
+      (`canister_query`/`canister_update_call`/`get_app_principal` `derivation_origin`); no per-app browser flow.
 - [x] **Per-app accounts**: `list_app_accounts(derivation_origin)` lists the user's accounts at
-      an app (via `mcp_get_accounts`), and `call_canister`/`get_app_principal` take an
+      an app (via `mcp_get_accounts`), and `canister_query`/`canister_update_call`/`get_app_principal` take an
       `account` name to act as a specific (non-default) account.
 - [ ] Deploy the `mcp_register_v2` + `mcp_get_accounts` + `mcp_prepare_delegation` +
       `mcp_get_delegation` canister methods (server is built against the merged II

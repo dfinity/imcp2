@@ -13,8 +13,8 @@ Quick reminders:
 
 ## Encoding & footguns
 
-`call_canister` encodes your args **against the method's declared Candid types**
-whenever it can read the canister's interface — so plain literals coerce to what
+`canister_query` and `canister_update_call` encode your args **against the method's
+declared Candid types** whenever they can read the canister's interface — so plain literals coerce to what
 the method expects (`42` → `nat64`, `1` → `float64`, the right `opt`/`vec`
 element types, etc.) and you usually **don't** need `: type` annotations.
 

@@ -1617,8 +1617,8 @@ pub struct OpenAppOutput {
     pub app_url_source: String,
     /// The normalized application origin of `app_url`.
     pub application_origin: String,
-    /// The Internet Identity derivation origin to use — pass this (or `app_url`)
-    /// to get_app_principal / list_app_accounts / call_canister.
+    /// The Internet Identity derivation origin to use — pass this to
+    /// get_app_principal / list_app_accounts / canister_query / canister_update_call.
     pub derivation_origin: String,
     /// How `derivation_origin` was determined: "declared", "known", or
     /// "app_url_default" (see resolve_app).
