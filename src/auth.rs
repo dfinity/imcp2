@@ -46,11 +46,16 @@
 //! In the confused-deputy path the delegation lands in the honest page in the
 //! VICTIM's browser, whose cookie does not match the one `X` was bound to, so the
 //! redeem aborts. This closes the split-browser injection for all transports incl.
-//! loopback (a loopback redirect resolves on the consenter's own machine). Not
-//! closed here (companion control): the *same-browser* variant where a victim is
-//! socially engineered into running the whole flow toward an attacker-registered
-//! **hosted** `redirect_uri`; that needs hosted-redirect allow-listing (loopback is
-//! safe either way).
+//! loopback (a loopback redirect resolves on the consenter's own machine). The
+//! *same-browser* variant (a victim socially engineered into running the whole
+//! flow toward an attacker-registered **hosted** `redirect_uri`) is closed by a
+//! **hosted-redirect allow-list** ([`redirect_uri_permitted`]): open DCR may
+//! register only loopback or allow-listed-domain hosted redirects, so an attacker
+//! cannot register a hosted destination it controls (loopback is safe either way).
+//! A client turned away by the allow-list is pointed at [`ALLOWLIST_CONTACT`] to
+//! request approval: `/oauth/register` says so in its JSON `error_description`,
+//! and a browser that reaches `/oauth/authorize` gets the on-brand
+//! [`not_allowlisted_page`] instead of a raw error.
 //!
 //! The wire shapes match the merged II contract (verified against the beta II
 //! canister's live `.did`, `fgte5-ciaaa-aaaad-aaatq-cai`): the connect link
@@ -157,15 +162,98 @@ fn persist_clients(clients: &HashMap<String, ClientReg>) {
     }
 }
 
+/// Registrable domains whose hosts (and subdomains) may register a **hosted**
+/// (non-loopback) OAuth `redirect_uri`. Dynamic client registration is open, so
+/// without this an attacker could register a client with a hosted redirect it
+/// controls and phish an authorization code to it (the same-browser variant that
+/// Consent-Bound Completion does not close). Loopback redirects are exempt (a
+/// loopback code resolves on the consenter's own machine), so native/CLI clients
+/// need no entry. Seeded with the MCP connector vendors seen in practice; widen
+/// at deploy time with `OAUTH_ALLOWED_REDIRECT_DOMAINS` (comma/space-separated,
+/// additive) without a rebuild.
+const DEFAULT_ALLOWED_REDIRECT_DOMAINS: &[&str] = &[
+    "antigravity.google", // Google Antigravity
+    "chatgpt.com",        // OpenAI ChatGPT connectors
+    "claude.ai",          // Anthropic Claude
+    "cursor.com",         // Cursor
+    "grok.com",           // xAI Grok
+    "perplexity.ai",      // Perplexity (any subdomain)
+    "perplexity.com",     // Perplexity (any subdomain)
+    "vscode.dev",         // Visual Studio Code (any subdomain, e.g. insiders.)
+];
+
+/// The effective hosted-redirect allow-list: the compiled-in defaults plus any
+/// entries in `OAUTH_ALLOWED_REDIRECT_DOMAINS`. Each env entry may be a bare
+/// domain or an `https://…` origin (scheme/port/path are stripped to the host).
+/// Additive: the shipped binary is safe by default and ops can only widen the
+/// set, never accidentally drop a known vendor.
+fn allowed_redirect_domains() -> Vec<String> {
+    let mut domains: Vec<String> =
+        DEFAULT_ALLOWED_REDIRECT_DOMAINS.iter().map(|d| d.to_string()).collect();
+    if let Ok(extra) = std::env::var("OAUTH_ALLOWED_REDIRECT_DOMAINS") {
+        for raw in extra.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
+            // Parse as a URL to robustly reduce an entry to its bare host, stripping
+            // scheme, userinfo, port, and path alike. Bare domains have no scheme, so
+            // give them one first (`vendor.example` / `vendor.example:8443` -> host
+            // `vendor.example`), matching what `Url::host_str()` yields at match time.
+            let candidate =
+                if raw.contains("://") { raw.to_string() } else { format!("https://{raw}") };
+            let host = url::Url::parse(&candidate)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase()))
+                .filter(|h| !h.is_empty());
+            if let Some(host) = host {
+                domains.push(host);
+            }
+        }
+    }
+    domains
+}
+
+/// Whether a `redirect_uri` may be registered or receive an authorization code.
+/// Loopback (`http://localhost` / `127.0.0.1` / `[::1]`, any port) is always
+/// allowed. A hosted redirect must be `https`, carry no userinfo, and its host
+/// must equal, or be a subdomain of, an allow-listed registrable domain. The host
+/// is read from the PARSED URL, not the raw string, so authority tricks such as
+/// `https://claude.ai@evil.com` or `https://claude.ai.evil.com` resolve to their
+/// real host and are refused; a bare `https://user@claude.ai` is refused too
+/// (userinfo serves no purpose in a redirect target, only muddies which host is
+/// addressed, and loopback already rejects it).
+fn redirect_uri_permitted(redirect_uri: &str) -> bool {
+    if is_loopback_redirect(redirect_uri) {
+        return true;
+    }
+    let Ok(url) = url::Url::parse(redirect_uri) else {
+        return false;
+    };
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    // host == domain, or host is a dot-boundary subdomain of it. `strip_suffix`
+    // keeps the same semantics as `ends_with(format!(".{d}"))` without allocating
+    // a string per candidate on every register/authorize validation.
+    allowed_redirect_domains()
+        .iter()
+        .any(|d| host == *d || host.strip_suffix(d.as_str()).is_some_and(|p| p.ends_with('.')))
+}
+
 /// Acceptance rule for a redirect (OAuth 2.1): the client must be REGISTERED,
-/// and the requested redirect must either exactly match a registered URI, or be
-/// a loopback URI matching a registered loopback URI on everything but the
-/// port. RFC 8252 §7.3 requires the any-port latitude — native clients bind an
-/// ephemeral loopback port at runtime, so the exact port can't be registered —
-/// but registration itself is still required, so every client that can receive
-/// a code is on record (DCR is open, so this is an audit trail, not vetting).
+/// the redirect must pass the hosted-redirect allow-list
+/// ([`redirect_uri_permitted`]), and it must either exactly match a registered
+/// URI or be a loopback URI matching a registered loopback URI on everything but
+/// the port. RFC 8252 §7.3 requires the any-port latitude, since native clients
+/// bind an ephemeral loopback port at runtime, so the exact port can't be
+/// registered. The allow-list is re-checked here (not only at registration) so a
+/// pre-existing registration whose domain is no longer allowed can't be used.
 fn redirect_allowed(reg: Option<&ClientReg>, redirect_uri: &str) -> bool {
     let Some(reg) = reg else { return false };
+    if !redirect_uri_permitted(redirect_uri) {
+        return false;
+    }
     reg.redirect_uris
         .iter()
         .any(|u| u == redirect_uri || loopback_match(u, redirect_uri))
@@ -335,6 +423,15 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
         None => return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "response_type=code required"),
     }
     if !store.validate_client(&q.client_id, &q.redirect_uri).await {
+        // A well-formed hosted `redirect_uri` that simply isn't on the allow-list
+        // is an approval gap, not a malformed request: show the browser a friendly
+        // page naming the cause and the contact, rather than a raw JSON blob. This
+        // covers clients that skip DCR or use a stored-but-disallowed registration
+        // (the standard flow is blocked earlier, at `/oauth/register`). The page is
+        // static and reflects nothing, so naming the cause leaks nothing.
+        if !redirect_uri_permitted(&q.redirect_uri) {
+            return not_allowlisted_page();
+        }
         // `invalid_client` (not `invalid_request`): the request is well-formed,
         // it's the CLIENT identification that failed — the AS error code the
         // MCP server guide (and RFC 6749's taxonomy) expects here. No redirect:
@@ -663,6 +760,60 @@ fn pinned_callback_page(prefix: &str) -> Response {
     h.insert(
         axum::http::header::REFERRER_POLICY,
         axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    h.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    resp
+}
+
+/// Where a rejected MCP client is told to request allow-listing. Shown both in
+/// the browser-facing `/oauth/authorize` error page ([`not_allowlisted_page`])
+/// and in the `/oauth/register` JSON `error_description`, so a vendor blocked by
+/// the hosted-redirect allow-list ([`redirect_uri_permitted`]) has a clear next
+/// step rather than an opaque failure.
+const ALLOWLIST_CONTACT: &str = "mcp@dfinity.org";
+
+/// HTML for the "MCP client not allowed" page, a real `.html` asset (compiled in
+/// via `include_str!`, no runtime file I/O). It reuses the pinned callback page's
+/// self-contained shell (`assets/connect.css`, the inlined logo) but carries no
+/// script. `__NONCE__`/`__CSS__`/`__LOGO__`/`__CONTACT__` are spliced in at render
+/// time; none is user-influenced (the contact is a compiled-in constant), so no
+/// request value is ever reflected into the markup.
+const CONNECT_ERROR_HTML: &str = include_str!("assets/connect-error.html");
+
+/// The friendly, browser-facing rejection for a client whose `redirect_uri` is
+/// not on the hosted-redirect allow-list ([`redirect_uri_permitted`]). A real
+/// browser reaches `/oauth/authorize` by top-level navigation, so a terse JSON
+/// `invalid_client` renders as a raw error blob; this serves an on-brand page
+/// that names the cause and points the vendor at [`ALLOWLIST_CONTACT`]. Static
+/// and non-reflecting: no query or redirect value is interpolated, so it can't be
+/// turned into a content-injection or open-redirect surface. `403 Forbidden`: the
+/// request is understood but refused by policy.
+fn not_allowlisted_page() -> Response {
+    let nonce = csp_nonce();
+    let html = CONNECT_ERROR_HTML
+        .replace("__NONCE__", &nonce)
+        .replace("__CSS__", CONNECT_PAGE_CSS)
+        .replace("__LOGO__", CONNECT_LOGO_SVG)
+        .replace("__CONTACT__", ALLOWLIST_CONTACT);
+    // No script on this page, so no `script-src`; the only inline is the nonce'd
+    // `<style>`. Everything else is denied (`default-src 'none'`), and framing is
+    // refused so the page can't be embedded for UI redress.
+    let csp = format!(
+        "default-src 'none'; style-src 'nonce-{nonce}'; base-uri 'none'; \
+         form-action 'none'; frame-ancestors 'none'"
+    );
+    let mut resp = (StatusCode::FORBIDDEN, Html(html)).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_str(&csp).expect("valid CSP"),
     );
     h.insert(
         axum::http::header::X_CONTENT_TYPE_OPTIONS,
@@ -1127,6 +1278,21 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
         );
     };
 
+    // Hosted-redirect allow-list (auth-code phishing, same-browser variant):
+    // open DCR must not let a caller register a hosted redirect it controls.
+    // Loopback is exempt. Reject BEFORE anything is stored.
+    if let Some(bad) = req.redirect_uris.iter().find(|u| !redirect_uri_permitted(u.as_str())) {
+        return oauth_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_redirect_uri",
+            &format!(
+                "redirect_uri {bad} is not permitted: a hosted redirect must be https on an \
+                 allow-listed domain (loopback redirects are always allowed). To have this MCP \
+                 client added to the allow-list, contact {ALLOWLIST_CONTACT}."
+            ),
+        );
+    }
+
     let client_id = format!("client-{}", Uuid::new_v4());
     let snapshot = {
         let mut clients = store.clients.write().await;
@@ -1274,7 +1440,10 @@ pub type _JsonValue = Value;
 
 #[cfg(test)]
 mod tests {
-    use super::{build_redirect, is_loopback_redirect, pkce_s256, redirect_allowed, ClientReg};
+    use super::{
+        build_redirect, is_loopback_redirect, pkce_s256, redirect_allowed, redirect_uri_permitted,
+        ClientReg,
+    };
 
     /// RFC 7636 Appendix B test vector.
     #[test]
@@ -1296,6 +1465,43 @@ mod tests {
         assert!(!redirect_allowed(None, "https://claude.ai/api/mcp/auth_callback"));
         assert!(!redirect_allowed(None, "http://127.0.0.1:51000/callback"));
         assert!(!redirect_allowed(None, "http://[::1]:8080/cb"));
+    }
+
+    /// Hosted-redirect allow-list (auth-code phishing, same-browser variant):
+    /// allow-listed vendor domains and their subdomains pass; loopback always
+    /// passes; everything else, including authority-trick look-alikes, is refused.
+    #[test]
+    fn hosted_redirect_allow_list() {
+        // Allow-listed vendor registrable domains and their subdomains.
+        assert!(redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback"));
+        assert!(redirect_uri_permitted("https://chatgpt.com/connector/oauth/abc"));
+        assert!(redirect_uri_permitted("https://grok.com/mcp/callback"));
+        assert!(redirect_uri_permitted("https://www.perplexity.ai/rest/connections/oauth_callback"));
+        assert!(redirect_uri_permitted("https://staging.perplexity.com/x"));
+        assert!(redirect_uri_permitted("https://antigravity.google/oauth-callback"));
+        assert!(redirect_uri_permitted("https://cursor.com/oauth/callback"));
+        assert!(redirect_uri_permitted("https://vscode.dev/redirect"));
+        assert!(redirect_uri_permitted("https://insiders.vscode.dev/redirect")); // subdomain
+        // Loopback is always allowed (any port), no allow-list entry needed.
+        assert!(redirect_uri_permitted("http://127.0.0.1:6112/cb"));
+        assert!(redirect_uri_permitted("http://localhost/callback"));
+        assert!(redirect_uri_permitted("http://[::1]:8080/cb"));
+        // Attacker-controlled hosted redirects: refused (the finding's payloads).
+        assert!(!redirect_uri_permitted("https://example.com/cb"));
+        assert!(!redirect_uri_permitted("https://attacker.example/cb"));
+        // Look-alikes and authority tricks resolve to the real (non-allowed) host.
+        assert!(!redirect_uri_permitted("https://claude.ai.evil.com/cb")); // subdomain of evil.com
+        assert!(!redirect_uri_permitted("https://evilclaude.ai/cb")); // no dot boundary
+        assert!(!redirect_uri_permitted("https://claude.ai@evil.com/cb")); // userinfo -> evil.com
+        // Userinfo is refused even when the host itself is allow-listed.
+        assert!(!redirect_uri_permitted("https://user@claude.ai/cb"));
+        assert!(!redirect_uri_permitted("https://user:pass@claude.ai/cb"));
+        // A hosted redirect must be https even to an allowed domain.
+        assert!(!redirect_uri_permitted("http://claude.ai/cb"));
+        // Defense in depth: a client registered before the allow-list (or via a
+        // now-removed domain) still can't receive a code at /oauth/authorize.
+        let junk = ClientReg { redirect_uris: vec!["https://example.com/cb".to_string()] };
+        assert!(!redirect_allowed(Some(&junk), "https://example.com/cb"));
     }
 
     /// A registered loopback redirect matches at ANY port (RFC 8252 §7.3 — the
@@ -1568,14 +1774,14 @@ mod tests {
         // Register a client so `validate_client` passes and we reach the redirect.
         store.clients.write().await.insert(
             "client-x".into(),
-            super::ClientReg { redirect_uris: vec!["https://app.example/cb".into()] },
+            super::ClientReg { redirect_uris: vec!["https://claude.ai/api/mcp/auth_callback".into()] },
         );
         let resp = super::authorize(
             State(store.clone()),
             Query(super::AuthorizeQuery {
                 response_type: Some("code".into()),
                 client_id: "client-x".into(),
-                redirect_uri: "https://app.example/cb".into(),
+                redirect_uri: "https://claude.ai/api/mcp/auth_callback".into(),
                 state: Some("xyz".into()),
                 code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
                 code_challenge_method: Some("S256".into()),
@@ -1603,6 +1809,86 @@ mod tests {
             cookie.contains(&format!("{}=", super::CONNECT_COOKIE)),
             "the binding cookie must be set: {cookie}"
         );
+    }
+
+    // A client turned away by the allow-list gets the on-brand HTML page, not a
+    // raw JSON blob: 403, names the contact, ships a strict nonce'd CSP, carries
+    // no script, and (taking no input) reflects nothing.
+    #[tokio::test]
+    async fn not_allowlisted_page_names_contact_and_reflects_nothing() {
+        let resp = super::not_allowlisted_page();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        let csp = resp
+            .headers()
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .expect("CSP header present")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(csp.contains("default-src 'none'"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        // No script on this page: the CSP must not open a script-src.
+        assert!(!csp.contains("script-src"), "the error page needs no script-src: {csp}");
+        let nonce = csp
+            .split("'nonce-")
+            .nth(1)
+            .and_then(|s| s.split('\'').next())
+            .expect("nonce in CSP")
+            .to_string();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains(super::ALLOWLIST_CONTACT), "the page must name the contact");
+        assert!(!html.contains("<script"), "the error page carries no script");
+        assert!(
+            html.contains(&format!("<style nonce=\"{nonce}\">")),
+            "the inline style nonce must match the CSP nonce"
+        );
+    }
+
+    // `/oauth/authorize` distinguishes an allow-list rejection (a friendly HTML
+    // page) from other client-validation failures (a terse JSON `invalid_client`).
+    #[tokio::test]
+    async fn authorize_allowlist_rejection_is_friendly_but_unknown_client_stays_json() {
+        use axum::extract::{Query, State};
+        let store = test_store();
+        // A stored-but-disallowed registration (the legacy example.com entries this
+        // work neutralizes): a hosted redirect on a non-allow-listed domain.
+        store.clients.write().await.insert(
+            "client-legacy".into(),
+            super::ClientReg { redirect_uris: vec!["https://example.com/cb".into()] },
+        );
+        let mk = |client_id: &str, redirect_uri: &str| super::AuthorizeQuery {
+            response_type: Some("code".into()),
+            client_id: client_id.into(),
+            redirect_uri: redirect_uri.into(),
+            state: Some("xyz".into()),
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            scope: None,
+            resource: None,
+        };
+
+        // Disallowed hosted redirect -> friendly 403 HTML naming the contact.
+        let resp =
+            super::authorize(State(store.clone()), Query(mk("client-legacy", "https://example.com/cb"))).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        let ctype =
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+        assert!(ctype.starts_with("text/html"), "an allow-list rejection renders HTML, not JSON: {ctype}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains(super::ALLOWLIST_CONTACT));
+
+        // Unknown client but an allow-listed redirect -> stays a terse JSON invalid_client.
+        let resp = super::authorize(
+            State(store.clone()),
+            Query(mk("client-nope", "https://claude.ai/api/mcp/auth_callback")),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let ctype =
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+        assert!(ctype.contains("json"), "a permitted-but-unregistered redirect stays JSON: {ctype}");
     }
 
     // The pinned page ships a strict CSP whose script nonce MATCHES the inline
