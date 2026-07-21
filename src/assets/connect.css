@@ -82,7 +82,10 @@ body {
   color: var(--ink);
 }
 .detail { margin: 0; max-width: 32ch; font-size: 1rem; color: var(--secondary); }
-.hint { margin: 0; font-size: 0.9rem; color: var(--muted); }
+.hint { margin: 0; max-width: 34ch; font-size: 0.9rem; color: var(--muted); }
+/* Links appear only on the error page (the callback page has none): keep them on
+   the Ember accent so they read as links in both themes without a UA blue. */
+.detail a, .hint a { color: var(--accent); }
 /* Foot-of-page attribution: an eyebrow label + the DFINITY mark in a soft pill. */
 .hosted {
   display: flex;

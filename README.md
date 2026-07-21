@@ -421,7 +421,11 @@ the callback page.
 > destination it controls. The list is seeded with the known MCP connector vendors
 > and widened per deployment with `OAUTH_ALLOWED_REDIRECT_DOMAINS` (additive);
 > loopback/native clients are exempt (the code resolves on the consenter's own
-> machine). Enforced at both `/oauth/register` and `/oauth/authorize`.
+> machine). Enforced at both `/oauth/register` and `/oauth/authorize`. A client
+> turned away is pointed at a contact address to request approval:
+> `/oauth/register` says so in its JSON `error_description`, and a browser that
+> reaches `/oauth/authorize` gets an on-brand "not allowed" page (not a raw error)
+> naming the same contact.
 
 ### The registration-delegation connect handshake
 

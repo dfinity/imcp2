@@ -52,6 +52,10 @@
 //! **hosted-redirect allow-list** ([`redirect_uri_permitted`]): open DCR may
 //! register only loopback or allow-listed-domain hosted redirects, so an attacker
 //! cannot register a hosted destination it controls (loopback is safe either way).
+//! A client turned away by the allow-list is pointed at [`ALLOWLIST_CONTACT`] to
+//! request approval: `/oauth/register` says so in its JSON `error_description`,
+//! and a browser that reaches `/oauth/authorize` gets the on-brand
+//! [`not_allowlisted_page`] instead of a raw error.
 //!
 //! The wire shapes match the merged II contract (verified against the beta II
 //! canister's live `.did`, `fgte5-ciaaa-aaaad-aaatq-cai`): the connect link
@@ -412,6 +416,15 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
         None => return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "response_type=code required"),
     }
     if !store.validate_client(&q.client_id, &q.redirect_uri).await {
+        // A well-formed hosted `redirect_uri` that simply isn't on the allow-list
+        // is an approval gap, not a malformed request: show the browser a friendly
+        // page naming the cause and the contact, rather than a raw JSON blob. This
+        // covers clients that skip DCR or use a stored-but-disallowed registration
+        // (the standard flow is blocked earlier, at `/oauth/register`). The page is
+        // static and reflects nothing, so naming the cause leaks nothing.
+        if !redirect_uri_permitted(&q.redirect_uri) {
+            return not_allowlisted_page();
+        }
         // `invalid_client` (not `invalid_request`): the request is well-formed,
         // it's the CLIENT identification that failed — the AS error code the
         // MCP server guide (and RFC 6749's taxonomy) expects here. No redirect:
@@ -740,6 +753,60 @@ fn pinned_callback_page(prefix: &str) -> Response {
     h.insert(
         axum::http::header::REFERRER_POLICY,
         axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    h.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    resp
+}
+
+/// Where a rejected MCP client is told to request allow-listing. Shown both in
+/// the browser-facing `/oauth/authorize` error page ([`not_allowlisted_page`])
+/// and in the `/oauth/register` JSON `error_description`, so a vendor blocked by
+/// the hosted-redirect allow-list ([`redirect_uri_permitted`]) has a clear next
+/// step rather than an opaque failure.
+const ALLOWLIST_CONTACT: &str = "mcp@dfinity.org";
+
+/// HTML for the "MCP client not allowed" page, a real `.html` asset (compiled in
+/// via `include_str!`, no runtime file I/O). It reuses the pinned callback page's
+/// self-contained shell (`assets/connect.css`, the inlined logo) but carries no
+/// script. `__NONCE__`/`__CSS__`/`__LOGO__`/`__CONTACT__` are spliced in at render
+/// time; none is user-influenced (the contact is a compiled-in constant), so no
+/// request value is ever reflected into the markup.
+const CONNECT_ERROR_HTML: &str = include_str!("assets/connect-error.html");
+
+/// The friendly, browser-facing rejection for a client whose `redirect_uri` is
+/// not on the hosted-redirect allow-list ([`redirect_uri_permitted`]). A real
+/// browser reaches `/oauth/authorize` by top-level navigation, so a terse JSON
+/// `invalid_client` renders as a raw error blob; this serves an on-brand page
+/// that names the cause and points the vendor at [`ALLOWLIST_CONTACT`]. Static
+/// and non-reflecting: no query or redirect value is interpolated, so it can't be
+/// turned into a content-injection or open-redirect surface. `403 Forbidden`: the
+/// request is understood but refused by policy.
+fn not_allowlisted_page() -> Response {
+    let nonce = csp_nonce();
+    let html = CONNECT_ERROR_HTML
+        .replace("__NONCE__", &nonce)
+        .replace("__CSS__", CONNECT_PAGE_CSS)
+        .replace("__LOGO__", CONNECT_LOGO_SVG)
+        .replace("__CONTACT__", ALLOWLIST_CONTACT);
+    // No script on this page, so no `script-src`; the only inline is the nonce'd
+    // `<style>`. Everything else is denied (`default-src 'none'`), and framing is
+    // refused so the page can't be embedded for UI redress.
+    let csp = format!(
+        "default-src 'none'; style-src 'nonce-{nonce}'; base-uri 'none'; \
+         form-action 'none'; frame-ancestors 'none'"
+    );
+    let mut resp = (StatusCode::FORBIDDEN, Html(html)).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_str(&csp).expect("valid CSP"),
     );
     h.insert(
         axum::http::header::X_CONTENT_TYPE_OPTIONS,
@@ -1213,7 +1280,8 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
             "invalid_redirect_uri",
             &format!(
                 "redirect_uri {bad} is not permitted: a hosted redirect must be https on an \
-                 allow-listed domain (loopback redirects are always allowed)"
+                 allow-listed domain (loopback redirects are always allowed). To have this MCP \
+                 client added to the allow-list, contact {ALLOWLIST_CONTACT}."
             ),
         );
     }
@@ -1728,6 +1796,86 @@ mod tests {
             cookie.contains(&format!("{}=", super::CONNECT_COOKIE)),
             "the binding cookie must be set: {cookie}"
         );
+    }
+
+    // A client turned away by the allow-list gets the on-brand HTML page, not a
+    // raw JSON blob: 403, names the contact, ships a strict nonce'd CSP, carries
+    // no script, and (taking no input) reflects nothing.
+    #[tokio::test]
+    async fn not_allowlisted_page_names_contact_and_reflects_nothing() {
+        let resp = super::not_allowlisted_page();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        let csp = resp
+            .headers()
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .expect("CSP header present")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(csp.contains("default-src 'none'"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        // No script on this page: the CSP must not open a script-src.
+        assert!(!csp.contains("script-src"), "the error page needs no script-src: {csp}");
+        let nonce = csp
+            .split("'nonce-")
+            .nth(1)
+            .and_then(|s| s.split('\'').next())
+            .expect("nonce in CSP")
+            .to_string();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains(super::ALLOWLIST_CONTACT), "the page must name the contact");
+        assert!(!html.contains("<script"), "the error page carries no script");
+        assert!(
+            html.contains(&format!("<style nonce=\"{nonce}\">")),
+            "the inline style nonce must match the CSP nonce"
+        );
+    }
+
+    // `/oauth/authorize` distinguishes an allow-list rejection (a friendly HTML
+    // page) from other client-validation failures (a terse JSON `invalid_client`).
+    #[tokio::test]
+    async fn authorize_allowlist_rejection_is_friendly_but_unknown_client_stays_json() {
+        use axum::extract::{Query, State};
+        let store = test_store();
+        // A stored-but-disallowed registration (the legacy example.com entries this
+        // work neutralizes): a hosted redirect on a non-allow-listed domain.
+        store.clients.write().await.insert(
+            "client-legacy".into(),
+            super::ClientReg { redirect_uris: vec!["https://example.com/cb".into()] },
+        );
+        let mk = |client_id: &str, redirect_uri: &str| super::AuthorizeQuery {
+            response_type: Some("code".into()),
+            client_id: client_id.into(),
+            redirect_uri: redirect_uri.into(),
+            state: Some("xyz".into()),
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            scope: None,
+            resource: None,
+        };
+
+        // Disallowed hosted redirect -> friendly 403 HTML naming the contact.
+        let resp =
+            super::authorize(State(store.clone()), Query(mk("client-legacy", "https://example.com/cb"))).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        let ctype =
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+        assert!(ctype.starts_with("text/html"), "an allow-list rejection renders HTML, not JSON: {ctype}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains(super::ALLOWLIST_CONTACT));
+
+        // Unknown client but an allow-listed redirect -> stays a terse JSON invalid_client.
+        let resp = super::authorize(
+            State(store.clone()),
+            Query(mk("client-nope", "https://claude.ai/api/mcp/auth_callback")),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let ctype =
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+        assert!(ctype.contains("json"), "a permitted-but-unregistered redirect stays JSON: {ctype}");
     }
 
     // The pinned page ships a strict CSP whose script nonce MATCHES the inline
