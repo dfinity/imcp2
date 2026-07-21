@@ -3,10 +3,10 @@
 Some Internet Computer canisters expose **OQL** — a standard, self-describing,
 agent-queryable surface over their data, carried by just two Candid **query**
 methods that speak JSON-in-text. When `get_canister_candid` reports `oql: true` for a
-canister, use the **`get_canister_oql_schema`** and **`run_canister_oql_query`** tools to explore and query
-it rather than guessing bespoke per-question methods. Those tools wrap the two
-methods below, so you pass plain JSON (no Candid escaping); this guide explains
-the dialect they speak.
+canister, use the **`get_canister_oql_schema`** and **`canister_query`** (its `oql`
+argument) tools to explore and query it rather than guessing bespoke per-question
+methods. These wrap the two methods below, so you pass plain JSON (no Candid
+escaping); this guide explains the dialect they speak.
 
 ## The two methods
 
@@ -22,7 +22,7 @@ the dialect they speak.
 
 > **Authentication.** Both `schema` and `execute` are gated by the CALLER's
 > principal: an app shows a principal only the entities and rows it may see. So
-> `get_canister_oql_schema` and `run_canister_oql_query` **require** the app's
+> `get_canister_oql_schema` and `canister_query`'s `oql` path both **require** the app's
 > canonical `derivation_origin` (from `open_app` / `resolve_app`) — an anonymous
 > per-app read is disabled for now and is **rejected** with guidance to pass the
 > origin, rather than silently returning an empty schema or zero rows. Passing the
@@ -33,9 +33,9 @@ the dialect they speak.
   the single text argument (`Result` is the paged rows record defined under
   **Result shape** below):
   `{"start":"<entity>", "where":<pred>, "groupBy":["f"], "aggregate":[{"fn":"count|sum|avg|min|max", "field":"f", "as":"out"}], "orderBy":[{"field":"f", "dir":"asc|desc"}], "offset":N, "limit":N, "select":["f"]}`
-  Only `"start"` is required; a `count` aggregate needs no `"field"`. `run_canister_oql_query`
-  sends this as a query call for you — it is the way to reach `execute`, since raw
-  `call_canister` query calls are rejected on a canister that exposes OQL.
+  Only `"start"` is required; a `count` aggregate needs no `"field"`. `canister_query`
+  (its `oql` argument) sends this as a query call for you — it is the way to reach
+  `execute`, since a Candid `method` query is rejected on a canister that exposes OQL.
 
 ## Predicates
 
@@ -59,7 +59,7 @@ via `"in"`.
 ## Result shape
 
 `record { hasMore : bool; rows : vec vec Cell }`, where
-`Cell = record { name : text; value : variant }`. `run_canister_oql_query` decodes this into
+`Cell = record { name : text; value : variant }`. `canister_query` decodes this into
 `columns` + `rows` (one column per cell `name`) and renders a table for you; when
 `has_more` is true, re-query with a higher `offset` to page. (If you read the raw
 `execute` reply yourself, read cells **by name, never by position**.)
@@ -69,12 +69,13 @@ Prefer server-side `where`/`aggregate` over pulling whole tables into context.
 ## Example
 
 To find the first 10 employees whose last name contains "smith", returning only
-their first and last names, call `run_canister_oql_query` with:
+their first and last names, call `canister_query` with:
 
 - `canister_id`: the OQL canister's id
-- `query` (plain JSON — no Candid escaping):
+- `oql` (plain JSON — no Candid escaping):
   `{"start":"employee","where":{"icontains":{"field":"lastName","value":"smith"}},"select":["firstName","lastName"],"limit":10}`
+- `derivation_origin`: the app's canonical origin (required for OQL)
 
-`run_canister_oql_query` returns the rows as a `firstName` / `lastName` table — it wraps the
+`canister_query` returns the rows as a `firstName` / `lastName` table — it wraps the
 `execute` query method and does the Candid text-arg escaping for you. (Reaching `execute`
-through raw `call_canister` query calls is rejected on an OQL canister, so use this tool.)
+through a Candid `method` query is rejected on an OQL canister, so use the `oql` argument.)
