@@ -34,19 +34,49 @@ const resp = (status, { headers = {}, body = "" } = {}) => ({
 });
 
 /**
- * Install a fetch stub that dispatches on "METHOD url".
- * @param {Record<string, ReturnType<typeof resp>>} routes
+ * Install a fetch stub that dispatches on "METHOD url". A route value is either a
+ * `resp(...)` object or a function `(init) => resp(...)` that answers by request
+ * (used to mirror the /oauth/register allow-list, which branches on the body).
+ * @param {Record<string, ReturnType<typeof resp> | ((init: RequestInit) => ReturnType<typeof resp>)>} routes
  */
 const stubFetch = (routes) => {
   const original = globalThis.fetch;
   globalThis.fetch = async (url, init = {}) => {
     const key = `${init.method ?? "GET"} ${url.split("?")[0]}`;
-    if (routes[key]) return routes[key];
+    const route = routes[key];
+    if (route) return typeof route === "function" ? route(init) : route;
     throw new Error(`unexpected fetch: ${key}`);
   };
   return () => {
     globalThis.fetch = original;
   };
+};
+
+/**
+ * `/oauth/register` mock mirroring the hosted-redirect allow-list: a loopback
+ * redirect mints a client_id (201); a non-allow-listed hosted redirect is
+ * rejected (400 invalid_redirect_uri).
+ */
+const registerRoute = (init) => {
+  const ru = (JSON.parse(init.body ?? "{}").redirect_uris ?? [])[0] ?? "";
+  let loopback = false;
+  try {
+    const u = new URL(ru);
+    // Match the server's is_loopback_redirect: http scheme, NO userinfo, and a
+    // loopback HOSTNAME (so a look-alike like http://localhost.evil.com, or an
+    // authority trick like http://user@127.0.0.1, is NOT loopback). URL.hostname
+    // yields the bracketed [::1]; accept the bare ::1 too for robustness.
+    loopback =
+      u.protocol === "http:" &&
+      u.username === "" &&
+      u.password === "" &&
+      ["localhost", "127.0.0.1", "[::1]", "::1"].includes(u.hostname);
+  } catch {
+    loopback = false;
+  }
+  return loopback
+    ? resp(201, { body: JSON.stringify({ client_id: "client-123" }) })
+    : resp(400, { body: JSON.stringify({ error: "invalid_redirect_uri" }) });
 };
 
 test("worstStatus picks the most severe status", () => {
@@ -155,9 +185,7 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
       },
       body: JSON.stringify({ error: "invalid_token" }),
     }),
-    [`POST ${origin}/oauth/register`]: resp(201, {
-      body: JSON.stringify({ client_id: "client-123" }),
-    }),
+    [`POST ${origin}/oauth/register`]: registerRoute,
     [`GET ${origin}/oauth/authorize`]: resp(400, { body: "missing client_id" }),
     [`POST ${origin}/oauth/token`]: resp(400, {
       body: JSON.stringify({ error: "invalid_grant" }),
@@ -172,6 +200,7 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
     assert.equal(byId(section, "metadata-consistency").status, "pass");
     assert.equal(byId(section, "mcp-challenge").status, "pass");
     assert.equal(byId(section, "oauth-register").status, "pass");
+    assert.equal(byId(section, "oauth-register-allowlist").status, "pass");
     assert.equal(byId(section, "oauth-authorize").status, "pass");
     assert.equal(byId(section, "oauth-token").status, "pass");
     // Deployment facts are captured and a GitHub commit link is derived.
@@ -213,9 +242,7 @@ test("checkMcpEndpoints flags a missing OAuth challenge", async () => {
     }),
     // 200 instead of a 401 challenge → wrong contract.
     [`POST ${origin}/mcp`]: resp(200, { body: "{}" }),
-    [`POST ${origin}/oauth/register`]: resp(201, {
-      body: JSON.stringify({ client_id: "x" }),
-    }),
+    [`POST ${origin}/oauth/register`]: registerRoute,
     [`GET ${origin}/oauth/authorize`]: resp(400),
     [`POST ${origin}/oauth/token`]: resp(400, {
       body: JSON.stringify({ error: "invalid_grant" }),
@@ -224,6 +251,48 @@ test("checkMcpEndpoints flags a missing OAuth challenge", async () => {
   try {
     const { section } = await checkMcpEndpoints(origin, 2000);
     assert.equal(byId(section, "mcp-challenge").status, "fail");
+  } finally {
+    restore();
+  }
+});
+
+test("checkMcpEndpoints flags a missing hosted-redirect allow-list", async () => {
+  const origin = "https://mcp.beta.test";
+  const restore = stubFetch({
+    [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
+    [`GET ${origin}/version`]: resp(404),
+    [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
+      body: JSON.stringify({ authorization_servers: [origin], resource: `${origin}/mcp` }),
+    }),
+    [`GET ${origin}/.well-known/oauth-authorization-server`]: resp(200, {
+      body: JSON.stringify({
+        issuer: origin,
+        authorization_endpoint: `${origin}/oauth/authorize`,
+        token_endpoint: `${origin}/oauth/token`,
+        registration_endpoint: `${origin}/oauth/register`,
+      }),
+    }),
+    [`POST ${origin}/mcp`]: resp(401, {
+      headers: {
+        "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource"`,
+      },
+      body: JSON.stringify({ error: "invalid_token" }),
+    }),
+    // Guard MISSING: the server accepts ANY redirect (even a hosted one) with 201.
+    [`POST ${origin}/oauth/register`]: resp(201, {
+      body: JSON.stringify({ client_id: "leaked" }),
+    }),
+    [`GET ${origin}/oauth/authorize`]: resp(400),
+    [`POST ${origin}/oauth/token`]: resp(400, {
+      body: JSON.stringify({ error: "invalid_grant" }),
+    }),
+  });
+  try {
+    const { section } = await checkMcpEndpoints(origin, 2000);
+    // DCR still mints a client_id for the loopback probe, but the allow-list
+    // probe (a hosted redirect) wrongly succeeds, so the guard check goes red.
+    assert.equal(byId(section, "oauth-register").status, "pass");
+    assert.equal(byId(section, "oauth-register-allowlist").status, "fail");
   } finally {
     restore();
   }
