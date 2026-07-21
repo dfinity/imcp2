@@ -10,7 +10,8 @@ It answers three questions and adds a few suggestions:
    correct status codes?** — probes the landing page, the build/version endpoint
    (`/version`), the two OAuth discovery documents, the `/mcp` endpoint's
    unauthenticated `401` challenge, dynamic client registration, and the
-   `/oauth/authorize` + `/oauth/token` endpoints, plus TLS certificate freshness.
+   `/mcp/oauth/authorize` + `/mcp/oauth/token` endpoints, plus TLS certificate
+   freshness.
 2. **Which Internet Identity instance is it linked to?** — resolves the II
    origin (derived from the `mcp.<env>.id.ai` ↔ `<env>.id.ai` convention, or
    overridden explicitly). Question 3 then checks that resolved origin is

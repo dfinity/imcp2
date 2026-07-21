@@ -1711,6 +1711,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "imcp2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "candid",
+ "candid_parser",
+ "crc32fast",
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "hex",
+ "http-body-util",
+ "ic-agent",
+ "ic-representation-independent-hash",
+ "ic-signature-verification",
+ "p256",
+ "regex",
+ "reqwest",
+ "rmcp",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http 0.7.0",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1983,40 +2019,6 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
-
-[[package]]
-name = "imcp2"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "candid",
- "candid_parser",
- "crc32fast",
- "ed25519-dalek",
- "getrandom 0.3.4",
- "hex",
- "ic-agent",
- "ic-representation-independent-hash",
- "ic-signature-verification",
- "p256",
- "regex",
- "reqwest",
- "rmcp",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
- "tokio-util",
- "tower-http 0.7.0",
- "tracing",
- "tracing-subscriber",
- "url",
- "urlencoding",
- "uuid",
-]
 
 [[package]]
 name = "memchr"

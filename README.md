@@ -1,11 +1,84 @@
 # IMCP2
 
-Minimal MCP server that bridges an LLM to the Internet Computer.
+Minimal MCP server that bridges an LLM to the Internet Computer — packaged as
+an embeddable Rust **library crate** (`imcp2`) plus a thin deployment binary.
 
 The LLM only ever speaks **textual Candid**; this server does all the
 encoding/decoding and signing against the IC via
 [`ic-agent`](https://github.com/dfinity/agent-rs). The MCP layer is the
 [official Rust SDK](https://github.com/modelcontextprotocol/rust-sdk) (`rmcp`).
+
+## Use as a library
+
+One `McpServer` serves one Internet Identity instance as two
+[`axum`](https://github.com/tokio-rs/axum) routers:
+
+- **`McpServer::mcp_router()`** — the MCP streamable-HTTP endpoint (the router
+  fallback, bearer-token gated) plus the OAuth authorization server under
+  `/oauth`, nested at the mount path of your choice.
+- **`McpServer::well_known_router()`** — the OAuth discovery documents, merged
+  at the application root (well-known URIs are origin-scoped), **parametric on
+  the mount path**: the AS issuer is `{public_url}{mcp_path}` (an RFC 8414 path
+  issuer) and the documents live at the path-inserted well-known locations.
+  `root_well_known_router()` adds the plain-root fallback documents for the
+  origin's default instance, and `auth_callbacks_router(&[…])` the
+  origin-global II auth-callback allow-list covering every instance.
+
+The IC `Agent` is **inherited from the caller**, not built by the library: a
+host — an API boundary node or a gateway — passes in its own route-configured
+agent, so the whole process links one `ic-agent` and shares one boundary-node
+client. (`ic-agent` stays a direct dependency until
+[`ic-bn-lib`](https://github.com/dfinity/ic-bn-lib) — the shared BN/gateway
+crate it should eventually be sourced through — releases against ic-agent 0.48;
+see `Cargo.toml`.)
+
+```rust
+use imcp2::{auth_callbacks_router, Agent, IiInstance, McpConfig, McpServer, SharedClients, IC_URL};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Standalone: a default mainnet agent. Embedded: hand in the host's own.
+    let agent = Agent::builder().with_url(IC_URL).build()?;
+    let server = McpServer::new(McpConfig {
+        agent,
+        instance: IiInstance::beta().map_err(anyhow::Error::msg)?,
+        public_url: "https://mcp.example.com".into(),
+        mcp_path: "/mcp".into(),
+        clients: SharedClients::load(),
+    });
+    server.spawn_session_reaper();
+    let app = axum::Router::new()
+        // nest_service (not nest): it also forwards the trailing-slash form.
+        .nest_service(server.mcp_path(), server.mcp_router())
+        .merge(server.well_known_router())
+        // Exactly one instance per origin also answers the root probes and
+        // serves the origin-global II auth-callback allow-list.
+        .merge(server.root_well_known_router())
+        .merge(auth_callbacks_router(&[&server]));
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+```
+
+Mounted at `/mcp`, that serves:
+
+```
+POST /mcp                          the MCP endpoint (401 + WWW-Authenticate until authorized)
+GET  /mcp/oauth/authorize         ─┐
+GET  /mcp/oauth/connect/callback   │ the OAuth authorization server
+POST /mcp/oauth/connect/redeem     │ (login via Internet Identity;
+POST /mcp/oauth/token              │  issuer https://mcp.example.com/mcp)
+POST /mcp/oauth/register          ─┘
+GET  /.well-known/oauth-authorization-server/mcp   (+ root + /mcp/.well-known/… alternates)
+GET  /.well-known/oauth-protected-resource/mcp     (+ root fallback)
+GET  /.well-known/ii-auth-callbacks                (origin-global, all instances)
+```
+
+Several instances share one origin by giving each its own `McpServer` (one
+shared `SharedClients`, one `auth_callbacks_router` over all of them) — exactly
+what the bundled binary does with beta and production Internet Identity (see
+below).
 
 ## Tools
 
@@ -287,7 +360,7 @@ flow.
 
 ```bash
 cargo run
-# serves http://0.0.0.0:8000  (MCP streamable-HTTP at /mcp, info page at /)
+# serves http://0.0.0.0:8000  (MCP at /mcp and /mcp-prod, OAuth under each mount, info page at /)
 # honours $PORT (default 8000) and $PUBLIC_URL (default http://localhost:8000)
 ```
 
@@ -312,22 +385,24 @@ cloudflared tunnel --url http://localhost:8000   # prints https://<name>.tryclou
 PUBLIC_URL=https://<name>.trycloudflare.com cargo run
 ```
 
-## Try it (raw MCP over curl)
+## Probe it (curl)
+
+The MCP endpoint is bearer-gated (see Auth), so tool calls need an OAuth-capable
+MCP client — but the discovery surface and the auth handshake are probeable:
 
 ```bash
-# 1. initialize, grab the session id
-SID=$(curl -s -D - -o /dev/null \
-  -H 'Accept: application/json, text/event-stream' -H 'Content-Type: application/json' \
+# OAuth discovery documents (path-inserted; root fallbacks also served)
+curl -s http://127.0.0.1:8000/.well-known/oauth-authorization-server/mcp | jq
+curl -s http://127.0.0.1:8000/.well-known/oauth-protected-resource/mcp | jq
+curl -s http://127.0.0.1:8000/.well-known/ii-auth-callbacks | jq
+
+# Unauthenticated MCP calls answer 401 with the RFC 9728 challenge clients
+# use to find the authorization server:
+curl -si -X POST \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}' \
-  http://127.0.0.1:8000/mcp | grep -i '^mcp-session-id' | tr -d '\r' | awk '{print $2}')
-
-H=(-H "Accept: application/json, text/event-stream" -H "Content-Type: application/json" -H "Mcp-Session-Id: $SID")
-curl -s "${H[@]}" -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' http://127.0.0.1:8000/mcp >/dev/null
-
-# 2. query a real mainnet canister (ICP ledger)
-curl -s "${H[@]}" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"canister_query","arguments":{"canister_id":"ryjl3-tyaaa-aaaaa-aaaba-cai","method":"icrc1_name","args":"()"}}}' \
-  http://127.0.0.1:8000/mcp | grep '^data: {' | sed 's/^data: //' | jq -r '.result.content[0].text'
-# => ("Internet Computer")
+  http://127.0.0.1:8000/mcp | grep -i www-authenticate
+# -> WWW-Authenticate: Bearer resource_metadata=".../.well-known/oauth-protected-resource/mcp"
 ```
 
 ## Auth (OAuth 2.1, login via Internet Identity)
@@ -338,13 +413,13 @@ in and navigates the browser back to a **pinned callback page** on our origin,
 carrying a canister-signed delegation in the URL fragment. We bridge that to a
 single **authorization-code + PKCE** flow, so any OAuth 2.1 client works:
 
-- `/oauth/authorize` validates the client + redirect and PKCE, sets a
+- `/mcp/oauth/authorize` validates the client + redirect and PKCE, sets a
   **browser-binding cookie** (see below), and redirects to II's handshake, carrying
   this connect's registration public key `pub(X)` in the link fragment
   (`registration_key`). II certifies a short-lived, two-hop delegation chain and
   navigates the browser back to our pinned callback page (`GET
-  /oauth/connect/callback`) with the chain in the fragment. That page POSTs the
-  chain (with the cookie) to `/oauth/connect/redeem`, which redeems it (one
+  /mcp/oauth/connect/callback`) with the chain in the fragment. That page POSTs the
+  chain (with the cookie) to `/mcp/oauth/connect/redeem`, which redeems it (one
   `mcp_register_v2` call), mints a PKCE-bound code, and returns the client
   `redirect_uri?code=…&state=…` for the page to navigate to.
 
@@ -354,25 +429,31 @@ flow relies on.
 
 Endpoints:
 
-- `GET /.well-known/oauth-authorization-server` — AS metadata (advertises
+The default (beta) instance is mounted at `/mcp`, so its AS issuer is
+`<PUBLIC_URL>/mcp` and everything OAuth lives under it:
+
+- `GET /.well-known/oauth-authorization-server/mcp` — AS metadata (RFC 8414
+  path-inserted; also served at the OIDC-style `/mcp/.well-known/…` alternate
+  and, for this default instance, at the plain root; advertises
   `grant_types_supported: ["authorization_code"]`)
-- `GET /.well-known/oauth-protected-resource` — points clients at the AS
-- `POST /oauth/register` — dynamic client registration (RFC 7591); `redirect_uris`
+- `GET /.well-known/oauth-protected-resource/mcp` — points clients at the AS
+  (RFC 9728 §3.1 path-inserted; root fallback also served)
+- `POST /mcp/oauth/register` — dynamic client registration (RFC 7591); `redirect_uris`
   are stored and persisted to `OAUTH_CLIENTS_FILE`; requested `grant_types` are
   honoured (intersected with `authorization_code`). A **hosted** `redirect_uri` is
   rejected unless its host is on the allow-list (see the Companion-control note
   below); loopback redirects are always accepted.
 
-- `GET  /oauth/authorize` — validates the client + redirect, requires PKCE, sets
+- `GET  /mcp/oauth/authorize` — validates the client + redirect, requires PKCE, sets
   the binding cookie, then redirects to II's handshake (with `registration_key`)
-- `GET  /oauth/connect/callback` — the **pinned callback page**: II navigates here
+- `GET  /mcp/oauth/connect/callback` — the **pinned callback page**: II navigates here
   with the delegation in the URL fragment; the page reads it client-side and POSTs
   it to the redeem endpoint (it is the sole fragment reader and reflects nothing
   into the DOM)
-- `POST /oauth/connect/redeem` — redeems the fragment delegation (requires the
+- `POST /mcp/oauth/connect/redeem` — redeems the fragment delegation (requires the
   binding cookie), binds the session key via `mcp_register_v2`, mints a PKCE-bound
   code, and returns the client `redirect_uri?code=…&state=…`
-- `POST /oauth/token` — exchanges an authorization `code` (PKCE) for the access token
+- `POST /mcp/oauth/token` — exchanges an authorization `code` (PKCE) for the access token
 
 Registration is **proven synchronously**: redemption is a signed `mcp_register_v2`
 that must return `Ok`. Unauthenticated `/mcp` requests get `401` with a
@@ -402,10 +483,10 @@ gate) stay JSON — no browser ever lands on them.
 
 The `state` in the II connect link is echoed back to the client in the final
 redirect, so it **cannot by itself prove** that the browser redeeming at
-`/oauth/connect/redeem` is the one that started at `/oauth/authorize` — nor that it
+`…/oauth/connect/redeem` is the one that started at `…/oauth/authorize` — nor that it
 is the one that actually **consented** at II. Without a binding there's a
 session-fixation takeover: an attacker registers a client (open DCR) with their own
-`redirect_uri` + PKCE challenge, calls `/oauth/authorize`, reads the II connect link
+`redirect_uri` + PKCE challenge, calls `…/oauth/authorize`, reads the II connect link
 from the 302, and phishes it to a victim who already trusts this origin in II
 Settings (II's consent screen names only the *origin*, never the OAuth client, so
 nothing warns the victim). The victim consents; the attacker completes the flow and
@@ -413,12 +494,12 @@ redeems the code with their own PKCE verifier — a token acting as the victim. 
 initiator-only cookie does *not* close this: the attacker is the initiator, so it
 holds the cookie.)
 
-**The fix.** `/oauth/connect/redeem` mints a code only when the requesting browser
+**The fix.** `…/oauth/connect/redeem` mints a code only when the requesting browser
 presents **both** proofs, which can co-reside in one browser only in the legitimate
 same-browser flow:
 
 1. **initiator** — an unguessable `HttpOnly; Secure; SameSite=Lax` `sid` cookie
-   (scoped to the instance's `…/oauth` path) set at `/oauth/authorize`;
+   (scoped to the instance's `…/oauth` path) set at `…/oauth/authorize`;
 2. **consenter** — the canister-signed delegation chain, delivered by II *only* to
    the consenting browser as a URL fragment and *required* to redeem, so only the
    browser that drove the II consent holds it;
@@ -452,10 +533,10 @@ the callback page.
 > MCP connector vendors' callback paths and widened per deployment with
 > `OAUTH_ALLOWED_REDIRECT_PREFIXES` (additive; each entry a full `https://host/path`
 > URL prefix, a bare domain is refused); loopback/native clients are exempt (the code
-> resolves on the consenter's own machine). Enforced at both `/oauth/register` and `/oauth/authorize`. A client
+> resolves on the consenter's own machine). Enforced at both `…/oauth/register` and `…/oauth/authorize`. A client
 > turned away is pointed at a contact address to request approval:
-> `/oauth/register` says so in its JSON `error_description`, and a browser that
-> reaches `/oauth/authorize` gets an on-brand "not allowed" page (not a raw error)
+> `…/oauth/register` says so in its JSON `error_description`, and a browser that
+> reaches `…/oauth/authorize` gets an on-brand "not allowed" page (not a raw error)
 > naming the same contact.
 
 ### The registration-delegation connect handshake
@@ -528,7 +609,7 @@ credentials, `no-store`, 8 KB cap, `application/json` required) and requires the
 callback URL to be **exactly** (string-equal) one of the declared entries —
 **fail-closed**, so serving this document is mandatory once #4091 ships. This
 server serves it for both instances (one origin-global document listing each
-instance's `{prefix}/oauth/connect/callback`), built from the same helper that
+instance's `{mcp_path}/oauth/connect/callback`), built from the same helper that
 builds the II links' callback URLs so the two can never drift.
 
 The wire shapes match the **merged II contract** (verified against the
@@ -554,9 +635,9 @@ Server side:
 - **`X`, a per-connect registration keypair** bound to the connect `sid`;
   `priv(X)` never leaves the backend, and `pub(X)` rides the II link
   (`registration_key`, base64url DER).
-- **A pinned callback page** at `GET /oauth/connect/callback` — the *sole* reader
+- **A pinned callback page** at `GET …/oauth/connect/callback` — the *sole* reader
   of the returned fragment. It reads `location.hash` client-side, POSTs it (with
-  the connect cookie) to `POST /oauth/connect/redeem`, and reflects nothing into
+  the connect cookie) to `POST …/oauth/connect/redeem`, and reflects nothing into
   the DOM; it ships a strict CSP (`default-src 'none'`, a per-response script
   nonce, `connect-src 'self'`).
 - **Redemption** builds a `DelegatedIdentity` from `priv(X)` + the delegation and
@@ -628,9 +709,10 @@ both point at the same II.
 
 The same server exposes a second, fully isolated instance connected to
 **production** Internet Identity: MCP endpoint `/mcp-prod`, with its own
-path-scoped authorization server under `/prod/oauth/*` (issuer
-`<PUBLIC_URL>/prod`, an RFC 8414 path issuer; AS metadata at
-`/.well-known/oauth-authorization-server/prod`, resource metadata at
+authorization server under `/mcp-prod/oauth/*` (issuer
+`<PUBLIC_URL>/mcp-prod`, an RFC 8414 path issuer; AS metadata at
+`/.well-known/oauth-authorization-server/mcp-prod` plus the OIDC-style
+`/mcp-prod/.well-known/…` alternate, resource metadata at
 `/.well-known/oauth-protected-resource/mcp-prod`). Configure with `II_URL_PROD`
 (default `https://id.ai`) and `II_CANISTER_ID_PROD` (default
 `rdmx6-jaaaa-aaaaa-aaadq-cai`).
@@ -742,7 +824,7 @@ delegation. Omitting `account` uses the default account.
 - [x] OAuth 2.1 auth (authorization-code + PKCE): II's `/mcp` **registration-delegation**
       handshake binds the connection's session key (a fragment-delivered, canister-signed
       delegation redeemed via `mcp_register_v2`), with **Consent-Bound Completion** binding
-      `/oauth/connect/redeem` to both the initiator (`sid` cookie) and the consenter (the
+      `…/oauth/connect/redeem` to both the initiator (`sid` cookie) and the consenter (the
       fragment delegation); expiring tokens. The same-browser phishing variant is closed
       by a hosted-redirect allow-list (see Auth). (The RFC 8628 device grant was dropped.)
 - [x] On-demand **domain identities**: the registered session key mints per-app

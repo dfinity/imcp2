@@ -320,14 +320,14 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
       typeof issuer === "string" &&
       Array.isArray(asList) &&
       asList.includes(issuer) &&
-      issuer === mcpOrigin;
+      issuer === `${mcpOrigin}/mcp`;
     checks.push({
       id: "metadata-consistency",
       label: "Discovery documents are self-consistent",
       description:
-        "Cross-checks the two discovery documents agree: the authorization server's issuer must match this origin and be listed as an authorization_server.",
+        "Cross-checks the two discovery documents agree: the authorization server's issuer must be this origin's /mcp path issuer and be listed as an authorization_server.",
       target: "oauth-protected-resource ↔ oauth-authorization-server",
-      expected: "issuer === origin and listed as authorization_server",
+      expected: "issuer === origin/mcp and listed as authorization_server",
       status: consistent ? "pass" : "warn",
       httpStatus: null,
       latencyMs: null,
@@ -361,7 +361,10 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
       }),
     });
     const wwwAuth = r.headers.get("www-authenticate") ?? "";
-    const expectedMetadata = `${mcpOrigin}/.well-known/oauth-protected-resource`;
+    // The challenge points at the resource's path-aware metadata document
+    // (RFC 9728 §3.1): the resource is `<origin>/mcp`, so its metadata lives at
+    // `/.well-known/oauth-protected-resource/mcp`.
+    const expectedMetadata = `${mcpOrigin}/.well-known/oauth-protected-resource/mcp`;
     const challengeOk =
       r.status === 401 &&
       /bearer/i.test(wwwAuth) &&
@@ -387,7 +390,7 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
   //    allow-list exempts it), so this is the dependency-free way to confirm a
   //    client can self-register without manual approval, which is what DCR is for.
   {
-    const url = `${mcpOrigin}/oauth/register`;
+    const url = `${mcpOrigin}/mcp/oauth/register`;
     const r = await probe(url, {
       timeoutMs,
       method: "POST",
@@ -431,7 +434,7 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
   //     allow-listed by a deployment, so this can't false-alert if the allow-list
   //     is widened via OAUTH_ALLOWED_REDIRECT_PREFIXES.
   {
-    const url = `${mcpOrigin}/oauth/register`;
+    const url = `${mcpOrigin}/mcp/oauth/register`;
     const r = await probe(url, {
       timeoutMs,
       method: "POST",
@@ -468,7 +471,7 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
   //    (rather than 5xx / connection error). It is interactive, so we only
   //    assert it is alive and validating, not a full successful redirect.
   {
-    const url = `${mcpOrigin}/oauth/authorize`;
+    const url = `${mcpOrigin}/mcp/oauth/authorize`;
     const r = await probe(url, { timeoutMs });
     const alive = r.ok && r.status >= 400 && r.status < 500;
     checks.push({
@@ -489,7 +492,7 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
 
   // 7. Token endpoint liveness: a bogus grant must be rejected with 400.
   {
-    const url = `${mcpOrigin}/oauth/token`;
+    const url = `${mcpOrigin}/mcp/oauth/token`;
     const r = await probe(url, {
       timeoutMs,
       method: "POST",
@@ -569,7 +572,7 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
 
 /**
  * Resolve which II instance the MCP server is paired with. We don't try to
- * confirm the link by following `/oauth/authorize` headlessly: that endpoint
+ * confirm the link by following `/mcp/oauth/authorize` headlessly: that endpoint
  * issues a *script-initiated* navigation (an HTML page that calls
  * `location.replace`), not an HTTP 3xx redirect — because the II `/mcp` URL
  * carries its params in the fragment and form-action CSP is enforced across
@@ -884,7 +887,7 @@ export const buildSuggestions = (sections, facts) => {
   if (checkById["mcp-challenge"]?.status !== "pass") {
     suggestions.push(
       "The unauthenticated /mcp response should be a 401 carrying " +
-        'WWW-Authenticate: Bearer resource_metadata="…/.well-known/oauth-protected-resource". ' +
+        'WWW-Authenticate: Bearer resource_metadata="…/.well-known/oauth-protected-resource/mcp". ' +
         "MCP clients rely on this header to discover the authorization server.",
     );
   }
@@ -896,11 +899,11 @@ export const buildSuggestions = (sections, facts) => {
       "external uptime monitors have no clean liveness probe.",
   );
   suggestions.push(
-    "POST /oauth/register accepts anonymous dynamic client registration. " +
+    "POST /mcp/oauth/register accepts anonymous dynamic client registration. " +
       "Ensure it is rate-limited and that stale/unused clients are pruned to " +
       "avoid unbounded growth, and that registrations are shared across all " +
       "server replicas (a freshly registered client_id was not immediately " +
-      "usable at /oauth/authorize during probing).",
+      "usable at /mcp/oauth/authorize during probing).",
   );
 
   const certWarn = [facts?.mcp, facts?.ii]

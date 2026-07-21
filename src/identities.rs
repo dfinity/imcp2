@@ -99,12 +99,12 @@ const READ_ONLY_MSG: &str = "This Internet Identity session is read-only, so it 
      — are update calls that a read-only session can't make. Reconnect with Internet Identity and turn \
      OFF the read-only option on the consent screen, then try again.";
 
-/// One Internet Identity instance this server can connect users against. The
-/// default ("beta") instance serves `/mcp` with its OAuth AS at the root of
-/// `PUBLIC_URL`; the "prod" instance serves `/mcp-prod` with a path-scoped AS
-/// (issuer `<PUBLIC_URL>/prod`, RFC 8414 path issuer). Each instance gets its
+/// One Internet Identity instance this server can connect users against —
+/// purely *which II* (origin + canister), nothing about where the instance is
+/// mounted on this server: the mount path is deployment composition, chosen in
+/// `McpConfig` when the instance's routers are built. Each instance gets its
 /// own `Identities` + `AuthStore`, so sessions/tokens never cross instances;
-/// II trust in the user's settings is by ORIGIN, which both instances share.
+/// II trust in the user's settings is by ORIGIN, which all instances share.
 #[derive(Clone, Debug)]
 pub struct IiInstance {
     /// Short name for logging ("beta", "prod").
@@ -113,10 +113,6 @@ pub struct IiInstance {
     pub ii_url: String,
     /// Canister id of that II instance — the target of the `mcp_*` calls.
     pub ii_canister: Principal,
-    /// This instance's OAuth path prefix on the server: "" (root) or "/prod".
-    pub oauth_prefix: &'static str,
-    /// The MCP resource path this instance gates: "/mcp" or "/mcp-prod".
-    pub mcp_path: &'static str,
 }
 
 impl IiInstance {
@@ -126,8 +122,6 @@ impl IiInstance {
             name: "beta",
             ii_url: env_origin("II_URL", II_URL_DEFAULT),
             ii_canister: env_principal("II_CANISTER_ID", II_CANISTER_ID_DEFAULT)?,
-            oauth_prefix: "",
-            mcp_path: "/mcp",
         })
     }
 
@@ -137,8 +131,6 @@ impl IiInstance {
             name: "prod",
             ii_url: env_origin("II_URL_PROD", II_URL_PROD_DEFAULT),
             ii_canister: env_principal("II_CANISTER_ID_PROD", II_CANISTER_ID_PROD_DEFAULT)?,
-            oauth_prefix: "/prod",
-            mcp_path: "/mcp-prod",
         })
     }
 }
@@ -181,12 +173,12 @@ const ACTIVE_SESSION_WINDOW_NS: u64 = 15 * 60 * 1_000_000_000;
 /// [`Identities::session_gauges`] so a scrape locks and iterates the session map
 /// once and reports a consistent `active <= live` pair.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SessionGauges {
+pub struct SessionGauges {
     /// Sessions holding a currently-valid II grant (the `live_sessions` gauge).
-    pub(crate) live: usize,
+    pub live: usize,
     /// The subset also active within [`ACTIVE_SESSION_WINDOW_NS`] (the
     /// `active_sessions` gauge). Always `<= live`.
-    pub(crate) active: usize,
+    pub active: usize,
 }
 
 /// Remap a domain to the `target_origin` II expects for account derivation.
@@ -439,13 +431,19 @@ pub struct ResolveAppOutput {
 pub struct Identities {
     /// The II instance every session in this store is registered against.
     instance: IiInstance,
+    /// This MCP server's own public origin — the `target_origin` the
+    /// management identity is derived at (`target_origin()` reduces it to a
+    /// bare origin either way). Injected by the embedding application, never
+    /// read from the environment here.
+    public_url: String,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
 }
 
 impl Identities {
-    pub fn new(instance: IiInstance) -> Self {
+    pub fn new(instance: IiInstance, public_url: String) -> Self {
         Self {
             instance,
+            public_url,
             sessions: Arc::default(),
         }
     }
@@ -620,7 +618,7 @@ impl Identities {
     /// reported pair is consistent (`active <= live`) — two separate reads could
     /// straddle a grant expiry and momentarily report `active > live`. A cheap
     /// read-lock snapshot.
-    pub(crate) async fn session_gauges(&self) -> SessionGauges {
+    pub async fn session_gauges(&self) -> SessionGauges {
         let now = now_ns();
         let sessions = self.sessions.read().await;
         let mut g = SessionGauges { live: 0, active: 0 };
@@ -738,7 +736,7 @@ impl Identities {
     /// across reconnects (unlike the ephemeral session key), so it works as the
     /// user's controller/funder identity.
     pub async fn management_identity(&self, session_id: &str) -> Result<DelegatedIdentity, String> {
-        let origin = crate::auth::base_url();
+        let origin = self.public_url.clone();
         self.delegated_identity(session_id, &origin, None).await
     }
 
@@ -1275,15 +1273,12 @@ mod tests {
     use super::*;
 
     /// The built-in instance defaults must parse (canister ids are compile-time
-    /// strings) and carry the expected paths/prefixes.
+    /// strings) and point at two distinct Internet Identity instances.
     #[test]
     fn instance_defaults_are_valid() {
         let beta = IiInstance::beta().expect("beta defaults");
-        assert_eq!(beta.oauth_prefix, "");
-        assert_eq!(beta.mcp_path, "/mcp");
         let prod = IiInstance::prod().expect("prod defaults");
-        assert_eq!(prod.oauth_prefix, "/prod");
-        assert_eq!(prod.mcp_path, "/mcp-prod");
+        assert_ne!(beta.ii_url, prod.ii_url);
         assert_ne!(beta.ii_canister, prod.ii_canister);
     }
 
@@ -1348,13 +1343,14 @@ mod tests {
 
     // An Identities store over a dummy II instance (tests never hit the network).
     fn test_ids() -> Identities {
-        Identities::new(IiInstance {
-            name: "test",
-            ii_url: "https://ii.test".into(),
-            ii_canister: Principal::anonymous(),
-            oauth_prefix: "",
-            mcp_path: "/mcp",
-        })
+        Identities::new(
+            IiInstance {
+                name: "test",
+                ii_url: "https://ii.test".into(),
+                ii_canister: Principal::anonymous(),
+            },
+            "https://mcp.test".into(),
+        )
     }
 
     // Seed a session with a live grant, bypassing the network connect flow.
