@@ -509,7 +509,7 @@ pub async fn authorize(
             // not an approval gap, so classify it `invalid_request` and show the
             // generic sign-in error rather than a misleading "request access" page.
             return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
-                "redirect_uri is malformed or is not an https or loopback URL", SIGNIN_HEADLINE,
+                "redirect_uri must be a valid https or loopback URL", SIGNIN_HEADLINE,
                 MALFORMED_DIAGNOSTIC);
         }
         // `invalid_client` (not `invalid_request`): the request is well-formed,
@@ -924,7 +924,7 @@ fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
 /// page's strict resource CSP). The address is the compiled-in [`CONTACT`], never
 /// a request value.
 fn contact_report_hint() -> String {
-    format!("If this error is unexpected, please email <a href=\"mailto:{CONTACT}\">{CONTACT}</a> to report it.")
+    format!("If this error is unexpected, please contact <a href=\"mailto:{CONTACT}\">{CONTACT}</a> to report it.")
 }
 
 /// Render one of the shared browser-facing error screens
