@@ -203,27 +203,32 @@ const DEFAULT_ALLOWED_REDIRECTS: &[(&str, &str)] = &[
 /// `https://host/path` value pinning an origin + path prefix; an entry that is not
 /// https, has no host, or carries only the root path (`/`) is dropped with a
 /// warning (a domain-wide entry is exactly the hole this closes). Additive: the
-/// shipped binary is safe by default and ops can only widen the set.
-fn allowed_redirects() -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> =
-        DEFAULT_ALLOWED_REDIRECTS.iter().map(|(d, p)| (d.to_string(), p.to_string())).collect();
-    if let Ok(extra) = std::env::var("OAUTH_ALLOWED_REDIRECT_PREFIXES") {
-        for raw in extra.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
-            let entry = url::Url::parse(raw).ok().filter(|u| u.scheme() == "https").and_then(|u| {
-                let host = u.host_str()?.trim_end_matches('.').to_ascii_lowercase();
-                let path = u.path().to_string();
-                (!host.is_empty() && path != "/" && !path.is_empty()).then_some((host, path))
-            });
-            match entry {
-                Some(e) => out.push(e),
-                None => tracing::warn!(
-                    "ignoring OAUTH_ALLOWED_REDIRECT_PREFIXES entry `{raw}`: must be an https \
-                     URL with a non-root path prefix (domain-wide entries are refused)"
-                ),
+/// shipped binary is safe by default and ops can only widen the set. Computed ONCE
+/// (the env is process-static) via `OnceLock`, so `/oauth/register` and
+/// `/oauth/authorize` neither re-parse the env nor re-log its warnings per call.
+fn allowed_redirects() -> &'static [(String, String)] {
+    static CACHE: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut out: Vec<(String, String)> =
+            DEFAULT_ALLOWED_REDIRECTS.iter().map(|(d, p)| (d.to_string(), p.to_string())).collect();
+        if let Ok(extra) = std::env::var("OAUTH_ALLOWED_REDIRECT_PREFIXES") {
+            for raw in extra.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
+                let entry = url::Url::parse(raw).ok().filter(|u| u.scheme() == "https").and_then(|u| {
+                    let host = u.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+                    let path = u.path().to_string();
+                    (!host.is_empty() && path != "/" && !path.is_empty()).then_some((host, path))
+                });
+                match entry {
+                    Some(e) => out.push(e),
+                    None => tracing::warn!(
+                        "ignoring OAUTH_ALLOWED_REDIRECT_PREFIXES entry `{raw}`: must be an https \
+                         URL with a non-root path prefix (domain-wide entries are refused)"
+                    ),
+                }
             }
         }
-    }
-    out
+        out
+    })
 }
 
 /// Whether `path` equals `prefix` or is a descendant of it at a SEGMENT boundary,
@@ -234,6 +239,20 @@ fn path_within_prefix(path: &str, prefix: &str) -> bool {
         Some(rest) => rest.is_empty() || prefix.ends_with('/') || rest.starts_with('/'),
         None => false,
     }
+}
+
+/// Whether the redirect carries a `.`/`..` path segment (raw or `%2e`-encoded). A
+/// user agent normalizes these away before requesting, so a redirect like
+/// `/connector/oauth/../../g/evil` could satisfy the pinned-prefix check here yet
+/// land OUTSIDE the prefix in the browser; such redirects are refused outright.
+/// (`url::Url` already normalizes special-scheme paths, so this is a belt-and-
+/// suspenders check on the raw input, independent of that normalization.)
+fn has_dot_segment(redirect_uri: &str) -> bool {
+    let normalized = redirect_uri.to_ascii_lowercase().replace("%2e", ".");
+    normalized.split('/').any(|seg| {
+        let seg = seg.split(['?', '#']).next().unwrap_or("");
+        seg == "." || seg == ".."
+    })
 }
 
 /// Whether a `redirect_uri` may be registered or receive an authorization code.
@@ -256,6 +275,11 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
         return false;
     };
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    // Refuse `.`/`..` (raw or `%2e`) path segments: they normalize in the browser
+    // and could escape the pinned callback prefix (`/connector/oauth/../../g/evil`).
+    if has_dot_segment(redirect_uri) {
         return false;
     }
     let Some(host) = url.host_str() else {
@@ -1529,6 +1553,10 @@ mod tests {
         // Right domain, wrong path, plus a non-segment-boundary near-miss of the pin.
         assert!(!redirect_uri_permitted("https://claude.ai/foo"));
         assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callbackEVIL"));
+        // Dot-segment traversal that would normalize (in the browser) outside the
+        // pinned prefix, raw and percent-encoded (`%2e`) forms.
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/../../g/evil"));
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%2e%2e/%2e%2e/g/evil"));
         // Cursor: allowed at its real hosted callback path (registered as
         // www.cursor.com), refused on any other path.
         assert!(redirect_uri_permitted("https://www.cursor.com/agents/mcp/oauth/callback"));
@@ -1554,6 +1582,21 @@ mod tests {
         // now-removed domain) still can't receive a code at /oauth/authorize.
         let junk = ClientReg { redirect_uris: vec!["https://example.com/cb".to_string()] };
         assert!(!redirect_allowed(Some(&junk), "https://example.com/cb"));
+    }
+
+    /// Dot-segment detection, independent of `url::Url` normalization: whole-segment
+    /// `.`/`..` (raw or `%2e`) is caught; dots inside a segment and in the query are not.
+    #[test]
+    fn detects_dot_segments() {
+        use super::has_dot_segment;
+        assert!(has_dot_segment("https://x.example/a/../b"));
+        assert!(has_dot_segment("https://x.example/a/./b"));
+        assert!(has_dot_segment("https://x.example/a/%2e%2e/b"));
+        assert!(has_dot_segment("https://x.example/a/%2E%2E/b"));
+        assert!(has_dot_segment("https://x.example/foo/.."));
+        assert!(!has_dot_segment("https://x.example/api/mcp/auth_callback"));
+        assert!(!has_dot_segment("https://x.example/a.b/c..d")); // dots inside a segment
+        assert!(!has_dot_segment("https://x.example/cb?next=../x")); // query, not path
     }
 
     /// A registered loopback redirect matches at ANY port (RFC 8252 §7.3 — the
