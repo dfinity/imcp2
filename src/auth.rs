@@ -199,10 +199,12 @@ const DEFAULT_ALLOWED_REDIRECTS: &[(&str, &str)] = &[
 ];
 
 /// The effective hosted-redirect allow-list: the compiled-in defaults plus any
-/// entries in `OAUTH_ALLOWED_REDIRECT_PREFIXES`. Each env entry is a full
+/// entries in `OAUTH_ALLOWED_REDIRECT_PREFIXES`. Each env entry is a bare
 /// `https://host/path` value pinning an origin + path prefix; an entry that is not
-/// https, has no host, or carries only the root path (`/`) is dropped with a
-/// warning (a domain-wide entry is exactly the hole this closes). Additive: the
+/// https, has no host, carries only the root path (`/`), or specifies a port,
+/// query, fragment, or userinfo is dropped with a warning (a domain-wide entry is
+/// exactly the hole this closes; the others would be silently ignored since only
+/// `(host, path)` is stored). Additive: the
 /// shipped binary is safe by default and ops can only widen the set. Computed ONCE
 /// (the env is process-static) via `OnceLock`, so `/oauth/register` and
 /// `/oauth/authorize` neither re-parse the env nor re-log its warnings per call.
@@ -213,22 +215,38 @@ fn allowed_redirects() -> &'static [(String, String)] {
             DEFAULT_ALLOWED_REDIRECTS.iter().map(|(d, p)| (d.to_string(), p.to_string())).collect();
         if let Ok(extra) = std::env::var("OAUTH_ALLOWED_REDIRECT_PREFIXES") {
             for raw in extra.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
-                let entry = url::Url::parse(raw).ok().filter(|u| u.scheme() == "https").and_then(|u| {
-                    let host = u.host_str()?.trim_end_matches('.').to_ascii_lowercase();
-                    let path = u.path().to_string();
-                    (!host.is_empty() && path != "/" && !path.is_empty()).then_some((host, path))
-                });
-                match entry {
+                match parse_redirect_prefix(raw) {
                     Some(e) => out.push(e),
                     None => tracing::warn!(
-                        "ignoring OAUTH_ALLOWED_REDIRECT_PREFIXES entry `{raw}`: must be an https \
-                         URL with a non-root path prefix (domain-wide entries are refused)"
+                        "ignoring OAUTH_ALLOWED_REDIRECT_PREFIXES entry `{raw}`: must be a bare \
+                         `https://host/path` with a non-root path prefix and no port, query, \
+                         fragment, or userinfo (domain-wide entries are refused)"
                     ),
                 }
             }
         }
         out
     })
+}
+
+/// Parse one `OAUTH_ALLOWED_REDIRECT_PREFIXES` entry into the `(host, path)` pair
+/// the matcher stores. Returns `None` (drop + warn) unless the entry is a bare
+/// `https://host/path` with a non-root path and no port, query, fragment, or
+/// userinfo: only `(host, path)` is matched, so anything else would be silently
+/// ignored and give the operator a false sense of what they pinned.
+fn parse_redirect_prefix(raw: &str) -> Option<(String, String)> {
+    let u = url::Url::parse(raw).ok().filter(|u| u.scheme() == "https")?;
+    if u.port().is_some()
+        || u.query().is_some()
+        || u.fragment().is_some()
+        || !u.username().is_empty()
+        || u.password().is_some()
+    {
+        return None;
+    }
+    let host = u.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    let path = u.path().to_string();
+    (!host.is_empty() && path != "/" && !path.is_empty()).then_some((host, path))
 }
 
 /// Whether `path` equals `prefix` or is a descendant of it at a SEGMENT boundary,
@@ -257,7 +275,8 @@ fn has_dot_segment(redirect_uri: &str) -> bool {
 
 /// Whether a `redirect_uri` may be registered or receive an authorization code.
 /// Loopback (`http://localhost` / `127.0.0.1` / `[::1]`, any port) is always
-/// allowed. A hosted redirect must be `https`, carry no userinfo, its host must
+/// allowed. A hosted redirect must be `https`, carry no userinfo, name no
+/// off-origin port (only the implicit/`:443` default is allowed), its host must
 /// equal (or be a subdomain of) an allow-listed registrable domain, AND its path
 /// must fall within that entry's pinned callback prefix (see
 /// [`DEFAULT_ALLOWED_REDIRECTS`]), so a user-content path on an allow-listed
@@ -275,6 +294,13 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
         return false;
     };
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    // Refuse an explicit non-default port: `https://claude.ai:444/…` is a DIFFERENT
+    // origin than the pinned `https://claude.ai` and may serve different content, so
+    // the path pin wouldn't hold. `url::Url::port()` returns `None` for the scheme's
+    // default (443), so `:443` and no-port both pass; only an off-origin port fails.
+    if url.port().is_some() {
         return false;
     }
     // Refuse `.`/`..` (raw or `%2e`) path segments: they normalize in the browser
@@ -1576,6 +1602,10 @@ mod tests {
         // Userinfo is refused even when host + path are otherwise valid.
         assert!(!redirect_uri_permitted("https://user@claude.ai/api/mcp/auth_callback"));
         assert!(!redirect_uri_permitted("https://user:pass@claude.ai/api/mcp/auth_callback"));
+        // An off-origin port is refused (different origin than the pinned host), but
+        // the implicit / explicit default `:443` is the same origin and stays allowed.
+        assert!(!redirect_uri_permitted("https://claude.ai:444/api/mcp/auth_callback"));
+        assert!(redirect_uri_permitted("https://claude.ai:443/api/mcp/auth_callback"));
         // A hosted redirect must be https even to an allowed domain + path.
         assert!(!redirect_uri_permitted("http://claude.ai/api/mcp/auth_callback"));
         // Defense in depth: a client registered before the allow-list (or via a
@@ -1597,6 +1627,38 @@ mod tests {
         assert!(!has_dot_segment("https://x.example/api/mcp/auth_callback"));
         assert!(!has_dot_segment("https://x.example/a.b/c..d")); // dots inside a segment
         assert!(!has_dot_segment("https://x.example/cb?next=../x")); // query, not path
+    }
+
+    /// `OAUTH_ALLOWED_REDIRECT_PREFIXES` entries parse to `(host, path)` only for a
+    /// bare `https://host/path`; a port, query, fragment, or userinfo is refused
+    /// (dropped) rather than silently discarded, and so is a non-https or root-path
+    /// entry that would reopen the domain-wide hole.
+    #[test]
+    fn redirect_prefix_entry_parsing() {
+        use super::parse_redirect_prefix;
+        assert_eq!(
+            parse_redirect_prefix("https://vendor.example/mcp/callback"),
+            Some(("vendor.example".to_string(), "/mcp/callback".to_string()))
+        );
+        assert_eq!(
+            parse_redirect_prefix("https://VENDOR.example/mcp/callback"),
+            Some(("vendor.example".to_string(), "/mcp/callback".to_string()))
+        );
+        // The default `:443` is the same origin, so it is accepted and the port drops.
+        assert_eq!(
+            parse_redirect_prefix("https://vendor.example:443/mcp/callback"),
+            Some(("vendor.example".to_string(), "/mcp/callback".to_string()))
+        );
+        // Silently-ignored components are refused rather than dropped.
+        assert_eq!(parse_redirect_prefix("https://vendor.example:8443/mcp/callback"), None);
+        assert_eq!(parse_redirect_prefix("https://vendor.example/mcp/callback?x=1"), None);
+        assert_eq!(parse_redirect_prefix("https://vendor.example/mcp/callback#frag"), None);
+        assert_eq!(parse_redirect_prefix("https://user@vendor.example/mcp/callback"), None);
+        // Non-https and domain-wide (root or empty path) entries are refused.
+        assert_eq!(parse_redirect_prefix("http://vendor.example/mcp/callback"), None);
+        assert_eq!(parse_redirect_prefix("https://vendor.example/"), None);
+        assert_eq!(parse_redirect_prefix("https://vendor.example"), None);
+        assert_eq!(parse_redirect_prefix("not a url"), None);
     }
 
     /// A registered loopback redirect matches at ANY port (RFC 8252 §7.3 — the
