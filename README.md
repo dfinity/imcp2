@@ -378,6 +378,26 @@ Registration is **proven synchronously**: redemption is a signed `mcp_register_v
 that must return `Ok`. Unauthenticated `/mcp` requests get `401` with a
 `WWW-Authenticate` header pointing at the resource metadata, as the MCP spec expects.
 
+### Browser-facing error screens
+
+`/oauth/authorize` and the pinned connect callback are **front-channel** endpoints
+the user reaches in a browser, so any error they stumble upon during sign-in or the
+II handshake renders as a **nicely formatted, on-brand screen** — an editorial
+headline, a best-effort diagnostic ("your client may be out of date; remove and
+re-add the connector", etc.), and always the line *"If this error is unexpected,
+please contact mcp@dfinity.org to report it."* — rather than a raw JSON blob. The
+shared shell lives in `src/assets/connect-error.html` + `src/assets/connect.css` (reused from
+the connect callback page: same parchment grid, serif display, foot-of-page "Hosted
+by" mark, light/dark theming) and is fully self-contained under a strict, nonce'd,
+non-scripted, unframeable CSP that reflects no request value. Authorize errors
+**content-negotiate**: a browser (`Accept: text/html`) gets the screen, a
+programmatic OAuth caller keeps the RFC-style JSON error. Handshake/redeem failures
+surface on the callback page, which reveals the same contact line once it enters its
+error state. The dedicated allow-list rejection (below) is a distinct, actionable
+screen: it names the concrete next step (request access) instead of the report line.
+The **back-channel** endpoints (`/oauth/token`, `/oauth/register`, the `/mcp` bearer
+gate) stay JSON — no browser ever lands on them.
+
 ### Consent-Bound Completion (split-browser injection defense)
 
 The `state` in the II connect link is echoed back to the client in the final

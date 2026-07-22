@@ -70,22 +70,42 @@ body {
   border-top-color: var(--accent);
   animation: connect-spin 0.8s linear infinite;
 }
-/* Editorial serif headline, allowed to wrap to a couple of lines. */
+/* Editorial serif headline, allowed to wrap to a couple of lines. `text-wrap:
+   balance` evens the lines so a headline never leaves one lonely word on the
+   last line (browsers that predate it just fall back to normal wrapping). A hair
+   more width than the copy needs lets balancing pick the nicer break point. */
 .msg {
   margin: 0;
-  max-width: 20ch;
+  max-width: 24ch;
   font-family: var(--font-display);
   font-weight: 400;
   font-size: clamp(1.85rem, 6vw, 2.45rem);
-  line-height: 1.18;
+  line-height: 1.2;
   letter-spacing: -0.01em;
   color: var(--ink);
+  text-wrap: balance;
 }
-.detail { margin: 0; max-width: 32ch; font-size: 1rem; color: var(--secondary); }
-.hint { margin: 0; max-width: 34ch; font-size: 0.9rem; color: var(--muted); }
-/* Links appear only on the error page (the callback page has none): keep them on
-   the Ember accent so they read as links in both themes without a UA blue. */
+/* Body copy uses `text-wrap: pretty` so the last line is never a single orphan
+   word; both selectors degrade gracefully where the property is unsupported. */
+.detail { margin: 0; max-width: 34ch; font-size: 1.02rem; line-height: 1.55; color: var(--secondary); text-wrap: pretty; }
+.hint { margin: 0; max-width: 34ch; font-size: 0.9rem; line-height: 1.5; color: var(--muted); text-wrap: pretty; }
+/* Links appear in the error copy (the error page's contact line, and the callback
+   page's contact line once it enters the error state): keep them on the Ember
+   accent so they read as links in both themes without a UA blue. */
 .detail a, .hint a { color: var(--accent); }
+/* The callback page carries a "contact us to report it" line that stays hidden
+   during a normal connect and appears only once a terminal error is shown (the
+   page's script adds `.error` to `.screen`). The standalone error pages ship the
+   `.error` state, so their `.hint` (which is not a `.contact-hint`) is unaffected
+   and always visible. */
+.contact-hint { display: none; }
+.screen.error .contact-hint { display: block; }
+/* On the callback page the status message and its contact line share one
+   `role=status` (polite, atomic) live region, so a screen reader announces the
+   error AND the "contact us" line together when the page enters its error state.
+   The wrapper mirrors the stage's own column layout and gap so the grouping does
+   not change the visual spacing. */
+.status { display: flex; flex-direction: column; align-items: center; gap: 2.25rem; }
 /* Foot-of-page attribution: an eyebrow label + the DFINITY mark in a soft pill. */
 .hosted {
   display: flex;

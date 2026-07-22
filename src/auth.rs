@@ -54,10 +54,24 @@
 //! that vendor's pinned OAuth-callback path, so an attacker cannot register a
 //! hosted destination it controls, not even a user-content path (`/page/…`,
 //! `/g/…`) on an allow-listed origin (loopback is safe either way).
-//! A client turned away by the allow-list is pointed at [`ALLOWLIST_CONTACT`] to
+//! A client turned away by the allow-list is pointed at [`CONTACT`] to
 //! request approval: `/oauth/register` says so in its JSON `error_description`,
 //! and a browser that reaches `/oauth/authorize` gets the on-brand
 //! [`not_allowlisted_page`] instead of a raw error.
+//!
+//! ## Browser-facing error screens
+//!
+//! `/oauth/authorize` and the pinned connect callback are FRONT-CHANNEL endpoints
+//! the user reaches in a browser, so any error they stumble upon must render as a
+//! friendly on-brand screen — a headline, a best-effort diagnostic, and always a
+//! "contact [`CONTACT`] to report it" line — rather than a raw JSON blob. The
+//! shared shell lives in `assets/connect-error.html` + `assets/connect.css` and is
+//! rendered by [`error_screen`]. Authorize errors content-negotiate ([`accepts_html`]):
+//! a browser gets the screen ([`signin_error`]), a programmatic OAuth caller keeps
+//! the RFC-style JSON. Handshake/redeem failures surface on the pinned callback
+//! page, which reveals the same contact line once it enters its error state. The
+//! back-channel endpoints (`/oauth/token`, `/oauth/register`, the `/mcp` bearer
+//! gate) stay JSON — no browser ever lands on them.
 //!
 //! The wire shapes match the merged II contract (verified against the beta II
 //! canister's live `.did`, `fgte5-ciaaa-aaaad-aaatq-cai`): the connect link
@@ -326,6 +340,28 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     })
 }
 
+/// Whether `redirect_uri` is a **well-formed hosted** redirect: it parses, is
+/// `https`, carries no userinfo, and has a host. This is the shape that could
+/// legitimately be allow-listed and that [`redirect_uri_permitted`] rejects only
+/// because its host isn't on the list. It lets `/oauth/authorize` tell "a real
+/// client whose redirect just isn't approved yet" (→ the [`not_allowlisted_page`])
+/// apart from a genuinely **malformed or ineligible** `redirect_uri`
+/// (unparseable, non-`https`, or userinfo-bearing), which is a client-side request
+/// error, not an approval gap. Loopback is intentionally NOT counted here: a
+/// loopback redirect is always permitted, so it never reaches the not-permitted
+/// branch this distinction guards.
+fn is_wellformed_hosted_redirect(redirect_uri: &str) -> bool {
+    match url::Url::parse(redirect_uri) {
+        Ok(url) => {
+            url.scheme() == "https"
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.host_str().is_some_and(|h| !h.is_empty())
+        }
+        Err(_) => false,
+    }
+}
+
 /// Acceptance rule for a redirect (OAuth 2.1): the client must be REGISTERED,
 /// the redirect must pass the hosted-redirect allow-list
 /// ([`redirect_uri_permitted`]), and it must either exactly match a registered
@@ -500,36 +536,87 @@ pub struct AuthorizeQuery {
 /// GET /oauth/authorize — the redirect-based entry point. Validates the client
 /// and PKCE, records a pending connect, and redirects the browser to II's `/mcp`
 /// handshake; II navigates back to our pinned callback page with the delegation.
-pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<AuthorizeQuery>) -> Response {
+///
+/// This is a FRONT-CHANNEL endpoint: the MCP client opens the user's browser
+/// here to start sign-in, and any failure reached before a validated
+/// `redirect_uri` cannot be redirected back to the client (OAuth 2.1 forbids
+/// sending an error to an unvalidated redirect), so it surfaces to the user
+/// directly. Rather than show a raw JSON blob, each such failure goes through
+/// [`signin_error`], which serves the on-brand [`error_screen`] to a browser and
+/// keeps the RFC-style JSON for a programmatic caller (see [`accepts_html`]). The
+/// `headers` are read only for that content negotiation.
+pub async fn authorize(
+    State(store): State<AuthStore>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<AuthorizeQuery>,
+) -> Response {
+    // A single best-effort diagnostic for the "client sent a request we can't
+    // process" family (wrong response_type, missing/unsupported PKCE): the cause
+    // is almost always a client that is out of date or misconfigured.
+    const MALFORMED_DIAGNOSTIC: &str = "Your MCP client sent a request this server can't process. \
+        The client may be out of date. Try updating it. If that doesn't help, remove the connector \
+        and add it again. Then sign in.";
+    const SIGNIN_HEADLINE: &str = "We couldn't start your sign-in.";
+
     // Only the authorization-code response type is supported.
     match q.response_type.as_deref() {
         Some("code") => {}
-        Some(_) => return oauth_err(StatusCode::BAD_REQUEST, "unsupported_response_type", "only response_type=code"),
-        None => return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "response_type=code required"),
+        Some(_) => {
+            return signin_error(&headers, StatusCode::BAD_REQUEST, "unsupported_response_type",
+                "only response_type=code", SIGNIN_HEADLINE, MALFORMED_DIAGNOSTIC)
+        }
+        None => {
+            return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
+                "response_type=code required", SIGNIN_HEADLINE, MALFORMED_DIAGNOSTIC)
+        }
     }
     if !store.validate_client(&q.client_id, &q.redirect_uri).await {
-        // A well-formed hosted `redirect_uri` that simply isn't on the allow-list
-        // is an approval gap, not a malformed request: show the browser a friendly
-        // page naming the cause and the contact, rather than a raw JSON blob. This
-        // covers clients that skip DCR or use a stored-but-disallowed registration
-        // (the standard flow is blocked earlier, at `/oauth/register`). The page is
-        // static and reflects nothing, so naming the cause leaks nothing.
         if !redirect_uri_permitted(&q.redirect_uri) {
-            return not_allowlisted_page();
+            // Two distinct failures reach here. A WELL-FORMED hosted `redirect_uri`
+            // that simply isn't on the allow-list is an approval gap, not a
+            // malformed request: show the browser the dedicated "not approved" page
+            // naming the cause and the concrete next step (request access). This
+            // covers clients that skip DCR or use a stored-but-disallowed
+            // registration (the standard flow is blocked earlier, at
+            // `/oauth/register`). The page is static and reflects nothing, so naming
+            // the cause leaks nothing. A programmatic caller (no `text/html`) gets
+            // the machine-readable JSON.
+            if is_wellformed_hosted_redirect(&q.redirect_uri) {
+                return if accepts_html(&headers) {
+                    not_allowlisted_page()
+                } else {
+                    oauth_err(StatusCode::FORBIDDEN, "invalid_client",
+                        &format!("redirect_uri is not on the hosted-redirect allow-list; contact {CONTACT} to request access"))
+                };
+            }
+            // Otherwise the `redirect_uri` is malformed or ineligible (unparseable,
+            // non-https, or userinfo-bearing). That's a client-side request error,
+            // not an approval gap, so classify it `invalid_request` and show the
+            // generic sign-in error rather than a misleading "request access" page.
+            return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
+                "redirect_uri must be a valid https or loopback URL", SIGNIN_HEADLINE,
+                MALFORMED_DIAGNOSTIC);
         }
         // `invalid_client` (not `invalid_request`): the request is well-formed,
         // it's the CLIENT identification that failed — the AS error code the
         // MCP server guide (and RFC 6749's taxonomy) expects here. No redirect:
         // an unvalidated redirect_uri must never receive an error response.
-        return oauth_err(StatusCode::BAD_REQUEST, "invalid_client", "unknown client_id / redirect_uri");
+        return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_client",
+            "unknown client_id / redirect_uri", SIGNIN_HEADLINE,
+            "This server doesn't recognize your MCP client. Its registration may have expired. \
+             Remove the connector and add it again. Then sign in.");
     }
     // OAuth 2.1: PKCE is required for public clients.
     let Some(code_challenge) = q.code_challenge.clone() else {
-        return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "code_challenge (PKCE S256) required");
+        return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
+            "code_challenge (PKCE S256) required", SIGNIN_HEADLINE,
+            "Your MCP client's request was missing a required security check (PKCE). The client may \
+             be out of date. Try updating it. If that doesn't help, remove the connector and add it again.");
     };
     if let Some(m) = &q.code_challenge_method {
         if m != "S256" {
-            return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "only code_challenge_method=S256 is supported");
+            return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
+                "only code_challenge_method=S256 is supported", SIGNIN_HEADLINE, MALFORMED_DIAGNOSTIC);
         }
     }
 
@@ -798,11 +885,11 @@ const PINNED_PAGE_JS: &str = r#"(function () {
       if (d && d.redirect) {
         location.replace(d.redirect);
       } else {
-        show((d && d.error) || 'Could not finish the connection. Restart from your client.', true);
+        show((d && d.error) || "We couldn't finish the connection. Restart from your client.", true);
       }
     })
     .catch(function () {
-      show('Could not reach the server. Restart from your client.', true);
+      show("We couldn't reach the server. Restart from your client.", true);
     });
 })();"#;
 
@@ -813,15 +900,19 @@ fn pinned_callback_page(prefix: &str) -> Response {
     // The markup lives in `assets/connect-callback.html` (include_str!). The
     // status line is a `role=status` / `aria-live=polite` region so screen
     // readers announce both "Connecting agent to Internet Identity…" and any
-    // terminal error the script swaps in. The DFINITY logo carries its own
-    // `aria-label`; the spinner is decorative (`aria-hidden`). `__NONCE__` (both
-    // the `<style>` and `<script>` tags), then the self-contained stylesheet,
-    // logo, and redeem script are spliced in; none of those values contains a
-    // placeholder token, so the order is immaterial.
+    // terminal error the script swaps in. Below it sits a `.contact-hint` line
+    // (hidden during a normal connect; revealed by the stylesheet once the
+    // script adds `.error` to `.screen`) so every handshake/redeem failure the
+    // user lands on carries the "contact us to report it" line. The DFINITY logo
+    // carries its own `aria-label`; the spinner is decorative (`aria-hidden`).
+    // `__NONCE__` (both the `<style>` and `<script>` tags), the self-contained
+    // stylesheet, logo, the contact address, and redeem script are spliced in;
+    // none of those values contains a placeholder token, so the order is immaterial.
     let html = PINNED_PAGE_HTML
         .replace("__NONCE__", &nonce)
         .replace("__CSS__", CONNECT_PAGE_CSS)
         .replace("__LOGO__", CONNECT_LOGO_SVG)
+        .replace("__CONTACT__", CONTACT)
         .replace("__SCRIPT__", &script);
     // `style-src 'nonce-{nonce}'` admits ONLY the nonce'd `<style>` block above
     // (no `'unsafe-inline'`, so an injected `style=` attribute or stray `<style>`
@@ -857,44 +948,94 @@ fn pinned_callback_page(prefix: &str) -> Response {
     resp
 }
 
-/// Where a rejected MCP client is told to request allow-listing. Shown both in
-/// the browser-facing `/oauth/authorize` error page ([`not_allowlisted_page`])
-/// and in the `/oauth/register` JSON `error_description`, so a vendor blocked by
-/// the hosted-redirect allow-list ([`redirect_uri_permitted`]) has a clear next
+/// Where users are pointed for a sign-in problem: rejected MCP clients are told
+/// here to request allow-listing (`/oauth/register` JSON `error_description` and
+/// the [`not_allowlisted_page`]), and every other browser-facing sign-in/handshake
+/// error asks the user to report it here (via [`error_screen`] and the pinned
+/// callback page's contact line). One address, so a user always has a clear next
 /// step rather than an opaque failure.
-const ALLOWLIST_CONTACT: &str = "mcp@dfinity.org";
+const CONTACT: &str = "mcp@dfinity.org";
 
-/// HTML for the "MCP client not allowed" page, a real `.html` asset (compiled in
-/// via `include_str!`, no runtime file I/O). It reuses the pinned callback page's
-/// self-contained shell (`assets/connect.css`, the inlined logo) but carries no
-/// script. `__NONCE__`/`__CSS__`/`__LOGO__`/`__CONTACT__` are spliced in at render
-/// time; none is user-influenced (the contact is a compiled-in constant), so no
-/// request value is ever reflected into the markup.
+/// HTML shell for the browser-facing error screens, a real `.html` asset (compiled
+/// in via `include_str!`, no runtime file I/O). It reuses the pinned callback
+/// page's self-contained shell (`assets/connect.css`, the inlined logo) but
+/// carries no script. Rendered by [`error_screen`], which splices in
+/// `__NONCE__`/`__CSS__`/`__LOGO__` plus the `__TITLE__`/`__HEADLINE__`/`__DETAIL__`/
+/// `__HINT__` text; every text value is a compiled-in constant at the call site
+/// (never a request value), so no request input is ever reflected into the markup.
 const CONNECT_ERROR_HTML: &str = include_str!("assets/connect-error.html");
 
-/// The friendly, browser-facing rejection for a client whose `redirect_uri` is
-/// not on the hosted-redirect allow-list ([`redirect_uri_permitted`]). A real
-/// browser reaches `/oauth/authorize` by top-level navigation, so a terse JSON
-/// `invalid_client` renders as a raw error blob; this serves an on-brand page
-/// that names the cause and points the vendor at [`ALLOWLIST_CONTACT`]. Static
-/// and non-reflecting: no query or redirect value is interpolated, so it can't be
-/// turned into a content-injection or open-redirect surface. `403 Forbidden`: the
-/// request is understood but refused by policy.
-fn not_allowlisted_page() -> Response {
+/// The tab title used by every generic `/oauth/authorize` error screen.
+const SIGNIN_ERROR_TITLE: &str = "Sign-in error";
+
+/// Whether the request explicitly accepts an HTML response — i.e. it comes from a
+/// browser. This is a coarse browser-vs-machine split, NOT a full preference
+/// ranking: it does not weigh `text/html`'s q-value against JSON's, only whether
+/// `text/html` is an acceptable type at all. That is deliberate — a browser always
+/// lists `text/html` as acceptable, so treating any acceptable `text/html` as "serve
+/// the screen" is enough. `/oauth/authorize` is a front-channel endpoint reached by
+/// top-level navigation, so a browser gets the friendly [`error_screen`], while a
+/// programmatic OAuth caller (`Accept: application/json`, `*/*`, or no `Accept` at
+/// all) keeps the machine-readable JSON: the machine default is JSON.
+///
+/// The `Accept` header is parsed as media ranges rather than substring-matched:
+/// media types are case-insensitive (RFC 9110 §12.5.1), and a `;q=0` parameter
+/// marks a type as *not* acceptable (§12.4.2), so `text/html;q=0, application/json`
+/// correctly stays on JSON and `TEXT/HTML` is still recognized. A wildcard
+/// (`text/*`, `*/*`) does NOT opt into HTML — only an explicit `text/html` does,
+/// keeping the JSON default for anything that isn't unambiguously a browser.
+fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
+    let Some(accept) = headers.get(axum::http::header::ACCEPT).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    accept.split(',').any(|range| {
+        let mut parts = range.split(';').map(str::trim);
+        if !parts.next().is_some_and(|media| media.eq_ignore_ascii_case("text/html")) {
+            return false;
+        }
+        // Acceptable unless an explicit `q=0` (any spelling: `0`, `0.0`, `0.000`).
+        // A malformed or absent q-value leaves the range acceptable.
+        !parts.any(|param| {
+            param
+                .split_once('=')
+                .is_some_and(|(k, v)| k.trim().eq_ignore_ascii_case("q")
+                    && v.trim().parse::<f32>().is_ok_and(|q| q <= 0.0))
+        })
+    })
+}
+
+/// The always-present "report it" line for a sign-in/handshake error screen. The
+/// contact renders as a `mailto:` link (a top-level navigation, unaffected by the
+/// page's strict resource CSP). The address is the compiled-in [`CONTACT`], never
+/// a request value.
+fn contact_report_hint() -> String {
+    format!("If this error is unexpected, please contact <a href=\"mailto:{CONTACT}\">{CONTACT}</a> to report it.")
+}
+
+/// Render one of the shared browser-facing error screens
+/// (`assets/connect-error.html`). Every text slot — the tab `title`, the
+/// `headline`, the `detail` (a best-effort diagnostic), and the `hint` (typically
+/// the [`contact_report_hint`]) — is a compiled-in constant at the call site, so
+/// the page reflects nothing and can't be turned into a content-injection surface;
+/// `detail`/`hint` may carry trusted inline markup (e.g. the `mailto:` link). No
+/// script on the page, so no `script-src`; the only inline is the nonce'd
+/// `<style>`, everything else is denied (`default-src 'none'`), and framing is
+/// refused so the page can't be embedded for UI redress.
+fn error_screen(status: StatusCode, title: &str, headline: &str, detail: &str, hint: &str) -> Response {
     let nonce = csp_nonce();
     let html = CONNECT_ERROR_HTML
         .replace("__NONCE__", &nonce)
         .replace("__CSS__", CONNECT_PAGE_CSS)
         .replace("__LOGO__", CONNECT_LOGO_SVG)
-        .replace("__CONTACT__", ALLOWLIST_CONTACT);
-    // No script on this page, so no `script-src`; the only inline is the nonce'd
-    // `<style>`. Everything else is denied (`default-src 'none'`), and framing is
-    // refused so the page can't be embedded for UI redress.
+        .replace("__TITLE__", title)
+        .replace("__HEADLINE__", headline)
+        .replace("__DETAIL__", detail)
+        .replace("__HINT__", hint);
     let csp = format!(
         "default-src 'none'; style-src 'nonce-{nonce}'; base-uri 'none'; \
          form-action 'none'; frame-ancestors 'none'"
     );
-    let mut resp = (StatusCode::FORBIDDEN, Html(html)).into_response();
+    let mut resp = (status, Html(html)).into_response();
     let h = resp.headers_mut();
     h.insert(
         axum::http::header::CONTENT_SECURITY_POLICY,
@@ -909,6 +1050,49 @@ fn not_allowlisted_page() -> Response {
         axum::http::HeaderValue::from_static("DENY"),
     );
     resp
+}
+
+/// A browser-facing `/oauth/authorize` failure: serve the on-brand [`error_screen`]
+/// (headline + best-effort `diagnostic` + the [`contact_report_hint`]) to a browser,
+/// or the RFC-style JSON (`error`/`desc`) to a programmatic caller (see
+/// [`accepts_html`]). Used for every authorize error that can't be redirected back
+/// to the client.
+fn signin_error(
+    headers: &axum::http::HeaderMap,
+    status: StatusCode,
+    error: &str,
+    desc: &str,
+    headline: &str,
+    diagnostic: &str,
+) -> Response {
+    if accepts_html(headers) {
+        error_screen(status, SIGNIN_ERROR_TITLE, headline, diagnostic, &contact_report_hint())
+    } else {
+        oauth_err(status, error, desc)
+    }
+}
+
+/// The friendly, browser-facing rejection for a client whose `redirect_uri` is
+/// not on the hosted-redirect allow-list ([`redirect_uri_permitted`]). A real
+/// browser reaches `/oauth/authorize` by top-level navigation, so a terse JSON
+/// `invalid_client` renders as a raw error blob; this serves an on-brand page
+/// that names the cause and points the vendor at [`CONTACT`]. Static and
+/// non-reflecting: no query or redirect value is interpolated, so it can't be
+/// turned into a content-injection or open-redirect surface. `403 Forbidden`: the
+/// request is understood but refused by policy. Unlike the generic sign-in error,
+/// this is an EXPECTED, actionable rejection, so its hint gives the concrete next
+/// step (request access) rather than the "report it" line.
+fn not_allowlisted_page() -> Response {
+    error_screen(
+        StatusCode::FORBIDDEN,
+        "MCP client not approved",
+        "This MCP client isn't approved yet.",
+        "This server only accepts approved MCP clients. Yours isn't on the allow-list yet.",
+        &format!(
+            "To request access, email <a href=\"mailto:{CONTACT}\">{CONTACT}</a>. Tell us the name \
+             of your MCP client or AI chatbot."
+        ),
+    )
 }
 
 /// POST /oauth/connect/redeem body — what [`pinned_callback_page`] sends after
@@ -1107,10 +1291,10 @@ pub async fn connect_redeem(
         })
     };
     let Some((expired, cookie, client_id, redirect_uri, client_state, code_challenge, existing_code)) = snap else {
-        return redeem_err("unknown or already-used connect request — restart from your client");
+        return redeem_err("This connect request is unknown or already used. Restart from your client.");
     };
     if expired {
-        return redeem_err("connect request expired — restart from your client");
+        return redeem_err("This connect request has expired. Restart from your client.");
     }
     // Initiator proof: only the browser that STARTED this connect (holding the
     // `sid` cookie) may redeem. In the confused-deputy path the delegation lands
@@ -1118,7 +1302,7 @@ pub async fn connect_redeem(
     // one `X` was bound to, so this aborts (see the design's security argument).
     if connect_cookie(&headers).as_deref() != Some(cookie.as_str()) {
         return redeem_err(
-            "this sign-in was started in a different browser session — restart the connection from your client",
+            "This sign-in started in a different browser. Restart from your client.",
         );
     }
     // Idempotent: if a code was already minted for this connect, return it again.
@@ -1131,7 +1315,7 @@ pub async fn connect_redeem(
     // captured them at prepare and recovers them from caller() == P_reg).
     let (user_key, chain) = match parse_registration_delegation(&body.delegation) {
         Ok(v) => v,
-        Err(e) => return redeem_err(&format!("malformed registration delegation: {e}")),
+        Err(e) => return redeem_err(&format!("We couldn't read the sign-in response. Restart from your client. ({e})")),
     };
     // Single-flight: atomically claim this connect's redemption so a double-submit
     // can't fire two concurrent mcp_register_v2 calls (and a request racing a
@@ -1144,11 +1328,11 @@ pub async fn connect_redeem(
         }
         RedeemClaim::InProgress => {
             return redeem_err(
-                "another redemption attempt for this connect is already in progress — \
-                 wait a moment; if it does not complete, restart from your client",
+                "This connect request is already being processed. Wait a moment. \
+                 If nothing happens, restart from your client.",
             )
         }
-        RedeemClaim::Vanished => return redeem_err("connect request vanished — restart from your client"),
+        RedeemClaim::Vanished => return redeem_err("This connect request is no longer available. Restart from your client."),
     }
     // Redeem: build a DelegatedIdentity from priv(X) + the chain and make one
     // authenticated mcp_register_v2 call. Success proves consent AND registration.
@@ -1178,7 +1362,7 @@ pub async fn connect_redeem(
     let (code, newly_minted) = {
         let mut authz = store.authz.write().await;
         let Some(a) = authz.get_mut(&body.state) else {
-            return redeem_err("connect request vanished — restart from your client");
+            return redeem_err("This connect request is no longer available. Restart from your client.");
         };
         a.redeeming = false;
         match &a.code {
@@ -1374,7 +1558,7 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
                 "redirect_uri {bad} is not permitted: a hosted redirect must be https on an \
                  allow-listed domain AND under that vendor's registered OAuth-callback path \
                  (loopback redirects are always allowed). To have this MCP client added to the \
-                 allow-list, contact {ALLOWLIST_CONTACT}."
+                 allow-list, contact {CONTACT}."
             ),
         );
     }
@@ -1812,6 +1996,27 @@ mod tests {
         super::AuthStore::new(ids, super::SharedClients(std::sync::Arc::default()))
     }
 
+    /// A request header map that accepts HTML — i.e. a browser hitting the
+    /// front-channel `/oauth/authorize`.
+    fn html_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("text/html,application/xhtml+xml,*/*"),
+        );
+        h
+    }
+
+    /// A request header map for a programmatic OAuth caller (no HTML).
+    fn json_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        h
+    }
+
     async fn seed_pending(store: &super::AuthStore, id: &str, cookie: &str) {
         // Insert a pending authorization directly (bypasses the browser redirect).
         store.authz.write().await.insert(
@@ -1938,6 +2143,8 @@ mod tests {
         );
         let resp = super::authorize(
             State(store.clone()),
+            // The success path is Accept-agnostic; an empty header map is fine.
+            axum::http::HeaderMap::new(),
             Query(super::AuthorizeQuery {
                 response_type: Some("code".into()),
                 client_id: "client-x".into(),
@@ -1997,7 +2204,13 @@ mod tests {
             .to_string();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains(super::ALLOWLIST_CONTACT), "the page must name the contact");
+        assert!(html.contains(super::CONTACT), "the page must name the contact");
+        // The contact renders as a mailto link, and no placeholder token leaks.
+        assert!(
+            html.contains(&format!("mailto:{}", super::CONTACT)),
+            "the contact must be a mailto link"
+        );
+        assert!(!html.contains("__"), "every template placeholder must be substituted: {html}");
         assert!(!html.contains("<script"), "the error page carries no script");
         assert!(
             html.contains(&format!("<style nonce=\"{nonce}\">")),
@@ -2005,14 +2218,16 @@ mod tests {
         );
     }
 
-    // `/oauth/authorize` distinguishes an allow-list rejection (a friendly HTML
-    // page) from other client-validation failures (a terse JSON `invalid_client`).
+    // `/oauth/authorize` content-negotiates every non-redirectable failure: a
+    // browser (Accept: text/html) gets an on-brand error screen naming the
+    // contact, while a programmatic OAuth caller keeps the RFC-style JSON. This
+    // covers both the allow-list rejection (403) and an unknown client (400).
     #[tokio::test]
-    async fn authorize_allowlist_rejection_is_friendly_but_unknown_client_stays_json() {
+    async fn authorize_errors_are_friendly_for_browsers_and_json_for_machines() {
         use axum::extract::{Query, State};
         let store = test_store();
-        // A stored-but-disallowed registration (the legacy example.com entries this
-        // work neutralizes): a hosted redirect on a non-allow-listed domain.
+        // A stored-but-disallowed registration (a hosted redirect on a
+        // non-allow-listed domain) plus a permitted-but-unregistered client.
         store.clients.write().await.insert(
             "client-legacy".into(),
             super::ClientReg { redirect_uris: vec!["https://example.com/cb".into()] },
@@ -2027,28 +2242,181 @@ mod tests {
             scope: None,
             resource: None,
         };
+        let content_type = |resp: &axum::response::Response| {
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string()
+        };
 
-        // Disallowed hosted redirect -> friendly 403 HTML naming the contact.
-        let resp =
-            super::authorize(State(store.clone()), Query(mk("client-legacy", "https://example.com/cb"))).await;
-        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
-        let ctype =
-            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
-        assert!(ctype.starts_with("text/html"), "an allow-list rejection renders HTML, not JSON: {ctype}");
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains(super::ALLOWLIST_CONTACT));
-
-        // Unknown client but an allow-listed redirect -> stays a terse JSON invalid_client.
+        // -- Browser (Accept: text/html): friendly on-brand HTML in both cases. --
+        // Disallowed hosted redirect -> 403 HTML naming the contact.
         let resp = super::authorize(
             State(store.clone()),
+            html_headers(),
+            Query(mk("client-legacy", "https://example.com/cb")),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        assert!(content_type(&resp).starts_with("text/html"), "an allow-list rejection renders HTML for a browser");
+        let html = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains(super::CONTACT));
+
+        // Unknown client but an allow-listed redirect -> 400 friendly HTML that
+        // names the contact via the "report it" line.
+        let resp = super::authorize(
+            State(store.clone()),
+            html_headers(),
             Query(mk("client-nope", "https://claude.ai/api/mcp/auth_callback")),
         )
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(content_type(&resp).starts_with("text/html"), "an unknown client renders HTML for a browser");
+        let html = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains(super::CONTACT), "the screen must name the contact");
+        assert!(html.contains("report it"), "the screen must carry the report-it line");
+
+        // -- Machine (Accept: application/json): RFC-style JSON in both cases. --
+        for (client_id, redirect_uri, want_status) in [
+            ("client-legacy", "https://example.com/cb", axum::http::StatusCode::FORBIDDEN),
+            ("client-nope", "https://claude.ai/api/mcp/auth_callback", axum::http::StatusCode::BAD_REQUEST),
+        ] {
+            let resp = super::authorize(
+                State(store.clone()),
+                json_headers(),
+                Query(mk(client_id, redirect_uri)),
+            )
+            .await;
+            assert_eq!(resp.status(), want_status);
+            assert!(content_type(&resp).contains("json"), "a machine caller keeps JSON for {client_id}");
+        }
+    }
+
+    // A malformed or ineligible redirect_uri (here: non-loopback http) is a
+    // client request error, NOT an approval gap: it is classified invalid_request
+    // and shows the generic sign-in error, never the "request access" allow-list
+    // page. (`redirect_uri_permitted` rejects it, but it isn't a well-formed
+    // hosted redirect, so it must not be funneled to the not-approved screen.)
+    #[tokio::test]
+    async fn authorize_malformed_redirect_is_invalid_request_not_allowlist() {
+        use axum::extract::{Query, State};
+        let store = test_store();
+        // Registered directly (bypassing DCR, which would reject it) so the failure
+        // is the redirect eligibility check, not an unknown client.
+        store.clients.write().await.insert(
+            "client-x".into(),
+            super::ClientReg { redirect_uris: vec!["http://evil.example/cb".into()] },
+        );
+        let mk = || super::AuthorizeQuery {
+            response_type: Some("code".into()),
+            client_id: "client-x".into(),
+            redirect_uri: "http://evil.example/cb".into(), // non-loopback http: ineligible AND not well-formed hosted
+            state: Some("xyz".into()),
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            scope: None,
+            resource: None,
+        };
+
+        // Browser: the generic sign-in error, NOT the allow-list "request access" page.
+        let resp = super::authorize(State(store.clone()), html_headers(), Query(mk())).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let html = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("report it"), "shows the generic sign-in error with the report line");
+        assert!(!html.contains("allow-list"), "must NOT be the allow-list rejection page: {html}");
+
+        // Machine: invalid_request JSON, not invalid_client / 403.
+        let resp = super::authorize(State(store.clone()), json_headers(), Query(mk())).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("invalid_request"), "machine gets invalid_request: {body}");
+    }
+
+    // A malformed sign-in request (here: PKCE missing) reached in a browser gets
+    // the friendly screen with a best-effort diagnostic AND the report-it line,
+    // while a machine keeps the RFC `invalid_request` JSON. The screen is the
+    // strict, non-scripted, unframeable error shell.
+    #[tokio::test]
+    async fn authorize_missing_pkce_is_friendly_for_browsers() {
+        use axum::extract::{Query, State};
+        let store = test_store();
+        store.clients.write().await.insert(
+            "client-x".into(),
+            super::ClientReg { redirect_uris: vec!["https://claude.ai/api/mcp/auth_callback".into()] },
+        );
+        let mk = || super::AuthorizeQuery {
+            response_type: Some("code".into()),
+            client_id: "client-x".into(),
+            redirect_uri: "https://claude.ai/api/mcp/auth_callback".into(),
+            state: Some("xyz".into()),
+            code_challenge: None, // the failure under test
+            code_challenge_method: None,
+            scope: None,
+            resource: None,
+        };
+
+        // Browser: a friendly 400 screen naming the cause and the contact.
+        let resp = super::authorize(State(store.clone()), html_headers(), Query(mk())).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let csp = resp
+            .headers()
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .expect("CSP header present")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(csp.contains("default-src 'none'") && csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(!csp.contains("script-src"), "the error screen needs no script-src: {csp}");
+        let html = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("PKCE"), "the diagnostic should name the missing security parameter");
+        assert!(html.contains(&format!("mailto:{}", super::CONTACT)), "the screen names the contact");
+        assert!(!html.contains("__"), "every placeholder must be substituted: {html}");
+
+        // Machine: the RFC-style JSON error is preserved.
+        let resp = super::authorize(State(store.clone()), json_headers(), Query(mk())).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
         let ctype =
             resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
-        assert!(ctype.contains("json"), "a permitted-but-unregistered redirect stays JSON: {ctype}");
+        assert!(ctype.contains("json"), "a machine caller keeps JSON: {ctype}");
+    }
+
+    // `accepts_html` keys on an explicit `text/html`, so browsers (which always
+    // send it) get screens and machines default to JSON.
+    #[test]
+    fn accepts_html_detects_browsers_only() {
+        use axum::http::{header::ACCEPT, HeaderMap, HeaderValue};
+        let with = |v: &'static str| {
+            let mut h = HeaderMap::new();
+            h.insert(ACCEPT, HeaderValue::from_static(v));
+            h
+        };
+        assert!(super::accepts_html(&with("text/html,application/xhtml+xml,*/*")));
+        assert!(super::accepts_html(&with("text/html")));
+        assert!(super::accepts_html(&with("text/html;q=0.9,application/json")));
+        // Media types are case-insensitive (RFC 9110 §12.5.1).
+        assert!(super::accepts_html(&with("TEXT/HTML")));
+        assert!(!super::accepts_html(&with("application/json")));
+        assert!(!super::accepts_html(&with("*/*")));
+        // A wildcard does not opt into HTML; only an explicit `text/html` does.
+        assert!(!super::accepts_html(&with("text/*")));
+        // `;q=0` explicitly marks text/html as NOT acceptable (§12.4.2), so a
+        // caller that says so stays on JSON despite naming the type.
+        assert!(!super::accepts_html(&with("text/html;q=0, application/json")));
+        assert!(!super::accepts_html(&with("text/html;q=0.0")));
+        // No Accept header at all → treated as a machine (JSON).
+        assert!(!super::accepts_html(&HeaderMap::new()));
     }
 
     // The pinned page ships a strict CSP whose script nonce MATCHES the inline
@@ -2097,6 +2465,15 @@ mod tests {
         assert!(html.contains("location.hash"), "the page reads the fragment client-side");
         assert!(html.contains("/prod/oauth/connect/redeem"), "posts to the instance's redeem path");
         assert!(!html.contains("__REDEEM_URL__"), "the redeem-URL placeholder must be substituted");
+        // Every handshake/redeem failure lands on this page, so it carries the
+        // "contact us to report it" line (hidden until the script adds `.error`),
+        // and the contact placeholder must be substituted for a real mailto link.
+        assert!(
+            html.contains(&format!("mailto:{}", super::CONTACT)),
+            "the callback page must carry the contact mailto link"
+        );
+        assert!(html.contains("contact-hint"), "the contact line uses the .contact-hint hook");
+        assert!(!html.contains("__CONTACT__"), "the contact placeholder must be substituted");
         // Merged contract: the page forwards ONLY the chain and the connect
         // state. It reads neither the consent values (captured earlier at
         // prepare, recovered by II from caller() == P_reg) nor an anchor.
