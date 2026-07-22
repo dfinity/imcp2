@@ -83,9 +83,17 @@ body {
 }
 .detail { margin: 0; max-width: 32ch; font-size: 1rem; color: var(--secondary); }
 .hint { margin: 0; max-width: 34ch; font-size: 0.9rem; color: var(--muted); }
-/* Links appear only on the error page (the callback page has none): keep them on
-   the Ember accent so they read as links in both themes without a UA blue. */
+/* Links appear in the error copy (the error page's contact line, and the callback
+   page's contact line once it enters the error state): keep them on the Ember
+   accent so they read as links in both themes without a UA blue. */
 .detail a, .hint a { color: var(--accent); }
+/* The callback page carries a "contact us to report it" line that stays hidden
+   during a normal connect and appears only once a terminal error is shown (the
+   page's script adds `.error` to `.screen`). The standalone error pages ship the
+   `.error` state, so their `.hint` (which is not a `.contact-hint`) is unaffected
+   and always visible. */
+.contact-hint { display: none; }
+.screen.error .contact-hint { display: block; }
 /* Foot-of-page attribution: an eyebrow label + the DFINITY mark in a soft pill. */
 .hosted {
   display: flex;
