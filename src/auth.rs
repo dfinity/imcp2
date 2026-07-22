@@ -856,13 +856,33 @@ const SIGNIN_ERROR_TITLE: &str = "Sign-in error";
 /// `/oauth/authorize` is a front-channel endpoint reached by top-level navigation,
 /// so a browser (which always sends `Accept: text/html`) gets the friendly
 /// [`error_screen`], while a programmatic OAuth caller (`Accept: application/json`,
-/// `*/*`, or no `Accept` at all) keeps the machine-readable JSON. Keying on the
-/// explicit presence of `text/html` means the machine default is JSON.
+/// `*/*`, or no `Accept` at all) keeps the machine-readable JSON. Keying on an
+/// explicit, ACCEPTABLE `text/html` media range means the machine default is JSON.
+///
+/// The `Accept` header is parsed as media ranges rather than substring-matched:
+/// media types are case-insensitive (RFC 9110 §12.5.1), and a `;q=0` parameter
+/// marks a type as *not* acceptable (§12.4.2), so `text/html;q=0, application/json`
+/// correctly stays on JSON and `TEXT/HTML` is still recognized. A wildcard
+/// (`text/*`, `*/*`) does NOT opt into HTML — only an explicit `text/html` does,
+/// keeping the JSON default for anything that isn't unambiguously a browser.
 fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
-    headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|a| a.contains("text/html"))
+    let Some(accept) = headers.get(axum::http::header::ACCEPT).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    accept.split(',').any(|range| {
+        let mut parts = range.split(';').map(str::trim);
+        if !parts.next().is_some_and(|media| media.eq_ignore_ascii_case("text/html")) {
+            return false;
+        }
+        // Acceptable unless an explicit `q=0` (any spelling: `0`, `0.0`, `0.000`).
+        // A malformed or absent q-value leaves the range acceptable.
+        !parts.any(|param| {
+            param
+                .split_once('=')
+                .is_some_and(|(k, v)| k.trim().eq_ignore_ascii_case("q")
+                    && v.trim().parse::<f32>().is_ok_and(|q| q <= 0.0))
+        })
+    })
 }
 
 /// The always-present "report it" line for a sign-in/handshake error screen. The
@@ -2145,8 +2165,17 @@ mod tests {
         };
         assert!(super::accepts_html(&with("text/html,application/xhtml+xml,*/*")));
         assert!(super::accepts_html(&with("text/html")));
+        assert!(super::accepts_html(&with("text/html;q=0.9,application/json")));
+        // Media types are case-insensitive (RFC 9110 §12.5.1).
+        assert!(super::accepts_html(&with("TEXT/HTML")));
         assert!(!super::accepts_html(&with("application/json")));
         assert!(!super::accepts_html(&with("*/*")));
+        // A wildcard does not opt into HTML; only an explicit `text/html` does.
+        assert!(!super::accepts_html(&with("text/*")));
+        // `;q=0` explicitly marks text/html as NOT acceptable (§12.4.2), so a
+        // caller that says so stays on JSON despite naming the type.
+        assert!(!super::accepts_html(&with("text/html;q=0, application/json")));
+        assert!(!super::accepts_html(&with("text/html;q=0.0")));
         // No Accept header at all → treated as a machine (JSON).
         assert!(!super::accepts_html(&HeaderMap::new()));
     }
