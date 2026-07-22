@@ -200,11 +200,12 @@ const DEFAULT_ALLOWED_REDIRECTS: &[(&str, &str)] = &[
 
 /// The effective hosted-redirect allow-list: the compiled-in defaults plus any
 /// entries in `OAUTH_ALLOWED_REDIRECT_PREFIXES`. Each env entry is a bare
-/// `https://host/path` value pinning an origin + path prefix; an entry that is not
-/// https, has no host, carries only the root path (`/`), or specifies a port,
-/// query, fragment, or userinfo is dropped with a warning (a domain-wide entry is
-/// exactly the hole this closes; the others would be silently ignored since only
-/// `(host, path)` is stored). Additive: the
+/// `https://host/path` value pinning a host + path prefix; an entry that is not
+/// https, has no host, carries only the root path (`/`), or specifies a non-default
+/// port (explicit `:443` is fine, being the same origin), query, fragment, or
+/// userinfo is dropped with a warning (a domain-wide entry is exactly the hole this
+/// closes; the others would be silently ignored since only `(host, path)` is
+/// stored). Additive: the
 /// shipped binary is safe by default and ops can only widen the set. Computed ONCE
 /// (the env is process-static) via `OnceLock`, so `/oauth/register` and
 /// `/oauth/authorize` neither re-parse the env nor re-log its warnings per call.
@@ -219,8 +220,9 @@ fn allowed_redirects() -> &'static [(String, String)] {
                     Some(e) => out.push(e),
                     None => tracing::warn!(
                         "ignoring OAUTH_ALLOWED_REDIRECT_PREFIXES entry `{raw}`: must be a bare \
-                         `https://host/path` with a non-root path prefix and no port, query, \
-                         fragment, or userinfo (domain-wide entries are refused)"
+                         `https://host/path` with a non-root path prefix and no non-default port \
+                         (`:443` is fine), query, fragment, or userinfo (domain-wide entries are \
+                         refused)"
                     ),
                 }
             }
@@ -231,9 +233,10 @@ fn allowed_redirects() -> &'static [(String, String)] {
 
 /// Parse one `OAUTH_ALLOWED_REDIRECT_PREFIXES` entry into the `(host, path)` pair
 /// the matcher stores. Returns `None` (drop + warn) unless the entry is a bare
-/// `https://host/path` with a non-root path and no port, query, fragment, or
-/// userinfo: only `(host, path)` is matched, so anything else would be silently
-/// ignored and give the operator a false sense of what they pinned.
+/// `https://host/path` with a non-root path and no non-default port (explicit
+/// `:443` is accepted as the same origin), query, fragment, or userinfo: only
+/// `(host, path)` is matched, so anything else would be silently ignored and give
+/// the operator a false sense of what they pinned.
 fn parse_redirect_prefix(raw: &str) -> Option<(String, String)> {
     let u = url::Url::parse(raw).ok().filter(|u| u.scheme() == "https")?;
     if u.port().is_some()

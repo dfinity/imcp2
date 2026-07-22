@@ -431,7 +431,7 @@ the callback page.
 > vendor-controlled, non-user-content endpoint. The list is seeded with the known
 > MCP connector vendors' callback paths and widened per deployment with
 > `OAUTH_ALLOWED_REDIRECT_PREFIXES` (additive; each entry a full `https://host/path`
-> origin, a bare domain is refused); loopback/native clients are exempt (the code
+> URL prefix, a bare domain is refused); loopback/native clients are exempt (the code
 > resolves on the consenter's own machine). Enforced at both `/oauth/register` and `/oauth/authorize`. A client
 > turned away is pointed at a contact address to request approval:
 > `/oauth/register` says so in its JSON `error_description`, and a browser that
