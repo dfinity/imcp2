@@ -386,7 +386,7 @@ II handshake renders as a **nicely formatted, on-brand screen** — an editorial
 headline, a best-effort diagnostic ("your client may be out of date; remove and
 re-add the connector", etc.), and always the line *"If this error is unexpected,
 please contact mcp@dfinity.org to report it."* — rather than a raw JSON blob. The
-shared shell lives in `src/assets/connect-error.html` + `connect.css` (reused from
+shared shell lives in `src/assets/connect-error.html` + `src/assets/connect.css` (reused from
 the connect callback page: same parchment grid, serif display, foot-of-page "Hosted
 by" mark, light/dark theming) and is fully self-contained under a strict, nonce'd,
 non-scripted, unframeable CSP that reflects no request value. Authorize errors

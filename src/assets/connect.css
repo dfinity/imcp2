@@ -100,6 +100,12 @@ body {
    and always visible. */
 .contact-hint { display: none; }
 .screen.error .contact-hint { display: block; }
+/* On the callback page the status message and its contact line share one
+   `role=status` (polite, atomic) live region, so a screen reader announces the
+   error AND the "contact us" line together when the page enters its error state.
+   The wrapper mirrors the stage's own column layout and gap so the grouping does
+   not change the visual spacing. */
+.status { display: flex; flex-direction: column; align-items: center; gap: 2.25rem; }
 /* Foot-of-page attribution: an eyebrow label + the DFINITY mark in a soft pill. */
 .hosted {
   display: flex;
