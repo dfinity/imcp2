@@ -255,6 +255,28 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
         .any(|d| host == *d || host.strip_suffix(d.as_str()).is_some_and(|p| p.ends_with('.')))
 }
 
+/// Whether `redirect_uri` is a **well-formed hosted** redirect: it parses, is
+/// `https`, carries no userinfo, and has a host. This is the shape that could
+/// legitimately be allow-listed and that [`redirect_uri_permitted`] rejects only
+/// because its host isn't on the list. It lets `/oauth/authorize` tell "a real
+/// client whose redirect just isn't approved yet" (→ the [`not_allowlisted_page`])
+/// apart from a genuinely **malformed or ineligible** `redirect_uri`
+/// (unparseable, non-`https`, or userinfo-bearing), which is a client-side request
+/// error, not an approval gap. Loopback is intentionally NOT counted here: a
+/// loopback redirect is always permitted, so it never reaches the not-permitted
+/// branch this distinction guards.
+fn is_wellformed_hosted_redirect(redirect_uri: &str) -> bool {
+    match url::Url::parse(redirect_uri) {
+        Ok(url) => {
+            url.scheme() == "https"
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.host_str().is_some_and(|h| !h.is_empty())
+        }
+        Err(_) => false,
+    }
+}
+
 /// Acceptance rule for a redirect (OAuth 2.1): the client must be REGISTERED,
 /// the redirect must pass the hosted-redirect allow-list
 /// ([`redirect_uri_permitted`]), and it must either exactly match a registered
@@ -446,10 +468,10 @@ pub async fn authorize(
     // A single best-effort diagnostic for the "client sent a request we can't
     // process" family (wrong response_type, missing/unsupported PKCE): the cause
     // is almost always a client that is out of date or misconfigured.
-    const MALFORMED_DIAGNOSTIC: &str = "Your MCP client sent a sign-in request this server couldn't \
-        process. The client may be out of date — try updating it, or remove and re-add this connector, \
-        then sign in again.";
-    const SIGNIN_HEADLINE: &str = "Sign-in couldn't start";
+    const MALFORMED_DIAGNOSTIC: &str = "Your MCP client sent a request this server can't process. \
+        The client may be out of date. Try updating it. If that doesn't help, remove the connector \
+        and add it again. Then sign in.";
+    const SIGNIN_HEADLINE: &str = "We couldn't start your sign-in";
 
     // Only the authorization-code response type is supported.
     match q.response_type.as_deref() {
@@ -464,21 +486,31 @@ pub async fn authorize(
         }
     }
     if !store.validate_client(&q.client_id, &q.redirect_uri).await {
-        // A well-formed hosted `redirect_uri` that simply isn't on the allow-list
-        // is an approval gap, not a malformed request: show the browser the
-        // dedicated "not allowed" page naming the cause and the concrete next
-        // step (request access), rather than a raw JSON blob. This covers clients
-        // that skip DCR or use a stored-but-disallowed registration (the standard
-        // flow is blocked earlier, at `/oauth/register`). The page is static and
-        // reflects nothing, so naming the cause leaks nothing. A programmatic
-        // caller (no `text/html`) still gets the machine-readable JSON.
         if !redirect_uri_permitted(&q.redirect_uri) {
-            return if accepts_html(&headers) {
-                not_allowlisted_page()
-            } else {
-                oauth_err(StatusCode::FORBIDDEN, "invalid_client",
-                    &format!("redirect_uri is not on the hosted-redirect allow-list; contact {CONTACT} to request access"))
-            };
+            // Two distinct failures reach here. A WELL-FORMED hosted `redirect_uri`
+            // that simply isn't on the allow-list is an approval gap, not a
+            // malformed request: show the browser the dedicated "not approved" page
+            // naming the cause and the concrete next step (request access). This
+            // covers clients that skip DCR or use a stored-but-disallowed
+            // registration (the standard flow is blocked earlier, at
+            // `/oauth/register`). The page is static and reflects nothing, so naming
+            // the cause leaks nothing. A programmatic caller (no `text/html`) gets
+            // the machine-readable JSON.
+            if is_wellformed_hosted_redirect(&q.redirect_uri) {
+                return if accepts_html(&headers) {
+                    not_allowlisted_page()
+                } else {
+                    oauth_err(StatusCode::FORBIDDEN, "invalid_client",
+                        &format!("redirect_uri is not on the hosted-redirect allow-list; contact {CONTACT} to request access"))
+                };
+            }
+            // Otherwise the `redirect_uri` is malformed or ineligible (unparseable,
+            // non-https, or userinfo-bearing). That's a client-side request error,
+            // not an approval gap, so classify it `invalid_request` and show the
+            // generic sign-in error rather than a misleading "request access" page.
+            return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
+                "redirect_uri is malformed or is not an https or loopback URL", SIGNIN_HEADLINE,
+                MALFORMED_DIAGNOSTIC);
         }
         // `invalid_client` (not `invalid_request`): the request is well-formed,
         // it's the CLIENT identification that failed — the AS error code the
@@ -486,16 +518,15 @@ pub async fn authorize(
         // an unvalidated redirect_uri must never receive an error response.
         return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_client",
             "unknown client_id / redirect_uri", SIGNIN_HEADLINE,
-            "This server doesn't recognize your MCP client. Its registration may have expired, or \
-             the server may have been redeployed since you added it. Remove and re-add this connector \
-             in your client, then sign in again.");
+            "This server doesn't recognize your MCP client. Its registration may have expired. \
+             Remove the connector and add it again. Then sign in.");
     }
     // OAuth 2.1: PKCE is required for public clients.
     let Some(code_challenge) = q.code_challenge.clone() else {
         return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
             "code_challenge (PKCE S256) required", SIGNIN_HEADLINE,
-            "Your MCP client's sign-in request was missing a required security parameter (PKCE). \
-             The client may be out of date — try updating it, or remove and re-add this connector.");
+            "Your MCP client's request was missing a required security check (PKCE). The client may \
+             be out of date. Try updating it. If that doesn't help, remove the connector and add it again.");
     };
     if let Some(m) = &q.code_challenge_method {
         if m != "S256" {
@@ -769,11 +800,11 @@ const PINNED_PAGE_JS: &str = r#"(function () {
       if (d && d.redirect) {
         location.replace(d.redirect);
       } else {
-        show((d && d.error) || 'Could not finish the connection. Restart from your client.', true);
+        show((d && d.error) || "We couldn't finish the connection. Restart from your client.", true);
       }
     })
     .catch(function () {
-      show('Could not reach the server. Restart from your client.', true);
+      show("We couldn't reach the server. Restart from your client.", true);
     });
 })();"#;
 
@@ -852,12 +883,15 @@ const CONNECT_ERROR_HTML: &str = include_str!("assets/connect-error.html");
 /// The tab title used by every generic `/oauth/authorize` error screen.
 const SIGNIN_ERROR_TITLE: &str = "Sign-in error";
 
-/// Whether the request prefers an HTML response — i.e. it comes from a browser.
-/// `/oauth/authorize` is a front-channel endpoint reached by top-level navigation,
-/// so a browser (which always sends `Accept: text/html`) gets the friendly
-/// [`error_screen`], while a programmatic OAuth caller (`Accept: application/json`,
-/// `*/*`, or no `Accept` at all) keeps the machine-readable JSON. Keying on an
-/// explicit, ACCEPTABLE `text/html` media range means the machine default is JSON.
+/// Whether the request explicitly accepts an HTML response — i.e. it comes from a
+/// browser. This is a coarse browser-vs-machine split, NOT a full preference
+/// ranking: it does not weigh `text/html`'s q-value against JSON's, only whether
+/// `text/html` is an acceptable type at all. That is deliberate — a browser always
+/// lists `text/html` as acceptable, so treating any acceptable `text/html` as "serve
+/// the screen" is enough. `/oauth/authorize` is a front-channel endpoint reached by
+/// top-level navigation, so a browser gets the friendly [`error_screen`], while a
+/// programmatic OAuth caller (`Accept: application/json`, `*/*`, or no `Accept` at
+/// all) keeps the machine-readable JSON: the machine default is JSON.
 ///
 /// The `Accept` header is parsed as media ranges rather than substring-matched:
 /// media types are case-insensitive (RFC 9110 §12.5.1), and a `;q=0` parameter
@@ -890,7 +924,7 @@ fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
 /// page's strict resource CSP). The address is the compiled-in [`CONTACT`], never
 /// a request value.
 fn contact_report_hint() -> String {
-    format!("If this error is unexpected, please contact <a href=\"mailto:{CONTACT}\">{CONTACT}</a> to report it.")
+    format!("If this error is unexpected, please email <a href=\"mailto:{CONTACT}\">{CONTACT}</a> to report it.")
 }
 
 /// Render one of the shared browser-facing error screens
@@ -966,12 +1000,11 @@ fn signin_error(
 fn not_allowlisted_page() -> Response {
     error_screen(
         StatusCode::FORBIDDEN,
-        "MCP client not allowed",
-        "This MCP client isn't allowed",
-        "This server only accepts connections from approved MCP clients, and the one you're \
-         connecting from is not on the allow-list.",
+        "MCP client not approved",
+        "This MCP client isn't approved yet",
+        "This server only accepts approved MCP clients. Yours isn't on the allow-list yet.",
         &format!(
-            "To request access, email <a href=\"mailto:{CONTACT}\">{CONTACT}</a> and include your \
+            "To request access, email <a href=\"mailto:{CONTACT}\">{CONTACT}</a>. Include your \
              MCP client's redirect URI."
         ),
     )
@@ -1173,10 +1206,10 @@ pub async fn connect_redeem(
         })
     };
     let Some((expired, cookie, client_id, redirect_uri, client_state, code_challenge, existing_code)) = snap else {
-        return redeem_err("unknown or already-used connect request — restart from your client");
+        return redeem_err("This connect request is unknown or already used. Restart from your client.");
     };
     if expired {
-        return redeem_err("connect request expired — restart from your client");
+        return redeem_err("This connect request has expired. Restart from your client.");
     }
     // Initiator proof: only the browser that STARTED this connect (holding the
     // `sid` cookie) may redeem. In the confused-deputy path the delegation lands
@@ -1184,7 +1217,7 @@ pub async fn connect_redeem(
     // one `X` was bound to, so this aborts (see the design's security argument).
     if connect_cookie(&headers).as_deref() != Some(cookie.as_str()) {
         return redeem_err(
-            "this sign-in was started in a different browser session — restart the connection from your client",
+            "This sign-in started in a different browser. Restart from your client.",
         );
     }
     // Idempotent: if a code was already minted for this connect, return it again.
@@ -1197,7 +1230,7 @@ pub async fn connect_redeem(
     // captured them at prepare and recovers them from caller() == P_reg).
     let (user_key, chain) = match parse_registration_delegation(&body.delegation) {
         Ok(v) => v,
-        Err(e) => return redeem_err(&format!("malformed registration delegation: {e}")),
+        Err(e) => return redeem_err(&format!("We couldn't read the sign-in response: {e}")),
     };
     // Single-flight: atomically claim this connect's redemption so a double-submit
     // can't fire two concurrent mcp_register_v2 calls (and a request racing a
@@ -1210,11 +1243,11 @@ pub async fn connect_redeem(
         }
         RedeemClaim::InProgress => {
             return redeem_err(
-                "another redemption attempt for this connect is already in progress — \
-                 wait a moment; if it does not complete, restart from your client",
+                "This connect request is already being processed. Wait a moment. \
+                 If nothing happens, restart from your client.",
             )
         }
-        RedeemClaim::Vanished => return redeem_err("connect request vanished — restart from your client"),
+        RedeemClaim::Vanished => return redeem_err("This connect request is no longer available. Restart from your client."),
     }
     // Redeem: build a DelegatedIdentity from priv(X) + the chain and make one
     // authenticated mcp_register_v2 call. Success proves consent AND registration.
@@ -1244,7 +1277,7 @@ pub async fn connect_redeem(
     let (code, newly_minted) = {
         let mut authz = store.authz.write().await;
         let Some(a) = authz.get_mut(&body.state) else {
-            return redeem_err("connect request vanished — restart from your client");
+            return redeem_err("This connect request is no longer available. Restart from your client.");
         };
         a.redeeming = false;
         match &a.code {
@@ -2100,6 +2133,52 @@ mod tests {
             assert_eq!(resp.status(), want_status);
             assert!(content_type(&resp).contains("json"), "a machine caller keeps JSON for {client_id}");
         }
+    }
+
+    // A malformed or ineligible redirect_uri (here: non-loopback http) is a
+    // client request error, NOT an approval gap: it is classified invalid_request
+    // and shows the generic sign-in error, never the "request access" allow-list
+    // page. (`redirect_uri_permitted` rejects it, but it isn't a well-formed
+    // hosted redirect, so it must not be funneled to the not-approved screen.)
+    #[tokio::test]
+    async fn authorize_malformed_redirect_is_invalid_request_not_allowlist() {
+        use axum::extract::{Query, State};
+        let store = test_store();
+        // Registered directly (bypassing DCR, which would reject it) so the failure
+        // is the redirect eligibility check, not an unknown client.
+        store.clients.write().await.insert(
+            "client-x".into(),
+            super::ClientReg { redirect_uris: vec!["http://evil.example/cb".into()] },
+        );
+        let mk = || super::AuthorizeQuery {
+            response_type: Some("code".into()),
+            client_id: "client-x".into(),
+            redirect_uri: "http://evil.example/cb".into(), // non-loopback http: ineligible AND not well-formed hosted
+            state: Some("xyz".into()),
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            scope: None,
+            resource: None,
+        };
+
+        // Browser: the generic sign-in error, NOT the allow-list "request access" page.
+        let resp = super::authorize(State(store.clone()), html_headers(), Query(mk())).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let html = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("report it"), "shows the generic sign-in error with the report line");
+        assert!(!html.contains("allow-list"), "must NOT be the allow-list rejection page: {html}");
+
+        // Machine: invalid_request JSON, not invalid_client / 403.
+        let resp = super::authorize(State(store.clone()), json_headers(), Query(mk())).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("invalid_request"), "machine gets invalid_request: {body}");
     }
 
     // A malformed sign-in request (here: PKCE missing) reached in a browser gets
