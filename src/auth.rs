@@ -471,7 +471,7 @@ pub async fn authorize(
     const MALFORMED_DIAGNOSTIC: &str = "Your MCP client sent a request this server can't process. \
         The client may be out of date. Try updating it. If that doesn't help, remove the connector \
         and add it again. Then sign in.";
-    const SIGNIN_HEADLINE: &str = "We couldn't start your sign-in";
+    const SIGNIN_HEADLINE: &str = "We couldn't start your sign-in.";
 
     // Only the authorization-code response type is supported.
     match q.response_type.as_deref() {
@@ -1001,11 +1001,11 @@ fn not_allowlisted_page() -> Response {
     error_screen(
         StatusCode::FORBIDDEN,
         "MCP client not approved",
-        "This MCP client isn't approved yet",
+        "This MCP client isn't approved yet.",
         "This server only accepts approved MCP clients. Yours isn't on the allow-list yet.",
         &format!(
-            "To request access, email <a href=\"mailto:{CONTACT}\">{CONTACT}</a>. Include your \
-             MCP client's redirect URI."
+            "To request access, email <a href=\"mailto:{CONTACT}\">{CONTACT}</a>. Tell us the name \
+             of your MCP client or AI chatbot."
         ),
     )
 }
@@ -1230,7 +1230,7 @@ pub async fn connect_redeem(
     // captured them at prepare and recovers them from caller() == P_reg).
     let (user_key, chain) = match parse_registration_delegation(&body.delegation) {
         Ok(v) => v,
-        Err(e) => return redeem_err(&format!("We couldn't read the sign-in response: {e}")),
+        Err(e) => return redeem_err(&format!("We couldn't read the sign-in response. Restart from your client. ({e})")),
     };
     // Single-flight: atomically claim this connect's redemption so a double-submit
     // can't fire two concurrent mcp_register_v2 calls (and a request racing a
