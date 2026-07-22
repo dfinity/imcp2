@@ -50,8 +50,10 @@
 //! *same-browser* variant (a victim socially engineered into running the whole
 //! flow toward an attacker-registered **hosted** `redirect_uri`) is closed by a
 //! **hosted-redirect allow-list** ([`redirect_uri_permitted`]): open DCR may
-//! register only loopback or allow-listed-domain hosted redirects, so an attacker
-//! cannot register a hosted destination it controls (loopback is safe either way).
+//! register only loopback, or a hosted redirect on an allow-listed domain UNDER
+//! that vendor's pinned OAuth-callback path, so an attacker cannot register a
+//! hosted destination it controls, not even a user-content path (`/page/…`,
+//! `/g/…`) on an allow-listed origin (loopback is safe either way).
 //! A client turned away by the allow-list is pointed at [`ALLOWLIST_CONTACT`] to
 //! request approval: `/oauth/register` says so in its JSON `error_description`,
 //! and a browser that reaches `/oauth/authorize` gets the on-brand
@@ -162,63 +164,131 @@ fn persist_clients(clients: &HashMap<String, ClientReg>) {
     }
 }
 
-/// Registrable domains whose hosts (and subdomains) may register a **hosted**
-/// (non-loopback) OAuth `redirect_uri`. Dynamic client registration is open, so
-/// without this an attacker could register a client with a hosted redirect it
-/// controls and phish an authorization code to it (the same-browser variant that
-/// Consent-Bound Completion does not close). Loopback redirects are exempt (a
-/// loopback code resolves on the consenter's own machine), so native/CLI clients
-/// need no entry. Seeded with the MCP connector vendors seen in practice; widen
-/// at deploy time with `OAUTH_ALLOWED_REDIRECT_DOMAINS` (comma/space-separated,
-/// additive) without a rebuild.
-const DEFAULT_ALLOWED_REDIRECT_DOMAINS: &[&str] = &[
-    "antigravity.google", // Google Antigravity
-    "chatgpt.com",        // OpenAI ChatGPT connectors
-    "claude.ai",          // Anthropic Claude
-    "cursor.com",         // Cursor
-    "grok.com",           // xAI Grok
-    "perplexity.ai",      // Perplexity (any subdomain)
-    "perplexity.com",     // Perplexity (any subdomain)
-    "vscode.dev",         // Visual Studio Code (any subdomain, e.g. insiders.)
+/// (registrable domain, redirect-path prefix) pairs whose hosts (and subdomains)
+/// may register a **hosted** (non-loopback) OAuth `redirect_uri`. Open dynamic
+/// client registration means that without this an attacker could register a hosted
+/// redirect it controls and phish an authorization code to it (the same-browser
+/// variant Consent-Bound Completion does not close, CWE-601).
+///
+/// Matching the DOMAIN alone is NOT enough: several allow-listed origins also
+/// serve third-party, potentially script-executing content on the SAME origin
+/// (e.g. `perplexity.ai/page/…`, `chatgpt.com/g/…` and `/share/…`). A domain-only
+/// rule would let an attacker register a `redirect_uri` on such a path; via the
+/// same-browser flow the victim's browser lands there with `?code=…` and on-origin
+/// JS exfiltrates it. So each entry also pins the PATH to the vendor's dedicated
+/// OAuth-callback endpoint (see [`path_within_prefix`]): a registered redirect
+/// always lands on a vendor-controlled, non-user-content path. (`claude.ai` runs
+/// artifacts on a separate sandboxed `claudeusercontent.com` origin, off this list.)
+///
+/// Loopback redirects are exempt (a loopback code resolves on the consenter's own
+/// machine). Seeded from the connector vendors' real callback paths; widen at
+/// deploy time with `OAUTH_ALLOWED_REDIRECT_PREFIXES` (comma/space-separated full
+/// `https://host/path` URL prefixes, each pinning a host + path prefix), additive, no
+/// rebuild; a bare-domain (root-path) entry is refused so ops can't reopen the
+/// domain-wide hole.
+const DEFAULT_ALLOWED_REDIRECTS: &[(&str, &str)] = &[
+    ("antigravity.google", "/oauth-callback"), // Google Antigravity
+    ("chatgpt.com", "/connector/oauth/"),      // OpenAI ChatGPT connectors
+    ("claude.ai", "/api/mcp/auth_callback"),   // Anthropic Claude
+    ("cursor.com", "/agents/mcp/oauth/callback"), // Cursor (registered as www.cursor.com)
+    ("grok.com", "/connector/oauth/"),         // xAI Grok
+    ("grok.com", "/connectors-oauth-exchange-code/"),
+    ("grok.com", "/mcp/callback"),
+    ("perplexity.ai", "/rest/connections/oauth_callback"), // Perplexity (any subdomain)
+    ("perplexity.com", "/rest/connections/oauth_callback"),
 ];
 
 /// The effective hosted-redirect allow-list: the compiled-in defaults plus any
-/// entries in `OAUTH_ALLOWED_REDIRECT_DOMAINS`. Each env entry may be a bare
-/// domain or an `https://…` origin (scheme/port/path are stripped to the host).
-/// Additive: the shipped binary is safe by default and ops can only widen the
-/// set, never accidentally drop a known vendor.
-fn allowed_redirect_domains() -> Vec<String> {
-    let mut domains: Vec<String> =
-        DEFAULT_ALLOWED_REDIRECT_DOMAINS.iter().map(|d| d.to_string()).collect();
-    if let Ok(extra) = std::env::var("OAUTH_ALLOWED_REDIRECT_DOMAINS") {
-        for raw in extra.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
-            // Parse as a URL to robustly reduce an entry to its bare host, stripping
-            // scheme, userinfo, port, and path alike. Bare domains have no scheme, so
-            // give them one first (`vendor.example` / `vendor.example:8443` -> host
-            // `vendor.example`), matching what `Url::host_str()` yields at match time.
-            let candidate =
-                if raw.contains("://") { raw.to_string() } else { format!("https://{raw}") };
-            let host = url::Url::parse(&candidate)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase()))
-                .filter(|h| !h.is_empty());
-            if let Some(host) = host {
-                domains.push(host);
+/// entries in `OAUTH_ALLOWED_REDIRECT_PREFIXES`. Each env entry is a bare
+/// `https://host/path` value pinning a host + path prefix; an entry that is not
+/// https, has no host, carries only the root path (`/`), or specifies a non-default
+/// port (explicit `:443` is fine, being the same origin), query, fragment, or
+/// userinfo is dropped with a warning (a domain-wide entry is exactly the hole this
+/// closes; the others would be silently ignored since only `(host, path)` is
+/// stored). Additive: the
+/// shipped binary is safe by default and ops can only widen the set. Computed ONCE
+/// (the env is process-static) via `OnceLock`, so `/oauth/register` and
+/// `/oauth/authorize` neither re-parse the env nor re-log its warnings per call.
+fn allowed_redirects() -> &'static [(String, String)] {
+    static CACHE: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut out: Vec<(String, String)> =
+            DEFAULT_ALLOWED_REDIRECTS.iter().map(|(d, p)| (d.to_string(), p.to_string())).collect();
+        if let Ok(extra) = std::env::var("OAUTH_ALLOWED_REDIRECT_PREFIXES") {
+            for raw in extra.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
+                match parse_redirect_prefix(raw) {
+                    Some(e) => out.push(e),
+                    None => tracing::warn!(
+                        "ignoring OAUTH_ALLOWED_REDIRECT_PREFIXES entry `{raw}`: must be a bare \
+                         `https://host/path` with a non-root path prefix and no non-default port \
+                         (`:443` is fine), query, fragment, or userinfo (domain-wide entries are \
+                         refused)"
+                    ),
+                }
             }
         }
+        out
+    })
+}
+
+/// Parse one `OAUTH_ALLOWED_REDIRECT_PREFIXES` entry into the `(host, path)` pair
+/// the matcher stores. Returns `None` (drop + warn) unless the entry is a bare
+/// `https://host/path` with a non-root path and no non-default port (explicit
+/// `:443` is accepted as the same origin), query, fragment, or userinfo: only
+/// `(host, path)` is matched, so anything else would be silently ignored and give
+/// the operator a false sense of what they pinned.
+fn parse_redirect_prefix(raw: &str) -> Option<(String, String)> {
+    let u = url::Url::parse(raw).ok().filter(|u| u.scheme() == "https")?;
+    if u.port().is_some()
+        || u.query().is_some()
+        || u.fragment().is_some()
+        || !u.username().is_empty()
+        || u.password().is_some()
+    {
+        return None;
     }
-    domains
+    let host = u.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    let path = u.path().to_string();
+    (!host.is_empty() && path != "/" && !path.is_empty()).then_some((host, path))
+}
+
+/// Whether `path` equals `prefix` or is a descendant of it at a SEGMENT boundary,
+/// so a pinned `/api/mcp/auth_callback` admits `/api/mcp/auth_callback` and
+/// `/api/mcp/auth_callback/…` but NOT `/api/mcp/auth_callbackEVIL`.
+fn path_within_prefix(path: &str, prefix: &str) -> bool {
+    match path.strip_prefix(prefix) {
+        Some(rest) => rest.is_empty() || prefix.ends_with('/') || rest.starts_with('/'),
+        None => false,
+    }
+}
+
+/// Whether the redirect carries a `.`/`..` path segment (raw or `%2e`-encoded). A
+/// user agent normalizes these away before requesting, so a redirect like
+/// `/connector/oauth/../../g/evil` could satisfy the pinned-prefix check here yet
+/// land OUTSIDE the prefix in the browser; such redirects are refused outright.
+/// (`url::Url` already normalizes special-scheme paths, so this is a belt-and-
+/// suspenders check on the raw input, independent of that normalization.)
+fn has_dot_segment(redirect_uri: &str) -> bool {
+    let normalized = redirect_uri.to_ascii_lowercase().replace("%2e", ".");
+    normalized.split('/').any(|seg| {
+        let seg = seg.split(['?', '#']).next().unwrap_or("");
+        seg == "." || seg == ".."
+    })
 }
 
 /// Whether a `redirect_uri` may be registered or receive an authorization code.
 /// Loopback (`http://localhost` / `127.0.0.1` / `[::1]`, any port) is always
-/// allowed. A hosted redirect must be `https`, carry no userinfo, and its host
-/// must equal, or be a subdomain of, an allow-listed registrable domain. The host
-/// is read from the PARSED URL, not the raw string, so authority tricks such as
-/// `https://claude.ai@evil.com` or `https://claude.ai.evil.com` resolve to their
-/// real host and are refused; a bare `https://user@claude.ai` is refused too
-/// (userinfo serves no purpose in a redirect target, only muddies which host is
-/// addressed, and loopback already rejects it).
+/// allowed. A hosted redirect must be `https`, carry no userinfo, name no
+/// off-origin port (only the implicit/`:443` default is allowed), its host must
+/// equal (or be a subdomain of) an allow-listed registrable domain, AND its path
+/// must fall within that entry's pinned callback prefix (see
+/// [`DEFAULT_ALLOWED_REDIRECTS`]), so a user-content path on an allow-listed
+/// origin (`perplexity.ai/page/…`, `chatgpt.com/g/…`) is refused even though the
+/// host matches. The host is read from the PARSED URL, not the raw string, so
+/// authority tricks such as `https://claude.ai@evil.com` or
+/// `https://claude.ai.evil.com` resolve to their real host and are refused; a bare
+/// `https://user@claude.ai` is refused too (userinfo serves no purpose in a
+/// redirect target, only muddies which host is addressed, and loopback rejects it).
 fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     if is_loopback_redirect(redirect_uri) {
         return true;
@@ -229,16 +299,31 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
         return false;
     }
+    // Refuse an explicit non-default port: `https://claude.ai:444/…` is a DIFFERENT
+    // origin than the pinned `https://claude.ai` and may serve different content, so
+    // the path pin wouldn't hold. `url::Url::port()` returns `None` for the scheme's
+    // default (443), so `:443` and no-port both pass; only an off-origin port fails.
+    if url.port().is_some() {
+        return false;
+    }
+    // Refuse `.`/`..` (raw or `%2e`) path segments: they normalize in the browser
+    // and could escape the pinned callback prefix (`/connector/oauth/../../g/evil`).
+    if has_dot_segment(redirect_uri) {
+        return false;
+    }
     let Some(host) = url.host_str() else {
         return false;
     };
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    // host == domain, or host is a dot-boundary subdomain of it. `strip_suffix`
-    // keeps the same semantics as `ends_with(format!(".{d}"))` without allocating
-    // a string per candidate on every register/authorize validation.
-    allowed_redirect_domains()
-        .iter()
-        .any(|d| host == *d || host.strip_suffix(d.as_str()).is_some_and(|p| p.ends_with('.')))
+    let path = url.path();
+    // host == domain (or a dot-boundary subdomain) AND the path is within the
+    // vendor's pinned callback prefix. The path pin is what keeps a registration
+    // off third-party/user-content paths (e.g. `/page/…`, `/g/…`) on the same
+    // origin; without it, domain-only matching would let those capture the code.
+    allowed_redirects().iter().any(|(domain, prefix)| {
+        (host == *domain || host.strip_suffix(domain.as_str()).is_some_and(|p| p.ends_with('.')))
+            && path_within_prefix(path, prefix)
+    })
 }
 
 /// Acceptance rule for a redirect (OAuth 2.1): the client must be REGISTERED,
@@ -1287,8 +1372,9 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
             "invalid_redirect_uri",
             &format!(
                 "redirect_uri {bad} is not permitted: a hosted redirect must be https on an \
-                 allow-listed domain (loopback redirects are always allowed). To have this MCP \
-                 client added to the allow-list, contact {ALLOWLIST_CONTACT}."
+                 allow-listed domain AND under that vendor's registered OAuth-callback path \
+                 (loopback redirects are always allowed). To have this MCP client added to the \
+                 allow-list, contact {ALLOWLIST_CONTACT}."
             ),
         );
     }
@@ -1467,41 +1553,115 @@ mod tests {
         assert!(!redirect_allowed(None, "http://[::1]:8080/cb"));
     }
 
-    /// Hosted-redirect allow-list (auth-code phishing, same-browser variant):
-    /// allow-listed vendor domains and their subdomains pass; loopback always
-    /// passes; everything else, including authority-trick look-alikes, is refused.
+    /// Hosted-redirect allow-list (auth-code phishing, same-browser variant): an
+    /// allow-listed vendor domain (or subdomain) passes ONLY under that vendor's
+    /// pinned callback path; loopback always passes; everything else (a
+    /// user-content path on an allow-listed origin, a wrong path, an unlisted
+    /// domain, or an authority-trick look-alike) is refused.
     #[test]
     fn hosted_redirect_allow_list() {
-        // Allow-listed vendor registrable domains and their subdomains.
+        // Allow-listed vendor domains/subdomains UNDER their pinned callback path.
         assert!(redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback"));
         assert!(redirect_uri_permitted("https://chatgpt.com/connector/oauth/abc"));
         assert!(redirect_uri_permitted("https://grok.com/mcp/callback"));
+        assert!(redirect_uri_permitted("https://grok.com/connectors-oauth-exchange-code/x"));
         assert!(redirect_uri_permitted("https://www.perplexity.ai/rest/connections/oauth_callback"));
-        assert!(redirect_uri_permitted("https://staging.perplexity.com/x"));
+        // Subdomain + the pinned path (Perplexity uses www/staging/enterprise/n).
+        assert!(redirect_uri_permitted("https://staging.perplexity.com/rest/connections/oauth_callback"));
         assert!(redirect_uri_permitted("https://antigravity.google/oauth-callback"));
-        assert!(redirect_uri_permitted("https://cursor.com/oauth/callback"));
-        assert!(redirect_uri_permitted("https://vscode.dev/redirect"));
-        assert!(redirect_uri_permitted("https://insiders.vscode.dev/redirect")); // subdomain
         // Loopback is always allowed (any port), no allow-list entry needed.
         assert!(redirect_uri_permitted("http://127.0.0.1:6112/cb"));
         assert!(redirect_uri_permitted("http://localhost/callback"));
         assert!(redirect_uri_permitted("http://[::1]:8080/cb"));
+        // PATH PIN (the core of the CWE-601 finding): an allow-listed origin on a
+        // third-party/user-content path is refused, even though the host matches.
+        assert!(!redirect_uri_permitted("https://perplexity.ai/page/attacker"));
+        assert!(!redirect_uri_permitted("https://www.perplexity.ai/page/attacker"));
+        assert!(!redirect_uri_permitted("https://chatgpt.com/g/evil-gpt"));
+        assert!(!redirect_uri_permitted("https://chatgpt.com/share/abcd"));
+        // Right domain, wrong path, plus a non-segment-boundary near-miss of the pin.
+        assert!(!redirect_uri_permitted("https://claude.ai/foo"));
+        assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callbackEVIL"));
+        // Dot-segment traversal that would normalize (in the browser) outside the
+        // pinned prefix, raw and percent-encoded (`%2e`) forms.
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/../../g/evil"));
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%2e%2e/%2e%2e/g/evil"));
+        // Cursor: allowed at its real hosted callback path (registered as
+        // www.cursor.com), refused on any other path.
+        assert!(redirect_uri_permitted("https://www.cursor.com/agents/mcp/oauth/callback"));
+        assert!(!redirect_uri_permitted("https://cursor.com/oauth/callback")); // wrong path
+        // vscode.dev is deliberately NOT allow-listed: its only registered path is
+        // `/redirect`, a web-to-desktop forwarding endpoint (see the PR discussion).
+        assert!(!redirect_uri_permitted("https://vscode.dev/redirect"));
+        assert!(!redirect_uri_permitted("https://insiders.vscode.dev/redirect"));
         // Attacker-controlled hosted redirects: refused (the finding's payloads).
         assert!(!redirect_uri_permitted("https://example.com/cb"));
         assert!(!redirect_uri_permitted("https://attacker.example/cb"));
-        // Look-alikes and authority tricks resolve to the real (non-allowed) host.
-        assert!(!redirect_uri_permitted("https://claude.ai.evil.com/cb")); // subdomain of evil.com
-        assert!(!redirect_uri_permitted("https://evilclaude.ai/cb")); // no dot boundary
-        assert!(!redirect_uri_permitted("https://claude.ai@evil.com/cb")); // userinfo -> evil.com
-        // Userinfo is refused even when the host itself is allow-listed.
-        assert!(!redirect_uri_permitted("https://user@claude.ai/cb"));
-        assert!(!redirect_uri_permitted("https://user:pass@claude.ai/cb"));
-        // A hosted redirect must be https even to an allowed domain.
-        assert!(!redirect_uri_permitted("http://claude.ai/cb"));
+        // Look-alikes and authority tricks resolve to the real (non-allowed) host,
+        // tested with an OTHERWISE-valid path so only the host/userinfo is at fault.
+        assert!(!redirect_uri_permitted("https://claude.ai.evil.com/api/mcp/auth_callback"));
+        assert!(!redirect_uri_permitted("https://evilclaude.ai/api/mcp/auth_callback"));
+        assert!(!redirect_uri_permitted("https://claude.ai@evil.com/api/mcp/auth_callback"));
+        // Userinfo is refused even when host + path are otherwise valid.
+        assert!(!redirect_uri_permitted("https://user@claude.ai/api/mcp/auth_callback"));
+        assert!(!redirect_uri_permitted("https://user:pass@claude.ai/api/mcp/auth_callback"));
+        // An off-origin port is refused (different origin than the pinned host), but
+        // the implicit / explicit default `:443` is the same origin and stays allowed.
+        assert!(!redirect_uri_permitted("https://claude.ai:444/api/mcp/auth_callback"));
+        assert!(redirect_uri_permitted("https://claude.ai:443/api/mcp/auth_callback"));
+        // A hosted redirect must be https even to an allowed domain + path.
+        assert!(!redirect_uri_permitted("http://claude.ai/api/mcp/auth_callback"));
         // Defense in depth: a client registered before the allow-list (or via a
         // now-removed domain) still can't receive a code at /oauth/authorize.
         let junk = ClientReg { redirect_uris: vec!["https://example.com/cb".to_string()] };
         assert!(!redirect_allowed(Some(&junk), "https://example.com/cb"));
+    }
+
+    /// Dot-segment detection, independent of `url::Url` normalization: whole-segment
+    /// `.`/`..` (raw or `%2e`) is caught; dots inside a segment and in the query are not.
+    #[test]
+    fn detects_dot_segments() {
+        use super::has_dot_segment;
+        assert!(has_dot_segment("https://x.example/a/../b"));
+        assert!(has_dot_segment("https://x.example/a/./b"));
+        assert!(has_dot_segment("https://x.example/a/%2e%2e/b"));
+        assert!(has_dot_segment("https://x.example/a/%2E%2E/b"));
+        assert!(has_dot_segment("https://x.example/foo/.."));
+        assert!(!has_dot_segment("https://x.example/api/mcp/auth_callback"));
+        assert!(!has_dot_segment("https://x.example/a.b/c..d")); // dots inside a segment
+        assert!(!has_dot_segment("https://x.example/cb?next=../x")); // query, not path
+    }
+
+    /// `OAUTH_ALLOWED_REDIRECT_PREFIXES` entries parse to `(host, path)` only for a
+    /// bare `https://host/path`; a port, query, fragment, or userinfo is refused
+    /// (dropped) rather than silently discarded, and so is a non-https or root-path
+    /// entry that would reopen the domain-wide hole.
+    #[test]
+    fn redirect_prefix_entry_parsing() {
+        use super::parse_redirect_prefix;
+        assert_eq!(
+            parse_redirect_prefix("https://vendor.example/mcp/callback"),
+            Some(("vendor.example".to_string(), "/mcp/callback".to_string()))
+        );
+        assert_eq!(
+            parse_redirect_prefix("https://VENDOR.example/mcp/callback"),
+            Some(("vendor.example".to_string(), "/mcp/callback".to_string()))
+        );
+        // The default `:443` is the same origin, so it is accepted and the port drops.
+        assert_eq!(
+            parse_redirect_prefix("https://vendor.example:443/mcp/callback"),
+            Some(("vendor.example".to_string(), "/mcp/callback".to_string()))
+        );
+        // Silently-ignored components are refused rather than dropped.
+        assert_eq!(parse_redirect_prefix("https://vendor.example:8443/mcp/callback"), None);
+        assert_eq!(parse_redirect_prefix("https://vendor.example/mcp/callback?x=1"), None);
+        assert_eq!(parse_redirect_prefix("https://vendor.example/mcp/callback#frag"), None);
+        assert_eq!(parse_redirect_prefix("https://user@vendor.example/mcp/callback"), None);
+        // Non-https and domain-wide (root or empty path) entries are refused.
+        assert_eq!(parse_redirect_prefix("http://vendor.example/mcp/callback"), None);
+        assert_eq!(parse_redirect_prefix("https://vendor.example/"), None);
+        assert_eq!(parse_redirect_prefix("https://vendor.example"), None);
+        assert_eq!(parse_redirect_prefix("not a url"), None);
     }
 
     /// A registered loopback redirect matches at ANY port (RFC 8252 §7.3 — the
