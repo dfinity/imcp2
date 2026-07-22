@@ -421,11 +421,18 @@ the callback page.
 > Completion alone, since the victim's browser legitimately holds both proofs. It
 > **is** closed by a **hosted-redirect allow-list**: dynamic client registration
 > accepts only a loopback redirect, or a hosted redirect whose host is (a subdomain
-> of) an allow-listed registrable domain, so an attacker cannot register a hosted
-> destination it controls. The list is seeded with the known MCP connector vendors
-> and widened per deployment with `OAUTH_ALLOWED_REDIRECT_DOMAINS` (additive);
-> loopback/native clients are exempt (the code resolves on the consenter's own
-> machine). Enforced at both `/oauth/register` and `/oauth/authorize`. A client
+> of) an allow-listed registrable domain **and** whose path falls within that
+> vendor's pinned OAuth-callback prefix, so an attacker cannot register a hosted
+> destination it controls. The path pin matters because several allow-listed
+> origins also serve third-party, script-capable content on the same origin
+> (`perplexity.ai/page/…`, `chatgpt.com/g/…`, `/share/…`); a domain-only rule would
+> let an attacker register such a path and capture the code from on-origin JS.
+> Pinning to the vendor's dedicated callback path keeps every registration on a
+> vendor-controlled, non-user-content endpoint. The list is seeded with the known
+> MCP connector vendors' callback paths and widened per deployment with
+> `OAUTH_ALLOWED_REDIRECT_PREFIXES` (additive; each entry a full `https://host/path`
+> origin, a bare domain is refused); loopback/native clients are exempt (the code
+> resolves on the consenter's own machine). Enforced at both `/oauth/register` and `/oauth/authorize`. A client
 > turned away is pointed at a contact address to request approval:
 > `/oauth/register` says so in its JSON `error_description`, and a browser that
 > reaches `/oauth/authorize` gets an on-brand "not allowed" page (not a raw error)
