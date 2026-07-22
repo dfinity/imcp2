@@ -183,7 +183,7 @@ fn persist_clients(clients: &HashMap<String, ClientReg>) {
 /// Loopback redirects are exempt (a loopback code resolves on the consenter's own
 /// machine). Seeded from the connector vendors' real callback paths; widen at
 /// deploy time with `OAUTH_ALLOWED_REDIRECT_PREFIXES` (comma/space-separated full
-/// `https://host/path` origins, each pinning a host + path prefix), additive, no
+/// `https://host/path` URL prefixes, each pinning a host + path prefix), additive, no
 /// rebuild; a bare-domain (root-path) entry is refused so ops can't reopen the
 /// domain-wide hole.
 const DEFAULT_ALLOWED_REDIRECTS: &[(&str, &str)] = &[
