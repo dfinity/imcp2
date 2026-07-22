@@ -429,7 +429,7 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
   //     before any client_id is issued; loopback (above) stays exempt. The probe
   //     uses a reserved `.invalid` host (RFC 2606) that can never be legitimately
   //     allow-listed by a deployment, so this can't false-alert if the allow-list
-  //     is widened via OAUTH_ALLOWED_REDIRECT_DOMAINS.
+  //     is widened via OAUTH_ALLOWED_REDIRECT_PREFIXES.
   {
     const url = `${mcpOrigin}/oauth/register`;
     const r = await probe(url, {
