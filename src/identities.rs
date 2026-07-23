@@ -54,9 +54,6 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-/// Public IC API boundary node the II canister calls are made against.
-const IC_URL: &str = "https://icp-api.io";
-
 /// Re-derive once the cached delegation is within this margin of expiry, so a
 /// call never goes out with an about-to-expire delegation.
 const REDERIVE_MARGIN_NS: u64 = 30 * 1_000_000_000;
@@ -99,12 +96,12 @@ const READ_ONLY_MSG: &str = "This Internet Identity session is read-only, so it 
      — are update calls that a read-only session can't make. Reconnect with Internet Identity and turn \
      OFF the read-only option on the consent screen, then try again.";
 
-/// One Internet Identity instance this server can connect users against. The
-/// default ("beta") instance serves `/mcp` with its OAuth AS at the root of
-/// `PUBLIC_URL`; the "prod" instance serves `/mcp-prod` with a path-scoped AS
-/// (issuer `<PUBLIC_URL>/prod`, RFC 8414 path issuer). Each instance gets its
+/// One Internet Identity instance this server can connect users against —
+/// purely *which II* (origin + canister), nothing about where the instance is
+/// mounted on this server: the mount path is deployment composition, chosen in
+/// `McpConfig` when the instance's routers are built. Each instance gets its
 /// own `Identities` + `AuthStore`, so sessions/tokens never cross instances;
-/// II trust in the user's settings is by ORIGIN, which both instances share.
+/// II trust in the user's settings is by ORIGIN, which all instances share.
 #[derive(Clone, Debug)]
 pub struct IiInstance {
     /// Short name for logging ("beta", "prod").
@@ -113,10 +110,6 @@ pub struct IiInstance {
     pub ii_url: String,
     /// Canister id of that II instance — the target of the `mcp_*` calls.
     pub ii_canister: Principal,
-    /// This instance's OAuth path prefix on the server: "" (root) or "/prod".
-    pub oauth_prefix: &'static str,
-    /// The MCP resource path this instance gates: "/mcp" or "/mcp-prod".
-    pub mcp_path: &'static str,
 }
 
 impl IiInstance {
@@ -126,8 +119,6 @@ impl IiInstance {
             name: "beta",
             ii_url: env_origin("II_URL", II_URL_DEFAULT),
             ii_canister: env_principal("II_CANISTER_ID", II_CANISTER_ID_DEFAULT)?,
-            oauth_prefix: "",
-            mcp_path: "/mcp",
         })
     }
 
@@ -137,8 +128,6 @@ impl IiInstance {
             name: "prod",
             ii_url: env_origin("II_URL_PROD", II_URL_PROD_DEFAULT),
             ii_canister: env_principal("II_CANISTER_ID_PROD", II_CANISTER_ID_PROD_DEFAULT)?,
-            oauth_prefix: "/prod",
-            mcp_path: "/mcp-prod",
         })
     }
 }
@@ -181,12 +170,12 @@ const ACTIVE_SESSION_WINDOW_NS: u64 = 15 * 60 * 1_000_000_000;
 /// [`Identities::session_gauges`] so a scrape locks and iterates the session map
 /// once and reports a consistent `active <= live` pair.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SessionGauges {
+pub struct SessionGauges {
     /// Sessions holding a currently-valid II grant (the `live_sessions` gauge).
-    pub(crate) live: usize,
+    pub live: usize,
     /// The subset also active within [`ACTIVE_SESSION_WINDOW_NS`] (the
     /// `active_sessions` gauge). Always `<= live`.
-    pub(crate) active: usize,
+    pub active: usize,
 }
 
 /// Remap a domain to the `target_origin` II expects for account derivation.
@@ -439,15 +428,36 @@ pub struct ResolveAppOutput {
 pub struct Identities {
     /// The II instance every session in this store is registered against.
     instance: IiInstance,
+    /// This MCP server's own public origin — the `target_origin` the
+    /// management identity is derived at (`target_origin()` reduces it to a
+    /// bare origin either way). Injected by the embedding application, never
+    /// read from the environment here.
+    public_url: String,
+    /// The injected base agent (see `McpConfig::agent`). Every identity-bearing
+    /// agent is a clone of it with the identity swapped, so delegated and II
+    /// calls inherit the host's boundary-node routing and transport.
+    agent: Agent,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
 }
 
 impl Identities {
-    pub fn new(instance: IiInstance) -> Self {
+    pub fn new(instance: IiInstance, public_url: String, agent: Agent) -> Self {
         Self {
             instance,
+            public_url,
+            agent,
             sessions: Arc::default(),
         }
+    }
+
+    /// The injected base agent with `identity` swapped in: a clone shares the
+    /// transport, route provider, and root key, so calls signed as `identity`
+    /// go through the embedding application's boundary-node routing — never a
+    /// second, hard-coded endpoint.
+    pub(crate) fn agent_as<I: ic_agent::Identity + 'static>(&self, identity: I) -> Agent {
+        let mut agent = self.agent.clone();
+        agent.set_identity(identity);
+        agent
     }
 
     /// The II instance this store connects against.
@@ -620,7 +630,7 @@ impl Identities {
     /// reported pair is consistent (`active <= live`) — two separate reads could
     /// straddle a grant expiry and momentarily report `active > live`. A cheap
     /// read-lock snapshot.
-    pub(crate) async fn session_gauges(&self) -> SessionGauges {
+    pub async fn session_gauges(&self) -> SessionGauges {
         let now = now_ns();
         let sessions = self.sessions.read().await;
         let mut g = SessionGauges { live: 0, active: 0 };
@@ -725,11 +735,7 @@ impl Identities {
     /// key. This is the caller II recovers the anchor from for the `mcp_*` calls.
     async fn session_agent(&self, session_id: &str) -> Result<Agent, String> {
         let signer = self.session_signer(session_id).await?;
-        Agent::builder()
-            .with_url(IC_URL)
-            .with_identity(signer)
-            .build()
-            .map_err(|e| format!("could not build II agent: {e}"))
+        Ok(self.agent_as(signer))
     }
 
     /// A stable per-user identity for the canister-management tools — the user's
@@ -738,7 +744,7 @@ impl Identities {
     /// across reconnects (unlike the ephemeral session key), so it works as the
     /// user's controller/funder identity.
     pub async fn management_identity(&self, session_id: &str) -> Result<DelegatedIdentity, String> {
-        let origin = crate::auth::base_url();
+        let origin = self.public_url.clone();
         self.delegated_identity(session_id, &origin, None).await
     }
 
@@ -837,11 +843,7 @@ impl Identities {
         // `reg_user_key` is `der(P_reg)`: the chain root II recovers `caller() ==
         // P_reg` from.
         let identity = registration_identity(reg_user_key, reg_seed, &reg_der, chain)?;
-        let agent = Agent::builder()
-            .with_url(IC_URL)
-            .with_identity(identity)
-            .build()
-            .map_err(|e| format!("could not build registration agent: {e}"))?;
+        let agent = self.agent_as(identity);
 
         // mcp_register_v2(session_key) -> variant { Ok : McpRegisterV2Ok; Err : text }
         // The ONLY argument is `session_key` (= `pub(S)`). Consent (permissions,
@@ -1274,17 +1276,16 @@ impl IiSignedDelegation {
 mod tests {
     use super::*;
 
-    /// The built-in instance defaults must parse (canister ids are compile-time
-    /// strings) and carry the expected paths/prefixes.
+    /// Both built-in instance constructors must succeed: the fallible part is
+    /// parsing the canister id (a compile-time default string, or its env
+    /// override) into a `Principal`, so this guards those defaults against a
+    /// typo. It deliberately does NOT assert the two instances differ — both
+    /// read `II_URL*` / `II_CANISTER_ID*` from the environment, and a
+    /// legitimate setup (e.g. local testing) may point both at the same II.
     #[test]
     fn instance_defaults_are_valid() {
-        let beta = IiInstance::beta().expect("beta defaults");
-        assert_eq!(beta.oauth_prefix, "");
-        assert_eq!(beta.mcp_path, "/mcp");
-        let prod = IiInstance::prod().expect("prod defaults");
-        assert_eq!(prod.oauth_prefix, "/prod");
-        assert_eq!(prod.mcp_path, "/mcp-prod");
-        assert_ne!(beta.ii_canister, prod.ii_canister);
+        IiInstance::beta().expect("beta defaults");
+        IiInstance::prod().expect("prod defaults");
     }
 
     #[test]
@@ -1348,13 +1349,19 @@ mod tests {
 
     // An Identities store over a dummy II instance (tests never hit the network).
     fn test_ids() -> Identities {
-        Identities::new(IiInstance {
-            name: "test",
-            ii_url: "https://ii.test".into(),
-            ii_canister: Principal::anonymous(),
-            oauth_prefix: "",
-            mcp_path: "/mcp",
-        })
+        let agent = Agent::builder()
+            .with_url("https://ii.test")
+            .build()
+            .expect("test agent");
+        Identities::new(
+            IiInstance {
+                name: "test",
+                ii_url: "https://ii.test".into(),
+                ii_canister: Principal::anonymous(),
+            },
+            "https://mcp.test".into(),
+            agent,
+        )
     }
 
     // Seed a session with a live grant, bypassing the network connect flow.

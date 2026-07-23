@@ -15,7 +15,14 @@ rmcp = { version = "1.7", features = [
     "transport-streamable-http-server",
     "auth",
 ] }
-ic-agent = "0.48"
+# The Agent is INJECTED by the embedding application (see McpServer::new), so a
+# host shares one boundary-node client and one ic-agent across the process.
+# Deliberately a direct dependency for now: sourcing ic-agent through ic-bn-lib
+# (the shared boundary-node/gateway crate, the eventual goal so the version is
+# pinned by the same crate the hosts use) is deferred until ic-bn-lib releases
+# against this ic-agent line — its current release pins an older one, which
+# would revert the read-only delegation-permissions support this depends on.
+ic-agent = "0.49"
 candid = { version = "0.10", features = ["value"] }
 candid_parser = "0.3.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
@@ -42,3 +49,9 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 getrandom = "0.3.4"
 urlencoding = "2.1.3"
 url = "2"
+
+[dev-dependencies]
+# Router-level contract tests (tests/routers.rs) drive the composed app with
+# tower::ServiceExt::oneshot and read bodies via http-body-util.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

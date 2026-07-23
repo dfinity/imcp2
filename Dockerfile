@@ -11,7 +11,7 @@ ENV GIT_SHA=${GIT_SHA}
 ENV BUILD_TIME=${BUILD_TIME}
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-# static/ is needed at build time too: main.rs/auth.rs include_str! the HTML pages.
+# static/ is needed at build time too: tools.rs include_str!s the candid/OQL references.
 COPY static ./static
 RUN cargo build --release
 

@@ -166,28 +166,28 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
     [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        authorization_servers: [origin],
+        authorization_servers: [`${origin}/mcp`],
         resource: `${origin}/mcp`,
       }),
     }),
     [`GET ${origin}/.well-known/oauth-authorization-server`]: resp(200, {
       body: JSON.stringify({
-        issuer: origin,
-        authorization_endpoint: `${origin}/oauth/authorize`,
-        token_endpoint: `${origin}/oauth/token`,
-        registration_endpoint: `${origin}/oauth/register`,
+        issuer: `${origin}/mcp`,
+        authorization_endpoint: `${origin}/mcp/oauth/authorize`,
+        token_endpoint: `${origin}/mcp/oauth/token`,
+        registration_endpoint: `${origin}/mcp/oauth/register`,
         code_challenge_methods_supported: ["S256"],
       }),
     }),
     [`POST ${origin}/mcp`]: resp(401, {
       headers: {
-        "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource"`,
+        "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
       },
       body: JSON.stringify({ error: "invalid_token" }),
     }),
-    [`POST ${origin}/oauth/register`]: registerRoute,
-    [`GET ${origin}/oauth/authorize`]: resp(400, { body: "missing client_id" }),
-    [`POST ${origin}/oauth/token`]: resp(400, {
+    [`POST ${origin}/mcp/oauth/register`]: registerRoute,
+    [`GET ${origin}/mcp/oauth/authorize`]: resp(400, { body: "missing client_id" }),
+    [`POST ${origin}/mcp/oauth/token`]: resp(400, {
       body: JSON.stringify({ error: "invalid_grant" }),
     }),
   });
@@ -230,21 +230,21 @@ test("checkMcpEndpoints flags a missing OAuth challenge", async () => {
     [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
     [`GET ${origin}/version`]: resp(404),
     [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
-      body: JSON.stringify({ authorization_servers: [origin], resource: `${origin}/mcp` }),
+      body: JSON.stringify({ authorization_servers: [`${origin}/mcp`], resource: `${origin}/mcp` }),
     }),
     [`GET ${origin}/.well-known/oauth-authorization-server`]: resp(200, {
       body: JSON.stringify({
-        issuer: origin,
-        authorization_endpoint: `${origin}/oauth/authorize`,
-        token_endpoint: `${origin}/oauth/token`,
-        registration_endpoint: `${origin}/oauth/register`,
+        issuer: `${origin}/mcp`,
+        authorization_endpoint: `${origin}/mcp/oauth/authorize`,
+        token_endpoint: `${origin}/mcp/oauth/token`,
+        registration_endpoint: `${origin}/mcp/oauth/register`,
       }),
     }),
     // 200 instead of a 401 challenge → wrong contract.
     [`POST ${origin}/mcp`]: resp(200, { body: "{}" }),
-    [`POST ${origin}/oauth/register`]: registerRoute,
-    [`GET ${origin}/oauth/authorize`]: resp(400),
-    [`POST ${origin}/oauth/token`]: resp(400, {
+    [`POST ${origin}/mcp/oauth/register`]: registerRoute,
+    [`GET ${origin}/mcp/oauth/authorize`]: resp(400),
+    [`POST ${origin}/mcp/oauth/token`]: resp(400, {
       body: JSON.stringify({ error: "invalid_grant" }),
     }),
   });
@@ -262,28 +262,28 @@ test("checkMcpEndpoints flags a missing hosted-redirect allow-list", async () =>
     [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
     [`GET ${origin}/version`]: resp(404),
     [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
-      body: JSON.stringify({ authorization_servers: [origin], resource: `${origin}/mcp` }),
+      body: JSON.stringify({ authorization_servers: [`${origin}/mcp`], resource: `${origin}/mcp` }),
     }),
     [`GET ${origin}/.well-known/oauth-authorization-server`]: resp(200, {
       body: JSON.stringify({
-        issuer: origin,
-        authorization_endpoint: `${origin}/oauth/authorize`,
-        token_endpoint: `${origin}/oauth/token`,
-        registration_endpoint: `${origin}/oauth/register`,
+        issuer: `${origin}/mcp`,
+        authorization_endpoint: `${origin}/mcp/oauth/authorize`,
+        token_endpoint: `${origin}/mcp/oauth/token`,
+        registration_endpoint: `${origin}/mcp/oauth/register`,
       }),
     }),
     [`POST ${origin}/mcp`]: resp(401, {
       headers: {
-        "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource"`,
+        "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
       },
       body: JSON.stringify({ error: "invalid_token" }),
     }),
     // Guard MISSING: the server accepts ANY redirect (even a hosted one) with 201.
-    [`POST ${origin}/oauth/register`]: resp(201, {
+    [`POST ${origin}/mcp/oauth/register`]: resp(201, {
       body: JSON.stringify({ client_id: "leaked" }),
     }),
-    [`GET ${origin}/oauth/authorize`]: resp(400),
-    [`POST ${origin}/oauth/token`]: resp(400, {
+    [`GET ${origin}/mcp/oauth/authorize`]: resp(400),
+    [`POST ${origin}/mcp/oauth/token`]: resp(400, {
       body: JSON.stringify({ error: "invalid_grant" }),
     }),
   });

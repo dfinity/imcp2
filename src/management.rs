@@ -36,8 +36,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::identities::Identities;
 
-/// Public IC API boundary node (same as elsewhere in the crate).
-const IC_URL: &str = "https://icp-api.io";
 /// Cycles ledger — creates/funds canisters from a principal's cycles balance.
 const CYCLES_LEDGER: &str = "um5iw-rqaaa-aaaaq-qaaba-cai";
 /// Cycles Minting Canister — mints cycles from ICP for the `icp` funding path
@@ -539,11 +537,9 @@ async fn management_agent(ids: &Identities, session_id: &str) -> Result<(Agent, 
     let principal = identity
         .sender()
         .map_err(|e| format!("could not derive your principal: {e}"))?;
-    let agent = Agent::builder()
-        .with_url(IC_URL)
-        .with_identity(identity)
-        .build()
-        .map_err(|e| format!("could not build agent: {e}"))?;
+    // A clone of the injected base agent with the management identity swapped
+    // in — same boundary-node routing as every other call.
+    let agent = ids.agent_as(identity);
     Ok((agent, principal))
 }
 

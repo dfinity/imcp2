@@ -128,11 +128,6 @@ const GRANT_TTL_SECS: u64 = 3600;
 /// `/oauth/connect/redeem`: only the browser that started the flow can complete it.
 const CONNECT_COOKIE: &str = "mcp_connect";
 
-/// Public base URL clients use to reach this server. Override with PUBLIC_URL.
-pub fn base_url() -> String {
-    std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
-}
-
 /// A registered OAuth client (RFC 7591): the redirect URIs it declared. The
 /// auth-code flow only redirects a code to one of these (exact match), so the
 /// server is not an open redirector and needs no hardcoded host allowlist.
@@ -406,6 +401,16 @@ pub struct AuthStore {
     /// Shared with the MCP tools: the session's backend key / grant expiration
     /// live here (keyed by `session_id`) for the tools to sign with.
     identities: Identities,
+    /// Public base URL (origin, no trailing slash) clients use to reach this
+    /// server — injected by the embedding application, never read from the
+    /// environment here.
+    public_url: String,
+    /// The path this instance's mcp router is nested at ("" for the root, else
+    /// `/mcp`-like: leading slash, no trailing slash). Everything an absolute
+    /// URL is built from — the AS issuer `{public_url}{mcp_path}`, the OAuth
+    /// endpoints `{issuer}/oauth/*`, the II callback URL, and the
+    /// path-inserted discovery documents — derives from this one value.
+    mcp_path: String,
 }
 
 /// An auth-code connect awaiting the user's II handshake.
@@ -460,19 +465,29 @@ struct TokenInfo {
 #[derive(Clone)]
 pub struct SharedClients(Arc<RwLock<HashMap<String, ClientReg>>>);
 
-/// Load the persisted client registrations once, to be shared by all stores.
-pub fn load_shared_clients() -> SharedClients {
-    SharedClients(Arc::new(RwLock::new(load_clients())))
+impl SharedClients {
+    /// Load the persisted client registrations once, to be shared by all stores
+    /// (file from `OAUTH_CLIENTS_FILE`, default `oauth-clients.json`).
+    pub fn load() -> Self {
+        Self(Arc::new(RwLock::new(load_clients())))
+    }
 }
 
 impl AuthStore {
-    pub fn new(identities: Identities, clients: SharedClients) -> Self {
+    pub fn new(
+        identities: Identities,
+        clients: SharedClients,
+        public_url: String,
+        mcp_path: String,
+    ) -> Self {
         Self {
             clients: clients.0,
             tokens: Arc::default(),
             authz: Arc::default(),
             codes: Arc::default(),
             identities,
+            public_url,
+            mcp_path,
         }
     }
 
@@ -481,17 +496,21 @@ impl AuthStore {
         self.identities.instance()
     }
 
-    /// This instance's protected-resource metadata URL (RFC 9728), advertised in
-    /// the 401 challenge. The default instance keeps the root document; other
-    /// instances use the path-inserted form for their resource path.
+    /// This instance's AS issuer: `{public_url}{mcp_path}` (an RFC 8414 *path
+    /// issuer* whenever the router is nested below the root). Every OAuth
+    /// endpoint lives under it, at `{issuer}/oauth/*`.
+    fn issuer(&self) -> String {
+        format!("{}{}", self.public_url, self.mcp_path)
+    }
+
+    /// This instance's protected-resource metadata URL (RFC 9728 §3.1),
+    /// advertised in the 401 challenge: the path-inserted form for the
+    /// resource `{public_url}{mcp_path}`.
     fn resource_metadata_url(&self) -> String {
-        let inst = self.instance();
-        let base = base_url();
-        if inst.oauth_prefix.is_empty() {
-            format!("{base}/.well-known/oauth-protected-resource")
-        } else {
-            format!("{base}/.well-known/oauth-protected-resource{}", inst.mcp_path)
-        }
+        format!(
+            "{}/.well-known/oauth-protected-resource{}",
+            self.public_url, self.mcp_path
+        )
     }
 
     /// Whether `redirect_uri` is acceptable for `client_id`: the client must be
@@ -522,7 +541,6 @@ pub struct AuthorizeQuery {
     state: Option<String>,
     #[serde(default)]
     code_challenge: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     code_challenge_method: Option<String>,
     #[allow(dead_code)]
@@ -613,11 +631,16 @@ pub async fn authorize(
             "Your MCP client's request was missing a required security check (PKCE). The client may \
              be out of date. Try updating it. If that doesn't help, remove the connector and add it again.");
     };
-    if let Some(m) = &q.code_challenge_method {
-        if m != "S256" {
-            return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
-                "only code_challenge_method=S256 is supported", SIGNIN_HEADLINE, MALFORMED_DIAGNOSTIC);
-        }
+    // `token` only ever verifies S256, so require the method to say so
+    // EXPLICITLY. Per RFC 7636 an *omitted* method defaults to `plain` —
+    // accepting the omission and then verifying as S256 would hand a
+    // spec-strict `plain` client a code it can never exchange.
+    if q.code_challenge_method.as_deref() != Some("S256") {
+        return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
+            "code_challenge_method=S256 is required", SIGNIN_HEADLINE,
+            "Your MCP client's request used an unsupported PKCE method (only S256 is supported). \
+             The client may be out of date. Try updating it. If that doesn't help, remove the \
+             connector and add it again.");
     }
 
     let session_id = format!("sess-{}", Uuid::new_v4());
@@ -644,21 +667,27 @@ pub async fn authorize(
     // Redirect the browser to this instance's II handshake, setting the binding
     // cookie. II navigates back to our pinned callback page once it certifies the
     // delegation; SameSite=Lax lets the cookie ride that top-level cross-site GET
-    // back to us. Scoped to this instance's OAuth prefix. `Secure` only when served
-    // over HTTPS (production always is): a `Secure` cookie is dropped by browsers
-    // over plain HTTP, which would break the initiator check for local
-    // `http://localhost` development.
-    let secure = if base_url().starts_with("https://") { "; Secure" } else { "" };
+    // back to us. Scoped to this instance's OAuth subtree (`{mcp_path}/oauth`).
+    // `Secure` only when served over HTTPS (production always is): a `Secure`
+    // cookie is dropped by browsers over plain HTTP, which would break the
+    // initiator check for local `http://localhost` development. `McpServer::new`
+    // normalizes `public_url` to a lowercase-scheme origin, but compare
+    // case-insensitively so this stays correct for a directly-built store too.
+    let is_https = store
+        .public_url
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"));
+    let secure = if is_https { "; Secure" } else { "" };
     let set_cookie = format!(
         "{CONNECT_COOKIE}={cookie}; Path={}/oauth; Max-Age={}; HttpOnly{secure}; SameSite=Lax",
-        store.instance().oauth_prefix,
+        store.mcp_path,
         CONNECT_TTL.as_secs(),
     );
     // Mint this connect's registration key `X` and carry `pub(X)` in the II link,
     // toward which II builds the registration chain (`P_reg -> Y -> X`, the last
     // hop browser-signed to `X`).
     let reg_pubkey = store.identities.registration_pubkey_b64(&session_id).await;
-    let ii_url = ii_mcp_url(store.instance(), &session_id, &reg_pubkey);
+    let ii_url = ii_mcp_url(&store, &session_id, &reg_pubkey);
     // Redirect the consenting browser to the II connect link with a real HTTP
     // 302 (`Location`). The link's params ride in the URL fragment
     // (`#callback=…&state=…&registration_key=…`); modern browsers preserve a
@@ -718,11 +747,11 @@ fn build_redirect(redirect_uri: &str, code: &str, client_state: &str) -> String 
 /// delegation in the fragment; that callback page is our sole fragment reader
 /// ([`connect_callback_page`]). No `priv(X)` is ever put in the link — only its
 /// public half.
-fn ii_mcp_url(inst: &crate::identities::IiInstance, session_id: &str, reg_pubkey_b64: &str) -> String {
+fn ii_mcp_url(store: &AuthStore, session_id: &str, reg_pubkey_b64: &str) -> String {
     format!(
         "{ii}/mcp#callback={cb}&state={st}&ttl={ttl}&registration_key={rk}",
-        ii = inst.ii_url,
-        cb = urlencoding::encode(&connect_callback_url(inst)),
+        ii = store.instance().ii_url,
+        cb = urlencoding::encode(&connect_callback_url(store)),
         st = urlencoding::encode(session_id),
         ttl = GRANT_TTL_SECS,
         rk = urlencoding::encode(reg_pubkey_b64),
@@ -744,8 +773,8 @@ pub const AUTH_CALLBACKS_WELL_KNOWN: &str = "/.well-known/ii-auth-callbacks";
 /// the II link fragment and in the [`auth_callbacks`] allow-list, so the two
 /// can never drift: II matches them by exact string equality (no
 /// normalization, no case/slash slack).
-fn connect_callback_url(inst: &crate::identities::IiInstance) -> String {
-    format!("{}{}/oauth/connect/callback", base_url(), inst.oauth_prefix)
+fn connect_callback_url(store: &AuthStore) -> String {
+    format!("{}/oauth/connect/callback", store.issuer())
 }
 
 /// GET /.well-known/ii-auth-callbacks — declare every instance's connect
@@ -754,7 +783,7 @@ fn connect_callback_url(inst: &crate::identities::IiInstance) -> String {
 /// Served with CORS (II's frontend fetches it cross-origin) and well under
 /// II's 8 KB cap.
 pub async fn auth_callbacks(State(stores): State<Vec<AuthStore>>) -> Response {
-    let callbacks: Vec<String> = stores.iter().map(|s| connect_callback_url(s.instance())).collect();
+    let callbacks: Vec<String> = stores.iter().map(connect_callback_url).collect();
     let mut resp = Json(json!({ "callbacks": callbacks })).into_response();
     // Fail-closed, exact-match infrastructure must never be served stale: II's
     // fetch is `cache: no-store` on ITS side, but an intermediary (CDN/proxy)
@@ -777,7 +806,7 @@ pub async fn auth_callbacks(State(stores): State<Vec<AuthStore>>) -> Response {
 /// redirect the backend returns. It never writes any fragment/query value into
 /// the DOM (no reflection), and ships a strict CSP.
 pub async fn connect_callback_page(State(store): State<AuthStore>) -> Response {
-    pinned_callback_page(store.instance().oauth_prefix)
+    pinned_callback_page(&store.mcp_path)
 }
 
 /// A fresh CSP nonce: 128 bits from the OS CSPRNG, **standard** base64. CSP3's
@@ -1588,11 +1617,15 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
 
 // ---- Discovery metadata -------------------------------------------------
 
-/// GET /.well-known/oauth-authorization-server (root for the default instance,
-/// `…/prod` for the prod instance — RFC 8414 path issuer). The issuer is
-/// `<PUBLIC_URL><oauth_prefix>`, and every endpoint lives under it.
+/// GET `/.well-known/oauth-authorization-server{mcp_path}` — RFC 8414 metadata
+/// for this instance's AS. The issuer is `{public_url}{mcp_path}` (a *path
+/// issuer* when the instance is nested below the root), and every endpoint
+/// lives under it. Also served at the OIDC-style alternate location inside the
+/// mount (`{issuer}/.well-known/oauth-authorization-server`) and, for the
+/// origin's default instance, at the plain root as a courtesy for clients that
+/// probe there without doing RFC 8414 path insertion.
 pub async fn authorization_server_metadata(State(store): State<AuthStore>) -> Response {
-    let issuer = format!("{}{}", base_url(), store.instance().oauth_prefix);
+    let issuer = store.issuer();
     Json(json!({
         "issuer": issuer,
         "authorization_endpoint": format!("{issuer}/oauth/authorize"),
@@ -1606,14 +1639,14 @@ pub async fn authorization_server_metadata(State(store): State<AuthStore>) -> Re
     .into_response()
 }
 
-/// GET /.well-known/oauth-protected-resource (and the path-inserted variants):
-/// this instance's MCP resource and the AS that protects it.
+/// GET `/.well-known/oauth-protected-resource{mcp_path}` (RFC 9728 §3.1; also
+/// the root variant for the default instance): this instance's MCP resource
+/// and the AS that protects it — both `{public_url}{mcp_path}`.
 pub async fn protected_resource_metadata(State(store): State<AuthStore>) -> Response {
-    let base = base_url();
-    let inst = store.instance();
+    let issuer = store.issuer();
     Json(json!({
-        "resource": format!("{base}{}", inst.mcp_path),
-        "authorization_servers": [format!("{base}{}", inst.oauth_prefix)],
+        "resource": issuer,
+        "authorization_servers": [issuer],
     }))
     .into_response()
 }
@@ -1983,17 +2016,30 @@ mod tests {
 
     // Build an AuthStore over a dummy II instance (these tests never hit the
     // network — the connect paths are pure-local crypto/state).
+    // Build an AuthStore over a dummy II instance, as if its mcp router were
+    // nested at `/mcp` on `https://mcp.test`.
     fn test_store() -> super::AuthStore {
         use crate::identities::{Identities, IiInstance};
         use candid::Principal;
-        let ids = Identities::new(IiInstance {
-            name: "test",
-            ii_url: "https://ii.test".into(),
-            ii_canister: Principal::anonymous(),
-            oauth_prefix: "",
-            mcp_path: "/mcp",
-        });
-        super::AuthStore::new(ids, super::SharedClients(std::sync::Arc::default()))
+        let agent = crate::Agent::builder()
+            .with_url("https://ii.test")
+            .build()
+            .expect("test agent");
+        let ids = Identities::new(
+            IiInstance {
+                name: "test",
+                ii_url: "https://ii.test".into(),
+                ii_canister: Principal::anonymous(),
+            },
+            "https://mcp.test".into(),
+            agent,
+        );
+        super::AuthStore::new(
+            ids,
+            super::SharedClients(std::sync::Arc::default()),
+            "https://mcp.test".into(),
+            "/mcp".into(),
+        )
     }
 
     /// A request header map that accepts HTML — i.e. a browser hitting the
@@ -2041,20 +2087,14 @@ mod tests {
     // addition to the callback/state/ttl fragment, all in the URL fragment.
     #[test]
     fn v2_link_carries_registration_key() {
-        use crate::identities::IiInstance;
-        use candid::Principal;
-        let inst = IiInstance {
-            name: "t",
-            ii_url: "https://ii.test".into(),
-            ii_canister: Principal::anonymous(),
-            oauth_prefix: "",
-            mcp_path: "/mcp",
-        };
-        let url = super::ii_mcp_url(&inst, "sess-1", "PUBX");
+        let store = test_store();
+        let url = super::ii_mcp_url(&store, "sess-1", "PUBX");
         assert!(url.starts_with("https://ii.test/mcp#"), "everything rides the fragment: {url}");
         assert!(url.contains("state=sess-1"));
         assert!(url.contains("registration_key=PUBX"));
-        assert!(url.contains("callback="));
+        // The callback lives under the instance's mount ({public_url}{mcp_path}).
+        let encoded = urlencoding::encode("https://mcp.test/mcp/oauth/connect/callback").into_owned();
+        assert!(url.contains(&format!("callback={encoded}")), "callback under the mount: {url}");
     }
 
     // The allow-list invariant (II #4091 matches by EXACT string equality): the
@@ -2067,21 +2107,29 @@ mod tests {
         use axum::extract::State;
         use crate::identities::{Identities, IiInstance};
         use candid::Principal;
-        let make = |prefix: &'static str, mcp_path: &'static str| {
+        let make = |mcp_path: &'static str| {
+            let agent = crate::Agent::builder()
+                .with_url("https://ii.test")
+                .build()
+                .expect("test agent");
             super::AuthStore::new(
-                Identities::new(IiInstance {
-                    name: "t",
-                    ii_url: "https://ii.test".into(),
-                    ii_canister: Principal::anonymous(),
-                    oauth_prefix: prefix,
-                    mcp_path,
-                }),
+                Identities::new(
+                    IiInstance {
+                        name: "t",
+                        ii_url: "https://ii.test".into(),
+                        ii_canister: Principal::anonymous(),
+                    },
+                    "https://mcp.test".into(),
+                    agent,
+                ),
                 super::SharedClients(std::sync::Arc::default()),
+                "https://mcp.test".into(),
+                mcp_path.into(),
             )
         };
-        // Both instances, so the allow-list covers each prefix.
-        let beta = make("", "/mcp");
-        let prod = make("/prod", "/mcp-prod");
+        // Both instances, so the allow-list covers each mount.
+        let beta = make("/mcp");
+        let prod = make("/mcp-prod");
 
         let r = super::auth_callbacks(State(vec![beta.clone(), prod.clone()])).await;
         assert_eq!(r.status(), axum::http::StatusCode::OK);
@@ -2112,10 +2160,10 @@ mod tests {
         // Each declared entry must equal the callback embedded in that
         // instance's II link, byte for byte.
         for (store, link) in [
-            (&beta, super::ii_mcp_url(beta.instance(), "s", "K")),
-            (&prod, super::ii_mcp_url(prod.instance(), "s", "K")),
+            (&beta, super::ii_mcp_url(&beta, "s", "K")),
+            (&prod, super::ii_mcp_url(&prod, "s", "K")),
         ] {
-            let expected = super::connect_callback_url(store.instance());
+            let expected = super::connect_callback_url(store);
             assert!(declared.contains(&expected), "{expected} must be declared: {declared:?}");
             let encoded = format!("callback={}", urlencoding::encode(&expected));
             assert!(link.contains(&encoded), "the II link must embed the declared URL: {link}");
@@ -2123,7 +2171,7 @@ mod tests {
         // Both entries share the origin II fetches the document from, and no
         // entry carries a fragment (II rejects both).
         for d in &declared {
-            assert!(d.starts_with(&super::base_url()), "same-origin entries only: {d}");
+            assert!(d.starts_with("https://mcp.test"), "same-origin entries only: {d}");
             assert!(!d.contains('#'), "no fragments in declared callbacks: {d}");
         }
     }
@@ -2425,7 +2473,7 @@ mod tests {
     // `location.hash` and never writes it into the HTML).
     #[tokio::test]
     async fn pinned_page_has_strict_csp_matching_nonce_and_no_reflection() {
-        let resp = super::pinned_callback_page("/prod");
+        let resp = super::pinned_callback_page("/mcp-prod");
         let csp = resp
             .headers()
             .get(axum::http::header::CONTENT_SECURITY_POLICY)
@@ -2463,7 +2511,7 @@ mod tests {
             "the inline style nonce must match the CSP nonce"
         );
         assert!(html.contains("location.hash"), "the page reads the fragment client-side");
-        assert!(html.contains("/prod/oauth/connect/redeem"), "posts to the instance's redeem path");
+        assert!(html.contains("/mcp-prod/oauth/connect/redeem"), "posts to the instance's redeem path");
         assert!(!html.contains("__REDEEM_URL__"), "the redeem-URL placeholder must be substituted");
         // Every handshake/redeem failure lands on this page, so it carries the
         // "contact us to report it" line (hidden until the script adds `.error`),
