@@ -2042,6 +2042,42 @@ mod tests {
         )
     }
 
+    /// Like [`test_store`], but its `Identities` redeems any parseable chain to a
+    /// canned `mcp_register_v2` outcome instead of verifying the chain against the
+    /// IC root key and calling a live II (the [`Identities::with_register_override`]
+    /// seam). This is what lets the connect → redeem → token exchange run end to
+    /// end hermetically: only the un-hermetic crypto/network step is stubbed.
+    fn test_store_registering(expiration_ns: u64, permissions: &'static str) -> super::AuthStore {
+        use crate::identities::{Identities, IiInstance, RegistrationOutcome};
+        use candid::Principal;
+        let agent = crate::Agent::builder()
+            .with_url("https://ii.test")
+            .build()
+            .expect("test agent");
+        let ids = Identities::new(
+            IiInstance {
+                name: "test",
+                ii_url: "https://ii.test".into(),
+                ii_canister: Principal::anonymous(),
+            },
+            "https://mcp.test".into(),
+            agent,
+        )
+        .with_register_override(std::sync::Arc::new(move |_sid, _user_key, chain| {
+            // The chain parsed cleanly and reached redemption — a live II would
+            // now verify and bind it. Assert the handler forwarded the parsed
+            // chain, then hand back the canned grant.
+            assert!(!chain.is_empty(), "redeem must receive the parsed delegation chain");
+            Ok(RegistrationOutcome { expiration_ns, permissions })
+        }));
+        super::AuthStore::new(
+            ids,
+            super::SharedClients(std::sync::Arc::default()),
+            "https://mcp.test".into(),
+            "/mcp".into(),
+        )
+    }
+
     /// A request header map that accepts HTML — i.e. a browser hitting the
     /// front-channel `/oauth/authorize`.
     fn html_headers() -> axum::http::HeaderMap {
@@ -2727,5 +2763,156 @@ mod tests {
         )
         .await;
         assert_eq!(redeem.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// A well-formed two-hop registration chain as II's #4093 frontend delivers
+    /// it in the callback fragment (`JSON.stringify(DelegationChain.toJSON())`):
+    /// hex byte fields, a HEX-string expiration, a principal-text target on the
+    /// canister-signed hop, and top-level `publicKey` = `der(P_reg)`. The byte
+    /// values are arbitrary — the [`test_store_registering`] seam stands in for
+    /// chain verification, so this only has to satisfy `parse_registration_delegation`.
+    fn well_formed_reg_chain_json() -> String {
+        serde_json::json!({
+            "delegations": [
+                {
+                    "delegation": {
+                        "pubkey": hex::encode([7u8, 7, 7]),        // Y (II's ephemeral key)
+                        "expiration": format!("{:x}", 66u64),
+                        "targets": ["aaaaa-aa"],
+                    },
+                    "signature": hex::encode([4u8, 5, 6]),
+                },
+                {
+                    "delegation": {
+                        "pubkey": hex::encode([9u8, 8, 7, 6]),     // X (our registration key)
+                        "expiration": format!("{:x}", 66u64),
+                    },
+                    "signature": hex::encode([1u8, 9, 9]),
+                },
+            ],
+            "publicKey": hex::encode([1u8, 2, 3]),                 // der(P_reg)
+        })
+        .to_string()
+    }
+
+    /// The MCP↔II connect handshake **success path**, end to end and hermetic
+    /// (the registration seam stubs only the chain-verification + live
+    /// `mcp_register_v2` step): a redeem carrying the connect's initiator cookie
+    /// mints a PKCE-bound authorization code, the token endpoint exchanges that
+    /// code — enforcing the PKCE S256 challenge — for a bearer access token, and
+    /// that token authenticates via `session_for_token` (the exact predicate
+    /// `require_token` gates on), resolving to this connect's session and
+    /// principal, with the II grant's expiration flowing into the token TTL. The
+    /// authorization code is then proven single-use.
+    #[tokio::test]
+    async fn connect_redeem_then_token_issues_a_working_access_token() {
+        use axum::extract::State;
+
+        // A grant that expires an hour out, read-only ("queries").
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let expiration_ns = now_ns + 3_600 * 1_000_000_000;
+        let store = test_store_registering(expiration_ns, "queries");
+
+        // A PKCE pair, seeded as an in-flight connect whose initiator cookie the
+        // redeem must present (bypassing the browser redirect that would set it).
+        let verifier = "connect-redeem-verifier-0123456789";
+        let challenge = super::pkce_s256(verifier);
+        let cookie = "bind-connect";
+        let state = "sess-connect";
+        store.authz.write().await.insert(
+            state.into(),
+            super::AuthzPending {
+                client_id: "client-1".into(),
+                redirect_uri: "http://127.0.0.1:4321/cb".into(),
+                client_state: "xyz".into(),
+                code_challenge: Some(challenge),
+                cookie: cookie.into(),
+                created: std::time::Instant::now(),
+                code: None,
+                redeeming: false,
+            },
+        );
+
+        // Cookie header carrying the initiator binding.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("{}={cookie}", super::CONNECT_COOKIE)).unwrap(),
+        );
+
+        // Redeem: mints the PKCE-bound authorization code, returns the client redirect.
+        let resp = super::connect_redeem(
+            State(store.clone()),
+            headers,
+            axum::Json(super::RedeemBody {
+                state: state.into(),
+                delegation: well_formed_reg_chain_json(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK, "redeem should succeed");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let redirect = doc["redirect"].as_str().expect("redeem returns a client redirect");
+        assert!(
+            redirect.starts_with("http://127.0.0.1:4321/cb?code="),
+            "redirect carries the authorization code: {redirect}"
+        );
+        assert!(redirect.contains("state=xyz"), "and echoes the client state: {redirect}");
+        let code = url::Url::parse(redirect)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .map(|(_, v)| v.into_owned())
+            .expect("code param");
+
+        // Token: the PKCE verifier redeems the code for a bearer access token.
+        let token_resp = super::token(
+            State(store.clone()),
+            axum::extract::Form(super::TokenForm {
+                grant_type: "authorization_code".into(),
+                code: code.clone(),
+                client_id: "client-1".into(),
+                code_verifier: Some(verifier.into()),
+            }),
+        )
+        .await;
+        assert_eq!(token_resp.status(), axum::http::StatusCode::OK, "token exchange should succeed");
+        let body = axum::body::to_bytes(token_resp.into_body(), usize::MAX).await.unwrap();
+        let tok: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let access_token = tok["access_token"].as_str().expect("access_token issued");
+        assert_eq!(tok["token_type"], "Bearer");
+        // The token never outlives the grant: TTL is positive and capped at ~1h.
+        let expires_in = tok["expires_in"].as_u64().expect("expires_in");
+        assert!(expires_in > 0 && expires_in <= 3_600, "token TTL tracks the grant: {expires_in}");
+
+        // The minted token authenticates (the predicate `require_token` gates on)
+        // and resolves to this connect's session and principal.
+        let (principal, session_id) = store
+            .session_for_token(access_token)
+            .await
+            .expect("the minted token must authenticate");
+        assert_eq!(session_id, state);
+        assert_eq!(Some(principal), store.identities.session_principal(state).await);
+
+        // The authorization code is single-use: a replay is rejected.
+        let replay = super::token(
+            State(store.clone()),
+            axum::extract::Form(super::TokenForm {
+                grant_type: "authorization_code".into(),
+                code,
+                client_id: "client-1".into(),
+                code_verifier: Some(verifier.into()),
+            }),
+        )
+        .await;
+        assert_eq!(
+            replay.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "an authorization code must be single-use"
+        );
     }
 }
