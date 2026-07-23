@@ -140,7 +140,7 @@ pub struct McpServer {
 
 impl McpServer {
     pub fn new(config: McpConfig) -> Self {
-        let public_url = config.public_url.trim_end_matches('/').to_string();
+        let public_url = normalize_public_url(&config.public_url);
         let mcp_path = normalize_mount_path(&config.mcp_path);
         let identities =
             identities::Identities::new(config.instance, public_url.clone(), config.agent.clone());
@@ -455,9 +455,65 @@ fn normalize_mount_path(path: &str) -> String {
     }
 }
 
+/// Canonicalize [`McpConfig::public_url`] to a clean **origin** — `scheme://host[:port]`,
+/// with a lowercase scheme, the default port dropped, and any path/query/fragment
+/// removed. `public_url` is the single source of truth for every absolute URL the
+/// server emits (the AS issuer, the discovery documents, the II callback), for the
+/// `Secure`-cookie decision, and for the DNS-rebinding host allow-list, so a
+/// scheme-less host (`mcp.example.com`), an uppercase scheme (`HTTPS://…`), or a
+/// stray path (`https://mcp.example.com/mcp`) would otherwise produce malformed
+/// issuers/callbacks or a wrongly-dropped `Secure` flag. Self-corrects rather than
+/// failing: an `https` scheme is assumed when none is given, and if parsing can't
+/// yield a host the trimmed input is returned unchanged (best effort).
+fn normalize_public_url(raw: &str) -> String {
+    let raw = raw.trim();
+    // Give `Url::parse` a scheme to work with; a bare host isn't a valid URL.
+    let candidate = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("https://{raw}")
+    };
+    if let Ok(url) = url::Url::parse(&candidate) {
+        // `scheme()` is lowercased by the parser; `host_str()` keeps IPv6
+        // brackets; `port()` is `None` for an absent or default port (so the
+        // origin omits `:443`/`:80`).
+        if let Some(host) = url.host_str() {
+            let scheme = url.scheme();
+            return match url.port() {
+                Some(port) => format!("{scheme}://{host}:{port}"),
+                None => format!("{scheme}://{host}"),
+            };
+        }
+    }
+    raw.trim_end_matches('/').to_string()
+}
+
 #[cfg(test)]
 mod lib_tests {
-    use super::{allowed_hosts_for, normalize_mount_path};
+    use super::{allowed_hosts_for, normalize_mount_path, normalize_public_url};
+
+    /// `public_url` canonicalizes to a clean origin regardless of the shape the
+    /// caller passes: a scheme is added when absent, an uppercase scheme is
+    /// lowercased (so the `Secure`-cookie check sees `https://`), a trailing
+    /// slash or a stray path is dropped, and a default port is omitted while a
+    /// non-default one is kept.
+    #[test]
+    fn public_url_normalizes_to_an_origin() {
+        assert_eq!(normalize_public_url("https://mcp.example.com"), "https://mcp.example.com");
+        assert_eq!(normalize_public_url("https://mcp.example.com/"), "https://mcp.example.com");
+        // Stray path dropped (would otherwise double up under {public_url}{mcp_path}).
+        assert_eq!(normalize_public_url("https://mcp.example.com/mcp"), "https://mcp.example.com");
+        // Scheme-less host gets https.
+        assert_eq!(normalize_public_url("mcp.example.com"), "https://mcp.example.com");
+        // Uppercase scheme lowercased (fixes the Secure-cookie check).
+        assert_eq!(normalize_public_url("HTTPS://mcp.example.com"), "https://mcp.example.com");
+        // Default port dropped; non-default kept; local http preserved.
+        assert_eq!(normalize_public_url("https://mcp.example.com:443"), "https://mcp.example.com");
+        assert_eq!(normalize_public_url("https://mcp.example.com:8443"), "https://mcp.example.com:8443");
+        assert_eq!(normalize_public_url("http://localhost:8000"), "http://localhost:8000");
+        // IPv6 literal stays bracketed.
+        assert_eq!(normalize_public_url("http://[::1]:8080"), "http://[::1]:8080");
+    }
 
     #[test]
     fn mount_paths_are_normalized() {

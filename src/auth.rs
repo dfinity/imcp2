@@ -670,8 +670,14 @@ pub async fn authorize(
     // back to us. Scoped to this instance's OAuth subtree (`{mcp_path}/oauth`).
     // `Secure` only when served over HTTPS (production always is): a `Secure`
     // cookie is dropped by browsers over plain HTTP, which would break the
-    // initiator check for local `http://localhost` development.
-    let secure = if store.public_url.starts_with("https://") { "; Secure" } else { "" };
+    // initiator check for local `http://localhost` development. `McpServer::new`
+    // normalizes `public_url` to a lowercase-scheme origin, but compare
+    // case-insensitively so this stays correct for a directly-built store too.
+    let is_https = store
+        .public_url
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"));
+    let secure = if is_https { "; Secure" } else { "" };
     let set_cookie = format!(
         "{CONNECT_COOKIE}={cookie}; Path={}/oauth; Max-Age={}; HttpOnly{secure}; SameSite=Lax",
         store.mcp_path,
