@@ -1276,14 +1276,16 @@ impl IiSignedDelegation {
 mod tests {
     use super::*;
 
-    /// The built-in instance defaults must parse (canister ids are compile-time
-    /// strings) and point at two distinct Internet Identity instances.
+    /// Both built-in instance constructors must succeed: the fallible part is
+    /// parsing the canister id (a compile-time default string, or its env
+    /// override) into a `Principal`, so this guards those defaults against a
+    /// typo. It deliberately does NOT assert the two instances differ — both
+    /// read `II_URL*` / `II_CANISTER_ID*` from the environment, and a
+    /// legitimate setup (e.g. local testing) may point both at the same II.
     #[test]
     fn instance_defaults_are_valid() {
-        let beta = IiInstance::beta().expect("beta defaults");
-        let prod = IiInstance::prod().expect("prod defaults");
-        assert_ne!(beta.ii_url, prod.ii_url);
-        assert_ne!(beta.ii_canister, prod.ii_canister);
+        IiInstance::beta().expect("beta defaults");
+        IiInstance::prod().expect("prod defaults");
     }
 
     #[test]
