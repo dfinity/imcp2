@@ -1939,7 +1939,8 @@ impl ServerHandler for IcTools {
              mass/weight (g,kg↔oz,lb), length/height/distance (cm,m,km↔in,ft,mi), and volume \
              (mL,L↔fl oz,US gal). Infer the user's locale and time zone from the conversation (their \
              language, where they are, the app) or ask when it matters; keep the raw value alongside \
-             when precision matters (money, exact timestamps) or the source unit is uncertain. Don't \
+             the converted one when precision matters (money, exact timestamps) or the source unit \
+             is uncertain. Don't \
              convert blindly — first establish the SOURCE unit (from get_canister_api_doc, the \
              field/entity name, or the schema), then convert.\n\n\
              `canister_query` (reads) and `canister_update_call` (writes) call a method with \

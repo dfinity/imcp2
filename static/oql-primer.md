@@ -73,9 +73,9 @@ Unix epoch (UTC)**, quantities in the app's stored unit (see `get_canister_api_d
 When you show them to the user, convert to their local conventions: their **time
 zone** for dates/times, and their locale's **units** for the measures that split
 US-customary vs metric — temperature (°C/°F), weight (kg/lb), length & height
-(cm·m/in·ft), distance (km/mi), volume (L/US gal). Establish the source unit first
-(the API doc, or the field name), then convert; keep the raw value when precision
-matters.
+(cm, m / in, ft), distance (km/mi), volume (L/US gal). Establish the source unit
+first (the API doc, or the field name), then convert; keep the raw value alongside
+the converted one when precision matters.
 
 ## Example
 
