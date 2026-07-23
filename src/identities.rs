@@ -427,9 +427,10 @@ pub struct ResolveAppOutput {
 /// TEST-ONLY seam standing in for the parts of
 /// [`Identities::redeem_registration_delegation`] that cannot run hermetically —
 /// building the `DelegatedIdentity` from the delivered chain (which
-/// [`DelegatedIdentity::new`] verifies against the IC **mainnet root key**, so a
-/// fabricated chain is rejected) and the authenticated `mcp_register_v2` round
-/// trip to a live Internet Identity. Given exactly what the real method receives
+/// [`DelegatedIdentity::new_with_root_key`] verifies against the injected agent's
+/// root key, so a chain not signed by that IC is rejected) and the authenticated
+/// `mcp_register_v2` round trip to a live Internet Identity. Given exactly what
+/// the real method receives
 /// — `(session_id, reg_user_key, chain)` — a double returns the
 /// [`RegistrationOutcome`] II would have. Installed with
 /// [`Identities::with_register_override`]; `None` (and the real path) in every
@@ -857,8 +858,9 @@ impl Identities {
 
         // TEST SEAM (see the `register_override` field): stand in for the two
         // steps that cannot run hermetically — `registration_identity` below
-        // verifies the delivered chain against the IC mainnet root key, and the
-        // `mcp_register_v2` call reaches a live II — while still exercising the
+        // verifies the delivered chain against the injected agent's root key
+        // (needing a chain a real IC signed), and the `mcp_register_v2` call
+        // reaches a live II — while still exercising the
         // real grant bookkeeping. Everything AROUND redemption (the redeem
         // handler's cookie/single-flight guards, code minting, the token
         // exchange) runs unchanged. Absent from every non-test build.
@@ -887,7 +889,13 @@ impl Identities {
         // Sign `mcp_register_v2` AS X, presenting the `P_reg -> Y -> X` chain.
         // `reg_user_key` is `der(P_reg)`: the chain root II recovers `caller() ==
         // P_reg` from.
-        let identity = registration_identity(reg_user_key, reg_seed, &reg_der, chain)?;
+        // Verify the delivered chain against the injected agent's root key (the
+        // network we are about to make the `mcp_register_v2` call to), not a
+        // hard-coded mainnet key — so a host pointed at a non-mainnet IC verifies
+        // and signs against the same trust anchor. In production the agent is
+        // mainnet, so this is the mainnet root.
+        let identity =
+            registration_identity(reg_user_key, reg_seed, &reg_der, chain, &self.agent.read_root_key())?;
         let agent = self.agent_as(identity);
 
         // mcp_register_v2(session_key) -> variant { Ok : McpRegisterV2Ok; Err : text }
@@ -1105,14 +1113,23 @@ fn build_identity(app: &AppDelegation) -> Result<DelegatedIdentity, String> {
 /// the chain root. Guards locally that the chain is non-empty and its FINAL hop
 /// delegates to this connect's `X` — the only key we hold the private half of,
 /// so a chain toward any other key is rejected before signing anything. Length
-/// is otherwise not constrained here: the replica authoritatively verifies
-/// every hop (the canister signature on `P_reg -> Y`, the `Y` signature on
-/// `Y -> X`) at redemption.
+/// is otherwise not constrained here.
+///
+/// The chain is verified at construction by
+/// [`DelegatedIdentity::new_with_root_key`] against `root_key` — the **injected
+/// agent's** root key (`Agent::read_root_key`), which is the IC mainnet key in
+/// production and whatever the agent targets otherwise (e.g. a local replica's
+/// key after `fetch_root_key`). Using the agent's own trust anchor — rather than
+/// hard-coding mainnet via [`DelegatedIdentity::new`] — keeps chain verification
+/// consistent with the network the `mcp_register_v2` call itself goes to: the
+/// canister signature on `P_reg -> Y` is BLS-verified against that root, and the
+/// `Y -> X` hop against `Y`. The replica re-verifies every hop at redemption.
 fn registration_identity(
     reg_user_key: Vec<u8>,
     reg_seed: [u8; 32],
     reg_der: &[u8],
     chain: Vec<SignedDelegation>,
+    root_key: &[u8],
 ) -> Result<DelegatedIdentity, String> {
     match chain.last() {
         Some(last) if last.delegation.pubkey == reg_der => {}
@@ -1123,8 +1140,13 @@ fn registration_identity(
         }
         None => return Err("registration delegation chain is empty".to_string()),
     }
-    DelegatedIdentity::new(reg_user_key, Box::new(BasicIdentity::from_raw_key(&reg_seed)), chain)
-        .map_err(|e| format!("invalid registration delegation chain: {e}"))
+    DelegatedIdentity::new_with_root_key(
+        reg_user_key,
+        Box::new(BasicIdentity::from_raw_key(&reg_seed)),
+        chain,
+        root_key,
+    )
+    .map_err(|e| format!("invalid registration delegation chain: {e}"))
 }
 
 /// Render an `AccountDelegationError` as an actionable message. Any `Unauthorized`
@@ -2056,7 +2078,15 @@ mod tests {
         };
         let chain = vec![hop(&preg_seed, &y_der), hop(&y_seed, &x_der)];
 
-        let identity = registration_identity(preg_der.clone(), x_seed, &x_der, chain)
+        // Verified against the agent's root key (mainnet default here); the
+        // Ed25519 stand-in hops don't consult it — only a real canister-signed
+        // hop would — so any root key builds this all-Ed25519 chain.
+        let root = crate::Agent::builder()
+            .with_url("https://ii.test")
+            .build()
+            .expect("agent")
+            .read_root_key();
+        let identity = registration_identity(preg_der.clone(), x_seed, &x_der, chain, &root)
             .expect("a two-hop chain ending at X must build");
         let sender = identity.sender().expect("sender");
         let content = EnvelopeContent::Call {
@@ -2078,7 +2108,7 @@ mod tests {
         // signing — we don't hold that key's private half.
         let (_, other_der) = fresh_ed25519();
         let bad = vec![hop(&preg_seed, &y_der), hop(&y_seed, &other_der)];
-        assert!(registration_identity(preg_der, x_seed, &x_der, bad).is_err());
+        assert!(registration_identity(preg_der, x_seed, &x_der, bad, &root).is_err());
     }
 
     // Redemption with no registration key minted, or an empty chain, fails
