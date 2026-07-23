@@ -386,7 +386,14 @@ fn allowed_hosts_for(public_url: &str) -> Vec<String> {
     let mut hosts = vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
+        // IPv6 loopback in BOTH spellings: a real `Host` header serializes it
+        // bracketed (`[::1]`, matching the `host_str()` form the public-host
+        // branch below emits), while the bare `::1` is kept for readers/tools
+        // that use it. (rmcp normalizes brackets on both sides before matching,
+        // so either would match today — carrying both keeps the list
+        // self-consistent and independent of that normalization.)
         "::1".to_string(),
+        "[::1]".to_string(),
     ];
     let public_url = public_url.trim();
     let candidate = if public_url.contains("://") {
@@ -472,7 +479,9 @@ mod lib_tests {
 
         let hosts = allowed_hosts_for("https://mcp.example.com");
         assert!(has(&hosts, "mcp.example.com"), "{hosts:?}");
-        assert!(has(&hosts, "localhost") && has(&hosts, "127.0.0.1") && has(&hosts, "::1"));
+        assert!(has(&hosts, "localhost") && has(&hosts, "127.0.0.1"));
+        // IPv6 loopback in both the bare and the bracketed (Host-header) form.
+        assert!(has(&hosts, "::1") && has(&hosts, "[::1]"), "{hosts:?}");
 
         // Explicit port: both forms are allowed (the Host header carries the
         // port for non-default ports).

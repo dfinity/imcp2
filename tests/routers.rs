@@ -13,7 +13,26 @@ use tower::ServiceExt;
 
 const PUBLIC_URL: &str = "https://mcp.example.com";
 
+/// Point the OAuth client-registration store at a throwaway temp path BEFORE
+/// any `SharedClients::load()`, so these tests neither read nor write a
+/// developer's real `oauth-clients.json`. The authorize-path assertions rely on
+/// an EMPTY registration set (unknown/unregistered clients are rejected); a
+/// stray real registration for `client_id=unknown`/`x` would otherwise flip
+/// them. `load()` treats a missing file as empty, so a fresh, deleted path
+/// gives a deterministic empty set. Set exactly once (env is process-global).
+fn isolate_client_store() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let mut path = std::env::temp_dir();
+        path.push("imcp2-router-tests-oauth-clients.json");
+        let _ = std::fs::remove_file(&path); // drop any stale file from a prior run
+        std::env::set_var("OAUTH_CLIENTS_FILE", &path);
+    });
+}
+
 fn server(instance: imcp2::IiInstance, mcp_path: &str) -> imcp2::McpServer {
+    isolate_client_store();
     let agent = imcp2::Agent::builder()
         .with_url(imcp2::IC_URL)
         .build()
