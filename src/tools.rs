@@ -1929,6 +1929,19 @@ impl ServerHandler for IcTools {
              prose \"how this app behaves\" guide (units, auth, lifecycle, mutation safety, polling, \
              gotchas) the Candid types don't convey; when the flag is false the canister has no such \
              doc and the Candid types ARE the interface — don't call it.\n\n\
+             PRESENT VALUES IN THE USER'S LOCAL FORMAT. Canister data is stored in canonical, \
+             locale-neutral forms, so CONVERT it for the user rather than echoing the raw value. \
+             Timestamps are almost always nanoseconds since the Unix epoch in UTC (IC time; divide \
+             by 1e9 for seconds) — render them in the USER's time zone and date/number \
+             conventions, not raw UTC nanoseconds. Physical quantities are usually SI/metric or an \
+             app-defined unit — check `get_canister_api_doc` for the exact unit, then convert to the \
+             user's locale for the measures that split US-customary vs metric: temperature (°C↔°F), \
+             mass/weight (g,kg↔oz,lb), length/height/distance (cm,m,km↔in,ft,mi), and volume \
+             (mL,L↔fl oz,US gal). Infer the user's locale and time zone from the conversation (their \
+             language, where they are, the app) or ask when it matters; keep the raw value alongside \
+             the converted one when precision matters (money, exact timestamps) or the source unit \
+             is uncertain. Don't convert blindly — first establish the SOURCE unit (from \
+             `get_canister_api_doc`, the field/entity name, or the schema), then convert.\n\n\
              `canister_query` (reads) and `canister_update_call` (writes) call a method with \
              textual Candid in/out: omit the identity args to call anonymously, or act AS your \
              account at an app. To act as an app account, identify the app by its \

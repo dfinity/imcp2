@@ -66,6 +66,18 @@ via `"in"`.
 
 Prefer server-side `where`/`aggregate` over pulling whole tables into context.
 
+## Presenting results to the user
+
+Cells hold canonical, locale-neutral values — timestamps as **nanoseconds since the
+Unix epoch (UTC)** (divide by 1e9 for seconds), quantities in the app's stored unit
+(see `get_canister_api_doc`).
+When you show them to the user, convert to their local conventions: their **time
+zone** for dates/times, and their locale's **units** for the measures that split
+US-customary vs metric — temperature (°C/°F), mass/weight (g, kg / oz, lb), length &
+height (cm, m / in, ft), distance (km/mi), volume (mL, L / fl oz, US gal). Establish
+the source unit first (the API doc, the field name, or the schema), then convert;
+keep the raw value alongside the converted one when precision matters.
+
 ## Example
 
 To find the first 10 employees whose last name contains "smith", returning only
