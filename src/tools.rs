@@ -1940,9 +1940,8 @@ impl ServerHandler for IcTools {
              (mL,L↔fl oz,US gal). Infer the user's locale and time zone from the conversation (their \
              language, where they are, the app) or ask when it matters; keep the raw value alongside \
              the converted one when precision matters (money, exact timestamps) or the source unit \
-             is uncertain. Don't \
-             convert blindly — first establish the SOURCE unit (from get_canister_api_doc, the \
-             field/entity name, or the schema), then convert.\n\n\
+             is uncertain. Don't convert blindly — first establish the SOURCE unit (from \
+             get_canister_api_doc, the field/entity name, or the schema), then convert.\n\n\
              `canister_query` (reads) and `canister_update_call` (writes) call a method with \
              textual Candid in/out: omit the identity args to call anonymously, or act AS your \
              account at an app. To act as an app account, identify the app by its \
