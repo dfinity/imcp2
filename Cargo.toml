@@ -20,9 +20,9 @@ rmcp = { version = "1.7", features = [
 # Deliberately a direct dependency for now: sourcing ic-agent through ic-bn-lib
 # (the shared boundary-node/gateway crate, the eventual goal so the version is
 # pinned by the same crate the hosts use) is deferred until ic-bn-lib releases
-# against ic-agent 0.48 — its current release pins 0.47, which would revert the
-# read-only delegation-permissions support added with the 0.48 bump.
-ic-agent = "0.48"
+# against this ic-agent line — its current release pins an older one, which
+# would revert the read-only delegation-permissions support this depends on.
+ic-agent = "0.49"
 candid = { version = "0.10", features = ["value"] }
 candid_parser = "0.3.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
