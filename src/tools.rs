@@ -1932,7 +1932,7 @@ impl ServerHandler for IcTools {
              PRESENT VALUES IN THE USER'S LOCAL FORMAT. Canister data is stored in canonical, \
              locale-neutral forms, so CONVERT it for the user rather than echoing the raw value. \
              Timestamps are almost always nanoseconds since the Unix epoch in UTC (IC time; divide \
-             by 1_000_000_000 for seconds) — render them in the USER's time zone and date/number \
+             by 1e9 for seconds) — render them in the USER's time zone and date/number \
              conventions, not raw UTC nanoseconds. Physical quantities are usually SI/metric or an \
              app-defined unit — check get_canister_api_doc for the exact unit, then convert to the \
              user's locale for the measures that split US-customary vs metric: temperature (°C↔°F), \
