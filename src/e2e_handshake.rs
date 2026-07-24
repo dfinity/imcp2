@@ -64,7 +64,12 @@ struct McpConfig {
     url: Option<String>,
 }
 
-/// `type Delegation = record { pubkey; expiration; targets; permissions }`.
+/// `type Delegation = record { pubkey; expiration; targets : opt vec principal;
+/// permissions : opt text }`. The delegation record's `permissions` is `opt
+/// text` ("queries" = read-only, absent = unrestricted) — deliberately NOT the
+/// named `Permissions` variant above (that variant is only the `prepare_…`
+/// argument / `mcp_register_v2` reply). Mixing them up is the II #40 outage
+/// class; the registration delegation returns this field absent (`None`).
 #[derive(CandidType, Deserialize)]
 struct Delegation {
     pubkey: Vec<u8>,
