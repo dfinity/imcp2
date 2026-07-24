@@ -48,27 +48,16 @@ async fn log_request(
     resp
 }
 
-/// The landing page served at `/`. Markup, stylesheet, and the DFINITY mark
-/// live in `assets/` (compiled in via `include_str!`, no runtime file I/O) so
-/// the page is fully self-contained: no external fonts, scripts, or images.
-/// It shares the connect flow's ICP look (parchment grid, editorial serif,
-/// rust accent, foot-of-page "Hosted by" mark) so the root page and the connect
-/// screens read as one product. Tools are grouped by what they do: service
-/// discovery, user identity, OQL, actions, and skills.
-const INDEX_HTML_TEMPLATE: &str = include_str!("assets/index.html");
-const INDEX_PAGE_CSS: &str = include_str!("assets/index.css");
-const DFINITY_LOGO_SVG: &str = include_str!("assets/dfinity-logo.svg");
-
-/// The rendered landing page, built once on first request. Splicing the
-/// stylesheet and logo into the template is a couple of string replacements;
-/// doing it lazily keeps it off the hot path and out of a `const` (which can't
-/// call `.replace`). `__CSS__`/`__LOGO__` are the same placeholder convention
-/// the connect pages use; the sources carry no such tokens, so no ordering hazard.
-static INDEX_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    INDEX_HTML_TEMPLATE
-        .replace("__CSS__", INDEX_PAGE_CSS)
-        .replace("__LOGO__", DFINITY_LOGO_SVG)
-});
+/// The landing page served at `/`: a self-contained design bundle exported from
+/// Claude Design (`assets/index.html`, compiled in via `include_str!`, no
+/// runtime file I/O). It is a single HTML document that inlines its own fonts,
+/// images, styles, and render runtime as an embedded resource bundle and unpacks
+/// itself client-side — so it stays self-contained (no external fonts, scripts,
+/// or images) despite the richer look. It shares the connect flow's ICP identity
+/// — parchment grid, editorial serif, rust accent, "Hosted by DFINITY" mark — so
+/// the root page and the connect screens read as one product, and walks through
+/// what an agent can do: discovery, identity, on-network queries, actions, skills.
+const INDEX_HTML: &str = include_str!("assets/index.html");
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -123,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     let (ver_beta, ver_prod) = (beta.clone(), prod.clone());
 
     let app = Router::new()
-        .route("/", get(|| async { Html(INDEX_HTML.as_str()) }))
+        .route("/", get(|| async { Html(INDEX_HTML) }))
         // Unauthenticated build/version probe so operators and the status
         // dashboard can confirm exactly which deployment is live: the running
         // commit (baked in at build time via GIT_SHA), the build time
