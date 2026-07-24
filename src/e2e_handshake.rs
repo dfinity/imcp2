@@ -267,6 +267,24 @@ fn field<'a>(blob: &'a str, key: &str) -> Option<&'a str> {
         .map(|(_, v)| v)
 }
 
+/// Restores (or clears) the process-global `OAUTH_CLIENTS_FILE` on drop — even on
+/// a panic-unwind — so this test's override can't leak into other test threads
+/// running in parallel, and removes the temp file it pointed at.
+struct ClientsFileEnvGuard {
+    prev: Option<std::ffi::OsString>,
+    path: std::path::PathBuf,
+}
+
+impl Drop for ClientsFileEnvGuard {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(v) => std::env::set_var("OAUTH_CLIENTS_FILE", v),
+            None => std::env::remove_var("OAUTH_CLIENTS_FILE"),
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[tokio::test]
 async fn registration_delegation_end_to_end() {
     // Runtime guard: skip cleanly unless the un-fetchable artifacts are provided.
@@ -281,10 +299,24 @@ async fn registration_delegation_end_to_end() {
     };
     let ii_wasm = std::fs::read(&ii_wasm_path).expect("read II_WASM (gz bytes; PocketIC gunzips)");
 
-    // Isolate the OAuth client store from any developer file.
+    // Isolate the OAuth client store: a UNIQUE temp file (so concurrent runs
+    // never collide on a fixed name) plus a guard that restores/clears the
+    // process-global `OAUTH_CLIENTS_FILE` on drop — even on a panic — so the
+    // override can't leak into other test threads.
+    let nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let mut clients_file = std::env::temp_dir();
-    clients_file.push("imcp2-e2e-oauth-clients.json");
+    clients_file.push(format!(
+        "imcp2-e2e-oauth-clients-{}-{nanos}.json",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&clients_file);
+    let _clients_env = ClientsFileEnvGuard {
+        prev: std::env::var_os("OAUTH_CLIENTS_FILE"),
+        path: clients_file.clone(),
+    };
     std::env::set_var("OAUTH_CLIENTS_FILE", &clients_file);
 
     // --- PocketIC + live II ---
