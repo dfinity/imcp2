@@ -75,6 +75,13 @@ mod management;
 mod skills;
 mod tools;
 
+// Real II<>MCP handshake test against a live Internet Identity canister in
+// PocketIC. In-crate (not tests/) so it can use the feature-gated optional
+// `pocket-ic` dependency and the crate internals; gated so the default build
+// compiles neither it nor `pocket-ic`. See the module docs to run it.
+#[cfg(all(test, feature = "e2e"))]
+mod e2e_handshake;
+
 use axum::{
     middleware,
     routing::{get, post},

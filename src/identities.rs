@@ -424,22 +424,6 @@ pub struct ResolveAppOutput {
     pub note: Option<String>,
 }
 
-/// TEST-ONLY seam standing in for the parts of
-/// [`Identities::redeem_registration_delegation`] that cannot run hermetically —
-/// building the `DelegatedIdentity` from the delivered chain (which
-/// [`DelegatedIdentity::new_with_root_key`] verifies against the injected agent's
-/// root key, so a chain not signed by that IC is rejected) and the authenticated
-/// `mcp_register_v2` round trip to a live Internet Identity. Given exactly what
-/// the real method receives
-/// — `(session_id, reg_user_key, chain)` — a double returns the
-/// [`RegistrationOutcome`] II would have. Installed with
-/// [`Identities::with_register_override`]; `None` (and the real path) in every
-/// non-test build. See the `register_override` field.
-#[cfg(test)]
-pub(crate) type RegisterOverride = Arc<
-    dyn Fn(&str, &[u8], &[SignedDelegation]) -> Result<RegistrationOutcome, String> + Send + Sync,
->;
-
 #[derive(Clone)]
 pub struct Identities {
     /// The II instance every session in this store is registered against.
@@ -454,10 +438,6 @@ pub struct Identities {
     /// calls inherit the host's boundary-node routing and transport.
     agent: Agent,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
-    /// Test seam for the un-hermetic registration step (see [`RegisterOverride`]).
-    /// Compiled only under `cfg(test)`, so it adds nothing to the real build.
-    #[cfg(test)]
-    register_override: Option<RegisterOverride>,
 }
 
 impl Identities {
@@ -467,17 +447,7 @@ impl Identities {
             public_url,
             agent,
             sessions: Arc::default(),
-            #[cfg(test)]
-            register_override: None,
         }
-    }
-
-    /// Install the [`RegisterOverride`] test seam. Call BEFORE this `Identities`
-    /// is cloned into an [`crate::auth::AuthStore`] so every clone shares it.
-    #[cfg(test)]
-    pub(crate) fn with_register_override(mut self, f: RegisterOverride) -> Self {
-        self.register_override = Some(f);
-        self
     }
 
     /// The injected base agent with `identity` swapped in: a clone shares the
@@ -855,22 +825,6 @@ impl Identities {
         chain: Vec<SignedDelegation>,
     ) -> Result<RegistrationOutcome, String> {
         self.ensure_session(session_id).await;
-
-        // TEST SEAM (see the `register_override` field): stand in for the two
-        // steps that cannot run hermetically — `registration_identity` below
-        // verifies the delivered chain against the injected agent's root key
-        // (needing a chain a real IC signed), and the `mcp_register_v2` call
-        // reaches a live II — while still exercising the
-        // real grant bookkeeping. Everything AROUND redemption (the redeem
-        // handler's cookie/single-flight guards, code minting, the token
-        // exchange) runs unchanged. Absent from every non-test build.
-        #[cfg(test)]
-        if let Some(over) = &self.register_override {
-            let outcome = over(session_id, &reg_user_key, &chain)?;
-            self.set_grant_expiration(session_id, outcome.expiration_ns).await;
-            self.set_permissions(session_id, outcome.permissions).await;
-            return Ok(outcome);
-        }
 
         // priv(X) to sign the ingress as, and pub(S) to register.
         let (reg_seed, reg_der, session_der) = {
