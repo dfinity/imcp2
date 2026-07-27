@@ -209,11 +209,22 @@ addresses, since the ship job runs inside the VPN.
 | `DEPLOY_ACME_EMAIL` | `PROD_DEPLOY_ACME_EMAIL` | Email for Let's Encrypt / ACME |
 | `DEPLOY_KNOWN_HOSTS` | `PROD_DEPLOY_KNOWN_HOSTS` | *(optional)* output of `ssh-keyscan <host>`; pin it to avoid trust-on-first-use |
 
-> **These must be repository-level secrets** (**Settings → Secrets and variables →
-> Actions**), *not* environment-scoped ones. A caller passes secrets into a reusable
-> workflow from outside any environment context, so environment-scoped secrets resolve
-> to empty there. Environment **protection rules** still apply normally — it is only
-> environment *secrets* that cannot be used this way.
+> **Set these as repository-level secrets** (**Settings → Secrets and variables →
+> Actions**). The callers pass them into the reusable workflow, and a job that calls
+> one with `uses:` cannot itself declare an `environment:` — so `${{ secrets.* }}` in
+> the caller only resolves repository and organization secrets. An environment-scoped
+> secret referenced there arrives empty.
+>
+> Environment secrets are *not* unusable, though. The `ship` job inside
+> `deploy-native.yml` does set `environment:`, and a secret defined on that
+> environment resolves there — and **takes precedence over the value passed in by the
+> caller**. So defining, say, `DEPLOY_HOST` on both the `staging` environment and at
+> repository level is not additive: the environment copy silently wins inside `ship`.
+> Pick one place per secret. Repository level is what the table above assumes, and
+> keeps the two callers symmetric.
+>
+> Environment **protection rules** are unaffected either way — see the approval gate
+> below.
 
 The host prerequisites above (DNS, inbound 80/443, sudo SSH user) still apply — the
 workflow only automates the build-and-ship step, not provisioning the box.
