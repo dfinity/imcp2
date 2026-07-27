@@ -1,7 +1,8 @@
 # Reusable native deploy: cross-build the binary for inputs.arch (arm64 or amd64),
 # then ship it over SSH and (re)start the systemd services. Called by deploy.yml
-# (main -> staging) and deploy-release.yml (release-* tags -> production); see
-# deploy/native/README.md.
+# (main -> staging). Environment, runner and architecture are all inputs so a second
+# caller can drive a different target — production on release tags is the intended
+# one — without duplicating any of this. See deploy/native/README.md.
 #
 # Split into two jobs on purpose:
 #
