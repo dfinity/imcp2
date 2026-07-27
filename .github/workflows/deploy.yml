@@ -1,12 +1,16 @@
-# Auto-redeploy imcp2 on every push to main.
+# Auto-redeploy imcp2 to staging on every push to main.
 #
-# Reuses the existing native (Docker-free) deploy under deploy/native: cross-builds
-# the linux/arm64 binary, then ships it + static/ over SSH and (re)starts the systemd
-# services on the target host. See deploy/native/README.md for the deploy model.
+# Staging tracks main continuously so changes get exercised on a real host before a
+# release is cut. Production is a separate host that only moves on a `release-*`
+# tag — see deploy-release.yml. Both share the mechanics in deploy-native.yml, which
+# cross-builds the binary and ships it + static/ over SSH to systemd services. See
+# deploy/native/README.md for the deploy model.
 #
 # Required repository secrets (Settings -> Secrets and variables -> Actions):
 #   DEPLOY_SSH_KEY    private SSH key (PEM/OpenSSH) for a sudo-capable user on the host
-#   DEPLOY_HOST       user@host, e.g. ec2-user@1.2.3.4   (matches deploy.sh's HOST)
+#   DEPLOY_HOST       user@host (matches deploy.sh's HOST). Must be the host's
+#                     PRIVATE address — the ship job runs on the on-prem runner and
+#                     reaches it over the VPN, not over the public internet.
 #   DEPLOY_DOMAIN     public FQDN served over HTTPS, e.g. mcp.example.com
 #   DEPLOY_ACME_EMAIL email for Let's Encrypt / ACME
 # Optional:
@@ -22,71 +26,24 @@ on:
 
 # Never run two deploys at once; let an in-flight deploy finish rather than cancel it.
 concurrency:
-  group: deploy-main
+  group: deploy-staging
   cancel-in-progress: false
 
 jobs:
   deploy:
-    # arm64 runner: build.sh produces a linux/arm64 binary, so building natively here
-    # (vs. emulating under QEMU on x86) is far faster. The bullseye build container in
-    # build.sh still pins glibc 2.31 for Amazon Linux 2023 compatibility.
-    runs-on: ubuntu-24.04-arm
-    # Approval gate: this job only runs once the `production` environment's
-    # protection rules are satisfied. Configure required reviewers under
-    # Settings -> Environments -> production for the gate to take effect.
-    environment: production
-    steps:
-      # Third-party actions are pinned to a commit SHA (supply-chain hardening);
-      # the trailing comment records the human-readable version.
-      - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-
-      # Gate the deploy on the status dashboard's unit tests. They are fast and
-      # network-free, and the dashboard is shipped (and run as a systemd service)
-      # by deploy.sh, so a regression here should stop the rollout.
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Test status dashboard
-        run: npm test --prefix monitoring/mcp-status
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
-
-      - name: Cross-build arm64 binary
-        env:
-          GIT_SHA: ${{ github.sha }}
-        run: deploy/native/build.sh
-
-      - name: Configure SSH
-        env:
-          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
-          HOST: ${{ secrets.DEPLOY_HOST }}
-        run: |
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          if [ -n "$DEPLOY_KNOWN_HOSTS" ]; then
-            printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          else
-            # Trust-on-first-use: no pinned key, so we accept whatever the host
-            # presents now. This is susceptible to MITM / DNS hijack — set the
-            # DEPLOY_KNOWN_HOSTS secret (output of `ssh-keyscan <host>`) to pin it.
-            echo "::warning::DEPLOY_KNOWN_HOSTS not set; trusting host key on first use (ssh-keyscan). Set DEPLOY_KNOWN_HOSTS to pin it."
-            ssh-keyscan -T 20 -H "${HOST##*@}" > ~/.ssh/known_hosts 2>/dev/null || true
-            if [ ! -s ~/.ssh/known_hosts ]; then
-              echo "::error::ssh-keyscan captured no host keys for ${HOST##*@}; aborting." >&2
-              exit 1
-            fi
-          fi
-          chmod 644 ~/.ssh/known_hosts
-
-      - name: Deploy
-        env:
-          HOST: ${{ secrets.DEPLOY_HOST }}
-          DOMAIN: ${{ secrets.DEPLOY_DOMAIN }}
-          ACME_EMAIL: ${{ secrets.DEPLOY_ACME_EMAIL }}
-        run: deploy/native/deploy.sh
+    uses: ./.github/workflows/deploy-native.yml
+    with:
+      environment: staging
+      # Ship from the on-prem runner, same as production. Staging sits in the same
+      # VPN-propagated subnet, so the runner reaches it on its private address —
+      # which is what lets the host drop SSH from the public internet entirely.
+      ship_runs_on: '["self-hosted","linux"]'
+      # Staging host is arm64 (Graviton).
+      arch: arm64
+      build_runs_on: '"ubuntu-24.04-arm"'
+    secrets:
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_DOMAIN: ${{ secrets.DEPLOY_DOMAIN }}
+      DEPLOY_ACME_EMAIL: ${{ secrets.DEPLOY_ACME_EMAIL }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}

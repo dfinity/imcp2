@@ -1,0 +1,198 @@
+# Reusable native deploy: cross-build the binary for inputs.arch (arm64 or amd64),
+# then ship it over SSH and (re)start the systemd services. Called by deploy.yml
+# (main -> staging) and deploy-release.yml (release-* tags -> production); see
+# deploy/native/README.md.
+#
+# Split into two jobs on purpose:
+#
+#   build  runs on a GitHub-hosted arm64 runner. It needs Docker (build.sh compiles
+#          in a container) and does the expensive Rust build. Nothing here touches
+#          the target host, so it needs no network access to it.
+#   ship   runs wherever the target host is reachable. It only needs ssh + tar, so a
+#          self-hosted runner on a private network does NOT need Docker or Rust.
+#
+# That split is what makes a private-IP target workable: the heavy build stays on
+# hosted infrastructure, and only the ~20MB binary crosses into the private network.
+name: Deploy (native)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub Environment for the ship job (carries the approval gate).
+        required: true
+        type: string
+      ship_runs_on:
+        description: >-
+          JSON runner spec for the ship job, e.g. '"ubuntu-24.04-arm"' or
+          '["self-hosted","linux","imcp-prod"]'. Must be somewhere the target host
+          is reachable. Parsed with fromJSON, so it must be valid JSON.
+        required: true
+        type: string
+      arch:
+        description: >-
+          Target CPU architecture: arm64 (Graviton) or amd64 (x86_64). Must match
+          the deploy target's `uname -m`; deploy.sh aborts on a mismatch.
+        required: true
+        type: string
+      build_runs_on:
+        description: >-
+          JSON runner spec for the build job. Build natively for the target arch
+          where possible — emulating the other arch under QEMU is several times
+          slower. Parsed with fromJSON.
+        required: true
+        type: string
+      ref:
+        description: Git ref to build and deploy. Defaults to the triggering ref.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      DEPLOY_SSH_KEY:
+        description: Private SSH key for the sudo-capable host user.
+        required: true
+      DEPLOY_HOST:
+        description: user@host for the target, e.g. ec2-user@10.118.0.61.
+        required: true
+      DEPLOY_DOMAIN:
+        description: Public FQDN served over HTTPS.
+        required: true
+      DEPLOY_ACME_EMAIL:
+        description: Email for Let's Encrypt / ACME.
+        required: true
+      DEPLOY_KNOWN_HOSTS:
+        description: Optional pinned host keys (ssh-keyscan output). TOFU if unset.
+        required: false
+
+jobs:
+  build:
+    # Pick a runner matching inputs.arch so build.sh compiles natively rather than
+    # under QEMU. The bullseye build container in build.sh pins glibc 2.31 for
+    # Amazon Linux 2023 compatibility regardless of architecture.
+    runs-on: ${{ fromJSON(inputs.build_runs_on) }}
+    steps:
+      # Third-party actions are pinned to a commit SHA (supply-chain hardening);
+      # the trailing comment records the human-readable version.
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.ref }}
+
+      # Gate the deploy on the status dashboard's unit tests. They are fast and
+      # network-free, and the dashboard is shipped (and run as a systemd service)
+      # by deploy.sh, so a regression here should stop the rollout.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Test status dashboard
+        run: npm test --prefix monitoring/mcp-status
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      # Resolve the commit from the checkout, not from github.sha: on a
+      # workflow_dispatch rollback the event SHA is the default branch, while the
+      # checkout is the ref we were asked to deploy. The build bakes this in and
+      # the ship job asserts the host reports it back, so both must agree.
+      - name: Resolve commit
+        id: built
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Cross-build ${{ inputs.arch }} binary
+        env:
+          # Baked into the binary and surfaced at GET /version, so a live host can
+          # always be traced back to an exact commit.
+          GIT_SHA: ${{ steps.built.outputs.sha }}
+          ARCH: ${{ inputs.arch }}
+        run: deploy/native/build.sh
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: imcp2-binary
+          path: build-out/imcp2
+          retention-days: 7
+          if-no-files-found: error
+
+    outputs:
+      sha: ${{ steps.built.outputs.sha }}
+
+  ship:
+    needs: build
+    runs-on: ${{ fromJSON(inputs.ship_runs_on) }}
+    # Approval gate: this job only runs once the named environment's protection
+    # rules are satisfied. Configure required reviewers under
+    # Settings -> Environments -> <name> for the gate to take effect.
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: imcp2-binary
+          path: build-out
+
+      # The artifact format does not preserve the executable bit, and deploy.sh
+      # refuses to run unless build-out/imcp2 is executable.
+      - name: Restore executable bit
+        run: chmod +x build-out/imcp2
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "$DEPLOY_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            # Trust-on-first-use: no pinned key, so we accept whatever the host
+            # presents now. This is susceptible to MITM / DNS hijack — set the
+            # DEPLOY_KNOWN_HOSTS secret (output of `ssh-keyscan <host>`) to pin it.
+            echo "::warning::DEPLOY_KNOWN_HOSTS not set; trusting host key on first use (ssh-keyscan). Set DEPLOY_KNOWN_HOSTS to pin it."
+            ssh-keyscan -T 20 -H "${HOST##*@}" > ~/.ssh/known_hosts 2>/dev/null || true
+            if [ ! -s ~/.ssh/known_hosts ]; then
+              echo "::error::ssh-keyscan captured no host keys for ${HOST##*@}; aborting." >&2
+              exit 1
+            fi
+          fi
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          DOMAIN: ${{ secrets.DEPLOY_DOMAIN }}
+          ACME_EMAIL: ${{ secrets.DEPLOY_ACME_EMAIL }}
+        run: deploy/native/deploy.sh
+
+      # Confirm the host is actually running the commit we just shipped, rather
+      # than trusting that `systemctl restart` picked up the new binary. Read over
+      # SSH from the host itself so this works even when $DOMAIN is not resolvable
+      # from the runner (private-network deploys).
+      - name: Verify deployed version
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          EXPECTED: ${{ needs.build.outputs.sha }}
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o ConnectTimeout=20 "$HOST" \
+            'curl -fsS --retry 5 --retry-delay 2 --retry-connrefused http://127.0.0.1:8000/version' > version.json
+          cat version.json
+          got="$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' version.json)"
+          if [ -z "$got" ] || [ "$got" = unknown ]; then
+            echo "::warning::/version reported no usable commit; skipping assertion."
+          elif [ "$got" != "$EXPECTED" ]; then
+            echo "::error::host reports commit=$got, expected $EXPECTED" >&2
+            exit 1
+          else
+            echo "verified: host is running $got"
+          fi
