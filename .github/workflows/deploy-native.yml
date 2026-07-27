@@ -132,10 +132,18 @@ jobs:
     # Settings -> Environments -> <name> for the gate to take effect.
     environment: ${{ inputs.environment }}
     steps:
+      # Check out the exact commit the build job resolved, not inputs.ref. The
+      # binary arrives as an artifact from that commit, but deploy.sh ships static/
+      # and monitoring/ straight from this checkout — so if inputs.ref is a branch
+      # (or a retagged tag) that moved while the build ran or while this job waited
+      # on the environment's approval gate, the host would get assets from one
+      # commit and a binary from another. The /version assertion below would not
+      # catch it either: it compares against the build's SHA, which the binary
+      # reports correctly no matter how stale the assets are.
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.build.outputs.sha }}
 
       - name: Download binary
         uses: actions/download-artifact@v4
