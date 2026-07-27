@@ -48,7 +48,33 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A `release-*` tag push is constrained by the trigger. workflow_dispatch is not:
+  # its `ref` is free text, so `main` would deploy whatever that branch points at
+  # right now — the exact property this workflow exists to prevent. Accept only refs
+  # that cannot move: a release-* tag, or a full 40-character commit SHA for the case
+  # where the commit to roll back to never had a tag cut for it.
+  validate-ref:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject refs that can move
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ "${REF#release-}" != "$REF" ] || printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "ref '$REF' cannot move; proceeding."
+          else
+            echo "::error::Refusing to deploy '$REF' to production: it is neither a release-* tag nor a full 40-character commit SHA. Branches and abbreviated SHAs can move or become ambiguous, so the deployed revision would not be reproducible. Cut a release-* tag, or pass the full commit SHA."
+            exit 1
+          fi
+
   deploy:
+    needs: validate-ref
+    # validate-ref is skipped on a tag push, and a skipped dependency would skip this
+    # job too under the default `success()` gate. Gate on "nothing failed" instead, so
+    # tag pushes proceed while a rejected dispatch ref still stops the deploy.
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/deploy-native.yml
     with:
       environment: production
