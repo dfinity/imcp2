@@ -5,9 +5,11 @@
 #
 # Split into two jobs on purpose:
 #
-#   build  runs on a GitHub-hosted arm64 runner. It needs Docker (build.sh compiles
-#          in a container) and does the expensive Rust build. Nothing here touches
-#          the target host, so it needs no network access to it.
+#   build  runs on inputs.build_runs_on — normally a GitHub-hosted runner whose
+#          architecture matches inputs.arch, so the compile is native rather than
+#          emulated. It needs Docker (build.sh compiles in a container) and does
+#          the expensive Rust build. Nothing here touches the target host, so it
+#          needs no network access to it.
 #   ship   runs wherever the target host is reachable. It only needs ssh + tar, so a
 #          self-hosted runner on a private network does NOT need Docker or Rust.
 #
@@ -71,8 +73,10 @@ jobs:
     # Amazon Linux 2023 compatibility regardless of architecture.
     runs-on: ${{ fromJSON(inputs.build_runs_on) }}
     steps:
-      # Third-party actions are pinned to a commit SHA (supply-chain hardening);
-      # the trailing comment records the human-readable version.
+      # Where a commit SHA appears below, the action is pinned against tag movement
+      # (supply-chain hardening) and the trailing comment records the readable
+      # version. actions/{setup-node,upload-artifact,download-artifact} still float
+      # on their major tag; pin them the same way when their SHAs are to hand.
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:

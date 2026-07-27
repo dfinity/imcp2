@@ -14,8 +14,8 @@ managed VPC) and you just want to put the app on it. The repo's
 
 Hosts are **arm64 (Graviton)**. Keep any additional host on the same architecture:
 `aws-lc-sys` and `ring` carry per-arch assembly, so a host differing from the one
-changes are rehearsed on would leave the crypto paths the auth flow depends on
-unexercised. `build.sh` can target `amd64` if you ever need it (`ARCH=amd64`), and `deploy.sh`
+that changes are rehearsed on would leave the crypto paths the auth flow depends
+on unexercised. `build.sh` can target `amd64` if you ever need it (`ARCH=amd64`), and `deploy.sh`
 compares the built binary's ELF header against the host's `uname -m` and aborts on a
 mismatch — otherwise the unit installs fine and then crash-loops on
 `Exec format error`, which reads like an app bug rather than a build-target mistake.

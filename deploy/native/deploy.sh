@@ -30,7 +30,12 @@ repo_root="$(cd "$here/../.." && pwd)"
 # app bug rather than a build-target mistake. Read the ELF header directly — no
 # dependency on `file` or its output wording.
 bin="$repo_root/build-out/imcp2"
-[ "$(od -An -c -j1 -N3 "$bin" | tr -d '[:space:]')" = "ELF" ] || {
+# Match all four magic bytes (0x7F 'E' 'L' 'F'), not just the "ELF" that trails
+# them: a file whose first byte is anything else is not an ELF object however its
+# next three read. A file shorter than four bytes leaves the tail fields empty and
+# fails here too.
+read -r magic0 magic1 magic2 magic3 <<<"$(od -An -tu1 -j0 -N4 "$bin")"
+[ "$magic0 $magic1 $magic2 $magic3" = "127 69 76 70" ] || {
   echo "ERROR: $bin is not an ELF binary — did build.sh write something else there?" >&2
   exit 1
 }
