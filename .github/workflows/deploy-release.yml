@@ -37,7 +37,9 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Tag (or commit) to deploy, e.g. release-2026-07-27'
+        description: >-
+          release-* tag (e.g. release-2026-07-27, or the fully-qualified
+          refs/tags/release-2026-07-27), or a full 40-character commit SHA.
         required: true
         type: string
 
@@ -62,10 +64,17 @@ jobs:
           REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          if [ "${REF#release-}" != "$REF" ] || printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+          # Strip a fully-qualified tag prefix so refs/tags/release-X is treated the
+          # same as release-X — it names the identical tag and is just as immutable.
+          # Only refs/tags/ is stripped: refs/heads/release-X must stay rejected, and
+          # does, because after no stripping it no longer starts with "release-".
+          ref="${REF#refs/tags/}"
+          # Hex is matched case-insensitively; git resolves an uppercase SHA to the
+          # same commit, so rejecting it would be a surprise with no safety value.
+          if [ "${ref#release-}" != "$ref" ] || printf '%s' "$ref" | grep -Eq '^[0-9a-fA-F]{40}$'; then
             echo "ref '$REF' cannot move; proceeding."
           else
-            echo "::error::Refusing to deploy '$REF' to production: it is neither a release-* tag nor a full 40-character commit SHA. Branches and abbreviated SHAs can move or become ambiguous, so the deployed revision would not be reproducible. Cut a release-* tag, or pass the full commit SHA."
+            echo "::error::Refusing to deploy '$REF' to production: it is neither a release-* tag (bare or refs/tags/-qualified) nor a full 40-character commit SHA. Branches and abbreviated SHAs can move or become ambiguous, so the deployed revision would not be reproducible. Cut a release-* tag, or pass the full commit SHA."
             exit 1
           fi
 
