@@ -115,7 +115,7 @@ sessions; the reaper can be managed without a token), dev-deps `tower` + `http-b
 
 **`axum`** shrinks to at most the transient login callback (§6). The recommendation is to
 **hand-roll** that 3-route loopback listener so the local crate drops `axum`/`tower-http`
-entirely; reusing axum is the lower-effort fallback (see §8 decision).
+entirely; reusing axum is the lower-effort fallback (see §9 decision).
 
 Net minimal local deps: `imcp2` (with `default-features = false`) +
 `rmcp{server,macros,transport-io}` + `tokio` +
@@ -131,7 +131,7 @@ only used as the management-identity derivation origin (`identities.rs:746`) and
 fixed local value; it need not be a reachable server.
 
 `II_URL`/`II_CANISTER_ID` remain env-overridable (`identities.rs:120`), so the binary can be
-pointed at **beta** II for testing (see §9 — beta is the only instance verified end-to-end
+pointed at **beta** II for testing (see §10 — beta is the only instance verified end-to-end
 today) while defaulting to production per the locked decision.
 
 ## 5. Dropping OAuth 2.1, keeping the II handshake
@@ -176,9 +176,11 @@ callback↔connect correlator.
 3. Bind a transient listener on `127.0.0.1:0`; the callback origin is
    `http://127.0.0.1:<port>`. Both the II link's `callback` and the well-known entry derive
    from this one value, so they cannot drift (II matches by exact string equality).
-4. Build the II link (`iiconnect::ii_mcp_url`) against `https://id.ai`, open the browser
-   (print the URL to **stderr** always — stdout is the JSON-RPC channel — plus best-effort
-   `open`/`webbrowser`).
+4. Build the II link (`iiconnect::ii_mcp_url`) against `https://id.ai` and surface it to the
+   user **in-band** — as the text result of an `authenticate` MCP tool (§7) — plus a
+   best-effort server-side browser auto-open. Do **not** rely on **stderr** for the URL: every
+   client routes a stdio server's stderr to a log file/panel, never the chat (§7). stdout is
+   the JSON-RPC channel, so all logging stays on stderr.
 5. Serve exactly three loopback routes: `GET /callback` (the pinned fragment-reading page),
    `POST /redeem` (slim redeem → `redeem_registration_delegation`), and
    `GET /.well-known/ii-auth-callbacks` (the `#4091` allow-list, one `Access-Control-Allow-Origin: *`
@@ -186,11 +188,91 @@ callback↔connect correlator.
 6. On redeem success, record the grant in memory and shut the listener down. `IcTools` now
    serves tools over stdio, minting per-app delegations on demand against mainnet.
 
+Login is **lazy and non-blocking**: it runs as an MCP tool the agent calls on the first
+authenticated action — not at startup (most clients require the user to approve the first tool
+call, and some cap `initialize` at ~10 s) — and it returns the URL immediately rather than
+blocking on the callback (Codex times out a tool call at 60 s; Claude Code auto-backgrounds
+calls over 2 min). A follow-up `auth_status` tool (or simply the next tool call) confirms the
+grant landed. §7 covers the per-client specifics.
+
 Sessions are **in-memory** (re-login per run), matching today's model and the roadmap.
 Optional future work: persist the session seed `S` to an OS keychain to survive restarts —
 but `S` is a live capability to the user's real anchor, so never plaintext.
 
-## 7. Tool / session seam
+## 7. Working with AI tool clients
+
+The local binary is a **stdio** MCP server, so it is reachable by any client that can **spawn a
+local subprocess**, and unreachable by one that only connects to a remote **URL**. The five
+requested clients split cleanly along that line (verified against current docs, mid-2026):
+
+| Client / surface | Local stdio? | Where you register it | Reaches `imcp2-local`? |
+|---|---|---|---|
+| **Claude Desktop** (mac/Win) | yes | `claude_desktop_config.json` → `mcpServers`; or a `.mcpb` bundle (one-click install) | ✅ |
+| **Claude Code** (CLI) | yes | `claude mcp add --transport stdio … -- <bin>`; `.mcp.json` / `~/.claude.json` | ✅ |
+| claude.ai web / mobile / Cowork | no | remote connectors (OAuth) only | ❌ → hosted |
+| **Codex** CLI / IDE ext / desktop | yes | `~/.codex/config.toml` → `[mcp_servers.<n>]` | ✅ |
+| Codex Cloud | no | HTTP MCP only | ❌ → hosted |
+| **Cursor** | yes | `~/.cursor/mcp.json` or `.cursor/mcp.json` → `mcpServers` | ✅ (≤40 tools total; we expose ~26) |
+| **Perplexity** macOS app | yes (via a `PerplexityXPC` helper) | Settings → Connectors → Add → Advanced JSON | ✅ macOS only |
+| Perplexity web / Windows / remote | no | remote HTTPS URL + OAuth 2.1 + DCR + `/.well-known/mcp-connector.json` | ❌ → hosted |
+| **Antigravity** IDE / CLI / 2.0 | yes | `~/.gemini/config/mcp_config.json` or `.agents/mcp_config.json` → `mcpServers` | ✅ |
+
+**Two classes, two binaries.** Every desktop/CLI/IDE surface — Claude Desktop, Claude Code,
+Codex (CLI/IDE/desktop), Cursor, Antigravity, and the **Perplexity macOS app** — runs
+`imcp2-local` directly. The cloud/remote-only surfaces — claude.ai web/mobile, Perplexity
+web/Windows, Codex Cloud — cannot reach `localhost`; they need the **hosted `imcp2`** server
+(the OAuth path kept in §5). This is precisely why the OAuth layer stays in `imcp2` rather than
+being deleted: it is the only way to serve the cloud clients.
+
+**Registration** (absolute binary path everywhere; `imcp2-local` needs no args):
+
+- Claude Desktop / Cursor / Antigravity all use a `mcpServers` JSON object:
+  ```json
+  { "mcpServers": { "imcp2": { "command": "/usr/local/bin/imcp2-local" } } }
+  ```
+  (Antigravity: `~/.gemini/config/mcp_config.json`; Cursor: `~/.cursor/mcp.json`; Claude
+  Desktop: `claude_desktop_config.json`, or ship a `.mcpb` bundle for one-click install.)
+- Claude Code: `claude mcp add --transport stdio imcp2 -- /usr/local/bin/imcp2-local`
+- Codex (`~/.codex/config.toml`):
+  ```toml
+  [mcp_servers.imcp2]
+  command = "/usr/local/bin/imcp2-local"
+  ```
+- Perplexity macOS: Settings → Connectors → Add Connector → Advanced (needs the PerplexityXPC
+  helper): `{ "command": "/usr/local/bin/imcp2-local", "args": [], "env": {} }`
+
+**Cross-client login invariants** (every subprocess-capable client agreed):
+1. **Host OAuth never touches a stdio server.** All five drive OAuth only for *remote* servers;
+   for a local stdio server the host just pipes stdin/stdout. So the II login is entirely the
+   binary's own browser handshake (§6) — which also sidesteps Antigravity's known-buggy remote
+   MCP-OAuth.
+2. **stderr is not shown in chat — anywhere.** Claude, Codex, Cursor, and Antigravity all route
+   a stdio server's stderr to a log file/panel, and stdout is reserved for JSON-RPC. So the
+   login URL is surfaced **in-band**: the `authenticate` tool returns it as text (the model
+   relays it; Claude Desktop linkifies `http(s)`), backed by a best-effort browser auto-open.
+   Use a plain `http(s)://…` URL — custom URI schemes are not reliably opened.
+3. **First tool call needs approval.** Cursor/Antigravity default to "Ask", Codex to its
+   approval policy — so login cannot run silently at startup; it triggers lazily on the first
+   authenticated tool.
+4. **Don't block on the callback** (Codex 60 s tool / 10 s `initialize`; Claude Code
+   auto-backgrounds > 2 min): `authenticate` returns the URL and starts the listener
+   immediately; a follow-up `auth_status` (or the next tool call) confirms completion.
+5. **Absolute paths; stdout = JSON-RPC only** (all diagnostics to stderr). A self-contained
+   native binary avoids the frequent wrong-runtime/path failures Node-based servers hit.
+
+*(Implementation: `authenticate`/`auth_status` are **local-only** tools — define them in the
+`imcp2` library gated to the local build so they never appear on the hosted server, which logs
+in via OAuth instead. Cursor's ~40-tool cap is comfortable: `imcp2` exposes ~26 plus these.)*
+
+**Serving the cloud clients (hosted `imcp2`).** claude.ai web/mobile and Perplexity-web reach
+only a public HTTPS MCP endpoint with OAuth 2.1 — which hosted `imcp2` already is. Two
+Perplexity-specific gaps to verify before claiming support there: it expects a
+`/.well-known/mcp-connector.json` discovery document (not currently served), and its remote
+OAuth has an open DCR bug that rejects RFC 7591 public-client registrations lacking a
+`client_secret` (the same registrations that work on Claude/ChatGPT/Grok). Neither affects the
+local binary.
+
+## 8. Tool / session seam
 
 Today a tool gets its `session_id` via bearer → `require_token` → `AuthedSession` injected in
 the request extensions → `authed_session(ctx)` (`tools.rs:1475`). Under stdio there is one
@@ -211,7 +293,7 @@ Tools that are already session-free work unchanged locally: `get_canister_candid
 `get_canister_api_doc`, `open_app`, `resolve_app`, `discover_app_canisters`, the skills/lookup
 tools, and the anonymous path of `canister_query`.
 
-## 8. Security model & open decisions
+## 9. Security model & open decisions
 
 **Trust boundary.** Dropping the bearer gate is sound *only because* the transport is stdio:
 a stdio server has no listening socket — it is reachable only by the parent process holding
@@ -232,12 +314,14 @@ Decisions for the implementation PR (recommendations first):
    header) so the local crate drops `axum`/`tower-http` — the security-sensitive page/CSP is a
    static asset reused from core, not re-derived. Reuse-axum is the lower-effort fallback.
 2. **Browser open:** `open`/`webbrowser` crate (convenience) vs `std::process::Command`
-   (zero-dep). *Recommend* always print the URL + best-effort auto-open, flow never depends on
-   auto-open succeeding.
-3. **Login timing:** eager at startup vs lazy on first authenticated tool call.
+   (zero-dep). *Recommend* always return the URL in-band (the `authenticate` tool result) +
+   best-effort auto-open; the flow never depends on auto-open succeeding.
+3. **Login timing:** *resolved by the client research (§7)* — lazy on the first authenticated
+   tool call, never at startup (clients gate the first call on approval and cap `initialize`),
+   and non-blocking.
 4. **Session persistence:** in-memory only (recommend for v1) vs keychain-backed `S`.
 
-## 9. Risks to verify against PRODUCTION II
+## 10. Risks to verify against PRODUCTION II
 
 The single biggest external dependency: the in-repo II contract was verified only against
 **beta** II (`fgte5-…`, `identities.rs:814`, `auth.rs:76`), but this binary targets
@@ -256,13 +340,13 @@ II carries the `#4086` MCP feature set" (`README.md:724`). Verify against live `
 Mitigation while prod II catches up: the existing env overrides let the binary point at beta
 II, which is verified end-to-end today.
 
-## 10. Work breakdown
+## 11. Work breakdown
 
 **Phase 1 — carve out the core (no behavior change to the `imcp2` binary).** Make the
 `imcp2` library the transport/OAuth-agnostic core: keep `identities/calls/discover/management/
 skills/tools` + `static/` + connect assets, extract `iiconnect` from `auth.rs`, and put the
 OAuth AS + `McpServer`/`main.rs` behind the default-on `hosted` feature (optional
-`axum`/`tower-http`). Apply the `SessionSource` seam (§7) and drop the 4 dead deps +
+`axum`/`tower-http`). Apply the `SessionSource` seam (§8) and drop the 4 dead deps +
 `schemars 0.8`. *Exit:* the `imcp2` binary builds and its tests pass unchanged; `imcp2` with
 `default-features = false` compiles a minimal closure.
 
@@ -271,9 +355,9 @@ login driver + the loopback callback listener. *Exit:* `cargo build -p imcp2-loc
 logs in against II and runs read/write tools as their accounts.
 
 **Phase 3 — polish.** Docs (how to add the binary to an MCP client config; the wallet-grade
-trust note), the production-II verification (§9), optional session persistence.
+trust note), the production-II verification (§10), optional session persistence.
 
-## 11. Evidence index
+## 12. Evidence index
 
 - Dead deps (0 refs): `ed25519-dalek`/`p256`/`ic-signature-verification`/
   `ic-representation-independent-hash`; Ed25519 via `ic-agent` `identities.rs:1044`; replica
@@ -281,6 +365,6 @@ trust note), the production-II verification (§9), optional session persistence.
 - rmcp features + streamable-HTTP wiring: `Cargo.toml:12`, `lib.rs:83,194-208`.
 - OAuth AS vs II-connect split: `auth.rs:24-60` (module docs), handlers `auth.rs:566/1440/1570`,
   connect subset `auth.rs:750/808-978/1207-1245/1302`, `#4091` `auth.rs:770/785`.
-- Session seam: `auth.rs:1664/1691`, `tools.rs:1475`, 13 call-sites listed in §7.
+- Session seam: `auth.rs:1664/1691`, `tools.rs:1475`, 13 call-sites listed in §8.
 - II login primitives: `identities.rs:501/821`, `ii_mcp_url` `auth.rs:750`.
 - Prod-vs-beta verification caveat: `identities.rs:79/814`, `README.md:724`.
