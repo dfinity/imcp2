@@ -1,0 +1,66 @@
+# Deploy a tagged release to production.
+#
+# Every `release-*` tag pushed to this repository is rolled out to the production
+# host. Nothing else deploys here — production only ever moves when someone cuts a
+# tag, so the deployed revision is always a named, reproducible point in history.
+#
+# Cutting a release:
+#   git tag release-2026-07-27 <commit>   # any suffix; the prefix is what matters
+#   git push origin release-2026-07-27
+#
+# Rolling back: re-run this workflow from the Actions tab with the previous tag as
+# the `ref` input. That rebuilds and ships that exact commit — no revert commit and
+# no new tag needed.
+#
+# Required REPOSITORY secrets (Settings -> Secrets and variables -> Actions).
+# They cannot be environment-scoped: a caller resolves the secrets it passes into a
+# reusable workflow outside any environment context, so environment secrets would
+# arrive empty here. The `production` environment's protection rules still apply
+# normally — it is only environment *secrets* that do not work this way.
+#   PROD_DEPLOY_SSH_KEY     private SSH key for the sudo-capable user on the host
+#   PROD_DEPLOY_HOST        user@host, e.g. ec2-user@10.118.0.61
+#   PROD_DEPLOY_DOMAIN      public FQDN served over HTTPS
+#   PROD_DEPLOY_ACME_EMAIL  email for Let's Encrypt / ACME
+# Optional:
+#   PROD_DEPLOY_KNOWN_HOSTS  output of `ssh-keyscan <host>`; pin it to avoid TOFU.
+name: Deploy release
+
+on:
+  push:
+    tags: ['release-*']
+  # Manual re-run, and the rollback path: pass an earlier release tag as `ref`.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag (or commit) to deploy, e.g. release-2026-07-27'
+        required: true
+        type: string
+
+# Never run two production deploys at once; let an in-flight deploy finish rather
+# than cancel it half-way through replacing the binary on the host.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/deploy-native.yml
+    with:
+      environment: production
+      # The production host is on a private network (RFC1918 v4), so a
+      # GitHub-hosted runner cannot reach it. Ship from the on-prem runner, which
+      # is inside that network. Its arch is irrelevant — the ship job only runs
+      # ssh/tar, never the binary itself.
+      ship_runs_on: '["self-hosted","linux"]'
+      # arm64, matching staging. Parity matters here: aws-lc-sys/ring carry
+      # per-arch assembly, so a differing production arch would leave the crypto
+      # paths this server's auth depends on unexercised by staging.
+      arch: arm64
+      build_runs_on: '"ubuntu-24.04-arm"'
+      ref: ${{ inputs.ref || github.ref }}
+    secrets:
+      DEPLOY_SSH_KEY: ${{ secrets.PROD_DEPLOY_SSH_KEY }}
+      DEPLOY_HOST: ${{ secrets.PROD_DEPLOY_HOST }}
+      DEPLOY_DOMAIN: ${{ secrets.PROD_DEPLOY_DOMAIN }}
+      DEPLOY_ACME_EMAIL: ${{ secrets.PROD_DEPLOY_ACME_EMAIL }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.PROD_DEPLOY_KNOWN_HOSTS }}

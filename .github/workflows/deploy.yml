@@ -1,9 +1,8 @@
 # Auto-redeploy imcp2 to staging on every push to main.
 #
 # Staging tracks main continuously so changes get exercised on a real host before a
-# release is cut. Production is planned as a separate host moving only on a
-# `release-*` tag, added as its own caller of the shared mechanics rather than as a
-# branch of this workflow. Those mechanics live in deploy-native.yml, which
+# release is cut. Production is a separate host that only moves on a `release-*`
+# tag — see deploy-release.yml. Both share the mechanics in deploy-native.yml, which
 # cross-builds the binary and ships it + static/ over SSH to systemd services. See
 # deploy/native/README.md for the deploy model.
 #

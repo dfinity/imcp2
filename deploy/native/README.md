@@ -145,17 +145,35 @@ being able to `ssh` in does not mean 80/443 are reachable from the internet.
 that there's no public IPv4 inbound, and that AWS creds are granted — ask it to make
 the box publicly reachable and report the address to set DNS *before* the deploy.
 
-## Automated deploys
+## Automated deploys: staging on `main`, production on `release-*`
 
-[`deploy.yml`](../../.github/workflows/deploy.yml) redeploys the **staging** host on
-every push to `main` (and can be re-run by hand from the Actions tab), so changes are
-exercised on a real box continuously. It runs in the `staging` GitHub Environment, and
-a `concurrency` group serializes deploys so two never overlap.
+Two hosts, two triggers, one shared mechanism:
+
+| Workflow | Trigger | Target | Environment |
+|---|---|---|---|
+| [`deploy.yml`](../../.github/workflows/deploy.yml) | push to `main` | staging | `staging` |
+| [`deploy-release.yml`](../../.github/workflows/deploy-release.yml) | push tag `release-*` | production | `production` |
+
+Staging tracks `main` continuously so changes get exercised on a real host; production
+only ever moves when someone cuts a tag, so the live revision is always a named,
+reproducible point in history.
 
 The mechanics live in [`deploy-native.yml`](../../.github/workflows/deploy-native.yml),
-a reusable workflow. It first runs the status dashboard's unit tests (a regression
-there stops the rollout), cross-builds the binary with `build.sh`, then runs
-`deploy.sh` over SSH — which ships and (re)starts the app and the dashboard service.
+a reusable workflow both call. It first runs the status dashboard's unit tests (a
+regression there stops the rollout), cross-builds the binary with `build.sh`, then runs
+`deploy.sh` over SSH — which ships and (re)starts the app and the dashboard service. A
+`concurrency` group per environment serializes deploys so two never overlap.
+
+### Cutting a release
+
+```sh
+git tag release-2026-07-27 <commit>   # any suffix; the `release-` prefix is the trigger
+git push origin release-2026-07-27
+```
+
+**Rolling back:** re-run `deploy-release.yml` from the Actions tab with an earlier tag
+as the `ref` input. That rebuilds and ships that exact commit — no revert commit, no
+new tag.
 
 ### The build/ship split
 
@@ -179,13 +197,17 @@ kept the old binary fails the run instead of passing quietly.
 
 ### Secrets
 
-| Secret | Value |
-|---|---|
-| `DEPLOY_SSH_KEY` | Private SSH key for the sudo-capable host user |
-| `DEPLOY_HOST` | `user@host` — the host's **private** address, since the ship job runs inside the VPN |
-| `DEPLOY_DOMAIN` | Public FQDN served over HTTPS |
-| `DEPLOY_ACME_EMAIL` | Email for Let's Encrypt / ACME |
-| `DEPLOY_KNOWN_HOSTS` | *(optional)* output of `ssh-keyscan <host>`; pin it to avoid trust-on-first-use |
+Staging and production take separate secrets so a production rollout can never be
+pointed at the wrong box by a stale value. Both hosts are reached on their **private**
+addresses, since the ship job runs inside the VPN.
+
+| Staging | Production | Value |
+|---|---|---|
+| `DEPLOY_SSH_KEY` | `PROD_DEPLOY_SSH_KEY` | Private SSH key for the sudo-capable host user |
+| `DEPLOY_HOST` | `PROD_DEPLOY_HOST` | `user@host`, the host's private address |
+| `DEPLOY_DOMAIN` | `PROD_DEPLOY_DOMAIN` | Public FQDN served over HTTPS |
+| `DEPLOY_ACME_EMAIL` | `PROD_DEPLOY_ACME_EMAIL` | Email for Let's Encrypt / ACME |
+| `DEPLOY_KNOWN_HOSTS` | `PROD_DEPLOY_KNOWN_HOSTS` | *(optional)* output of `ssh-keyscan <host>`; pin it to avoid trust-on-first-use |
 
 > **These must be repository-level secrets** (**Settings → Secrets and variables →
 > Actions**), *not* environment-scoped ones. A caller passes secrets into a reusable
@@ -198,10 +220,10 @@ workflow only automates the build-and-ship step, not provisioning the box.
 
 ### Approval gate
 
-The deploy job runs in a named GitHub Environment. To require manual approval before a
-rollout, add yourself (or a team) as a **Required reviewer** under **Settings →
-Environments → <name>**. Until a reviewer is configured the environment imposes no
-gate, so pushes deploy straight through.
+Each deploy job runs in its named GitHub Environment. To require manual approval
+before production rollouts, go to **Settings → Environments → production** and add
+yourself (or a team) as a **Required reviewer**. Until a reviewer is configured the
+environment imposes no gate, so a `release-*` tag deploys straight through.
 
 ## Operating
 
