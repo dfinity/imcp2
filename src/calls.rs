@@ -376,11 +376,59 @@ pub(crate) const MAX_CANDID_DEPTH: usize = 128;
 /// idle mapping costs no resident memory.
 const CANDID_PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
 
+/// Deep-stack parse threads allowed to be alive at once, per core (min 4). These
+/// parses are CPU-bound, and running them inline on the tokio workers already
+/// capped them at roughly one per core; the permit restores that ceiling instead
+/// of letting untrusted traffic multiply threads — and 64 MiB stack mappings —
+/// with request concurrency. Waiting for a permit blocks the caller exactly as a
+/// busy worker used to, and every parse is bounded by [`MAX_CANDID_TEXT_BYTES`]
+/// and [`MAX_CANDID_DEPTH`], so the queue always drains.
+const CANDID_PARSE_THREADS_PER_CORE: usize = 1;
+
+/// Free deep-stack parse permits, and the condvar sleepers wait on.
+fn candid_parse_permits() -> &'static (std::sync::Mutex<usize>, std::sync::Condvar) {
+    static PERMITS: std::sync::OnceLock<(std::sync::Mutex<usize>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let limit = (cores * CANDID_PARSE_THREADS_PER_CORE).max(4);
+        (std::sync::Mutex::new(limit), std::sync::Condvar::new())
+    })
+}
+
+/// Holds one [`candid_parse_permits`] slot; returns it on drop, including while
+/// unwinding from a parser panic.
+struct CandidParsePermit;
+
+impl CandidParsePermit {
+    /// Block until a slot is free, then take it.
+    fn acquire() -> Self {
+        let (free, wakeup) = candid_parse_permits();
+        // The critical sections below cannot panic, so the lock cannot be poisoned.
+        let mut free = free.lock().expect("candid parse permits poisoned");
+        while *free == 0 {
+            free = wakeup.wait(free).expect("candid parse permits poisoned");
+        }
+        *free -= 1;
+        Self
+    }
+}
+
+impl Drop for CandidParsePermit {
+    fn drop(&mut self) {
+        let (free, wakeup) = candid_parse_permits();
+        *free.lock().expect("candid parse permits poisoned") += 1;
+        wakeup.notify_one();
+    }
+}
+
 /// Run `f` — a parse of untrusted textual Candid, plus everything done with the
 /// resulting AST before it is dropped — on a dedicated thread with a
-/// [`CANDID_PARSE_STACK_BYTES`] stack. `None` only if that thread can't be spawned
-/// (resource exhaustion); callers then degrade exactly as they do for input they
-/// can't parse, and never fall back to parsing on the caller's small stack.
+/// [`CANDID_PARSE_STACK_BYTES`] stack, at most
+/// [`CANDID_PARSE_THREADS_PER_CORE`]-per-core of them at a time. `None` only if
+/// that thread can't be spawned (resource exhaustion); callers then degrade
+/// exactly as they do for input they can't parse, and never fall back to parsing
+/// on the caller's small stack.
 ///
 /// Defense in depth behind [`guard_candid_text`] (CWE-674). A stack overflow is an
 /// uncatchable process abort that would drop every concurrent session, and
@@ -388,7 +436,12 @@ const CANDID_PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
 /// unguarded, so the depth limit must never be the only thing standing between a
 /// hostile input and the guard page: should the scanner ever mis-measure a value,
 /// the parse still has to run thousands of levels deep before it can hurt anyone.
+///
+/// The permit is held by the CALLING thread for the whole call, so these must not
+/// nest: an `f` that itself calls `on_deep_stack` could exhaust the permits and
+/// wait on itself. Every current caller parses directly instead.
 pub(crate) fn on_deep_stack<T: Send>(f: impl FnOnce() -> T + Send) -> Option<T> {
+    let _permit = CandidParsePermit::acquire();
     let mut out = None;
     let mut panicked = None;
     std::thread::scope(|scope| {
@@ -1337,6 +1390,32 @@ mod tests {
         // Well under the limit: still parses and encodes (on the deep stack).
         let ok = format!("({}0)", "opt ".repeat(MAX_CANDID_DEPTH / 2));
         assert!(encode_args(None, "m", &ok).is_ok(), "legitimate nesting must still encode");
+    }
+
+    // Untrusted traffic must not be able to multiply 64 MiB parse threads with
+    // request concurrency, so `on_deep_stack` holds a per-core permit — but a cap
+    // that can deadlock or lose work would be worse than none. Far more callers
+    // than permits must all still make progress, and every one must get its own
+    // closure's result back.
+    #[test]
+    fn deep_stack_parses_are_capped_but_all_complete() {
+        use super::on_deep_stack;
+        let callers: Vec<_> = (0..64u32)
+            .map(|i| std::thread::spawn(move || on_deep_stack(|| i * 2)))
+            .collect();
+        let got: Vec<_> = callers
+            .into_iter()
+            .map(|c| c.join().expect("caller must not panic or hang"))
+            .collect();
+        assert_eq!(got, (0..64u32).map(|i| Some(i * 2)).collect::<Vec<_>>());
+        // Permits are returned, so a later call still runs rather than blocking.
+        assert_eq!(on_deep_stack(|| "after"), Some("after"));
+        // A panicking parse must surface on the caller's thread AND hand its
+        // permit back; leaking one would wedge a slot for the process's lifetime.
+        // (The parse thread's panic message on stderr here is expected.)
+        let boom = std::panic::catch_unwind(|| on_deep_stack(|| panic!("parser blew up")));
+        assert!(boom.is_err(), "a panic inside the parse must reach the caller");
+        assert_eq!(on_deep_stack(|| "after panic"), Some("after panic"));
     }
 
     // OQL detection is name-based (both `schema` and `execute` must be present),
