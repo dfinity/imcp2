@@ -12,11 +12,16 @@
 # the `ref` input. That rebuilds and ships that exact commit — no revert commit and
 # no new tag needed.
 #
-# Required REPOSITORY secrets (Settings -> Secrets and variables -> Actions).
-# They cannot be environment-scoped: a caller resolves the secrets it passes into a
-# reusable workflow outside any environment context, so environment secrets would
-# arrive empty here. The `production` environment's protection rules still apply
-# normally — it is only environment *secrets* that do not work this way.
+# Required REPOSITORY secrets (Settings -> Secrets and variables -> Actions). A job
+# calling a reusable workflow with `uses:` cannot declare an `environment:`, so the
+# secrets passed below resolve at repository and organization scope only — naming an
+# environment-scoped secret here gets an empty value.
+#
+# The converse is NOT true, and it is the trap: deploy-native.yml's ship job does set
+# `environment:`, so a secret defined on the `production` environment resolves there
+# and OVERRIDES whatever this caller passed in. Define each secret in exactly one
+# place; defining it in both means the environment copy silently wins. The
+# `production` environment's protection rules apply either way.
 #   PROD_DEPLOY_SSH_KEY     private SSH key for the sudo-capable user on the host
 #   PROD_DEPLOY_HOST        user@host, e.g. ec2-user@10.118.0.61
 #   PROD_DEPLOY_DOMAIN      public FQDN served over HTTPS
@@ -51,7 +56,14 @@ jobs:
       # GitHub-hosted runner cannot reach it. Ship from the on-prem runner, which
       # is inside that network. Its arch is irrelevant — the ship job only runs
       # ssh/tar, never the binary itself.
-      ship_runs_on: '["self-hosted","linux"]'
+      # `imcp-prod` must be a label unique to the on-prem production runner, and has
+      # to be added there before a release tag will deploy anything. `self-hosted`
+      # and `linux` are applied automatically to every Linux self-hosted runner, so
+      # those two alone select *any* of them — handing an arbitrary machine the
+      # production SSH key and reachability into that network. Requiring a label
+      # that may not exist yet makes the job queue instead, which is the safe
+      # direction to fail for production.
+      ship_runs_on: '["self-hosted","linux","imcp-prod"]'
       # arm64, matching staging. Parity matters here: aws-lc-sys/ring carry
       # per-arch assembly, so a differing production arch would leave the crypto
       # paths this server's auth depends on unexercised by staging.
