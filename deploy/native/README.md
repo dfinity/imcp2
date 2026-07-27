@@ -1,16 +1,24 @@
 # Native (Docker-free) deploy of imcp2
 
-Run `imcp2` directly on an **existing** Amazon Linux 2023 (arm64) host as native
-`systemd` services — no Docker on the box. Useful when the instance already exists
-(e.g. in a managed VPC) and you just want to put the app on it. The repo's
+Run `imcp2` directly on an **existing** Amazon Linux 2023 host as native `systemd`
+services — no Docker on the box. Useful when the instance already exists (e.g. in a
+managed VPC) and you just want to put the app on it. The repo's
 [`Dockerfile`](../../Dockerfile) remains the container-based alternative.
 
 ```
-   build.sh  ─────►  build-out/imcp2        (cross-built linux/arm64 binary)
+   build.sh  ─────►  build-out/imcp2        (cross-built linux/arm64 or amd64 binary)
    deploy.sh ─────►  /opt/imcp2/{imcp2,static}   + systemd: imcp2.service
                      /opt/imcp2/monitoring         + systemd: imcp-status.service (dashboard)
                      /usr/local/bin/caddy          + systemd: caddy.service (TLS)
 ```
+
+Hosts are **arm64 (Graviton)**. Keep any additional host on the same architecture:
+`aws-lc-sys` and `ring` carry per-arch assembly, so a host differing from the one
+that changes are rehearsed on would leave the crypto paths the auth flow depends
+on unexercised. `build.sh` can target `amd64` if you ever need it (`ARCH=amd64`), and `deploy.sh`
+compares the built binary's ELF header against the host's `uname -m` and aborts on a
+mismatch — otherwise the unit installs fine and then crash-loops on
+`Exec format error`, which reads like an app bug rather than a build-target mistake.
 
 `imcp2` listens on `127.0.0.1:8000`/`0.0.0.0:8000`; **Caddy** terminates HTTPS for
 your domain and reverse-proxies to it, obtaining a Let's Encrypt cert automatically.
@@ -26,6 +34,7 @@ step and no third-party dependencies.
 
 ```sh
 # 1. Cross-build the arm64 binary (needs Docker locally; compiles in a container).
+#    Use ARCH=amd64 for an x86_64 target.
 deploy/native/build.sh
 
 # 2. Ship it and stand up the services.
@@ -39,8 +48,10 @@ HOST=ec2-user@<host> DOMAIN=mcp.example.com ACME_EMAIL=you@example.com \
 
 `build.sh` compiles in a `rust:1-slim-bullseye` container (glibc **2.31**). A binary
 linked against an older glibc runs on newer ones, so it works on AL2023 (glibc 2.34).
-Building against bookworm (glibc 2.36) would fail at runtime on AL2023. The build is
-native arm64 (no QEMU) and handles the heavy deps (`aws-lc-sys`, `ring`, `rustls`).
+Building against bookworm (glibc 2.36) would fail at runtime on AL2023. Pick a runner
+matching `ARCH` so the build stays native (no QEMU) — it handles the heavy deps
+(`aws-lc-sys`, `ring`, `rustls`), and emulating the other architecture is several
+times slower.
 
 ## Host prerequisites
 
@@ -59,6 +70,45 @@ IPv6 (if the subnet routes `::/0` to an Internet Gateway) is publicly reachable.
 public IPv4, attach a **second ENI in a public subnet** (route table `0.0.0.0/0 → IGW`)
 and associate an Elastic IP; AL2023's `amazon-ec2-net-utils` auto-configures the
 source-based policy routing for the secondary interface. Point `$DOMAIN` at that EIP.
+
+**Do not settle for an AAAA-only deployment.** A host with a public IPv6 but only a
+private IPv4 can obtain a Let's Encrypt cert (ACME validates over IPv6 happily) and
+will look healthy from any v6-capable network — while being entirely unreachable from
+IPv4-only clients. For a public MCP server that is a silent outage for a large share
+of callers, and the `/status/` dashboard will not reveal it if the prober itself has
+v6. Publish both an `A` and an `AAAA` record, and verify both families from outside
+before calling a rollout done.
+
+### Verifying dual-stack reachability
+
+Three things bite here, none of them visible from inside the box:
+
+**An Elastic IP only works if the ENI's subnet routes to an IGW.** AWS lets you
+associate an EIP with an instance in a NAT-routed private subnet, and nothing
+complains — but inbound to it silently blackholes. The instance can't tell you
+either: an EIP is 1:1 NAT at the gateway, so `ip addr` correctly shows only the
+private address whether the EIP works or not. Check the egress path instead:
+
+```sh
+curl -4 -s -m5 ifconfig.me    # expect the Elastic IP itself
+```
+
+If that returns the EIP, the subnet has an IGW route and inbound will work. If it
+returns anything else, egress is via a NAT gateway, the EIP is not on the path, and
+no security-group change will make inbound reach it.
+
+**IPv4 and IPv6 security-group rules are separate entries.** Opening 80/443 to
+`0.0.0.0/0` does nothing for v6; `::/0` needs its own rules. Miss them and ACME may
+still succeed over whichever family works, leaving a valid cert on a half-reachable
+host.
+
+**Check both families from outside** once DNS is published — a v6-capable network
+will happily mask a broken v4 path:
+
+```sh
+curl -4 -sS -o /dev/null -w 'v4 -> %{http_code}\n' https://$DOMAIN/
+curl -6 -sS -o /dev/null -w 'v6 -> %{http_code}\n' https://$DOMAIN/
+```
 
 ## Handing this off (deploying via a Claude Code session)
 
@@ -95,36 +145,63 @@ being able to `ssh` in does not mean 80/443 are reachable from the internet.
 that there's no public IPv4 inbound, and that AWS creds are granted — ask it to make
 the box publicly reachable and report the address to set DNS *before* the deploy.
 
-## Automated redeploy on push to `main`
+## Automated deploys
 
-[`.github/workflows/deploy.yml`](../../.github/workflows/deploy.yml) runs this same
-native deploy automatically on every push to `main` (and can be re-run by hand from the
-Actions tab). It first runs the status dashboard's unit tests (a regression there stops
-the rollout), cross-builds the arm64 binary with `build.sh`, then runs `deploy.sh`
-over SSH — which ships and (re)starts both the app and the dashboard service. A
-`concurrency` group serializes deploys so two never overlap.
+[`deploy.yml`](../../.github/workflows/deploy.yml) redeploys the **staging** host on
+every push to `main` (and can be re-run by hand from the Actions tab), so changes are
+exercised on a real box continuously. It runs in the `staging` GitHub Environment, and
+a `concurrency` group serializes deploys so two never overlap.
 
-Configure these repository secrets (**Settings → Secrets and variables → Actions**):
+The mechanics live in [`deploy-native.yml`](../../.github/workflows/deploy-native.yml),
+a reusable workflow. It first runs the status dashboard's unit tests (a regression
+there stops the rollout), cross-builds the binary with `build.sh`, then runs
+`deploy.sh` over SSH — which ships and (re)starts the app and the dashboard service.
+
+### The build/ship split
+
+`deploy-native.yml` runs as two jobs. **build** runs on a GitHub-hosted runner matching
+`inputs.arch` — it needs Docker for `build.sh` and does the expensive Rust compile.
+**ship** runs wherever the target host is reachable and needs only `ssh` + `tar`, no
+Docker and no Rust.
+
+That split is what lets the ship job run on a **self-hosted on-prem runner**, which is
+how staging is deployed: the host is reached on its private address over the VPN rather
+than over the public internet, so it needs no inbound SSH from the world. The heavy
+build stays on hosted infrastructure and only the binary crosses into the private
+network. The ship runner's own architecture is irrelevant; it never executes the binary.
+
+Set `ship_runs_on` to labels matching your runner. It takes a JSON string, so a single
+label is `'"ubuntu-24.04-arm"'` and a label set is `'["self-hosted","linux"]'`.
+
+After each deploy the ship job reads `GET /version` on the host and asserts the
+reported `commit` matches what was just built, so a `systemctl restart` that silently
+kept the old binary fails the run instead of passing quietly.
+
+### Secrets
 
 | Secret | Value |
 |---|---|
-| `DEPLOY_SSH_KEY` | Private SSH key for the sudo-capable host user (e.g. `ec2-user`) |
-| `DEPLOY_HOST` | `user@host`, e.g. `ec2-user@1.2.3.4` (the `HOST` deploy.sh expects) |
-| `DEPLOY_DOMAIN` | Public FQDN served over HTTPS, e.g. `mcp.example.com` |
+| `DEPLOY_SSH_KEY` | Private SSH key for the sudo-capable host user |
+| `DEPLOY_HOST` | `user@host` — the host's **private** address, since the ship job runs inside the VPN |
+| `DEPLOY_DOMAIN` | Public FQDN served over HTTPS |
 | `DEPLOY_ACME_EMAIL` | Email for Let's Encrypt / ACME |
-| `DEPLOY_KNOWN_HOSTS` | *(optional)* output of `ssh-keyscan <host>`; pin it to avoid trust-on-first-use. If omitted, the host key is fetched at run time. |
+| `DEPLOY_KNOWN_HOSTS` | *(optional)* output of `ssh-keyscan <host>`; pin it to avoid trust-on-first-use |
+
+> **These must be repository-level secrets** (**Settings → Secrets and variables →
+> Actions**), *not* environment-scoped ones. A caller passes secrets into a reusable
+> workflow from outside any environment context, so environment-scoped secrets resolve
+> to empty there. Environment **protection rules** still apply normally — it is only
+> environment *secrets* that cannot be used this way.
 
 The host prerequisites above (DNS, inbound 80/443, sudo SSH user) still apply — the
 workflow only automates the build-and-ship step, not provisioning the box.
 
 ### Approval gate
 
-The deploy job runs in the GitHub **`production` environment**. To require a manual
-approval before each deploy, go to **Settings → Environments → production** and add
-yourself (or a team) as a **Required reviewer**. Until a reviewer is configured the
-environment imposes no gate, so the deploy still runs automatically on push to `main`.
-You can also scope the environment's secrets/branches there if you'd rather not keep
-`DEPLOY_*` as repo-wide secrets.
+The deploy job runs in a named GitHub Environment. To require manual approval before a
+rollout, add yourself (or a team) as a **Required reviewer** under **Settings →
+Environments → <name>**. Until a reviewer is configured the environment imposes no
+gate, so pushes deploy straight through.
 
 ## Operating
 
