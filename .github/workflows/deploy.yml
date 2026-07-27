@@ -9,9 +9,10 @@
 #
 # Required repository secrets (Settings -> Secrets and variables -> Actions):
 #   DEPLOY_SSH_KEY    private SSH key (PEM/OpenSSH) for a sudo-capable user on the host
-#   DEPLOY_HOST       user@host (matches deploy.sh's HOST). Must be the host's
-#                     PRIVATE address — the ship job runs on the on-prem runner and
-#                     reaches it over the VPN, not over the public internet.
+#   DEPLOY_HOST       user@host (matches deploy.sh's HOST). Must be an address the
+#                     ship runner can actually reach — see the ship_runs_on comment
+#                     below, which is what decides whether that is the host's private
+#                     address or its public one.
 #   DEPLOY_DOMAIN     public FQDN served over HTTPS, e.g. mcp.example.com
 #   DEPLOY_ACME_EMAIL email for Let's Encrypt / ACME
 # Optional:
@@ -35,10 +36,19 @@ jobs:
     uses: ./.github/workflows/deploy-native.yml
     with:
       environment: staging
-      # Ship from the on-prem runner, same as production. Staging sits in the same
-      # VPN-propagated subnet, so the runner reaches it on its private address —
-      # which is what lets the host drop SSH from the public internet entirely.
-      ship_runs_on: '["self-hosted","linux"]'
+      # `["self-hosted","linux"]` never matched anything: the org's self-hosted
+      # capacity is ARC-managed pools, and a runner scale set is selected by its name
+      # alone — it does not carry the default self-hosted/linux labels that classic
+      # runners get. The first deploy after that landed sat queued indefinitely.
+      #
+      # dind-small is one of those org-wide pools (Kubernetes, dfinity-ops/k8s, on the
+      # dm1-idx1 / zh1-idx1 clusters). Whether its pods can route to this host's
+      # RFC1918 address is UNCONFIRMED — that is what this is testing. If they cannot,
+      # the ship step fails at SSH rather than hanging, which is the point: a fast,
+      # legible answer instead of a queue that never drains. Should it fail, the
+      # build/ship split still needs a runner inside the VPC, and the host cannot drop
+      # public SSH until one exists.
+      ship_runs_on: '"dind-small"'
       # Staging host is arm64 (Graviton).
       arch: arm64
       build_runs_on: '"ubuntu-24.04-arm"'
