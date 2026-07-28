@@ -220,11 +220,30 @@ fact:
 sudo journalctl -u sshd --since '15 minutes ago' | grep 'Accepted publickey'
 ```
 
-One observation is not enough to write a firewall rule from: the pools are ephemeral
-pods spread across more than one cluster, so consecutive deploys can present different
-sources. Get the documented range for every cluster and both address families from
-whoever operates the runners before narrowing the rule, and note that the group
-permitting `22` from `10.0.0.0/8` has no IPv6 entry at all.
+**Do not try to solve this with a narrower CIDR — there isn't one.** Calico source-NATs
+each pod to the IP of whichever worker node it landed on, and traffic bound for this VPC
+leaves over a routed IPsec tunnel rather than a NATting gateway, so that node address
+arrives unchanged. Node IPs are provisioned dynamically rather than declared, the two
+clusters are separate sites with separate address ranges and either can run the job, and
+the SNAT-to-node-IP behaviour is an unpinned Calico default rather than a contract. Any
+prefix that looks right today can stop being right after routine cluster maintenance,
+and it would fail as a deploy timeout rather than as anything self-explanatory.
+
+The step above is therefore for **observing** what is happening, not for harvesting a
+range to hardcode. The durable fix is to stop needing inbound SSH at all — reach the
+host through **AWS Systems Manager Session Manager**, which requires no inbound port.
+`ssh` still works over it via a `ProxyCommand` using `AWS-StartSSHSession`, so
+`deploy.sh` needs no changes; only the workflow's SSH setup does. That closes `22`
+outright instead of narrowing it, and makes each deploy auditable in CloudTrail.
+
+Two things not to reach for, both circular here: a job that opens a short-lived rule for
+its own address cannot discover which address to open (that is what this whole section is
+about), and a bastion still needs inbound SSH from the same unstable sources.
+
+The `::/0` half of the port-22 rule has been removed: the IPsec tunnels and BGP sessions
+to this VPC are IPv4-only, so the deploy never arrives over IPv6 and that half permitted
+nothing but internet-sourced attempts. Note the group permitting `22` from `10.0.0.0/8`
+has no IPv6 entry either, so nothing on the v6 side was relying on it.
 
 `ship_runs_on` takes a JSON string, so a bare name is `'"dind-small"'` and a label set
 is `'["self-hosted","linux"]'`. Both deploys use the bare-name form, because the org's
