@@ -1919,7 +1919,7 @@ mod tests {
     /// per-instance metadata URL verbatim.
     #[test]
     fn bearer_challenge_carries_error_only_for_presented_tokens() {
-        let meta = "https://x.test/.well-known/oauth-protected-resource/mcp-prod";
+        let meta = "https://x.test/.well-known/oauth-protected-resource/mcp-beta";
         let with_token = super::bearer_challenge(true, meta);
         assert!(with_token.starts_with("Bearer "));
         assert!(with_token.contains("error=\"invalid_token\""));
@@ -2128,10 +2128,10 @@ mod tests {
             )
         };
         // Both instances, so the allow-list covers each mount.
-        let beta = make("/mcp");
-        let prod = make("/mcp-prod");
+        let prod = make("/mcp");
+        let beta = make("/mcp-beta");
 
-        let r = super::auth_callbacks(State(vec![beta.clone(), prod.clone()])).await;
+        let r = super::auth_callbacks(State(vec![prod.clone(), beta.clone()])).await;
         assert_eq!(r.status(), axum::http::StatusCode::OK);
         assert!(
             r.headers()
@@ -2160,8 +2160,8 @@ mod tests {
         // Each declared entry must equal the callback embedded in that
         // instance's II link, byte for byte.
         for (store, link) in [
-            (&beta, super::ii_mcp_url(&beta, "s", "K")),
             (&prod, super::ii_mcp_url(&prod, "s", "K")),
+            (&beta, super::ii_mcp_url(&beta, "s", "K")),
         ] {
             let expected = super::connect_callback_url(store);
             assert!(declared.contains(&expected), "{expected} must be declared: {declared:?}");
@@ -2473,7 +2473,7 @@ mod tests {
     // `location.hash` and never writes it into the HTML).
     #[tokio::test]
     async fn pinned_page_has_strict_csp_matching_nonce_and_no_reflection() {
-        let resp = super::pinned_callback_page("/mcp-prod");
+        let resp = super::pinned_callback_page("/mcp-beta");
         let csp = resp
             .headers()
             .get(axum::http::header::CONTENT_SECURITY_POLICY)
@@ -2511,7 +2511,7 @@ mod tests {
             "the inline style nonce must match the CSP nonce"
         );
         assert!(html.contains("location.hash"), "the page reads the fragment client-side");
-        assert!(html.contains("/mcp-prod/oauth/connect/redeem"), "posts to the instance's redeem path");
+        assert!(html.contains("/mcp-beta/oauth/connect/redeem"), "posts to the instance's redeem path");
         assert!(!html.contains("__REDEEM_URL__"), "the redeem-URL placeholder must be substituted");
         // Every handshake/redeem failure lands on this page, so it carries the
         // "contact us to report it" line (hidden until the script adds `.error`),

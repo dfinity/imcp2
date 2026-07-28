@@ -46,19 +46,21 @@ fn server(instance: imcp2::IiInstance, mcp_path: &str) -> imcp2::McpServer {
     })
 }
 
-/// The composed app, shaped like the deployment binary: beta (the default
-/// instance, owning the root discovery documents and sharing the origin-global
-/// auth-callback allow-list) at `/mcp`, prod at `/mcp-prod`.
+/// The composed app, shaped like the STAGING deployment binary (which serves
+/// both instances): prod (the default instance, owning the root discovery
+/// documents and sharing the origin-global auth-callback allow-list) at `/mcp`,
+/// beta at `/mcp-beta`. A production deployment serves `/mcp` alone; composing
+/// both here exercises the multi-instance routing contract.
 fn app() -> Router {
-    let beta = server(imcp2::IiInstance::beta().expect("beta"), "/mcp");
-    let prod = server(imcp2::IiInstance::prod().expect("prod"), "/mcp-prod");
+    let prod = server(imcp2::IiInstance::prod().expect("prod"), "/mcp");
+    let beta = server(imcp2::IiInstance::beta().expect("beta"), "/mcp-beta");
     Router::new()
-        .nest_service(beta.mcp_path(), beta.mcp_router())
         .nest_service(prod.mcp_path(), prod.mcp_router())
-        .merge(beta.well_known_router())
+        .nest_service(beta.mcp_path(), beta.mcp_router())
         .merge(prod.well_known_router())
-        .merge(beta.root_well_known_router())
-        .merge(imcp2::auth_callbacks_router(&[&beta, &prod]))
+        .merge(beta.well_known_router())
+        .merge(prod.root_well_known_router())
+        .merge(imcp2::auth_callbacks_router(&[&prod, &beta]))
 }
 
 async fn get_json(app: Router, path: &str) -> (StatusCode, serde_json::Value) {
@@ -74,8 +76,8 @@ async fn get_json(app: Router, path: &str) -> (StatusCode, serde_json::Value) {
 
 #[tokio::test]
 async fn protected_resource_metadata_follows_each_mount() {
-    // Beta: served path-inserted (RFC 9728 §3.1) and, as the default instance,
-    // at the plain root.
+    // Prod (the default `/mcp` instance): served path-inserted (RFC 9728 §3.1)
+    // and, as the default instance, at the plain root.
     for path in [
         "/.well-known/oauth-protected-resource/mcp",
         "/.well-known/oauth-protected-resource",
@@ -85,11 +87,11 @@ async fn protected_resource_metadata_follows_each_mount() {
         assert_eq!(doc["resource"], format!("{PUBLIC_URL}/mcp"), "GET {path}");
         assert_eq!(doc["authorization_servers"][0], format!("{PUBLIC_URL}/mcp"));
     }
-    // Prod: path-inserted only, with its own resource/AS.
-    let (status, doc) = get_json(app(), "/.well-known/oauth-protected-resource/mcp-prod").await;
+    // Beta (`/mcp-beta`): path-inserted only, with its own resource/AS.
+    let (status, doc) = get_json(app(), "/.well-known/oauth-protected-resource/mcp-beta").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(doc["resource"], format!("{PUBLIC_URL}/mcp-prod"));
-    assert_eq!(doc["authorization_servers"][0], format!("{PUBLIC_URL}/mcp-prod"));
+    assert_eq!(doc["resource"], format!("{PUBLIC_URL}/mcp-beta"));
+    assert_eq!(doc["authorization_servers"][0], format!("{PUBLIC_URL}/mcp-beta"));
 }
 
 #[tokio::test]
@@ -117,15 +119,15 @@ async fn authorization_server_metadata_is_a_path_issuer_per_instance() {
         assert!(doc.get("scopes_supported").is_none());
     }
     for path in [
-        "/.well-known/oauth-authorization-server/mcp-prod",
-        "/mcp-prod/.well-known/oauth-authorization-server",
+        "/.well-known/oauth-authorization-server/mcp-beta",
+        "/mcp-beta/.well-known/oauth-authorization-server",
     ] {
         let (status, doc) = get_json(app(), path).await;
         assert_eq!(status, StatusCode::OK, "GET {path}");
-        assert_eq!(doc["issuer"], format!("{PUBLIC_URL}/mcp-prod"), "GET {path}");
+        assert_eq!(doc["issuer"], format!("{PUBLIC_URL}/mcp-beta"), "GET {path}");
         assert_eq!(
             doc["authorization_endpoint"],
-            format!("{PUBLIC_URL}/mcp-prod/oauth/authorize")
+            format!("{PUBLIC_URL}/mcp-beta/oauth/authorize")
         );
     }
 }
@@ -144,7 +146,7 @@ async fn auth_callbacks_document_declares_every_mount() {
         declared,
         vec![
             format!("{PUBLIC_URL}/mcp/oauth/connect/callback"),
-            format!("{PUBLIC_URL}/mcp-prod/oauth/connect/callback"),
+            format!("{PUBLIC_URL}/mcp-beta/oauth/connect/callback"),
         ],
         "one entry per instance, under each mount"
     );
@@ -180,9 +182,9 @@ async fn unauthenticated_mcp_requests_get_the_path_aware_challenge() {
         );
     }
 
-    // Prod's challenge points at prod's document.
+    // Beta's challenge points at beta's document.
     let resp = app()
-        .oneshot(Request::post("/mcp-prod").body(Body::empty()).unwrap())
+        .oneshot(Request::post("/mcp-beta").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -192,7 +194,7 @@ async fn unauthenticated_mcp_requests_get_the_path_aware_challenge() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     assert!(
-        challenge.contains("/.well-known/oauth-protected-resource/mcp-prod\""),
+        challenge.contains("/.well-known/oauth-protected-resource/mcp-beta\""),
         "prod challenge: {challenge}"
     );
 }
@@ -268,7 +270,7 @@ async fn authorize_validates_its_inputs() {
 #[tokio::test]
 async fn oauth_endpoints_live_under_each_mount() {
     // Token: a bogus grant is rejected with a standards-shaped 400.
-    for path in ["/mcp/oauth/token", "/mcp-prod/oauth/token"] {
+    for path in ["/mcp/oauth/token", "/mcp-beta/oauth/token"] {
         let resp = app()
             .oneshot(
                 Request::post(path)
@@ -290,7 +292,7 @@ async fn oauth_endpoints_live_under_each_mount() {
     // instance's redeem path.
     for (page, redeem) in [
         ("/mcp/oauth/connect/callback", "/mcp/oauth/connect/redeem"),
-        ("/mcp-prod/oauth/connect/callback", "/mcp-prod/oauth/connect/redeem"),
+        ("/mcp-beta/oauth/connect/callback", "/mcp-beta/oauth/connect/redeem"),
     ] {
         let resp = app()
             .oneshot(Request::get(page).body(Body::empty()).unwrap())
