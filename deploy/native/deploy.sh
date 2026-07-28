@@ -76,7 +76,9 @@ tar -C "$repo_root" -cf - static | $SSH "tar -C $REMOTE_DIR -xf -"
 tar -C "$repo_root" -cf - monitoring | $SSH "tar -C $REMOTE_DIR -xf -"
 
 echo ">> rendering + installing units and Caddyfile, then (re)starting services"
-unit_mcp="$(sed "s#__PUBLIC_URL__#https://$DOMAIN#g" "$here/imcp2.service")"
+# MCP_SERVE_BETA is set (to "1") only for the staging deployment, so /mcp-beta
+# is exposed there and not in production; it defaults to empty (off) otherwise.
+unit_mcp="$(sed -e "s#__PUBLIC_URL__#https://$DOMAIN#g" -e "s#__MCP_SERVE_BETA__#${MCP_SERVE_BETA:-}#g" "$here/imcp2.service")"
 caddyfile="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__ACME_EMAIL__#$ACME_EMAIL#g" "$here/Caddyfile")"
 caddy_unit="$(cat "$here/caddy.service")"
 # Pin the dashboard's SSRF allowlist to this deployment's own host. It used to be
