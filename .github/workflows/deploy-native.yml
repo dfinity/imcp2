@@ -21,6 +21,14 @@ name: Deploy (native)
 
 on:
   workflow_call:
+    outputs:
+      sha:
+        # The commit the binary was actually built from. A caller must use this
+        # rather than github.sha to describe what was deployed: on a
+        # workflow_dispatch rollback github.sha is the default branch, while this
+        # is the ref the run was asked to deploy.
+        description: Commit the deployed binary was built from.
+        value: ${{ jobs.build.outputs.sha }}
     inputs:
       environment:
         description: GitHub Environment for the ship job (carries the approval gate).
