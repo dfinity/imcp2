@@ -83,7 +83,15 @@ export const renderText = (report, opts = {}) => {
   );
   lines.push(
     `MCP server: ${c(ANSI.cyan, clean(report.targets.mcpOrigin))}   ` +
-      `II instance: ${c(ANSI.cyan, clean(report.targets.iiOrigin ?? "(unresolved)"))}`,
+      `II instance${report.targets.iiOrigins?.length > 1 ? "s" : ""}: ` +
+      c(
+        ANSI.cyan,
+        clean(
+          report.targets.iiOrigins?.length
+            ? report.targets.iiOrigins.join(", ")
+            : "(unresolved)",
+        ),
+      ),
   );
   const dep = report.deployment;
   if (dep && (dep.version || dep.commit)) {

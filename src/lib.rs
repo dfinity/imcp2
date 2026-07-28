@@ -175,6 +175,18 @@ impl McpServer {
         &self.mcp_path
     }
 
+    /// Which Internet Identity this instance connects users against (the
+    /// [`McpConfig::instance`] it was built with).
+    ///
+    /// Exposed so a deployment can *advertise* its II pairing — see the
+    /// `instances` array on `main.rs`'s `/version`. Without that, an external
+    /// monitor can only guess which II a given origin hands off to, and the
+    /// obvious guess (strip the `mcp.` label off the host) is wrong for any
+    /// deployment whose MCP origin is not a subdomain of its II.
+    pub fn instance(&self) -> &IiInstance {
+        self.identities.instance()
+    }
+
     /// The MCP API and its OAuth authorization server, as one router to nest
     /// at [`Self::mcp_path`]:
     ///

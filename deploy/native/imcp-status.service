@@ -7,10 +7,12 @@ Wants=network-online.target
 Type=simple
 User=ec2-user
 WorkingDirectory=/opt/imcp2/monitoring/mcp-status
-# Probe the public deployment end-to-end (through Caddy/TLS). The II origin is
-# derived from the MCP origin (mcp.<env>.id.ai -> <env>.id.ai). The allowlist is
-# pinned to the deployment's own domain so the probes can never be steered
-# elsewhere. Binds to 127.0.0.1; Caddy publishes it under https://<domain>/status/.
+# Probe the public deployment end-to-end (through Caddy/TLS). Which Internet
+# Identity instances to probe is read from this server's own /version, so no II
+# origin is configured here. The allowlist is pinned to the deployment's own host
+# (the dashboard always permits the built-in id.ai suffixes on top), so the probes
+# can never be steered elsewhere -- including by the server's own /version.
+# Binds to 127.0.0.1; Caddy publishes it under https://<domain>/status/.
 Environment=MCP_STATUS_ALLOWED_HOSTS=__ALLOWED_HOSTS__
 ExecStart=/usr/bin/node /opt/imcp2/monitoring/mcp-status/server.js --port 8137 --host 127.0.0.1 --mcp https://__DOMAIN__
 Restart=always

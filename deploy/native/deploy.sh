@@ -79,9 +79,13 @@ echo ">> rendering + installing units and Caddyfile, then (re)starting services"
 unit_mcp="$(sed "s#__PUBLIC_URL__#https://$DOMAIN#g" "$here/imcp2.service")"
 caddyfile="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__ACME_EMAIL__#$ACME_EMAIL#g" "$here/Caddyfile")"
 caddy_unit="$(cat "$here/caddy.service")"
-# Pin the dashboard's SSRF allowlist to the deployment's parent domain so it
-# covers both the MCP host (mcp.<env>.id.ai) and the derived II host (<env>.id.ai).
-status_allowed="${DOMAIN#*.}"
+# Pin the dashboard's SSRF allowlist to this deployment's own host. It used to be
+# the PARENT domain (${DOMAIN#*.}) because the dashboard guessed the II origin by
+# stripping the `mcp.` label — on mcp.internetcomputer.org that silently
+# allowlisted all of internetcomputer.org. The II origins now come from the
+# server's /version and are covered by the dashboard's built-in id.ai suffixes,
+# so only the MCP host itself needs adding.
+status_allowed="$DOMAIN"
 unit_status="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__ALLOWED_HOSTS__#$status_allowed#g" "$here/imcp-status.service")"
 
 $SSH "sudo bash -s" <<EOF
