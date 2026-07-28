@@ -25,6 +25,47 @@ repo_root="$(cd "$here/../.." && pwd)"
 
 [ -x "$repo_root/build-out/imcp2" ] || { echo "build-out/imcp2 missing — run deploy/native/build.sh first"; exit 1; }
 
+# Refuse to ship a binary built for the wrong architecture. Without this the unit
+# installs cleanly and then crash-loops on "Exec format error", which reads like an
+# app bug rather than a build-target mistake. Read the ELF header directly — no
+# dependency on `file` or its output wording.
+bin="$repo_root/build-out/imcp2"
+# Match all four magic bytes (0x7F 'E' 'L' 'F'), not just the "ELF" that trails
+# them: a file whose first byte is anything else is not an ELF object however its
+# next three read. A file shorter than four bytes leaves the tail fields empty and
+# fails here too.
+read -r magic0 magic1 magic2 magic3 <<<"$(od -An -tu1 -j0 -N4 "$bin")"
+[ "$magic0 $magic1 $magic2 $magic3" = "127 69 76 70" ] || {
+  echo "ERROR: $bin is not an ELF binary — did build.sh write something else there?" >&2
+  exit 1
+}
+# e_machine is a 2-byte field at offset 18, in the byte order named by EI_DATA
+# (offset 5: 1 = little-endian, 2 = big-endian). Read the whole field rather than
+# assuming it fits in the low byte: it does for our targets (x86-64 is 0x003E,
+# aarch64 0x00B7) but not in general — LoongArch is 258, whose low byte is 2.
+elf_data="$(od -An -tu1 -j5 -N1 "$bin" | tr -d '[:space:]')"
+read -r m0 m1 <<<"$(od -An -tu1 -j18 -N2 "$bin")"
+case "$elf_data" in
+  1) elf_machine=$(( m0 | (m1 << 8) )) ;;
+  2) elf_machine=$(( (m0 << 8) | m1 )) ;;
+  *) elf_machine=-1 ;;
+esac
+case "$elf_machine" in
+  62)  built_for=x86_64 ;;   # 0x003E EM_X86_64
+  183) built_for=aarch64 ;;  # 0x00B7 EM_AARCH64
+  *)   built_for="unknown(e_machine=$elf_machine)" ;;
+esac
+host_arch="$($SSH 'uname -m')"
+if [ "$built_for" != "$host_arch" ]; then
+  echo "ERROR: build-out/imcp2 is $built_for but $HOST is $host_arch." >&2
+  case "$host_arch" in
+    x86_64)  echo "       Rebuild with: ARCH=amd64 deploy/native/build.sh" >&2 ;;
+    aarch64) echo "       Rebuild with: ARCH=arm64 deploy/native/build.sh" >&2 ;;
+  esac
+  exit 1
+fi
+echo ">> architecture ok ($built_for -> $HOST)"
+
 echo ">> staging $REMOTE_DIR"
 $SSH "sudo install -d -o \$(id -un) -g \$(id -gn) $REMOTE_DIR"
 
@@ -65,7 +106,13 @@ UNIT
 
 # --- caddy: install static binary if missing, create user/dirs ---
 if [ ! -x /usr/local/bin/caddy ]; then
-  curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=arm64" -o /usr/local/bin/caddy
+  # Match the host, not the build host: this box may be Graviton or x86_64.
+  case "\$(uname -m)" in
+    aarch64) caddy_arch=arm64 ;;
+    x86_64)  caddy_arch=amd64 ;;
+    *) echo "unsupported architecture \$(uname -m) for caddy download" >&2; exit 1 ;;
+  esac
+  curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=\$caddy_arch" -o /usr/local/bin/caddy
   chmod +x /usr/local/bin/caddy
 fi
 id caddy >/dev/null 2>&1 || useradd --system --home-dir /var/lib/caddy --shell /sbin/nologin caddy

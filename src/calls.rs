@@ -369,6 +369,101 @@ pub(crate) const MAX_CANDID_TEXT_BYTES: usize = 1024 * 1024;
 /// above any legitimate value/interface yet far below the stack-overflow depth.
 pub(crate) const MAX_CANDID_DEPTH: usize = 128;
 
+/// Stack given to the thread that parses untrusted textual Candid. Tool handlers
+/// run on tokio worker threads with a 2 MiB stack; 32× that is a wide margin —
+/// thousands of times the depth [`guard_candid_text`] admits — though with input
+/// capped at [`MAX_CANDID_TEXT_BYTES`] it is a margin, not a proof. Virtual, so an
+/// idle mapping costs no resident memory.
+const CANDID_PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Deep-stack parse threads allowed to be alive at once, per core (min 4). These
+/// parses are CPU-bound, and running them inline on the tokio workers already
+/// capped them at roughly one per core; the permit restores that ceiling instead
+/// of letting untrusted traffic multiply threads — and 64 MiB stack mappings —
+/// with request concurrency. Waiting for a permit blocks the caller exactly as a
+/// busy worker used to, and every parse is bounded by [`MAX_CANDID_TEXT_BYTES`]
+/// and [`MAX_CANDID_DEPTH`], so the queue always drains.
+const CANDID_PARSE_THREADS_PER_CORE: usize = 1;
+
+/// Free deep-stack parse permits, and the condvar sleepers wait on.
+fn candid_parse_permits() -> &'static (std::sync::Mutex<usize>, std::sync::Condvar) {
+    static PERMITS: std::sync::OnceLock<(std::sync::Mutex<usize>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let limit = (cores * CANDID_PARSE_THREADS_PER_CORE).max(4);
+        (std::sync::Mutex::new(limit), std::sync::Condvar::new())
+    })
+}
+
+/// Holds one [`candid_parse_permits`] slot; returns it on drop, including while
+/// unwinding from a parser panic.
+struct CandidParsePermit;
+
+impl CandidParsePermit {
+    /// Block until a slot is free, then take it.
+    fn acquire() -> Self {
+        let (free, wakeup) = candid_parse_permits();
+        // The critical sections below cannot panic, so the lock cannot be poisoned.
+        let mut free = free.lock().expect("candid parse permits poisoned");
+        while *free == 0 {
+            free = wakeup.wait(free).expect("candid parse permits poisoned");
+        }
+        *free -= 1;
+        Self
+    }
+}
+
+impl Drop for CandidParsePermit {
+    fn drop(&mut self) {
+        let (free, wakeup) = candid_parse_permits();
+        *free.lock().expect("candid parse permits poisoned") += 1;
+        wakeup.notify_one();
+    }
+}
+
+/// Run `f` — a parse of untrusted textual Candid, plus everything done with the
+/// resulting AST before it is dropped — on a dedicated thread with a
+/// [`CANDID_PARSE_STACK_BYTES`] stack, at most
+/// [`CANDID_PARSE_THREADS_PER_CORE`]-per-core of them at a time. `None` only if
+/// that thread can't be spawned (resource exhaustion); callers then degrade
+/// exactly as they do for input they can't parse, and never fall back to parsing
+/// on the caller's small stack.
+///
+/// Defense in depth behind [`guard_candid_text`] (CWE-674). A stack overflow is an
+/// uncatchable process abort that would drop every concurrent session, and
+/// `candid_parser`'s parse / type-check / `Display` / `Drop` passes all recurse
+/// unguarded, so the depth limit must never be the only thing standing between a
+/// hostile input and the guard page: should the scanner ever mis-measure a value,
+/// the parse still has to run thousands of levels deep before it can hurt anyone.
+///
+/// The permit is held by the CALLING thread for the whole call, so these must not
+/// nest: an `f` that itself calls `on_deep_stack` could exhaust the permits and
+/// wait on itself. Every current caller parses directly instead.
+pub(crate) fn on_deep_stack<T: Send>(f: impl FnOnce() -> T + Send) -> Option<T> {
+    let _permit = CandidParsePermit::acquire();
+    let mut out = None;
+    let mut panicked = None;
+    std::thread::scope(|scope| {
+        let slot = &mut out;
+        let spawned = std::thread::Builder::new()
+            .name("candid-parse".into())
+            .stack_size(CANDID_PARSE_STACK_BYTES)
+            .spawn_scoped(scope, move || *slot = Some(f()));
+        if let Ok(handle) = spawned {
+            if let Err(payload) = handle.join() {
+                panicked = Some(payload);
+            }
+        }
+    });
+    // A panic inside `f` must surface on the caller's thread exactly as it would
+    // have without this helper — not be silently laundered into `None`.
+    if let Some(payload) = panicked {
+        std::panic::resume_unwind(payload);
+    }
+    out
+}
+
 /// Reject caller-supplied textual Candid (a value, or `.did` service text) that
 /// is too large or too deeply nested to parse safely, BEFORE handing it to
 /// `candid_parser` (CWE-674). `what` names the input for the error message.
@@ -380,9 +475,11 @@ pub(crate) const MAX_CANDID_DEPTH: usize = 128;
 /// it — NOT merely because the next token is a word: that word may be
 /// `record`/`variant`, which opens a bracket the prefix must outlive (so
 /// `opt record { … }` correctly counts as two levels, not one). String literals
-/// are skipped so their contents can't inflate the count. It is a conservative
-/// over-approximation that tracks the parser's container recursion without
-/// under-counting nested `opt`/`vec`/bracket levels.
+/// are skipped so their contents can't inflate the count, and comments are skipped
+/// exactly as the lexer skips them (see [`skip_trivia`] — a `"` inside a comment
+/// must NOT open a string, or the scan would desynchronize from the parser and
+/// under-count). It is a conservative over-approximation that tracks the parser's
+/// container recursion without under-counting nested `opt`/`vec`/bracket levels.
 pub(crate) fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
     if text.len() > MAX_CANDID_TEXT_BYTES {
         return Err(format!(
@@ -400,16 +497,14 @@ pub(crate) fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
             stack.pop();
         }
     }
-    // The next non-whitespace byte at/after `j` (to tell `record {` from a leaf).
-    let peek_significant = |j: usize| -> Option<u8> {
-        bytes[j..]
-            .iter()
-            .find(|&&b| !b.is_ascii_whitespace())
-            .copied()
-    };
+    // The next significant (non-trivia) byte at/after `j` — used to tell
+    // `record {` from a leaf, so an interposed comment can't hide the `{`.
+    let peek_significant = |j: usize| -> Option<u8> { bytes.get(skip_trivia(bytes, j)).copied() };
     let mut i = 0;
     while i < bytes.len() {
-        let c = bytes[i];
+        // Whitespace and comments carry no structure and never complete a value.
+        i = skip_trivia(bytes, i);
+        let Some(&c) = bytes.get(i) else { break };
         match c {
             b'"' => {
                 // Skip a string literal (handles \" escapes) so its contents don't count.
@@ -477,6 +572,57 @@ fn depth_err(what: &str) -> String {
     format!("{what} is nested too deeply (limit {MAX_CANDID_DEPTH}) — refusing to parse")
 }
 
+/// Advance past everything `candid_parser`'s lexer treats as trivia — whitespace
+/// and comments — returning the index of the next significant byte (or
+/// `bytes.len()`). Candid has BOTH `//` line comments (to the next `\n`, or EOF)
+/// and `/* … */` block comments, which **nest**; the lexer skips them in the value
+/// and `.did` grammars alike.
+///
+/// [`guard_candid_text`] MUST skip them the same way. The scanner treats a `"` as
+/// the start of a string literal whose contents it ignores, so a quote hidden in a
+/// comment — `//"` — would otherwise make the guard swallow all the structure that
+/// follows (depth stays 0, `Ok`) while the parser, which drops the comment, goes on
+/// to parse the arbitrarily deep value after it: an unrecoverable stack-overflow
+/// process abort (CWE-674). Any divergence must err toward over-counting, never
+/// under-counting; an unclosed comment simply runs to EOF here, and the parser
+/// rejects it as a lexical error anyway.
+fn skip_trivia(bytes: &[u8], mut j: usize) -> usize {
+    loop {
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        match (bytes.get(j), bytes.get(j + 1)) {
+            (Some(b'/'), Some(b'/')) => {
+                j += 2;
+                while j < bytes.len() && bytes[j] != b'\n' {
+                    j += 1;
+                }
+            }
+            (Some(b'/'), Some(b'*')) => {
+                // Mirrors the lexer's nesting counter: `/*` opens, `*/` closes.
+                j += 2;
+                let mut depth = 1usize;
+                while depth > 0 && j < bytes.len() {
+                    match (bytes[j], bytes.get(j + 1)) {
+                        (b'/', Some(b'*')) => {
+                            depth += 1;
+                            j += 2;
+                        }
+                        (b'*', Some(b'/')) => {
+                            depth -= 1;
+                            j += 2;
+                        }
+                        _ => j += 1,
+                    }
+                }
+            }
+            // A lone `/` is not a Candid token at all (the parser errors on it);
+            // leave it to the caller as a significant byte.
+            _ => return j,
+        }
+    }
+}
+
 /// Encode textual Candid args to bytes. With `did` (the canister interface),
 /// coerce the args to the method's declared parameter types — so plain literals
 /// land as the method expects (`42` -> `nat64`, `1` -> `float64`, `opt`/`vec`
@@ -489,20 +635,23 @@ pub fn encode_args(did: Option<&str>, method: &str, args_text: &str) -> Result<V
     // a hard reject (CWE-674). An over-limit `did` is non-fatal: skip the typed
     // path (don't parse it) and fall back to type-less encoding below.
     guard_candid_text("the `args` value", args_text)?;
-    let parsed = candid_parser::parse_idl_args(args_text)
-        .map_err(|e| format!("could not parse args `{args_text}`: {e}"))?;
-    if let Some(did) = did.filter(|d| guard_candid_text("the `candid` interface", d).is_ok()) {
-        if let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() {
-            if let Ok(func) = env.get_method(&actor, method) {
-                return parsed
-                    .to_bytes_with_types(&env, &func.args)
-                    .map_err(|e| format!("args don't match `{method}`'s Candid signature: {e}"));
+    on_deep_stack(|| {
+        let parsed = candid_parser::parse_idl_args(args_text)
+            .map_err(|e| format!("could not parse args `{args_text}`: {e}"))?;
+        if let Some(did) = did.filter(|d| guard_candid_text("the `candid` interface", d).is_ok()) {
+            if let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() {
+                if let Ok(func) = env.get_method(&actor, method) {
+                    return parsed.to_bytes_with_types(&env, &func.args).map_err(|e| {
+                        format!("args don't match `{method}`'s Candid signature: {e}")
+                    });
+                }
             }
         }
-    }
-    parsed
-        .to_bytes()
-        .map_err(|e| format!("could not encode args `{args_text}`: {e}"))
+        parsed
+            .to_bytes()
+            .map_err(|e| format!("could not encode args `{args_text}`: {e}"))
+    })
+    .unwrap_or_else(|| Err("could not spawn a thread to parse the `args` value".into()))
 }
 
 /// Decode reply `bytes` to textual Candid. With `did`, decode against the
@@ -525,11 +674,14 @@ pub fn decode_bytes_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<St
     // Skip (fall back to type-less decoding) if the interface is too large/nested
     // to parse safely (CWE-674).
     guard_candid_text("the `candid` interface", did).ok()?;
-    let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
-    let actor = actor?;
-    let func = env.get_method(&actor, method).ok()?;
-    let decoded = IDLArgs::from_bytes_with_types(bytes, &env, &func.rets).ok()?;
-    Some(decoded.to_string())
+    on_deep_stack(|| {
+        let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
+        let actor = actor?;
+        let func = env.get_method(&actor, method).ok()?;
+        let decoded = IDLArgs::from_bytes_with_types(bytes, &env, &func.rets).ok()?;
+        Some(decoded.to_string())
+    })
+    .flatten()
 }
 
 /// True when `did` exposes the standard OQL query surface: BOTH a `schema` and
@@ -548,10 +700,13 @@ pub fn has_oql(did: &str) -> bool {
     if guard_candid_text("the `candid` interface", did).is_err() {
         return false;
     }
-    let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() else {
-        return false;
-    };
-    env.get_method(&actor, "schema").is_ok() && env.get_method(&actor, "execute").is_ok()
+    on_deep_stack(|| {
+        let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() else {
+            return false;
+        };
+        env.get_method(&actor, "schema").is_ok() && env.get_method(&actor, "execute").is_ok()
+    })
+    .unwrap_or(false)
 }
 
 /// Whether `method` is callable as a Candid `query` in `did`: `Some(true)` for a
@@ -569,10 +724,13 @@ pub fn is_query_method(did: &str, method: &str) -> Option<bool> {
     if guard_candid_text("the `candid` interface", did).is_err() {
         return None;
     }
-    let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
-    let actor = actor?;
-    let func = env.get_method(&actor, method).ok()?;
-    Some(func.is_query())
+    on_deep_stack(|| {
+        let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
+        let actor = actor?;
+        let func = env.get_method(&actor, method).ok()?;
+        Some(func.is_query())
+    })
+    .flatten()
 }
 
 /// Enforce "prefer OQL": when a canister exposes an OQL query surface, its data
@@ -914,12 +1072,15 @@ pub fn api_doc_method(did: &str) -> Option<&'static str> {
     if guard_candid_text("the `candid` interface", did).is_err() {
         return None;
     }
-    let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() else {
-        return None;
-    };
-    ["getApiDoc", "get_api_doc"]
-        .into_iter()
-        .find(|m| env.get_method(&actor, m).is_ok())
+    on_deep_stack(|| {
+        let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() else {
+            return None;
+        };
+        ["getApiDoc", "get_api_doc"]
+            .into_iter()
+            .find(|m| env.get_method(&actor, m).is_ok())
+    })
+    .flatten()
 }
 
 /// Decode a reply against the declared return types of `method` in `did`,
@@ -927,10 +1088,13 @@ pub fn api_doc_method(did: &str) -> Option<&'static str> {
 /// like the rest of the decode path; None on any guard/parse/decode failure.
 fn decode_args_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<IDLArgs> {
     guard_candid_text("the `candid` interface", did).ok()?;
-    let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
-    let actor = actor?;
-    let func = env.get_method(&actor, method).ok()?;
-    IDLArgs::from_bytes_with_types(bytes, &env, &func.rets).ok()
+    on_deep_stack(|| {
+        let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
+        let actor = actor?;
+        let func = env.get_method(&actor, method).ok()?;
+        IDLArgs::from_bytes_with_types(bytes, &env, &func.rets).ok()
+    })
+    .flatten()
 }
 
 /// Recognize an OQL result value: a `record { hasMore; rows }`, optionally
@@ -1146,6 +1310,112 @@ mod tests {
         // SIBLING (non-nested) opts stay shallow.
         assert!(guard_candid_text("v", &format!("\"{}\"", "(".repeat(10_000))).is_ok());
         assert!(guard_candid_text("v", &format!("(record {{ {} }})", "a = opt 1; ".repeat(1000))).is_ok());
+    }
+
+    // CWE-674, comment-hidden quote: `candid_parser`'s lexer drops `//` and
+    // `/* */` comments (block comments NEST) in both grammars, so the guard must
+    // too. A `"` inside a comment used to look like the start of a string literal
+    // to the scanner, which then swallowed every following byte at depth 0 and
+    // returned Ok — while the parser, seeing only a comment, went on to parse the
+    // arbitrarily deep value behind it and overflowed the stack.
+    #[test]
+    fn candid_guard_is_comment_aware() {
+        use super::guard_candid_text;
+        // The premise, straight from the parser: a quote inside a comment is not
+        // a string, and the value AFTER the comment is parsed normally. That is
+        // exactly what a comment-blind guard would fail to account for.
+        for hidden in ["//\"\n", "/*\"*/", "/* /* \" */ */"] {
+            assert!(
+                candid_parser::parse_idl_args(&format!("({hidden}opt opt 0)")).is_ok(),
+                "candid_parser is expected to skip {hidden:?} and parse what follows"
+            );
+        }
+        let deep = format!("{}0", "opt ".repeat(5000));
+        // Every way of hiding a quote in a CLOSED comment must still be refused.
+        for hidden in [
+            "//\"\n",
+            "// \" trailing text\n",
+            "/*\"*/",
+            "/* \" */",
+            "/* /* \" */ */", // block comments nest, exactly as the lexer counts them
+            "//\"\n//\"\n",
+        ] {
+            let attack = format!("({hidden}{deep})");
+            assert!(
+                guard_candid_text("v", &attack).is_err(),
+                "quote hidden in {hidden:?} must not disable the depth scan"
+            );
+            // The same holds for the `.did` path and for bracket-only nesting.
+            assert!(
+                guard_candid_text("v", &format!("{hidden}{}", "{".repeat(200))).is_err(),
+                "quote hidden in {hidden:?} must not disable bracket counting"
+            );
+        }
+        // A comment may also sit BETWEEN a prefix and the group it wraps: the
+        // `opt` must survive the comment and still outlive `record`'s braces.
+        let deep_commented = format!(
+            "{}1{}",
+            "opt /* c */ record // c\n { a = ".repeat(100),
+            " }".repeat(100),
+        );
+        assert!(
+            guard_candid_text("v", &deep_commented).is_err(),
+            "a comment between `opt` and `record {{` must not drop the prefix"
+        );
+
+        // No false positives: comments are trivia, and `//` or `/*` INSIDE a
+        // string is ordinary string content, not a comment.
+        assert!(guard_candid_text(
+            "v",
+            "// the service\nservice : { /* a method */ f : (nat) -> (nat) query; }"
+        )
+        .is_ok());
+        assert!(guard_candid_text("v", "(opt /* c */ record /* c */ { a = opt 1 })").is_ok());
+        assert!(guard_candid_text("v", &format!("(\"// {}\")", "(".repeat(10_000))).is_ok());
+        assert!(guard_candid_text("v", &format!("(\"/* {}\")", "{".repeat(10_000))).is_ok());
+        // A lone `/` is not a comment (nor any Candid token) — it must not stall
+        // the scan or hide the nesting that follows it.
+        assert!(guard_candid_text("v", &format!("/{}", "(".repeat(200))).is_err());
+    }
+
+    // End to end: the guard is what stands between a hostile `args` value and an
+    // unrecoverable stack-overflow abort, so the comment-hidden vector must come
+    // back as an ordinary error — while a legitimately nested value still encodes.
+    #[test]
+    fn encode_args_refuses_comment_hidden_deep_nesting() {
+        use super::{encode_args, MAX_CANDID_DEPTH};
+        let attack = format!("(//\"\n{}0)", "opt ".repeat(20_000));
+        let err = encode_args(None, "m", &attack).expect_err("must be refused, not parsed");
+        assert!(err.contains("nested too deeply"), "unexpected error: {err}");
+        // Well under the limit: still parses and encodes (on the deep stack).
+        let ok = format!("({}0)", "opt ".repeat(MAX_CANDID_DEPTH / 2));
+        assert!(encode_args(None, "m", &ok).is_ok(), "legitimate nesting must still encode");
+    }
+
+    // Untrusted traffic must not be able to multiply 64 MiB parse threads with
+    // request concurrency, so `on_deep_stack` holds a per-core permit — but a cap
+    // that can deadlock or lose work would be worse than none. Far more callers
+    // than permits must all still make progress, and every one must get its own
+    // closure's result back.
+    #[test]
+    fn deep_stack_parses_are_capped_but_all_complete() {
+        use super::on_deep_stack;
+        let callers: Vec<_> = (0..64u32)
+            .map(|i| std::thread::spawn(move || on_deep_stack(|| i * 2)))
+            .collect();
+        let got: Vec<_> = callers
+            .into_iter()
+            .map(|c| c.join().expect("caller must not panic or hang"))
+            .collect();
+        assert_eq!(got, (0..64u32).map(|i| Some(i * 2)).collect::<Vec<_>>());
+        // Permits are returned, so a later call still runs rather than blocking.
+        assert_eq!(on_deep_stack(|| "after"), Some("after"));
+        // A panicking parse must surface on the caller's thread AND hand its
+        // permit back; leaking one would wedge a slot for the process's lifetime.
+        // (The parse thread's panic message on stderr here is expected.)
+        let boom = std::panic::catch_unwind(|| on_deep_stack(|| panic!("parser blew up")));
+        assert!(boom.is_err(), "a panic inside the parse must reach the caller");
+        assert_eq!(on_deep_stack(|| "after panic"), Some("after panic"));
     }
 
     // OQL detection is name-based (both `schema` and `execute` must be present),

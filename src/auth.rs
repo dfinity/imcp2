@@ -126,7 +126,7 @@ const GRANT_TTL_SECS: u64 = 3600;
 
 /// Name of the browser-session cookie that binds `/oauth/authorize` to
 /// `/oauth/connect/redeem`: only the browser that started the flow can complete it.
-const CONNECT_COOKIE: &str = "mcp_connect";
+pub(crate) const CONNECT_COOKIE: &str = "mcp_connect";
 
 /// A registered OAuth client (RFC 7591): the redirect URIs it declared. The
 /// auth-code flow only redirects a code to one of these (exact match), so the
