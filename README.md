@@ -392,9 +392,9 @@ cargo run
 # $MCP_SERVE_BETA (set it to also serve the beta II instance at /mcp-beta, for staging)
 ```
 
-`GET /` serves a self-contained, ICP-styled landing page that names the two MCP
-endpoints (`/mcp` on beta II, `/mcp-prod` on production II) and lists the tools
-grouped by purpose. `GET /version` is the operations probe (see [Auth](#auth-oauth-21-login-via-internet-identity)).
+`GET /` serves a self-contained, ICP-styled landing page that names the
+production `/mcp` endpoint (staging also serves beta II at `/mcp-beta`) and lists
+the tools grouped by purpose. `GET /version` is the operations probe (see [Auth](#auth-oauth-21-login-via-internet-identity)).
 
 ## Deploy
 
