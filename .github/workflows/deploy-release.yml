@@ -69,12 +69,40 @@ jobs:
           REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
+
+          # Constrain the entire input to one line of refname characters BEFORE
+          # looking at its shape. This step writes an input-derived value to
+          # $GITHUB_OUTPUT, and the dispatch input is free text that the REST API
+          # will happily accept newlines in. A newline turns the write below into
+          # multiple key=value lines, a second `ref=` line wins, and the deploy
+          # checks out whatever was appended while the run's inputs still show the
+          # innocuous value — the guard defeated, with a misleading audit trail.
+          #
+          # Anchors must bind the whole string, so this uses bash [[ =~ ]] rather
+          # than grep: grep is line-oriented and would match a payload's first line
+          # and report success for the whole thing.
+          #
+          # $REF is deliberately not echoed here — it has not been vetted yet, and
+          # stdout is parsed for ::workflow commands::.
+          if [[ ! "$REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Refusing the dispatch ref: it must be a single line of [A-Za-z0-9._/-] characters. Pass a release-* tag or a full 40-character commit SHA."
+            exit 1
+          fi
+
           # Strip a fully-qualified tag prefix so refs/tags/release-X is treated the
           # same as release-X — it names the identical tag and is just as immutable.
           # Only refs/tags/ is stripped: refs/heads/release-X must stay rejected, and
           # does, because after no stripping it no longer starts with "release-".
           ref="${REF#refs/tags/}"
-          if [ "${ref#release-}" != "$ref" ]; then
+
+          if [[ "$ref" =~ ^release-[A-Za-z0-9._/-]+$ ]]; then
+            # git's own refname grammar catches what a character class cannot: "..",
+            # "@{", a trailing ".lock", a leading or trailing dot, an empty path
+            # component. No repository required — this is a pure syntax check.
+            if ! git check-ref-format "refs/tags/$ref"; then
+              echo "::error::Refusing to deploy '$REF': not a valid git tag name."
+              exit 1
+            fi
             # Emit the tag fully qualified rather than echoing the input back. A bare
             # release-X is ambiguous if a *branch* of that name also exists, and a
             # textual check cannot tell them apart — refs/tags/release-X can only
@@ -82,7 +110,7 @@ jobs:
             echo "ref=refs/tags/$ref" >> "$GITHUB_OUTPUT"
           # Hex is matched case-insensitively; git resolves an uppercase SHA to the
           # same commit, so rejecting it would be a surprise with no safety value.
-          elif printf '%s' "$ref" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+          elif [[ "$ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
             echo "ref=$ref" >> "$GITHUB_OUTPUT"
           else
             echo "::error::Refusing to deploy '$REF' to production: it is neither a release-* tag (bare or refs/tags/-qualified) nor a full 40-character commit SHA. Branches and abbreviated SHAs can move or become ambiguous, so the deployed revision would not be reproducible. Cut a release-* tag, or pass the full commit SHA."
