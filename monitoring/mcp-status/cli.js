@@ -6,7 +6,8 @@
 //
 // Options:
 //   --mcp <origin>     MCP server origin to monitor (default https://mcp.beta.id.ai)
-//   --ii <origin>      Internet Identity origin (default: derived from the MCP origin)
+//   --ii <origin>      Pin the Internet Identity origin (default: the ones the
+//                      server advertises in /version's instances[])
 //   --timeout <ms>     Per-probe timeout in milliseconds (default 10000)
 //   --json             Emit the raw JSON report instead of the text view
 //   --no-color         Disable ANSI colours
@@ -74,7 +75,7 @@ const HELP = `IMCP (IC MCP) status dashboard
 Usage: node monitoring/mcp-status/cli.js [options]
 
   --mcp <origin>   MCP server origin (default https://mcp.beta.id.ai)
-  --ii <origin>    Internet Identity origin (default: derived from --mcp)
+  --ii <origin>    Pin the II origin (default: read from the server's /version)
   --timeout <ms>   Per-probe timeout (default 10000)
   --json           Emit raw JSON instead of the text report
   --no-color       Disable ANSI colours

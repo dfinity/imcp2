@@ -133,6 +133,29 @@ async fn main() -> anyhow::Result<()> {
     // gauge reports zero for it when the staging instance isn't served.
     let (ver_prod, ver_beta) = (prod.clone(), beta.clone());
 
+    // Which II each served mount hands off to. Built once (fixed for the process)
+    // and cloned per request. This is the only way an external monitor can learn
+    // the pairing: neither the mount path nor the origin implies it —
+    // `mcp.internetcomputer.org` pairs with `id.ai`, not with
+    // `internetcomputer.org` — and `II_URL`/`II_URL_PROD` can move the origins at
+    // runtime, so reporting the resolved value beats any list a monitor hardcodes.
+    // Only served instances are listed, so `/mcp-beta` appears iff $MCP_SERVE_BETA
+    // put it on the router.
+    let instances = serde_json::Value::Array(
+        std::iter::once(&prod)
+            .chain(beta.as_ref())
+            .map(|s| {
+                let i = s.instance();
+                serde_json::json!({
+                    "name": i.name,
+                    "mcp_path": s.mcp_path(),
+                    "ii_origin": i.ii_url,
+                    "ii_canister": i.ii_canister.to_text(),
+                })
+            })
+            .collect(),
+    );
+
     let mut app = Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
         // Unauthenticated build/version probe so operators and the status
@@ -147,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
                 // `Fn` (reusable across requests) while the async body owns them.
                 let ver_prod = ver_prod.clone();
                 let ver_beta = ver_beta.clone();
+                let instances = instances.clone();
                 async move {
                     // Per-instance session gauges, each from one lock + iteration
                     // of the session map:
@@ -169,6 +193,11 @@ async fn main() -> anyhow::Result<()> {
                         "commit": option_env!("GIT_SHA").unwrap_or("unknown"),
                         "built_at": option_env!("BUILD_TIME").and_then(|s| s.parse::<u64>().ok()),
                         "started_at": started_at,
+                        // The II instances this origin actually serves: mount path,
+                        // the II origin that mount hands off to, and that II's
+                        // canister id. A status monitor needs this to probe the
+                        // right II — the pairing is not derivable from the origin.
+                        "instances": instances,
                         // Per-instance count of live sessions: authenticated
                         // sessions with a non-expired II grant. A session counts
                         // from grant redemption until its grant expires, idle or not.

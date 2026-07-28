@@ -12,13 +12,22 @@ It answers three questions and adds a few suggestions:
    unauthenticated `401` challenge, dynamic client registration, and the
    `/mcp/oauth/authorize` + `/mcp/oauth/token` endpoints, plus TLS certificate
    freshness.
-2. **Which Internet Identity instance is it linked to?** — resolves the II
-   origin (derived from the `mcp.<env>.id.ai` ↔ `<env>.id.ai` convention, or
-   overridden explicitly). Question 3 then checks that resolved origin is
-   reachable and serving its `/mcp` connect page. The pairing itself is
-   inferred from config / the naming convention — the dashboard doesn't
-   live-verify that the MCP server actually hands off to that II instance.
-3. **Is that II instance healthy and is its `/mcp` connect page served?** —
+2. **Which Internet Identity instance(s) is it linked to?** — read from the
+   `instances` array the server advertises at `GET /version`, one entry per
+   served mount (`{name, mcp_path, ii_origin, ii_canister}`). The server is the
+   authority on its own pairing, so this is not guessed: an earlier version
+   derived the II origin by stripping the `mcp.` label off the MCP host, which
+   works only when the MCP server is a subdomain of its II — it mapped
+   `mcp.internetcomputer.org` to `internetcomputer.org`, an unrelated site whose
+   `404` on `/mcp` read as an Internet Identity outage. Advertised origins are
+   still validated against the probe allowlist before use, so a misconfigured or
+   compromised server cannot steer these probes at a third party; a rejected
+   entry is reported rather than silently dropped. Pin an origin with
+   `--ii` / `II_ORIGIN` to override the advertised list entirely.
+3. **Is each II instance healthy and is its `/mcp` connect page served?** —
+   question 3 runs once per served instance, so a staging deployment serving
+   both `/mcp` (production II) and `/mcp-beta` (beta II) has both monitored.
+   For each it
    checks the II frontend is reachable and IC-certified, reports its frontend
    canister id and related origins, confirms it serves its runtime config
    (textual Candid) at `/.config`, and verifies the `/mcp` connect page is

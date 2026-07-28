@@ -389,13 +389,30 @@
           activeTab = firstBad ? firstBad.id : tabs[0] && tabs[0].id;
         }
 
-        const canister = report.facts?.ii?.canisterId;
+        // One entry per II instance the server advertises at /version, so a
+        // deployment serving both /mcp and /mcp-beta shows both here rather
+        // than only whichever one a single field happened to hold.
+        const iiFacts = report.facts?.iiInstances ?? {};
+        const iiNames = Object.keys(iiFacts);
+        const ii = (t.iiOrigins ?? []).length
+          ? t.iiOrigins
+              .map((origin, i) => {
+                const name = iiNames[i];
+                const canister = name ? iiFacts[name]?.canisterId : undefined;
+                return (
+                  `<code>${esc(origin)}</code>` +
+                  (name ? ` <span class="sub">(${esc(name)})</span>` : "") +
+                  (canister ? ` <span class="sub">canister <code>${esc(canister)}</code></span>` : "")
+                );
+              })
+              .join(" &nbsp;·&nbsp; ")
+          : `<code>(unresolved)</code>`;
         const parts = [];
         parts.push(`<div class="overall">
           ${dot(report.overall)}
           <div>
             <div><strong>Overall: </strong>${badge(report.overall)}</div>
-            <div class="sub">MCP: <code>${esc(t.mcpOrigin)}</code> &nbsp;·&nbsp; II: <code>${esc(t.iiOrigin || "(unresolved)")}</code>${canister ? ` &nbsp;·&nbsp; II canister: <code>${esc(canister)}</code>` : ""}</div>
+            <div class="sub">MCP: <code>${esc(t.mcpOrigin)}</code> &nbsp;·&nbsp; II: ${ii}</div>
             ${deploymentHtml(report.deployment)}
           </div>
         </div>`);
