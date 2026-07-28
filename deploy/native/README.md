@@ -76,8 +76,22 @@ private IPv4 can obtain a Let's Encrypt cert (ACME validates over IPv6 happily) 
 will look healthy from any v6-capable network — while being entirely unreachable from
 IPv4-only clients. For a public MCP server that is a silent outage for a large share
 of callers, and the `/status/` dashboard will not reveal it if the prober itself has
-v6. Publish both an `A` and an `AAAA` record, and verify both families from outside
-before calling a rollout done.
+v6. This is not hypothetical: both hosts sat in exactly that state for a while,
+unnoticed because every observer had v6.
+
+**The two families are not symmetric, so "publish both" is the wrong rule.** What
+matters is that **IPv4 works**. An `A`-only deployment is fine in practice, because
+IPv4 reaches effectively everyone; the IPv6-only networks that do exist are mostly
+mobile carriers, and those generally run NAT64/DNS64 so their clients can still reach
+v4-only services. That translation is a property of the *client's* network, though, not
+something this deployment provides — a v6-only client whose network lacks it cannot
+reach an `A`-only host at all. So publish an `AAAA` too whenever the v6 path is
+genuinely reachable; just never publish `AAAA` *instead* of `A`. Production is `A`-only
+today because its IPv4 path was repaired and its `AAAA` record removed at the same time.
+
+Verify **IPv4 specifically**, from a network that has no v6 of its own if you can. A
+v6-capable client will happily mask a dead v4 path, and so will any check you run from
+inside a VPN or a cloud shell.
 
 ### Verifying dual-stack reachability
 
@@ -182,11 +196,54 @@ new tag.
 **ship** runs wherever the target host is reachable and needs only `ssh` + `tar`, no
 Docker and no Rust.
 
-That split is what lets the ship job run on a **self-hosted on-prem runner**, which is
-how staging is deployed: the host is reached on its private address over the VPN rather
-than over the public internet, so it needs no inbound SSH from the world. The heavy
-build stays on hosted infrastructure and only the binary crosses into the private
-network. The ship runner's own architecture is irrelevant; it never executes the binary.
+That split is what lets the ship job run on a **self-hosted runner**, which is how both
+environments deploy: the host is reached on its private address over the VPN rather than
+over the public internet. The heavy build stays on hosted infrastructure and only the
+binary crosses into the private network. The ship runner's own architecture is
+irrelevant; it never executes the binary.
+
+#### Narrowing inbound SSH
+
+The point of shipping over the VPN is that the host should not need `22/tcp` open to the
+world. It still does, because closing it requires knowing what source address to allow
+instead, and that is **not** simply the private network the host lives in. The security
+group already permits `22` from `10.0.0.0/8`; removing the world-facing rule broke the
+deploy anyway, so the ship pods reach an RFC1918 destination while presenting a source
+outside `10/8`.
+
+Nor can the runner tell you its own answer — `curl ifconfig.me` reports public internet
+egress, which this path does not use. Ask the host instead, which is what the ship job's
+**Report source address as seen by the host** step does via `$SSH_CLIENT`, or after the
+fact:
+
+```sh
+sudo journalctl -u sshd --since '15 minutes ago' | grep 'Accepted publickey'
+```
+
+**Do not try to solve this with a narrower CIDR — there isn't one.** Calico source-NATs
+each pod to the IP of whichever worker node it landed on, and traffic bound for this VPC
+leaves over a routed IPsec tunnel rather than a NATting gateway, so that node address
+arrives unchanged. Node IPs are provisioned dynamically rather than declared, the two
+clusters are separate sites with separate address ranges and either can run the job, and
+the SNAT-to-node-IP behaviour is an unpinned Calico default rather than a contract. Any
+prefix that looks right today can stop being right after routine cluster maintenance,
+and it would fail as a deploy timeout rather than as anything self-explanatory.
+
+The step above is therefore for **observing** what is happening, not for harvesting a
+range to hardcode. The durable fix is to stop needing inbound SSH at all — reach the
+host through **AWS Systems Manager Session Manager**, which requires no inbound port.
+`ssh` still works over it via a `ProxyCommand` using `AWS-StartSSHSession`, so
+`deploy.sh` needs no changes; only the workflow's SSH setup does. That closes `22`
+outright instead of narrowing it, and makes each deploy auditable in CloudTrail.
+
+Two things not to reach for, both circular here: a job that opens a short-lived rule for
+its own address cannot discover which address to open (that is what this whole section is
+about), and a bastion still needs inbound SSH from the same unstable sources.
+
+The `::/0` half of the port-22 rule has been removed: the IPsec tunnels and BGP sessions
+to this VPC are IPv4-only, so the deploy never arrives over IPv6 and that half permitted
+nothing but internet-sourced attempts. Note the group permitting `22` from `10.0.0.0/8`
+has no IPv6 entry either, so nothing on the v6 side was relying on it.
 
 `ship_runs_on` takes a JSON string, so a bare name is `'"dind-small"'` and a label set
 is `'["self-hosted","linux"]'`. Both deploys use the bare-name form, because the org's

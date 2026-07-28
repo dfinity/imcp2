@@ -183,6 +183,35 @@ jobs:
           fi
           chmod 644 ~/.ssh/known_hosts
 
+      # Record the address the HOST sees this runner coming from. That is the only
+      # thing a 22/tcp security-group rule can match on, and it is not knowable from
+      # the runner: `curl ifconfig.me` reports public internet egress, while this path
+      # goes over the VPN to an RFC1918 address, so the two are unrelated.
+      #
+      # Worth having on every run because narrowing 22/tcp away from 0.0.0.0/0 needs
+      # it, and a single observation is not enough to write a rule from — the ship
+      # pools are ephemeral pods spread over more than one cluster, so consecutive
+      # deploys can present different sources. Assuming this address was inside
+      # 10.0.0.0/8, which the host already permits, is what broke two deploys.
+      #
+      # Never fails the job: this is diagnostics, and if SSH is broken the Deploy step
+      # below reports it properly.
+      - name: Report source address as seen by the host
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          # Keep ssh's stderr: "Connection timed out", "Permission denied" and a host
+          # key mismatch are entirely different diagnoses, and surfacing which one it
+          # was is most of the value of a step that exists to explain SSH problems.
+          # Collapsed to one line because ::warning:: annotations are line-oriented.
+          err="${RUNNER_TEMP:-/tmp}/ssh-source.err"
+          if src="$(ssh -o BatchMode=yes -o ConnectTimeout=20 "$HOST" \
+                     'echo "${SSH_CLIENT%% *}"' 2>"$err")" && [ -n "$src" ]; then
+            echo "ship runner reaches the host from: $src"
+          else
+            echo "::warning::could not read SSH_CLIENT from the host: $(tr '\n' ' ' < "$err" 2>/dev/null)"
+          fi
+
       - name: Deploy
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
