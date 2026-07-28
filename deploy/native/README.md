@@ -145,17 +145,35 @@ being able to `ssh` in does not mean 80/443 are reachable from the internet.
 that there's no public IPv4 inbound, and that AWS creds are granted — ask it to make
 the box publicly reachable and report the address to set DNS *before* the deploy.
 
-## Automated deploys
+## Automated deploys: staging on `main`, production on `release-*`
 
-[`deploy.yml`](../../.github/workflows/deploy.yml) redeploys the **staging** host on
-every push to `main` (and can be re-run by hand from the Actions tab), so changes are
-exercised on a real box continuously. It runs in the `staging` GitHub Environment, and
-a `concurrency` group serializes deploys so two never overlap.
+Two hosts, two triggers, one shared mechanism:
+
+| Workflow | Trigger | Target | Environment |
+|---|---|---|---|
+| [`deploy.yml`](../../.github/workflows/deploy.yml) | push to `main` | staging | `staging` |
+| [`deploy-release.yml`](../../.github/workflows/deploy-release.yml) | push tag `release-*` | production | `production` |
+
+Staging tracks `main` continuously so changes get exercised on a real host; production
+only ever moves when someone cuts a tag, so the live revision is always a named,
+reproducible point in history.
 
 The mechanics live in [`deploy-native.yml`](../../.github/workflows/deploy-native.yml),
-a reusable workflow. It first runs the status dashboard's unit tests (a regression
-there stops the rollout), cross-builds the binary with `build.sh`, then runs
-`deploy.sh` over SSH — which ships and (re)starts the app and the dashboard service.
+a reusable workflow both call. It first runs the status dashboard's unit tests (a
+regression there stops the rollout), cross-builds the binary with `build.sh`, then runs
+`deploy.sh` over SSH — which ships and (re)starts the app and the dashboard service. A
+`concurrency` group per environment serializes deploys so two never overlap.
+
+### Cutting a release
+
+```sh
+git tag release-2026-07-27 <commit>   # any suffix; the `release-` prefix is the trigger
+git push origin release-2026-07-27
+```
+
+**Rolling back:** re-run `deploy-release.yml` from the Actions tab with an earlier tag
+as the `ref` input. That rebuilds and ships that exact commit — no revert commit, no
+new tag.
 
 ### The build/ship split
 
@@ -170,8 +188,13 @@ than over the public internet, so it needs no inbound SSH from the world. The he
 build stays on hosted infrastructure and only the binary crosses into the private
 network. The ship runner's own architecture is irrelevant; it never executes the binary.
 
-Set `ship_runs_on` to labels matching your runner. It takes a JSON string, so a single
-label is `'"ubuntu-24.04-arm"'` and a label set is `'["self-hosted","linux"]'`.
+`ship_runs_on` takes a JSON string, so a bare name is `'"dind-small"'` and a label set
+is `'["self-hosted","linux"]'`. Both deploys use the bare-name form, because the org's
+self-hosted capacity is **ARC runner scale sets** — a scale set is selected by its name
+alone and carries none of the `self-hosted` / `linux` / `x64` labels that classic
+runners get automatically. A label list therefore matches no scale set however the pool
+is labelled, and a job requesting one simply queues forever rather than failing, which
+reads like a stuck runner rather than a misconfigured selector.
 
 After each deploy the ship job reads `GET /version` on the host and asserts the
 reported `commit` matches what was just built, so a `systemctl restart` that silently
@@ -179,29 +202,44 @@ kept the old binary fails the run instead of passing quietly.
 
 ### Secrets
 
-| Secret | Value |
-|---|---|
-| `DEPLOY_SSH_KEY` | Private SSH key for the sudo-capable host user |
-| `DEPLOY_HOST` | `user@host` — the host's **private** address, since the ship job runs inside the VPN |
-| `DEPLOY_DOMAIN` | Public FQDN served over HTTPS |
-| `DEPLOY_ACME_EMAIL` | Email for Let's Encrypt / ACME |
-| `DEPLOY_KNOWN_HOSTS` | *(optional)* output of `ssh-keyscan <host>`; pin it to avoid trust-on-first-use |
+Staging and production take separate secrets so a production rollout can never be
+pointed at the wrong box by a stale value. Both hosts are reached on their **private**
+addresses, since the ship job runs inside the VPN.
 
-> **These must be repository-level secrets** (**Settings → Secrets and variables →
-> Actions**), *not* environment-scoped ones. A caller passes secrets into a reusable
-> workflow from outside any environment context, so environment-scoped secrets resolve
-> to empty there. Environment **protection rules** still apply normally — it is only
-> environment *secrets* that cannot be used this way.
+| Staging | Production | Value |
+|---|---|---|
+| `DEPLOY_SSH_KEY` | `PROD_DEPLOY_SSH_KEY` | Private SSH key for the sudo-capable host user |
+| `DEPLOY_HOST` | `PROD_DEPLOY_HOST` | `user@host`, the host's private address |
+| `DEPLOY_DOMAIN` | `PROD_DEPLOY_DOMAIN` | Public FQDN served over HTTPS |
+| `DEPLOY_ACME_EMAIL` | `PROD_DEPLOY_ACME_EMAIL` | Email for Let's Encrypt / ACME |
+| `DEPLOY_KNOWN_HOSTS` | `PROD_DEPLOY_KNOWN_HOSTS` | *(optional)* output of `ssh-keyscan <host>`; pin it to avoid trust-on-first-use |
+
+> **Set these as repository-level secrets** (**Settings → Secrets and variables →
+> Actions**). The callers pass them into the reusable workflow, and a job that calls
+> one with `uses:` cannot itself declare an `environment:` — so `${{ secrets.* }}` in
+> the caller only resolves repository and organization secrets. An environment-scoped
+> secret referenced there arrives empty.
+>
+> Environment secrets are *not* unusable, though. The `ship` job inside
+> `deploy-native.yml` does set `environment:`, and a secret defined on that
+> environment resolves there — and **takes precedence over the value passed in by the
+> caller**. So defining, say, `DEPLOY_HOST` on both the `staging` environment and at
+> repository level is not additive: the environment copy silently wins inside `ship`.
+> Pick one place per secret. Repository level is what the table above assumes, and
+> keeps the two callers symmetric.
+>
+> Environment **protection rules** are unaffected either way — see the approval gate
+> below.
 
 The host prerequisites above (DNS, inbound 80/443, sudo SSH user) still apply — the
 workflow only automates the build-and-ship step, not provisioning the box.
 
 ### Approval gate
 
-The deploy job runs in a named GitHub Environment. To require manual approval before a
-rollout, add yourself (or a team) as a **Required reviewer** under **Settings →
-Environments → <name>**. Until a reviewer is configured the environment imposes no
-gate, so pushes deploy straight through.
+Each deploy job runs in its named GitHub Environment. To require manual approval
+before production rollouts, go to **Settings → Environments → production** and add
+yourself (or a team) as a **Required reviewer**. Until a reviewer is configured the
+environment imposes no gate, so a `release-*` tag deploys straight through.
 
 ## Operating
 

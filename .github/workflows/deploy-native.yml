@@ -1,8 +1,9 @@
 # Reusable native deploy: cross-build the binary for inputs.arch (arm64 or amd64),
 # then ship it over SSH and (re)start the systemd services. Called by deploy.yml
-# (main -> staging). Environment, runner and architecture are all inputs so a second
-# caller can drive a different target — production on release tags is the intended
-# one — without duplicating any of this. See deploy/native/README.md.
+# (main -> staging) and deploy-release.yml (release-* tags -> production). Each
+# caller supplies its own environment, runner labels and architecture; the release
+# caller additionally pins an explicit ref, so a rollback can name an earlier tag.
+# See deploy/native/README.md.
 #
 # Split into two jobs on purpose:
 #
@@ -27,9 +28,11 @@ on:
         type: string
       ship_runs_on:
         description: >-
-          JSON runner spec for the ship job, e.g. '"ubuntu-24.04-arm"' or
-          '["self-hosted","linux","imcp-prod"]'. Must be somewhere the target host
-          is reachable. Parsed with fromJSON, so it must be valid JSON.
+          JSON runner spec for the ship job — a bare name for an ARC runner scale
+          set ('"dind-small"'), or a label list for classic runners
+          ('["self-hosted","linux"]'). Scale sets carry no default labels, so a list
+          will not select one. Must be somewhere the target host is reachable.
+          Parsed with fromJSON, so it must be valid JSON.
         required: true
         type: string
       arch:

@@ -1,9 +1,8 @@
 # Auto-redeploy imcp2 to staging on every push to main.
 #
 # Staging tracks main continuously so changes get exercised on a real host before a
-# release is cut. Production is planned as a separate host moving only on a
-# `release-*` tag, added as its own caller of the shared mechanics rather than as a
-# branch of this workflow. Those mechanics live in deploy-native.yml, which
+# release is cut. Production is a separate host that only moves on a `release-*`
+# tag — see deploy-release.yml. Both share the mechanics in deploy-native.yml, which
 # cross-builds the binary and ships it + static/ over SSH to systemd services. See
 # deploy/native/README.md for the deploy model.
 #
@@ -36,18 +35,16 @@ jobs:
     uses: ./.github/workflows/deploy-native.yml
     with:
       environment: staging
-      # `["self-hosted","linux"]` never matched anything: the org's self-hosted
-      # capacity is ARC-managed pools, and a runner scale set is selected by its name
-      # alone — it does not carry the default self-hosted/linux labels that classic
-      # runners get. The first deploy after that landed sat queued indefinitely.
+      # A bare scale-set name, not a label list. `["self-hosted","linux"]` matched
+      # nothing and left the first post-#84 deploy queued indefinitely: the org's
+      # self-hosted capacity is ARC-managed pools, and a runner scale set is selected
+      # by its name alone, carrying none of the default labels classic runners get.
       #
       # dind-small is one of those org-wide pools (Kubernetes, dfinity-ops/k8s, on the
-      # dm1-idx1 / zh1-idx1 clusters). Whether its pods can route to this host's
-      # RFC1918 address is UNCONFIRMED — that is what this is testing. If they cannot,
-      # the ship step fails at SSH rather than hanging, which is the point: a fast,
-      # legible answer instead of a queue that never drains. Should it fail, the
-      # build/ship split still needs a runner inside the VPC, and the host cannot drop
-      # public SSH until one exists.
+      # dm1-idx1 / zh1-idx1 clusters, runner group dm1). Its pods reach this host on
+      # its private address — confirmed by a deploy that shipped and passed the
+      # /version assertion from a dind-small pod — which is what lets the host drop
+      # inbound SSH from the public internet.
       ship_runs_on: '"dind-small"'
       # Staging host is arm64 (Graviton).
       arch: arm64
