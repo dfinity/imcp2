@@ -76,8 +76,19 @@ private IPv4 can obtain a Let's Encrypt cert (ACME validates over IPv6 happily) 
 will look healthy from any v6-capable network — while being entirely unreachable from
 IPv4-only clients. For a public MCP server that is a silent outage for a large share
 of callers, and the `/status/` dashboard will not reveal it if the prober itself has
-v6. Publish both an `A` and an `AAAA` record, and verify both families from outside
-before calling a rollout done.
+v6. This is not hypothetical: both hosts sat in exactly that state for a while,
+unnoticed because every observer had v6.
+
+**The two families are not symmetric, so "publish both" is the wrong rule.** What
+matters is that **IPv4 works**. An `A`-only deployment is fine — IPv4 reaches
+effectively everyone, and IPv6-only clients (some mobile carriers) reach v4-only
+services through NAT64/DNS64. An `AAAA`-only deployment is the dangerous one. Publish
+both if both are genuinely reachable, but if you can only have one, have the `A`.
+Production is deliberately `A`-only for that reason.
+
+Verify **IPv4 specifically**, from a network that has no v6 of its own if you can. A
+v6-capable client will happily mask a dead v4 path, and so will any check you run from
+inside a VPN or a cloud shell.
 
 ### Verifying dual-stack reachability
 
@@ -182,11 +193,35 @@ new tag.
 **ship** runs wherever the target host is reachable and needs only `ssh` + `tar`, no
 Docker and no Rust.
 
-That split is what lets the ship job run on a **self-hosted on-prem runner**, which is
-how staging is deployed: the host is reached on its private address over the VPN rather
-than over the public internet, so it needs no inbound SSH from the world. The heavy
-build stays on hosted infrastructure and only the binary crosses into the private
-network. The ship runner's own architecture is irrelevant; it never executes the binary.
+That split is what lets the ship job run on a **self-hosted runner**, which is how both
+environments deploy: the host is reached on its private address over the VPN rather than
+over the public internet. The heavy build stays on hosted infrastructure and only the
+binary crosses into the private network. The ship runner's own architecture is
+irrelevant; it never executes the binary.
+
+#### Narrowing inbound SSH
+
+The point of shipping over the VPN is that the host should not need `22/tcp` open to the
+world. It still does, because closing it requires knowing what source address to allow
+instead, and that is **not** simply the private network the host lives in. The security
+group already permits `22` from `10.0.0.0/8`; removing the world-facing rule broke the
+deploy anyway, so the ship pods reach an RFC1918 destination while presenting a source
+outside `10/8`.
+
+Nor can the runner tell you its own answer — `curl ifconfig.me` reports public internet
+egress, which this path does not use. Ask the host instead, which is what the ship job's
+**Report source address as seen by the host** step does via `$SSH_CLIENT`, or after the
+fact:
+
+```sh
+sudo journalctl -u sshd --since '15 minutes ago' | grep 'Accepted publickey'
+```
+
+One observation is not enough to write a firewall rule from: the pools are ephemeral
+pods spread across more than one cluster, so consecutive deploys can present different
+sources. Get the documented range for every cluster and both address families from
+whoever operates the runners before narrowing the rule, and note that the group
+permitting `22` from `10.0.0.0/8` has no IPv6 entry at all.
 
 `ship_runs_on` takes a JSON string, so a bare name is `'"dind-small"'` and a label set
 is `'["self-hosted","linux"]'`. Both deploys use the bare-name form, because the org's
