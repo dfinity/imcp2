@@ -61,7 +61,7 @@ const REDERIVE_MARGIN_NS: u64 = 30 * 1_000_000_000;
 /// Internet Identity instance, single source of truth. Default: **`beta.id.ai`**.
 /// A real domain is required: the raw `<canister>.icp0.io` origin is rate-limited
 /// (HTTP 429) for the browser login SPA, leaving the II popup blank. Used for the
-/// connect-time `/mcp` handshake (browser). Override with `II_URL`.
+/// connect-time `/mcp-beta` (staging) handshake (browser). Override with `II_URL`.
 const II_URL_DEFAULT: &str = "https://beta.id.ai";
 
 /// Canister id of that same II instance, used for the on-demand account
@@ -70,7 +70,7 @@ const II_URL_DEFAULT: &str = "https://beta.id.ai";
 /// `II_CANISTER_ID`.
 const II_CANISTER_ID_DEFAULT: &str = "fgte5-ciaaa-aaaad-aaatq-cai";
 
-/// Production Internet Identity origin, used by the `/mcp-prod` instance.
+/// Production Internet Identity origin, used by the `/mcp` (production) instance.
 /// Override with `II_URL_PROD`.
 const II_URL_PROD_DEFAULT: &str = "https://id.ai";
 

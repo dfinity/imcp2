@@ -77,8 +77,8 @@ GET  /.well-known/ii-auth-callbacks                (origin-global, all instances
 
 Several instances share one origin by giving each its own `McpServer` (one
 shared `SharedClients`, one `auth_callbacks_router` over all of them) — exactly
-what the bundled binary does with beta and production Internet Identity (see
-below).
+what the bundled binary does on staging, serving production Internet Identity at
+`/mcp` and beta at `/mcp-beta` (see below).
 
 ## Tools
 
@@ -360,8 +360,9 @@ flow.
 
 ```bash
 cargo run
-# serves http://0.0.0.0:8000  (MCP at /mcp and /mcp-prod, OAuth under each mount, info page at /)
-# honours $PORT (default 8000) and $PUBLIC_URL (default http://localhost:8000)
+# serves http://0.0.0.0:8000  (MCP at /mcp against production II, OAuth under it, info page at /)
+# honours $PORT (default 8000), $PUBLIC_URL (default http://localhost:8000), and
+# $MCP_SERVE_BETA (set it to also serve the beta II instance at /mcp-beta, for staging)
 ```
 
 ## Deploy
@@ -429,8 +430,8 @@ flow relies on.
 
 Endpoints:
 
-The default (beta) instance is mounted at `/mcp`, so its AS issuer is
-`<PUBLIC_URL>/mcp` and everything OAuth lives under it:
+The production instance is mounted at `/mcp` (the origin's default instance), so
+its AS issuer is `<PUBLIC_URL>/mcp` and everything OAuth lives under it:
 
 - `GET /.well-known/oauth-authorization-server/mcp` — AS metadata (RFC 8414
   path-inserted; also served at the OIDC-style `/mcp/.well-known/…` alternate
@@ -700,30 +701,29 @@ as "session over → reconnect": the server surfaces a reconnect message and doe
 not retry.
 
 Set the public base URL (used in the discovery docs, as the MCP origin, and as the
-management identity's derivation origin) with `PUBLIC_URL`. The Internet Identity
-instance is `II_URL` (browser login, default `beta.id.ai`) plus `II_CANISTER_ID`
-(the canister the `mcp_*` calls target, default `fgte5-ciaaa-aaaad-aaatq-cai`) —
-both point at the same II.
+management identity's derivation origin) with `PUBLIC_URL`. The `/mcp` endpoint is
+**production** Internet Identity: `II_URL_PROD` (browser login, default
+`https://id.ai`) plus `II_CANISTER_ID_PROD` (the canister the `mcp_*` calls target,
+default `rdmx6-jaaaa-aaaaa-aaadq-cai`); both point at the same II.
 
-### Production instance (`/mcp-prod`)
+### Staging: beta instance (`/mcp-beta`)
 
-The same server exposes a second, fully isolated instance connected to
-**production** Internet Identity: MCP endpoint `/mcp-prod`, with its own
-authorization server under `/mcp-prod/oauth/*` (issuer
-`<PUBLIC_URL>/mcp-prod`, an RFC 8414 path issuer; AS metadata at
-`/.well-known/oauth-authorization-server/mcp-prod` plus the OIDC-style
-`/mcp-prod/.well-known/…` alternate, resource metadata at
-`/.well-known/oauth-protected-resource/mcp-prod`). Configure with `II_URL_PROD`
-(default `https://id.ai`) and `II_CANISTER_ID_PROD` (default
-`rdmx6-jaaaa-aaaaa-aaadq-cai`).
+The staging deployment exposes a second, fully isolated instance connected to
+**beta** Internet Identity at `/mcp-beta`, opt in with `MCP_SERVE_BETA`
+(`1`/`true`/`yes`/`on`). It is off by default, so a production deployment serves
+`/mcp` alone. When served it has its own authorization server under
+`/mcp-beta/oauth/*` (issuer `<PUBLIC_URL>/mcp-beta`, an RFC 8414 path issuer; AS
+metadata at `/.well-known/oauth-authorization-server/mcp-beta` plus the
+OIDC-style `/mcp-beta/.well-known/…` alternate, resource metadata at
+`/.well-known/oauth-protected-resource/mcp-beta`). Configure the beta II with
+`II_URL` (default `https://beta.id.ai`) and `II_CANISTER_ID` (default
+`fgte5-ciaaa-aaaad-aaatq-cai`).
 
-Sessions and tokens are per-instance — a `/mcp` token is not valid on
-`/mcp-prod` and vice versa — while dynamic client registrations are shared
+Sessions and tokens are per-instance (a `/mcp` token is not valid on
+`/mcp-beta` and vice versa), while dynamic client registrations are shared
 (they only pin redirect URIs). II trust is by origin, so users enable this
-server's origin as their trusted MCP server in their **id.ai** settings
-(a separate identity from their beta anchor). Note: `/mcp-prod` only completes
-once the production II carries the #4086 MCP feature set; until then the
-connect fails at the II step with a "may not support MCP connect yet" hint.
+server's origin as their trusted MCP server in their **beta.id.ai** settings
+(a separate identity from their production anchor).
 
 ## Domain identities (on demand)
 

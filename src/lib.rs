@@ -55,9 +55,9 @@
 //! }
 //! ```
 //!
-//! Several instances can share one origin (e.g. beta II at `/mcp`, production
-//! II at `/mcp-prod`): give each its own `McpServer` — sessions and tokens
-//! never cross instances — share ONE [`SharedClients`] between them so dynamic
+//! Several instances can share one origin (e.g. production II at `/mcp`, beta
+//! II at `/mcp-beta`): give each its own `McpServer` (sessions and tokens
+//! never cross instances), share ONE [`SharedClients`] between them so dynamic
 //! client registrations (II-agnostic) persist to a single snapshot, and pass
 //! every instance to [`auth_callbacks_router`] so the one allow-list document
 //! declares all callbacks.

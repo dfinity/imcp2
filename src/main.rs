@@ -1,18 +1,22 @@
-//! Deployment binary for the [`imcp2`] library: composes two Internet Identity
-//! instances at their canonical paths and adds the deployment niceties (the
-//! landing page, a `/version` probe with live-session gauges, request logging,
+//! Deployment binary for the [`imcp2`] library: serves the production Internet
+//! Identity instance at `/mcp` and adds the deployment niceties (the landing
+//! page, a `/version` probe with live-session gauges, request logging,
 //! env-driven config, drained graceful shutdown).
 //!
-//!   * `/mcp` — MCP endpoint against **beta** Internet Identity, with its
-//!     OAuth AS at `/mcp/oauth/*` (issuer `<PUBLIC_URL>/mcp`)
-//!   * `/mcp-prod` — the same against **production** Internet Identity
-//!     (`/mcp-prod/oauth/*`, issuer `<PUBLIC_URL>/mcp-prod`)
-//!   * `/.well-known/*` — the OAuth discovery documents (path-inserted per
-//!     instance, plus the plain-root fallbacks for the default beta instance)
-//!     and the origin-global II auth-callback allow-list
+//!   * `/mcp`: the MCP endpoint against **production** Internet Identity, with
+//!     its OAuth AS at `/mcp/oauth/*` (issuer `<PUBLIC_URL>/mcp`). Always
+//!     served, and the origin's default instance (it answers the plain-root
+//!     probes).
+//!   * `/mcp-beta`: the same against **beta** Internet Identity, served ONLY
+//!     when `$MCP_SERVE_BETA` is set (the staging deployment). Off by default,
+//!     so a production deployment serves `/mcp` alone.
+//!   * `/.well-known/*`: the OAuth discovery documents (path-inserted per
+//!     served instance, plus the plain-root fallbacks for the default `/mcp`
+//!     instance) and the origin-global II auth-callback allow-list
 //!
-//! Honours `$PORT` (bind port, default 8000) and `$PUBLIC_URL` (the public
-//! base URL baked into the discovery documents and the II handshake).
+//! Honours `$PORT` (bind port, default 8000), `$PUBLIC_URL` (the public base
+//! URL baked into the discovery documents and the II handshake), and
+//! `$MCP_SERVE_BETA` (opt in to the `/mcp-beta` staging instance).
 
 use axum::{response::Html, routing::get, Json, Router};
 use imcp2::{auth_callbacks_router, Agent, IiInstance, McpConfig, McpServer, SharedClients, IC_URL};
@@ -27,6 +31,16 @@ fn bind_address() -> String {
 /// Public base URL clients use to reach this server. Override with PUBLIC_URL.
 fn public_url() -> String {
     std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
+}
+
+/// Whether to also serve the beta Internet Identity instance at `/mcp-beta`.
+/// Off unless `$MCP_SERVE_BETA` is truthy (`1`/`true`/`yes`/`on`), so a
+/// production deployment serves only `/mcp` (production II) and the staging
+/// deployment opts in to the extra beta endpoint.
+fn serve_beta() -> bool {
+    std::env::var("MCP_SERVE_BETA")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 /// Log each inbound request: method, path, response status, and latency — gives
@@ -76,29 +90,36 @@ async fn main() -> anyhow::Result<()> {
     let public_url = public_url();
 
     // Dynamic client registrations are II-agnostic (redirect allow-list only),
-    // so both instances share one store — and one persisted snapshot.
+    // so all instances share one store (and one persisted snapshot).
     let clients = SharedClients::load();
 
-    // Two Internet Identity instances, each a self-contained McpServer:
-    // sessions/tokens never cross instances. Beta is the origin's default
-    // instance (it also answers the plain-root discovery probes).
-    let beta = McpServer::new(McpConfig {
+    // Production Internet Identity at `/mcp`: always served, and the origin's
+    // default instance (it answers the plain-root discovery probes). A
+    // self-contained McpServer whose sessions/tokens never cross instances.
+    let prod = McpServer::new(McpConfig {
         agent: agent.clone(),
-        instance: IiInstance::beta().map_err(anyhow::Error::msg)?,
+        instance: IiInstance::prod().map_err(anyhow::Error::msg)?,
         public_url: public_url.clone(),
         mcp_path: "/mcp".into(),
         clients: clients.clone(),
     });
-    let prod = McpServer::new(McpConfig {
-        agent,
-        instance: IiInstance::prod().map_err(anyhow::Error::msg)?,
-        public_url: public_url.clone(),
-        mcp_path: "/mcp-prod".into(),
-        clients,
-    });
-    // Per-instance session reapers (expired-grant eviction + close-event logs).
-    beta.spawn_session_reaper();
     prod.spawn_session_reaper();
+
+    // Beta Internet Identity at `/mcp-beta`: opt in via `$MCP_SERVE_BETA`, so
+    // only the staging deployment exposes it; production serves `/mcp` alone.
+    let beta = if serve_beta() {
+        let beta = McpServer::new(McpConfig {
+            agent,
+            instance: IiInstance::beta().map_err(anyhow::Error::msg)?,
+            public_url: public_url.clone(),
+            mcp_path: "/mcp-beta".into(),
+            clients,
+        });
+        beta.spawn_session_reaper();
+        Some(beta)
+    } else {
+        None
+    };
 
     // When this process started — i.e. when the deployment last (re)started.
     // Every deploy restarts the service, so this is the "last redeployment" time.
@@ -107,11 +128,12 @@ async fn main() -> anyhow::Result<()> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Per-instance handles for the /version live-session gauge (Arc-backed, so
-    // cloning shares the same session maps the tools mutate).
-    let (ver_beta, ver_prod) = (beta.clone(), prod.clone());
+    // Handles for the /version live-session gauges (Arc-backed, so cloning
+    // shares the same session maps the tools mutate). Beta is `Option`: the
+    // gauge reports zero for it when the staging instance isn't served.
+    let (ver_prod, ver_beta) = (prod.clone(), beta.clone());
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
         // Unauthenticated build/version probe so operators and the status
         // dashboard can confirm exactly which deployment is live: the running
@@ -123,19 +145,25 @@ async fn main() -> anyhow::Result<()> {
             get(move || {
                 // Clone the Arc-backed handles per request so the handler stays
                 // `Fn` (reusable across requests) while the async body owns them.
-                let ver_beta = ver_beta.clone();
                 let ver_prod = ver_prod.clone();
+                let ver_beta = ver_beta.clone();
                 async move {
-                    // Two per-instance session gauges, each from one lock +
-                    // iteration of the session map:
+                    // Per-instance session gauges, each from one lock + iteration
+                    // of the session map:
                     // - live_sessions: authenticated sessions whose II grant has
                     //   not yet expired. Tracks the grant lifecycle — an idle
                     //   session still counts; only expiry removes it.
                     // - active_sessions: the subset also seen requesting within the
                     //   activity window (~15 min) — a ballpark of who is working
                     //   right now, for timing a low-disruption redeploy.
-                    let beta = ver_beta.session_gauges().await;
+                    // Beta reports zero when the staging instance isn't served.
                     let prod = ver_prod.session_gauges().await;
+                    let beta = match &ver_beta {
+                        Some(b) => Some(b.session_gauges().await),
+                        None => None,
+                    };
+                    let (beta_live, beta_active) =
+                        beta.map(|g| (g.live, g.active)).unwrap_or((0, 0));
                     Json(serde_json::json!({
                         "version": env!("CARGO_PKG_VERSION"),
                         "commit": option_env!("GIT_SHA").unwrap_or("unknown"),
@@ -144,27 +172,36 @@ async fn main() -> anyhow::Result<()> {
                         // Per-instance count of live sessions: authenticated
                         // sessions with a non-expired II grant. A session counts
                         // from grant redemption until its grant expires, idle or not.
-                        "live_sessions": { "beta": beta.live, "prod": prod.live },
+                        "live_sessions": { "prod": prod.live, "beta": beta_live },
                         // Per-instance count of active sessions: the subset of live
                         // sessions that also made a request within the ~15-min
                         // activity window. Use this (not live_sessions) to time a
                         // redeploy for minimal disruption.
-                        "active_sessions": { "beta": beta.active, "prod": prod.active },
+                        "active_sessions": { "prod": prod.active, "beta": beta_active },
                     }))
                 }
             }),
         )
         // `nest_service`, not `nest`: it also forwards the bare trailing-slash
         // form (`/mcp/`), which axum's `nest` never routes into the nested router.
-        .nest_service(beta.mcp_path(), beta.mcp_router())
         .nest_service(prod.mcp_path(), prod.mcp_router())
-        .merge(beta.well_known_router())
         .merge(prod.well_known_router())
-        // Beta is the default instance: it also owns the plain-root documents.
-        .merge(beta.root_well_known_router())
-        // The II auth-callback allow-list is origin-global: one document
-        // declares BOTH instances' callbacks.
-        .merge(auth_callbacks_router(&[&beta, &prod]))
+        // `/mcp` (production II) is the default instance: it owns the plain-root
+        // documents that clients probing the bare origin fall back to.
+        .merge(prod.root_well_known_router());
+
+    // Staging additionally serves the beta II instance at `/mcp-beta`.
+    if let Some(beta) = &beta {
+        app = app
+            .nest_service(beta.mcp_path(), beta.mcp_router())
+            .merge(beta.well_known_router());
+    }
+
+    // The II auth-callback allow-list is origin-global: one document declares
+    // every served instance's callbacks (prod always, beta only on staging).
+    let servers: Vec<&McpServer> = std::iter::once(&prod).chain(beta.as_ref()).collect();
+    let app = app
+        .merge(auth_callbacks_router(&servers))
         // Log every inbound request (method, path, status, latency) so we can see
         // what external clients actually hit — discovery probes, unknown paths,
         // etc. Only the path is logged, never the query string, so single-use
@@ -173,11 +210,17 @@ async fn main() -> anyhow::Result<()> {
 
     let bind = bind_address();
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    tracing::info!(
-        "listening on http://{bind}  (MCP at {} and {}, OAuth under each mount)",
-        beta.mcp_path(),
-        prod.mcp_path(),
-    );
+    match beta.as_ref() {
+        Some(beta) => tracing::info!(
+            "listening on http://{bind}  (MCP at {} and {}, OAuth under each mount)",
+            prod.mcp_path(),
+            beta.mcp_path(),
+        ),
+        None => tracing::info!(
+            "listening on http://{bind}  (MCP at {}, OAuth under it)",
+            prod.mcp_path(),
+        ),
+    }
     // Drain-then-cancel, on ALL exit paths. `with_graceful_shutdown` stops
     // accepting new connections and drains the in-flight ones first; only then
     // do we cancel the rmcp services' tokens (via McpServer::shutdown). Ordering
@@ -190,8 +233,10 @@ async fn main() -> anyhow::Result<()> {
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await;
-    beta.shutdown();
     prod.shutdown();
+    if let Some(beta) = &beta {
+        beta.shutdown();
+    }
     serve_result?;
     Ok(())
 }
