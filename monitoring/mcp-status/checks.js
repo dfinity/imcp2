@@ -591,8 +591,8 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
  * across redirects — so there is no `Location` header to read and the probe
  * could never pass. What the advertised list does give us is the right origins
  * to probe, and all of them: the II-health section runs once per instance, so a
- * server that mounts beta II at `/mcp` and production II at `/mcp-prod` has both
- * monitored instead of just the one a hostname guess happened to name.
+ * staging deployment serving production II at `/mcp` and beta II at `/mcp-beta`
+ * has both monitored instead of just the one a hostname guess happened to name.
  *
  * @param {string} mcpOrigin
  * @param {import("./config.js").IiInstanceTarget[]} instances
@@ -976,8 +976,9 @@ export const buildSuggestions = (sections, facts) => {
       "usable at /mcp/oauth/authorize during probing).",
   );
 
-  // facts.ii is one entry per served II instance, so flatten before scanning.
-  const certWarn = [facts?.mcp, ...Object.values(facts?.ii ?? {})]
+  // facts.iiInstances is one entry per served II instance, so flatten before
+  // scanning; a cert nearing expiry on ANY of them is worth the warning.
+  const certWarn = [facts?.mcp, ...Object.values(facts?.iiInstances ?? {})]
     .map((f) => /** @type {any} */ (f)?.certificate ?? f?.mcpCertificate)
     .filter((c) => c && typeof c.daysRemaining === "number" && c.daysRemaining < 21);
   if (certWarn.length > 0) {
@@ -1062,8 +1063,11 @@ export const runDashboard = async (overrides = {}) => {
     mcp: endpoints.facts,
     linkage: linkage.facts,
     // Keyed by instance name so a multi-instance deployment's facts stay
-    // attributable; buildSuggestions flattens the values.
-    ii: Object.fromEntries(
+    // attributable. Named `iiInstances`, not `ii`: the old key held ONE
+    // instance's facts, and a consumer reaching for `facts.ii.canisterId`
+    // against this shape would silently read undefined. An absent key makes
+    // that a visible break instead of a quiet wrong answer.
+    iiInstances: Object.fromEntries(
       iiHealths.map((h, i) => [instances[i]?.name ?? "unresolved", h.facts]),
     ),
   };

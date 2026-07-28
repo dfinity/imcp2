@@ -126,8 +126,9 @@ export const assertAllowedOrigin = (origin) => {
  * `internetcomputer.org` — an unrelated marketing site that legitimately 404s
  * on `/mcp`, which read as an Internet Identity outage on a healthy
  * deployment. It was also blind by construction: one origin cannot describe a
- * server that mounts two IIs (`/mcp` → beta, `/mcp-prod` → production), so the
- * non-default instance went unmonitored everywhere.
+ * server that mounts more than one II (staging serves production II at `/mcp`
+ * and beta II at `/mcp-beta`), so the non-default instance went unmonitored
+ * everywhere.
  *
  * Origins here come from a remote response, so each is validated against the
  * host allowlist before it can be probed — a compromised or misconfigured
