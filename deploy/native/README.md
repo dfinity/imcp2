@@ -188,8 +188,13 @@ than over the public internet, so it needs no inbound SSH from the world. The he
 build stays on hosted infrastructure and only the binary crosses into the private
 network. The ship runner's own architecture is irrelevant; it never executes the binary.
 
-Set `ship_runs_on` to labels matching your runner. It takes a JSON string, so a single
-label is `'"ubuntu-24.04-arm"'` and a label set is `'["self-hosted","linux"]'`.
+`ship_runs_on` takes a JSON string, so a bare name is `'"dind-small"'` and a label set
+is `'["self-hosted","linux"]'`. Both deploys use the bare-name form, because the org's
+self-hosted capacity is **ARC runner scale sets** — a scale set is selected by its name
+alone and carries none of the `self-hosted` / `linux` / `x64` labels that classic
+runners get automatically. A label list therefore matches no scale set however the pool
+is labelled, and a job requesting one simply queues forever rather than failing, which
+reads like a stuck runner rather than a misconfigured selector.
 
 After each deploy the ship job reads `GET /version` on the host and asserts the
 reported `commit` matches what was just built, so a `systemctl restart` that silently

@@ -87,18 +87,20 @@ jobs:
     uses: ./.github/workflows/deploy-native.yml
     with:
       environment: production
-      # The production host is on a private network (RFC1918 v4), so a
-      # GitHub-hosted runner cannot reach it. Ship from the on-prem runner, which
-      # is inside that network. Its arch is irrelevant — the ship job only runs
-      # ssh/tar, never the binary itself.
-      # `imcp-prod` must be a label unique to the on-prem production runner, and has
-      # to be added there before a release tag will deploy anything. `self-hosted`
-      # and `linux` are applied automatically to every Linux self-hosted runner, so
-      # those two alone select *any* of them — handing an arbitrary machine the
-      # production SSH key and reachability into that network. Requiring a label
-      # that may not exist yet makes the job queue instead, which is the safe
-      # direction to fail for production.
-      ship_runs_on: '["self-hosted","linux","imcp-prod"]'
+      # The production host is on a private network (RFC1918 v4), so no
+      # GitHub-hosted runner can reach it. dind-small is an org-wide ARC pool whose
+      # pods can: staging deploys over its private address from this same pool. The
+      # pool's arch is irrelevant — ship only runs ssh/tar, never the binary.
+      #
+      # It is a bare name, not a label list. An ARC runner scale set is selected by
+      # its name alone and carries none of the default self-hosted/linux/x64 labels
+      # that classic runners get, so a list like ["self-hosted","linux","imcp-prod"]
+      # matches nothing here no matter what labels are added to the pool — an earlier
+      # revision of this file used exactly that and could never have deployed.
+      #
+      # Note this puts the production SSH key on shared multi-tenant pods. Accepted
+      # for now; a dedicated scale set is the way to isolate it later.
+      ship_runs_on: '"dind-small"'
       # arm64, matching staging. Parity matters here: aws-lc-sys/ring carry
       # per-arch assembly, so a differing production arch would leave the crypto
       # paths this server's auth depends on unexercised by staging.
