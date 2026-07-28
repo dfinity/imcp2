@@ -195,7 +195,7 @@ async fn unauthenticated_mcp_requests_get_the_path_aware_challenge() {
         .unwrap_or_default();
     assert!(
         challenge.contains("/.well-known/oauth-protected-resource/mcp-beta\""),
-        "prod challenge: {challenge}"
+        "beta challenge: {challenge}"
     );
 }
 
