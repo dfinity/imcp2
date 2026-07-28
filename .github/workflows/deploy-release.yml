@@ -157,3 +157,76 @@ jobs:
       DEPLOY_DOMAIN: ${{ secrets.PROD_DEPLOY_DOMAIN }}
       DEPLOY_ACME_EMAIL: ${{ secrets.PROD_DEPLOY_ACME_EMAIL }}
       DEPLOY_KNOWN_HOSTS: ${{ secrets.PROD_DEPLOY_KNOWN_HOSTS }}
+
+  # Attach the binary that was actually deployed to the tag's Release page. Without
+  # this the only copy is a workflow artifact, which expires after 7 days, so the
+  # revision running in production stops being retrievable well before it stops
+  # running.
+  #
+  # Runs only after deploy succeeds, because an asset here asserts "this is what
+  # production is running" — publishing a binary whose rollout failed would make the
+  # Release page lie. And only on the tag-push path: a workflow_dispatch rollback
+  # re-deploys an existing tag whose Release already carries these assets, and
+  # github.ref_name on a dispatch is the branch rather than the tag, so there would
+  # be no correct release to attach to.
+  publish:
+    needs: deploy
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      # Everything else in this repo runs read-only. An explicit block replaces the
+      # defaults wholesale, so both of these have to be spelled out.
+      contents: write  # create the Release and upload assets to it
+      actions: read    # read this run's artifacts (the download below)
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # gh normally infers the repository from the checkout's git remote, and this job
+      # deliberately has no checkout — it needs an artifact and a tag, not a worktree.
+      # Without this every gh call below fails on "could not determine base repository".
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # Fetched with gh rather than actions/download-artifact so this job depends on
+      # nothing beyond the CLI it already uses to publish. GITHUB_RUN_ID scopes it to
+      # this run, so it can only ever pick up the artifact the deploy above built.
+      - name: Download the deployed binary
+        run: gh run download "$GITHUB_RUN_ID" --name imcp2-binary --dir dist
+
+      - name: Name and checksum the asset
+        env:
+          ARCH: arm64
+        run: |
+          set -euo pipefail
+          # The artifact is a bare "imcp2"; on a Release page it needs to say what it
+          # is, since nothing else there records the target platform.
+          mv dist/imcp2 "dist/imcp2-linux-${ARCH}"
+          ( cd dist && sha256sum "imcp2-linux-${ARCH}" > "imcp2-linux-${ARCH}.sha256" )
+          cat "dist/imcp2-linux-${ARCH}.sha256"
+
+      - name: Publish to the Release page
+        env:
+          TAG: ${{ github.ref_name }}
+          # From the reusable workflow, not github.sha: on a rollback those differ,
+          # and the whole point of this is to record what was deployed.
+          BUILT_SHA: ${{ needs.deploy.outputs.sha }}
+        run: |
+          set -euo pipefail
+          notes="$(cat <<EOF
+          Rolled out to production.
+
+          | | |
+          |---|---|
+          | Commit | \`$BUILT_SHA\` |
+          | Target | \`linux/arm64\` (Amazon Linux 2023, Graviton) |
+          | Run | [$GITHUB_RUN_ID](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |
+
+          The attached binary is the one that was shipped: the deploy asserts
+          \`GET /version\` on the host reports this commit before the run is allowed
+          to pass. Verify with \`sha256sum -c imcp2-linux-arm64.sha256\`.
+          EOF
+          )"
+          # Idempotent so a re-run repairs a partial publish rather than failing.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" --title "$TAG" --notes "$notes" dist/*
+          fi
