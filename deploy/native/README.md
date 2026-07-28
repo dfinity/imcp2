@@ -80,11 +80,14 @@ v6. This is not hypothetical: both hosts sat in exactly that state for a while,
 unnoticed because every observer had v6.
 
 **The two families are not symmetric, so "publish both" is the wrong rule.** What
-matters is that **IPv4 works**. An `A`-only deployment is fine — IPv4 reaches
-effectively everyone, and IPv6-only clients (some mobile carriers) reach v4-only
-services through NAT64/DNS64. An `AAAA`-only deployment is the dangerous one. Publish
-both if both are genuinely reachable, but if you can only have one, have the `A`.
-Production is deliberately `A`-only for that reason.
+matters is that **IPv4 works**. An `A`-only deployment is fine in practice, because
+IPv4 reaches effectively everyone; the IPv6-only networks that do exist are mostly
+mobile carriers, and those generally run NAT64/DNS64 so their clients can still reach
+v4-only services. That translation is a property of the *client's* network, though, not
+something this deployment provides — a v6-only client whose network lacks it cannot
+reach an `A`-only host at all. So publish an `AAAA` too whenever the v6 path is
+genuinely reachable; just never publish `AAAA` *instead* of `A`. Production is `A`-only
+today because its IPv4 path was repaired and its `AAAA` record removed at the same time.
 
 Verify **IPv4 specifically**, from a network that has no v6 of its own if you can. A
 v6-capable client will happily mask a dead v4 path, and so will any check you run from

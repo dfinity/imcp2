@@ -200,11 +200,16 @@ jobs:
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
+          # Keep ssh's stderr: "Connection timed out", "Permission denied" and a host
+          # key mismatch are entirely different diagnoses, and surfacing which one it
+          # was is most of the value of a step that exists to explain SSH problems.
+          # Collapsed to one line because ::warning:: annotations are line-oriented.
+          err="${RUNNER_TEMP:-/tmp}/ssh-source.err"
           if src="$(ssh -o BatchMode=yes -o ConnectTimeout=20 "$HOST" \
-                     'echo "${SSH_CLIENT%% *}"' 2>/dev/null)" && [ -n "$src" ]; then
+                     'echo "${SSH_CLIENT%% *}"' 2>"$err")" && [ -n "$src" ]; then
             echo "ship runner reaches the host from: $src"
           else
-            echo "::warning::could not read SSH_CLIENT from the host; SSH may be blocked or the host may not export it."
+            echo "::warning::could not read SSH_CLIENT from the host: $(tr '\n' ' ' < "$err" 2>/dev/null)"
           fi
 
       - name: Deploy
