@@ -174,14 +174,22 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
-      # Everything else in this repo runs read-only; creating a Release needs write.
-      contents: write
+      # Everything else in this repo runs read-only. An explicit block replaces the
+      # defaults wholesale, so both of these have to be spelled out.
+      contents: write  # create the Release and upload assets to it
+      actions: read    # read this run's artifacts (the download below)
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # gh normally infers the repository from the checkout's git remote, and this job
+      # deliberately has no checkout — it needs an artifact and a tag, not a worktree.
+      # Without this every gh call below fails on "could not determine base repository".
+      GH_REPO: ${{ github.repository }}
     steps:
+      # Fetched with gh rather than actions/download-artifact so this job depends on
+      # nothing beyond the CLI it already uses to publish. GITHUB_RUN_ID scopes it to
+      # this run, so it can only ever pick up the artifact the deploy above built.
       - name: Download the deployed binary
-        uses: actions/download-artifact@v4
-        with:
-          name: imcp2-binary
-          path: dist
+        run: gh run download "$GITHUB_RUN_ID" --name imcp2-binary --dir dist
 
       - name: Name and checksum the asset
         env:
@@ -196,7 +204,6 @@ jobs:
 
       - name: Publish to the Release page
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
           # From the reusable workflow, not github.sha: on a rollback those differ,
           # and the whole point of this is to record what was deployed.
@@ -204,7 +211,7 @@ jobs:
         run: |
           set -euo pipefail
           notes="$(cat <<EOF
-          Deployed to production by [\`$TAG\`](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}).
+          Rolled out to production.
 
           | | |
           |---|---|
