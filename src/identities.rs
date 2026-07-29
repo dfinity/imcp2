@@ -32,6 +32,25 @@
 //! The derived `(user_key, chain, expiration)` is cached per `(session_id,
 //! domain, account_number)` with a margin under the delegation's expiration; it
 //! is reused until near-expiry, then re-derived.
+//!
+//! ## Bounded state (CWE-770)
+//!
+//! Everything held here is capped, because the connect entry point is reachable
+//! without authentication: `/oauth/authorize` mints one `Session` (two Ed25519
+//! keypairs) per request, so an unauthenticated `GET` loop would otherwise grow
+//! the map forever. Two mechanisms, working together:
+//!
+//!   * **Admission** ([`make_room`], on every session creation): prune what is
+//!     stale, evict the oldest PENDING connects past [`MAX_PENDING_CONNECTS`],
+//!     and refuse a new session outright past [`MAX_SESSIONS`] — never evicting a
+//!     live grant to make room. This is what bounds the map *between* sweeps.
+//!   * **Reaping** ([`Identities::reap_expired_sessions`], on a 60s timer):
+//!     expired grants and abandoned connects (pending for more than
+//!     [`PENDING_CONNECT_TTL_NS`]) leave the map.
+//!
+//! Per session, the delegation cache is capped at [`MAX_APP_DELEGATIONS`]
+//! entries, evicted by nearest expiry — a session picks its own cache keys
+//! (one per `(origin, account)` it asks for), so that map is caller-driven too.
 
 use std::{
     collections::HashMap,
@@ -57,6 +76,44 @@ use tokio::sync::RwLock;
 /// Re-derive once the cached delegation is within this margin of expiry, so a
 /// call never goes out with an about-to-expire delegation.
 const REDERIVE_MARGIN_NS: u64 = 30 * 1_000_000_000;
+
+/// Ceiling on **connects in flight** — sessions minted by `/oauth/authorize`
+/// that have not (yet) redeemed a grant. That endpoint is UNAUTHENTICATED, so
+/// each request would otherwise add a permanent `Session` (holding two Ed25519
+/// keypairs) to the map: a bare `GET` loop is an unbounded-growth primitive
+/// (CWE-770). Once the cap is reached a new connect evicts the OLDEST pending
+/// one ([`make_room`]) rather than being refused, so a flood churns its own
+/// entries out instead of blocking sign-in, and granted sessions are never
+/// touched. Also the cap on `AuthStore.authz`, which holds one entry per
+/// pending connect (see `crate::auth`), so the two maps stay in step.
+pub(crate) const MAX_PENDING_CONNECTS: usize = 1_024;
+
+/// Hard ceiling on the session map. Only sessions holding a redeemed grant can
+/// push toward it (pending ones are bounded far lower by
+/// [`MAX_PENDING_CONNECTS`]), and each of those costs a real II consent, so this
+/// is a backstop rather than an attacker-reachable limit: a live grant is never
+/// evicted to make room, and a connect that would exceed the cap is refused with
+/// [`AT_CAPACITY_MSG`].
+const MAX_SESSIONS: usize = 20_000;
+
+/// How long a session that never redeemed a grant is kept before the reaper
+/// treats the connect as abandoned. Comfortably past `crate::auth`'s 10-minute
+/// `CONNECT_TTL`, after which the connect can no longer be redeemed anyway, so
+/// this only ever drops sessions that are already dead weight.
+const PENDING_CONNECT_TTL_NS: u64 = 15 * 60 * 1_000_000_000;
+
+/// Per-session ceiling on cached per-app delegations. `store` inserts one per
+/// distinct `(derivation origin, account)` a session asks for, so a single
+/// authenticated session could otherwise inflate its own map without limit by
+/// requesting delegations at many origins. Generous next to real use (an agent
+/// touches a handful of apps per session); eviction is by expiry, and an evicted
+/// entry is simply re-derived on the next call.
+const MAX_APP_DELEGATIONS: usize = 64;
+
+/// Shown when a connect can't be started because the session map is at
+/// [`MAX_SESSIONS`]. Actionable: the caller should retry, not re-register.
+const AT_CAPACITY_MSG: &str = "This server is at capacity for Internet Identity sessions right now. \
+     Wait a few minutes and start the sign-in again.";
 
 /// Internet Identity instance, single source of truth. Default: **`beta.id.ai`**.
 /// A real domain is required: the raw `<canister>.icp0.io` origin is rate-limited
@@ -219,6 +276,13 @@ struct Session {
     /// a missing value is not treated as expired — an `Unauthorized` from a signed
     /// call is the authoritative "session over" signal.
     grant_expiration_ns: Option<u64>,
+    /// Wall-clock (ns since the epoch) this session was created at, i.e. when
+    /// `/oauth/authorize` started the connect. Never updated. Two bounds read
+    /// it: the reaper drops a session that still holds no grant
+    /// [`PENDING_CONNECT_TTL_NS`] after this (an abandoned connect), and
+    /// [`make_room`] evicts the oldest pending connects first when the map hits
+    /// [`MAX_PENDING_CONNECTS`].
+    created_ns: u64,
     /// Wall-clock (ns since the epoch) of this session's most recent
     /// authenticated request, bumped per request via [`Identities::touch_session`]
     /// (and on connect). Drives ONLY the `/version` `active_sessions` gauge's
@@ -465,21 +529,44 @@ impl Identities {
         &self.instance
     }
 
-    async fn ensure_session(&self, session_id: &str) {
-        let mut sessions = self.sessions.write().await;
-        sessions.entry(session_id.to_string()).or_insert_with(|| {
-            let (key_seed, pubkey_der) = fresh_ed25519();
-            Session {
-                key_seed,
-                pubkey_der,
-                grant_expiration_ns: None,
-                last_seen_ns: AtomicU64::new(now_ns()),
-                reg_key_seed: None,
-                reg_pubkey_der: None,
-                read_only: None,
-                app_delegations: HashMap::new(),
+    /// Create this session if it doesn't exist yet, enforcing the map's bounds
+    /// on the way in (see [`make_room`]): stale entries are pruned, pending
+    /// connects beyond [`MAX_PENDING_CONNECTS`] are evicted oldest-first, and a
+    /// map already at [`MAX_SESSIONS`] live sessions refuses the new one with
+    /// [`AT_CAPACITY_MSG`]. An EXISTING session is returned as-is, with no scan,
+    /// so the authenticated hot path pays nothing.
+    async fn ensure_session(&self, session_id: &str) -> Result<(), String> {
+        let now = now_ns();
+        let closed = {
+            let mut sessions = self.sessions.write().await;
+            if sessions.contains_key(session_id) {
+                return Ok(());
             }
-        });
+            let closed = make_room(&mut sessions, now)?;
+            let (key_seed, pubkey_der) = fresh_ed25519();
+            sessions.insert(
+                session_id.to_string(),
+                Session {
+                    key_seed,
+                    pubkey_der,
+                    grant_expiration_ns: None,
+                    created_ns: now,
+                    last_seen_ns: AtomicU64::new(now),
+                    reg_key_seed: None,
+                    reg_pubkey_der: None,
+                    read_only: None,
+                    app_delegations: HashMap::new(),
+                },
+            );
+            closed
+        };
+        // A grant that expired since the last sweep may have been reclaimed to
+        // make room. Log it exactly as the reaper would (outside the lock), so
+        // every "session opened" still gets its paired "session closed".
+        for sid in &closed {
+            tracing::info!(instance = self.instance.name, session_id = %sid, "session closed");
+        }
+        Ok(())
     }
 
     /// The backend session key seed and its DER pubkey.
@@ -498,16 +585,21 @@ impl Identities {
     /// for the whole connect (a re-issued link reuses it). See
     /// [`Self::redeem_registration_delegation`] for the redemption that consumes
     /// `priv(X)`.
-    pub(crate) async fn registration_pubkey_b64(&self, session_id: &str) -> String {
-        self.ensure_session(session_id).await;
+    ///
+    /// Errors when the session map is at capacity ([`make_room`]) — the connect
+    /// cannot be started, and `/oauth/authorize` surfaces that as a "try again in
+    /// a moment" screen rather than handing II a key it isn't tracking.
+    pub(crate) async fn registration_pubkey_b64(&self, session_id: &str) -> Result<String, String> {
+        self.ensure_session(session_id).await?;
         let mut sessions = self.sessions.write().await;
-        let s = sessions.get_mut(session_id).expect("ensured session");
+        let s = sessions.get_mut(session_id).ok_or("no such session")?;
         if s.reg_key_seed.is_none() {
             let (seed, der) = fresh_ed25519();
             s.reg_key_seed = Some(seed);
             s.reg_pubkey_der = Some(der);
         }
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s.reg_pubkey_der.as_ref().expect("just set"))
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(s.reg_pubkey_der.as_ref().expect("just set")))
     }
 
     /// The session's principal (`self_authenticating(session_pubkey)`), the
@@ -520,7 +612,13 @@ impl Identities {
     /// Record the grant's expiration from the `mcp_register_v2` reply, at connect
     /// redemption. The value is nanoseconds since the epoch.
     pub async fn set_grant_expiration(&self, session_id: &str, expiration_ns: u64) {
-        self.ensure_session(session_id).await;
+        // Best effort: the redeem path ensured this session already, so a
+        // capacity refusal here means it was reaped mid-flight — nothing to
+        // record, and the client's next call gets the reconnect message.
+        if let Err(e) = self.ensure_session(session_id).await {
+            tracing::warn!(session_id = %session_id, "could not record the grant expiration: {e}");
+            return;
+        }
         // Read the clock once (before taking the lock), so the "was it live"
         // and "is it now live" checks use a single consistent instant and we
         // don't hold the write lock across a syscall.
@@ -571,7 +669,12 @@ impl Identities {
                 return;
             }
         };
-        self.ensure_session(session_id).await;
+        // Same best-effort posture as `set_grant_expiration`: recorded on the
+        // session the redeem path already created, or dropped with a warning.
+        if let Err(e) = self.ensure_session(session_id).await {
+            tracing::warn!(session_id = %session_id, "could not record the access level: {e}");
+            return;
+        }
         let mut sessions = self.sessions.write().await;
         if let Some(s) = sessions.get_mut(session_id) {
             s.read_only = level;
@@ -660,38 +763,47 @@ impl Identities {
         self.session_gauges().await.active
     }
 
-    /// Evict sessions whose grant has expired, emitting a "session closed" log
-    /// per eviction so the journal has a grant-lifecycle close event to pair with
-    /// "session opened". Eviction keys on grant EXPIRY, the same criterion as the
-    /// live gauge: a merely idle (but still valid) session is KEPT — its token is
-    /// still good, the client may return and reuse it, and it still counts as
-    /// live meanwhile. Sessions with no recorded expiry (`None`)
-    /// are also KEPT: that covers a session still mid-connect (evicting it would
-    /// strand the registration key `X` that II already certified) and a v1
-    /// session whose best-effort POST never arrived. Returns how many were
-    /// reaped. This caps the map's growth from expired-grant sessions (the common
-    /// case: every authenticated session eventually expires); it does NOT bound
-    /// no-expiry (`None`) sessions, which persist until they gain and then
-    /// outlive a grant. Called on a timer from `main`.
+    /// Evict every session that no longer serves anyone ([`prune_stale`]) and
+    /// return how many went:
+    ///
+    ///   * grant EXPIRED — the same criterion as the live gauge, emitting a
+    ///     "session closed" log per eviction so the journal has a
+    ///     grant-lifecycle close event to pair with "session opened". A merely
+    ///     idle (but still valid) session is KEPT: its token is still good, the
+    ///     client may return and reuse it, and it still counts as live meanwhile.
+    ///   * connect ABANDONED — a session that never redeemed a grant, older than
+    ///     [`PENDING_CONNECT_TTL_NS`]. `/oauth/authorize` mints one of these per
+    ///     request without authentication, so leaving them forever made the map
+    ///     grow without bound (CWE-770); by that age the connect can no longer be
+    ///     redeemed anyway. A YOUNGER pending session is kept — it is a sign-in in
+    ///     progress, and evicting it would strand the registration key `X` II may
+    ///     already have certified.
+    ///
+    /// Together with the admission bounds in [`make_room`] (which cap the map
+    /// between sweeps) this is what keeps the session map bounded. Called on a
+    /// timer from `McpServer::spawn_session_reaper`.
     pub async fn reap_expired_sessions(&self) -> usize {
         let now = now_ns();
-        let mut closed = Vec::new();
         // Scope the write lock to the mutation only: release it BEFORE logging so
         // a slow log sink can't block other readers/writers of the session map.
-        {
+        let (closed, abandoned) = {
             let mut sessions = self.sessions.write().await;
-            sessions.retain(|sid, s| match s.grant_expiration_ns {
-                Some(exp) if exp <= now => {
-                    closed.push(sid.clone());
-                    false
-                }
-                _ => true,
-            });
-        }
+            prune_stale(&mut sessions, now)
+        };
         for sid in &closed {
             tracing::info!(instance = self.instance.name, session_id = %sid, "session closed");
         }
-        closed.len()
+        // Abandoned connects never opened a session, so they get no paired
+        // "closed" line — one aggregate count keeps the journal readable under a
+        // flood while still showing the sweep did something.
+        if !abandoned.is_empty() {
+            tracing::info!(
+                instance = self.instance.name,
+                count = abandoned.len(),
+                "abandoned connects reaped"
+            );
+        }
+        closed.len() + abandoned.len()
     }
 
     /// This session's known access level: `Some(true)` = read-only, `Some(false)`
@@ -720,7 +832,7 @@ impl Identities {
     /// fall back to attempting the signed call, where an `Unauthorized` is the
     /// authoritative signal).
     async fn session_signer(&self, session_id: &str) -> Result<BasicIdentity, String> {
-        self.ensure_session(session_id).await;
+        self.ensure_session(session_id).await?;
         let sessions = self.sessions.read().await;
         let s = sessions.get(session_id).ok_or("no such session")?;
         if let Some(exp) = s.grant_expiration_ns {
@@ -824,7 +936,7 @@ impl Identities {
         reg_user_key: Vec<u8>,
         chain: Vec<SignedDelegation>,
     ) -> Result<RegistrationOutcome, String> {
-        self.ensure_session(session_id).await;
+        self.ensure_session(session_id).await?;
 
         // priv(X) to sign the ingress as, and pub(S) to register.
         let (reg_seed, reg_der, session_der) = {
@@ -931,7 +1043,7 @@ impl Identities {
         domain: &str,
         account_number: Option<u64>,
     ) -> Result<DelegatedIdentity, String> {
-        self.ensure_session(session_id).await;
+        self.ensure_session(session_id).await?;
 
         // Reuse a cached, still-fresh delegation if present.
         if let Some(app) = self.cached_fresh(session_id, domain, account_number).await {
@@ -970,7 +1082,14 @@ impl Identities {
     async fn store(&self, session_id: &str, domain: &str, account_number: Option<u64>, app: AppDelegation) {
         let mut sessions = self.sessions.write().await;
         if let Some(s) = sessions.get_mut(session_id) {
-            s.app_delegations.insert((domain.to_string(), account_number), app);
+            let key = (domain.to_string(), account_number);
+            // Bound the per-session cache before growing it. Only a NEW key can
+            // grow the map — refreshing an existing origin/account just replaces
+            // its entry, so it needs no room made.
+            if !s.app_delegations.contains_key(&key) {
+                bound_app_delegations(&mut s.app_delegations);
+            }
+            s.app_delegations.insert(key, app);
         }
     }
 
@@ -1041,6 +1160,88 @@ impl Identities {
             expiration_ns: prepared.expiration,
             app_key_seed,
         })
+    }
+}
+
+/// Drop every session that no longer serves anyone, returning the ids of each
+/// kind so the caller can log them: sessions whose grant has EXPIRED (paired
+/// with the "session opened" log by a "session closed" one), and ABANDONED
+/// connects — sessions that never redeemed a grant and are older than
+/// [`PENDING_CONNECT_TTL_NS`], long past the point where their connect could
+/// still be redeemed. A pending connect younger than that is kept: it is a
+/// sign-in in progress, and evicting it would strand the registration key `X`
+/// that II may already have certified.
+fn prune_stale(sessions: &mut HashMap<String, Session>, now: u64) -> (Vec<String>, Vec<String>) {
+    let (mut closed, mut abandoned) = (Vec::new(), Vec::new());
+    sessions.retain(|sid, s| match s.grant_expiration_ns {
+        Some(exp) if exp <= now => {
+            closed.push(sid.clone());
+            false
+        }
+        None if now.saturating_sub(s.created_ns) >= PENDING_CONNECT_TTL_NS => {
+            abandoned.push(sid.clone());
+            false
+        }
+        _ => true,
+    });
+    (closed, abandoned)
+}
+
+/// Make room for one more session, bounding the map (CWE-770) without stalling
+/// the common case: below [`MAX_PENDING_CONNECTS`] entries nothing is scanned at
+/// all. Above it, stale entries go first ([`prune_stale`]), then — since
+/// `/oauth/authorize` is unauthenticated and mints one session per request — the
+/// oldest PENDING connects are evicted down to the cap. A live grant is never
+/// evicted: if that leaves the map at [`MAX_SESSIONS`], the new session is
+/// refused ([`AT_CAPACITY_MSG`]) rather than logging an authenticated user out.
+///
+/// Returns the ids of any EXPIRED-grant sessions it closed on the way, so the
+/// caller can emit the same "session closed" log the reaper does — otherwise a
+/// session closed here would leave its "session opened" without a pair. Pending
+/// connects evicted to make room get no log line: they never opened a session.
+fn make_room(sessions: &mut HashMap<String, Session>, now: u64) -> Result<Vec<String>, String> {
+    if sessions.len() < MAX_PENDING_CONNECTS {
+        return Ok(Vec::new());
+    }
+    let (closed, _abandoned) = prune_stale(sessions, now);
+    let mut pending: Vec<(u64, String)> = sessions
+        .iter()
+        .filter(|(_, s)| s.grant_expiration_ns.is_none())
+        .map(|(sid, s)| (s.created_ns, sid.clone()))
+        .collect();
+    // Leave room for the caller's own entry: evict down to cap - 1.
+    if pending.len() >= MAX_PENDING_CONNECTS {
+        pending.sort_unstable(); // oldest first
+        let excess = pending.len() + 1 - MAX_PENDING_CONNECTS;
+        for (_, sid) in pending.into_iter().take(excess) {
+            sessions.remove(&sid);
+        }
+    }
+    if sessions.len() >= MAX_SESSIONS {
+        return Err(AT_CAPACITY_MSG.to_string());
+    }
+    Ok(closed)
+}
+
+/// Make room for one more cached per-app delegation, bounding a single session's
+/// cache at [`MAX_APP_DELEGATIONS`] (a session picks its own `(origin, account)`
+/// keys, so the map is caller-driven). Entries too close to expiry to be reused
+/// go first — they would be re-derived anyway ([`AppDelegation::fresh`]) — then,
+/// if the cache is still full, the entry nearest expiry.
+fn bound_app_delegations(cache: &mut HashMap<(String, Option<u64>), AppDelegation>) {
+    if cache.len() < MAX_APP_DELEGATIONS {
+        return;
+    }
+    cache.retain(|_, a| a.fresh());
+    while cache.len() >= MAX_APP_DELEGATIONS {
+        let Some(victim) = cache
+            .iter()
+            .min_by_key(|(_, a)| a.expiration_ns)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        cache.remove(&victim);
     }
 }
 
@@ -1349,7 +1550,7 @@ mod tests {
     #[tokio::test]
     async fn permissions_set_read_only_and_gate_writes() {
         let ids = test_ids();
-        ids.ensure_session("sess").await;
+        ids.ensure_session("sess").await.expect("room for a session");
         assert_eq!(ids.is_read_only("sess").await, None);
         assert!(ids.require_write("sess").await.is_ok());
         ids.set_permissions("sess", "queries").await;
@@ -1362,7 +1563,7 @@ mod tests {
         // An UNRECOGNIZED value must NOT assume full access: it leaves the level
         // unknown (None) so the call falls through to the ingress-rejection path,
         // rather than the server wrongly reporting the session as writable.
-        ids.ensure_session("sess2").await;
+        ids.ensure_session("sess2").await.expect("room for a session");
         ids.set_permissions("sess2", "something-new").await;
         assert_eq!(ids.is_read_only("sess2").await, None);
         assert!(ids.require_write("sess2").await.is_ok());
@@ -1387,7 +1588,7 @@ mod tests {
 
     // Seed a session with a live grant, bypassing the network connect flow.
     async fn seed_live(ids: &Identities, session_id: &str) {
-        ids.ensure_session(session_id).await;
+        ids.ensure_session(session_id).await.expect("room for a session");
         let mut sessions = ids.sessions.write().await;
         let s = sessions.get_mut(session_id).expect("ensured session");
         s.grant_expiration_ns = Some(u64::MAX);
@@ -1445,7 +1646,7 @@ mod tests {
     #[tokio::test]
     async fn expired_grant_blocks_signing() {
         let ids = test_ids();
-        ids.ensure_session("sess").await;
+        ids.ensure_session("sess").await.expect("room for a session");
         ids.set_grant_expiration("sess", now_ns().saturating_sub(1)).await;
         // A past grant expiration short-circuits to the reconnect message.
         assert!(ids.session_signer("sess").await.is_err());
@@ -1466,7 +1667,7 @@ mod tests {
         // An expired grant.
         ids.set_grant_expiration("expired", now_ns().saturating_sub(1)).await;
         // A session with no recorded expiry.
-        ids.ensure_session("pending").await;
+        ids.ensure_session("pending").await.expect("room for a session");
 
         assert_eq!(ids.live_session_count().await, 2);
     }
@@ -1479,7 +1680,7 @@ mod tests {
         let future = now_ns() + 3_600_000_000_000;
         ids.set_grant_expiration("live", future).await;
         ids.set_grant_expiration("expired", now_ns().saturating_sub(1)).await;
-        ids.ensure_session("pending").await;
+        ids.ensure_session("pending").await.expect("room for a session");
 
         assert_eq!(ids.reap_expired_sessions().await, 1);
         // The expired one is gone; the live and no-expiry ones remain.
@@ -1491,6 +1692,159 @@ mod tests {
         // Idempotent: a second sweep finds nothing new to reap.
         assert_eq!(ids.reap_expired_sessions().await, 0);
         assert_eq!(ids.live_session_count().await, 1);
+    }
+
+    // ---- Bounded state (CWE-770) --------------------------------------------
+
+    // A bare `Session` with the given age/grant, for the bound tests — no key
+    // material needed, since the bounds only read the timestamps and the grant.
+    fn session_at(created_ns: u64, grant_expiration_ns: Option<u64>) -> Session {
+        Session {
+            key_seed: [0u8; 32],
+            pubkey_der: Vec::new(),
+            grant_expiration_ns,
+            created_ns,
+            last_seen_ns: AtomicU64::new(created_ns),
+            reg_key_seed: None,
+            reg_pubkey_der: None,
+            read_only: None,
+            app_delegations: HashMap::new(),
+        }
+    }
+
+    fn app_delegation(expiration_ns: u64) -> AppDelegation {
+        AppDelegation {
+            user_key: Vec::new(),
+            chain: Vec::new(),
+            expiration_ns,
+            app_key_seed: [0u8; 32],
+        }
+    }
+
+    // `/oauth/authorize` is unauthenticated, so the connects in flight are
+    // capped: making room evicts the OLDEST pending connect (a flood churns its
+    // own entries out) and never touches a session holding a live grant.
+    #[test]
+    fn make_room_bounds_pending_connects_and_spares_grants() {
+        let now = 1_700_000_000 * 1_000_000_000;
+        let mut sessions = HashMap::new();
+        sessions.insert("live".to_string(), session_at(now, Some(now + 3_600_000_000_000)));
+        // `pending-i` is i milliseconds old, so `pending-{cap-1}` is the oldest.
+        for i in 0..MAX_PENDING_CONNECTS as u64 {
+            sessions.insert(format!("pending-{i}"), session_at(now - i * 1_000_000, None));
+        }
+
+        make_room(&mut sessions, now).expect("pending pressure must not refuse a connect");
+
+        assert!(sessions.contains_key("live"), "a live grant is never evicted");
+        let pending = sessions.values().filter(|s| s.grant_expiration_ns.is_none()).count();
+        assert_eq!(pending, MAX_PENDING_CONNECTS - 1, "room made for exactly one more connect");
+        assert!(
+            !sessions.contains_key(&format!("pending-{}", MAX_PENDING_CONNECTS - 1)),
+            "the oldest pending connect goes first"
+        );
+        assert!(sessions.contains_key("pending-0"), "recent connects in flight are kept");
+    }
+
+    // Stale entries are reclaimed before anything live is considered: an expired
+    // grant and an abandoned connect free the room a new connect needs.
+    #[test]
+    fn make_room_reclaims_stale_entries_first() {
+        let now = 1_700_000_000 * 1_000_000_000;
+        let mut sessions = HashMap::new();
+        sessions.insert("expired".to_string(), session_at(now, Some(now - 1)));
+        sessions.insert(
+            "abandoned".to_string(),
+            session_at(now.saturating_sub(PENDING_CONNECT_TTL_NS + 1), None),
+        );
+        for i in 0..(MAX_PENDING_CONNECTS as u64 - 2) {
+            sessions.insert(format!("pending-{i}"), session_at(now - i * 1_000_000, None));
+        }
+
+        let closed = make_room(&mut sessions, now).expect("room is available");
+
+        assert_eq!(closed, vec!["expired".to_string()], "an expired grant is reported for logging");
+        assert!(!sessions.contains_key("expired"));
+        assert!(!sessions.contains_key("abandoned"));
+        // Reclaiming those two was enough, so no live-ish connect was evicted.
+        assert!(sessions.contains_key("pending-0"));
+        assert_eq!(sessions.len(), MAX_PENDING_CONNECTS - 2);
+    }
+
+    // The hard ceiling refuses a new connect rather than evicting an
+    // authenticated user's live grant to make room.
+    #[test]
+    fn make_room_refuses_rather_than_evicting_live_grants() {
+        let now = 1_700_000_000 * 1_000_000_000;
+        let mut sessions: HashMap<String, Session> = (0..MAX_SESSIONS)
+            .map(|i| (format!("live-{i}"), session_at(now, Some(now + 3_600_000_000_000))))
+            .collect();
+
+        let err = make_room(&mut sessions, now).expect_err("a full map must refuse the connect");
+        assert!(err.contains("at capacity"), "got: {err}");
+        assert_eq!(sessions.len(), MAX_SESSIONS, "no live grant was evicted to make room");
+    }
+
+    // A connect that never redeems is reaped once it is past the point of being
+    // redeemable; a connect still in flight is kept (evicting it would strand the
+    // registration key `X` II may already have certified).
+    #[tokio::test]
+    async fn reap_drops_abandoned_connects_and_keeps_fresh_ones() {
+        let ids = test_ids();
+        ids.ensure_session("in-flight").await.expect("room for a session");
+        ids.ensure_session("abandoned").await.expect("room for a session");
+        {
+            let mut sessions = ids.sessions.write().await;
+            sessions.get_mut("abandoned").expect("session").created_ns =
+                now_ns().saturating_sub(PENDING_CONNECT_TTL_NS + 1);
+        }
+
+        assert_eq!(ids.reap_expired_sessions().await, 1);
+        let sessions = ids.sessions.read().await;
+        assert!(sessions.contains_key("in-flight"), "a connect in flight survives the sweep");
+        assert!(!sessions.contains_key("abandoned"), "an abandoned connect is reaped");
+    }
+
+    // A single session can't grow its delegation cache without bound by asking
+    // for delegations at many origins: the cache is capped, and the entry nearest
+    // expiry (the one that would be re-derived soonest anyway) is evicted.
+    #[tokio::test]
+    async fn app_delegation_cache_is_capped_per_session() {
+        let ids = test_ids();
+        seed_live(&ids, "sess").await;
+        let base = now_ns() + REDERIVE_MARGIN_NS + 60 * 1_000_000_000;
+        for i in 0..MAX_APP_DELEGATIONS as u64 {
+            // Later `i` expires later, so `app0` is always the nearest expiry.
+            ids.store("sess", &format!("app{i}.example"), None, app_delegation(base + i * 1_000_000_000))
+                .await;
+        }
+        assert_eq!(
+            ids.sessions.read().await.get("sess").expect("session").app_delegations.len(),
+            MAX_APP_DELEGATIONS
+        );
+
+        ids.store("sess", "one-more.example", None, app_delegation(base + 9_999_000_000_000)).await;
+
+        {
+            let sessions = ids.sessions.read().await;
+            let cache = &sessions.get("sess").expect("session").app_delegations;
+            assert_eq!(cache.len(), MAX_APP_DELEGATIONS, "the cache stays at its cap");
+            assert!(
+                !cache.contains_key(&("app0.example".to_string(), None)),
+                "the entry nearest expiry is evicted"
+            );
+            assert!(
+                cache.contains_key(&("one-more.example".to_string(), None)),
+                "the new entry is cached"
+            );
+        }
+
+        // Refreshing an EXISTING origin/account replaces its entry, evicting nothing.
+        ids.store("sess", "app1.example", None, app_delegation(base + 9_999_000_000_000)).await;
+        assert_eq!(
+            ids.sessions.read().await.get("sess").expect("session").app_delegations.len(),
+            MAX_APP_DELEGATIONS
+        );
     }
 
     // The live gauge tracks the grant lifecycle, NOT request activity: a session
@@ -1913,8 +2267,8 @@ mod tests {
     #[tokio::test]
     async fn registration_key_is_minted_once_and_distinct_from_session_key() {
         let ids = test_ids();
-        let x1 = ids.registration_pubkey_b64("sess").await;
-        let x2 = ids.registration_pubkey_b64("sess").await;
+        let x1 = ids.registration_pubkey_b64("sess").await.expect("mint X");
+        let x2 = ids.registration_pubkey_b64("sess").await.expect("mint X");
         assert_eq!(x1, x2, "the registration key is stable across a connect");
         // X's key material must differ from the session key S.
         let (s_der, x_der) = {
@@ -1985,7 +2339,7 @@ mod tests {
     async fn redeem_rejects_delegation_not_targeting_registration_key() {
         let ids = test_ids();
         // Mint X so the missing-key guard passes and we reach the target check.
-        let _ = ids.registration_pubkey_b64("sess").await;
+        ids.registration_pubkey_b64("sess").await.expect("mint X");
         let wrong_target = SignedDelegation {
             delegation: Delegation {
                 pubkey: vec![0xaa; 32], // not der(X)
@@ -2078,7 +2432,7 @@ mod tests {
         assert!(err.contains("no registration key"), "got: {err}");
 
         // With X minted, an EMPTY chain is rejected (nothing to present to II).
-        let _ = ids.registration_pubkey_b64("sess").await;
+        ids.registration_pubkey_b64("sess").await.expect("mint X");
         let err = ids
             .redeem_registration_delegation("sess", vec![1], vec![])
             .await

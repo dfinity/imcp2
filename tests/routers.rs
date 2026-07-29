@@ -199,6 +199,83 @@ async fn unauthenticated_mcp_requests_get_the_path_aware_challenge() {
     );
 }
 
+/// Dynamic client registration round-trips through the **bounded** client store
+/// (capped, LRU-evicted, with coalesced write-through): a loopback redirect
+/// registers, that `client_id` is then accepted at `/oauth/authorize` (which also
+/// marks it recently used, keeping it ahead of the LRU eviction), the
+/// registration lands in `OAUTH_CLIENTS_FILE` so it survives a restart, and a
+/// redirect off the hosted allow-list is refused before anything is stored.
+#[tokio::test]
+async fn dynamic_client_registration_round_trips_and_persists() {
+    // One app, cloned per request, so both calls share the same client store.
+    let app = app();
+    let register = |body: &'static str| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::post("/mcp/oauth/register")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+        }
+    };
+
+    let (status, doc) = register(r#"{"redirect_uris":["http://127.0.0.1:4321/cb"]}"#).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let client_id = doc["client_id"].as_str().expect("a client_id").to_string();
+    assert_eq!(doc["redirect_uris"][0], "http://127.0.0.1:4321/cb");
+
+    // The fresh registration is usable: authorize accepts it and hands the
+    // browser to Internet Identity (302 + the binding cookie).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/mcp/oauth/authorize?response_type=code&client_id={client_id}\
+                 &redirect_uri=http://127.0.0.1:4321/cb&code_challenge=abc\
+                 &code_challenge_method=S256"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND, "a registered client can start a sign-in");
+    assert!(resp.headers().contains_key("set-cookie"), "the binding cookie must be set");
+
+    // A hosted redirect that isn't allow-listed is refused (nothing stored).
+    let (status, doc) = register(r#"{"redirect_uris":["https://attacker.example/cb"]}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(doc["error"], "invalid_redirect_uri");
+
+    // Registrations are persisted (coalesced, so on a background task): poll
+    // briefly for the write rather than assuming it has already landed.
+    let path = std::env::var("OAUTH_CLIENTS_FILE").expect("isolated store path");
+    let mut persisted = String::new();
+    for _ in 0..100 {
+        persisted = std::fs::read_to_string(&path).unwrap_or_default();
+        if persisted.contains(&client_id) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        persisted.contains(&client_id),
+        "the registration must reach {path} so it survives a restart"
+    );
+    assert!(
+        !persisted.contains("attacker.example"),
+        "a refused registration must never be stored"
+    );
+}
+
 #[tokio::test]
 async fn invalid_token_challenge_carries_rfc6750_error() {
     let resp = app()
