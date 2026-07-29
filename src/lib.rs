@@ -342,18 +342,27 @@ impl McpServer {
             .layer(permissive_cors())
     }
 
-    /// Spawn this instance's session reaper: sweeps once shortly after startup
+    /// Spawn this instance's state reaper: sweeps once shortly after startup
     /// and then every 60s (tokio's interval fires its first tick immediately;
-    /// the startup sweep is harmless, the map is empty then), evicting
-    /// expired-grant sessions (emitting a "session closed" log each) and giving
-    /// the journal a close event to reconcile against "session opened". This
-    /// caps growth from expired grants (the common case: every authenticated
-    /// session eventually expires); sessions with no recorded expiry
-    /// (mid-connect) are deliberately kept and so are NOT bounded by this.
+    /// the startup sweep is harmless, the maps are empty then). Each sweep
+    /// evicts:
+    ///
+    ///   * expired-grant sessions, emitting a "session closed" log each so the
+    ///     journal has a close event to reconcile against "session opened",
+    ///     plus connects abandoned mid-handshake (a session that never redeemed
+    ///     a grant);
+    ///   * the matching short-lived OAuth state — pending connects past their
+    ///     TTL, authorization codes never exchanged, and expired access tokens.
+    ///
+    /// Reaping is what RETURNS the memory; the per-insert admission bounds (see
+    /// `identities::make_room` / `auth::make_room`) are what cap these maps
+    /// between sweeps, since the connect endpoints are unauthenticated. Running
+    /// this is therefore expected, not optional, for a long-lived deployment.
     /// Tied to [`Self::shutdown`] so the task stops cleanly on drain. Must be
     /// called from within a tokio runtime.
     pub fn spawn_session_reaper(&self) {
         let ids = self.identities.clone();
+        let store = self.store.clone();
         let reap_ct = self.ct.child_token();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -366,6 +375,7 @@ impl McpServer {
                     _ = reap_ct.cancelled() => break,
                     _ = tick.tick() => {
                         ids.reap_expired_sessions().await;
+                        store.reap_expired().await;
                     }
                 }
             }
