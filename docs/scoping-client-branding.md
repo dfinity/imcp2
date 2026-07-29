@@ -29,15 +29,15 @@ Two decisions frame everything below:
 
 ## 2. Where this plugs into the current flow (verified, file:line)
 
-- **The connect link** (`ii_mcp_url`, `auth.rs:1062`):
+- **The connect link** (`ii_mcp_url`, `auth.rs:1071`):
   `"{ii}/mcp#callback=...&state=...&ttl=...&registration_key=..."`. Everything rides the URL
   **fragment**, so it never goes on the wire; II reads it from `location.hash`. This is where the
   product-name string is added.
-- **The authorize handler** (`authorize`, `auth.rs:865`): before building the link it has already
-  validated the request's `redirect_uri` (`validate_client`, `auth.rs:890`). That `redirect_uri`
+- **The authorize handler** (`authorize`, `auth.rs:874`): before building the link it has already
+  validated the request's `redirect_uri` (`validate_client`, `auth.rs:759`). That `redirect_uri`
   is the direct, authoritative signal of product identity (see 4), so the product name is
   resolved right here.
-- **The origin II already trusts for this connect** (`#4091`, `auth.rs:1082-1109`): before
+- **The origin II already trusts for this connect** (`#4091`, `auth.rs:1091-1118`): before
   honoring a callback, II fetches `<callback origin>/.well-known/ii-auth-callbacks`
   (fail-closed, exact string match, 8 KB cap, CORS, `no-store`) and requires the callback to be a
   declared entry. That establishes the callback **origin** as a validated, server-controlled
@@ -51,7 +51,7 @@ Two decisions frame everything below:
 ## 3. Vetting model: branding for allow-listed products only
 
 Dynamic client registration is **unauthenticated and open** (`POST /oauth/register` takes all
-callers, `auth.rs:1888`). So any client-supplied `client_name` / `logo_uri` is attacker-
+callers, `auth.rs:1897`). So any client-supplied `client_name` / `logo_uri` is attacker-
 controlled. Rendering it on a consent screen would be a phishing gift: a hostile client
 registers `client_name: "Internet Identity"` with a lookalike mark and the user sees a spoofed,
 trusted-looking prompt.
@@ -67,17 +67,17 @@ Consequences:
   screen**. Nothing regresses; it just gets no name/logo.
 - There is **no open logo proxy** and **no SSRF surface** in v1: we never fetch an arbitrary
   client `logo_uri`. Logos are compiled-in assets (like the DFINITY logo already inlined into the
-  callback page via `include_str!`, `auth.rs:1161`).
+  callback page via `include_str!`, `auth.rs:1170`).
 
 ## 4. The identifier is a product name, not a `client_id`
 
 `client_id`s are **not a durable identity**, so nothing in this design keys on them:
 
-- Minted fresh per registration: `client-{uuid_v4}` (`auth.rs:1913`), a new random value each
+- Minted fresh per registration: `client-{uuid_v4}` (`auth.rs:1922`), a new random value each
   time anyone registers.
 - Stable only for the life of one cached registration, and it churns everywhere else: reinstall
   / "remove the connector and add it again" (which the server's own error copy instructs,
-  `auth.rs:923`) / expiry all mint a new id; the store is LRU-evicted at `MAX_CLIENTS` so an idle
+  `auth.rs:932`) / expiry all mint a new id; the store is LRU-evicted at `MAX_CLIENTS` so an idle
   client is dropped and re-registers with a new id (`make_room_for_client`, `auth.rs:340`); and it
   is per-registration, not per-vendor, so one product maps to many ids across users and devices.
 
@@ -123,10 +123,10 @@ There are two classes of MCP client, and only one can be vouched for:
 
 ### 5.1 MCP-server side (this repo)
 
-1. **Resolve the product at authorize time.** In `authorize` (`auth.rs:865`), after
+1. **Resolve the product at authorize time.** In `authorize` (`auth.rs:874`), after
    `validate_client`, match `q.redirect_uri` against `allowed_redirects()` to get the product
    slug (or none for an unvetted redirect).
-2. **Put the product slug in the connect link.** `ii_mcp_url` (`auth.rs:1062`) appends
+2. **Put the product slug in the connect link.** `ii_mcp_url` (`auth.rs:1071`) appends
    `&connector={slug}` to the fragment when a slug resolved; omit it otherwise. Additive: an II
    that does not know the param ignores it (see 8). The slug is not secret, so the fragment
    placement (consistent with the other params) is fine.
@@ -149,12 +149,12 @@ and `#4093` (`registration_key`). II must:
 ## 6. Endpoints
 
 Rooted at the instance issuer (`connect_callback_url` derives from `store.issuer()`,
-`auth.rs:1088`), so they are same-origin with the callback II already trusts.
+`auth.rs:1097`), so they are same-origin with the callback II already trusts.
 
 - **`GET {issuer}/branding/{slug}`** returns a tiny JSON metadata document for a vetted product,
   e.g. `{ "name": "ChatGPT", "logo": "<issuer>/branding/chatgpt/logo", "verified": true }`.
   `404` for any slug outside the curated set. Served with CORS (II fetches cross-origin, mirroring
-  `auth_callbacks`, `auth.rs:1097`) and `no-store`.
+  `auth_callbacks`, `auth.rs:1106`) and `no-store`.
 - **`GET {issuer}/branding/{slug}/logo`** returns the bundled image bytes (SVG is fine: served as
   `image/svg+xml`), with `X-Content-Type-Options: nosniff` and a cache header. `404` otherwise.
   **II must render it via a fixed-size `<img src=...>`, never by inlining the SVG markup into the
