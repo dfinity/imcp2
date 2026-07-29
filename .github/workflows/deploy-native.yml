@@ -225,6 +225,9 @@ jobs:
           HOST: ${{ secrets.DEPLOY_HOST }}
           DOMAIN: ${{ secrets.DEPLOY_DOMAIN }}
           ACME_EMAIL: ${{ secrets.DEPLOY_ACME_EMAIL }}
+          # Expose the beta II instance at /mcp-beta on staging only; production
+          # serves /mcp (production II) alone. Empty string reads as off.
+          MCP_SERVE_BETA: ${{ inputs.environment == 'staging' && '1' || '' }}
         run: deploy/native/deploy.sh
 
       # Confirm the host is actually running the commit we just shipped, rather

@@ -172,6 +172,11 @@ Staging tracks `main` continuously so changes get exercised on a real host; prod
 only ever moves when someone cuts a tag, so the live revision is always a named,
 reproducible point in history.
 
+The staging deploy additionally sets `MCP_SERVE_BETA=1` (via `deploy-native.yml`,
+substituted into the unit by `deploy.sh`), so staging serves the beta Internet
+Identity instance at `/mcp-beta` alongside the production `/mcp`. Production leaves
+it unset, so it serves `/mcp` (production II) alone.
+
 The mechanics live in [`deploy-native.yml`](../../.github/workflows/deploy-native.yml),
 a reusable workflow both call. It first runs the status dashboard's unit tests (a
 regression there stops the rollout), cross-builds the binary with `build.sh`, then runs
