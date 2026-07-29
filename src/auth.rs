@@ -316,7 +316,9 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     if url.query().is_some() || url.fragment().is_some() {
         return false;
     }
-    if is_loopback_redirect(redirect_uri) {
+    // Loopback is checked on the already-parsed `url` (not a re-parse of the raw
+    // string), since this runs on the `/oauth/register` and `/oauth/authorize` path.
+    if is_loopback_url(&url) {
         return true;
     }
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
@@ -350,7 +352,7 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
 }
 
 /// Whether `redirect_uri` is a **well-formed hosted** redirect: it parses, is
-/// `https`, carries no userinfo, and has a host. This is the shape that could
+/// `https`, carries no userinfo, has a host, and has no query or fragment. This is the shape that could
 /// legitimately be allow-listed and that [`redirect_uri_permitted`] rejects only
 /// because its host isn't on the list. It lets `/oauth/authorize` tell "a real
 /// client whose redirect just isn't approved yet" (→ the [`not_allowlisted_page`])
@@ -1744,9 +1746,12 @@ fn bearer_challenge(had_token: bool, resource_metadata_url: &str) -> String {
 /// and the userinfo-with-port form `http://localhost:1234@evil.com` all parse to
 /// host `evil.com` (or carry userinfo) and are rejected.
 fn is_loopback_redirect(redirect_uri: &str) -> bool {
-    let Ok(url) = url::Url::parse(redirect_uri) else {
-        return false;
-    };
+    url::Url::parse(redirect_uri).map(|u| is_loopback_url(&u)).unwrap_or(false)
+}
+
+/// Loopback test on an already-parsed URL, so a caller that has parsed the
+/// `redirect_uri` (e.g. [`redirect_uri_permitted`]) need not parse it again.
+fn is_loopback_url(url: &url::Url) -> bool {
     url.scheme() == "http"
         && url.username().is_empty()
         && url.password().is_none()
