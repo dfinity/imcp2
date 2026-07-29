@@ -271,20 +271,6 @@ fn path_within_prefix(path: &str, prefix: &str) -> bool {
     }
 }
 
-/// Whether the redirect carries a `.`/`..` path segment (raw or `%2e`-encoded). A
-/// user agent normalizes these away before requesting, so a redirect like
-/// `/connector/oauth/../../g/evil` could satisfy the pinned-prefix check here yet
-/// land OUTSIDE the prefix in the browser; such redirects are refused outright.
-/// (`url::Url` already normalizes special-scheme paths, so this is a belt-and-
-/// suspenders check on the raw input, independent of that normalization.)
-fn has_dot_segment(redirect_uri: &str) -> bool {
-    let normalized = redirect_uri.to_ascii_lowercase().replace("%2e", ".");
-    normalized.split('/').any(|seg| {
-        let seg = seg.split(['?', '#']).next().unwrap_or("");
-        seg == "." || seg == ".."
-    })
-}
-
 /// Whether a `redirect_uri` may be registered or receive an authorization code.
 /// No redirect (loopback or hosted) may carry a query or fragment component: the
 /// authorization endpoint appends `?code=…&state=…`, so a pre-existing query would
@@ -321,12 +307,6 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     if is_loopback_url(&url) {
         return true;
     }
-    // Refuse `.`/`..` (raw or `%2e`) path segments before url::Url normalises them
-    // away: they normalize in the browser and could escape the pinned callback prefix
-    // (`/connector/oauth/../../g/evil`), and the parsed path wouldn't reveal them.
-    if has_dot_segment(redirect_uri) {
-        return false;
-    }
     let Some(host) = url.host_str() else {
         return false;
     };
@@ -344,6 +324,10 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
         return false;
     }
     let host = host.trim_end_matches('.').to_ascii_lowercase();
+    // `url.path()` is already dot-segment-normalized: url::Url follows the WHATWG URL
+    // Standard, collapsing `.`/`..` (raw or `%2e`/`%2E`-encoded) on parse, so a
+    // traversal like `/connector/oauth/../../g/evil` arrives here as `/g/evil` and is
+    // caught by the prefix check below (no separate raw-string dot-segment guard needed).
     let path = url.path();
     // host == domain (or a dot-boundary subdomain) AND the path is within the
     // vendor's pinned callback prefix. The path pin is what keeps a registration
@@ -1827,10 +1811,14 @@ mod tests {
         // Right domain, wrong path, plus a non-segment-boundary near-miss of the pin.
         assert!(!redirect_uri_permitted("https://claude.ai/foo"));
         assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callbackEVIL"));
-        // Dot-segment traversal that would normalize (in the browser) outside the
-        // pinned prefix, raw and percent-encoded (`%2e`) forms.
+        // Dot-segment traversal (raw and percent-encoded): url::Url normalizes these
+        // to `/g/evil` on parse (WHATWG), which then fails the pinned-prefix check.
         assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/../../g/evil"));
         assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%2e%2e/%2e%2e/g/evil"));
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%2E%2E/%2E%2E/g/evil"));
+        // A dot-segment that normalizes to WITHIN the vendor's pinned prefix is fine
+        // (it lands in the vendor's own callback space, not an escape).
+        assert!(redirect_uri_permitted("https://chatgpt.com/connector/oauth/x/../y"));
         // Cursor: allowed at its real hosted callback path (registered as
         // www.cursor.com), refused on any other path.
         assert!(redirect_uri_permitted("https://www.cursor.com/agents/mcp/oauth/callback"));
@@ -1868,21 +1856,6 @@ mod tests {
         // now-removed domain) still can't receive a code at /oauth/authorize.
         let junk = ClientReg { redirect_uris: vec!["https://example.com/cb".to_string()] };
         assert!(!redirect_allowed(Some(&junk), "https://example.com/cb"));
-    }
-
-    /// Dot-segment detection, independent of `url::Url` normalization: whole-segment
-    /// `.`/`..` (raw or `%2e`) is caught; dots inside a segment and in the query are not.
-    #[test]
-    fn detects_dot_segments() {
-        use super::has_dot_segment;
-        assert!(has_dot_segment("https://x.example/a/../b"));
-        assert!(has_dot_segment("https://x.example/a/./b"));
-        assert!(has_dot_segment("https://x.example/a/%2e%2e/b"));
-        assert!(has_dot_segment("https://x.example/a/%2E%2E/b"));
-        assert!(has_dot_segment("https://x.example/foo/.."));
-        assert!(!has_dot_segment("https://x.example/api/mcp/auth_callback"));
-        assert!(!has_dot_segment("https://x.example/a.b/c..d")); // dots inside a segment
-        assert!(!has_dot_segment("https://x.example/cb?next=../x")); // query, not path
     }
 
     /// `OAUTH_ALLOWED_REDIRECT_PREFIXES` entries parse to `(host, path)` only for a
