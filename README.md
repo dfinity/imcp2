@@ -535,7 +535,10 @@ the callback page.
 > MCP connector vendors' callback paths and widened per deployment with
 > `OAUTH_ALLOWED_REDIRECT_PREFIXES` (additive; each entry a full `https://host/path`
 > URL prefix, a bare domain is refused); loopback/native clients are exempt (the code
-> resolves on the consenter's own machine). Enforced at both `…/oauth/register` and `…/oauth/authorize`. A client
+> resolves on the consenter's own machine). No redirect (loopback or hosted) may
+> carry a **query or fragment**: the authorization endpoint appends `?code=…&state=…`,
+> so a pre-existing query would risk `code=…&code=…` parameter pollution, and a
+> fragment is meaningless on a redirect target. Enforced at both `…/oauth/register` and `…/oauth/authorize`. A client
 > turned away is pointed at a contact address to request approval:
 > `…/oauth/register` says so in its JSON `error_description`, and a browser that
 > reaches `…/oauth/authorize` gets an on-brand "not allowed" page (not a raw error)

@@ -472,23 +472,13 @@ fn path_within_prefix(path: &str, prefix: &str) -> bool {
     }
 }
 
-/// Whether the redirect carries a `.`/`..` path segment (raw or `%2e`-encoded). A
-/// user agent normalizes these away before requesting, so a redirect like
-/// `/connector/oauth/../../g/evil` could satisfy the pinned-prefix check here yet
-/// land OUTSIDE the prefix in the browser; such redirects are refused outright.
-/// (`url::Url` already normalizes special-scheme paths, so this is a belt-and-
-/// suspenders check on the raw input, independent of that normalization.)
-fn has_dot_segment(redirect_uri: &str) -> bool {
-    let normalized = redirect_uri.to_ascii_lowercase().replace("%2e", ".");
-    normalized.split('/').any(|seg| {
-        let seg = seg.split(['?', '#']).next().unwrap_or("");
-        seg == "." || seg == ".."
-    })
-}
-
 /// Whether a `redirect_uri` may be registered or receive an authorization code.
-/// Loopback (`http://localhost` / `127.0.0.1` / `[::1]`, any port) is always
-/// allowed. A hosted redirect must be `https`, carry no userinfo, name no
+/// No redirect (loopback or hosted) may carry a query or fragment component: the
+/// authorization endpoint appends `?code=…&state=…`, so a pre-existing query would
+/// risk `code=…&code=…` parameter pollution (MCP05), and a fragment is meaningless
+/// on a redirect target. Loopback (`http://localhost` / `127.0.0.1` / `[::1]`, any
+/// port) is otherwise always allowed. A hosted redirect must be `https`, carry no
+/// userinfo, name no
 /// off-origin port (only the implicit/`:443` default is allowed), its host must
 /// equal (or be a subdomain of) an allow-listed registrable domain, AND its path
 /// must fall within that entry's pinned callback prefix (see
@@ -500,31 +490,45 @@ fn has_dot_segment(redirect_uri: &str) -> bool {
 /// `https://user@claude.ai` is refused too (userinfo serves no purpose in a
 /// redirect target, only muddies which host is addressed, and loopback rejects it).
 fn redirect_uri_permitted(redirect_uri: &str) -> bool {
-    if is_loopback_redirect(redirect_uri) {
-        return true;
-    }
     let Ok(url) = url::Url::parse(redirect_uri) else {
         return false;
     };
-    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+    // Reject any query or fragment component (MCP05), on loopback and hosted alike.
+    // `/oauth/authorize` appends `?code=…&state=…` to the redirect, so a redirect
+    // that already carries a query invites `code=123&code=456` parameter pollution
+    // a lax downstream parser could resolve to an attacker-seeded value; a fragment
+    // serves no purpose in a redirect target. Every seeded vendor callback and every
+    // registered loopback URI is already query/fragment-free, so this rejects nothing
+    // legitimate while keeping the code-appending redirect unambiguous.
+    if url.query().is_some() || url.fragment().is_some() {
         return false;
     }
-    // Refuse an explicit non-default port: `https://claude.ai:444/…` is a DIFFERENT
-    // origin than the pinned `https://claude.ai` and may serve different content, so
-    // the path pin wouldn't hold. `url::Url::port()` returns `None` for the scheme's
-    // default (443), so `:443` and no-port both pass; only an off-origin port fails.
-    if url.port().is_some() {
-        return false;
-    }
-    // Refuse `.`/`..` (raw or `%2e`) path segments: they normalize in the browser
-    // and could escape the pinned callback prefix (`/connector/oauth/../../g/evil`).
-    if has_dot_segment(redirect_uri) {
-        return false;
+    // Loopback is checked on the already-parsed `url` (not a re-parse of the raw
+    // string), since this runs on the `/oauth/register` and `/oauth/authorize` path.
+    if is_loopback_url(&url) {
+        return true;
     }
     let Some(host) = url.host_str() else {
         return false;
     };
+    // Allowlist the redirect's SHAPE rather than denylisting each disallowed part: a
+    // permitted hosted redirect serialises to exactly `https://<host><path>` (https,
+    // no userinfo, no port, no query, no fragment). Rebuild that canonical form from
+    // the parts we allow and require an exact match, so any unexpected component is
+    // refused in one comparison. url::Url drops the https-default `:443` (so it still
+    // matches), while an off-origin `:444`, a userinfo prefix, or an `http` scheme
+    // makes the two differ; query and fragment were already refused above.
+    let Ok(canonical) = url::Url::parse(&format!("https://{host}{}", url.path())) else {
+        return false;
+    };
+    if url != canonical {
+        return false;
+    }
     let host = host.trim_end_matches('.').to_ascii_lowercase();
+    // `url.path()` is already dot-segment-normalized: url::Url follows the WHATWG URL
+    // Standard, collapsing `.`/`..` (raw or `%2e`/`%2E`-encoded) on parse, so a
+    // traversal like `/connector/oauth/../../g/evil` arrives here as `/g/evil` and is
+    // caught by the prefix check below (no separate raw-string dot-segment guard needed).
     let path = url.path();
     // host == domain (or a dot-boundary subdomain) AND the path is within the
     // vendor's pinned callback prefix. The path pin is what keeps a registration
@@ -537,13 +541,13 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
 }
 
 /// Whether `redirect_uri` is a **well-formed hosted** redirect: it parses, is
-/// `https`, carries no userinfo, and has a host. This is the shape that could
+/// `https`, carries no userinfo, has a host, and has no query or fragment. This is the shape that could
 /// legitimately be allow-listed and that [`redirect_uri_permitted`] rejects only
 /// because its host isn't on the list. It lets `/oauth/authorize` tell "a real
 /// client whose redirect just isn't approved yet" (→ the [`not_allowlisted_page`])
 /// apart from a genuinely **malformed or ineligible** `redirect_uri`
-/// (unparseable, non-`https`, or userinfo-bearing), which is a client-side request
-/// error, not an approval gap. Loopback is intentionally NOT counted here: a
+/// (unparseable, non-`https`, userinfo-bearing, or query/fragment-carrying), which
+/// is a client-side request error, not an approval gap. Loopback is intentionally NOT counted here: a
 /// loopback redirect is always permitted, so it never reaches the not-permitted
 /// branch this distinction guards.
 fn is_wellformed_hosted_redirect(redirect_uri: &str) -> bool {
@@ -553,6 +557,11 @@ fn is_wellformed_hosted_redirect(redirect_uri: &str) -> bool {
                 && url.username().is_empty()
                 && url.password().is_none()
                 && url.host_str().is_some_and(|h| !h.is_empty())
+                // A query or fragment makes it ineligible (MCP05), not merely
+                // unapproved, so it is classified `invalid_request` rather than
+                // routed to the "request access" page.
+                && url.query().is_none()
+                && url.fragment().is_none()
         }
         Err(_) => false,
     }
@@ -2042,9 +2051,12 @@ fn bearer_challenge(had_token: bool, resource_metadata_url: &str) -> String {
 /// and the userinfo-with-port form `http://localhost:1234@evil.com` all parse to
 /// host `evil.com` (or carry userinfo) and are rejected.
 fn is_loopback_redirect(redirect_uri: &str) -> bool {
-    let Ok(url) = url::Url::parse(redirect_uri) else {
-        return false;
-    };
+    url::Url::parse(redirect_uri).map(|u| is_loopback_url(&u)).unwrap_or(false)
+}
+
+/// Loopback test on an already-parsed URL, so a caller that has parsed the
+/// `redirect_uri` (e.g. [`redirect_uri_permitted`]) need not parse it again.
+fn is_loopback_url(url: &url::Url) -> bool {
     url.scheme() == "http"
         && url.username().is_empty()
         && url.password().is_none()
@@ -2116,10 +2128,14 @@ mod tests {
         // Right domain, wrong path, plus a non-segment-boundary near-miss of the pin.
         assert!(!redirect_uri_permitted("https://claude.ai/foo"));
         assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callbackEVIL"));
-        // Dot-segment traversal that would normalize (in the browser) outside the
-        // pinned prefix, raw and percent-encoded (`%2e`) forms.
+        // Dot-segment traversal (raw and percent-encoded): url::Url normalizes these
+        // to `/g/evil` on parse (WHATWG), which then fails the pinned-prefix check.
         assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/../../g/evil"));
         assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%2e%2e/%2e%2e/g/evil"));
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%2E%2E/%2E%2E/g/evil"));
+        // A dot-segment that normalizes to WITHIN the vendor's pinned prefix is fine
+        // (it lands in the vendor's own callback space, not an escape).
+        assert!(redirect_uri_permitted("https://chatgpt.com/connector/oauth/x/../y"));
         // Cursor: allowed at its real hosted callback path (registered as
         // www.cursor.com), refused on any other path.
         assert!(redirect_uri_permitted("https://www.cursor.com/agents/mcp/oauth/callback"));
@@ -2145,25 +2161,18 @@ mod tests {
         assert!(redirect_uri_permitted("https://claude.ai:443/api/mcp/auth_callback"));
         // A hosted redirect must be https even to an allowed domain + path.
         assert!(!redirect_uri_permitted("http://claude.ai/api/mcp/auth_callback"));
+        // A query or fragment is refused (MCP05: `?code=…` appended by the AS would
+        // pollute a redirect that already carries one), on hosted AND loopback, even
+        // when the host + path are otherwise valid. The same URI with no query passes.
+        assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback?code=123"));
+        assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback?x=1"));
+        assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback#frag"));
+        assert!(!redirect_uri_permitted("http://127.0.0.1:6112/cb?code=123"));
+        assert!(!redirect_uri_permitted("http://localhost/callback#frag"));
         // Defense in depth: a client registered before the allow-list (or via a
         // now-removed domain) still can't receive a code at /oauth/authorize.
         let junk = ClientReg::new(vec!["https://example.com/cb".to_string()]);
         assert!(!redirect_allowed(Some(&junk), "https://example.com/cb"));
-    }
-
-    /// Dot-segment detection, independent of `url::Url` normalization: whole-segment
-    /// `.`/`..` (raw or `%2e`) is caught; dots inside a segment and in the query are not.
-    #[test]
-    fn detects_dot_segments() {
-        use super::has_dot_segment;
-        assert!(has_dot_segment("https://x.example/a/../b"));
-        assert!(has_dot_segment("https://x.example/a/./b"));
-        assert!(has_dot_segment("https://x.example/a/%2e%2e/b"));
-        assert!(has_dot_segment("https://x.example/a/%2E%2E/b"));
-        assert!(has_dot_segment("https://x.example/foo/.."));
-        assert!(!has_dot_segment("https://x.example/api/mcp/auth_callback"));
-        assert!(!has_dot_segment("https://x.example/a.b/c..d")); // dots inside a segment
-        assert!(!has_dot_segment("https://x.example/cb?next=../x")); // query, not path
     }
 
     /// `OAUTH_ALLOWED_REDIRECT_PREFIXES` entries parse to `(host, path)` only for a
