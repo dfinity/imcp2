@@ -66,7 +66,12 @@ on:
         description: Private SSH key for the sudo-capable host user.
         required: true
       DEPLOY_HOST:
-        description: user@host for the target, e.g. ec2-user@10.118.0.61.
+        description: >-
+          user@host for the target's PRIVATE address, e.g. ec2-user@<private-ip>.
+          Must NOT be the public FQDN from DEPLOY_DOMAIN: that resolves to the
+          public-facing interface, so the deploy leaves over the internet rather
+          than the VPN, and that interface's security group does not permit 22.
+          Staging was set this way and failed with a connection timeout.
         required: true
       DEPLOY_DOMAIN:
         description: Public FQDN served over HTTPS.

@@ -23,7 +23,12 @@
 # place; defining it in both means the environment copy silently wins. The
 # `production` environment's protection rules apply either way.
 #   PROD_DEPLOY_SSH_KEY     private SSH key for the sudo-capable user on the host
-#   PROD_DEPLOY_HOST        user@host, e.g. ec2-user@10.118.0.61
+#   PROD_DEPLOY_HOST        user@host for the host's PRIVATE address, e.g.
+#                           ec2-user@<private-ip>. NOT the public FQDN: that resolves
+#                           to the public-facing interface, which sends the deploy out
+#                           over the internet instead of the VPN, and whose security
+#                           group does not permit 22. Staging was misconfigured this
+#                           way and failed with a connection timeout.
 #   PROD_DEPLOY_DOMAIN      public FQDN served over HTTPS
 #   PROD_DEPLOY_ACME_EMAIL  email for Let's Encrypt / ACME
 # Optional:
