@@ -321,24 +321,28 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     if is_loopback_url(&url) {
         return true;
     }
-    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
-        return false;
-    }
-    // Refuse an explicit non-default port: `https://claude.ai:444/…` is a DIFFERENT
-    // origin than the pinned `https://claude.ai` and may serve different content, so
-    // the path pin wouldn't hold. `url::Url::port()` returns `None` for the scheme's
-    // default (443), so `:443` and no-port both pass; only an off-origin port fails.
-    if url.port().is_some() {
-        return false;
-    }
-    // Refuse `.`/`..` (raw or `%2e`) path segments: they normalize in the browser
-    // and could escape the pinned callback prefix (`/connector/oauth/../../g/evil`).
+    // Refuse `.`/`..` (raw or `%2e`) path segments before url::Url normalises them
+    // away: they normalize in the browser and could escape the pinned callback prefix
+    // (`/connector/oauth/../../g/evil`), and the parsed path wouldn't reveal them.
     if has_dot_segment(redirect_uri) {
         return false;
     }
     let Some(host) = url.host_str() else {
         return false;
     };
+    // Allowlist the redirect's SHAPE rather than denylisting each disallowed part: a
+    // permitted hosted redirect serialises to exactly `https://<host><path>` (https,
+    // no userinfo, no port, no query, no fragment). Rebuild that canonical form from
+    // the parts we allow and require an exact match, so any unexpected component is
+    // refused in one comparison. url::Url drops the https-default `:443` (so it still
+    // matches), while an off-origin `:444`, a userinfo prefix, or an `http` scheme
+    // makes the two differ; query and fragment were already refused above.
+    let Ok(canonical) = url::Url::parse(&format!("https://{host}{}", url.path())) else {
+        return false;
+    };
+    if url != canonical {
+        return false;
+    }
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     let path = url.path();
     // host == domain (or a dot-boundary subdomain) AND the path is within the
