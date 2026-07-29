@@ -171,7 +171,17 @@ jobs:
   # be no correct release to attach to.
   publish:
     needs: deploy
-    if: github.event_name == 'push'
+    # The event check must be combined with a status function, not left bare. An `if:`
+    # with no status function gets an implicit success() over the whole upstream chain,
+    # and that chain contains validate-ref, which is SKIPPED on a tag push — so a bare
+    # `github.event_name == 'push'` never passed on the only path this job is gated to
+    # run on. It was skipped on release-2026-07-29 (run 30441720101) for exactly that
+    # reason, having never run at all since it merged.
+    #
+    # This is the same trap the deploy job above documents and works around; the fix
+    # did not get carried down to here. !failure() && !cancelled() suppresses the
+    # implicit success(), and `needs: deploy` still means a failed rollout stops this.
+    if: ${{ !failure() && !cancelled() && github.event_name == 'push' }}
     runs-on: ubuntu-latest
     permissions:
       # Everything else in this repo runs read-only. An explicit block replaces the
