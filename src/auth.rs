@@ -286,8 +286,12 @@ fn has_dot_segment(redirect_uri: &str) -> bool {
 }
 
 /// Whether a `redirect_uri` may be registered or receive an authorization code.
-/// Loopback (`http://localhost` / `127.0.0.1` / `[::1]`, any port) is always
-/// allowed. A hosted redirect must be `https`, carry no userinfo, name no
+/// No redirect (loopback or hosted) may carry a query or fragment component: the
+/// authorization endpoint appends `?code=…&state=…`, so a pre-existing query would
+/// risk `code=…&code=…` parameter pollution (MCP05), and a fragment is meaningless
+/// on a redirect target. Loopback (`http://localhost` / `127.0.0.1` / `[::1]`, any
+/// port) is otherwise always allowed. A hosted redirect must be `https`, carry no
+/// userinfo, name no
 /// off-origin port (only the implicit/`:443` default is allowed), its host must
 /// equal (or be a subdomain of) an allow-listed registrable domain, AND its path
 /// must fall within that entry's pinned callback prefix (see
@@ -299,12 +303,22 @@ fn has_dot_segment(redirect_uri: &str) -> bool {
 /// `https://user@claude.ai` is refused too (userinfo serves no purpose in a
 /// redirect target, only muddies which host is addressed, and loopback rejects it).
 fn redirect_uri_permitted(redirect_uri: &str) -> bool {
-    if is_loopback_redirect(redirect_uri) {
-        return true;
-    }
     let Ok(url) = url::Url::parse(redirect_uri) else {
         return false;
     };
+    // Reject any query or fragment component (MCP05), on loopback and hosted alike.
+    // `/oauth/authorize` appends `?code=…&state=…` to the redirect, so a redirect
+    // that already carries a query invites `code=123&code=456` parameter pollution
+    // a lax downstream parser could resolve to an attacker-seeded value; a fragment
+    // serves no purpose in a redirect target. Every seeded vendor callback and every
+    // registered loopback URI is already query/fragment-free, so this rejects nothing
+    // legitimate while keeping the code-appending redirect unambiguous.
+    if url.query().is_some() || url.fragment().is_some() {
+        return false;
+    }
+    if is_loopback_redirect(redirect_uri) {
+        return true;
+    }
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
         return false;
     }
@@ -341,8 +355,8 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
 /// because its host isn't on the list. It lets `/oauth/authorize` tell "a real
 /// client whose redirect just isn't approved yet" (→ the [`not_allowlisted_page`])
 /// apart from a genuinely **malformed or ineligible** `redirect_uri`
-/// (unparseable, non-`https`, or userinfo-bearing), which is a client-side request
-/// error, not an approval gap. Loopback is intentionally NOT counted here: a
+/// (unparseable, non-`https`, userinfo-bearing, or query/fragment-carrying), which
+/// is a client-side request error, not an approval gap. Loopback is intentionally NOT counted here: a
 /// loopback redirect is always permitted, so it never reaches the not-permitted
 /// branch this distinction guards.
 fn is_wellformed_hosted_redirect(redirect_uri: &str) -> bool {
@@ -352,6 +366,11 @@ fn is_wellformed_hosted_redirect(redirect_uri: &str) -> bool {
                 && url.username().is_empty()
                 && url.password().is_none()
                 && url.host_str().is_some_and(|h| !h.is_empty())
+                // A query or fragment makes it ineligible (MCP05), not merely
+                // unapproved, so it is classified `invalid_request` rather than
+                // routed to the "request access" page.
+                && url.query().is_none()
+                && url.fragment().is_none()
         }
         Err(_) => false,
     }
@@ -1828,6 +1847,14 @@ mod tests {
         assert!(redirect_uri_permitted("https://claude.ai:443/api/mcp/auth_callback"));
         // A hosted redirect must be https even to an allowed domain + path.
         assert!(!redirect_uri_permitted("http://claude.ai/api/mcp/auth_callback"));
+        // A query or fragment is refused (MCP05: `?code=…` appended by the AS would
+        // pollute a redirect that already carries one), on hosted AND loopback, even
+        // when the host + path are otherwise valid. The same URI with no query passes.
+        assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback?code=123"));
+        assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback?x=1"));
+        assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback#frag"));
+        assert!(!redirect_uri_permitted("http://127.0.0.1:6112/cb?code=123"));
+        assert!(!redirect_uri_permitted("http://localhost/callback#frag"));
         // Defense in depth: a client registered before the allow-list (or via a
         // now-removed domain) still can't receive a code at /oauth/authorize.
         let junk = ClientReg { redirect_uris: vec!["https://example.com/cb".to_string()] };
