@@ -40,11 +40,15 @@ jobs:
       # self-hosted capacity is ARC-managed pools, and a runner scale set is selected
       # by its name alone, carrying none of the default labels classic runners get.
       #
-      # dind-small is one of those org-wide pools (Kubernetes, dfinity-ops/k8s, on the
-      # dm1-idx1 / zh1-idx1 clusters, runner group dm1). Its pods reach this host on
-      # its private address — confirmed by a deploy that shipped and passed the
-      # /version assertion from a dind-small pod — which is what lets the host drop
-      # inbound SSH from the public internet.
+      # dind-small is one of those org-wide, Kubernetes-backed pools. Its pods can
+      # reach this host on its private address over the VPN — confirmed by a deploy
+      # that shipped and passed the /version assertion from one — which is what makes
+      # the private-network target workable without exposing SSH to the internet.
+      #
+      # The pool spans more than one cluster and a pod can land on either, so the
+      # source address the host sees is not fixed. DEPLOY_HOST must name the host's
+      # private address for any of this to hold; see deploy-native.yml's description
+      # of that secret.
       ship_runs_on: '"dind-small"'
       # Staging host is arm64 (Graviton).
       arch: arm64
