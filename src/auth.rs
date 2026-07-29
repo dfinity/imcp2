@@ -484,9 +484,19 @@ fn path_within_prefix(path: &str, prefix: &str) -> bool {
 /// attacker-controlled, script-capable path (CWE-601). No legitimate vendor callback
 /// path contains any of these encodings, so a hosted redirect carrying one is
 /// refused outright, confining the redirect to the pinned path under every encoding.
+///
+/// Scans the bytes for `%` + the two hex digits (case-insensitive) rather than
+/// lowercasing the whole path: this runs on the unauthenticated front-channel
+/// (`/oauth/register`, `/oauth/authorize`), so it avoids a per-call allocation over a
+/// caller-controlled string and short-circuits on the first match.
 fn path_has_encoded_separator(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.contains("%2f") || lower.contains("%5c") || lower.contains("%2e")
+    path.as_bytes().windows(3).any(|w| {
+        w[0] == b'%'
+            && matches!(
+                (w[1].to_ascii_lowercase(), w[2].to_ascii_lowercase()),
+                (b'2', b'f') | (b'5', b'c') | (b'2', b'e')
+            )
+    })
 }
 
 /// Whether a `redirect_uri` may be registered or receive an authorization code.
