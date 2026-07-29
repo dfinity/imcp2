@@ -219,7 +219,7 @@ That split only works if `DEPLOY_HOST` names the host's **private** address. Poi
 the public FQDN and the deploy leaves over the internet instead of the VPN and arrives on
 the public interface, where `22` is no longer permitted — which is exactly how staging was
 configured, unnoticed, until that change made it fail. The secret's description in
-`deploy-native.yml` now says so.
+[`deploy-native.yml`](../../.github/workflows/deploy-native.yml) now says so.
 
 What remains open is `22` on the private interface, so anything that can route to the
 host's private address still reaches SSH: the VPN and the on-prem estate. That is accepted
