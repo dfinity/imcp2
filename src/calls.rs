@@ -699,10 +699,19 @@ pub fn decode_reply(did: Option<&str>, method: &str, bytes: &[u8]) -> String {
     if let Some(text) = did.and_then(|d| decode_bytes_with_did(d, method, bytes)) {
         return text;
     }
-    match IDLArgs::from_bytes(bytes) {
+    // Type-less fallback on the guarded deep stack (CWE-674). The reply bytes are
+    // attacker-controlled (the caller picks the target canister), and candid's decoder,
+    // `IDLArgs`' `Display`, AND the recursive `Drop` of the decoded tree each recurse
+    // once per nesting level with no depth bound; a recursive reply (`type t = opt t`:
+    // a few KB of `opt` tags) would overflow the ~2 MiB worker stack and abort the
+    // whole process. So decode, render, and drop the tree on the deep stack, exactly as
+    // the DID path already does. Not nested: the DID path's `on_deep_stack` has already
+    // returned by the time we reach here, and only the rendered `String` crosses back.
+    on_deep_stack(|| match IDLArgs::from_bytes(bytes) {
         Ok(decoded) => decoded.to_string(),
         Err(e) => format!("(call succeeded but reply is not decodable as Candid: {e})"),
-    }
+    })
+    .unwrap_or_else(|| "(could not spawn a thread to decode the reply)".to_string())
 }
 
 /// Decode Candid `bytes` against the return types of `method` declared in the
@@ -1061,17 +1070,27 @@ pub enum OqlResult {
 /// generally can't be recognized, so we fall back to `Unrecognized` with the raw
 /// reply rather than guessing.
 pub fn parse_execute_reply(did: Option<&str>, reply: &[u8]) -> OqlResult {
-    let decoded = match did.and_then(|d| decode_args_with_did(d, "execute", reply)) {
-        Some(args) => args,
-        None => match IDLArgs::from_bytes(reply) {
-            Ok(args) => args,
-            Err(e) => return OqlResult::Unrecognized(format!("(undecodable reply: {e})")),
-        },
-    };
-    match decoded.args.into_iter().next() {
-        Some(val) => extract_oql(&val).unwrap_or_else(|| OqlResult::Unrecognized(val.to_string())),
-        None => OqlResult::Unrecognized("(empty reply)".to_string()),
-    }
+    // Decode the attacker-controlled reply AND walk/render the decoded tree on the
+    // guarded deep stack (CWE-674): `from_bytes`, the recursive `extract_oql`/
+    // `cell_scalar` walk, the `Display` fallback, and the tree's recursive `Drop` all
+    // recurse once per nesting level with no depth bound. The whole thing (creation
+    // through drop of the `IDLArgs`) stays on the deep stack; only the rendered
+    // `OqlResult` (owned strings) crosses back. One `on_deep_stack`, never nested:
+    // `decode_args_with_did` now decodes in place rather than taking its own.
+    on_deep_stack(move || {
+        let decoded = match did.and_then(|d| decode_args_with_did(d, "execute", reply)) {
+            Some(args) => args,
+            None => match IDLArgs::from_bytes(reply) {
+                Ok(args) => args,
+                Err(e) => return OqlResult::Unrecognized(format!("(undecodable reply: {e})")),
+            },
+        };
+        match decoded.args.into_iter().next() {
+            Some(val) => extract_oql(&val).unwrap_or_else(|| OqlResult::Unrecognized(val.to_string())),
+            None => OqlResult::Unrecognized("(empty reply)".to_string()),
+        }
+    })
+    .unwrap_or_else(|| OqlResult::Unrecognized("(could not spawn a thread to decode the reply)".to_string()))
 }
 
 /// Decode a reply that is a single `text` value (e.g. `schema` or the API-doc
@@ -1080,16 +1099,24 @@ pub fn parse_execute_reply(did: Option<&str>, reply: &[u8]) -> OqlResult {
 /// (so nothing is silently dropped, even though these methods return one value by
 /// contract); an undecodable reply yields an explanatory string.
 pub fn decode_text_reply(reply: &[u8]) -> String {
-    let args = match IDLArgs::from_bytes(reply) {
-        Ok(a) => a,
-        Err(e) => return format!("(undecodable reply: {e})"),
-    };
-    match args.args.as_slice() {
-        [] => "(empty reply)".to_string(),
-        [IDLValue::Text(s)] => s.clone(),
-        [single] => single.to_string(),
-        _ => args.to_string(),
-    }
+    // Decode, match, render, and drop the attacker-controlled reply on the guarded
+    // deep stack (CWE-674): `from_bytes`, the `Display` of a non-text single value or
+    // the whole tuple, and the decoded tree's recursive `Drop` each recurse per nesting
+    // level, so a recursive reply would overflow the ~2 MiB worker stack and abort the
+    // process. Only the resulting `String` crosses back.
+    on_deep_stack(|| {
+        let args = match IDLArgs::from_bytes(reply) {
+            Ok(a) => a,
+            Err(e) => return format!("(undecodable reply: {e})"),
+        };
+        match args.args.as_slice() {
+            [] => "(empty reply)".to_string(),
+            [IDLValue::Text(s)] => s.clone(),
+            [single] => single.to_string(),
+            _ => args.to_string(),
+        }
+    })
+    .unwrap_or_else(|| "(could not spawn a thread to decode the reply)".to_string())
 }
 
 /// Decode a `schema` reply — a single `text` (the JSON catalogue). Pretty-print
@@ -1122,17 +1149,20 @@ pub fn api_doc_method(did: &str) -> Option<&'static str> {
 }
 
 /// Decode a reply against the declared return types of `method` in `did`,
-/// returning the structured `IDLArgs` (field names recovered). Guarded (CWE-674)
-/// like the rest of the decode path; None on any guard/parse/decode failure.
+/// returning the structured `IDLArgs` (field names recovered). None on any
+/// guard/parse/decode failure.
+///
+/// MUST run on the deep stack: it parses the untrusted `.did` and decodes the reply,
+/// both of which recurse unguarded (CWE-674), and the returned `IDLArgs` is later
+/// walked and dropped by the caller. Its sole caller ([`parse_execute_reply`]) wraps
+/// the whole decode-and-render in one [`on_deep_stack`], so this must NOT take its own
+/// (a nested `on_deep_stack` could exhaust the parse permits and wait on itself).
 fn decode_args_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<IDLArgs> {
     guard_candid_text("the `candid` interface", did).ok()?;
-    on_deep_stack(|| {
-        let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
-        let actor = actor?;
-        let func = env.get_method(&actor, method).ok()?;
-        IDLArgs::from_bytes_with_types(bytes, &env, &func.rets).ok()
-    })
-    .flatten()
+    let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
+    let actor = actor?;
+    let func = env.get_method(&actor, method).ok()?;
+    IDLArgs::from_bytes_with_types(bytes, &env, &func.rets).ok()
 }
 
 /// Recognize an OQL result value: a `record { hasMore; rows }`, optionally
@@ -1824,6 +1854,41 @@ mod tests {
         let multi = encode_reply(multi_did, "foo", "(\"a\", 5 : nat)");
         let out = decode_text_reply(&multi);
         assert!(out.contains("a") && out.contains('5'), "multi-value reply keeps all values: {out}");
+    }
+
+    // Every type-less reply-decode path runs on the guarded deep stack (CWE-674). The
+    // finding's repro is a recursive `opt` chain: a few KB on the wire, but it decodes
+    // to a tree whose `from_bytes` / `Display` / recursive `Drop` (and the OQL walk)
+    // recurse once per level. At attacker scale that overflows the ~2 MiB worker stack
+    // and aborts the process; the fix decodes/renders/drops on the 64 MiB stack. This
+    // exercises those paths end-to-end on a deeply-nested reply and asserts they return
+    // a rendered value rather than erroring or mishandling it. DEPTH is kept modest so
+    // CI stays fast (candid's decode/Display is superlinear in depth); it is not sized
+    // to trigger an abort, which is uncatchable and cannot be asserted on anyway.
+    #[test]
+    fn typeless_reply_paths_bound_deep_nesting() {
+        use super::{decode_reply, decode_text_reply, on_deep_stack, parse_execute_reply, OqlResult};
+        use candid::{IDLArgs, IDLValue};
+        // ~DEPTH-deep `opt opt … opt null`. Build, encode, AND drop the input tree on
+        // the deep stack too, so the test harness thread (also ~2 MiB) can't overflow
+        // while preparing the input.
+        const DEPTH: usize = 2_000;
+        let bytes = on_deep_stack(|| {
+            let mut val = IDLValue::Null;
+            for _ in 0..DEPTH {
+                val = IDLValue::Opt(Box::new(val));
+            }
+            IDLArgs::new(&[val]).to_bytes().expect("encode nested opt reply")
+        })
+        .expect("spawn deep stack to encode");
+        assert!(bytes.len() < 100_000, "nested opt is compact on the wire: {} bytes", bytes.len());
+
+        // Type-less fallback (no `.did`): decodes + renders on the deep stack.
+        assert!(decode_reply(None, "m", &bytes).contains("opt"));
+        assert!(decode_text_reply(&bytes).contains("opt"));
+        // The OQL path walks + renders the decoded tree; a non-OQL shape degrades to
+        // Unrecognized, but crucially without overflowing.
+        assert!(matches!(parse_execute_reply(None, &bytes), OqlResult::Unrecognized(_)));
     }
 
     // #1: the anonymous-empty auth note names the missing-auth diagnosis and the

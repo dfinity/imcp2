@@ -901,10 +901,19 @@ fn format_status(target: Principal, bytes: &[u8]) -> String {
                 s.settings.freezing_threshold,
             )
         }
-        Err(_) => match IDLArgs::from_bytes(bytes) {
+        // Defense in depth (CWE-674): this reply is the management canister's own
+        // `canister_status` record (a trusted, bounded shape), not the target
+        // canister's arbitrary output, but the type-less fallback still runs candid's
+        // unbounded decode + `Display` + recursive `Drop`, so bound it on the deep
+        // stack like every other reply decode rather than on the ~2 MiB worker stack.
+        Err(_) => crate::calls::on_deep_stack(move || match IDLArgs::from_bytes(bytes) {
             Ok(d) => format!("Canister {target} status (raw Candid):\n{d}"),
             Err(e) => format!("canister_status succeeded but the reply didn't decode: {e}"),
-        },
+        })
+        .unwrap_or_else(|| {
+            "canister_status succeeded but the reply could not be decoded (no parse thread)"
+                .to_string()
+        }),
     }
 }
 
