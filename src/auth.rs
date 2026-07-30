@@ -472,6 +472,24 @@ fn path_within_prefix(path: &str, prefix: &str) -> bool {
     }
 }
 
+/// Whether `path` contains ANY percent-encoding (a literal `%`). A legitimate hosted
+/// vendor callback path is plain ASCII with no percent-encoding, so rather than
+/// enumerate the dangerous sequences we reject percent-encoding wholesale: it is the
+/// only way an encoded path separator or dot-segment can hide from the pinned-prefix
+/// check, and refusing all of it means never having to reason about which sequences a
+/// given downstream server/CDN happens to decode.
+///
+/// The concrete break it closes (CWE-601): url::Url does not decode `%2f` on parse, so
+/// `/connector/oauth/%2e%2e%2f%2e%2e%2fg%2fx` rides through [`path_within_prefix`] as
+/// one opaque segment under the pinned prefix, yet a vendor that later decodes `%2f`
+/// (and resolves the `..`) routes the appended `?code=…` to `/g/x` on the trusted
+/// origin, an attacker-controlled, script-capable path. A single byte scan, so no
+/// allocation on the unauthenticated front-channel (`/oauth/register`,
+/// `/oauth/authorize`).
+fn path_has_percent_encoding(path: &str) -> bool {
+    path.contains('%')
+}
+
 /// Whether a `redirect_uri` may be registered or receive an authorization code.
 /// No redirect (loopback or hosted) may carry a query or fragment component: the
 /// authorization endpoint appends `?code=…&state=…`, so a pre-existing query would
@@ -525,11 +543,19 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
         return false;
     }
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    // `url.path()` is already dot-segment-normalized: url::Url follows the WHATWG URL
-    // Standard, collapsing `.`/`..` (raw or `%2e`/`%2E`-encoded) on parse, so a
-    // traversal like `/connector/oauth/../../g/evil` arrives here as `/g/evil` and is
-    // caught by the prefix check below (no separate raw-string dot-segment guard needed).
     let path = url.path();
+    // url::Url collapses only LITERAL `.`/`..` segments (raw or `%2e`-encoded whole
+    // segments), so a real-slash traversal `/connector/oauth/../../g/evil` arrives
+    // here already normalized to `/g/evil` and fails the prefix check. It does NOT
+    // decode `%2f`, though, so an ENCODED-slash traversal
+    // (`/connector/oauth/%2e%2e%2f%2e%2e%2fg%2fx`) would otherwise ride through as one
+    // opaque segment under the prefix and later decode to `/g/x` on the vendor origin.
+    // A vendor callback path is plain ASCII, so reject ANY percent-encoding in the
+    // path first (CWE-601), which holds the pin under every encoding without having to
+    // enumerate the dangerous sequences (see [`path_has_percent_encoding`]).
+    if path_has_percent_encoding(path) {
+        return false;
+    }
     // host == domain (or a dot-boundary subdomain) AND the path is within the
     // vendor's pinned callback prefix. The path pin is what keeps a registration
     // off third-party/user-content paths (e.g. `/page/…`, `/g/…`) on the same
@@ -562,6 +588,10 @@ fn is_wellformed_hosted_redirect(redirect_uri: &str) -> bool {
                 // routed to the "request access" page.
                 && url.query().is_none()
                 && url.fragment().is_none()
+                // Percent-encoding in the path is likewise ineligible (CWE-601 pin
+                // bypass), not a real client awaiting approval, so it is classified
+                // `invalid_request` rather than offered "request access".
+                && !path_has_percent_encoding(url.path())
         }
         Err(_) => false,
     }
@@ -2136,6 +2166,29 @@ mod tests {
         // A dot-segment that normalizes to WITHIN the vendor's pinned prefix is fine
         // (it lands in the vendor's own callback space, not an escape).
         assert!(redirect_uri_permitted("https://chatgpt.com/connector/oauth/x/../y"));
+        // ENCODED-slash traversal (CWE-601): url::Url does NOT decode `%2f`, so
+        // `%2e%2e%2f%2e%2e%2fg%2f…` stays one opaque segment under the pinned prefix
+        // and slips past the prefix check, yet a vendor CDN that later decodes `%2f`
+        // routes the appended `?code=…` to `/g/…` on the trusted origin. A vendor
+        // callback path is plain ASCII, so ANY percent-encoding in the path is refused
+        // outright (upper/lower, separators AND otherwise-harmless escapes alike).
+        assert!(!redirect_uri_permitted(
+            "https://chatgpt.com/connector/oauth/%2e%2e%2f%2e%2e%2fg%2fattacker"
+        ));
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%2E%2E%2Fg%2Fevil"));
+        // Even an encoded slash that would decode to WITHIN the prefix is refused (we
+        // reject percent-encoding outright rather than decode-and-renormalize).
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/x%2fy"));
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/x%5cy"));
+        assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback%2f%2e%2e"));
+        // A non-separator escape (e.g. `%20`, `%41`) is refused too: the whole point is
+        // to avoid reasoning about which encodings a given downstream decodes.
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/a%20b"));
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%41"));
+        // Such a payload is ineligible (invalid_request), not a client awaiting approval.
+        assert!(!super::is_wellformed_hosted_redirect(
+            "https://chatgpt.com/connector/oauth/%2e%2e%2f%2e%2e%2fg%2fattacker"
+        ));
         // Cursor: allowed at its real hosted callback path (registered as
         // www.cursor.com), refused on any other path.
         assert!(redirect_uri_permitted("https://www.cursor.com/agents/mcp/oauth/callback"));
