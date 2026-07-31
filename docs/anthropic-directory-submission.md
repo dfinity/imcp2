@@ -72,12 +72,48 @@ considering as a follow-up if usage grows.
 
 > "Missing or incomplete privacy policies result in immediate rejection."
 
-Neither this repo nor the landing page links a privacy policy today. The
-natural URL is <https://dfinity.org/privacy> (live, foundation-wide). Before
-submitting, have legal confirm it covers this service's actual data handling —
-II principals and account names flowing through the server, in-memory session
-state, request logs on the hosts — or publish a short service-specific
-addendum. Linking the chosen URL from the landing page is also recommended.
+Neither this repo nor the landing page links a privacy policy today, and the
+two existing DFINITY policies don't cover this service:
+
+- The [Internet Identity Privacy Policy](https://identitysupport.dfinity.org/hc/en-us/articles/36662081856148-DFINITY-Internet-Identity-Privacy-Policy)
+  (effective 2026-04-07) scopes itself solely to processing "when you link
+  your Internet Identity account with your Google account" and states "This
+  Privacy Policy does not apply to any other data processing". It never
+  mentions the MCP server, OAuth sessions, or AI-assistant connections — it
+  cannot be cited for this connector, though it is the precedent for
+  publishing a service-specific policy on the help center.
+- <https://dfinity.org/privacy> is the foundation-wide website policy; legal
+  would need to confirm (unlikely as-is) that it covers this service's
+  processing.
+
+So a **dedicated ICP MCP privacy policy** is needed. Anthropic's review
+checks that the linked policy covers data collection, use/storage,
+third-party sharing, retention, and a contact channel. Mapped to what this
+server actually does, it should cover at least:
+
+- **Collected/processed:** the II principal and time-boxed delegation
+  (session key, chosen duration and permission level), named account labels,
+  OAuth client registrations (redirect URI, client name), issued tokens and
+  auth codes, and tool-call arguments passing through the server (canister
+  ids, Candid/OQL arguments — whatever the user's chat sends).
+- **Storage/retention:** session and OAuth state is held in bounded
+  **in-memory** stores only (lost on restart; sessions capped at the II grant
+  duration, ≤30 days); host-side request/tracing logs (including client IP
+  addresses at the TLS proxy) with their retention window.
+- **On-chain consequence:** calls the user makes are executed on the public
+  Internet Computer as the user's per-app principal — update calls become
+  part of public, permanent chain state; that is inherent to the service, not
+  a data-sharing choice of the server.
+- **Third parties:** none beyond DFINITY-operated services (boundary nodes,
+  `dashboard.internetcomputer.org`, `skills.internetcomputer.org`, Internet
+  Identity); no analytics on the MCP endpoints today (say so explicitly, or
+  disclose them if added).
+- **Controller and contact:** DFINITY Stiftung; <mcp@dfinity.org> (or
+  <support@dfinity.org>, matching the II policy).
+
+Publish it (help-center article alongside the II policy, or a page under
+`mcp.internetcomputer.org`), link it from the landing page, and use that URL
+in the portal.
 
 ### 2. Financial-transactions policy (decision needed)
 
