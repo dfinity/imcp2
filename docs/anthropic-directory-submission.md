@@ -91,8 +91,8 @@ checks that the linked policy covers data collection, use/storage,
 third-party sharing, retention, and a contact channel. Mapped to what this
 server actually does, it should cover at least:
 
-- **Collected/processed:** the II principal and time-boxed delegation
-  (session key, chosen duration and permission level), named account labels,
+- **Collected/processed:** the time-boxed delegation (session key, chosen
+  duration and access level), named account labels,
   OAuth client registrations (redirect URI, client name), issued tokens and
   auth codes, and tool-call arguments passing through the server (canister
   ids, Candid/OQL arguments — whatever the user's chat sends).
@@ -100,9 +100,10 @@ server actually does, it should cover at least:
   **in-memory** stores only (lost on restart; sessions capped at the II grant
   duration, ≤30 days); host-side request/tracing logs (including client IP
   addresses at the TLS proxy) with their retention window.
-- **On-chain consequence:** calls the user makes are executed on the public
-  Internet Computer as the user's per-app principal — update calls become
-  part of public, permanent chain state; that is inherent to the service, not
+- **Public-network consequence:** calls the user makes execute on the
+  Internet Computer, a public network, as the user's per-app principal; what
+  an application records or publishes when called is governed by that
+  application and may be publicly accessible — under the user's control, not
   a data-sharing choice of the server.
 - **Third parties:** none beyond DFINITY-operated services (boundary nodes,
   `dashboard.internetcomputer.org`, `skills.internetcomputer.org`, Internet
@@ -140,14 +141,17 @@ Options, in increasing order of product impact:
    refusing calls to known ledger canisters' transfer methods), keeping the
    full server available as a custom connector at the same or another path.
 3. **Submit as-is** and argue in the description that funds movement is gated
-   by II's read-only-by-default consent + explicit user opt-in. Risk:
+   by the explicit access-level choice on the II consent screen ("Questions
+   only" vs "Actions & questions"). Risk:
    rejection at the automated scan, burning review-queue time.
 
 Related honesty point for the same step: there is **no per-call confirmation**
 for sensitive methods server-side today (an open roadmap item in the README) —
-mitigations are II's read-only default, delegation-level enforcement at IC
-ingress, and accurate `destructiveHint` annotations (which make Claude prompt
-before each destructive call).
+mitigations are the explicit access-level choice on the II consent screen
+("Questions only" vs "Actions & questions", enforced at IC ingress),
+revocability at any time via id.ai/manage/access (≤5 min latency), and
+accurate `destructiveHint` annotations (which make Claude prompt before each
+destructive call).
 
 ### 3. Reviewer test account (prepare before submitting)
 
@@ -197,10 +201,11 @@ Paste-and-adapt; portal limits in parentheses.
   > specific app, and manage canisters you control: check status, create,
   > install code, start/stop, and top up with cycles.
   >
-  > Sessions are read-only by default: on the Internet Identity consent screen
-  > you choose the session duration (10 minutes to 30 days) and whether the
-  > connection may make state-changing calls. Write access is enforced by the
-  > Internet Computer itself at ingress, not just by this server. Every tool
+  > On the Internet Identity consent screen you explicitly choose the session
+  > duration (10 minutes to 30 days) and the access level: "Questions only"
+  > or "Actions & questions". For a Questions-only session, the Internet
+  > Computer itself rejects actions at ingress, not just this server, and you
+  > can revoke any connection at https://id.ai/manage/access. Every tool
   > is annotated read-only or destructive, returns structured results, and
   > identity-bearing results echo the app origin they were derived for, so
   > mismatches are visible. The server never guesses domains from app names —
@@ -219,7 +224,8 @@ Paste-and-adapt; portal limits in parentheses.
   API, `skills.internetcomputer.org`, Internet Identity at `id.ai`). No
   personal-health data. No ads or sponsored content.
 - **Allowed link URIs:** none needed (no `ui/open-link` usage).
-- **Example prompts** (≥3 required; all work with a fresh read-only session):
+- **Example prompts** (≥3 required; all work with a fresh Questions-only
+  session):
   1. *"What is canister ryjl3-tyaaa-aaaaa-aaaba-cai? Who controls it and
      what's its interface?"*
   2. *"Open the NNS app and list my accounts there."*
@@ -234,12 +240,14 @@ Paste-and-adapt; portal limits in parentheses.
 >    "Continue with recovery phrase" (or first create your own identity at
 >    https://id.ai — takes under a minute; any identity works for read-only
 >    tools, which read public chain state).
-> 2. On the consent screen pick a session duration; leave "read-only" ON to
->    exercise the 17 read-only tools, or OFF to also exercise
->    canister-management tools (needs the test identity's cycles balance).
-> 3. Try the example prompts above. Read-only sessions cause management tools
->    to return an actionable "reconnect with read-only off" message rather
->    than an opaque error — that behavior is intended.
+> 2. On the consent screen pick a session duration and an access level:
+>    "Questions only" exercises the 17 read-only-annotated tools; "Actions &
+>    questions" also exercises canister-management tools (needs the test
+>    identity's cycles balance).
+> 3. Try the example prompts above. Questions-only sessions cause management
+>    tools to return an actionable reconnect message rather than an opaque
+>    error — that behavior is intended. Access is revocable at any time at
+>    https://id.ai/manage/access.
 
 ### The seven compliance acknowledgments
 
