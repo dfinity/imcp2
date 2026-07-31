@@ -182,14 +182,18 @@ accounts stay there, are never entered into the chat, and are never shared
 with the Service.</p>
 
 <p>What the Service does hold, once you approve a connection, is a
-<strong>delegated session signing key</strong>. Internet Identity issues it a
-time-limited, scope-limited authorization to act as you, and the Service uses
-that key to sign the requests your assistant makes. It is a signing
-credential, so it is worth being precise about its limits: it is not your
-Internet Identity key, it cannot be used to sign in as you anywhere else, and
-it stops working when the authorization expires or you revoke it. Separately,
-your AI assistant holds an OAuth access token that lets it reach the Service;
-that token's lifetime is capped by the same authorization.</p>
+<strong>delegated session signing key that the Service generates
+itself</strong>, inside the server. No secret key crosses a network in either
+direction: your credentials stay with Internet Identity, and the Service's
+key never leaves the Service. What travels is only the key's public half,
+which Internet Identity signs, issuing a time-limited, scope-limited
+authorization for that key to act as you; the Service then uses the key to
+sign the requests your assistant makes. It is a signing credential, so it is
+worth being precise about its limits: it is not your Internet Identity key,
+it cannot be used to sign in as you anywhere else, and it stops working when
+the authorization expires or you revoke it. Separately, your AI assistant
+holds an OAuth access token that lets it reach the Service; that token's
+lifetime is capped by the same authorization.</p>
 
 <p>On the Internet Identity consent screen you make two explicit choices: how
 long the connection lasts (from 10 minutes up to 30 days), and its access
@@ -463,9 +467,6 @@ about one hour.</li>
 a complaint with the Swiss Federal Data Protection and Information
 Commissioner (FDPIC), and, where the GDPR applies to you, with the supervisory
 authority of your EU or EEA country of residence or workplace.</p>
-
-<p class=needs-input>[NEEDS INPUT: if an EU representative is required under
-GDPR Art. 27, name them here.]</p>
 
 <p>Data you have submitted to applications on the Internet Computer through
 your own requests is held by those applications, not by the Service; requests

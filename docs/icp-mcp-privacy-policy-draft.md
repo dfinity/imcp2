@@ -34,12 +34,15 @@
 > 3. **Metrics retention: resolved.** Verified in code: gauges are computed
 >    on demand from in-memory session maps and the status dashboard persists
 >    nothing, so the policy states they are not stored.
-> 4. **EU representative: still open**, marked `[NEEDS INPUT]` in section 7.
->    If GDPR Art. 3(2) applies (a directory listing distributed to EU users
->    weighs toward it), Art. 27's exemption will not fit — the processing is
->    core and continuous, not occasional — so DFINITY legal should either
->    name a representative (reusing any existing appointment) or record a
->    reasoned position that Art. 3(2) does not apply.
+> 4. **EU representative: open with DFINITY legal, off the page.** The
+>    published text asserts nothing either way (the FDPIC/EU-authority
+>    complaint sentence is accurate regardless), so publication does not
+>    pre-empt the decision. The underlying question stands: if GDPR
+>    Art. 3(2) applies (a directory listing distributed to EU users weighs
+>    toward it), Art. 27's exemption will not fit — the processing is core
+>    and continuous, not occasional — so legal should either name a
+>    representative in section 7 (reusing any existing appointment) or
+>    record a reasoned position that Art. 3(2) does not apply.
 >    `dfinity.org/privacy` is JS-rendered and could not be text-checked for
 >    an existing appointment.
 
@@ -87,14 +90,18 @@ there, are never entered into the chat, and are never shared with the
 Service.
 
 What the Service does hold, once you approve a connection, is a **delegated
-session signing key**. Internet Identity issues it a time-limited, scope-
-limited authorization to act as you, and the Service uses that key to sign
-the requests your assistant makes. It is a signing credential, so it is worth
-being precise about its limits: it is not your Internet Identity key, it
-cannot be used to sign in as you anywhere else, and it stops working when the
-authorization expires or you revoke it. Separately, your AI assistant holds an
-OAuth access token that lets it reach the Service; that token's lifetime is
-capped by the same authorization.
+session signing key that the Service generates itself**, inside the server.
+No secret key crosses a network in either direction: your credentials stay
+with Internet Identity, and the Service's key never leaves the Service. What
+travels is only the key's public half, which Internet Identity signs,
+issuing a time-limited, scope-limited authorization for that key to act as
+you; the Service then uses the key to sign the requests your assistant
+makes. It is a signing credential, so it is worth being precise about its
+limits: it is not your Internet Identity key, it cannot be used to sign in
+as you anywhere else, and it stops working when the authorization expires or
+you revoke it. Separately, your AI assistant holds an OAuth access token
+that lets it reach the Service; that token's lifetime is capped by the same
+authorization.
 
 On the Internet Identity consent screen you make two explicit choices: how
 long the connection lasts (from 10 minutes up to 30 days), and its access
@@ -338,9 +345,6 @@ If you believe we have handled your personal data unlawfully, you may lodge a
 complaint with the Swiss Federal Data Protection and Information Commissioner
 (FDPIC), and, where the GDPR applies to you, with the supervisory authority of
 your EU or EEA country of residence or workplace.
-`[NEEDS INPUT: if an EU representative is required under GDPR Art. 27, name
-them here.]`
-
 Data you have submitted to applications on the Internet Computer through your
 own requests is held by those applications, not by the Service; requests about
 it should be directed to the relevant application operator.
