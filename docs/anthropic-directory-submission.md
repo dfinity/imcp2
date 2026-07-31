@@ -145,13 +145,18 @@ Three IMCP2 capabilities are exposed to that reading:
 - `icp_create_canister` / `icp_top_up_canister` with the `icp` argument
   convert ICP from the user's ledger account via the CMC.
 
-Options, in increasing order of product impact:
+**Status: asked.** The email to <mcp-review@anthropic.com> went out on
+2026-07-31, covering two of the questions; awaiting a reply. Do not check the
+compliance boxes or submit until it lands — a truthful acknowledgment isn't
+possible without it. If the reply doesn't settle the **first-party API**
+question (see the data-handling note below: the connector reaches the network
+through DAO-governed infrastructure *and* forwards user-directed calls to
+third-party canisters), follow up on that one rather than self-certifying.
 
-1. **Ask first.** Email <mcp-review@anthropic.com> describing the connector
-   and these capabilities; ask whether cycles funding (compute-resource
-   payment) and generic update calls are acceptable, before submitting.
-   Recommended — a truthful compliance acknowledgment isn't possible today
-   without an answer.
+Options, in increasing order of product impact, once the answer arrives:
+
+1. **Proceed as-is** if cycles funding (compute-resource payment) and generic
+   update calls are cleared.
 2. **Directory-safe profile.** Serve a restricted instance for the
    directory, keeping the full server available as a custom connector at
    another path. Note that a blocklist of known ledger canisters or transfer
@@ -160,10 +165,10 @@ Options, in increasing order of product impact:
    that actually satisfies the prohibition has to drop the generic update
    tool and the `icp` conversion paths entirely, or restrict actions to a
    reviewed allow-list of non-financial operations.
-3. **Submit as-is** and argue in the description that funds movement is gated
+3. **Submit anyway**, arguing in the description that funds movement is gated
    by the explicit access-level choice on the II consent screen ("Questions
-   only" vs "Actions & questions"). Risk:
-   rejection at the automated scan, burning review-queue time.
+   only" vs "Actions & questions"). Only if the reply is inconclusive — the
+   risk is rejection at the automated scan, burning review-queue time.
 
 Related honesty point for the same step: there is **no per-call confirmation**
 for sensitive methods server-side today (an open roadmap item in the README) —
@@ -317,7 +322,7 @@ conversation beyond tool arguments and generates no media.
 ## Submission-day checklist
 
 - [ ] Dedicated ICP MCP privacy policy live at `https://mcp.internetcomputer.org/privacy-policy` (page + landing-page link merged; needs the production release) and entered in the portal (blocker 1)
-- [ ] Financial-transactions stance settled with mcp-review@anthropic.com (blocker 2)
+- [ ] Reply received from mcp-review@anthropic.com settling the financial-transactions and first-party-API acknowledgments (asked 2026-07-31; blocker 2)
 - [ ] Test II identity created, funded (if needed), recovery phrase in the team vault (blocker 3)
 - [ ] `release-*` tag cut; `/version` on production shows the intended commit (blocker 4)
 - [x] Square PNG icon exported — `docs/assets/icp-logo-{1024,512}.png` (blocker 5)
