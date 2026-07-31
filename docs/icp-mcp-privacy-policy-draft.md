@@ -115,15 +115,22 @@ We process the following categories of data, solely to provide the Service:
 
 ### 2. Data Sharing
 
-The Service shares data in two ways.
+The Service shares data in three ways.
 
-First, with the infrastructure required to perform your requests, operated
+First, with the AI assistant you connect, which is the point of the
+Service: everything the Service returns goes back to that assistant,
+including — when you ask for them — your Internet Identity account names
+and your per-application identities. Your assistant's provider (for
+example, Anthropic for Claude) processes that data under its own terms and
+privacy policy, not this one.
+
+Second, with the infrastructure required to perform your requests, operated
 by DFINITY Foundation: the Internet Computer API boundary nodes (which
 submit your requests to the network), Internet Identity (`id.ai`), the
 public canister-metadata service at `dashboard.internetcomputer.org`, and
 the developer-skills service at `skills.internetcomputer.org`.
 
-Second, at your direction, with the applications you choose to interact
+Third, at your direction, with the applications you choose to interact
 with. A question or action you send to an application necessarily carries
 your request arguments and your per-application identity to that application
 and its operator, who may be a third party; and when you ask the Service to
@@ -159,9 +166,17 @@ you chose elapses. To end the authorization itself, revoke it at
 [id.ai/manage/access](https://id.ai/manage/access): that page lists every
 active connection for your Internet Identity, so you can review and revoke
 access there even if you no longer remember which AI sessions are still
-active, and revocation takes effect within at most five minutes. No data
-about you remains in the Service after a session ends, other than technical
-logs for the period stated above.
+active. Revocation is carried out by Internet Identity and takes effect
+within at most five minutes, after which the Internet Computer rejects any
+request made with that authorization.
+
+Revoking ends the authorization. The session record the Service holds in
+memory (the session key and any cached application delegations, which
+without a valid authorization can no longer be used to act for you) is
+discarded when the session duration you originally chose elapses, or when
+the Service restarts, whichever comes first. Apart from that record and the
+technical logs described above, no data about you remains in the Service
+after a session ends.
 
 Data you have submitted to applications on the Internet Computer through
 your own requests is held by those applications, not by the Service, and
