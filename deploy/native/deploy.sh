@@ -132,28 +132,6 @@ cat > /etc/systemd/system/caddy.service <<'UNIT'
 $caddy_unit
 UNIT
 
-# --- log retention: bound journald to the privacy policy's three months ---
-# Everything this deployment logs (imcp2 tracing, Caddy, the dashboard) lands
-# in journald, whose default retention is size-based with no time cap — logs
-# could outlive the "retained for up to three months" the ICP MCP privacy
-# policy states. MaxRetentionSec deletes an archived journal FILE once its
-# newest entry passes the cap, so a file's oldest entries can overshoot by one
-# rotation period; MaxFileSec=1week bounds that overshoot, making the worst
-# case 12+1 weeks (~91 days). Size-based vacuuming may still delete entries
-# sooner, which the policy's "up to" wording allows. A drop-in (not an edit to
-# journald.conf) so the setting is owned by this deploy and idempotent.
-mkdir -p /etc/systemd/journald.conf.d
-cat > /etc/systemd/journald.conf.d/90-imcp2-retention.conf <<'JOURNALD'
-# Installed by imcp2 deploy/native/deploy.sh. Bounds log retention to match
-# the ICP MCP privacy policy ("technical logs are retained for up to three
-# months"): files rotate at most weekly and are deleted 12 weeks after their
-# newest entry. Size pressure may delete them sooner.
-[Journal]
-MaxFileSec=1week
-MaxRetentionSec=12week
-JOURNALD
-systemctl restart systemd-journald
-
 # One-time migration off the pre-rename unit: imcp2.service replaces
 # mcp-poc.service. Stop, disable, and remove the old unit (if present) so the
 # two don't contend for :8000 on hosts first deployed before the rename.
