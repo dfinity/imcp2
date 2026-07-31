@@ -40,3 +40,41 @@ jobs:
 
       - name: Test
         run: cargo test --locked --all-targets
+
+  # Block new internal network identifiers from entering the repository. Secret
+  # scanning and push protection already cover credentials; this covers the
+  # class they cannot know about — private addresses and cloud resource ids —
+  # and it reads commit messages as well as the diff, because the disclosure
+  # that prompted it was in a commit message rather than in a file.
+  #
+  # Pull requests only: `main` is protected and reachable solely through a pull
+  # request, so this is the point where a change can still be stopped.
+  scan:
+    name: Scan for internal identifiers
+    # Needed as well as the comment above: this workflow also runs on pushes to
+    # main, where the pull_request context is empty and the range below would
+    # collapse to an invalid "...HEAD". No `needs:`, so a bare condition here
+    # carries no implicit success() over an upstream job.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Full history: the commit-message scan walks the pull request's
+          # commits, and the default shallow clone would leave it with nothing
+          # to read — passing silently rather than failing loudly.
+          fetch-depth: 0
+          # Check out the real head rather than the synthetic merge commit, so
+          # the scanned range is exactly the pull request's own commits.
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # Guard the guard: a scanner that never fires looks identical to a
+      # passing build, so its own tests run here too.
+      - name: Test the scanner
+        run: bash .github/scripts/scan-internal-identifiers.test.sh
+
+      - name: Scan
+        run: |
+          bash .github/scripts/scan-internal-identifiers.sh \
+            "${{ github.event.pull_request.base.sha }}...HEAD"
