@@ -5,10 +5,13 @@
 > (effective 2026-04-07). Square brackets mark decisions/values legal or ops
 > must supply. Technical claims (what is stored, where, for how long) are
 > drawn from this repository's actual behavior and should be re-verified
-> against the deployed release at publication time. Decisions needed:
-> **(a)** the publication venue (help-center article alongside the II policy
-> vs. a page on `mcp.internetcomputer.org`), **(b)** the effective date.
-> The contact address is decided: `mcp@dfinity.org`.
+> against the deployed release at publication time. Decision still needed:
+> the effective date. Decided: the publication venue is
+> `https://mcp.internetcomputer.org/privacy-policy`, served by the MCP
+> server itself (a route + static page to add once legal approves this
+> text — note that merging the page to `main` publishes it on staging
+> immediately and on production at the next `release-*` tag), and the
+> contact address is `mcp@dfinity.org`.
 >
 > **Ops prerequisite before publishing:** the three-month log-retention bound
 > stated in section 3 is enforced by
