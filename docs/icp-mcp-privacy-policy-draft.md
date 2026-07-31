@@ -56,8 +56,8 @@ assistant may only read) or **"Actions & questions"** (it may also submit
 actions). For a "Questions only" connection, the Internet Computer network
 itself rejects action requests; the restriction does not depend on the
 Service alone. You can revoke a connection's access at any time at
-[id.ai/manage/access](https://id.ai/manage/access); revocation takes effect
-within at most five minutes.
+[id.ai/manage/access](https://id.ai/manage/access); revocation is carried out
+by Internet Identity and takes effect within at most five minutes.
 
 The Service does not profile individual users and does not use advertising or
 tracking cookies. It sets one transient, security-purpose cookie during
