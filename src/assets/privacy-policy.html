@@ -223,17 +223,13 @@ cookie during sign-in, described below.</p>
 
 <h2>1. Data Categories Processed, Purposes, and Legal Bases</h2>
 
-<p class=needs-input>[NEEDS INPUT: the legal bases below are proposed;
-confirm with legal before publication.]</p>
-
 <p>We process the following categories, solely to provide, secure, and improve
 the Service.</p>
 
 <p><strong>Session and authorization data</strong>: the delegated session
-signing key, the session duration and access level you chose, and the
-identifier the Service uses for you at its own origin. Purpose: performing the
-requests your assistant makes. Legal basis: performance of the service you
-requested. During sign-in the Service also sets one transient cookie
+signing key and the session duration and access level you chose. Purpose:
+performing the requests your assistant makes. Legal basis: performance of the
+service you requested. During sign-in the Service also sets one transient cookie
 (<code>mcp_connect</code>; HttpOnly, Secure, SameSite=Lax), set and read by the
 server only and not accessible to scripts in web pages. It binds the sign-in
 to the browser that started it, protecting you against session-fixation
@@ -250,7 +246,8 @@ include account names and numbers, balances and holdings, activity and
 timestamps, identifiers, web addresses, and application-specific records. The
 Service encodes, signs, forwards, and returns this data; it processes it
 transiently to execute each call and does not store it after the call
-completes, and it does not store conversation content. Legal basis:
+completes, with one exception, the per-application connection material
+described below. It does not store conversation content. Legal basis:
 performance of the service you requested.</p>
 
 <p><strong>Account information</strong>: when your assistant uses tools that
@@ -258,9 +255,24 @@ list your Internet Identity accounts at an application, or that ask which
 identity you use there, the Service processes those account names, numbers,
 and last-used timestamps, and the per-application identity in question. A
 per-application identity is a pseudonym specific to that application;
-depending on how you use that application, you may consider it private.
-Processed to answer the request; not stored after the session. Legal basis:
-performance of the service you requested.</p>
+depending on how you use that application, you may consider it private. Not
+stored after the session; the account number and application used for an
+authenticated call are kept during the session as part of the connection
+material described next. Legal basis: performance of the service you
+requested.</p>
+
+<p><strong>Per-application connection material</strong>: the first time your
+assistant acts at a given application, the Service derives the identity you
+use there and keeps, for the remainder of the session: the application's
+domain, the account number used, the per-application key it generated, and
+Internet Identity's signed authorization for that application (itself valid
+for at most one hour). Keeping this avoids re-deriving an authorization on
+every call to the same application. The Service's own origin is treated as
+one such application when you use the canister-management tools, and the
+identity derived for it is stable across your connections. All of this is
+held in memory only, bounded in size, and discarded when the session ends or
+the Service restarts. Legal basis: performance of the service you
+requested.</p>
 
 <p><strong>Connection (OAuth) data</strong>: when an assistant connects, the
 Service stores its registration: a generated client identifier, the
@@ -317,20 +329,25 @@ from that address, which discloses the request to whoever runs that site.</p>
 canister-metadata service at <code>dashboard.internetcomputer.org</code> and
 the developer-skills service at <code>skills.internetcomputer.org</code>.</p>
 
-<p><strong>Our hosting and infrastructure providers</strong>, which process
-data on our behalf as processors under contract.</p>
-
-<p class=needs-input>[NEEDS INPUT: name the hosting provider, and any
-observability or error-reporting processor if one is introduced.]</p>
+<p><strong>Our hosting provider.</strong> The Service runs on servers we rent
+from Amazon Web Services, which processes data on our behalf as a processor
+under its data-processing terms. We use no other infrastructure processors
+today; if an observability or error-reporting provider is ever introduced, it
+will be named here first.</p>
 
 <p>We do not sell your data, and we do not share it with third parties for
 their own purposes.</p>
 
 <h2>3. International Transfers</h2>
 
-<p class=needs-input>[NEEDS INPUT: state the country or countries the
-application hosts, logs, and metrics reside in, and the transfer safeguard
-relied on where that is outside Switzerland and the EEA.]</p>
+<p>The Service's servers, and the technical logs they hold, are located in
+<strong>Germany</strong> (Amazon Web Services' Frankfurt region). Germany is a
+member of the European Economic Area, whose countries are recognised by the
+Swiss Federal Council as providing adequate data protection, so no additional
+transfer safeguard is required for this hosting. Amazon Web Services may have
+limited remote access from other countries for support and operations; that
+access is governed by its data-processing terms, which incorporate the
+recognised safeguards for such transfers.</p>
 
 <p>Separately, and by design, the Internet Computer is a global public
 network: its nodes are operated by independent providers in many countries, so
@@ -346,8 +363,13 @@ network rather than a transfer we arrange.</p>
 duration)</td><td>In volatile memory only, never written to disk. Discarded
 when the duration you chose elapses (at most 30 days) or when the Service
 restarts, whichever comes first.</td></tr>
-<tr><td>Requests, results, account information</td><td>Processed transiently;
-not retained after the call completes.</td></tr>
+<tr><td>Requests and results</td><td>Processed transiently; not retained
+after the call completes.</td></tr>
+<tr><td>Per-application connection material (application domain, account
+number, per-application key, signed authorization)</td><td>In memory, per
+session; an entry is replaced when refreshed and all are discarded when the
+session ends or the Service restarts. The signed authorization itself expires
+at most one hour after issue.</td></tr>
 <tr><td>Authorization codes and access tokens</td><td>In memory only; codes
 expire after two minutes, tokens no later than the session duration you
 chose.</td></tr>
@@ -357,16 +379,16 @@ limit</strong>: a registration is kept until it is displaced once the store
 reaches its cap of 10,000, which for a rarely-used deployment can mean
 indefinitely.</td></tr>
 <tr><td>Technical logs</td><td>Up to three months, then deleted.</td></tr>
-<tr><td>Aggregated operational metrics</td><td>[NEEDS INPUT: state a retention
-period, or state that they are not persisted beyond the current
-process.]</td></tr>
+<tr><td>Aggregated operational metrics</td><td>Computed on demand from data
+already in memory; not stored.</td></tr>
 </table>
 
-<p>Revoking a connection ends the authorization immediately, but does not by
-itself erase the session record: the delegated signing key stays in memory,
-unusable, until the duration you originally chose elapses or the Service
-restarts. We intend to discard it as soon as a revocation is observed; until
-that ships, the table above describes the actual behaviour.</p>
+<p>Revoking a connection takes effect in the two steps described in section
+7. Revocation does not by itself erase the session record: the delegated
+signing key and the per-application connection material stay in memory until
+the duration you originally chose elapses or the Service restarts. We intend
+to discard them as soon as a revocation is observed; until that ships, the
+table above describes the actual behaviour.</p>
 
 <h2>5. What Our Logs Contain</h2>
 
@@ -376,9 +398,11 @@ that ships, the table above describes the actual behaviour.</p>
 <li>Every request produces one log line with the HTTP method, the path, the
 response status, and how long it took. Query strings and request bodies are
 never included, which keeps single-use codes and delegations out of logs.</li>
-<li>Sign-in and session events log the session identifier, the identifier the
-Service uses for you at its own origin, the access level, and expiry
-times.</li>
+<li>Sign-in and session events log the session identifier, a per-connection
+identifier derived from that connection's key, the access level, and expiry
+times. The per-connection identifier is new for every connection, so log
+entries from different sessions cannot be linked to each other through
+it.</li>
 <li><strong>No log line records the applications or canisters you interact
 with, the arguments you send, or the results you receive.</strong> The parts
 of the Service that perform tool calls do no logging at all.</li>
@@ -395,13 +419,16 @@ the retention bound above.</li>
 
 <p>Internet Identity gives each application a different identity for you, so
 applications cannot recognise you across applications. The Service is a
-participant in that design and we want to be plain about what it can see: to
-do its job it handles your per-application identities, and the identifier it
-holds for you at its own origin is stable for a given Internet Identity, so in
-principle it could associate separate sessions with the same user. Two things
-limit that in practice: per-application identities and the applications you
-visit are never written to logs (section 5), and nothing the Service discloses
-to an application lets that application recognise you anywhere else.</p>
+participant in that design and we want to be plain about what it can see.
+While a session is live it holds, in memory, the per-application identities
+it has derived for you, including a stable identity for you at its own origin
+that the canister-management tools act as; software holding that stable
+identity could in principle associate separate sessions with the same user.
+Three things limit that in practice: none of these identifiers is written to
+logs, which carry only a per-connection identifier that is new for every
+connection (section 5); the applications you visit are not written to logs
+either; and nothing the Service discloses to an application lets that
+application recognise you anywhere else.</p>
 
 <h2>7. Your Rights</h2>
 
@@ -423,9 +450,13 @@ authorization.</li>
 <a href="https://id.ai/manage/access">id.ai/manage/access</a>, which lists
 every active connection for your Internet Identity so you can review and
 revoke access even if you no longer remember which assistant sessions are
-active. Revocation is carried out by Internet Identity and takes effect within
-at most five minutes, after which the Internet Computer rejects any request
-made with that authorization.</li>
+active. Revocation is carried out by Internet Identity and takes effect in
+two steps: within at most five minutes, Internet Identity stops honouring the
+connection, so the Service can no longer obtain authorizations for any
+application; authorizations already issued for particular applications remain
+usable until they expire, at most one hour after they were issued. The
+practical worst case between revoking and all activity stopping is therefore
+about one hour.</li>
 </ul>
 
 <p>If you believe we have handled your personal data unlawfully, you may lodge

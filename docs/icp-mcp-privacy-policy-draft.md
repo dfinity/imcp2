@@ -10,18 +10,38 @@
 > revision (see "Logging audit" at the foot of this file). Re-verify them
 > against the deployed release whenever the policy is republished.
 >
-> **Three items still need input before this can be called final** and are
-> marked `[NEEDS INPUT]` in the text:
+> **Open-items status (2026-07-31):**
 >
-> 1. **Hosting locations.** Nothing in this repository records where the hosts
->    run. Swiss law requires naming the countries personal data is transferred
->    to and the safeguards relied on, so ops must supply the region(s) for the
->    application hosts and for anything holding logs or metrics.
-> 2. **Legal bases.** Proposed per purpose below, but the mapping is a legal
->    determination, not an engineering one.
-> 3. **Supervisory authority and EU representative.** The FDPIC is named. If
->    the Service is treated as offering services into the EEA, GDPR Art. 27
->    may require a representative, and one should be named here.
+> 1. **Hosting locations: resolved.** Both deployments run on AWS EC2 in
+>    `eu-central-1` (Frankfurt, Germany) — established by mapping the
+>    production and staging addresses (v4 and v6) against AWS's published
+>    `ip-ranges.json`. Logs live in journald on those same hosts; metrics are
+>    not persisted at all. Germany is an EEA state on Switzerland's adequacy
+>    list (FADP Art. 16(1)), so no additional transfer safeguard is needed
+>    for the hosting itself; the policy adds one sentence for residual
+>    processor access under the AWS data-processing terms. If the hosts ever
+>    move region, section 3 must be updated.
+> 2. **Legal bases: adopted.** GDPR Art. 6(1)(b) (performance of the
+>    requested service) for the service categories — per EDPB Guidelines
+>    2/2019 this covers processing objectively necessary to deliver what the
+>    user asked for, and does not require written terms — and Art. 6(1)(f)
+>    (legitimate interests: security per Recital 49, abuse prevention,
+>    service improvement) for the cookie, logs, and metrics. Under the Swiss
+>    FADP no per-purpose legal basis is required of private controllers;
+>    listing them satisfies GDPR Art. 13(1)(c) where the GDPR applies and is
+>    harmless otherwise. A short Terms of Use would make the 6(1)(b) footing
+>    more robust and is noted as a follow-up in the submission doc.
+> 3. **Metrics retention: resolved.** Verified in code: gauges are computed
+>    on demand from in-memory session maps and the status dashboard persists
+>    nothing, so the policy states they are not stored.
+> 4. **EU representative: still open**, marked `[NEEDS INPUT]` in section 7.
+>    If GDPR Art. 3(2) applies (a directory listing distributed to EU users
+>    weighs toward it), Art. 27's exemption will not fit — the processing is
+>    core and continuous, not occasional — so DFINITY legal should either
+>    name a representative (reusing any existing appointment) or record a
+>    reasoned position that Art. 3(2) does not apply.
+>    `dfinity.org/privacy` is JS-rendered and could not be text-checked for
+>    an existing appointment.
 
 ---
 
@@ -105,15 +125,13 @@ during sign-in, described below.
 
 ### 1. Data Categories Processed, Purposes, and Legal Bases
 
-`[NEEDS INPUT: the legal bases below are proposed; confirm with legal.]`
-
 We process the following categories, solely to provide, secure, and improve
 the Service.
 
-**Session and authorization data**: the delegated session signing key, the
-session duration and access level you chose, and the identifier the Service
-uses for you at its own origin. Purpose: performing the requests your
-assistant makes. Legal basis: performance of the service you requested.
+**Session and authorization data**: the delegated session signing key and
+the session duration and access level you chose. Purpose: performing the
+requests your assistant makes. Legal basis: performance of the service you
+requested.
 During sign-in the Service also sets one transient cookie (`mcp_connect`;
 HttpOnly, Secure, SameSite=Lax), set and read by the server only and not
 accessible to scripts in web pages. It binds the sign-in to the browser that
@@ -129,7 +147,8 @@ applications you query. Depending on what you ask for, results may include
 account names and numbers, balances and holdings, activity and timestamps,
 identifiers, web addresses, and application-specific records. The Service
 encodes, signs, forwards, and returns this data; it processes it transiently
-to execute each call and does not store it after the call completes, and it
+to execute each call and does not store it after the call completes, with
+one exception, the per-application connection material described below. It
 does not store conversation content. Legal basis: performance of the service
 you requested.
 
@@ -138,9 +157,22 @@ Internet Identity accounts at an application, or that ask which identity you
 use there, the Service processes those account names, numbers, and last-used
 timestamps, and the per-application identity in question. A per-application
 identity is a pseudonym specific to that application; depending on how you use
-that application, you may consider it private. Processed to answer the
-request; not stored after the session. Legal basis: performance of the
-service you requested.
+that application, you may consider it private. Not stored after the session;
+the account number and application used for an authenticated call are kept
+during the session as part of the connection material described next. Legal
+basis: performance of the service you requested.
+
+**Per-application connection material**: the first time your assistant acts
+at a given application, the Service derives the identity you use there and
+keeps, for the remainder of the session: the application's domain, the
+account number used, the per-application key it generated, and Internet
+Identity's signed authorization for that application (itself valid for at
+most one hour). Keeping this avoids re-deriving an authorization on every
+call to the same application. The Service's own origin is treated as one
+such application when you use the canister-management tools, and the
+identity derived for it is stable across your connections. All of this is
+held in memory only, bounded in size, and discarded when the session ends or
+the Service restarts. Legal basis: performance of the service you requested.
 
 **Connection (OAuth) data**: when an assistant connects, the Service stores
 its registration: a generated client identifier, the assistant's redirect
@@ -195,18 +227,25 @@ address, which discloses the request to whoever runs that site.
 service at `dashboard.internetcomputer.org` and the developer-skills service
 at `skills.internetcomputer.org`.
 
-**Our hosting and infrastructure providers**, which process data on our behalf
-as processors under contract. `[NEEDS INPUT: name the hosting provider, and
-any observability or error-reporting processor if one is introduced.]`
+**Our hosting provider.** The Service runs on servers we rent from Amazon Web
+Services, which processes data on our behalf as a processor under its
+data-processing terms. We use no other infrastructure processors today; if an
+observability or error-reporting provider is ever introduced, it will be
+named here first.
 
 We do not sell your data, and we do not share it with third parties for their
 own purposes.
 
 ### 3. International Transfers
 
-`[NEEDS INPUT: state the country or countries the application hosts, logs,
-and metrics reside in, and the transfer safeguard relied on where that is
-outside Switzerland and the EEA.]`
+The Service's servers, and the technical logs they hold, are located in
+**Germany** (Amazon Web Services' Frankfurt region). Germany is a member of
+the European Economic Area, whose countries are recognised by the Swiss
+Federal Council as providing adequate data protection, so no additional
+transfer safeguard is required for this hosting. Amazon Web Services may
+have limited remote access from other countries for support and operations;
+that access is governed by its data-processing terms, which incorporate the
+recognised safeguards for such transfers.
 
 Separately, and by design, the Internet Computer is a global public network:
 its nodes are operated by independent providers in many countries, so
@@ -219,17 +258,19 @@ network rather than a transfer we arrange.
 | Category | Retained |
 |---|---|
 | Session and authorization data (signing key, access level, duration) | In volatile memory only, never written to disk. Discarded when the duration you chose elapses (at most 30 days) or when the Service restarts, whichever comes first. |
-| Requests, results, account information | Processed transiently; not retained after the call completes. |
+| Requests and results | Processed transiently; not retained after the call completes. |
+| Per-application connection material (application domain, account number, per-application key, signed authorization) | In memory, per session; an entry is replaced when refreshed and all are discarded when the session ends or the Service restarts. The signed authorization itself expires at most one hour after issue. |
 | Authorization codes and access tokens | In memory only; codes expire after two minutes, tokens no later than the session duration you chose. |
 | Connection (OAuth) registrations | Stored on disk so an assistant can reconnect across restarts. There is currently **no time limit**: a registration is kept until it is displaced once the store reaches its cap of 10,000, which for a rarely-used deployment can mean indefinitely. |
 | Technical logs | Up to three months, then deleted. |
-| Aggregated operational metrics | `[NEEDS INPUT: state a retention period, or state that they are not persisted beyond the current process.]` |
+| Aggregated operational metrics | Computed on demand from data already in memory; not stored. |
 
-Revoking a connection ends the authorization immediately, but does not by
-itself erase the session record: the delegated signing key stays in memory,
-unusable, until the duration you originally chose elapses or the Service
-restarts. We intend to discard it as soon as a revocation is observed; until
-that ships, the row above describes the actual behaviour.
+Revoking a connection takes effect in the two steps described in section 7.
+Revocation does not by itself erase the session record: the delegated
+signing key and the per-application connection material stay in memory until
+the duration you originally chose elapses or the Service restarts. We intend
+to discard them as soon as a revocation is observed; until that ships, the
+table above describes the actual behaviour.
 
 ### 5. What Our Logs Contain
 
@@ -238,8 +279,10 @@ We would rather be specific than make sweeping promises, so:
 - Every request produces one log line with the HTTP method, the path, the
   response status, and how long it took. Query strings and request bodies are
   never included, which keeps single-use codes and delegations out of logs.
-- Sign-in and session events log the session identifier, the identifier the
-  Service uses for you at its own origin, the access level, and expiry times.
+- Sign-in and session events log the session identifier, a per-connection
+  identifier derived from that connection's key, the access level, and expiry
+  times. The per-connection identifier is new for every connection, so log
+  entries from different sessions cannot be linked to each other through it.
 - **No log line records the applications or canisters you interact with, the
   arguments you send, or the results you receive.** The parts of the Service
   that perform tool calls do no logging at all.
@@ -254,14 +297,16 @@ We would rather be specific than make sweeping promises, so:
 
 Internet Identity gives each application a different identity for you, so
 applications cannot recognise you across applications. The Service is a
-participant in that design and we want to be plain about what it can see: to
-do its job it handles your per-application identities, and the identifier it
-holds for you at its own origin is stable for a given Internet Identity, so
-in principle it could associate separate sessions with the same user. Two
-things limit that in practice: per-application identities and the
-applications you visit are never written to logs (section 5), and nothing the
-Service discloses to an application lets that application recognise you
-anywhere else.
+participant in that design and we want to be plain about what it can see.
+While a session is live it holds, in memory, the per-application identities
+it has derived for you, including a stable identity for you at its own
+origin that the canister-management tools act as; software holding that
+stable identity could in principle associate separate sessions with the same
+user. Three things limit that in practice: none of these identifiers is
+written to logs, which carry only a per-connection identifier that is new
+for every connection (section 5); the applications you visit are not written
+to logs either; and nothing the Service discloses to an application lets
+that application recognise you anywhere else.
 
 ### 7. Your Rights
 
@@ -281,9 +326,13 @@ You can also act directly, without contacting us:
   [id.ai/manage/access](https://id.ai/manage/access), which lists every active
   connection for your Internet Identity so you can review and revoke access
   even if you no longer remember which assistant sessions are active.
-  Revocation is carried out by Internet Identity and takes effect within at
-  most five minutes, after which the Internet Computer rejects any request
-  made with that authorization.
+  Revocation is carried out by Internet Identity and takes effect in two
+  steps: within at most five minutes, Internet Identity stops honouring the
+  connection, so the Service can no longer obtain authorizations for any
+  application; authorizations already issued for particular applications
+  remain usable until they expire, at most one hour after they were issued.
+  The practical worst case between revoking and all activity stopping is
+  therefore about one hour.
 
 If you believe we have handled your personal data unlawfully, you may lodge a
 complaint with the Swiss Federal Data Protection and Information Commissioner
@@ -323,8 +372,11 @@ Section 5 rests on this; redo it whenever the policy is republished.
   `args`, or `origin` returns nothing.
 - Request logging (`log_request`, `src/main.rs`) records method, path, status,
   and latency, and deliberately omits the query string and the body.
-- Session/auth events log `session_id`, the Service-scoped principal, the
-  access level, and expirations.
+- Session/auth events log `session_id` and the session-key principal
+  (`session_principal` = `self_authenticating` over the per-connection
+  session key, `src/identities.rs` — ephemeral, new per connection; NOT the
+  stable own-origin management identity, which is never logged), plus the
+  access level and expirations.
 - `deploy/native/Caddyfile` configures no `log` directive, so the reverse
   proxy writes no access log.
 - The status dashboard emits a single sanitised error line
