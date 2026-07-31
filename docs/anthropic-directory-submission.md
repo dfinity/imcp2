@@ -113,7 +113,8 @@ server actually does, it should cover at least:
 
 Publish it (help-center article alongside the II policy, or a page under
 `mcp.internetcomputer.org`), link it from the landing page, and use that URL
-in the portal.
+in the portal. A draft in the II policy's style is ready for legal review at
+[`icp-mcp-privacy-policy-draft.md`](icp-mcp-privacy-policy-draft.md).
 
 ### 2. Financial-transactions policy (decision needed)
 
