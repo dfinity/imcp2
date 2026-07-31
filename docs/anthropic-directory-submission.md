@@ -191,11 +191,23 @@ The live server reports commit `48f1ed6`; `main` carries later hardening
 (e.g. #98, #99, #107, #108). Cut a `release-*` tag so the deployment under
 review includes them.
 
-### 5. Icon asset
+### 5. Icon asset — ready
 
-The portal asks for an icon (specs surface in the portal UI). Candidate
-source: [`src/assets/dfinity-logo.svg`](../src/assets/dfinity-logo.svg) or the
-official ICP mark — have a square PNG export ready.
+The official ICP mark is committed at
+[`assets/icp-logo.svg`](assets/icp-logo.svg), with square, transparent PNG
+exports beside it for the portal's icon field:
+[1024×1024](assets/icp-logo-1024.png) and [512×512](assets/icp-logo-512.png).
+Upload whichever the portal asks for; exact specs surface in its UI, and any
+smaller size downscales cleanly from the 1024.
+
+The mark is ~2.05:1, so the exports centre it at 84% of the canvas width on a
+square transparent field — no cropping, even margins, and it sits correctly on
+both light and dark listing backgrounds. Regenerate with the Chromium
+rasteriser if the source ever changes (lighter rasterisers mis-render its
+`linearGradient` with a `rotate` transform). This is the *listing* icon only:
+the served pages keep using the DFINITY wordmark
+([`src/assets/dfinity-logo.svg`](../src/assets/dfinity-logo.svg)) for their
+"Hosted by" footer.
 
 ## Portal field drafts
 
@@ -255,6 +267,8 @@ Paste-and-adapt; portal limits in parentheses.
   don't fit, ask in the mcp-review email (blocker 2) rather than
   self-certifying "own API". No personal-health data. No ads or sponsored
   content.
+- **Icon:** [`docs/assets/icp-logo-1024.png`](assets/icp-logo-1024.png)
+  (square, transparent; 512 variant beside it).
 - **Allowed link URIs:** none needed (no `ui/open-link` usage).
 - **Example prompts** (≥3 required; all work with a fresh Questions-only
   session):
@@ -306,6 +320,6 @@ conversation beyond tool arguments and generates no media.
 - [ ] Financial-transactions stance settled with mcp-review@anthropic.com (blocker 2)
 - [ ] Test II identity created, funded (if needed), recovery phrase in the team vault (blocker 3)
 - [ ] `release-*` tag cut; `/version` on production shows the intended commit (blocker 4)
-- [ ] Square PNG icon exported (blocker 5)
+- [x] Square PNG icon exported — `docs/assets/icp-logo-{1024,512}.png` (blocker 5)
 - [ ] Every tool exercised once by the submitter (portal asks you to confirm this; MCP Inspector or a custom connector in Claude both count)
 - [ ] Submitter has Owner / Directory-management access in DFINITY's Claude Team/Enterprise org
