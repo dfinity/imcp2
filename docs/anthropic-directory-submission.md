@@ -146,12 +146,22 @@ Three IMCP2 capabilities are exposed to that reading:
   convert ICP from the user's ledger account via the CMC.
 
 **Status: asked.** The email to <mcp-review@anthropic.com> went out on
-2026-07-31, covering two of the questions; awaiting a reply. Do not check the
-compliance boxes or submit until it lands — a truthful acknowledgment isn't
-possible without it. If the reply doesn't settle the **first-party API**
-question (see the data-handling note below: the connector reaches the network
-through DAO-governed infrastructure *and* forwards user-directed calls to
-third-party canisters), follow up on that one rather than self-certifying.
+2026-07-31 and put **two** questions: whether cycles funding (including the
+ICP-conversion path) is acceptable, and whether the general-purpose
+`canister_update_call` passes review. Awaiting a reply; do not check the
+compliance boxes or submit until it lands, since a truthful acknowledgment
+isn't possible without it.
+
+Two things that email leaves open:
+
+- **The first-party-API acknowledgment was not asked about.** It needs its
+  own follow-up (see the data-handling draft below).
+- **The mitigation it offers for `canister_update_call` — blocking the
+  well-known ledger `transfer`/`approve` methods — does not actually satisfy
+  the prohibition,** for the reason in option 2 below: the tool can reach a
+  custom ledger, or an intermediary canister that forwards a transfer. If the
+  reply takes that offer up, correct the record before shipping it; committing
+  to a bypassable control is worse than the current position.
 
 Options, in increasing order of product impact, once the answer arrives:
 
@@ -178,17 +188,24 @@ revocability at any time via id.ai/manage/access (≤5 min latency), and
 accurate `destructiveHint` annotations (which make Claude prompt before each
 destructive call).
 
-### 3. Reviewer test account (prepare before submitting)
+### 3. Reviewer access — self-serve, no shared identity
 
-The portal requires a *fully populated* test account with step-by-step
-instructions. Internet Identity is self-serve, but passkeys are device-bound,
-so a shared account needs a **recovery-phrase-based test identity**. Prepare:
+**Decided:** reviewers create their own Internet Identity rather than being
+handed a shared test account, and the test-credentials field points them at
+the setup instructions on <https://mcp.internetcomputer.org>. This is the
+right call for this connector: Internet Identity is passkey-based and
+device-bound, so a "shared account" would mean circulating a recovery phrase,
+and every read-only tool works against public network state, so a
+freshly-created identity exercises the bulk of the surface within a minute.
 
-1. A dedicated test II identity (create at <https://id.ai>, add a recovery
-   phrase, store it in the team vault) with a couple of named accounts and —
-   only if write tools are in scope — a small cycles-ledger balance.
-2. Reviewer instructions (draft below) plus the recovery phrase in the
-   portal's test-credentials field.
+One tension to be ready for: the review criteria say *"Test credentials are
+required and must be a fully populated account."* Self-serve sign-up is a
+reasonable answer for an authentication system nobody can pre-provision into,
+but a reviewer may still ask for a populated account — most plausibly to
+exercise the canister-management tools, which need an identity that actually
+controls a canister and holds a cycles balance. If that comes back, the
+fallback is a dedicated identity with a recovery phrase in the team vault, a
+canister it controls, and a small cycles balance.
 
 ### 4. Production is behind `main`
 
@@ -267,11 +284,11 @@ Paste-and-adapt; portal limits in parentheses.
   two counts: that, and user-directed calls being forwarded to third-party
   application canisters chosen by the user (carrying the call arguments and
   the user's per-app principal), plus app discovery fetching metadata from
-  user-supplied origins. Pick the portal
-  option matching a legitimately-proxied/gateway service; if the options
-  don't fit, ask in the mcp-review email (blocker 2) rather than
-  self-certifying "own API". No personal-health data. No ads or sponsored
-  content.
+  user-supplied origins. Pick the portal option matching a
+  legitimately-proxied/gateway service; if the options don't fit, put this to
+  mcp-review as a follow-up (the 2026-07-31 email did not cover it) rather
+  than self-certifying "own API". No personal-health data. No ads or
+  sponsored content.
 - **Icon:** [`docs/assets/icp-logo-1024.png`](assets/icp-logo-1024.png)
   (square, transparent; 512 variant beside it).
 - **Allowed link URIs:** none needed (no `ui/open-link` usage).
@@ -286,19 +303,23 @@ Paste-and-adapt; portal limits in parentheses.
 
 ### Reviewer test instructions (draft for the test-credentials field)
 
-> 1. The connector authenticates with Internet Identity (passkey-based). Use
->    the provided test identity: open the connector's sign-in, choose
->    "Continue with recovery phrase" (or first create your own identity at
->    https://id.ai — takes under a minute; any identity works for read-only
->    tools, which read public chain state).
+> 1. No shared test account is needed, and none would work well: Internet
+>    Identity is passkey-based and device-bound. Create your own at
+>    https://id.ai — it takes under a minute — then add the connector by
+>    following the setup instructions at https://mcp.internetcomputer.org.
+>    Every read-only tool works with any identity, because it reads public
+>    network state.
 > 2. On the consent screen pick a session duration and an access level:
 >    "Questions only" exercises the 17 read-only-annotated tools; "Actions &
->    questions" also exercises canister-management tools (needs the test
->    identity's cycles balance).
+>    questions" additionally allows state-changing calls.
 > 3. Try the example prompts above. Questions-only sessions cause management
 >    tools to return an actionable reconnect message rather than an opaque
 >    error — that behavior is intended. Access is revocable at any time at
 >    https://id.ai/manage/access.
+> 4. The canister-management tools act on canisters you control and spend
+>    cycles, so a brand-new identity has nothing for them to operate on. Ask
+>    us at mcp@dfinity.org if you would like an identity provisioned with a
+>    canister and a cycles balance to exercise those.
 
 ### The seven compliance acknowledgments
 
@@ -323,7 +344,7 @@ conversation beyond tool arguments and generates no media.
 
 - [ ] Dedicated ICP MCP privacy policy live at `https://mcp.internetcomputer.org/privacy-policy` (page + landing-page link merged; needs the production release) and entered in the portal (blocker 1)
 - [ ] Reply received from mcp-review@anthropic.com settling the financial-transactions and first-party-API acknowledgments (asked 2026-07-31; blocker 2)
-- [ ] Test II identity created, funded (if needed), recovery phrase in the team vault (blocker 3)
+- [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — provision a funded identity only if a reviewer asks
 - [ ] `release-*` tag cut; `/version` on production shows the intended commit (blocker 4)
 - [x] Square PNG icon exported — `docs/assets/icp-logo-{1024,512}.png` (blocker 5)
 - [ ] Every tool exercised once by the submitter (portal asks you to confirm this; MCP Inspector or a custom connector in Claude both count)
