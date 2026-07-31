@@ -5,14 +5,14 @@
 > (effective 2026-04-07). Square brackets mark decisions/values legal or ops
 > must supply. Technical claims (what is stored, where, for how long) are
 > drawn from this repository's actual behavior and should be re-verified
-> against the deployed release at publication time. Decision still needed:
-> the effective date. Decided: the publication venue is
+> against the deployed release at publication time. All decisions are made:
+> the publication venue is
 > `https://mcp.internetcomputer.org/privacy-policy`, served by the MCP
 > server itself — implemented in
-> [#112](https://github.com/dfinity/imcp2/pull/112), which stays a draft
-> until legal approves this text (merging it publishes the page on staging
-> immediately and on production at the next `release-*` tag) — and the
-> contact address is `mcp@dfinity.org`.
+> [#112](https://github.com/dfinity/imcp2/pull/112) (merging it publishes
+> the page on staging immediately and on production at the next `release-*`
+> tag) — the contact address is `mcp@dfinity.org`, and the effective date is
+> August 3, 2026.
 >
 > **Ops prerequisite before publishing:** the three-month log-retention bound
 > stated in section 3 is enforced by
@@ -23,7 +23,7 @@
 
 ## ICP MCP Privacy Policy
 
-**Effective Date: [YYYY-MM-DD]**
+**Effective Date: August 3, 2026**
 
 We, DFINITY Stiftung, Genferstrasse 11, 8002 Zürich, Switzerland ("DFINITY
 Foundation") disclose in this ICP MCP Privacy Policy ("Privacy Policy") how we
