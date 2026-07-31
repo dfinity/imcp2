@@ -112,13 +112,16 @@ server actually does, it should cover at least:
   an application records or publishes when called is governed by that
   application and may be publicly accessible — under the user's control, not
   a data-sharing choice of the server.
-- **Third parties:** DFINITY-operated services (boundary nodes,
-  `dashboard.internetcomputer.org`, `skills.internetcomputer.org`, Internet
-  Identity) plus, at the user's direction, the applications the user chooses
-  to interact with — a call carries its arguments and the user's per-app
-  principal to that application's operator, and app discovery fetches
-  metadata from user-supplied origins. No analytics on the MCP endpoints
-  today (say so explicitly, or disclose them if added).
+- **Third parties:** the connected AI assistant (results go back to it and
+  its provider); the Internet Computer's public API boundary nodes
+  (`icp-api.io`) and Internet Identity (`id.ai`), both **DAO-governed via
+  the NNS, not DFINITY-operated**; the DFINITY-operated
+  `dashboard.internetcomputer.org` and `skills.internetcomputer.org`; and,
+  at the user's direction, the applications the user chooses to interact
+  with — a call carries its arguments and the user's per-app principal to
+  that application's operator, and app discovery fetches metadata from
+  user-supplied origins. No analytics on the MCP endpoints today (say so
+  explicitly, or disclose them if added).
 - **Controller and contact:** DFINITY Stiftung; <mcp@dfinity.org>.
 
 Publication venue: `https://mcp.internetcomputer.org/privacy-policy`, served
@@ -239,13 +242,15 @@ Paste-and-adapt; portal limits in parentheses.
 - **Support contact:** `mcp@dfinity.org`
 - **Company:** DFINITY Foundation / DFINITY Stiftung, `https://dfinity.org`,
   plus a named primary contact for review updates.
-- **Data handling:** declare the gateway model honestly. The server and the
-  infrastructure it talks to are DFINITY-operated (IC boundary nodes,
-  `dashboard.internetcomputer.org`, `skills.internetcomputer.org`, Internet
-  Identity at `id.ai`), but it is not "first-party APIs only": user-directed
-  calls are forwarded to third-party application canisters chosen by the
-  user (carrying the call arguments and the user's per-app principal), and
-  app discovery fetches metadata from user-supplied origins. Pick the portal
+- **Data handling:** declare the gateway model honestly. DFINITY operates
+  the server itself plus `dashboard.internetcomputer.org` and
+  `skills.internetcomputer.org`, but **not** the rest of what it talks to:
+  the API boundary nodes (`icp-api.io`) and Internet Identity (`id.ai`) are
+  DAO-governed through the NNS. So this is not "first-party APIs only" on
+  two counts: that, and user-directed calls being forwarded to third-party
+  application canisters chosen by the user (carrying the call arguments and
+  the user's per-app principal), plus app discovery fetching metadata from
+  user-supplied origins. Pick the portal
   option matching a legitimately-proxied/gateway service; if the options
   don't fit, ask in the mcp-review email (blocker 2) rather than
   self-certifying "own API". No personal-health data. No ads or sponsored
@@ -282,10 +287,10 @@ Topics: directory guidelines, first-party API usage, financial transactions,
 AI media generation, prompt injection, conversation-data collection, public
 documentation. Two need resolution before the boxes can be checked
 truthfully: **financial transactions** (blocker 2) and **first-party API
-usage** — the connector legitimately proxies the Internet Computer protocol
-on DFINITY-operated infrastructure, but user-directed calls do reach
-third-party application canisters; fold both questions into the mcp-review
-email. The **prompt-injection** acknowledgment needs open disclosure rather
+usage** — DFINITY operates the connector, but it reaches the network through
+DAO-governed infrastructure (`icp-api.io`, `id.ai`) and forwards
+user-directed calls to third-party application canisters, so "first-party"
+is not a clean yes; fold both questions into the mcp-review email. The **prompt-injection** acknowledgment needs open disclosure rather
 than a bare yes: tool descriptions are static and contain no hidden
 instructions, but `icp_list_skills`/`icp_get_skill` (and the `skill://`
 resources) intentionally return DFINITY-published how-to documents fetched

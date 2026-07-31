@@ -124,10 +124,15 @@ and your per-application identities. Your assistant's provider (for
 example, Anthropic for Claude) processes that data under its own terms and
 privacy policy, not this one.
 
-Second, with the infrastructure required to perform your requests, operated
-by DFINITY Foundation: the Internet Computer API boundary nodes (which
-submit your requests to the network), Internet Identity (`id.ai`), the
-public canister-metadata service at `dashboard.internetcomputer.org`, and
+Second, with the infrastructure that carries out your requests: the Internet
+Computer's public API boundary nodes (`icp-api.io`), which submit your
+requests to the network, and Internet Identity (`id.ai`), which
+authenticates you. These are part of the Internet Computer and are governed
+by its DAO, the Network Nervous System, rather than operated by DFINITY
+Foundation; Internet Identity's own processing is covered by the
+[Internet Identity Privacy Policy](https://identitysupport.dfinity.org/hc/en-us/articles/36662081856148-DFINITY-Internet-Identity-Privacy-Policy).
+The Service also queries two services that DFINITY Foundation does operate:
+the public canister-metadata service at `dashboard.internetcomputer.org` and
 the developer-skills service at `skills.internetcomputer.org`.
 
 Third, at your direction, with the applications you choose to interact
