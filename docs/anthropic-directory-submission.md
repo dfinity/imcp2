@@ -92,23 +92,34 @@ third-party sharing, retention, and a contact channel. Mapped to what this
 server actually does, it should cover at least:
 
 - **Collected/processed:** the time-boxed delegation (session key, chosen
-  duration and access level), named account labels,
-  OAuth client registrations (redirect URI, client name), issued tokens and
+  duration and access level), named account labels, OAuth client
+  registrations (generated client id, redirect URI, last-used timestamp —
+  `client_name` is echoed in the response but not stored), issued tokens and
   auth codes, and tool-call arguments passing through the server (canister
   ids, Candid/OQL arguments — whatever the user's chat sends).
-- **Storage/retention:** session and OAuth state is held in bounded
-  **in-memory** stores only (lost on restart; sessions capped at the II grant
-  duration, ≤30 days); host-side request/tracing logs (including client IP
-  addresses at the TLS proxy) with their retention window.
+- **Storage/retention:** session, token, and account state is held in
+  bounded **in-memory** stores (lost on restart; sessions capped at the II
+  grant duration, ≤30 days) — but OAuth client registrations are **persisted
+  to disk** (`OAUTH_CLIENTS_FILE`, kept in the unit's `StateDirectory` so
+  client ids survive redeploys) with no time-based expiry, only LRU eviction
+  at 10,000 entries; they contain no user personal data (client id, redirect
+  URI, last-used timestamp). Host-side tracing logs record method, path,
+  status, and latency per request (never query strings or bodies) plus auth
+  events that include session ids and the Service-scoped principal; the
+  Service's own logs do not systematically record client IPs or user agents
+  (Caddy runs without access logs).
 - **Public-network consequence:** calls the user makes execute on the
   Internet Computer, a public network, as the user's per-app principal; what
   an application records or publishes when called is governed by that
   application and may be publicly accessible — under the user's control, not
   a data-sharing choice of the server.
-- **Third parties:** none beyond DFINITY-operated services (boundary nodes,
+- **Third parties:** DFINITY-operated services (boundary nodes,
   `dashboard.internetcomputer.org`, `skills.internetcomputer.org`, Internet
-  Identity); no analytics on the MCP endpoints today (say so explicitly, or
-  disclose them if added).
+  Identity) plus, at the user's direction, the applications the user chooses
+  to interact with — a call carries its arguments and the user's per-app
+  principal to that application's operator, and app discovery fetches
+  metadata from user-supplied origins. No analytics on the MCP endpoints
+  today (say so explicitly, or disclose them if added).
 - **Controller and contact:** DFINITY Stiftung; <mcp@dfinity.org> (or
   <support@dfinity.org>, matching the II policy).
 
@@ -214,15 +225,24 @@ Paste-and-adapt; portal limits in parentheses.
   closest to data/productivity/web3.
 - **Documentation URL:** `https://mcp.internetcomputer.org` (landing page;
   README as backup: `https://github.com/dfinity/imcp2#readme`)
-- **Privacy policy URL:** `https://dfinity.org/privacy` (pending blocker 1)
+- **Privacy policy URL:** unresolved — leave the submission blocked on
+  blocker 1 and enter the dedicated ICP MCP policy's URL once published. Do
+  not substitute the foundation-wide `dfinity.org/privacy`: an incomplete
+  policy is documented as immediate rejection.
 - **Support contact:** `mcp@dfinity.org`
 - **Company:** DFINITY Foundation / DFINITY Stiftung, `https://dfinity.org`,
   plus a named primary contact for review updates.
-- **Data handling:** first-party APIs only — the server talks to the IC
-  through DFINITY-operated boundary-node infrastructure, and to
-  DFINITY-operated ancillary services (`dashboard.internetcomputer.org` public
-  API, `skills.internetcomputer.org`, Internet Identity at `id.ai`). No
-  personal-health data. No ads or sponsored content.
+- **Data handling:** declare the gateway model honestly. The server and the
+  infrastructure it talks to are DFINITY-operated (IC boundary nodes,
+  `dashboard.internetcomputer.org`, `skills.internetcomputer.org`, Internet
+  Identity at `id.ai`), but it is not "first-party APIs only": user-directed
+  calls are forwarded to third-party application canisters chosen by the
+  user (carrying the call arguments and the user's per-app principal), and
+  app discovery fetches metadata from user-supplied origins. Pick the portal
+  option matching a legitimately-proxied/gateway service; if the options
+  don't fit, ask in the mcp-review email (blocker 2) rather than
+  self-certifying "own API". No personal-health data. No ads or sponsored
+  content.
 - **Allowed link URIs:** none needed (no `ui/open-link` usage).
 - **Example prompts** (≥3 required; all work with a fresh Questions-only
   session):
@@ -253,14 +273,18 @@ Paste-and-adapt; portal limits in parentheses.
 
 Topics: directory guidelines, first-party API usage, financial transactions,
 AI media generation, prompt injection, conversation-data collection, public
-documentation. All are straightforwardly true for IMCP2 **except financial
-transactions** (blocker 2): resolve that before checking the box. The server
-collects nothing from the conversation beyond tool arguments, pulls no
-behavioral instructions from external sources, and generates no media.
+documentation. Two need resolution before the boxes can be checked
+truthfully: **financial transactions** (blocker 2) and **first-party API
+usage** — the connector legitimately proxies the Internet Computer protocol
+on DFINITY-operated infrastructure, but user-directed calls do reach
+third-party application canisters; fold both questions into the mcp-review
+email. The rest are straightforwardly true: the server collects nothing from
+the conversation beyond tool arguments, pulls no behavioral instructions
+from external sources, and generates no media.
 
 ## Submission-day checklist
 
-- [ ] Privacy policy URL confirmed by legal and linked from the landing page (blocker 1)
+- [ ] Dedicated ICP MCP privacy policy published; its URL (not the foundation-wide one) entered in the portal and linked from the landing page (blocker 1)
 - [ ] Financial-transactions stance settled with mcp-review@anthropic.com (blocker 2)
 - [ ] Test II identity created, funded (if needed), recovery phrase in the team vault (blocker 3)
 - [ ] `release-*` tag cut; `/version` on production shows the intended commit (blocker 4)

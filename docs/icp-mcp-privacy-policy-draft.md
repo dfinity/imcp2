@@ -69,11 +69,11 @@ We process the following categories of data, solely to provide the Service:
   level ("Questions only" or "Actions & questions") you chose on the Internet
   Identity consent screen, for the sole purpose of performing the requests
   your AI assistant makes during the session. During sign-in, the Service
-  sets one transient cookie (`sid`; HttpOnly, Secure, SameSite=Lax). This
-  cookie is set and read by the server only and is not accessible to scripts
-  running in web pages; it is used solely to bind the sign-in to the browser
-  that initiated it, protecting you against session-fixation attacks. It is
-  not used for tracking.
+  sets one transient cookie (`mcp_connect`; HttpOnly, Secure, SameSite=Lax).
+  This cookie is set and read by the server only and is not accessible to
+  scripts running in web pages; it is used solely to bind the sign-in to the
+  browser that initiated it, protecting you against session-fixation attacks.
+  It is not used for tracking.
 - **Account information.** When your AI assistant uses tools that list your
   Internet Identity accounts at an application, or that request the
   identifier (principal) you use at an application, the Service processes the
@@ -83,9 +83,14 @@ We process the following categories of data, solely to provide the Service:
   application, you may consider it private. The Service processes it only to
   answer your assistant's request and does not store it beyond the session.
 - **Connection (OAuth) data.** When an AI assistant connects, the Service
-  stores its OAuth client registration (redirect address and client name) and
-  issues short-lived authorization codes and access tokens whose lifetime is
-  capped by the session duration you chose.
+  stores the assistant's OAuth client registration: a generated client
+  identifier, the assistant's redirect address, and a last-used timestamp.
+  A registration identifies the AI assistant software, not you, and contains
+  no personal data about you; it is kept on disk so the assistant can
+  reconnect across Service restarts, and is retained until it is displaced
+  from a bounded store of registrations. The Service also issues short-lived
+  authorization codes and access tokens whose lifetime is capped by the
+  session duration you chose; these are held in memory only.
 - **Tool-call data.** The requests your AI assistant makes (application and
   canister identifiers, method names, query and call arguments) pass through
   the Service, which encodes, signs, and forwards them to the Internet
@@ -95,37 +100,50 @@ We process the following categories of data, solely to provide the Service:
   operational metrics from the Service, for example how many connections are
   active at a given time or how often errors occur, to operate, secure, and
   improve the Service. These metrics do not identify individual users.
-- **Technical log data.** Like most web services, our servers record
-  technical logs: IP address, user agent, request paths, timestamps, status
-  codes, and error traces. We use them for operating, securing, and debugging
-  the Service and for abuse prevention.
+- **Technical log data.** Our servers record technical logs: for each
+  request, the method, path, response status, and latency (query strings and
+  request bodies are never logged), together with service events and error
+  traces that can include pseudonymous session identifiers and the
+  pseudonymous identifier the Service uses for you. The Service's own logs
+  do not systematically record client IP addresses or browser user agents.
+  We use logs for operating, securing, and debugging the Service and for
+  abuse prevention.
 
 ### 2. Data Sharing
 
-The Service shares data only with infrastructure required to perform your
-requests, operated by DFINITY Foundation: the Internet Computer API boundary
-nodes (which submit your requests to the network), Internet Identity
-(`id.ai`), the public canister-metadata service at
-`dashboard.internetcomputer.org`, and the developer-skills service at
-`skills.internetcomputer.org`. We do not sell or share your data with third
-parties for their own purposes.
+The Service shares data in two ways.
 
-Note that requests you direct at applications through the Service execute on
-the Internet Computer, a public network, as your per-application identity.
-What an application records, retains, or publishes when you interact with it
-is governed by that application and its operator, not by this Privacy Policy,
-and may be publicly accessible. Which applications to interact with, and
-what to submit to them, is under your control; it is not a data-sharing
-choice of the Service.
+First, with the infrastructure required to perform your requests, operated
+by DFINITY Foundation: the Internet Computer API boundary nodes (which
+submit your requests to the network), Internet Identity (`id.ai`), the
+public canister-metadata service at `dashboard.internetcomputer.org`, and
+the developer-skills service at `skills.internetcomputer.org`.
+
+Second, at your direction, with the applications you choose to interact
+with. A question or action you send to an application necessarily carries
+your request arguments and your per-application identity to that application
+and its operator, who may be a third party; and when you ask the Service to
+discover an application from its web address, the Service fetches metadata
+from that address. Requests you direct at applications execute on the
+Internet Computer, a public network. What an application records, retains,
+or publishes when you interact with it is governed by that application and
+its operator, not by this Privacy Policy, and may be publicly accessible.
+Which applications to interact with, and what to submit to them, is under
+your control; it is not a data-sharing choice of the Service.
+
+We do not sell your data or share it with third parties for their own
+purposes.
 
 ### 3. Data Retention
 
-Session, authorization, account, and connection data are held in the
-Service's volatile memory only. They are never written to disk, they expire
-no later than the session duration you chose (at most 30 days), and they are
-lost on a server restart. Tool-call data is processed transiently and not
-retained after the call completes. Technical logs are retained for up to
-three months and then deleted.
+Session, authorization, and account data are held in the Service's volatile
+memory only. They are never written to disk, they expire no later than the
+session duration you chose (at most 30 days), and they are lost on a server
+restart. OAuth client registrations, which contain no personal data about
+you, are kept on disk and retained until displaced from a bounded store.
+Tool-call data is processed transiently and not retained after the call
+completes. Technical logs are retained for up to three months and then
+deleted.
 
 ### 4. User Rights & Compliance
 
