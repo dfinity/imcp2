@@ -116,6 +116,13 @@ check "real address alongside an allowed one is still caught" 1 \
 check "allowed value that prefixes a real address does not mask it" 1 \
   "$(scenario "the host is $ip_prefix_collision" 'clean message')"
 
+# Regression: an added line whose own text opens with the diff's file-header
+# marker must not be mistaken for a header and skipped. With the default '+'
+# indicator this line renders identically to "+++ b/…", which made the check
+# bypassable by anyone who knew to start a line that way.
+check "added line disguised as a diff file header is still scanned" 1 \
+  "$(scenario "++ b/decoy $ip_priv" 'clean message')"
+
 # Regression: a commit that exists only on the base branch is not part of this
 # pull request and must not fail its scan. `git rev-list base...HEAD` is a
 # symmetric difference and would walk it; the scanner converts the range to two

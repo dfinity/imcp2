@@ -93,24 +93,31 @@ while read -r sha; do
 done < <(git rev-list "$REV_RANGE")
 
 # --- added lines in the diff -------------------------------------------------
-# Only added lines (`^+`), so pre-existing content does not fail every future
-# build; the goal is to stop new introductions. `--no-color` and `-U0` keep the
-# output parseable, and the `+++` header is skipped so filenames never match.
+# Only added lines, so pre-existing content does not fail every future build;
+# the goal is to stop new introductions.
+#
+# `--output-indicator-new` is a correctness fix, not a stylistic one. With the
+# default '+' marker, an added line whose own text starts with "++ b/" renders
+# in the diff as "+++ b/…" — byte-identical to a file header. Such a line was
+# skipped as a header *and* overwrote the reported filename, so anything on it
+# went unscanned: a one-line, deliberately reachable bypass of the whole check.
+# Marking added lines with a character no diff header begins with removes the
+# ambiguity at the source rather than trying to out-guess it while parsing.
 current_file=""
 while IFS= read -r line; do
   case "$line" in
     '+++ b/'*) current_file="${line#+++ b/}" ; continue ;;
-    '+'*) ;;
+    'X'*) ;;
     *) continue ;;
   esac
   case "$line" in *"$ESCAPE"*) continue ;; esac
   lines_scanned=$((lines_scanned + 1))
-  hit="$(printf '%s\n' "${line#+}" | strip_allowed | grep -oE "$PATTERNS" || true)"
+  hit="$(printf '%s\n' "${line#X}" | strip_allowed | grep -oE "$PATTERNS" || true)"
   if [ -n "$hit" ]; then
     echo "::error file=${current_file}::added line contains an internal identifier: $(printf '%s' "$hit" | tr '\n' ' ')"
     findings=1
   fi
-done < <(git diff --no-color -U0 "$RANGE")
+done < <(git diff --no-color -U0 --output-indicator-new=X "$RANGE")
 
 if [ "$findings" -ne 0 ]; then
   cat >&2 <<'EOF'
