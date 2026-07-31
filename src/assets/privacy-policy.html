@@ -149,7 +149,8 @@ up to 30 days), and its access level, either <strong>"Questions only"</strong>
 Computer network itself rejects action requests; the restriction does not
 depend on the Service alone. You can revoke a connection's access at any time
 at <a href="https://id.ai/manage/access">id.ai/manage/access</a>; revocation
-takes effect within at most five minutes.</p>
+is carried out by Internet Identity and takes effect within at most five
+minutes.</p>
 
 <p>The Service does not profile individual users and does not use advertising
 or tracking cookies. It sets one transient, security-purpose cookie during
@@ -212,16 +213,28 @@ prevention.</li>
 
 <h2>2. Data Sharing</h2>
 
-<p>The Service shares data in two ways.</p>
+<p>The Service shares data in three ways.</p>
 
-<p>First, with the infrastructure required to perform your requests, operated
-by DFINITY Foundation: the Internet Computer API boundary nodes (which submit
-your requests to the network), Internet Identity (<code>id.ai</code>), the
-public canister-metadata service at
-<code>dashboard.internetcomputer.org</code>, and the developer-skills service
+<p>First, with the AI assistant you connect, which is the point of the
+Service: everything the Service returns goes back to that assistant,
+including — when you ask for them — your Internet Identity account names and
+your per-application identities. Your assistant's provider (for example,
+Anthropic for Claude) processes that data under its own terms and privacy
+policy, not this one.</p>
+
+<p>Second, with the infrastructure that carries out your requests: the
+Internet Computer's public API boundary nodes (<code>icp-api.io</code>),
+which submit your requests to the network, and Internet Identity
+(<code>id.ai</code>), which authenticates you. These are part of the Internet
+Computer and are governed by its DAO, the Network Nervous System, rather than
+operated by DFINITY Foundation; Internet Identity's own processing is covered
+by the <a href="https://identitysupport.dfinity.org/hc/en-us/articles/36662081856148-DFINITY-Internet-Identity-Privacy-Policy">Internet
+Identity Privacy Policy</a>. The Service also queries two services that
+DFINITY Foundation does operate: the public canister-metadata service at
+<code>dashboard.internetcomputer.org</code> and the developer-skills service
 at <code>skills.internetcomputer.org</code>.</p>
 
-<p>Second, at your direction, with the applications you choose to interact
+<p>Third, at your direction, with the applications you choose to interact
 with. A question or action you send to an application necessarily carries
 your request arguments and your per-application identity to that application
 and its operator, who may be a third party; and when you ask the Service to
@@ -257,9 +270,17 @@ you chose elapses. To end the authorization itself, revoke it at
 <a href="https://id.ai/manage/access">id.ai/manage/access</a>: that page
 lists every active connection for your Internet Identity, so you can review
 and revoke access there even if you no longer remember which AI sessions are
-still active, and revocation takes effect within at most five minutes. No
-data about you remains in the Service after a session ends, other than
-technical logs for the period stated above.</p>
+still active. Revocation is carried out by Internet Identity and takes effect
+within at most five minutes, after which the Internet Computer rejects any
+request made with that authorization.</p>
+
+<p>Revoking ends the authorization. The session record the Service holds in
+memory (the session key and any cached application delegations, which without
+a valid authorization can no longer be used to act for you) is discarded when
+the session duration you originally chose elapses, or when the Service
+restarts, whichever comes first. Apart from that record and the technical
+logs described above, no data about you remains in the Service after a
+session ends.</p>
 
 <p>Data you have submitted to applications on the Internet Computer through
 your own requests is held by those applications, not by the Service, and
