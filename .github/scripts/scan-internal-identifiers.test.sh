@@ -106,6 +106,20 @@ check "inline escape hatch is honoured" 0 \
 check "real address alongside an allowed one is still caught" 1 \
   "$(scenario "permits 10.0.0.0/8 but the host is $ip_priv" 'clean message')"
 
+# The shallow-clone footgun: an empty commit walk must fail rather than report
+# a clean scan. Simulated with an empty range, which is what rev-list yields
+# when the history is not there.
+empty_dir="$(scenario 'nothing interesting here' 'a clean commit message')"
+actual=0
+( cd "$empty_dir" && bash "$SCANNER" "HEAD...HEAD" ) >/dev/null 2>&1 || actual=$?
+if [ "$actual" -eq 1 ]; then
+  echo "  ok    empty commit walk fails instead of passing silently"
+  pass=$((pass + 1))
+else
+  echo "  FAIL  empty commit walk fails instead of passing silently (got $actual)"
+  fail=$((fail + 1))
+fi
+
 echo
 echo "  $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

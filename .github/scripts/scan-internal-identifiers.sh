@@ -59,10 +59,13 @@ ESCAPE='internal-scan:allow'
 strip_allowed() { sed -E "s@${ALLOWED}@@g"; }
 
 findings=0
+commits_scanned=0
+lines_scanned=0
 
 # --- commit messages in the range -------------------------------------------
 while read -r sha; do
   [ -n "$sha" ] || continue
+  commits_scanned=$((commits_scanned + 1))
   msg="$(git log -1 --format='%B' "$sha")"
   hit="$(printf '%s\n' "$msg" | grep -vE "$ESCAPE" | strip_allowed | grep -oE "$PATTERNS" || true)"
   if [ -n "$hit" ]; then
@@ -83,6 +86,7 @@ while IFS= read -r line; do
     *) continue ;;
   esac
   case "$line" in *"$ESCAPE"*) continue ;; esac
+  lines_scanned=$((lines_scanned + 1))
   hit="$(printf '%s\n' "${line#+}" | strip_allowed | grep -oE "$PATTERNS" || true)"
   if [ -n "$hit" ]; then
     echo "::error file=${current_file}::added line contains an internal identifier: $(printf '%s' "$hit" | tr '\n' ' ')"
@@ -103,4 +107,17 @@ EOF
   exit 1
 fi
 
-echo "no internal identifiers introduced in $RANGE"
+# A scan that walked nothing prints exactly the same reassuring line as a scan
+# that walked everything, so refuse to report success on an empty commit walk.
+# In practice this means one thing: the workflow lost `fetch-depth: 0` and the
+# shallow clone left rev-list with no history. Every pull request has at least
+# one commit, so zero is never legitimate.
+if [ "$commits_scanned" -eq 0 ]; then
+  echo "::error::scanned 0 commits in range '$RANGE' — the checkout is probably shallow (needs fetch-depth: 0). Refusing to report success." >&2
+  exit 1
+fi
+
+# Deletion-only changes legitimately add no lines, so that count is reported
+# rather than enforced.
+echo "no internal identifiers introduced in $RANGE" \
+     "(scanned $commits_scanned commit message(s), $lines_scanned added line(s))"
