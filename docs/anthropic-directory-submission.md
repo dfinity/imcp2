@@ -120,8 +120,7 @@ server actually does, it should cover at least:
   principal to that application's operator, and app discovery fetches
   metadata from user-supplied origins. No analytics on the MCP endpoints
   today (say so explicitly, or disclose them if added).
-- **Controller and contact:** DFINITY Stiftung; <mcp@dfinity.org> (or
-  <support@dfinity.org>, matching the II policy).
+- **Controller and contact:** DFINITY Stiftung; <mcp@dfinity.org>.
 
 Publish it (help-center article alongside the II policy, or a page under
 `mcp.internetcomputer.org`), link it from the landing page, and use that URL
@@ -147,10 +146,14 @@ Options, in increasing order of product impact:
    payment) and generic update calls are acceptable, before submitting.
    Recommended — a truthful compliance acknowledgment isn't possible today
    without an answer.
-2. **Directory-safe profile.** Serve a restricted instance for the directory
-   (e.g. an env-gated tool set omitting the `icp` conversion paths and
-   refusing calls to known ledger canisters' transfer methods), keeping the
-   full server available as a custom connector at the same or another path.
+2. **Directory-safe profile.** Serve a restricted instance for the
+   directory, keeping the full server available as a custom connector at
+   another path. Note that a blocklist of known ledger canisters or transfer
+   methods is NOT sufficient: `canister_update_call` can reach any custom
+   ledger, or an intermediary canister that forwards a transfer. A profile
+   that actually satisfies the prohibition has to drop the generic update
+   tool and the `icp` conversion paths entirely, or restrict actions to a
+   reviewed allow-list of non-financial operations.
 3. **Submit as-is** and argue in the description that funds movement is gated
    by the explicit access-level choice on the II consent screen ("Questions
    only" vs "Actions & questions"). Risk:
@@ -217,7 +220,8 @@ Paste-and-adapt; portal limits in parentheses.
   > or "Actions & questions". For a Questions-only session, the Internet
   > Computer itself rejects actions at ingress, not just this server, and you
   > can revoke any connection at https://id.ai/manage/access. Every tool
-  > is annotated read-only or destructive, returns structured results, and
+  > declares what it does (read-only, state-changing, or destructive — the
+  > destructive ones prompt before running), returns structured results, and
   > identity-bearing results echo the app origin they were derived for, so
   > mismatches are visible. The server never guesses domains from app names —
   > lookalike domains are refused rather than resolved.
@@ -278,9 +282,15 @@ truthfully: **financial transactions** (blocker 2) and **first-party API
 usage** — the connector legitimately proxies the Internet Computer protocol
 on DFINITY-operated infrastructure, but user-directed calls do reach
 third-party application canisters; fold both questions into the mcp-review
-email. The rest are straightforwardly true: the server collects nothing from
-the conversation beyond tool arguments, pulls no behavioral instructions
-from external sources, and generates no media.
+email. The **prompt-injection** acknowledgment needs open disclosure rather
+than a bare yes: tool descriptions are static and contain no hidden
+instructions, but `icp_list_skills`/`icp_get_skill` (and the `skill://`
+resources) intentionally return DFINITY-published how-to documents fetched
+live from `skills.internetcomputer.org` at the user's request — describe
+this in the submission so reviewers see documented, user-requested
+functionality rather than covertly pulled behavioral instructions. The rest
+are straightforwardly true: the server collects nothing from the
+conversation beyond tool arguments and generates no media.
 
 ## Submission-day checklist
 

@@ -7,8 +7,8 @@
 > drawn from this repository's actual behavior and should be re-verified
 > against the deployed release at publication time. Decisions needed:
 > **(a)** the publication venue (help-center article alongside the II policy
-> vs. a page on `mcp.internetcomputer.org`), **(b)** the contact address
-> (`mcp@dfinity.org` vs. `support@dfinity.org`), **(c)** the effective date.
+> vs. a page on `mcp.internetcomputer.org`), **(b)** the effective date.
+> The contact address is decided: `mcp@dfinity.org`.
 >
 > **Ops prerequisite before publishing:** the three-month log-retention bound
 > stated in section 3 is enforced by
@@ -147,20 +147,23 @@ deleted.
 
 ### 4. User Rights & Compliance
 
-You can end the Service's ability to act for you at any time, in either of
-two ways: disconnect the connector in your AI assistant, or revoke the
-connection at [id.ai/manage/access](https://id.ai/manage/access). The id.ai
-page lists every active connection for your Internet Identity, so you can
-review and revoke access there even if you no longer remember which AI
-sessions are still active; revocation takes effect within at most five
-minutes. No data about you remains in the Service after a session ends,
-other than technical logs for the period stated above.
+You can stop your AI assistant from using the Service at any time by
+disconnecting the connector in the assistant. Disconnecting ends that
+assistant's use of the connection, but it does not by itself end the
+underlying authorization, which otherwise remains valid until the duration
+you chose elapses. To end the authorization itself, revoke it at
+[id.ai/manage/access](https://id.ai/manage/access): that page lists every
+active connection for your Internet Identity, so you can review and revoke
+access there even if you no longer remember which AI sessions are still
+active, and revocation takes effect within at most five minutes. No data
+about you remains in the Service after a session ends, other than technical
+logs for the period stated above.
 
 Data you have submitted to applications on the Internet Computer through
 your own requests is held by those applications, not by the Service, and
 requests concerning it should be directed to the relevant application
 operator. For questions on how to exercise your rights, please send an email
-to [mcp@dfinity.org].
+to mcp@dfinity.org.
 
 ### 5. Changes to This Policy
 
@@ -170,4 +173,4 @@ time, at our discretion.
 ### 6. Contact
 
 For questions about this Privacy Policy or the Service, please send an email
-to [mcp@dfinity.org].
+to mcp@dfinity.org.
