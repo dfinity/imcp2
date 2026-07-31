@@ -8,9 +8,10 @@
 > against the deployed release at publication time. Decision still needed:
 > the effective date. Decided: the publication venue is
 > `https://mcp.internetcomputer.org/privacy-policy`, served by the MCP
-> server itself (a route + static page to add once legal approves this
-> text — note that merging the page to `main` publishes it on staging
-> immediately and on production at the next `release-*` tag), and the
+> server itself — implemented in
+> [#112](https://github.com/dfinity/imcp2/pull/112), which stays a draft
+> until legal approves this text (merging it publishes the page on staging
+> immediately and on production at the next `release-*` tag) — and the
 > contact address is `mcp@dfinity.org`.
 >
 > **Ops prerequisite before publishing:** the three-month log-retention bound
