@@ -62,6 +62,10 @@ res_eni="eni-0$(printf '%015x' $((0xfedcba987654)))"
 # correctly flagged it when it was one.
 rule="$(printf -- '-%.0s' 1 2 3 4 5)"
 pem_header="${rule}BEGIN OPENSSH PRIVATE KEY${rule}"
+# A real address whose leading characters are an allow-listed example: the bare
+# allowed value with one more digit appended. Assembled for the same reason as
+# the rest — written out, it would be a finding in this file.
+ip_prefix_collision="10.0.0.1$((5 + 5))"
 
 echo "scan-internal-identifiers.sh"
 
@@ -105,6 +109,43 @@ check "inline escape hatch is honoured" 0 \
 # the whole line: otherwise a real address rides along beside a safe one.
 check "real address alongside an allowed one is still caught" 1 \
   "$(scenario "permits 10.0.0.0/8 but the host is $ip_priv" 'clean message')"
+
+# Regression: an allowed value that is a *prefix* of a real one must not take a
+# bite out of it. Without boundaries on the allow-list, the strip removes the
+# allowed prefix and leaves a lone trailing digit, so the real address passes.
+check "allowed value that prefixes a real address does not mask it" 1 \
+  "$(scenario "the host is $ip_prefix_collision" 'clean message')"
+
+# Regression: a commit that exists only on the base branch is not part of this
+# pull request and must not fail its scan. `git rev-list base...HEAD` is a
+# symmetric difference and would walk it; the scanner converts the range to two
+# dots for the commit walk while keeping three dots for the diff.
+base_side="$work/baseside"
+mkdir -p "$base_side"
+git -C "$base_side" init -q -b main
+git -C "$base_side" config user.email t@example.invalid
+git -C "$base_side" config user.name test
+echo base > "$base_side/base.txt"
+git -C "$base_side" add -A
+git -C "$base_side" commit -qm "shared base"
+git -C "$base_side" branch -q feature
+# A forbidden value lands on the base branch, after the branch point.
+echo other > "$base_side/other.txt"
+git -C "$base_side" add -A
+git -C "$base_side" commit -qm "unrelated base commit mentioning $ip_priv"
+git -C "$base_side" checkout -q feature
+echo clean > "$base_side/change.txt"
+git -C "$base_side" add -A
+git -C "$base_side" commit -qm "a clean pull request commit"
+actual=0
+( cd "$base_side" && bash "$SCANNER" "main...HEAD" ) >/dev/null 2>&1 || actual=$?
+if [ "$actual" -eq 0 ]; then
+  echo "  ok    base-branch-only commit does not fail the pull request"
+  pass=$((pass + 1))
+else
+  echo "  FAIL  base-branch-only commit does not fail the pull request (got $actual)"
+  fail=$((fail + 1))
+fi
 
 # The shallow-clone footgun: an empty commit walk must fail rather than report
 # a clean scan. Simulated with an empty range, which is what rev-list yields

@@ -48,8 +48,15 @@ PATTERNS+='|(-----BEGIN [A-Z ]*PRIVATE KEY-----)'
 # it is scanned rather than exempting the whole line. Whole-line exemption
 # would let a real address ride along on a line that also mentions 10.0.0.0/8 —
 # and the SSRF tests in src/discover.rs legitimately contain several of these.
-ALLOWED='10\.0\.0\.0/8|172\.16\.0\.0/12|192\.168\.0\.0/16'
-ALLOWED+='|10\.0\.0\.1|172\.16\.0\.1|192\.168\.1\.1|192\.168\.0\.1'
+#
+# The boundaries are load-bearing, not decoration. Without them the removal is
+# a plain substring replacement, so an allowed value that is a *prefix* of a
+# real one takes a bite out of it — append one digit to any bare address below
+# and the strip leaves a lone digit behind, which matches nothing and passes
+# silently. Longest alternatives first so the CIDR forms win over the bare
+# addresses they contain.
+ALLOWED='\b(10\.0\.0\.0/8|172\.16\.0\.0/12|192\.168\.0\.0/16'
+ALLOWED+='|10\.0\.0\.1|172\.16\.0\.1|192\.168\.1\.1|192\.168\.0\.1)\b'
 
 # Per-line escape hatch. Deliberately an inline marker rather than a config
 # file: it shows up in the diff, so a reviewer sees the suppression alongside
@@ -57,6 +64,17 @@ ALLOWED+='|10\.0\.0\.1|172\.16\.0\.1|192\.168\.1\.1|192\.168\.0\.1'
 ESCAPE='internal-scan:allow'
 
 strip_allowed() { sed -E "s@${ALLOWED}@@g"; }
+
+# `A...B` means two different things to the two commands below, and passing the
+# caller's range to both is wrong for one of them:
+#
+#   git diff A...B      changes on B since the merge base   <- what we want
+#   git rev-list A...B  symmetric difference: commits unique to EITHER side
+#
+# So rev-list with three dots also walks commits that are only on the base
+# branch. A base commit that has nothing to do with this pull request would
+# then fail its scan. Two dots gives exactly the commits B has and A does not.
+REV_RANGE="${RANGE/.../..}"
 
 findings=0
 commits_scanned=0
@@ -72,7 +90,7 @@ while read -r sha; do
     echo "::error::commit $(git rev-parse --short "$sha") message contains an internal identifier: $(printf '%s' "$hit" | tr '\n' ' ')"
     findings=1
   fi
-done < <(git rev-list "$RANGE")
+done < <(git rev-list "$REV_RANGE")
 
 # --- added lines in the diff -------------------------------------------------
 # Only added lines (`^+`), so pre-existing content does not fail every future
@@ -113,7 +131,7 @@ fi
 # shallow clone left rev-list with no history. Every pull request has at least
 # one commit, so zero is never legitimate.
 if [ "$commits_scanned" -eq 0 ]; then
-  echo "::error::scanned 0 commits in range '$RANGE' — the checkout is probably shallow (needs fetch-depth: 0). Refusing to report success." >&2
+  echo "::error::scanned 0 commits in range '$REV_RANGE' — the checkout is probably shallow (needs fetch-depth: 0). Refusing to report success." >&2
   exit 1
 fi
 
