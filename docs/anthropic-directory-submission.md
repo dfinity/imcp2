@@ -54,7 +54,7 @@ Verified against the live production deployment (2026-07-31):
 | Certificates from a recognized authority | ✅ Let's Encrypt via Caddy |
 | OAuth endpoint latency ≤ 10 s (discovery/registration/token) | ✅ all sub-second in probes |
 | Support channel | ✅ <mcp@dfinity.org> (shown on every error screen) |
-| Security-vulnerability reporting mechanism (Terms §) | ✅ [`SECURITY.md`](../SECURITY.md) → HackenProof bug bounty |
+| Security-vulnerability reporting mechanism (a Software Directory Terms obligation) | ✅ [`SECURITY.md`](../SECURITY.md) → Hackenproof bug bounty |
 | Public documentation by publish date | ✅ this repo's README + the landing page at <https://mcp.internetcomputer.org> |
 | Status/health visibility | ✅ <https://mcp.internetcomputer.org/status/> |
 
