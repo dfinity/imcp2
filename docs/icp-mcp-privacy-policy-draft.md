@@ -95,13 +95,16 @@ No secret key crosses a network in either direction: your credentials stay
 with Internet Identity, and the Service's key never leaves the Service. What
 travels is only the key's public half, which Internet Identity signs,
 issuing a time-limited, scope-limited authorization for that key to act as
-you; the Service then uses the key to sign the requests your assistant
-makes. It is a signing credential, so it is worth being precise about its
-limits: it is not your Internet Identity key, it cannot be used to sign in
-as you anywhere else, and it stops working when the authorization expires or
-you revoke it. Separately, your AI assistant holds an OAuth access token
-that lets it reach the Service; that token's lifetime is capped by the same
-authorization.
+you. The Service uses the session key with Internet Identity to obtain, for
+each application you interact with, a further short-lived authorization and
+per-application key (the connection material described in section 1), and
+those per-application keys are what actually sign your requests. All of
+these are signing credentials the Service generated itself, so it is worth
+being precise about their limits: none of them is your Internet Identity
+key, none can be used to sign in as you anywhere else, and revoking the
+connection stops them in the two steps described in section 7. Separately,
+your AI assistant holds an OAuth access token that lets it reach the
+Service; that token's lifetime is capped by the same authorization.
 
 On the Internet Identity consent screen you make two explicit choices: how
 long the connection lasts (from 10 minutes up to 30 days), and its access
@@ -270,7 +273,7 @@ network rather than a transfer we arrange.
 | Authorization codes and access tokens | In memory only; codes expire after two minutes, tokens no later than the session duration you chose. |
 | Connection (OAuth) registrations | Stored on disk so an assistant can reconnect across restarts. There is currently **no time limit**: a registration is kept until it is displaced once the store reaches its cap of 10,000, which for a rarely-used deployment can mean indefinitely. |
 | Technical logs | Up to three months, then deleted. |
-| Aggregated operational metrics | Computed on demand from data already in memory; not stored. |
+| Aggregated operational metrics | Held in memory only, never written to disk: gauges are computed on demand, and the status dashboard keeps its most recent health report in memory until the next one replaces it or the process restarts. |
 
 Revoking a connection takes effect in the two steps described in section 7.
 Revocation does not by itself erase the session record: the delegated
@@ -283,9 +286,12 @@ table above describes the actual behaviour.
 
 We would rather be specific than make sweeping promises, so:
 
-- Every request produces one log line with the HTTP method, the path, the
-  response status, and how long it took. Query strings and request bodies are
-  never included, which keeps single-use codes and delegations out of logs.
+- Every request that reaches the Service's application produces one log line
+  with the HTTP method, the path, the response status, and how long it took.
+  Query strings and request bodies are never included, which keeps
+  single-use codes and delegations out of these logs. Requests to the status
+  dashboard (`/status/`) bypass the application and produce no routine log
+  line at all.
 - Sign-in and session events log the session identifier, a per-connection
   identifier derived from that connection's key, the access level, and expiry
   times. The per-connection identifier is new for every connection, so log
@@ -295,8 +301,9 @@ We would rather be specific than make sweeping promises, so:
   that perform tool calls do no logging at all.
 - Our web server is configured without access logging, so client IP addresses
   and browser user agents are not recorded as a matter of course. They are
-  unavoidably processed in transit in order to serve a request, and can appear
-  in diagnostic output when a connection or the process itself fails.
+  unavoidably processed in transit in order to serve a request, and its
+  diagnostics for failed requests can include connection details and the
+  requested address, including any query string, when something goes wrong.
 - Logs are held by the operating system's journal on our hosts, subject to the
   retention bound above.
 
@@ -375,7 +382,11 @@ Section 5 rests on this; redo it whenever the policy is republished.
   safe. A grep for `tracing::` lines mentioning `derivation`, `canister`,
   `args`, or `origin` returns nothing.
 - Request logging (`log_request`, `src/main.rs`) records method, path, status,
-  and latency, and deliberately omits the query string and the body.
+  and latency, and deliberately omits the query string and the body. It covers
+  only the MCP application: Caddy proxies `/status/*` straight to the Node
+  dashboard, which has no routine request log (its one log line is a sanitised
+  error). Caddy's own failure diagnostics can include request URIs (with query
+  strings), so section 5 hedges accordingly.
 - Session/auth events log `session_id` and the session-key principal
   (`session_principal` = `self_authenticating` over the per-connection
   session key, `src/identities.rs` — ephemeral, new per connection; NOT the
