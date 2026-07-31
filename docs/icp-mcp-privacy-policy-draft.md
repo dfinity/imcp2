@@ -11,12 +11,11 @@
 > (`mcp@dfinity.org` vs. `support@dfinity.org`), **(c)** the effective date.
 >
 > **Ops prerequisite before publishing:** the three-month log-retention bound
-> stated in section 3 is not enforced by anything today. Both services log to
-> journald, whose default retention is size-based with no time cap. Enforce it
-> with a journald drop-in on both hosts (e.g.
-> `/etc/systemd/journald.conf.d/90-retention.conf` with
-> `MaxRetentionSec=90day`), installed by `deploy/native/deploy.sh` so it
-> survives host rebuilds.
+> stated in section 3 is enforced by a journald drop-in
+> (`/etc/systemd/journald.conf.d/90-imcp2-retention.conf`, `MaxFileSec=1week`
+> + `MaxRetentionSec=12week`) that `deploy/native/deploy.sh` installs. Run a
+> deploy to BOTH hosts (staging and production) after this change lands, and
+> before the policy is published, so the bound is actually in force.
 
 ---
 
