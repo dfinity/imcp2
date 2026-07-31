@@ -73,6 +73,21 @@ async fn log_request(
 /// what an agent can do: discovery, identity, on-network queries, actions, skills.
 const INDEX_HTML: &str = include_str!("assets/index.html");
 
+/// The privacy policy served at `/privacy-policy` — the URL the Anthropic
+/// connectors-directory listing (and the landing page) point at. The markup
+/// lives in `assets/privacy-policy.html` (compiled in via `include_str!`, no
+/// runtime file I/O) and shares the connect flow's ICP identity so it reads as
+/// the same product. Its one substitution is the shared DFINITY wordmark
+/// (`assets/dfinity-logo.svg`), inlined once on first use so the served page
+/// stays fully self-contained (no external fonts, scripts, or images).
+const PRIVACY_POLICY_HTML: &str = include_str!("assets/privacy-policy.html");
+const DFINITY_LOGO_SVG: &str = include_str!("assets/dfinity-logo.svg");
+
+fn privacy_policy_page() -> &'static str {
+    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PAGE.get_or_init(|| PRIVACY_POLICY_HTML.replace("__LOGO__", DFINITY_LOGO_SVG))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
@@ -158,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut app = Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
+        .route("/privacy-policy", get(|| async { Html(privacy_policy_page()) }))
         // Unauthenticated build/version probe so operators and the status
         // dashboard can confirm exactly which deployment is live: the running
         // commit (baked in at build time via GIT_SHA), the build time
