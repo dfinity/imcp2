@@ -1,0 +1,165 @@
+# Off-host health probe for the production MCP service.
+#
+# The status dashboard already runs every check this needs — MCP, the OAuth
+# suite, TLS, and the Internet Identity linkage — but it runs *on the host* and
+# is pull-only: something has to look at it. This runs the same probe suite from
+# GitHub's infrastructure on a schedule, which is the part the host cannot do
+# for itself. A host that is down cannot tell you it is down.
+#
+# Escalation, honestly labelled: a failure here fails the workflow, which
+# notifies watchers by email, and posts to Slack when a webhook is configured.
+# Neither is a page. Nobody is on call. For real escalation the probe belongs in
+# the organisation's Prometheus/OpsGenie stack, where an alert reaches someone
+# who has agreed to be woken — this is the stopgap, not the destination.
+#
+# Optional repository secret:
+#   SLACK_WEBHOOK_URL  Incoming-webhook URL, intended for #eng-identity-imcp2.
+#                      Absent, the Slack step is skipped and the workflow
+#                      failure remains the only signal. Nothing else changes.
+name: Production health
+
+on:
+  schedule:
+    # Every 15 minutes. GitHub's scheduler is best-effort and routinely drifts
+    # under load, so treat this as "noticed within the hour", not an SLA. Note
+    # that scheduled workflows are disabled automatically after 60 days without
+    # repository activity.
+    - cron: '*/15 * * * *'
+  # Manual run, for verifying the probe itself rather than waiting for a tick.
+  workflow_dispatch:
+
+# One probe at a time; a slow run should not overlap the next tick.
+concurrency:
+  group: health
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    env:
+      MCP_ORIGIN: https://mcp.internetcomputer.org
+      # The probe refuses any origin outside its SSRF allow-list, which defaults
+      # to id.ai and loopback. The production host is neither, so it has to be
+      # named explicitly — exactly as deploy.sh does when it starts the hosted
+      # dashboard. Without this the run fails with a usage error rather than a
+      # health verdict, which is a confusing way to learn the service is fine.
+      MCP_STATUS_ALLOWED_HOSTS: mcp.internetcomputer.org
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Deliberately NOT --strict. That flag escalates warnings to failures, and
+      # a third of the suite probes Internet Identity and the IC — infrastructure
+      # this team does not operate. Alerting on someone else's degradation is how
+      # a channel learns to ignore the alerts. Real failures still fail: without
+      # --strict the CLI exits non-zero exactly when `overall` is "fail", which
+      # is the same threshold the dashboard uses to serve 503.
+      - name: Probe production
+        id: probe
+        run: |
+          set +e
+          node monitoring/mcp-status/cli.js --mcp "$MCP_ORIGIN" --json > report.json 2> probe.err
+          code=$?
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 0 ]; then
+            echo "healthy"
+          else
+            echo "probe exited $code"
+            cat probe.err || true
+          fi
+
+      # Summarise which checks failed, rather than only that something did. A
+      # bare "the workflow failed" costs the reader a log dive at exactly the
+      # moment they are least inclined to do one.
+      - name: Summarise
+        id: summary
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          try:
+              r = json.load(open("report.json"))
+          except Exception as e:
+              print(f"Could not parse the probe report: {e}\n")
+              print("The probe did not produce usable JSON — most likely it could "
+                    "not reach the host at all, which is itself the finding.")
+              raise SystemExit(0)
+          bad = []
+          for section in r.get("sections", []):
+              for c in section.get("checks", []):
+                  if c.get("status") in ("fail", "warn"):
+                      bad.append((c.get("status"), section.get("title", "?"), c.get("label", "?")))
+          print(f"**overall: {r.get('overall')}**\n")
+          if bad:
+              print("| status | section | check |")
+              print("|---|---|---|")
+              for s, sec, lab in bad:
+                  print(f"| {s} | {sec} | {lab} |")
+          else:
+              print("All checks passed.")
+          PY
+          # A one-line form for the Slack payload.
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          try:
+              r = json.load(open("report.json"))
+              failed = [c.get("label", "?")
+                        for s in r.get("sections", [])
+                        for c in s.get("checks", [])
+                        if c.get("status") == "fail"]
+              line = ", ".join(failed) if failed else "no individual check reported fail"
+          except Exception:
+              line = "the probe produced no usable report (the host may be unreachable)"
+          # $GITHUB_OUTPUT is line-oriented, so a newline in a value would let
+          # the value declare further outputs. The labels are our own static
+          # strings today, but sanitising here costs nothing and keeps this from
+          # becoming a hazard if a future check ever interpolates a server value.
+          line = " ".join(line.split())[:400]
+          print(f"failed={line}")
+          PY
+
+      # Skipped when the secret is absent, so this workflow is useful the moment
+      # it lands and gains Slack routing later with no code change. `secrets` is
+      # not available in a step condition, hence the job-level env mapping above.
+      #
+      # The condition reads the probe's recorded exit code rather than
+      # `failure()`. The probe step swallows its own failure on purpose, so at
+      # this point in the job nothing has failed yet and `failure()` is false —
+      # the notification would never have fired, while the run still went red at
+      # the final step and looked correct from the outside.
+      - name: Notify Slack
+        if: steps.probe.outputs.exit_code != '0' && env.SLACK_WEBHOOK_URL != ''
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          python3 - "$run_url" <<'PY' > payload.json
+          import json, sys, os
+          text = (
+              ":rotating_light: *ICP MCP production health check failed*\n"
+              f"Failing: {os.environ.get('FAILED', 'unknown')}\n"
+              f"<{sys.argv[1]}|Run log>  ·  "
+              "<https://mcp.internetcomputer.org/status/|Status page>"
+          )
+          json.dump({"text": text}, sys.stdout)
+          PY
+          curl -sS --fail-with-body -X POST -H 'Content-type: application/json' \
+            --data @payload.json "$SLACK_WEBHOOK_URL"
+        env:
+          FAILED: ${{ steps.summary.outputs.failed }}
+
+      # Re-raise the probe's verdict so the run itself is red. This is the
+      # baseline notification and the one that needs no configuration at all.
+      - name: Fail the run if unhealthy
+        if: steps.probe.outputs.exit_code != '0'
+        run: |
+          echo "::error::production health check failed (${{ steps.summary.outputs.failed }})"
+          exit 1
