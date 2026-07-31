@@ -72,8 +72,7 @@ considering as a follow-up if usage grows.
 
 > "Missing or incomplete privacy policies result in immediate rejection."
 
-Neither this repo nor the landing page links a privacy policy today, and the
-two existing DFINITY policies don't cover this service:
+The two existing DFINITY policies don't cover this service:
 
 - The [Internet Identity Privacy Policy](https://identitysupport.dfinity.org/hc/en-us/articles/36662081856148-DFINITY-Internet-Identity-Privacy-Policy)
   (effective 2026-04-07) scopes itself solely to processing "when you link
@@ -122,11 +121,14 @@ server actually does, it should cover at least:
   today (say so explicitly, or disclose them if added).
 - **Controller and contact:** DFINITY Stiftung; <mcp@dfinity.org>.
 
-Publication venue (decided): `https://mcp.internetcomputer.org/privacy-policy`,
-served by the MCP server itself — add the route + page once legal approves
-the text, link it from the landing page, and use that URL in the portal. A
-draft in the II policy's style is ready for legal review at
-[`icp-mcp-privacy-policy-draft.md`](icp-mcp-privacy-policy-draft.md).
+Publication venue: `https://mcp.internetcomputer.org/privacy-policy`, served
+by the MCP server itself. The page and its route shipped in
+[#112](https://github.com/dfinity/imcp2/pull/112) (effective date August 3,
+2026) and the landing page's footer links it, so what remains is the
+**production release**: staging serves it now, production at the next
+`release-*` tag — cut on or after August 3 so the live page and its stated
+effective date agree. Then enter that URL in the portal. The reviewed source
+text is [`icp-mcp-privacy-policy-draft.md`](icp-mcp-privacy-policy-draft.md).
 
 ### 2. Financial-transactions policy (decision needed)
 
@@ -295,7 +297,7 @@ conversation beyond tool arguments and generates no media.
 
 ## Submission-day checklist
 
-- [ ] Dedicated ICP MCP privacy policy live at `https://mcp.internetcomputer.org/privacy-policy`, entered in the portal, and linked from the landing page (blocker 1)
+- [ ] Dedicated ICP MCP privacy policy live at `https://mcp.internetcomputer.org/privacy-policy` (page + landing-page link merged; needs the production release) and entered in the portal (blocker 1)
 - [ ] Financial-transactions stance settled with mcp-review@anthropic.com (blocker 2)
 - [ ] Test II identity created, funded (if needed), recovery phrase in the team vault (blocker 3)
 - [ ] `release-*` tag cut; `/version` on production shows the intended commit (blocker 4)

@@ -74,9 +74,8 @@ async fn log_request(
 const INDEX_HTML: &str = include_str!("assets/index.html");
 
 /// The privacy policy served at `/privacy-policy` — the URL the Anthropic
-/// connectors-directory listing points at. (The landing page does not link it
-/// yet: it is a compiled design bundle, so adding its footer link is a
-/// follow-up bundle regeneration.) The markup lives in
+/// connectors-directory listing points at, and the target of the landing
+/// page's footer link. The markup lives in
 /// `assets/privacy-policy.html` (compiled in via `include_str!`, no runtime
 /// file I/O) and shares the connect flow's ICP identity so it reads as the
 /// same product. Its one substitution is the shared DFINITY wordmark
