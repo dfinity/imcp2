@@ -184,7 +184,7 @@ Related honesty point for the same step: there is **no per-call confirmation**
 for sensitive methods server-side today (an open roadmap item in the README) —
 mitigations are the explicit access-level choice on the II consent screen
 ("Questions only" vs "Actions & questions", enforced at IC ingress),
-revocability at any time via id.ai/manage/access (≤5 min latency), and
+revocability at any time via id.ai/manage/settings (≤5 min latency), and
 accurate `destructiveHint` annotations (which make Claude prompt before each
 destructive call).
 
@@ -259,7 +259,7 @@ Paste-and-adapt; portal limits in parentheses.
   > duration (10 minutes to 30 days) and the access level: "Questions only"
   > or "Actions & questions". For a Questions-only session, the Internet
   > Computer itself rejects actions at ingress, not just this server, and you
-  > can revoke any connection at https://id.ai/manage/access. Every tool
+  > can revoke any connection at https://id.ai/manage/settings. Every tool
   > declares what it does (read-only, state-changing, or destructive — the
   > destructive ones prompt before running), returns structured results, and
   > identity-bearing results echo the app origin they were derived for, so
@@ -315,7 +315,7 @@ Paste-and-adapt; portal limits in parentheses.
 > 3. Try the example prompts above. Questions-only sessions cause management
 >    tools to return an actionable reconnect message rather than an opaque
 >    error — that behavior is intended. Access is revocable at any time at
->    https://id.ai/manage/access.
+>    https://id.ai/manage/settings.
 > 4. The canister-management tools act on canisters you control and spend
 >    cycles, so a brand-new identity has nothing for them to operate on. Ask
 >    us at mcp@dfinity.org if you would like an identity provisioned with a

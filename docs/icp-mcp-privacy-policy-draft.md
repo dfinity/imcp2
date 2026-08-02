@@ -127,7 +127,7 @@ Service derives a per-application identity on demand for whichever application
 is named at the time. Combined with a duration of up to 30 days, that is a
 broad credential, so choose the shortest duration that suits your task, and
 revoke connections you are no longer using at
-[id.ai/manage/access](https://id.ai/manage/access).
+[id.ai/manage/settings](https://id.ai/manage/settings).
 
 The Service does not profile individual users, does not use advertising, and
 does not use tracking cookies. It sets one transient, security-purpose cookie
@@ -337,7 +337,7 @@ You can also act directly, without contacting us:
   using the connection, but does not by itself end the underlying
   authorization.
 - **Revoke** the authorization at
-  [id.ai/manage/access](https://id.ai/manage/access), which lists every active
+  [id.ai/manage/settings](https://id.ai/manage/settings), which lists every active
   connection for your Internet Identity so you can review and revoke access
   even if you no longer remember which assistant sessions are active.
   Revocation is carried out by Internet Identity and takes effect in two
