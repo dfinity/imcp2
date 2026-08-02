@@ -233,6 +233,10 @@ jobs:
           # Expose the beta II instance at /mcp-beta on staging only; production
           # serves /mcp (production II) alone. Empty string reads as off.
           MCP_SERVE_BETA: ${{ inputs.environment == 'staging' && '1' || '' }}
+          # OpenAI Apps domain verification (ChatGPT-directory submission).
+          # A repository VARIABLE, not a secret: the token is world-readable at
+          # /.well-known/openai-apps-challenge by design. Unset -> endpoint 404s.
+          OPENAI_APPS_CHALLENGE_TOKEN: ${{ vars.OPENAI_APPS_CHALLENGE_TOKEN || '' }}
         run: deploy/native/deploy.sh
 
       # Confirm the host is actually running the commit we just shipped, rather

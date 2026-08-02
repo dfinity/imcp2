@@ -15,6 +15,11 @@ Environment=RUST_LOG=info
 # production. An empty value reads as off, so production serves /mcp (production
 # II) alone; staging additionally exposes /mcp-beta (beta II).
 Environment=MCP_SERVE_BETA=__MCP_SERVE_BETA__
+# OpenAI Apps domain verification: the token the ChatGPT-directory submission
+# portal reveals, served verbatim at /.well-known/openai-apps-challenge. Empty
+# (the default) keeps that endpoint 404. Public by design, so it is a plain
+# repository VARIABLE (OPENAI_APPS_CHALLENGE_TOKEN), not a secret.
+Environment=OPENAI_APPS_CHALLENGE_TOKEN=__OPENAI_APPS_CHALLENGE_TOKEN__
 # Dynamic client registrations persist here so OAuth clients that cached their
 # client_id keep working across redeploys. StateDirectory (=/var/lib/imcp2) is
 # created service-owned and survives restarts; /opt/imcp2 is replaced each deploy.

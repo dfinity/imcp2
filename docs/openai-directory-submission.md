@@ -69,15 +69,19 @@ if a reviewer reports a failure.
 
 ## Blockers and open items
 
-### 1. Domain-verification endpoint (small code change)
+### 1. Domain-verification endpoint — implemented, awaits the token
 
 The portal requires proving control of the host: an endpoint at
 `https://<host>/.well-known/openai-apps-challenge` must return **only** the
 verification token revealed during submission ("do not return JSON, a list of
-tokens, or multiple tokens"). Implementation: a route reading an
-`OPENAI_APPS_CHALLENGE_TOKEN` env var (set in `imcp2.service` at deploy),
-returning it as `text/plain`, 404 when unset. Do this when the submission is
-started, since the token comes from the portal.
+tokens, or multiple tokens"). The route ships with this PR: it serves
+`$OPENAI_APPS_CHALLENGE_TOKEN` verbatim as `text/plain` (trimmed, so unit-file
+whitespace can't break OpenAI's exact-match check) and 404s while the variable
+is unset, so it is inert until a submission is in flight. When the portal
+reveals the token: set the **repository variable**
+`OPENAI_APPS_CHALLENGE_TOKEN` (Settings → Secrets and variables → Actions →
+Variables — a variable, not a secret; the token is world-readable by design)
+and deploy. Then have the portal run its check.
 
 ### 2. Demo account (same tension as Anthropic, stricter wording)
 
@@ -160,7 +164,7 @@ Negative:
 
 - [ ] OpenAI Platform organization verified (business verification)
 - [ ] Submitter holds the Apps Management write permission
-- [ ] `/.well-known/openai-apps-challenge` route deployed with the portal's token (blocker 1)
+- [ ] Repository variable `OPENAI_APPS_CHALLENGE_TOKEN` set to the portal's token and deployed; `curl https://mcp.internetcomputer.org/.well-known/openai-apps-challenge` returns exactly the token (blocker 1 — the route itself ships with this PR)
 - [ ] Privacy policy live at `https://mcp.internetcomputer.org/privacy-policy` (same release as the Anthropic listing needs)
 - [ ] Tools re-scanned in the portal after any server change; annotations verified in the scan
 - [ ] 5+ positive and 3+ negative test cases entered, verified on web and mobile
