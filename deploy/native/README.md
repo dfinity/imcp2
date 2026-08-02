@@ -290,6 +290,7 @@ addresses, since the ship job runs inside the VPN.
 | `DEPLOY_DOMAIN` | `PROD_DEPLOY_DOMAIN` | Public FQDN served over HTTPS |
 | `DEPLOY_ACME_EMAIL` | `PROD_DEPLOY_ACME_EMAIL` | Email for Let's Encrypt / ACME |
 | `DEPLOY_KNOWN_HOSTS` | `PROD_DEPLOY_KNOWN_HOSTS` | *(optional)* output of `ssh-keyscan <host>`; pin it to avoid trust-on-first-use |
+| `OPENAI_APPS_CHALLENGE_TOKEN` | *(same name)* | *(optional)* OpenAI Apps domain-verification token, served at `/.well-known/openai-apps-challenge` (404 while unset). Submission-specific rather than host-specific, so one repository-level secret feeds both environments |
 
 > **Set these as repository-level secrets** (**Settings → Secrets and variables →
 > Actions**). The callers pass them into the reusable workflow, and a job that calls

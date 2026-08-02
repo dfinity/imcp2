@@ -162,6 +162,9 @@ jobs:
       DEPLOY_DOMAIN: ${{ secrets.PROD_DEPLOY_DOMAIN }}
       DEPLOY_ACME_EMAIL: ${{ secrets.PROD_DEPLOY_ACME_EMAIL }}
       DEPLOY_KNOWN_HOSTS: ${{ secrets.PROD_DEPLOY_KNOWN_HOSTS }}
+      # Submission-specific, not host-specific: deliberately NOT PROD_-prefixed;
+      # the same repository-level secret feeds staging and production.
+      OPENAI_APPS_CHALLENGE_TOKEN: ${{ secrets.OPENAI_APPS_CHALLENGE_TOKEN }}
 
   # Attach the binary that was actually deployed to the tag's Release page. Without
   # this the only copy is a workflow artifact, which expires after 7 days, so the

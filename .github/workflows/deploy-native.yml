@@ -82,6 +82,15 @@ on:
       DEPLOY_KNOWN_HOSTS:
         description: Optional pinned host keys (ssh-keyscan output). TOFU if unset.
         required: false
+      OPENAI_APPS_CHALLENGE_TOKEN:
+        description: >-
+          OpenAI Apps domain-verification token (ChatGPT-directory submission),
+          served verbatim at /.well-known/openai-apps-challenge. It is
+          world-readable at that endpoint by design; it is handled as a secret
+          for consistency with the other deploy inputs. Unset -> the endpoint
+          404s. Not host-specific, so both callers pass the same
+          repository-level secret.
+        required: false
 
 jobs:
   build:
@@ -234,9 +243,9 @@ jobs:
           # serves /mcp (production II) alone. Empty string reads as off.
           MCP_SERVE_BETA: ${{ inputs.environment == 'staging' && '1' || '' }}
           # OpenAI Apps domain verification (ChatGPT-directory submission).
-          # A repository VARIABLE, not a secret: the token is world-readable at
-          # /.well-known/openai-apps-challenge by design. Unset -> endpoint 404s.
-          OPENAI_APPS_CHALLENGE_TOKEN: ${{ vars.OPENAI_APPS_CHALLENGE_TOKEN || '' }}
+          # Unset -> endpoint 404s. An optional secret that neither caller
+          # passes arrives here as the empty string.
+          OPENAI_APPS_CHALLENGE_TOKEN: ${{ secrets.OPENAI_APPS_CHALLENGE_TOKEN }}
         run: deploy/native/deploy.sh
 
       # Confirm the host is actually running the commit we just shipped, rather

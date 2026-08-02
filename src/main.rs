@@ -80,13 +80,13 @@ const INDEX_HTML: &str = include_str!("assets/index.html");
 /// `GET /.well-known/openai-apps-challenge` must return VERBATIM as the whole
 /// body — plain text, exactly one token, no JSON ("do not return JSON, a list
 /// of tokens, or multiple tokens from the same URL"). The token is public by
-/// design (the endpoint is world-readable proof of domain control), so it
-/// arrives as the ordinary env var `$OPENAI_APPS_CHALLENGE_TOKEN` — a
-/// repository *variable*, not a secret, substituted into the unit by
-/// `deploy.sh` — and the route serves 404 while the variable is unset or
-/// blank, keeping the endpoint inert until a submission is actually in
-/// flight. The value is trimmed so unit-file whitespace can't corrupt the
-/// exact-match comparison OpenAI performs.
+/// design (the endpoint is world-readable proof of domain control); it
+/// arrives as the env var `$OPENAI_APPS_CHALLENGE_TOKEN`, substituted into
+/// the unit by `deploy.sh` from the repository secret of the same name, and
+/// the route serves 404 while the value is unset or blank, keeping the
+/// endpoint inert until a submission is actually in flight. The value is
+/// trimmed so unit-file whitespace can't corrupt the exact-match comparison
+/// OpenAI performs.
 fn openai_apps_challenge_router(token: Option<String>) -> Router {
     let token = token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
     Router::new().route(

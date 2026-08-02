@@ -79,10 +79,10 @@ tokens, or multiple tokens"). The route ships with this PR: it serves
 `$OPENAI_APPS_CHALLENGE_TOKEN` verbatim as `text/plain` (trimmed, so unit-file
 whitespace can't break OpenAI's exact-match check) and 404s while the variable
 is unset, so it is inert until a submission is in flight. When the portal
-reveals the token: set the **repository variable**
+reveals the token: set the **repository secret**
 `OPENAI_APPS_CHALLENGE_TOKEN` (Settings → Secrets and variables → Actions →
-Variables — a variable, not a secret; the token is world-readable by design)
-and deploy. Then have the portal run its check.
+Secrets, repository level — both deploy callers pass the same one) and
+deploy. Then have the portal run its check.
 
 ### 2. Demo account (same tension as Anthropic, stricter wording)
 
@@ -165,7 +165,7 @@ Negative:
 
 - [ ] OpenAI Platform organization verified (business verification)
 - [ ] Submitter holds the Apps Management write permission
-- [ ] Repository variable `OPENAI_APPS_CHALLENGE_TOKEN` set to the portal's token and deployed; `curl https://mcp.internetcomputer.org/.well-known/openai-apps-challenge` returns exactly the token (blocker 1 — the route itself ships with this PR)
+- [ ] Repository secret `OPENAI_APPS_CHALLENGE_TOKEN` set to the portal's token and deployed; `curl https://mcp.internetcomputer.org/.well-known/openai-apps-challenge` returns exactly the token (blocker 1 — the route itself ships with this PR)
 - [ ] Privacy policy live at `https://mcp.internetcomputer.org/privacy-policy` (same release as the Anthropic listing needs)
 - [ ] Tools re-scanned in the portal after any server change; annotations verified in the scan
 - [ ] 5+ positive and 3+ negative test cases entered, verified on web and mobile
