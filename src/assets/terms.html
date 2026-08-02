@@ -1,0 +1,233 @@
+<!DOCTYPE html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>ICP MCP Terms of Service</title>
+<style>
+/* Shares the connect flow's ICP identity (see connect.css): parchment grid,
+   editorial serif, rust accent, "Hosted by DFINITY" mark, light/dark themes.
+   Duplicated rather than imported so the page stays a single self-contained
+   document (no external fonts, scripts, images, or stylesheets). */
+:root {
+  color-scheme: light dark;
+  --bg: #faf9f5;
+  --surface: #ffffff;
+  --ink: #1a1a1a;
+  --secondary: #4b4943;
+  --muted: #868078;
+  --accent: #a8482b;
+  --hairline: #e7e3da;
+  --grid: rgba(26, 26, 26, 0.04);
+  --font-display: ui-serif, "Iowan Old Style", Georgia, Cambria, "Times New Roman", serif;
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14110d; --surface: #1c1813; --ink: #f0ebe0; --secondary: #cfc7b8;
+    --muted: #9a9384; --accent: #c25a37; --hairline: #342e25; --grid: rgba(240, 235, 224, 0.05);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: var(--font-ui);
+  line-height: 1.6;
+  color: var(--ink);
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(to right, var(--grid) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+.doc {
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 3.5rem 1.5rem 1rem;
+}
+.eyebrow {
+  margin: 0 0 0.75rem;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--secondary);
+}
+.eyebrow a { color: inherit; text-decoration: none; }
+.eyebrow a:hover { color: var(--accent); }
+h1 {
+  margin: 0 0 0.5rem;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: clamp(2rem, 6vw, 2.6rem);
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+.effective { margin: 0 0 2.5rem; font-size: 0.95rem; color: var(--muted); }
+h2 {
+  margin: 2.5rem 0 0.75rem;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 1.45rem;
+  line-height: 1.25;
+  letter-spacing: -0.005em;
+}
+p, li { color: var(--secondary); text-wrap: pretty; }
+p { margin: 0 0 1rem; }
+ul { margin: 0 0 1rem; padding-left: 1.4rem; }
+li { margin-bottom: 0.75rem; }
+strong { color: var(--ink); font-weight: 600; }
+a { color: var(--accent); }
+code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  padding: 0.1em 0.35em;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+}
+.hosted {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.85rem;
+  padding: 2.5rem 1.5rem 2.75rem;
+}
+.hosted-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--secondary);
+}
+.hosted-logo {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.5rem 0.9rem;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+}
+.dfinity-logo { height: 1.1rem; width: auto; color: var(--ink); }
+</style></head>
+<body>
+<main class=doc>
+<p class=eyebrow><a href="/">ICP MCP</a></p>
+<h1>ICP MCP Terms of Service</h1>
+<p class=effective>Effective date: August 3, 2026</p>
+
+<p>These Terms of Service ("Terms") govern your use of the ICP MCP server
+(the "Service"), operated by DFINITY Stiftung, Genferstrasse 11, 8002
+Z&uuml;rich, Switzerland ("DFINITY Foundation", "we"), at
+<code>mcp.internetcomputer.org</code> and its pre-release deployment
+<code>mcp.beta.id.ai</code>. By connecting an AI assistant to the Service, or
+by using its pages and tools, you agree to these Terms. How we handle
+personal data is described separately in the
+<a href="/privacy-policy">ICP MCP Privacy Policy</a>.</p>
+
+<h2>1. The Service</h2>
+
+<p>The Service is a Model Context Protocol server that lets an AI assistant
+read public information from the Internet Computer and, once you authorize a
+connection through Internet Identity, act on your behalf: read data
+applications hold for you, submit actions, and manage canisters you control.
+The Service is provided free of charge.</p>
+
+<p>The Service is <strong>non-custodial</strong>: it never holds your funds
+or your long-term credentials. What it holds during a session is a delegated,
+time-limited authorization, as described in the
+<a href="/privacy-policy">Privacy Policy</a>.</p>
+
+<h2>2. Your Responsibilities</h2>
+
+<p>The Service acts on instructions your AI assistant sends under your
+authorization, and it cannot tell a wise instruction from an unwise one.
+<strong>Requests made under your authorization are treated as yours.</strong>
+You are responsible for: what you ask your assistant to do; the access level
+("Questions only" or "Actions &amp; questions") and duration you grant on the
+Internet Identity consent screen; the security of your own devices and
+Internet Identity; and revoking connections you no longer want, at
+<a href="https://id.ai/manage/access">id.ai/manage/access</a>.</p>
+
+<p>You agree to use the Service lawfully, and not to: disrupt or overload it;
+attempt to circumvent its authorization, rate, or safety mechanisms; or probe
+it for vulnerabilities outside the
+<a href="https://hackenproof.com/programs/internet-computer-protocol">Internet
+Computer bug bounty</a>'s rules.</p>
+
+<h2>3. Actions Can Be Irreversible</h2>
+
+<p>Actions execute on the Internet Computer, a public network that neither we
+nor anyone else can roll back. Depending on what you authorize, that can
+include moving tokens, spending cycles, installing code, and deleting
+canisters together with their data. <strong>We cannot undo an action after
+the network accepts it.</strong> Prefer "Questions only" sessions when you do
+not need actions, keep authorization durations short, and review what your
+assistant intends before approving state-changing calls.</p>
+
+<h2>4. Third Parties</h2>
+
+<p>The applications and canisters you interact with through the Service are
+operated by third parties under their own terms; the Internet Computer and
+Internet Identity are governed by the Network Nervous System; and your AI
+assistant is provided under its provider's terms. We are not a party to your
+relationship with any of them, and data returned by the Service originates
+from them, not from us.</p>
+
+<h2>5. Availability and Changes to the Service</h2>
+
+<p>We aim to keep the Service available but do not promise it: we may change,
+suspend, or discontinue the Service or any of its tools at any time, and we
+may suspend access that we reasonably believe is abusive or a security
+risk. Current operational status is published at
+<a href="/status/">mcp.internetcomputer.org/status/</a>.</p>
+
+<h2>6. Intellectual Property</h2>
+
+<p>The Service's software is open source under the Apache License 2.0 at
+<a href="https://github.com/dfinity/imcp2">github.com/dfinity/imcp2</a>.
+These Terms grant no rights to DFINITY Foundation's names, logos, or other
+trademarks.</p>
+
+<h2>7. Disclaimer of Warranties</h2>
+
+<p>The Service is provided <strong>"as is" and "as available"</strong>,
+without warranties of any kind, whether express or implied, including
+availability, fitness for a particular purpose, and the accuracy,
+completeness, or timeliness of data it returns, which comes from the network
+and the applications you query.</p>
+
+<h2>8. Limitation of Liability</h2>
+
+<p>To the maximum extent permitted by law, DFINITY Foundation is not liable
+for damages arising from your use of the Service, including indirect or
+consequential damages, loss of tokens, cycles, or other assets, and loss of
+data, whether resulting from actions taken under your authorization, from
+third-party applications, from the behaviour of the Internet Computer or
+Internet Identity, or from the Service being unavailable, changed, or
+discontinued. Nothing in these Terms excludes or limits liability that
+cannot be excluded under applicable law, including liability under Swiss law
+for damage caused by unlawful intent or gross negligence.</p>
+
+<h2>9. Changes to These Terms</h2>
+
+<p>We may update these Terms. When we do, we will change the effective date
+at the top of this page, and for changes that materially affect your rights
+or obligations we will give reasonable advance notice before they take
+effect.</p>
+
+<h2>10. Governing Law and Jurisdiction</h2>
+
+<p>These Terms are governed by Swiss substantive law, excluding its conflict
+of law rules. The exclusive place of jurisdiction is Z&uuml;rich,
+Switzerland, subject to any mandatory statutory forum available to you as a
+consumer.</p>
+
+<h2>11. Contact</h2>
+
+<p>Questions about these Terms: <a href="mailto:mcp@dfinity.org">mcp@dfinity.org</a>.
+For everything else, see <a href="/support">Support</a>.</p>
+</main>
+<footer class=hosted><span class=hosted-label>Hosted by</span>
+<span class=hosted-logo>__LOGO__</span></footer>
+</body></html>

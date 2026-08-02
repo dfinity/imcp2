@@ -59,6 +59,7 @@ add details not published in the docs.
 | Public HTTPS production endpoint, stable and complete ("trial or demo plugins will not be accepted") | ✅ production deployment |
 | Privacy policy disclosing "categories of personal data collected, purposes of use, categories of recipients, data retention timelines" | ⏳ **pending the production release**: the rewritten policy matches these four required disclosures exactly and is live on staging, but `https://mcp.internetcomputer.org/privacy-policy` serves nothing until the next `release-*` tag ships it (see the checklist) |
 | Customer support contact (OpenAI asks for a URL) | ✅ `https://mcp.internetcomputer.org/support` — ships with this PR (live at the next release); routes users to <mcp@dfinity.org>, the status dashboard, id.ai access management, GitHub issues, and the security policy |
+| Terms of Service URL | ✅ `https://mcp.internetcomputer.org/terms` — ships with this PR (live at the next release); Swiss-law terms covering the non-custodial model, user responsibility for authorized actions, irreversibility of network actions, as-is/liability limits with the Art. 100 CO carve-out. Needs the same legal pass as the privacy policy |
 | Logo | ✅ [`docs/assets/icp-logo-1024.png`](assets/icp-logo-1024.png) |
 
 Note the legacy redirect `chatgpt.com/connector_platform_oauth_redirect` is

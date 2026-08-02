@@ -133,6 +133,17 @@ fn support_page() -> &'static str {
     PAGE.get_or_init(|| SUPPORT_HTML.replace("__LOGO__", DFINITY_LOGO_SVG))
 }
 
+/// The Terms of Service served at `/terms` — the terms URL the directory
+/// listings point at, and the usage contract the privacy policy's
+/// performance-of-service legal basis rests on. Same construction as
+/// `/privacy-policy` and `/support`.
+const TERMS_HTML: &str = include_str!("assets/terms.html");
+
+fn terms_page() -> &'static str {
+    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PAGE.get_or_init(|| TERMS_HTML.replace("__LOGO__", DFINITY_LOGO_SVG))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
@@ -220,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(|| async { Html(INDEX_HTML) }))
         .route("/privacy-policy", get(|| async { Html(privacy_policy_page()) }))
         .route("/support", get(|| async { Html(support_page()) }))
+        .route("/terms", get(|| async { Html(terms_page()) }))
         // Unauthenticated build/version probe so operators and the status
         // dashboard can confirm exactly which deployment is live: the running
         // commit (baked in at build time via GIT_SHA), the build time
