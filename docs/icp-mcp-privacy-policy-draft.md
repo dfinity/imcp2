@@ -58,13 +58,9 @@ process personal data in connection with the ICP MCP server (the "Service"),
 which lets an AI assistant interact with the Internet Computer and its
 ecosystem of applications on your behalf.
 
-This Privacy Policy covers the Service wherever we operate it:
-
-- `mcp.internetcomputer.org`, the production deployment; and
-- `mcp.beta.id.ai`, a pre-release deployment used for testing, which runs the
-  same software against a test instance of Internet Identity.
-
-It covers both authenticated use, where you have signed in with Internet
+This Privacy Policy covers the Service at `mcp.internetcomputer.org`,
+together with any pre-release deployments of the same software that we
+operate. It covers both authenticated use, where you have signed in with Internet
 Identity, and unauthenticated use: browsing the Service's public pages or
 using the tools that read public network information generates requests and
 technical logs even when you never sign in.
