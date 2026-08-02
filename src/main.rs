@@ -120,6 +120,19 @@ fn privacy_policy_page() -> &'static str {
     PAGE.get_or_init(|| PRIVACY_POLICY_HTML.replace("__LOGO__", DFINITY_LOGO_SVG))
 }
 
+/// The support page served at `/support` — the customer-support URL the
+/// directory listings (OpenAI requires a URL, not just an address) point at.
+/// Same construction as `/privacy-policy`: a self-contained document sharing
+/// the connect flow's ICP identity, with the DFINITY wordmark as its one
+/// substitution. It routes users to mcp@dfinity.org, the status dashboard,
+/// id.ai's access management, GitHub issues, and the security policy.
+const SUPPORT_HTML: &str = include_str!("assets/support.html");
+
+fn support_page() -> &'static str {
+    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PAGE.get_or_init(|| SUPPORT_HTML.replace("__LOGO__", DFINITY_LOGO_SVG))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
@@ -206,6 +219,7 @@ async fn main() -> anyhow::Result<()> {
     let mut app = Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
         .route("/privacy-policy", get(|| async { Html(privacy_policy_page()) }))
+        .route("/support", get(|| async { Html(support_page()) }))
         // Unauthenticated build/version probe so operators and the status
         // dashboard can confirm exactly which deployment is live: the running
         // commit (baked in at build time via GIT_SHA), the build time
