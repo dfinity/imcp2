@@ -54,10 +54,10 @@ add details not published in the docs.
 | Discovery documents (RFC 8414 AS metadata + RFC 9728 protected-resource) | ✅ all live, path-scoped + root fallback |
 | ChatGPT's callback `https://chatgpt.com/connector/oauth/{callback_id}` accepted | ✅ the redirect allow-list pins `("chatgpt.com", "/connector/oauth/")` as a prefix ([`src/auth.rs`](../src/auth.rs), `DEFAULT_ALLOWED_REDIRECTS`) |
 | No machine-to-machine grants (client credentials etc. unsupported by ChatGPT) | ✅ user-consent authorization-code flow only |
-| Tools explicitly annotated `readOnlyHint` / `destructiveHint` / `openWorldHint` — "incorrect or missing action labels are a common cause of rejection" | ✅ all 26 tools, test-enforced |
+| Tools explicitly annotated `readOnlyHint` / `destructiveHint` / `openWorldHint` — "incorrect or missing action labels are a common cause of rejection" | ✅ set on all 26 tools. The unit test enforces annotation presence and the `readOnlyHint`/`destructiveHint` values; `openWorldHint` is declared everywhere but not asserted by the test, so re-check it in the portal's Scan Tools step |
 | Tool names "human-readable, specific, and descriptive"; accurate descriptions; minimum-information requests | ✅ reviewed against the same bar for the Anthropic listing |
 | Public HTTPS production endpoint, stable and complete ("trial or demo plugins will not be accepted") | ✅ production deployment |
-| Privacy policy disclosing "categories of personal data collected, purposes of use, categories of recipients, data retention timelines" | ✅ `https://mcp.internetcomputer.org/privacy-policy` (live at the next release) — the rewritten policy matches these four required disclosures exactly |
+| Privacy policy disclosing "categories of personal data collected, purposes of use, categories of recipients, data retention timelines" | ⏳ **pending the production release**: the rewritten policy matches these four required disclosures exactly and is live on staging, but `https://mcp.internetcomputer.org/privacy-policy` serves nothing until the next `release-*` tag ships it (see the checklist) |
 | Customer support contact | ✅ <mcp@dfinity.org> |
 | Logo | ✅ [`docs/assets/icp-logo-1024.png`](assets/icp-logo-1024.png) |
 
@@ -130,8 +130,11 @@ Positive:
 6. "Get the Motoko skill" → returns the skill document.
 
 Negative:
-1. "Open multidex.com" → refused with the guessed-domain guard and the
-   canonical-URL hint (never resolves a lookalike).
+1. "Open https://multidex.com" → refused by the IC-evidence gate, with the
+   did-you-mean error naming the real app (`https://multidex.ai`). The
+   explicit scheme matters: a bare `multidex.com` is deliberately treated as
+   a wrong-TLD guess and *repaired* to the canonical URL rather than refused,
+   so the bare form is not a negative case.
 2. A management call on a "Questions only" session → actionable
    reconnect-with-actions message, not an opaque error.
 3. Any authenticated tool with no sign-in → clean 401 → OAuth flow starts
@@ -143,10 +146,14 @@ Negative:
 
 - **Country availability** (Global tab): presumably all countries; decide
   explicitly.
-- **Category** and final listing copy: reuse the Anthropic drafts (name
+- **Category** and final listing copy: start from the Anthropic drafts (name
   `Internet Computer (ICP)`, the description in
   [`anthropic-directory-submission.md`](anthropic-directory-submission.md)),
-  adjusted to OpenAI's field limits as the portal reveals them.
+  but the adaptation is more than field limits — that description names
+  Claude throughout ("The official connector between Claude and the Internet
+  Computer", "Claude can work with the IC directly"). Replace every
+  platform-specific mention with ChatGPT (or neutral "your AI assistant")
+  wording before submitting.
 - **Which OpenAI org** submits, and who holds the Apps Management role.
 
 ## Submission-day checklist
