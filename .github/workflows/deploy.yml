@@ -59,3 +59,6 @@ jobs:
       DEPLOY_DOMAIN: ${{ secrets.DEPLOY_DOMAIN }}
       DEPLOY_ACME_EMAIL: ${{ secrets.DEPLOY_ACME_EMAIL }}
       DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+      # Submission-specific, not host-specific: the same repository-level
+      # secret feeds staging and production (see deploy-native.yml).
+      OPENAI_APPS_CHALLENGE_TOKEN: ${{ secrets.OPENAI_APPS_CHALLENGE_TOKEN }}

@@ -15,8 +15,10 @@
 //!     instance) and the origin-global II auth-callback allow-list
 //!
 //! Honours `$PORT` (bind port, default 8000), `$PUBLIC_URL` (the public base
-//! URL baked into the discovery documents and the II handshake), and
-//! `$MCP_SERVE_BETA` (opt in to the `/mcp-beta` staging instance).
+//! URL baked into the discovery documents and the II handshake),
+//! `$MCP_SERVE_BETA` (opt in to the `/mcp-beta` staging instance), and
+//! `$OPENAI_APPS_CHALLENGE_TOKEN` (serve the OpenAI Apps domain-verification
+//! token at `/.well-known/openai-apps-challenge`; 404 while unset).
 
 use axum::{response::Html, routing::get, Json, Router};
 use imcp2::{auth_callbacks_router, Agent, IiInstance, McpConfig, McpServer, SharedClients, IC_URL};
@@ -73,6 +75,35 @@ async fn log_request(
 /// what an agent can do: discovery, identity, on-network queries, actions, skills.
 const INDEX_HTML: &str = include_str!("assets/index.html");
 
+/// The OpenAI Apps domain-verification endpoint. During a ChatGPT-directory
+/// submission the portal reveals a token that
+/// `GET /.well-known/openai-apps-challenge` must return VERBATIM as the whole
+/// body — plain text, exactly one token, no JSON ("do not return JSON, a list
+/// of tokens, or multiple tokens from the same URL"). The token is public by
+/// design (the endpoint is world-readable proof of domain control); it
+/// arrives as the env var `$OPENAI_APPS_CHALLENGE_TOKEN`, substituted into
+/// the unit by `deploy.sh` from the repository secret of the same name, and
+/// the route serves 404 while the value is unset or blank, keeping the
+/// endpoint inert until a submission is actually in flight. The value is
+/// trimmed so unit-file whitespace can't corrupt the exact-match comparison
+/// OpenAI performs.
+fn openai_apps_challenge_router(token: Option<String>) -> Router {
+    let token = token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    Router::new().route(
+        "/.well-known/openai-apps-challenge",
+        get(move || {
+            let token = token.clone();
+            async move {
+                use axum::response::IntoResponse;
+                match token {
+                    Some(t) => (axum::http::StatusCode::OK, t).into_response(),
+                    None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        }),
+    )
+}
+
 /// The privacy policy served at `/privacy-policy` — the URL the Anthropic
 /// connectors-directory listing points at, and the target of the landing
 /// page's footer link. The markup lives in
@@ -87,6 +118,30 @@ const DFINITY_LOGO_SVG: &str = include_str!("assets/dfinity-logo.svg");
 fn privacy_policy_page() -> &'static str {
     static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PAGE.get_or_init(|| PRIVACY_POLICY_HTML.replace("__LOGO__", DFINITY_LOGO_SVG))
+}
+
+/// The support page served at `/support` — the customer-support URL the
+/// directory listings (OpenAI requires a URL, not just an address) point at.
+/// Same construction as `/privacy-policy`: a self-contained document sharing
+/// the connect flow's ICP identity, with the DFINITY wordmark as its one
+/// substitution. It routes users to mcp@dfinity.org, the status dashboard,
+/// id.ai's access management, GitHub issues, and the security policy.
+const SUPPORT_HTML: &str = include_str!("assets/support.html");
+
+fn support_page() -> &'static str {
+    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PAGE.get_or_init(|| SUPPORT_HTML.replace("__LOGO__", DFINITY_LOGO_SVG))
+}
+
+/// The Terms of Service served at `/terms` — the terms URL the directory
+/// listings point at, and the usage contract the privacy policy's
+/// performance-of-service legal basis rests on. Same construction as
+/// `/privacy-policy` and `/support`.
+const TERMS_HTML: &str = include_str!("assets/terms.html");
+
+fn terms_page() -> &'static str {
+    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PAGE.get_or_init(|| TERMS_HTML.replace("__LOGO__", DFINITY_LOGO_SVG))
 }
 
 #[tokio::main]
@@ -175,6 +230,8 @@ async fn main() -> anyhow::Result<()> {
     let mut app = Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
         .route("/privacy-policy", get(|| async { Html(privacy_policy_page()) }))
+        .route("/support", get(|| async { Html(support_page()) }))
+        .route("/terms", get(|| async { Html(terms_page()) }))
         // Unauthenticated build/version probe so operators and the status
         // dashboard can confirm exactly which deployment is live: the running
         // commit (baked in at build time via GIT_SHA), the build time
@@ -234,7 +291,12 @@ async fn main() -> anyhow::Result<()> {
         .merge(prod.well_known_router())
         // `/mcp` (production II) is the default instance: it owns the plain-root
         // documents that clients probing the bare origin fall back to.
-        .merge(prod.root_well_known_router());
+        .merge(prod.root_well_known_router())
+        // OpenAI Apps domain verification: inert (404) until
+        // $OPENAI_APPS_CHALLENGE_TOKEN is set for a directory submission.
+        .merge(openai_apps_challenge_router(
+            std::env::var("OPENAI_APPS_CHALLENGE_TOKEN").ok(),
+        ));
 
     // Staging additionally serves the beta II instance at `/mcp-beta`.
     if let Some(beta) = &beta {
@@ -320,4 +382,54 @@ async fn shutdown_signal() {
         let _ = tokio::signal::ctrl_c().await;
     }
     tracing::info!("shutdown signal received; draining in-flight requests");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::openai_apps_challenge_router;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    async fn challenge(token: Option<&str>) -> (StatusCode, String, Option<String>) {
+        let app = openai_apps_challenge_router(token.map(str::to_string));
+        let resp = app
+            .oneshot(
+                Request::get("/.well-known/openai-apps-challenge")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(body.to_vec()).unwrap(), content_type)
+    }
+
+    // The endpoint must return ONLY the token (plain text, no JSON wrapper):
+    // OpenAI compares the whole body against the token it revealed in the
+    // portal. Trimming guards against unit-file whitespace breaking that
+    // exact match.
+    #[tokio::test]
+    async fn openai_challenge_serves_the_bare_token_when_configured() {
+        let (status, body, content_type) = challenge(Some(" tok-123\n")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "tok-123");
+        assert!(content_type.unwrap().starts_with("text/plain"));
+    }
+
+    // Unset or blank means no submission is in flight: the endpoint stays
+    // inert rather than serving an empty body OpenAI would fail against.
+    #[tokio::test]
+    async fn openai_challenge_is_404_when_unset_or_blank() {
+        for token in [None, Some(""), Some("   \n")] {
+            let (status, body, _) = challenge(token).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "token {token:?}");
+            assert_eq!(body, "", "token {token:?}");
+        }
+    }
 }
