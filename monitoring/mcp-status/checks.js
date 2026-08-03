@@ -9,7 +9,11 @@
 // point that returns a fully structured, JSON-serialisable report.
 
 import tls from "node:tls";
-import { commitUrl, deriveIiOrigin, resolveConfig } from "./config.js";
+import {
+  commitUrl,
+  parseAdvertisedInstances,
+  resolveConfig,
+} from "./config.js";
 
 /**
  * @typedef {"pass" | "warn" | "fail"} Status
@@ -40,7 +44,7 @@ import { commitUrl, deriveIiOrigin, resolveConfig } from "./config.js";
  *
  * @typedef {Object} DashboardReport
  * @property {string} generatedAt
- * @property {{ mcpOrigin: string, iiOrigin: string | undefined, iiOriginSource: string }} targets
+ * @property {{ mcpOrigin: string, iiOrigins: string[], iiOriginSource: string }} targets
  * @property {Deployment} deployment
  * @property {Status} overall
  * @property {Section[]} sections
@@ -223,6 +227,10 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
       builtAt,
       startedAt,
     };
+    // Which II instances this server hands off to. Read here rather than
+    // guessed from the hostname: see parseAdvertisedInstances in config.js for
+    // why the hostname cannot answer this.
+    facts.advertised = parseAdvertisedInstances(json);
     const exposed = r.ok && r.status === 200 && !!commit;
     const known = exposed && commit !== "unknown";
     checks.push({
@@ -571,60 +579,96 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve which II instance the MCP server is paired with. We don't try to
- * confirm the link by following `/mcp/oauth/authorize` headlessly: that endpoint
- * issues a *script-initiated* navigation (an HTML page that calls
- * `location.replace`), not an HTTP 3xx redirect — because the II `/mcp` URL
- * carries its params in the fragment and form-action CSP is enforced across
- * redirects — so there is no `Location` header to read and the probe could
- * never pass. Instead we resolve the origin (configured or naming-convention
- * derived); the II-health section below then checks that *resolved* origin is
- * reachable and serving its `/mcp` connect page. Note this does not
- * live-verify that the MCP server actually hands off to that II instance — the
- * pairing is inferred from config / the naming convention, not proven.
+ * Resolve which II instance(s) the MCP server is paired with, from the
+ * `instances` array it advertises at `GET /version` — one entry per mount, each
+ * naming the II origin that mount hands off to. The server is the authority on
+ * its own pairing, so this is read, not inferred.
+ *
+ * We still don't confirm the link by following `/mcp/oauth/authorize`
+ * headlessly: that endpoint issues a *script-initiated* navigation (an HTML page
+ * that calls `location.replace`), not an HTTP 3xx redirect — because the II
+ * `/mcp` URL carries its params in the fragment and form-action CSP is enforced
+ * across redirects — so there is no `Location` header to read and the probe
+ * could never pass. What the advertised list does give us is the right origins
+ * to probe, and all of them: the II-health section runs once per instance, so a
+ * staging deployment serving production II at `/mcp` and beta II at `/mcp-beta`
+ * has both monitored instead of just the one a hostname guess happened to name.
  *
  * @param {string} mcpOrigin
- * @param {string | undefined} configuredIi
+ * @param {import("./config.js").IiInstanceTarget[]} instances
+ * @param {{ name: string, origin: string, reason: string }[]} rejected
  * @param {string} iiOriginSource
- * @returns {{ section: Section, iiOrigin: string | undefined, facts: Record<string, unknown> }}
+ * @returns {{ section: Section, facts: Record<string, unknown> }}
  */
-export const checkLinkage = (mcpOrigin, configuredIi, iiOriginSource) => {
+export const checkLinkage = (
+  mcpOrigin,
+  instances,
+  rejected,
+  iiOriginSource,
+) => {
   /** @type {CheckResult[]} */
   const checks = [];
   /** @type {Record<string, unknown>} */
-  const facts = {};
+  const facts = { instances, rejected };
 
-  const iiOrigin = configuredIi ?? deriveIiOrigin(mcpOrigin);
-  const resolvedSource =
-    iiOriginSource === "explicit"
-      ? "explicitly configured"
-      : iiOriginSource === "derived"
-        ? "derived from naming convention (mcp.<env>.id.ai → <env>.id.ai)"
-        : "unknown";
-
-  checks.push({
-    id: "ii-target",
-    label: "Linked Internet Identity instance",
-    description:
-      "Identifies which Internet Identity instance this MCP server is paired with (explicitly configured, or derived from the naming convention — the pairing is inferred, not live-verified). The II-health section below then checks that resolved origin is reachable and serving its /mcp connect page.",
-    target: mcpOrigin,
-    expected: "a resolvable II origin",
-    status: iiOrigin ? "pass" : "fail",
-    httpStatus: null,
-    latencyMs: null,
-    detail: iiOrigin
-      ? `${iiOrigin} (${resolvedSource})`
-      : "could not resolve a linked II origin",
-  });
+  if (instances.length === 0) {
+    checks.push({
+      id: "ii-target",
+      label: "Linked Internet Identity instance",
+      description:
+        "Identifies which Internet Identity instance(s) this MCP server is paired with, from the `instances` array it advertises at GET /version. Without it the pairing is unknowable from outside — the MCP origin does not imply its II — so the II-health checks below cannot run.",
+      target: `GET ${mcpOrigin}/version`,
+      expected: "an instances[] array naming each mount's II origin",
+      status: "fail",
+      httpStatus: null,
+      latencyMs: null,
+      detail:
+        rejected.length > 0
+          ? `every advertised II origin was rejected: ${rejected.map((r) => `${r.name} → ${r.origin} (${r.reason})`).join("; ")}`
+          : "the server advertises no II instances at /version (a build predating the instances[] field, or an unreachable /version). Pin one with --ii / II_ORIGIN to probe it anyway.",
+    });
+  } else {
+    for (const inst of instances) {
+      checks.push({
+        id: `ii-target:${inst.name}`,
+        label: `Linked Internet Identity instance — ${inst.name}`,
+        description:
+          "Identifies which Internet Identity instance this mount hands off to, as advertised by the server at GET /version. The II-health section below probes this origin's reachability and /mcp connect page.",
+        target: `${mcpOrigin}${inst.mcpPath ?? ""}`,
+        expected: "a resolvable II origin",
+        status: "pass",
+        httpStatus: null,
+        latencyMs: null,
+        detail:
+          `${inst.origin} (${iiOriginSource})` +
+          (inst.iiCanister ? `, canister ${inst.iiCanister}` : ""),
+      });
+    }
+    // Advertised but unprobeable: report it rather than quietly monitoring less
+    // than the section's title implies.
+    for (const r of rejected) {
+      checks.push({
+        id: `ii-target-rejected:${r.name}`,
+        label: `Advertised II origin not probeable — ${r.name}`,
+        description:
+          "The server advertises this II origin, but the dashboard will not probe it: advertised origins are validated against the probe allowlist so a misconfigured or compromised server cannot steer these probes at a third party. Extend MCP_STATUS_ALLOWED_HOSTS if the origin is legitimate.",
+        target: r.origin,
+        expected: "an origin within the probe allowlist",
+        status: "warn",
+        httpStatus: null,
+        latencyMs: null,
+        detail: r.reason,
+      });
+    }
+  }
 
   return {
     section: {
       id: "linkage",
-      title: "Linked Internet Identity instance",
+      title: "Linked Internet Identity instances",
       status: worstStatus(checks.map((c) => c.status)),
       checks,
     },
-    iiOrigin,
     facts,
   };
 };
@@ -639,11 +683,20 @@ export const checkLinkage = (mcpOrigin, configuredIi, iiOriginSource) => {
  * @param {number} timeoutMs
  * @returns {Promise<{ section: Section, facts: Record<string, unknown> }>}
  */
-export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
+export const checkIiHealth = async (
+  iiOrigin,
+  mcpOrigin,
+  timeoutMs,
+  instanceName,
+) => {
   /** @type {CheckResult[]} */
   const checks = [];
   /** @type {Record<string, unknown>} */
   const facts = {};
+  // One section per served II instance, so ids must be unique across them.
+  // Unsuffixed when no instance is named, keeping single-target callers stable.
+  const sfx = instanceName ? `:${instanceName}` : "";
+  const named = instanceName ? ` — ${instanceName}` : "";
 
   if (!iiOrigin) {
     checks.push({
@@ -660,8 +713,8 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
     });
     return {
       section: {
-        id: "ii-health",
-        title: "Internet Identity health & recognition",
+        id: `ii-health${sfx}`,
+        title: `Internet Identity health & recognition${named}`,
         status: "fail",
         checks,
       },
@@ -678,7 +731,7 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
 
   // 1. Frontend reachability.
   checks.push({
-    id: "ii-reachable",
+    id: `ii-reachable${sfx}`,
     label: "II frontend reachable",
     description:
       "Confirms the linked Internet Identity frontend is reachable and returns HTTP 200.",
@@ -694,7 +747,7 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
 
   // 2. Served & certified by the Internet Computer (canister is live).
   checks.push({
-    id: "ii-certified",
+    id: `ii-certified${sfx}`,
     label: "IC-certified response (canister live)",
     description:
       "Checks the II response carries an ic-certificate header, indicating it is served and certified by a live Internet Computer canister.",
@@ -730,7 +783,7 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
     const mr = await probe(url, { timeoutMs });
     const served = mr.ok && mr.status === 200;
     checks.push({
-      id: "ii-mcp-flow",
+      id: `ii-mcp-flow${sfx}`,
       label: "II /mcp connect page served",
       description:
         "Confirms the II serves its /mcp connect page. The connect flow runs on a top-level navigation back to the server's pinned callback page and a fetch() from that page to the server (governed by CSP connect-src, which allows the https MCP origin) — neither is gated by form-action — so serving the page is the health signal. Since #4052 trust is per-user (each identity adds its trusted server in II Settings, synced on-chain), which servers a given identity trusts is not globally inspectable; this checks the instance-wide flow is enabled.",
@@ -777,7 +830,7 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
     const present = cr.ok && cr.status === 200 && looksLikeConfig;
     facts.config = { status: cr.status, bytes, backendCanisterId };
     checks.push({
-      id: "ii-config",
+      id: `ii-config${sfx}`,
       label: "II frontend config (.config)",
       description:
         "Checks the II frontend serves its runtime config (textual Candid) at /.config, reporting the backend canister id. (Post-#4052 this config no longer carries an mcp_server_origin — MCP trust moved to per-user, on-chain settings.)",
@@ -801,7 +854,7 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
   );
   facts.relatedOrigins = relatedOrigins;
   checks.push({
-    id: "ii-related-origins",
+    id: `ii-related-origins${sfx}`,
     label: "II related origins",
     description:
       "Reports the II's configured related/alternative frontend origins (from the CSP frame-ancestors directive) for context.",
@@ -821,7 +874,7 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
   facts.certificate = cert;
   if ("error" in cert) {
     checks.push({
-      id: "ii-tls",
+      id: `ii-tls${sfx}`,
       label: "TLS certificate",
       description:
         "Checks the Internet Identity host's TLS certificate is valid and not close to expiry.",
@@ -834,7 +887,7 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
     });
   } else {
     checks.push({
-      id: "ii-tls",
+      id: `ii-tls${sfx}`,
       label: "TLS certificate",
       description:
         "Checks the Internet Identity host's TLS certificate is valid and not close to expiry.",
@@ -854,8 +907,8 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
 
   return {
     section: {
-      id: "ii-health",
-      title: "Internet Identity health & recognition",
+      id: `ii-health${sfx}`,
+      title: `Internet Identity health & recognition${named}`,
       status: worstStatus(checks.map((c) => c.status)),
       checks,
     },
@@ -875,13 +928,30 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
 export const buildSuggestions = (sections, facts) => {
   const suggestions = [];
   const checkById = {};
-  for (const s of sections) for (const c of s.checks) checkById[c.id] = c;
+  /** @type {CheckResult[]} */
+  const allChecks = [];
+  for (const s of sections)
+    for (const c of s.checks) {
+      checkById[c.id] = c;
+      allChecks.push(c);
+    }
 
-  if (checkById["ii-mcp-flow"]?.status === "fail") {
+  // Ids are suffixed per instance (`ii-mcp-flow:prod`), so match on the family
+  // rather than an exact id, and name the instances that are actually failing.
+  const flowFailures = allChecks.filter(
+    (c) =>
+      (c.id === "ii-mcp-flow" || c.id.startsWith("ii-mcp-flow:")) &&
+      c.status === "fail",
+  );
+  if (flowFailures.length > 0) {
+    const which = flowFailures
+      .map((c) => c.id.split(":")[1])
+      .filter(Boolean)
+      .join(", ");
     suggestions.push(
-      "The linked II does not serve its /mcp connect page. The MCP connect " +
-        "flow cannot run until an II build that includes the /mcp flow is " +
-        "deployed at this origin.",
+      `The linked II${which ? ` (${which})` : ""} does not serve its /mcp ` +
+        "connect page. The MCP connect flow cannot run until an II build that " +
+        "includes the /mcp flow is deployed at this origin.",
     );
   }
   if (checkById["mcp-challenge"]?.status !== "pass") {
@@ -906,7 +976,9 @@ export const buildSuggestions = (sections, facts) => {
       "usable at /mcp/oauth/authorize during probing).",
   );
 
-  const certWarn = [facts?.mcp, facts?.ii]
+  // facts.iiInstances is one entry per served II instance, so flatten before
+  // scanning; a cert nearing expiry on ANY of them is worth the warning.
+  const certWarn = [facts?.mcp, ...Object.values(facts?.iiInstances ?? {})]
     .map((f) => /** @type {any} */ (f)?.certificate ?? f?.mcpCertificate)
     .filter((c) => c && typeof c.daysRemaining === "number" && c.daysRemaining < 21);
   if (certWarn.length > 0) {
@@ -938,26 +1010,74 @@ export const runDashboard = async (overrides = {}) => {
   const cfg = resolveConfig(overrides);
 
   const endpoints = await checkMcpEndpoints(cfg.mcpOrigin, cfg.timeoutMs);
-  const linkage = checkLinkage(cfg.mcpOrigin, cfg.iiOrigin, cfg.iiOriginSource);
-  const iiHealth = await checkIiHealth(
-    linkage.iiOrigin,
+
+  // Which IIs to probe. Normally the ones the server advertises at /version —
+  // it is the authority on its own pairing, and it lists every mount, so both a
+  // production deployment (`/mcp` alone) and staging (`/mcp` + `/mcp-beta`) are
+  // covered without per-deployment config. An explicit --ii / II_ORIGIN replaces
+  // that entirely, for a build that predates the instances[] field.
+  const advertised = /** @type {any} */ (endpoints.facts.advertised) ?? {
+    instances: [],
+    rejected: [],
+  };
+  const instances = cfg.iiOverride
+    ? [{ name: "configured", origin: cfg.iiOverride, mcpPath: undefined }]
+    : advertised.instances;
+  const rejected = cfg.iiOverride ? [] : advertised.rejected;
+  const iiOriginSource = cfg.iiOverride
+    ? "explicitly configured"
+    : "advertised by the server at /version";
+
+  const linkage = checkLinkage(
     cfg.mcpOrigin,
-    cfg.timeoutMs,
+    instances,
+    rejected,
+    iiOriginSource,
   );
 
-  const sections = [endpoints.section, linkage.section, iiHealth.section];
+  // One II-health section per served instance. Sequential, not concurrent: the
+  // list is short and this keeps the per-probe latencies reported here
+  // comparable to what a single user experiences.
+  const iiHealths = [];
+  if (instances.length === 0) {
+    iiHealths.push(await checkIiHealth(undefined, cfg.mcpOrigin, cfg.timeoutMs));
+  } else {
+    for (const inst of instances) {
+      iiHealths.push(
+        await checkIiHealth(
+          inst.origin,
+          cfg.mcpOrigin,
+          cfg.timeoutMs,
+          instances.length > 1 ? inst.name : undefined,
+        ),
+      );
+    }
+  }
+
+  const sections = [
+    endpoints.section,
+    linkage.section,
+    ...iiHealths.map((h) => h.section),
+  ];
   const facts = {
     mcp: endpoints.facts,
     linkage: linkage.facts,
-    ii: iiHealth.facts,
+    // Keyed by instance name so a multi-instance deployment's facts stay
+    // attributable. Named `iiInstances`, not `ii`: the old key held ONE
+    // instance's facts, and a consumer reaching for `facts.ii.canisterId`
+    // against this shape would silently read undefined. An absent key makes
+    // that a visible break instead of a quiet wrong answer.
+    iiInstances: Object.fromEntries(
+      iiHealths.map((h, i) => [instances[i]?.name ?? "unresolved", h.facts]),
+    ),
   };
 
   return {
     generatedAt: new Date().toISOString(),
     targets: {
       mcpOrigin: cfg.mcpOrigin,
-      iiOrigin: linkage.iiOrigin,
-      iiOriginSource: cfg.iiOriginSource,
+      iiOrigins: instances.map((i) => i.origin),
+      iiOriginSource,
     },
     deployment: /** @type {Deployment} */ (
       endpoints.facts.deployment ?? {

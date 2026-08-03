@@ -499,7 +499,8 @@ its AS issuer is `<PUBLIC_URL>/mcp` and everything OAuth lives under it:
 - `GET /.well-known/oauth-protected-resource/mcp` — points clients at the AS
   (RFC 9728 §3.1 path-inserted; root fallback also served)
 - `POST /mcp/oauth/register` — dynamic client registration (RFC 7591); `redirect_uris`
-  are stored and persisted to `OAUTH_CLIENTS_FILE`; requested `grant_types` are
+  are stored and persisted to `OAUTH_CLIENTS_FILE` (a bounded, LRU-evicted store —
+  see [Bounded state](#bounded-state-memory--disk)); requested `grant_types` are
   honoured (intersected with `authorization_code`). A **hosted** `redirect_uri` is
   rejected unless its host is on the allow-list (see the Companion-control note
   below); loopback redirects are always accepted.
@@ -593,7 +594,10 @@ the callback page.
 > MCP connector vendors' callback paths and widened per deployment with
 > `OAUTH_ALLOWED_REDIRECT_PREFIXES` (additive; each entry a full `https://host/path`
 > URL prefix, a bare domain is refused); loopback/native clients are exempt (the code
-> resolves on the consenter's own machine). Enforced at both `…/oauth/register` and `…/oauth/authorize`. A client
+> resolves on the consenter's own machine). No redirect (loopback or hosted) may
+> carry a **query or fragment**: the authorization endpoint appends `?code=…&state=…`,
+> so a pre-existing query would risk `code=…&code=…` parameter pollution, and a
+> fragment is meaningless on a redirect target. Enforced at both `…/oauth/register` and `…/oauth/authorize`. A client
 > turned away is pointed at a contact address to request approval:
 > `…/oauth/register` says so in its JSON `error_description`, and a browser that
 > reaches `…/oauth/authorize` gets an on-brand "not allowed" page (not a raw error)
@@ -657,7 +661,10 @@ cadence) evicts it. These bracket what `live_sessions` counts, modulo the
 reaper's cadence: the gauge drops the instant a grant expires, while the paired
 `closed` log lands on the reaper's next sweep (up to 60s later), so `opened`
 minus `closed` can momentarily exceed the gauge by the sessions expired since
-that sweep.
+that sweep. The same sweep logs `abandoned connects reaped` (with a `count`) for
+sign-ins that were started but never completed — those never opened a session, so
+they get no paired `closed` line. See
+[Bounded state](#bounded-state-memory--disk) for everything the sweep covers.
 
 **Callback allow-list (`/.well-known/ii-auth-callbacks`).** II is moving to
 validate the connect callback named in the (attacker-craftable) link fragment
@@ -719,6 +726,39 @@ Server side:
 > [#4093](https://github.com/dfinity/internet-identity/pull/4093) through to
 > this merged shape. This also relies on the callback allow-list (an II-side
 > validation) as its security precondition.
+
+### Bounded state (memory + disk)
+
+Every map the server keeps is capped, because two of the endpoints that fill them
+are reachable **without authentication**: `POST /oauth/register` (open dynamic
+client registration, which MCP clients require) and `GET /oauth/authorize` (which
+mints a session with two Ed25519 keypairs per call). Left unbounded, a bare
+request loop against either was an unauthenticated memory-growth primitive, and
+registration additionally rewrote the whole persisted store on every call —
+O(N²) disk I/O for N registrations. Each map now has an **admission bound**
+(what caps it between sweeps) and a **reaper** (what returns the memory), and
+none of them can be filled at the expense of an authenticated user:
+
+| State | Cap | When full |
+| --- | --- | --- |
+| Client registrations (`POST /oauth/register`) | 10 000 | least-recently-used registration is evicted; every `/oauth/authorize` marks its client used, so a flood evicts its own unused entries first, and an evicted client re-registers (DCR is automatic) |
+| Connects in flight (`GET /oauth/authorize`, one session + one pending-authz entry each) | 1 024 | oldest pending connect is evicted; sessions holding a live grant are never touched |
+| Sessions overall | 20 000 | a **new connect is refused** (`503`, on-brand "server is busy, try again" screen) rather than evicting an authenticated user's live grant |
+| Authorization codes | 4 096 | closest-to-expiry code is evicted (inserting one requires a completed II consent) |
+| Access tokens | 20 000 | closest-to-expiry token is evicted |
+| Per-app delegation cache, **per session** | 64 origins/accounts | entry nearest expiry is evicted (it would be re-derived anyway) |
+
+The per-instance reaper (60s cadence — `spawn_session_reaper`, which a deployment
+must call) drops expired grants, **connects abandoned mid-handshake** (a session
+that never redeemed a grant, after 15 minutes), pending authorizations past their
+10-minute TTL, unexchanged authorization codes, and expired access tokens.
+Registrations are the one long-lived map: they must survive a restart, so they
+are persisted — now on a coalescing background writer (at most one full write per
+2s) instead of one full rewrite per registration.
+
+Note the server itself does **no rate limiting**; these bounds cap what a flood
+can cost in memory and disk, not the request rate. Put a rate limiter in front
+(the reverse proxy) if you need that.
 
 ### Read-only sessions
 

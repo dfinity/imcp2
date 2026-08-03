@@ -76,12 +76,18 @@ tar -C "$repo_root" -cf - static | $SSH "tar -C $REMOTE_DIR -xf -"
 tar -C "$repo_root" -cf - monitoring | $SSH "tar -C $REMOTE_DIR -xf -"
 
 echo ">> rendering + installing units and Caddyfile, then (re)starting services"
-unit_mcp="$(sed "s#__PUBLIC_URL__#https://$DOMAIN#g" "$here/imcp2.service")"
+# MCP_SERVE_BETA is set (to "1") only for the staging deployment, so /mcp-beta
+# is exposed there and not in production; it defaults to empty (off) otherwise.
+unit_mcp="$(sed -e "s#__PUBLIC_URL__#https://$DOMAIN#g" -e "s#__MCP_SERVE_BETA__#${MCP_SERVE_BETA:-}#g" -e "s#__OPENAI_APPS_CHALLENGE_TOKEN__#${OPENAI_APPS_CHALLENGE_TOKEN:-}#g" "$here/imcp2.service")"
 caddyfile="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__ACME_EMAIL__#$ACME_EMAIL#g" "$here/Caddyfile")"
 caddy_unit="$(cat "$here/caddy.service")"
-# Pin the dashboard's SSRF allowlist to the deployment's parent domain so it
-# covers both the MCP host (mcp.<env>.id.ai) and the derived II host (<env>.id.ai).
-status_allowed="${DOMAIN#*.}"
+# Pin the dashboard's SSRF allowlist to this deployment's own host. It used to be
+# the PARENT domain (${DOMAIN#*.}) because the dashboard guessed the II origin by
+# stripping the `mcp.` label — on mcp.internetcomputer.org that silently
+# allowlisted all of internetcomputer.org. The II origins now come from the
+# server's /version and are covered by the dashboard's built-in id.ai suffixes,
+# so only the MCP host itself needs adding.
+status_allowed="$DOMAIN"
 unit_status="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__ALLOWED_HOSTS__#$status_allowed#g" "$here/imcp-status.service")"
 
 $SSH "sudo bash -s" <<EOF
@@ -125,6 +131,28 @@ CADDY
 cat > /etc/systemd/system/caddy.service <<'UNIT'
 $caddy_unit
 UNIT
+
+# --- log retention: bound journald to the privacy policy's three months ---
+# Everything this deployment logs (imcp2 tracing, Caddy, the dashboard) lands
+# in journald, whose default retention is size-based with no time cap — logs
+# could outlive the "retained for up to three months" the ICP MCP privacy
+# policy states. MaxRetentionSec deletes an archived journal FILE once its
+# newest entry passes the cap, so a file's oldest entries can overshoot by one
+# rotation period; MaxFileSec=1week bounds that overshoot, making the worst
+# case 12+1 weeks (~91 days). Size-based vacuuming may still delete entries
+# sooner, which the policy's "up to" wording allows. A drop-in (not an edit to
+# journald.conf) so the setting is owned by this deploy and idempotent.
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/90-imcp2-retention.conf <<'JOURNALD'
+# Installed by imcp2 deploy/native/deploy.sh. Bounds log retention to match
+# the ICP MCP privacy policy ("technical logs are retained for up to three
+# months"): files rotate at most weekly and are deleted 12 weeks after their
+# newest entry. Size pressure may delete them sooner.
+[Journal]
+MaxFileSec=1week
+MaxRetentionSec=12week
+JOURNALD
+systemctl restart systemd-journald
 
 # One-time migration off the pre-rename unit: imcp2.service replaces
 # mcp-poc.service. Stop, disable, and remove the old unit (if present) so the

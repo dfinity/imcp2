@@ -1,44 +1,47 @@
 # Security Policy
 
-We take the security of this project seriously and appreciate responsible
-disclosure of vulnerabilities.
+DFINITY takes the security of our software products seriously, which includes all source code repositories under the [DFINITY](https://github.com/dfinity) GitHub organization.
 
-## Reporting a Vulnerability
+> [!IMPORTANT]
+> [DFINITY Foundation](https://dfinity.org) has a [Internet Computer (ICP) Bug Bounty program](https://dfinity.org/bug-bounty/) that rewards researchers for finding and reporting vulnerabilities in the Internet Computer. Please check the scope and eligibility criteria outlined in the policy to see if the vulnerability you found qualifies for a reward.
 
-**Please do not report security vulnerabilities through public GitHub issues,
-pull requests, or discussions.**
+## How to report a vulnerability
 
-Instead, report them privately using GitHub's private vulnerability reporting:
+We appreciate your help in keeping our projects secure.
+If you believe you have found a security vulnerability in any of our repositories, please report it responsibly to us as described below:
 
-1. Go to the **Security** tab of this repository.
-2. Click **Report a vulnerability**.
-3. Provide as much detail as you can (see below).
+1. **Do not disclose the vulnerability publicly.** Public disclosure could be exploited by attackers before it can be fixed. In particular, please do not report it through public GitHub issues, pull requests, or discussions.
+2. **Disclose the vulnerability through [Hackenproof](https://hackenproof.com/programs/internet-computer-protocol)**
+    * Hackenproof facilitates disclosure and streamlines Bugbounty payouts.
 
-<!--
-  TODO (before publishing): if the DFINITY organization has a central
-  vulnerability-disclosure program or security contact that should handle
-  reports for this repository, link it here (and confirm private vulnerability
-  reporting is enabled under Settings -> Code security and analysis).
--->
+We will respond to your report within 72 hours and work with you to fix the vulnerability as soon as possible.
 
-Please include:
+To help us triage quickly, please include what you can of the following:
 
-- A description of the vulnerability and its potential impact.
-- Steps to reproduce, or a proof of concept.
-- The affected version, commit, or deployment.
-- Any suggested mitigation, if you have one.
+* A description of the vulnerability and its potential impact.
+* Steps to reproduce, or a proof of concept.
+* The affected version, commit, or deployment.
+* Any suggested mitigation, if you have one.
 
-## What to expect
+### Security Updates
 
-- We will acknowledge your report as soon as we can.
-- We will investigate and keep you informed of our progress.
-- We ask that you give us a reasonable amount of time to address the issue
-  before any public disclosure, and that you avoid privacy violations,
-  data destruction, or service degradation while researching.
+We are committed to fixing security vulnerabilities in a timely manner. Once a security vulnerability is reported, we will:
+
+* Investigate the report and confirm the vulnerability.
+* Develop a fix for the vulnerability.
+* Release a new version of the project that includes the fix.
+* Announce the security fix in the project's release notes.
 
 ## Supported versions
 
 This project is under active development and has not yet reached a stable `1.0`
-release. Security fixes are applied to the latest revision on the `main` branch.
+release. Security fixes are applied to the latest revision on the `main` branch
+and reach the deployment on the next `release-*` tag.
 
-Thank you for helping keep this project and its users safe.
+## Preferred Language
+
+We prefer all communications to be in English.
+
+## Disclaimer
+
+This security policy is subject to change at any time.

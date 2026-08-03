@@ -172,6 +172,11 @@ Staging tracks `main` continuously so changes get exercised on a real host; prod
 only ever moves when someone cuts a tag, so the live revision is always a named,
 reproducible point in history.
 
+The staging deploy additionally sets `MCP_SERVE_BETA=1` (via `deploy-native.yml`,
+substituted into the unit by `deploy.sh`), so staging serves the beta Internet
+Identity instance at `/mcp-beta` alongside the production `/mcp`. Production leaves
+it unset, so it serves `/mcp` (production II) alone.
+
 The mechanics live in [`deploy-native.yml`](../../.github/workflows/deploy-native.yml),
 a reusable workflow both call. It first runs the status dashboard's unit tests (a
 regression there stops the rollout), cross-builds the binary with `build.sh`, then runs
@@ -204,46 +209,61 @@ irrelevant; it never executes the binary.
 
 #### Narrowing inbound SSH
 
-The point of shipping over the VPN is that the host should not need `22/tcp` open to the
-world. It still does, because closing it requires knowing what source address to allow
-instead, and that is **not** simply the private network the host lives in. The security
-group already permits `22` from `10.0.0.0/8`; removing the world-facing rule broke the
-deploy anyway, so the ship pods reach an RFC1918 destination while presenting a source
-outside `10/8`.
+Inbound SSH from the public internet is **closed** on both hosts. Each one has two
+network interfaces — a public-facing one carrying the HTTPS address, and a private one the
+deploy reaches over the VPN — and security groups attach per-interface, so the public one
+carries a group permitting `80`/`443` only. Verified from outside the VPN: `22` times out
+where it previously reached `sshd`. See #91 for the before/after evidence.
 
-Nor can the runner tell you its own answer — `curl ifconfig.me` reports public internet
-egress, which this path does not use. Ask the host instead, which is what the ship job's
-**Report source address as seen by the host** step does via `$SSH_CLIENT`, or after the
+That split only works if `DEPLOY_HOST` names the host's **private** address. Point it at
+the public FQDN and the deploy leaves over the internet instead of the VPN and arrives on
+the public interface, where `22` is no longer permitted — which is exactly how staging was
+configured, unnoticed, until that change made it fail. The secret's description in
+[`deploy-native.yml`](../../.github/workflows/deploy-native.yml) now says so.
+
+What remains open is `22` on the private interface, so anything that can route to the
+host's private address still reaches SSH: the VPN and the on-prem estate. That is accepted
+as the current state.
+
+To see what source the host actually sees, ask the host — the ship job's **Report source
+address as seen by the host** step does this via `$SSH_CLIENT` on every run, or after the
 fact:
 
 ```sh
 sudo journalctl -u sshd --since '15 minutes ago' | grep 'Accepted publickey'
 ```
 
-**Do not try to solve this with a narrower CIDR — there isn't one.** Calico source-NATs
-each pod to the IP of whichever worker node it landed on, and traffic bound for this VPC
-leaves over a routed IPsec tunnel rather than a NATting gateway, so that node address
-arrives unchanged. Node IPs are provisioned dynamically rather than declared, the two
-clusters are separate sites with separate address ranges and either can run the job, and
-the SNAT-to-node-IP behaviour is an unpinned Calico default rather than a contract. Any
-prefix that looks right today can stop being right after routine cluster maintenance,
-and it would fail as a deploy timeout rather than as anything self-explanatory.
+Do not substitute `curl ifconfig.me` on the runner: that reports public internet egress,
+which the VPN path does not use, and the two are unrelated.
 
-The step above is therefore for **observing** what is happening, not for harvesting a
-range to hardcode. The durable fix is to stop needing inbound SSH at all — reach the
-host through **AWS Systems Manager Session Manager**, which requires no inbound port.
-`ssh` still works over it via a `ProxyCommand` using `AWS-StartSSHSession`, so
-`deploy.sh` needs no changes; only the workflow's SSH setup does. That closes `22`
-outright instead of narrowing it, and makes each deploy auditable in CloudTrail.
+**The remaining step is to narrow the rule to the private range and delete the
+world-facing one.** Deploys taking the VPN path have so far presented sources inside that
+range, which the hosts already permit — but confirm it across both runner clusters before
+acting, because Calico source-NATs each pod to whichever worker node it landed on, node
+addresses are provisioned dynamically rather than declared, the two clusters are separate
+sites with separate ranges, and that SNAT behaviour is an unpinned upstream default rather
+than a contract. A prefix that looks right today can stop matching after routine cluster
+maintenance, and it fails as a deploy timeout rather than as anything self-explanatory.
+When adding the rule, add our own rather than relying on the existing one, which belongs
+to another team and can change without reference to this deployment.
 
-Two things not to reach for, both circular here: a job that opens a short-lived rule for
-its own address cannot discover which address to open (that is what this whole section is
-about), and a bastion still needs inbound SSH from the same unstable sources.
+An earlier attempt at this removed the world-facing rule *before* any of the above was
+understood, and broke the deploy. The cause was staging's public-FQDN misconfiguration
+rather than the rule, but the lesson stands: measure the source first.
+
+Considered and declined: reaching the hosts through **AWS Systems Manager Session
+Manager**, which needs no inbound port at all and records each session in CloudTrail.
+`ssh` keeps working over it via a `ProxyCommand`, so `deploy.sh` would need no changes —
+only the workflow's SSH setup. It is the stronger end state, but it was judged
+over-engineering for the residual risk once internet-facing SSH was closed. Revisit if
+that judgement changes. Two alternatives that do not work at all: a job that opens a
+short-lived rule for its own address cannot discover which address to open, and a bastion
+still needs inbound SSH from the same sources.
 
 The `::/0` half of the port-22 rule has been removed: the IPsec tunnels and BGP sessions
 to this VPC are IPv4-only, so the deploy never arrives over IPv6 and that half permitted
-nothing but internet-sourced attempts. Note the group permitting `22` from `10.0.0.0/8`
-has no IPv6 entry either, so nothing on the v6 side was relying on it.
+nothing but internet-sourced attempts. The rule permitting `22` from the private range has
+no IPv6 entry either, so nothing on the v6 side was relying on it.
 
 `ship_runs_on` takes a JSON string, so a bare name is `'"dind-small"'` and a label set
 is `'["self-hosted","linux"]'`. Both deploys use the bare-name form, because the org's
@@ -270,6 +290,7 @@ addresses, since the ship job runs inside the VPN.
 | `DEPLOY_DOMAIN` | `PROD_DEPLOY_DOMAIN` | Public FQDN served over HTTPS |
 | `DEPLOY_ACME_EMAIL` | `PROD_DEPLOY_ACME_EMAIL` | Email for Let's Encrypt / ACME |
 | `DEPLOY_KNOWN_HOSTS` | `PROD_DEPLOY_KNOWN_HOSTS` | *(optional)* output of `ssh-keyscan <host>`; pin it to avoid trust-on-first-use |
+| `OPENAI_APPS_CHALLENGE_TOKEN` | *(same name)* | *(optional)* OpenAI Apps domain-verification token, served at `/.well-known/openai-apps-challenge` (404 while unset). Submission-specific rather than host-specific, so one repository-level secret feeds both environments |
 
 > **Set these as repository-level secrets** (**Settings → Secrets and variables →
 > Actions**). The callers pass them into the reusable workflow, and a job that calls

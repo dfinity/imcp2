@@ -23,7 +23,13 @@ const evilReport = () => ({
   generatedAt: "2026-07-05T00:00:00.000Z",
   targets: {
     mcpOrigin: `https://mcp.example${ESC}[31mSPOOF`,
-    iiOrigin: `https://id.example${CR}SPOOF`,
+    // A list now (one entry per served II instance), and every element is
+    // probe-derived: the origins come from the monitored server's /version, so
+    // each must be sanitised — including the join between them.
+    iiOrigins: [
+      `https://id.example${CR}SPOOF`,
+      `https://beta.id.example${ESC}[31mSPOOF2`,
+    ],
   },
   deployment: {
     version: `1.2.3${ESC}[2K`,

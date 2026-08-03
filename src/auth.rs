@@ -88,7 +88,10 @@
 
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -124,6 +127,32 @@ const TOKEN_TTL: Duration = Duration::from_secs(3600);
 /// `ttl` (seconds) requested for the II grant. Clamped by II to [600, 2592000].
 const GRANT_TTL_SECS: u64 = 3600;
 
+/// Ceiling on the dynamic-client-registration store. `POST /oauth/register` is
+/// UNAUTHENTICATED (open DCR, as MCP clients require), so without a cap a bare
+/// POST loop grows the map — and the file it is persisted to — without limit
+/// (CWE-770). Eviction is least-recently-used ([`make_room_for_client`]): far
+/// above any plausible legitimate population (a handful of vendors plus one
+/// registration per desktop install), and a client evicted anyway just
+/// re-registers, since DCR is automatic.
+const MAX_CLIENTS: usize = 10_000;
+
+/// Floor on the interval between write-throughs of the registration store. The
+/// store is re-serialized in full on every write, so writing once per
+/// registration made N unauthenticated registrations cost O(N²) disk I/O; a
+/// burst now coalesces into one write per interval (see
+/// [`ClientStore::persist_soon`]). Short enough that a registration is on disk
+/// long before the client comes back to use it.
+const PERSIST_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Ceiling on minted-but-unexchanged authorization codes. Inserting one requires
+/// a COMPLETED II consent, so this is a backstop rather than an attacker-reachable
+/// limit; expired codes are dropped first ([`make_room`]).
+const MAX_CODES: usize = 4_096;
+
+/// Ceiling on live access tokens. Like [`MAX_CODES`], only a completed connect
+/// can add one; expired tokens are dropped first, and only then the oldest.
+const MAX_TOKENS: usize = 20_000;
+
 /// Name of the browser-session cookie that binds `/oauth/authorize` to
 /// `/oauth/connect/redeem`: only the browser that started the flow can complete it.
 pub(crate) const CONNECT_COOKIE: &str = "mcp_connect";
@@ -135,6 +164,29 @@ pub(crate) const CONNECT_COOKIE: &str = "mcp_connect";
 struct ClientReg {
     #[serde(default)]
     redirect_uris: Vec<String>,
+    /// Unix seconds this registration was last USED — set at registration and
+    /// refreshed whenever `/oauth/authorize` names it
+    /// ([`ClientStore::redirect_allowed_for`]). Read only by the LRU eviction
+    /// that bounds the store at [`MAX_CLIENTS`], so that a flood of never-used
+    /// registrations churns itself out before touching clients in active use.
+    /// Not persisted on every use (only registrations write through), so after a
+    /// restart the order is as of the last registration — good enough for an
+    /// eviction heuristic. An entry from a store written before this field
+    /// existed defaults to the load time, i.e. as if just used.
+    #[serde(default = "now_secs")]
+    last_used: u64,
+}
+
+impl ClientReg {
+    /// A registration for `redirect_uris`, used as of now.
+    fn new(redirect_uris: Vec<String>) -> Self {
+        Self { redirect_uris, last_used: now_secs() }
+    }
+}
+
+/// Wall-clock seconds since the Unix epoch (0 if the clock is before it).
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 /// File the dynamic client registrations are persisted to. RFC 7591 clients are
@@ -170,6 +222,155 @@ fn persist_clients(clients: &HashMap<String, ClientReg>) {
             }
         }
         Err(e) => tracing::warn!("could not serialize client registrations: {e}"),
+    }
+}
+
+/// The dynamic-client-registration store: the registrations plus the state that
+/// keeps writing them to disk cheap. Two bounds live here, both because
+/// `POST /oauth/register` is unauthenticated:
+///
+///   * **size** — capped at [`MAX_CLIENTS`], evicting the least-recently-used
+///     registration ([`make_room_for_client`]);
+///   * **disk I/O** — write-throughs are coalesced to at most one per
+///     [`PERSIST_MIN_INTERVAL`] ([`Self::persist_soon`]), since each one
+///     re-serializes the whole store.
+struct ClientStore {
+    registrations: RwLock<HashMap<String, ClientReg>>,
+    /// Set when the store holds registrations not yet written to disk. Cleared
+    /// by the persist task before it snapshots, so a registration landing
+    /// mid-write sets it again and gets its own pass (no lost updates).
+    dirty: AtomicBool,
+    /// Set while a persist task is running, so concurrent registrations only
+    /// mark the store dirty instead of each spawning their own writer.
+    writing: AtomicBool,
+}
+
+impl ClientStore {
+    /// Load the persisted registrations (see [`load_clients`]).
+    fn load() -> Arc<Self> {
+        Self::with(load_clients())
+    }
+
+    /// A store over `registrations` as given (the seam tests use to start from a
+    /// known, empty set without reading the deployment's file).
+    fn with(registrations: HashMap<String, ClientReg>) -> Arc<Self> {
+        Arc::new(Self {
+            registrations: RwLock::new(registrations),
+            dirty: AtomicBool::new(false),
+            writing: AtomicBool::new(false),
+        })
+    }
+
+    /// Whether `redirect_uri` is acceptable for `client_id` ([`redirect_allowed`]),
+    /// marking the registration as used when it is so the LRU eviction keeps
+    /// clients that are actually signing users in.
+    async fn redirect_allowed_for(&self, client_id: &str, redirect_uri: &str) -> bool {
+        let mut clients = self.registrations.write().await;
+        if !redirect_allowed(clients.get(client_id), redirect_uri) {
+            return false;
+        }
+        if let Some(reg) = clients.get_mut(client_id) {
+            reg.last_used = now_secs();
+        }
+        true
+    }
+
+    /// Register `redirect_uris` under `client_id` directly, with no bound check
+    /// and no write-through — the seam tests use to set up a known client
+    /// without touching the disk.
+    #[cfg(test)]
+    async fn seed(&self, client_id: &str, redirect_uris: Vec<&str>) {
+        let reg = ClientReg::new(redirect_uris.into_iter().map(str::to_string).collect());
+        self.registrations.write().await.insert(client_id.to_string(), reg);
+    }
+
+    /// Store a registration, bounding the store first, then scheduling a
+    /// (coalesced) write-through.
+    async fn register(self: &Arc<Self>, client_id: String, reg: ClientReg) {
+        {
+            let mut clients = self.registrations.write().await;
+            make_room_for_client(&mut clients);
+            clients.insert(client_id, reg);
+        }
+        self.persist_soon();
+    }
+
+    /// Schedule a write-through of the registration store, **coalesced**: the
+    /// first caller spawns the writer, later callers only mark the store dirty
+    /// and the running writer picks their changes up on its next pass, at most
+    /// one write per [`PERSIST_MIN_INTERVAL`]. Without this each
+    /// `POST /oauth/register` re-serialized and rewrote the entire store, so N
+    /// unauthenticated registrations cost O(N²) disk writes (CWE-770
+    /// amplification). The trade is that up to one interval of registrations can
+    /// be lost to a hard restart; persistence was already best-effort (a client
+    /// whose registration didn't survive simply re-registers).
+    fn persist_soon(self: &Arc<Self>) {
+        self.dirty.store(true, Ordering::SeqCst);
+        if self.writing.swap(true, Ordering::SeqCst) {
+            return; // a writer is already running and will see `dirty`
+        }
+        let store = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                // Clear `dirty` BEFORE snapshotting, so a registration landing
+                // during the write is guaranteed another pass.
+                while store.dirty.swap(false, Ordering::SeqCst) {
+                    let snapshot = store.registrations.read().await.clone();
+                    tokio::task::spawn_blocking(move || persist_clients(&snapshot)).await.ok();
+                    tokio::time::sleep(PERSIST_MIN_INTERVAL).await;
+                }
+                store.writing.store(false, Ordering::SeqCst);
+                // A registration may have landed between that last check and
+                // releasing the writer slot: re-take it if so (unless another
+                // caller already did), else this writer is done.
+                if !store.dirty.load(Ordering::SeqCst) || store.writing.swap(true, Ordering::SeqCst) {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+/// Evict registrations until there is room for one more, bounding the store at
+/// [`MAX_CLIENTS`] (CWE-770: open DCR means anyone can add entries). The
+/// least-recently-used entry goes first — every `/oauth/authorize` marks its
+/// client used, so an unauthenticated registration flood evicts its own unused
+/// entries well before it reaches a client that is actively signing users in, and
+/// an evicted client re-registers automatically.
+fn make_room_for_client(clients: &mut HashMap<String, ClientReg>) {
+    while clients.len() >= MAX_CLIENTS {
+        let Some(victim) = clients
+            .iter()
+            .min_by_key(|(_, c)| c.last_used)
+            .map(|(id, _)| id.clone())
+        else {
+            break;
+        };
+        clients.remove(&victim);
+    }
+}
+
+/// Make room for one more entry in a bounded, self-expiring map, ordering
+/// everything by each entry's REMAINING lifetime (zero = already expired, see the
+/// `remaining` methods on [`AuthzPending`], [`CodeGrant`], and [`TokenInfo`]):
+/// expired entries go first, then whatever expires soonest, down to `cap - 1`.
+/// Never refuses the caller's insert, so a full map degrades by dropping its
+/// closest-to-dead entries instead of by turning users away. Shared by the
+/// pending connects, the authorization codes, and the access tokens; only pending
+/// connects are reachable without authentication, but all three are capped.
+fn make_room<K, V>(map: &mut HashMap<K, V>, cap: usize, remaining: impl Fn(&V) -> Duration)
+where
+    K: Clone + Eq + std::hash::Hash,
+{
+    if map.len() < cap {
+        return;
+    }
+    map.retain(|_, v| !remaining(v).is_zero());
+    while map.len() >= cap {
+        let Some(victim) = map.iter().min_by_key(|(_, v)| remaining(v)).map(|(k, _)| k.clone()) else {
+            break;
+        };
+        map.remove(&victim);
     }
 }
 
@@ -271,23 +472,31 @@ fn path_within_prefix(path: &str, prefix: &str) -> bool {
     }
 }
 
-/// Whether the redirect carries a `.`/`..` path segment (raw or `%2e`-encoded). A
-/// user agent normalizes these away before requesting, so a redirect like
-/// `/connector/oauth/../../g/evil` could satisfy the pinned-prefix check here yet
-/// land OUTSIDE the prefix in the browser; such redirects are refused outright.
-/// (`url::Url` already normalizes special-scheme paths, so this is a belt-and-
-/// suspenders check on the raw input, independent of that normalization.)
-fn has_dot_segment(redirect_uri: &str) -> bool {
-    let normalized = redirect_uri.to_ascii_lowercase().replace("%2e", ".");
-    normalized.split('/').any(|seg| {
-        let seg = seg.split(['?', '#']).next().unwrap_or("");
-        seg == "." || seg == ".."
-    })
+/// Whether `path` contains ANY percent-encoding (a literal `%`). A legitimate hosted
+/// vendor callback path is plain ASCII with no percent-encoding, so rather than
+/// enumerate the dangerous sequences we reject percent-encoding wholesale: it is the
+/// only way an encoded path separator or dot-segment can hide from the pinned-prefix
+/// check, and refusing all of it means never having to reason about which sequences a
+/// given downstream server/CDN happens to decode.
+///
+/// The concrete break it closes (CWE-601): url::Url does not decode `%2f` on parse, so
+/// `/connector/oauth/%2e%2e%2f%2e%2e%2fg%2fx` rides through [`path_within_prefix`] as
+/// one opaque segment under the pinned prefix, yet a vendor that later decodes `%2f`
+/// (and resolves the `..`) routes the appended `?code=…` to `/g/x` on the trusted
+/// origin, an attacker-controlled, script-capable path. A single byte scan, so no
+/// allocation on the unauthenticated front-channel (`/oauth/register`,
+/// `/oauth/authorize`).
+fn path_has_percent_encoding(path: &str) -> bool {
+    path.contains('%')
 }
 
 /// Whether a `redirect_uri` may be registered or receive an authorization code.
-/// Loopback (`http://localhost` / `127.0.0.1` / `[::1]`, any port) is always
-/// allowed. A hosted redirect must be `https`, carry no userinfo, name no
+/// No redirect (loopback or hosted) may carry a query or fragment component: the
+/// authorization endpoint appends `?code=…&state=…`, so a pre-existing query would
+/// risk `code=…&code=…` parameter pollution (MCP05), and a fragment is meaningless
+/// on a redirect target. Loopback (`http://localhost` / `127.0.0.1` / `[::1]`, any
+/// port) is otherwise always allowed. A hosted redirect must be `https`, carry no
+/// userinfo, name no
 /// off-origin port (only the implicit/`:443` default is allowed), its host must
 /// equal (or be a subdomain of) an allow-listed registrable domain, AND its path
 /// must fall within that entry's pinned callback prefix (see
@@ -299,32 +508,54 @@ fn has_dot_segment(redirect_uri: &str) -> bool {
 /// `https://user@claude.ai` is refused too (userinfo serves no purpose in a
 /// redirect target, only muddies which host is addressed, and loopback rejects it).
 fn redirect_uri_permitted(redirect_uri: &str) -> bool {
-    if is_loopback_redirect(redirect_uri) {
-        return true;
-    }
     let Ok(url) = url::Url::parse(redirect_uri) else {
         return false;
     };
-    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+    // Reject any query or fragment component (MCP05), on loopback and hosted alike.
+    // `/oauth/authorize` appends `?code=…&state=…` to the redirect, so a redirect
+    // that already carries a query invites `code=123&code=456` parameter pollution
+    // a lax downstream parser could resolve to an attacker-seeded value; a fragment
+    // serves no purpose in a redirect target. Every seeded vendor callback and every
+    // registered loopback URI is already query/fragment-free, so this rejects nothing
+    // legitimate while keeping the code-appending redirect unambiguous.
+    if url.query().is_some() || url.fragment().is_some() {
         return false;
     }
-    // Refuse an explicit non-default port: `https://claude.ai:444/…` is a DIFFERENT
-    // origin than the pinned `https://claude.ai` and may serve different content, so
-    // the path pin wouldn't hold. `url::Url::port()` returns `None` for the scheme's
-    // default (443), so `:443` and no-port both pass; only an off-origin port fails.
-    if url.port().is_some() {
-        return false;
-    }
-    // Refuse `.`/`..` (raw or `%2e`) path segments: they normalize in the browser
-    // and could escape the pinned callback prefix (`/connector/oauth/../../g/evil`).
-    if has_dot_segment(redirect_uri) {
-        return false;
+    // Loopback is checked on the already-parsed `url` (not a re-parse of the raw
+    // string), since this runs on the `/oauth/register` and `/oauth/authorize` path.
+    if is_loopback_url(&url) {
+        return true;
     }
     let Some(host) = url.host_str() else {
         return false;
     };
+    // Allowlist the redirect's SHAPE rather than denylisting each disallowed part: a
+    // permitted hosted redirect serialises to exactly `https://<host><path>` (https,
+    // no userinfo, no port, no query, no fragment). Rebuild that canonical form from
+    // the parts we allow and require an exact match, so any unexpected component is
+    // refused in one comparison. url::Url drops the https-default `:443` (so it still
+    // matches), while an off-origin `:444`, a userinfo prefix, or an `http` scheme
+    // makes the two differ; query and fragment were already refused above.
+    let Ok(canonical) = url::Url::parse(&format!("https://{host}{}", url.path())) else {
+        return false;
+    };
+    if url != canonical {
+        return false;
+    }
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     let path = url.path();
+    // url::Url collapses only LITERAL `.`/`..` segments (raw or `%2e`-encoded whole
+    // segments), so a real-slash traversal `/connector/oauth/../../g/evil` arrives
+    // here already normalized to `/g/evil` and fails the prefix check. It does NOT
+    // decode `%2f`, though, so an ENCODED-slash traversal
+    // (`/connector/oauth/%2e%2e%2f%2e%2e%2fg%2fx`) would otherwise ride through as one
+    // opaque segment under the prefix and later decode to `/g/x` on the vendor origin.
+    // A vendor callback path is plain ASCII, so reject ANY percent-encoding in the
+    // path first (CWE-601), which holds the pin under every encoding without having to
+    // enumerate the dangerous sequences (see [`path_has_percent_encoding`]).
+    if path_has_percent_encoding(path) {
+        return false;
+    }
     // host == domain (or a dot-boundary subdomain) AND the path is within the
     // vendor's pinned callback prefix. The path pin is what keeps a registration
     // off third-party/user-content paths (e.g. `/page/…`, `/g/…`) on the same
@@ -336,13 +567,13 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
 }
 
 /// Whether `redirect_uri` is a **well-formed hosted** redirect: it parses, is
-/// `https`, carries no userinfo, and has a host. This is the shape that could
+/// `https`, carries no userinfo, has a host, and has no query or fragment. This is the shape that could
 /// legitimately be allow-listed and that [`redirect_uri_permitted`] rejects only
 /// because its host isn't on the list. It lets `/oauth/authorize` tell "a real
 /// client whose redirect just isn't approved yet" (→ the [`not_allowlisted_page`])
 /// apart from a genuinely **malformed or ineligible** `redirect_uri`
-/// (unparseable, non-`https`, or userinfo-bearing), which is a client-side request
-/// error, not an approval gap. Loopback is intentionally NOT counted here: a
+/// (unparseable, non-`https`, userinfo-bearing, or query/fragment-carrying), which
+/// is a client-side request error, not an approval gap. Loopback is intentionally NOT counted here: a
 /// loopback redirect is always permitted, so it never reaches the not-permitted
 /// branch this distinction guards.
 fn is_wellformed_hosted_redirect(redirect_uri: &str) -> bool {
@@ -352,6 +583,15 @@ fn is_wellformed_hosted_redirect(redirect_uri: &str) -> bool {
                 && url.username().is_empty()
                 && url.password().is_none()
                 && url.host_str().is_some_and(|h| !h.is_empty())
+                // A query or fragment makes it ineligible (MCP05), not merely
+                // unapproved, so it is classified `invalid_request` rather than
+                // routed to the "request access" page.
+                && url.query().is_none()
+                && url.fragment().is_none()
+                // Percent-encoding in the path is likewise ineligible (CWE-601 pin
+                // bypass), not a real client awaiting approval, so it is classified
+                // `invalid_request` rather than offered "request access".
+                && !path_has_percent_encoding(url.path())
         }
         Err(_) => false,
     }
@@ -391,10 +631,12 @@ fn loopback_match(registered: &str, requested: &str) -> bool {
 
 #[derive(Clone)]
 pub struct AuthStore {
-    clients: Arc<RwLock<HashMap<String, ClientReg>>>,
+    clients: Arc<ClientStore>,
     tokens: Arc<RwLock<HashMap<String, TokenInfo>>>,
     /// Auth-code connects in flight, keyed by `session_id` (= the II connect
-    /// `state`).
+    /// `state`). Bounded at [`crate::identities::MAX_PENDING_CONNECTS`] (one
+    /// entry per pending connect, same as the session map) and swept of expired
+    /// entries by [`AuthStore::reap_expired`].
     authz: Arc<RwLock<HashMap<String, AuthzPending>>>,
     /// Minted authorization codes awaiting exchange at `/oauth/token`.
     codes: Arc<RwLock<HashMap<String, CodeGrant>>>,
@@ -440,6 +682,15 @@ struct AuthzPending {
     redeeming: bool,
 }
 
+impl AuthzPending {
+    /// How long this connect may still be redeemed for — zero once it is past
+    /// [`CONNECT_TTL`]. The single definition of "expired" for a pending connect:
+    /// the redeem gate, the reaper, and the bound ([`make_room`]) all read it.
+    fn remaining(&self) -> Duration {
+        CONNECT_TTL.saturating_sub(self.created.elapsed())
+    }
+}
+
 /// A minted authorization code awaiting exchange.
 #[derive(Clone, Debug)]
 struct CodeGrant {
@@ -447,6 +698,14 @@ struct CodeGrant {
     code_challenge: Option<String>,
     session_id: String,
     created: Instant,
+}
+
+impl CodeGrant {
+    /// How long this code may still be exchanged for — zero once it is past
+    /// [`CODE_TTL`].
+    fn remaining(&self) -> Duration {
+        CODE_TTL.saturating_sub(self.created.elapsed())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -457,19 +716,28 @@ struct TokenInfo {
     ttl: Duration,
 }
 
+impl TokenInfo {
+    /// How long this access token is still valid for — zero once it has expired.
+    /// Its `ttl` tracks the II grant (see [`token_ttl`]), so an expiring token and
+    /// an expiring session go together.
+    fn remaining(&self) -> Duration {
+        self.ttl.saturating_sub(self.created.elapsed())
+    }
+}
+
 /// The dynamic-client-registration store, shared by every instance's
 /// [`AuthStore`]. Client registration is II-agnostic (it only pins redirect
 /// URIs to a `client_id`), so a client registered against either instance's AS
 /// is known to both — and, since both stores share one map, the persisted
 /// snapshot never loses the other instance's entries.
 #[derive(Clone)]
-pub struct SharedClients(Arc<RwLock<HashMap<String, ClientReg>>>);
+pub struct SharedClients(Arc<ClientStore>);
 
 impl SharedClients {
     /// Load the persisted client registrations once, to be shared by all stores
     /// (file from `OAUTH_CLIENTS_FILE`, default `oauth-clients.json`).
     pub fn load() -> Self {
-        Self(Arc::new(RwLock::new(load_clients())))
+        Self(ClientStore::load())
     }
 }
 
@@ -515,18 +783,88 @@ impl AuthStore {
 
     /// Whether `redirect_uri` is acceptable for `client_id`: the client must be
     /// registered, and the redirect must match a registered URI (exactly, or
-    /// port-agnostically for loopback per RFC 8252 §7.3).
+    /// port-agnostically for loopback per RFC 8252 §7.3). A match also marks the
+    /// registration as recently used (it is about to sign a user in), which is
+    /// what keeps it ahead of the store's LRU eviction.
     async fn validate_client(&self, client_id: &str, redirect_uri: &str) -> bool {
-        redirect_allowed(self.clients.read().await.get(client_id), redirect_uri)
+        self.clients.redirect_allowed_for(client_id, redirect_uri).await
     }
 
     /// The verified principal + session id behind a bearer token, if valid.
     pub async fn session_for_token(&self, token: &str) -> Option<(String, String)> {
         let tokens = self.tokens.read().await;
         let info = tokens.get(token)?;
-        (info.created.elapsed() < info.ttl).then(|| (info.principal.clone(), info.session_id.clone()))
+        (!info.remaining().is_zero()).then(|| (info.principal.clone(), info.session_id.clone()))
     }
 
+    /// Record a connect awaiting its II handshake, bounding the map first
+    /// ([`make_room`]): `/oauth/authorize` is unauthenticated, so expired entries
+    /// go and — if the map is still at the cap — the oldest pending connect is
+    /// evicted, which makes an authorize flood churn its own entries out instead
+    /// of growing the map (CWE-770). The cap is shared with the session map, whose
+    /// entries pair 1:1 with these.
+    async fn insert_pending(&self, session_id: String, pending: AuthzPending) {
+        let mut authz = self.authz.write().await;
+        make_room(&mut authz, crate::identities::MAX_PENDING_CONNECTS, AuthzPending::remaining);
+        authz.insert(session_id, pending);
+    }
+
+    /// Drop every expired entry from the short-lived OAuth maps, returning how
+    /// many went from each. The admission bounds ([`make_room`]) cap these maps at
+    /// all times; this is what returns the memory once a burst has passed, so an
+    /// abandoned connect, an unexchanged code, or an expired token doesn't linger
+    /// for the process's lifetime (CWE-770). Run on the same 60s timer as the
+    /// session reaper (`McpServer::spawn_session_reaper`).
+    pub(crate) async fn reap_expired(&self) -> ReapedOauthState {
+        let mut reaped = ReapedOauthState::default();
+        {
+            let mut authz = self.authz.write().await;
+            let before = authz.len();
+            authz.retain(|_, a| !a.remaining().is_zero());
+            reaped.pending = before - authz.len();
+        }
+        {
+            let mut codes = self.codes.write().await;
+            let before = codes.len();
+            codes.retain(|_, c| !c.remaining().is_zero());
+            reaped.codes = before - codes.len();
+        }
+        {
+            let mut tokens = self.tokens.write().await;
+            let before = tokens.len();
+            // A token's lifetime tracks its II grant, so this expires in step
+            // with the session the grant belongs to.
+            tokens.retain(|_, t| !t.remaining().is_zero());
+            reaped.tokens = before - tokens.len();
+        }
+        if reaped.any() {
+            tracing::debug!(
+                pending_connects = reaped.pending,
+                codes = reaped.codes,
+                tokens = reaped.tokens,
+                "reaped expired OAuth state"
+            );
+        }
+        reaped
+    }
+}
+
+/// What one [`AuthStore::reap_expired`] sweep dropped, per map.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ReapedOauthState {
+    /// Pending connects past [`CONNECT_TTL`] (an abandoned `/oauth/authorize`).
+    pending: usize,
+    /// Authorization codes past [`CODE_TTL`], never exchanged.
+    codes: usize,
+    /// Access tokens past their grant-tracking TTL.
+    tokens: usize,
+}
+
+impl ReapedOauthState {
+    /// Whether the sweep dropped anything at all (worth a log line).
+    fn any(&self) -> bool {
+        self.pending + self.codes + self.tokens > 0
+    }
 }
 
 // ---- Authorization code (poll bridge) ----------------------------------
@@ -644,25 +982,42 @@ pub async fn authorize(
     }
 
     let session_id = format!("sess-{}", Uuid::new_v4());
+    // Mint this connect's registration key `X` FIRST (before recording anything):
+    // it is the step that can be refused when the session map is at capacity, and
+    // doing it first means a refusal leaves no pending connect behind. `pub(X)`
+    // then rides the II link, toward which II builds the registration chain
+    // (`P_reg -> Y -> X`, the last hop browser-signed to `X`).
+    let reg_pubkey = match store.identities.registration_pubkey_b64(&session_id).await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!("refusing a connect: {e}");
+            return signin_error(&headers, StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable",
+                "the server is at capacity for sessions; retry shortly", SIGNIN_HEADLINE,
+                "This server is busy right now, so it couldn't start a new sign-in. Wait a moment \
+                 and try again.");
+        }
+    };
     // Bind this browser to the flow (the `sid` cookie, set now and required at
     // `/oauth/connect/redeem`). The `state` alone can't prove the redeeming
     // browser is the initiator (it's echoed to the client). The cookie proves
     // *initiator*; the fragment-delivered delegation proves *consenter*; requiring
     // both closes the split-browser injection.
     let cookie = format!("bind-{}", Uuid::new_v4());
-    store.authz.write().await.insert(
-        session_id.clone(),
-        AuthzPending {
-            client_id: q.client_id.clone(),
-            redirect_uri: q.redirect_uri.clone(),
-            client_state: q.state.clone().unwrap_or_default(),
-            code_challenge: Some(code_challenge),
-            cookie: cookie.clone(),
-            created: Instant::now(),
-            code: None,
-            redeeming: false,
-        },
-    );
+    store
+        .insert_pending(
+            session_id.clone(),
+            AuthzPending {
+                client_id: q.client_id.clone(),
+                redirect_uri: q.redirect_uri.clone(),
+                client_state: q.state.clone().unwrap_or_default(),
+                code_challenge: Some(code_challenge),
+                cookie: cookie.clone(),
+                created: Instant::now(),
+                code: None,
+                redeeming: false,
+            },
+        )
+        .await;
 
     // Redirect the browser to this instance's II handshake, setting the binding
     // cookie. II navigates back to our pinned callback page once it certifies the
@@ -683,10 +1038,6 @@ pub async fn authorize(
         store.mcp_path,
         CONNECT_TTL.as_secs(),
     );
-    // Mint this connect's registration key `X` and carry `pub(X)` in the II link,
-    // toward which II builds the registration chain (`P_reg -> Y -> X`, the last
-    // hop browser-signed to `X`).
-    let reg_pubkey = store.identities.registration_pubkey_b64(&session_id).await;
     let ii_url = ii_mcp_url(&store, &session_id, &reg_pubkey);
     // Redirect the consenting browser to the II connect link with a real HTTP
     // 302 (`Location`). The link's params ride in the URL fragment
@@ -1309,7 +1660,7 @@ pub async fn connect_redeem(
         let authz = store.authz.read().await;
         authz.get(&body.state).map(|a| {
             (
-                a.created.elapsed() >= CONNECT_TTL,
+                a.remaining().is_zero(),
                 a.cookie.clone(),
                 a.client_id.clone(),
                 a.redirect_uri.clone(),
@@ -1403,7 +1754,9 @@ pub async fn connect_redeem(
         }
     };
     if newly_minted {
-        store.codes.write().await.insert(
+        let mut codes = store.codes.write().await;
+        make_room(&mut codes, MAX_CODES, CodeGrant::remaining);
+        codes.insert(
             code.clone(),
             CodeGrant {
                 client_id,
@@ -1446,7 +1799,7 @@ pub async fn token(State(store): State<AuthStore>, Form(req): Form<TokenForm>) -
 
 async fn token_authorization_code(store: AuthStore, req: TokenForm) -> Response {
     let grant = match store.codes.write().await.remove(&req.code) {
-        Some(g) if g.created.elapsed() < CODE_TTL => g,
+        Some(g) if !g.remaining().is_zero() => g,
         Some(_) => return oauth_err(StatusCode::BAD_REQUEST, "invalid_grant", "code expired"),
         None => return oauth_err(StatusCode::BAD_REQUEST, "invalid_grant", "unknown or used code"),
     };
@@ -1503,15 +1856,19 @@ async fn issue_token(store: &AuthStore, session_id: &str) -> Response {
     );
 
     let access_token = format!("mcp-token-{}", Uuid::new_v4());
-    store.tokens.write().await.insert(
-        access_token.clone(),
-        TokenInfo {
-            principal: principal.clone(),
-            session_id: session_id.to_string(),
-            created: Instant::now(),
-            ttl,
-        },
-    );
+    {
+        let mut tokens = store.tokens.write().await;
+        make_room(&mut tokens, MAX_TOKENS, TokenInfo::remaining);
+        tokens.insert(
+            access_token.clone(),
+            TokenInfo {
+                principal: principal.clone(),
+                session_id: session_id.to_string(),
+                created: Instant::now(),
+                ttl,
+            },
+        );
+    }
     tracing::info!(%principal, ttl_secs = ttl.as_secs(), "issued MCP access token");
 
     Json(json!({
@@ -1593,12 +1950,11 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
     }
 
     let client_id = format!("client-{}", Uuid::new_v4());
-    let snapshot = {
-        let mut clients = store.clients.write().await;
-        clients.insert(client_id.clone(), ClientReg { redirect_uris: req.redirect_uris.clone() });
-        clients.clone()
-    };
-    tokio::task::spawn_blocking(move || persist_clients(&snapshot)).await.ok();
+    // Bounded + coalesced-persistence insert (see [`ClientStore`]): the store is
+    // capped at MAX_CLIENTS by LRU, and the write-through is scheduled rather
+    // than done inline, so an unauthenticated registration flood can neither grow
+    // the map without limit nor amplify into a full re-serialization per request.
+    store.clients.register(client_id.clone(), ClientReg::new(req.redirect_uris.clone())).await;
 
     // Public client (PKCE, no secret): OMIT client_secret entirely (returning
     // null breaks clients that validate it as a string).
@@ -1725,9 +2081,12 @@ fn bearer_challenge(had_token: bool, resource_metadata_url: &str) -> String {
 /// and the userinfo-with-port form `http://localhost:1234@evil.com` all parse to
 /// host `evil.com` (or carry userinfo) and are rejected.
 fn is_loopback_redirect(redirect_uri: &str) -> bool {
-    let Ok(url) = url::Url::parse(redirect_uri) else {
-        return false;
-    };
+    url::Url::parse(redirect_uri).map(|u| is_loopback_url(&u)).unwrap_or(false)
+}
+
+/// Loopback test on an already-parsed URL, so a caller that has parsed the
+/// `redirect_uri` (e.g. [`redirect_uri_permitted`]) need not parse it again.
+fn is_loopback_url(url: &url::Url) -> bool {
     url.scheme() == "http"
         && url.username().is_empty()
         && url.password().is_none()
@@ -1743,6 +2102,8 @@ pub type _JsonValue = Value;
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, time::Duration};
+
     use super::{
         build_redirect, is_loopback_redirect, pkce_s256, redirect_allowed, redirect_uri_permitted,
         ClientReg,
@@ -1758,9 +2119,7 @@ mod tests {
 
     #[test]
     fn redirect_requires_registration() {
-        let reg = ClientReg {
-            redirect_uris: vec!["https://claude.ai/api/mcp/auth_callback".to_string()],
-        };
+        let reg = ClientReg::new(vec!["https://claude.ai/api/mcp/auth_callback".to_string()]);
         // Hosted redirects: exact registered match only.
         assert!(redirect_allowed(Some(&reg), "https://claude.ai/api/mcp/auth_callback"));
         assert!(!redirect_allowed(Some(&reg), "https://claude.ai/api/mcp/auth_callback/x"));
@@ -1799,10 +2158,37 @@ mod tests {
         // Right domain, wrong path, plus a non-segment-boundary near-miss of the pin.
         assert!(!redirect_uri_permitted("https://claude.ai/foo"));
         assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callbackEVIL"));
-        // Dot-segment traversal that would normalize (in the browser) outside the
-        // pinned prefix, raw and percent-encoded (`%2e`) forms.
+        // Dot-segment traversal (raw and percent-encoded): url::Url normalizes these
+        // to `/g/evil` on parse (WHATWG), which then fails the pinned-prefix check.
         assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/../../g/evil"));
         assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%2e%2e/%2e%2e/g/evil"));
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%2E%2E/%2E%2E/g/evil"));
+        // A dot-segment that normalizes to WITHIN the vendor's pinned prefix is fine
+        // (it lands in the vendor's own callback space, not an escape).
+        assert!(redirect_uri_permitted("https://chatgpt.com/connector/oauth/x/../y"));
+        // ENCODED-slash traversal (CWE-601): url::Url does NOT decode `%2f`, so
+        // `%2e%2e%2f%2e%2e%2fg%2f…` stays one opaque segment under the pinned prefix
+        // and slips past the prefix check, yet a vendor CDN that later decodes `%2f`
+        // routes the appended `?code=…` to `/g/…` on the trusted origin. A vendor
+        // callback path is plain ASCII, so ANY percent-encoding in the path is refused
+        // outright (upper/lower, separators AND otherwise-harmless escapes alike).
+        assert!(!redirect_uri_permitted(
+            "https://chatgpt.com/connector/oauth/%2e%2e%2f%2e%2e%2fg%2fattacker"
+        ));
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%2E%2E%2Fg%2Fevil"));
+        // Even an encoded slash that would decode to WITHIN the prefix is refused (we
+        // reject percent-encoding outright rather than decode-and-renormalize).
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/x%2fy"));
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/x%5cy"));
+        assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback%2f%2e%2e"));
+        // A non-separator escape (e.g. `%20`, `%41`) is refused too: the whole point is
+        // to avoid reasoning about which encodings a given downstream decodes.
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/a%20b"));
+        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%41"));
+        // Such a payload is ineligible (invalid_request), not a client awaiting approval.
+        assert!(!super::is_wellformed_hosted_redirect(
+            "https://chatgpt.com/connector/oauth/%2e%2e%2f%2e%2e%2fg%2fattacker"
+        ));
         // Cursor: allowed at its real hosted callback path (registered as
         // www.cursor.com), refused on any other path.
         assert!(redirect_uri_permitted("https://www.cursor.com/agents/mcp/oauth/callback"));
@@ -1828,25 +2214,18 @@ mod tests {
         assert!(redirect_uri_permitted("https://claude.ai:443/api/mcp/auth_callback"));
         // A hosted redirect must be https even to an allowed domain + path.
         assert!(!redirect_uri_permitted("http://claude.ai/api/mcp/auth_callback"));
+        // A query or fragment is refused (MCP05: `?code=…` appended by the AS would
+        // pollute a redirect that already carries one), on hosted AND loopback, even
+        // when the host + path are otherwise valid. The same URI with no query passes.
+        assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback?code=123"));
+        assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback?x=1"));
+        assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback#frag"));
+        assert!(!redirect_uri_permitted("http://127.0.0.1:6112/cb?code=123"));
+        assert!(!redirect_uri_permitted("http://localhost/callback#frag"));
         // Defense in depth: a client registered before the allow-list (or via a
         // now-removed domain) still can't receive a code at /oauth/authorize.
-        let junk = ClientReg { redirect_uris: vec!["https://example.com/cb".to_string()] };
+        let junk = ClientReg::new(vec!["https://example.com/cb".to_string()]);
         assert!(!redirect_allowed(Some(&junk), "https://example.com/cb"));
-    }
-
-    /// Dot-segment detection, independent of `url::Url` normalization: whole-segment
-    /// `.`/`..` (raw or `%2e`) is caught; dots inside a segment and in the query are not.
-    #[test]
-    fn detects_dot_segments() {
-        use super::has_dot_segment;
-        assert!(has_dot_segment("https://x.example/a/../b"));
-        assert!(has_dot_segment("https://x.example/a/./b"));
-        assert!(has_dot_segment("https://x.example/a/%2e%2e/b"));
-        assert!(has_dot_segment("https://x.example/a/%2E%2E/b"));
-        assert!(has_dot_segment("https://x.example/foo/.."));
-        assert!(!has_dot_segment("https://x.example/api/mcp/auth_callback"));
-        assert!(!has_dot_segment("https://x.example/a.b/c..d")); // dots inside a segment
-        assert!(!has_dot_segment("https://x.example/cb?next=../x")); // query, not path
     }
 
     /// `OAUTH_ALLOWED_REDIRECT_PREFIXES` entries parse to `(host, path)` only for a
@@ -1886,9 +2265,7 @@ mod tests {
     /// and a registered hosted URI grants no loopback latitude.
     #[test]
     fn registered_loopback_matches_any_port() {
-        let reg = ClientReg {
-            redirect_uris: vec!["http://localhost:54321/callback".to_string()],
-        };
+        let reg = ClientReg::new(vec!["http://localhost:54321/callback".to_string()]);
         assert!(redirect_allowed(Some(&reg), "http://localhost:54321/callback"));
         assert!(redirect_allowed(Some(&reg), "http://localhost:61832/callback"));
         assert!(redirect_allowed(Some(&reg), "http://localhost/callback"));
@@ -1898,9 +2275,7 @@ mod tests {
         // Look-alike hosts fail is_loopback_redirect on the requested side.
         assert!(!redirect_allowed(Some(&reg), "http://localhost.evil.com:54321/callback"));
         // A registered HOSTED uri gives no loopback latitude.
-        let hosted = ClientReg {
-            redirect_uris: vec!["https://claude.ai/cb".to_string()],
-        };
+        let hosted = ClientReg::new(vec!["https://claude.ai/cb".to_string()]);
         assert!(!redirect_allowed(Some(&hosted), "http://localhost:1234/cb"));
     }
 
@@ -2036,7 +2411,7 @@ mod tests {
         );
         super::AuthStore::new(
             ids,
-            super::SharedClients(std::sync::Arc::default()),
+            super::SharedClients(super::ClientStore::with(std::collections::HashMap::new())),
             "https://mcp.test".into(),
             "/mcp".into(),
         )
@@ -2064,8 +2439,9 @@ mod tests {
     }
 
     async fn seed_pending(store: &super::AuthStore, id: &str, cookie: &str) {
-        // Insert a pending authorization directly (bypasses the browser redirect).
-        store.authz.write().await.insert(
+        // Record a pending authorization the way `authorize` does — through the
+        // bounded insert — just without the browser redirect around it.
+        store.insert_pending(
             id.to_string(),
             super::AuthzPending {
                 client_id: "c".into(),
@@ -2077,7 +2453,123 @@ mod tests {
                 code: None,
                 redeeming: false,
             },
+        )
+        .await;
+    }
+
+    // ---- Bounded state (CWE-770) --------------------------------------------
+
+    // `make_room` frees a slot by dropping what has already EXPIRED (zero
+    // remaining lifetime) and only then whatever expires soonest, so a bounded
+    // map degrades by losing its deadest entries instead of refusing the caller.
+    #[test]
+    fn make_room_drops_expired_before_the_soonest_to_expire() {
+        let mut map: HashMap<&str, Duration> = HashMap::new();
+        map.insert("expired", Duration::ZERO);
+        map.insert("expires-soon", Duration::from_secs(1));
+        map.insert("expires-later", Duration::from_secs(60));
+
+        super::make_room(&mut map, 3, |remaining| *remaining);
+        assert_eq!(map.len(), 2, "one slot freed");
+        assert!(!map.contains_key("expired"), "the expired entry goes first");
+
+        // Nothing expired left: the one closest to expiry makes the room.
+        super::make_room(&mut map, 2, |remaining| *remaining);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("expires-later") && !map.contains_key("expires-soon"));
+    }
+
+    // Pending connects are capped: `/oauth/authorize` is unauthenticated, so a
+    // flood must churn its own entries out instead of growing the map. (WHICH
+    // entry a full map gives up is the eviction policy, pinned by the two
+    // `make_room` tests; here the invariant is that the map never grows past its
+    // cap and that the connect just started is the one kept.)
+    #[tokio::test]
+    async fn pending_connects_are_capped() {
+        let cap = crate::identities::MAX_PENDING_CONNECTS;
+        let store = test_store();
+        for i in 0..cap + 16 {
+            seed_pending(&store, &format!("sess-{i}"), "bind").await;
+        }
+
+        let authz = store.authz.read().await;
+        assert_eq!(authz.len(), cap, "the map never grows past its cap");
+        assert!(
+            authz.contains_key(&format!("sess-{}", cap + 15)),
+            "the connect just started is never the one evicted"
         );
+    }
+
+    // The registration store is LRU-bounded: open (unauthenticated) DCR means the
+    // map must be capped, and the entry unused for longest goes — every
+    // `/oauth/authorize` refreshes its client's stamp, so registrations that are
+    // actually signing users in outlive a flood of never-used ones.
+    #[test]
+    fn make_room_for_client_evicts_least_recently_used() {
+        let mut clients: HashMap<String, ClientReg> = (0..super::MAX_CLIENTS)
+            .map(|i| {
+                let mut reg = ClientReg::new(vec!["http://localhost/cb".to_string()]);
+                reg.last_used = 1_000 + i as u64; // client-0 is the least recently used
+                (format!("client-{i}"), reg)
+            })
+            .collect();
+
+        super::make_room_for_client(&mut clients);
+
+        assert_eq!(clients.len(), super::MAX_CLIENTS - 1, "room for exactly one more client");
+        assert!(!clients.contains_key("client-0"), "the least-recently-used registration goes");
+        assert!(clients.contains_key(&format!("client-{}", super::MAX_CLIENTS - 1)));
+    }
+
+    // Using a client (an authorize that accepts its redirect) refreshes its LRU
+    // stamp; a rejected redirect does not, so a probe can't keep a stale
+    // registration alive.
+    #[tokio::test]
+    async fn a_used_client_is_marked_recently_used() {
+        let store = test_store();
+        let redirect = "https://claude.ai/api/mcp/auth_callback";
+        store.clients.seed("client-x", vec![redirect]).await;
+        let backdate = || async {
+            store.clients.registrations.write().await.get_mut("client-x").expect("client").last_used = 0;
+        };
+        let stamp = || async { store.clients.registrations.read().await["client-x"].last_used };
+
+        backdate().await;
+        assert!(store.validate_client("client-x", redirect).await);
+        assert!(stamp().await > 0, "an accepted redirect refreshes the LRU stamp");
+
+        backdate().await;
+        assert!(!store.validate_client("client-x", "https://claude.ai/api/mcp/auth_callback/nope").await);
+        assert_eq!(stamp().await, 0, "a rejected redirect must not refresh the stamp");
+    }
+
+    // The periodic sweep returns the memory expired entries hold, and leaves live
+    // state alone. A zero-TTL token is exactly what `token_ttl` mints for an
+    // already-expired grant, so it stands in for "token whose grant has lapsed".
+    #[tokio::test]
+    async fn reap_expired_drops_dead_state_and_keeps_live_state() {
+        let store = test_store();
+        seed_pending(&store, "sess-live", "bind-live").await;
+        let token = |ttl: Duration| super::TokenInfo {
+            principal: "p".into(),
+            session_id: "sess-live".into(),
+            created: std::time::Instant::now(),
+            ttl,
+        };
+        {
+            let mut tokens = store.tokens.write().await;
+            tokens.insert("dead".into(), token(Duration::ZERO));
+            tokens.insert("live".into(), token(Duration::from_secs(3600)));
+        }
+
+        let reaped = store.reap_expired().await;
+
+        assert_eq!(reaped.tokens, 1, "the lapsed token is dropped");
+        assert_eq!(reaped.pending, 0, "a connect still inside its TTL is kept");
+        assert_eq!(reaped.codes, 0);
+        let tokens = store.tokens.read().await;
+        assert!(tokens.contains_key("live") && !tokens.contains_key("dead"));
+        assert!(store.authz.read().await.contains_key("sess-live"));
     }
 
     // ---- Connect: link + redeem ---------------------------------------------
@@ -2122,7 +2614,7 @@ mod tests {
                     "https://mcp.test".into(),
                     agent,
                 ),
-                super::SharedClients(std::sync::Arc::default()),
+                super::SharedClients(super::ClientStore::with(std::collections::HashMap::new())),
                 "https://mcp.test".into(),
                 mcp_path.into(),
             )
@@ -2185,10 +2677,7 @@ mod tests {
         use axum::extract::{Query, State};
         let store = test_store();
         // Register a client so `validate_client` passes and we reach the redirect.
-        store.clients.write().await.insert(
-            "client-x".into(),
-            super::ClientReg { redirect_uris: vec!["https://claude.ai/api/mcp/auth_callback".into()] },
-        );
+        store.clients.seed("client-x", vec!["https://claude.ai/api/mcp/auth_callback"]).await;
         let resp = super::authorize(
             State(store.clone()),
             // The success path is Accept-agnostic; an empty header map is fine.
@@ -2276,10 +2765,7 @@ mod tests {
         let store = test_store();
         // A stored-but-disallowed registration (a hosted redirect on a
         // non-allow-listed domain) plus a permitted-but-unregistered client.
-        store.clients.write().await.insert(
-            "client-legacy".into(),
-            super::ClientReg { redirect_uris: vec!["https://example.com/cb".into()] },
-        );
+        store.clients.seed("client-legacy", vec!["https://example.com/cb"]).await;
         let mk = |client_id: &str, redirect_uri: &str| super::AuthorizeQuery {
             response_type: Some("code".into()),
             client_id: client_id.into(),
@@ -2354,10 +2840,7 @@ mod tests {
         let store = test_store();
         // Registered directly (bypassing DCR, which would reject it) so the failure
         // is the redirect eligibility check, not an unknown client.
-        store.clients.write().await.insert(
-            "client-x".into(),
-            super::ClientReg { redirect_uris: vec!["http://evil.example/cb".into()] },
-        );
+        store.clients.seed("client-x", vec!["http://evil.example/cb"]).await;
         let mk = || super::AuthorizeQuery {
             response_type: Some("code".into()),
             client_id: "client-x".into(),
@@ -2397,10 +2880,7 @@ mod tests {
     async fn authorize_missing_pkce_is_friendly_for_browsers() {
         use axum::extract::{Query, State};
         let store = test_store();
-        store.clients.write().await.insert(
-            "client-x".into(),
-            super::ClientReg { redirect_uris: vec!["https://claude.ai/api/mcp/auth_callback".into()] },
-        );
+        store.clients.seed("client-x", vec!["https://claude.ai/api/mcp/auth_callback"]).await;
         let mk = || super::AuthorizeQuery {
             response_type: Some("code".into()),
             client_id: "client-x".into(),

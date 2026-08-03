@@ -23,7 +23,12 @@
 # place; defining it in both means the environment copy silently wins. The
 # `production` environment's protection rules apply either way.
 #   PROD_DEPLOY_SSH_KEY     private SSH key for the sudo-capable user on the host
-#   PROD_DEPLOY_HOST        user@host, e.g. ec2-user@10.118.0.61
+#   PROD_DEPLOY_HOST        user@host for the host's PRIVATE address, e.g.
+#                           ec2-user@<private-ip>. NOT the public FQDN: that resolves
+#                           to the public-facing interface, which sends the deploy out
+#                           over the internet instead of the VPN, and whose security
+#                           group does not permit 22. Staging was misconfigured this
+#                           way and failed with a connection timeout.
 #   PROD_DEPLOY_DOMAIN      public FQDN served over HTTPS
 #   PROD_DEPLOY_ACME_EMAIL  email for Let's Encrypt / ACME
 # Optional:
@@ -157,6 +162,9 @@ jobs:
       DEPLOY_DOMAIN: ${{ secrets.PROD_DEPLOY_DOMAIN }}
       DEPLOY_ACME_EMAIL: ${{ secrets.PROD_DEPLOY_ACME_EMAIL }}
       DEPLOY_KNOWN_HOSTS: ${{ secrets.PROD_DEPLOY_KNOWN_HOSTS }}
+      # Submission-specific, not host-specific: deliberately NOT PROD_-prefixed;
+      # the same repository-level secret feeds staging and production.
+      OPENAI_APPS_CHALLENGE_TOKEN: ${{ secrets.OPENAI_APPS_CHALLENGE_TOKEN }}
 
   # Attach the binary that was actually deployed to the tag's Release page. Without
   # this the only copy is a workflow artifact, which expires after 7 days, so the
@@ -171,7 +179,17 @@ jobs:
   # be no correct release to attach to.
   publish:
     needs: deploy
-    if: github.event_name == 'push'
+    # The event check must be combined with a status function, not left bare. An `if:`
+    # with no status function gets an implicit success() over the whole upstream chain,
+    # and that chain contains validate-ref, which is SKIPPED on a tag push — so a bare
+    # `github.event_name == 'push'` never passed on the only path this job is gated to
+    # run on. It was skipped on release-2026-07-29 (run 30441720101) for exactly that
+    # reason, having never run at all since it merged.
+    #
+    # This is the same trap the deploy job above documents and works around; the fix
+    # did not get carried down to here. !failure() && !cancelled() suppresses the
+    # implicit success(), and `needs: deploy` still means a failed rollout stops this.
+    if: ${{ !failure() && !cancelled() && github.event_name == 'push' }}
     runs-on: ubuntu-latest
     permissions:
       # Everything else in this repo runs read-only. An explicit block replaces the

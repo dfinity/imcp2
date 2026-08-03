@@ -1,0 +1,169 @@
+<!DOCTYPE html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>ICP MCP Support</title>
+<style>
+/* Shares the connect flow's ICP identity (see connect.css): parchment grid,
+   editorial serif, rust accent, "Hosted by DFINITY" mark, light/dark themes.
+   Duplicated rather than imported so the page stays a single self-contained
+   document (no external fonts, scripts, images, or stylesheets). */
+:root {
+  color-scheme: light dark;
+  --bg: #faf9f5;
+  --surface: #ffffff;
+  --ink: #1a1a1a;
+  --secondary: #4b4943;
+  --muted: #868078;
+  --accent: #a8482b;
+  --hairline: #e7e3da;
+  --grid: rgba(26, 26, 26, 0.04);
+  --font-display: ui-serif, "Iowan Old Style", Georgia, Cambria, "Times New Roman", serif;
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14110d; --surface: #1c1813; --ink: #f0ebe0; --secondary: #cfc7b8;
+    --muted: #9a9384; --accent: #c25a37; --hairline: #342e25; --grid: rgba(240, 235, 224, 0.05);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: var(--font-ui);
+  line-height: 1.6;
+  color: var(--ink);
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(to right, var(--grid) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+.doc {
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 3.5rem 1.5rem 1rem;
+}
+.eyebrow {
+  margin: 0 0 0.75rem;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--secondary);
+}
+.eyebrow a { color: inherit; text-decoration: none; }
+.eyebrow a:hover { color: var(--accent); }
+h1 {
+  margin: 0 0 0.5rem;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: clamp(2rem, 6vw, 2.6rem);
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+.effective { margin: 0 0 2.5rem; font-size: 0.95rem; color: var(--muted); }
+h2 {
+  margin: 2.5rem 0 0.75rem;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 1.45rem;
+  line-height: 1.25;
+  letter-spacing: -0.005em;
+}
+p, li { color: var(--secondary); text-wrap: pretty; }
+p { margin: 0 0 1rem; }
+ul { margin: 0 0 1rem; padding-left: 1.4rem; }
+li { margin-bottom: 0.75rem; }
+strong { color: var(--ink); font-weight: 600; }
+a { color: var(--accent); }
+code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  padding: 0.1em 0.35em;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+}
+.hosted {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.85rem;
+  padding: 2.5rem 1.5rem 2.75rem;
+}
+.hosted-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--secondary);
+}
+.hosted-logo {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.5rem 0.9rem;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+}
+.dfinity-logo { height: 1.1rem; width: auto; color: var(--ink); }
+</style></head>
+<body>
+<main class=doc>
+<p class=eyebrow><a href="/">ICP MCP</a></p>
+<h1>Support</h1>
+<p class=effective>Help with the ICP MCP connector, hosted by DFINITY.</p>
+
+<h2>Contact us</h2>
+
+<p>Email <a href="mailto:mcp@dfinity.org"><strong>mcp@dfinity.org</strong></a>
+for any question about the connector: something not working, a question about
+what it can do, feedback, or a data-protection request. To help us help you
+quickly, include which AI assistant you were using (Claude, ChatGPT, or
+another MCP client), what you asked it to do, roughly when it happened, and
+any error message you saw. Please never include recovery phrases, private
+keys, or passwords in an email; we will never ask for them.</p>
+
+<h2>Check the Service first</h2>
+
+<p>The live status of this deployment and the Internet Identity service it
+depends on is at <a href="/status/">mcp.internetcomputer.org/status/</a>. If
+something just stopped working, that page usually says why.</p>
+
+<h2>Manage or revoke access</h2>
+
+<p>You can review every AI-assistant connection authorized for your Internet
+Identity, and revoke any of them, at
+<a href="https://id.ai/manage/settings">id.ai/manage/settings</a>. Revoking there
+works even if you no longer remember which assistant or session holds the
+connection.</p>
+
+<h2>Report a bug</h2>
+
+<p>The connector is developed in the open at
+<a href="https://github.com/dfinity/imcp2">github.com/dfinity/imcp2</a>;
+bug reports are welcome as
+<a href="https://github.com/dfinity/imcp2/issues">GitHub issues</a>. If you
+are unsure whether something is a bug, email us instead.</p>
+
+<h2>Report a security vulnerability</h2>
+
+<p>Please do not report security vulnerabilities in public issues. Disclose
+them through the
+<a href="https://hackenproof.com/programs/internet-computer-protocol">Internet
+Computer bug bounty on Hackenproof</a>, per the project's
+<a href="https://github.com/dfinity/imcp2/blob/main/SECURITY.md">security
+policy</a>.</p>
+
+<h2>Privacy</h2>
+
+<p>How the Service handles personal data is described in the
+<a href="/privacy-policy">ICP MCP Privacy Policy</a>. Requests to exercise
+your data-protection rights go to
+<a href="mailto:mcp@dfinity.org">mcp@dfinity.org</a>.</p>
+</main>
+<footer class=hosted><span class=hosted-label>Hosted by</span>
+<span class=hosted-logo>__LOGO__</span></footer>
+</body></html>

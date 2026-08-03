@@ -18,9 +18,9 @@ import {
 } from "./checks.js";
 import {
   commitUrl,
-  deriveIiOrigin,
   isAllowedOrigin,
   normaliseOrigin,
+  parseAdvertisedInstances,
   resolveConfig,
 } from "./config.js";
 
@@ -98,10 +98,76 @@ test("parseCspDirective extracts a directive's sources", () => {
   assert.equal(parseCspDirective(null, "form-action"), undefined);
 });
 
-test("deriveIiOrigin strips the mcp. label", () => {
-  assert.equal(deriveIiOrigin("https://mcp.beta.id.ai"), "https://beta.id.ai");
-  assert.equal(deriveIiOrigin("https://mcp.id.ai"), "https://id.ai");
-  assert.equal(deriveIiOrigin("https://example.com"), undefined);
+test("parseAdvertisedInstances reads every served mount from /version", () => {
+  const { instances, rejected } = parseAdvertisedInstances({
+    instances: [
+      {
+        name: "prod",
+        mcp_path: "/mcp",
+        ii_origin: "https://id.ai",
+        ii_canister: "rdmx6-jaaaa-aaaaa-aaadq-cai",
+      },
+      {
+        name: "beta",
+        mcp_path: "/mcp-beta",
+        ii_origin: "https://beta.id.ai",
+        ii_canister: "fgte5-ciaaa-aaaad-aaatq-cai",
+      },
+    ],
+  });
+  assert.deepEqual(rejected, []);
+  assert.deepEqual(
+    instances.map((i) => [i.name, i.mcpPath, i.origin]),
+    [
+      ["prod", "/mcp", "https://id.ai"],
+      ["beta", "/mcp-beta", "https://beta.id.ai"],
+    ],
+  );
+  assert.equal(instances[0].iiCanister, "rdmx6-jaaaa-aaaaa-aaadq-cai");
+});
+
+// The whole point of reading the pairing instead of deriving it: an MCP origin
+// that is not a subdomain of its II. The old `strip the mcp. label` rule turned
+// mcp.internetcomputer.org into internetcomputer.org, an unrelated site whose
+// 404 on /mcp read as an Internet Identity outage on a healthy deployment.
+test("advertised instances are unrelated to the MCP hostname", () => {
+  const { instances } = parseAdvertisedInstances({
+    instances: [{ name: "prod", mcp_path: "/mcp", ii_origin: "https://id.ai" }],
+  });
+  assert.deepEqual(
+    instances.map((i) => i.origin),
+    ["https://id.ai"],
+  );
+});
+
+// Advertised origins come from a remote response, so the allowlist still gates
+// them: a server must not be able to point these probes at a third party.
+test("parseAdvertisedInstances rejects origins outside the allowlist", () => {
+  const { instances, rejected } = parseAdvertisedInstances({
+    instances: [
+      { name: "prod", mcp_path: "/mcp", ii_origin: "https://id.ai" },
+      { name: "evil", mcp_path: "/x", ii_origin: "https://attacker.example" },
+      { name: "junk", mcp_path: "/y", ii_origin: "not a url" },
+    ],
+  });
+  assert.deepEqual(
+    instances.map((i) => i.name),
+    ["prod"],
+  );
+  assert.deepEqual(
+    rejected.map((r) => r.name),
+    ["evil", "junk"],
+  );
+  assert.match(rejected[0].reason, /allowlist/);
+});
+
+test("parseAdvertisedInstances tolerates a build with no instances[]", () => {
+  for (const raw of [{}, undefined, null, { instances: "nope" }]) {
+    assert.deepEqual(parseAdvertisedInstances(raw), {
+      instances: [],
+      rejected: [],
+    });
+  }
 });
 
 test("commitUrl builds a GitHub link only for real SHAs", () => {
@@ -119,11 +185,24 @@ test("normaliseOrigin rejects origins with a path", () => {
   assert.throws(() => normaliseOrigin("https://mcp.beta.id.ai/mcp"));
 });
 
-test("resolveConfig derives the II origin from the MCP origin", () => {
+test("resolveConfig leaves the II origin unset unless pinned", () => {
   const cfg = resolveConfig({ mcpOrigin: "https://mcp.beta.id.ai" });
   assert.equal(cfg.mcpOrigin, "https://mcp.beta.id.ai");
-  assert.equal(cfg.iiOrigin, "https://beta.id.ai");
-  assert.equal(cfg.iiOriginSource, "derived");
+  // No derivation: the server's /version is the authority on its pairing.
+  assert.equal(cfg.iiOverride, undefined);
+
+  const pinned = resolveConfig({
+    mcpOrigin: "https://mcp.beta.id.ai",
+    iiOrigin: "https://beta.id.ai",
+  });
+  assert.equal(pinned.iiOverride, "https://beta.id.ai");
+  // A pinned origin is still allowlist-checked.
+  assert.throws(() =>
+    resolveConfig({
+      mcpOrigin: "https://mcp.beta.id.ai",
+      iiOrigin: "https://attacker.example",
+    }),
+  );
 });
 
 test("isAllowedOrigin enforces the host allowlist (SSRF guard)", () => {
@@ -298,18 +377,44 @@ test("checkMcpEndpoints flags a missing hosted-redirect allow-list", async () =>
   }
 });
 
-test("checkLinkage resolves the II origin without a live-discovery probe", () => {
-  const { section, iiOrigin } = checkLinkage(
-    "https://mcp.beta.test",
-    undefined,
-    "derived",
+test("checkLinkage reports one target per advertised instance", () => {
+  const { section } = checkLinkage(
+    "https://mcp.internetcomputer.org",
+    [
+      { name: "prod", mcpPath: "/mcp", origin: "https://id.ai" },
+      { name: "beta", mcpPath: "/mcp-beta", origin: "https://beta.id.ai" },
+    ],
+    [],
+    "advertised by the server at /version",
   );
-  assert.equal(iiOrigin, "https://beta.test");
   assert.equal(section.status, "pass");
-  // Only the target check remains; the obsolete live-discovery check is gone.
-  assert.equal(section.checks.length, 1);
-  assert.equal(section.checks[0].id, "ii-target");
+  assert.deepEqual(
+    section.checks.map((c) => c.id),
+    ["ii-target:prod", "ii-target:beta"],
+  );
+  assert.match(byId(section, "ii-target:prod").detail, /https:\/\/id\.ai/);
+  // The obsolete live-discovery check is gone.
   assert.equal(byId(section, "ii-discovery"), undefined);
+});
+
+test("checkLinkage fails when the server advertises no II instance", () => {
+  const { section } = checkLinkage("https://mcp.test", [], [], "n/a");
+  assert.equal(section.status, "fail");
+  assert.equal(byId(section, "ii-target").status, "fail");
+  assert.match(byId(section, "ii-target").detail, /advertises no II instances/);
+});
+
+// A rejected origin must be visible, not silently dropped — otherwise the
+// section reads as fully monitored while covering less than it claims.
+test("checkLinkage surfaces advertised origins the allowlist rejected", () => {
+  const { section } = checkLinkage(
+    "https://mcp.test",
+    [{ name: "prod", mcpPath: "/mcp", origin: "https://id.ai" }],
+    [{ name: "evil", origin: "https://attacker.example", reason: "not allowed" }],
+    "advertised by the server at /version",
+  );
+  assert.equal(section.status, "warn");
+  assert.equal(byId(section, "ii-target-rejected:evil").status, "warn");
 });
 
 test("checkIiHealth verifies the /mcp delegation flow and config", async () => {
@@ -403,6 +508,49 @@ test("checkIiHealth passes on a served /mcp even with loopback-only form-action"
   } finally {
     restore();
   }
+});
+
+// With more than one served instance the check ids are suffixed so the two
+// sections don't collide; buildSuggestions must still match them.
+test("checkIiHealth suffixes its check ids per instance", async () => {
+  const ii = "https://beta.test";
+  const restore = stubFetch({
+    [`GET ${ii}/`]: resp(200, { headers: { "ic-certificate": "certificate=:a:" } }),
+    [`GET ${ii}/mcp`]: resp(200),
+    [`GET ${ii}/.config`]: resp(200, {
+      headers: { "content-type": "text/plain" },
+      body: `record { backend_canister_id = principal "fgte5-ciaaa-aaaad-aaatq-cai"; }`,
+    }),
+  });
+  try {
+    const { section } = await checkIiHealth(ii, "https://mcp.test", 2000, "beta");
+    assert.equal(section.id, "ii-health:beta");
+    assert.match(section.title, /beta/);
+    assert.equal(byId(section, "ii-mcp-flow:beta").status, "pass");
+    // Unsuffixed ids must NOT appear once an instance is named.
+    assert.equal(byId(section, "ii-mcp-flow"), undefined);
+  } finally {
+    restore();
+  }
+});
+
+test("buildSuggestions names which instance's /mcp flow failed", () => {
+  const sections = [
+    {
+      id: "ii-health:beta",
+      title: "",
+      status: "fail",
+      checks: [
+        { id: "ii-mcp-flow:prod", status: "pass" },
+        { id: "ii-mcp-flow:beta", status: "fail" },
+      ],
+    },
+  ];
+  const suggestions = buildSuggestions(sections, {});
+  const hit = suggestions.find((s) => s.includes("/mcp"));
+  assert.ok(hit, "expected a suggestion about the /mcp connect flow");
+  assert.match(hit, /beta/);
+  assert.doesNotMatch(hit, /prod/);
 });
 
 test("buildSuggestions surfaces a /mcp delegation flow failure", () => {

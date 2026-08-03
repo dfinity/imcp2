@@ -1,0 +1,496 @@
+<!DOCTYPE html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>ICP MCP Privacy Policy</title>
+<style>
+/* Shares the connect flow's ICP identity (see connect.css): parchment grid,
+   editorial serif, rust accent, "Hosted by DFINITY" mark, light/dark themes.
+   Duplicated rather than imported so the page stays a single self-contained
+   document (no external fonts, scripts, images, or stylesheets). */
+:root {
+  color-scheme: light dark;
+  --bg: #faf9f5;
+  --surface: #ffffff;
+  --ink: #1a1a1a;
+  --secondary: #4b4943;
+  --muted: #868078;
+  --accent: #a8482b;
+  --hairline: #e7e3da;
+  --grid: rgba(26, 26, 26, 0.04);
+  --font-display: ui-serif, "Iowan Old Style", Georgia, Cambria, "Times New Roman", serif;
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14110d; --surface: #1c1813; --ink: #f0ebe0; --secondary: #cfc7b8;
+    --muted: #9a9384; --accent: #c25a37; --hairline: #342e25; --grid: rgba(240, 235, 224, 0.05);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: var(--font-ui);
+  line-height: 1.6;
+  color: var(--ink);
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(to right, var(--grid) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+.doc {
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 3.5rem 1.5rem 1rem;
+}
+.eyebrow {
+  margin: 0 0 0.75rem;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--secondary);
+}
+.eyebrow a { color: inherit; text-decoration: none; }
+.eyebrow a:hover { color: var(--accent); }
+h1 {
+  margin: 0 0 0.5rem;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: clamp(2rem, 6vw, 2.6rem);
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+.effective { margin: 0 0 2.5rem; font-size: 0.95rem; color: var(--muted); }
+h2 {
+  margin: 2.5rem 0 0.75rem;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 1.45rem;
+  line-height: 1.25;
+  letter-spacing: -0.005em;
+}
+p, li { color: var(--secondary); text-wrap: pretty; }
+p { margin: 0 0 1rem; }
+ul { margin: 0 0 1rem; padding-left: 1.4rem; }
+li { margin-bottom: 0.75rem; }
+strong { color: var(--ink); font-weight: 600; }
+a { color: var(--accent); }
+code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  padding: 0.1em 0.35em;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+}
+.hosted {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.85rem;
+  padding: 2.5rem 1.5rem 2.75rem;
+}
+.hosted-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--secondary);
+}
+.hosted-logo {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.5rem 0.9rem;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 1rem;
+  font-size: 0.95rem;
+}
+th, td {
+  text-align: left;
+  vertical-align: top;
+  padding: 0.6rem 0.8rem 0.6rem 0;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--secondary);
+}
+th { color: var(--ink); font-weight: 600; }
+td:first-child, th:first-child { padding-right: 1.2rem; width: 34%; }
+.needs-input {
+  display: block;
+  margin: 0 0 1rem;
+  padding: 0.7rem 0.9rem;
+  border-left: 3px solid var(--accent);
+  background: var(--surface);
+  font-size: 0.92rem;
+  color: var(--secondary);
+}
+.dfinity-logo { height: 1.1rem; width: auto; color: var(--ink); }
+</style></head>
+<body>
+<main class=doc>
+<p class=eyebrow><a href="/">ICP MCP</a></p>
+<h1>ICP MCP Privacy Policy</h1>
+<p class=effective>Effective date: August 3, 2026</p>
+
+<p>We, DFINITY Stiftung, Genferstrasse 11, 8002 Z&uuml;rich, Switzerland
+("DFINITY Foundation") disclose in this ICP MCP Privacy Policy ("Privacy
+Policy") how we process personal data in connection with the ICP MCP server
+(the "Service"), which lets an AI assistant interact with the Internet
+Computer and its ecosystem of applications on your behalf.</p>
+
+<p>This Privacy Policy covers the Service at
+<code>mcp.internetcomputer.org</code>, together with any pre-release
+deployments of the same software that we operate.</p>
+
+<p>It covers both authenticated use, where you have signed in with Internet
+Identity, and unauthenticated use: browsing the Service's public pages or
+using the tools that read public network information generates requests and
+technical logs even when you never sign in.</p>
+
+<p>This Privacy Policy does not apply to other data processing, including:
+processing by your AI assistant's provider (for example, Anthropic for
+Claude), under its own terms and privacy policy; processing by Internet
+Identity, which is covered by the
+<a href="https://identitysupport.dfinity.org/hc/en-us/articles/36662081856148-DFINITY-Internet-Identity-Privacy-Policy">Internet
+Identity Privacy Policy</a>; and processing by the applications you choose to
+interact with through the Service, which are operated by third parties under
+their own policies.</p>
+
+<h2>How signing in works, and what the Service holds</h2>
+
+<p>The Internet Computer is a public network that runs applications reliably
+using a consensus protocol. The Service lets an AI assistant read public
+information from it without any sign-in.</p>
+
+<p>For an assistant to act on your behalf, you sign in once with Internet
+Identity. <strong>Your long-term authentication credentials never leave
+Internet Identity</strong>: your passkeys, recovery phrase, and any linked
+accounts stay there, are never entered into the chat, and are never shared
+with the Service.</p>
+
+<p>What the Service does hold, once you approve a connection, is a
+<strong>delegated session signing key that the Service generates
+itself</strong>, inside the server. No secret key crosses a network in either
+direction: your credentials stay with Internet Identity, and the Service's
+key never leaves the Service. What travels is only the key's public half,
+which Internet Identity signs, issuing a time-limited, scope-limited
+authorization for that key to act as you. The Service uses the session key
+with Internet Identity to obtain, for each application you interact with, a
+further short-lived authorization and per-application key (the connection
+material described in section 1), and those per-application keys are what
+actually sign your requests. All of these are signing credentials the
+Service generated itself, so it is worth being precise about their limits:
+none of them is your Internet Identity key, none can be used to sign in as
+you anywhere else, and revoking the connection stops them in the two steps
+described in section 7. Separately, your AI assistant holds an OAuth access
+token that lets it reach the Service; that token's lifetime is capped by the
+same authorization.</p>
+
+<p>On the Internet Identity consent screen you make two explicit choices: how
+long the connection lasts (from 10 minutes up to 30 days), and its access
+level:</p>
+
+<ul>
+<li><strong>"Questions only"</strong> lets the assistant read. Read access is
+not the same as harmless: acting as you, the Service can retrieve data that
+applications show only to you, including account balances, holdings, and
+activity history, and those results are returned to your assistant. What this
+level prevents is <em>changing</em> anything.</li>
+<li><strong>"Actions &amp; questions"</strong> additionally lets the assistant
+submit actions that change state.</li>
+</ul>
+
+<p>For a "Questions only" connection, the Internet Computer network itself
+rejects action requests; the restriction does not depend on the Service
+alone.</p>
+
+<p><strong>The authorization is not restricted to particular
+applications.</strong> Whichever level you choose applies to any application
+your assistant is directed to: the Service derives a per-application identity
+on demand for whichever application is named at the time. Combined with a
+duration of up to 30 days, that is a broad credential, so choose the shortest
+duration that suits your task, and revoke connections you are no longer using
+at <a href="https://id.ai/manage/settings">id.ai/manage/settings</a>.</p>
+
+<p>The Service does not profile individual users, does not use advertising,
+and does not use tracking cookies. It sets one transient, security-purpose
+cookie during sign-in, described below.</p>
+
+<h2>1. Data Categories Processed, Purposes, and Legal Bases</h2>
+
+<p>We process the following categories, solely to provide, secure, and improve
+the Service.</p>
+
+<p><strong>Session and authorization data</strong>: the delegated session
+signing key and the session duration and access level you chose. Purpose:
+performing the requests your assistant makes. Legal basis: performance of the
+service you requested. During sign-in the Service also sets one transient cookie
+(<code>mcp_connect</code>; HttpOnly, Secure, SameSite=Lax), set and read by the
+server only and not accessible to scripts in web pages. It binds the sign-in
+to the browser that started it, protecting you against session-fixation
+attacks, and is not used for tracking. Legal basis: our legitimate interest in
+securing the sign-in, and it is strictly necessary for a function you
+requested.</p>
+
+<p><strong>Requests and their results</strong>: the requests your assistant
+makes (application and canister identifiers, method names, query and call
+arguments) and <strong>the results returned for them</strong>. Both can
+contain arbitrary personal data: your own, and data about third parties held
+by the applications you query. Depending on what you ask for, results may
+include account names and numbers, balances and holdings, activity and
+timestamps, identifiers, web addresses, and application-specific records. The
+Service encodes, signs, forwards, and returns this data; it processes it
+transiently to execute each call and does not store it after the call
+completes, with one exception, the per-application connection material
+described below. It does not store conversation content. Legal basis:
+performance of the service you requested.</p>
+
+<p><strong>Account information</strong>: when your assistant uses tools that
+list your Internet Identity accounts at an application, or that ask which
+identity you use there, the Service processes those account names, numbers,
+and last-used timestamps, and the per-application identity in question. A
+per-application identity is a pseudonym specific to that application;
+depending on how you use that application, you may consider it private. Not
+stored after the session; the account number and application used for an
+authenticated call are kept during the session as part of the connection
+material described next. Legal basis: performance of the service you
+requested.</p>
+
+<p><strong>Per-application connection material</strong>: the first time your
+assistant acts at a given application, the Service derives the identity you
+use there and keeps, for the remainder of the session: the application's
+domain, the account number used, the per-application key it generated, and
+Internet Identity's signed authorization for that application (itself valid
+for at most one hour). Keeping this avoids re-deriving an authorization on
+every call to the same application. The Service's own origin is treated as
+one such application when you use the canister-management tools, and the
+identity derived for it is stable across your connections. All of this is
+held in memory only, bounded in size, and discarded when the session ends or
+the Service restarts. Legal basis: performance of the service you
+requested.</p>
+
+<p><strong>Connection (OAuth) data</strong>: when an assistant connects, the
+Service stores its registration: a generated client identifier, the
+assistant's redirect address, and a last-used timestamp, plus short-lived
+authorization codes and access tokens. A registration describes assistant
+software rather than you, but we treat it as pseudonymous personal data,
+because a redirect address can identify an organisation, a deployment, or a
+device. Legal basis: performance of the service you requested.</p>
+
+<p><strong>Technical logs</strong>: see section 5 for exactly what these
+contain. Purposes: operating, securing, and debugging the Service, and abuse
+prevention. Legal basis: our legitimate interest in keeping the Service
+available, secure, and free of abuse.</p>
+
+<p><strong>Aggregated operational metrics</strong>: counts such as how many
+connections are active and how often errors occur. These are aggregates and do
+not identify individual users. Purpose: operating and improving the Service.
+Legal basis: our legitimate interest in understanding and improving how the
+Service performs.</p>
+
+<h2>2. Who Receives Data</h2>
+
+<p>Using the Service necessarily sends data to others. In order of how
+directly each one is involved:</p>
+
+<p><strong>Your AI assistant, and its provider.</strong> Everything the
+Service returns goes back to the assistant that asked for it. That includes
+results you requested that contain private, account-specific data, your
+account names, and your per-application identities. Your assistant's provider
+(for example, Anthropic for Claude) processes that data under its own terms
+and privacy policy, not this one. This is inherent to using an AI assistant as
+the interface.</p>
+
+<p><strong>The Internet Computer network.</strong> Your requests are executed
+by the network's nodes, which are operated by independent node providers in a
+number of countries, and reach it through public API boundary nodes
+(<code>icp-api.io</code>). Internet Identity (<code>id.ai</code>)
+authenticates you. These are part of the Internet Computer and are governed by
+its DAO, the Network Nervous System, rather than operated by DFINITY
+Foundation.</p>
+
+<p><strong>The applications you choose.</strong> A question or action you
+direct at an application carries your request and your per-application
+identity to that application and its operator, who may be anyone. What an
+application records, retains, or publishes is governed by that application,
+not by this Privacy Policy, and may be publicly accessible. Actions that
+change state become part of that application's state on a public network.</p>
+
+<p><strong>Websites you ask the Service to look up.</strong> When you ask it
+to find the application behind a web address, the Service fetches metadata
+from that address, which discloses the request to whoever runs that site.</p>
+
+<p><strong>Two services DFINITY Foundation operates</strong>: the public
+canister-metadata service at <code>dashboard.internetcomputer.org</code> and
+the developer-skills service at <code>skills.internetcomputer.org</code>.</p>
+
+<p><strong>Our hosting provider.</strong> The Service runs on servers we rent
+from Amazon Web Services, which processes data on our behalf as a processor
+under its data-processing terms. We use no other infrastructure processors
+today; if an observability or error-reporting provider is ever introduced, it
+will be named here first.</p>
+
+<p>We do not sell your data, and we do not share it with third parties for
+their own purposes.</p>
+
+<h2>3. International Transfers</h2>
+
+<p>The Service's servers, and the technical logs they hold, are located in
+<strong>Germany</strong> (Amazon Web Services' Frankfurt region). Germany is a
+member of the European Economic Area, whose countries are recognised by the
+Swiss Federal Council as providing adequate data protection, so no additional
+transfer safeguard is required for this hosting. Amazon Web Services may have
+limited remote access from other countries for support and operations; that
+access is governed by its data-processing terms, which incorporate the
+recognised safeguards for such transfers.</p>
+
+<p>Separately, and by design, the Internet Computer is a global public
+network: its nodes are operated by independent providers in many countries, so
+requests you submit and anything you write to an application are processed
+internationally and outside our control. That is inherent to using a public
+network rather than a transfer we arrange.</p>
+
+<h2>4. Data Retention</h2>
+
+<table>
+<tr><th>Category</th><th>Retained</th></tr>
+<tr><td>Session and authorization data (signing key, access level,
+duration)</td><td>In volatile memory only, never written to disk. Discarded
+when the duration you chose elapses (at most 30 days) or when the Service
+restarts, whichever comes first.</td></tr>
+<tr><td>Requests and results</td><td>Processed transiently; not retained
+after the call completes.</td></tr>
+<tr><td>Per-application connection material (application domain, account
+number, per-application key, signed authorization)</td><td>In memory, per
+session; an entry is replaced when refreshed and all are discarded when the
+session ends or the Service restarts. The signed authorization itself expires
+at most one hour after issue.</td></tr>
+<tr><td>Authorization codes and access tokens</td><td>In memory only; codes
+expire after two minutes, tokens no later than the session duration you
+chose.</td></tr>
+<tr><td>Connection (OAuth) registrations</td><td>Stored on disk so an
+assistant can reconnect across restarts. There is currently <strong>no time
+limit</strong>: a registration is kept until it is displaced once the store
+reaches its cap of 10,000, which for a rarely-used deployment can mean
+indefinitely.</td></tr>
+<tr><td>Technical logs</td><td>Up to three months, then deleted.</td></tr>
+<tr><td>Aggregated operational metrics</td><td>Held in memory only, never
+written to disk: gauges are computed on demand, and the status dashboard
+keeps its most recent health report in memory until the next one replaces it
+or the process restarts.</td></tr>
+</table>
+
+<p>Revoking a connection takes effect in the two steps described in section
+7. Revocation does not by itself erase the session record: the delegated
+signing key and the per-application connection material stay in memory until
+the duration you originally chose elapses or the Service restarts. We intend
+to discard them as soon as a revocation is observed; until that ships, the
+table above describes the actual behaviour.</p>
+
+<h2>5. What Our Logs Contain</h2>
+
+<p>We would rather be specific than make sweeping promises, so:</p>
+
+<ul>
+<li>Every request that reaches the Service's application produces one log
+line with the HTTP method, the path, the response status, and how long it
+took. Query strings and request bodies are never included, which keeps
+single-use codes and delegations out of these logs. Requests to the status
+dashboard (<code>/status/</code>) bypass the application and produce no
+routine log line at all.</li>
+<li>Sign-in and session events log the session identifier, a per-connection
+identifier derived from that connection's key, the access level, and expiry
+times. The per-connection identifier is new for every connection, so log
+entries from different sessions cannot be linked to each other through
+it.</li>
+<li><strong>No log line records the applications or canisters you interact
+with, the arguments you send, or the results you receive.</strong> The parts
+of the Service that perform tool calls do no logging at all.</li>
+<li>Our web server is configured without access logging, so client IP
+addresses and browser user agents are not recorded as a matter of course.
+They are unavoidably processed in transit in order to serve a request, and
+its diagnostics for failed requests can include connection details and the
+requested address, including any query string, when something goes
+wrong.</li>
+<li>Logs are held by the operating system's journal on our hosts, subject to
+the retention bound above.</li>
+</ul>
+
+<h2>6. Identifiers, and What They Could Link</h2>
+
+<p>Internet Identity gives each application a different identity for you, so
+applications cannot recognise you across applications. The Service is a
+participant in that design and we want to be plain about what it can see.
+While a session is live it holds, in memory, the per-application identities
+it has derived for you, including a stable identity for you at its own origin
+that the canister-management tools act as; software holding that stable
+identity could in principle associate separate sessions with the same user.
+Three things limit that in practice: none of these identifiers is written to
+logs, which carry only a per-connection identifier that is new for every
+connection (section 5); the applications you visit are not written to logs
+either; and nothing the Service discloses to an application lets that
+application recognise you anywhere else.</p>
+
+<h2>7. Your Rights</h2>
+
+<p>Subject to the conditions in applicable law, you have the right to
+<strong>access</strong> the personal data we hold about you, to have
+inaccurate data <strong>rectified</strong>, to have data
+<strong>erased</strong>, to <strong>restrict</strong> or <strong>object
+to</strong> processing (including processing based on our legitimate
+interests), and to receive data you provided in a portable form. To exercise
+any of these, email <a href="mailto:mcp@dfinity.org">mcp@dfinity.org</a>.</p>
+
+<p>You can also act directly, without contacting us:</p>
+
+<ul>
+<li><strong>Disconnect</strong> the connector in your assistant. This stops
+that assistant using the connection, but does not by itself end the underlying
+authorization.</li>
+<li><strong>Revoke</strong> the authorization at
+<a href="https://id.ai/manage/settings">id.ai/manage/settings</a>, which lists
+every active connection for your Internet Identity so you can review and
+revoke access even if you no longer remember which assistant sessions are
+active. Revocation is carried out by Internet Identity and takes effect in
+two steps: within at most five minutes, Internet Identity stops honouring the
+connection, so the Service can no longer obtain authorizations for any
+application; authorizations already issued for particular applications remain
+usable until they expire, at most one hour after they were issued. The
+practical worst case between revoking and all activity stopping is therefore
+about one hour.</li>
+</ul>
+
+<p>If you believe we have handled your personal data unlawfully, you may lodge
+a complaint with the Swiss Federal Data Protection and Information
+Commissioner (FDPIC), and, where the GDPR applies to you, with the supervisory
+authority of your EU or EEA country of residence or workplace.</p>
+
+<p>Data you have submitted to applications on the Internet Computer through
+your own requests is held by those applications, not by the Service; requests
+about it should be directed to the relevant application operator.</p>
+
+<h2>8. Changes to This Policy</h2>
+
+<p>We may update this Privacy Policy. When we do, we will change the effective
+date at the top of this page. For changes that materially affect how we use
+your data or what an authorization permits, we will give reasonable advance
+notice before the change takes effect, and will not apply them retroactively
+to data already collected.</p>
+
+<h2>9. Contact</h2>
+
+<p>For questions about this Privacy Policy or the Service, or to exercise any
+of the rights in section 7, email
+<a href="mailto:mcp@dfinity.org">mcp@dfinity.org</a>.</p>
+</main>
+<footer class=hosted><span class=hosted-label>Hosted by</span>
+<span class=hosted-logo>__LOGO__</span></footer>
+</body></html>

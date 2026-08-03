@@ -368,6 +368,24 @@ pub(crate) const MAX_CANDID_TEXT_BYTES: usize = 1024 * 1024;
 /// concurrent session. Real Candid nests only a handful of levels; 128 is far
 /// above any legitimate value/interface yet far below the stack-overflow depth.
 pub(crate) const MAX_CANDID_DEPTH: usize = 128;
+/// Maximum number of `type` declarations in caller-supplied `.did` text.
+///
+/// [`MAX_CANDID_DEPTH`] measures INLINE nesting only, so it cannot see the
+/// recursion a chain of sibling aliases forces:
+/// `type t0 = opt t1; type t1 = opt t2; …` is flat — every alias is depth 1, and
+/// the prefix frame pops at the `;` — yet resolving `t0` recurses once per link.
+/// `candid_parser`'s type checker and `candid`'s type-table serializer both walk
+/// that chain without a depth limit of their own, so within
+/// [`MAX_CANDID_TEXT_BYTES`] an attacker packs tens of thousands of links and
+/// drives an unrecoverable stack-overflow **process abort** (CWE-674). Measured
+/// on a release build: ~10k links overflow a 2 MiB tokio worker stack. Checking
+/// the chain is also QUADRATIC — 1k links ≈ 125 ms, 8k ≈ 10 s, so an interface
+/// that fits the byte cap can burn minutes of CPU before it ever overflows.
+///
+/// 1024 bounds both: ~125 ms of checking, and a resolution depth ~90× below what
+/// [`CANDID_PARSE_STACK_BYTES`] absorbs. Real interfaces are far smaller — NNS
+/// governance, the largest in common use, declares under 200 types.
+pub(crate) const MAX_CANDID_TYPE_DECLS: usize = 1024;
 
 /// Stack given to the thread that parses untrusted textual Candid. Tool handlers
 /// run on tokio worker threads with a 2 MiB stack; 32× that is a wide margin —
@@ -480,6 +498,14 @@ pub(crate) fn on_deep_stack<T: Send>(f: impl FnOnce() -> T + Send) -> Option<T> 
 /// must NOT open a string, or the scan would desynchronize from the parser and
 /// under-count). It is a conservative over-approximation that tracks the parser's
 /// container recursion without under-counting nested `opt`/`vec`/bracket levels.
+///
+/// Inline depth is not the whole story: a `.did` can force recursion that is
+/// nowhere visible in its nesting, by chaining sibling type aliases. So the scan
+/// also counts `type` declarations and holds them to [`MAX_CANDID_TYPE_DECLS`],
+/// which bounds the longest possible alias chain. Counting the bare word is exact
+/// — Candid lexes `type` as a keyword, never an identifier, so it cannot appear as
+/// a field name (`record { type : nat }` is a syntax error); the quoted form
+/// `record { "type" : nat }` is a string literal, which the scan already skips.
 pub(crate) fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
     if text.len() > MAX_CANDID_TEXT_BYTES {
         return Err(format!(
@@ -489,6 +515,9 @@ pub(crate) fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
     }
     // Frames: b'B' = bracket group, b'P' = pending opt/vec prefix awaiting its value.
     let mut stack: Vec<u8> = Vec::new();
+    // `type` declarations seen so far — an upper bound on the alias-chain length,
+    // and so on the recursion resolving one costs (see MAX_CANDID_TYPE_DECLS).
+    let mut type_decls = 0usize;
     let bytes = text.as_bytes();
     let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
     // Pop the prefix frames waiting on a value that has just completed.
@@ -548,6 +577,15 @@ pub(crate) fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
                     i += 1;
                 }
                 let word = &bytes[start..i];
+                if word == b"type" {
+                    type_decls += 1;
+                    if type_decls > MAX_CANDID_TYPE_DECLS {
+                        return Err(format!(
+                            "{what} declares too many types (limit \
+                             {MAX_CANDID_TYPE_DECLS}) — refusing to parse"
+                        ));
+                    }
+                }
                 if word == b"opt" || word == b"vec" {
                     stack.push(b'P');
                     if stack.len() > MAX_CANDID_DEPTH {
@@ -661,10 +699,19 @@ pub fn decode_reply(did: Option<&str>, method: &str, bytes: &[u8]) -> String {
     if let Some(text) = did.and_then(|d| decode_bytes_with_did(d, method, bytes)) {
         return text;
     }
-    match IDLArgs::from_bytes(bytes) {
+    // Type-less fallback on the guarded deep stack (CWE-674). The reply bytes are
+    // attacker-controlled (the caller picks the target canister), and candid's decoder,
+    // `IDLArgs`' `Display`, AND the recursive `Drop` of the decoded tree each recurse
+    // once per nesting level with no depth bound; a recursive reply (`type t = opt t`:
+    // a few KB of `opt` tags) would overflow the ~2 MiB worker stack and abort the
+    // whole process. So decode, render, and drop the tree on the deep stack, exactly as
+    // the DID path already does. Not nested: the DID path's `on_deep_stack` has already
+    // returned by the time we reach here, and only the rendered `String` crosses back.
+    on_deep_stack(|| match IDLArgs::from_bytes(bytes) {
         Ok(decoded) => decoded.to_string(),
         Err(e) => format!("(call succeeded but reply is not decodable as Candid: {e})"),
-    }
+    })
+    .unwrap_or_else(|| "(could not spawn a thread to decode the reply)".to_string())
 }
 
 /// Decode Candid `bytes` against the return types of `method` declared in the
@@ -1023,17 +1070,27 @@ pub enum OqlResult {
 /// generally can't be recognized, so we fall back to `Unrecognized` with the raw
 /// reply rather than guessing.
 pub fn parse_execute_reply(did: Option<&str>, reply: &[u8]) -> OqlResult {
-    let decoded = match did.and_then(|d| decode_args_with_did(d, "execute", reply)) {
-        Some(args) => args,
-        None => match IDLArgs::from_bytes(reply) {
-            Ok(args) => args,
-            Err(e) => return OqlResult::Unrecognized(format!("(undecodable reply: {e})")),
-        },
-    };
-    match decoded.args.into_iter().next() {
-        Some(val) => extract_oql(&val).unwrap_or_else(|| OqlResult::Unrecognized(val.to_string())),
-        None => OqlResult::Unrecognized("(empty reply)".to_string()),
-    }
+    // Decode the attacker-controlled reply AND walk/render the decoded tree on the
+    // guarded deep stack (CWE-674): `from_bytes`, the recursive `extract_oql`/
+    // `cell_scalar` walk, the `Display` fallback, and the tree's recursive `Drop` all
+    // recurse once per nesting level with no depth bound. The whole thing (creation
+    // through drop of the `IDLArgs`) stays on the deep stack; only the rendered
+    // `OqlResult` (owned strings) crosses back. One `on_deep_stack`, never nested:
+    // `decode_args_with_did` now decodes in place rather than taking its own.
+    on_deep_stack(move || {
+        let decoded = match did.and_then(|d| decode_args_with_did(d, "execute", reply)) {
+            Some(args) => args,
+            None => match IDLArgs::from_bytes(reply) {
+                Ok(args) => args,
+                Err(e) => return OqlResult::Unrecognized(format!("(undecodable reply: {e})")),
+            },
+        };
+        match decoded.args.into_iter().next() {
+            Some(val) => extract_oql(&val).unwrap_or_else(|| OqlResult::Unrecognized(val.to_string())),
+            None => OqlResult::Unrecognized("(empty reply)".to_string()),
+        }
+    })
+    .unwrap_or_else(|| OqlResult::Unrecognized("(could not spawn a thread to decode the reply)".to_string()))
 }
 
 /// Decode a reply that is a single `text` value (e.g. `schema` or the API-doc
@@ -1042,16 +1099,24 @@ pub fn parse_execute_reply(did: Option<&str>, reply: &[u8]) -> OqlResult {
 /// (so nothing is silently dropped, even though these methods return one value by
 /// contract); an undecodable reply yields an explanatory string.
 pub fn decode_text_reply(reply: &[u8]) -> String {
-    let args = match IDLArgs::from_bytes(reply) {
-        Ok(a) => a,
-        Err(e) => return format!("(undecodable reply: {e})"),
-    };
-    match args.args.as_slice() {
-        [] => "(empty reply)".to_string(),
-        [IDLValue::Text(s)] => s.clone(),
-        [single] => single.to_string(),
-        _ => args.to_string(),
-    }
+    // Decode, match, render, and drop the attacker-controlled reply on the guarded
+    // deep stack (CWE-674): `from_bytes`, the `Display` of a non-text single value or
+    // the whole tuple, and the decoded tree's recursive `Drop` each recurse per nesting
+    // level, so a recursive reply would overflow the ~2 MiB worker stack and abort the
+    // process. Only the resulting `String` crosses back.
+    on_deep_stack(|| {
+        let args = match IDLArgs::from_bytes(reply) {
+            Ok(a) => a,
+            Err(e) => return format!("(undecodable reply: {e})"),
+        };
+        match args.args.as_slice() {
+            [] => "(empty reply)".to_string(),
+            [IDLValue::Text(s)] => s.clone(),
+            [single] => single.to_string(),
+            _ => args.to_string(),
+        }
+    })
+    .unwrap_or_else(|| "(could not spawn a thread to decode the reply)".to_string())
 }
 
 /// Decode a `schema` reply — a single `text` (the JSON catalogue). Pretty-print
@@ -1084,17 +1149,20 @@ pub fn api_doc_method(did: &str) -> Option<&'static str> {
 }
 
 /// Decode a reply against the declared return types of `method` in `did`,
-/// returning the structured `IDLArgs` (field names recovered). Guarded (CWE-674)
-/// like the rest of the decode path; None on any guard/parse/decode failure.
+/// returning the structured `IDLArgs` (field names recovered). None on any
+/// guard/parse/decode failure.
+///
+/// MUST run on the deep stack: it parses the untrusted `.did` and decodes the reply,
+/// both of which recurse unguarded (CWE-674), and the returned `IDLArgs` is later
+/// walked and dropped by the caller. Its sole caller ([`parse_execute_reply`]) wraps
+/// the whole decode-and-render in one [`on_deep_stack`], so this must NOT take its own
+/// (a nested `on_deep_stack` could exhaust the parse permits and wait on itself).
 fn decode_args_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<IDLArgs> {
     guard_candid_text("the `candid` interface", did).ok()?;
-    on_deep_stack(|| {
-        let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
-        let actor = actor?;
-        let func = env.get_method(&actor, method).ok()?;
-        IDLArgs::from_bytes_with_types(bytes, &env, &func.rets).ok()
-    })
-    .flatten()
+    let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
+    let actor = actor?;
+    let func = env.get_method(&actor, method).ok()?;
+    IDLArgs::from_bytes_with_types(bytes, &env, &func.rets).ok()
 }
 
 /// Recognize an OQL result value: a `record { hasMore; rows }`, optionally
@@ -1390,6 +1458,98 @@ mod tests {
         // Well under the limit: still parses and encodes (on the deep stack).
         let ok = format!("({}0)", "opt ".repeat(MAX_CANDID_DEPTH / 2));
         assert!(encode_args(None, "m", &ok).is_ok(), "legitimate nesting must still encode");
+    }
+
+    // CWE-674, flat alias chain: `type t0 = opt t1; type t1 = opt t2; …` is
+    // INLINE-shallow — every alias is depth 1 and its prefix frame pops at the
+    // `;` — so the depth scan alone never trips no matter how long the chain is.
+    // Resolving `t0` still recurses once per link, and both `candid_parser`'s
+    // type checker and `candid`'s type-table serializer follow it with no depth
+    // limit, so the byte cap was the only thing bounding the recursion. The
+    // declaration count is what actually bounds the chain.
+    #[test]
+    fn candid_guard_bounds_type_alias_chains() {
+        use super::{guard_candid_text, MAX_CANDID_TYPE_DECLS};
+        let chain = |n: usize, rhs: &dyn Fn(usize) -> String| {
+            let mut s = String::new();
+            for i in 0..n {
+                s.push_str(&format!("type t{i}={};", rhs(i)));
+            }
+            s.push_str(&format!("type t{n}=nat;service:{{m:(t0)->(t0)}}"));
+            s
+        };
+        // The reported vector, and the bare-`Var` chain that is even cheaper to
+        // pack. Both stay at inline depth 1, so only the decl cap can catch them.
+        let opt_link = |i: usize| format!("opt t{}", i + 1);
+        let var_link = |i: usize| format!("t{}", i + 1);
+        let links: [&dyn Fn(usize) -> String; 2] = [&opt_link, &var_link];
+        for rhs in links {
+            let attack = chain(20_000, rhs);
+            assert!(attack.len() < super::MAX_CANDID_TEXT_BYTES, "vector must fit the byte cap");
+            let err = guard_candid_text("d", &attack).expect_err("alias chain must be refused");
+            assert!(err.contains("too many types"), "unexpected error: {err}");
+        }
+        // The cap is the thing being enforced, exactly: at the limit, through.
+        let at_limit = chain(MAX_CANDID_TYPE_DECLS - 1, &|i| format!("opt t{}", i + 1));
+        assert!(
+            guard_candid_text("d", &at_limit).is_ok(),
+            "an interface at the declaration limit must still be accepted"
+        );
+        let over = chain(MAX_CANDID_TYPE_DECLS, &|i| format!("opt t{}", i + 1));
+        assert!(guard_candid_text("d", &over).is_err(), "one past the limit must be refused");
+
+        // No false positives. `type` is a keyword, never an identifier, so it
+        // cannot be a field name — but the QUOTED form is a legal field name, and
+        // lives inside a string literal the scan skips. Thousands of those must
+        // not be mistaken for declarations.
+        let quoted = format!("service:{{m:(record{{{}}})->()}}", "\"type\":nat;".repeat(5_000));
+        assert!(
+            guard_candid_text("d", &quoted).is_ok(),
+            "`\"type\"` field names are string content, not declarations"
+        );
+        // A realistic interface is nowhere near the cap.
+        let realistic = format!(
+            "{}service:{{ get:(t0)->(t0) query; set:(t0)->() }}",
+            (0..180)
+                .map(|i| format!("type t{i}=record{{a:nat;b:opt text}};"))
+                .collect::<String>()
+        );
+        assert!(guard_candid_text("d", &realistic).is_ok(), "real interfaces must pass");
+    }
+
+    // The alias chain arrives through the caller-supplied `candid` argument, so
+    // every entry point that parses interface text must refuse it — and refuse it
+    // the way each already handles interfaces it cannot parse, never by erroring
+    // out a call that would otherwise work.
+    #[test]
+    fn interface_entry_points_refuse_alias_chains() {
+        use super::{
+            api_doc_method, decode_bytes_with_did, encode_args, has_oql, is_query_method,
+            MAX_CANDID_TYPE_DECLS,
+        };
+        // Just past the cap: cheap to check even if the guard ever stopped firing,
+        // so a regression here shows up as a failure rather than a hung CI job.
+        let n = MAX_CANDID_TYPE_DECLS + 100;
+        let mut did = String::new();
+        for i in 0..n {
+            did.push_str(&format!("type t{i}=opt t{};", i + 1));
+        }
+        did.push_str(&format!(
+            "type t{n}=nat;service:{{m:(t0)->(t0) query;schema:()->(text) query;\
+             execute:(text)->(text) query;getApiDoc:()->(text) query}}"
+        ));
+
+        // Fail-closed detection paths: no OQL surface, no API doc, no verdict on
+        // query-vs-update (the caller then fails open and lets the IC decide).
+        assert!(!has_oql(&did), "an unparseable interface must not advertise OQL");
+        assert_eq!(api_doc_method(&did), None);
+        assert_eq!(is_query_method(&did, "m"), None);
+        // Decode falls back to type-less rather than erroring.
+        assert_eq!(decode_bytes_with_did(&did, "m", &[]), None);
+        // An over-limit `candid` is non-fatal for encoding: the typed path is
+        // skipped and the args still encode type-lessly.
+        let encoded = encode_args(Some(&did), "m", "(42 : nat)");
+        assert!(encoded.is_ok(), "an over-limit interface must not fail the call: {encoded:?}");
     }
 
     // Untrusted traffic must not be able to multiply 64 MiB parse threads with
@@ -1694,6 +1854,41 @@ mod tests {
         let multi = encode_reply(multi_did, "foo", "(\"a\", 5 : nat)");
         let out = decode_text_reply(&multi);
         assert!(out.contains("a") && out.contains('5'), "multi-value reply keeps all values: {out}");
+    }
+
+    // Every type-less reply-decode path runs on the guarded deep stack (CWE-674). The
+    // finding's repro is a recursive `opt` chain: a few KB on the wire, but it decodes
+    // to a tree whose `from_bytes` / `Display` / recursive `Drop` (and the OQL walk)
+    // recurse once per level. At attacker scale that overflows the ~2 MiB worker stack
+    // and aborts the process; the fix decodes/renders/drops on the 64 MiB stack. This
+    // exercises those paths end-to-end on a deeply-nested reply and asserts they return
+    // a rendered value rather than erroring or mishandling it. DEPTH is kept modest so
+    // CI stays fast (candid's decode/Display is superlinear in depth); it is not sized
+    // to trigger an abort, which is uncatchable and cannot be asserted on anyway.
+    #[test]
+    fn typeless_reply_paths_bound_deep_nesting() {
+        use super::{decode_reply, decode_text_reply, on_deep_stack, parse_execute_reply, OqlResult};
+        use candid::{IDLArgs, IDLValue};
+        // ~DEPTH-deep `opt opt … opt null`. Build, encode, AND drop the input tree on
+        // the deep stack too, so the test harness thread (also ~2 MiB) can't overflow
+        // while preparing the input.
+        const DEPTH: usize = 2_000;
+        let bytes = on_deep_stack(|| {
+            let mut val = IDLValue::Null;
+            for _ in 0..DEPTH {
+                val = IDLValue::Opt(Box::new(val));
+            }
+            IDLArgs::new(&[val]).to_bytes().expect("encode nested opt reply")
+        })
+        .expect("spawn deep stack to encode");
+        assert!(bytes.len() < 100_000, "nested opt is compact on the wire: {} bytes", bytes.len());
+
+        // Type-less fallback (no `.did`): decodes + renders on the deep stack.
+        assert!(decode_reply(None, "m", &bytes).contains("opt"));
+        assert!(decode_text_reply(&bytes).contains("opt"));
+        // The OQL path walks + renders the decoded tree; a non-OQL shape degrades to
+        // Unrecognized, but crucially without overflowing.
+        assert!(matches!(parse_execute_reply(None, &bytes), OqlResult::Unrecognized(_)));
     }
 
     // #1: the anonymous-empty auth note names the missing-auth diagnosis and the
