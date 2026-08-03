@@ -39,6 +39,13 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-24.04
+    # Below the probe cadence, and deliberately so. `concurrency` above lets one
+    # run at a time without cancelling, so a wedged run does not just waste a
+    # slot — it queues every later tick behind itself. With the default 6-hour
+    # job timeout that is 24 missed probes, during which the monitor reports
+    # nothing and silence is indistinguishable from health. Failing fast and
+    # letting the next tick try again is strictly better than hanging.
+    timeout-minutes: 10
     env:
       MCP_ORIGIN: https://mcp.internetcomputer.org
       # The probe refuses any origin outside its SSRF allow-list, which defaults
@@ -47,7 +54,14 @@ jobs:
       # dashboard. Without this the run fails with a usage error rather than a
       # health verdict, which is a confusing way to learn the service is fine.
       MCP_STATUS_ALLOWED_HOSTS: mcp.internetcomputer.org
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      # A boolean, not the secret. The webhook itself is scoped to the one step
+      # that posts it (below); putting it in the job environment would hand it to
+      # every step and to the checked-out probe code, none of which needs it, and
+      # log masking does not stop a process from reading its own environment.
+      # This expression evaluates to "true"/"false" without exposing the value,
+      # which is what lets the step condition stay declarative — `secrets` is not
+      # available in a step `if:`.
+      HAS_SLACK: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -55,7 +69,11 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # 20 reached end of life on 2026-04-30 and no longer gets security
+          # fixes, and this job parses responses from an internet-facing service.
+          # deploy-native.yml and the host still pin 20; bumping those is a
+          # separate change with its own blast radius.
+          node-version: 22
 
       # Deliberately NOT --strict. That flag escalates warnings to failures, and
       # a third of the suite probes Internet Identity and the IC — infrastructure
@@ -94,17 +112,26 @@ jobs:
               print("The probe did not produce usable JSON — most likely it could "
                     "not reach the host at all, which is itself the finding.")
               raise SystemExit(0)
+          # Not every value here is ours. The probed server supplies the II
+          # instance names in /version, and the dashboard interpolates them
+          # straight into check labels and section titles. A misconfigured or
+          # compromised host could therefore put a pipe, a newline or Markdown
+          # into a table cell and corrupt or spoof this summary. Escape per cell.
+          def cell(v):
+              t = "".join(ch if ch.isprintable() else " " for ch in str(v))
+              return " ".join(t.split()).replace("\\", "").replace("|", "\\|")[:120] or "?"
+
           bad = []
           for section in r.get("sections", []):
               for c in section.get("checks", []):
                   if c.get("status") in ("fail", "warn"):
                       bad.append((c.get("status"), section.get("title", "?"), c.get("label", "?")))
-          print(f"**overall: {r.get('overall')}**\n")
+          print(f"**overall: {cell(r.get('overall'))}**\n")
           if bad:
               print("| status | section | check |")
               print("|---|---|---|")
               for s, sec, lab in bad:
-                  print(f"| {s} | {sec} | {lab} |")
+                  print(f"| {cell(s)} | {cell(sec)} | {cell(lab)} |")
           else:
               print("All checks passed.")
           PY
@@ -121,9 +148,9 @@ jobs:
           except Exception:
               line = "the probe produced no usable report (the host may be unreachable)"
           # $GITHUB_OUTPUT is line-oriented, so a newline in a value would let
-          # the value declare further outputs. The labels are our own static
-          # strings today, but sanitising here costs nothing and keeps this from
-          # becoming a hazard if a future check ever interpolates a server value.
+          # the value declare further outputs. This is not hypothetical: check
+          # labels embed the II instance names the probed server advertises, so
+          # part of this string originates outside our control.
           line = " ".join(line.split())[:400]
           print(f"failed={line}")
           PY
@@ -138,7 +165,7 @@ jobs:
       # the notification would never have fired, while the run still went red at
       # the final step and looked correct from the outside.
       - name: Notify Slack
-        if: steps.probe.outputs.exit_code != '0' && env.SLACK_WEBHOOK_URL != ''
+        if: steps.probe.outputs.exit_code != '0' && env.HAS_SLACK == 'true'
         run: |
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           python3 - "$run_url" <<'PY' > payload.json
@@ -151,9 +178,14 @@ jobs:
           )
           json.dump({"text": text}, sys.stdout)
           PY
-          curl -sS --fail-with-body -X POST -H 'Content-type: application/json' \
+          # --max-time so a stalled webhook cannot eat the job's budget and
+          # queue every later tick behind this one.
+          curl -sS --fail-with-body --max-time 20 \
+            -X POST -H 'Content-type: application/json' \
             --data @payload.json "$SLACK_WEBHOOK_URL"
         env:
+          # Scoped to this step alone — the only one that needs it.
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           FAILED: ${{ steps.summary.outputs.failed }}
 
       # Re-raise the probe's verdict so the run itself is red. This is the
