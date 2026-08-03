@@ -142,16 +142,18 @@ const II_CANISTER_ID_PROD_DEFAULT: &str = "rdmx6-jaaaa-aaaaa-aaadq-cai";
 const RECONNECT_MSG: &str = "Your Internet Identity session is over (the grant expired, was revoked, \
      or was replaced by a newer connection). Reconnect with Internet Identity to continue — do not retry.";
 
-/// Shown when a tool needs update (write) access but the II session is read-only
-/// (`permissions = "queries"` — the default when the user just clicks "Allow" on
-/// II's consent screen, which defaults to read-only). The IC rejects update calls
-/// made through a read-only session's delegations at ingress, which would
+/// Shown when a tool needs update (write) access but the II session is
+/// query-only (`permissions = "queries"`). II's consent screen requires the user
+/// to pick an access level — "Questions only" or "Actions & questions" — and this
+/// is what the former grants; there is no read-only toggle to turn off, so the
+/// message names the choice the user actually has to make. The IC rejects update
+/// calls made through such a session's delegations at ingress, which would
 /// otherwise surface as an opaque low-level rejection — so we stop early with an
 /// actionable message (H2).
-const READ_ONLY_MSG: &str = "This Internet Identity session is read-only, so it can't make changes. \
-     Creating, installing, starting, stopping, or deleting canisters — and even reading canister status \
-     — are update calls that a read-only session can't make. Reconnect with Internet Identity and turn \
-     OFF the read-only option on the consent screen, then try again.";
+const READ_ONLY_MSG: &str = "This Internet Identity session was authorized for \"Questions only\", so it \
+     can't make changes. Creating, installing, starting, stopping, or deleting canisters — and even \
+     reading canister status — are update calls a Questions-only session can't make. Reconnect with \
+     Internet Identity and choose \"Actions & questions\" on the consent screen, then try again.";
 
 /// One Internet Identity instance this server can connect users against —
 /// purely *which II* (origin + canister), nothing about where the instance is
@@ -387,8 +389,8 @@ pub struct PrincipalOutput {
     pub account: Option<String>,
     /// The principal you act as at that app.
     pub principal: String,
-    /// True if this Internet Identity session is read-only (canister
-    /// management is unavailable until reconnected with read-only OFF).
+    /// True if this Internet Identity session is query-only (canister management
+    /// is unavailable until reconnected under "Actions & questions").
     pub read_only: bool,
 }
 
@@ -815,8 +817,8 @@ impl Identities {
     }
 
     /// Guard a tool that needs update (write) access (H2): error early with an
-    /// actionable "reconnect with read-only off" message if the session is KNOWN
-    /// to be read-only. An unknown level (`None`) passes — we can't be sure the
+    /// actionable "reconnect under Actions & questions" message if the session is
+    /// KNOWN to be query-only. An unknown level (`None`) passes — we can't be sure the
     /// POST simply didn't arrive, so the call proceeds and the IC's ingress
     /// rejection (if any) surfaces as the fallback signal.
     pub async fn require_write(&self, session_id: &str) -> Result<(), String> {

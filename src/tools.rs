@@ -818,15 +818,16 @@ impl IcTools {
             Ok(p) => p.to_text(),
             Err(e) => return Ok(err(format!("could not derive principal for {}: {e}", target.origin))),
         };
-        // Surface a read-only session (H2) so the LLM won't attempt (and have the
+        // Surface a query-only session (H2) so the LLM won't attempt (and have the
         // IC reject at ingress) canister-management updates.
         let read_only = self.identities.is_read_only(&session_id).await == Some(true);
         let mut text = format!("{principal}\n\n[{}]", identity_annotation(&target, None));
         if read_only {
             text.push_str(
-                "\n\n(This Internet Identity session is READ-ONLY: reads work, but canister \
-                 management — create/install/start/stop/delete, and icp_canister_status — needs \
-                 update access. Ask the user to reconnect with the read-only option turned OFF.)",
+                "\n\n(This Internet Identity session was authorized for \"Questions only\": reads work, \
+                 but canister management — create/install/start/stop/delete, and icp_canister_status — \
+                 needs update access. Ask the user to reconnect and choose \"Actions & questions\" on \
+                 Internet Identity's consent screen.)",
             );
         }
         let output = identities::PrincipalOutput {
@@ -1356,7 +1357,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Report a canister's status: run state, cycle balance, module hash, memory size, controllers, and allocations. Controller-only (acts as your Internet Identity). This only READS status (it changes nothing), but on the IC it is an update call, so it needs a full (non-read-only) Internet Identity session. Requires an authenticated session.",
+        description = "Report a canister's status: run state, cycle balance, module hash, memory size, controllers, and allocations. Controller-only (acts as your Internet Identity). This only READS status (it changes nothing), but on the IC it is an update call, so it needs an Internet Identity session authorized for \"Actions & questions\" rather than \"Questions only\". Requires an authenticated session.",
         annotations(title = "Get canister status", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
@@ -1965,10 +1966,10 @@ impl ServerHandler for IcTools {
              credential is obtained when you connect \
              (authenticate via Internet Identity) and lasts for the session duration you choose when \
              connecting (up to 30 days); reconnect when it expires. \
-             The session may be READ-ONLY (Internet Identity's consent screen defaults to read-only): \
-             reads work, but the canister-management tools below make update calls the network \
-             rejects for a read-only session — if one fails that way, ask the user to reconnect with \
-             the read-only option turned OFF.\n\n\
+             Internet Identity's consent screen asks the user to choose an access level, \
+             \"Questions only\" or \"Actions & questions\". On a Questions-only session reads work, but \
+             the canister-management tools below make update calls the network rejects — if one fails \
+             that way, ask the user to reconnect and choose \"Actions & questions\".\n\n\
              Typical flow (acting FOR THE USER at an app): (0-2) `open_app(name-or-URL)` in ONE \
              call gives the `derivation_origin` AND the app's canisters (with `oql`/`api_doc_available` \
              flags) — pass the NAME the user said (well-known apps NNS/Oisy/MULTI/DEX/ICPSwap resolve \
