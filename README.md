@@ -29,7 +29,7 @@ host — an API boundary node or a gateway — passes in its own route-configure
 agent, so the whole process links one `ic-agent` and shares one boundary-node
 client. (`ic-agent` stays a direct dependency until
 [`ic-bn-lib`](https://github.com/dfinity/ic-bn-lib) — the shared BN/gateway
-crate it should eventually be sourced through — releases against ic-agent 0.48;
+crate it should eventually be sourced through — releases against ic-agent 0.49;
 see `Cargo.toml`.)
 
 ```rust
@@ -98,8 +98,8 @@ results).
 | `icp_lookup_canister_info_by_id` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
 | `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus two capability flags: `oql` (`true` when it exposes an OQL query surface — a `schema` + `execute` pair — with a pointer to `icp_oql_guide`) and `api_doc_available` (`true` when it declares a `getApiDoc`/`get_api_doc` method, gating `get_canister_api_doc`) |
 | `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), from its `getApiDoc`/`get_api_doc` method. Call **only** when `get_canister_candid`/`open_app` report `api_doc_available`. Returns a **structured** result in every case — `available` + the doc on success, else `available:false` with `expected`/`retry`/`next` so an expected absence is distinct from an unreachable canister |
-| `canister_query` | `canister_id`, `method?` **or** `oql?`, `args?` (textual Candid), `derivation_origin?`, `account?` | READ a canister — provide EITHER a Candid `query` `method` (with `args`) OR an `oql` query (a JSON object string, run against `execute`). A Candid `method` query may be anonymous or as your account and returns textual Candid; an `oql` query **requires** `derivation_origin` and returns `columns` + `rows` (a table) with `has_more`, validating `start` against the schema on an empty result. On an OQL canister a Candid `method` query is rejected — use `oql`. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
-| `canister_update_call` | `canister_id`, `method`, `args` (textual Candid), `derivation_origin?`, `account?` | Make an UPDATE (state-changing) call; reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`/`resolve_app`). Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
+| `canister_query` | `canister_id`, `method?` **or** `oql?`, `args?` (textual Candid), `derivation_origin?`, `account?`, `candid?` | READ a canister — provide EITHER a Candid `query` `method` (with `args`) OR an `oql` query (a JSON object string, run against `execute`). A Candid `method` query may be anonymous or as your account and returns textual Candid; an `oql` query **requires** `derivation_origin` and returns `columns` + `rows` (a table) with `has_more`, validating `start` against the schema on an empty result. On an OQL canister a Candid `method` query is rejected — use `oql`. `candid` is a fallback: the `.did` interface text to encode/decode against when the canister exposes no `candid:service` metadata. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
+| `canister_update_call` | `canister_id`, `method`, `args` (textual Candid), `derivation_origin?`, `account?`, `candid?` | Make an UPDATE (state-changing) call; reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`/`resolve_app`). `candid` is the same `.did` fallback as on `canister_query`, used when the interface isn't published on-chain. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
 | `get_app_principal` | `derivation_origin`, `account?` | The principal you act as at an app, without a call. Identify the app by its `derivation_origin` (from `open_app`/`resolve_app`). Echoes `derived_for_origin` / `requested` so an origin mismatch is visible |
 | `list_app_accounts` | `derivation_origin` | The user's Internet Identity accounts at an app — the default account plus any named ones — with name, number, last-used, and the derivation origin they were listed for. Identify the app by its `derivation_origin` (from `open_app`/`resolve_app`) |
 | `resolve_app` | `app_url` | Resolve an app URL to its Internet Identity derivation context: `application_origin`, the `derivation_origin` to use (declared in `/.well-known/ic-app.json`, else a built-in known-app value, else assumed = app origin — flagged via `derivation_origin_source`: `declared`/`known`/`app_url_default`, with `application_is_ic` echoing the gateway evidence), and the app's `alternative_origins` (informational). An origin with **no IC evidence** that would need the `app_url_default` assumption is **refused** (guessed-domain guard, with a "did you mean" repair when the host resembles a well-known app). Does not return a principal (no account chosen) or require auth — pass the `derivation_origin` to `get_app_principal`/`list_app_accounts` |
@@ -115,11 +115,17 @@ results).
 | `icp_start_canister` / `icp_stop_canister` / `icp_uninstall_code` / `icp_delete_canister` | `canister_id` | Canister lifecycle |
 | `icp_top_up_canister` | `canister_id`, `cycles?` / `icp?` | Add cycles to an existing canister — from your cycles-ledger balance (`cycles`) or by converting ICP from your ICP-ledger account via the CMC (`icp`) |
 
-`discover_app_canisters` is the entry point when the user names a **website** instead
-of a canister id. Sources, most authoritative first: **app-declared metadata**
-(below), the frontend via the `x-ic-canister-id` header, and backend candidates
-mined from `/env.json` + the JS bundle (pick by label, prefer production/`IC_`
-ids, confirm with `get_canister_candid`).
+`open_app` (its `app` argument takes a name **or** a URL) is the one-call entry point
+when the user names or links an app: it resolves the Internet Identity
+`derivation_origin` **and** discovers the
+canisters behind the app together (see [Typical flow](#typical-flow)).
+`discover_app_canisters` is the canister-only path underneath it, used directly
+when you already have the app's domain or URL (its `domain` argument accepts
+either) and only need the canister ids. Its sources are listed in the table row
+above (app-declared metadata first, then the `x-ic-canister-id` frontend header,
+then backend candidates mined from `/env.json` + the JS bundle); among the mined
+candidates, pick by label, prefer production/`IC_` ids, and confirm with
+`get_canister_candid`.
 
 ### Typical flow
 
@@ -190,6 +196,19 @@ are ignored, so the format can grow. Both sources are the app's own claim about
 its composition — stronger than anything mined from client code — but an
 SPA catch-all serving HTML at these paths simply yields no findings (no meta
 tag; JSON parse fails), and every id is still validated as a principal.
+
+Discovery fetches are **SSRF-hardened** (CWE-918). Only `https` URLs with a real
+host are fetched, and every outbound fetch runs under a redirect guard (a 3xx may only
+go to a **globally-routable** IP or the same host, never a different private
+target; capped at 10 hops) with per-body and aggregate size caps, so a hostile or
+accidental large body can't exhaust memory. The untrusted **user-supplied** site
+fetches (an app origin from `discover_app_canisters`, `open_app`, or `resolve_app`)
+additionally resolve the target host up front and **pin** the connection to that
+validated globally-routable address, so a name resolving to a
+private/loopback/link-local address is refused and re-resolution can't rebind
+mid-flight. Fixed public-host enrichment (the IC dashboard, the skills registry)
+uses the redirect guard but is not separately address-pinned. No JavaScript is
+executed, and every extracted id is validated as a principal.
 
 The optional top-level **`derivation_origin`** is the app's declaration of the
 Internet Identity derivation origin its frontends pin (see the identity section
@@ -280,10 +299,21 @@ Some canisters expose **OQL** — a self-describing, agent-queryable surface ove
 their data via two Candid query methods: `schema : () -> (text) query` (a JSON
 catalogue of entities, fields, and edges) and `execute : (text) -> (Result)
 query` (a JSON query language with filters, aggregation, ordering, and edge
-traversal). `get_canister_candid` detects the pair and reports `oql: true` (parsing the
-interface behind the same CWE-674 guard the encode/decode path uses, so a
-malformed `.did` just fails closed to `false`). Rather than inline the whole
-dialect into every interface read, `get_canister_candid` emits only that flag plus a
+traversal). `get_canister_candid` detects the pair and reports `oql: true`, parsing
+the interface behind the same **CWE-674 guard** the encode/decode path uses. That
+guard is a pre-parse structural check that rejects textual Candid over 1 MiB or
+nested past 128 levels before the parser runs, so a malicious input can't
+stack-overflow and abort the whole process, taking every concurrent session with
+it; it covers the textual-Candid inputs (tool `args`, `.did` interfaces, and
+install `arg`), and is fail-closed, so a malformed `.did` degrades to `oql: false`.
+The same ceiling is enforced past the parser on the untrusted structures
+themselves: type-alias chains in a fetched interface are depth-bounded during
+resolution, and the type-less reply decode/render path is depth-bounded too, so
+a hostile canister's `.did` or reply can't recurse the decoder even when each
+individual layer is small.
+The OQL query path is JSON rather than Candid, so it shares the same 1 MiB size cap
+but is parsed by the JSON parser, not this structural guard. Rather than inline the
+whole dialect into every interface read, `get_canister_candid` emits only that flag plus a
 one-line pointer; the full guide is served on demand by `icp_oql_guide` and as
 the `oql://usage` MCP **resource**.
 
@@ -322,8 +352,10 @@ top-ups fund the canister one of two ways, both keyed to that management princip
   **ICP-ledger** account (`ryjl3-tyaaa-aaaaa-aaaba-cai`, default subaccount) to
   the **CMC**, which mints cycles into the canister (`notify_create_canister` /
   `notify_top_up`). Best-effort, single attempt: if the transfer lands but the
-  mint fails, the error carries the ICP-ledger block index to recover with — the
-  call is **not** idempotent, so don't blindly re-run it.
+  mint fails, the ICP is held by the CMC and the error carries the ICP-ledger
+  block index. Recovery means re-notifying the CMC for that block **with the same
+  arguments the call used** (the block index alone is not enough), not re-running
+  the tool: the call is **not** idempotent, so re-running it would transfer ICP again.
 
 `cycles` takes precedence if both are given. Lifecycle calls
 (`icp_install_code`, `icp_canister_status`, `icp_update_canister_settings`,
@@ -352,9 +384,10 @@ connection's session key as a time-boxed grant and returns you to the client, an
 the tools become available. All clients use the same **authorization-code + PKCE**
 flow.
 
-> On II's consent screen, **leave the read-only option OFF** if you want to create
-> or manage canisters — read-only is the default, and it makes every management
-> tool inert (see [Read-only sessions](#read-only-sessions) below).
+> II's consent screen makes you choose an access level: **"Questions only"** or
+> **"Actions & questions"**. Choose **Actions & questions** if you want to create
+> or manage canisters — a Questions-only session makes every management tool
+> inert (see [Read-only sessions](#read-only-sessions) below).
 
 ## Run
 
@@ -365,9 +398,30 @@ cargo run
 # $MCP_SERVE_BETA (set it to also serve the beta II instance at /mcp-beta, for staging)
 ```
 
+`GET /` serves a self-contained, ICP-styled landing page that names the
+production `/mcp` endpoint (staging also serves beta II at `/mcp-beta`) and lists
+the tools grouped by purpose. `GET /version` is the operations probe (see [Auth](#auth-oauth-21-login-via-internet-identity)).
+
+The binary also serves the official pages the connector directories require:
+`/privacy-policy` (linked from the landing page's footer), `/support`, and
+`/terms` — self-contained documents compiled in like every other asset. For the
+OpenAI directory's domain-verification check, `GET
+/.well-known/openai-apps-challenge` returns `$OPENAI_APPS_CHALLENGE_TOKEN`
+verbatim as `text/plain` (trimmed), and 404s while the variable is unset or
+blank — so the endpoint is inert except during a submission window.
+
 ## Deploy
 
-The server is a single binary plus the `static/` assets. Two requirements when hosting:
+The deployment binary is **self-contained**: the connect/landing HTML, CSS, and SVG
+(`src/assets/`) and the reference docs (`static/`) are compiled in with `include_str!`,
+so nothing has to ship next to it (both are build-time inputs only). The
+only runtime file is the OAuth clients store, which the server always uses: it reads
+the file on startup and writes it (best-effort) as client registrations change, so
+give it a writable path. It defaults to `oauth-clients.json` in the working
+directory; override the location with `OAUTH_CLIENTS_FILE`. On `SIGTERM` (what
+`systemctl stop`/`restart` sends) or `SIGINT`, the server drains in-flight requests
+before exiting, so a redeploy doesn't cut off calls mid-flight. Two requirements
+when hosting:
 
 - **HTTPS** — the id.ai passkey (WebAuthn) only works in a secure context.
 - **`PUBLIC_URL`** — set it to the public https URL; it's used in the OAuth
@@ -376,7 +430,11 @@ The server is a single binary plus the `static/` assets. Two requirements when h
   must add this exact origin as their trusted MCP server in II Settings — there
   is no longer a deploy-time `mcp_server_origin` on II's side.)
 
-A `Dockerfile` is included (works on Render / Fly / Cloud Run / Koyeb). For a
+A `Dockerfile` is included (works on Render / Fly / Cloud Run / Koyeb). The
+reference deployment (`deploy/native/`, see its README) instead runs the binary
+and Caddy as native systemd units: pushes to `main` auto-deploy staging, and
+`release-*` tags deploy production, attaching the deployed binary to the GitHub
+release. For a
 zero-signup public URL during testing, expose the local server with a tunnel:
 
 ```bash
@@ -404,6 +462,25 @@ curl -si -X POST \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}' \
   http://127.0.0.1:8000/mcp | grep -i www-authenticate
 # -> WWW-Authenticate: Bearer resource_metadata=".../.well-known/oauth-protected-resource/mcp"
+```
+
+Once you hold an access token (run the OAuth flow from an MCP client, see
+[Connect](#connect-from-an-mcp-client)), you can call a tool directly. The service
+runs **stateless** with plain-JSON responses: each POST is handled independently
+(no `initialize` handshake and no `Mcp-Session-Id`), and a `tools/call` returns a
+single JSON-RPC object, not an SSE stream. The POST handler still requires the dual
+`Accept` header.
+
+```bash
+TOKEN=mcp-token-…   # from the OAuth flow (client -> Internet Identity sign-in)
+H=(-H "Accept: application/json, text/event-stream" -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN")
+
+# anonymous public read from a real mainnet canister (ICP ledger); pass
+# derivation_origin to call as your account at an app instead
+curl -s "${H[@]}" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"canister_query","arguments":{"canister_id":"ryjl3-tyaaa-aaaaa-aaaba-cai","method":"icrc1_name","args":"()"}}}' \
+  http://127.0.0.1:8000/mcp | jq -r '.result.content[0].text'
+# => ("Internet Computer")
 ```
 
 ## Auth (OAuth 2.1, login via Internet Identity)
@@ -500,8 +577,10 @@ holds the cookie.)
 presents **both** proofs, which can co-reside in one browser only in the legitimate
 same-browser flow:
 
-1. **initiator** — an unguessable `HttpOnly; Secure; SameSite=Lax` `sid` cookie
-   (scoped to the instance's `…/oauth` path) set at `…/oauth/authorize`;
+1. **initiator** — an unguessable `HttpOnly; SameSite=Lax` connect cookie
+   (`mcp_connect`, scoped to the instance's `…/oauth` path; `Secure` whenever
+   `PUBLIC_URL` is https, i.e. everywhere but plain-HTTP local development) set
+   at `…/oauth/authorize`;
 2. **consenter** — the canister-signed delegation chain, delivered by II *only* to
    the consenting browser as a URL fragment and *required* to redeem, so only the
    browser that drove the II consent holds it;
@@ -509,10 +588,10 @@ same-browser flow:
    must return `Ok`, so it is synchronous and on-chain, never a bare notification.
 
 In the confused-deputy path the delegation lands in the honest pinned page in the
-**victim's** browser, whose `sid` cookie does not match the one the connect (and its
+**victim's** browser, whose connect cookie does not match the one the connect (and its
 registration key `X`) was bound to, so the redeem aborts. An attacker who initiates
-then phishes the II link holds `sid` but never the delegation (it reaches only the
-consenting victim's browser); the victim holds the delegation but never `sid`.
+then phishes the II link holds the cookie but never the delegation (it reaches only the
+consenting victim's browser); the victim holds the delegation but never the cookie.
 Neither can redeem. This closes the split-browser injection for **all transports
 incl. loopback** (a loopback redirect resolves on the consenter's own machine).
 `SameSite=Lax` still rides the top-level cross-site GET II uses to navigate back to
@@ -525,8 +604,10 @@ the callback page.
 > **is** closed by a **hosted-redirect allow-list**: dynamic client registration
 > accepts only a loopback redirect, or a hosted redirect whose host is (a subdomain
 > of) an allow-listed registrable domain **and** whose path falls within that
-> vendor's pinned OAuth-callback prefix, so an attacker cannot register a hosted
-> destination it controls. The path pin matters because several allow-listed
+> vendor's pinned OAuth-callback prefix (percent-encoded slashes and dots in the
+> path are rejected, so the prefix check cannot be dodged by encoding), so an
+> attacker cannot register a hosted destination it controls. The path pin
+> matters because several allow-listed
 > origins also serve third-party, script-capable content on the same origin
 > (`perplexity.ai/page/…`, `chatgpt.com/g/…`, `/share/…`); a domain-only rule would
 > let an attacker register such a path and capture the code from on-origin JS.
@@ -558,7 +639,11 @@ call as `X`, binding the long-lived session key `S` to the anchor. II never bind
 bare key it was shown.
 
 `/version` is the unauthenticated operations probe. It reports the running
-build (`version`, `commit`, `built_at`, `started_at`) and two real-time
+build (`version`, `commit`, `built_at`, `started_at`), the served **II
+pairings** (`instances`: each mount path with the II origin and canister it
+hands off to — the only way an external monitor can learn the pairing, since
+neither the mount path nor the server's origin implies it and the `II_URL*`
+variables can move it), and two real-time
 per-instance **session gauges** — `live_sessions` (open grants) and
 `active_sessions` (a subset: those also requesting recently):
 
@@ -640,7 +725,7 @@ reaches (or is logged by) this server. (The chosen access level does come
 
 Server side:
 
-- **`X`, a per-connect registration keypair** bound to the connect `sid`;
+- **`X`, a per-connect registration keypair** bound to the connect cookie;
   `priv(X)` never leaves the backend, and `pub(X)` rides the II link
   (`registration_key`, base64url DER).
 - **A pinned callback page** at `GET …/oauth/connect/callback` — the *sole* reader
@@ -703,8 +788,9 @@ can cost in memory and disk, not the request rate. Put a rate limiter in front
 
 ### Read-only sessions
 
-II's consent screen **defaults to read-only** (opt-out). A user who just clicks
-"Allow" gets a session whose per-app delegations are `permissions = "queries"`,
+II's consent screen requires an explicit access-level choice: **"Questions
+only"** or **"Actions & questions"**. A user who picks Questions only gets a
+session whose per-app delegations are `permissions = "queries"`,
 and the IC **rejects update calls made through them at ingress**. That makes the
 entire canister-management surface inert — `create`/`install`/`start`/`stop`/
 `uninstall`/`delete`, and even `icp_canister_status`, are update calls. To handle this
@@ -802,11 +888,17 @@ mcp_get_delegation :
   principal from an anchored regex on that bare origin, so the server first strips
   any path, query, fragment, trailing slash, or redundant `:443` (a stray one
   would derive a *different* principal), then applies the gateway remap:
-  `*.icp0.io` / `*.icp.net` → `*.ic0.app`. Note this replicates only II's
-  *domain-based* derivation — a **custom derivation origin** declared via
-  `/.well-known/ii-alternative-origins` isn't visible through the `mcp_*` methods,
-  so an app using one derives a different principal here than in a browser (see the
-  caveat under [Tools](#tools)); fetching that declaration is a future enhancement.
+  `*.icp0.io` / `*.icp.net` → `*.ic0.app`. `target_origin` replicates only II's
+  *domain-based* derivation: a raw `derivation_origin` is canonicalized and used
+  verbatim, with no recovery of a custom derivation origin from it. When an
+  `app_url` is passed instead, `resolve_app` resolves the derivation origin by
+  precedence **declared** (`/.well-known/ic-app.json` `derivation_origin`) >
+  built-in **known-app** registry > application origin, so a custom origin an app
+  declares (or that ships in the registry, e.g. `oisy.com`) **is** honoured, and
+  the app's `/.well-known/ii-alternative-origins` list is fetched and surfaced by
+  `resolve_app` (see the caveat under [Tools](#tools)). The one genuine limitation:
+  there is no reverse lookup from an app URL to a custom origin the app has not
+  declared.
 - `account_number` names which of the anchor's accounts at `target_origin` to act
   as; `null` selects the (mutable) default account there. `prepare` resolves it
   and returns the concrete account in its reply, which is threaded back into
@@ -864,7 +956,7 @@ delegation. Omitting `account` uses the default account.
 - [x] OAuth 2.1 auth (authorization-code + PKCE): II's `/mcp` **registration-delegation**
       handshake binds the connection's session key (a fragment-delivered, canister-signed
       delegation redeemed via `mcp_register_v2`), with **Consent-Bound Completion** binding
-      `…/oauth/connect/redeem` to both the initiator (`sid` cookie) and the consenter (the
+      `…/oauth/connect/redeem` to both the initiator (`mcp_connect` cookie) and the consenter (the
       fragment delegation); expiring tokens. The same-browser phishing variant is closed
       by a hosted-redirect allow-list (see Auth). (The RFC 8628 device grant was dropped.)
 - [x] On-demand **domain identities**: the registered session key mints per-app
