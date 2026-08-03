@@ -1295,8 +1295,11 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Create and fund a NEW Internet Computer canister (as your Internet Identity). Fund it EITHER with `cycles` (exact, drawn from your cycles-ledger balance) OR with `icp` (a decimal-ICP string like \"0.5\", transferred from your ICP-ledger account and converted to cycles via the CMC). BOTH accounts belong to your management principal — the same principal icp_cycles_balance reports (its default subaccount); check/fund it before calling (cycles-ledger balance via icp_cycles_balance, or hold ICP in that principal's ICP-ledger account). The ICP path is best-effort with no retries: if the ICP transfer lands but the mint fails, the error carries the block index to recover with — do not blindly re-run. `cycles` wins if both are given. Controllers default to your own principal. Returns the new canister id — then build your Wasm (see the motoko/icp-cli skills) and install it with icp_install_code. Requires an authenticated session.",
-        annotations(title = "Create a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true),
+        description = "Create and fund a NEW Internet Computer canister (as your Internet Identity). SPENDS FUNDS: this draws cycles or ICP from your accounts and cannot be automatically reversed, so confirm with the user before calling it. Fund it EITHER with `cycles` (exact, drawn from your cycles-ledger balance) OR with `icp` (a decimal-ICP string like \"0.5\", transferred from your ICP-ledger account and converted to cycles via the CMC). BOTH accounts belong to your management principal — the same principal icp_cycles_balance reports (its default subaccount); check/fund it before calling (cycles-ledger balance via icp_cycles_balance, or hold ICP in that principal's ICP-ledger account). The ICP path is best-effort with no retries: if the ICP transfer lands but the mint fails, the error carries the block index to recover with — do not blindly re-run. `cycles` wins if both are given. Controllers default to your own principal. Returns the new canister id — then build your Wasm (see the motoko/icp-cli skills) and install it with icp_install_code. Requires an authenticated session.",
+        // destructive_hint = true: it adds a canister, but it does so by spending the
+        // user's cycles or ICP irreversibly, and it is not idempotent (a retry spends
+        // again). See the annotation test for why "additive" is the wrong read here.
+        annotations(title = "Create a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CreatedCanister>(),
     )]
     async fn icp_create_canister(
@@ -1315,8 +1318,11 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Add cycles to an existing canister (as your Internet Identity). Fund EITHER with `cycles` (exact, drawn from your cycles-ledger balance) OR with `icp` (a decimal-ICP string, transferred from your ICP-ledger account and converted via the CMC straight into the target canister). Both accounts belong to your management principal — the one icp_cycles_balance reports (default subaccount). The ICP path is best-effort with no retries: if the transfer lands but the mint fails, the error carries the block index to recover with — do not blindly re-run. `cycles` wins if both are given. Requires an authenticated session.",
-        annotations(title = "Top up a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true),
+        description = "Add cycles to an existing canister (as your Internet Identity). SPENDS FUNDS: this draws cycles or ICP from your accounts and cannot be automatically reversed, so confirm with the user before calling it. Fund EITHER with `cycles` (exact, drawn from your cycles-ledger balance) OR with `icp` (a decimal-ICP string, transferred from your ICP-ledger account and converted via the CMC straight into the target canister). Both accounts belong to your management principal — the one icp_cycles_balance reports (default subaccount). The ICP path is best-effort with no retries: if the transfer lands but the mint fails, the error carries the block index to recover with — do not blindly re-run. `cycles` wins if both are given. Requires an authenticated session.",
+        // destructive_hint = true: same reasoning as icp_create_canister — the cycles
+        // land in the target canister, but the funds leave the user's accounts for
+        // good, and a retry spends again.
+        annotations(title = "Top up a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
     async fn icp_top_up_canister(
@@ -2360,14 +2366,27 @@ mod tests {
             assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");
             assert_eq!(a.destructive_hint, Some(false), "{name} should set destructive=false explicitly");
         }
-        // Destructive writes: not read-only, destructive.
-        for name in ["icp_delete_canister", "icp_uninstall_code", "icp_install_code", "icp_update_canister_settings"] {
+        // Destructive writes: not read-only, destructive. Two kinds live here.
+        // Overwriting/removing state: delete, uninstall, install (reinstall and
+        // upgrade replace the running module), settings (can hand control away).
+        // And SPENDING THE USER'S FUNDS: create and top-up add a canister or its
+        // cycles, so "additive" is tempting — but the cycles or ICP leave the user's
+        // ledger accounts irreversibly, no tool here can claw them back, and neither
+        // call is idempotent, so a client retry spends again. `destructiveHint` is
+        // what a client gates its confirmation prompt on and its spec default is
+        // `true`, so declaring `false` would be an affirmative (and wrong) promise
+        // that a stray call costs the user nothing. Keep them here.
+        for name in [
+            "icp_delete_canister", "icp_uninstall_code", "icp_install_code", "icp_update_canister_settings",
+            "icp_create_canister", "icp_top_up_canister",
+        ] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(false), "{name} should not be read-only");
             assert_eq!(a.destructive_hint, Some(true), "{name} should be destructive");
         }
-        // Additive/reversible writes: not read-only, not destructive.
-        for name in ["icp_create_canister", "icp_top_up_canister", "icp_start_canister", "icp_stop_canister"] {
+        // Additive/reversible writes: not read-only, not destructive. These change
+        // run state only, cost nothing, and each is undone by its counterpart.
+        for name in ["icp_start_canister", "icp_stop_canister"] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(false), "{name} should not be read-only");
             assert_eq!(a.destructive_hint, Some(false), "{name} should not be destructive");
