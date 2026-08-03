@@ -306,6 +306,11 @@ nested past 128 levels before the parser runs, so a malicious input can't
 stack-overflow and abort the whole process, taking every concurrent session with
 it; it covers the textual-Candid inputs (tool `args`, `.did` interfaces, and
 install `arg`), and is fail-closed, so a malformed `.did` degrades to `oql: false`.
+The same ceiling is enforced past the parser on the untrusted structures
+themselves: type-alias chains in a fetched interface are depth-bounded during
+resolution, and the type-less reply decode/render path is depth-bounded too, so
+a hostile canister's `.did` or reply can't recurse the decoder even when each
+individual layer is small.
 The OQL query path is JSON rather than Candid, so it shares the same 1 MiB size cap
 but is parsed by the JSON parser, not this structural guard. Rather than inline the
 whole dialect into every interface read, `get_canister_candid` emits only that flag plus a
@@ -379,9 +384,10 @@ connection's session key as a time-boxed grant and returns you to the client, an
 the tools become available. All clients use the same **authorization-code + PKCE**
 flow.
 
-> On II's consent screen, **leave the read-only option OFF** if you want to create
-> or manage canisters — read-only is the default, and it makes every management
-> tool inert (see [Read-only sessions](#read-only-sessions) below).
+> II's consent screen makes you choose an access level: **"Questions only"** or
+> **"Actions & questions"**. Choose **Actions & questions** if you want to create
+> or manage canisters — a Questions-only session makes every management tool
+> inert (see [Read-only sessions](#read-only-sessions) below).
 
 ## Run
 
@@ -395,6 +401,14 @@ cargo run
 `GET /` serves a self-contained, ICP-styled landing page that names the
 production `/mcp` endpoint (staging also serves beta II at `/mcp-beta`) and lists
 the tools grouped by purpose. `GET /version` is the operations probe (see [Auth](#auth-oauth-21-login-via-internet-identity)).
+
+The binary also serves the official pages the connector directories require:
+`/privacy-policy` (linked from the landing page's footer), `/support`, and
+`/terms` — self-contained documents compiled in like every other asset. For the
+OpenAI directory's domain-verification check, `GET
+/.well-known/openai-apps-challenge` returns `$OPENAI_APPS_CHALLENGE_TOKEN`
+verbatim as `text/plain` (trimmed), and 404s while the variable is unset or
+blank — so the endpoint is inert except during a submission window.
 
 ## Deploy
 
@@ -416,7 +430,11 @@ when hosting:
   must add this exact origin as their trusted MCP server in II Settings — there
   is no longer a deploy-time `mcp_server_origin` on II's side.)
 
-A `Dockerfile` is included (works on Render / Fly / Cloud Run / Koyeb). For a
+A `Dockerfile` is included (works on Render / Fly / Cloud Run / Koyeb). The
+reference deployment (`deploy/native/`, see its README) instead runs the binary
+and Caddy as native systemd units: pushes to `main` auto-deploy staging, and
+`release-*` tags deploy production, attaching the deployed binary to the GitHub
+release. For a
 zero-signup public URL during testing, expose the local server with a tunnel:
 
 ```bash
@@ -559,8 +577,10 @@ holds the cookie.)
 presents **both** proofs, which can co-reside in one browser only in the legitimate
 same-browser flow:
 
-1. **initiator** — an unguessable `HttpOnly; Secure; SameSite=Lax` `sid` cookie
-   (scoped to the instance's `…/oauth` path) set at `…/oauth/authorize`;
+1. **initiator** — an unguessable `HttpOnly; SameSite=Lax` connect cookie
+   (`mcp_connect`, scoped to the instance's `…/oauth` path; `Secure` whenever
+   `PUBLIC_URL` is https, i.e. everywhere but plain-HTTP local development) set
+   at `…/oauth/authorize`;
 2. **consenter** — the canister-signed delegation chain, delivered by II *only* to
    the consenting browser as a URL fragment and *required* to redeem, so only the
    browser that drove the II consent holds it;
@@ -568,10 +588,10 @@ same-browser flow:
    must return `Ok`, so it is synchronous and on-chain, never a bare notification.
 
 In the confused-deputy path the delegation lands in the honest pinned page in the
-**victim's** browser, whose `sid` cookie does not match the one the connect (and its
+**victim's** browser, whose connect cookie does not match the one the connect (and its
 registration key `X`) was bound to, so the redeem aborts. An attacker who initiates
-then phishes the II link holds `sid` but never the delegation (it reaches only the
-consenting victim's browser); the victim holds the delegation but never `sid`.
+then phishes the II link holds the cookie but never the delegation (it reaches only the
+consenting victim's browser); the victim holds the delegation but never the cookie.
 Neither can redeem. This closes the split-browser injection for **all transports
 incl. loopback** (a loopback redirect resolves on the consenter's own machine).
 `SameSite=Lax` still rides the top-level cross-site GET II uses to navigate back to
@@ -584,8 +604,10 @@ the callback page.
 > **is** closed by a **hosted-redirect allow-list**: dynamic client registration
 > accepts only a loopback redirect, or a hosted redirect whose host is (a subdomain
 > of) an allow-listed registrable domain **and** whose path falls within that
-> vendor's pinned OAuth-callback prefix, so an attacker cannot register a hosted
-> destination it controls. The path pin matters because several allow-listed
+> vendor's pinned OAuth-callback prefix (percent-encoded slashes and dots in the
+> path are rejected, so the prefix check cannot be dodged by encoding), so an
+> attacker cannot register a hosted destination it controls. The path pin
+> matters because several allow-listed
 > origins also serve third-party, script-capable content on the same origin
 > (`perplexity.ai/page/…`, `chatgpt.com/g/…`, `/share/…`); a domain-only rule would
 > let an attacker register such a path and capture the code from on-origin JS.
@@ -617,7 +639,11 @@ call as `X`, binding the long-lived session key `S` to the anchor. II never bind
 bare key it was shown.
 
 `/version` is the unauthenticated operations probe. It reports the running
-build (`version`, `commit`, `built_at`, `started_at`) and two real-time
+build (`version`, `commit`, `built_at`, `started_at`), the served **II
+pairings** (`instances`: each mount path with the II origin and canister it
+hands off to — the only way an external monitor can learn the pairing, since
+neither the mount path nor the server's origin implies it and the `II_URL*`
+variables can move it), and two real-time
 per-instance **session gauges** — `live_sessions` (open grants) and
 `active_sessions` (a subset: those also requesting recently):
 
@@ -699,7 +725,7 @@ reaches (or is logged by) this server. (The chosen access level does come
 
 Server side:
 
-- **`X`, a per-connect registration keypair** bound to the connect `sid`;
+- **`X`, a per-connect registration keypair** bound to the connect cookie;
   `priv(X)` never leaves the backend, and `pub(X)` rides the II link
   (`registration_key`, base64url DER).
 - **A pinned callback page** at `GET …/oauth/connect/callback` — the *sole* reader
@@ -762,8 +788,9 @@ can cost in memory and disk, not the request rate. Put a rate limiter in front
 
 ### Read-only sessions
 
-II's consent screen **defaults to read-only** (opt-out). A user who just clicks
-"Allow" gets a session whose per-app delegations are `permissions = "queries"`,
+II's consent screen requires an explicit access-level choice: **"Questions
+only"** or **"Actions & questions"**. A user who picks Questions only gets a
+session whose per-app delegations are `permissions = "queries"`,
 and the IC **rejects update calls made through them at ingress**. That makes the
 entire canister-management surface inert — `create`/`install`/`start`/`stop`/
 `uninstall`/`delete`, and even `icp_canister_status`, are update calls. To handle this
@@ -929,7 +956,7 @@ delegation. Omitting `account` uses the default account.
 - [x] OAuth 2.1 auth (authorization-code + PKCE): II's `/mcp` **registration-delegation**
       handshake binds the connection's session key (a fragment-delivered, canister-signed
       delegation redeemed via `mcp_register_v2`), with **Consent-Bound Completion** binding
-      `…/oauth/connect/redeem` to both the initiator (`sid` cookie) and the consenter (the
+      `…/oauth/connect/redeem` to both the initiator (`mcp_connect` cookie) and the consenter (the
       fragment delegation); expiring tokens. The same-browser phishing variant is closed
       by a hosted-redirect allow-list (see Auth). (The RFC 8628 device grant was dropped.)
 - [x] On-demand **domain identities**: the registered session key mints per-app
