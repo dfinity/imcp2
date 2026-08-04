@@ -78,18 +78,6 @@ async fn log_request(
 /// what an agent can do: discovery, identity, on-network queries, actions, skills.
 const INDEX_HTML: &str = include_str!("assets/index.html");
 
-/// The OpenAI Apps domain-verification endpoint. During a ChatGPT-directory
-/// submission the portal reveals a token that
-/// `GET /.well-known/openai-apps-challenge` must return VERBATIM as the whole
-/// body — plain text, exactly one token, no JSON ("do not return JSON, a list
-/// of tokens, or multiple tokens from the same URL"). The token is public by
-/// design (the endpoint is world-readable proof of domain control); it
-/// arrives as the env var `$OPENAI_APPS_CHALLENGE_TOKEN`, substituted into
-/// the unit by `deploy.sh` from the repository secret of the same name, and
-/// the route serves 404 while the value is unset or blank, keeping the
-/// endpoint inert until a submission is actually in flight. The value is
-/// trimmed so unit-file whitespace can't corrupt the exact-match comparison
-/// OpenAI performs.
 /// The public, human-facing pages this origin serves, as absolute-path
 /// suffixes. This is the sitemap's and robots.txt's shared idea of "content":
 /// every other route is machine surface that a crawler has no use for and that
@@ -181,6 +169,18 @@ fn site_metadata_router(public_url: &str) -> Router {
         )
 }
 
+/// The OpenAI Apps domain-verification endpoint. During a ChatGPT-directory
+/// submission the portal reveals a token that
+/// `GET /.well-known/openai-apps-challenge` must return VERBATIM as the whole
+/// body — plain text, exactly one token, no JSON ("do not return JSON, a list
+/// of tokens, or multiple tokens from the same URL"). The token is public by
+/// design (the endpoint is world-readable proof of domain control); it
+/// arrives as the env var `$OPENAI_APPS_CHALLENGE_TOKEN`, substituted into
+/// the unit by `deploy.sh` from the repository secret of the same name, and
+/// the route serves 404 while the value is unset or blank, keeping the
+/// endpoint inert until a submission is actually in flight. The value is
+/// trimmed so unit-file whitespace can't corrupt the exact-match comparison
+/// OpenAI performs.
 fn openai_apps_challenge_router(token: Option<String>) -> Router {
     let token = token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
     Router::new().route(
