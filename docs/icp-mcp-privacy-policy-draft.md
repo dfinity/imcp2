@@ -67,12 +67,13 @@
 >    OAuth client registrations instead of retention until LRU displacement.
 >    That is a code change; the policy keeps stating the current behaviour
 >    honestly until it ships, and the retention row must be updated when it
->    does. Tracked with the other two engineering follow-ups from this
->    round: purging session credentials immediately when revocation is
->    observed, and a deployment-level logging audit (AWS services, load
->    balancer, reverse proxy, crash diagnostics, DNS/CDN, journald, support
->    access) to substantiate the policy's logging claims beyond application
->    code.
+>    does. Tracked with the other engineering follow-ups from this round:
+>    purging session credentials immediately when revocation is observed and
+>    shortening the lifetime of already-issued per-application authorizations
+>    (both in issue #121), and a deployment-level logging audit (AWS
+>    services, load balancer, reverse proxy, crash diagnostics, DNS/CDN,
+>    journald, support access) to substantiate the policy's logging claims
+>    beyond application code.
 
 ---
 
@@ -297,10 +298,11 @@ protection. When you direct the Service to read from or act on an
 application, the Service submits that request to the network deliberately,
 on your instruction, and the network processes it internationally to execute
 what you asked. What travels is the content of your request and its results
-(section 1) under the pseudonymous per-application identifiers described in
-section 6. This processing is inherent to the network's design and applies
-to every request, so take it into account when deciding which applications
-to direct the Service at.
+(section 1); a request made as you travels under the pseudonymous
+per-application identifier described in section 6, while a public read made
+without signing in carries no user identifier at all. This processing is
+inherent to the network's design and applies to every request, so take it
+into account when deciding which applications to direct the Service at.
 
 ### 4. Data Retention
 
