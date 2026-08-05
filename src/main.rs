@@ -19,6 +19,9 @@
 //! `$MCP_SERVE_BETA` (opt in to the `/mcp-beta` staging instance), and
 //! `$OPENAI_APPS_CHALLENGE_TOKEN` (serve the OpenAI Apps domain-verification
 //! token at `/.well-known/openai-apps-challenge`; 404 while unset).
+//!
+//! Also serves `/sitemap.xml` and `/robots.txt`, both built from `$PUBLIC_URL`
+//! so each deployment advertises its own origin.
 
 use axum::{response::Html, routing::get, Json, Router};
 use imcp2::{auth_callbacks_router, Agent, IiInstance, McpConfig, McpServer, SharedClients, IC_URL};
@@ -74,6 +77,97 @@ async fn log_request(
 /// the root page and the connect screens read as one product, and walks through
 /// what an agent can do: discovery, identity, on-network queries, actions, skills.
 const INDEX_HTML: &str = include_str!("assets/index.html");
+
+/// The public, human-facing pages this origin serves, as absolute-path
+/// suffixes. This is the sitemap's and robots.txt's shared idea of "content":
+/// every other route is machine surface that a crawler has no use for and that
+/// we do not want indexed — `/mcp` (+ `/mcp-beta`) answer 401 to an
+/// unauthenticated fetch, `/version` is an operations probe, `/status/` is the
+/// dashboard, and `/.well-known/*` documents are for clients, not readers.
+/// Keep in step with the page routes registered in `main`.
+const PUBLIC_PAGES: &[&str] = &["/", "/privacy-policy", "/terms", "/support"];
+
+/// Escape the five XML metacharacters. `PUBLIC_URL` is operator-supplied, so a
+/// stray `&` in it must not produce a malformed sitemap that a crawler rejects
+/// wholesale.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// `GET /sitemap.xml` — a [sitemaps.org] 0.9 urlset naming the public pages.
+///
+/// The entries must be absolute, so they are built from `PUBLIC_URL` at
+/// startup rather than baked in: staging and production then each advertise
+/// their own origin instead of both claiming production's. A trailing slash on
+/// the configured value is trimmed so the joins can't yield `//privacy-policy`.
+///
+/// Deliberately `<loc>`-only: `<lastmod>` would have to come from build time,
+/// which changes on every redeploy whether or not a page did, and `changefreq`
+/// and `priority` are ignored by the major crawlers.
+///
+/// [sitemaps.org]: https://www.sitemaps.org/protocol.html
+fn sitemap_xml(public_url: &str) -> String {
+    let origin = xml_escape(public_url.trim_end_matches('/'));
+    let urls: String = PUBLIC_PAGES
+        .iter()
+        .map(|p| format!("  <url><loc>{origin}{}</loc></url>\n", if *p == "/" { "/" } else { p }))
+        .collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n\
+         {urls}</urlset>\n"
+    )
+}
+
+/// `GET /robots.txt` — points crawlers at the sitemap (its only discovery
+/// path, short of submitting it to each search console by hand) and keeps them
+/// off the machine surface. Nothing here is a security control: the paths it
+/// names are already either authenticated or harmless, and robots.txt is
+/// advisory. It exists so crawl budget goes to the four pages that are worth
+/// reading and so the MCP and probe endpoints stay out of search results.
+fn robots_txt(public_url: &str) -> String {
+    let origin = public_url.trim_end_matches('/');
+    format!(
+        "User-agent: *\n\
+         Allow: /\n\
+         Disallow: /mcp\n\
+         Disallow: /mcp-beta\n\
+         Disallow: /version\n\
+         Disallow: /status/\n\
+         Disallow: /.well-known/\n\
+         \n\
+         Sitemap: {origin}/sitemap.xml\n"
+    )
+}
+
+/// Serve `/sitemap.xml` and `/robots.txt` for the given public origin, each
+/// with the content type its consumers expect (`application/xml` and
+/// `text/plain`).
+fn site_metadata_router(public_url: &str) -> Router {
+    let sitemap = sitemap_xml(public_url);
+    let robots = robots_txt(public_url);
+    Router::new()
+        .route(
+            "/sitemap.xml",
+            get(move || {
+                let sitemap = sitemap.clone();
+                async move { ([(axum::http::header::CONTENT_TYPE, "application/xml")], sitemap) }
+            }),
+        )
+        .route(
+            "/robots.txt",
+            get(move || {
+                let robots = robots.clone();
+                async move {
+                    ([(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], robots)
+                }
+            }),
+        )
+}
 
 /// The OpenAI Apps domain-verification endpoint. During a ChatGPT-directory
 /// submission the portal reveals a token that
@@ -296,7 +390,9 @@ async fn main() -> anyhow::Result<()> {
         // $OPENAI_APPS_CHALLENGE_TOKEN is set for a directory submission.
         .merge(openai_apps_challenge_router(
             std::env::var("OPENAI_APPS_CHALLENGE_TOKEN").ok(),
-        ));
+        ))
+        // /sitemap.xml + /robots.txt, built from this deployment's PUBLIC_URL.
+        .merge(site_metadata_router(&public_url));
 
     // Staging additionally serves the beta II instance at `/mcp-beta`.
     if let Some(beta) = &beta {
@@ -386,10 +482,75 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::openai_apps_challenge_router;
+    use super::{openai_apps_challenge_router, site_metadata_router, sitemap_xml, PUBLIC_PAGES};
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    async fn fetch(public_url: &str, path: &str) -> (StatusCode, String, Option<String>) {
+        let resp = site_metadata_router(public_url)
+            .oneshot(Request::get(path).body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let content_type =
+            resp.headers().get("content-type").map(|v| v.to_str().unwrap().to_string());
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(body.to_vec()).unwrap(), content_type)
+    }
+
+    // Every public page must appear exactly once, as an ABSOLUTE url on the
+    // configured origin: a sitemap of relative paths, or one naming another
+    // deployment's origin, is rejected or ignored by crawlers.
+    #[tokio::test]
+    async fn sitemap_lists_every_public_page_as_an_absolute_url() {
+        let (status, body, content_type) =
+            fetch("https://mcp.internetcomputer.org", "/sitemap.xml").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("application/xml"));
+        for page in PUBLIC_PAGES {
+            let loc = format!("<loc>https://mcp.internetcomputer.org{page}</loc>");
+            assert_eq!(body.matches(&loc).count(), 1, "{page} should appear once in:\n{body}");
+        }
+        assert_eq!(body.matches("<loc>").count(), PUBLIC_PAGES.len());
+        // The machine surface stays out: these must never be advertised.
+        for hidden in ["/version", "/status/", "/.well-known", "/mcp<", "/mcp-beta"] {
+            assert!(!body.contains(hidden), "sitemap must not list {hidden}:\n{body}");
+        }
+    }
+
+    // A trailing slash on PUBLIC_URL must not produce `//privacy-policy`, and
+    // the root entry must stay exactly one slash.
+    #[tokio::test]
+    async fn sitemap_normalizes_a_trailing_slash_on_the_public_url() {
+        let body = sitemap_xml("https://example.test/");
+        assert!(body.contains("<loc>https://example.test/</loc>"));
+        assert!(body.contains("<loc>https://example.test/terms</loc>"));
+        assert!(!body.contains("//terms"));
+    }
+
+    // An operator-supplied origin is escaped, so a stray metacharacter cannot
+    // emit a malformed document that a crawler discards wholesale.
+    #[tokio::test]
+    async fn sitemap_escapes_xml_metacharacters_in_the_origin() {
+        let body = sitemap_xml("https://example.test/?a=1&b=2");
+        assert!(body.contains("&amp;b=2"), "{body}");
+        assert!(!body.contains("&b=2"));
+    }
+
+    // robots.txt is the sitemap's only discovery path for a crawler that was
+    // never handed the URL directly, so the absolute reference must be there.
+    #[tokio::test]
+    async fn robots_points_at_the_sitemap_and_excludes_the_machine_surface() {
+        let (status, body, content_type) =
+            fetch("https://mcp.internetcomputer.org/", "/robots.txt").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("text/plain; charset=utf-8"));
+        assert!(body.contains("Sitemap: https://mcp.internetcomputer.org/sitemap.xml"), "{body}");
+        for path in ["/mcp", "/mcp-beta", "/version", "/status/", "/.well-known/"] {
+            assert!(body.contains(&format!("Disallow: {path}\n")), "{path} missing:\n{body}");
+        }
+    }
 
     async fn challenge(token: Option<&str>) -> (StatusCode, String, Option<String>) {
         let app = openai_apps_challenge_router(token.map(str::to_string));
