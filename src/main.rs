@@ -80,7 +80,9 @@ async fn log_request(
     tracing::info!(%method, %path, status, elapsed_ms, "http request");
     metrics.observe_request(
         metrics::route_label(matched.as_deref()),
-        method.as_str(),
+        // Allow-listed for the same reason as the route: HTTP permits arbitrary
+        // extension method tokens, so this is attacker-chosen too.
+        metrics::method_label(method.as_str()),
         status,
         elapsed.as_secs_f64(),
     );

@@ -35,6 +35,14 @@
 //! by the route table by construction, and stays correct when routes are added
 //! without anyone remembering to update a list here. Anything the router did not
 //! match has no template and collapses to a single `other` bucket.
+//!
+//! The same reasoning applies to **every** label a request can influence, which
+//! is easy to forget once one of them is handled. `method` is equally
+//! attacker-chosen: HTTP permits arbitrary extension method tokens, so a request
+//! line reading `WIBBLE / HTTP/1.1` would otherwise mint its own series — and
+//! its own full set of histogram buckets, which multiplies the cost by roughly
+//! the bucket count. It is allow-listed to the standard methods for that reason.
+//! `status` is safe by contrast: the server chooses it, from a small closed set.
 
 use prometheus::{
     Encoder, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts,
@@ -44,6 +52,16 @@ use prometheus::{
 /// The bucket every unmatched request shares. One series for the entire
 /// internet's worth of probing, rather than one per path attempted.
 const UNMATCHED_ROUTE: &str = "other";
+
+/// The same, for request methods outside the standard set.
+const UNKNOWN_METHOD: &str = "other";
+
+/// Methods that may appear as a label. HTTP permits arbitrary extension method
+/// tokens, so this is an allow-list rather than a deny-list: anything unlisted
+/// collapses into [`UNKNOWN_METHOD`].
+const KNOWN_METHODS: [&str; 9] = [
+    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT",
+];
 
 /// Latency buckets in seconds. Chosen for what this service actually does: the
 /// static pages and `/version` answer in single-digit milliseconds, while an MCP
@@ -221,13 +239,51 @@ pub fn route_label(matched: Option<&str>) -> &str {
     }
 }
 
+/// The `method` label for a request: the method itself when it is one of the
+/// standard set, otherwise [`UNKNOWN_METHOD`].
+///
+/// Returns `&'static str` deliberately — it is not possible for a caller to
+/// smuggle a borrowed request value through this function, so the bound holds by
+/// type rather than by discipline.
+pub fn method_label(method: &str) -> &'static str {
+    match KNOWN_METHODS.iter().position(|m| *m == method) {
+        Some(i) => KNOWN_METHODS[i],
+        None => UNKNOWN_METHOD,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, http::Request, routing::get, Router};
+    use tower::ServiceExt;
+
+    /// A router shaped like the real one: one real route, and the same
+    /// `log_request` middleware the binary installs.
+    ///
+    /// The cardinality tests below go through this rather than calling
+    /// `observe_request` directly. That distinction is the entire point: calling
+    /// the recorder with a pre-computed label only proves the recorder is
+    /// deterministic. Driving real requests proves the *middleware* derives a
+    /// bounded label from a hostile one — which is the property being claimed,
+    /// and the one that would break if someone later passed the raw URI.
+    fn app(m: Metrics) -> Router {
+        Router::new()
+            .route("/version", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(move |req, next| {
+                let m = m.clone();
+                async move { crate::log_request(m, req, next).await }
+            }))
+    }
+
+    fn request_series(out: &str) -> Vec<&str> {
+        out.lines()
+            .filter(|l| l.starts_with("imcp2_http_requests_total{"))
+            .collect()
+    }
 
     #[test]
     fn unmatched_requests_share_one_label() {
-        // The property that matters: nothing an outsider sends can mint a series.
         assert_eq!(route_label(None), UNMATCHED_ROUTE);
         assert_eq!(route_label(Some("")), UNMATCHED_ROUTE);
     }
@@ -236,6 +292,16 @@ mod tests {
     fn matched_requests_keep_their_template() {
         assert_eq!(route_label(Some("/version")), "/version");
         assert_eq!(route_label(Some("/mcp")), "/mcp");
+    }
+
+    #[test]
+    fn standard_methods_pass_through_and_the_rest_collapse() {
+        for m in KNOWN_METHODS {
+            assert_eq!(method_label(m), m);
+        }
+        for m in ["WIBBLE", "get", "", "GET ", "X-CUSTOM"] {
+            assert_eq!(method_label(m), UNKNOWN_METHOD, "{m:?} should collapse");
+        }
     }
 
     #[test]
@@ -256,7 +322,6 @@ mod tests {
         let m = Metrics::new("0", "0", 0).unwrap();
         m.observe_request("/version", "GET", 200, 0.002);
         m.observe_request("/version", "GET", 200, 0.003);
-        m.observe_request(UNMATCHED_ROUTE, "GET", 404, 0.001);
         m.set_sessions("prod", 7, 3);
 
         let out = m.render().unwrap();
@@ -266,19 +331,11 @@ mod tests {
             ),
             "{out}"
         );
-        assert!(
-            out.contains(r#"imcp2_http_requests_total{method="GET",route="other",status="404"} 1"#),
-            "{out}"
-        );
-        assert!(
-            out.contains(r#"imcp2_live_sessions{instance="prod"} 7"#),
-            "{out}"
-        );
+        assert!(out.contains(r#"imcp2_live_sessions{instance="prod"} 7"#), "{out}");
         assert!(
             out.contains(r#"imcp2_active_sessions{instance="prod"} 3"#),
             "{out}"
         );
-        // The histogram must carry the observations, not just exist.
         assert!(
             out.contains(
                 r#"imcp2_http_request_duration_seconds_count{method="GET",route="/version"} 2"#
@@ -287,26 +344,72 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_flood_of_distinct_paths_does_not_grow_the_series_count() {
-        // The cardinality guarantee, asserted rather than asserted-in-a-comment:
-        // 500 different unmatched paths must still be one series.
+    /// 200 distinct paths, sent as real requests, must produce one series.
+    #[tokio::test]
+    async fn a_flood_of_distinct_paths_yields_one_series() {
         let m = Metrics::new("0", "0", 0).unwrap();
-        for i in 0..500 {
-            let path = format!("/{i}-{}", "x".repeat(i % 17));
-            // What the middleware does for an unrouted request.
-            m.observe_request(route_label(None), "GET", 404, 0.001);
-            let _ = path;
+        for i in 0..200 {
+            let req = Request::builder()
+                .uri(format!("/scan-{i}-{}", "x".repeat(i % 13)))
+                .body(Body::empty())
+                .unwrap();
+            app(m.clone()).oneshot(req).await.unwrap();
         }
         let out = m.render().unwrap();
-        let series = out
+        let series = request_series(&out);
+        assert_eq!(series.len(), 1, "expected one series, got:\n{out}");
+        assert!(series[0].contains(r#"route="other""#), "{}", series[0]);
+        assert!(series[0].ends_with(" 200"), "{}", series[0]);
+    }
+
+    /// The same property for the method label. HTTP permits arbitrary extension
+    /// tokens, and each unique one previously minted a counter series *and* a
+    /// full set of histogram buckets — the histogram multiplying the cost by
+    /// roughly the bucket count.
+    #[tokio::test]
+    async fn a_flood_of_extension_methods_yields_one_series() {
+        let m = Metrics::new("0", "0", 0).unwrap();
+        for i in 0..100 {
+            let req = Request::builder()
+                .method(format!("WIBBLE{i}").as_str())
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap();
+            app(m.clone()).oneshot(req).await.unwrap();
+        }
+        let out = m.render().unwrap();
+        let series = request_series(&out);
+        assert_eq!(series.len(), 1, "expected one series, got:\n{out}");
+        assert!(series[0].contains(r#"method="other""#), "{}", series[0]);
+
+        // The histogram is where the real damage would be, so bound it too.
+        let buckets = out
             .lines()
-            .filter(|l| l.starts_with("imcp2_http_requests_total{"))
+            .filter(|l| l.starts_with("imcp2_http_request_duration_seconds_bucket"))
             .count();
-        assert_eq!(series, 1, "expected exactly one series, got:\n{out}");
+        assert_eq!(
+            buckets,
+            LATENCY_BUCKETS.len() + 1,
+            "one label set means one bucket family (+Inf), got:\n{out}"
+        );
+    }
+
+    /// Real traffic still resolves to its own template, so bounding the labels
+    /// has not flattened everything into `other` and made the metric useless.
+    #[tokio::test]
+    async fn real_routes_keep_their_identity() {
+        let m = Metrics::new("0", "0", 0).unwrap();
+        let req = Request::builder()
+            .uri("/version")
+            .body(Body::empty())
+            .unwrap();
+        app(m.clone()).oneshot(req).await.unwrap();
+        let out = m.render().unwrap();
         assert!(
-            out.contains(r#"status="404"} 500"#),
-            "all 500 should land in the one series:\n{out}"
+            out.contains(
+                r#"imcp2_http_requests_total{method="GET",route="/version",status="200"} 1"#
+            ),
+            "{out}"
         );
     }
 }
