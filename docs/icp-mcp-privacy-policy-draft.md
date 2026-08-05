@@ -3,77 +3,11 @@
 > This is the source text for the page served at
 > `https://mcp.internetcomputer.org/privacy-policy`
 > (`src/assets/privacy-policy.html`). Keep the two in sync: the served page is
-> what users and the Anthropic directory review actually see.
->
-> **Revised against the privacy review of 2026-07-31.** Technical claims are
-> drawn from this repository's behaviour and were re-verified for that
-> revision (see "Logging audit" at the foot of this file). Re-verify them
-> against the deployed release whenever the policy is republished.
->
-> **Open-items status (2026-07-31):**
->
-> 1. **Hosting locations: resolved.** Both deployments run on AWS EC2 in
->    `eu-central-1` (Frankfurt, Germany) — established by mapping the
->    production and staging addresses (v4 and v6) against AWS's published
->    `ip-ranges.json`. Logs live in journald on those same hosts; metrics are
->    not persisted at all. Germany is an EEA state on Switzerland's adequacy
->    list (FADP Art. 16(1)), so no additional transfer safeguard is needed
->    for the hosting itself; the policy adds one sentence for residual
->    processor access under the AWS data-processing terms. If the hosts ever
->    move region, section 3 must be updated.
-> 2. **Legal bases: adopted.** GDPR Art. 6(1)(b) (performance of the
->    requested service) for the service categories — per EDPB Guidelines
->    2/2019 this covers processing objectively necessary to deliver what the
->    user asked for, and does not require written terms — and Art. 6(1)(f)
->    (legitimate interests: security per Recital 49, abuse prevention,
->    service improvement) for the cookie, logs, and metrics. Under the Swiss
->    FADP no per-purpose legal basis is required of private controllers;
->    listing them satisfies GDPR Art. 13(1)(c) where the GDPR applies and is
->    harmless otherwise. A short Terms of Use would make the 6(1)(b) footing
->    more robust and is noted as a follow-up in the submission doc.
-> 3. **Metrics retention: resolved.** Verified in code: gauges are computed
->    on demand from in-memory session maps and the status dashboard persists
->    nothing, so the policy states they are not stored.
-> 4. **EU representative: handled outside this repository.** The published
->    text asserts nothing either way (the FDPIC/EU-authority complaint
->    sentence is accurate regardless). Update section 7 if a representative
->    is named.
->
-> **Revised against the legal review round of 2026-08-03.** Three wording
-> corrections adopted verbatim or near-verbatim from that review:
->
-> 5. **Credential custody restated.** "Never leave Internet Identity" wrongly
->    implied II stores the credentials. The policy now says they are never
->    sent to the Service and names where each actually lives (passkey private
->    keys with the authenticator, recovery material with the user,
->    linked-account credentials with their providers).
-> 6. **International transfers.** Section 3's network paragraph describes the
->    international processing factually: the Service submits requests
->    deliberately at the user's direction, node locations are set by the
->    network's governance, and it names what travels. The wording of this
->    paragraph is maintained together with DFINITY legal; coordinate any
->    change to it (and keep the served page and this text in sync). The AWS
->    hosting sentence (Data Processing Addendum incorporating the EU
->    Standard Contractual Clauses, with the Swiss extension) is confirmed
->    and stands.
-> 7. **Sharing sentence de-contradicted.** "We do not share it with third
->    parties for their own purposes" conflicted with section 2, which
->    discloses that assistants, applications, and their operators process
->    data under their own policies. Replaced with: no sale, no disclosure
->    for advertising, disclosure only to the section-2 recipients as
->    necessary to perform requests, secure the Service, or comply with law.
-> 8. **OAuth registration lifetime: engineering, tracked.** The review asks
->    for a fixed inactivity lifetime (and ideally a deletion mechanism) for
->    OAuth client registrations instead of retention until LRU displacement.
->    That is a code change; the policy keeps stating the current behaviour
->    honestly until it ships, and the retention row must be updated when it
->    does. Tracked with the other engineering follow-ups from this round:
->    purging session credentials immediately when revocation is observed and
->    shortening the lifetime of already-issued per-application authorizations
->    (both in issue #121), and a deployment-level logging audit (AWS
->    services, load balancer, reverse proxy, crash diagnostics, DNS/CDN,
->    journald, support access) to substantiate the policy's logging claims
->    beyond application code.
+> what users and directory reviews actually see. Technical claims are drawn
+> from this repository's behaviour; re-verify them against the deployed
+> release whenever the policy is republished (and update section 3 if the
+> hosting region ever changes). Operational and review notes are maintained
+> outside this repository.
 
 ---
 
@@ -298,11 +232,12 @@ protection. When you direct the Service to read from or act on an
 application, the Service submits that request to the network deliberately,
 on your instruction, and the network processes it internationally to execute
 what you asked. What travels is the content of your request and its results
-(section 1); a request made as you travels under the pseudonymous
-per-application identifier described in section 6, while a public read made
-without signing in carries no user identifier at all. This processing is
-inherent to the network's design and applies to every request, so take it
-into account when deciding which applications to direct the Service at.
+(section 1). Authenticated requests also carry the pseudonymous
+per-application identifier described in section 6; unauthenticated public
+reads use the Internet Computer's shared anonymous principal, which
+identifies no one. This processing is inherent to the network's design and
+applies to every request, so take it into account when deciding which
+applications to direct the Service at.
 
 ### 4. Data Retention
 
@@ -409,33 +344,3 @@ to data already collected.
 
 For questions about this Privacy Policy or the Service, or to exercise any of
 the rights in section 7, email <mcp@dfinity.org>.
-
----
-
-## Logging audit (2026-07-31)
-
-Section 5 rests on this; redo it whenever the policy is republished.
-
-- Application logging lives in three files only: `src/main.rs`,
-  `src/auth.rs`, `src/identities.rs`. `calls.rs`, `discover.rs`, `tools.rs`,
-  `management.rs`, and `skills.rs` contain **zero** `tracing::` calls, which
-  is what makes the "no canister ids, arguments, or results in logs" claim
-  safe. A grep for `tracing::` lines mentioning `derivation`, `canister`,
-  `args`, or `origin` returns nothing.
-- Request logging (`log_request`, `src/main.rs`) records method, path, status,
-  and latency, and deliberately omits the query string and the body. It covers
-  only the MCP application: Caddy proxies `/status/*` straight to the Node
-  dashboard, which has no routine request log (its one log line is a sanitised
-  error). Caddy's own failure diagnostics can include request URIs (with query
-  strings), so section 5 hedges accordingly.
-- Session/auth events log `session_id` and the session-key principal
-  (`session_principal` = `self_authenticating` over the per-connection
-  session key, `src/identities.rs` — ephemeral, new per connection; NOT the
-  stable own-origin management identity, which is never logged), plus the
-  access level and expirations.
-- `deploy/native/Caddyfile` configures no `log` directive, so the reverse
-  proxy writes no access log.
-- The status dashboard emits a single sanitised error line
-  (`monitoring/mcp-status/server.js`).
-- Everything lands in journald, bounded by the `MaxFileSec=1week` +
-  `MaxRetentionSec=12week` drop-in that `deploy/native/deploy.sh` installs.

@@ -369,11 +369,12 @@ protection. When you direct the Service to read from or act on an
 application, the Service submits that request to the network deliberately,
 on your instruction, and the network processes it internationally to execute
 what you asked. What travels is the content of your request and its results
-(section 1); a request made as you travels under the pseudonymous
-per-application identifier described in section 6, while a public read made
-without signing in carries no user identifier at all. This processing is
-inherent to the network's design and applies to every request, so take it
-into account when deciding which applications to direct the Service at.</p>
+(section 1). Authenticated requests also carry the pseudonymous
+per-application identifier described in section 6; unauthenticated public
+reads use the Internet Computer's shared anonymous principal, which
+identifies no one. This processing is inherent to the network's design and
+applies to every request, so take it into account when deciding which
+applications to direct the Service at.</p>
 
 <h2>4. Data Retention</h2>
 
