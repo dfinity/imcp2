@@ -34,17 +34,45 @@
 > 3. **Metrics retention: resolved.** Verified in code: gauges are computed
 >    on demand from in-memory session maps and the status dashboard persists
 >    nothing, so the policy states they are not stored.
-> 4. **EU representative: open with DFINITY legal, off the page.** The
->    published text asserts nothing either way (the FDPIC/EU-authority
->    complaint sentence is accurate regardless), so publication does not
->    pre-empt the decision. The underlying question stands: if GDPR
->    Art. 3(2) applies (a directory listing distributed to EU users weighs
->    toward it), Art. 27's exemption will not fit — the processing is core
->    and continuous, not occasional — so legal should either name a
->    representative in section 7 (reusing any existing appointment) or
->    record a reasoned position that Art. 3(2) does not apply.
->    `dfinity.org/privacy` is JS-rendered and could not be text-checked for
->    an existing appointment.
+> 4. **EU representative: handled outside this repository.** The published
+>    text asserts nothing either way (the FDPIC/EU-authority complaint
+>    sentence is accurate regardless). Update section 7 if a representative
+>    is named.
+>
+> **Revised against the legal review round of 2026-08-03.** Three wording
+> corrections adopted verbatim or near-verbatim from that review:
+>
+> 5. **Credential custody restated.** "Never leave Internet Identity" wrongly
+>    implied II stores the credentials. The policy now says they are never
+>    sent to the Service and names where each actually lives (passkey private
+>    keys with the authenticator, recovery material with the user,
+>    linked-account credentials with their providers).
+> 6. **International transfers.** Section 3's network paragraph describes the
+>    international processing factually: the Service submits requests
+>    deliberately at the user's direction, node locations are set by the
+>    network's governance, and it names what travels. The wording of this
+>    paragraph is maintained together with DFINITY legal; coordinate any
+>    change to it (and keep the served page and this text in sync). The AWS
+>    hosting sentence (Data Processing Addendum incorporating the EU
+>    Standard Contractual Clauses, with the Swiss extension) is confirmed
+>    and stands.
+> 7. **Sharing sentence de-contradicted.** "We do not share it with third
+>    parties for their own purposes" conflicted with section 2, which
+>    discloses that assistants, applications, and their operators process
+>    data under their own policies. Replaced with: no sale, no disclosure
+>    for advertising, disclosure only to the section-2 recipients as
+>    necessary to perform requests, secure the Service, or comply with law.
+> 8. **OAuth registration lifetime: engineering, tracked.** The review asks
+>    for a fixed inactivity lifetime (and ideally a deletion mechanism) for
+>    OAuth client registrations instead of retention until LRU displacement.
+>    That is a code change; the policy keeps stating the current behaviour
+>    honestly until it ships, and the retention row must be updated when it
+>    does. Tracked with the other two engineering follow-ups from this
+>    round: purging session credentials immediately when revocation is
+>    observed, and a deployment-level logging audit (AWS services, load
+>    balancer, reverse proxy, crash diagnostics, DNS/CDN, journald, support
+>    access) to substantiate the policy's logging claims beyond application
+>    code.
 
 ---
 
@@ -80,15 +108,16 @@ using a consensus protocol. The Service lets an AI assistant read public
 information from it without any sign-in.
 
 For an assistant to act on your behalf, you sign in once with Internet
-Identity. **Your long-term authentication credentials never leave Internet
-Identity**: your passkeys, recovery phrase, and any linked accounts stay
-there, are never entered into the chat, and are never shared with the
-Service.
+Identity. **Your long-term credentials are never sent to the Service.**
+Passkey private keys remain with your authenticator, recovery material
+remains with you, and linked-account credentials remain with their
+respective providers; none of them are entered into the chat or shared with
+the Service.
 
 What the Service does hold, once you approve a connection, is a **delegated
 session signing key that the Service generates itself**, inside the server.
 No secret key crosses a network in either direction: your credentials stay
-with Internet Identity, and the Service's key never leaves the Service. What
+where they already live, and the Service's key never leaves the Service. What
 travels is only the key's public half, which Internet Identity signs,
 issuing a time-limited, scope-limited authorization for that key to act as
 you. The Service uses the session key with Internet Identity to obtain, for
@@ -239,8 +268,13 @@ data-processing terms. We use no other infrastructure processors today; if an
 observability or error-reporting provider is ever introduced, it will be
 named here first.
 
-We do not sell your data, and we do not share it with third parties for their
-own purposes.
+**Public authorities, where the law requires it.** If we are legally obliged
+to disclose personal data, for example by a court order or a binding request
+from a competent authority, we disclose the minimum required.
+
+We do not sell personal data or disclose it for advertising. We disclose it
+only to the recipients described above, as necessary to perform your
+requests, secure the Service, or comply with law.
 
 ### 3. International Transfers
 
@@ -250,14 +284,23 @@ the European Economic Area, whose countries are recognised by the Swiss
 Federal Council as providing adequate data protection, so no additional
 transfer safeguard is required for this hosting. Amazon Web Services may
 have limited remote access from other countries for support and operations;
-that access is governed by its data-processing terms, which incorporate the
-recognised safeguards for such transfers.
+that access is governed by the AWS Data Processing Addendum, which
+incorporates the EU Standard Contractual Clauses, as extended to Swiss
+transfers in line with the FDPIC's guidance, for any processing from a
+country without an adequate level of data protection.
 
-Separately, and by design, the Internet Computer is a global public network:
-its nodes are operated by independent providers in many countries, so
-requests you submit and anything you write to an application are processed
-internationally and outside our control. That is inherent to using a public
-network rather than a transfer we arrange.
+Separately, the Internet Computer is a global public network: its nodes are
+operated by independent providers in many countries, whose locations are set
+by the network's governance, not by us, and can include countries that
+Switzerland and the EEA do not recognise as providing adequate data
+protection. When you direct the Service to read from or act on an
+application, the Service submits that request to the network deliberately,
+on your instruction, and the network processes it internationally to execute
+what you asked. What travels is the content of your request and its results
+(section 1) under the pseudonymous per-application identifiers described in
+section 6. This processing is inherent to the network's design and applies
+to every request, so take it into account when deciding which applications
+to direct the Service at.
 
 ### 4. Data Retention
 

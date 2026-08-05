@@ -171,15 +171,16 @@ using a consensus protocol. The Service lets an AI assistant read public
 information from it without any sign-in.</p>
 
 <p>For an assistant to act on your behalf, you sign in once with Internet
-Identity. <strong>Your long-term authentication credentials never leave
-Internet Identity</strong>: your passkeys, recovery phrase, and any linked
-accounts stay there, are never entered into the chat, and are never shared
-with the Service.</p>
+Identity. <strong>Your long-term credentials are never sent to the
+Service.</strong> Passkey private keys remain with your authenticator,
+recovery material remains with you, and linked-account credentials remain
+with their respective providers; none of them are entered into the chat or
+shared with the Service.</p>
 
 <p>What the Service does hold, once you approve a connection, is a
 <strong>delegated session signing key that the Service generates
 itself</strong>, inside the server. No secret key crosses a network in either
-direction: your credentials stay with Internet Identity, and the Service's
+direction: your credentials stay where they already live, and the Service's
 key never leaves the Service. What travels is only the key's public half,
 which Internet Identity signs, issuing a time-limited, scope-limited
 authorization for that key to act as you. The Service uses the session key
@@ -338,8 +339,14 @@ under its data-processing terms. We use no other infrastructure processors
 today; if an observability or error-reporting provider is ever introduced, it
 will be named here first.</p>
 
-<p>We do not sell your data, and we do not share it with third parties for
-their own purposes.</p>
+<p><strong>Public authorities, where the law requires it.</strong> If we are
+legally obliged to disclose personal data, for example by a court order or a
+binding request from a competent authority, we disclose the minimum
+required.</p>
+
+<p>We do not sell personal data or disclose it for advertising. We disclose
+it only to the recipients described above, as necessary to perform your
+requests, secure the Service, or comply with law.</p>
 
 <h2>3. International Transfers</h2>
 
@@ -349,14 +356,23 @@ member of the European Economic Area, whose countries are recognised by the
 Swiss Federal Council as providing adequate data protection, so no additional
 transfer safeguard is required for this hosting. Amazon Web Services may have
 limited remote access from other countries for support and operations; that
-access is governed by its data-processing terms, which incorporate the
-recognised safeguards for such transfers.</p>
+access is governed by the AWS Data Processing Addendum, which incorporates
+the EU Standard Contractual Clauses, as extended to Swiss transfers in line
+with the FDPIC's guidance, for any processing from a country without an
+adequate level of data protection.</p>
 
-<p>Separately, and by design, the Internet Computer is a global public
-network: its nodes are operated by independent providers in many countries, so
-requests you submit and anything you write to an application are processed
-internationally and outside our control. That is inherent to using a public
-network rather than a transfer we arrange.</p>
+<p>Separately, the Internet Computer is a global public network: its nodes
+are operated by independent providers in many countries, whose locations are
+set by the network's governance, not by us, and can include countries that
+Switzerland and the EEA do not recognise as providing adequate data
+protection. When you direct the Service to read from or act on an
+application, the Service submits that request to the network deliberately,
+on your instruction, and the network processes it internationally to execute
+what you asked. What travels is the content of your request and its results
+(section 1) under the pseudonymous per-application identifiers described in
+section 6. This processing is inherent to the network's design and applies
+to every request, so take it into account when deciding which applications
+to direct the Service at.</p>
 
 <h2>4. Data Retention</h2>
 
