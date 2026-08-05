@@ -35,6 +35,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
 tower-http = { version = "0.7", features = ["cors"] }
+# Metrics exposition at /metrics. Pinned to the version dfinity/ic uses: these
+# series are destined for the same Prometheus / Victoria Metrics clusters that
+# scrape the IC, so matching the org's client keeps one exposition dialect in the
+# estate. The `process` feature adds CPU / RSS / file-descriptor collectors on
+# Linux, which is the deploy target.
+prometheus = { version = "0.14", features = ["process"] }
 sha2 = "0.11.0"
 base64 = "0.22.1"
 hex = "0.4.3"

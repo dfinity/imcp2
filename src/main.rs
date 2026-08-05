@@ -28,6 +28,8 @@ use imcp2::{auth_callbacks_router, Agent, IiInstance, McpConfig, McpServer, Shar
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Bind address. Honours `$PORT` (set by most PaaS), defaulting to 8000.
+mod metrics;
+
 fn bind_address() -> String {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8000".to_string());
     format!("0.0.0.0:{port}")
@@ -54,16 +56,34 @@ fn serve_beta() -> bool {
 /// keeping any single-use `?code=` out of logs) — and request bodies are never
 /// logged (the redeem POST carries the connection-scoped `state` and delegation).
 async fn log_request(
+    metrics: metrics::Metrics,
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    // The route *template* the router matched, for the metrics label. Read before
+    // `next.run` consumes the request. Deliberately not `path`: an outsider
+    // chooses the path, and a label they choose is an unbounded-series primitive
+    // on an internet-facing service. See metrics::route_label.
+    let matched = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string());
     let started = std::time::Instant::now();
     let resp = next.run(req).await;
     let status = resp.status().as_u16();
-    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let elapsed = started.elapsed();
+    let elapsed_ms = elapsed.as_millis() as u64;
+    // The log keeps the full path — it is the record of what external clients
+    // actually probe, and its cardinality costs nothing there. The metric cannot.
     tracing::info!(%method, %path, status, elapsed_ms, "http request");
+    metrics.observe_request(
+        metrics::route_label(matched.as_deref()),
+        method.as_str(),
+        status,
+        elapsed.as_secs_f64(),
+    );
     resp
 }
 
@@ -298,6 +318,19 @@ async fn main() -> anyhow::Result<()> {
     // gauge reports zero for it when the staging instance isn't served.
     let (ver_prod, ver_beta) = (prod.clone(), beta.clone());
 
+    // Metrics registry. Built once; the handle is cloned into the middleware and
+    // the /metrics route. A failure here means duplicate collector names, i.e. a
+    // programming error, so surface it at startup rather than serving a
+    // half-registered endpoint.
+    let metrics = metrics::Metrics::new(
+        env!("CARGO_PKG_VERSION"),
+        option_env!("GIT_SHA").unwrap_or("unknown"),
+        started_at,
+    )?;
+    // The session gauges are read at scrape time, so /metrics needs the same
+    // handles /version uses.
+    let (met_prod, met_beta) = (prod.clone(), beta.clone());
+
     // Which II each served mount hands off to. Built once (fixed for the process)
     // and cloned per request. This is the only way an external monitor can learn
     // the pairing: neither the mount path nor the origin implies it —
@@ -379,6 +412,62 @@ async fn main() -> anyhow::Result<()> {
                 }
             }),
         )
+        // Prometheus exposition. Unauthenticated like /version; see the note in
+        // deploy/native/Caddyfile on why this path is not published publicly.
+        .route(
+            "/metrics",
+            get({
+                let metrics = metrics.clone();
+                move || {
+                    let metrics = metrics.clone();
+                    let met_prod = met_prod.clone();
+                    let met_beta = met_beta.clone();
+                    async move {
+                        // Refresh the derived gauges from the authoritative
+                        // session maps before encoding. Beta reports zero when the
+                        // staging instance is not served, so the series exists
+                        // continuously rather than appearing and vanishing with
+                        // the deployment shape — a gap in a gauge is much harder
+                        // to reason about than a flat zero.
+                        let p = met_prod.session_gauges().await;
+                        metrics.set_sessions("prod", p.live as i64, p.active as i64);
+                        let (b_live, b_active) = match &met_beta {
+                            Some(b) => {
+                                let g = b.session_gauges().await;
+                                (g.live as i64, g.active as i64)
+                            }
+                            None => (0, 0),
+                        };
+                        metrics.set_sessions("beta", b_live, b_active);
+
+                        match metrics.render() {
+                            Ok(body) => (
+                                axum::http::StatusCode::OK,
+                                [(
+                                    axum::http::header::CONTENT_TYPE,
+                                    "text/plain; version=0.0.4; charset=utf-8",
+                                )],
+                                body,
+                            ),
+                            // A scrape failure must not be silent: Prometheus
+                            // reads a non-200 as the target being down, which is
+                            // the honest reading.
+                            Err(e) => {
+                                tracing::error!(error = %e, "failed to encode metrics");
+                                (
+                                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                    [(
+                                        axum::http::header::CONTENT_TYPE,
+                                        "text/plain; charset=utf-8",
+                                    )],
+                                    String::from("failed to encode metrics\n"),
+                                )
+                            }
+                        }
+                    }
+                }
+            }),
+        )
         // `nest_service`, not `nest`: it also forwards the bare trailing-slash
         // form (`/mcp/`), which axum's `nest` never routes into the nested router.
         .nest_service(prod.mcp_path(), prod.mcp_router())
@@ -410,7 +499,10 @@ async fn main() -> anyhow::Result<()> {
         // what external clients actually hit — discovery probes, unknown paths,
         // etc. Only the path is logged, never the query string, so single-use
         // secrets (`?code=`) don't land in logs.
-        .layer(axum::middleware::from_fn(log_request));
+        .layer(axum::middleware::from_fn(move |req, next| {
+            let metrics = metrics.clone();
+            async move { log_request(metrics, req, next).await }
+        }));
 
     let bind = bind_address();
     let listener = tokio::net::TcpListener::bind(&bind).await?;

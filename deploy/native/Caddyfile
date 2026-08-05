@@ -10,6 +10,21 @@ __DOMAIN__ {
     reverse_proxy 127.0.0.1:8137
   }
 
+  # Prometheus exposition is NOT published to the public internet. The app serves
+  # /metrics on 0.0.0.0:8000, so a scraper reaches it directly on the host's
+  # private address over the VPN — the same path the deploy already uses — and
+  # nothing needs to be exposed here to make that work.
+  #
+  # Returning 404 rather than 403 so the endpoint is not advertised as existing.
+  # Metrics are not secret, but they are a free operational read: request volumes
+  # and error rates by route, live session counts, process memory. That is
+  # reconnaissance for anyone probing the service, and a public scrape target is
+  # also an amplification lever, since each request makes the process gather and
+  # encode its whole registry.
+  handle /metrics {
+    respond 404
+  }
+
   # Everything else is the MCP server.
   handle {
     # Retry the upstream for a few seconds if the dial fails, so the ~1-3s gap
