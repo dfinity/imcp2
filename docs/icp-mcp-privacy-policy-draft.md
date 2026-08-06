@@ -3,48 +3,11 @@
 > This is the source text for the page served at
 > `https://mcp.internetcomputer.org/privacy-policy`
 > (`src/assets/privacy-policy.html`). Keep the two in sync: the served page is
-> what users and the Anthropic directory review actually see.
->
-> **Revised against the privacy review of 2026-07-31.** Technical claims are
-> drawn from this repository's behaviour and were re-verified for that
-> revision (see "Logging audit" at the foot of this file). Re-verify them
-> against the deployed release whenever the policy is republished.
->
-> **Open-items status (2026-07-31):**
->
-> 1. **Hosting locations: resolved.** Both deployments run on AWS EC2 in
->    `eu-central-1` (Frankfurt, Germany) — established by mapping the
->    production and staging addresses (v4 and v6) against AWS's published
->    `ip-ranges.json`. Logs live in journald on those same hosts; metrics are
->    not persisted at all. Germany is an EEA state on Switzerland's adequacy
->    list (FADP Art. 16(1)), so no additional transfer safeguard is needed
->    for the hosting itself; the policy adds one sentence for residual
->    processor access under the AWS data-processing terms. If the hosts ever
->    move region, section 3 must be updated.
-> 2. **Legal bases: adopted.** GDPR Art. 6(1)(b) (performance of the
->    requested service) for the service categories — per EDPB Guidelines
->    2/2019 this covers processing objectively necessary to deliver what the
->    user asked for, and does not require written terms — and Art. 6(1)(f)
->    (legitimate interests: security per Recital 49, abuse prevention,
->    service improvement) for the cookie, logs, and metrics. Under the Swiss
->    FADP no per-purpose legal basis is required of private controllers;
->    listing them satisfies GDPR Art. 13(1)(c) where the GDPR applies and is
->    harmless otherwise. A short Terms of Use would make the 6(1)(b) footing
->    more robust and is noted as a follow-up in the submission doc.
-> 3. **Metrics retention: resolved.** Verified in code: gauges are computed
->    on demand from in-memory session maps and the status dashboard persists
->    nothing, so the policy states they are not stored.
-> 4. **EU representative: open with DFINITY legal, off the page.** The
->    published text asserts nothing either way (the FDPIC/EU-authority
->    complaint sentence is accurate regardless), so publication does not
->    pre-empt the decision. The underlying question stands: if GDPR
->    Art. 3(2) applies (a directory listing distributed to EU users weighs
->    toward it), Art. 27's exemption will not fit — the processing is core
->    and continuous, not occasional — so legal should either name a
->    representative in section 7 (reusing any existing appointment) or
->    record a reasoned position that Art. 3(2) does not apply.
->    `dfinity.org/privacy` is JS-rendered and could not be text-checked for
->    an existing appointment.
+> what users and directory reviews actually see. Technical claims are drawn
+> from this repository's behaviour; re-verify them against the deployed
+> release whenever the policy is republished (and update section 3 if the
+> hosting region ever changes). Operational and review notes are maintained
+> outside this repository.
 
 ---
 
@@ -80,15 +43,16 @@ using a consensus protocol. The Service lets an AI assistant read public
 information from it without any sign-in.
 
 For an assistant to act on your behalf, you sign in once with Internet
-Identity. **Your long-term authentication credentials never leave Internet
-Identity**: your passkeys, recovery phrase, and any linked accounts stay
-there, are never entered into the chat, and are never shared with the
-Service.
+Identity. **Your long-term credentials are never sent to the Service.**
+Passkey private keys remain with your authenticator, recovery material
+remains with you, and linked-account credentials remain with their
+respective providers; none of them are entered into the chat or shared with
+the Service.
 
 What the Service does hold, once you approve a connection, is a **delegated
 session signing key that the Service generates itself**, inside the server.
 No secret key crosses a network in either direction: your credentials stay
-with Internet Identity, and the Service's key never leaves the Service. What
+where they already live, and the Service's key never leaves the Service. What
 travels is only the key's public half, which Internet Identity signs,
 issuing a time-limited, scope-limited authorization for that key to act as
 you. The Service uses the session key with Internet Identity to obtain, for
@@ -239,8 +203,13 @@ data-processing terms. We use no other infrastructure processors today; if an
 observability or error-reporting provider is ever introduced, it will be
 named here first.
 
-We do not sell your data, and we do not share it with third parties for their
-own purposes.
+**Public authorities, where the law requires it.** If we are legally obliged
+to disclose personal data, for example by a court order or a binding request
+from a competent authority, we disclose the minimum required.
+
+We do not sell personal data or disclose it for advertising. We disclose it
+only to the recipients described above, as necessary to perform your
+requests, secure the Service, or comply with law.
 
 ### 3. International Transfers
 
@@ -250,14 +219,25 @@ the European Economic Area, whose countries are recognised by the Swiss
 Federal Council as providing adequate data protection, so no additional
 transfer safeguard is required for this hosting. Amazon Web Services may
 have limited remote access from other countries for support and operations;
-that access is governed by its data-processing terms, which incorporate the
-recognised safeguards for such transfers.
+that access is governed by the AWS Data Processing Addendum, which
+incorporates the EU Standard Contractual Clauses, as extended to Swiss
+transfers in line with the FDPIC's guidance, for any processing from a
+country without an adequate level of data protection.
 
-Separately, and by design, the Internet Computer is a global public network:
-its nodes are operated by independent providers in many countries, so
-requests you submit and anything you write to an application are processed
-internationally and outside our control. That is inherent to using a public
-network rather than a transfer we arrange.
+Separately, the Internet Computer is a global public network: its nodes are
+operated by independent providers in many countries, whose locations are set
+by the network's governance, not by us, and can include countries that
+Switzerland and the EEA do not recognise as providing adequate data
+protection. When you direct the Service to read from or act on an
+application, the Service submits that request to the network deliberately,
+on your instruction, and the network processes it internationally to execute
+what you asked. What travels is the content of your request and its results
+(section 1). Authenticated requests also carry the pseudonymous
+per-application identifier described in section 6; unauthenticated public
+reads use the Internet Computer's shared anonymous principal, which
+identifies no one. This processing is inherent to the network's design and
+applies to every request, so take it into account when deciding which
+applications to direct the Service at.
 
 ### 4. Data Retention
 
@@ -364,33 +344,3 @@ to data already collected.
 
 For questions about this Privacy Policy or the Service, or to exercise any of
 the rights in section 7, email <mcp@dfinity.org>.
-
----
-
-## Logging audit (2026-07-31)
-
-Section 5 rests on this; redo it whenever the policy is republished.
-
-- Application logging lives in three files only: `src/main.rs`,
-  `src/auth.rs`, `src/identities.rs`. `calls.rs`, `discover.rs`, `tools.rs`,
-  `management.rs`, and `skills.rs` contain **zero** `tracing::` calls, which
-  is what makes the "no canister ids, arguments, or results in logs" claim
-  safe. A grep for `tracing::` lines mentioning `derivation`, `canister`,
-  `args`, or `origin` returns nothing.
-- Request logging (`log_request`, `src/main.rs`) records method, path, status,
-  and latency, and deliberately omits the query string and the body. It covers
-  only the MCP application: Caddy proxies `/status/*` straight to the Node
-  dashboard, which has no routine request log (its one log line is a sanitised
-  error). Caddy's own failure diagnostics can include request URIs (with query
-  strings), so section 5 hedges accordingly.
-- Session/auth events log `session_id` and the session-key principal
-  (`session_principal` = `self_authenticating` over the per-connection
-  session key, `src/identities.rs` — ephemeral, new per connection; NOT the
-  stable own-origin management identity, which is never logged), plus the
-  access level and expirations.
-- `deploy/native/Caddyfile` configures no `log` directive, so the reverse
-  proxy writes no access log.
-- The status dashboard emits a single sanitised error line
-  (`monitoring/mcp-status/server.js`).
-- Everything lands in journald, bounded by the `MaxFileSec=1week` +
-  `MaxRetentionSec=12week` drop-in that `deploy/native/deploy.sh` installs.
