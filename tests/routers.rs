@@ -115,6 +115,9 @@ async fn authorization_server_metadata_is_a_path_issuer_per_instance() {
             doc["registration_endpoint"],
             format!("{PUBLIC_URL}/mcp/oauth/register")
         );
+        // RFC 9207: we emit `iss` on authorization responses, so the AS metadata
+        // MUST advertise the parameter.
+        assert_eq!(doc["authorization_response_iss_parameter_supported"], true);
         // Optional fields absent per RFC 8414 must be OMITTED, not null.
         assert!(doc.get("scopes_supported").is_none());
     }
