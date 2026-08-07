@@ -23,7 +23,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=build /app/target/release/imcp2 /usr/local/bin/imcp2
 # Static assets (signing frontend + WASM codec) are served relative to the workdir.
 COPY static ./static
-ENV RUST_LOG=info
+# See deploy/native/imcp2.service: the per-request log line is debug-level, and
+# is worth keeping on a deployed host.
+ENV RUST_LOG=info,imcp2::metrics=debug
 # PaaS injects $PORT; the server honours it (default 8000). PUBLIC_URL must be set
 # to the deployment's public https URL so OAuth discovery + the /app link are correct.
 CMD ["imcp2"]

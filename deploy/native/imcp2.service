@@ -9,7 +9,11 @@ User=ec2-user
 WorkingDirectory=/opt/imcp2
 Environment=PORT=8000
 Environment=PUBLIC_URL=__PUBLIC_URL__
-Environment=RUST_LOG=info
+# The per-request line moved to debug so it does not drown `info` for embedders
+# and local runs. On a deployed host that line is the record of what external
+# clients actually probe, so keep it: enable debug for that target only, rather
+# than turning the whole crate to debug.
+Environment=RUST_LOG=info,imcp2::metrics=debug
 # Also serve the beta II instance at /mcp-beta on STAGING only. deploy.sh
 # substitutes __MCP_SERVE_BETA__ per environment: `1` on staging, empty on
 # production. An empty value reads as off, so production serves /mcp (production

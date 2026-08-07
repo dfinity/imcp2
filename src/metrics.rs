@@ -209,9 +209,16 @@ impl Metrics {
         registry.register(Box::new(build_info.clone()))?;
         build_info.with_label_values(&[version, commit]).set(1);
 
-        // Conventional name and semantics, matching what node_exporter and the
-        // client libraries use, so existing dashboards and "restarted recently"
-        // alert expressions work without special-casing this target.
+        // NOT the conventional `process_start_time_seconds` — the prefix makes it
+        // `imcp2_process_start_time_seconds`, and it deliberately measures a
+        // different thing. The process collector's conventional series is the OS
+        // process start; this is when the server finished initialising and began
+        // serving, which is the moment a redeploy actually becomes visible to
+        // clients. On a real host the two differ by a second or two.
+        //
+        // Both are worth having, and an embedder gets only this one, since the
+        // library does not register the process collector — see
+        // `register_process_collector`.
         let start_time = IntGauge::new(
             metric!("process_start_time_seconds"),
             "Unix epoch seconds at which this process started, i.e. when the deployment \
@@ -229,9 +236,26 @@ impl Metrics {
         })
     }
 
-    /// Record one completed request. `route` must already be a bounded template
-    /// — see [`route_label`].
-    pub fn observe_request(&self, route: &str, method: &str, status: u16, elapsed_secs: f64) {
+    /// Record one completed request.
+    ///
+    /// Deliberately **not** public. Making it so would hand an embedder a way to
+    /// write arbitrary strings straight into `route` and `method`, reintroducing
+    /// exactly the unbounded cardinality this module exists to prevent — the
+    /// bound would then live only in the middleware, and be one direct call away
+    /// from being bypassed. The supported entry point is
+    /// [`write_request_metrics`], which derives both labels from the request.
+    ///
+    /// `method` is normalised here as well as in the middleware. Belt and braces
+    /// is cheap, and it means the invariant holds at the recording site rather
+    /// than depending on every caller remembering.
+    pub(crate) fn observe_request(
+        &self,
+        route: &str,
+        method: &str,
+        status: u16,
+        elapsed_secs: f64,
+    ) {
+        let method = method_label(method);
         // `status` is rendered rather than bucketed: HTTP codes are a small
         // closed set in practice, and keeping the exact code lets a query
         // separate 401 from 404 from 500, which grouping into 4xx/5xx destroys.
