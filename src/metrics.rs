@@ -1,10 +1,22 @@
-//! Prometheus metrics for the deployment binary, exposed at `GET /metrics` in
-//! the standard text exposition format.
+//! Prometheus instrumentation for this crate, usable from the library rather
+//! than only from the bundled binary.
 //!
 //! Uses the `prometheus` crate at the version `dfinity/ic` pins, since these
 //! series are destined for the same Prometheus/Victoria Metrics clusters that
 //! scrape the IC — matching the org's client avoids two exposition dialects in
 //! one estate.
+//!
+//! ## The registry belongs to the caller
+//!
+//! [`Metrics::new`] registers its collectors into a [`Registry`] you supply and
+//! keeps no registry of its own. A host embedding this crate already has one,
+//! already exposes it somewhere, and would never see series published into a
+//! registry this module kept to itself. Exposition is therefore the host's job
+//! too: this module has no `render` — gather your own registry.
+//!
+//! One consequence worth stating: registering twice into the same registry
+//! returns [`prometheus::Error::AlreadyReg`] rather than panicking, so build one
+//! `Metrics` per registry and clone it. Cloning shares the collectors.
 //!
 //! What is here and why:
 //!
@@ -44,10 +56,30 @@
 //! the bucket count. It is allow-listed to the standard methods for that reason.
 //! `status` is safe by contrast: the server chooses it, from a small closed set.
 
-use prometheus::{
-    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+use axum::{
+    extract::{MatchedPath, Request, State},
+    middleware::Next,
+    response::Response,
 };
+use prometheus::{
+    Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+};
+
+/// Every metric this crate publishes is named `imcp2_*`. The prefix is factored
+/// out so it cannot drift between the seven definitions and the assertions that
+/// check them, and it is a macro rather than a `const` + `format!` so the names
+/// stay `&'static str` and stay greppable in full — searching an alert rule's
+/// `imcp2_http_requests_total` should land on the line that defines it.
+///
+/// Deliberately fixed, not caller-configurable: a metric name identifies the
+/// software emitting it, and `imcp2_http_requests_total` meaning the same thing
+/// on every deployment is what lets one dashboard and one alert rule work
+/// everywhere.
+macro_rules! metric {
+    ($suffix:literal) => {
+        concat!("imcp2_", $suffix)
+    };
+}
 
 /// The bucket every unmatched request shares. One series for the entire
 /// internet's worth of probing, rather than one per path attempted.
@@ -72,11 +104,13 @@ const LATENCY_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
-/// Handle for recording and rendering metrics. Cheap to clone: everything inside
-/// is `Arc`-backed by the `prometheus` crate, so clones share one registry.
+/// Handle for recording this crate's metrics. Cheap to clone: every collector is
+/// `Arc`-backed by the `prometheus` crate, so clones share one set of series.
+///
+/// Holds no [`Registry`] — see the module docs. Clone this into your middleware
+/// state and wherever else you record from.
 #[derive(Clone)]
 pub struct Metrics {
-    registry: Registry,
     requests: IntCounterVec,
     duration: HistogramVec,
     live_sessions: IntGaugeVec,
@@ -85,17 +119,31 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    /// Build the registry and register every collector.
+    /// Register this crate's collectors into `registry` and return a handle for
+    /// recording against them.
     ///
-    /// `commit` and `version` become labels on a single `build_info` gauge — the
+    /// The registry is borrowed, never retained: exposition stays the caller's
+    /// job, so a host embedding this crate publishes these series from wherever
+    /// it already publishes its own.
+    ///
+    /// `version` and `commit` become labels on a single `build_info` gauge — the
     /// conventional way to attach immutable facts to a target without pinning
-    /// them onto every other series.
-    pub fn new(version: &str, commit: &str, started_at: u64) -> prometheus::Result<Self> {
-        let registry = Registry::new();
+    /// them onto every other series. They are constructor arguments rather than
+    /// a separate setter so that forgetting them is impossible; a silently
+    /// absent `build_info` is hard to notice and annoying to debug.
+    ///
+    /// Returns [`prometheus::Error::AlreadyReg`] if called twice against the same
+    /// registry. Build one and clone it.
+    pub fn new(
+        registry: &Registry,
+        version: &str,
+        commit: &str,
+        started_at: u64,
+    ) -> prometheus::Result<Self> {
 
         let requests = IntCounterVec::new(
             Opts::new(
-                "imcp2_http_requests_total",
+                metric!("http_requests_total"),
                 "Total HTTP requests, by matched route template, method and status code.",
             ),
             &["route", "method", "status"],
@@ -107,7 +155,7 @@ impl Metrics {
         // "how slow was it" is rarely a question about one status code.
         let duration = HistogramVec::new(
             HistogramOpts::new(
-                "imcp2_http_request_duration_seconds",
+                metric!("http_request_duration_seconds"),
                 "HTTP request latency in seconds, by matched route template and method.",
             )
             .buckets(LATENCY_BUCKETS.to_vec()),
@@ -117,7 +165,7 @@ impl Metrics {
 
         let live_sessions = IntGaugeVec::new(
             Opts::new(
-                "imcp2_live_sessions",
+                metric!("live_sessions"),
                 "Authenticated sessions holding a currently-valid Internet Identity grant. \
                  A session counts from grant redemption until the grant expires, idle or not.",
             ),
@@ -127,7 +175,7 @@ impl Metrics {
 
         let active_sessions = IntGaugeVec::new(
             Opts::new(
-                "imcp2_active_sessions",
+                metric!("active_sessions"),
                 "The subset of live sessions that also made a request within the activity \
                  window. Always <= imcp2_live_sessions. Use this to time a low-disruption \
                  redeploy.",
@@ -141,7 +189,7 @@ impl Metrics {
         // and the resulting gap looks like an outage that never happened.
         let scrapes = Histogram::with_opts(
             HistogramOpts::new(
-                "imcp2_metrics_scrape_duration_seconds",
+                metric!("metrics_scrape_duration_seconds"),
                 "Time spent gathering and encoding this endpoint's own response.",
             )
             .buckets(vec![0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]),
@@ -153,7 +201,7 @@ impl Metrics {
         // it to a commit.
         let build_info = IntGaugeVec::new(
             Opts::new(
-                "imcp2_build_info",
+                metric!("build_info"),
                 "Always 1. Carries the running version and commit as labels.",
             ),
             &["version", "commit"],
@@ -165,23 +213,14 @@ impl Metrics {
         // client libraries use, so existing dashboards and "restarted recently"
         // alert expressions work without special-casing this target.
         let start_time = IntGauge::new(
-            "imcp2_process_start_time_seconds",
+            metric!("process_start_time_seconds"),
             "Unix epoch seconds at which this process started, i.e. when the deployment \
              last restarted. Every deploy restarts the service.",
         )?;
         registry.register(Box::new(start_time.clone()))?;
         start_time.set(started_at as i64);
 
-        // CPU, resident memory and file descriptors. Only compiled where the
-        // crate can implement it: it reads /proc, so it is Linux-only. The deploy
-        // target is Amazon Linux; this keeps a macOS dev build working.
-        #[cfg(target_os = "linux")]
-        registry.register(Box::new(
-            prometheus::process_collector::ProcessCollector::for_self(),
-        ))?;
-
         Ok(Self {
-            registry,
             requests,
             duration,
             live_sessions,
@@ -214,15 +253,103 @@ impl Metrics {
             .set(active);
     }
 
-    /// Gather and encode the registry in Prometheus text format.
-    pub fn render(&self) -> prometheus::Result<String> {
-        let timer = self.scrapes.start_timer();
-        let mut buf = Vec::new();
-        TextEncoder::new().encode(&self.registry.gather(), &mut buf)?;
-        timer.observe_duration();
-        String::from_utf8(buf)
-            .map_err(|e| prometheus::Error::Msg(format!("metrics output was not UTF-8: {e}")))
+    /// Record how long a scrape took to gather and encode.
+    ///
+    /// Exposition belongs to whoever owns the registry, so this crate cannot time
+    /// it — but the signal is worth keeping: a scrape that quietly got slow is how
+    /// a target starts being dropped for timing out, and the resulting gap looks
+    /// like an outage that never happened. Call this from your `/metrics` handler.
+    pub fn observe_scrape(&self, seconds: f64) {
+        self.scrapes.observe(seconds);
     }
+}
+
+/// Register the process collector — CPU, resident memory, open file descriptors.
+///
+/// Separate from [`Metrics::new`], and deliberately so. It emits un-namespaced
+/// `process_*` series describing the whole OS process, which belongs to the
+/// application rather than to this crate; registering it from library code would
+/// both claim series that are not ours and collide with any host that already has
+/// one. Standalone binaries should call it; embedders generally should not.
+///
+/// A no-op off Linux, where the crate cannot implement it (it reads `/proc`).
+pub fn register_process_collector(registry: &Registry) -> prometheus::Result<()> {
+    #[cfg(target_os = "linux")]
+    registry.register(Box::new(
+        prometheus::process_collector::ProcessCollector::for_self(),
+    ))?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = registry;
+    Ok(())
+}
+
+/// Middleware: record request count and latency.
+///
+/// Split from [`write_request_logs`] because the two have genuinely different
+/// constraints and a combined layer forces the stricter one on both. Metrics must
+/// bound every label — see the module docs — while a log line can afford the full
+/// path, and is in fact more useful for carrying it. Separating them also lets a
+/// host take one and not the other.
+///
+/// Apply with the handle as state:
+///
+/// ```ignore
+/// use axum::middleware::from_fn_with_state;
+/// let metrics = imcp2::metrics::Metrics::new(&registry, version, commit, started_at)?;
+/// let app = router.layer(from_fn_with_state(
+///     metrics.clone(),
+///     imcp2::metrics::write_request_metrics,
+/// ));
+/// ```
+pub async fn write_request_metrics(
+    State(metrics): State<Metrics>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // Read the matched template before `next.run` consumes the request.
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string());
+    let method = req.method().clone();
+    let started = std::time::Instant::now();
+    let resp = next.run(req).await;
+    metrics.observe_request(
+        route_label(route.as_deref()),
+        method_label(method.as_str()),
+        resp.status().as_u16(),
+        started.elapsed().as_secs_f64(),
+    );
+    resp
+}
+
+/// Middleware: log one line per request — method, path, status, elapsed.
+///
+/// At `debug` level. This fires on every request including the noise floor of an
+/// internet-facing service, so it does not belong at `info`, where it drowns the
+/// handful of lines an operator actually wants. `RUST_LOG=imcp2=debug` turns it on.
+///
+/// Only the path is logged, never the query string, so single-use secrets
+/// (`?code=`) do not land in logs. Request bodies are never logged either — the
+/// redeem POST carries the connection-scoped `state` and the delegation.
+///
+/// Unlike [`write_request_metrics`] this keeps the *full* path rather than the
+/// route template: it is the record of what external clients actually probe, and
+/// unbounded cardinality costs nothing in a log.
+///
+/// ```ignore
+/// use axum::middleware::from_fn;
+/// let app = router.layer(from_fn(imcp2::metrics::write_request_logs));
+/// ```
+pub async fn write_request_logs(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let started = std::time::Instant::now();
+    let resp = next.run(req).await;
+    let status = resp.status().as_u16();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    tracing::debug!(%method, %path, status, elapsed_ms, "http request");
+    resp
 }
 
 /// The `route` label for a request: the route template the router matched, or
@@ -255,30 +382,45 @@ pub fn method_label(method: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request, routing::get, Router};
+    use axum::{body::Body, http::Request as HttpRequest, routing::get, Router};
+    use prometheus::{Encoder, TextEncoder};
     use tower::ServiceExt;
 
-    /// A router shaped like the real one: one real route, and the same
-    /// `log_request` middleware the binary installs.
+    /// Stand-in for what a host does at scrape time, now that this crate does not
+    /// render: gather the caller's registry and encode it.
+    fn encode(registry: &Registry) -> String {
+        let mut buf = Vec::new();
+        TextEncoder::new()
+            .encode(&registry.gather(), &mut buf)
+            .unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    fn fixture() -> (Registry, Metrics) {
+        let r = Registry::new();
+        let m = Metrics::new(&r, "1.2.3", "abc1234", 1_700_000_000).unwrap();
+        (r, m)
+    }
+
+    /// A router shaped like a host's: a real route, and the exported middleware.
     ///
-    /// The cardinality tests below go through this rather than calling
-    /// `observe_request` directly. That distinction is the entire point: calling
-    /// the recorder with a pre-computed label only proves the recorder is
-    /// deterministic. Driving real requests proves the *middleware* derives a
-    /// bounded label from a hostile one — which is the property being claimed,
-    /// and the one that would break if someone later passed the raw URI.
+    /// The cardinality tests go through this rather than calling `observe_request`
+    /// directly. Calling the recorder with a pre-computed label only proves the
+    /// recorder is deterministic; driving real requests proves the *middleware*
+    /// derives a bounded label from a hostile one, which is the actual claim and
+    /// the thing that breaks if someone later passes the raw URI.
     fn app(m: Metrics) -> Router {
         Router::new()
             .route("/version", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                let m = m.clone();
-                async move { crate::log_request(m, req, next).await }
-            }))
+            .layer(axum::middleware::from_fn_with_state(
+                m,
+                write_request_metrics,
+            ))
     }
 
     fn request_series(out: &str) -> Vec<&str> {
         out.lines()
-            .filter(|l| l.starts_with("imcp2_http_requests_total{"))
+            .filter(|l| l.starts_with(metric!("http_requests_total")) && l.contains('{'))
             .collect()
     }
 
@@ -291,7 +433,6 @@ mod tests {
     #[test]
     fn matched_requests_keep_their_template() {
         assert_eq!(route_label(Some("/version")), "/version");
-        assert_eq!(route_label(Some("/mcp")), "/mcp");
     }
 
     #[test]
@@ -305,87 +446,126 @@ mod tests {
     }
 
     #[test]
-    fn renders_text_format_with_build_info_and_start_time() {
-        let m = Metrics::new("1.2.3", "abc1234", 1_700_000_000).unwrap();
-        let out = m.render().unwrap();
-        assert!(out.contains("imcp2_build_info"), "{out}");
+    fn collectors_land_in_the_callers_registry() {
+        let (r, _m) = fixture();
+        let out = encode(&r);
+        assert!(out.contains(metric!("build_info")), "{out}");
         assert!(out.contains(r#"version="1.2.3""#), "{out}");
         assert!(out.contains(r#"commit="abc1234""#), "{out}");
         assert!(
-            out.contains("imcp2_process_start_time_seconds 1700000000"),
+            out.contains(concat!(metric!("process_start_time_seconds"), " 1700000000")),
+            "{out}"
+        );
+    }
+
+    /// The library must not claim the host's process-level series. `process_*` is
+    /// un-namespaced and describes the whole OS process, which belongs to the
+    /// application embedding this crate, not to this crate.
+    #[test]
+    fn new_does_not_register_the_process_collector() {
+        let (r, _m) = fixture();
+        let out = encode(&r);
+        assert!(
+            !out.contains("process_cpu_seconds_total"),
+            "Metrics::new must not register process_* series:\n{out}"
+        );
+        // It is available, just opt-in and separate.
+        register_process_collector(&r).unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(encode(&r).contains("process_cpu_seconds_total"));
+    }
+
+    /// Registering twice into one registry is an error, not a panic — so a host
+    /// that wires this up twice gets a `Result` it can act on. Build one and clone.
+    #[test]
+    fn double_registration_is_an_error_not_a_panic() {
+        let (r, _m) = fixture();
+        match Metrics::new(&r, "1.2.3", "abc1234", 0) {
+            Err(prometheus::Error::AlreadyReg) => {}
+            Err(e) => panic!("expected AlreadyReg, got {e:?}"),
+            Ok(_) => panic!("expected the second registration to fail"),
+        }
+    }
+
+    /// Two independent registries do not collide, which is what makes the
+    /// clone-or-rebuild guidance workable.
+    #[test]
+    fn separate_registries_are_independent() {
+        let (_r1, _m1) = fixture();
+        let (_r2, _m2) = fixture();
+    }
+
+    #[test]
+    fn records_requests_and_sessions() {
+        let (r, m) = fixture();
+        m.observe_request("/version", "GET", 200, 0.002);
+        m.observe_request("/version", "GET", 200, 0.003);
+        m.set_sessions("prod", 7, 3);
+        let out = encode(&r);
+        assert!(
+            out.contains(concat!(
+                metric!("http_requests_total"),
+                r#"{method="GET",route="/version",status="200"} 2"#
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(concat!(metric!("live_sessions"), r#"{instance="prod"} 7"#)),
+            "{out}"
+        );
+        assert!(
+            out.contains(concat!(metric!("active_sessions"), r#"{instance="prod"} 3"#)),
             "{out}"
         );
     }
 
     #[test]
-    fn records_requests_and_sessions() {
-        let m = Metrics::new("0", "0", 0).unwrap();
-        m.observe_request("/version", "GET", 200, 0.002);
-        m.observe_request("/version", "GET", 200, 0.003);
-        m.set_sessions("prod", 7, 3);
-
-        let out = m.render().unwrap();
+    fn scrape_duration_is_recordable_by_the_host() {
+        let (r, m) = fixture();
+        m.observe_scrape(0.004);
         assert!(
-            out.contains(
-                r#"imcp2_http_requests_total{method="GET",route="/version",status="200"} 2"#
-            ),
-            "{out}"
-        );
-        assert!(out.contains(r#"imcp2_live_sessions{instance="prod"} 7"#), "{out}");
-        assert!(
-            out.contains(r#"imcp2_active_sessions{instance="prod"} 3"#),
-            "{out}"
-        );
-        assert!(
-            out.contains(
-                r#"imcp2_http_request_duration_seconds_count{method="GET",route="/version"} 2"#
-            ),
-            "{out}"
+            encode(&r).contains(concat!(metric!("metrics_scrape_duration_seconds"), "_count 1")),
+            "{}",
+            encode(&r)
         );
     }
 
-    /// 200 distinct paths, sent as real requests, must produce one series.
     #[tokio::test]
     async fn a_flood_of_distinct_paths_yields_one_series() {
-        let m = Metrics::new("0", "0", 0).unwrap();
+        let (r, m) = fixture();
         for i in 0..200 {
-            let req = Request::builder()
+            let req = HttpRequest::builder()
                 .uri(format!("/scan-{i}-{}", "x".repeat(i % 13)))
                 .body(Body::empty())
                 .unwrap();
             app(m.clone()).oneshot(req).await.unwrap();
         }
-        let out = m.render().unwrap();
+        let out = encode(&r);
         let series = request_series(&out);
         assert_eq!(series.len(), 1, "expected one series, got:\n{out}");
         assert!(series[0].contains(r#"route="other""#), "{}", series[0]);
         assert!(series[0].ends_with(" 200"), "{}", series[0]);
     }
 
-    /// The same property for the method label. HTTP permits arbitrary extension
-    /// tokens, and each unique one previously minted a counter series *and* a
-    /// full set of histogram buckets — the histogram multiplying the cost by
-    /// roughly the bucket count.
     #[tokio::test]
     async fn a_flood_of_extension_methods_yields_one_series() {
-        let m = Metrics::new("0", "0", 0).unwrap();
+        let (r, m) = fixture();
         for i in 0..100 {
-            let req = Request::builder()
+            let req = HttpRequest::builder()
                 .method(format!("WIBBLE{i}").as_str())
                 .uri("/version")
                 .body(Body::empty())
                 .unwrap();
             app(m.clone()).oneshot(req).await.unwrap();
         }
-        let out = m.render().unwrap();
+        let out = encode(&r);
         let series = request_series(&out);
         assert_eq!(series.len(), 1, "expected one series, got:\n{out}");
         assert!(series[0].contains(r#"method="other""#), "{}", series[0]);
 
-        // The histogram is where the real damage would be, so bound it too.
         let buckets = out
             .lines()
-            .filter(|l| l.starts_with("imcp2_http_request_duration_seconds_bucket"))
+            .filter(|l| l.starts_with(concat!(metric!("http_request_duration_seconds"), "_bucket")))
             .count();
         assert_eq!(
             buckets,
@@ -394,22 +574,21 @@ mod tests {
         );
     }
 
-    /// Real traffic still resolves to its own template, so bounding the labels
-    /// has not flattened everything into `other` and made the metric useless.
     #[tokio::test]
     async fn real_routes_keep_their_identity() {
-        let m = Metrics::new("0", "0", 0).unwrap();
-        let req = Request::builder()
+        let (r, m) = fixture();
+        let req = HttpRequest::builder()
             .uri("/version")
             .body(Body::empty())
             .unwrap();
         app(m.clone()).oneshot(req).await.unwrap();
-        let out = m.render().unwrap();
         assert!(
-            out.contains(
-                r#"imcp2_http_requests_total{method="GET",route="/version",status="200"} 1"#
-            ),
-            "{out}"
+            encode(&r).contains(concat!(
+                metric!("http_requests_total"),
+                r#"{method="GET",route="/version",status="200"} 1"#
+            )),
+            "{}",
+            encode(&r)
         );
     }
 }

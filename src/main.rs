@@ -28,8 +28,6 @@ use imcp2::{auth_callbacks_router, Agent, IiInstance, McpConfig, McpServer, Shar
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Bind address. Honours `$PORT` (set by most PaaS), defaulting to 8000.
-mod metrics;
-
 fn bind_address() -> String {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8000".to_string());
     format!("0.0.0.0:{port}")
@@ -50,44 +48,6 @@ fn serve_beta() -> bool {
         .unwrap_or(false)
 }
 
-/// Log each inbound request: method, path, response status, and latency — gives
-/// visibility into what external MCP clients probe (discovery URLs, unknown
-/// paths) at `RUST_LOG=info`. The query string is never logged (defense in depth,
-/// keeping any single-use `?code=` out of logs) — and request bodies are never
-/// logged (the redeem POST carries the connection-scoped `state` and delegation).
-async fn log_request(
-    metrics: metrics::Metrics,
-    req: axum::http::Request<axum::body::Body>,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let method = req.method().clone();
-    let path = req.uri().path().to_string();
-    // The route *template* the router matched, for the metrics label. Read before
-    // `next.run` consumes the request. Deliberately not `path`: an outsider
-    // chooses the path, and a label they choose is an unbounded-series primitive
-    // on an internet-facing service. See metrics::route_label.
-    let matched = req
-        .extensions()
-        .get::<axum::extract::MatchedPath>()
-        .map(|m| m.as_str().to_string());
-    let started = std::time::Instant::now();
-    let resp = next.run(req).await;
-    let status = resp.status().as_u16();
-    let elapsed = started.elapsed();
-    let elapsed_ms = elapsed.as_millis() as u64;
-    // The log keeps the full path — it is the record of what external clients
-    // actually probe, and its cardinality costs nothing there. The metric cannot.
-    tracing::info!(%method, %path, status, elapsed_ms, "http request");
-    metrics.observe_request(
-        metrics::route_label(matched.as_deref()),
-        // Allow-listed for the same reason as the route: HTTP permits arbitrary
-        // extension method tokens, so this is attacker-chosen too.
-        metrics::method_label(method.as_str()),
-        status,
-        elapsed.as_secs_f64(),
-    );
-    resp
-}
 
 /// The landing page served at `/`: a self-contained design bundle exported from
 /// Claude Design (`assets/index.html`, compiled in via `include_str!`, no
@@ -324,11 +284,19 @@ async fn main() -> anyhow::Result<()> {
     // the /metrics route. A failure here means duplicate collector names, i.e. a
     // programming error, so surface it at startup rather than serving a
     // half-registered endpoint.
-    let metrics = metrics::Metrics::new(
+    // This binary is the standalone case, so it owns the registry. An embedder
+    // passes its own instead; see imcp2::metrics.
+    let registry = prometheus::Registry::new();
+    let metrics = imcp2::metrics::Metrics::new(
+        &registry,
         env!("CARGO_PKG_VERSION"),
         option_env!("GIT_SHA").unwrap_or("unknown"),
         started_at,
     )?;
+    // CPU / RSS / file descriptors. Registered here rather than by the library:
+    // `process_*` describes the whole OS process, which belongs to the
+    // application, and this binary *is* the application.
+    imcp2::metrics::register_process_collector(&registry)?;
     // The session gauges are read at scrape time, so /metrics needs the same
     // handles /version uses.
     let (met_prod, met_beta) = (prod.clone(), beta.clone());
@@ -442,7 +410,19 @@ async fn main() -> anyhow::Result<()> {
                         };
                         metrics.set_sessions("beta", b_live, b_active);
 
-                        match metrics.render() {
+                        let started = std::time::Instant::now();
+                        let encoded = {
+                            use prometheus::Encoder;
+                            let mut buf = Vec::new();
+                            prometheus::TextEncoder::new()
+                                .encode(&registry.gather(), &mut buf)
+                                .map_err(|e| e.to_string())
+                                .and_then(|()| {
+                                    String::from_utf8(buf).map_err(|e| e.to_string())
+                                })
+                        };
+                        metrics.observe_scrape(started.elapsed().as_secs_f64());
+                        match encoded {
                             Ok(body) => (
                                 axum::http::StatusCode::OK,
                                 [(
@@ -501,10 +481,16 @@ async fn main() -> anyhow::Result<()> {
         // what external clients actually hit — discovery probes, unknown paths,
         // etc. Only the path is logged, never the query string, so single-use
         // secrets (`?code=`) don't land in logs.
-        .layer(axum::middleware::from_fn(move |req, next| {
-            let metrics = metrics.clone();
-            async move { log_request(metrics, req, next).await }
-        }));
+        // Two layers rather than one. They have different constraints — metrics
+        // must bound every label, a log line is more useful carrying the full
+        // path — and splitting them lets an embedder take either independently.
+        .layer(axum::middleware::from_fn_with_state(
+            metrics.clone(),
+            imcp2::metrics::write_request_metrics,
+        ))
+        .layer(axum::middleware::from_fn(
+            imcp2::metrics::write_request_logs,
+        ));
 
     let bind = bind_address();
     let listener = tokio::net::TcpListener::bind(&bind).await?;
