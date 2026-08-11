@@ -653,6 +653,14 @@ pub struct AuthStore {
     /// endpoints `{issuer}/oauth/*`, the II callback URL, and the
     /// path-inserted discovery documents — derives from this one value.
     mcp_path: String,
+    /// Strict RFC 8707: when set, both OAuth legs REQUIRE a `resource` naming
+    /// this instance — a request that omits it is refused (`invalid_request`),
+    /// not just one that names a foreign server. Closes the confused-deputy path
+    /// for clients that never send `resource` at all, at the cost of turning away
+    /// any client predating RFC 8707. Injected by the embedding application (see
+    /// [`crate::McpConfig::require_resource`]); when clear, a missing `resource`
+    /// is tolerated.
+    require_resource: bool,
 }
 
 /// An auth-code connect awaiting the user's II handshake.
@@ -747,6 +755,7 @@ impl AuthStore {
         clients: SharedClients,
         public_url: String,
         mcp_path: String,
+        require_resource: bool,
     ) -> Self {
         Self {
             clients: clients.0,
@@ -756,6 +765,7 @@ impl AuthStore {
             identities,
             public_url,
             mcp_path,
+            require_resource,
         }
     }
 
@@ -1024,19 +1034,30 @@ pub async fn authorize(
     // RFC 8707 Resource Indicators (MCP authorization): a token must only be
     // issued for THIS instance, so refuse a `resource` that names any other
     // server — the MCP spec requires the authorization server to bind tokens to
-    // the requested resource. A MISSING `resource` is still accepted, for clients
-    // that predate RFC 8707. Each leg (here and /oauth/token) validates
+    // the requested resource. Each leg (here and /oauth/token) validates
     // independently against this instance's own issuer; with exactly one valid
     // resource per instance, that is equivalent to binding it into the code and
-    // re-checking, without the extra state.
-    if let Some(resource) = q.resource.as_deref() {
-        if !resource_matches_issuer(resource, &store.issuer()) {
+    // re-checking, without the extra state. Whether a MISSING `resource` is
+    // tolerated is the `require_resource` policy: strict refuses it (closing the
+    // confused-deputy for clients that never send one), lenient accepts it for
+    // clients predating RFC 8707.
+    match q.resource.as_deref() {
+        Some(resource) if resource_matches_issuer(resource, &store.issuer()) => {}
+        Some(_) => {
             return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_target",
                 "the `resource` does not identify this MCP server (RFC 8707)", SIGNIN_HEADLINE,
                 "Your MCP client requested sign-in for a different server than this one. Update your \
                  client or reconnect; if you were connecting a third-party tool, check that it's the \
                  one you intended.");
         }
+        None if store.require_resource => {
+            tracing::warn!("refusing an authorize with no RFC 8707 `resource` (strict mode)");
+            return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
+                "the `resource` parameter is required (RFC 8707)", SIGNIN_HEADLINE,
+                "Your MCP client didn't say which server it's signing in to (the RFC 8707 `resource` \
+                 parameter). The client may be out of date. Try updating it, then reconnect.");
+        }
+        None => {}
     }
 
     let session_id = format!("sess-{}", Uuid::new_v4());
@@ -1864,12 +1885,20 @@ async fn token_authorization_code(store: AuthStore, req: TokenForm) -> Response 
     // RFC 8707: refuse a token request whose `resource` names a different MCP
     // server than this one (mirrors the check in `authorize`). Done before the
     // code is consumed below, so a spurious/foreign request can't burn a valid
-    // pending code. A missing `resource` is accepted (clients predating RFC 8707).
-    if let Some(resource) = req.resource.as_deref() {
-        if !resource_matches_issuer(resource, &store.issuer()) {
+    // pending code. A missing `resource` is refused under the strict
+    // `require_resource` policy, else accepted (clients predating RFC 8707).
+    match req.resource.as_deref() {
+        Some(resource) if resource_matches_issuer(resource, &store.issuer()) => {}
+        Some(_) => {
             return oauth_err(StatusCode::BAD_REQUEST, "invalid_target",
                 "the `resource` does not identify this MCP server (RFC 8707)");
         }
+        None if store.require_resource => {
+            tracing::warn!("refusing a token request with no RFC 8707 `resource` (strict mode)");
+            return oauth_err(StatusCode::BAD_REQUEST, "invalid_request",
+                "the `resource` parameter is required (RFC 8707)");
+        }
+        None => {}
     }
     let grant = match store.codes.write().await.remove(&req.code) {
         Some(g) if !g.remaining().is_zero() => g,
@@ -2466,7 +2495,13 @@ mod tests {
     // network — the connect paths are pure-local crypto/state).
     // Build an AuthStore over a dummy II instance, as if its mcp router were
     // nested at `/mcp` on `https://mcp.test`.
+    /// Lenient store (tolerates a missing `resource`) — the default the bulk of
+    /// the OAuth tests exercise. Strict RFC 8707 is covered by [`test_store_cfg`].
     fn test_store() -> super::AuthStore {
+        test_store_cfg(false)
+    }
+
+    fn test_store_cfg(require_resource: bool) -> super::AuthStore {
         use crate::identities::{Identities, IiInstance};
         use candid::Principal;
         let agent = crate::Agent::builder()
@@ -2487,6 +2522,7 @@ mod tests {
             super::SharedClients(super::ClientStore::with(std::collections::HashMap::new())),
             "https://mcp.test".into(),
             "/mcp".into(),
+            require_resource,
         )
     }
 
@@ -2690,6 +2726,7 @@ mod tests {
                 super::SharedClients(super::ClientStore::with(std::collections::HashMap::new())),
                 "https://mcp.test".into(),
                 mcp_path.into(),
+                false,
             )
         };
         // Both instances, so the allow-list covers each mount.
@@ -2942,6 +2979,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(legacy.status(), StatusCode::OK, "a missing resource must remain accepted");
+    }
+
+    // Strict RFC 8707 (`require_resource`): `/oauth/authorize` now REQUIRES a
+    // `resource`. A missing one is refused with `invalid_request`; a foreign one
+    // is still `invalid_target`; the canonical one still reaches II.
+    #[tokio::test]
+    async fn authorize_strict_requires_resource() {
+        use axum::extract::{Query, State};
+        let store = test_store_cfg(true);
+        store.clients.seed("client-x", vec!["https://claude.ai/api/mcp/auth_callback"]).await;
+        let mk = |resource: Option<&str>| super::AuthorizeQuery {
+            response_type: Some("code".into()),
+            client_id: "client-x".into(),
+            redirect_uri: "https://claude.ai/api/mcp/auth_callback".into(),
+            state: Some("xyz".into()),
+            code_challenge: Some(super::pkce_s256("verifier")),
+            code_challenge_method: Some("S256".into()),
+            scope: None,
+            resource: resource.map(str::to_owned),
+        };
+
+        // Missing resource → refused with `invalid_request` (the strict delta).
+        let missing = super::authorize(State(store.clone()), json_headers(), Query(mk(None))).await;
+        assert_eq!(missing.status(), axum::http::StatusCode::BAD_REQUEST, "strict mode must refuse a missing resource");
+        let body = axum::body::to_bytes(missing.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "invalid_request");
+
+        // Foreign resource → still `invalid_target`.
+        let foreign = super::authorize(State(store.clone()), json_headers(), Query(mk(Some("https://other.example/mcp")))).await;
+        assert_eq!(foreign.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(foreign.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "invalid_target");
+
+        // Canonical resource → still reaches II.
+        let ok = super::authorize(State(store.clone()), axum::http::HeaderMap::new(), Query(mk(Some("https://mcp.test/mcp")))).await;
+        assert_eq!(ok.status(), axum::http::StatusCode::FOUND, "the canonical resource must still be accepted in strict mode");
+    }
+
+    // Strict RFC 8707 at `/oauth/token`: a missing `resource` is refused with
+    // `invalid_request` and does NOT consume the code; the canonical resource
+    // still mints a token.
+    #[tokio::test]
+    async fn token_strict_requires_resource() {
+        use axum::{body::Body, http::{header, Request, StatusCode}, routing::post, Router};
+        use tower::ServiceExt;
+
+        let store = test_store_cfg(true);
+        let app = || Router::new().route("/oauth/token", post(super::token)).with_state(store.clone());
+        let seed = || super::CodeGrant {
+            client_id: "mcp-client".into(),
+            code_challenge: Some(super::pkce_s256("verifier")),
+            session_id: "mcp-session".into(),
+            created: std::time::Instant::now(),
+        };
+        let body_for = |code: &str, resource: Option<&str>| {
+            let mut b = format!("grant_type=authorization_code&code={code}&client_id=mcp-client&code_verifier=verifier");
+            if let Some(r) = resource {
+                b.push_str(&format!("&resource={}", urlencoding::encode(r)));
+            }
+            b
+        };
+
+        // Missing resource → refused with `invalid_request`, code untouched.
+        store.codes.write().await.insert("proof-code".into(), seed());
+        let refused = app()
+            .oneshot(
+                Request::post("/oauth/token")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body_for("proof-code", None)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "strict mode must refuse a missing resource at /oauth/token");
+        let body = axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "invalid_request");
+        assert!(store.codes.read().await.contains_key("proof-code"), "a refused request must not consume the code");
+
+        // Canonical resource → token minted.
+        let ok = app()
+            .oneshot(
+                Request::post("/oauth/token")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body_for("proof-code", Some("https://mcp.test/mcp"))))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK, "the canonical resource must mint a token in strict mode");
     }
 
     // A client turned away by the allow-list gets the on-brand HTML page, not a

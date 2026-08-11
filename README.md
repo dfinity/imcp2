@@ -429,6 +429,12 @@ when hosting:
   (II derives the MCP server origin from the connect callback, and each user
   must add this exact origin as their trusted MCP server in II Settings — there
   is no longer a deploy-time `mcp_server_origin` on II's side.)
+- **`OAUTH_REQUIRE_RESOURCE`** — strict RFC 8707 resource indicators, **on by
+  default**: both OAuth legs require a `resource` naming this server, so a token
+  can never be minted for (and replayed from) a different MCP server. Set it to a
+  falsey value (`0`/`false`/`no`/`off`) only if you must serve a client too old to
+  send `resource`; that reopens the confused-deputy path for such clients, so
+  prefer updating the client.
 
 A `Dockerfile` is included (works on Render / Fly / Cloud Run / Koyeb). The
 reference deployment (`deploy/native/`, see its README) instead runs the binary
