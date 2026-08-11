@@ -93,7 +93,7 @@ pub struct SkillUrls {
 /// Arguments for `icp_get_skill`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetSkillArgs {
-    /// Skill name, e.g. "motoko", "icp-cli", "cycles-management".
+    /// Skill name, e.g. "writing-motoko", "icp-cli", "cycles-management".
     pub name: String,
 }
 
@@ -101,7 +101,7 @@ pub struct GetSkillArgs {
 /// [`SkillEntry`] — the internal fetch `urls` are intentionally omitted).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct SkillSummary {
-    /// The skill name to pass to icp_get_skill, e.g. "motoko".
+    /// The skill name to pass to icp_get_skill, e.g. "writing-motoko".
     pub name: String,
     /// The skill's human title.
     pub title: String,
@@ -328,22 +328,30 @@ mod tests {
         );
     }
 
-    // Live network: the real registry parses into our (subset) structs and the
-    // headline skills are present and fetchable. Mirrors discover.rs's live tests.
+    // Live network: the real registry parses into our (subset) structs, serves a
+    // populated catalogue, and a listed skill is fetchable. Mirrors discover.rs's
+    // live tests.
+    //
+    // Asserts on the catalogue's SHAPE, never on specific skill names. The registry
+    // owns its naming and reorganises it — `motoko` became `writing-motoko`,
+    // `migrating-motoko-actors` and `troubleshooting-motoko-migrations` — so a pinned
+    // name turns an upstream rename into a red build on every unrelated pull request,
+    // which is exactly what it did before this was relaxed. What this server depends
+    // on survives a rename: the manifest parses, it is not empty, every entry carries
+    // a name, and a name taken from that list can be fetched.
     #[tokio::test]
     async fn fetches_real_registry_and_a_skill() {
         let catalog = SkillsCatalog::new();
         let skills = catalog.list().await.expect("list skills");
+        assert!(!skills.is_empty(), "registry served an empty catalogue");
         assert!(
-            skills.iter().any(|s| s.name == "motoko"),
-            "motoko skill missing from registry"
+            skills.iter().all(|s| !s.name.trim().is_empty()),
+            "every entry needs a name — it is the key icp_get_skill takes"
         );
-        assert!(
-            skills.iter().any(|s| s.name == "cycles-management"),
-            "cycles-management skill missing"
-        );
-        // Every entry should carry a markdown URL we can fetch.
-        let motoko = catalog.get("motoko").await.expect("get motoko skill");
-        assert!(!motoko.trim().is_empty(), "motoko SKILL.md was empty");
+        // Fetch a skill NAMED BY THE REGISTRY rather than one hardcoded here, so this
+        // follows the catalogue wherever it goes.
+        let name = &skills[0].name;
+        let body = catalog.get(name).await.unwrap_or_else(|e| panic!("get `{name}`: {e}"));
+        assert!(!body.trim().is_empty(), "`{name}` SKILL.md was empty");
     }
 }

@@ -2000,8 +2000,9 @@ impl ServerHandler for IcTools {
              (the `icp_` create/install/status/… tools) acts as your standing MANAGEMENT principal at \
              this server's origin — a DIFFERENT identity than the per-app principals above.\n\n\
              To AUTHOR, BUILD and DEPLOY IC code, first consult the official IC skills: \
-             `icp_list_skills` lists them and `icp_get_skill(name)` loads one. Especially `motoko` \
-             (language), `mops-cli` (deps/build), `icp-cli` (build & deploy), `cycles-management` \
+             `icp_list_skills` lists them and `icp_get_skill(name)` loads one. Especially \
+             `writing-motoko` (language), `mops-cli` (deps/build), `icp-cli` (build & deploy), \
+             `cycles-management` \
              (ICP↔cycles & funding), `stable-memory` (upgrades) and `canister-security`. Compiling \
              Motoko/Rust to Wasm happens in YOUR environment (guided by these skills); these tools \
              then put it on chain. To CREATE and MANAGE canisters as your Internet Identity, use: \
