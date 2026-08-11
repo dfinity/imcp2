@@ -897,26 +897,34 @@ pub struct AuthorizeQuery {
 /// `https://mcp.internetcomputer.org/mcp`), which is exactly the value published
 /// as `resource` in the protected-resource metadata.
 ///
-/// Compared by normalized components, not raw string, so trivial variance still
-/// matches (scheme/host case — already lowercased by `url::Url` — an explicit
-/// `:443`, one trailing slash), while a different host or a different instance
-/// path (`/mcp` vs `/mcp-beta`) does not. Per RFC 8707 §2 a resource indicator
-/// MUST NOT carry a fragment, so a fragment-bearing (or unparseable) value is
-/// refused. A query is ignored: it cannot turn a same-origin, same-path value
-/// into a foreign one.
+/// Compared by identifying URL components, so trivial variance still matches
+/// (scheme/host case — already lowercased by `url::Url` — an explicit `:443`,
+/// one trailing slash), while anything that is not the advertised identifier is
+/// refused: a different host, a different instance path (`/mcp` vs `/mcp-beta`),
+/// a non-default port, a doubled trailing slash, or a differing query. RFC 8707
+/// permits a query, so it is part of the identifier and must match (the issuer
+/// carries none); per RFC 8707 §2 a resource indicator is an absolute URI with
+/// no fragment and no userinfo, so a fragment-bearing, userinfo-bearing, or
+/// unparseable value is refused.
 fn resource_matches_issuer(resource: &str, issuer: &str) -> bool {
     let (Ok(got), Ok(want)) = (url::Url::parse(resource), url::Url::parse(issuer)) else {
         return false;
     };
-    if got.fragment().is_some() {
+    // The advertised resource never carries a fragment or userinfo, so refuse
+    // those outright rather than normalizing them away.
+    if got.fragment().is_some() || !got.username().is_empty() || got.password().is_some() {
         return false;
     }
+    // Identifying components. Tolerate exactly one trailing slash (`/mcp` vs
+    // `/mcp/`) so a doubled slash is still a distinct path; the query is part of
+    // the RFC 8707 identifier, so it must match too.
     let norm = |u: &url::Url| {
         (
             u.scheme().to_owned(),
             u.host_str().map(str::to_owned),
             u.port_or_known_default(),
-            u.path().trim_end_matches('/').to_owned(),
+            u.path().strip_suffix('/').unwrap_or(u.path()).to_owned(),
+            u.query().map(str::to_owned),
         )
     };
     norm(&got) == norm(&want)
@@ -2793,14 +2801,19 @@ mod tests {
         ] {
             assert!(super::resource_matches_issuer(ok, issuer), "must accept {ok}");
         }
-        // Foreign host, a sibling instance's path, a non-default port, a fragment,
-        // and unparseable input must all be refused.
+        // Anything that is not the advertised identifier is refused: foreign
+        // host, sibling instance path, non-default port, fragment, userinfo,
+        // a differing query, a doubled trailing slash, scheme downgrade, and
+        // unparseable input.
         for bad in [
             "https://other.example/mcp",
             "https://mcp.test/mcp-beta",
             "https://mcp.test:8443/mcp",
             "https://mcp.test/mcp#x",
-            "http://mcp.test/mcp",     // scheme downgrade
+            "https://user@mcp.test/mcp",         // userinfo is not part of the identifier
+            "https://mcp.test/mcp?tenant=other", // a query differs from the issuer's (none)
+            "https://mcp.test/mcp//",            // doubled trailing slash is a distinct path
+            "http://mcp.test/mcp",               // scheme downgrade
             "not-a-url",
         ] {
             assert!(!super::resource_matches_issuer(bad, issuer), "must refuse {bad}");
