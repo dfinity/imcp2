@@ -328,6 +328,18 @@ fn terms_page() -> &'static str {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // When this process started — i.e. when the deployment last (re)started, since
+    // every deploy restarts the service. Read as the very first statement so it
+    // means what both `/version` and `imcp2_process_start_time_seconds` say it
+    // means. Taken later — after the agent, the servers and their reapers, as it
+    // was — it silently drifted seconds past process start while still being
+    // published as process start, and disagreed with the process collector's
+    // conventional series for no reason a consumer could discover.
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -375,13 +387,6 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-
-    // When this process started — i.e. when the deployment last (re)started.
-    // Every deploy restarts the service, so this is the "last redeployment" time.
-    let started_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
 
     // Handles for the /version live-session gauges (Arc-backed, so cloning
     // shares the same session maps the tools mutate). Beta is `Option`: the

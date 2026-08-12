@@ -224,8 +224,9 @@ impl SessionCollector {
             counts,
             live: Desc::new(
                 metric!("live_sessions").to_string(),
-                "Authenticated sessions holding a currently-valid Internet Identity grant. \
-                 A session counts from grant redemption until the grant expires, idle or not."
+                "Authenticated sessions holding a currently-valid Internet Identity grant, \
+                 summed over every tracked server serving this instance. A session counts \
+                 from grant redemption until the grant expires, idle or not."
                     .to_string(),
                 vec!["instance".to_string()],
                 HashMap::new(),
@@ -233,8 +234,9 @@ impl SessionCollector {
             active: Desc::new(
                 metric!("active_sessions").to_string(),
                 "The subset of live sessions that also made a request within the activity \
-                 window. Always <= imcp2_live_sessions, in the exposition and not just in \
-                 the writer. Use this to time a low-disruption redeploy."
+                 window, summed the same way. Always <= imcp2_live_sessions, in the \
+                 exposition and not just in the writer. Use this to time a low-disruption \
+                 redeploy."
                     .to_string(),
                 vec!["instance".to_string()],
                 HashMap::new(),
@@ -298,6 +300,31 @@ fn gauge_family<'a>(desc: &Desc, values: impl Iterator<Item = (&'a str, i64)>) -
             .collect(),
     );
     family
+}
+
+/// Sum per-server counts into per-instance counts, so several servers sharing an
+/// instance name produce one total rather than overwriting each other.
+///
+/// The `instance` label names an Internet Identity instance, not a mount path, and
+/// nothing stops an embedder serving one instance at two mounts — two `McpServer`s
+/// whose `IiInstance::prod()` both carry the name `prod`. Writing each in turn made
+/// the last one win, so the exported gauge silently reported one server's sessions
+/// as if it were the whole instance's: an under-report with no symptom, which is the
+/// worst shape a metric bug can take. Summing makes the number mean what the label
+/// says, for one server or five.
+///
+/// A free function over an iterator so the aggregation can be checked directly.
+/// Testing it through `refresh` would need authenticated sessions to distinguish
+/// summing from overwriting, since every count a unit test can produce is zero.
+fn totals(counts: impl IntoIterator<Item = (&'static str, Counts)>) -> BTreeMap<&'static str, Counts>
+{
+    let mut out: BTreeMap<&'static str, Counts> = BTreeMap::new();
+    for (instance, (live, active)) in counts {
+        let entry = out.entry(instance).or_insert((0, 0));
+        entry.0 += live;
+        entry.1 += active;
+    }
+    out
 }
 
 /// Handle for recording this crate's metrics. Cheap to clone: every collector is
@@ -399,16 +426,22 @@ impl Metrics {
             &["version", "commit"],
         )?;
 
-        // NOT the conventional `process_start_time_seconds` — the prefix makes it
-        // `imcp2_process_start_time_seconds`, and it deliberately measures a
-        // different thing. The process collector's conventional series is the OS
-        // process start; this is when the server finished initialising and began
-        // serving, which is the moment a redeploy actually becomes visible to
-        // clients. On a real host the two differ by a second or two.
+        // The namespaced twin of the conventional `process_start_time_seconds` — the
+        // prefix means it cannot BE that series, so it agrees with it instead:
+        // `started_at` is read as the first statement of `main`, which is process
+        // start to within microseconds.
         //
-        // Both are worth having, and an embedder gets only this one, since the
-        // library does not register the process collector — see
-        // `register_process_collector`.
+        // It used to be justified as measuring something deliberately different
+        // ("when the server began serving"). That was not true of the value it was
+        // given, which was captured mid-initialisation — neither process start nor
+        // ready-to-serve — so the series disagreed with the conventional one by a
+        // couple of seconds for a reason no consumer could discover. A metric whose
+        // name says one thing and whose value means another is worse than not having
+        // it. The reading moved; the name and help text were already right.
+        //
+        // Kept despite the overlap because an embedder gets only this one: the
+        // library does not register the process collector (see
+        // `register_process_collector`), and that collector is Linux-only besides.
         let start_time = IntGauge::new(
             metric!("process_start_time_seconds"),
             "Unix epoch seconds at which this process started, i.e. when the deployment \
@@ -501,6 +534,11 @@ impl Metrics {
     /// everything inside it is shared, so this holds a handle rather than a copy
     /// of any state.
     ///
+    /// Tracking several servers that share an instance name is allowed and adds
+    /// their counts together — the label names an Internet Identity instance, not a
+    /// mount, so one instance served at two mounts is one instance's worth of
+    /// sessions. See [`totals`].
+    ///
     /// Publishes zeroes immediately, so a tracked instance's gauges read `0` from
     /// the moment it is registered rather than being absent until the first
     /// refresh. An instance that is *not* served is simply not tracked and has no
@@ -567,9 +605,13 @@ impl Metrics {
                 return;
             }
         };
+        let mut read = Vec::with_capacity(servers.len());
         for server in &servers {
             let g = server.session_gauges().await;
-            self.set_sessions(server.instance().name, g.live as i64, g.active as i64);
+            read.push((server.instance().name, (g.live as i64, g.active as i64)));
+        }
+        for (instance, (live, active)) in totals(read) {
+            self.set_sessions(instance, live, active);
         }
     }
 
@@ -737,6 +779,12 @@ mod tests {
     /// it is left alone rather than redirected, since `$OAUTH_CLIENTS_FILE` is
     /// process-global and this test binary shares it with every other unit test.
     fn server() -> crate::McpServer {
+        server_at("/mcp")
+    }
+
+    /// The same, at a chosen mount — for the case of one Internet Identity instance
+    /// served at more than one path.
+    fn server_at(mcp_path: &str) -> crate::McpServer {
         crate::McpServer::new(crate::McpConfig {
             agent: crate::Agent::builder()
                 .with_url(crate::IC_URL)
@@ -744,7 +792,7 @@ mod tests {
                 .expect("build agent"),
             instance: crate::IiInstance::prod().expect("prod instance"),
             public_url: "https://mcp.example.com".into(),
-            mcp_path: "/mcp".into(),
+            mcp_path: mcp_path.into(),
             clients: crate::SharedClients::load(),
             require_resource: true,
         })
@@ -1135,6 +1183,45 @@ mod tests {
             assert!(out.contains(&want_live), "missing {want_live}:\n{out}");
             assert!(out.contains(&want_active), "missing {want_active}:\n{out}");
         }
+    }
+
+    /// Several servers serving one instance must **add up**, not overwrite. Writing
+    /// each in turn made the last one win, so the gauge reported one server's
+    /// sessions as the whole instance's — an under-report with no symptom.
+    ///
+    /// Tested on the aggregation directly, because no unit test can tell summing
+    /// from overwriting through `refresh`: every count a test can produce without
+    /// authenticated sessions is zero, and 0 + 0 = 0 either way.
+    #[test]
+    fn servers_sharing_an_instance_name_are_summed() {
+        assert_eq!(
+            totals([("prod", (7, 3)), ("beta", (2, 1)), ("prod", (5, 2))]),
+            BTreeMap::from([("prod", (12, 5)), ("beta", (2, 1))]),
+            "counts for one instance must add, and other instances stay separate"
+        );
+        // The invariant survives aggregation: summing two pairs that each satisfy
+        // active <= live cannot produce one that does not.
+        let summed = totals([("prod", (10, 10)), ("prod", (1, 0))]);
+        let (live, active) = summed["prod"];
+        assert!(active <= live, "({live},{active})");
+        assert!(totals([]).is_empty(), "nothing tracked, nothing published");
+    }
+
+    /// And through the public API: two distinct servers on the same instance must
+    /// leave one series, not two competing ones.
+    #[tokio::test]
+    async fn two_servers_on_one_instance_expose_one_series() {
+        let (r, m) = fixture();
+        m.track(&server());
+        m.track(&server_at("/mcp-alt"));
+        m.refresh().await;
+        let live: Vec<_> = encode(&r)
+            .lines()
+            .filter(|l| l.starts_with(concat!(metric!("live_sessions"), "{")))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(live.len(), 1, "expected one series for one instance, got {live:?}");
+        assert!(live[0].contains(r#"instance="prod""#), "{}", live[0]);
     }
 
     /// `refresh` with nothing tracked must be a harmless no-op — an embedder that
