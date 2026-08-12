@@ -115,6 +115,14 @@ fn metrics_router(registry: prometheus::Registry, metrics: imcp2::metrics::Metri
             // what it needs; both handles are `Arc`-backed.
             let (registry, metrics) = (registry.clone(), metrics.clone());
             async move {
+                // Timed from the top, refresh included. The refresh scans every
+                // tracked server's session map and waits for any refresh already in
+                // flight, so it is part of what this endpoint costs — start the
+                // clock after it and the one thing this metric exists to catch, a
+                // scrape slow enough for the scraper to drop the target, can come
+                // entirely from time the metric does not count.
+                let started = std::time::Instant::now();
+
                 // Pull the derived session gauges immediately before encoding, so
                 // what is reported is exact as of this scrape rather than as of
                 // whenever it was last pushed. Which servers get refreshed was
@@ -122,7 +130,6 @@ fn metrics_router(registry: prometheus::Registry, metrics: imcp2::metrics::Metri
                 // refresh from its own exposition path, or on a timer, instead.
                 metrics.refresh().await;
 
-                let started = std::time::Instant::now();
                 let encoded = {
                     use prometheus::Encoder;
                     let mut buf = Vec::new();

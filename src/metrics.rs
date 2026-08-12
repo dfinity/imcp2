@@ -382,7 +382,8 @@ impl Metrics {
         let scrapes = Histogram::with_opts(
             HistogramOpts::new(
                 metric!("metrics_scrape_duration_seconds"),
-                "Time spent gathering and encoding this endpoint's own response.",
+                "Time spent producing this endpoint's own response: recomputing the derived \
+                 gauges, then gathering and encoding the registry.",
             )
             .buckets(vec![0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]),
         )?;
@@ -572,12 +573,17 @@ impl Metrics {
         }
     }
 
-    /// Record how long a scrape took to gather and encode.
+    /// Record how long producing a scrape took.
     ///
     /// Exposition belongs to whoever owns the registry, so this crate cannot time
     /// it — but the signal is worth keeping: a scrape that quietly got slow is how
     /// a target starts being dropped for timing out, and the resulting gap looks
-    /// like an outage that never happened. Call this from your `/metrics` handler.
+    /// like an outage that never happened.
+    ///
+    /// Time the **whole** handler, [`Self::refresh`] included, not just the gather
+    /// and encode. Refresh scans every tracked server's session map and waits on any
+    /// refresh already in flight; excluded from the measurement, it is latency this
+    /// metric cannot see, which defeats the one thing it is for.
     pub fn observe_scrape(&self, seconds: f64) {
         self.scrapes.observe(seconds);
     }
@@ -1044,37 +1050,74 @@ mod tests {
     /// produce a mixed pair. Have `collect` take the lock once per family instead
     /// and this fails within a few thousand gathers.
     ///
-    /// The gather count is asserted too: a loop that barely ran would pass this
-    /// without ever exercising the race.
+    /// The writer runs until the *reader* is done, rather than the reader looping
+    /// until a fixed number of writes finish. That direction matters: a writer with
+    /// a fixed workload can complete it before the reader is ever scheduled, which
+    /// on a loaded runner would fail a "did the loop actually run" assertion while
+    /// the collector was perfectly correct. Here the reader always performs the same
+    /// number of gathers and the writer cannot end early, so nothing about CI speed
+    /// can change the verdict. A barrier makes both sides live before the first
+    /// gather, and the writer's own count is asserted so a writer that never ran
+    /// cannot pass this quietly.
+    ///
+    /// It also has to *fail* properly, which took two goes. Asserting inside the
+    /// read loop unwound the test before clearing the stop flag, leaving the writer
+    /// spinning — and dropping a runtime waits for its blocking tasks, so a
+    /// detected violation hung the run instead of reporting it. A hanging test is
+    /// worse than a flaky one: it eats the job timeout and says nothing. So the
+    /// violation is recorded and asserted after the writer is released, and the
+    /// writer carries its own bound in case the reader dies some other way.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_gather_never_exports_a_pair_that_never_existed() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Barrier;
+
+        const GATHERS: u32 = 2_000;
+        /// Liveness guard, not a workload — roughly 3x what the reader's gathers
+        /// take, so reaching it means the reader is gone rather than slow. Hitting
+        /// it early cannot change the verdict: the reader's iteration count is
+        /// fixed and only `writes > 0` is asserted of the writer.
+        const WRITE_CAP: u64 = 5_000_000;
+
         let (r, m) = fixture();
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(Barrier::new(2));
         let writer = tokio::task::spawn_blocking({
-            let m = m.clone();
+            let (m, stop, ready) = (m.clone(), Arc::clone(&stop), Arc::clone(&ready));
             move || {
-                for i in 0..60_000 {
-                    // Both valid on their own; only a mixed read yields active > live.
-                    if i % 2 == 0 {
+                ready.wait();
+                let mut writes = 0u64;
+                while !stop.load(Ordering::Relaxed) && writes < WRITE_CAP {
+                    // Both pairs are valid on their own; only a mixed read of the
+                    // two families can yield active > live.
+                    if writes.is_multiple_of(2) {
                         m.set_sessions("prod", 10, 5);
                     } else {
                         m.set_sessions("prod", 3, 1);
                     }
+                    writes += 1;
                 }
+                writes
             }
         });
+        ready.wait();
 
-        let mut gathers = 0u32;
-        while !writer.is_finished() {
-            for (instance, live, active) in gathered_pairs(&r) {
-                assert!(
-                    active <= live,
-                    "gather {gathers} exported {instance}: active={active} > live={live}"
-                );
+        let mut violation = None;
+        for gather in 0..GATHERS {
+            if let Some((instance, live, active)) = gathered_pairs(&r)
+                .into_iter()
+                .find(|(_, live, active)| active > live)
+            {
+                violation =
+                    Some(format!("gather {gather}: {instance} active={active} > live={live}"));
+                break;
             }
-            gathers += 1;
         }
-        writer.await.unwrap();
-        assert!(gathers > 100, "only {gathers} gathers — the race was not exercised");
+        stop.store(true, Ordering::Relaxed);
+        let writes = writer.await.unwrap();
+
+        assert!(violation.is_none(), "{}", violation.unwrap_or_default());
+        assert!(writes > 0, "the writer never ran, so the race was not exercised");
     }
 
     /// The values a scrape reports must be the ones that were written. Building the
