@@ -1080,23 +1080,57 @@ async fn read_capped(mut resp: reqwest::Response, max: usize) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-fn add(found: &mut BTreeMap<String, Found>, id: &str, label: Option<String>, source: String) {
-    // Drop false positives by validating as a real principal.
-    if Principal::from_text(id).is_err() {
-        return;
-    }
-    let entry = found.entry(id.to_string()).or_insert_with(|| Found {
-        canister_id: id.to_string(),
-        label: None,
-        sources: Vec::new(),
-        name: None,
-        kind: None,
-    });
-    if entry.label.is_none() {
-        entry.label = label;
-    }
-    if !entry.sources.contains(&source) {
-        entry.sources.push(source);
+/// Accumulator for discovered canister ids, with a hard ceiling on the number of
+/// DISTINCT entries retained. A hostile discovery target can pack the permitted
+/// 8 MiB scan buffer with hundreds of thousands of unique, CRC-valid principals;
+/// without a ceiling, every one is validated, allocated as a map key + [`Found`],
+/// and later ordered — hundreds of MiB of peak memory for a reply that
+/// [`bound_findings`] trims to at most 50 (CWE-770). Entries past the cap are
+/// counted (folded into [`Discovery::omitted`]), not stored.
+#[derive(Default)]
+struct Findings {
+    map: BTreeMap<String, Found>,
+    /// Distinct valid ids seen once the cap was reached and dropped without
+    /// allocating a `Found`. Added to `omitted` so the reported count stays exact.
+    dropped: usize,
+}
+
+impl Findings {
+    /// Ceiling on distinct retained ids — an order of magnitude above the largest
+    /// real bundle seen in the wild (a token wallet embedding every ledger/index
+    /// it supports is still only a few hundred), so legitimate discovery is never
+    /// trimmed here; the authority-ranked cut in [`bound_findings`] does the
+    /// user-facing trimming. The authoritative sources (metadata/header/env) are
+    /// recorded before any bundle scan, so they are never the entries dropped.
+    const MAX: usize = 1024;
+
+    /// Record `id` under `source` (validated as a real principal first), merging
+    /// labels/sources for an id already seen (first label wins). A NEW id is
+    /// stored only while under [`Self::MAX`]; beyond that it is counted, not
+    /// allocated — so peak memory and the later ordering stay bounded regardless
+    /// of how many matches the scanned bytes contain.
+    fn add(&mut self, id: &str, label: Option<String>, source: String) {
+        // Drop false positives by validating as a real principal.
+        if Principal::from_text(id).is_err() {
+            return;
+        }
+        if let Some(entry) = self.map.get_mut(id) {
+            // Already known: merge in place, no new key allocation.
+            if entry.label.is_none() {
+                entry.label = label;
+            }
+            if !entry.sources.contains(&source) {
+                entry.sources.push(source);
+            }
+        } else if self.map.len() < Self::MAX {
+            self.map.insert(
+                id.to_string(),
+                Found { canister_id: id.to_string(), label, sources: vec![source], name: None, kind: None },
+            );
+        } else {
+            // At capacity and this id is new — count it, don't allocate it.
+            self.dropped += 1;
+        }
     }
 }
 
@@ -1115,7 +1149,7 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
     // uses the URL as given.
     let origin = base_url.origin().ascii_serialization();
 
-    let mut found: BTreeMap<String, Found> = BTreeMap::new();
+    let mut found = Findings::default();
 
     // 1. App-declared metadata — the app saying, in bytes it serves itself,
     // which canisters it comprises. Most authoritative of all sources, and
@@ -1133,8 +1167,7 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
         if resp.status().is_success() {
             let page = read_capped(resp, MAX_META_BYTES).await;
             if let Some(id) = parse_meta(&page, "ic:canister-id") {
-                add(
-                    &mut found,
+                found.add(
                     id.trim(),
                     Some("main backend (App Connect)".into()),
                     "ai-connect.html".into(),
@@ -1146,7 +1179,7 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
         if resp.status().is_success() {
             let text = read_capped(resp, MAX_META_BYTES).await;
             for (id, label) in canisters_from_app_manifest(&text) {
-                add(&mut found, &id, label, "ic-app.json".into());
+                found.add(&id, label, "ic-app.json".into());
             }
         }
     }
@@ -1164,7 +1197,7 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
         .get("x-ic-canister-id")
         .and_then(|v| v.to_str().ok())
     {
-        add(&mut found, id, Some("frontend".into()), "header".into());
+        found.add(id, Some("frontend".into()), "header".into());
     }
     let html = read_capped(resp, MAX_BODY_BYTES).await;
 
@@ -1173,7 +1206,7 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
         if resp.status().is_success() {
             let text = read_capped(resp, MAX_ENV_JSON_BYTES).await;
             for (id, label) in canisters_from_env_json(&text) {
-                add(&mut found, &id, Some(label), "env.json".into());
+                found.add(&id, Some(label), "env.json".into());
             }
         }
     }
@@ -1181,10 +1214,18 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
     // 4. JS bundle: labelled constants first, then any bare canister literals.
     let mut blob = html.clone();
     let script_re = Regex::new(r#"["'](/[^"'<> ]+?\.js)["']"#).unwrap();
-    let mut scripts: Vec<String> = script_re
-        .captures_iter(&html)
-        .map(|c| c[1].to_string())
-        .collect();
+    // Only the first 20 (sorted, deduped) paths are fetched below, and no real
+    // page has anywhere near this many <script> tags — so cap the raw collection
+    // (CWE-770): a hostile page packed with `"/a.js"` must not allocate a Vec of
+    // hundreds of thousands of paths just to have 20 survive.
+    const MAX_SCRIPT_PATHS: usize = 128;
+    let mut scripts: Vec<String> = Vec::new();
+    for c in script_re.captures_iter(&html) {
+        if scripts.len() >= MAX_SCRIPT_PATHS {
+            break;
+        }
+        scripts.push(c[1].to_string());
+    }
     scripts.sort();
     scripts.dedup();
     for s in scripts.iter().take(20) {
@@ -1208,17 +1249,18 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
     .unwrap();
     for c in label_re.captures_iter(&blob) {
         let label = c[1].to_string();
-        add(&mut found, &c[2], Some(label.clone()), format!("bundle:{label}"));
+        found.add(&c[2], Some(label.clone()), format!("bundle:{label}"));
     }
     for m in canister_re().find_iter(&blob) {
-        add(&mut found, m.as_str(), None, "bundle".into());
+        found.add(m.as_str(), None, "bundle".into());
     }
 
     // Order: app-declared metadata first (App Connect main, then the manifest
     // siblings), then header (frontend), env.json, labelled bundle, bare.
-    let mut out: Vec<Found> = found.into_values().collect();
-    out.sort_by_key(|f| {
-        let rank = if f.sources.iter().any(|s| s == "ai-connect.html") {
+    // Authority tier of a finding (lower = more authoritative). Kept as a helper
+    // so the sort can compare it without cloning `canister_id` into a key.
+    let rank = |f: &Found| {
+        if f.sources.iter().any(|s| s == "ai-connect.html") {
             0
         } else if f.sources.iter().any(|s| s == "ic-app.json") {
             1
@@ -1230,16 +1272,19 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
             4
         } else {
             5
-        };
-        // Tiebreak by canister_id so the subset that survives the cap in
-        // bound_findings follows an explicit order, rather than depending on
-        // the source BTreeMap order that the stable sort would carry through.
-        (rank, f.canister_id.clone())
-    });
+        }
+    };
+    let dropped = found.dropped;
+    let mut out: Vec<Found> = found.map.into_values().collect();
+    // Tiebreak by canister_id so the subset that survives the cap in
+    // bound_findings follows an explicit order, rather than depending on the
+    // source BTreeMap order that the stable sort would carry through.
+    out.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.canister_id.cmp(&b.canister_id)));
 
     // Bound the result BEFORE enrichment, so every kept entry gets a dashboard
-    // lookup and dropped ones cost nothing.
-    let mut bounded = bound_findings(out);
+    // lookup and dropped ones cost nothing. `dropped` (ids the extraction cap
+    // refused to allocate) folds into the reported `omitted`.
+    let mut bounded = bound_findings(out, dropped);
     // Annotate each id with its IC dashboard identity (name/type) where known,
     // so a bare principal becomes an identified service. Best-effort.
     enrich_with_dashboard(&client, &mut bounded.canisters).await;
@@ -1256,7 +1301,7 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
 /// Assumes authority order (bare literals sort last), so the cut always drops
 /// the least authoritative tail. The number dropped is REPORTED via
 /// [`Discovery::omitted`], never silently.
-fn bound_findings(mut out: Vec<Found>) -> Discovery {
+fn bound_findings(mut out: Vec<Found>, extra_omitted: usize) -> Discovery {
     const MAX_BARE_BUNDLE: usize = 20;
     const MAX_CANISTERS: usize = 50;
     let total = out.len();
@@ -1272,7 +1317,9 @@ fn bound_findings(mut out: Vec<Found>) -> Discovery {
         }
     });
     out.truncate(MAX_CANISTERS);
-    Discovery { omitted: total - out.len(), canisters: out }
+    // `extra_omitted` = distinct ids the extraction cap refused before they ever
+    // reached this Vec; add it so the reported count covers every dropped id.
+    Discovery { omitted: extra_omitted + (total - out.len()), canisters: out }
 }
 
 /// Annotate found canisters with their dashboard label/type, concurrently and
@@ -1912,7 +1959,7 @@ mod tests {
         ];
         found.extend((3..40).map(|i| mk(i, None, "bundle")));
 
-        let d = bound_findings(found);
+        let d = bound_findings(found, 0);
         // All 3 labelled kept; bare capped at 20; 37 - 20 = 17 omitted.
         assert_eq!(d.canisters.len(), 23, "3 labelled + 20 bare");
         assert_eq!(d.omitted, 17);
@@ -1923,13 +1970,40 @@ mod tests {
 
         // The global cap backstops labelled tiers too, and still reports.
         let many_labelled: Vec<Found> = (0..60).map(|i| mk(i, Some("x"), "ic-app.json")).collect();
-        let d = bound_findings(many_labelled);
+        let d = bound_findings(many_labelled, 0);
         assert_eq!(d.canisters.len(), 50);
         assert_eq!(d.omitted, 10);
 
         // Nothing to cut: nothing reported.
-        let d = bound_findings(vec![mk(0, Some("frontend"), "header")]);
+        let d = bound_findings(vec![mk(0, Some("frontend"), "header")], 0);
         assert_eq!((d.canisters.len(), d.omitted), (1, 0));
+    }
+
+    // A hostile target can pack the scan buffer with hundreds of thousands of
+    // distinct valid principals. `Findings` must cap the DISTINCT entries it
+    // allocates (so peak memory / the sort stay bounded), count the overflow, and
+    // still report every dropped id via `omitted` (CWE-770, ICPBB-380).
+    #[test]
+    fn findings_caps_distinct_ids_and_reports_every_omission() {
+        let overflow = 500;
+        let n = Findings::MAX + overflow;
+        let mut found = Findings::default();
+        for i in 0..n {
+            // Distinct, round-tripped principals — always accepted by from_text.
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let id = Principal::from_slice(&bytes).to_text();
+            found.add(&id, None, "bundle".into());
+        }
+        assert_eq!(found.map.len(), Findings::MAX, "distinct ids are capped at MAX");
+        assert_eq!(found.dropped, overflow, "the overflow is counted, not allocated");
+
+        // The full pipeline still reports every omitted id: MAX entries reach
+        // bound_findings, 20 bare survive, and the extraction drop is folded in.
+        let dropped = found.dropped;
+        let d = bound_findings(found.map.into_values().collect(), dropped);
+        assert_eq!(d.canisters.len(), 20, "bare-bundle tier capped to 20");
+        assert_eq!(d.omitted, n - 20, "every one of the {n} ids beyond the 20 kept is reported");
     }
 
     // Live network test against a stable public IC app (OISY). Bundle mining
@@ -2126,11 +2200,11 @@ mod tests {
     // first-label-wins semantics that ordering relies on.
     #[test]
     fn add_keeps_first_label_so_declared_probes_run_first() {
-        let mut found = BTreeMap::new();
+        let mut found = Findings::default();
         let id = "dmp3l-2yaaa-aaaae-aamva-cai";
-        add(&mut found, id, Some("main backend (App Connect)".into()), "ai-connect.html".into());
-        add(&mut found, id, Some("frontend".into()), "header".into());
-        let f = &found[id];
+        found.add(id, Some("main backend (App Connect)".into()), "ai-connect.html".into());
+        found.add(id, Some("frontend".into()), "header".into());
+        let f = &found.map[id];
         assert_eq!(f.label.as_deref(), Some("main backend (App Connect)"));
         assert_eq!(f.sources, vec!["ai-connect.html", "header"], "both provenances kept");
     }
