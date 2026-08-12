@@ -93,7 +93,7 @@ pub struct SkillUrls {
 /// Arguments for `icp_get_skill`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetSkillArgs {
-    /// Skill name, e.g. "motoko", "icp-cli", "cycles-management".
+    /// Skill name, e.g. "writing-motoko", "icp-cli", "cycles-management".
     pub name: String,
 }
 
@@ -101,7 +101,7 @@ pub struct GetSkillArgs {
 /// [`SkillEntry`] — the internal fetch `urls` are intentionally omitted).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct SkillSummary {
-    /// The skill name to pass to icp_get_skill, e.g. "motoko".
+    /// The skill name to pass to icp_get_skill, e.g. "writing-motoko".
     pub name: String,
     /// The skill's human title.
     pub title: String,
@@ -328,22 +328,27 @@ mod tests {
         );
     }
 
-    // Live network: the real registry parses into our (subset) structs and the
-    // headline skills are present and fetchable. Mirrors discover.rs's live tests.
+    // Live network: the real registry parses into our (subset) structs, is
+    // non-empty, and a known skill is fetchable. Mirrors discover.rs's live tests.
     #[tokio::test]
     async fn fetches_real_registry_and_a_skill() {
         let catalog = SkillsCatalog::new();
         let skills = catalog.list().await.expect("list skills");
-        assert!(
-            skills.iter().any(|s| s.name == "motoko"),
-            "motoko skill missing from registry"
-        );
-        assert!(
-            skills.iter().any(|s| s.name == "cycles-management"),
-            "cycles-management skill missing"
-        );
-        // Every entry should carry a markdown URL we can fetch.
-        let motoko = catalog.get("motoko").await.expect("get motoko skill");
-        assert!(!motoko.trim().is_empty(), "motoko SKILL.md was empty");
+
+        // The registry parses and is non-empty. Deliberately do NOT pin a single
+        // skill name: the registry reorganizes its catalog over time (e.g.
+        // `motoko` was split into `writing-motoko` / `migrating-motoko-actors`),
+        // so a hard-coded name is a standing false-failure. Instead require that
+        // at least one CORE skill is present — resilient to any single rename.
+        assert!(!skills.is_empty(), "the registry returned no skills");
+        let core = ["internet-identity", "icp-cli", "cycles-management"];
+        let present = skills.iter().find(|s| core.contains(&s.name.as_str())).unwrap_or_else(|| {
+            let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+            panic!("none of the core skills {core:?} are in the registry; got {names:?}")
+        });
+
+        // Every entry carries a markdown URL we can fetch; the SKILL.md is non-empty.
+        let md = catalog.get(&present.name).await.expect("get a core skill's markdown");
+        assert!(!md.trim().is_empty(), "{}'s SKILL.md was empty", present.name);
     }
 }

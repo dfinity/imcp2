@@ -38,6 +38,20 @@ fn public_url() -> String {
     std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
 }
 
+/// Whether to enforce strict RFC 8707 resource indicators: require a `resource`
+/// naming this instance on both OAuth legs, refusing a request that omits it.
+/// **On by default** — the confused-deputy token-theft path is only fully closed
+/// when a missing `resource` is refused. Set `OAUTH_REQUIRE_RESOURCE` to a falsey
+/// value (`0`/`false`/`no`/`off`) to fall back to lenient (tolerate a missing
+/// `resource` for clients predating RFC 8707); any other value, or unset, is
+/// strict.
+fn require_resource() -> bool {
+    match std::env::var("OAUTH_REQUIRE_RESOURCE") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
+}
+
 /// Whether to also serve the beta Internet Identity instance at `/mcp-beta`.
 /// Off unless `$MCP_SERVE_BETA` is truthy (`1`/`true`/`yes`/`on`), so a
 /// production deployment serves only `/mcp` (production II) and the staging
@@ -249,6 +263,7 @@ async fn main() -> anyhow::Result<()> {
         public_url: public_url.clone(),
         mcp_path: "/mcp".into(),
         clients: clients.clone(),
+        require_resource: require_resource(),
     });
     prod.spawn_session_reaper();
 
@@ -261,6 +276,7 @@ async fn main() -> anyhow::Result<()> {
             public_url: public_url.clone(),
             mcp_path: "/mcp-beta".into(),
             clients,
+            require_resource: require_resource(),
         });
         beta.spawn_session_reaper();
         Some(beta)

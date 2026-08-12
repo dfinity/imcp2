@@ -43,6 +43,9 @@ fn server(instance: imcp2::IiInstance, mcp_path: &str) -> imcp2::McpServer {
         public_url: PUBLIC_URL.into(),
         mcp_path: mcp_path.into(),
         clients: imcp2::SharedClients::load(),
+        // Lenient: these router contract tests drive flows that don't carry a
+        // `resource`; strict RFC 8707 is covered by the auth unit tests.
+        require_resource: false,
     })
 }
 

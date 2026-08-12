@@ -38,6 +38,7 @@
 //!         public_url: "https://mcp.example.com".into(),
 //!         mcp_path: "/mcp".into(),
 //!         clients: SharedClients::load(),
+//!         require_resource: true, // strict RFC 8707 (reject a missing `resource`)
 //!     });
 //!     server.spawn_session_reaper();
 //!     let app = axum::Router::new()
@@ -132,6 +133,13 @@ pub struct McpConfig {
     /// The dynamic-client-registration store. Share ONE across every instance
     /// on an origin (registrations are II-agnostic and persist to one file).
     pub clients: SharedClients,
+    /// Strict RFC 8707 resource indicators: when `true`, both OAuth legs REQUIRE
+    /// a `resource` naming this instance, refusing a request that omits it (not
+    /// just one that names a foreign server). This closes the confused-deputy
+    /// token-theft path even for clients that never send `resource`, at the cost
+    /// of turning away any client predating RFC 8707. When `false`, a missing
+    /// `resource` is tolerated (a present one must still match).
+    pub require_resource: bool,
 }
 
 /// One MCP server instance: the shared state behind [`Self::mcp_router`] and
@@ -160,6 +168,7 @@ impl McpServer {
             config.clients,
             public_url.clone(),
             mcp_path.clone(),
+            config.require_resource,
         );
         Self {
             agent: config.agent,
