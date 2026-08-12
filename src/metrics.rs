@@ -101,6 +101,18 @@ const KNOWN_METHODS: [&str; 9] = [
     "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT",
 ];
 
+/// The label naming which Internet Identity instance a session gauge is about.
+///
+/// **Not `instance`.** Prometheus attaches `job` and `instance` target labels to
+/// every sample it scrapes, and with the default `honor_labels: false` a scraped
+/// label of the same name is not merged — it is renamed to `exported_instance`
+/// while `instance` becomes the target's address. So an exposed `instance="prod"`
+/// arrives in the database as `exported_instance="prod"`, and every alert or
+/// dashboard query written against `instance="prod"` silently matches nothing.
+/// Silently is the problem: the series exists, the query is valid, and the panel is
+/// just empty. A domain-specific name cannot collide, and says what it means.
+const SESSION_LABEL: &str = "ii_instance";
+
 /// Latency buckets in seconds. Chosen for what this service actually does: the
 /// static pages and `/version` answer in single-digit milliseconds, while an MCP
 /// tool call that talks to the IC is a network round trip and lands in the
@@ -228,7 +240,7 @@ impl SessionCollector {
                  summed over every tracked server serving this instance. A session counts \
                  from grant redemption until the grant expires, idle or not."
                     .to_string(),
-                vec!["instance".to_string()],
+                vec![SESSION_LABEL.to_string()],
                 HashMap::new(),
             )?,
             active: Desc::new(
@@ -238,7 +250,7 @@ impl SessionCollector {
                  exposition and not just in the writer. Use this to time a low-disruption \
                  redeploy."
                     .to_string(),
-                vec!["instance".to_string()],
+                vec![SESSION_LABEL.to_string()],
                 HashMap::new(),
             )?,
         })
@@ -288,7 +300,7 @@ fn gauge_family<'a>(desc: &Desc, values: impl Iterator<Item = (&'a str, i64)>) -
         values
             .map(|(instance, value)| {
                 let mut label = LabelPair::default();
-                label.set_name("instance".to_string());
+                label.set_name(SESSION_LABEL.to_string());
                 label.set_value(instance.to_string());
                 let mut gauge = Gauge::default();
                 gauge.set_value(value as f64);
@@ -544,18 +556,25 @@ impl Metrics {
     /// refresh. An instance that is *not* served is simply not tracked and has no
     /// series — which is the honest reading: there is no such instance here, as
     /// distinct from one that exists and currently has no sessions.
+    ///
+    /// The zero is only ever *introduced*, never written over an existing value. It
+    /// has to be: with counts summed per instance, tracking a second server for an
+    /// instance that already has sessions would otherwise reset the whole
+    /// instance's total to zero until the next refresh — the sessions would appear
+    /// to vanish, and the fix for under-reporting would have introduced a different
+    /// wrong number.
     pub fn track(&self, server: &crate::McpServer) {
         let name = server.instance().name;
         match self.tracked.lock() {
             Ok(mut v) => {
-                // Zero-fill and publish the server under ONE hold of this lock. Do
-                // it after releasing and a [`Self::refresh`] racing in between can
-                // publish the server's real counts, which the zero-fill then
+                // Seed the series and publish the server under ONE hold of this
+                // lock. Do it after releasing and a [`Self::refresh`] racing in
+                // between can publish the server's real counts, which the seed then
                 // overwrites — the instance would read 0 until the next refresh.
                 // `refresh` only ever takes this lock to clone the list out, and
                 // never takes it while holding the session-counts lock, so nesting
                 // in this direction cannot deadlock.
-                self.set_sessions(name, 0, 0);
+                self.seed_sessions(name);
                 v.push(server.clone());
             }
             // A poisoned lock means another thread panicked mid-push. Losing the
@@ -563,6 +582,20 @@ impl Metrics {
             // call, so warn and carry on un-tracked — publishing nothing, rather
             // than a zero series for an instance nothing will ever refresh.
             Err(_) => tracing::warn!(instance = name, "metrics: tracked-server lock poisoned"),
+        }
+    }
+
+    /// Give `instance` a zero pair if it has none, leaving any existing counts
+    /// alone.
+    ///
+    /// Distinct from [`Self::set_sessions`] precisely because it must not overwrite:
+    /// see [`Self::track`], which is its only caller.
+    fn seed_sessions(&self, instance: &'static str) {
+        match self.sessions.lock() {
+            Ok(mut m) => {
+                m.entry(instance).or_insert((0, 0));
+            }
+            Err(_) => tracing::warn!(instance, "metrics: session-counts lock poisoned"),
         }
     }
 
@@ -829,7 +862,7 @@ mod tests {
                         let instance = m
                             .get_label()
                             .iter()
-                            .find(|l| l.name() == "instance")
+                            .find(|l| l.name() == SESSION_LABEL)
                             .map(|l| l.value().to_string())
                             .unwrap_or_default();
                         (instance, m.get_gauge().value() as i64)
@@ -994,11 +1027,11 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains(concat!(metric!("live_sessions"), r#"{instance="prod"} 7"#)),
+            out.contains(concat!(metric!("live_sessions"), r#"{ii_instance="prod"} 7"#)),
             "{out}"
         );
         assert!(
-            out.contains(concat!(metric!("active_sessions"), r#"{instance="prod"} 3"#)),
+            out.contains(concat!(metric!("active_sessions"), r#"{ii_instance="prod"} 3"#)),
             "{out}"
         );
     }
@@ -1077,11 +1110,11 @@ mod tests {
         m.track(&server());
         let out = encode(&r);
         assert!(
-            out.contains(concat!(metric!("live_sessions"), r#"{instance="prod"} 0"#)),
+            out.contains(concat!(metric!("live_sessions"), r#"{ii_instance="prod"} 0"#)),
             "{out}"
         );
         assert!(
-            out.contains(concat!(metric!("active_sessions"), r#"{instance="prod"} 0"#)),
+            out.contains(concat!(metric!("active_sessions"), r#"{ii_instance="prod"} 0"#)),
             "{out}"
         );
     }
@@ -1177,9 +1210,9 @@ mod tests {
         for (live, active) in [(10, 5), (3, 1), (7, 7), (0, 0), (4, 2)] {
             m.set_sessions("prod", live, active);
             let out = encode(&r);
-            let want_live = format!(concat!(metric!("live_sessions"), r#"{{instance="prod"}} {}"#), live);
+            let want_live = format!(concat!(metric!("live_sessions"), r#"{{ii_instance="prod"}} {}"#), live);
             let want_active =
-                format!(concat!(metric!("active_sessions"), r#"{{instance="prod"}} {}"#), active);
+                format!(concat!(metric!("active_sessions"), r#"{{ii_instance="prod"}} {}"#), active);
             assert!(out.contains(&want_live), "missing {want_live}:\n{out}");
             assert!(out.contains(&want_active), "missing {want_active}:\n{out}");
         }
@@ -1207,6 +1240,28 @@ mod tests {
         assert!(totals([]).is_empty(), "nothing tracked, nothing published");
     }
 
+    /// Tracking a second server for an instance that already has sessions must not
+    /// zero the instance's total. With the counts summed, an unconditional zero-fill
+    /// in `track` would make live sessions appear to vanish until the next refresh —
+    /// the fix for under-reporting replaced by a different wrong number.
+    #[test]
+    fn tracking_another_server_does_not_reset_an_instance() {
+        let (r, m) = fixture();
+        m.track(&server());
+        // Stand in for a refresh having run against a server with live sessions.
+        m.set_sessions("prod", 7, 3);
+        m.track(&server_at("/mcp-alt"));
+        let out = encode(&r);
+        assert!(
+            out.contains(concat!(metric!("live_sessions"), r#"{ii_instance="prod"} 7"#)),
+            "the second track reset the instance's total:\n{out}"
+        );
+        assert!(
+            out.contains(concat!(metric!("active_sessions"), r#"{ii_instance="prod"} 3"#)),
+            "{out}"
+        );
+    }
+
     /// And through the public API: two distinct servers on the same instance must
     /// leave one series, not two competing ones.
     #[tokio::test]
@@ -1221,7 +1276,7 @@ mod tests {
             .map(str::to_string)
             .collect();
         assert_eq!(live.len(), 1, "expected one series for one instance, got {live:?}");
-        assert!(live[0].contains(r#"instance="prod""#), "{}", live[0]);
+        assert!(live[0].contains(r#"ii_instance="prod""#), "{}", live[0]);
     }
 
     /// `refresh` with nothing tracked must be a harmless no-op — an embedder that
@@ -1255,11 +1310,11 @@ mod tests {
         tokio::join!(m.refresh(), other.refresh());
         let out = encode(&r);
         assert!(
-            out.contains(concat!(metric!("live_sessions"), r#"{instance="prod"} 0"#)),
+            out.contains(concat!(metric!("live_sessions"), r#"{ii_instance="prod"} 0"#)),
             "{out}"
         );
         assert!(
-            out.contains(concat!(metric!("active_sessions"), r#"{instance="prod"} 0"#)),
+            out.contains(concat!(metric!("active_sessions"), r#"{ii_instance="prod"} 0"#)),
             "{out}"
         );
     }

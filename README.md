@@ -100,7 +100,10 @@ let app = app
 
 Published as `imcp2_*`: request counts and a latency histogram, the
 `live_sessions` / `active_sessions` gauges that mirror `/version`, `build_info`,
-and process start time. `register_process_collector(&registry)` adds CPU/RSS/fd —
+and process start time. The session gauges are labelled `ii_instance`, **not**
+`instance`: Prometheus attaches its own `instance` target label to every sample and
+renames a colliding exposed one to `exported_instance`, so a query written against
+`instance="prod"` would silently match nothing. `register_process_collector(&registry)` adds CPU/RSS/fd —
 separate on purpose, since un-namespaced `process_*` describes the whole OS
 process, which belongs to the application, not to this crate.
 
