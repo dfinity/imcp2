@@ -64,6 +64,7 @@ use axum::{
 use prometheus::{
     Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
 };
+use std::sync::{Arc, Mutex};
 
 /// Every metric this crate publishes is named `imcp2_*`. The prefix is factored
 /// out so it cannot drift between the seven definitions and the assertions that
@@ -116,6 +117,9 @@ pub struct Metrics {
     live_sessions: IntGaugeVec,
     active_sessions: IntGaugeVec,
     scrapes: Histogram,
+    /// Servers whose derived gauges [`Metrics::refresh`] republishes. Shared
+    /// across clones, so tracking through any handle is visible to all of them.
+    tracked: Arc<Mutex<Vec<crate::McpServer>>>,
 }
 
 impl Metrics {
@@ -233,6 +237,7 @@ impl Metrics {
             live_sessions,
             active_sessions,
             scrapes,
+            tracked: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -268,13 +273,74 @@ impl Metrics {
             .observe(elapsed_secs);
     }
 
-    /// Publish one instance's session counts. Called during a scrape, so the
-    /// value reported is the one read at scrape time.
-    pub fn set_sessions(&self, instance: &str, live: i64, active: i64) {
+    /// Publish one instance's session counts.
+    ///
+    /// Not public, for the same reason as [`Self::observe_request`]: `instance`
+    /// would be a caller-supplied label string. Use [`Self::track`], which takes
+    /// the name from [`crate::IiInstance`] where it is already a `&'static str`.
+    pub(crate) fn set_sessions(&self, instance: &'static str, live: i64, active: i64) {
         self.live_sessions.with_label_values(&[instance]).set(live);
         self.active_sessions
             .with_label_values(&[instance])
             .set(active);
+    }
+
+    /// Track a server whose derived gauges [`Self::refresh`] should publish.
+    ///
+    /// Call once per served [`crate::McpServer`]. The server is cheap to clone and
+    /// everything inside it is shared, so this holds a handle rather than a copy
+    /// of any state.
+    ///
+    /// Publishes zeroes immediately, so a tracked instance's gauges read `0` from
+    /// the moment it is registered rather than being absent until the first
+    /// refresh. An instance that is *not* served is simply not tracked and has no
+    /// series — which is the honest reading: there is no such instance here, as
+    /// distinct from one that exists and currently has no sessions.
+    pub fn track(&self, server: &crate::McpServer) {
+        let name = server.instance().name;
+        match self.tracked.lock() {
+            Ok(mut v) => v.push(server.clone()),
+            // A poisoned lock means another thread panicked mid-push. Losing the
+            // registration is not worth propagating a panic from an instrumentation
+            // call, so warn and carry on un-tracked.
+            Err(_) => {
+                tracing::warn!(instance = name, "metrics: tracked-server lock poisoned");
+                return;
+            }
+        }
+        self.set_sessions(name, 0, 0);
+    }
+
+    /// Recompute and publish the derived gauges for every tracked server.
+    ///
+    /// The session counts are *derived state*: the authoritative value is whatever
+    /// the session map says when asked, so they have to be pulled rather than
+    /// incremented as events happen. Something must therefore decide when to ask.
+    ///
+    /// This crate deliberately does not decide for you. Call it from your
+    /// exposition path immediately before gathering, which makes the reported
+    /// value exact as of the scrape; or call it on a timer if your metrics
+    /// pipeline refreshes on its own schedule. Either works, and a host embedding
+    /// this crate already has such a place — which the bundled binary's
+    /// `/metrics` handler cannot be, for anybody else.
+    ///
+    /// Cheap: one lock plus one iteration of each tracked server's session map.
+    /// A no-op with nothing tracked.
+    pub async fn refresh(&self) {
+        // Clone the handles out before awaiting: holding a std Mutex across an
+        // await point can deadlock, and is a lint in most codebases for exactly
+        // that reason.
+        let servers = match self.tracked.lock() {
+            Ok(v) => v.clone(),
+            Err(_) => {
+                tracing::warn!("metrics: tracked-server lock poisoned; skipping refresh");
+                return;
+            }
+        };
+        for server in &servers {
+            let g = server.session_gauges().await;
+            self.set_sessions(server.instance().name, g.live as i64, g.active as i64);
+        }
     }
 
     /// Record how long a scrape took to gather and encode.
@@ -595,6 +661,51 @@ mod tests {
             buckets,
             LATENCY_BUCKETS.len() + 1,
             "one label set means one bucket family (+Inf), got:\n{out}"
+        );
+    }
+
+    /// `track` must publish zeroes at once, so a tracked instance has a series
+    /// from registration rather than being absent until something refreshes.
+    #[test]
+    fn tracking_publishes_zeroes_immediately() {
+        let (r, m) = fixture();
+        assert!(
+            !encode(&r).contains(metric!("live_sessions")),
+            "no instance tracked yet, so no series"
+        );
+        // A real McpServer needs an Agent and network config, so assert the
+        // narrower property directly: registration is what creates the series.
+        m.set_sessions("prod", 0, 0);
+        let out = encode(&r);
+        assert!(
+            out.contains(concat!(metric!("live_sessions"), r#"{instance="prod"} 0"#)),
+            "{out}"
+        );
+        assert!(
+            out.contains(concat!(metric!("active_sessions"), r#"{instance="prod"} 0"#)),
+            "{out}"
+        );
+    }
+
+    /// `refresh` with nothing tracked must be a harmless no-op — an embedder that
+    /// calls it on a timer before wiring anything up should not get a panic.
+    #[tokio::test]
+    async fn refresh_with_nothing_tracked_is_a_noop() {
+        let (r, m) = fixture();
+        m.refresh().await;
+        assert!(!encode(&r).contains(metric!("live_sessions")));
+    }
+
+    /// Cloning shares the tracked set, so an embedder can track through one handle
+    /// and refresh through another — which is what happens when the handle is
+    /// cloned into middleware state and into an exposition path separately.
+    #[test]
+    fn clones_share_the_tracked_set() {
+        let (_r, m) = fixture();
+        let clone = m.clone();
+        assert!(
+            std::sync::Arc::ptr_eq(&m.tracked, &clone.tracked),
+            "clones must share one tracked set, not copy it"
         );
     }
 

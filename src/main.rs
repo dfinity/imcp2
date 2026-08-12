@@ -297,9 +297,13 @@ async fn main() -> anyhow::Result<()> {
     // `process_*` describes the whole OS process, which belongs to the
     // application, and this binary *is* the application.
     imcp2::metrics::register_process_collector(&registry)?;
-    // The session gauges are read at scrape time, so /metrics needs the same
-    // handles /version uses.
-    let (met_prod, met_beta) = (prod.clone(), beta.clone());
+    // Register the served instances so `Metrics::refresh` knows what to publish.
+    // An unserved instance is simply not tracked and has no series, which reads as
+    // "no such instance here" rather than "exists, currently idle".
+    metrics.track(&prod);
+    if let Some(beta) = &beta {
+        metrics.track(beta);
+    }
 
     // Which II each served mount hands off to. Built once (fixed for the process)
     // and cloned per request. This is the only way an external monitor can learn
@@ -390,25 +394,14 @@ async fn main() -> anyhow::Result<()> {
                 let metrics = metrics.clone();
                 move || {
                     let metrics = metrics.clone();
-                    let met_prod = met_prod.clone();
-                    let met_beta = met_beta.clone();
                     async move {
-                        // Refresh the derived gauges from the authoritative
-                        // session maps before encoding. Beta reports zero when the
-                        // staging instance is not served, so the series exists
-                        // continuously rather than appearing and vanishing with
-                        // the deployment shape — a gap in a gauge is much harder
-                        // to reason about than a flat zero.
-                        let p = met_prod.session_gauges().await;
-                        metrics.set_sessions("prod", p.live as i64, p.active as i64);
-                        let (b_live, b_active) = match &met_beta {
-                            Some(b) => {
-                                let g = b.session_gauges().await;
-                                (g.live as i64, g.active as i64)
-                            }
-                            None => (0, 0),
-                        };
-                        metrics.set_sessions("beta", b_live, b_active);
+                        // Pull the derived session gauges immediately before
+                        // encoding, so what is reported is exact as of this scrape
+                        // rather than as of whenever it was last pushed. Which
+                        // servers get refreshed was decided by the `track` calls at
+                        // startup; an embedder calls refresh from its own exposition
+                        // path, or on a timer, instead.
+                        metrics.refresh().await;
 
                         let started = std::time::Instant::now();
                         let encoded = {
