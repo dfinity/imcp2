@@ -177,15 +177,25 @@ EOF
 echo ">> deployed. Verifying..."
 sleep 6
 $SSH "systemctl is-active imcp2 caddy imcp-status; ss -tlnp 2>/dev/null | grep -E ':(80|443|8000|8137)\b' || true"
-# The Prometheus exposition should be serving on the app's own port, where a
-# scraper reaches it over the VPN. It is gated on MCP_SERVE_METRICS (off by
-# default, since a deployment with no proxy in front would publish it), so this
-# also confirms the unit's environment actually took effect — otherwise the only
-# symptom is a scrape target that silently returns nothing.
-if $SSH "curl -fsS --max-time 5 http://127.0.0.1:8000/metrics | grep -q imcp2_build_info"; then
-  echo "on-host http://127.0.0.1:8000/metrics -> serving the exposition"
-else
-  echo "WARNING: on-host /metrics is not serving; MCP_SERVE_METRICS may not have taken effect" >&2
+# The Prometheus exposition must be serving on the app's own port, where a scraper
+# reaches it over the VPN. It is gated on MCP_SERVE_METRICS (off by default, since
+# a deployment with no proxy in front would publish it) and the unit hardcodes the
+# opt-in, so a missing endpoint here is not an optional condition — it means the
+# unit's environment did not take effect, or the app is not up. Fatal rather than a
+# warning: the alternative is a scrape target that silently returns nothing, which
+# looks exactly like a service with no traffic.
+metrics_ok=""
+for attempt in 1 2 3 4 5; do
+  if $SSH "curl -fsS --max-time 5 http://127.0.0.1:8000/metrics | grep -q imcp2_build_info"; then
+    metrics_ok=1
+    echo "on-host http://127.0.0.1:8000/metrics -> serving the exposition (attempt $attempt)"
+    break
+  fi
+  sleep 3
+done
+if [ -z "$metrics_ok" ]; then
+  echo "FATAL: on-host /metrics never served imcp2_build_info; MCP_SERVE_METRICS did not take effect, or the app is not up" >&2
+  exit 1
 fi
 
 echo ">> external check:"
@@ -197,11 +207,31 @@ curl -sS -o /dev/null -w "https://$DOMAIN/status/ -> HTTP %{http_code}\n" "https
 # any other path, publishing request volumes, session counts and process memory,
 # and handing out a whole-registry gather per request. That is a config edit away
 # at all times, so assert it on every deploy rather than trusting the file to
-# still say what it said when it was written. A hard failure: the deploy is
-# idempotent and re-runnable, and a published exposition is worth stopping for.
-code="$(curl -sS -o /dev/null -w '%{http_code}' "https://$DOMAIN/metrics" || echo 000)"
-if [ "$code" = 200 ]; then
-  echo "FATAL: https://$DOMAIN/metrics answered 200 — the Prometheus exposition is public" >&2
+# still say what it said when it was written.
+#
+# The assertion is "exactly the configured 404", not "anything but 200". Absence of
+# a 200 is not absence of exposure: if the catch-all is proxying this path and the
+# app happens to answer 500, or if this curl never reached the origin at all
+# (`000`), a not-200 check reports "not published" while having disproved nothing.
+# So every other code fails too, retrying first because Caddy may still be
+# reloading. A hard failure is right here — the deploy is idempotent and
+# re-runnable, and a published exposition is worth stopping for.
+hidden=""
+for attempt in 1 2 3 4 5; do
+  code="$(curl -sS -o /dev/null -w '%{http_code}' "https://$DOMAIN/metrics" || echo 000)"
+  if [ "$code" = 200 ]; then
+    echo "FATAL: https://$DOMAIN/metrics answered 200 — the Prometheus exposition is public" >&2
+    exit 1
+  fi
+  if [ "$code" = 404 ]; then
+    hidden=1
+    echo "https://$DOMAIN/metrics -> HTTP 404 (not published, as intended)"
+    break
+  fi
+  echo "https://$DOMAIN/metrics -> HTTP $code, expected 404 (attempt $attempt)" >&2
+  sleep 3
+done
+if [ -z "$hidden" ]; then
+  echo "FATAL: https://$DOMAIN/metrics never answered the configured 404, so its exposure is unproven" >&2
   exit 1
 fi
-echo "https://$DOMAIN/metrics -> HTTP $code (not published, as intended)"

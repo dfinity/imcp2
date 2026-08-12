@@ -507,10 +507,15 @@ async fn main() -> anyhow::Result<()> {
     // /version when it is served, so whatever fronts this process is what keeps
     // it off the public internet.
     //
-    // The request-metrics middleware below is NOT gated: it stays on so the
-    // recorded state is the same whether or not anything can read it, and an
-    // operator who flips this on gets counters that were already counting rather
-    // than a registry that starts at zero mid-incident.
+    // The request-metrics middleware below is NOT gated, and not because flipping
+    // this on later would find warm counters — it wouldn't: this is read once while
+    // the router is built, so enabling it means a restart, which builds a fresh
+    // registry from zero regardless. The reason is uniformity. Gating the layer too
+    // would mean the instrumented request path only ever runs on hosts that expose
+    // it, leaving the shape most operators run — the Dockerfile default, with the
+    // gate off — as the one nothing exercises. The cost of keeping it is two atomic
+    // increments and a histogram observation per request, against MCP calls that
+    // make IC round trips.
     if serve_metrics() {
         app = app.merge(metrics_router(registry, metrics.clone()));
     } else {

@@ -25,9 +25,11 @@
 //!     every request; this records the same facts as series rather than as
 //!     lines nobody aggregates.
 //!   * **Session gauges**, mirroring `/version`'s `live_sessions` and
-//!     `active_sessions`. Read at scrape time rather than pushed, because they
-//!     are derived state: the authoritative value is whatever the session map
-//!     says when asked.
+//!     `active_sessions`. Recomputed on [`Metrics::refresh`] rather than pushed as
+//!     events happen, because they are derived state: the authoritative value is
+//!     whatever the session map says when asked. Both come from one collector over
+//!     one snapshot, so `active <= live` holds of what a scrape *exports* and not
+//!     merely of what the writer intended — see [`SessionCollector`].
 //!   * **Build and start info**, so a series can be attributed to an exact
 //!     commit and a redeploy is visible as a step change rather than inferred.
 //!   * **Process collector** (Linux only): CPU, RSS, open file descriptors.
@@ -62,9 +64,11 @@ use axum::{
     response::Response,
 };
 use prometheus::{
-    core::Collector, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
-    Opts, Registry,
+    core::{Collector, Desc},
+    proto::{Gauge, LabelPair, Metric, MetricFamily, MetricType},
+    Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
 };
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 /// Every metric this crate publishes is named `imcp2_*`. The prefix is factored
@@ -118,9 +122,17 @@ const LATENCY_BUCKETS: &[f64] = &[
 /// *first* collector, reporting a cause that has nothing to do with the problem.
 /// All or nothing avoids both.
 ///
-/// Every collector registered here has exactly one descriptor, which is what
-/// makes unwinding per collector sufficient: there is no partially-registered
-/// collector to worry about, only a partially-registered group.
+/// What the unwind restores, precisely: the registered collectors and their
+/// descriptor ids, which is what a retry needs and what leaving them behind
+/// breaks. It does **not** restore the registry's `fq_name -> dim_hash` table —
+/// `Registry::unregister` deliberately keeps those "consistent throughout the
+/// lifetime of a program", so once this constructor has *attempted* a name, a
+/// differently-shaped collector claiming that same name can no longer be
+/// registered even after the rollback. Nothing here can undo that, and an
+/// aggregate collector would not either: `Registry::register` records each
+/// descriptor's dim hash as it validates them, before it commits anything. It also
+/// costs nothing real — the names are ours, and the shape they are reserved with is
+/// the shape we use.
 struct Registration<'a> {
     registry: &'a Registry,
     /// Registered so far, kept for the rollback.
@@ -172,25 +184,120 @@ impl<'a> Registration<'a> {
     }
 }
 
-/// Whether one instance's `active` gauge must be written before its `live` gauge
-/// when moving to `next_live`.
+/// One instance's session counts, as a pair that is only ever read or written
+/// together: `(live, active)`.
+type Counts = (i64, i64);
+
+/// Publishes `imcp2_live_sessions` and `imcp2_active_sessions` from a single
+/// snapshot, so `active <= live` holds in the exposition and not merely in the
+/// writer.
 ///
-/// There is no way to update two `prometheus` series atomically, so the write
-/// *order* is what upholds `active <= live` — the invariant `imcp2_active_sessions`
-/// documents, and the one an alert dividing the two depends on. Given that both
-/// endpoints satisfy it:
+/// Two `IntGaugeVec`s cannot give that guarantee, and no amount of care at the
+/// write site fixes it, because the *reader* is not taking an instantaneous
+/// observation either: [`Registry::gather`] calls each registered collector in
+/// turn, so it reads `live` at one instant and `active` at another with nothing
+/// held in between. A refresh landing between those two reads exports a pair that
+/// was never simultaneously true — `live` from before it and `active` from after —
+/// and with counts falling that is exactly `active > live`, the one thing the help
+/// text promises cannot happen and the reason an alert may divide the two.
 ///
-///   * live is falling — lower `active` first. The new active is `<=` the new
-///     live, hence `<=` the old one, so the intermediate `(live_old, active_new)`
-///     holds.
-///   * live is rising or unchanged — raise `live` first. The old active is `<=`
-///     the old live, hence `<=` the new one, so `(live_new, active_old)` holds.
+/// Ordering the two writes narrows the window but cannot close it; only making the
+/// pair inseparable does. So both counts live in one map behind one mutex, and
+/// [`Collector::collect`] takes that lock once and builds both families from the
+/// same snapshot. Every exported pair is then a pair that existed.
 ///
-/// Written as a pure function of the two live values so the property can be
-/// checked over every ordering of endpoints rather than argued in a comment; see
-/// `no_write_order_exposes_active_above_live`.
-fn active_before_live(current_live: i64, next_live: i64) -> bool {
-    next_live < current_live
+/// Instances are keyed by `&'static str` — see [`Metrics::set_sessions`] on why
+/// that, and not a `String`, is what bounds this label.
+///
+/// `Clone` shares the map and copies the descriptors, which is what lets
+/// [`Registration`] hold a second handle for its rollback.
+#[derive(Clone)]
+struct SessionCollector {
+    counts: Arc<Mutex<BTreeMap<&'static str, Counts>>>,
+    live: Desc,
+    active: Desc,
+}
+
+impl SessionCollector {
+    fn new(counts: Arc<Mutex<BTreeMap<&'static str, Counts>>>) -> prometheus::Result<Self> {
+        Ok(Self {
+            counts,
+            live: Desc::new(
+                metric!("live_sessions").to_string(),
+                "Authenticated sessions holding a currently-valid Internet Identity grant. \
+                 A session counts from grant redemption until the grant expires, idle or not."
+                    .to_string(),
+                vec!["instance".to_string()],
+                HashMap::new(),
+            )?,
+            active: Desc::new(
+                metric!("active_sessions").to_string(),
+                "The subset of live sessions that also made a request within the activity \
+                 window. Always <= imcp2_live_sessions, in the exposition and not just in \
+                 the writer. Use this to time a low-disruption redeploy."
+                    .to_string(),
+                vec!["instance".to_string()],
+                HashMap::new(),
+            )?,
+        })
+    }
+}
+
+impl Collector for SessionCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        vec![&self.live, &self.active]
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        // One lock, both families. This single line is the entire reason this type
+        // exists rather than a pair of `IntGaugeVec`s.
+        let snapshot: Vec<(&'static str, Counts)> = match self.counts.lock() {
+            Ok(m) => m.iter().map(|(k, v)| (*k, *v)).collect(),
+            // A poisoned lock means a writer panicked. Reporting nothing is the
+            // honest option: a stale pair would be indistinguishable from a real
+            // one, and panicking inside `gather` would take out the whole scrape.
+            Err(_) => {
+                tracing::warn!("metrics: session-counts lock poisoned; reporting no sessions");
+                return Vec::new();
+            }
+        };
+        vec![
+            gauge_family(&self.live, snapshot.iter().map(|(n, (live, _))| (*n, *live))),
+            gauge_family(
+                &self.active,
+                snapshot.iter().map(|(n, (_, active))| (*n, *active)),
+            ),
+        ]
+    }
+}
+
+/// One gauge `MetricFamily` from a descriptor and its `instance`-labelled values.
+///
+/// Hand-built because a custom collector returns the wire types directly; there is
+/// no `IntGaugeVec` in the middle to do it. An empty family is fine to return —
+/// [`Registry::gather`] prunes those, which is what makes an untracked instance
+/// absent rather than reported as zero.
+fn gauge_family<'a>(desc: &Desc, values: impl Iterator<Item = (&'a str, i64)>) -> MetricFamily {
+    let mut family = MetricFamily::default();
+    family.set_name(desc.fq_name.clone());
+    family.set_help(desc.help.clone());
+    family.set_field_type(MetricType::GAUGE);
+    family.set_metric(
+        values
+            .map(|(instance, value)| {
+                let mut label = LabelPair::default();
+                label.set_name("instance".to_string());
+                label.set_value(instance.to_string());
+                let mut gauge = Gauge::default();
+                gauge.set_value(value as f64);
+                let mut metric = Metric::default();
+                metric.set_label(vec![label]);
+                metric.set_gauge(gauge);
+                metric
+            })
+            .collect(),
+    );
+    family
 }
 
 /// Handle for recording this crate's metrics. Cheap to clone: every collector is
@@ -202,8 +309,9 @@ fn active_before_live(current_live: i64, next_live: i64) -> bool {
 pub struct Metrics {
     requests: IntCounterVec,
     duration: HistogramVec,
-    live_sessions: IntGaugeVec,
-    active_sessions: IntGaugeVec,
+    /// The session counts, written here and read by [`SessionCollector`] — which is
+    /// what makes each instance's `(live, active)` inseparable on both sides.
+    sessions: Arc<Mutex<BTreeMap<&'static str, Counts>>>,
     scrapes: Histogram,
     /// Servers whose derived gauges [`Metrics::refresh`] republishes. Shared
     /// across clones, so tracking through any handle is visible to all of them.
@@ -231,10 +339,12 @@ impl Metrics {
     /// Returns [`prometheus::Error::AlreadyReg`] if called twice against the same
     /// registry. Build one and clone it.
     ///
-    /// On **any** failure the caller's registry is left exactly as it was found:
-    /// every collector is built first and the group is registered atomically, so a
-    /// collision partway through does not strand half a metric set in a registry
-    /// whose owner was handed an error and no handle. See [`Registration`].
+    /// On **any** failure no collector of ours stays registered: every collector is
+    /// built before the first registration and the group is registered as a unit
+    /// that unwinds, so a collision partway through does not strand half a metric
+    /// set in a registry whose owner was handed an error and no handle, and a retry
+    /// after the caller resolves the collision works. What a rollback cannot undo —
+    /// the registry's name-to-shape table — is spelled out on [`Registration`].
     pub fn new(
         registry: &Registry,
         version: &str,
@@ -261,24 +371,10 @@ impl Metrics {
             &["route", "method"],
         )?;
 
-        let live_sessions = IntGaugeVec::new(
-            Opts::new(
-                metric!("live_sessions"),
-                "Authenticated sessions holding a currently-valid Internet Identity grant. \
-                 A session counts from grant redemption until the grant expires, idle or not.",
-            ),
-            &["instance"],
-        )?;
-
-        let active_sessions = IntGaugeVec::new(
-            Opts::new(
-                metric!("active_sessions"),
-                "The subset of live sessions that also made a request within the activity \
-                 window. Always <= imcp2_live_sessions. Use this to time a low-disruption \
-                 redeploy.",
-            ),
-            &["instance"],
-        )?;
+        // Both session gauges, from one collector over one map — see
+        // `SessionCollector` for why they cannot be two.
+        let sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let session_collector = SessionCollector::new(Arc::clone(&sessions))?;
 
         // Self-observability for the endpoint itself. A scrape that quietly got
         // slow is how a monitoring target starts being dropped for timing out,
@@ -324,8 +420,7 @@ impl Metrics {
         Registration::new(registry)
             .add(&requests)
             .add(&duration)
-            .add(&live_sessions)
-            .add(&active_sessions)
+            .add(&session_collector)
             .add(&scrapes)
             .add(&build_info)
             .add(&start_time)
@@ -340,8 +435,7 @@ impl Metrics {
         Ok(Self {
             requests,
             duration,
-            live_sessions,
-            active_sessions,
+            sessions,
             scrapes,
             tracked: Arc::new(Mutex::new(Vec::new())),
             refreshing: Arc::new(tokio::sync::Mutex::new(())),
@@ -386,21 +480,17 @@ impl Metrics {
     /// would be a caller-supplied label string. Use [`Self::track`], which takes
     /// the name from [`crate::IiInstance`] where it is already a `&'static str`.
     ///
-    /// The two writes are *ordered*, not merely issued: a scrape landing between
-    /// them must not see `active > live`, which the help text promises and an
-    /// alert dividing the two would otherwise report as a ratio above 1. See
-    /// [`active_before_live`]. Ordering is the whole guarantee available here —
-    /// two `prometheus` series cannot be updated atomically — so it holds for a
-    /// single writer, which is what [`Self::refresh`]'s serialization provides.
+    /// The pair is written as a pair, under one lock, because it is read as a pair
+    /// under the same lock — see [`SessionCollector`]. That is what makes
+    /// `active <= live` true of the exposition and not merely of the writer.
     pub(crate) fn set_sessions(&self, instance: &'static str, live: i64, active: i64) {
-        let live_gauge = self.live_sessions.with_label_values(&[instance]);
-        let active_gauge = self.active_sessions.with_label_values(&[instance]);
-        if active_before_live(live_gauge.get(), live) {
-            active_gauge.set(active);
-            live_gauge.set(live);
-        } else {
-            live_gauge.set(live);
-            active_gauge.set(active);
+        match self.sessions.lock() {
+            Ok(mut m) => {
+                m.insert(instance, (live, active));
+            }
+            // Losing one instance's counts is not worth propagating a panic out of
+            // an instrumentation call; the collector reports the same poisoning.
+            Err(_) => tracing::warn!(instance, "metrics: session-counts lock poisoned"),
         }
     }
 
@@ -418,16 +508,23 @@ impl Metrics {
     pub fn track(&self, server: &crate::McpServer) {
         let name = server.instance().name;
         match self.tracked.lock() {
-            Ok(mut v) => v.push(server.clone()),
+            Ok(mut v) => {
+                // Zero-fill and publish the server under ONE hold of this lock. Do
+                // it after releasing and a [`Self::refresh`] racing in between can
+                // publish the server's real counts, which the zero-fill then
+                // overwrites — the instance would read 0 until the next refresh.
+                // `refresh` only ever takes this lock to clone the list out, and
+                // never takes it while holding the session-counts lock, so nesting
+                // in this direction cannot deadlock.
+                self.set_sessions(name, 0, 0);
+                v.push(server.clone());
+            }
             // A poisoned lock means another thread panicked mid-push. Losing the
             // registration is not worth propagating a panic from an instrumentation
-            // call, so warn and carry on un-tracked.
-            Err(_) => {
-                tracing::warn!(instance = name, "metrics: tracked-server lock poisoned");
-                return;
-            }
+            // call, so warn and carry on un-tracked — publishing nothing, rather
+            // than a zero series for an instance nothing will ever refresh.
+            Err(_) => tracing::warn!(instance = name, "metrics: tracked-server lock poisoned"),
         }
-        self.set_sessions(name, 0, 0);
     }
 
     /// Recompute and publish the derived gauges for every tracked server.
@@ -448,11 +545,10 @@ impl Metrics {
     /// then written, so two overlapping refreshes can commit in the order they
     /// finish rather than the order they read: the one that read *first* writes
     /// last and leaves stale numbers standing until the next refresh — a whole
-    /// scrape interval of a value that was never true. Interleaved writes to the
-    /// two gauges of one instance would also break the `active <= live` invariant
-    /// that [`Self::set_sessions`]'s write ordering upholds for a single writer.
-    /// Overlap is not hypothetical: two scrapers, or a scrape arriving while an
-    /// embedder's timer fires, is enough.
+    /// scrape interval of a value that was never true. Overlap is not hypothetical:
+    /// two scrapers, or a scrape arriving while an embedder's timer fires, is
+    /// enough. (What a *scrape* sees is a separate matter, handled at the read side
+    /// by [`SessionCollector`] rather than by anything this method does.)
     ///
     /// Cheap: one lock plus one iteration of each tracked server's session map.
     /// A no-op with nothing tracked.
@@ -662,6 +758,39 @@ mod tests {
                 m,
                 write_request_metrics,
             ))
+    }
+
+    /// The `(instance, live, active)` triples one `gather()` exported, read out of
+    /// the wire types rather than the encoded text — the concurrency test below
+    /// compares the two families against each other, which the text form makes
+    /// needlessly fiddly.
+    fn gathered_pairs(registry: &Registry) -> Vec<(String, i64, i64)> {
+        let families = registry.gather();
+        let values = |name: &str| -> Vec<(String, i64)> {
+            families
+                .iter()
+                .filter(|f| f.name() == name)
+                .flat_map(|f| {
+                    f.get_metric().iter().map(|m| {
+                        let instance = m
+                            .get_label()
+                            .iter()
+                            .find(|l| l.name() == "instance")
+                            .map(|l| l.value().to_string())
+                            .unwrap_or_default();
+                        (instance, m.get_gauge().value() as i64)
+                    })
+                })
+                .collect()
+        };
+        let active: HashMap<String, i64> = values(metric!("active_sessions")).into_iter().collect();
+        values(metric!("live_sessions"))
+            .into_iter()
+            .map(|(instance, live)| {
+                let a = active.get(&instance).copied().unwrap_or(0);
+                (instance, live, a)
+            })
+            .collect()
     }
 
     fn request_series(out: &str) -> Vec<&str> {
@@ -903,40 +1032,56 @@ mod tests {
         );
     }
 
-    /// The `active <= live` invariant must hold at *every* observable instant, not
-    /// only after both writes land — a scrape can arrive between them.
+    /// The `(live, active)` pair each `gather()` exports must be a pair that
+    /// actually existed — in particular never `active > live`, which the help text
+    /// promises and an alert dividing the two depends on.
     ///
-    /// Checked as a property over every pair of endpoint states in a small grid
-    /// rather than by racing a gather against a writer, which would make the test
-    /// probabilistic. Each iteration reconstructs the intermediate state the chosen
-    /// write order produces and asserts the invariant there. Flip the comparison in
-    /// `active_before_live` and this fails on the first falling-live case.
-    #[test]
-    fn no_write_order_exposes_active_above_live() {
-        for live_from in 0..6i64 {
-            for active_from in 0..=live_from {
-                for live_to in 0..6i64 {
-                    for active_to in 0..=live_to {
-                        let (mid_live, mid_active) = if active_before_live(live_from, live_to) {
-                            (live_from, active_to) // active written first
-                        } else {
-                            (live_to, active_from) // live written first
-                        };
-                        assert!(
-                            mid_active <= mid_live,
-                            "({live_from},{active_from}) -> ({live_to},{active_to}) \
-                             passes through ({mid_live},{mid_active}), where active > live"
-                        );
+    /// This is the property two separate collectors cannot have, and it is a
+    /// *reader*-side property, so it has to be tested by reading concurrently with a
+    /// writer rather than by reasoning about write order. A background task flips
+    /// the counts between two valid pairs while this one gathers as fast as it can;
+    /// with both families built from one locked snapshot, no interleaving can
+    /// produce a mixed pair. Have `collect` take the lock once per family instead
+    /// and this fails within a few thousand gathers.
+    ///
+    /// The gather count is asserted too: a loop that barely ran would pass this
+    /// without ever exercising the race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_gather_never_exports_a_pair_that_never_existed() {
+        let (r, m) = fixture();
+        let writer = tokio::task::spawn_blocking({
+            let m = m.clone();
+            move || {
+                for i in 0..60_000 {
+                    // Both valid on their own; only a mixed read yields active > live.
+                    if i % 2 == 0 {
+                        m.set_sessions("prod", 10, 5);
+                    } else {
+                        m.set_sessions("prod", 3, 1);
                     }
                 }
             }
+        });
+
+        let mut gathers = 0u32;
+        while !writer.is_finished() {
+            for (instance, live, active) in gathered_pairs(&r) {
+                assert!(
+                    active <= live,
+                    "gather {gathers} exported {instance}: active={active} > live={live}"
+                );
+            }
+            gathers += 1;
         }
+        writer.await.unwrap();
+        assert!(gathers > 100, "only {gathers} gathers — the race was not exercised");
     }
 
-    /// The end state is what a scrape usually sees, so assert it directly too —
-    /// the ordering above must not have swapped which gauge gets which number.
+    /// The values a scrape reports must be the ones that were written. Building the
+    /// families by hand means nothing checks the wiring but a test: swap the two and
+    /// every invariant above still holds while both numbers are wrong.
     #[test]
-    fn ordered_writes_still_land_on_the_requested_values() {
+    fn the_exposition_reports_the_values_that_were_written() {
         let (r, m) = fixture();
         for (live, active) in [(10, 5), (3, 1), (7, 7), (0, 0), (4, 2)] {
             m.set_sessions("prod", live, active);
