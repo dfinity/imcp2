@@ -931,12 +931,20 @@ fn resource_matches_issuer(resource: &str, issuer: &str) -> bool {
     let (Ok(got), Ok(want)) = (url::Url::parse(resource), url::Url::parse(issuer)) else {
         return false;
     };
-    // The advertised resource never carries a fragment or userinfo, so refuse
-    // those outright rather than normalizing them away. `url` erases an EMPTY
-    // userinfo (`https://@host` and `https://:@host` both parse to
-    // `https://host`), so `username()`/`password()` can't see it — scan the raw
-    // authority for `@` to catch every userinfo form, empty or not.
-    if got.fragment().is_some() || raw_authority_has_userinfo(resource) {
+    // The advertised resource is a plain absolute URI: no fragment, no userinfo,
+    // and none of the ASCII tab/newline/CR that `url` silently strips from
+    // ANYWHERE in the input (WHATWG URL). Reject that whitespace first, so
+    // stripping can't desync the raw scan from what `url` parsed — e.g.
+    // `https:\t//user@host` parses WITH userinfo yet hides the `://` from a
+    // literal scan. Then reject userinfo via BOTH the parsed username/password
+    // (authoritative for any non-empty userinfo) AND the raw-authority scan (for
+    // an EMPTY userinfo `url` erases: `https://@host` → `https://host`).
+    if got.fragment().is_some()
+        || resource.contains(['\t', '\n', '\r'])
+        || !got.username().is_empty()
+        || got.password().is_some()
+        || raw_authority_has_userinfo(resource)
+    {
         return false;
     }
     // Identifying components. Tolerate exactly one trailing slash (`/mcp` vs
@@ -2864,6 +2872,8 @@ mod tests {
             "https://user@mcp.test/mcp",         // userinfo is not part of the identifier
             "https://@mcp.test/mcp",             // empty userinfo (url erases it) — still refused
             "https://:@mcp.test/mcp",            // empty user:pass userinfo — still refused
+            "https:\t//user@mcp.test/mcp",       // tab hides `://`; url strips it, parsing userinfo
+            "https://mcp.test\n/mcp",            // stripped newline must not smuggle content past the scan
             "https://mcp.test/mcp?tenant=other", // a query differs from the issuer's (none)
             "https://mcp.test/mcp//",            // doubled trailing slash is a distinct path
             "http://mcp.test/mcp",               // scheme downgrade
