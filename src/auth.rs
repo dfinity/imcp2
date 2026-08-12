@@ -916,13 +916,27 @@ pub struct AuthorizeQuery {
 /// carries none); per RFC 8707 §2 a resource indicator is an absolute URI with
 /// no fragment and no userinfo, so a fragment-bearing, userinfo-bearing, or
 /// unparseable value is refused.
+/// Whether `raw`'s authority carries a userinfo component — `user[:pass]@`, or
+/// even a bare/empty `@`. `url` normalizes an empty userinfo away before parsing,
+/// so [`resource_matches_issuer`] scans the raw string: the authority is the
+/// slice between `://` and the first `/`, `?`, or `#`, and a `@` in it is
+/// userinfo (a `@` in the path or query is not).
+fn raw_authority_has_userinfo(raw: &str) -> bool {
+    raw.split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(rest))
+        .is_some_and(|authority| authority.contains('@'))
+}
+
 fn resource_matches_issuer(resource: &str, issuer: &str) -> bool {
     let (Ok(got), Ok(want)) = (url::Url::parse(resource), url::Url::parse(issuer)) else {
         return false;
     };
     // The advertised resource never carries a fragment or userinfo, so refuse
-    // those outright rather than normalizing them away.
-    if got.fragment().is_some() || !got.username().is_empty() || got.password().is_some() {
+    // those outright rather than normalizing them away. `url` erases an EMPTY
+    // userinfo (`https://@host` and `https://:@host` both parse to
+    // `https://host`), so `username()`/`password()` can't see it — scan the raw
+    // authority for `@` to catch every userinfo form, empty or not.
+    if got.fragment().is_some() || raw_authority_has_userinfo(resource) {
         return false;
     }
     // Identifying components. Tolerate exactly one trailing slash (`/mcp` vs
@@ -2848,6 +2862,8 @@ mod tests {
             "https://mcp.test:8443/mcp",
             "https://mcp.test/mcp#x",
             "https://user@mcp.test/mcp",         // userinfo is not part of the identifier
+            "https://@mcp.test/mcp",             // empty userinfo (url erases it) — still refused
+            "https://:@mcp.test/mcp",            // empty user:pass userinfo — still refused
             "https://mcp.test/mcp?tenant=other", // a query differs from the issuer's (none)
             "https://mcp.test/mcp//",            // doubled trailing slash is a distinct path
             "http://mcp.test/mcp",               // scheme downgrade
