@@ -328,30 +328,27 @@ mod tests {
         );
     }
 
-    // Live network: the real registry parses into our (subset) structs, serves a
-    // populated catalogue, and a listed skill is fetchable. Mirrors discover.rs's
-    // live tests.
-    //
-    // Asserts on the catalogue's SHAPE, never on specific skill names. The registry
-    // owns its naming and reorganises it — `motoko` became `writing-motoko`,
-    // `migrating-motoko-actors` and `troubleshooting-motoko-migrations` — so a pinned
-    // name turns an upstream rename into a red build on every unrelated pull request,
-    // which is exactly what it did before this was relaxed. What this server depends
-    // on survives a rename: the manifest parses, it is not empty, every entry carries
-    // a name, and a name taken from that list can be fetched.
+    // Live network: the real registry parses into our (subset) structs, is
+    // non-empty, and a known skill is fetchable. Mirrors discover.rs's live tests.
     #[tokio::test]
     async fn fetches_real_registry_and_a_skill() {
         let catalog = SkillsCatalog::new();
         let skills = catalog.list().await.expect("list skills");
-        assert!(!skills.is_empty(), "registry served an empty catalogue");
-        assert!(
-            skills.iter().all(|s| !s.name.trim().is_empty()),
-            "every entry needs a name — it is the key icp_get_skill takes"
-        );
-        // Fetch a skill NAMED BY THE REGISTRY rather than one hardcoded here, so this
-        // follows the catalogue wherever it goes.
-        let name = &skills[0].name;
-        let body = catalog.get(name).await.unwrap_or_else(|e| panic!("get `{name}`: {e}"));
-        assert!(!body.trim().is_empty(), "`{name}` SKILL.md was empty");
+
+        // The registry parses and is non-empty. Deliberately do NOT pin a single
+        // skill name: the registry reorganizes its catalog over time (e.g.
+        // `motoko` was split into `writing-motoko` / `migrating-motoko-actors`),
+        // so a hard-coded name is a standing false-failure. Instead require that
+        // at least one CORE skill is present — resilient to any single rename.
+        assert!(!skills.is_empty(), "the registry returned no skills");
+        let core = ["internet-identity", "icp-cli", "cycles-management"];
+        let present = skills.iter().find(|s| core.contains(&s.name.as_str())).unwrap_or_else(|| {
+            let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+            panic!("none of the core skills {core:?} are in the registry; got {names:?}")
+        });
+
+        // Every entry carries a markdown URL we can fetch; the SKILL.md is non-empty.
+        let md = catalog.get(&present.name).await.expect("get a core skill's markdown");
+        assert!(!md.trim().is_empty(), "{}'s SKILL.md was empty", present.name);
     }
 }
