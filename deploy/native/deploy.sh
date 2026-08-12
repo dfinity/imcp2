@@ -177,6 +177,31 @@ EOF
 echo ">> deployed. Verifying..."
 sleep 6
 $SSH "systemctl is-active imcp2 caddy imcp-status; ss -tlnp 2>/dev/null | grep -E ':(80|443|8000|8137)\b' || true"
+# The Prometheus exposition should be serving on the app's own port, where a
+# scraper reaches it over the VPN. It is gated on MCP_SERVE_METRICS (off by
+# default, since a deployment with no proxy in front would publish it), so this
+# also confirms the unit's environment actually took effect — otherwise the only
+# symptom is a scrape target that silently returns nothing.
+if $SSH "curl -fsS --max-time 5 http://127.0.0.1:8000/metrics | grep -q imcp2_build_info"; then
+  echo "on-host http://127.0.0.1:8000/metrics -> serving the exposition"
+else
+  echo "WARNING: on-host /metrics is not serving; MCP_SERVE_METRICS may not have taken effect" >&2
+fi
+
 echo ">> external check:"
 curl -sS -o /dev/null -w "https://$DOMAIN/ -> HTTP %{http_code} (TLS verify %{ssl_verify_result})\n" "https://$DOMAIN/" || true
 curl -sS -o /dev/null -w "https://$DOMAIN/status/ -> HTTP %{http_code}\n" "https://$DOMAIN/status/" || true
+
+# ...and it must NOT be reachable on the public origin. Caddy answers /metrics
+# itself with a 404; drop that one block and the catch-all reverse-proxies it like
+# any other path, publishing request volumes, session counts and process memory,
+# and handing out a whole-registry gather per request. That is a config edit away
+# at all times, so assert it on every deploy rather than trusting the file to
+# still say what it said when it was written. A hard failure: the deploy is
+# idempotent and re-runnable, and a published exposition is worth stopping for.
+code="$(curl -sS -o /dev/null -w '%{http_code}' "https://$DOMAIN/metrics" || echo 000)"
+if [ "$code" = 200 ]; then
+  echo "FATAL: https://$DOMAIN/metrics answered 200 — the Prometheus exposition is public" >&2
+  exit 1
+fi
+echo "https://$DOMAIN/metrics -> HTTP $code (not published, as intended)"

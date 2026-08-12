@@ -62,7 +62,8 @@ use axum::{
     response::Response,
 };
 use prometheus::{
-    Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    core::Collector, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
+    Opts, Registry,
 };
 use std::sync::{Arc, Mutex};
 
@@ -105,6 +106,93 @@ const LATENCY_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Registers a group of collectors into a caller-owned [`Registry`] as a unit,
+/// unwinding on the first failure.
+///
+/// `prometheus::Registry` offers no transactional registration, and a plain
+/// sequence of `registry.register(…)?` calls is not one: a collision on the fifth
+/// collector leaves the first four registered and returns `Err`. The caller then
+/// holds no handle while its registry keeps a partial set of this crate's
+/// descriptors that nothing can ever write to — and once the caller fixes the
+/// collision, the retry fails with [`prometheus::Error::AlreadyReg`] on the
+/// *first* collector, reporting a cause that has nothing to do with the problem.
+/// All or nothing avoids both.
+///
+/// Every collector registered here has exactly one descriptor, which is what
+/// makes unwinding per collector sufficient: there is no partially-registered
+/// collector to worry about, only a partially-registered group.
+struct Registration<'a> {
+    registry: &'a Registry,
+    /// Registered so far, kept for the rollback.
+    done: Vec<Box<dyn Collector>>,
+    /// The first failure. Once set, [`Self::add`] stops registering.
+    failure: Option<prometheus::Error>,
+}
+
+impl<'a> Registration<'a> {
+    fn new(registry: &'a Registry) -> Self {
+        Self {
+            registry,
+            done: Vec::new(),
+            failure: None,
+        }
+    }
+
+    /// Register one collector, or record the first failure and stop.
+    ///
+    /// Takes the collector by reference and clones it twice: `register` consumes
+    /// its `Box` and `unregister` needs another one, while `Box<dyn Collector>` is
+    /// not itself cloneable. Cloning a `prometheus` collector is an `Arc` bump, so
+    /// both boxes address the same series.
+    fn add<C: Collector + Clone + 'static>(mut self, c: &C) -> Self {
+        if self.failure.is_some() {
+            return self;
+        }
+        match self.registry.register(Box::new(c.clone())) {
+            Ok(()) => self.done.push(Box::new(c.clone())),
+            Err(e) => self.failure = Some(e),
+        }
+        self
+    }
+
+    /// Commit the group, or roll it back and return the failure.
+    fn finish(mut self) -> prometheus::Result<()> {
+        match self.failure.take() {
+            None => Ok(()),
+            Some(e) => {
+                for c in self.done.drain(..) {
+                    // A failed removal can only mean something else already
+                    // unregistered it, and the caller is getting the original,
+                    // more informative error either way.
+                    let _ = self.registry.unregister(c);
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Whether one instance's `active` gauge must be written before its `live` gauge
+/// when moving to `next_live`.
+///
+/// There is no way to update two `prometheus` series atomically, so the write
+/// *order* is what upholds `active <= live` — the invariant `imcp2_active_sessions`
+/// documents, and the one an alert dividing the two depends on. Given that both
+/// endpoints satisfy it:
+///
+///   * live is falling — lower `active` first. The new active is `<=` the new
+///     live, hence `<=` the old one, so the intermediate `(live_old, active_new)`
+///     holds.
+///   * live is rising or unchanged — raise `live` first. The old active is `<=`
+///     the old live, hence `<=` the new one, so `(live_new, active_old)` holds.
+///
+/// Written as a pure function of the two live values so the property can be
+/// checked over every ordering of endpoints rather than argued in a comment; see
+/// `no_write_order_exposes_active_above_live`.
+fn active_before_live(current_live: i64, next_live: i64) -> bool {
+    next_live < current_live
+}
+
 /// Handle for recording this crate's metrics. Cheap to clone: every collector is
 /// `Arc`-backed by the `prometheus` crate, so clones share one set of series.
 ///
@@ -120,6 +208,10 @@ pub struct Metrics {
     /// Servers whose derived gauges [`Metrics::refresh`] republishes. Shared
     /// across clones, so tracking through any handle is visible to all of them.
     tracked: Arc<Mutex<Vec<crate::McpServer>>>,
+    /// Serializes [`Metrics::refresh`] against itself — see there for why. A
+    /// `tokio` mutex because it is held across the awaits that read each tracked
+    /// server's session map.
+    refreshing: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Metrics {
@@ -138,13 +230,17 @@ impl Metrics {
     ///
     /// Returns [`prometheus::Error::AlreadyReg`] if called twice against the same
     /// registry. Build one and clone it.
+    ///
+    /// On **any** failure the caller's registry is left exactly as it was found:
+    /// every collector is built first and the group is registered atomically, so a
+    /// collision partway through does not strand half a metric set in a registry
+    /// whose owner was handed an error and no handle. See [`Registration`].
     pub fn new(
         registry: &Registry,
         version: &str,
         commit: &str,
         started_at: u64,
     ) -> prometheus::Result<Self> {
-
         let requests = IntCounterVec::new(
             Opts::new(
                 metric!("http_requests_total"),
@@ -152,7 +248,6 @@ impl Metrics {
             ),
             &["route", "method", "status"],
         )?;
-        registry.register(Box::new(requests.clone()))?;
 
         // No status label: a histogram multiplies series by its bucket count, so
         // adding a third dimension here costs far more than on the counter, and
@@ -165,7 +260,6 @@ impl Metrics {
             .buckets(LATENCY_BUCKETS.to_vec()),
             &["route", "method"],
         )?;
-        registry.register(Box::new(duration.clone()))?;
 
         let live_sessions = IntGaugeVec::new(
             Opts::new(
@@ -175,7 +269,6 @@ impl Metrics {
             ),
             &["instance"],
         )?;
-        registry.register(Box::new(live_sessions.clone()))?;
 
         let active_sessions = IntGaugeVec::new(
             Opts::new(
@@ -186,7 +279,6 @@ impl Metrics {
             ),
             &["instance"],
         )?;
-        registry.register(Box::new(active_sessions.clone()))?;
 
         // Self-observability for the endpoint itself. A scrape that quietly got
         // slow is how a monitoring target starts being dropped for timing out,
@@ -198,7 +290,6 @@ impl Metrics {
             )
             .buckets(vec![0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]),
         )?;
-        registry.register(Box::new(scrapes.clone()))?;
 
         // Immutable deployment facts. Value is always 1; the information is in
         // the labels, so `imcp2_build_info` joined onto another series attributes
@@ -210,8 +301,6 @@ impl Metrics {
             ),
             &["version", "commit"],
         )?;
-        registry.register(Box::new(build_info.clone()))?;
-        build_info.with_label_values(&[version, commit]).set(1);
 
         // NOT the conventional `process_start_time_seconds` — the prefix makes it
         // `imcp2_process_start_time_seconds`, and it deliberately measures a
@@ -228,7 +317,24 @@ impl Metrics {
             "Unix epoch seconds at which this process started, i.e. when the deployment \
              last restarted. Every deploy restarts the service.",
         )?;
-        registry.register(Box::new(start_time.clone()))?;
+
+        // Nothing above touched the registry: every collector is built first so
+        // that the only fallible step left is registration, which then either
+        // takes the whole group or leaves the registry untouched.
+        Registration::new(registry)
+            .add(&requests)
+            .add(&duration)
+            .add(&live_sessions)
+            .add(&active_sessions)
+            .add(&scrapes)
+            .add(&build_info)
+            .add(&start_time)
+            .finish()?;
+
+        // Only once the group is committed. Setting these earlier would write
+        // values into collectors a rollback then removes — harmless, but it would
+        // put the constructor's observable effects out of step with its result.
+        build_info.with_label_values(&[version, commit]).set(1);
         start_time.set(started_at as i64);
 
         Ok(Self {
@@ -238,6 +344,7 @@ impl Metrics {
             active_sessions,
             scrapes,
             tracked: Arc::new(Mutex::new(Vec::new())),
+            refreshing: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -278,11 +385,23 @@ impl Metrics {
     /// Not public, for the same reason as [`Self::observe_request`]: `instance`
     /// would be a caller-supplied label string. Use [`Self::track`], which takes
     /// the name from [`crate::IiInstance`] where it is already a `&'static str`.
+    ///
+    /// The two writes are *ordered*, not merely issued: a scrape landing between
+    /// them must not see `active > live`, which the help text promises and an
+    /// alert dividing the two would otherwise report as a ratio above 1. See
+    /// [`active_before_live`]. Ordering is the whole guarantee available here —
+    /// two `prometheus` series cannot be updated atomically — so it holds for a
+    /// single writer, which is what [`Self::refresh`]'s serialization provides.
     pub(crate) fn set_sessions(&self, instance: &'static str, live: i64, active: i64) {
-        self.live_sessions.with_label_values(&[instance]).set(live);
-        self.active_sessions
-            .with_label_values(&[instance])
-            .set(active);
+        let live_gauge = self.live_sessions.with_label_values(&[instance]);
+        let active_gauge = self.active_sessions.with_label_values(&[instance]);
+        if active_before_live(live_gauge.get(), live) {
+            active_gauge.set(active);
+            live_gauge.set(live);
+        } else {
+            live_gauge.set(live);
+            active_gauge.set(active);
+        }
     }
 
     /// Track a server whose derived gauges [`Self::refresh`] should publish.
@@ -324,9 +443,23 @@ impl Metrics {
     /// this crate already has such a place — which the bundled binary's
     /// `/metrics` handler cannot be, for anybody else.
     ///
+    /// Concurrent calls are **serialized** rather than interleaved, and that is a
+    /// correctness property, not tidiness. Each instance's counts are read and
+    /// then written, so two overlapping refreshes can commit in the order they
+    /// finish rather than the order they read: the one that read *first* writes
+    /// last and leaves stale numbers standing until the next refresh — a whole
+    /// scrape interval of a value that was never true. Interleaved writes to the
+    /// two gauges of one instance would also break the `active <= live` invariant
+    /// that [`Self::set_sessions`]'s write ordering upholds for a single writer.
+    /// Overlap is not hypothetical: two scrapers, or a scrape arriving while an
+    /// embedder's timer fires, is enough.
+    ///
     /// Cheap: one lock plus one iteration of each tracked server's session map.
     /// A no-op with nothing tracked.
     pub async fn refresh(&self) {
+        // Held across the whole read-then-write pass, so a refresh either happens
+        // entirely before or entirely after another one.
+        let _serialized = self.refreshing.lock().await;
         // Clone the handles out before awaiting: holding a std Mutex across an
         // await point can deadlock, and is a lint in most codebases for exactly
         // that reason.
@@ -492,6 +625,29 @@ mod tests {
         (r, m)
     }
 
+    /// A real production-instance [`crate::McpServer`], for the tests that must go
+    /// through [`Metrics::track`] rather than the private setter.
+    ///
+    /// Construction is pure — `McpServer::new` wires up handles and touches the
+    /// network for nothing — so this needs no server, no runtime and no fixture
+    /// scaffolding beyond an `Agent` pointed at mainnet. `SharedClients::load()`
+    /// reads the OAuth registration store, which these assertions never consult;
+    /// it is left alone rather than redirected, since `$OAUTH_CLIENTS_FILE` is
+    /// process-global and this test binary shares it with every other unit test.
+    fn server() -> crate::McpServer {
+        crate::McpServer::new(crate::McpConfig {
+            agent: crate::Agent::builder()
+                .with_url(crate::IC_URL)
+                .build()
+                .expect("build agent"),
+            instance: crate::IiInstance::prod().expect("prod instance"),
+            public_url: "https://mcp.example.com".into(),
+            mcp_path: "/mcp".into(),
+            clients: crate::SharedClients::load(),
+            require_resource: true,
+        })
+    }
+
     /// A router shaped like a host's: a real route, and the exported middleware.
     ///
     /// The cardinality tests go through this rather than calling `observe_request`
@@ -575,6 +731,61 @@ mod tests {
             Err(e) => panic!("expected AlreadyReg, got {e:?}"),
             Ok(_) => panic!("expected the second registration to fail"),
         }
+    }
+
+    /// A collision *partway through* must leave the caller's registry as it was.
+    ///
+    /// This is the case a sequence of `register(…)?` calls gets wrong, and
+    /// `double_registration_is_an_error_not_a_panic` cannot catch it: a second
+    /// `Metrics::new` fails on the very first collector, so nothing is ever
+    /// half-registered. Colliding on the sixth of seven is what exercises the
+    /// unwind — the proof being that the retry succeeds, which it cannot do if any
+    /// collector from the abandoned attempt is still registered.
+    ///
+    /// The squatter mirrors `build_info`'s help and labels deliberately. A
+    /// same-name collector is refused whatever its shape, but `Registry` keeps
+    /// `fq_name -> dim_hash` for the lifetime of the process even across
+    /// `unregister`, so only an identical descriptor can be cleared out of the way
+    /// again. If the real help text drifts from this copy, the retry below fails
+    /// with that mismatch rather than passing silently.
+    #[test]
+    fn a_failed_registration_rolls_back_the_earlier_collectors() {
+        let r = Registry::new();
+        let squatter = IntGaugeVec::new(
+            Opts::new(
+                metric!("build_info"),
+                "Always 1. Carries the running version and commit as labels.",
+            ),
+            &["version", "commit"],
+        )
+        .unwrap();
+        r.register(Box::new(squatter.clone())).unwrap();
+
+        match Metrics::new(&r, "1.2.3", "abc1234", 0) {
+            Err(prometheus::Error::AlreadyReg) => {}
+            Err(e) => panic!("expected AlreadyReg on the host's collector, got {e:?}"),
+            Ok(_) => panic!("expected the collision to fail the constructor"),
+        }
+
+        // The host resolves the collision; the constructor must now work. Without
+        // the rollback this fails with AlreadyReg on `imcp2_http_requests_total`,
+        // reporting a cause with nothing to do with the actual problem.
+        r.unregister(Box::new(squatter)).unwrap();
+        let m = Metrics::new(&r, "1.2.3", "abc1234", 1_700_000_000)
+            .expect("retry once the collision is cleared");
+
+        // And the handle from the successful attempt records into that registry —
+        // i.e. the retry registered live collectors, not descriptors left over from
+        // the attempt that failed.
+        m.observe_request("/version", "GET", 200, 0.002);
+        assert!(
+            encode(&r).contains(concat!(
+                metric!("http_requests_total"),
+                r#"{method="GET",route="/version",status="200"} 1"#
+            )),
+            "{}",
+            encode(&r)
+        );
     }
 
     /// Two independent registries do not collide, which is what makes the
@@ -666,6 +877,13 @@ mod tests {
 
     /// `track` must publish zeroes at once, so a tracked instance has a series
     /// from registration rather than being absent until something refreshes.
+    ///
+    /// Goes through the public `track` with a real server, not through
+    /// `set_sessions`. Calling the private setter would assert only that writing a
+    /// gauge writes a gauge: the test would keep passing if `track` stopped
+    /// retaining the server, stopped zero-filling, or read the instance name from
+    /// somewhere else. What is being claimed is that *handing `track` a server*
+    /// produces the series, so a server is what it gets handed.
     #[test]
     fn tracking_publishes_zeroes_immediately() {
         let (r, m) = fixture();
@@ -673,9 +891,7 @@ mod tests {
             !encode(&r).contains(metric!("live_sessions")),
             "no instance tracked yet, so no series"
         );
-        // A real McpServer needs an Agent and network config, so assert the
-        // narrower property directly: registration is what creates the series.
-        m.set_sessions("prod", 0, 0);
+        m.track(&server());
         let out = encode(&r);
         assert!(
             out.contains(concat!(metric!("live_sessions"), r#"{instance="prod"} 0"#)),
@@ -687,6 +903,52 @@ mod tests {
         );
     }
 
+    /// The `active <= live` invariant must hold at *every* observable instant, not
+    /// only after both writes land — a scrape can arrive between them.
+    ///
+    /// Checked as a property over every pair of endpoint states in a small grid
+    /// rather than by racing a gather against a writer, which would make the test
+    /// probabilistic. Each iteration reconstructs the intermediate state the chosen
+    /// write order produces and asserts the invariant there. Flip the comparison in
+    /// `active_before_live` and this fails on the first falling-live case.
+    #[test]
+    fn no_write_order_exposes_active_above_live() {
+        for live_from in 0..6i64 {
+            for active_from in 0..=live_from {
+                for live_to in 0..6i64 {
+                    for active_to in 0..=live_to {
+                        let (mid_live, mid_active) = if active_before_live(live_from, live_to) {
+                            (live_from, active_to) // active written first
+                        } else {
+                            (live_to, active_from) // live written first
+                        };
+                        assert!(
+                            mid_active <= mid_live,
+                            "({live_from},{active_from}) -> ({live_to},{active_to}) \
+                             passes through ({mid_live},{mid_active}), where active > live"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The end state is what a scrape usually sees, so assert it directly too —
+    /// the ordering above must not have swapped which gauge gets which number.
+    #[test]
+    fn ordered_writes_still_land_on_the_requested_values() {
+        let (r, m) = fixture();
+        for (live, active) in [(10, 5), (3, 1), (7, 7), (0, 0), (4, 2)] {
+            m.set_sessions("prod", live, active);
+            let out = encode(&r);
+            let want_live = format!(concat!(metric!("live_sessions"), r#"{{instance="prod"}} {}"#), live);
+            let want_active =
+                format!(concat!(metric!("active_sessions"), r#"{{instance="prod"}} {}"#), active);
+            assert!(out.contains(&want_live), "missing {want_live}:\n{out}");
+            assert!(out.contains(&want_active), "missing {want_active}:\n{out}");
+        }
+    }
+
     /// `refresh` with nothing tracked must be a harmless no-op — an embedder that
     /// calls it on a timer before wiring anything up should not get a panic.
     #[tokio::test]
@@ -694,6 +956,37 @@ mod tests {
         let (r, m) = fixture();
         m.refresh().await;
         assert!(!encode(&r).contains(metric!("live_sessions")));
+    }
+
+    /// `refresh` must reach a tracked server's session map, and overlapping calls
+    /// must serialize rather than deadlock.
+    ///
+    /// A fresh server has no sessions, so a refresh publishes zeroes — which is
+    /// also what `track` already wrote, and asserting on them directly would prove
+    /// nothing about `refresh` at all. So the gauges are first set to values no
+    /// session map would produce: only a refresh that actually reached the tracked
+    /// server can clear them. Stop `track` retaining the server, or `refresh`
+    /// iterating what it retained, and this fails.
+    ///
+    /// Two refreshes are driven concurrently because that is the ordering that
+    /// hangs if the serialization lock or the tracked-set lock is ever held across
+    /// the wrong await.
+    #[tokio::test]
+    async fn refresh_reads_through_to_a_tracked_server() {
+        let (r, m) = fixture();
+        m.track(&server());
+        m.set_sessions("prod", 99, 42);
+        let other = m.clone();
+        tokio::join!(m.refresh(), other.refresh());
+        let out = encode(&r);
+        assert!(
+            out.contains(concat!(metric!("live_sessions"), r#"{instance="prod"} 0"#)),
+            "{out}"
+        );
+        assert!(
+            out.contains(concat!(metric!("active_sessions"), r#"{instance="prod"} 0"#)),
+            "{out}"
+        );
     }
 
     /// Cloning shares the tracked set, so an embedder can track through one handle

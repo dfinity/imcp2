@@ -10,10 +10,18 @@ __DOMAIN__ {
     reverse_proxy 127.0.0.1:8137
   }
 
-  # Prometheus exposition is NOT published to the public internet. The app serves
-  # /metrics on 0.0.0.0:8000, so a scraper reaches it directly on the host's
-  # private address over the VPN — the same path the deploy already uses — and
-  # nothing needs to be exposed here to make that work.
+  # Prometheus exposition is not published on this origin. On this host the app
+  # does serve /metrics (imcp2.service sets MCP_SERVE_METRICS=1), but on
+  # 0.0.0.0:8000 — so a scraper reaches it directly on the host's private address
+  # over the VPN, the same path the deploy already uses, and nothing needs to be
+  # published here to make that work.
+  #
+  # This block is what makes that true, so it is load-bearing rather than
+  # decorative: without it the catch-all below reverse-proxies /metrics to the app
+  # like any other path, and the exposition is on the public internet. The app's
+  # own gate is the other half — a deployment with no proxy in front (the bundled
+  # Dockerfile on a PaaS) leaves MCP_SERVE_METRICS unset and serves no /metrics at
+  # all, since there would be nothing here to hide it.
   #
   # Returning 404 rather than 403 so the endpoint is not advertised as existing.
   # Metrics are not secret, but they are a free operational read: request volumes

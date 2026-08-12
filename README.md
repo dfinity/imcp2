@@ -80,6 +80,48 @@ shared `SharedClients`, one `auth_callbacks_router` over all of them) — exactl
 what the bundled binary does on staging, serving production Internet Identity at
 `/mcp` and beta at `/mcp-beta` (see below).
 
+### Metrics (`imcp2::metrics`)
+
+Prometheus instrumentation, in the library rather than only in the binary — the
+`prometheus` crate at the version `dfinity/ic` pins, since these series are bound
+for the same clusters. **The registry belongs to the caller**: `Metrics::new`
+registers into a `Registry` you supply and keeps none of its own, so a host
+publishes them from wherever it already publishes. There is no `render` here.
+
+```rust
+let registry = prometheus::Registry::new();          // or the host's own
+let metrics = imcp2::metrics::Metrics::new(&registry, version, commit, started_at)?;
+metrics.track(&server);                               // per served McpServer
+let app = app
+    .layer(axum::middleware::from_fn_with_state(
+        metrics.clone(), imcp2::metrics::write_request_metrics))
+    .layer(axum::middleware::from_fn(imcp2::metrics::write_request_logs));
+```
+
+Published as `imcp2_*`: request counts and a latency histogram, the
+`live_sessions` / `active_sessions` gauges that mirror `/version`, `build_info`,
+and process start time. `register_process_collector(&registry)` adds CPU/RSS/fd —
+separate on purpose, since un-namespaced `process_*` describes the whole OS
+process, which belongs to the application, not to this crate.
+
+Two things are the caller's to decide. **When the derived gauges are pulled**:
+session counts are derived state, so `Metrics::refresh().await` recomputes them —
+call it from your exposition path immediately before gathering, or on whatever
+timer your metrics pipeline already runs. And **whether the exposition is
+reachable**: the bundled binary serves `/metrics` only when
+`$MCP_SERVE_METRICS` is set, because the request/session/process data is a free
+operational read for anyone probing the service and each scrape makes the process
+gather and encode the whole registry. The native deployment sets it and has Caddy
+answer `/metrics` itself; a PaaS deployment from the bundled `Dockerfile` has no
+proxy in front and so leaves it off.
+
+The `route` label is axum's `MatchedPath` — the route *template*, never the
+requested path — and `method` is allow-listed to the standard set. Both are
+bounded by construction because an internet-facing service is continuously
+scanned, and a label an outsider picks is a memory-exhaustion primitive: each
+unique 404 path or extension method token would otherwise mint a permanent
+series, with a full set of histogram buckets behind it.
+
 ## Tools
 
 Every tool declares an MCP `outputSchema` and, on success, attaches
@@ -394,8 +436,9 @@ flow.
 ```bash
 cargo run
 # serves http://0.0.0.0:8000  (MCP at /mcp against production II, OAuth under it, info page at /)
-# honours $PORT (default 8000), $PUBLIC_URL (default http://localhost:8000), and
-# $MCP_SERVE_BETA (set it to also serve the beta II instance at /mcp-beta, for staging)
+# honours $PORT (default 8000), $PUBLIC_URL (default http://localhost:8000),
+# $MCP_SERVE_BETA (set it to also serve the beta II instance at /mcp-beta, for staging),
+# and $MCP_SERVE_METRICS (set it to serve the Prometheus exposition at /metrics)
 ```
 
 `GET /` serves a self-contained, ICP-styled landing page that names the

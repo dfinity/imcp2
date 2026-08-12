@@ -16,7 +16,9 @@
 //!
 //! Honours `$PORT` (bind port, default 8000), `$PUBLIC_URL` (the public base
 //! URL baked into the discovery documents and the II handshake),
-//! `$MCP_SERVE_BETA` (opt in to the `/mcp-beta` staging instance), and
+//! `$MCP_SERVE_BETA` (opt in to the `/mcp-beta` staging instance),
+//! `$MCP_SERVE_METRICS` (opt in to the Prometheus exposition at `/metrics`; off
+//! by default because nothing here can know whether a proxy is hiding it), and
 //! `$OPENAI_APPS_CHALLENGE_TOKEN` (serve the OpenAI Apps domain-verification
 //! token at `/.well-known/openai-apps-challenge`; 404 while unset).
 //!
@@ -62,6 +64,31 @@ fn serve_beta() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether to serve the Prometheus exposition at `/metrics`. Off unless
+/// `$MCP_SERVE_METRICS` is truthy (`1`/`true`/`yes`/`on`).
+///
+/// **Off by default because the default is the exposed case.** On the native
+/// deployment a reverse proxy sits in front and answers `/metrics` itself, so a
+/// scraper reaches the app directly on the host's private address over the VPN
+/// and the endpoint is never published; that path sets this to `1`. But the
+/// Dockerfile is a documented, supported deployment (README: Render, Fly, Cloud
+/// Run, Koyeb) and there is no proxy in it — the platform routes the public
+/// hostname straight at this process, so every path the router registers is on
+/// the internet. An unconditional `/metrics` would therefore be public on a
+/// deployment we ship, which is how a "not published" endpoint ends up
+/// published. Gating it means the exposure requires a deliberate opt-in on the
+/// host that has a proxy to hide it, rather than requiring every other operator
+/// to notice and remove it.
+///
+/// What is at stake if it is public: request volumes and error rates by route,
+/// live session counts and process memory — reconnaissance for anyone probing
+/// the service — plus an amplification lever, since each scrape makes the
+/// process gather and encode the whole registry.
+fn serve_metrics() -> bool {
+    std::env::var("MCP_SERVE_METRICS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
 
 /// The landing page served at `/`: a self-contained design bundle exported from
 /// Claude Design (`assets/index.html`, compiled in via `include_str!`, no
@@ -73,6 +100,64 @@ fn serve_beta() -> bool {
 /// the root page and the connect screens read as one product, and walks through
 /// what an agent can do: discovery, identity, on-network queries, actions, skills.
 const INDEX_HTML: &str = include_str!("assets/index.html");
+
+/// `GET /metrics` — the Prometheus exposition for `registry`.
+///
+/// Its own router so the decision to serve it stays one line at the call site (see
+/// [`serve_metrics`]) and the handler can be exercised without standing up the
+/// whole app. Unauthenticated, like `/version`: whatever fronts this process is
+/// what keeps it off the public internet.
+fn metrics_router(registry: prometheus::Registry, metrics: imcp2::metrics::Metrics) -> Router {
+    Router::new().route(
+        "/metrics",
+        get(move || {
+            // Clone per request so the handler stays `Fn` while the async body owns
+            // what it needs; both handles are `Arc`-backed.
+            let (registry, metrics) = (registry.clone(), metrics.clone());
+            async move {
+                // Pull the derived session gauges immediately before encoding, so
+                // what is reported is exact as of this scrape rather than as of
+                // whenever it was last pushed. Which servers get refreshed was
+                // decided by the `track` calls at startup; an embedder calls
+                // refresh from its own exposition path, or on a timer, instead.
+                metrics.refresh().await;
+
+                let started = std::time::Instant::now();
+                let encoded = {
+                    use prometheus::Encoder;
+                    let mut buf = Vec::new();
+                    prometheus::TextEncoder::new()
+                        .encode(&registry.gather(), &mut buf)
+                        .map_err(|e| e.to_string())
+                        .and_then(|()| String::from_utf8(buf).map_err(|e| e.to_string()))
+                };
+                // After the gather, so this response reports the *previous* scrape's
+                // cost. A scrape cannot time itself and also contain the timing.
+                metrics.observe_scrape(started.elapsed().as_secs_f64());
+                match encoded {
+                    Ok(body) => (
+                        axum::http::StatusCode::OK,
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; version=0.0.4; charset=utf-8",
+                        )],
+                        body,
+                    ),
+                    // A scrape failure must not be silent: Prometheus reads a
+                    // non-200 as the target being down, which is the honest reading.
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to encode metrics");
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                            String::from("failed to encode metrics\n"),
+                        )
+                    }
+                }
+            }
+        }),
+    )
+}
 
 /// The public, human-facing pages this origin serves, as absolute-path
 /// suffixes. This is the sitemap's and robots.txt's shared idea of "content":
@@ -402,63 +487,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             }),
         )
-        // Prometheus exposition. Unauthenticated like /version; see the note in
-        // deploy/native/Caddyfile on why this path is not published publicly.
-        .route(
-            "/metrics",
-            get({
-                let metrics = metrics.clone();
-                move || {
-                    let metrics = metrics.clone();
-                    async move {
-                        // Pull the derived session gauges immediately before
-                        // encoding, so what is reported is exact as of this scrape
-                        // rather than as of whenever it was last pushed. Which
-                        // servers get refreshed was decided by the `track` calls at
-                        // startup; an embedder calls refresh from its own exposition
-                        // path, or on a timer, instead.
-                        metrics.refresh().await;
-
-                        let started = std::time::Instant::now();
-                        let encoded = {
-                            use prometheus::Encoder;
-                            let mut buf = Vec::new();
-                            prometheus::TextEncoder::new()
-                                .encode(&registry.gather(), &mut buf)
-                                .map_err(|e| e.to_string())
-                                .and_then(|()| {
-                                    String::from_utf8(buf).map_err(|e| e.to_string())
-                                })
-                        };
-                        metrics.observe_scrape(started.elapsed().as_secs_f64());
-                        match encoded {
-                            Ok(body) => (
-                                axum::http::StatusCode::OK,
-                                [(
-                                    axum::http::header::CONTENT_TYPE,
-                                    "text/plain; version=0.0.4; charset=utf-8",
-                                )],
-                                body,
-                            ),
-                            // A scrape failure must not be silent: Prometheus
-                            // reads a non-200 as the target being down, which is
-                            // the honest reading.
-                            Err(e) => {
-                                tracing::error!(error = %e, "failed to encode metrics");
-                                (
-                                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                                    [(
-                                        axum::http::header::CONTENT_TYPE,
-                                        "text/plain; charset=utf-8",
-                                    )],
-                                    String::from("failed to encode metrics\n"),
-                                )
-                            }
-                        }
-                    }
-                }
-            }),
-        )
         // `nest_service`, not `nest`: it also forwards the bare trailing-slash
         // form (`/mcp/`), which axum's `nest` never routes into the nested router.
         .nest_service(prod.mcp_path(), prod.mcp_router())
@@ -473,6 +501,25 @@ async fn main() -> anyhow::Result<()> {
         ))
         // /sitemap.xml + /robots.txt, built from this deployment's PUBLIC_URL.
         .merge(site_metadata_router(&public_url));
+
+    // Prometheus exposition, registered only when $MCP_SERVE_METRICS opts in —
+    // see `serve_metrics()` for why the default is off. Unauthenticated like
+    // /version when it is served, so whatever fronts this process is what keeps
+    // it off the public internet.
+    //
+    // The request-metrics middleware below is NOT gated: it stays on so the
+    // recorded state is the same whether or not anything can read it, and an
+    // operator who flips this on gets counters that were already counting rather
+    // than a registry that starts at zero mid-incident.
+    if serve_metrics() {
+        app = app.merge(metrics_router(registry, metrics.clone()));
+    } else {
+        // Say so once at startup. A silently absent endpoint is indistinguishable
+        // from a broken one when a scrape 404s and someone has to work out why.
+        tracing::info!(
+            "/metrics not served; set MCP_SERVE_METRICS=1 to enable (do not expose it publicly)"
+        );
+    }
 
     // Staging additionally serves the beta II instance at `/mcp-beta`.
     if let Some(beta) = &beta {
@@ -571,10 +618,76 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{openai_apps_challenge_router, site_metadata_router, sitemap_xml, PUBLIC_PAGES};
+    use super::{
+        metrics_router, openai_apps_challenge_router, serve_metrics, site_metadata_router,
+        sitemap_xml, PUBLIC_PAGES,
+    };
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// The exposition must be **off** unless asked for, and the ask must be
+    /// explicit. This is the security-relevant half of the gate: the native host
+    /// has a proxy answering `/metrics` with a 404, but the bundled `Dockerfile` on
+    /// a PaaS has no proxy at all, so a default-on endpoint would publish request
+    /// volumes, session counts and process memory — and hand out a registry-wide
+    /// gather per request — on a deployment path we ship.
+    ///
+    /// Truthiness only, matching `MCP_SERVE_BETA`: anything else, including the
+    /// plausible-looking `MCP_SERVE_METRICS=please`, leaves it off. `$MCP_SERVE_BETA`
+    /// is untouched here — the two gates are independent and this is the only test
+    /// that writes this process-global variable.
+    #[test]
+    fn the_metrics_endpoint_is_off_unless_explicitly_enabled() {
+        std::env::remove_var("MCP_SERVE_METRICS");
+        assert!(!serve_metrics(), "unset must mean off");
+        for on in ["1", "true", "yes", "on", "TRUE", " on "] {
+            std::env::set_var("MCP_SERVE_METRICS", on);
+            assert!(serve_metrics(), "{on:?} should enable the endpoint");
+        }
+        for off in ["", "0", "false", "no", "off", "please", "2", "-1"] {
+            std::env::set_var("MCP_SERVE_METRICS", off);
+            assert!(!serve_metrics(), "{off:?} must not enable the endpoint");
+        }
+        std::env::remove_var("MCP_SERVE_METRICS");
+    }
+
+    /// When it *is* served: the exposition renders the caller's registry, carries
+    /// the text format's version in its content type (Prometheus negotiates on it),
+    /// and records its own cost — a scrape that quietly got slow is how a target
+    /// starts being dropped for timing out, and the resulting gap looks like an
+    /// outage that never happened.
+    #[tokio::test]
+    async fn metrics_endpoint_renders_the_registry_and_times_the_previous_scrape() {
+        let registry = prometheus::Registry::new();
+        let metrics =
+            imcp2::metrics::Metrics::new(&registry, "1.2.3", "abc1234", 1_700_000_000).unwrap();
+        let app = metrics_router(registry, metrics);
+
+        let scrape = |app: axum::Router| async move {
+            let resp = app
+                .oneshot(Request::get("/metrics").body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let content_type =
+                resp.headers().get("content-type").map(|v| v.to_str().unwrap().to_string());
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8(body.to_vec()).unwrap(), content_type)
+        };
+
+        let (status, body, content_type) = scrape(app.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("text/plain; version=0.0.4; charset=utf-8"));
+        assert!(body.contains(r#"imcp2_build_info{commit="abc1234",version="1.2.3"} 1"#), "{body}");
+        assert!(body.contains("imcp2_process_start_time_seconds 1700000000"), "{body}");
+        // Its own timing cannot appear in the response that produced it.
+        assert!(body.contains("imcp2_metrics_scrape_duration_seconds_count 0"), "{body}");
+
+        // The next one reports the previous one's cost.
+        let (_, body, _) = scrape(app).await;
+        assert!(body.contains("imcp2_metrics_scrape_duration_seconds_count 1"), "{body}");
+    }
 
     async fn fetch(public_url: &str, path: &str) -> (StatusCode, String, Option<String>) {
         let resp = site_metadata_router(public_url)
