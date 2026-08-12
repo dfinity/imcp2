@@ -93,7 +93,7 @@ pub struct SkillUrls {
 /// Arguments for `icp_get_skill`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetSkillArgs {
-    /// Skill name, e.g. "motoko", "icp-cli", "cycles-management".
+    /// Skill name, e.g. "writing-motoko", "icp-cli", "cycles-management".
     pub name: String,
 }
 
@@ -101,7 +101,7 @@ pub struct GetSkillArgs {
 /// [`SkillEntry`] — the internal fetch `urls` are intentionally omitted).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct SkillSummary {
-    /// The skill name to pass to icp_get_skill, e.g. "motoko".
+    /// The skill name to pass to icp_get_skill, e.g. "writing-motoko".
     pub name: String,
     /// The skill's human title.
     pub title: String,

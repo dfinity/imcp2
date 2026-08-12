@@ -1255,7 +1255,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Fetch the full instructions (SKILL.md) of one Internet Computer skill by name (e.g. \"motoko\", \"icp-cli\", \"mops-cli\", \"cycles-management\", \"stable-memory\", \"canister-security\"). Call icp_list_skills first to see the available names. Use this to learn the exact, current way to do an IC task before doing it.",
+        description = "Fetch the full instructions (SKILL.md) of one Internet Computer skill by name (e.g. \"writing-motoko\", \"icp-cli\", \"mops-cli\", \"cycles-management\", \"stable-memory\", \"canister-security\"). Call icp_list_skills first to see the available names. Use this to learn the exact, current way to do an IC task before doing it.",
         annotations(title = "Get an Internet Computer skill", read_only_hint = true, destructive_hint = false, open_world_hint = false),
         output_schema = schema_for_output::<skills::SkillOutput>(),
     )]
@@ -1295,7 +1295,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Create and fund a NEW Internet Computer canister (as your Internet Identity). SPENDS FUNDS: this draws cycles or ICP from your accounts and cannot be automatically reversed, so confirm with the user before calling it. Fund it EITHER with `cycles` (exact, drawn from your cycles-ledger balance) OR with `icp` (a decimal-ICP string like \"0.5\", transferred from your ICP-ledger account and converted to cycles via the CMC). BOTH accounts belong to your management principal — the same principal icp_cycles_balance reports (its default subaccount); check/fund it before calling (cycles-ledger balance via icp_cycles_balance, or hold ICP in that principal's ICP-ledger account). The ICP path is best-effort with no retries: if the ICP transfer lands but the mint fails, the error carries the block index to recover with — do not blindly re-run. `cycles` wins if both are given. Controllers default to your own principal. Returns the new canister id — then build your Wasm (see the motoko/icp-cli skills) and install it with icp_install_code. Requires an authenticated session.",
+        description = "Create and fund a NEW Internet Computer canister (as your Internet Identity). SPENDS FUNDS: this draws cycles or ICP from your accounts and cannot be automatically reversed, so confirm with the user before calling it. Fund it EITHER with `cycles` (exact, drawn from your cycles-ledger balance) OR with `icp` (a decimal-ICP string like \"0.5\", transferred from your ICP-ledger account and converted to cycles via the CMC). BOTH accounts belong to your management principal — the same principal icp_cycles_balance reports (its default subaccount); check/fund it before calling (cycles-ledger balance via icp_cycles_balance, or hold ICP in that principal's ICP-ledger account). The ICP path is best-effort with no retries: if the ICP transfer lands but the mint fails, the error carries the block index to recover with — do not blindly re-run. `cycles` wins if both are given. Controllers default to your own principal. Returns the new canister id — then build your Wasm (see the writing-motoko/icp-cli skills) and install it with icp_install_code. Requires an authenticated session.",
         // destructive_hint = true: it adds a canister, but it does so by spending the
         // user's cycles or ICP irreversibly, and it is not idempotent (a retry spends
         // again). See the annotation test for why "additive" is the wrong read here.
@@ -1342,7 +1342,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Install a compiled Wasm module on a canister you control (as your Internet Identity). Provide the module as `wasm_base64` (or `wasm_hex`); large modules are uploaded via the chunk store automatically. `mode` is \"install\" (default, empty canister), \"reinstall\" (wipe state), or \"upgrade\" (preserve stable memory). `arg` is the init/upgrade argument in textual Candid, e.g. \"()\". Build the Wasm in your own environment first (see the motoko / icp-cli / mops-cli skills). Requires an authenticated session.",
+        description = "Install a compiled Wasm module on a canister you control (as your Internet Identity). Provide the module as `wasm_base64` (or `wasm_hex`); large modules are uploaded via the chunk store automatically. `mode` is \"install\" (default, empty canister), \"reinstall\" (wipe state), or \"upgrade\" (preserve stable memory). `arg` is the init/upgrade argument in textual Candid, e.g. \"()\". Build the Wasm in your own environment first (see the writing-motoko / icp-cli / mops-cli skills). Requires an authenticated session.",
         annotations(title = "Install code on a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
@@ -2000,8 +2000,9 @@ impl ServerHandler for IcTools {
              (the `icp_` create/install/status/… tools) acts as your standing MANAGEMENT principal at \
              this server's origin — a DIFFERENT identity than the per-app principals above.\n\n\
              To AUTHOR, BUILD and DEPLOY IC code, first consult the official IC skills: \
-             `icp_list_skills` lists them and `icp_get_skill(name)` loads one. Especially `motoko` \
-             (language), `mops-cli` (deps/build), `icp-cli` (build & deploy), `cycles-management` \
+             `icp_list_skills` lists them and `icp_get_skill(name)` loads one. Especially \
+             `writing-motoko` (language), `mops-cli` (deps/build), `icp-cli` (build & deploy), \
+             `cycles-management` \
              (ICP↔cycles & funding), `stable-memory` (upgrades) and `canister-security`. Compiling \
              Motoko/Rust to Wasm happens in YOUR environment (guided by these skills); these tools \
              then put it on chain. To CREATE and MANAGE canisters as your Internet Identity, use: \
