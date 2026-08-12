@@ -177,18 +177,25 @@ EOF
 echo ">> deployed. Verifying..."
 sleep 6
 $SSH "systemctl is-active imcp2 caddy imcp-status; ss -tlnp 2>/dev/null | grep -E ':(80|443|8000|8137)\b' || true"
-# The Prometheus exposition must be serving on the app's own port, where a scraper
-# reaches it over the VPN. It is gated on MCP_SERVE_METRICS (off by default, since
-# a deployment with no proxy in front would publish it) and the unit hardcodes the
-# opt-in, so a missing endpoint here is not an optional condition — it means the
-# unit's environment did not take effect, or the app is not up. Fatal rather than a
-# warning: the alternative is a scrape target that silently returns nothing, which
-# looks exactly like a service with no traffic.
+# The Prometheus exposition must be serving on the app's own port. It is gated on
+# MCP_SERVE_METRICS (off by default, since a deployment with no proxy in front would
+# publish it) and the unit hardcodes the opt-in, so a missing endpoint here is not an
+# optional condition — it means the unit's environment did not take effect, or the
+# app is not up. Fatal rather than a warning: the alternative is a scrape target that
+# silently returns nothing, which looks exactly like a service with no traffic.
+#
+# What this proves and what it does not. Over loopback it proves the app serves the
+# endpoint. It does NOT prove a scraper can reach it: that needs the private
+# interface to accept TCP 8000 from the scraper's range, which is a security-group
+# and VPN-routing question this script cannot answer — the deploy runs from a
+# GitHub-hosted runner, which is not on the VPN and so cannot probe the host's
+# private address at all. Do not read a green deploy as "the scrape path works". It
+# remains the open question on the pull request that added this endpoint.
 metrics_ok=""
 for attempt in 1 2 3 4 5; do
   if $SSH "curl -fsS --max-time 5 http://127.0.0.1:8000/metrics | grep -q imcp2_build_info"; then
     metrics_ok=1
-    echo "on-host http://127.0.0.1:8000/metrics -> serving the exposition (attempt $attempt)"
+    echo "on-host loopback /metrics -> serving the exposition (attempt $attempt)"
     break
   fi
   sleep 3
@@ -196,6 +203,26 @@ done
 if [ -z "$metrics_ok" ]; then
   echo "FATAL: on-host /metrics never served imcp2_build_info; MCP_SERVE_METRICS did not take effect, or the app is not up" >&2
   exit 1
+fi
+
+# The part of the scrape path that IS checkable from here: the host reaching itself
+# on its private address, which proves the app bound 0.0.0.0 rather than loopback and
+# that no host-local firewall drops the port. The remaining hop — the scraper's
+# network reaching that address — cannot be tested from a GitHub-hosted runner.
+#
+# The address is never printed. This repository is public, so its Actions logs are
+# too, and echoing a private address into them is the exact disclosure the
+# repository was scrubbed to remove (see .github/scripts/scan-internal-identifiers.sh).
+# curl's own errors would carry the URL, so its stderr is dropped and this reports
+# only pass or fail.
+#
+# A warning, not fatal: users are served through Caddy over loopback either way, so
+# this affects scraping alone — and the fix would be a security-group or firewall
+# change, which failing a deploy does not bring any closer.
+if $SSH 'addr="$(hostname -I 2>/dev/null | awk "{print \$1}")"; [ -n "$addr" ] && curl -fsS --max-time 5 "http://$addr:8000/metrics" 2>/dev/null | grep -q imcp2_build_info'; then
+  echo "on-host private-address /metrics -> reachable off loopback (scraper ingress still unverified)"
+else
+  echo "WARNING: /metrics did not answer on the host's private address; a scraper cannot reach it (app bound to loopback, or a host firewall drops :8000)" >&2
 fi
 
 echo ">> external check:"
