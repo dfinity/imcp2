@@ -258,8 +258,14 @@ jobs:
           EXPECTED: ${{ needs.build.outputs.sha }}
         run: |
           set -euo pipefail
+          # --max-time bounds each attempt (curl applies it per transfer, so the
+          # retries still get their own budget). Without it an app that accepts the
+          # connection and then stalls mid-response hangs this step until the job
+          # timeout, and the assertion below — the one thing this step exists for —
+          # is never reached. `--retry` does not cover that: it retries failures, not
+          # a transfer that never ends.
           ssh -o BatchMode=yes -o ConnectTimeout=20 "$HOST" \
-            'curl -fsS --retry 5 --retry-delay 2 --retry-connrefused http://127.0.0.1:8000/version' > version.json
+            'curl -fsS --max-time 10 --retry 5 --retry-delay 2 --retry-connrefused http://127.0.0.1:8000/version' > version.json
           cat version.json
           got="$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' version.json)"
           if [ -z "$got" ] || [ "$got" = unknown ]; then

@@ -226,8 +226,13 @@ else
 fi
 
 echo ">> external check:"
-curl -sS -o /dev/null -w "https://$DOMAIN/ -> HTTP %{http_code} (TLS verify %{ssl_verify_result})\n" "https://$DOMAIN/" || true
-curl -sS -o /dev/null -w "https://$DOMAIN/status/ -> HTTP %{http_code}\n" "https://$DOMAIN/status/" || true
+# --max-time on every external request. An origin that accepts the connection and
+# then never finishes the response hangs curl indefinitely, and `|| true` does not
+# help with that: it handles a non-zero exit, not the absence of one. A hung verify
+# step wedges the deploy after the service has already been restarted, and (for the
+# checks below) never reaches the retry loop or the failure it exists to report.
+curl -sS --max-time 20 -o /dev/null -w "https://$DOMAIN/ -> HTTP %{http_code} (TLS verify %{ssl_verify_result})\n" "https://$DOMAIN/" || true
+curl -sS --max-time 20 -o /dev/null -w "https://$DOMAIN/status/ -> HTTP %{http_code}\n" "https://$DOMAIN/status/" || true
 
 # ...and it must NOT be reachable on the public origin. Caddy answers /metrics
 # itself with a 404; drop that one block and the catch-all reverse-proxies it like
@@ -243,9 +248,15 @@ curl -sS -o /dev/null -w "https://$DOMAIN/status/ -> HTTP %{http_code}\n" "https
 # So every other code fails too, retrying first because Caddy may still be
 # reloading. A hard failure is right here — the deploy is idempotent and
 # re-runnable, and a published exposition is worth stopping for.
+#
+# --max-time is load-bearing rather than hygiene: without it a stalled response
+# hangs here forever, so this check never reaches its own retry or its own failure —
+# the security assertion silently becomes a deadlock. A timeout yields `000`, which
+# is not 404, so it retries and then fails, which is the honest verdict for an
+# origin that would not answer.
 hidden=""
 for attempt in 1 2 3 4 5; do
-  code="$(curl -sS -o /dev/null -w '%{http_code}' "https://$DOMAIN/metrics" || echo 000)"
+  code="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "https://$DOMAIN/metrics" || echo 000)"
   if [ "$code" = 200 ]; then
     echo "FATAL: https://$DOMAIN/metrics answered 200 — the Prometheus exposition is public" >&2
     exit 1
