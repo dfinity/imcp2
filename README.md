@@ -82,48 +82,33 @@ what the bundled binary does on staging, serving production Internet Identity at
 
 ### Metrics (`imcp2::metrics`)
 
-Prometheus instrumentation, in the library rather than only in the binary — the
-`prometheus` crate at the version `dfinity/ic` pins, since these series are bound
-for the same clusters. **The registry belongs to the caller**: `Metrics::new`
-registers into a `Registry` you supply and keeps none of its own, so a host
-publishes them from wherever it already publishes. There is no `render` here.
+Prometheus instrumentation, usable from the library (the `prometheus` crate at
+the version `dfinity/ic` pins). **The registry belongs to the caller**:
+`Metrics::new` registers into a `Registry` you supply — exposition stays your
+job, and there is no `render` here.
 
 ```rust
 let registry = prometheus::Registry::new();          // or the host's own
-let metrics = imcp2::metrics::Metrics::new(&registry, version, commit, started_at)?;
-metrics.track(&server);                               // per served McpServer
+let metrics = imcp2::metrics::Metrics::new(
+    &registry, version, commit, started_at, &[&server])?;
 let app = app
     .layer(axum::middleware::from_fn_with_state(
         metrics.clone(), imcp2::metrics::write_request_metrics))
     .layer(axum::middleware::from_fn(imcp2::metrics::write_request_logs));
+// in your exposition path (or on a timer): metrics.refresh().await
 ```
 
-Published as `imcp2_*`: request counts and a latency histogram, the
-`live_sessions` / `active_sessions` gauges that mirror `/version`, `build_info`,
-and process start time. The session gauges are labelled `ii_instance`, **not**
-`instance`: Prometheus attaches its own `instance` target label to every sample and
-renames a colliding exposed one to `exported_instance`, so a query written against
-`instance="prod"` would silently match nothing. `register_process_collector(&registry)` adds CPU/RSS/fd —
-separate on purpose, since un-namespaced `process_*` describes the whole OS
-process, which belongs to the application, not to this crate.
+Published as `imcp2_*`: request counts and a latency histogram (`route` and
+`method` labels are bounded — a label an outsider picks is a memory-exhaustion
+primitive; see the module docs), `live_sessions` / `active_sessions` per II
+instance (labelled `ii_instance`, because Prometheus's own `instance` target
+label renames a colliding exposed one to `exported_instance`), `build_info`, and
+process start time. `register_process_collector(&registry)` adds CPU/RSS/fd
+separately — un-namespaced `process_*` belongs to the application, not the crate.
 
-Two things are the caller's to decide. **When the derived gauges are pulled**:
-session counts are derived state, so `Metrics::refresh().await` recomputes them —
-call it from your exposition path immediately before gathering, or on whatever
-timer your metrics pipeline already runs. And **whether the exposition is
-reachable**: the bundled binary serves `/metrics` only when
-`$MCP_SERVE_METRICS` is set, because the request/session/process data is a free
-operational read for anyone probing the service and each scrape makes the process
-gather and encode the whole registry. The native deployment sets it and has Caddy
-answer `/metrics` itself; a PaaS deployment from the bundled `Dockerfile` has no
-proxy in front and so leaves it off.
-
-The `route` label is axum's `MatchedPath` — the route *template*, never the
-requested path — and `method` is allow-listed to the standard set. Both are
-bounded by construction because an internet-facing service is continuously
-scanned, and a label an outsider picks is a memory-exhaustion primitive: each
-unique 404 path or extension method token would otherwise mint a permanent
-series, with a full set of histogram buckets behind it.
+The bundled binary serves `/metrics` only when `$MCP_SERVE_METRICS` is set: the
+native deployment sets it and has Caddy hide the path publicly; a PaaS deployment
+from the bundled `Dockerfile` has no proxy in front and leaves it off.
 
 ## Tools
 

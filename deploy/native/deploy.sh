@@ -177,20 +177,11 @@ EOF
 echo ">> deployed. Verifying..."
 sleep 6
 $SSH "systemctl is-active imcp2 caddy imcp-status; ss -tlnp 2>/dev/null | grep -E ':(80|443|8000|8137)\b' || true"
-# The Prometheus exposition must be serving on the app's own port. It is gated on
-# MCP_SERVE_METRICS (off by default, since a deployment with no proxy in front would
-# publish it) and the unit hardcodes the opt-in, so a missing endpoint here is not an
-# optional condition — it means the unit's environment did not take effect, or the
-# app is not up. Fatal rather than a warning: the alternative is a scrape target that
-# silently returns nothing, which looks exactly like a service with no traffic.
-#
-# What this proves and what it does not. Over loopback it proves the app serves the
-# endpoint. It does NOT prove a scraper can reach it: that needs the private
-# interface to accept TCP 8000 from the scraper's range, which is a security-group
-# and VPN-routing question this script cannot answer — the deploy runs from a
-# GitHub-hosted runner, which is not on the VPN and so cannot probe the host's
-# private address at all. Do not read a green deploy as "the scrape path works". It
-# remains the open question on the pull request that added this endpoint.
+# The unit hardcodes MCP_SERVE_METRICS=1, so a missing /metrics means the
+# environment did not take effect or the app is not up — fatal, or the scrape
+# target silently returns nothing. This proves the app serves the endpoint; it
+# does NOT prove a scraper can reach it (security-group ingress on TCP 8000
+# cannot be probed from a GitHub-hosted runner, which is not on the VPN).
 metrics_ok=""
 for attempt in 1 2 3 4 5; do
   if $SSH "curl -fsS --max-time 5 http://127.0.0.1:8000/metrics | grep -q imcp2_build_info"; then
@@ -205,20 +196,11 @@ if [ -z "$metrics_ok" ]; then
   exit 1
 fi
 
-# The part of the scrape path that IS checkable from here: the host reaching itself
-# on its private address, which proves the app bound 0.0.0.0 rather than loopback and
-# that no host-local firewall drops the port. The remaining hop — the scraper's
-# network reaching that address — cannot be tested from a GitHub-hosted runner.
-#
-# The address is never printed. This repository is public, so its Actions logs are
-# too, and echoing a private address into them is the exact disclosure the
-# repository was scrubbed to remove (see .github/scripts/scan-internal-identifiers.sh).
-# curl's own errors would carry the URL, so its stderr is dropped and this reports
-# only pass or fail.
-#
-# A warning, not fatal: users are served through Caddy over loopback either way, so
-# this affects scraping alone — and the fix would be a security-group or firewall
-# change, which failing a deploy does not bring any closer.
+# The host reaching itself on its private address proves the app bound 0.0.0.0
+# and no host-local firewall drops :8000. The address is never printed — this
+# repo's Actions logs are public, and curl's errors would carry the URL, so its
+# stderr is dropped. A warning, not fatal: only scraping is affected, and the
+# remedy is a firewall change a failed deploy would not bring closer.
 if $SSH 'addr="$(hostname -I 2>/dev/null | awk "{print \$1}")"; [ -n "$addr" ] && curl -fsS --max-time 5 "http://$addr:8000/metrics" 2>/dev/null | grep -q imcp2_build_info'; then
   echo "on-host private-address /metrics -> reachable off loopback (scraper ingress still unverified)"
 else
@@ -226,34 +208,17 @@ else
 fi
 
 echo ">> external check:"
-# --max-time on every external request. An origin that accepts the connection and
-# then never finishes the response hangs curl indefinitely, and `|| true` does not
-# help with that: it handles a non-zero exit, not the absence of one. A hung verify
-# step wedges the deploy after the service has already been restarted, and (for the
-# checks below) never reaches the retry loop or the failure it exists to report.
+# --max-time on every external request: an origin that accepts the connection but
+# never finishes the response would otherwise hang the deploy (`|| true` handles a
+# non-zero exit, not the absence of one).
 curl -sS --max-time 20 -o /dev/null -w "https://$DOMAIN/ -> HTTP %{http_code} (TLS verify %{ssl_verify_result})\n" "https://$DOMAIN/" || true
 curl -sS --max-time 20 -o /dev/null -w "https://$DOMAIN/status/ -> HTTP %{http_code}\n" "https://$DOMAIN/status/" || true
 
-# ...and it must NOT be reachable on the public origin. Caddy answers /metrics
-# itself with a 404; drop that one block and the catch-all reverse-proxies it like
-# any other path, publishing request volumes, session counts and process memory,
-# and handing out a whole-registry gather per request. That is a config edit away
-# at all times, so assert it on every deploy rather than trusting the file to
-# still say what it said when it was written.
-#
-# The assertion is "exactly the configured 404", not "anything but 200". Absence of
-# a 200 is not absence of exposure: if the catch-all is proxying this path and the
-# app happens to answer 500, or if this curl never reached the origin at all
-# (`000`), a not-200 check reports "not published" while having disproved nothing.
-# So every other code fails too, retrying first because Caddy may still be
-# reloading. A hard failure is right here — the deploy is idempotent and
-# re-runnable, and a published exposition is worth stopping for.
-#
-# --max-time is load-bearing rather than hygiene: without it a stalled response
-# hangs here forever, so this check never reaches its own retry or its own failure —
-# the security assertion silently becomes a deadlock. A timeout yields `000`, which
-# is not 404, so it retries and then fails, which is the honest verdict for an
-# origin that would not answer.
+# ...and /metrics must NOT be reachable on the public origin. Caddy answers it
+# with a 404; losing that one block would publish the exposition, so assert it on
+# every deploy. The assertion is "exactly the configured 404": any other code —
+# a proxied 500, a `000` from an unreachable or stalled origin — has not disproved
+# exposure, so it retries (Caddy may be reloading) and then fails hard.
 hidden=""
 for attempt in 1 2 3 4 5; do
   code="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "https://$DOMAIN/metrics" || echo 000)"
