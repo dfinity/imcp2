@@ -1090,8 +1090,14 @@ async fn read_capped(mut resp: reqwest::Response, max: usize) -> String {
 #[derive(Default)]
 struct Findings {
     map: BTreeMap<String, Found>,
-    /// Distinct valid ids seen once the cap was reached and dropped without
-    /// allocating a `Found`. Added to `omitted` so the reported count stays exact.
+    /// Count of distinct ids seen once the [`Self::MAX`] cap was reached and
+    /// dropped without allocating a `Found`; folded into [`Discovery::omitted`].
+    /// Exact for the common shape (each overflow id matched once); a hostile
+    /// target that repeats an overflow id — or names it in both scan passes —
+    /// makes this an UPPER BOUND. That is acceptable: it only inflates `omitted`
+    /// for a target already spamming ids, and counting overflow *distinctly*
+    /// would need the unbounded memory this cap exists to avoid. Saturating, so
+    /// it can never wrap.
     dropped: usize,
 }
 
@@ -1104,6 +1110,13 @@ impl Findings {
     /// recorded before any bundle scan, so they are never the entries dropped.
     const MAX: usize = 1024;
 
+    /// Ceiling on provenance sources kept per finding. A hostile bundle can name
+    /// the SAME retained principal under many distinct `bundle:{LABEL}` constants;
+    /// without this, each distinct source is stored (unbounded per-entry growth,
+    /// and the linear `contains` below turns quadratic) and later rendered into
+    /// the reply. A handful of provenances is all the output needs.
+    const MAX_SOURCES: usize = 8;
+
     /// Record `id` under `source` (validated as a real principal first), merging
     /// labels/sources for an id already seen (first label wins). A NEW id is
     /// stored only while under [`Self::MAX`]; beyond that it is counted, not
@@ -1115,11 +1128,12 @@ impl Findings {
             return;
         }
         if let Some(entry) = self.map.get_mut(id) {
-            // Already known: merge in place, no new key allocation.
+            // Already known: merge in place, no new key allocation. First label
+            // wins; provenance is bounded so one id can't grow without limit.
             if entry.label.is_none() {
                 entry.label = label;
             }
-            if !entry.sources.contains(&source) {
+            if entry.sources.len() < Self::MAX_SOURCES && !entry.sources.contains(&source) {
                 entry.sources.push(source);
             }
         } else if self.map.len() < Self::MAX {
@@ -1128,8 +1142,8 @@ impl Findings {
                 Found { canister_id: id.to_string(), label, sources: vec![source], name: None, kind: None },
             );
         } else {
-            // At capacity and this id is new — count it, don't allocate it.
-            self.dropped += 1;
+            // At capacity and this id is new — count it (saturating), don't allocate.
+            self.dropped = self.dropped.saturating_add(1);
         }
     }
 }
@@ -1214,20 +1228,24 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
     // 4. JS bundle: labelled constants first, then any bare canister literals.
     let mut blob = html.clone();
     let script_re = Regex::new(r#"["'](/[^"'<> ]+?\.js)["']"#).unwrap();
-    // Only the first 20 (sorted, deduped) paths are fetched below, and no real
-    // page has anywhere near this many <script> tags — so cap the raw collection
-    // (CWE-770): a hostile page packed with `"/a.js"` must not allocate a Vec of
-    // hundreds of thousands of paths just to have 20 survive.
+    // Only the first 20 (sorted) paths are fetched below, and no real page has
+    // anywhere near this many <script> tags — so collect at most MAX_SCRIPT_PATHS
+    // DISTINCT paths (CWE-770). Dedup WHILE collecting, not after: a hostile page
+    // front-loaded with copies of one path must not fill the cap and crowd out
+    // later real scripts, and a page packed with distinct `"/a.js"` must not grow
+    // the Vec without bound. The `contains` is O(cap), so it stays cheap.
     const MAX_SCRIPT_PATHS: usize = 128;
     let mut scripts: Vec<String> = Vec::new();
     for c in script_re.captures_iter(&html) {
-        if scripts.len() >= MAX_SCRIPT_PATHS {
-            break;
+        let path = &c[1];
+        if !scripts.iter().any(|s| s == path) {
+            scripts.push(path.to_string());
+            if scripts.len() >= MAX_SCRIPT_PATHS {
+                break;
+            }
         }
-        scripts.push(c[1].to_string());
     }
     scripts.sort();
-    scripts.dedup();
     for s in scripts.iter().take(20) {
         if blob.len() >= MAX_SCAN_BYTES {
             break; // aggregate cap: stop mining once we've buffered enough text
@@ -1248,7 +1266,10 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
     )
     .unwrap();
     for c in label_re.captures_iter(&blob) {
-        let label = c[1].to_string();
+        // Clamp the attacker-controlled constant name (clean_label caps length and
+        // strips control chars) BEFORE it becomes both a label and a `bundle:{}`
+        // source — the regex's `[A-Z0-9_]*` run is otherwise unbounded.
+        let label = clean_label(&c[1]);
         found.add(&c[2], Some(label.clone()), format!("bundle:{label}"));
     }
     for m in canister_re().find_iter(&blob) {
@@ -1979,6 +2000,13 @@ mod tests {
         assert_eq!((d.canisters.len(), d.omitted), (1, 0));
     }
 
+    // A distinct, round-tripped principal for `i` — always accepted by from_text.
+    fn valid_principal(i: usize) -> String {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        Principal::from_slice(&bytes).to_text()
+    }
+
     // A hostile target can pack the scan buffer with hundreds of thousands of
     // distinct valid principals. `Findings` must cap the DISTINCT entries it
     // allocates (so peak memory / the sort stay bounded), count the overflow, and
@@ -1989,14 +2017,10 @@ mod tests {
         let n = Findings::MAX + overflow;
         let mut found = Findings::default();
         for i in 0..n {
-            // Distinct, round-tripped principals — always accepted by from_text.
-            let mut bytes = [0u8; 16];
-            bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            let id = Principal::from_slice(&bytes).to_text();
-            found.add(&id, None, "bundle".into());
+            found.add(&valid_principal(i), None, "bundle".into());
         }
         assert_eq!(found.map.len(), Findings::MAX, "distinct ids are capped at MAX");
-        assert_eq!(found.dropped, overflow, "the overflow is counted, not allocated");
+        assert_eq!(found.dropped, overflow, "each once-seen overflow id is counted, not allocated");
 
         // The full pipeline still reports every omitted id: MAX entries reach
         // bound_findings, 20 bare survive, and the extraction drop is folded in.
@@ -2004,6 +2028,41 @@ mod tests {
         let d = bound_findings(found.map.into_values().collect(), dropped);
         assert_eq!(d.canisters.len(), 20, "bare-bundle tier capped to 20");
         assert_eq!(d.omitted, n - 20, "every one of the {n} ids beyond the 20 kept is reported");
+    }
+
+    // Overflow ids that REPEAT (or are matched by both scan passes) must not grow
+    // memory — the map stays capped — and `dropped` stays a bounded UPPER BOUND on
+    // distinct overflow rather than an unbounded occurrence count that wraps.
+    #[test]
+    fn findings_overflow_is_bounded_under_repeats() {
+        let mut found = Findings::default();
+        for i in 0..Findings::MAX {
+            found.add(&valid_principal(i), None, "bundle".into());
+        }
+        // One brand-new overflow id, hammered many times.
+        let overflow = valid_principal(Findings::MAX);
+        for _ in 0..10_000 {
+            found.add(&overflow, None, "bundle".into());
+        }
+        assert_eq!(found.map.len(), Findings::MAX, "memory stays capped under repeats");
+        // Occurrence-counted, so repeats inflate it (the documented upper-bound
+        // contract) — but it is finite and never allocates the overflow id.
+        assert_eq!(found.dropped, 10_000);
+        assert!(!found.map.contains_key(&overflow), "the overflow id is never stored");
+    }
+
+    // A single retained id named under many distinct `bundle:{LABEL}` constants
+    // must not grow its provenance list without bound (per-entry memory + the
+    // linear `contains` would otherwise be quadratic, and every source is rendered).
+    #[test]
+    fn findings_caps_sources_per_id() {
+        let id = valid_principal(0);
+        let mut found = Findings::default();
+        for i in 0..1000 {
+            found.add(&id, None, format!("bundle:LABEL_{i}"));
+        }
+        assert_eq!(found.map.len(), 1, "still one distinct id");
+        assert_eq!(found.map[&id].sources.len(), Findings::MAX_SOURCES, "provenance is capped");
     }
 
     // Live network test against a stable public IC app (OISY). Bundle mining
