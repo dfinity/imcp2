@@ -718,6 +718,105 @@ fn derivation_origin_authorized(
     declared == application_origin || declared_alt_origins.iter().any(|o| o == application_origin)
 }
 
+/// The `(derivation_origin, source)` a manifest-declared origin resolves to, given
+/// the declared origin's own alt-origins. Pure — the caller performs the fetches.
+/// An authorized declaration (self, or listed by the declared origin) keeps the
+/// declared origin as [`DerivationSource::Declared`]; an unauthorized one falls
+/// back to the application origin as [`DerivationSource::AppUrlDefault`], so the
+/// IC-evidence gate can still vet it (ICPBB-430).
+fn resolved_declared(
+    application_origin: &str,
+    declared: &str,
+    declared_alt_origins: &[String],
+) -> (String, DerivationSource) {
+    if derivation_origin_authorized(application_origin, declared, declared_alt_origins) {
+        (declared.to_string(), DerivationSource::Declared)
+    } else {
+        (application_origin.to_string(), DerivationSource::AppUrlDefault)
+    }
+}
+
+/// What the app's `/.well-known/ic-app.json` resolved to: its declared (and
+/// authorized) derivation origin or the application-origin default, whether the
+/// manifest response carried IC-hosting evidence (`x-ic-canister-id`), and — when
+/// an accepted CROSS-origin declaration fetched them — that origin's alt-origins
+/// (reused for the display list so it isn't fetched twice).
+struct DeclaredResolution {
+    derivation_origin: String,
+    source: DerivationSource,
+    ic_evidence: bool,
+    alt_origins: Option<Vec<String>>,
+}
+
+impl DeclaredResolution {
+    /// The application-origin default (no usable declaration), carrying whatever
+    /// IC evidence the manifest response showed.
+    fn app_default(application_origin: &str, ic_evidence: bool) -> Self {
+        Self {
+            derivation_origin: application_origin.to_string(),
+            source: DerivationSource::AppUrlDefault,
+            ic_evidence,
+            alt_origins: None,
+        }
+    }
+}
+
+/// Resolve the app's declared derivation origin from `/.well-known/ic-app.json`,
+/// authorizing a cross-origin claim against the declared origin's own
+/// `ii-alternative-origins` (the browser/II rule; see [`resolved_declared`]).
+/// Best-effort and flat: any fetch/parse failure, or an unauthorized claim, yields
+/// the application-origin default. The manifest response doubles as IC-hosting
+/// evidence, captured for the caller's later gate.
+async fn resolve_declared_origin(
+    client: &reqwest::Client,
+    application_origin: &str,
+) -> DeclaredResolution {
+    let Ok(resp) = client
+        .get(format!("{application_origin}/.well-known/ic-app.json"))
+        .send()
+        .await
+    else {
+        return DeclaredResolution::app_default(application_origin, false);
+    };
+    let ic_evidence = ic_evidence_from(&resp, application_origin);
+    if !resp.status().is_success() {
+        return DeclaredResolution::app_default(application_origin, ic_evidence);
+    }
+    let text = read_capped(resp, MAX_META_BYTES).await;
+    let Some(declared) = declared_derivation_origin(&text) else {
+        return DeclaredResolution::app_default(application_origin, ic_evidence);
+    };
+    // Self-declaration: the app names its own origin — accept without a
+    // cross-origin fetch.
+    if declared == application_origin {
+        return DeclaredResolution {
+            derivation_origin: declared,
+            source: DerivationSource::Declared,
+            ic_evidence,
+            alt_origins: None,
+        };
+    }
+    // Cross-origin claim: authorize it against the declared origin's own
+    // ii-alternative-origins. An unauthorized claim (ICPBB-430) falls back below.
+    let alts = fetch_alternative_origins(&declared).await;
+    if let (origin, DerivationSource::Declared) = resolved_declared(application_origin, &declared, &alts) {
+        return DeclaredResolution {
+            derivation_origin: origin,
+            source: DerivationSource::Declared,
+            ic_evidence,
+            alt_origins: Some(alts),
+        };
+    }
+    tracing::warn!(
+        application_origin = %application_origin,
+        declared = %declared,
+        "ignoring a cross-origin derivation_origin declaration: could not verify it against the \
+         declared origin's ii-alternative-origins (the app is not listed, or the list was \
+         unreachable / unparseable)"
+    );
+    DeclaredResolution::app_default(application_origin, ic_evidence)
+}
+
 /// `want_alt_origins` controls whether the resolved derivation origin's
 /// `ii-alternative-origins` list is surfaced in the returned [`AppIdentity`]: the
 /// `resolve_app` tool passes `true`; identity-bearing tools that resolve an
@@ -741,50 +840,15 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
     // `x-ic-canister-id` (a canister principal) on every response it serves
     // (including 404s), so capture it here — value-validated AND attributed to this
     // origin (not a redirect target), not just present — before any fallback decision.
-    let mut derivation_origin = application_origin.clone();
-    let mut derivation_origin_source = DerivationSource::AppUrlDefault;
-    let mut ic_evidence = false;
-    // Alt-origins of an ACCEPTED cross-origin declared origin, captured during the
-    // authorization check below so the display path needn't re-fetch the same list.
-    let mut resolved_alt_origins: Option<Vec<String>> = None;
-    if let Ok(resp) = client
-        .get(format!("{application_origin}/.well-known/ic-app.json"))
-        .send()
-        .await
-    {
-        ic_evidence = ic_evidence_from(&resp, &application_origin);
-        if resp.status().is_success() {
-            let text = read_capped(resp, MAX_META_BYTES).await;
-            if let Some(declared) = declared_derivation_origin(&text) {
-                if declared == application_origin {
-                    // Self-declaration: the app names its own origin — no
-                    // cross-origin trust to verify.
-                    derivation_origin = declared;
-                    derivation_origin_source = DerivationSource::Declared;
-                } else {
-                    // Cross-origin claim: authorize it exactly as Internet Identity
-                    // does — the DECLARED origin must list this application origin in
-                    // its `ii-alternative-origins`. Otherwise the site is trying to
-                    // borrow another app's identity (ICPBB-430); ignore the claim and
-                    // keep the application-origin default, which the IC-evidence gate
-                    // below then vets (a non-IC site is refused by the callers).
-                    let alts = fetch_alternative_origins(&declared).await;
-                    if derivation_origin_authorized(&application_origin, &declared, &alts) {
-                        derivation_origin = declared;
-                        derivation_origin_source = DerivationSource::Declared;
-                        resolved_alt_origins = Some(alts);
-                    } else {
-                        tracing::warn!(
-                            application_origin = %application_origin,
-                            declared = %declared,
-                            "refusing an unauthorized cross-origin derivation_origin declaration \
-                             (not listed in the declared origin's ii-alternative-origins)"
-                        );
-                    }
-                }
-            }
-        }
-    }
+    // Resolve (and, for a cross-origin claim, authorize) the app's declared
+    // derivation origin from its manifest — see [`resolve_declared_origin`]. The
+    // alt-origins of an accepted cross-origin declaration are reused for the
+    // display list below so it isn't fetched twice.
+    let resolved = resolve_declared_origin(&client, &application_origin).await;
+    let mut derivation_origin = resolved.derivation_origin;
+    let mut derivation_origin_source = resolved.source;
+    let mut ic_evidence = resolved.ic_evidence;
+    let resolved_alt_origins = resolved.alt_origins;
 
     // If the app didn't declare one, fall back to the built-in registry of
     // well-known custom-derivation-origin apps (the app's own declaration always
@@ -2318,6 +2382,33 @@ mod tests {
             "https://oisy.com",
             &["https://app.example:8443".into(), "http://app.example".into(), "https://app.example.evil".into()]
         ));
+    }
+
+    // The resolver decision (given a declared origin + its alt-origins) maps to the
+    // right (derivation_origin, source): an authorized claim keeps the declared
+    // origin as Declared; an unauthorized one FALLS BACK to the application origin
+    // as AppUrlDefault (so the IC-evidence gate still vets it) — the ICPBB-430 fix.
+    #[test]
+    fn resolved_declared_maps_origin_and_source() {
+        use super::{resolved_declared, DerivationSource};
+        let app = "https://app.example";
+        // Self-declaration → the app's own origin, marked Declared.
+        assert_eq!(resolved_declared(app, app, &[]), (app.to_string(), DerivationSource::Declared));
+        // Authorized cross-origin (the declared origin lists the app) → declared origin.
+        assert_eq!(
+            resolved_declared(app, "https://oisy.com", &[app.into()]),
+            ("https://oisy.com".to_string(), DerivationSource::Declared)
+        );
+        // Unauthorized cross-origin (the spoof) → fall back to the app origin.
+        assert_eq!(
+            resolved_declared(app, "https://oisy.com", &["https://oisy.com".into()]),
+            (app.to_string(), DerivationSource::AppUrlDefault)
+        );
+        // Unverifiable — empty list, i.e. not listed OR the fetch failed → fall back.
+        assert_eq!(
+            resolved_declared(app, "https://oisy.com", &[]),
+            (app.to_string(), DerivationSource::AppUrlDefault)
+        );
     }
 
     // `normalize` prepends https to a bare host but leaves an already-schemed URL
