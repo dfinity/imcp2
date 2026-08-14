@@ -697,11 +697,35 @@ fn ic_evidence_from(resp: &reqwest::Response, expected_origin: &str) -> bool {
 /// the application origin (a clearly-flagged default). Uses the same SSRF-pinned
 /// client and capped reads as `discover`; the app URL is user-controlled.
 ///
-/// `want_alt_origins` controls whether the app's informational
-/// `ii-alternative-origins` list is fetched: the `resolve_app` tool surfaces it, so
-/// it passes `true`; identity-bearing tools that resolve an `app_url` only to derive
-/// against it pass `false`, avoiding a second network round-trip per call (the list
-/// never affects the resolved derivation origin — it's the inverse relation).
+/// Whether an app at `application_origin` is authorized to derive Internet
+/// Identity principals against `declared` — the server-side form of the check
+/// Internet Identity and the browser enforce via `/.well-known/ii-alternative-origins`
+/// (dfinity/internet-identity `validateDerivationOrigin`). A cross-origin claim is
+/// honored ONLY when the DECLARED origin itself lists the application origin in
+/// `declared_alt_origins` (its own `ii-alternative-origins`); a self-declaration
+/// (`declared == application_origin`) needs no cross-origin trust.
+///
+/// Trusting the `derivation_origin` a site declares about itself — without this
+/// gate — let ANY site claim another app's identity and make the user's agent act
+/// as their principal there (ICPBB-430). The direction of trust matters: the
+/// authority is the origin being impersonated (which publishes who may derive
+/// against it), never the requesting site's self-declaration.
+fn derivation_origin_authorized(
+    application_origin: &str,
+    declared: &str,
+    declared_alt_origins: &[String],
+) -> bool {
+    declared == application_origin || declared_alt_origins.iter().any(|o| o == application_origin)
+}
+
+/// `want_alt_origins` controls whether the resolved derivation origin's
+/// `ii-alternative-origins` list is surfaced in the returned [`AppIdentity`]: the
+/// `resolve_app` tool passes `true`; identity-bearing tools that resolve an
+/// `app_url` only to derive against it pass `false`. Note this list is ALSO the
+/// authorization check for a cross-origin declared derivation origin (see
+/// [`derivation_origin_authorized`]), so it is fetched regardless of this flag
+/// whenever a declaration names a different origin — the flag only governs whether
+/// it is additionally returned for display.
 pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Result<AppIdentity, String> {
     let base = normalize(app_url);
     let (base_url, pinned) = resolve_public_url(&base).await?;
@@ -712,14 +736,17 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
     let client = site_client(&host, &pinned)?;
     let application_origin = base_url.origin().ascii_serialization();
 
-    // Declared derivation origin (authoritative) from the app's manifest. The
-    // manifest response also doubles as IC-ness evidence: the IC HTTP gateway
-    // stamps `x-ic-canister-id` (a canister principal) on every response it serves
+    // Declared derivation origin from the app's manifest. The manifest response
+    // also doubles as IC-ness evidence: the IC HTTP gateway stamps
+    // `x-ic-canister-id` (a canister principal) on every response it serves
     // (including 404s), so capture it here — value-validated AND attributed to this
     // origin (not a redirect target), not just present — before any fallback decision.
     let mut derivation_origin = application_origin.clone();
     let mut derivation_origin_source = DerivationSource::AppUrlDefault;
     let mut ic_evidence = false;
+    // Alt-origins of an ACCEPTED cross-origin declared origin, captured during the
+    // authorization check below so the display path needn't re-fetch the same list.
+    let mut resolved_alt_origins: Option<Vec<String>> = None;
     if let Ok(resp) = client
         .get(format!("{application_origin}/.well-known/ic-app.json"))
         .send()
@@ -729,8 +756,32 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
         if resp.status().is_success() {
             let text = read_capped(resp, MAX_META_BYTES).await;
             if let Some(declared) = declared_derivation_origin(&text) {
-                derivation_origin = declared;
-                derivation_origin_source = DerivationSource::Declared;
+                if declared == application_origin {
+                    // Self-declaration: the app names its own origin — no
+                    // cross-origin trust to verify.
+                    derivation_origin = declared;
+                    derivation_origin_source = DerivationSource::Declared;
+                } else {
+                    // Cross-origin claim: authorize it exactly as Internet Identity
+                    // does — the DECLARED origin must list this application origin in
+                    // its `ii-alternative-origins`. Otherwise the site is trying to
+                    // borrow another app's identity (ICPBB-430); ignore the claim and
+                    // keep the application-origin default, which the IC-evidence gate
+                    // below then vets (a non-IC site is refused by the callers).
+                    let alts = fetch_alternative_origins(&declared).await;
+                    if derivation_origin_authorized(&application_origin, &declared, &alts) {
+                        derivation_origin = declared;
+                        derivation_origin_source = DerivationSource::Declared;
+                        resolved_alt_origins = Some(alts);
+                    } else {
+                        tracing::warn!(
+                            application_origin = %application_origin,
+                            declared = %declared,
+                            "refusing an unauthorized cross-origin derivation_origin declaration \
+                             (not listed in the declared origin's ii-alternative-origins)"
+                        );
+                    }
+                }
             }
         }
     }
@@ -772,14 +823,17 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
         None
     };
 
-    // The alternative-origins list (informational only) — fetched only when the
-    // caller will surface it, so the identity hot path doesn't pay for a round-trip
-    // it never reads. It's authoritative at the DERIVATION ORIGIN (which declares the
-    // frontends allowed to derive against it), NOT the app URL — so fetch it there.
-    // This also makes the list identical for every frontend of the same app, since
-    // they all resolve to the same derivation origin.
+    // The alternative-origins list surfaced to the caller (resolve_app). It is
+    // authoritative at the DERIVATION ORIGIN (which declares the frontends allowed
+    // to derive against it), and is the same list the authorization check above
+    // already consulted — so reuse it when a cross-origin declaration was accepted,
+    // and otherwise fetch the resolved origin's list. The identity hot path
+    // (`want_alt_origins == false`) never surfaces it.
     let alternative_origins = if want_alt_origins {
-        fetch_alternative_origins(&derivation_origin).await
+        match resolved_alt_origins {
+            Some(alts) => alts,
+            None => fetch_alternative_origins(&derivation_origin).await,
+        }
     } else {
         Vec::new()
     };
@@ -2232,6 +2286,38 @@ mod tests {
             // Path reduced to bare origin; http:// / non-https / unparseable dropped.
             vec!["https://a.example"]
         );
+    }
+
+    // A cross-origin derivation_origin declaration is honored ONLY when the
+    // declared origin's ii-alternative-origins lists the requesting app origin —
+    // the browser/II rule. A self-declaration is always allowed; an unlisted claim
+    // (the ICPBB-430 spoof) is refused, and matching is by exact origin.
+    #[test]
+    fn derivation_origin_authorized_requires_the_declared_origin_to_list_the_app() {
+        use super::derivation_origin_authorized;
+        let app = "https://attacker.example";
+        // Self-declaration: the app names its own origin — always allowed.
+        assert!(derivation_origin_authorized(app, app, &[]));
+        // Cross-origin claim, NOT listed by the declared origin → refused (the spoof).
+        assert!(!derivation_origin_authorized(
+            app,
+            "https://oisy.com",
+            &["https://oisy.com".into(), "https://nns.ic0.app".into()]
+        ));
+        // Empty / missing list → refused.
+        assert!(!derivation_origin_authorized(app, "https://oisy.com", &[]));
+        // Cross-origin claim that IS listed → allowed (a legitimate multi-frontend app).
+        assert!(derivation_origin_authorized(
+            "https://frontend.example",
+            "https://oisy.com",
+            &["https://frontend.example".into()]
+        ));
+        // Matching is by exact origin: a different scheme/port/host must not pass.
+        assert!(!derivation_origin_authorized(
+            "https://app.example",
+            "https://oisy.com",
+            &["https://app.example:8443".into(), "http://app.example".into(), "https://app.example.evil".into()]
+        ));
     }
 
     // `normalize` prepends https to a bare host but leaves an already-schemed URL
