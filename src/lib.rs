@@ -70,6 +70,10 @@
 
 mod auth;
 mod calls;
+/// Prometheus instrumentation, usable by embedders as well as by the bundled
+/// binary. Exports the [`metrics::Metrics`] handle and the two request
+/// middlewares.
+pub mod metrics;
 mod discover;
 mod identities;
 mod management;

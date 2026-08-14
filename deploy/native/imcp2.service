@@ -9,12 +9,21 @@ User=ec2-user
 WorkingDirectory=/opt/imcp2
 Environment=PORT=8000
 Environment=PUBLIC_URL=__PUBLIC_URL__
-Environment=RUST_LOG=info
+# The per-request line moved to debug so it does not drown `info` for embedders
+# and local runs. On a deployed host that line is the record of what external
+# clients actually probe, so keep it: enable debug for that target only, rather
+# than turning the whole crate to debug.
+Environment=RUST_LOG=info,imcp2::metrics=debug
 # Also serve the beta II instance at /mcp-beta on STAGING only. deploy.sh
 # substitutes __MCP_SERVE_BETA__ per environment: `1` on staging, empty on
 # production. An empty value reads as off, so production serves /mcp (production
 # II) alone; staging additionally exposes /mcp-beta (beta II).
 Environment=MCP_SERVE_BETA=__MCP_SERVE_BETA__
+# Serve the Prometheus exposition at /metrics (off in the app by default; see
+# serve_metrics() in main.rs). This host can afford it: Caddy answers /metrics
+# on the public origin with a 404, so the endpoint exists only on the app's own
+# port, which a scraper reaches on the host's private address.
+Environment=MCP_SERVE_METRICS=1
 # OpenAI Apps domain verification: the token the ChatGPT-directory submission
 # portal reveals, served verbatim at /.well-known/openai-apps-challenge. Empty
 # (the default) keeps that endpoint 404. Supplied via the

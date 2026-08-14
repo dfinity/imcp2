@@ -177,6 +177,11 @@ substituted into the unit by `deploy.sh`), so staging serves the beta Internet
 Identity instance at `/mcp-beta` alongside the production `/mcp`. Production leaves
 it unset, so it serves `/mcp` (production II) alone.
 
+Both hosts set `MCP_SERVE_METRICS=1` (hardcoded in the unit), so the app serves
+the Prometheus exposition at `/metrics` on its own port for a scraper to reach on
+the host's private address. Caddy answers `/metrics` on the public origin with a
+404, which is what keeps it off the internet.
+
 The mechanics live in [`deploy-native.yml`](../../.github/workflows/deploy-native.yml),
 a reusable workflow both call. It first runs the status dashboard's unit tests (a
 regression there stops the rollout), cross-builds the binary with `build.sh`, then runs

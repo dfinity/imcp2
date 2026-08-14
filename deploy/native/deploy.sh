@@ -177,6 +177,64 @@ EOF
 echo ">> deployed. Verifying..."
 sleep 6
 $SSH "systemctl is-active imcp2 caddy imcp-status; ss -tlnp 2>/dev/null | grep -E ':(80|443|8000|8137)\b' || true"
+# The unit hardcodes MCP_SERVE_METRICS=1, so a missing /metrics means the
+# environment did not take effect or the app is not up — fatal, or the scrape
+# target silently returns nothing. This proves the app serves the endpoint; it
+# does NOT prove a scraper can reach it (security-group ingress on TCP 8000
+# cannot be probed from a GitHub-hosted runner, which is not on the VPN).
+metrics_ok=""
+for attempt in 1 2 3 4 5; do
+  if $SSH "curl -fsS --max-time 5 http://127.0.0.1:8000/metrics | grep -q imcp2_build_info"; then
+    metrics_ok=1
+    echo "on-host loopback /metrics -> serving the exposition (attempt $attempt)"
+    break
+  fi
+  sleep 3
+done
+if [ -z "$metrics_ok" ]; then
+  echo "FATAL: on-host /metrics never served imcp2_build_info; MCP_SERVE_METRICS did not take effect, or the app is not up" >&2
+  exit 1
+fi
+
+# The host reaching itself on its private address proves the app bound 0.0.0.0
+# and no host-local firewall drops :8000. The address is never printed — this
+# repo's Actions logs are public, and curl's errors would carry the URL, so its
+# stderr is dropped. A warning, not fatal: only scraping is affected, and the
+# remedy is a firewall change a failed deploy would not bring closer.
+if $SSH 'addr="$(hostname -I 2>/dev/null | awk "{print \$1}")"; [ -n "$addr" ] && curl -fsS --max-time 5 "http://$addr:8000/metrics" 2>/dev/null | grep -q imcp2_build_info'; then
+  echo "on-host private-address /metrics -> reachable off loopback (scraper ingress still unverified)"
+else
+  echo "WARNING: /metrics did not answer on the host's private address; a scraper cannot reach it (app bound to loopback, or a host firewall drops :8000)" >&2
+fi
+
 echo ">> external check:"
-curl -sS -o /dev/null -w "https://$DOMAIN/ -> HTTP %{http_code} (TLS verify %{ssl_verify_result})\n" "https://$DOMAIN/" || true
-curl -sS -o /dev/null -w "https://$DOMAIN/status/ -> HTTP %{http_code}\n" "https://$DOMAIN/status/" || true
+# --max-time on every external request: an origin that accepts the connection but
+# never finishes the response would otherwise hang the deploy (`|| true` handles a
+# non-zero exit, not the absence of one).
+curl -sS --max-time 20 -o /dev/null -w "https://$DOMAIN/ -> HTTP %{http_code} (TLS verify %{ssl_verify_result})\n" "https://$DOMAIN/" || true
+curl -sS --max-time 20 -o /dev/null -w "https://$DOMAIN/status/ -> HTTP %{http_code}\n" "https://$DOMAIN/status/" || true
+
+# ...and /metrics must NOT be reachable on the public origin. Caddy answers it
+# with a 404; losing that one block would publish the exposition, so assert it on
+# every deploy. The assertion is "exactly the configured 404": any other code —
+# a proxied 500, a `000` from an unreachable or stalled origin — has not disproved
+# exposure, so it retries (Caddy may be reloading) and then fails hard.
+hidden=""
+for attempt in 1 2 3 4 5; do
+  code="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "https://$DOMAIN/metrics" || echo 000)"
+  if [ "$code" = 200 ]; then
+    echo "FATAL: https://$DOMAIN/metrics answered 200 — the Prometheus exposition is public" >&2
+    exit 1
+  fi
+  if [ "$code" = 404 ]; then
+    hidden=1
+    echo "https://$DOMAIN/metrics -> HTTP 404 (not published, as intended)"
+    break
+  fi
+  echo "https://$DOMAIN/metrics -> HTTP $code, expected 404 (attempt $attempt)" >&2
+  sleep 3
+done
+if [ -z "$hidden" ]; then
+  echo "FATAL: https://$DOMAIN/metrics never answered the configured 404, so its exposure is unproven" >&2
+  exit 1
+fi

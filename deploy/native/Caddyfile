@@ -10,6 +10,15 @@ __DOMAIN__ {
     reverse_proxy 127.0.0.1:8137
   }
 
+  # The app serves /metrics on its own port (imcp2.service sets
+  # MCP_SERVE_METRICS=1); a scraper reaches it on the host's private address.
+  # This block keeps it OFF the public origin — without it the catch-all below
+  # proxies /metrics like any other path. 404 rather than 403 so the endpoint is
+  # not advertised; deploy.sh asserts this exact response on every deploy.
+  handle /metrics {
+    respond 404
+  }
+
   # Everything else is the MCP server.
   handle {
     # Retry the upstream for a few seconds if the dial fails, so the ~1-3s gap

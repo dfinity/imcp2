@@ -16,7 +16,9 @@
 //!
 //! Honours `$PORT` (bind port, default 8000), `$PUBLIC_URL` (the public base
 //! URL baked into the discovery documents and the II handshake),
-//! `$MCP_SERVE_BETA` (opt in to the `/mcp-beta` staging instance), and
+//! `$MCP_SERVE_BETA` (opt in to the `/mcp-beta` staging instance),
+//! `$MCP_SERVE_METRICS` (opt in to the Prometheus exposition at `/metrics`; off
+//! by default because nothing here can know whether a proxy is hiding it), and
 //! `$OPENAI_APPS_CHALLENGE_TOKEN` (serve the OpenAI Apps domain-verification
 //! token at `/.well-known/openai-apps-challenge`; 404 while unset).
 //!
@@ -62,23 +64,19 @@ fn serve_beta() -> bool {
         .unwrap_or(false)
 }
 
-/// Log each inbound request: method, path, response status, and latency — gives
-/// visibility into what external MCP clients probe (discovery URLs, unknown
-/// paths) at `RUST_LOG=info`. The query string is never logged (defense in depth,
-/// keeping any single-use `?code=` out of logs) — and request bodies are never
-/// logged (the redeem POST carries the connection-scoped `state` and delegation).
-async fn log_request(
-    req: axum::http::Request<axum::body::Body>,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let method = req.method().clone();
-    let path = req.uri().path().to_string();
-    let started = std::time::Instant::now();
-    let resp = next.run(req).await;
-    let status = resp.status().as_u16();
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    tracing::info!(%method, %path, status, elapsed_ms, "http request");
-    resp
+/// Whether to serve the Prometheus exposition at `/metrics`. Off unless
+/// `$MCP_SERVE_METRICS` is truthy (`1`/`true`/`yes`/`on`).
+///
+/// Off by default because the default deployment shape is the exposed one: the
+/// bundled Dockerfile has no proxy in front, so every registered route is on the
+/// public internet. The native host opts in — its Caddy answers `/metrics` with a
+/// 404, so the endpoint exists only on the app's own port. Public exposition
+/// would hand out request/session/process data and a whole-registry gather per
+/// request.
+fn serve_metrics() -> bool {
+    std::env::var("MCP_SERVE_METRICS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 /// The landing page served at `/`: a self-contained design bundle exported from
@@ -91,6 +89,61 @@ async fn log_request(
 /// the root page and the connect screens read as one product, and walks through
 /// what an agent can do: discovery, identity, on-network queries, actions, skills.
 const INDEX_HTML: &str = include_str!("assets/index.html");
+
+/// `GET /metrics` — the Prometheus exposition for `registry`. Its own router so
+/// the gate stays one line at the call site (see [`serve_metrics`]) and the
+/// handler is testable alone. Unauthenticated, like `/version`: whatever fronts
+/// this process is what keeps it off the public internet.
+fn metrics_router(registry: prometheus::Registry, metrics: imcp2::metrics::Metrics) -> Router {
+    Router::new().route(
+        "/metrics",
+        get(move || {
+            // Clone per request so the handler stays `Fn`; both are Arc-backed.
+            let (registry, metrics) = (registry.clone(), metrics.clone());
+            async move {
+                // Timed from the top, refresh included — the refresh is the part
+                // of a scrape that can get slow.
+                let started = std::time::Instant::now();
+
+                // Recompute the session gauges just before gathering, so they are
+                // exact as of this scrape.
+                metrics.refresh().await;
+
+                let encoded = {
+                    use prometheus::Encoder;
+                    let mut buf = Vec::new();
+                    prometheus::TextEncoder::new()
+                        .encode(&registry.gather(), &mut buf)
+                        .map_err(|e| e.to_string())
+                        .and_then(|()| String::from_utf8(buf).map_err(|e| e.to_string()))
+                };
+                // After the gather, so this response reports the *previous* scrape's
+                // cost. A scrape cannot time itself and also contain the timing.
+                metrics.observe_scrape(started.elapsed().as_secs_f64());
+                match encoded {
+                    Ok(body) => (
+                        axum::http::StatusCode::OK,
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; version=0.0.4; charset=utf-8",
+                        )],
+                        body,
+                    ),
+                    // A scrape failure must not be silent: Prometheus reads a
+                    // non-200 as the target being down, which is the honest reading.
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to encode metrics");
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                            String::from("failed to encode metrics\n"),
+                        )
+                    }
+                }
+            }
+        }),
+    )
+}
 
 /// The public, human-facing pages this origin serves, as absolute-path
 /// suffixes. This is the sitemap's and robots.txt's shared idea of "content":
@@ -254,6 +307,14 @@ fn terms_page() -> &'static str {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // When this process started — i.e. when the deployment last (re)started.
+    // Read as the very first statement of main so it means what `/version` and
+    // `imcp2_process_start_time_seconds` say it means.
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -302,17 +363,28 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // When this process started — i.e. when the deployment last (re)started.
-    // Every deploy restarts the service, so this is the "last redeployment" time.
-    let started_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
     // Handles for the /version live-session gauges (Arc-backed, so cloning
     // shares the same session maps the tools mutate). Beta is `Option`: the
     // gauge reports zero for it when the staging instance isn't served.
     let (ver_prod, ver_beta) = (prod.clone(), beta.clone());
+
+    // Every served instance, in one list — the metrics constructor and the
+    // origin-global auth-callback allow-list both want it.
+    let servers: Vec<&McpServer> = std::iter::once(&prod).chain(beta.as_ref()).collect();
+
+    // Metrics. This binary is the standalone case, so it owns the registry; an
+    // embedder passes its own instead (see imcp2::metrics). The process collector
+    // is registered here rather than by the library because un-namespaced
+    // `process_*` belongs to the application, and this binary is the application.
+    let registry = prometheus::Registry::new();
+    let metrics = imcp2::metrics::Metrics::new(
+        &registry,
+        env!("CARGO_PKG_VERSION"),
+        option_env!("GIT_SHA").unwrap_or("unknown"),
+        started_at,
+        &servers,
+    )?;
+    imcp2::metrics::register_process_collector(&registry)?;
 
     // Which II each served mount hands off to. Built once (fixed for the process)
     // and cloned per request. This is the only way an external monitor can learn
@@ -410,6 +482,19 @@ async fn main() -> anyhow::Result<()> {
         // /sitemap.xml + /robots.txt, built from this deployment's PUBLIC_URL.
         .merge(site_metadata_router(&public_url));
 
+    // Prometheus exposition, only when $MCP_SERVE_METRICS opts in — see
+    // `serve_metrics()`. The recording middleware below stays on either way, so
+    // every deployment runs the same request path; the cost is a few atomic
+    // increments per request.
+    if serve_metrics() {
+        app = app.merge(metrics_router(registry, metrics.clone()));
+    } else {
+        // Say so once, or an absent endpoint looks like a broken one.
+        tracing::info!(
+            "/metrics not served; set MCP_SERVE_METRICS=1 to enable (do not expose it publicly)"
+        );
+    }
+
     // Staging additionally serves the beta II instance at `/mcp-beta`.
     if let Some(beta) = &beta {
         app = app
@@ -419,14 +504,18 @@ async fn main() -> anyhow::Result<()> {
 
     // The II auth-callback allow-list is origin-global: one document declares
     // every served instance's callbacks (prod always, beta only on staging).
-    let servers: Vec<&McpServer> = std::iter::once(&prod).chain(beta.as_ref()).collect();
     let app = app
         .merge(auth_callbacks_router(&servers))
-        // Log every inbound request (method, path, status, latency) so we can see
-        // what external clients actually hit — discovery probes, unknown paths,
-        // etc. Only the path is logged, never the query string, so single-use
-        // secrets (`?code=`) don't land in logs.
-        .layer(axum::middleware::from_fn(log_request));
+        // Request metrics and a per-request debug log line, as separate layers so
+        // an embedder can take either alone. The log keeps the full path (never
+        // the query string); the metrics bound every label — see imcp2::metrics.
+        .layer(axum::middleware::from_fn_with_state(
+            metrics.clone(),
+            imcp2::metrics::write_request_metrics,
+        ))
+        .layer(axum::middleware::from_fn(
+            imcp2::metrics::write_request_logs,
+        ));
 
     let bind = bind_address();
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -498,10 +587,77 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{openai_apps_challenge_router, site_metadata_router, sitemap_xml, PUBLIC_PAGES};
+    use super::{
+        metrics_router, openai_apps_challenge_router, serve_metrics, site_metadata_router,
+        sitemap_xml, PUBLIC_PAGES,
+    };
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// The exposition must be **off** unless asked for, and the ask must be
+    /// explicit. This is the security-relevant half of the gate: the native host
+    /// has a proxy answering `/metrics` with a 404, but the bundled `Dockerfile` on
+    /// a PaaS has no proxy at all, so a default-on endpoint would publish request
+    /// volumes, session counts and process memory — and hand out a registry-wide
+    /// gather per request — on a deployment path we ship.
+    ///
+    /// Truthiness only, matching `MCP_SERVE_BETA`: anything else, including the
+    /// plausible-looking `MCP_SERVE_METRICS=please`, leaves it off. `$MCP_SERVE_BETA`
+    /// is untouched here — the two gates are independent and this is the only test
+    /// that writes this process-global variable.
+    #[test]
+    fn the_metrics_endpoint_is_off_unless_explicitly_enabled() {
+        std::env::remove_var("MCP_SERVE_METRICS");
+        assert!(!serve_metrics(), "unset must mean off");
+        for on in ["1", "true", "yes", "on", "TRUE", " on "] {
+            std::env::set_var("MCP_SERVE_METRICS", on);
+            assert!(serve_metrics(), "{on:?} should enable the endpoint");
+        }
+        for off in ["", "0", "false", "no", "off", "please", "2", "-1"] {
+            std::env::set_var("MCP_SERVE_METRICS", off);
+            assert!(!serve_metrics(), "{off:?} must not enable the endpoint");
+        }
+        std::env::remove_var("MCP_SERVE_METRICS");
+    }
+
+    /// When it *is* served: the exposition renders the caller's registry, carries
+    /// the text format's version in its content type (Prometheus negotiates on it),
+    /// and records its own cost — a scrape that quietly got slow is how a target
+    /// starts being dropped for timing out, and the resulting gap looks like an
+    /// outage that never happened.
+    #[tokio::test]
+    async fn metrics_endpoint_renders_the_registry_and_times_the_previous_scrape() {
+        let registry = prometheus::Registry::new();
+        let metrics =
+            imcp2::metrics::Metrics::new(&registry, "1.2.3", "abc1234", 1_700_000_000, &[])
+                .unwrap();
+        let app = metrics_router(registry, metrics);
+
+        let scrape = |app: axum::Router| async move {
+            let resp = app
+                .oneshot(Request::get("/metrics").body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let content_type =
+                resp.headers().get("content-type").map(|v| v.to_str().unwrap().to_string());
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8(body.to_vec()).unwrap(), content_type)
+        };
+
+        let (status, body, content_type) = scrape(app.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("text/plain; version=0.0.4; charset=utf-8"));
+        assert!(body.contains(r#"imcp2_build_info{commit="abc1234",version="1.2.3"} 1"#), "{body}");
+        assert!(body.contains("imcp2_process_start_time_seconds 1700000000"), "{body}");
+        // Its own timing cannot appear in the response that produced it.
+        assert!(body.contains("imcp2_metrics_scrape_duration_seconds_count 0"), "{body}");
+
+        // The next one reports the previous one's cost.
+        let (_, body, _) = scrape(app).await;
+        assert!(body.contains("imcp2_metrics_scrape_duration_seconds_count 1"), "{body}");
+    }
 
     async fn fetch(public_url: &str, path: &str) -> (StatusCode, String, Option<String>) {
         let resp = site_metadata_router(public_url)
