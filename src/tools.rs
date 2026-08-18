@@ -10,7 +10,7 @@
 use candid::Principal;
 use ic_agent::{Agent, Identity};
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::wrapper::Parameters,
     model::*,
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -53,7 +53,6 @@ pub(crate) struct IcTools {
     agent: Agent,
     identities: Identities,
     skills: skills::SkillsCatalog,
-    tool_router: ToolRouter<IcTools>,
 }
 
 #[tool_router]
@@ -63,7 +62,6 @@ impl IcTools {
             agent,
             identities,
             skills,
-            tool_router: Self::tool_router(),
         }
     }
 
@@ -2237,10 +2235,6 @@ fn schema_for_output<T: schemars::JsonSchema + std::any::Any>() -> std::sync::Ar
             std::any::type_name::<T>()
         )
     })
-}
-
-fn ok(text: String) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(text)])
 }
 
 /// A success result carrying both the human-readable `text` and a machine-
