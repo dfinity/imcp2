@@ -42,9 +42,9 @@ fn public_url() -> String {
 
 /// Directory imcp2 creates its operational files in (today: the persisted
 /// client-registration store). Set with `IMCP2_STATE_DIR`; defaults to the
-/// current working directory, so a bare local run keeps `oauth-clients.json`
-/// beside the binary as before. The native deployment points it at the unit's
-/// `StateDirectory` (`/var/lib/imcp2`).
+/// process's current working directory, so a bare local run keeps
+/// `oauth-clients.json` under the directory it was launched from, as before. The
+/// native deployment points it at the unit's `StateDirectory` (`/var/lib/imcp2`).
 fn state_dir() -> std::path::PathBuf {
     std::env::var_os("IMCP2_STATE_DIR")
         .map(std::path::PathBuf::from)

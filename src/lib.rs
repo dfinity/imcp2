@@ -168,9 +168,6 @@ pub struct McpServer {
     store: auth::AuthStore,
     public_url: String,
     mcp_path: String,
-    /// The operational-files directory this instance was built with
-    /// ([`McpConfig::state_dir`]). Read via [`Self::state_dir`].
-    state_dir: PathBuf,
     /// Cancels the streamable-HTTP sessions and the session reaper on
     /// [`Self::shutdown`].
     ct: CancellationToken,
@@ -178,6 +175,16 @@ pub struct McpServer {
 
 impl McpServer {
     pub fn new(config: McpConfig) -> Self {
+        // Single operational home: `clients` must have been loaded from the same
+        // `state_dir` this config declares. Enforcing it here (rather than storing
+        // a second copy of the path) keeps `Self::state_dir` — which reports the
+        // store's actual directory — from ever disagreeing with the field.
+        assert_eq!(
+            config.clients.state_dir(),
+            config.state_dir,
+            "McpConfig.clients must be loaded from McpConfig.state_dir \
+             (SharedClients::load(&state_dir))",
+        );
         let public_url = normalize_public_url(&config.public_url);
         let mcp_path = normalize_mount_path(&config.mcp_path);
         let identities =
@@ -196,17 +203,18 @@ impl McpServer {
             store,
             public_url,
             mcp_path,
-            state_dir: config.state_dir,
             ct: CancellationToken::new(),
         }
     }
 
-    /// The operational-files directory this instance was built with
-    /// ([`McpConfig::state_dir`]) — where imcp2 creates the state a restart must
-    /// survive (today, the client-registration store). Exposed so an embedder can
-    /// place its own operational files under the same configured home.
+    /// The operational-files directory this instance uses — where imcp2 creates
+    /// the state a restart must survive (today, the client-registration store).
+    /// Reported straight from the client store, so it is the directory files
+    /// actually go to (construction enforces it equals [`McpConfig::state_dir`]).
+    /// Exposed so an embedder can place its own operational files under the same
+    /// home.
     pub fn state_dir(&self) -> &Path {
-        &self.state_dir
+        self.store.state_dir()
     }
 
     /// The path this instance's [`Self::mcp_router`] must be nested at — the
@@ -560,7 +568,51 @@ fn normalize_public_url(raw: &str) -> String {
 
 #[cfg(test)]
 mod lib_tests {
-    use super::{allowed_hosts_for, normalize_mount_path, normalize_public_url};
+    use super::{
+        allowed_hosts_for, normalize_mount_path, normalize_public_url, Agent, IiInstance, McpConfig,
+        McpServer, SharedClients, IC_URL,
+    };
+    use std::path::PathBuf;
+
+    /// Build a server whose `clients` load and `state_dir` field both point at
+    /// `dir` (the correct pairing). Construction is pure — no network.
+    fn server_with_dir(dir: PathBuf) -> McpServer {
+        McpServer::new(McpConfig {
+            agent: Agent::builder().with_url(IC_URL).build().expect("agent"),
+            instance: IiInstance::prod().expect("prod instance"),
+            public_url: "https://mcp.example.com".into(),
+            mcp_path: "/mcp".into(),
+            clients: SharedClients::load(&dir),
+            state_dir: dir,
+            require_resource: true,
+        })
+    }
+
+    /// `state_dir()` reports the directory the client store actually uses (single
+    /// source of truth), not a separately-stored copy.
+    #[test]
+    fn state_dir_reports_the_store_directory() {
+        let dir = std::env::temp_dir().join("imcp2-lib-state-dir-test");
+        let server = server_with_dir(dir.clone());
+        assert_eq!(server.state_dir(), dir);
+    }
+
+    /// Constructing with `clients` loaded from a DIFFERENT directory than
+    /// `state_dir` is a programmer error and must fail loudly at construction,
+    /// rather than let `state_dir()` silently report a directory files don't use.
+    #[test]
+    #[should_panic(expected = "must be loaded from McpConfig.state_dir")]
+    fn mismatched_state_dir_and_clients_panics() {
+        let _ = McpServer::new(McpConfig {
+            agent: Agent::builder().with_url(IC_URL).build().expect("agent"),
+            instance: IiInstance::prod().expect("prod instance"),
+            public_url: "https://mcp.example.com".into(),
+            mcp_path: "/mcp".into(),
+            clients: SharedClients::load(std::env::temp_dir().join("dir-a")),
+            state_dir: std::env::temp_dir().join("dir-b"),
+            require_resource: true,
+        });
+    }
 
     /// `public_url` canonicalizes to a clean origin regardless of the shape the
     /// caller passes: a scheme is added when absent, an uppercase scheme is

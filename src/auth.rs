@@ -273,10 +273,13 @@ fn persist_clients_to(path: &Path, clients: &HashMap<String, ClientReg>) {
 ///     re-serializes the whole store.
 struct ClientStore {
     registrations: RwLock<HashMap<String, ClientReg>>,
-    /// The file this store loads from and persists to — `{state_dir}/{CLIENTS_FILENAME}`.
-    /// Owned by the store so the coalesced writer ([`Self::persist_soon`]) needs no
-    /// global/env lookup to know where to write.
-    file: PathBuf,
+    /// The operational directory this store lives in — the SINGLE source of truth
+    /// for where registrations persist (its file is `state_dir/{CLIENTS_FILENAME}`,
+    /// derived in [`Self::file`]). Owned by the store so the coalesced writer
+    /// ([`Self::persist_soon`]) needs no global/env lookup, and surfaced upward via
+    /// [`SharedClients::state_dir`] so `McpServer` reports the true location rather
+    /// than a possibly-diverging second copy.
+    state_dir: PathBuf,
     /// Set when the store holds registrations not yet written to disk. Cleared
     /// by the persist task before it snapshots, so a registration landing
     /// mid-write sets it again and gets its own pass (no lost updates).
@@ -287,24 +290,29 @@ struct ClientStore {
 }
 
 impl ClientStore {
-    /// Load the persisted registrations from `{state_dir}/{CLIENTS_FILENAME}`,
-    /// binding the store to that file for later write-throughs.
-    fn load(state_dir: &Path) -> Arc<Self> {
-        let file = state_dir.join(CLIENTS_FILENAME);
-        let registrations = load_clients_from(&file);
-        Self::with(registrations, file)
+    /// Load the persisted registrations from `state_dir/{CLIENTS_FILENAME}`,
+    /// binding the store to `state_dir` for later write-throughs.
+    fn load(state_dir: PathBuf) -> Arc<Self> {
+        let registrations = load_clients_from(&state_dir.join(CLIENTS_FILENAME));
+        Self::with(registrations, state_dir)
     }
 
-    /// A store over `registrations` as given, bound to `file` for write-throughs
-    /// (the seam tests use to start from a known set without reading the
-    /// deployment's file — pass a throwaway path when persistence is irrelevant).
-    fn with(registrations: HashMap<String, ClientReg>, file: PathBuf) -> Arc<Self> {
+    /// A store over `registrations` as given, bound to `state_dir` for
+    /// write-throughs (the seam tests use to start from a known set without
+    /// reading the deployment's file — pass a throwaway dir when persistence is
+    /// irrelevant).
+    fn with(registrations: HashMap<String, ClientReg>, state_dir: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             registrations: RwLock::new(registrations),
-            file,
+            state_dir,
             dirty: AtomicBool::new(false),
             writing: AtomicBool::new(false),
         })
+    }
+
+    /// The file registrations persist to: `state_dir/{CLIENTS_FILENAME}`.
+    fn file(&self) -> PathBuf {
+        self.state_dir.join(CLIENTS_FILENAME)
     }
 
     /// Whether `redirect_uri` is acceptable for `client_id` ([`redirect_allowed`]),
@@ -362,7 +370,7 @@ impl ClientStore {
                 // during the write is guaranteed another pass.
                 while store.dirty.swap(false, Ordering::SeqCst) {
                     let snapshot = store.registrations.read().await.clone();
-                    let file = store.file.clone();
+                    let file = store.file();
                     tokio::task::spawn_blocking(move || persist_clients_to(&file, &snapshot))
                         .await
                         .ok();
@@ -799,7 +807,15 @@ impl SharedClients {
     /// registration made against either instance's AS is known to both and the
     /// persisted snapshot never loses the other's entries.
     pub fn load(state_dir: impl AsRef<Path>) -> Self {
-        Self(ClientStore::load(state_dir.as_ref()))
+        Self(ClientStore::load(state_dir.as_ref().to_path_buf()))
+    }
+
+    /// The operational directory this store loads from and persists to — the
+    /// authoritative location, so [`McpServer::state_dir`](crate::McpServer::state_dir)
+    /// reports where files actually go rather than a separately-stored copy that
+    /// could drift from the one passed to [`Self::load`].
+    pub fn state_dir(&self) -> &Path {
+        &self.0.state_dir
     }
 }
 
@@ -826,6 +842,12 @@ impl AuthStore {
     /// The II instance this store serves.
     fn instance(&self) -> &crate::identities::IiInstance {
         self.identities.instance()
+    }
+
+    /// The operational directory the client store persists to — the location
+    /// `McpServer::state_dir` reports (single source of truth).
+    pub(crate) fn state_dir(&self) -> &Path {
+        &self.clients.state_dir
     }
 
     /// This instance's AS issuer: `{public_url}{mcp_path}` (an RFC 8414 *path
@@ -2678,7 +2700,7 @@ mod tests {
             ids,
             super::SharedClients(super::ClientStore::with(
                 std::collections::HashMap::new(),
-                std::env::temp_dir().join("imcp2-unused-test-clients.json"),
+                std::env::temp_dir(),
             )),
             "https://mcp.test".into(),
             "/mcp".into(),
@@ -2884,9 +2906,9 @@ mod tests {
                     agent,
                 ),
                 super::SharedClients(super::ClientStore::with(
-                std::collections::HashMap::new(),
-                std::env::temp_dir().join("imcp2-unused-test-clients.json"),
-            )),
+                    std::collections::HashMap::new(),
+                    std::env::temp_dir(),
+                )),
                 "https://mcp.test".into(),
                 mcp_path.into(),
                 false,
