@@ -822,6 +822,18 @@ pub fn oql_query_redirect(did: Option<&str>) -> Option<String> {
 /// otherwise bloat the reply.
 pub(crate) const MAX_OQL_ENTITIES: usize = 40;
 
+/// Widest and tallest table [`rows_to_table`] will materialize from a reply
+/// before it signals truncation (folded into `has_more`). Their product bounds
+/// the dense `Vec<Vec<String>>` it builds: without a cap, a compact reply whose
+/// first row declares tens of thousands of columns and that then carries
+/// thousands of (even empty) rows densifies to `cols × rows` owned `String`s —
+/// hundreds of MB out of an ~80 KB reply (ICPBB-384/385). The decode quota
+/// (#132) does not catch this: the decoded tree stays small; the blow-up is in
+/// OUR alignment loop, not candid's decoder. Real OQL pages are far smaller; a
+/// larger result set is paged through `has_more` + offset, not widened here.
+pub(crate) const MAX_OQL_COLUMNS: usize = 256;
+pub(crate) const MAX_OQL_ROWS: usize = 1_000;
+
 /// The #1 remediation note for a per-app read that came back EMPTY while
 /// ANONYMOUS. Empty almost always means "not authenticated as your account", not
 /// "no data", because the canister gates data by caller principal. `what` names
@@ -1172,11 +1184,13 @@ fn extract_oql(val: &IDLValue) -> Option<OqlResult> {
         IDLValue::Record(fields) => {
             let rows_val = field_by_name(fields, "rows")?;
             let has_more = matches!(field_by_name(fields, "hasMore"), Some(IDLValue::Bool(true)));
-            let (columns, rows) = rows_to_table(rows_val)?;
+            let (columns, rows, truncated) = rows_to_table(rows_val)?;
             Some(OqlResult::Table {
                 columns,
                 rows,
-                has_more,
+                // A reply we truncated is, by definition, not the full result set,
+                // so surface it as `has_more` even if the canister said otherwise.
+                has_more: has_more || truncated,
             })
         }
         IDLValue::Variant(var) => {
@@ -1198,25 +1212,38 @@ fn extract_oql(val: &IDLValue) -> Option<OqlResult> {
     }
 }
 
-/// Turn the `rows : vec vec Cell` value into (columns, string rows). Columns are
-/// taken from the first row's cell names; every row is then aligned to them by
-/// name (per the primer: read cells by name, never by position).
+/// Turn the `rows : vec vec Cell` value into (columns, string rows, truncated).
+/// Columns are taken from the first row's cell names; every row is then aligned
+/// to them by name (per the primer: read cells by name, never by position).
+///
+/// Bounded output: at most [`MAX_OQL_COLUMNS`] columns (the first row's extra
+/// cell names are dropped) and [`MAX_OQL_ROWS`] materialized rows — a reply that
+/// exceeds either sets the `truncated` flag, which the caller folds into
+/// `has_more` so the agent knows to page rather than treat the table as
+/// complete. This caps the dense `cols × rows` allocation an attacker-controlled
+/// reply could otherwise force (ICPBB-384/385).
 ///
 /// Fail-closed: `None` (→ Unrecognized) if the value isn't a vec, if any row
 /// isn't a vec, or if the first row yields no named cells — so a malformed /
 /// non-OQL reply degrades to the raw Candid rather than a bogus "0 columns"
 /// table. An empty `rows` (a query that matched nothing) is the one legitimate
 /// zero-column case and returns an empty table.
-fn rows_to_table(rows_val: &IDLValue) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+fn rows_to_table(rows_val: &IDLValue) -> Option<(Vec<String>, Vec<Vec<String>>, bool)> {
     let IDLValue::Vec(rows) = rows_val else {
         return None;
     };
     if rows.is_empty() {
-        return Some((Vec::new(), Vec::new()));
+        return Some((Vec::new(), Vec::new(), false));
     }
     let mut columns: Vec<String> = Vec::new();
     let mut out_rows: Vec<Vec<String>> = Vec::new();
+    let mut truncated = false;
     for row in rows {
+        // Stop materializing once the row cap is hit; the remainder is `has_more`.
+        if out_rows.len() >= MAX_OQL_ROWS {
+            truncated = true;
+            break;
+        }
         let IDLValue::Vec(cells) = row else {
             return None;
         };
@@ -1236,7 +1263,16 @@ fn rows_to_table(rows_val: &IDLValue) -> Option<(Vec<String>, Vec<Vec<String>>)>
                 // First row carried no named cells — not a recognizable OQL row.
                 return None;
             }
-            columns = pairs.iter().map(|(n, _)| n.clone()).collect();
+            // Cap the column set taken from the first row; extras are dropped and
+            // the table is flagged truncated (bounds every later row's width).
+            if pairs.len() > MAX_OQL_COLUMNS {
+                truncated = true;
+            }
+            columns = pairs
+                .iter()
+                .take(MAX_OQL_COLUMNS)
+                .map(|(n, _)| n.clone())
+                .collect();
         }
         // Align this row to `columns` via a name→value map (first occurrence
         // wins, matching a linear find) so wide tables stay O(cols), not O(cols²).
@@ -1250,7 +1286,7 @@ fn rows_to_table(rows_val: &IDLValue) -> Option<(Vec<String>, Vec<Vec<String>>)>
             .collect();
         out_rows.push(aligned);
     }
-    Some((columns, out_rows))
+    Some((columns, out_rows, truncated))
 }
 
 /// Render one OQL cell value as a scalar string. Cell values are wrapped in a
@@ -1767,6 +1803,48 @@ mod tests {
             }
             _ => panic!("empty rows should be a Table, not an error/Unrecognized"),
         }
+    }
+
+    // A reply whose first row over-declares columns and that carries more rows
+    // than the cap is densified only up to MAX_OQL_COLUMNS × MAX_OQL_ROWS, and the
+    // truncation is surfaced as `has_more` — so an attacker-controlled reply can't
+    // force a `cols × rows` allocation blow-up (ICPBB-384/385).
+    #[test]
+    fn rows_to_table_caps_wide_and_tall_replies() {
+        use super::{rows_to_table, IDLField, IDLValue, Label, MAX_OQL_COLUMNS, MAX_OQL_ROWS};
+
+        let named = |name: &str, val: &str| {
+            IDLValue::Record(vec![
+                IDLField {
+                    id: Label::Named("name".into()),
+                    val: IDLValue::Text(name.into()),
+                },
+                IDLField {
+                    id: Label::Named("value".into()),
+                    val: IDLValue::Text(val.into()),
+                },
+            ])
+        };
+
+        // First row declares 300 columns (> MAX_OQL_COLUMNS); 1_100 rows total
+        // (> MAX_OQL_ROWS). Every cell name is present in row 0 so alignment finds
+        // them; later rows are empty, which is the worst case for the blow-up (the
+        // width comes entirely from the densification, not the wire).
+        let wide_first: Vec<IDLValue> = (0..300)
+            .map(|c| named(&format!("c{c}"), "x"))
+            .collect();
+        let mut rows: Vec<IDLValue> = vec![IDLValue::Vec(wide_first)];
+        rows.extend((0..1_100).map(|_| IDLValue::Vec(Vec::new())));
+
+        let (columns, out_rows, truncated) =
+            rows_to_table(&IDLValue::Vec(rows)).expect("recognizable table");
+        assert_eq!(columns.len(), MAX_OQL_COLUMNS, "columns capped");
+        assert_eq!(out_rows.len(), MAX_OQL_ROWS, "materialized rows capped");
+        assert!(truncated, "over-cap reply must signal truncation");
+        assert!(
+            out_rows.iter().all(|r| r.len() == MAX_OQL_COLUMNS),
+            "every row aligned to the capped column set (no ragged rows)"
+        );
     }
 
     // Fail-closed decoding (per review): a variant reply whose arm is neither a
