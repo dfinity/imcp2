@@ -1241,23 +1241,31 @@ fn extract_oql(val: &IDLValue) -> Option<OqlResult> {
     }
 }
 
-/// Turn the `rows : vec vec Cell` value into a [`TableOutcome`]. Columns are
-/// taken from the first row's cell names; every row is then aligned to them by
+/// Turn the `rows : vec vec Cell` value into a [`TableOutcome`]. The column set
+/// is the first row's distinct cell names; every row is then aligned to it by
 /// name (per the primer: read cells by name, never by position).
 ///
 /// Two independent bounds cap the dense `cols × rows` allocation an
-/// attacker-controlled reply could otherwise force (ICPBB-384/385), and they are
-/// reported SEPARATELY because they page differently:
+/// attacker-controlled reply could otherwise force (ICPBB-384/385), reported
+/// SEPARATELY because they page differently:
 ///
 ///   * **width** — if the first row declares more than [`MAX_OQL_COLUMNS`]
-///     columns the table is refused ([`TableOutcome::TooWide`]). The column set
-///     is chosen by the query's `select`, not by `offset`, so a truncated-wide
-///     table is not recoverable by paging; the caller asks the agent to narrow
-///     `select` instead. Refusing at the first row also bounds the allocation
-///     before any row is materialized.
+///     distinct columns the table is refused ([`TableOutcome::TooWide`]). The
+///     column set is chosen by the query's `select`, not by `offset`, so a
+///     truncated-wide table is not recoverable by paging; the caller asks the
+///     agent to narrow `select`. Refusing at the first row also bounds the dense
+///     table before any row is materialized.
 ///   * **height** — rows past [`MAX_OQL_ROWS`] are not materialized and
 ///     `rows_truncated` is set, which the caller folds into `has_more` (a higher
 ///     `offset` DOES page these).
+///
+/// EVERY row's intermediate allocation is bounded to `O(columns)` too, not just
+/// the final table: a row is aligned by rendering ONLY the cells whose name is a
+/// known column (a `col_pos` lookup), so a reply with a narrow first row and a
+/// later row carrying tens of thousands of junk cells cannot force a large
+/// transient `Vec` before alignment. The per-cell scan is O(1)-space; a row's
+/// junk cells cost a lookup each but allocate nothing. (This keeps the bound
+/// local, rather than leaning on the decode quota to size intermediates.)
 ///
 /// Fail-closed: `None` (→ Unrecognized) if the value isn't a vec, if any row
 /// isn't a vec, or if the first row yields no named cells — so a malformed /
@@ -1276,6 +1284,10 @@ fn rows_to_table(rows_val: &IDLValue) -> Option<TableOutcome> {
         });
     }
     let mut columns: Vec<String> = Vec::new();
+    // Column name → its position in `columns` (first occurrence). Owned keys so
+    // the map does not borrow `columns` (which is moved into the result), and
+    // bounded to at most MAX_OQL_COLUMNS entries.
+    let mut col_pos: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut out_rows: Vec<Vec<String>> = Vec::new();
     let mut rows_truncated = false;
     for row in rows {
@@ -1287,41 +1299,60 @@ fn rows_to_table(rows_val: &IDLValue) -> Option<TableOutcome> {
         let IDLValue::Vec(cells) = row else {
             return None;
         };
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        for cell in cells {
-            if let IDLValue::Record(cf) = cell {
-                let name = match field_by_name(cf, "name") {
-                    Some(IDLValue::Text(s)) => s.clone(),
-                    _ => continue,
-                };
-                let value = field_by_name(cf, "value").map(cell_scalar).unwrap_or_default();
-                pairs.push((name, value));
-            }
-        }
+
         if columns.is_empty() {
-            if pairs.is_empty() {
+            // First row establishes the columns (distinct names, first-occurrence
+            // order). Count named cells with a plain counter — no allocation — so a
+            // too-wide row is detected without ever building a full-width `Vec`.
+            let mut named = 0usize;
+            let mut over_wide = false;
+            for cell in cells {
+                if let IDLValue::Record(cf) = cell {
+                    if let Some(IDLValue::Text(name)) = field_by_name(cf, "name") {
+                        named += 1;
+                        if !col_pos.contains_key(name.as_str()) {
+                            if columns.len() == MAX_OQL_COLUMNS {
+                                // A distinct name beyond the cap: refuse (keep
+                                // scanning only to count, `col_pos` stays capped).
+                                over_wide = true;
+                            } else {
+                                col_pos.insert(name.clone(), columns.len());
+                                columns.push(name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            if named == 0 {
                 // First row carried no named cells — not a recognizable OQL row.
                 return None;
             }
-            // Refuse a table wider than the cap rather than silently dropping
-            // columns: the dropped set is chosen by `select`, not `offset`, so
-            // paging can't recover it. Bailing here also bounds the dense
-            // allocation before any row is materialized.
-            if pairs.len() > MAX_OQL_COLUMNS {
-                return Some(TableOutcome::TooWide { column_count: pairs.len() });
+            if over_wide {
+                // Refuse rather than silently drop columns the query asked for; the
+                // dropped set is chosen by `select`, not `offset`, so paging can't
+                // recover it. `named` is the declared cell count (== column count
+                // for a well-formed reply with no duplicate names).
+                return Some(TableOutcome::TooWide { column_count: named });
             }
-            columns = pairs.iter().map(|(n, _)| n.clone()).collect();
         }
-        // Align this row to `columns` via a name→value map (first occurrence
-        // wins, matching a linear find) so wide tables stay O(cols), not O(cols²).
-        let mut by_name: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-        for (n, v) in &pairs {
-            by_name.entry(n.as_str()).or_insert(v.as_str());
+
+        // Align this row to `columns`, rendering ONLY cells whose name is a known
+        // column (first occurrence wins). Allocates O(columns), never O(cells).
+        let mut aligned = vec![String::new(); columns.len()];
+        let mut filled = vec![false; columns.len()];
+        for cell in cells {
+            if let IDLValue::Record(cf) = cell {
+                if let Some(IDLValue::Text(name)) = field_by_name(cf, "name") {
+                    if let Some(&pos) = col_pos.get(name.as_str()) {
+                        if !filled[pos] {
+                            filled[pos] = true;
+                            aligned[pos] =
+                                field_by_name(cf, "value").map(cell_scalar).unwrap_or_default();
+                        }
+                    }
+                }
+            }
         }
-        let aligned = columns
-            .iter()
-            .map(|c| by_name.get(c.as_str()).copied().unwrap_or("").to_string())
-            .collect();
         out_rows.push(aligned);
     }
     Some(TableOutcome::Table { columns, rows: out_rows, rows_truncated })
@@ -1931,6 +1962,80 @@ mod tests {
                 assert_eq!(rows.len(), MAX_OQL_ROWS);
             }
             other => panic!("expected a Table, got: {}", oql_variant_name(&other)),
+        }
+    }
+
+    // The column cap is EXCLUSIVE: exactly MAX_OQL_COLUMNS distinct columns is
+    // accepted; one more is refused. (Guards the `columns.len() == MAX_OQL_COLUMNS`
+    // boundary against an off-by-one.)
+    #[test]
+    fn rows_to_table_column_cap_is_exclusive() {
+        use super::{rows_to_table, TableOutcome, IDLValue, MAX_OQL_COLUMNS};
+
+        let row_of = |n: usize| {
+            IDLValue::Vec((0..n).map(|c| oql_cell(&format!("c{c}"), "x")).collect())
+        };
+
+        // Exactly at the cap → a normal table with all columns.
+        match rows_to_table(&IDLValue::Vec(vec![row_of(MAX_OQL_COLUMNS)])).expect("recognizable") {
+            TableOutcome::Table { columns, .. } => assert_eq!(columns.len(), MAX_OQL_COLUMNS),
+            TableOutcome::TooWide { .. } => panic!("exactly MAX_OQL_COLUMNS must be accepted"),
+        }
+        // One over the cap → refused.
+        match rows_to_table(&IDLValue::Vec(vec![row_of(MAX_OQL_COLUMNS + 1)])).expect("recognizable") {
+            TableOutcome::TooWide { column_count } => assert_eq!(column_count, MAX_OQL_COLUMNS + 1),
+            TableOutcome::Table { .. } => panic!("MAX_OQL_COLUMNS + 1 must be refused"),
+        }
+    }
+
+    // The row cap is EXCLUSIVE: exactly MAX_OQL_ROWS rows materialize and are NOT
+    // flagged; one more row is dropped and flags rows_truncated.
+    #[test]
+    fn rows_to_table_row_cap_is_exclusive() {
+        use super::{rows_to_table, TableOutcome, IDLValue, MAX_OQL_ROWS};
+
+        let rows_of = |n: usize| {
+            IDLValue::Vec((0..n).map(|_| IDLValue::Vec(vec![oql_cell("id", "x")])).collect())
+        };
+
+        match rows_to_table(&rows_of(MAX_OQL_ROWS)).expect("recognizable") {
+            TableOutcome::Table { rows, rows_truncated, .. } => {
+                assert_eq!(rows.len(), MAX_OQL_ROWS);
+                assert!(!rows_truncated, "exactly MAX_OQL_ROWS must not be flagged truncated");
+            }
+            TableOutcome::TooWide { .. } => panic!("a 1-column table is never too wide"),
+        }
+        match rows_to_table(&rows_of(MAX_OQL_ROWS + 1)).expect("recognizable") {
+            TableOutcome::Table { rows, rows_truncated, .. } => {
+                assert_eq!(rows.len(), MAX_OQL_ROWS, "the extra row is not materialized");
+                assert!(rows_truncated, "one row over the cap must flag truncation");
+            }
+            TableOutcome::TooWide { .. } => panic!("a 1-column table is never too wide"),
+        }
+    }
+
+    // A narrow first row followed by a row carrying a huge number of junk cells
+    // must NOT blow up intermediate allocation: only cells whose name matches an
+    // established column are rendered, so the wide junk row aligns to the 1-column
+    // set and its unknown cells are skipped (PR #136 review, r3803651957).
+    #[test]
+    fn rows_to_table_bounds_a_wide_later_row() {
+        use super::{rows_to_table, TableOutcome, IDLValue};
+
+        // Row 0 establishes a single column "id"; row 1 carries "id" plus 5_000
+        // junk cells with names that are NOT columns.
+        let first = IDLValue::Vec(vec![oql_cell("id", "1")]);
+        let mut wide_cells = vec![oql_cell("id", "2")];
+        wide_cells.extend((0..5_000).map(|j| oql_cell(&format!("junk{j}"), "z")));
+        let second = IDLValue::Vec(wide_cells);
+
+        match rows_to_table(&IDLValue::Vec(vec![first, second])).expect("recognizable") {
+            TableOutcome::Table { columns, rows, .. } => {
+                assert_eq!(columns, vec!["id".to_string()], "later row can't add columns");
+                assert_eq!(rows, vec![vec!["1".to_string()], vec!["2".to_string()]]);
+                assert!(rows.iter().all(|r| r.len() == 1), "junk cells dropped, width stays 1");
+            }
+            TableOutcome::TooWide { .. } => panic!("a 1-column table is never too wide"),
         }
     }
 
