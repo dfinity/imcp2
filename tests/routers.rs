@@ -281,8 +281,16 @@ async fn dynamic_client_registration_round_trips_and_persists() {
 
 /// Open DCR is unauthenticated, so a single `POST /oauth/register` must not be
 /// able to store an unbounded `redirect_uris` array (count or per-URI length):
-/// both are rejected with `invalid_redirect_uri` before anything is stored, and
-/// a normal small registration still succeeds (ICPBB-379).
+/// both are rejected with `invalid_redirect_uri` before anything is validated or
+/// stored, and — because the bounds run ahead of grant-type validation — an
+/// over-count array is still `invalid_redirect_uri` even when the same request
+/// also carries unsupported grant types (ICPBB-379).
+///
+/// Every assertion here is a REJECTION, which returns before the store is
+/// touched, so this test schedules no persistence write and cannot race the
+/// store-file assertions in `dynamic_client_registration_round_trips_and_persists`
+/// (which already covers the accepting path — a small loopback registration
+/// through these same caps).
 #[tokio::test]
 async fn registration_bounds_redirect_uris() {
     let app = app();
@@ -306,7 +314,7 @@ async fn registration_bounds_redirect_uris() {
 
     // Too many redirect_uris (all individually valid loopback URLs) — refused.
     let many: Vec<String> = (0..64).map(|i| format!("http://127.0.0.1:4321/cb{i}")).collect();
-    let body = serde_json::json!({ "redirect_uris": many }).to_string();
+    let body = serde_json::json!({ "redirect_uris": many.clone() }).to_string();
     let (status, doc) = register(body).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "an over-count array is refused");
     assert_eq!(doc["error"], "invalid_redirect_uri");
@@ -319,10 +327,20 @@ async fn registration_bounds_redirect_uris() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "an over-long uri is refused");
     assert_eq!(doc["error"], "invalid_redirect_uri");
 
-    // A normal, small registration is unaffected.
-    let (status, _doc) =
-        register(r#"{"redirect_uris":["http://127.0.0.1:4321/cb"]}"#.to_string()).await;
-    assert_eq!(status, StatusCode::CREATED, "a small registration still succeeds");
+    // Combined invalid input: an over-count array AND unsupported grant types.
+    // Because the redirect bounds run FIRST, the deterministic answer is
+    // `invalid_redirect_uri`, never `invalid_client_metadata` from the grant check.
+    let body = serde_json::json!({
+        "redirect_uris": many,
+        "grant_types": ["client_credentials"],
+    })
+    .to_string();
+    let (status, doc) = register(body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "combined-invalid input is refused");
+    assert_eq!(
+        doc["error"], "invalid_redirect_uri",
+        "redirect overflow must win over the grant-type error"
+    );
 }
 
 #[tokio::test]
