@@ -920,15 +920,19 @@ pub fn closest_entity(start: &str, entities: &[String]) -> Option<String> {
     }
     // Small edit distance, scaled to the shorter of the two names so short names
     // demand a tighter match. Pick the nearest; ties keep the first (schema order).
+    let lc_chars = lc.chars().count();
     let mut best: Option<(usize, &String)> = None;
     for e in entities {
         let el = e.to_lowercase();
         let bound = (lc.len().min(el.len()) / 3).clamp(1, 3);
-        // Edit distance is at least the length difference, so a name whose length
-        // differs from `start` by more than the bound can never qualify — skip the
-        // O(m·n) DP for it (this also caps a malicious schema's over-long entity
-        // name: it can't be within `bound` of a `<= MAX_FUZZY_NAME_LEN` start).
-        if lc.len().abs_diff(el.len()) > bound {
+        // Edit distance is at least the CHARACTER-length difference, so a name
+        // whose char count differs from `start` by more than the bound can never
+        // qualify — skip the O(m·n) DP for it (this also caps a malicious schema's
+        // over-long entity name: it can't be within `bound` of a start that passed
+        // the length cap). The difference must be counted in `char`s, not bytes:
+        // `levenshtein` works on `char`s, so a byte-length difference (inflated by
+        // multi-byte chars) would wrongly prune a genuine near-miss.
+        if lc_chars.abs_diff(el.chars().count()) > bound {
             continue;
         }
         let d = levenshtein(&lc, &el);
@@ -2000,10 +2004,21 @@ mod tests {
         // A start longer than the cap is not fuzzy-matched (no near-miss possible).
         let huge = "u".repeat(MAX_FUZZY_NAME_LEN + 1);
         assert_eq!(closest_entity(&huge, &entities), None);
-        // Right at the cap, a genuine near-miss would still be considered; make it
-        // clearly not close so the answer is None either way (bounds, not behavior).
-        let capped = "z".repeat(MAX_FUZZY_NAME_LEN);
-        assert_eq!(closest_entity(&capped, &entities), None);
+
+        // The cap is INCLUSIVE: a genuine near-miss whose length is EXACTLY the cap
+        // is still repaired. This pins the boundary — flipping the guard to
+        // `>= MAX_FUZZY_NAME_LEN` would drop this suggestion and fail the test.
+        let at_cap_entity = "a".repeat(MAX_FUZZY_NAME_LEN); // len == cap
+        let at_cap_typo = format!("{}b", "a".repeat(MAX_FUZZY_NAME_LEN - 1)); // one edit away, len == cap
+        assert_eq!(
+            closest_entity(&at_cap_typo, &[at_cap_entity.clone()]).as_deref(),
+            Some(at_cap_entity.as_str()),
+            "a near-miss exactly at the cap length must still be suggested"
+        );
+        // One char OVER the cap: the same near-miss is dropped (fuzzy phase skipped).
+        let over_cap_typo = format!("{}b", "a".repeat(MAX_FUZZY_NAME_LEN));
+        let over_cap_entity = "a".repeat(MAX_FUZZY_NAME_LEN + 1);
+        assert_eq!(closest_entity(&over_cap_typo, &[over_cap_entity]), None);
 
         // Exact and plural repairs bypass the DP, so length never blocks them: a
         // huge entity name still matches its exact/plural `start`.
@@ -2011,6 +2026,15 @@ mod tests {
         let big = vec![long_entity.clone()];
         assert_eq!(closest_entity(&long_entity, &big).as_deref(), Some(long_entity.as_str()));
         assert_eq!(closest_entity(&format!("{long_entity}s"), &big).as_deref(), Some(long_entity.as_str()));
+
+        // Unicode: the length-difference pruning counts chars, not bytes, so a
+        // multi-byte near-miss (1 edit) is NOT wrongly pruned by a larger byte diff.
+        let unicode_entities = vec!["abcde\u{1F4A9}".to_string()]; // 6 chars, 9 bytes
+        assert_eq!(
+            closest_entity("abcdeX", &unicode_entities).as_deref(), // 6 chars, 6 bytes; 1 edit away
+            Some("abcde\u{1F4A9}"),
+            "a 1-char edit must survive pruning even when the byte-length diff exceeds the bound"
+        );
     }
 
     // #8: one COMPLETE canister_query per entity, each preserving the identity the
