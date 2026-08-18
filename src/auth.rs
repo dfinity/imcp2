@@ -1214,12 +1214,18 @@ fn redirect_302(url: &str) -> Response {
     resp
 }
 
-fn build_redirect(redirect_uri: &str, code: &str, client_state: &str) -> String {
+fn build_redirect(redirect_uri: &str, code: &str, client_state: &str, iss: &str) -> String {
     let sep = if redirect_uri.contains('?') { '&' } else { '?' };
     let mut r = format!("{redirect_uri}{sep}code={}", urlencoding::encode(code));
     if !client_state.is_empty() {
         r.push_str(&format!("&state={}", urlencoding::encode(client_state)));
     }
+    // RFC 9207: name the issuer on the authorization response so the client can
+    // detect an authorization-server mix-up before redeeming the code. Emitted on
+    // every success redirect and advertised via
+    // `authorization_response_iss_parameter_supported` in the AS metadata; the value
+    // is byte-for-byte the metadata `issuer` (clients compare it by exact string).
+    r.push_str(&format!("&iss={}", urlencoding::encode(iss)));
     r
 }
 
@@ -1821,9 +1827,12 @@ pub async fn connect_redeem(
             "This sign-in started in a different browser. Restart from your client.",
         );
     }
+    // Issuer for the RFC 9207 `iss` on every redirect below (byte-identical to the
+    // AS metadata `issuer`).
+    let iss = store.issuer();
     // Idempotent: if a code was already minted for this connect, return it again.
     if let Some(code) = existing_code {
-        return Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state) })).into_response();
+        return Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) })).into_response();
     }
     // Decode the fragment delegation (agent-js DelegationChain JSON, II #4093)
     // before claiming, so a malformed delivery never occupies the single-flight
@@ -1839,7 +1848,7 @@ pub async fn connect_redeem(
     match claim_redemption(&store, &body.state).await {
         RedeemClaim::Claimed => {}
         RedeemClaim::Existing(code) => {
-            return Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state) }))
+            return Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) }))
                 .into_response()
         }
         RedeemClaim::InProgress => {
@@ -1903,7 +1912,7 @@ pub async fn connect_redeem(
         );
     }
     tracing::info!(session_id = %body.state, "grant confirmed via registration delegation; issued authorization code");
-    Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state) })).into_response()
+    Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) })).into_response()
 }
 
 /// Escape a string for embedding inside a double-quoted JS string literal.
@@ -2178,6 +2187,10 @@ pub async fn authorization_server_metadata(State(store): State<AuthStore>) -> Re
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
+        // RFC 9207: we emit `iss` on every authorization response, so we MUST
+        // advertise it here (a client that sees this flag rejects any response
+        // missing `iss`). See `build_redirect`.
+        "authorization_response_iss_parameter_supported": true,
     }))
     .into_response()
 }
@@ -2624,12 +2637,18 @@ mod tests {
     }
 
     #[test]
-    fn build_redirect_encodes_code_and_state() {
-        let r = build_redirect("https://claude.ai/cb", "mcp-code-1", "abc/def");
-        assert_eq!(r, "https://claude.ai/cb?code=mcp-code-1&state=abc%2Fdef");
-        // Appends with & when the redirect already has a query.
-        let r2 = build_redirect("https://x.test/cb?foo=1", "c", "");
-        assert_eq!(r2, "https://x.test/cb?foo=1&code=c");
+    fn build_redirect_encodes_code_state_and_iss() {
+        let iss = "https://mcp.example/mcp";
+        let r = build_redirect("https://claude.ai/cb", "mcp-code-1", "abc/def", iss);
+        // code, then state (when present), then the RFC 9207 iss, all percent-encoded.
+        assert_eq!(
+            r,
+            "https://claude.ai/cb?code=mcp-code-1&state=abc%2Fdef&iss=https%3A%2F%2Fmcp.example%2Fmcp"
+        );
+        // Appends with & when the redirect already has a query; iss is present even
+        // when the client sent no state.
+        let r2 = build_redirect("https://x.test/cb?foo=1", "c", "", iss);
+        assert_eq!(r2, "https://x.test/cb?foo=1&code=c&iss=https%3A%2F%2Fmcp.example%2Fmcp");
     }
 
     // Build an AuthStore over a dummy II instance (these tests never hit the
