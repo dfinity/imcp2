@@ -1,6 +1,7 @@
-//! Prometheus instrumentation, usable from the library rather than only from
-//! the bundled binary. Uses the `prometheus` crate at the version `dfinity/ic`
-//! pins, so these series land in the same clusters without a second dialect.
+//! Prometheus instrumentation, usable by embedders as well as by the bundled
+//! binary — it exports the [`Metrics`] handle and the two request middlewares.
+//! Uses the `prometheus` crate at the version `dfinity/ic` pins, so these
+//! series land in the same clusters without a second dialect.
 //!
 //! The registry belongs to the caller: [`Metrics::new`] registers into a
 //! [`Registry`] you supply and keeps none of its own. Exposition is the
@@ -286,7 +287,8 @@ pub async fn write_request_logs(req: Request, next: Next) -> Response {
     resp
 }
 
-/// The `route` label: the matched route template, or [`UNMATCHED_ROUTE`].
+/// The `route` label: the matched route template, or the shared `other`
+/// bucket when nothing matched.
 pub fn route_label(matched: Option<&str>) -> &str {
     match matched {
         Some(t) if !t.is_empty() => t,
@@ -294,7 +296,8 @@ pub fn route_label(matched: Option<&str>) -> &str {
     }
 }
 
-/// The `method` label: the method when standard, otherwise [`UNKNOWN_METHOD`].
+/// The `method` label: the method when standard, otherwise the shared `other`
+/// bucket.
 /// Returns `&'static str` so a borrowed request value cannot pass through.
 pub fn method_label(method: &str) -> &'static str {
     match KNOWN_METHODS.iter().position(|m| *m == method) {

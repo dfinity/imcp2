@@ -165,7 +165,7 @@ const READ_ONLY_MSG: &str = "This Internet Identity session was authorized for \
 pub struct IiInstance {
     /// Short name for logging ("beta", "prod").
     pub name: &'static str,
-    /// Origin of the II instance (no trailing slash), e.g. "https://beta.id.ai".
+    /// Origin of the II instance (no trailing slash), e.g. <https://beta.id.ai>.
     pub ii_url: String,
     /// Canister id of that II instance — the target of the `mcp_*` calls.
     pub ii_canister: Principal,
@@ -226,13 +226,14 @@ fn now_ns() -> u64 {
 const ACTIVE_SESSION_WINDOW_NS: u64 = 15 * 60 * 1_000_000_000;
 
 /// The two `/version` session gauges, returned together by
-/// [`Identities::session_gauges`] so a scrape locks and iterates the session map
-/// once and reports a consistent `active <= live` pair.
+/// [`McpServer::session_gauges`](crate::McpServer::session_gauges) so a scrape
+/// locks and iterates the session map once and reports a consistent
+/// `active <= live` pair.
 #[derive(Debug, Clone, Copy)]
 pub struct SessionGauges {
     /// Sessions holding a currently-valid II grant (the `live_sessions` gauge).
     pub live: usize,
-    /// The subset also active within [`ACTIVE_SESSION_WINDOW_NS`] (the
+    /// The subset also active within the last 15 minutes (the
     /// `active_sessions` gauge). Always `<= live`.
     pub active: usize,
 }

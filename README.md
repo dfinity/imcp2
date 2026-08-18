@@ -10,6 +10,14 @@ encoding/decoding and signing against the IC via
 
 ## Use as a library
 
+Published on [crates.io](https://crates.io/crates/imcp2), API docs on
+[docs.rs](https://docs.rs/imcp2):
+
+```toml
+[dependencies]
+imcp2 = "0.1"
+```
+
 One `McpServer` serves one Internet Identity instance as two
 [`axum`](https://github.com/tokio-rs/axum) routers:
 

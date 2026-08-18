@@ -70,9 +70,9 @@
 
 mod auth;
 mod calls;
-/// Prometheus instrumentation, usable by embedders as well as by the bundled
-/// binary. Exports the [`metrics::Metrics`] handle and the two request
-/// middlewares.
+// Docs live in the module itself (`//!` in src/metrics.rs): an outer doc
+// comment here would resolve its intra-doc links in *this* scope rather than
+// the module's, silently breaking the links to `Registry` and `MatchedPath`.
 pub mod metrics;
 mod discover;
 mod identities;
@@ -395,9 +395,9 @@ impl McpServer {
         });
     }
 
-    /// This instance's live/active session gauges (see
-    /// [`identities::Identities::session_gauges`]) — for a deployment's
-    /// `/version`-style observability probe.
+    /// This instance's live/active session gauges ([`SessionGauges`]) — for a
+    /// deployment's `/version`-style observability probe. One pass over the
+    /// session map, so the pair is consistent.
     pub async fn session_gauges(&self) -> SessionGauges {
         self.identities.session_gauges().await
     }
