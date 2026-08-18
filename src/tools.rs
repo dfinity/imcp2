@@ -750,6 +750,19 @@ impl IcTools {
                 }
                 Ok(err(text))
             }
+            calls::OqlResult::TooManyColumns { column_count } => {
+                // The reply's first row was wider than the tool will densify. This
+                // is NOT pageable (paging raises `offset`, which returns more rows,
+                // not fewer columns), so give the actionable fix — narrow `select`
+                // — rather than a `has_more` that would loop the agent forever.
+                Ok(err(format!(
+                    "This OQL result has {column_count} columns, more than the \
+                     {max} this tool returns. Narrow the query's `select` to the \
+                     columns you need and re-query. (Paging with a higher `offset` \
+                     won't help — `offset` returns more rows, not fewer columns.)",
+                    max = calls::MAX_OQL_COLUMNS,
+                )))
+            }
             calls::OqlResult::Unrecognized(raw) => {
                 // Not a recognizable OQL result — hand back the raw decoded reply so
                 // the model still has the data. Carry a `note` (rather than null) so a

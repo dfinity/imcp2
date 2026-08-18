@@ -850,6 +850,18 @@ pub fn oql_query_redirect(did: Option<&str>) -> Option<String> {
 /// otherwise bloat the reply.
 pub(crate) const MAX_OQL_ENTITIES: usize = 40;
 
+/// Widest and tallest table [`rows_to_table`] will materialize from a reply
+/// before it signals truncation (folded into `has_more`). Their product bounds
+/// the dense `Vec<Vec<String>>` it builds: without a cap, a compact reply whose
+/// first row declares tens of thousands of columns and that then carries
+/// thousands of (even empty) rows densifies to `cols × rows` owned `String`s —
+/// hundreds of MB out of an ~80 KB reply (ICPBB-384/385). The decode quota
+/// (#132) does not catch this: the decoded tree stays small; the blow-up is in
+/// OUR alignment loop, not candid's decoder. Real OQL pages are far smaller; a
+/// larger result set is paged through `has_more` + offset, not widened here.
+pub(crate) const MAX_OQL_COLUMNS: usize = 256;
+pub(crate) const MAX_OQL_ROWS: usize = 1_000;
+
 /// The #1 remediation note for a per-app read that came back EMPTY while
 /// ANONYMOUS. Empty almost always means "not authenticated as your account", not
 /// "no data", because the canister gates data by caller principal. `what` names
@@ -1088,9 +1100,31 @@ pub enum OqlResult {
     },
     /// The canister returned its error arm (e.g. `variant { err = "…" }`).
     QueryError(String),
+    /// The reply's first row declared MORE than [`MAX_OQL_COLUMNS`] columns, so we
+    /// refuse to densify a table that wide (unbounded `cols × rows` allocation,
+    /// ICPBB-384/385). Distinct from row truncation on purpose: the dropped
+    /// columns are chosen by the query's `select`, not by `offset`, so this is NOT
+    /// pageable and must never be surfaced as `has_more`. The caller turns it into
+    /// guidance to narrow `select`. Carries the actual column count for that hint.
+    TooManyColumns { column_count: usize },
     /// The reply didn't match a recognizable OQL result shape; carries the raw
     /// decoded textual Candid so the caller can still surface the data.
     Unrecognized(String),
+}
+
+/// What [`rows_to_table`] made of a `rows : vec vec Cell` value. Keeps the two
+/// truncation reasons apart so the caller can treat them differently: only ROW
+/// truncation is pageable (→ `has_more`); a too-wide first row is refused.
+enum TableOutcome {
+    /// A densified table (at most [`MAX_OQL_ROWS`] rows). `rows_truncated` is true
+    /// when rows past the cap were dropped — recoverable via a higher `offset`.
+    Table {
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+        rows_truncated: bool,
+    },
+    /// The first row declared `column_count` (> [`MAX_OQL_COLUMNS`]) columns.
+    TooWide { column_count: usize },
 }
 
 /// Decode an `execute` reply into a table. `did` (the canister interface) is used
@@ -1200,12 +1234,21 @@ fn extract_oql(val: &IDLValue) -> Option<OqlResult> {
         IDLValue::Record(fields) => {
             let rows_val = field_by_name(fields, "rows")?;
             let has_more = matches!(field_by_name(fields, "hasMore"), Some(IDLValue::Bool(true)));
-            let (columns, rows) = rows_to_table(rows_val)?;
-            Some(OqlResult::Table {
-                columns,
-                rows,
-                has_more,
-            })
+            match rows_to_table(rows_val)? {
+                TableOutcome::Table { columns, rows, rows_truncated } => Some(OqlResult::Table {
+                    columns,
+                    rows,
+                    // Only ROW truncation is pageable, so only it may raise
+                    // `has_more` (whose contract is "more rows — page with a higher
+                    // `offset`"). Column truncation becomes TooManyColumns below:
+                    // paging can't recover dropped columns, so conflating it with
+                    // `has_more` would loop the agent forever on a wide final page.
+                    has_more: has_more || rows_truncated,
+                }),
+                TableOutcome::TooWide { column_count } => {
+                    Some(OqlResult::TooManyColumns { column_count })
+                }
+            }
         }
         IDLValue::Variant(var) => {
             let arm = &var.0;
@@ -1226,59 +1269,121 @@ fn extract_oql(val: &IDLValue) -> Option<OqlResult> {
     }
 }
 
-/// Turn the `rows : vec vec Cell` value into (columns, string rows). Columns are
-/// taken from the first row's cell names; every row is then aligned to them by
+/// Turn the `rows : vec vec Cell` value into a [`TableOutcome`]. The column set
+/// is the first row's distinct cell names; every row is then aligned to it by
 /// name (per the primer: read cells by name, never by position).
+///
+/// Two independent bounds cap the dense `cols × rows` allocation an
+/// attacker-controlled reply could otherwise force (ICPBB-384/385), reported
+/// SEPARATELY because they page differently:
+///
+///   * **width** — if the first row declares more than [`MAX_OQL_COLUMNS`]
+///     distinct columns the table is refused ([`TableOutcome::TooWide`]). The
+///     column set is chosen by the query's `select`, not by `offset`, so a
+///     truncated-wide table is not recoverable by paging; the caller asks the
+///     agent to narrow `select`. Refusing at the first row also bounds the dense
+///     table before any row is materialized.
+///   * **height** — rows past [`MAX_OQL_ROWS`] are not materialized and
+///     `rows_truncated` is set, which the caller folds into `has_more` (a higher
+///     `offset` DOES page these).
+///
+/// EVERY row's intermediate allocation is bounded to `O(columns)` too, not just
+/// the final table: a row is aligned by rendering ONLY the cells whose name is a
+/// known column (a `col_pos` lookup), so a reply with a narrow first row and a
+/// later row carrying tens of thousands of junk cells cannot force a large
+/// transient `Vec` before alignment. The per-cell scan is O(1)-space; a row's
+/// junk cells cost a lookup each but allocate nothing. (This keeps the bound
+/// local, rather than leaning on the decode quota to size intermediates.)
 ///
 /// Fail-closed: `None` (→ Unrecognized) if the value isn't a vec, if any row
 /// isn't a vec, or if the first row yields no named cells — so a malformed /
 /// non-OQL reply degrades to the raw Candid rather than a bogus "0 columns"
 /// table. An empty `rows` (a query that matched nothing) is the one legitimate
 /// zero-column case and returns an empty table.
-fn rows_to_table(rows_val: &IDLValue) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+fn rows_to_table(rows_val: &IDLValue) -> Option<TableOutcome> {
     let IDLValue::Vec(rows) = rows_val else {
         return None;
     };
     if rows.is_empty() {
-        return Some((Vec::new(), Vec::new()));
+        return Some(TableOutcome::Table {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            rows_truncated: false,
+        });
     }
     let mut columns: Vec<String> = Vec::new();
+    // Column name → its position in `columns` (first occurrence). Owned keys so
+    // the map does not borrow `columns` (which is moved into the result), and
+    // bounded to at most MAX_OQL_COLUMNS entries.
+    let mut col_pos: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut out_rows: Vec<Vec<String>> = Vec::new();
+    let mut rows_truncated = false;
     for row in rows {
+        // Stop materializing once the row cap is hit; the remainder is `has_more`.
+        if out_rows.len() >= MAX_OQL_ROWS {
+            rows_truncated = true;
+            break;
+        }
         let IDLValue::Vec(cells) = row else {
             return None;
         };
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        for cell in cells {
-            if let IDLValue::Record(cf) = cell {
-                let name = match field_by_name(cf, "name") {
-                    Some(IDLValue::Text(s)) => s.clone(),
-                    _ => continue,
-                };
-                let value = field_by_name(cf, "value").map(cell_scalar).unwrap_or_default();
-                pairs.push((name, value));
-            }
-        }
+
         if columns.is_empty() {
-            if pairs.is_empty() {
+            // First row establishes the columns (distinct names, first-occurrence
+            // order). Count named cells with a plain counter — no allocation — so a
+            // too-wide row is detected without ever building a full-width `Vec`.
+            let mut named = 0usize;
+            let mut over_wide = false;
+            for cell in cells {
+                if let IDLValue::Record(cf) = cell {
+                    if let Some(IDLValue::Text(name)) = field_by_name(cf, "name") {
+                        named += 1;
+                        if !col_pos.contains_key(name.as_str()) {
+                            if columns.len() == MAX_OQL_COLUMNS {
+                                // A distinct name beyond the cap: refuse (keep
+                                // scanning only to count, `col_pos` stays capped).
+                                over_wide = true;
+                            } else {
+                                col_pos.insert(name.clone(), columns.len());
+                                columns.push(name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            if named == 0 {
                 // First row carried no named cells — not a recognizable OQL row.
                 return None;
             }
-            columns = pairs.iter().map(|(n, _)| n.clone()).collect();
+            if over_wide {
+                // Refuse rather than silently drop columns the query asked for; the
+                // dropped set is chosen by `select`, not `offset`, so paging can't
+                // recover it. `named` is the declared cell count (== column count
+                // for a well-formed reply with no duplicate names).
+                return Some(TableOutcome::TooWide { column_count: named });
+            }
         }
-        // Align this row to `columns` via a name→value map (first occurrence
-        // wins, matching a linear find) so wide tables stay O(cols), not O(cols²).
-        let mut by_name: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-        for (n, v) in &pairs {
-            by_name.entry(n.as_str()).or_insert(v.as_str());
+
+        // Align this row to `columns`, rendering ONLY cells whose name is a known
+        // column (first occurrence wins). Allocates O(columns), never O(cells).
+        let mut aligned = vec![String::new(); columns.len()];
+        let mut filled = vec![false; columns.len()];
+        for cell in cells {
+            if let IDLValue::Record(cf) = cell {
+                if let Some(IDLValue::Text(name)) = field_by_name(cf, "name") {
+                    if let Some(&pos) = col_pos.get(name.as_str()) {
+                        if !filled[pos] {
+                            filled[pos] = true;
+                            aligned[pos] =
+                                field_by_name(cf, "value").map(cell_scalar).unwrap_or_default();
+                        }
+                    }
+                }
+            }
         }
-        let aligned = columns
-            .iter()
-            .map(|c| by_name.get(c.as_str()).copied().unwrap_or("").to_string())
-            .collect();
         out_rows.push(aligned);
     }
-    Some((columns, out_rows))
+    Some(TableOutcome::Table { columns, rows: out_rows, rows_truncated })
 }
 
 /// Render one OQL cell value as a scalar string. Cell values are wrapped in a
@@ -1822,6 +1927,183 @@ mod tests {
                 assert!(columns.is_empty() && rows.is_empty() && !has_more, "empty result is a 0-row table");
             }
             _ => panic!("empty rows should be a Table, not an error/Unrecognized"),
+        }
+    }
+
+    /// One named `record { name; value }` OQL cell.
+    #[cfg(test)]
+    fn oql_cell(name: &str, val: &str) -> super::IDLValue {
+        use super::{IDLField, IDLValue, Label};
+        IDLValue::Record(vec![
+            IDLField { id: Label::Named("name".into()), val: IDLValue::Text(name.into()) },
+            IDLField { id: Label::Named("value".into()), val: IDLValue::Text(val.into()) },
+        ])
+    }
+
+    /// Wrap a `rows : vec vec Cell` value in the `record { hasMore; rows }` shape
+    /// that `extract_oql` recognizes, with the given `hasMore`.
+    #[cfg(test)]
+    fn oql_record(rows: Vec<super::IDLValue>, has_more: bool) -> super::IDLValue {
+        use super::{IDLField, IDLValue, Label};
+        IDLValue::Record(vec![
+            IDLField { id: Label::Named("hasMore".into()), val: IDLValue::Bool(has_more) },
+            IDLField { id: Label::Named("rows".into()), val: IDLValue::Vec(rows) },
+        ])
+    }
+
+    // A first row wider than MAX_OQL_COLUMNS is REFUSED, not truncated: the
+    // dropped columns are chosen by `select`, not `offset`, so a truncated-wide
+    // table can't be paged. `rows_to_table` reports it as TooWide and `extract_oql`
+    // maps that to TooManyColumns — crucially NOT to a `has_more` table, which
+    // would loop the agent forever (ICPBB-384/385 + PR #136 review).
+    #[test]
+    fn rows_to_table_refuses_a_too_wide_first_row() {
+        use super::{extract_oql, rows_to_table, OqlResult, TableOutcome, IDLValue, MAX_OQL_COLUMNS};
+
+        let wide: Vec<IDLValue> = (0..MAX_OQL_COLUMNS + 44)
+            .map(|c| oql_cell(&format!("c{c}"), "x"))
+            .collect();
+        let width = wide.len();
+        // Extra rows after the wide first row must NOT flip this into a row-paged
+        // table: width is decided at the first row, before any row is materialized.
+        let mut rows: Vec<IDLValue> = vec![IDLValue::Vec(wide)];
+        rows.extend((0..5).map(|_| IDLValue::Vec(Vec::new())));
+
+        match rows_to_table(&IDLValue::Vec(rows.clone())).expect("recognizable") {
+            TableOutcome::TooWide { column_count } => assert_eq!(column_count, width),
+            TableOutcome::Table { .. } => panic!("an over-wide first row must be refused, not capped"),
+        }
+
+        // Through the public mapping: TooManyColumns, and never a has_more table.
+        match extract_oql(&oql_record(rows, false)).expect("recognizable") {
+            OqlResult::TooManyColumns { column_count } => assert_eq!(column_count, width),
+            other => panic!("expected TooManyColumns, got a different arm: {}", oql_variant_name(&other)),
+        }
+    }
+
+    // A NARROW reply taller than MAX_OQL_ROWS is capped to the row limit and
+    // reports the remainder as `has_more` (a higher `offset` DOES page these),
+    // even when the canister itself said hasMore = false.
+    #[test]
+    fn rows_to_table_caps_tall_replies_as_pageable() {
+        use super::{extract_oql, rows_to_table, OqlResult, TableOutcome, IDLValue, MAX_OQL_ROWS};
+
+        // Two columns (well within the width cap), MAX_OQL_ROWS + 100 rows.
+        let make_rows = || {
+            (0..MAX_OQL_ROWS + 100)
+                .map(|r| {
+                    IDLValue::Vec(vec![
+                        oql_cell("id", &format!("{r}")),
+                        oql_cell("name", "x"),
+                    ])
+                })
+                .collect::<Vec<_>>()
+        };
+
+        match rows_to_table(&IDLValue::Vec(make_rows())).expect("recognizable") {
+            TableOutcome::Table { columns, rows, rows_truncated } => {
+                assert_eq!(columns, vec!["id".to_string(), "name".to_string()]);
+                assert_eq!(rows.len(), MAX_OQL_ROWS, "materialized rows capped");
+                assert!(rows_truncated, "dropped rows must be flagged");
+                assert!(rows.iter().all(|r| r.len() == 2), "no ragged rows");
+            }
+            TableOutcome::TooWide { .. } => panic!("a narrow reply must not be refused"),
+        }
+
+        // The canister said hasMore = false, but we dropped rows, so the mapping
+        // must still report has_more = true (offset paging recovers them).
+        match extract_oql(&oql_record(make_rows(), false)).expect("recognizable") {
+            OqlResult::Table { has_more, rows, .. } => {
+                assert!(has_more, "row truncation must raise has_more even over canister's false");
+                assert_eq!(rows.len(), MAX_OQL_ROWS);
+            }
+            other => panic!("expected a Table, got: {}", oql_variant_name(&other)),
+        }
+    }
+
+    // The column cap is EXCLUSIVE: exactly MAX_OQL_COLUMNS distinct columns is
+    // accepted; one more is refused. (Guards the `columns.len() == MAX_OQL_COLUMNS`
+    // boundary against an off-by-one.)
+    #[test]
+    fn rows_to_table_column_cap_is_exclusive() {
+        use super::{rows_to_table, TableOutcome, IDLValue, MAX_OQL_COLUMNS};
+
+        let row_of = |n: usize| {
+            IDLValue::Vec((0..n).map(|c| oql_cell(&format!("c{c}"), "x")).collect())
+        };
+
+        // Exactly at the cap → a normal table with all columns.
+        match rows_to_table(&IDLValue::Vec(vec![row_of(MAX_OQL_COLUMNS)])).expect("recognizable") {
+            TableOutcome::Table { columns, .. } => assert_eq!(columns.len(), MAX_OQL_COLUMNS),
+            TableOutcome::TooWide { .. } => panic!("exactly MAX_OQL_COLUMNS must be accepted"),
+        }
+        // One over the cap → refused.
+        match rows_to_table(&IDLValue::Vec(vec![row_of(MAX_OQL_COLUMNS + 1)])).expect("recognizable") {
+            TableOutcome::TooWide { column_count } => assert_eq!(column_count, MAX_OQL_COLUMNS + 1),
+            TableOutcome::Table { .. } => panic!("MAX_OQL_COLUMNS + 1 must be refused"),
+        }
+    }
+
+    // The row cap is EXCLUSIVE: exactly MAX_OQL_ROWS rows materialize and are NOT
+    // flagged; one more row is dropped and flags rows_truncated.
+    #[test]
+    fn rows_to_table_row_cap_is_exclusive() {
+        use super::{rows_to_table, TableOutcome, IDLValue, MAX_OQL_ROWS};
+
+        let rows_of = |n: usize| {
+            IDLValue::Vec((0..n).map(|_| IDLValue::Vec(vec![oql_cell("id", "x")])).collect())
+        };
+
+        match rows_to_table(&rows_of(MAX_OQL_ROWS)).expect("recognizable") {
+            TableOutcome::Table { rows, rows_truncated, .. } => {
+                assert_eq!(rows.len(), MAX_OQL_ROWS);
+                assert!(!rows_truncated, "exactly MAX_OQL_ROWS must not be flagged truncated");
+            }
+            TableOutcome::TooWide { .. } => panic!("a 1-column table is never too wide"),
+        }
+        match rows_to_table(&rows_of(MAX_OQL_ROWS + 1)).expect("recognizable") {
+            TableOutcome::Table { rows, rows_truncated, .. } => {
+                assert_eq!(rows.len(), MAX_OQL_ROWS, "the extra row is not materialized");
+                assert!(rows_truncated, "one row over the cap must flag truncation");
+            }
+            TableOutcome::TooWide { .. } => panic!("a 1-column table is never too wide"),
+        }
+    }
+
+    // A narrow first row followed by a row carrying a huge number of junk cells
+    // must NOT blow up intermediate allocation: only cells whose name matches an
+    // established column are rendered, so the wide junk row aligns to the 1-column
+    // set and its unknown cells are skipped (PR #136 review, r3803651957).
+    #[test]
+    fn rows_to_table_bounds_a_wide_later_row() {
+        use super::{rows_to_table, TableOutcome, IDLValue};
+
+        // Row 0 establishes a single column "id"; row 1 carries "id" plus 5_000
+        // junk cells with names that are NOT columns.
+        let first = IDLValue::Vec(vec![oql_cell("id", "1")]);
+        let mut wide_cells = vec![oql_cell("id", "2")];
+        wide_cells.extend((0..5_000).map(|j| oql_cell(&format!("junk{j}"), "z")));
+        let second = IDLValue::Vec(wide_cells);
+
+        match rows_to_table(&IDLValue::Vec(vec![first, second])).expect("recognizable") {
+            TableOutcome::Table { columns, rows, .. } => {
+                assert_eq!(columns, vec!["id".to_string()], "later row can't add columns");
+                assert_eq!(rows, vec![vec!["1".to_string()], vec!["2".to_string()]]);
+                assert!(rows.iter().all(|r| r.len() == 1), "junk cells dropped, width stays 1");
+            }
+            TableOutcome::TooWide { .. } => panic!("a 1-column table is never too wide"),
+        }
+    }
+
+    /// Name of an `OqlResult` arm, for assertion failure messages.
+    #[cfg(test)]
+    fn oql_variant_name(r: &super::OqlResult) -> &'static str {
+        use super::OqlResult::*;
+        match r {
+            Table { .. } => "Table",
+            QueryError(_) => "QueryError",
+            TooManyColumns { .. } => "TooManyColumns",
+            Unrecognized(_) => "Unrecognized",
         }
     }
 
