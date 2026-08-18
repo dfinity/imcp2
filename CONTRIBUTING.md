@@ -77,6 +77,29 @@ instructions.
 5. A maintainer will review. Address feedback by pushing follow-up commits to
    the same branch.
 
+## Releasing to crates.io
+
+`imcp2` is published as a library crate. Releases are cut from a version tag:
+bump `version` in `Cargo.toml`, land that on `main`, then tag that commit and
+push the tag.
+
+```sh
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+`.github/workflows/publish-crate.yml` takes it from there — it checks the tag
+against `Cargo.toml`, runs the suite, and publishes. It authenticates with
+crates.io [trusted publishing](https://crates.io/docs/trusted-publishing)
+(short-lived OIDC credentials), so there is no crates.io token in this
+repository's secrets and none should be added. The workflow header documents
+the one-time crates.io configuration it depends on.
+
+Note that `v*` tags are for crate releases only; production rollouts are cut
+separately with `release-*` tags (see `.github/workflows/deploy-release.yml`).
+A crates.io release is permanent — a bad one can only be yanked, and a version
+number can never be reused — so the fix for a bad release is a new version.
+
 ## Coding guidelines
 
 - Match the style of the surrounding code; keep the tree `rustfmt`-clean and

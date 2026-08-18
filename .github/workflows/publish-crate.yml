@@ -1,0 +1,113 @@
+# Publish the crate to crates.io from a version tag.
+#
+# Every `v*` tag pushed to this repository publishes that exact commit to
+# crates.io. Deliberately a different prefix from `release-*` (deploy-release.yml,
+# which ships the production host): a library release and a production rollout are
+# separate events and should not be forced to happen together.
+#
+# Cutting a crate release:
+#   # bump `version` in Cargo.toml, land it on main, then from that commit:
+#   git tag v0.1.1
+#   git push origin v0.1.1
+#
+# The tag must match Cargo.toml's `version` exactly — the guard below fails the run
+# rather than publishing a version nobody can find by tag. There is no rollback:
+# crates.io releases are permanent and a bad one can only be yanked (`cargo yank
+# --version X.Y.Z`), which hides it from new dependency resolution but leaves it
+# downloadable for anyone whose lockfile already pins it. The fix for a bad release
+# is a new version, never a re-publish of the old one.
+#
+# AUTHENTICATION IS TRUSTED PUBLISHING (OIDC) — there is no crates.io token in this
+# repository's secrets, and there should not be one. The job asks GitHub for a
+# short-lived OIDC token, crates.io exchanges it for an access token good for ~30
+# minutes, and the action revokes that token in its post step. A leaked repository
+# secret would be a standing publish credential; this is not.
+#
+# One-time setup on crates.io (crate -> Settings -> Trusted Publishing -> Add):
+#   Repository owner   dfinity
+#   Repository name    imcp2
+#   Workflow filename  publish-crate.yml   <- this file's name; renaming it breaks
+#                                             publishing until the config is updated
+#   Environment name   release             <- must match the `environment:` below,
+#                                             or be left blank to accept any
+# A trusted publisher can only be configured on a crate that already exists, so the
+# FIRST release (0.1.0) has to be published by hand — `cargo publish --locked` with
+# a personal token — and every release after it goes through this workflow.
+name: Publish crate
+
+on:
+  push:
+    tags: ['v*']
+
+# Never publish two versions concurrently, and never cancel one half-way: a
+# cancelled `cargo publish` can leave crates.io holding a version this repository
+# has no record of shipping.
+concurrency:
+  group: publish-crate
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    # Names the deployment target for the OIDC token's `environment` claim, which
+    # crates.io checks against the trusted-publisher configuration. GitHub creates
+    # the environment on first use; adding required reviewers or a branch rule to
+    # it in Settings -> Environments then gates publishing without touching this
+    # file.
+    environment: release
+    permissions:
+      # Lets the job mint the OIDC token that stands in for a crates.io API token.
+      # This is the whole point of the workflow; without it the auth step 403s.
+      id-token: write
+      contents: read
+    steps:
+      # Third-party actions are pinned to a commit SHA (supply-chain hardening);
+      # the trailing comment records the human-readable version.
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # Use the runner's pre-installed rustup to pull a current stable toolchain,
+      # avoiding an extra (unpinned) third-party action. Same as ci.yml.
+      - name: Install stable Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustc --version && cargo --version
+
+      # A tag that disagrees with the manifest publishes a version under a name
+      # nobody can check out — and crates.io cannot take it back. Read the version
+      # from cargo itself rather than grepping the manifest, so the check reads the
+      # same field `cargo publish` will.
+      - name: Check the tag matches Cargo.toml
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(cargo metadata --format-version 1 --no-deps |
+            jq -er '.packages[] | select(.name == "imcp2") | .version')"
+          echo "tag=$tag manifest=$manifest"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${manifest}" >&2
+            exit 1
+          fi
+
+      # ci.yml runs on pull requests and on pushes to main; a tag can point at any
+      # commit, so re-run the suite against the exact revision about to become an
+      # immutable public release. `--locked` also guards Cargo.lock from drift, and
+      # the lockfile is what ships in the .crate.
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      # Rehearses the real thing — packages the crate and compiles the package in
+      # isolation — but stops short of uploading, so a package that only builds
+      # because of something untracked in the working tree fails here rather than
+      # after the upload is already permanent.
+      - name: Package
+        run: cargo publish --locked --dry-run
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
