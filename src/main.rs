@@ -40,6 +40,17 @@ fn public_url() -> String {
     std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
 }
 
+/// Directory imcp2 creates its operational files in (today: the persisted
+/// client-registration store). Set with `IMCP2_STATE_DIR`; defaults to the
+/// current working directory, so a bare local run keeps `oauth-clients.json`
+/// beside the binary as before. The native deployment points it at the unit's
+/// `StateDirectory` (`/var/lib/imcp2`).
+fn state_dir() -> std::path::PathBuf {
+    std::env::var_os("IMCP2_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
 /// Whether to enforce strict RFC 8707 resource indicators: require a `resource`
 /// naming this instance on both OAuth legs, refusing a request that omits it.
 /// **On by default** — the confused-deputy token-theft path is only fully closed
@@ -329,9 +340,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("built ic-agent against {IC_URL}");
     let public_url = public_url();
 
+    // The directory all operational files live in (the client-registration
+    // store today). One place, injected into every instance's McpConfig.
+    let state_dir = state_dir();
+
     // Dynamic client registrations are II-agnostic (redirect allow-list only),
-    // so all instances share one store (and one persisted snapshot).
-    let clients = SharedClients::load();
+    // so all instances share one store (and one persisted snapshot), loaded from
+    // the operational directory.
+    let clients = SharedClients::load(&state_dir);
 
     // Production Internet Identity at `/mcp`: always served, and the origin's
     // default instance (it answers the plain-root discovery probes). A
@@ -342,6 +358,7 @@ async fn main() -> anyhow::Result<()> {
         public_url: public_url.clone(),
         mcp_path: "/mcp".into(),
         clients: clients.clone(),
+        state_dir: state_dir.clone(),
         require_resource: require_resource(),
     });
     prod.spawn_session_reaper();
@@ -355,6 +372,7 @@ async fn main() -> anyhow::Result<()> {
             public_url: public_url.clone(),
             mcp_path: "/mcp-beta".into(),
             clients,
+            state_dir,
             require_resource: require_resource(),
         });
         beta.spawn_session_reaper();

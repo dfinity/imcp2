@@ -99,8 +99,8 @@ server actually does, it should cover at least:
 - **Storage/retention:** session, token, and account state is held in
   bounded **in-memory** stores (lost on restart; sessions capped at the II
   grant duration, ≤30 days) — but OAuth client registrations are **persisted
-  to disk** (`OAUTH_CLIENTS_FILE`, kept in the unit's `StateDirectory` so
-  client ids survive redeploys) with no time-based expiry, only LRU eviction
+  to disk** (`oauth-clients.json` in `IMCP2_STATE_DIR`, kept in the unit's
+  `StateDirectory` so client ids survive redeploys) with no time-based expiry, only LRU eviction
   at 10,000 entries; they contain no user personal data (client id, redirect
   URI, last-used timestamp). Host-side tracing logs record method, path,
   status, and latency per request (never query strings or bodies) plus auth

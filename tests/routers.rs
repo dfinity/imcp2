@@ -13,26 +13,26 @@ use tower::ServiceExt;
 
 const PUBLIC_URL: &str = "https://mcp.example.com";
 
-/// Point the OAuth client-registration store at a throwaway temp path BEFORE
-/// any `SharedClients::load()`, so these tests neither read nor write a
-/// developer's real `oauth-clients.json`. The authorize-path assertions rely on
-/// an EMPTY registration set (unknown/unregistered clients are rejected); a
-/// stray real registration for `client_id=unknown`/`x` would otherwise flip
-/// them. `load()` treats a missing file as empty, so a fresh, deleted path
-/// gives a deterministic empty set. Set exactly once (env is process-global).
-fn isolate_client_store() {
+/// A throwaway operational-files directory for these tests, so they neither read
+/// nor write a developer's real `oauth-clients.json`. The authorize-path
+/// assertions rely on an EMPTY registration set (unknown/unregistered clients are
+/// rejected); a stray real registration for `client_id=unknown`/`x` would flip
+/// them, so the store file is cleared once. `SharedClients::load` treats a
+/// missing file as empty, giving a deterministic empty set. One fixed directory,
+/// shared by every `app()` in this binary.
+fn test_state_dir() -> std::path::PathBuf {
     use std::sync::Once;
     static ONCE: Once = Once::new();
+    let dir = std::env::temp_dir().join("imcp2-router-tests");
     ONCE.call_once(|| {
-        let mut path = std::env::temp_dir();
-        path.push("imcp2-router-tests-oauth-clients.json");
-        let _ = std::fs::remove_file(&path); // drop any stale file from a prior run
-        std::env::set_var("OAUTH_CLIENTS_FILE", &path);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_file(dir.join("oauth-clients.json")); // drop any stale file
     });
+    dir
 }
 
 fn server(instance: imcp2::IiInstance, mcp_path: &str) -> imcp2::McpServer {
-    isolate_client_store();
+    let state_dir = test_state_dir();
     let agent = imcp2::Agent::builder()
         .with_url(imcp2::IC_URL)
         .build()
@@ -42,7 +42,8 @@ fn server(instance: imcp2::IiInstance, mcp_path: &str) -> imcp2::McpServer {
         instance,
         public_url: PUBLIC_URL.into(),
         mcp_path: mcp_path.into(),
-        clients: imcp2::SharedClients::load(),
+        clients: imcp2::SharedClients::load(&state_dir),
+        state_dir,
         // Lenient: these router contract tests drive flows that don't carry a
         // `resource`; strict RFC 8707 is covered by the auth unit tests.
         require_resource: false,
@@ -209,8 +210,9 @@ async fn unauthenticated_mcp_requests_get_the_path_aware_challenge() {
 /// (capped, LRU-evicted, with coalesced write-through): a loopback redirect
 /// registers, that `client_id` is then accepted at `/oauth/authorize` (which also
 /// marks it recently used, keeping it ahead of the LRU eviction), the
-/// registration lands in `OAUTH_CLIENTS_FILE` so it survives a restart, and a
-/// redirect off the hosted allow-list is refused before anything is stored.
+/// registration lands in the state directory's `oauth-clients.json` so it
+/// survives a restart, and a redirect off the hosted allow-list is refused
+/// before anything is stored.
 #[tokio::test]
 async fn dynamic_client_registration_round_trips_and_persists() {
     // One app, cloned per request, so both calls share the same client store.
@@ -262,8 +264,9 @@ async fn dynamic_client_registration_round_trips_and_persists() {
     assert_eq!(doc["error"], "invalid_redirect_uri");
 
     // Registrations are persisted (coalesced, so on a background task): poll
-    // briefly for the write rather than assuming it has already landed.
-    let path = std::env::var("OAUTH_CLIENTS_FILE").expect("isolated store path");
+    // briefly for the write rather than assuming it has already landed. The store
+    // file is `{state_dir}/oauth-clients.json` (see `test_state_dir`).
+    let path = test_state_dir().join("oauth-clients.json");
     let mut persisted = String::new();
     for _ in 0..100 {
         persisted = std::fs::read_to_string(&path).unwrap_or_default();
@@ -274,7 +277,8 @@ async fn dynamic_client_registration_round_trips_and_persists() {
     }
     assert!(
         persisted.contains(&client_id),
-        "the registration must reach {path} so it survives a restart"
+        "the registration must reach {} so it survives a restart",
+        path.display()
     );
     assert!(
         !persisted.contains("attacker.example"),

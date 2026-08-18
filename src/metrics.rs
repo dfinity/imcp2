@@ -336,7 +336,8 @@ mod tests {
             instance: crate::IiInstance::prod().expect("prod instance"),
             public_url: "https://mcp.example.com".into(),
             mcp_path: "/mcp".into(),
-            clients: crate::SharedClients::load(),
+            clients: crate::SharedClients::load(std::env::temp_dir()),
+            state_dir: std::env::temp_dir(),
             require_resource: true,
         })
     }
