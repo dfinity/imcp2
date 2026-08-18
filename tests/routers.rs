@@ -279,6 +279,52 @@ async fn dynamic_client_registration_round_trips_and_persists() {
     );
 }
 
+/// Open DCR is unauthenticated, so a single `POST /oauth/register` must not be
+/// able to store an unbounded `redirect_uris` array (count or per-URI length):
+/// both are rejected with `invalid_redirect_uri` before anything is stored, and
+/// a normal small registration still succeeds (ICPBB-379).
+#[tokio::test]
+async fn registration_bounds_redirect_uris() {
+    let app = app();
+    let register = |body: String| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::post("/mcp/oauth/register")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+        }
+    };
+
+    // Too many redirect_uris (all individually valid loopback URLs) — refused.
+    let many: Vec<String> = (0..64).map(|i| format!("http://127.0.0.1:4321/cb{i}")).collect();
+    let body = serde_json::json!({ "redirect_uris": many }).to_string();
+    let (status, doc) = register(body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "an over-count array is refused");
+    assert_eq!(doc["error"], "invalid_redirect_uri");
+
+    // A single over-long redirect_uri — refused (length is checked before the
+    // hosted allow-list, and before the store is touched).
+    let long = format!("http://127.0.0.1:4321/{}", "a".repeat(4096));
+    let body = serde_json::json!({ "redirect_uris": [long] }).to_string();
+    let (status, doc) = register(body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "an over-long uri is refused");
+    assert_eq!(doc["error"], "invalid_redirect_uri");
+
+    // A normal, small registration is unaffected.
+    let (status, _doc) =
+        register(r#"{"redirect_uris":["http://127.0.0.1:4321/cb"]}"#.to_string()).await;
+    assert_eq!(status, StatusCode::CREATED, "a small registration still succeeds");
+}
+
 #[tokio::test]
 async fn invalid_token_challenge_carries_rfc6750_error() {
     let resp = app()

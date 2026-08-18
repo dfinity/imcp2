@@ -136,6 +136,17 @@ const GRANT_TTL_SECS: u64 = 3600;
 /// re-registers, since DCR is automatic.
 const MAX_CLIENTS: usize = 10_000;
 
+/// Bounds on a SINGLE dynamic-client-registration request's `redirect_uris`.
+/// `POST /oauth/register` is unauthenticated, and [`MAX_CLIENTS`] bounds only the
+/// NUMBER of registrations, not the size of any one: without these a lone POST
+/// could store a huge array of long strings, and MAX_CLIENTS of them would bloat
+/// both memory and the persisted file (CWE-770). With the caps the store is
+/// bounded at roughly `MAX_CLIENTS × MAX_REDIRECT_URIS × MAX_REDIRECT_URI_LEN`.
+/// A real client registers a few short redirect URLs, so the ceilings are
+/// generous: 16 URIs, each within the 2 KB URL length most stacks already impose.
+const MAX_REDIRECT_URIS: usize = 16;
+const MAX_REDIRECT_URI_LEN: usize = 2_048;
+
 /// Floor on the interval between write-throughs of the registration store. The
 /// store is re-serialized in full on every write, so writing once per
 /// registration made N unauthenticated registrations cost O(N²) disk I/O; a
@@ -198,14 +209,18 @@ fn clients_file() -> String {
 }
 
 fn load_clients() -> HashMap<String, ClientReg> {
-    match std::fs::read(clients_file()) {
+    load_clients_from(&clients_file())
+}
+
+fn load_clients_from(path: &str) -> HashMap<String, ClientReg> {
+    match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            tracing::warn!("could not parse {}: {e}; starting with no clients", clients_file());
+            tracing::warn!("could not parse {path}: {e}; starting with no clients");
             HashMap::new()
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
         Err(e) => {
-            tracing::warn!("could not read {}: {e}; starting with no clients", clients_file());
+            tracing::warn!("could not read {path}: {e}; starting with no clients");
             HashMap::new()
         }
     }
@@ -214,14 +229,34 @@ fn load_clients() -> HashMap<String, ClientReg> {
 /// Best-effort write-through of the registration store. A failure (e.g. a
 /// read-only filesystem) only means registrations don't survive a restart — the
 /// client re-registers — so log and carry on.
+///
+/// Atomic replace: `std::fs::write` truncates the target in place, so a crash or
+/// a concurrent [`load_clients`] mid-write could observe a half-written,
+/// unparseable file and drop EVERY registration on the next load. Instead
+/// serialize to a sibling temp file and `rename` it over the target — atomic on
+/// POSIX, so a reader always sees either the old file or the complete new one.
+/// Only one writer runs at a time ([`ClientStore::persist_soon`]), so a fixed
+/// `.tmp` name cannot be raced.
 fn persist_clients(clients: &HashMap<String, ClientReg>) {
-    match serde_json::to_vec_pretty(clients) {
-        Ok(bytes) => {
-            if let Err(e) = std::fs::write(clients_file(), bytes) {
-                tracing::warn!("could not persist {}: {e}", clients_file());
-            }
+    persist_clients_to(&clients_file(), clients);
+}
+
+fn persist_clients_to(path: &str, clients: &HashMap<String, ClientReg>) {
+    let bytes = match serde_json::to_vec_pretty(clients) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!("could not serialize client registrations: {e}");
+            return;
         }
-        Err(e) => tracing::warn!("could not serialize client registrations: {e}"),
+    };
+    let tmp = format!("{path}.tmp");
+    if let Err(e) = std::fs::write(&tmp, &bytes) {
+        tracing::warn!("could not write {tmp}: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        tracing::warn!("could not replace {path}: {e}");
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -2057,6 +2092,30 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
         );
     };
 
+    // Bound the redirect_uris array (count + per-URI length) BEFORE validating or
+    // storing anything: open DCR is unauthenticated, so one request must not be
+    // able to pin unbounded memory or bloat the persisted store (CWE-770).
+    if req.redirect_uris.len() > MAX_REDIRECT_URIS {
+        return oauth_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_redirect_uri",
+            &format!(
+                "too many redirect_uris ({}, max {MAX_REDIRECT_URIS})",
+                req.redirect_uris.len()
+            ),
+        );
+    }
+    if let Some(bad) = req.redirect_uris.iter().find(|u| u.len() > MAX_REDIRECT_URI_LEN) {
+        return oauth_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_redirect_uri",
+            &format!(
+                "a redirect_uri is too long ({} bytes, max {MAX_REDIRECT_URI_LEN})",
+                bad.len()
+            ),
+        );
+    }
+
     // Hosted-redirect allow-list (auth-code phishing, same-browser variant):
     // open DCR must not let a caller register a hosted redirect it controls.
     // Loopback is exempt. Reject BEFORE anything is stored.
@@ -2239,6 +2298,47 @@ mod tests {
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let expected = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
         assert_eq!(pkce_s256(verifier), expected);
+    }
+
+    /// The registration store persists via a temp-file + atomic rename, so a
+    /// concurrent reader (or a crash) never observes a half-written file: the
+    /// round trip restores the registrations, and no `.tmp` is left behind. The
+    /// point of the atomic replace is that a reader racing the write sees either
+    /// the old complete file or the new one — never a truncated middle that would
+    /// parse-fail and drop every registration.
+    #[test]
+    fn client_store_persists_atomically() {
+        use super::{load_clients_from, persist_clients_to};
+
+        let path = std::env::temp_dir()
+            .join(format!("imcp2-clients-{}.json", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let tmp = format!("{path}.tmp");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut clients = HashMap::new();
+        clients.insert(
+            "client-abc".to_string(),
+            ClientReg::new(vec!["http://127.0.0.1:4321/cb".to_string()]),
+        );
+        persist_clients_to(&path, &clients);
+
+        // Round-trips, and the rename consumed the sibling temp file.
+        let loaded = load_clients_from(&path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded["client-abc"].redirect_uris,
+            vec!["http://127.0.0.1:4321/cb".to_string()]
+        );
+        assert!(!std::path::Path::new(&tmp).exists(), "no leftover .tmp file");
+
+        // The persisted target is always a COMPLETE json document.
+        let raw = std::fs::read(&path).unwrap();
+        assert!(serde_json::from_slice::<HashMap<String, ClientReg>>(&raw).is_ok());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
