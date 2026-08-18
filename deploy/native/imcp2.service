@@ -31,11 +31,13 @@ Environment=MCP_SERVE_METRICS=1
 # endpoint by design; handled as a secret for consistency with the other
 # deploy inputs).
 Environment=OPENAI_APPS_CHALLENGE_TOKEN=__OPENAI_APPS_CHALLENGE_TOKEN__
-# Dynamic client registrations persist here so OAuth clients that cached their
-# client_id keep working across redeploys. StateDirectory (=/var/lib/imcp2) is
-# created service-owned and survives restarts; /opt/imcp2 is replaced each deploy.
+# imcp2 creates its operational files (today: the dynamic-client-registration
+# store, so OAuth clients that cached their client_id keep working across
+# redeploys) in IMCP2_STATE_DIR. Point it at StateDirectory (=/var/lib/imcp2),
+# which systemd creates service-owned and preserves across restarts; /opt/imcp2
+# is replaced each deploy. The store lands at %S/imcp2/oauth-clients.json.
 StateDirectory=imcp2
-Environment=OAUTH_CLIENTS_FILE=%S/imcp2/oauth-clients.json
+Environment=IMCP2_STATE_DIR=%S/imcp2
 ExecStart=/opt/imcp2/imcp2
 Restart=always
 RestartSec=3
