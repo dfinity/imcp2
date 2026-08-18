@@ -89,11 +89,25 @@ git push origin v0.1.1
 ```
 
 `.github/workflows/publish-crate.yml` takes it from there — it checks the tag
-against `Cargo.toml`, runs the suite, and publishes. It authenticates with
-crates.io [trusted publishing](https://crates.io/docs/trusted-publishing)
-(short-lived OIDC credentials), so there is no crates.io token in this
-repository's secrets and none should be added. The workflow header documents
-the one-time crates.io configuration it depends on.
+against `Cargo.toml`, checks the tagged commit is on `main`, runs the suite and
+a dry-run package, and only then publishes from a second job that compiles
+nothing. It authenticates with crates.io
+[trusted publishing](https://crates.io/docs/trusted-publishing) (short-lived
+OIDC credentials), so there is no crates.io token in this repository's secrets
+and none should be added.
+
+Two repository settings are prerequisites, because GitHub loads a
+tag-triggered workflow from the tagged commit — so the guards in the workflow
+file cannot defend against a tag that carries its own edited copy of them:
+
+- **Protected `v*` tags** (Settings → Rules → Rulesets, targeting tags), so
+  only maintainers can start a release at all.
+- **Required reviewers on the `release` environment** (Settings →
+  Environments), which gates the one job that can reach crates.io from outside
+  the workflow file.
+
+The workflow header documents these along with the one-time crates.io
+configuration.
 
 Note that `v*` tags are for crate releases only; production rollouts are cut
 separately with `release-*` tags (see `.github/workflows/deploy-release.yml`).

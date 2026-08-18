@@ -10,16 +10,16 @@
 #   git tag v0.1.1
 #   git push origin v0.1.1
 #
-# The tag must match Cargo.toml's `version` exactly — the guard below fails the run
-# rather than publishing a version nobody can find by tag. There is no rollback:
-# crates.io releases are permanent and a bad one can only be yanked (`cargo yank
-# --version X.Y.Z`), which hides it from new dependency resolution but leaves it
-# downloadable for anyone whose lockfile already pins it. The fix for a bad release
-# is a new version, never a re-publish of the old one.
+# The tag must match Cargo.toml's `version` exactly and must point at a commit on
+# `main` — the guards below fail the run rather than publishing. There is no
+# rollback: crates.io releases are permanent and a bad one can only be yanked
+# (`cargo yank --version X.Y.Z`), which hides it from new dependency resolution but
+# leaves it downloadable for anyone whose lockfile already pins it. The fix for a
+# bad release is a new version, never a re-publish of the old one.
 #
 # AUTHENTICATION IS TRUSTED PUBLISHING (OIDC) — there is no crates.io token in this
-# repository's secrets, and there should not be one. The job asks GitHub for a
-# short-lived OIDC token, crates.io exchanges it for an access token good for ~30
+# repository's secrets, and there should not be one. The publish job asks GitHub for
+# a short-lived OIDC token, crates.io exchanges it for an access token good for ~30
 # minutes, and the action revokes that token in its post step. A leaked repository
 # secret would be a standing publish credential; this is not.
 #
@@ -33,38 +33,65 @@
 # A trusted publisher can only be configured on a crate that already exists, so the
 # FIRST release (0.1.0) has to be published by hand — `cargo publish --locked` with
 # a personal token — and every release after it goes through this workflow.
+#
+# REQUIRED REPOSITORY SETTINGS, to be in place BEFORE the trusted publisher is
+# enabled. Neither can be expressed in this file, and without them the guards below
+# are only mistake-guards:
+#
+#   * Protected tags for `v*` (Settings -> Rules -> Rulesets, target: tags). GitHub
+#     loads a tag-triggered workflow FROM THE TAGGED COMMIT, so whoever can push a
+#     `v*` tag can point it at an unreviewed commit carrying a doctored copy of this
+#     file — one with the guards deleted. That run still satisfies the trusted
+#     publisher's claims, because crates.io matches on repository, workflow filename
+#     and environment, none of which name a ref. Branch protection on `main` does
+#     not close this path; tag protection is what limits who can open it.
+#   * Required reviewers on the `release` environment (Settings -> Environments).
+#     This is the control that survives a doctored workflow: the environment gate is
+#     enforced by GitHub outside the workflow file, so the run cannot proceed to the
+#     credential-holding job until a human approves it.
 name: Publish crate
 
 on:
   push:
     tags: ['v*']
 
-# Never publish two versions concurrently, and never cancel one half-way: a
-# cancelled `cargo publish` can leave crates.io holding a version this repository
-# has no record of shipping.
+# Grouped per tag rather than one group for the whole workflow. A shared group
+# would be the obvious way to serialize releases, but GitHub concurrency is not a
+# queue: it holds at most one running and one pending run per group, and a third
+# arrival evicts the pending one even with `cancel-in-progress: false`. A burst of
+# tag pushes would then silently skip a version. Per tag, duplicate runs of the
+# SAME version (a re-push, a re-run) still collapse, and no version can cancel
+# another's release. `cancel-in-progress: false` so a publish is never killed
+# half-way.
 concurrency:
-  group: publish-crate
+  group: publish-crate-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  publish:
+  # Everything that compiles or executes project and dependency code — build
+  # scripts, proc macros, the test suite — runs HERE, in a job with no `id-token`
+  # permission and no crates.io credential anywhere in its environment.
+  #
+  # The split is the point. A job granted `id-token: write` exposes
+  # ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN to every process in it, so a build script
+  # anywhere in the locked dependency tree could mint its own crates.io-audience
+  # OIDC token, exchange it for a publish token, and keep it — the auth action's
+  # post step revokes only the token it fetched itself. Running the compile in a
+  # separate job means no dependency code ever executes within reach of the
+  # credential.
+  verify:
     runs-on: ubuntu-24.04
-    # Names the deployment target for the OIDC token's `environment` claim, which
-    # crates.io checks against the trusted-publisher configuration. GitHub creates
-    # the environment on first use; adding required reviewers or a branch rule to
-    # it in Settings -> Environments then gates publishing without touching this
-    # file.
-    environment: release
     permissions:
-      # Lets the job mint the OIDC token that stands in for a crates.io API token.
-      # This is the whole point of the workflow; without it the auth step 403s.
-      id-token: write
       contents: read
     steps:
       # Third-party actions are pinned to a commit SHA (supply-chain hardening);
       # the trailing comment records the human-readable version.
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Full history: the ancestry check below needs the commits between this
+          # tag and main, which the default shallow clone does not fetch.
+          fetch-depth: 0
 
       # Use the runner's pre-installed rustup to pull a current stable toolchain,
       # avoiding an extra (unpinned) third-party action. Same as ci.yml.
@@ -89,6 +116,20 @@ jobs:
             exit 1
           fi
 
+      # A tag can name any commit in the repository, including one that never went
+      # through review. This catches the mistake — tagging a topic branch, or a
+      # commit that was rebased away — and nothing more: a tag-triggered workflow is
+      # read from the tagged commit, so a deliberately doctored copy of this file
+      # would simply not contain this step. Protected `v*` tags and a reviewed
+      # `release` environment are what make that case hard; see the header.
+      - name: Check the tag is on main
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::${GITHUB_REF_NAME} points at a commit that is not on main" >&2
+            exit 1
+          fi
+
       # ci.yml runs on pull requests and on pushes to main; a tag can point at any
       # commit, so re-run the suite against the exact revision about to become an
       # immutable public release. `--locked` also guards Cargo.lock from drift, and
@@ -99,15 +140,47 @@ jobs:
       # Rehearses the real thing — packages the crate and compiles the package in
       # isolation — but stops short of uploading, so a package that only builds
       # because of something untracked in the working tree fails here rather than
-      # after the upload is already permanent.
+      # after the upload is already permanent. This is also the verify build that
+      # lets the publish job skip its own; see `--no-verify` below.
       - name: Package
         run: cargo publish --locked --dry-run
+
+  # Holds the credential, and compiles nothing.
+  publish:
+    needs: verify
+    runs-on: ubuntu-24.04
+    # Names the deployment target for the OIDC token's `environment` claim, which
+    # crates.io checks against the trusted-publisher configuration. It is also the
+    # hook for required reviewers (see the header): a protection rule here gates the
+    # only job that can reach crates.io, and does so from outside the workflow file.
+    environment: release
+    permissions:
+      # Lets the job mint the OIDC token that stands in for a crates.io API token.
+      # This is the whole point of the workflow; without it the auth step 403s.
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustc --version && cargo --version
 
       - name: Authenticate with crates.io
         id: auth
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
+      # `--no-verify` is deliberate and is the second half of the job split. Without
+      # it `cargo publish` compiles the package — running the dependency tree's build
+      # scripts and proc macros — while CARGO_REGISTRY_TOKEN sits in their
+      # environment. The verify build is not skipped, only moved: the `verify` job
+      # ran `cargo publish --locked --dry-run` over this same commit, which packages
+      # and compiles exactly what is uploaded here. What remains in this job is
+      # reading files into a .crate and an HTTPS upload.
       - name: Publish
-        run: cargo publish --locked
+        run: cargo publish --locked --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
