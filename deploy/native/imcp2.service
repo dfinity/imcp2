@@ -40,6 +40,15 @@ ExecStart=/opt/imcp2/imcp2
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
+# Blast-radius cap for memory-amplification / decode-bomb inputs (e.g. ICPBB-438,
+# 380, 384): the app's normal RSS is well under 100 MiB, so this ceiling never
+# bites legitimate load, but it turns a hostile allocation into a clean
+# per-service cgroup kill (recovered by Restart=always) instead of host-wide
+# memory pressure that could take Caddy or the status dashboard down with it.
+# MemorySwapMax=0 keeps the process from thrashing swap on the way to that kill.
+# Tune MemoryMax to the host's RAM if it ever needs raising.
+MemoryMax=2G
+MemorySwapMax=0
 # Graceful stop: systemd sends SIGTERM (the app drains in-flight requests on it),
 # then waits up to TimeoutStopSec before escalating to SIGKILL. Ample for our
 # short request handlers; keeps a `restart` from cutting live requests.
