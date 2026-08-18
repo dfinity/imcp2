@@ -18,8 +18,9 @@ The single most consequential improvement is **adopting Client ID Metadata
 Documents (CIMD) to replace imcp2's open Dynamic Client Registration**. It swaps
 a spoofable, attacker-controlled `/register` body for a DNS/TLS-authenticated
 `client_id` URL, re-bases the hardcoded hosted-redirect allow-list onto the
-spec's blessed "domain trust policy," and gives the branding goal in
-`scoping-client-branding.md` a non-spoofable key to hang name/logo on.
+spec's blessed "domain trust policy," and gives the branding goal in the
+client-branding scoping proposal (PR #103) a non-spoofable key to hang name/logo
+on.
 
 The meta-point: **imcp2's deliberate stateless, plain-JSON, no-session design is
 exactly the structural shift 2026-07-28 makes mandatory.** The revision removes
@@ -86,15 +87,20 @@ dependency)**
 - **imcp2 today:** Open, unauthenticated DCR at `/oauth/register`
   (`auth.rs:1927`) storing a `ClientReg` of `redirect_uris`; it defends phishing
   with the hardcoded `DEFAULT_ALLOWED_REDIRECTS` domain+path allow-list
-  (`auth.rs:399-409`) plus MCP05/CWE-601 hardening. The branding scoping doc
-  exists precisely because DCR `client_name`/`logo_uri` are attacker-controlled
-  and cannot be shown to II's consent screen.
+  (`auth.rs:399-409`) plus MCP05/CWE-601 hardening. The client-branding scoping
+  proposal (PR #103) exists precisely because DCR `client_name`/`logo_uri` are
+  attacker-controlled and cannot be shown to II's consent screen.
 - **Improvement:** Add a CIMD code path: accept URL-form `client_id`, fetch it
-  with SSRF guards (https-only, deny loopback/link-local/private IPs, timeouts,
-  size caps). The same same-origin-https + SSRF-fallback pattern already
-  implemented in `skills.rs`'s `markdown_url_for_base` (which rejects
-  `169.254.169.254`, `file://`, and cross-origin) is directly reusable. Enforce
-  `client_id` == URL and redirect_uri in doc. **Rewrite `allowed_redirects()` as
+  through a **dedicated SSRF-safe fetcher** (https-only; resolve the host and
+  reject loopback/link-local/private/unspecified addresses; cap redirects,
+  timeouts, and response size). Note `skills.rs`'s `markdown_url_for_base` is **not**
+  reusable for this: it only compares the candidate host against a fixed trusted
+  origin (and even ignores ports); it rejects `169.254.169.254` only incidentally
+  (that URL differs from the fixed skills origin), a protection that vanishes once
+  the fetched URL is itself attacker-selected, as a CIMD `client_id` is. The
+  closest existing building block is `discover.rs`'s `ip_is_global` (an actual
+  global-IP check), but the fetcher is net-new. Enforce `client_id` == URL and
+  redirect_uri in doc. **Rewrite `allowed_redirects()` as
   an allowed-`client_id`-host policy**, the spec's "domain allowed via trust
   policy." Advertise `client_id_metadata_document_supported: true` in AS metadata
   (`auth.rs:1985-1994`). Keep DCR only as deprecated backward-compat.
@@ -103,9 +109,9 @@ dependency)**
   at `https://chatgpt.com/...` without owning it). Key the curated vendor
   name/logo table on that domain. **Do NOT trust the doc's
   `client_name`/`logo_uri` directly**: CIMD provides no signing or attestation for
-  display fields; they are as spoofable as DCR metadata. This matches the branding
-  doc's own security spine (branding derived from the vetted vendor, never from
-  client-supplied metadata) but gives it a cleaner cryptographic key than the
+  display fields; they are as spoofable as DCR metadata. This matches that
+  proposal's own security spine (branding derived from the vetted vendor, never
+  from client-supplied metadata) but gives it a cleaner cryptographic key than the
   redirect-path allow-list.
 - **Caveat / risk:** The allow-list does **not** disappear; it moves from
   redirect-URI-domain to client-id-domain. A malicious actor can still host a
@@ -186,7 +192,7 @@ layer, or wait for rmcp)**
   `MissingRequiredClientCapability` to `-32021`.
 - **imcp2 today:** rmcp 1.7 still runs the `initialize` lifecycle.
   `IcTools::get_info()` supplies `ServerInfo`/`ServerCapabilities` once
-  (`tools.rs:1876-1881`) with a rich instructions string. imcp2 has **no**
+  (`tools.rs:1883-1888`) with a rich instructions string. imcp2 has **no**
   `server/discover` (note: its `discover.rs` is *app-canister* discovery, an
   unrelated name collision).
 - **Improvement:** When rmcp exposes the modern path, add `server/discover`
@@ -228,15 +234,20 @@ Med / Tractability: Med**
   (the ~26 tools are compile-time fixed, identical for every II caller) and emit
   them in deterministic (name-sorted) order, for cross-token/gateway caching plus
   higher LLM prompt-cache hits at zero behavioral cost. (b) **Re-surface public
-  on-chain metadata as MCP Resources** (`candid://<canister-id>`,
-  `oql-schema://<canister-id>`) so they carry `cacheScope: "public"` +
+  on-chain metadata as MCP Resources** — `candid://<canister-id>` (the Candid
+  interface is not caller-gated) carrying `cacheScope: "public"` +
   minutes-to-hours `ttlMs` (Candid changes only on redeploy). This is the *only*
-  way to attach cache hints and eliminates repeated mainnet round-trips. Live-state
-  reads (`canister_query`, `icp_canister_status`) stay tools or use
-  `private`/short-TTL.
+  way to attach cache hints and eliminates repeated mainnet round-trips.
+  **`oql-schema://<canister-id>` must NOT be public**: `get_canister_oql_schema`
+  is caller-gated — it requires `derivation_origin`/account and runs under the
+  user's delegated agent, so the visible schema is identity-specific
+  (`src/tools.rs:158-200`); a public cache keyed only by canister ID could return
+  one identity's schema to another. Keep it a tool, or model it as an
+  identity-keyed resource with `cacheScope: "private"`. Live-state reads
+  (`canister_query`, `icp_canister_status`) stay tools or use `private`/short-TTL.
 - **Caveat:** For a not-found canister/URI on the resource path, emit `-32602` +
   `data.uri` (imcp2 already uses `McpError::resource_not_found` at
-  `tools.rs:2060,2071` for its resource surface; audit that rmcp's code becomes
+  `tools.rs:2067,2078` for its resource surface; audit that rmcp's code becomes
   `-32602`, not `-32002`, on upgrade). Restructuring tool outputs into resources
   is real work; the `tools/list` tagging is cheap and worth doing first.
 
@@ -255,7 +266,7 @@ Med / Tractability: Med**
   principal-bound, TTL, per-request digest, server-side single-use).
 - **imcp2 today:** Missing/ambiguous args (canister id, `derivation_origin`) fail
   with an in-band `err()` text result the LLM must recover from (e.g.
-  `oql_needs_origin_error` `tools.rs:1488`; `get_app_principal` needs origin +
+  `oql_needs_origin_error` `tools.rs:1495`; `get_app_principal` needs origin +
   session). No server-initiated anything.
 - **Improvement, the canonical high-value use:** Instead of erroring, tools return
   `InputRequiredResult` with an `elicitation/create` describing exactly the missing
@@ -335,11 +346,16 @@ Med**
   body (`-32020` on mismatch).
 - **imcp2 today:** Schemas come from schemars; the edge cannot route/rate-limit
   without parsing textual Candid.
-- **Improvement:** Annotate `canister_id`/principal and target `network` (mainnet
-  vs local), and a discriminator on destructive `icp_` ops, so imcp2's
-  gateway/WAF/rate-limiter can act on `Mcp-Param-*` + `Mcp-Method`/`Mcp-Name`
-  without touching the body, e.g. step-up or rate-limit per canister or per
-  management operation.
+- **Improvement:** Annotate the EXISTING top-level `canister_id`/principal param
+  so imcp2's gateway/WAF/rate-limiter can act on `Mcp-Param-*` (mirrored from the
+  body) + `Mcp-Method`/`Mcp-Name` without parsing textual Candid — e.g. rate-limit
+  per canister. There is today **no** top-level `network` field or
+  destructive-operation discriminator in these schemas, so neither can be mirrored
+  into `Mcp-Param-*` (annotating an absent field would make the mandated
+  header/body validation fail — a header describing a field not in the body). Use
+  `Mcp-Name` for per-operation policy (e.g. step-up on destructive `icp_` ops),
+  and separately scope a new request parameter if network routing is actually
+  required.
 - **Caveat:** schemars 1.x will not emit `x-mcp-header`; imcp2 must post-process
   the generated `inputSchema`. Only static top-level string/int/bool params
   qualify. imcp2 must validate `Mcp-Param-*` regardless once the schema declares
@@ -357,9 +373,9 @@ High**
   UnsupportedProtocolVersion). App errors **SHOULD** live outside the reserved
   range.
 - **imcp2 today:** Tool business errors are in-band `isError=true` text via
-  `err()` (`tools.rs:2280`), no JSON-RPC codes, which is fine. Protocol codes
+  `err()` (`tools.rs:2287`), no JSON-RPC codes, which is fine. Protocol codes
   appear on the resource surface (`McpError::resource_not_found`,
-  `tools.rs:2060,2071`); audit what rmcp maps that to on upgrade.
+  `tools.rs:2067,2078`); audit what rmcp maps that to on upgrade.
 - **Improvement:** Ensure resource-not-found emits `-32602` + `data.uri`; keep
   IC/agent failures as human-readable messages outside the reserved band; emit
   `-32020/-32021/-32022` where the HTTP binding requires (ties to #3).
@@ -377,7 +393,7 @@ draft)**
 - **imcp2 today:** `skills.rs` already hand-rolls exactly this: a `skills.json`
   manifest + per-skill `SKILL.md` from `.well-known/skills/<name>/SKILL.md`,
   surfaced as tools (`icp_list_skills`/`icp_get_skill`, `tools.rs:1238-1265`) and
-  as `skill://<name>` resources (`tools.rs:2027-2029`). imcp2 is an early reference
+  as `skill://<name>` resources (`tools.rs:2033-2045`). imcp2 is an early reference
   case.
 - **Improvement:** When SEP-2640 finalizes, migrate to the standard
   Resources-based Skills Extension so hosts discover IC skills natively.
