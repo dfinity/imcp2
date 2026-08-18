@@ -272,21 +272,17 @@ fn field<'a>(blob: &'a str, key: &str) -> Option<&'a str> {
         .map(|(_, v)| v)
 }
 
-/// Restores (or clears) the process-global `OAUTH_CLIENTS_FILE` on drop — even on
-/// a panic-unwind — so this test's override can't leak into other test threads
-/// running in parallel, and removes the temp file it pointed at.
-struct ClientsFileEnvGuard {
-    prev: Option<std::ffi::OsString>,
-    path: std::path::PathBuf,
+/// Removes this test's throwaway operational directory on drop — even on a
+/// panic-unwind — so its client-store file can't leak between runs. The state
+/// directory is injected via [`crate::McpConfig::state_dir`], so there is no
+/// process-global env to restore.
+struct StateDirGuard {
+    dir: std::path::PathBuf,
 }
 
-impl Drop for ClientsFileEnvGuard {
+impl Drop for StateDirGuard {
     fn drop(&mut self) {
-        match self.prev.take() {
-            Some(v) => std::env::set_var("OAUTH_CLIENTS_FILE", v),
-            None => std::env::remove_var("OAUTH_CLIENTS_FILE"),
-        }
-        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -304,25 +300,20 @@ async fn registration_delegation_end_to_end() {
     };
     let ii_wasm = std::fs::read(&ii_wasm_path).expect("read II_WASM (gz bytes; PocketIC gunzips)");
 
-    // Isolate the OAuth client store: a UNIQUE temp file (so concurrent runs
-    // never collide on a fixed name) plus a guard that restores/clears the
-    // process-global `OAUTH_CLIENTS_FILE` on drop — even on a panic — so the
-    // override can't leak into other test threads.
+    // Isolate the OAuth client store in a UNIQUE temp directory (so concurrent
+    // runs never collide on a fixed name), removed on drop — even on a panic — by
+    // the guard. The directory is injected via `McpConfig::state_dir`; no
+    // process-global env is involved.
     let nanos = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let mut clients_file = std::env::temp_dir();
-    clients_file.push(format!(
-        "imcp2-e2e-oauth-clients-{}-{nanos}.json",
+    let state_dir = std::env::temp_dir().join(format!(
+        "imcp2-e2e-state-{}-{nanos}",
         std::process::id()
     ));
-    let _ = std::fs::remove_file(&clients_file);
-    let _clients_env = ClientsFileEnvGuard {
-        prev: std::env::var_os("OAUTH_CLIENTS_FILE"),
-        path: clients_file.clone(),
-    };
-    std::env::set_var("OAUTH_CLIENTS_FILE", &clients_file);
+    std::fs::create_dir_all(&state_dir).expect("create e2e state dir");
+    let _state_guard = StateDirGuard { dir: state_dir.clone() };
 
     // --- PocketIC + live II ---
     let mut pic = pocket_ic::PocketIcBuilder::new()
@@ -365,7 +356,8 @@ async fn registration_delegation_end_to_end() {
         },
         public_url: public_url.into(),
         mcp_path: "/mcp".into(),
-        clients: crate::SharedClients::load(),
+        clients: crate::SharedClients::load(&state_dir),
+        state_dir: state_dir.clone(),
         // The handshake under test carries no `resource`; keep it lenient.
         require_resource: false,
     });

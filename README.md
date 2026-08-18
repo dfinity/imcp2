@@ -39,12 +39,16 @@ use imcp2::{auth_callbacks_router, Agent, IiInstance, McpConfig, McpServer, Shar
 async fn main() -> anyhow::Result<()> {
     // Standalone: a default mainnet agent. Embedded: hand in the host's own.
     let agent = Agent::builder().with_url(IC_URL).build()?;
+    // Where imcp2 keeps operational state (the client-registration store).
+    let state_dir = std::path::PathBuf::from("/var/lib/imcp2");
     let server = McpServer::new(McpConfig {
         agent,
         instance: IiInstance::beta().map_err(anyhow::Error::msg)?,
         public_url: "https://mcp.example.com".into(),
         mcp_path: "/mcp".into(),
-        clients: SharedClients::load(),
+        clients: SharedClients::load(&state_dir),
+        state_dir,
+        require_resource: true, // strict RFC 8707 (reject a missing `resource`)
     });
     server.spawn_session_reaper();
     let app = axum::Router::new()
@@ -448,8 +452,9 @@ The deployment binary is **self-contained**: the connect/landing HTML, CSS, and 
 so nothing has to ship next to it (both are build-time inputs only). The
 only runtime file is the OAuth clients store, which the server always uses: it reads
 the file on startup and writes it (best-effort) as client registrations change, so
-give it a writable path. It defaults to `oauth-clients.json` in the working
-directory; override the location with `OAUTH_CLIENTS_FILE`. On `SIGTERM` (what
+give it a writable directory. imcp2 creates its operational files in
+`IMCP2_STATE_DIR` (the clients store at `<dir>/oauth-clients.json`); it defaults to
+the working directory. On `SIGTERM` (what
 `systemctl stop`/`restart` sends) or `SIGINT`, the server drains in-flight requests
 before exiting, so a redeploy doesn't cut off calls mid-flight. Two requirements
 when hosting:
@@ -554,8 +559,8 @@ its AS issuer is `<PUBLIC_URL>/mcp` and everything OAuth lives under it:
 - `GET /.well-known/oauth-protected-resource/mcp` — points clients at the AS
   (RFC 9728 §3.1 path-inserted; root fallback also served)
 - `POST /mcp/oauth/register` — dynamic client registration (RFC 7591); `redirect_uris`
-  are stored and persisted to `OAUTH_CLIENTS_FILE` (a bounded, LRU-evicted store —
-  see [Bounded state](#bounded-state-memory--disk)); requested `grant_types` are
+  are stored and persisted to `oauth-clients.json` in `IMCP2_STATE_DIR` (a bounded,
+  LRU-evicted store — see [Bounded state](#bounded-state-memory--disk)); requested `grant_types` are
   honoured (intersected with `authorization_code`). A **hosted** `redirect_uri` is
   rejected unless its host is on the allow-list (see the Companion-control note
   below); loopback redirects are always accepted.
