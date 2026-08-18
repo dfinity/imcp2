@@ -926,6 +926,14 @@ pub fn oql_query_start(query_json: &str) -> Option<String> {
         .and_then(|v| v.get("start").and_then(|s| s.as_str()).map(str::to_string))
 }
 
+/// Longest name the fuzzy (edit-distance) repair will run its `O(m·n)` DP over.
+/// A "did you mean?" repair only makes sense for identifier-length names, so a
+/// `start` — or a (malicious) schema entity name — far longer than that is never
+/// a near-miss and is skipped before the DP runs. Without this bound, an
+/// attacker-sized `start` (the `oql` argument is agent-controlled) would run
+/// Levenshtein against every entity and stall the async worker with pure CPU.
+const MAX_FUZZY_NAME_LEN: usize = 128;
+
 /// The closest entity name to `start`, for a "did you mean?" repair — a
 /// case-insensitive exact match first, then a plural/singular flip
 /// (`booking`↔`bookings`), then the smallest Levenshtein distance within a small
@@ -944,13 +952,30 @@ pub fn closest_entity(start: &str, entities: &[String]) -> Option<String> {
     }) {
         return Some((*e).clone());
     }
+    // Fuzzy phase is bounded (CWE-770 / worker stall): an over-long `start` can't
+    // be a typo of a short entity name, so skip the DP entirely rather than run it
+    // against every entity. The exact/plural checks above already ran.
+    if lc.len() > MAX_FUZZY_NAME_LEN {
+        return None;
+    }
     // Small edit distance, scaled to the shorter of the two names so short names
     // demand a tighter match. Pick the nearest; ties keep the first (schema order).
+    let lc_chars = lc.chars().count();
     let mut best: Option<(usize, &String)> = None;
     for e in entities {
         let el = e.to_lowercase();
-        let d = levenshtein(&lc, &el);
         let bound = (lc.len().min(el.len()) / 3).clamp(1, 3);
+        // Edit distance is at least the CHARACTER-length difference, so a name
+        // whose char count differs from `start` by more than the bound can never
+        // qualify — skip the O(m·n) DP for it (this also caps a malicious schema's
+        // over-long entity name: it can't be within `bound` of a start that passed
+        // the length cap). The difference must be counted in `char`s, not bytes:
+        // `levenshtein` works on `char`s, so a byte-length difference (inflated by
+        // multi-byte chars) would wrongly prune a genuine near-miss.
+        if lc_chars.abs_diff(el.chars().count()) > bound {
+            continue;
+        }
+        let d = levenshtein(&lc, &el);
         if d <= bound && best.map_or(true, |(bd, _)| d < bd) {
             best = Some((d, e));
         }
@@ -2303,6 +2328,51 @@ mod tests {
         assert_eq!(closest_entity("userz", &entities).as_deref(), Some("users"));
         // Nothing close → no suggestion (don't send the agent to a wrong entity).
         assert_eq!(closest_entity("invoices", &entities), None);
+    }
+
+    // The fuzzy phase is length-bounded so an attacker-sized `start` (or entity
+    // name) can't stall the worker with an O(m·n) Levenshtein sweep. An over-long
+    // `start` yields no suggestion (it isn't a typo of any short entity), while a
+    // still-exact/plural match of any length is unaffected.
+    #[test]
+    fn closest_entity_bounds_the_fuzzy_phase() {
+        use super::{closest_entity, MAX_FUZZY_NAME_LEN};
+        let entities = vec!["bookings".to_string(), "users".to_string()];
+
+        // A start longer than the cap is not fuzzy-matched (no near-miss possible).
+        let huge = "u".repeat(MAX_FUZZY_NAME_LEN + 1);
+        assert_eq!(closest_entity(&huge, &entities), None);
+
+        // The cap is INCLUSIVE: a genuine near-miss whose length is EXACTLY the cap
+        // is still repaired. This pins the boundary — flipping the guard to
+        // `>= MAX_FUZZY_NAME_LEN` would drop this suggestion and fail the test.
+        let at_cap_entity = "a".repeat(MAX_FUZZY_NAME_LEN); // len == cap
+        let at_cap_typo = format!("{}b", "a".repeat(MAX_FUZZY_NAME_LEN - 1)); // one edit away, len == cap
+        assert_eq!(
+            closest_entity(&at_cap_typo, &[at_cap_entity.clone()]).as_deref(),
+            Some(at_cap_entity.as_str()),
+            "a near-miss exactly at the cap length must still be suggested"
+        );
+        // One char OVER the cap: the same near-miss is dropped (fuzzy phase skipped).
+        let over_cap_typo = format!("{}b", "a".repeat(MAX_FUZZY_NAME_LEN));
+        let over_cap_entity = "a".repeat(MAX_FUZZY_NAME_LEN + 1);
+        assert_eq!(closest_entity(&over_cap_typo, &[over_cap_entity]), None);
+
+        // Exact and plural repairs bypass the DP, so length never blocks them: a
+        // huge entity name still matches its exact/plural `start`.
+        let long_entity = "a".repeat(MAX_FUZZY_NAME_LEN * 4);
+        let big = vec![long_entity.clone()];
+        assert_eq!(closest_entity(&long_entity, &big).as_deref(), Some(long_entity.as_str()));
+        assert_eq!(closest_entity(&format!("{long_entity}s"), &big).as_deref(), Some(long_entity.as_str()));
+
+        // Unicode: the length-difference pruning counts chars, not bytes, so a
+        // multi-byte near-miss (1 edit) is NOT wrongly pruned by a larger byte diff.
+        let unicode_entities = vec!["abcde\u{1F4A9}".to_string()]; // 6 chars, 9 bytes
+        assert_eq!(
+            closest_entity("abcdeX", &unicode_entities).as_deref(), // 6 chars, 6 bytes; 1 edit away
+            Some("abcde\u{1F4A9}"),
+            "a 1-char edit must survive pruning even when the byte-length diff exceeds the bound"
+        );
     }
 
     // #8: one COMPLETE canister_query per entity, each preserving the identity the
