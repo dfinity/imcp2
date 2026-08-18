@@ -1090,7 +1090,14 @@ fn ipv6_is_global(ip: &Ipv6Addr) -> bool {
         || ip.is_multicast()                 // ff00::/8
         || (seg[0] & 0xfe00) == 0xfc00       // fc00::/7 unique-local
         || (seg[0] & 0xffc0) == 0xfe80       // fe80::/10 link-local unicast
-        || (seg[0] == 0x2001 && seg[1] == 0x0db8)) // 2001:db8::/32 documentation
+        || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
+        // Transition mechanisms embed an IPv4 address deeper in the v6 space than
+        // `to_ipv4` decodes, so a NAT64/6to4/Teredo host would otherwise translate
+        // one of these to loopback/link-local/RFC1918/metadata (ICPBB-377). imcp2
+        // never needs to reach them, so refuse the prefixes outright.
+        || (seg[0] == 0x0064 && seg[1] == 0xff9b)  // 64:ff9b::/32 NAT64 (RFC 6052 WKP + RFC 8215 local-use)
+        || seg[0] == 0x2002                        // 2002::/16 6to4
+        || (seg[0] == 0x2001 && seg[1] == 0x0000)) // 2001::/32 Teredo
 }
 
 /// Validate a user-supplied discovery URL against SSRF and return the parsed URL
@@ -2057,9 +2064,17 @@ mod tests {
             "::1", "::", "fc00::1", "fd12::1", "fe80::1", "2001:db8::1",
             "::ffff:127.0.0.1", "::ffff:10.0.0.1", // IPv4-mapped private/loopback
             "::127.0.0.1", "::192.168.1.1",        // IPv4-compatible private/loopback
+            // Transition-mechanism prefixes: a NAT64/6to4/Teredo host translates
+            // these to internal/metadata IPv4 (ICPBB-377), so they must not pass.
+            "64:ff9b::a9fe:a9fe", "64:ff9b::7f00:1", "64:ff9b::a00:1", // NAT64 WKP → metadata/loopback/RFC1918
+            "64:ff9b:1::a9fe:a9fe",                                   // NAT64 RFC 8215 local-use
+            "2002:a9fe:a9fe::", "2002:7f00:1::",                      // 6to4 → metadata/loopback
+            "2001:0:0:0:0:0:a9fe:a9fe",                               // Teredo
         ] {
             assert!(!g(bad), "{bad} must be classified non-global");
         }
+        // A real public v6 that merely starts with 0x2001 (not db8/Teredo) stays global.
+        assert!(g("2001:4860:4860::8888"));
     }
 
     // The exact vectors from the finding, plus https-to-internal, are refused
