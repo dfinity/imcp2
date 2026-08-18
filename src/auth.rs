@@ -769,7 +769,7 @@ impl TokenInfo {
 }
 
 /// The dynamic-client-registration store, shared by every instance's
-/// [`AuthStore`]. Client registration is II-agnostic (it only pins redirect
+/// `AuthStore`. Client registration is II-agnostic (it only pins redirect
 /// URIs to a `client_id`), so a client registered against either instance's AS
 /// is known to both — and, since both stores share one map, the persisted
 /// snapshot never loses the other instance's entries.
