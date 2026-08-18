@@ -1,5 +1,24 @@
 {
   email __ACME_EMAIL__
+  # Slow-loris / slow-body containment on the public edge. Without these, a
+  # client can hold a connection open by dribbling the request headers or body a
+  # byte at a time and tie up server resources; HTTP/2 makes it cheaper still
+  # (many concurrent streams per connection). Bound how long a request may take
+  # to arrive: headers within 10s, the full body within 30s (MCP request bodies
+  # are small JSON — this is generous for a legit slow link, tight for an
+  # attacker), and idle keep-alive connections close after 120s.
+  #
+  # `write` is deliberately left at the default (unbounded): the MCP streamable
+  # transport answers with long-lived Server-Sent-Events responses, and a write
+  # timeout would cut those streams. `idle` governs the gap *between* requests on
+  # a kept-alive connection, not an in-flight streaming response, so it is safe.
+  servers {
+    timeouts {
+      read_header 10s
+      read_body 30s
+      idle 120s
+    }
+  }
 }
 __DOMAIN__ {
   # Status dashboard (internal Node service on :8137), published under /status/.
