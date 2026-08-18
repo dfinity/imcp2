@@ -6,7 +6,10 @@ description = "Minimal MCP server that bridges an LLM to the Internet Computer, 
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/dfinity/imcp2"
-homepage = "https://github.com/dfinity/imcp2"
+# The hosted deployment of this crate, not the repository: crates.io renders
+# `homepage` and `repository` as separate links, so pointing both at GitHub
+# wastes one. This is where a reader can actually connect an MCP client.
+homepage = "https://mcp.internetcomputer.org"
 keywords = ["mcp", "internet-computer", "icp", "candid", "axum"]
 categories = [
     "network-programming",
