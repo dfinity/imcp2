@@ -5,8 +5,28 @@ edition = "2021"
 description = "Minimal MCP server that bridges an LLM to the Internet Computer, speaking textual Candid."
 license = "Apache-2.0"
 readme = "README.md"
-# Internal binary crate — not intended for crates.io.
-publish = false
+repository = "https://github.com/dfinity/imcp2"
+homepage = "https://github.com/dfinity/imcp2"
+keywords = ["mcp", "internet-computer", "icp", "candid", "axum"]
+categories = [
+    "network-programming",
+    "web-programming::http-server",
+    "api-bindings",
+    "cryptography::cryptocurrencies",
+]
+# Everything the library and the bundled binary compile from ships; the
+# deployment scaffolding (container, systemd/native deploy, dashboards, CI,
+# submission docs) is repository-only and would just inflate the .crate.
+# `src/assets` and `static` are NOT optional: both are pulled in at compile
+# time with `include_str!`.
+exclude = [
+    ".github/",
+    ".dockerignore",
+    "Dockerfile",
+    "deploy/",
+    "docs/",
+    "monitoring/",
+]
 
 [dependencies]
 rmcp = { version = "1.7", features = [
