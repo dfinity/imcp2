@@ -692,6 +692,34 @@ pub fn encode_args(did: Option<&str>, method: &str, args_text: &str) -> Result<V
     .unwrap_or_else(|| Err("could not spawn a thread to parse the `args` value".into()))
 }
 
+/// Candid's per-value decoding-cost budget for an untrusted canister reply (a
+/// candid `DecoderConfig` quota — [`reply_decoder_config`]). The caller picks the
+/// target canister, so the reply bytes are attacker-controlled (CWE-789): a
+/// zero-byte element type lets a tiny reply declare an astronomical element count
+/// (`vec null` × 4e7 in ~13 wire bytes, or far more via nesting), and decoding it
+/// drives a multi-gigabyte allocation and an UNCATCHABLE `handle_alloc_error`/OOM
+/// abort that drops every concurrent session (ICPBB-438) — `on_deep_stack` recovers
+/// panics, not aborts.
+///
+/// candid charges this quota per decoded value, so the bound is ABSOLUTE: nesting
+/// or padding the wire cannot raise it, and exceeding it returns the ordinary
+/// "reply is not decodable" error instead of aborting. The worst case is the
+/// zero-byte `vec null` path (~3 cost + ~48 B allocated per element with no
+/// pre-sizing), so this cap keeps a rejected bomb's transient allocation to ~tens
+/// of MB, while leaving realistic replies — orders of magnitude smaller — untouched.
+/// A reply legitimately carrying >~1M decoded values would render to unusable
+/// megabytes of text anyway; raise this if that ever becomes a real need.
+const REPLY_DECODING_QUOTA: usize = 3_000_000;
+
+/// A [`candid::DecoderConfig`] carrying [`REPLY_DECODING_QUOTA`] for both the
+/// decoding and skipping counters, applied to every decode of untrusted reply bytes.
+fn reply_decoder_config() -> candid::DecoderConfig {
+    let mut cfg = candid::DecoderConfig::new();
+    cfg.set_decoding_quota(REPLY_DECODING_QUOTA)
+        .set_skipping_quota(REPLY_DECODING_QUOTA);
+    cfg
+}
+
 /// Decode reply `bytes` to textual Candid. With `did`, decode against the
 /// method's declared return types so record/variant field names are recovered;
 /// otherwise (or on any failure) fall back to type-less decoding.
@@ -707,7 +735,7 @@ pub fn decode_reply(did: Option<&str>, method: &str, bytes: &[u8]) -> String {
     // whole process. So decode, render, and drop the tree on the deep stack, exactly as
     // the DID path already does. Not nested: the DID path's `on_deep_stack` has already
     // returned by the time we reach here, and only the rendered `String` crosses back.
-    on_deep_stack(|| match IDLArgs::from_bytes(bytes) {
+    on_deep_stack(|| match IDLArgs::from_bytes_with_config(bytes, &reply_decoder_config()) {
         Ok(decoded) => decoded.to_string(),
         Err(e) => format!("(call succeeded but reply is not decodable as Candid: {e})"),
     })
@@ -725,7 +753,7 @@ pub fn decode_bytes_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<St
         let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
         let actor = actor?;
         let func = env.get_method(&actor, method).ok()?;
-        let decoded = IDLArgs::from_bytes_with_types(bytes, &env, &func.rets).ok()?;
+        let decoded = IDLArgs::from_bytes_with_types_with_config(bytes, &env, &func.rets, &reply_decoder_config()).ok()?;
         Some(decoded.to_string())
     })
     .flatten()
@@ -1080,7 +1108,7 @@ pub fn parse_execute_reply(did: Option<&str>, reply: &[u8]) -> OqlResult {
     on_deep_stack(move || {
         let decoded = match did.and_then(|d| decode_args_with_did(d, "execute", reply)) {
             Some(args) => args,
-            None => match IDLArgs::from_bytes(reply) {
+            None => match IDLArgs::from_bytes_with_config(reply, &reply_decoder_config()) {
                 Ok(args) => args,
                 Err(e) => return OqlResult::Unrecognized(format!("(undecodable reply: {e})")),
             },
@@ -1105,7 +1133,7 @@ pub fn decode_text_reply(reply: &[u8]) -> String {
     // level, so a recursive reply would overflow the ~2 MiB worker stack and abort the
     // process. Only the resulting `String` crosses back.
     on_deep_stack(|| {
-        let args = match IDLArgs::from_bytes(reply) {
+        let args = match IDLArgs::from_bytes_with_config(reply, &reply_decoder_config()) {
             Ok(a) => a,
             Err(e) => return format!("(undecodable reply: {e})"),
         };
@@ -1162,7 +1190,7 @@ fn decode_args_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<IDLArgs
     let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
     let actor = actor?;
     let func = env.get_method(&actor, method).ok()?;
-    IDLArgs::from_bytes_with_types(bytes, &env, &func.rets).ok()
+    IDLArgs::from_bytes_with_types_with_config(bytes, &env, &func.rets, &reply_decoder_config()).ok()
 }
 
 /// Recognize an OQL result value: a `record { hasMore; rows }`, optionally
@@ -1341,6 +1369,34 @@ pub async fn raw_call(
 
 #[cfg(test)]
 mod tests {
+    // CWE-789 (ICPBB-438): a ~13-byte reply declaring 40M zero-byte `vec null`
+    // elements would, without a decoding quota, drive a multi-GB allocation and an
+    // uncatchable abort. The `reply_decoder_config` quota bounds it, so the decode
+    // returns the ordinary "not decodable" error instead of killing the process.
+    #[test]
+    fn decode_reply_rejects_a_vec_null_bomb_instead_of_aborting() {
+        fn uleb128(mut n: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let b = (n & 0x7f) as u8;
+                n >>= 7;
+                if n == 0 {
+                    out.push(b);
+                    break;
+                }
+                out.push(b | 0x80);
+            }
+            out
+        }
+        // DIDL | one type T0 = vec (6d) null (7f) | one arg of T0 (01 00) | count.
+        let mut bomb = vec![0x44, 0x49, 0x44, 0x4c, 0x01, 0x6d, 0x7f, 0x01, 0x00];
+        bomb.extend(uleb128(40_000_000));
+        assert!(bomb.len() <= 16, "the bomb is tiny on the wire: {} bytes", bomb.len());
+        // Type-less path (did = None). Must return the decode-error string, not abort.
+        let out = super::decode_reply(None, "m", &bomb);
+        assert!(out.contains("not decodable"), "expected the decode-error path, got: {out:.120}");
+    }
+
     // CWE-674: the pre-parse guard rejects over-deep / oversized textual Candid
     // (which would otherwise stack-overflow candid_parser and abort the process),
     // without false-positiving on realistic values.
