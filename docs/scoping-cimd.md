@@ -101,8 +101,16 @@ when the URL is itself attacker-selected.
 
 ### 3.1 The gating decision (the crux)
 
-**Fetch a CIMD only when the `client_id` URL's host is on the trust policy.** A
-URL `client_id` whose host is *not* vetted is not fetched at all.
+**Fetch a CIMD only when the `client_id` URL's ORIGIN is on the trust policy** —
+an exact `https://<vetted-host>` on the default 443 port. A URL whose origin is
+not vetted is not fetched at all.
+
+Match the **origin, not the bare host**: `resolve_public_url` uses the
+caller-supplied port (`discover.rs:1113`), so a host-only check would let
+`https://claude.ai:8443/…` past a `claude.ai` gate and on to a non-default port —
+a service that was never vetted. Require the default HTTPS port (reject any
+explicit non-443 port, and any userinfo or other non-canonical authority) **before**
+the DNS lookup or fetch.
 
 Why gate rather than fetch any URL:
 
@@ -122,10 +130,10 @@ At `/oauth/authorize` (`auth.rs:1012`), branch on the shape of `client_id`:
 1. **Opaque `client-<uuid>`** → the existing DCR path (`validate_client`),
    unchanged.
 2. **`https` URL** →
-   - If the host is **not** on the client-id trust policy → **reject** with a
-     clear error naming the contact for allow-listing (mirroring the DCR
-     hosted-redirect rejection). *(Reject vs silent DCR-fallback is an open
-     question — see §8.)*
+   - If the URL's **origin** (scheme + host + default 443 port) is **not** on the
+     client-id trust policy → **reject** with a clear error naming the contact
+     for allow-listing (mirroring the DCR hosted-redirect rejection). *(Reject vs
+     silent DCR-fallback is an open question — see §8.)*
    - If on the policy → fetch the document through the SSRF-safe fetcher (§3.3),
      then validate (§3.4). On success, treat the verified URL as the
      `client_id` for the rest of the code+token flow; cache the document (§3.5).
@@ -135,20 +143,32 @@ At `/oauth/authorize` (`auth.rs:1012`), branch on the shape of `client_id`:
 Reuse the `discover.rs` machinery rather than writing a second SSRF guard.
 Because those functions are currently private to `discover.rs`, **Phase 0** is a
 small refactor: extract `resolve_public_url` / `site_client` /
-`ssrf_redirect_policy` / the capped-read helper into a shared `pub(crate)`
-module (e.g. `src/net.rs`). No behavior change; independently useful.
+`ssrf_redirect_policy` into a shared `pub(crate)` module (e.g. `src/net.rs`). No
+behavior change; independently useful.
+
+**Do NOT reuse discovery's capped *reader* unchanged.** The best-effort reader
+(`discover.rs:1207-1228`) deliberately returns lossy, partial text on a stream
+error or once the cap is reached, **without signaling** — correct for scraping an
+app bundle, unsafe at an auth boundary: a truncated or over-limit response whose
+prefix happens to be valid JSON would be accepted as client metadata. CIMD needs
+a **strict** reader instead. Leave the best-effort wrapper for discovery.
 
 CIMD-specific fetch parameters:
 
 - `GET`, `Accept: application/json`; require a JSON content type on the response.
 - A **tighter response-size cap** than discovery's 256 KB metadata cap — a CIMD
   is a few KB; propose 64 KB.
+- A **strict capped read** that **fails closed** — rejects (never truncates) an
+  over-limit body, a stream error, or invalid UTF-8 — so a partial body is never
+  parsed as a document.
 - Keep the 15 s timeout, address pinning, `https`-only, and bounded redirects.
 
 ### 3.4 Validation
 
-- `client_id` **exactly equals** the fetched URL (post-normalization the same
-  way redirects are compared).
+- The document's `client_id` value is a **plain string match** against the
+  requested URL — no normalization. (Hosted redirects already use exact string
+  membership, `auth.rs:648`; normalizing the client id would also mint aliases
+  that disagree with the raw-URL cache key of §3.5.)
 - The request's `redirect_uri` is a member of the document's `redirect_uris`
   **and** still passes `redirect_uri_permitted` (`auth.rs:545`). Keeping the
   existing host+path pin is deliberate belt-and-suspenders: if a vetted vendor's
@@ -164,13 +184,18 @@ CIMD-specific fetch parameters:
 - Bounded LRU, like the DCR store. **In-memory only** is likely sufficient (a
   cache miss just re-fetches), unlike DCR registrations which must survive a
   restart — but confirm (§8).
+- Also **negative-cache** URLs that fail validation or aren't CIMDs, so a repeat
+  of the same bogus path is cheap. Note the cache is *not* the outbound-DoS
+  control (path variation defeats it — §5); the rate/concurrency cap is.
 
 ### 3.6 Re-keying the allow-list
 
-Introduce a **client-id-host trust policy** (the spec's "domain allowed via
-trust policy"). Recommendation: derive it from the *same curated vendor set*
-that backs `DEFAULT_ALLOWED_REDIRECTS` (`auth.rs:434`) so there is one source of
-truth for "who is a vetted vendor," rather than a second independent list.
+Introduce a **client-id-ORIGIN trust policy** (the spec's "domain allowed via
+trust policy") — exact `https://<host>` entries on the default 443 port, matched
+as origins so the port gap in §3.1 cannot slip a non-default port past a host
+check. Recommendation: derive it from the *same curated vendor set* that backs
+`DEFAULT_ALLOWED_REDIRECTS` (`auth.rs:434`) so there is one source of truth for
+"who is a vetted vendor," rather than a second independent list.
 `redirect_uri_permitted` continues to gate the redirect leg.
 
 ### 3.7 Advertise support
@@ -200,14 +225,19 @@ That half still needs II coordination.
   compromised/misconfigured vendor DNS pointing at an internal address is still
   rejected.
 - **DoS (outbound amplification):** the fetch hangs off the *unauthenticated*
-  `/authorize` path. Gating bounds it to known hosts; the validated-document
-  cache turns repeat `/authorize` calls for a vetted `client_id` into cache
-  hits; add a global concurrency/rate cap on outbound CIMD fetches so a burst
-  can't fan out. (Consistent with this project's stance that availability
-  hardening is discretionary, but cheap here.)
+  `/authorize` path. Origin-gating bounds it to known **hosts**, but **not** to a
+  bounded number of fetches: an attacker can vary the URL **path** on a vetted
+  host (`https://claude.ai/a`, `/b`, …), and each distinct URL is a distinct
+  cache key and a fresh up-to-15 s fetch, so the cache does not bound misses. A
+  **concurrency + rate cap on outbound CIMD fetches is therefore required, not
+  optional** — cap it per client-id host (and globally) so path variation on one
+  vetted host cannot fan out, and negative-cache failed/for-non-CIMD URLs so a
+  repeat of the same bogus path is cheap. (This project treats availability
+  hardening as discretionary, but here the control is load-bearing, not a
+  nicety.)
 - **Phishing:** unchanged posture. The curated trust policy remains the phishing
   defense; CIMD only re-keys it from redirect-URI-host to the DNS-authenticated
-  client-id-host. Mandatory consent-screen hostname display stays.
+  client-id-origin. Mandatory consent-screen hostname display stays.
 - **Display-field spoofing:** never trust `client_name`/`logo_uri`; brand from
   the vetted vendor keyed on the verified domain.
 - **Confused deputy:** the existing `sid`-cookie consent binding is unaffected.
@@ -217,9 +247,12 @@ That half still needs II coordination.
 - **Phase 0 — shared SSRF fetcher.** Extract the `discover.rs` fetcher into a
   `pub(crate)` module. No behavior change.
 - **Phase 1 — CIMD accept path.** URL-form `client_id` in `/oauth/authorize`:
-  trust-policy gate → SSRF-safe fetch → validate (`client_id`==URL, redirect
-  membership + path pin, JSON structure) → cache. Add the client-id-host policy.
-  Advertise the metadata flag. **Keep DCR** as deprecated backward-compat.
+  origin-gate → SSRF-safe fetch (strict reader) → validate (`client_id`==URL
+  string match, redirect membership + path pin, JSON structure) → cache. Add the
+  client-id-origin policy. Advertise the metadata flag. **Keep DCR** as deprecated
+  backward-compat. **Acceptance criterion — the endpoint MUST NOT ship without its
+  outbound-DoS control:** a per-host + global concurrency/rate cap on CIMD fetches
+  plus negative-caching (§5), so path variation on a vetted host cannot fan out.
 - **Phase 2 — branding.** Key the vendor name/logo table on the verified domain;
   coordinate the display rules with II.
 - **Phase 3 — (optional, later).** Open CIMD beyond the trust policy to general
@@ -239,7 +272,7 @@ URL `client_id` on a vetted domain uses CIMD; everything else uses DCR.
    reject is clearer and avoids a confusing partial-support surface; a fallback
    is more permissive. Recommend reject with an allow-listing contact.
 2. **One list or two:** reuse the `DEFAULT_ALLOWED_REDIRECTS` vendor set as the
-   client-id-host policy, or maintain a separate list? Recommend one source of
+   client-id-origin policy, or maintain a separate list? Recommend one source of
    truth.
 3. **Cache lifetime & persistence:** in-memory only vs persisted; TTL floor /
    ceiling values; cache size cap.
