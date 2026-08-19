@@ -161,7 +161,15 @@ CIMD-specific fetch parameters:
 - A **strict capped read** that **fails closed** — rejects (never truncates) an
   over-limit body, a stream error, or invalid UTF-8 — so a partial body is never
   parsed as a document.
-- Keep the 15 s timeout, address pinning, `https`-only, and bounded redirects.
+- Keep the 15 s timeout, address pinning, and `https`-only.
+- **Do NOT reuse discovery's redirect policy.** `ssrf_redirect_policy` /
+  `redirect_hop_ok` (`discover.rs:1145-1153`) follow any *global-IP literal* and
+  any *same-host* hop **without a port check** — so a vetted `client_id` could
+  redirect the fetch to an unvetted public IP or to `vetted-host:8443`, escaping
+  the exact-origin gate of §3.1. A CIMD document is served directly at its URL, so
+  **disable redirects entirely** (recommended); if a vendor genuinely needs one,
+  require an **exact same-origin** hop (scheme + host + port all equal to the
+  vetted origin), never the discovery policy.
 
 ### 3.4 Validation
 
@@ -220,10 +228,11 @@ That half still needs II coordination.
 
 ## 5. Security analysis
 
-- **SSRF:** gated to trust-policy hosts, so no arbitrary-URL fetch — and even a
-  vetted host is fetched through the address-pinned, all-IPs-global fetcher, so a
-  compromised/misconfigured vendor DNS pointing at an internal address is still
-  rejected.
+- **SSRF:** gated to trust-policy origins, so no arbitrary-URL fetch — and even a
+  vetted origin is fetched through the address-pinned, all-IPs-global fetcher, so
+  a compromised/misconfigured vendor DNS pointing at an internal address is still
+  rejected. CIMD also **disables cross-origin redirects** (§3.3), so a vetted URL
+  can't be bounced to an unvetted public IP or a different port.
 - **DoS (outbound amplification):** the fetch hangs off the *unauthenticated*
   `/authorize` path. Origin-gating bounds it to known **hosts**, but **not** to a
   bounded number of fetches: an attacker can vary the URL **path** on a vetted
