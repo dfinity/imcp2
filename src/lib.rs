@@ -32,12 +32,15 @@
 //! async fn main() -> anyhow::Result<()> {
 //!     // Or hand in the host's own agent instead of building a default one.
 //!     let agent = Agent::builder().with_url(IC_URL).build()?;
+//!     // Where imcp2 keeps operational state (the client-registration store).
+//!     let state_dir = std::path::PathBuf::from("/var/lib/imcp2");
 //!     let server = McpServer::new(McpConfig {
 //!         agent,
 //!         instance: IiInstance::beta().map_err(anyhow::Error::msg)?,
 //!         public_url: "https://mcp.example.com".into(),
 //!         mcp_path: "/mcp".into(),
-//!         clients: SharedClients::load(),
+//!         clients: SharedClients::load(&state_dir),
+//!         state_dir,
 //!         require_resource: true, // strict RFC 8707 (reject a missing `resource`)
 //!     });
 //!     server.spawn_session_reaper();
@@ -58,15 +61,17 @@
 //!
 //! Several instances can share one origin (e.g. production II at `/mcp`, beta
 //! II at `/mcp-beta`): give each its own `McpServer` (sessions and tokens
-//! never cross instances), share ONE [`SharedClients`] between them so dynamic
-//! client registrations (II-agnostic) persist to a single snapshot, and pass
-//! every instance to [`auth_callbacks_router`] so the one allow-list document
-//! declares all callbacks.
+//! never cross instances), share ONE [`SharedClients`] between them — loaded
+//! once from the same [`McpConfig::state_dir`] — so dynamic client registrations
+//! (II-agnostic) persist to a single snapshot, and pass every instance to
+//! [`auth_callbacks_router`] so the one allow-list document declares all
+//! callbacks.
 //!
-//! Remaining knobs are environment variables read where they are used:
-//! `II_URL` / `II_CANISTER_ID` and `II_URL_PROD` / `II_CANISTER_ID_PROD` (the
-//! Internet Identity instances), `OAUTH_CLIENTS_FILE` (where dynamic client
-//! registrations persist) and `SKILLS_URL` (the IC skills registry).
+//! The operational-files location is [`McpConfig::state_dir`] (the embedder
+//! supplies it; the `imcp2` binary reads `$IMCP2_STATE_DIR`). Remaining knobs are
+//! environment variables read where they are used: `II_URL` / `II_CANISTER_ID`
+//! and `II_URL_PROD` / `II_CANISTER_ID_PROD` (the Internet Identity instances)
+//! and `SKILLS_URL` (the IC skills registry).
 
 mod auth;
 mod calls;
@@ -86,6 +91,8 @@ mod tools;
 // compiles neither it nor `pocket-ic`. See the module docs to run it.
 #[cfg(all(test, feature = "e2e"))]
 mod e2e_handshake;
+
+use std::path::{Path, PathBuf};
 
 use axum::{
     middleware,
@@ -132,7 +139,16 @@ pub struct McpConfig {
     pub mcp_path: String,
     /// The dynamic-client-registration store. Share ONE across every instance
     /// on an origin (registrations are II-agnostic and persist to one file).
+    /// Build it from [`Self::state_dir`] via [`SharedClients::load`].
     pub clients: SharedClients,
+    /// Directory in which imcp2 creates its operational files — the persistent
+    /// state a restart must survive. Today the only such file is the
+    /// dynamic-client-registration store (`{state_dir}/oauth-clients.json`, loaded
+    /// into [`Self::clients`]); it is a directory rather than a file path so
+    /// future operational state has one configured home. The embedding
+    /// application owns this location (it is not read from the environment); the
+    /// `imcp2` binary sets it from `$IMCP2_STATE_DIR`.
+    pub state_dir: PathBuf,
     /// Strict RFC 8707 resource indicators: when `true`, both OAuth legs REQUIRE
     /// a `resource` naming this instance, refusing a request that omits it (not
     /// just one that names a foreign server). This closes the confused-deputy
@@ -159,6 +175,16 @@ pub struct McpServer {
 
 impl McpServer {
     pub fn new(config: McpConfig) -> Self {
+        // Single operational home: `clients` must have been loaded from the same
+        // `state_dir` this config declares. Enforcing it here (rather than storing
+        // a second copy of the path) keeps `Self::state_dir` — which reports the
+        // store's actual directory — from ever disagreeing with the field.
+        assert_eq!(
+            config.clients.state_dir(),
+            config.state_dir,
+            "McpConfig.clients must be loaded from McpConfig.state_dir \
+             (SharedClients::load(&state_dir))",
+        );
         let public_url = normalize_public_url(&config.public_url);
         let mcp_path = normalize_mount_path(&config.mcp_path);
         let identities =
@@ -179,6 +205,16 @@ impl McpServer {
             mcp_path,
             ct: CancellationToken::new(),
         }
+    }
+
+    /// The operational-files directory this instance uses — where imcp2 creates
+    /// the state a restart must survive (today, the client-registration store).
+    /// Reported straight from the client store, so it is the directory files
+    /// actually go to (construction enforces it equals [`McpConfig::state_dir`]).
+    /// Exposed so an embedder can place its own operational files under the same
+    /// home.
+    pub fn state_dir(&self) -> &Path {
+        self.store.state_dir()
     }
 
     /// The path this instance's [`Self::mcp_router`] must be nested at — the
@@ -532,7 +568,51 @@ fn normalize_public_url(raw: &str) -> String {
 
 #[cfg(test)]
 mod lib_tests {
-    use super::{allowed_hosts_for, normalize_mount_path, normalize_public_url};
+    use super::{
+        allowed_hosts_for, normalize_mount_path, normalize_public_url, Agent, IiInstance, McpConfig,
+        McpServer, SharedClients, IC_URL,
+    };
+    use std::path::PathBuf;
+
+    /// Build a server whose `clients` load and `state_dir` field both point at
+    /// `dir` (the correct pairing). Construction is pure — no network.
+    fn server_with_dir(dir: PathBuf) -> McpServer {
+        McpServer::new(McpConfig {
+            agent: Agent::builder().with_url(IC_URL).build().expect("agent"),
+            instance: IiInstance::prod().expect("prod instance"),
+            public_url: "https://mcp.example.com".into(),
+            mcp_path: "/mcp".into(),
+            clients: SharedClients::load(&dir),
+            state_dir: dir,
+            require_resource: true,
+        })
+    }
+
+    /// `state_dir()` reports the directory the client store actually uses (single
+    /// source of truth), not a separately-stored copy.
+    #[test]
+    fn state_dir_reports_the_store_directory() {
+        let dir = std::env::temp_dir().join("imcp2-lib-state-dir-test");
+        let server = server_with_dir(dir.clone());
+        assert_eq!(server.state_dir(), dir);
+    }
+
+    /// Constructing with `clients` loaded from a DIFFERENT directory than
+    /// `state_dir` is a programmer error and must fail loudly at construction,
+    /// rather than let `state_dir()` silently report a directory files don't use.
+    #[test]
+    #[should_panic(expected = "must be loaded from McpConfig.state_dir")]
+    fn mismatched_state_dir_and_clients_panics() {
+        let _ = McpServer::new(McpConfig {
+            agent: Agent::builder().with_url(IC_URL).build().expect("agent"),
+            instance: IiInstance::prod().expect("prod instance"),
+            public_url: "https://mcp.example.com".into(),
+            mcp_path: "/mcp".into(),
+            clients: SharedClients::load(std::env::temp_dir().join("dir-a")),
+            state_dir: std::env::temp_dir().join("dir-b"),
+            require_resource: true,
+        });
+    }
 
     /// `public_url` canonicalizes to a clean origin regardless of the shape the
     /// caller passes: a scheme is added when absent, an uppercase scheme is

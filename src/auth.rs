@@ -88,6 +88,7 @@
 
 use std::{
     collections::HashMap,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -200,48 +201,49 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
-/// File the dynamic client registrations are persisted to. RFC 7591 clients are
+/// Basename of the dynamic-client-registration store within the operational
+/// directory ([`McpConfig::state_dir`](crate::McpConfig)). RFC 7591 clients are
 /// long-lived (they cache their `client_id`), so registrations must survive a
 /// restart — unlike codes/tokens/connects, which are short-lived and stay in
-/// memory. Override with `OAUTH_CLIENTS_FILE`.
-fn clients_file() -> String {
-    std::env::var("OAUTH_CLIENTS_FILE").unwrap_or_else(|_| "oauth-clients.json".to_string())
+/// memory. The directory is injected via config, not read from the environment,
+/// so the embedding application owns where operational files live.
+const CLIENTS_FILENAME: &str = "oauth-clients.json";
+
+/// The temp path a client-store write stages to before the atomic rename: the
+/// target with a `.tmp` suffix, in the same directory (so the rename stays on one
+/// filesystem). Built on `OsString` so a non-UTF-8 path is preserved.
+fn clients_tmp_path(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    PathBuf::from(tmp)
 }
 
-fn load_clients() -> HashMap<String, ClientReg> {
-    load_clients_from(&clients_file())
-}
-
-fn load_clients_from(path: &str) -> HashMap<String, ClientReg> {
+fn load_clients_from(path: &Path) -> HashMap<String, ClientReg> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            tracing::warn!("could not parse {path}: {e}; starting with no clients");
+            tracing::warn!("could not parse {}: {e}; starting with no clients", path.display());
             HashMap::new()
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
         Err(e) => {
-            tracing::warn!("could not read {path}: {e}; starting with no clients");
+            tracing::warn!("could not read {}: {e}; starting with no clients", path.display());
             HashMap::new()
         }
     }
 }
 
-/// Best-effort write-through of the registration store. A failure (e.g. a
-/// read-only filesystem) only means registrations don't survive a restart — the
-/// client re-registers — so log and carry on.
+/// Best-effort write-through of the registration store to `path`. A failure (e.g.
+/// a read-only filesystem) only means registrations don't survive a restart —
+/// the client re-registers — so log and carry on.
 ///
 /// Atomic replace: `std::fs::write` truncates the target in place, so a crash or
-/// a concurrent [`load_clients`] mid-write could observe a half-written,
+/// a concurrent [`load_clients_from`] mid-write could observe a half-written,
 /// unparseable file and drop EVERY registration on the next load. Instead
 /// serialize to a sibling temp file and `rename` it over the target — atomic on
 /// POSIX, so a reader always sees either the old file or the complete new one.
-/// Only one writer runs at a time ([`ClientStore::persist_soon`]), so a fixed
+/// Only one writer runs at a time ([`ClientStore::persist_soon`]), so the fixed
 /// `.tmp` name cannot be raced.
-fn persist_clients(clients: &HashMap<String, ClientReg>) {
-    persist_clients_to(&clients_file(), clients);
-}
-
-fn persist_clients_to(path: &str, clients: &HashMap<String, ClientReg>) {
+fn persist_clients_to(path: &Path, clients: &HashMap<String, ClientReg>) {
     let bytes = match serde_json::to_vec_pretty(clients) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -249,13 +251,13 @@ fn persist_clients_to(path: &str, clients: &HashMap<String, ClientReg>) {
             return;
         }
     };
-    let tmp = format!("{path}.tmp");
+    let tmp = clients_tmp_path(path);
     if let Err(e) = std::fs::write(&tmp, &bytes) {
-        tracing::warn!("could not write {tmp}: {e}");
+        tracing::warn!("could not write {}: {e}", tmp.display());
         return;
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
-        tracing::warn!("could not replace {path}: {e}");
+        tracing::warn!("could not replace {}: {e}", path.display());
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -271,6 +273,13 @@ fn persist_clients_to(path: &str, clients: &HashMap<String, ClientReg>) {
 ///     re-serializes the whole store.
 struct ClientStore {
     registrations: RwLock<HashMap<String, ClientReg>>,
+    /// The operational directory this store lives in — the SINGLE source of truth
+    /// for where registrations persist (its file is `state_dir/{CLIENTS_FILENAME}`,
+    /// derived in [`Self::file`]). Owned by the store so the coalesced writer
+    /// ([`Self::persist_soon`]) needs no global/env lookup, and surfaced upward via
+    /// [`SharedClients::state_dir`] so `McpServer` reports the true location rather
+    /// than a possibly-diverging second copy.
+    state_dir: PathBuf,
     /// Set when the store holds registrations not yet written to disk. Cleared
     /// by the persist task before it snapshots, so a registration landing
     /// mid-write sets it again and gets its own pass (no lost updates).
@@ -281,19 +290,29 @@ struct ClientStore {
 }
 
 impl ClientStore {
-    /// Load the persisted registrations (see [`load_clients`]).
-    fn load() -> Arc<Self> {
-        Self::with(load_clients())
+    /// Load the persisted registrations from `state_dir/{CLIENTS_FILENAME}`,
+    /// binding the store to `state_dir` for later write-throughs.
+    fn load(state_dir: PathBuf) -> Arc<Self> {
+        let registrations = load_clients_from(&state_dir.join(CLIENTS_FILENAME));
+        Self::with(registrations, state_dir)
     }
 
-    /// A store over `registrations` as given (the seam tests use to start from a
-    /// known, empty set without reading the deployment's file).
-    fn with(registrations: HashMap<String, ClientReg>) -> Arc<Self> {
+    /// A store over `registrations` as given, bound to `state_dir` for
+    /// write-throughs (the seam tests use to start from a known set without
+    /// reading the deployment's file — pass a throwaway dir when persistence is
+    /// irrelevant).
+    fn with(registrations: HashMap<String, ClientReg>, state_dir: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             registrations: RwLock::new(registrations),
+            state_dir,
             dirty: AtomicBool::new(false),
             writing: AtomicBool::new(false),
         })
+    }
+
+    /// The file registrations persist to: `state_dir/{CLIENTS_FILENAME}`.
+    fn file(&self) -> PathBuf {
+        self.state_dir.join(CLIENTS_FILENAME)
     }
 
     /// Whether `redirect_uri` is acceptable for `client_id` ([`redirect_allowed`]),
@@ -351,7 +370,10 @@ impl ClientStore {
                 // during the write is guaranteed another pass.
                 while store.dirty.swap(false, Ordering::SeqCst) {
                     let snapshot = store.registrations.read().await.clone();
-                    tokio::task::spawn_blocking(move || persist_clients(&snapshot)).await.ok();
+                    let file = store.file();
+                    tokio::task::spawn_blocking(move || persist_clients_to(&file, &snapshot))
+                        .await
+                        .ok();
                     tokio::time::sleep(PERSIST_MIN_INTERVAL).await;
                 }
                 store.writing.store(false, Ordering::SeqCst);
@@ -777,10 +799,23 @@ impl TokenInfo {
 pub struct SharedClients(Arc<ClientStore>);
 
 impl SharedClients {
-    /// Load the persisted client registrations once, to be shared by all stores
-    /// (file from `OAUTH_CLIENTS_FILE`, default `oauth-clients.json`).
-    pub fn load() -> Self {
-        Self(ClientStore::load())
+    /// Load the persisted client registrations from `state_dir` once, to be shared
+    /// by every instance on the origin (the store lives at
+    /// `{state_dir}/oauth-clients.json`). `state_dir` is the operational-files
+    /// directory the embedder configures as [`McpConfig::state_dir`](crate::McpConfig);
+    /// build ONE `SharedClients` from it and hand a clone to each instance so a
+    /// registration made against either instance's AS is known to both and the
+    /// persisted snapshot never loses the other's entries.
+    pub fn load(state_dir: impl AsRef<Path>) -> Self {
+        Self(ClientStore::load(state_dir.as_ref().to_path_buf()))
+    }
+
+    /// The operational directory this store loads from and persists to — the
+    /// authoritative location, so [`McpServer::state_dir`](crate::McpServer::state_dir)
+    /// reports where files actually go rather than a separately-stored copy that
+    /// could drift from the one passed to [`Self::load`].
+    pub fn state_dir(&self) -> &Path {
+        &self.0.state_dir
     }
 }
 
@@ -807,6 +842,12 @@ impl AuthStore {
     /// The II instance this store serves.
     fn instance(&self) -> &crate::identities::IiInstance {
         self.identities.instance()
+    }
+
+    /// The operational directory the client store persists to — the location
+    /// `McpServer::state_dir` reports (single source of truth).
+    pub(crate) fn state_dir(&self) -> &Path {
+        &self.clients.state_dir
     }
 
     /// This instance's AS issuer: `{public_url}{mcp_path}` (an RFC 8414 *path
@@ -2325,13 +2366,10 @@ mod tests {
     /// the target is always a complete json document, and no `.tmp` is left).
     #[test]
     fn client_store_persists_atomically() {
-        use super::{load_clients_from, persist_clients_to};
+        use super::{clients_tmp_path, load_clients_from, persist_clients_to};
 
-        let path = std::env::temp_dir()
-            .join(format!("imcp2-clients-{}.json", std::process::id()))
-            .to_string_lossy()
-            .into_owned();
-        let tmp = format!("{path}.tmp");
+        let path = std::env::temp_dir().join(format!("imcp2-clients-{}.json", std::process::id()));
+        let tmp = clients_tmp_path(&path);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&tmp);
 
@@ -2343,7 +2381,7 @@ mod tests {
             ClientReg::new(vec!["http://127.0.0.1:1111/old".to_string()]),
         );
         persist_clients_to(&path, &old);
-        assert!(std::path::Path::new(&path).exists(), "old snapshot must exist first");
+        assert!(path.exists(), "old snapshot must exist first");
 
         // Persist a DIFFERENT set over the existing file.
         let mut clients = HashMap::new();
@@ -2364,7 +2402,7 @@ mod tests {
             loaded["client-abc"].redirect_uris,
             vec!["http://127.0.0.1:4321/cb".to_string()]
         );
-        assert!(!std::path::Path::new(&tmp).exists(), "no leftover .tmp file");
+        assert!(!tmp.exists(), "no leftover .tmp file");
 
         // The persisted target is always a COMPLETE json document.
         let raw = std::fs::read(&path).unwrap();
@@ -2679,7 +2717,10 @@ mod tests {
         );
         super::AuthStore::new(
             ids,
-            super::SharedClients(super::ClientStore::with(std::collections::HashMap::new())),
+            super::SharedClients(super::ClientStore::with(
+                std::collections::HashMap::new(),
+                std::env::temp_dir(),
+            )),
             "https://mcp.test".into(),
             "/mcp".into(),
             require_resource,
@@ -2883,7 +2924,10 @@ mod tests {
                     "https://mcp.test".into(),
                     agent,
                 ),
-                super::SharedClients(super::ClientStore::with(std::collections::HashMap::new())),
+                super::SharedClients(super::ClientStore::with(
+                    std::collections::HashMap::new(),
+                    std::env::temp_dir(),
+                )),
                 "https://mcp.test".into(),
                 mcp_path.into(),
                 false,
