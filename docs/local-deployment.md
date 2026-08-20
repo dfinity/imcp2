@@ -29,8 +29,10 @@ there is no IMCP2 artifact that fits that slot.
 
 ## Non-goals
 
-- **Not a local-replica bridge** — the binary targets mainnet and production II only, not
-  the local replicas developers spawn with the ICP CLI.
+- **Not a local-replica product surface** — the shipped binary targets mainnet and
+  production II. A **test configuration** that talks to a local replica (as spawned by the
+  ICP CLI) is deliberately easy to compile and is how integration tests run — but it is not
+  a v1 user-facing mode.
 - **No change to the hosted server** — its name, behavior, and deployments stay as they are.
 - **No session persistence in v1** — sessions are in-memory; users re-login per run.
 - **Not for cloud-only AI surfaces** — claude.ai web/mobile, Perplexity web, and Codex Cloud
@@ -81,9 +83,10 @@ machinery is needed.
    introduce the session seam — no behavior change to the hosted server.
 2. **Ship `imcp2-local`.** The stdio server, the browser-login driver, and the loopback
    callback listener. Exit: a user logs in against II and uses the tools as their accounts.
-3. **Polish.** Per-client setup docs and the wallet-grade trust note; extend the existing
-   PocketIC end-to-end harness to cover the local login flow; optional keychain-backed
-   session persistence.
+3. **Polish.** Per-client setup docs and the wallet-grade trust note; integration tests that
+   run `imcp2-local` in its local-replica test configuration (against an ICP CLI-spawned
+   replica or PocketIC, with an II canister deployed there), extending the existing PocketIC
+   end-to-end harness to the local login flow; optional keychain-backed session persistence.
 
 Open decisions (details in the full doc): hand-rolled vs axum-based loopback listener; how
 to open the browser; v1 session persistence; two-crate vs three-crate layout.

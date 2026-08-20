@@ -42,10 +42,12 @@ fits that slot.
 
 ## Non-goals
 
-- **Not a local-replica bridge.** The local binary targets mainnet + production II — not the
-  local replicas developers spawn with the ICP CLI. There is no `fetch_root_key`, no
-  SSRF-guard relaxation, no local II. (A replica-targeting mode was scoped earlier and
-  explicitly rejected.)
+- **Not a local-replica product surface.** The *shipped* binary targets mainnet + production
+  II: its default build has no `fetch_root_key`, no SSRF-guard relaxation, no local II. A
+  **test configuration** that talks to a local replica (as spawned by the ICP CLI) is a
+  deliberate nice-to-have — easy to compile, guarded so it can never run against mainnet,
+  and the vehicle for integration testing (see component 3 and Verification) — but it is not
+  a v1 user-facing mode.
 - **No change to the hosted server's behavior, name, or deployment.** The `imcp2` binary,
   Dockerfile (`CMD ["imcp2"]`, `Dockerfile:23,31`), `imcp2.service`, and deploy scripts stay
   as they are.
@@ -216,6 +218,18 @@ The prod instance is env-overridable via `II_URL_PROD`/`II_CANISTER_ID_PROD`
 the hosted deployment itself serves **production II at `/mcp`** by default (beta is the
 opt-in `/mcp-beta` staging instance), so prod II is no longer the unverified path (see
 Verification under Implementation Stages).
+
+**Local-replica test configuration (nice-to-have; the integration-test vehicle).** The same
+wiring supports a test build that talks to a **local replica spawned by the ICP CLI**: an
+explicit IC-endpoint override for the agent, plus one `agent.fetch_root_key()` call so
+certificate verification trusts the local replica's key, plus the existing II overrides
+pointed at an II canister deployed on that replica. Guard: `fetch_root_key` is only ever
+called when the endpoint override is explicitly set to a loopback target — refused otherwise
+— so a mis-set environment can never make a binary trust a fetched root key against mainnet.
+Everything downstream already works on a test network: delegation chains are verified against
+the *injected agent's* root key (`new_with_root_key`, `identities.rs:1285-1303`), which is
+the same property the PocketIC e2e harness relies on. This configuration is how integration
+tests exercise the full local flow end-to-end (see Verification).
 
 ### 4. Dropping OAuth 2.1, keeping the II handshake
 
@@ -421,8 +435,9 @@ login driver + the loopback callback listener. *Exit:* `cargo build -p imcp2-loc
 logs in against II and runs read/write tools as their accounts.
 
 **Stage 3 — polish.** Docs (how to add the binary to an MCP client config; the wallet-grade
-trust note), extend the PocketIC e2e harness to the local login flow (see Verification),
-optional session persistence.
+trust note), integration tests via the local-replica test configuration (component 3),
+extending the PocketIC e2e harness to the local login flow (see Verification), optional
+session persistence.
 
 ### Verification against production II
 
@@ -448,9 +463,11 @@ the hosted https deployment never exercises:
 2. **CORS:** the well-known response needs `Access-Control-Allow-Origin` (II fetches it
    cross-origin; `*` is fine with `credentials: omit`).
 
-Verification plan: extend the PocketIC e2e harness to drive the local browser-handshake flow
-(loopback listener + slim redeem) with no live network; the
-`II_URL_PROD`/`II_CANISTER_ID_PROD` overrides remain available to point a binary at beta II.
+Verification plan: integration tests run `imcp2-local` in its **local-replica test
+configuration** (component 3) — against an ICP CLI-spawned replica or PocketIC carrying a
+deployed II canister — extending the existing PocketIC e2e harness to drive the local
+browser-handshake flow (loopback listener + slim redeem) with no live network. The
+`II_URL_PROD`/`II_CANISTER_ID_PROD` overrides additionally allow pointing a binary at beta II.
 
 ### Open decisions
 
