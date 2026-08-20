@@ -14,9 +14,10 @@ per-app account delegations), and **drops the entire OAuth 2.1 authorization-ser
 Login runs as a **built-in browser handshake**: the binary opens the user's browser to II and
 receives the delegation on a transient localhost callback.
 
-The existing crate keeps its name and role: **`imcp2`** remains the shared library (published
-on crates.io) and the hosted server binary; the hosted-only surfaces move behind a default-on
-`hosted` cargo feature so `imcp2-local` compiles a genuinely minimal dependency closure.
+The existing crate keeps its name and role: **`imcp2`** remains the published library and the
+hosted server binary. The shared components move down into a new **`imcp2-core`** crate that
+both the hosted server and the local binary build on, so `imcp2-local` compiles a genuinely
+minimal dependency closure — the isolation is a crate boundary, not a cargo feature.
 
 ## Problem
 
@@ -92,64 +93,77 @@ references point at it.
 
 ## Design components
 
-### 1. Crate layout — `imcp2` + a minimal `imcp2-local`
+### 1. Crate layout — `imcp2-core` under `imcp2` and `imcp2-local`
 
-The existing crate stays **`imcp2`** (its published, embeddable identity — `Cargo.toml:2`),
-and its default binary stays **`imcp2`** (the Dockerfile `CMD ["imcp2"]`, `imcp2.service`, and
-the deploy scripts all build/run a binary named `imcp2` — `Dockerfile:23,31`,
-`deploy/native/*`, so renaming it would churn every deploy config). The local binary is a
-**separate, minimal crate** so its dependency closure never includes the OAuth/HTTP machinery.
+The crate names stay stable — **`imcp2`** keeps its published identity (`Cargo.toml:2`) and
+its binary name (the Dockerfile `CMD ["imcp2"]`, `imcp2.service`, and the deploy scripts all
+build/run a binary named `imcp2` — `Dockerfile:23,31`, `deploy/native/*`) — and the shared
+components move **down** into a new **`imcp2-core`** crate that both binaries build on. The
+library's job is to expose components from which either a hosted binary (HTTP router, OAuth
+AS) or a local binary can be composed; the crate boundary — not a cargo feature — is what
+keeps the local closure minimal.
 
-- **`imcp2`** (lib + the hosted `imcp2` binary):
-  - The **library** is the shared, transport/OAuth-agnostic core both binaries build on:
-    - `identities.rs` **kept verbatim** (the II session-key grant + on-demand per-app account
-      delegations against production II — `IiInstance::prod()` at `identities.rs:185`,
-      `registration_pubkey_b64` `:595`, `redeem_registration_delegation` `:936`,
-      `delegated_identity_for` `:1030`, `list_accounts` `:873`).
-    - `calls.rs` (Candid textual↔binary codec, `raw_call`), `discover.rs` (discovery + SSRF
-      guard), `management.rs`, `skills.rs`.
-    - `tools.rs` — the **entire** MCP tool surface. The `#[tool_router]` / 26×`#[tool]` /
-      `#[tool_handler] impl ServerHandler for IcTools` macros expand into one impl on
-      `IcTools` and **must stay co-located**; both binaries construct `IcTools` and differ
-      only in transport + session source.
-    - **new `iiconnect` module** — the II connect-handshake primitives lifted out of
-      `auth.rs` (component 4), re-parameterised to plain values so they carry no
-      `AuthStore`/OAuth state.
-  - The **hosted binary** (`[[bin]] name = "imcp2"`, today's `main.rs`) and the OAuth 2.1
-    layer (`auth.rs`, `McpServer`/routers in `lib.rs`, the landing page, `tests/routers.rs`)
-    sit behind a **default-on `hosted` feature** that pulls `axum`/`tower-http`/`prometheus`
-    as *optional* dependencies (`required-features = ["hosted"]` on the bin). The gate also
-    covers `pub mod metrics` (the `/metrics` Prometheus exposition — axum-typed middleware,
-    new on main) and `McpConfig`'s `state_dir`/`clients`/`require_resource` (the persisted
-    DCR client store and RFC 8707 strict mode — all OAuth/HTTP-deployment concerns).
-    `cargo build` here produces the `imcp2` server exactly as today, deploy configs unchanged.
-    The existing `e2e` feature (`pocket-ic`, `src/e2e_handshake.rs`) keeps compiling — its
-    optional dep never enters any binary's closure.
-- **`imcp2-local`** (bin, new) — a few hundred lines that depend on
-  `imcp2 = { default-features = false }`, so the `hosted` optional deps (`axum`/`tower-http`/
-  the OAuth modules, `#[cfg(feature = "hosted")]`) are **not compiled**. It serves `IcTools`
-  over rmcp's stdio transport, plus a browser-handshake login driver and a transient loopback
-  callback listener. rmcp features here: `["server", "macros", "transport-io"]`.
+- **`imcp2-core`** (lib, new) — the transport/OAuth-agnostic components:
+  - `identities.rs` **kept verbatim** (the II session-key grant + on-demand per-app account
+    delegations against production II — `IiInstance::prod()` at `identities.rs:185`,
+    `registration_pubkey_b64` `:595`, `redeem_registration_delegation` `:936`,
+    `delegated_identity_for` `:1030`, `list_accounts` `:873`).
+  - `calls.rs` (Candid textual↔binary codec, `raw_call`), `discover.rs` (discovery + SSRF
+    guard), `management.rs`, `skills.rs`.
+  - `tools.rs` — the **entire** MCP tool surface. The `#[tool_router]` / 26×`#[tool]` /
+    `#[tool_handler] impl ServerHandler for IcTools` macros expand into one impl on
+    `IcTools` and **must stay co-located**; both binaries construct `IcTools` and differ
+    only in transport + session source. The `SessionSource` seam and the plain
+    `AuthedSession` struct (component 7) live here.
+  - **new `iiconnect` module** — the II connect-handshake primitives lifted out of
+    `auth.rs` (component 4), re-parameterised to plain values so they carry no
+    `AuthStore`/OAuth state.
+  - the `include_str!` assets those modules compile in: `static/` (the Candid/OQL
+    references) and the connect-flow assets under `src/assets/` (page, CSS, logo).
+  - Deps: rmcp `["server", "macros"]` (no transport), `ic-agent`/`candid`/`candid_parser`,
+    tokio, serde/serde_json, reqwest/url/regex (discovery), the II-connect and management
+    utilities (`base64`, `hex`, `sha2`, `crc32fast`, `getrandom`, `uuid`, `urlencoding`),
+    `http` (the request-extension type the Bearer session arm reads), tracing.
+- **`imcp2`** (existing crate: lib + the hosted `imcp2` binary) — depends on `imcp2-core`
+  and adds the hosted composition: the OAuth 2.1 AS (the OAuth half of `auth.rs`),
+  `McpServer`/`McpConfig`/the routers (`lib.rs`, including `state_dir`/`clients`/
+  `require_resource`), `metrics.rs` + `prometheus`, `main.rs` + the landing-page assets,
+  `tests/routers.rs`, and the PocketIC `e2e` harness (`src/e2e_handshake.rs` drives the
+  OAuth routes, so it stays here with its optional `pocket-ic` dep). It **re-exports**
+  `imcp2-core`'s public items (`pub use`), so existing embedders' `imcp2::…` imports keep
+  compiling — the restructure is a minor version bump, not a break. `cargo build` here
+  produces the `imcp2` server exactly as today; deploy configs unchanged.
+- **`imcp2-local`** (bin, new) — depends on **`imcp2-core` only**: a few hundred lines that
+  serve `IcTools` over rmcp's stdio transport (features `["server", "macros",
+  "transport-io"]`), plus the browser-handshake login driver and the transient loopback
+  callback listener. `axum`, `tower-http`, `prometheus`, and every OAuth module are simply
+  **absent from its dependency graph** — under any build invocation, not just `-p` builds.
 
-`cargo build -p imcp2-local` compiles only the minimal closure. (Caveat: `cargo build
---workspace` unifies features, so it would build the shared `imcp2` lib with `hosted` on;
-build the local binary with `-p imcp2-local` — or keep it out of the default workspace
-members — to ship the genuinely minimal artifact.)
+(One benign note: a `--workspace` build compiles rmcp once with both transport features
+unified — harmless, the linker strips the unused transport; the isolation that matters is
+that the OAuth/HTTP code never enters `imcp2-local`'s graph at all.)
 
-**Published crate.** `imcp2` is now on crates.io (v0.2.0), released from `v*` tags via
-trusted publishing with a tag-equals-version guard (`.github/workflows/publish-crate.yml`).
-Two consequences: the restructure is a semver-visible change to a crate with external
-embedders (the default-on `hosted` feature and `default-features = false` become supported
-public API → minor version bump), and the publish workflow must be generalised if
-`imcp2-local` becomes a second published crate (publish `imcp2` before the dependent crate,
-per-crate version guards). The `.crate` excludes `Dockerfile`/`deploy/`/`docs/`/`monitoring/`
-(repo-only), while `src/assets` and `static/` deliberately ship because they are pulled in
-via `include_str!` — which supports keeping those assets in the core crate.
+**Published crates.** `imcp2` is on crates.io (v0.2.0), released from `v*` tags via trusted
+publishing with a tag-equals-version guard (`.github/workflows/publish-crate.yml`). Because
+crates.io does not accept path-only dependencies of a published crate, `imcp2-core` becomes a
+second published crate: publish order core → `imcp2`, and the publish workflow is generalised
+per-crate. Recommend versioning `imcp2-core` 0.x and documenting it as internal to the imcp2
+family — its API is consumed through `imcp2`'s re-exports, with no independent stability
+promises — so component-level churn doesn't force `imcp2` majors. Whether `imcp2-local`
+itself is published (vs distributed as release binaries) is an independent choice; nothing
+depends on it. The `.crate` packaging constraint carries over: `src/assets` and `static/`
+ship with the crate that `include_str!`s them, i.e. they move to `imcp2-core`.
 
-*Alternative (stricter):* a three-crate split — `imcp2` (core lib, no bins), `imcp2-hosted`
-(bin), `imcp2-local` (bin) — isolates dependencies regardless of build invocation, at the
-cost of renaming the deployed binary to `imcp2-hosted` (deploy churn). The library changes
-below are identical either way.
+*Rejected alternative — a default-on `hosted` cargo feature on the single `imcp2` crate.* It
+can produce the same two binaries, but: cargo features are additive and **unify**, so any
+crate in a build graph that enables `imcp2/hosted` switches the OAuth/axum closure on for
+everyone (a `--workspace` build, or a sibling dependency of a third-party embedder), leaving
+the "minimal closure" claim invocation-dependent; it needs `#[cfg(feature = "hosted")]`
+gates scattered through `lib.rs`/`tools.rs`/`McpConfig`; and it expresses "the library
+exposes components" only implicitly, where the crate boundary states it structurally. *(A
+second variant — moving the hosted binary out into an `imcp2-hosted` crate — was also
+dropped: it renames the deployed binary and churns every deploy config for no isolation gain
+over this layout.)*
 
 ### 2. Dependency profile
 
@@ -184,9 +198,9 @@ gate is hand-rolled in `auth.rs`, and drops with the OAuth AS).
 MCP endpoint's browser-client layer and the OAuth/well-known permissive layer; locally only
 the `#4091` well-known needs one hand-set `Access-Control-Allow-Origin`), **`prometheus` +
 `src/metrics.rs`** (new on main: the `/metrics` Prometheus exposition behind
-`MCP_SERVE_METRICS` — axum-typed middleware coupled to `McpServer`, hosted-only; it must move
-behind the `hosted` feature or the local crate carries the metrics stack for nothing — the
-`SessionGauges` counters in `identities.rs` are plain integers and stay in core), `tokio-util`
+`MCP_SERVE_METRICS` — axum-typed middleware coupled to `McpServer`, hosted-only; it stays in
+the `imcp2` crate so the local graph never carries the metrics stack — the `SessionGauges`
+counters in `identities.rs` are plain integers and stay in core), `tokio-util`
 (only cancels the streamable-HTTP sessions; the reaper can be managed without a token),
 dev-deps `tower` + `http-body-util` (HTTP router tests), and `tokio`'s `signal` feature
 (graceful HTTP drain) plus its `time` feature (used only by the session-reaper tick and the
@@ -199,7 +213,7 @@ is to **hand-roll** that 3-route loopback listener so the local crate drops
 `axum`/`tower-http` entirely; reusing axum is the lower-effort fallback (an open decision
 under Implementation Stages).
 
-Net minimal local deps: `imcp2` (with `default-features = false`) +
+Net minimal local deps: `imcp2-core` +
 `rmcp{server,macros,transport-io}` + `tokio` +
 `anyhow` + `serde_json` + `url`/`urlencoding` + `tracing`/`tracing-subscriber` + a
 browser-opener (`open` crate, or `std::process::Command`).
@@ -378,9 +392,10 @@ rather than being deleted: it is the only way to serve the cloud clients.
 5. **Absolute paths; stdout = JSON-RPC only** (all diagnostics to stderr). A self-contained
    native binary avoids the frequent wrong-runtime/path failures Node-based servers hit.
 
-*(Implementation: `authenticate`/`auth_status` are **local-only** tools — define them in the
-`imcp2` library gated to the local build so they never appear on the hosted server, which logs
-in via OAuth instead. Cursor's ~40-tool cap is comfortable: `imcp2` exposes ~26 plus these.)*
+*(Implementation: `authenticate`/`auth_status` are **local-only** tools — defined in
+`imcp2-core` but included in the tool router only when `IcTools` is constructed with the
+singleton session source, so they never appear on the hosted server, which logs in via OAuth
+instead. Cursor's ~40-tool cap is comfortable: the core exposes ~26 plus these.)*
 
 **Serving the cloud clients (hosted `imcp2`).** claude.ai web/mobile and Perplexity-web reach
 only a public HTTPS MCP endpoint with OAuth 2.1 — which hosted `imcp2` already is. Two
@@ -401,11 +416,12 @@ Minimal, verified seam (no tool-signature changes, no `identities.rs` changes):
 - one `current_session_id(&self, &ctx) -> Option<String>` method replacing the free fn;
 - rewrite the **13** lookup call-sites (`tools.rs:351,809,865,1298,1321,1344,1365,1386,1407,
   1428,1446,1464,1482`) to call it; the `.ok_or(…)` handling is unchanged;
-- keep `authed_session` + the `auth` import behind the hosted arm only.
+- move the plain `AuthedSession` struct into `imcp2-core` beside the seam; the hosted
+  `require_token` middleware (in `imcp2`) keeps inserting it into the request extensions.
 
-To avoid dragging axum into core, read `http::request::Parts` (the `http` crate) rather than
-`axum::http::request::Parts` in the Bearer arm — axum merely re-exports it. Hosted constructs
-`IcTools` with `Bearer`; local with `Singleton(sid)`.
+With the core split, **no `#[cfg]` is needed anywhere**: the Bearer arm reads
+`http::request::Parts` (the `http` crate — axum merely re-exports it), which core can depend
+on unconditionally. Hosted constructs `IcTools` with `Bearer`; local with `Singleton(sid)`.
 
 Tools that are already session-free work unchanged locally: `get_canister_candid`,
 `get_canister_api_doc`, `open_app`, `resolve_app`, `discover_app_canisters`, the skills/lookup
@@ -435,15 +451,14 @@ targeting our freshly-minted `X`.
 
 ## Implementation Stages
 
-**Stage 1 — carve out the core (no behavior change to the `imcp2` binary).** Make the
-`imcp2` library the transport/OAuth-agnostic core: keep `identities/calls/discover/management/
-skills/tools` + `static/` + connect assets, extract `iiconnect` from `auth.rs`, and put the
-OAuth AS + `McpServer`/`main.rs` + `pub mod metrics` behind the default-on `hosted` feature
-(optional `axum`/`tower-http`/`prometheus`), threading `McpConfig`'s
-`state_dir`/`clients`/`require_resource` hosted-side and keeping the `e2e` feature compiling.
-(The vestigial-dep cleanup this stage originally included was already done on main, #100.)
-Apply the `SessionSource` seam (component 7). *Exit:* the `imcp2` binary builds and its tests
-pass unchanged; `imcp2` with `default-features = false` compiles a minimal closure.
+**Stage 1 — extract `imcp2-core` (no behavior change to the `imcp2` binary).** Move
+`identities/calls/discover/management/skills/tools` + the new `iiconnect` (extracted from
+`auth.rs`) + `static/` + the connect assets into the new core crate; `imcp2` keeps the OAuth
+AS, `McpServer`/`McpConfig`/`main.rs`, `metrics`, and the `e2e` harness, depends on core, and
+re-exports its public items so embedders keep compiling. Apply the `SessionSource` seam
+(component 7). (The vestigial-dep cleanup this stage originally included was already done on
+main, #100.) *Exit:* the `imcp2` binary builds and its tests pass unchanged; `imcp2-core`
+compiles standalone with no `axum`/`tower-http`/`prometheus`/OAuth in its graph.
 
 **Stage 2 — the local binary.** `imcp2-local`: stdio `IcTools` server + the browser-handshake
 login driver + the loopback callback listener. *Exit:* `cargo build -p imcp2-local`; a user
@@ -493,8 +508,11 @@ browser-handshake flow (loopback listener + slim redeem) with no live network. T
    (zero-dep). *Recommend* always return the URL in-band (the `authenticate` tool result) +
    best-effort auto-open; the flow never depends on auto-open succeeding.
 3. **Session persistence:** in-memory only (recommend for v1) vs keychain-backed `S`.
-4. **Crate layout:** `imcp2` + `imcp2-local` with a `hosted` feature (recommended, keeps the
-   `imcp2` binary name) vs the stricter three-crate split (component 1).
+4. **Crate layout:** `imcp2-core` as the common dependency of `imcp2` (lib + hosted binary)
+   and `imcp2-local` — *recommended*: structural isolation with no feature-unification
+   hazard, no `#[cfg]` gates, and the `imcp2` binary name/deployments unchanged. The
+   single-crate default-on `hosted` feature is rejected (component 1); the cost to accept is
+   publishing `imcp2-core` as a second (family-internal, 0.x) crates.io crate.
 
 (Login timing was resolved by the client research — lazy on the first authenticated tool
 call, non-blocking.)

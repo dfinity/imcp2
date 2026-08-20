@@ -11,7 +11,8 @@ with their AI tool (Claude, Codex, Cursor, …) as a local MCP server. It speaks
 experience — the user logs in with their real anchor via a browser handshake, and the server
 mints per-app account delegations on demand. What it drops is the entire **OAuth 2.1
 authorization server**: a single-user process reached over a pipe needs no bearer tokens.
-The existing `imcp2` crate remains the shared library and the hosted server.
+The shared components move into a new `imcp2-core` library; the existing `imcp2` crate
+remains the hosted server built on it.
 
 ## Problem
 
@@ -55,14 +56,16 @@ machinery is needed.
 - **Login is an in-band tool.** No AI client shows a stdio server's logs in chat, so the
   login URL is returned as the result of an `authenticate` tool (with best-effort browser
   auto-open), lazily on first use and without blocking on the callback.
-- **One library, two binaries.** `imcp2` stays the shared core (and the hosted binary,
-  behind a default-on `hosted` feature); `imcp2-local` is a new, small crate that compiles
-  none of the OAuth/HTTP machinery.
+- **A component core, two thin binaries.** A new `imcp2-core` library holds the shared
+  components (the tools, II sessions, the connect handshake) from which either server is
+  composed; `imcp2` keeps its name as the hosted server built on it, and `imcp2-local` is a
+  new small binary built on it whose dependency graph never contains the OAuth/HTTP
+  machinery.
 
 ## Design components
 
-1. **Crate layout** — `imcp2` (library + hosted binary; hosted-only surfaces behind the
-   `hosted` feature) and `imcp2-local` (new minimal binary).
+1. **Crate layout** — `imcp2-core` (shared components), `imcp2` (hosted library + binary;
+   unchanged name and deployments), `imcp2-local` (new minimal binary).
 2. **Dependency profile** — the local closure is the MCP stack (stdio), `ic-agent`/Candid,
    and the discovery/management essentials; no axum, no CORS layer, no metrics stack, no
    OAuth persistence.
@@ -81,8 +84,9 @@ machinery is needed.
 
 ## Implementation Stages
 
-1. **Carve out the core.** Move the hosted-only surfaces behind the `hosted` feature and
-   introduce the session seam — no behavior change to the hosted server.
+1. **Extract `imcp2-core`.** Move the shared components into the new core crate (with
+   `imcp2` re-exporting them for existing embedders) and introduce the session seam — no
+   behavior change to the hosted server.
 2. **Ship `imcp2-local`.** The stdio server, the browser-login driver, and the loopback
    callback listener. Exit: a user logs in against II and uses the tools as their accounts.
 3. **Polish.** Per-client setup docs and the wallet-grade trust note; integration tests that
@@ -91,4 +95,5 @@ machinery is needed.
    end-to-end harness to the local login flow; optional keychain-backed session persistence.
 
 Open decisions (details in the full doc): hand-rolled vs axum-based loopback listener; how
-to open the browser; v1 session persistence; two-crate vs three-crate layout.
+to open the browser; v1 session persistence; confirming the `imcp2-core` split (recommended
+over single-crate feature flags).
