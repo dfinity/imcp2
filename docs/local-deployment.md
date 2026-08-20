@@ -77,8 +77,11 @@ machinery is needed.
    lives in memory only.
 6. **AI tool clients** — Claude Desktop, Claude Code, Codex, Cursor, Antigravity, and the
    Perplexity macOS app run `imcp2-local` directly; cloud surfaces keep using hosted.
-7. **Session seam** — the hosted bearer-token lookup collapses to a singleton session id;
-   a small, verified change with no impact on tool behavior.
+7. **Session handling** — every tool call acts as the user's Internet Identity session, so
+   each server must answer "which session?" The hosted server serves many users and resolves
+   it from each request's OAuth bearer token; the local server has exactly one user, so its
+   tools read the single in-memory session established at login. The tool implementations
+   are identical in both.
 8. **Security model** — whoever drives the binary acts as the user's real II accounts on
    mainnet: treat the binary and its client config like a wallet.
 
