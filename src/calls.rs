@@ -1527,6 +1527,36 @@ mod tests {
         assert!(out.contains("not decodable"), "expected the decode-error path, got: {out:.120}");
     }
 
+    // CWE-674 DEPTH counterpart to the breadth bomb above. A compact reply can
+    // nest hundreds of thousands of `opt` levels (`type t = opt t`, one wire byte
+    // per level), and candid's decoder, `IDLArgs`' `Display`, and the tree's
+    // recursive `Drop` each recurse once per level — so without a depth bound a
+    // ~300 KB reply would overflow the deep-stack thread and abort the process,
+    // dropping every session. `REPLY_DECODING_QUOTA` bounds BREADTH, not depth;
+    // DEPTH is bounded by candid's own `stacker::remaining_stack()` recursion
+    // guard, which returns a decode error before the stack is exhausted (on any
+    // stack size). This pins that: a 300k-deep `opt` reply must degrade to the
+    // ordinary "not decodable" error, never a crash. It regression-guards against
+    // a candid downgrade/regression that would drop the recursion guard.
+    #[test]
+    fn decode_reply_rejects_a_deep_opt_chain_instead_of_aborting() {
+        // DIDL | 1 type: T0 = opt(6e) T0(00) | 1 arg of T0 (01 00) | value bytes.
+        let mut deep = vec![0x44, 0x49, 0x44, 0x4c, 0x01, 0x6e, 0x00, 0x01, 0x00];
+        deep.extend(std::iter::repeat_n(0x01u8, 300_000)); // 300k `opt` present tags
+        deep.push(0x00); // a final null (opt absent) terminates the chain
+        assert!(deep.len() < 350_000, "compact on the wire: {} bytes", deep.len());
+        // Type-less path (did = None): decode + render + drop on the deep stack.
+        // Require the genuine decode-error string: candid's recursion guard MUST
+        // have run and rejected the chain. Accepting the "(could not spawn …)"
+        // fallback would let a thread-spawn failure — which never reaches the
+        // guard — pass the test, defeating its purpose.
+        let out = super::decode_reply(None, "m", &deep);
+        assert!(
+            out.contains("not decodable"),
+            "deep opt chain must reach candid's guard and decode-error gracefully, got: {out:.120}"
+        );
+    }
+
     // CWE-674: the pre-parse guard rejects over-deep / oversized textual Candid
     // (which would otherwise stack-overflow candid_parser and abort the process),
     // without false-positiving on realistic values.
