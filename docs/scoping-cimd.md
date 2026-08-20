@@ -173,16 +173,27 @@ CIMD-specific fetch parameters:
 
 ### 3.4 Validation
 
+Validation splits into two kinds, and the split matters for caching (§3.5):
+
+**Document-intrinsic** (a property of the URL/document alone — cacheable):
+
+- The fetch succeeded, the JSON parses, required fields are present and
+  well-typed, and arrays are size-bounded (same spirit as `MAX_REDIRECT_URIS`).
 - The document's `client_id` value is a **plain string match** against the
   requested URL — no normalization. (Hosted redirects already use exact string
   membership, `auth.rs:648`; normalizing the client id would also mint aliases
   that disagree with the raw-URL cache key of §3.5.)
-- The request's `redirect_uri` is a member of the document's `redirect_uris`
-  **and** still passes `redirect_uri_permitted` (`auth.rs:545`). Keeping the
-  existing host+path pin is deliberate belt-and-suspenders: if a vetted vendor's
-  domain is ever compromised, the path pin still limits where a code can land.
-- The JSON parses, required fields are present and well-typed, and arrays are
-  size-bounded (same spirit as `MAX_REDIRECT_URIS`).
+
+**Per-request** (depends on *this* request's `redirect_uri` — **never cached**):
+
+- The request's `redirect_uri` is a member of the cached document's
+  `redirect_uris` **and** still passes `redirect_uri_permitted` (`auth.rs:545`).
+  Keeping the existing host+path pin is deliberate belt-and-suspenders: if a
+  vetted vendor's domain is ever compromised, the path pin still limits where a
+  code can land. These checks run **on every request** against the (positively)
+  cached document — they must never contribute to a negative-cache entry, or a
+  bad-redirect probe of a real client would poison later legitimate requests
+  (§3.5).
 
 ### 3.5 Caching
 
@@ -192,9 +203,15 @@ CIMD-specific fetch parameters:
 - Bounded LRU, like the DCR store. **In-memory only** is likely sufficient (a
   cache miss just re-fetches), unlike DCR registrations which must survive a
   restart — but confirm (§8).
-- Also **negative-cache** URLs that fail validation or aren't CIMDs, so a repeat
-  of the same bogus path is cheap. Note the cache is *not* the outbound-DoS
-  control (path variation defeats it — §5); the rate/concurrency cap is.
+- Also **negative-cache** URLs that fail a **document-intrinsic** check (§3.4) —
+  didn't resolve to a valid CIMD, bad JSON, `client_id` ≠ URL — so a repeat of
+  the same bogus path is cheap. **Never** negative-cache a **per-request**
+  failure: a caller could otherwise request a *real* CIMD URL with a non-member
+  `redirect_uri`, cache that URL as "invalid," and lock out the legitimate
+  client. The redirect membership/policy checks always re-run per request against
+  the positively-cached document.
+- Note the cache is *not* the outbound-DoS control (path variation defeats it —
+  §5); the rate/concurrency cap is.
 
 ### 3.6 Re-keying the allow-list
 
@@ -240,8 +257,9 @@ That half still needs II coordination.
   cache key and a fresh up-to-15 s fetch, so the cache does not bound misses. A
   **concurrency + rate cap on outbound CIMD fetches is therefore required, not
   optional** — cap it per client-id host (and globally) so path variation on one
-  vetted host cannot fan out, and negative-cache failed/for-non-CIMD URLs so a
-  repeat of the same bogus path is cheap. (This project treats availability
+  vetted host cannot fan out, and negative-cache **document-intrinsic** failures
+  (non-CIMD / bad URLs — never per-request redirect failures, §3.5) so a repeat
+  of the same bogus path is cheap. (This project treats availability
   hardening as discretionary, but here the control is load-bearing, not a
   nicety.)
 - **Phishing:** unchanged posture. The curated trust policy remains the phishing
