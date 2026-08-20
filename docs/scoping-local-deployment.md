@@ -40,16 +40,16 @@ All findings below were verified against the current code; `file:line` reference
 
 The existing crate stays **`imcp2`** (its published, embeddable identity — `Cargo.toml:2`),
 and its default binary stays **`imcp2`** (the Dockerfile `CMD ["imcp2"]`, `imcp2.service`, and
-the deploy scripts all build/run a binary named `imcp2` — `Dockerfile:23,29`,
+the deploy scripts all build/run a binary named `imcp2` — `Dockerfile:23,31`,
 `deploy/native/*`, so renaming it would churn every deploy config). The local binary is a
 **separate, minimal crate** so its dependency closure never includes the OAuth/HTTP machinery.
 
 - **`imcp2`** (lib + the hosted `imcp2` binary):
   - The **library** is the shared, transport/OAuth-agnostic core both binaries build on:
     - `identities.rs` **kept verbatim** (the II session-key grant + on-demand per-app account
-      delegations against production II — `IiInstance::prod()` at `identities.rs:126`,
-      `registration_pubkey_b64` `:501`, `redeem_registration_delegation` `:821`,
-      `delegated_identity_for` `:908`, `list_accounts` `:758`).
+      delegations against production II — `IiInstance::prod()` at `identities.rs:185`,
+      `registration_pubkey_b64` `:595`, `redeem_registration_delegation` `:936`,
+      `delegated_identity_for` `:1030`, `list_accounts` `:873`).
     - `calls.rs` (Candid textual↔binary codec, `raw_call`), `discover.rs` (discovery + SSRF
       guard), `management.rs`, `skills.rs`.
     - `tools.rs` — the **entire** MCP tool surface. The `#[tool_router]` / 26×`#[tool]` /
@@ -61,9 +61,14 @@ the deploy scripts all build/run a binary named `imcp2` — `Dockerfile:23,29`,
       `AuthStore`/OAuth state.
   - The **hosted binary** (`[[bin]] name = "imcp2"`, today's `main.rs`) and the OAuth 2.1
     layer (`auth.rs`, `McpServer`/routers in `lib.rs`, the landing page, `tests/routers.rs`)
-    sit behind a **default-on `hosted` feature** that pulls `axum`/`tower-http` as *optional*
-    dependencies (`required-features = ["hosted"]` on the bin). `cargo build` here produces
-    the `imcp2` server exactly as today, deploy configs unchanged.
+    sit behind a **default-on `hosted` feature** that pulls `axum`/`tower-http`/`prometheus`
+    as *optional* dependencies (`required-features = ["hosted"]` on the bin). The gate also
+    covers `pub mod metrics` (the `/metrics` Prometheus exposition — axum-typed middleware,
+    new on main) and `McpConfig`'s `state_dir`/`clients`/`require_resource` (the persisted
+    DCR client store and RFC 8707 strict mode — all OAuth/HTTP-deployment concerns).
+    `cargo build` here produces the `imcp2` server exactly as today, deploy configs unchanged.
+    The existing `e2e` feature (`pocket-ic`, `src/e2e_handshake.rs`) keeps compiling — its
+    optional dep never enters any binary's closure.
 - **`imcp2-local`** (bin, new) — a few hundred lines that depend on
   `imcp2 = { default-features = false }`, so the `hosted` optional deps (`axum`/`tower-http`/
   the OAuth modules, `#[cfg(feature = "hosted")]`) are **not compiled**. It serves `IcTools`
@@ -75,6 +80,16 @@ the deploy scripts all build/run a binary named `imcp2` — `Dockerfile:23,29`,
 build the local binary with `-p imcp2-local` — or keep it out of the default workspace
 members — to ship the genuinely minimal artifact.)
 
+**Published crate.** `imcp2` is now on crates.io (v0.2.0), released from `v*` tags via
+trusted publishing with a tag-equals-version guard (`.github/workflows/publish-crate.yml`).
+Two consequences: the restructure is a semver-visible change to a crate with external
+embedders (the default-on `hosted` feature and `default-features = false` become supported
+public API → minor version bump), and the publish workflow must be generalised if
+`imcp2-local` becomes a second published crate (publish `imcp2` before the dependent crate,
+per-crate version guards). The `.crate` excludes `Dockerfile`/`deploy/`/`docs/`/`monitoring/`
+(repo-only), while `src/assets` and `static/` deliberately ship because they are pulled in
+via `include_str!` — which supports keeping those assets in the core crate.
+
 *Alternative (stricter):* a three-crate split — `imcp2` (core lib, no bins), `imcp2-hosted`
 (bin), `imcp2-local` (bin) — isolates dependencies regardless of build invocation, at the
 cost of renaming the deployed binary to `imcp2-hosted` (deploy churn). The library changes
@@ -82,17 +97,17 @@ below are identical either way.
 
 ## 3. Dependency stripping (verified)
 
-**Drop outright — zero references in `src/`** (verified by grep). These are pure dead weight
-today, independent of the local work, but the local crate must not carry them:
-
-- `ed25519-dalek` — all Ed25519 keygen/signing goes through `ic-agent`'s
-  `BasicIdentity::from_raw_key` (`identities.rs:1044`), never this crate.
-- `p256`, `ic-signature-verification` — the server never verifies delegation signatures
-  itself; the replica verifies every hop at redeem (`identities.rs:1064`).
-- `ic-representation-independent-hash` — unreferenced.
-- top-level `schemars = "0.8"` — **vestigial**: every `schemars::JsonSchema` derive resolves
-  through `use rmcp::schemars` (rmcp's re-exported 1.x), verified across all modules. rmcp's
-  own schemars re-export must stay enabled; the direct dep is removed.
+**Already removed on main (#100).** The five vestigial direct deps this doc originally
+proposed dropping — `ed25519-dalek`, `p256`, `ic-signature-verification`,
+`ic-representation-independent-hash`, and the top-level `schemars = "0.8"` — were removed on
+main (commit `0e52fe9`); none appears in `Cargo.toml` at v0.2.0, so no stripping work
+remains for them. The supporting facts still hold: all Ed25519 keygen/signing goes through
+`ic-agent`'s `BasicIdentity::from_raw_key` (`fresh_ed25519`, `identities.rs:1252`), every
+`schemars::JsonSchema` derive resolves through `use rmcp::schemars` (rmcp's re-exported 1.x),
+and delegation chains are verified inside `ic-agent` — now both client-side against the
+injected agent's root key (`DelegatedIdentity::new_with_root_key`, `identities.rs:1285-1303`)
+and again by the replica at redeem — never by those crates. (`ed25519-dalek`/`p256` remain
+*transitive* deps via `ic-agent`; #100 was direct-dep hygiene, not closure reduction.)
 
 **rmcp features:** keep `server` + `macros`; **swap** `transport-streamable-http-server` →
 the stdio/io transport (`transport-io` in rmcp 1.x — provides `rmcp::transport::stdio()` over
@@ -101,17 +116,27 @@ gate is hand-rolled in `auth.rs`, and drops with the OAuth AS).
 
 **Stays, but not for OAuth** (so the local crate keeps them):
 - discovery: `reqwest` (SSRF-pinned client, `discover.rs`), `url`, `regex`.
-- canister management: `sha2` (Wasm hash + ledger AccountIdentifier), `crc32fast`, `base64`,
-  `hex` (`management.rs`).
+- canister management: `sha2` (Wasm hash + ledger AccountIdentifier; also the OAuth PKCE
+  S256 check in `auth.rs`, which drops — management keeps it either way), `crc32fast`,
+  `base64`, `hex` (`management.rs`).
 - II connect/delegation: `getrandom` (key seeds + CSP nonce), `urlencoding` (II link),
   `uuid` (connect `state`; replaceable by `getrandom`), `base64`/`hex` (delegation chain).
 - core: `ic-agent`, `candid` (`value`), `candid_parser`, `tokio`, `serde`, `serde_json`,
   `tracing`, `tracing-subscriber`, `anyhow`.
 
-**Drops with the HTTP surface:** `tower-http` (CORS — only the `#4091` well-known needs one
-`Access-Control-Allow-Origin`, hand-settable), `tokio-util` (only cancels the streamable-HTTP
-sessions; the reaper can be managed without a token), dev-deps `tower` + `http-body-util`
-(HTTP router tests), and `tokio`'s `signal` feature (graceful HTTP drain).
+**Drops with the HTTP surface:** `tower-http` (CORS — it now backs two hosted surfaces, the
+MCP endpoint's browser-client layer and the OAuth/well-known permissive layer; locally only
+the `#4091` well-known needs one hand-set `Access-Control-Allow-Origin`), **`prometheus` +
+`src/metrics.rs`** (new on main: the `/metrics` Prometheus exposition behind
+`MCP_SERVE_METRICS` — axum-typed middleware coupled to `McpServer`, hosted-only; it must move
+behind the `hosted` feature or the local crate carries the metrics stack for nothing — the
+`SessionGauges` counters in `identities.rs` are plain integers and stay in core), `tokio-util`
+(only cancels the streamable-HTTP sessions; the reaper can be managed without a token),
+dev-deps `tower` + `http-body-util` (HTTP router tests), and `tokio`'s `signal` feature
+(graceful HTTP drain) plus its `time` feature (used only by the session-reaper tick and the
+OAuth persist throttle — subject to what rmcp's stdio transport itself requires).
+`pocket-ic` (new on main, optional behind the `e2e` feature for `src/e2e_handshake.rs`)
+never enters any binary's closure — no action needed.
 
 **`axum`** shrinks to at most the transient login callback (§6). The recommendation is to
 **hand-roll** that 3-route loopback listener so the local crate drops `axum`/`tower-http`
@@ -127,40 +152,50 @@ browser-opener (`open` crate, or `std::process::Command`).
 No replica changes: the local agent is `Agent::builder().with_url(IC_URL).build()` with
 `IC_URL = "https://icp-api.io"` and **no** `fetch_root_key` (mainnet root key is baked in).
 `Identities::new(IiInstance::prod()?, public_url, agent)` — production II. `public_url` is
-only used as the management-identity derivation origin (`identities.rs:746`) and can be a
+only used as the management-identity derivation origin (`identities.rs:861-863`) and can be a
 fixed local value; it need not be a reachable server.
 
-`II_URL`/`II_CANISTER_ID` remain env-overridable (`identities.rs:120`), so the binary can be
-pointed at **beta** II for testing (see §10 — beta is the only instance verified end-to-end
-today) while defaulting to production per the locked decision.
+The prod instance is env-overridable via `II_URL_PROD`/`II_CANISTER_ID_PROD`
+(`identities.rs:185-190`; the plain `II_URL`/`II_CANISTER_ID` pair now overrides only
+`IiInstance::beta()`), so the binary can still be pointed at beta II for testing. Since #92
+the hosted deployment itself serves **production II at `/mcp`** by default (beta is the
+opt-in `/mcp-beta` staging instance), so prod II is no longer the unverified path (see §10).
 
 ## 5. Dropping OAuth 2.1, keeping the II handshake
 
 `auth.rs` splits along the boundary its own module docs already draw (`auth.rs:24-60`).
 
 **Kept for local (the de-OAuth'd II browser handshake):**
-- `ii_mcp_url` (`auth.rs:750`) — builds II's `/mcp#callback=…&state=…&ttl=…&registration_key=…`
+- `ii_mcp_url` (`auth.rs:1284`) — builds II's `/mcp#callback=…&state=…&ttl=…&registration_key=…`
   link. Re-parameterise from `&AuthStore` to plain values.
 - the pinned callback page `connect_callback_page`/`pinned_callback_page` + assets + CSP nonce
-  (`auth.rs:808-978`). II delivers the delegation in the URL **fragment**, so the callback
+  (`auth.rs:1342-1515`). II delivers the delegation in the URL **fragment**, so the callback
   *must* be an HTML page that reads `location.hash` client-side and POSTs it back.
 - `parse_registration_delegation` + the `Json*` chain types + the 64 KB pre-parse bound
-  (`auth.rs:1170-1245`).
-- a slimmed `connect_redeem` (`auth.rs:1302`): shape-check the fragment, single-flight, call
+  (`auth.rs:1673-1782`).
+- a slimmed `connect_redeem` (`auth.rs:1839`): shape-check the fragment, single-flight, call
   `Identities::redeem_registration_delegation`, signal completion — **minus** the PKCE/code/
   token/cookie/redirect tail.
-- the **`#4091` allow-list** `/.well-known/ii-auth-callbacks` (`auth.rs:770,785`) — still
+- the **`#4091` allow-list** `/.well-known/ii-auth-callbacks` (`auth.rs:1304,1319`) — still
   mandatory: II fail-closed-fetches it before honoring the callback.
 
-**Dropped (the entire OAuth 2.1 AS):** `/authorize` (`auth.rs:566`), `/token` + PKCE + tokens
-(`auth.rs:1427-1528`), `/register` + DCR + `SharedClients` persistence (`auth.rs:1532-1616`,
-`465-474`), the hosted-redirect allow-list (`auth.rs:198-390`), AS/PR discovery metadata
-(`auth.rs:1627-1652`), the `require_token` bearer gate + `bearer_challenge` (`auth.rs:1664`),
-and the front-channel HTML error-screen machinery. `AuthStore` slims to
-`{identities, public_url, authz}` (loses `clients`/`tokens`/`codes`).
+**Dropped (the entire OAuth 2.1 AS):** `/authorize` (`auth.rs:1053`), `/token` + PKCE + tokens
+(`auth.rs:1969-2137`), `/register` + DCR + the persisted client store (`auth.rs:2139-2221`;
+`SharedClients` now wraps a bounded `ClientStore` persisting `{state_dir}/oauth-clients.json`
+per `McpConfig::state_dir`, `auth.rs:799-820`), the hosted-redirect allow-list
+(`auth.rs:434-687`), AS/PR discovery metadata (`auth.rs:2223-2262`), the `require_token`
+bearer gate + `bearer_challenge` (`auth.rs:2264,2313`), the front-channel HTML error-screen
+machinery, and the OAuth hardening added since this doc's first draft — RFC 8707
+resource-indicator enforcement (the `require_resource` flag, #127), RFC 9207 `iss` emission
+on redirects (#125), and the bounded/atomically-persisted DCR store (#137) — all on the
+OAuth side, so the partition is unchanged. `AuthStore` slims to
+`{identities, public_url, authz}` (loses `clients`/`tokens`/`codes`, plus the hosted-only
+`mcp_path` route prefix — the local build replaces it with a plain callback-base value — and
+`require_resource`). With `clients` gone the local binary needs **no `state_dir` at all**:
+it writes no files, and all its state is the in-memory `Identities` session map.
 
 **Consent-Bound Completion / the initiator cookie can be dropped locally.** The `sid` cookie
-(`auth.rs:129`, checked `:1332`) defends a *split-browser confused-deputy* that requires a
+(`auth.rs:170`, checked `:1869`) defends a *split-browser confused-deputy* that requires a
 public, multi-tenant initiate endpoint an attacker can start a connect on. Locally there is
 **no HTTP initiate endpoint**: the binary itself mints `X`, `priv(X)` never leaves the
 process, and `/redeem` is loopback-only and single-user. The consenter proof alone — the
@@ -172,7 +207,9 @@ callback↔connect correlator.
 
 1. Build the mainnet agent + `Identities` (prod II) once.
 2. Mint the session: `registration_pubkey_b64(&session_id)` → in-memory Ed25519 `S` + the
-   registration key `X`, returns base64url `pub(X)`.
+   registration key `X`, returns base64url `pub(X)`. (Now fallible — it returns `Result`,
+   refused only when the session map hits its CWE-770 capacity bound, which a single-user
+   binary never does.)
 3. Bind a transient listener on `127.0.0.1:0`; the callback origin is
    `http://127.0.0.1:<port>`. Both the II link's `callback` and the well-known entry derive
    from this one value, so they cannot drift (II matches by exact string equality).
@@ -275,14 +312,14 @@ local binary.
 ## 8. Tool / session seam
 
 Today a tool gets its `session_id` via bearer → `require_token` → `AuthedSession` injected in
-the request extensions → `authed_session(ctx)` (`tools.rs:1475`). Under stdio there is one
+the request extensions → `authed_session(ctx)` (`tools.rs:1493`). Under stdio there is one
 user and one connection, so this collapses to a **singleton** session id set at login.
 
 Minimal, verified seam (no tool-signature changes, no `identities.rs` changes):
 - add `session: SessionSource { Bearer, Singleton(String) }` to `IcTools` (`tools.rs:52`);
 - one `current_session_id(&self, &ctx) -> Option<String>` method replacing the free fn;
-- rewrite the **13** lookup call-sites (`tools.rs:353,798,853,1286,1306,1326,1347,1368,1389,
-  1410,1428,1446,1464`) to call it; the `.ok_or(…)` handling is unchanged;
+- rewrite the **13** lookup call-sites (`tools.rs:351,809,865,1298,1321,1344,1365,1386,1407,
+  1428,1446,1464,1482`) to call it; the `.ok_or(…)` handling is unchanged;
 - keep `authed_session` + the `auth` import behind the hosted arm only.
 
 To avoid dragging axum into core, read `http::request::Parts` (the `http` crate) rather than
@@ -304,7 +341,9 @@ update call / cycles spend, per-app delegations for every origin). This must be 
 the II grant (reconnect/expiry).
 
 **Loopback hardening for the login listener:** bind `127.0.0.1` explicitly (never `0.0.0.0`);
-validate the `Host` header (anti-DNS-rebinding, `lib.rs:385` pattern); up only for the
+validate the `Host` header (anti-DNS-rebinding — the `allowed_hosts_for` allow-list pattern,
+`lib.rs:463-495`, which the hosted server feeds to rmcp via `with_allowed_hosts`,
+`lib.rs:274`); up only for the
 handshake. Even so, a rebinding attacker is largely inert: `/redeem` only advances the connect
 *this* process started (`state` match) and `registration_identity` rejects any chain not
 targeting our freshly-minted `X`.
@@ -323,48 +362,70 @@ Decisions for the implementation PR (recommendations first):
 
 ## 10. Risks to verify against PRODUCTION II
 
-The single biggest external dependency: the in-repo II contract was verified only against
-**beta** II (`fgte5-…`, `identities.rs:814`, `auth.rs:76`), but this binary targets
-**production** II (`rdmx6-…`). Per the README, `/mcp-prod` "only completes once the production
-II carries the `#4086` MCP feature set" (`README.md:724`). Verify against live `id.ai`:
-1. that production II implements the connect handshake — `/mcp` link, `mcp_register_v2`
-   (the `variant { Ok: record { expiration; permissions }; Err }` shape) and the `#4091`
-   well-known validation;
-2. **mixed content:** II's https document must `fetch()` `http://127.0.0.1:<port>/.well-known/…`.
-   Loopback is "potentially trustworthy" (W3C Secure Contexts), so Chrome/Firefox allow
-   https→http-loopback — prefer the `127.0.0.1` literal over the `localhost` name; Safari and
-   enterprise policies are the unknowns;
-3. **CORS:** the well-known response needs `Access-Control-Allow-Origin` (II fetches it
+This section's original premise — that only beta II was verified — is resolved on main:
+since #92 the hosted deployment serves **production II at `/mcp` on every deploy**
+(`main.rs:376-385`; beta is the opt-in `/mcp-beta` staging instance), CI probes production
+health on a schedule (#113), and the crate gained a hermetic end-to-end test of the full
+connect contract — `src/e2e_handshake.rs` (`--features e2e`, optional `pocket-ic` dep,
+needs `II_WASM` + `POCKET_IC_BIN`) drives register → authorize → the II
+registration-delegation ceremony → redeem → a real `mcp_register_v2` → token against a real
+Internet Identity release build in PocketIC. So "does prod II implement the handshake" is
+answered in production. (Chains are also now verified client-side against the injected
+agent's root key — `new_with_root_key`, `identities.rs:1285-1303` — so a binary pointed at a
+test network can complete redemption after `fetch_root_key`, which is what makes a
+PocketIC-based test of the *local* flow possible.)
+
+What remains open is specific to the **local binary's `http://127.0.0.1` callback**, which
+the hosted https deployment never exercises:
+1. **Mixed content:** II's https document must `fetch()`
+   `http://127.0.0.1:<port>/.well-known/…`. Loopback is "potentially trustworthy" (W3C Secure
+   Contexts), so Chrome/Firefox allow https→http-loopback — prefer the `127.0.0.1` literal
+   over the `localhost` name; Safari and enterprise policies are the unknowns.
+2. **CORS:** the well-known response needs `Access-Control-Allow-Origin` (II fetches it
    cross-origin; `*` is fine with `credentials: omit`).
 
-Mitigation while prod II catches up: the existing env overrides let the binary point at beta
-II, which is verified end-to-end today.
+Verification plan: extend the PocketIC e2e harness to drive the local browser-handshake flow
+(loopback listener + slim redeem) with no live network; the
+`II_URL_PROD`/`II_CANISTER_ID_PROD` overrides remain available to point a binary at beta II.
 
 ## 11. Work breakdown
 
 **Phase 1 — carve out the core (no behavior change to the `imcp2` binary).** Make the
 `imcp2` library the transport/OAuth-agnostic core: keep `identities/calls/discover/management/
 skills/tools` + `static/` + connect assets, extract `iiconnect` from `auth.rs`, and put the
-OAuth AS + `McpServer`/`main.rs` behind the default-on `hosted` feature (optional
-`axum`/`tower-http`). Apply the `SessionSource` seam (§8) and drop the 4 dead deps +
-`schemars 0.8`. *Exit:* the `imcp2` binary builds and its tests pass unchanged; `imcp2` with
-`default-features = false` compiles a minimal closure.
+OAuth AS + `McpServer`/`main.rs` + `pub mod metrics` behind the default-on `hosted` feature
+(optional `axum`/`tower-http`/`prometheus`), threading `McpConfig`'s
+`state_dir`/`clients`/`require_resource` hosted-side and keeping the `e2e` feature compiling.
+(The vestigial-dep cleanup this phase originally included was already done on main, #100.)
+Apply the `SessionSource` seam (§8). *Exit:* the `imcp2` binary builds and its tests pass
+unchanged; `imcp2` with `default-features = false` compiles a minimal closure.
 
 **Phase 2 — the local binary.** `imcp2-local`: stdio `IcTools` server + the browser-handshake
 login driver + the loopback callback listener. *Exit:* `cargo build -p imcp2-local`; a user
 logs in against II and runs read/write tools as their accounts.
 
 **Phase 3 — polish.** Docs (how to add the binary to an MCP client config; the wallet-grade
-trust note), the production-II verification (§10), optional session persistence.
+trust note), extend the PocketIC e2e harness to the local login flow (§10), optional session
+persistence.
 
 ## 12. Evidence index
 
-- Dead deps (0 refs): `ed25519-dalek`/`p256`/`ic-signature-verification`/
-  `ic-representation-independent-hash`; Ed25519 via `ic-agent` `identities.rs:1044`; replica
-  verifies chains `identities.rs:1064`. `schemars` via `use rmcp::schemars` (all modules).
-- rmcp features + streamable-HTTP wiring: `Cargo.toml:12`, `lib.rs:83,194-208`.
-- OAuth AS vs II-connect split: `auth.rs:24-60` (module docs), handlers `auth.rs:566/1440/1570`,
-  connect subset `auth.rs:750/808-978/1207-1245/1302`, `#4091` `auth.rs:770/785`.
-- Session seam: `auth.rs:1664/1691`, `tools.rs:1475`, 13 call-sites listed in §8.
-- II login primitives: `identities.rs:501/821`, `ii_mcp_url` `auth.rs:750`.
-- Prod-vs-beta verification caveat: `identities.rs:79/814`, `README.md:724`.
+(Line refs re-stamped against the v0.2.0 tree after the rebase onto `189fabd`.)
+
+- Vestigial deps: already removed on main in #100 (`0e52fe9`); Ed25519 via `ic-agent`
+  (`fresh_ed25519`, `identities.rs:1252`); chains verified by `ic-agent` client-side
+  (`new_with_root_key`, `identities.rs:1285-1303`) and by the replica. `schemars` via
+  `use rmcp::schemars` (all modules).
+- rmcp features + streamable-HTTP wiring: `Cargo.toml:35-40`, `lib.rs:102-105,258-276`.
+- New hosted-only surfaces: `prometheus`/`src/metrics.rs` (`lib.rs:76-81`, `Cargo.toml:64-69`,
+  `MCP_SERVE_METRICS`); `McpConfig.state_dir`/`require_resource` (`lib.rs:144-158`,
+  `IMCP2_STATE_DIR`/`OAUTH_REQUIRE_RESOURCE` in `main.rs`).
+- OAuth AS vs II-connect split: `auth.rs:24-60` (module docs), handlers
+  `auth.rs:1053/1987/2139`, connect subset `auth.rs:1284/1342-1515/1673-1782/1839`,
+  `#4091` `auth.rs:1304/1319`.
+- Session seam: `auth.rs:2264/2292`, `tools.rs:1493`, 13 call-sites listed in §8.
+- II login primitives: `identities.rs:595/936`, `ii_mcp_url` `auth.rs:1284`.
+- Production II served at `/mcp` since #92 (`main.rs:376-385`); PocketIC e2e handshake test
+  `src/e2e_handshake.rs` (`e2e` feature); beta II constants `identities.rs:121-128`, candid
+  verification note `identities.rs:929-935`, generic live-round-trip caveat
+  `README.md:993-999`.
