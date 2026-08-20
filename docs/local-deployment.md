@@ -44,8 +44,10 @@ Hosted-vs-local is a **deployment axis, not a network one**: both talk to the sa
 and the same production II. What changes is who can reach the server, and therefore what
 machinery is needed.
 
-- **stdio transport.** The server has no listening socket; it is reachable only by the AI
-  tool that spawned it. The OS process boundary replaces the OAuth bearer gate.
+- **stdio transport.** The MCP tool surface has no listening socket: it is reachable only by
+  the AI tool that spawned it, over stdin/stdout, so the OS process boundary replaces the
+  OAuth bearer gate. The one socket the binary ever opens is the transient loopback listener
+  below — it serves only the login handshake, never the tools.
 - **Internet Identity stays.** On first authenticated use the binary opens the user's
   browser to II, receives the delegation on a transient localhost callback, redeems it, and
   holds the session in memory — the same handshake the hosted server runs, minus the OAuth

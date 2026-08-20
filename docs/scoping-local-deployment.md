@@ -295,6 +295,17 @@ callback↔connect correlator.
 6. On redeem success, record the grant in memory and shut the listener down. `IcTools` now
    serves tools over stdio, minting per-app delegations on demand against mainnet.
 
+The loopback listener is the unavoidable minimum, not a design slip: II delivers the
+delegation by *navigating the browser* to the callback (a URL fragment only a served page can
+read and POST back), and the `#4091` check *fetches* `/.well-known/ii-auth-callbacks` from
+the callback's **origin** before honoring it — both require a real HTTP origin. A custom URI
+scheme has no origin for that fetch (and component 6's client research found custom schemes
+unreliably opened), and II's MCP contract offers no device-grant-style manual alternative
+(the RFC 8628 device grant was dropped from this server early on). This is the standard
+native-app loopback redirect (RFC 8252 §7.3) — the same shape as `gh auth login` /
+`gcloud auth login`. The listener is transient (up for the handshake, torn down on redeem or
+timeout) and never serves the tool surface (component 8).
+
 Login is **lazy and non-blocking**: it runs as an MCP tool the agent calls on the first
 authenticated action — not at startup (most clients require the user to approve the first tool
 call, and some cap `initialize` at ~10 s) — and it returns the URL immediately rather than
@@ -402,9 +413,13 @@ tools, and the anonymous path of `canister_query`.
 
 ### 8. Security model
 
-**Trust boundary.** Dropping the bearer gate is sound *only because* the transport is stdio:
-a stdio server has no listening socket — it is reachable only by the parent process holding
-its stdin/stdout, i.e. the client that launched it. But that client then wields the user's
+**Trust boundary.** Dropping the bearer gate is sound *only because* the MCP tool surface
+rides stdio: it has no listening socket — it is reachable only by the parent process holding
+its stdin/stdout, i.e. the client that launched it. The one socket the binary ever opens is
+the transient login listener (component 5), and reaching it confers nothing: the callback
+page and the `#4091` well-known are static, and `/redeem` only advances the connect this
+process started (`state` must match) with a chain targeting the in-process `X` — it can
+neither invoke tools nor read the session. But the client then wields the user's
 **real production II accounts** on mainnet (canister create/install/start/stop/delete, any
 update call / cycles spend, per-app delegations for every origin). This must be stated plainly:
 **treat the binary and its client config like a wallet.** There is no revocable token — only
