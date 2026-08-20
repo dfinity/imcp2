@@ -99,6 +99,11 @@ fn serve_metrics() -> bool {
 /// — parchment grid, editorial serif, rust accent, "Hosted by DFINITY" mark — so
 /// the root page and the connect screens read as one product, and walks through
 /// what an agent can do: discovery, identity, on-network queries, actions, skills.
+///
+/// Patched over the raw export with the `<link rel=icon>` for [`FAVICON_SVG`],
+/// in the shell `<head>` and again in the head fragment the unpack routine
+/// injects — the unpack replaces `documentElement`, so only the second copy
+/// survives to render. A re-export drops both.
 const INDEX_HTML: &str = include_str!("assets/index.html");
 
 /// `GET /metrics` — the Prometheus exposition for `registry`. Its own router so
@@ -773,6 +778,30 @@ mod tests {
         assert!(svg.contains("<svg"), "{svg}");
         // Transparent, so the browser's own chrome shows through in either theme.
         assert!(!svg.contains("<rect"), "the mark must stay transparent: {svg}");
+    }
+
+    #[test]
+    fn every_served_page_links_the_favicon() {
+        let pages: [(&str, &str); 4] = [
+            ("/", super::INDEX_HTML),
+            ("/privacy-policy", super::privacy_policy_page()),
+            ("/support", super::support_page()),
+            ("/terms", super::terms_page()),
+        ];
+        assert_eq!(pages.len(), PUBLIC_PAGES.len());
+        for (path, html) in pages {
+            assert!(
+                html.contains("rel=icon href=/favicon.svg")
+                    || html.contains(r#"rel="icon" href="/favicon.svg""#),
+                "{path} does not link /favicon.svg"
+            );
+        }
+        // Both copies — see [`INDEX_HTML`].
+        assert_eq!(
+            super::INDEX_HTML.matches(r#"rel="icon" href="/favicon.svg""#).count(),
+            2,
+            "the landing bundle must link the icon in the shell head AND the injected head"
+        );
     }
 
     async fn challenge(token: Option<&str>) -> (StatusCode, String, Option<String>) {

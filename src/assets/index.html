@@ -2,6 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <title>Bundled Page</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -311,7 +312,10 @@ document.addEventListener('DOMContentLoaded', async function() {
     // The manifest bytes are ours; SRI protects against CDN compromise, not this.
     template = template.replace(/\s+integrity="[^"]*"/gi, '').replace(/\s+crossorigin="[^"]*"/gi, '');
 
-    const resourceScript = '<script>window.__resources = ' +
+    // The swap below discards this shell's <head>, so the icon has to ride into
+    // the template's head to survive.
+    const resourceScript = '<link rel="icon" href="/favicon.svg" type="image/svg+xml">' +
+      '<script>window.__resources = ' +
       JSON.stringify(resourceMap).replace(/<\//g, '<\\/') +
       ';</' + 'script>';
     // Inject after <head> so the DOCTYPE stays first; prepending the script
