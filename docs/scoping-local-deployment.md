@@ -42,9 +42,10 @@ fits that slot.
 
 ## Non-goals
 
-- **Not a local `dfx` replica bridge.** The local binary targets mainnet + production II.
-  There is no `fetch_root_key`, no SSRF-guard relaxation, no local II. (A replica-targeting
-  mode was scoped earlier and explicitly rejected.)
+- **Not a local-replica bridge.** The local binary targets mainnet + production II — not the
+  local replicas developers spawn with the ICP CLI. There is no `fetch_root_key`, no
+  SSRF-guard relaxation, no local II. (A replica-targeting mode was scoped earlier and
+  explicitly rejected.)
 - **No change to the hosted server's behavior, name, or deployment.** The `imcp2` binary,
   Dockerfile (`CMD ["imcp2"]`, `Dockerfile:23,31`), `imcp2.service`, and deploy scripts stay
   as they are.

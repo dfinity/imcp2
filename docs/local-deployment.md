@@ -29,7 +29,8 @@ there is no IMCP2 artifact that fits that slot.
 
 ## Non-goals
 
-- **Not a local `dfx` replica bridge** — the binary targets mainnet and production II only.
+- **Not a local-replica bridge** — the binary targets mainnet and production II only, not
+  the local replicas developers spawn with the ICP CLI.
 - **No change to the hosted server** — its name, behavior, and deployments stay as they are.
 - **No session persistence in v1** — sessions are in-memory; users re-login per run.
 - **Not for cloud-only AI surfaces** — claude.ai web/mobile, Perplexity web, and Codex Cloud
