@@ -1,42 +1,93 @@
-# Scoping: a minimal local MCP server binary (stdio, no OAuth)
+# IMCP2 local deployment: a minimal stdio binary
 
-Status: **draft / scoping** — analysis and design only, no code changes here.
+Status: **draft** — design only, no code changes in this PR.
 
-## 1. What "local deployment" means
+## Summary
 
-A second, **separate binary** that a user runs **on their own machine** (run-it-yourself),
-reached by a co-located MCP client (Claude Desktop, a local Claude Code, …). It still
-talks to **mainnet IC** (`https://icp-api.io`) and **production Internet Identity**
-(`https://id.ai`, `rdmx6-jaaaa-aaaaa-aaadq-cai`) — it is **not** a local `dfx` replica.
+We will ship **`imcp2-local`**: a separate, minimal binary that a user runs on their own
+machine and connects to their AI tool of choice. It speaks MCP over **stdio**, talks to
+**mainnet IC** (`https://icp-api.io`) and **production Internet Identity** (`https://id.ai`),
+keeps the full Internet Identity session model (login with the user's real anchor, on-demand
+per-app account delegations), and **drops the entire OAuth 2.1 authorization-server layer**.
+Login runs as a **built-in browser handshake**: the binary opens the user's browser to II and
+receives the delegation on a transient localhost callback.
 
-The distinction from the hosted server is the **deployment axis**, not the network:
+The existing crate keeps its name and role: **`imcp2`** remains the shared library (published
+on crates.io) and the hosted server binary; the hosted-only surfaces move behind a default-on
+`hosted` cargo feature so `imcp2-local` compiles a genuinely minimal dependency closure.
 
-| | Hosted `imcp2` (today) | Local binary (this scope) |
+## Problem
+
+Today the only way to use the IMCP2 tools is the **hosted** server: a public, multi-tenant
+streamable-HTTP endpoint gated by an OAuth 2.1 authorization server. That shape is right for
+cloud AI surfaces, but it forces two costs on a user who works from a desktop/CLI/IDE tool:
+
+- **Trust.** The user's Internet Identity login — and every per-app account delegation minted
+  from it — runs through a third-party server. A user acting on their real mainnet accounts
+  (balances, canisters, cycles) may reasonably want the bridge to run on their own machine,
+  where the session keys never leave a process they control.
+- **Unnecessary machinery.** The OAuth 2.1 layer (bearer tokens, PKCE, dynamic client
+  registration, redirect allow-lists, discovery documents) exists so *remote, third-party*
+  clients can authenticate to a *public* endpoint. A single-user server reached over a stdio
+  pipe by the client that spawned it needs none of it — carrying it anyway means more
+  dependencies, more attack surface, and an operational state directory the local case
+  doesn't want.
+
+Meanwhile, the AI tools users actually run — Claude Desktop/Code, Codex, Cursor, Antigravity,
+Perplexity's macOS app — all support spawning **local stdio MCP servers**, and their built-in
+OAuth support applies only to *remote* servers. There is currently no IMCP2 artifact that
+fits that slot.
+
+## Non-goals
+
+- **Not a local `dfx` replica bridge.** The local binary targets mainnet + production II.
+  There is no `fetch_root_key`, no SSRF-guard relaxation, no local II. (A replica-targeting
+  mode was scoped earlier and explicitly rejected.)
+- **No change to the hosted server's behavior, name, or deployment.** The `imcp2` binary,
+  Dockerfile (`CMD ["imcp2"]`, `Dockerfile:23,31`), `imcp2.service`, and deploy scripts stay
+  as they are.
+- **No session persistence in v1.** Sessions are in-memory (re-login per run), matching the
+  hosted model and the existing roadmap; keychain-backed persistence is future work.
+- **Not a path for cloud-only AI surfaces.** claude.ai web/mobile, Perplexity web/Windows,
+  and Codex Cloud cannot reach `localhost`; they keep using the hosted server (which is why
+  the OAuth layer stays in `imcp2` rather than being deleted).
+- **No new auth scheme.** The local binary adds no API keys or tokens of its own; the OS
+  process boundary replaces the bearer gate, and Internet Identity remains the only login.
+
+## Approach
+
+Hosted-vs-local is a **deployment axis, not a network one** — both talk to the same mainnet
+and the same production II. What changes is who can reach the server and therefore what
+machinery is needed:
+
+| | Hosted `imcp2` (today) | `imcp2-local` (this design) |
 |---|---|---|
 | Where it runs | a public server | the user's own machine |
 | MCP transport | streamable-HTTP | **stdio** |
 | Reached by | remote, third-party MCP clients | the co-located client that spawned it |
 | Client auth | **OAuth 2.1** (bearer tokens, PKCE, DCR) | **none** (process boundary) |
 | II login | OAuth-wrapped connect handshake | **built-in browser handshake** |
-| IC / II target | mainnet + beta/prod II | **mainnet + production II** |
+| IC / II target | mainnet + prod II (beta opt-in) | mainnet + production II |
 
-Because it is single-user and reachable only through the pipe of the client that launched
-it, the entire OAuth 2.1 authorization-server layer — which exists so *remote* clients can
-authenticate to a *public* endpoint — is unnecessary. Internet Identity itself is **kept**:
-the user still logs in with their real anchor and acts as their real II accounts on real
-mainnet apps, from a bridge they run themselves rather than trusting a hosted third party.
-
-Design decisions locked with the requester:
-- **Separate binary**, minimal dependencies (Cargo workspace split, not a runtime flag).
+Decisions locked with the requester:
+- **Separate binary**, minimal dependencies (a second crate, not a runtime flag).
 - **stdio** MCP transport.
 - **No OAuth 2.1** authorization server.
 - **Built-in browser II handshake**: the binary mints the session key, opens the browser to
   production II, receives the delegation on a transient localhost callback, redeems it, and
   holds the session in memory.
 
-All findings below were verified against the current code; `file:line` references point at it.
+Because it is single-user and reachable only through the pipe of the client that launched it,
+dropping OAuth removes no security the local case needs — while keeping Internet Identity
+preserves exactly what matters: the user logs in with their real anchor and acts as their
+real II accounts on real mainnet apps, from a bridge they run themselves.
 
-## 2. Design overview — the `imcp2` crate + a minimal `imcp2-local` binary
+Every claim below was verified against the current code (v0.2.0 tree); `file:line`
+references point at it.
+
+## Design components
+
+### 1. Crate layout — `imcp2` + a minimal `imcp2-local`
 
 The existing crate stays **`imcp2`** (its published, embeddable identity — `Cargo.toml:2`),
 and its default binary stays **`imcp2`** (the Dockerfile `CMD ["imcp2"]`, `imcp2.service`, and
@@ -57,7 +108,7 @@ the deploy scripts all build/run a binary named `imcp2` — `Dockerfile:23,31`,
       `IcTools` and **must stay co-located**; both binaries construct `IcTools` and differ
       only in transport + session source.
     - **new `iiconnect` module** — the II connect-handshake primitives lifted out of
-      `auth.rs` (see §5), re-parameterised to plain values so they carry no
+      `auth.rs` (component 4), re-parameterised to plain values so they carry no
       `AuthStore`/OAuth state.
   - The **hosted binary** (`[[bin]] name = "imcp2"`, today's `main.rs`) and the OAuth 2.1
     layer (`auth.rs`, `McpServer`/routers in `lib.rs`, the landing page, `tests/routers.rs`)
@@ -95,9 +146,9 @@ via `include_str!` — which supports keeping those assets in the core crate.
 cost of renaming the deployed binary to `imcp2-hosted` (deploy churn). The library changes
 below are identical either way.
 
-## 3. Dependency stripping (verified)
+### 2. Dependency profile
 
-**Already removed on main (#100).** The five vestigial direct deps this doc originally
+**Already removed on main (#100).** The five vestigial direct deps this design originally
 proposed dropping — `ed25519-dalek`, `p256`, `ic-signature-verification`,
 `ic-representation-independent-hash`, and the top-level `schemars = "0.8"` — were removed on
 main (commit `0e52fe9`); none appears in `Cargo.toml` at v0.2.0, so no stripping work
@@ -138,16 +189,17 @@ OAuth persist throttle — subject to what rmcp's stdio transport itself require
 `pocket-ic` (new on main, optional behind the `e2e` feature for `src/e2e_handshake.rs`)
 never enters any binary's closure — no action needed.
 
-**`axum`** shrinks to at most the transient login callback (§6). The recommendation is to
-**hand-roll** that 3-route loopback listener so the local crate drops `axum`/`tower-http`
-entirely; reusing axum is the lower-effort fallback (see §9 decision).
+**`axum`** shrinks to at most the transient login callback (component 5). The recommendation
+is to **hand-roll** that 3-route loopback listener so the local crate drops
+`axum`/`tower-http` entirely; reusing axum is the lower-effort fallback (an open decision
+under Implementation Stages).
 
 Net minimal local deps: `imcp2` (with `default-features = false`) +
 `rmcp{server,macros,transport-io}` + `tokio` +
 `anyhow` + `serde_json` + `url`/`urlencoding` + `tracing`/`tracing-subscriber` + a
 browser-opener (`open` crate, or `std::process::Command`).
 
-## 4. Talking to mainnet + production II
+### 3. Mainnet and production II wiring
 
 No replica changes: the local agent is `Agent::builder().with_url(IC_URL).build()` with
 `IC_URL = "https://icp-api.io"` and **no** `fetch_root_key` (mainnet root key is baked in).
@@ -159,9 +211,10 @@ The prod instance is env-overridable via `II_URL_PROD`/`II_CANISTER_ID_PROD`
 (`identities.rs:185-190`; the plain `II_URL`/`II_CANISTER_ID` pair now overrides only
 `IiInstance::beta()`), so the binary can still be pointed at beta II for testing. Since #92
 the hosted deployment itself serves **production II at `/mcp`** by default (beta is the
-opt-in `/mcp-beta` staging instance), so prod II is no longer the unverified path (see §10).
+opt-in `/mcp-beta` staging instance), so prod II is no longer the unverified path (see
+Verification under Implementation Stages).
 
-## 5. Dropping OAuth 2.1, keeping the II handshake
+### 4. Dropping OAuth 2.1, keeping the II handshake
 
 `auth.rs` splits along the boundary its own module docs already draw (`auth.rs:24-60`).
 
@@ -185,7 +238,7 @@ opt-in `/mcp-beta` staging instance), so prod II is no longer the unverified pat
 per `McpConfig::state_dir`, `auth.rs:799-820`), the hosted-redirect allow-list
 (`auth.rs:434-687`), AS/PR discovery metadata (`auth.rs:2223-2262`), the `require_token`
 bearer gate + `bearer_challenge` (`auth.rs:2264,2313`), the front-channel HTML error-screen
-machinery, and the OAuth hardening added since this doc's first draft — RFC 8707
+machinery, and the OAuth hardening added since this design's first draft — RFC 8707
 resource-indicator enforcement (the `require_resource` flag, #127), RFC 9207 `iss` emission
 on redirects (#125), and the bounded/atomically-persisted DCR store (#137) — all on the
 OAuth side, so the partition is unchanged. `AuthStore` slims to
@@ -200,10 +253,10 @@ public, multi-tenant initiate endpoint an attacker can start a connect on. Local
 **no HTTP initiate endpoint**: the binary itself mints `X`, `priv(X)` never leaves the
 process, and `/redeem` is loopback-only and single-user. The consenter proof alone — the
 delegation's final hop must target the in-memory `X`, replica-verified at redeem
-(`registration_identity`, `identities.rs:1066`) — suffices; keep the random `state` as the
+(`registration_identity`, `identities.rs:1285`) — suffices; keep the random `state` as the
 callback↔connect correlator.
 
-## 6. The built-in browser II login
+### 5. The built-in browser II login
 
 1. Build the mainnet agent + `Identities` (prod II) once.
 2. Mint the session: `registration_pubkey_b64(&session_id)` → in-memory Ed25519 `S` + the
@@ -214,10 +267,10 @@ callback↔connect correlator.
    `http://127.0.0.1:<port>`. Both the II link's `callback` and the well-known entry derive
    from this one value, so they cannot drift (II matches by exact string equality).
 4. Build the II link (`iiconnect::ii_mcp_url`) against `https://id.ai` and surface it to the
-   user **in-band** — as the text result of an `authenticate` MCP tool (§7) — plus a
+   user **in-band** — as the text result of an `authenticate` MCP tool (component 6) — plus a
    best-effort server-side browser auto-open. Do **not** rely on **stderr** for the URL: every
-   client routes a stdio server's stderr to a log file/panel, never the chat (§7). stdout is
-   the JSON-RPC channel, so all logging stays on stderr.
+   client routes a stdio server's stderr to a log file/panel, never the chat (component 6).
+   stdout is the JSON-RPC channel, so all logging stays on stderr.
 5. Serve exactly three loopback routes: `GET /callback` (the pinned fragment-reading page),
    `POST /redeem` (slim redeem → `redeem_registration_delegation`), and
    `GET /.well-known/ii-auth-callbacks` (the `#4091` allow-list, one `Access-Control-Allow-Origin: *`
@@ -230,13 +283,13 @@ authenticated action — not at startup (most clients require the user to approv
 call, and some cap `initialize` at ~10 s) — and it returns the URL immediately rather than
 blocking on the callback (Codex times out a tool call at 60 s; Claude Code auto-backgrounds
 calls over 2 min). A follow-up `auth_status` tool (or simply the next tool call) confirms the
-grant landed. §7 covers the per-client specifics.
+grant landed. Component 6 covers the per-client specifics.
 
 Sessions are **in-memory** (re-login per run), matching today's model and the roadmap.
 Optional future work: persist the session seed `S` to an OS keychain to survive restarts —
 but `S` is a live capability to the user's real anchor, so never plaintext.
 
-## 7. Working with AI tool clients
+### 6. Working with AI tool clients
 
 The local binary is a **stdio** MCP server, so it is reachable by any client that can **spawn a
 local subprocess**, and unreachable by one that only connects to a remote **URL**. The five
@@ -258,8 +311,8 @@ requested clients split cleanly along that line (verified against current docs, 
 Codex (CLI/IDE/desktop), Cursor, Antigravity, and the **Perplexity macOS app** — runs
 `imcp2-local` directly. The cloud/remote-only surfaces — claude.ai web/mobile, Perplexity
 web/Windows, Codex Cloud — cannot reach `localhost`; they need the **hosted `imcp2`** server
-(the OAuth path kept in §5). This is precisely why the OAuth layer stays in `imcp2` rather than
-being deleted: it is the only way to serve the cloud clients.
+(the OAuth path kept in component 4). This is precisely why the OAuth layer stays in `imcp2`
+rather than being deleted: it is the only way to serve the cloud clients.
 
 **Registration** (absolute binary path everywhere; `imcp2-local` needs no args):
 
@@ -281,8 +334,8 @@ being deleted: it is the only way to serve the cloud clients.
 **Cross-client login invariants** (every subprocess-capable client agreed):
 1. **Host OAuth never touches a stdio server.** All five drive OAuth only for *remote* servers;
    for a local stdio server the host just pipes stdin/stdout. So the II login is entirely the
-   binary's own browser handshake (§6) — which also sidesteps Antigravity's known-buggy remote
-   MCP-OAuth.
+   binary's own browser handshake (component 5) — which also sidesteps Antigravity's
+   known-buggy remote MCP-OAuth.
 2. **stderr is not shown in chat — anywhere.** Claude, Codex, Cursor, and Antigravity all route
    a stdio server's stderr to a log file/panel, and stdout is reserved for JSON-RPC. So the
    login URL is surfaced **in-band**: the `authenticate` tool returns it as text (the model
@@ -309,7 +362,7 @@ OAuth has an open DCR bug that rejects RFC 7591 public-client registrations lack
 `client_secret` (the same registrations that work on Claude/ChatGPT/Grok). Neither affects the
 local binary.
 
-## 8. Tool / session seam
+### 7. Tool / session seam
 
 Today a tool gets its `session_id` via bearer → `require_token` → `AuthedSession` injected in
 the request extensions → `authed_session(ctx)` (`tools.rs:1493`). Under stdio there is one
@@ -330,7 +383,7 @@ Tools that are already session-free work unchanged locally: `get_canister_candid
 `get_canister_api_doc`, `open_app`, `resolve_app`, `discover_app_canisters`, the skills/lookup
 tools, and the anonymous path of `canister_query`.
 
-## 9. Security model & open decisions
+### 8. Security model
 
 **Trust boundary.** Dropping the bearer gate is sound *only because* the transport is stdio:
 a stdio server has no listening socket — it is reachable only by the parent process holding
@@ -348,32 +401,40 @@ handshake. Even so, a rebinding attacker is largely inert: `/redeem` only advanc
 *this* process started (`state` match) and `registration_identity` rejects any chain not
 targeting our freshly-minted `X`.
 
-Decisions for the implementation PR (recommendations first):
-1. **Loopback listener: hand-roll vs reuse axum.** *Recommend hand-roll* (3 routes, one CORS
-   header) so the local crate drops `axum`/`tower-http` — the security-sensitive page/CSP is a
-   static asset reused from core, not re-derived. Reuse-axum is the lower-effort fallback.
-2. **Browser open:** `open`/`webbrowser` crate (convenience) vs `std::process::Command`
-   (zero-dep). *Recommend* always return the URL in-band (the `authenticate` tool result) +
-   best-effort auto-open; the flow never depends on auto-open succeeding.
-3. **Login timing:** *resolved by the client research (§7)* — lazy on the first authenticated
-   tool call, never at startup (clients gate the first call on approval and cap `initialize`),
-   and non-blocking.
-4. **Session persistence:** in-memory only (recommend for v1) vs keychain-backed `S`.
+## Implementation Stages
 
-## 10. Risks to verify against PRODUCTION II
+**Stage 1 — carve out the core (no behavior change to the `imcp2` binary).** Make the
+`imcp2` library the transport/OAuth-agnostic core: keep `identities/calls/discover/management/
+skills/tools` + `static/` + connect assets, extract `iiconnect` from `auth.rs`, and put the
+OAuth AS + `McpServer`/`main.rs` + `pub mod metrics` behind the default-on `hosted` feature
+(optional `axum`/`tower-http`/`prometheus`), threading `McpConfig`'s
+`state_dir`/`clients`/`require_resource` hosted-side and keeping the `e2e` feature compiling.
+(The vestigial-dep cleanup this stage originally included was already done on main, #100.)
+Apply the `SessionSource` seam (component 7). *Exit:* the `imcp2` binary builds and its tests
+pass unchanged; `imcp2` with `default-features = false` compiles a minimal closure.
 
-This section's original premise — that only beta II was verified — is resolved on main:
-since #92 the hosted deployment serves **production II at `/mcp` on every deploy**
-(`main.rs:376-385`; beta is the opt-in `/mcp-beta` staging instance), CI probes production
-health on a schedule (#113), and the crate gained a hermetic end-to-end test of the full
-connect contract — `src/e2e_handshake.rs` (`--features e2e`, optional `pocket-ic` dep,
-needs `II_WASM` + `POCKET_IC_BIN`) drives register → authorize → the II
-registration-delegation ceremony → redeem → a real `mcp_register_v2` → token against a real
-Internet Identity release build in PocketIC. So "does prod II implement the handshake" is
-answered in production. (Chains are also now verified client-side against the injected
-agent's root key — `new_with_root_key`, `identities.rs:1285-1303` — so a binary pointed at a
-test network can complete redemption after `fetch_root_key`, which is what makes a
-PocketIC-based test of the *local* flow possible.)
+**Stage 2 — the local binary.** `imcp2-local`: stdio `IcTools` server + the browser-handshake
+login driver + the loopback callback listener. *Exit:* `cargo build -p imcp2-local`; a user
+logs in against II and runs read/write tools as their accounts.
+
+**Stage 3 — polish.** Docs (how to add the binary to an MCP client config; the wallet-grade
+trust note), extend the PocketIC e2e harness to the local login flow (see Verification),
+optional session persistence.
+
+### Verification against production II
+
+The original concern here — that only beta II was verified — is resolved on main: since #92
+the hosted deployment serves **production II at `/mcp` on every deploy** (`main.rs:376-385`;
+beta is the opt-in `/mcp-beta` staging instance), CI probes production health on a schedule
+(#113), and the crate gained a hermetic end-to-end test of the full connect contract —
+`src/e2e_handshake.rs` (`--features e2e`, optional `pocket-ic` dep, needs `II_WASM` +
+`POCKET_IC_BIN`) drives register → authorize → the II registration-delegation ceremony →
+redeem → a real `mcp_register_v2` → token against a real Internet Identity release build in
+PocketIC. So "does prod II implement the handshake" is answered in production. (Chains are
+also now verified client-side against the injected agent's root key — `new_with_root_key`,
+`identities.rs:1285-1303` — so a binary pointed at a test network can complete redemption
+after `fetch_root_key`, which is what makes a PocketIC-based test of the *local* flow
+possible.)
 
 What remains open is specific to the **local binary's `http://127.0.0.1` callback**, which
 the hosted https deployment never exercises:
@@ -388,29 +449,24 @@ Verification plan: extend the PocketIC e2e harness to drive the local browser-ha
 (loopback listener + slim redeem) with no live network; the
 `II_URL_PROD`/`II_CANISTER_ID_PROD` overrides remain available to point a binary at beta II.
 
-## 11. Work breakdown
+### Open decisions
 
-**Phase 1 — carve out the core (no behavior change to the `imcp2` binary).** Make the
-`imcp2` library the transport/OAuth-agnostic core: keep `identities/calls/discover/management/
-skills/tools` + `static/` + connect assets, extract `iiconnect` from `auth.rs`, and put the
-OAuth AS + `McpServer`/`main.rs` + `pub mod metrics` behind the default-on `hosted` feature
-(optional `axum`/`tower-http`/`prometheus`), threading `McpConfig`'s
-`state_dir`/`clients`/`require_resource` hosted-side and keeping the `e2e` feature compiling.
-(The vestigial-dep cleanup this phase originally included was already done on main, #100.)
-Apply the `SessionSource` seam (§8). *Exit:* the `imcp2` binary builds and its tests pass
-unchanged; `imcp2` with `default-features = false` compiles a minimal closure.
+1. **Loopback listener: hand-roll vs reuse axum.** *Recommend hand-roll* (3 routes, one CORS
+   header) so the local crate drops `axum`/`tower-http` — the security-sensitive page/CSP is a
+   static asset reused from core, not re-derived. Reuse-axum is the lower-effort fallback.
+2. **Browser open:** `open`/`webbrowser` crate (convenience) vs `std::process::Command`
+   (zero-dep). *Recommend* always return the URL in-band (the `authenticate` tool result) +
+   best-effort auto-open; the flow never depends on auto-open succeeding.
+3. **Session persistence:** in-memory only (recommend for v1) vs keychain-backed `S`.
+4. **Crate layout:** `imcp2` + `imcp2-local` with a `hosted` feature (recommended, keeps the
+   `imcp2` binary name) vs the stricter three-crate split (component 1).
 
-**Phase 2 — the local binary.** `imcp2-local`: stdio `IcTools` server + the browser-handshake
-login driver + the loopback callback listener. *Exit:* `cargo build -p imcp2-local`; a user
-logs in against II and runs read/write tools as their accounts.
+(Login timing was resolved by the client research — lazy on the first authenticated tool
+call, non-blocking.)
 
-**Phase 3 — polish.** Docs (how to add the binary to an MCP client config; the wallet-grade
-trust note), extend the PocketIC e2e harness to the local login flow (§10), optional session
-persistence.
+## Appendix: evidence index
 
-## 12. Evidence index
-
-(Line refs re-stamped against the v0.2.0 tree after the rebase onto `189fabd`.)
+(Line refs stamped against the v0.2.0 tree, rebased onto `189fabd`.)
 
 - Vestigial deps: already removed on main in #100 (`0e52fe9`); Ed25519 via `ic-agent`
   (`fresh_ed25519`, `identities.rs:1252`); chains verified by `ic-agent` client-side
@@ -423,7 +479,7 @@ persistence.
 - OAuth AS vs II-connect split: `auth.rs:24-60` (module docs), handlers
   `auth.rs:1053/1987/2139`, connect subset `auth.rs:1284/1342-1515/1673-1782/1839`,
   `#4091` `auth.rs:1304/1319`.
-- Session seam: `auth.rs:2264/2292`, `tools.rs:1493`, 13 call-sites listed in §8.
+- Session seam: `auth.rs:2264/2292`, `tools.rs:1493`, 13 call-sites listed in component 7.
 - II login primitives: `identities.rs:595/936`, `ii_mcp_url` `auth.rs:1284`.
 - Production II served at `/mcp` since #92 (`main.rs:376-385`); PocketIC e2e handshake test
   `src/e2e_handshake.rs` (`e2e` feature); beta II constants `identities.rs:121-128`, candid
