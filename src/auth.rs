@@ -1481,6 +1481,8 @@ fn pinned_callback_page(prefix: &str) -> Response {
     // (no `'unsafe-inline'`, so an injected `style=` attribute or stray `<style>`
     // still can't apply). Without it the block falls back to `default-src
     // 'none'` and the page renders unstyled.
+    // `img-src 'self'`: CSP governs the `<link rel=icon>` fetch as an image, so
+    // without it the favicon is dropped.
     // `frame-ancestors 'none'`: II reaches this page only by top-level
     // navigation, so framing is never legitimate: deny it outright so the
     // delegation-bearing page can't be embedded for UI redress. X-Frame-Options
@@ -1488,7 +1490,8 @@ fn pinned_callback_page(prefix: &str) -> Response {
     // frame-ancestors is present).
     let csp = format!(
         "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; \
-         connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+         img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; \
+         frame-ancestors 'none'"
     );
     let mut resp = Html(html).into_response();
     let h = resp.headers_mut();
@@ -1595,7 +1598,7 @@ fn error_screen(status: StatusCode, title: &str, headline: &str, detail: &str, h
         .replace("__DETAIL__", detail)
         .replace("__HINT__", hint);
     let csp = format!(
-        "default-src 'none'; style-src 'nonce-{nonce}'; base-uri 'none'; \
+        "default-src 'none'; style-src 'nonce-{nonce}'; img-src 'self'; base-uri 'none'; \
          form-action 'none'; frame-ancestors 'none'"
     );
     let mut resp = (status, Html(html)).into_response();
@@ -3294,6 +3297,7 @@ mod tests {
             .to_string();
         assert!(csp.contains("default-src 'none'"), "{csp}");
         assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(csp.contains("img-src 'self'"), "{csp}");
         // No script on this page: the CSP must not open a script-src.
         assert!(!csp.contains("script-src"), "the error page needs no script-src: {csp}");
         let nonce = csp
@@ -3312,6 +3316,7 @@ mod tests {
         );
         assert!(!html.contains("__"), "every template placeholder must be substituted: {html}");
         assert!(!html.contains("<script"), "the error page carries no script");
+        assert!(html.contains("rel=icon href=/favicon.svg"), "{html}");
         assert!(
             html.contains(&format!("<style nonce=\"{nonce}\">")),
             "the inline style nonce must match the CSP nonce"
@@ -3526,6 +3531,7 @@ mod tests {
             .to_string();
         assert!(csp.contains("default-src 'none'"), "{csp}");
         assert!(csp.contains("connect-src 'self'"), "{csp}");
+        assert!(csp.contains("img-src 'self'"), "{csp}");
         // Never legitimately framed (II top-level-navigates here): deny UI redress.
         assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
         // Pull the nonce out of the CSP and confirm the inline <script> uses it.
@@ -3553,6 +3559,7 @@ mod tests {
             html.contains(&format!("<style nonce=\"{nonce}\">")),
             "the inline style nonce must match the CSP nonce"
         );
+        assert!(html.contains("rel=icon href=/favicon.svg"), "{html}");
         assert!(html.contains("location.hash"), "the page reads the fragment client-side");
         assert!(html.contains("/mcp-beta/oauth/connect/redeem"), "posts to the instance's redeem path");
         assert!(!html.contains("__REDEEM_URL__"), "the redeem-URL placeholder must be substituted");
