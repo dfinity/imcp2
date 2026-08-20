@@ -1,6 +1,8 @@
 # IMCP2 local deployment: a minimal stdio binary
 
-Status: **draft** — design only, no code changes in this PR.
+Status: **draft** — design only, no code changes in this PR. This is the **full** design doc,
+carrying code-level detail and evidence; a concise, high-level companion lives in
+[`local-deployment.md`](local-deployment.md).
 
 ## Summary
 
