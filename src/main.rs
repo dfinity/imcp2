@@ -156,6 +156,10 @@ fn metrics_router(registry: prometheus::Registry, metrics: imcp2::metrics::Metri
     )
 }
 
+/// The tab icon, from forumic.com: the ICP infinity mark on transparency, so it
+/// reads against both the light and dark browser chrome.
+const FAVICON_SVG: &str = include_str!("assets/favicon.svg");
+
 /// The public, human-facing pages this origin serves, as absolute-path
 /// suffixes. This is the sitemap's and robots.txt's shared idea of "content":
 /// every other route is machine surface that a crawler has no use for and that
@@ -222,13 +226,25 @@ fn robots_txt(public_url: &str) -> String {
     )
 }
 
-/// Serve `/sitemap.xml` and `/robots.txt` for the given public origin, each
-/// with the content type its consumers expect (`application/xml` and
-/// `text/plain`).
+/// Serve `/sitemap.xml`, `/robots.txt` and `/favicon.svg` for the given public
+/// origin, each with the content type its consumers expect (`application/xml`,
+/// `text/plain` and `image/svg+xml`).
 fn site_metadata_router(public_url: &str) -> Router {
     let sitemap = sitemap_xml(public_url);
     let robots = robots_txt(public_url);
     Router::new()
+        .route(
+            "/favicon.svg",
+            get(|| async {
+                (
+                    [
+                        (axum::http::header::CONTENT_TYPE, "image/svg+xml"),
+                        (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+                    ],
+                    FAVICON_SVG,
+                )
+            }),
+        )
         .route(
             "/sitemap.xml",
             get(move || {
@@ -740,6 +756,23 @@ mod tests {
         for path in ["/mcp", "/mcp-beta", "/version", "/status/", "/.well-known/"] {
             assert!(body.contains(&format!("Disallow: {path}\n")), "{path} missing:\n{body}");
         }
+    }
+
+    #[tokio::test]
+    async fn favicon_is_served_as_a_cacheable_svg() {
+        let resp = site_metadata_router("https://mcp.internetcomputer.org")
+            .oneshot(Request::get("/favicon.svg").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let header = |n: &str| resp.headers().get(n).map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(header("content-type").as_deref(), Some("image/svg+xml"));
+        assert_eq!(header("cache-control").as_deref(), Some("public, max-age=86400"));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let svg = String::from_utf8(body.to_vec()).unwrap();
+        assert!(svg.contains("<svg"), "{svg}");
+        // Transparent, so the browser's own chrome shows through in either theme.
+        assert!(!svg.contains("<rect"), "the mark must stay transparent: {svg}");
     }
 
     async fn challenge(token: Option<&str>) -> (StatusCode, String, Option<String>) {
