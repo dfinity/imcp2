@@ -1546,10 +1546,14 @@ mod tests {
         deep.push(0x00); // a final null (opt absent) terminates the chain
         assert!(deep.len() < 350_000, "compact on the wire: {} bytes", deep.len());
         // Type-less path (did = None): decode + render + drop on the deep stack.
+        // Require the genuine decode-error string: candid's recursion guard MUST
+        // have run and rejected the chain. Accepting the "(could not spawn …)"
+        // fallback would let a thread-spawn failure — which never reaches the
+        // guard — pass the test, defeating its purpose.
         let out = super::decode_reply(None, "m", &deep);
         assert!(
-            out.contains("not decodable") || out.contains("could not"),
-            "deep opt chain must decode-error gracefully, got: {out:.120}"
+            out.contains("not decodable"),
+            "deep opt chain must reach candid's guard and decode-error gracefully, got: {out:.120}"
         );
     }
 
