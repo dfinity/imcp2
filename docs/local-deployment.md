@@ -80,6 +80,11 @@ machinery is needed.
    are identical in both.
 8. **Security model** — whoever drives the binary acts as the user's real II accounts on
    mainnet: treat the binary and its client config like a wallet.
+9. **End-user setup** — no config editing anywhere: double-click the plugin bundle for
+   Claude Desktop, a one-click install link for Cursor, one pasted command for Claude Code
+   and Codex, guided connector UIs for Perplexity (macOS) and Antigravity — plus an
+   `imcp2-local setup` command that detects installed clients and registers the binary for
+   you. Signing in is one browser round-trip on first use.
 
 ## Implementation Stages
 
@@ -88,10 +93,9 @@ machinery is needed.
    behavior change to the hosted server.
 2. **Ship `imcp2-local`.** The stdio server, the browser-login driver, and the loopback
    callback listener. Exit: a user logs in against II and uses the tools as their accounts.
-3. **Polish.** Per-client setup docs and the wallet-grade trust note; integration tests that
+3. **Polish.** End-user packaging and setup (the double-click bundle, install links, the
+   `setup` command, signed binaries) and the wallet-grade trust note; integration tests that
    run `imcp2-local` in its local-replica test configuration (against an ICP CLI-spawned
    replica or PocketIC, with an II canister deployed there), extending the existing PocketIC
    end-to-end harness to the local login flow; optional keychain-backed session persistence.
 
-Open decisions (details in the full doc): hand-rolled vs axum-based loopback listener; how
-to open the browser; v1 session persistence.

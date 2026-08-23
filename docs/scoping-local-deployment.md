@@ -186,14 +186,15 @@ feature (`src/e2e_handshake.rs`). rmcp's `auth` feature is not used by either bi
 OAuth AS is hand-rolled.
 
 **Added by `imcp2-local`:** rmcp's `transport-io` (`rmcp::transport::stdio()` over tokio
-stdin/stdout, in place of `StreamableHttpService`), `tracing-subscriber` (stderr logging),
-and a browser-opener (`open` crate, or `std::process::Command`).
+stdin/stdout, in place of `StreamableHttpService`), `axum` (the transient login listener),
+`open` (browser launch), and `tracing-subscriber` (stderr logging).
 
 The local binary's one HTTP surface is the transient login callback (component 5) — three
-loopback routes. The recommendation is to **hand-roll** it on a bare `tokio` `TcpListener`
-(one hand-set `Access-Control-Allow-Origin` header on the `#4091` well-known) so
-`axum`/`tower-http` stay out of the local graph; building it on axum is the lower-effort
-fallback (an open decision under Implementation Stages).
+loopback routes served with **axum**, the same shape as the ICP CLI's web-identity flow
+(`icp identity link web`: an axum `Router` on a `TcpListener` at `127.0.0.1:0`, graceful
+shutdown on completion — `crates/icp-cli/src/commands/identity/link/web.rs`). `tower-http`
+is still not needed: the only CORS requirement is one `Access-Control-Allow-Origin` header
+on the `#4091` well-known, set directly on that response.
 
 Net minimal local deps: `imcp2-core` +
 `rmcp{server,macros,transport-io}` + `tokio` +
@@ -280,7 +281,9 @@ callback↔connect correlator.
    from this one value, so they cannot drift (II matches by exact string equality).
 4. Build the II link (`iiconnect::ii_mcp_url`) against `https://id.ai` and surface it to the
    user **in-band** — as the text result of an `authenticate` MCP tool (component 6) — plus a
-   best-effort server-side browser auto-open. Do **not** rely on **stderr** for the URL: every
+   best-effort server-side browser auto-open via `open::that` (the `open` crate, as in the
+   ICP CLI); the flow never depends on the auto-open succeeding. Do **not** rely on
+   **stderr** for the URL: every
    client routes a stdio server's stderr to a log file/panel, never the chat (component 6).
    stdout is the JSON-RPC channel, so all logging stays on stderr.
 5. Serve exactly three loopback routes: `GET /callback` (the pinned fragment-reading page),
@@ -353,6 +356,9 @@ rather than being deleted: it is the only way to serve the cloud clients.
   ```
 - Perplexity macOS: Settings → Connectors → Add Connector → Advanced (needs the PerplexityXPC
   helper): `{ "command": "/usr/local/bin/imcp2-local", "args": [], "env": {} }`
+
+These are the raw registration formats; component 9 gives the end-user setup paths that
+avoid editing them by hand.
 
 **Cross-client login invariants** (every subprocess-capable client agreed):
 1. **Host OAuth never touches a stdio server.** All five drive OAuth only for *remote* servers;
@@ -430,6 +436,37 @@ handshake. Even so, a rebinding attacker is largely inert: `/redeem` only advanc
 *this* process started (`state` match) and `registration_identity` rejects any chain not
 targeting our freshly-minted `X`.
 
+### 9. End-user setup (UX)
+
+The bar for setup: install the artifact, follow the prompts, sign in — **no JSON or config
+editing anywhere**. Two things deliver that: per-client one-click/one-command paths where
+the client provides one, and a `setup` subcommand in the binary for the rest.
+
+| Client | What the user does |
+|---|---|
+| Claude Desktop | **Double-click the `imcp2.mcpb` bundle** → Claude Desktop shows its install dialog → Enable. (MCPB is Claude Desktop's plugin format; the bundle carries the per-platform binary and installs it in one step.) |
+| Claude Code | Paste one command: `claude mcp add --transport stdio imcp2 -- <installed path>` |
+| Codex (CLI / IDE / desktop) | Paste one command: `codex mcp add imcp2 -- <installed path>` |
+| Cursor | Click the **"Add to Cursor"** install link on the docs page → Cursor opens its install prompt → Install. |
+| Antigravity | Settings → Manage MCP Servers → Add (UI) — or run `imcp2-local setup`. |
+| Perplexity (macOS) | Install Perplexity's local-MCP helper once (the app prompts for it), then Settings → Connectors → Add Connector and paste the binary path in the Simple tab. |
+
+**`imcp2-local setup`** closes the remaining gaps: run once, it detects installed clients
+(Claude Desktop, Claude Code, Codex, Cursor, Antigravity, Perplexity), shows what it will
+register, and writes each client's MCP config itself — the user never opens a JSON/TOML
+file. `imcp2-local setup --remove` undoes it. (What it writes is exactly the per-client
+registration in component 6.)
+
+**Signing in** is then the same everywhere: on the first tool call that needs the user's
+identity, the client asks to approve the `authenticate` tool, the browser opens to Internet
+Identity, the user signs in, and the tab says it can be closed. The session lives in memory,
+so quitting the client ends it; the next run repeats the same one-step sign-in.
+
+**Packaging that makes this work:** signed and notarized release binaries (macOS Gatekeeper
+and Windows SmartScreen block unsigned double-click installs), one artifact per platform,
+and the `.mcpb` manifest pointing at the right per-OS binary. Building these artifacts is a
+Stage 3 deliverable.
+
 ## Implementation Stages
 
 **Stage 1 — extract `imcp2-core` (no behavior change to the `imcp2` binary).** Move
@@ -444,10 +481,11 @@ compiles standalone with no `axum`/`tower-http`/`prometheus`/OAuth in its graph.
 login driver + the loopback callback listener. *Exit:* `cargo build -p imcp2-local`; a user
 logs in against II and runs read/write tools as their accounts.
 
-**Stage 3 — polish.** Docs (how to add the binary to an MCP client config; the wallet-grade
-trust note), integration tests via the local-replica test configuration (component 3),
-extending the PocketIC e2e harness to the local login flow (see Verification), optional
-session persistence.
+**Stage 3 — polish.** End-user packaging and setup (component 9: the `.mcpb` bundle, the
+Add-to-Cursor link, the `setup` subcommand, signed/notarized release binaries) and the
+wallet-grade trust note; integration tests via the local-replica test configuration
+(component 3), extending the PocketIC e2e harness to the local login flow (see
+Verification); optional keychain-backed session persistence.
 
 ### Verification against production II
 
@@ -478,16 +516,6 @@ deployed II canister — extending the existing PocketIC e2e harness to drive th
 browser-handshake flow (loopback listener + slim redeem) with no live network. The
 `II_URL_PROD`/`II_CANISTER_ID_PROD` overrides additionally allow pointing a binary at beta II.
 
-### Open decisions
-
-1. **Loopback listener: hand-roll vs reuse axum.** *Recommend hand-roll* (3 routes, one CORS
-   header) so the local crate drops `axum`/`tower-http` — the security-sensitive page/CSP is a
-   static asset reused from core, not re-derived. Reuse-axum is the lower-effort fallback.
-2. **Browser open:** `open`/`webbrowser` crate (convenience) vs `std::process::Command`
-   (zero-dep). *Recommend* always return the URL in-band (the `authenticate` tool result) +
-   best-effort auto-open; the flow never depends on auto-open succeeding.
-3. **Session persistence:** in-memory only (recommend for v1) vs keychain-backed `S`.
-
 ## Appendix: evidence index
 
 (Line refs stamped against the v0.2.0 tree, rebased onto `189fabd`.)
@@ -509,3 +537,7 @@ browser-handshake flow (loopback listener + slim redeem) with no live network. T
   `src/e2e_handshake.rs` (`e2e` feature); beta II constants `identities.rs:121-128`, candid
   verification note `identities.rs:929-935`, generic live-round-trip caveat
   `README.md:993-999`.
+- Login listener + browser-open follow the ICP CLI's web-identity flow: axum `Router` on
+  `TcpListener::bind("127.0.0.1:0")` with graceful shutdown, browser via `open::that`
+  (`icp-cli` `crates/icp-cli/src/commands/identity/link/web.rs:284,347,375,378`; workspace
+  deps `axum = "0.8"`, `open = "5"`).
