@@ -30,10 +30,6 @@ there is no IMCP2 artifact that fits that slot.
 
 ## Non-goals
 
-- **Not a local-replica product surface** — the shipped binary targets mainnet and
-  production II. A **test configuration** that talks to a local replica (as spawned by the
-  ICP CLI) is deliberately easy to compile and is how integration tests run — but it is not
-  a v1 user-facing mode.
 - **No change to the hosted server** — its name, behavior, and deployments stay as they are.
 - **No session persistence in v1** — sessions are in-memory; users re-login per run.
 - **Not for cloud-only AI surfaces** — claude.ai web/mobile, Perplexity web, and Codex Cloud

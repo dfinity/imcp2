@@ -43,12 +43,6 @@ fits that slot.
 
 ## Non-goals
 
-- **Not a local-replica product surface.** The *shipped* binary targets mainnet + production
-  II: its default build has no `fetch_root_key`, no SSRF-guard relaxation, no local II. A
-  **test configuration** that talks to a local replica (as spawned by the ICP CLI) is a
-  deliberate nice-to-have — easy to compile, guarded so it can never run against mainnet,
-  and the vehicle for integration testing (see component 3 and Verification) — but it is not
-  a v1 user-facing mode.
 - **No change to the hosted server's behavior, name, or deployment.** The `imcp2` binary,
   Dockerfile (`CMD ["imcp2"]`, `Dockerfile:23,31`), `imcp2.service`, and deploy scripts stay
   as they are.
