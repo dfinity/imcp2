@@ -457,6 +457,20 @@ register, and writes each client's MCP config itself — the user never opens a 
 file. `imcp2-local setup --remove` undoes it. (What it writes is exactly the per-client
 registration in component 6.)
 
+**Upgrading.** Client registrations point at a stable install path, so an upgrade is a
+binary swap at that path — nothing to re-register; each client picks the new version up the
+next time it starts the server (typically on app restart). Distribution and updates follow
+the ICP CLI: releases are built with cargo-dist (shell/PowerShell installers for the major
+platforms, with `install-updater = true` shipping the standalone axoupdater program
+alongside, so one `imcp2-local-update` run upgrades in place), and — like the ICP CLI's
+`dist_update_suggestion` — the binary detects which channel installed it (axoupdater
+receipt, Homebrew, npm) and, when a newer release exists, surfaces that channel's exact
+upgrade command. The Claude Desktop bundle has its own channel: upgrades ship as new
+`.mcpb` versions — double-click the new bundle to upgrade in place (directory-listed
+extensions update automatically). There is nothing to migrate: the binary keeps no on-disk
+state (sessions are in-memory), so after an upgrade the next use simply repeats the
+one-step sign-in.
+
 **Signing in** is then the same everywhere: on the first tool call that needs the user's
 identity, the client asks to approve the `authenticate` tool, the browser opens to Internet
 Identity, the user signs in, and the tab says it can be closed. The session lives in memory,
@@ -482,7 +496,8 @@ login driver + the loopback callback listener. *Exit:* `cargo build -p imcp2-loc
 logs in against II and runs read/write tools as their accounts.
 
 **Stage 3 — polish.** End-user packaging and setup (component 9: the `.mcpb` bundle, the
-Add-to-Cursor link, the `setup` subcommand, signed/notarized release binaries) and the
+Add-to-Cursor link, the `setup` subcommand, the cargo-dist installers + updater,
+signed/notarized release binaries) and the
 wallet-grade trust note; integration tests via the local-replica test configuration
 (component 3), extending the PocketIC e2e harness to the local login flow (see
 Verification); optional keychain-backed session persistence.
@@ -541,3 +556,7 @@ browser-handshake flow (loopback listener + slim redeem) with no live network. T
   `TcpListener::bind("127.0.0.1:0")` with graceful shutdown, browser via `open::that`
   (`icp-cli` `crates/icp-cli/src/commands/identity/link/web.rs:284,347,375,378`; workspace
   deps `axum = "0.8"`, `open = "5"`).
+- Distribution/updates follow the ICP CLI: cargo-dist with shell/PowerShell installers and
+  `install-updater = true` (`icp-cli` `dist-workspace.toml`), channel detection + upgrade
+  suggestion via axoupdater (`icp-cli` `crates/icp-cli/src/dist.rs:31,47-60`,
+  `axoupdater = "0.10"`).

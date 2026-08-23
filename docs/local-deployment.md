@@ -84,7 +84,9 @@ machinery is needed.
    Claude Desktop, a one-click install link for Cursor, one pasted command for Claude Code
    and Codex, guided connector UIs for Perplexity (macOS) and Antigravity — plus an
    `imcp2-local setup` command that detects installed clients and registers the binary for
-   you. Signing in is one browser round-trip on first use.
+   you. Signing in is one browser round-trip on first use. Upgrading is one command (or a
+   new double-click for the Claude Desktop bundle): clients point at a stable path, the
+   installer's updater swaps the binary in place, and there is no state to migrate.
 
 ## Implementation Stages
 
@@ -94,7 +96,8 @@ machinery is needed.
 2. **Ship `imcp2-local`.** The stdio server, the browser-login driver, and the loopback
    callback listener. Exit: a user logs in against II and uses the tools as their accounts.
 3. **Polish.** End-user packaging and setup (the double-click bundle, install links, the
-   `setup` command, signed binaries) and the wallet-grade trust note; integration tests that
+   `setup` command, the installers + in-place updater, signed binaries) and the wallet-grade
+   trust note; integration tests that
    run `imcp2-local` in its local-replica test configuration (against an ICP CLI-spawned
    replica or PocketIC, with an II canister deployed there), extending the existing PocketIC
    end-to-end harness to the local login flow; optional keychain-backed session persistence.
