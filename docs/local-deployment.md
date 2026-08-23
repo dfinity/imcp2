@@ -98,5 +98,4 @@ machinery is needed.
    end-to-end harness to the local login flow; optional keychain-backed session persistence.
 
 Open decisions (details in the full doc): hand-rolled vs axum-based loopback listener; how
-to open the browser; v1 session persistence; confirming the `imcp2-core` split (recommended
-over single-crate feature flags).
+to open the browser; v1 session persistence.
