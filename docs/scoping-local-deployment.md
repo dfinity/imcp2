@@ -132,7 +132,8 @@ minimal.
   `require_resource`), `metrics.rs` + `prometheus`, `main.rs` + the landing-page assets,
   `tests/routers.rs`, and the PocketIC `e2e` harness (`src/e2e_handshake.rs` drives the
   OAuth routes, so it stays here with its optional `pocket-ic` dep). It **re-exports**
-  `imcp2-core`'s public items (`pub use`), so existing embedders' `imcp2::…` imports keep
+  the `imcp2-core` items that were previously `imcp2` public API (`pub use`), so existing
+  embedders' `imcp2::…` imports keep
   compiling — the restructure is a minor version bump, not a break. `cargo build` here
   produces the `imcp2` server exactly as today; deploy configs unchanged.
 - **`imcp2-local`** (bin, new) — depends on `imcp2-core` plus its own small additions: a
@@ -140,9 +141,12 @@ minimal.
   over rmcp's stdio transport (features `["server",
   "macros", "transport-io"]`), the browser-handshake login driver, and the transient
   loopback callback listener (`axum`, serving only the three login routes of component 5 —
-  the MCP tool surface never rides HTTP here). `tower-http`, `prometheus`, and every OAuth
-  module are **absent from its dependency graph** — under any build invocation, not just
-  `-p` builds.
+  the MCP tool surface never rides HTTP here). `prometheus` and every OAuth module are
+  **absent from its dependency graph** — structurally, since `imcp2-local` never depends on
+  `imcp2` — under any build invocation, not just `-p` builds. The one nuance is
+  `tower-http`: the hosted CORS layer is not a dependency here, but the crate name still
+  appears deep in the graph as an rmcp/reqwest internal — the unavoidable transitive
+  baseline, not linked hosted code.
 
 (One benign note: a `--workspace` build compiles rmcp once with both transport features
 unified — harmless, the linker strips the unused transport; the isolation that matters is
@@ -153,8 +157,12 @@ publishing with a tag-equals-version guard (`.github/workflows/publish-crate.yml
 crates.io does not accept path-only dependencies of a published crate, `imcp2-core` becomes a
 second published crate: publish order core → `imcp2`, and the publish workflow is generalised
 per-crate. Recommend versioning `imcp2-core` 0.x and documenting it as internal to the imcp2
-family — its API is consumed through `imcp2`'s re-exports, with no independent stability
-promises — so component-level churn doesn't force `imcp2` majors. Whether `imcp2-local`
+family. That label relaxes stability only where `imcp2` does **not** re-export the item:
+whatever `imcp2` re-exports is `imcp2` public API, and breaking it is a breaking change for
+`imcp2` embedders under `imcp2`'s own semver, whatever core's version says. So the re-export
+set stays curated — exactly the pre-split `imcp2` surface — while the core-only composition
+seams (the session slot, the connect-page internals, everything only `imcp2-local` consumes)
+can churn on core 0.x bumps without forcing an `imcp2` release. Whether `imcp2-local`
 itself is published (vs distributed as release binaries) is an independent choice; nothing
 depends on it. The `.crate` packaging constraint carries over: `src/assets` and `static/`
 ship with the crate that `include_str!`s them, i.e. they move to `imcp2-core`.
@@ -567,7 +575,9 @@ building and signing these artifacts is a Stage 3 deliverable.
 AS, `McpServer`/`McpConfig`/`main.rs`, `metrics`, and the `e2e` harness, depends on core, and
 re-exports its public items so embedders keep compiling. Apply the `SessionSource` seam
 (component 7). *Exit:* the `imcp2` binary builds and its tests pass unchanged; `imcp2-core`
-compiles standalone with no `axum`/`tower-http`/`prometheus`/OAuth in its graph.
+compiles standalone with no `axum`, no `prometheus`, and no OAuth code in its graph —
+`tower-http` remains only as rmcp/reqwest's transitive internal, never as the direct CORS
+dependency.
 
 **Stage 2 — the local binary.** `imcp2-local`: stdio `IcTools` server + the browser-handshake
 login driver + the loopback callback listener. *Exit:* `cargo build -p imcp2-local`; a user
