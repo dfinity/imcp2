@@ -99,22 +99,29 @@ AS) or a local binary can be composed; the crate boundary is what keeps the loca
 minimal.
 
 - **`imcp2-core`** (lib, new) — the transport/OAuth-agnostic components:
-  - `identities.rs` **kept verbatim** (the II session-key grant + on-demand per-app account
-    delegations against production II — `IiInstance::prod()` at `identities.rs:185`,
-    `registration_pubkey_b64` `:595`, `redeem_registration_delegation` `:936`,
-    `delegated_identity_for` `:1030`, `list_accounts` `:873`).
+  - `identities.rs` **moved whole, logic unchanged** (the II session-key grant + on-demand
+    per-app account delegations against production II — `IiInstance::prod()` at
+    `identities.rs:185`, `registration_pubkey_b64` `:595`,
+    `redeem_registration_delegation` `:936`, `delegated_identity_for` `:1030`,
+    `list_accounts` `:873`).
   - `calls.rs` (Candid textual↔binary codec, `raw_call`), `discover.rs` (discovery + SSRF
     guard), `management.rs`, `skills.rs`.
   - `tools.rs` — the **entire** MCP tool surface. The `#[tool_router]` / 26×`#[tool]` /
     `#[tool_handler] impl ServerHandler for IcTools` macros expand into one impl on
-    `IcTools` and **must stay co-located**; both binaries construct `IcTools` and differ
-    only in transport + session source. The `SessionSource` seam and the plain
-    `AuthedSession` struct (component 7) live here.
+    `IcTools` and **must stay co-located**; both binaries construct `IcTools`, differing
+    in transport + session source (the local binary additionally wraps it in its login
+    handler, component 6). The `SessionSource` seam and the plain `AuthedSession` struct
+    (component 7) live here.
   - **new `iiconnect` module** — the II connect-handshake primitives lifted out of
     `auth.rs` (component 4), re-parameterised to plain values so they carry no
     `AuthStore`/OAuth state.
   - the `include_str!` assets those modules compile in: `static/` (the Candid/OQL
     references) and the connect-flow assets under `src/assets/` (page, CSS, logo).
+  - The move is not visibility-neutral: workspace packages share no crate-private access,
+    so the items the binaries compose against — `IcTools`/`IcTools::new` with
+    `SessionSource`, the `Identities` registration/redeem entry points above, the
+    `iiconnect` builders — graduate from `pub(crate)` behind one binary to core's
+    deliberate **public API** (`imcp2` re-exports it below, so embedders see no change).
   - Deps: rmcp `["server", "macros"]` (no transport), `ic-agent`/`candid`/`candid_parser`,
     tokio, serde/serde_json, reqwest/url/regex (discovery), the II-connect and management
     utilities (`base64`, `hex`, `sha2`, `crc32fast`, `getrandom`, `uuid`, `urlencoding`),
@@ -129,7 +136,8 @@ minimal.
   compiling — the restructure is a minor version bump, not a break. `cargo build` here
   produces the `imcp2` server exactly as today; deploy configs unchanged.
 - **`imcp2-local`** (bin, new) — depends on `imcp2-core` plus its own small additions: a
-  few hundred lines that serve `IcTools` over rmcp's stdio transport (features `["server",
+  few hundred lines that serve `IcTools` (wrapped in the local login handler, component 6)
+  over rmcp's stdio transport (features `["server",
   "macros", "transport-io"]`), the browser-handshake login driver, and the transient
   loopback callback listener (`axum`, serving only the three login routes of component 5 —
   the MCP tool surface never rides HTTP here). `tower-http`, `prometheus`, and every OAuth
@@ -246,7 +254,12 @@ test build at any other local replica, such as one spawned by the ICP CLI.
   (`auth.rs:1673-1782`).
 - a slimmed `connect_redeem` (`auth.rs:1839`): shape-check the fragment, single-flight, call
   `Identities::redeem_registration_delegation`, signal completion — **minus** the PKCE/code/
-  token/cookie/redirect tail.
+  token/cookie/redirect tail. Dropping the redirect changes the page contract: the callback
+  script today treats only a JSON `redirect` as success and shows the error screen otherwise
+  (`auth.rs:1447-1452`), so the shared page gains a second success arm — the local redeem
+  answers `{"done": true}` and the page renders its completion state in place ("Signed in —
+  you can close this tab", the state component 9 promises), while the hosted redeem keeps
+  answering `redirect`.
 - the **`#4091` allow-list** `/.well-known/ii-auth-callbacks` (`auth.rs:1304,1319`) — still
   mandatory: II fail-closed-fetches it before honoring the callback.
 
@@ -295,8 +308,10 @@ callback↔connect correlator.
    `POST /redeem` (slim redeem → `redeem_registration_delegation`), and
    `GET /.well-known/ii-auth-callbacks` (the `#4091` allow-list, one `Access-Control-Allow-Origin: *`
    header since II fetches it cross-origin).
-6. On redeem success, record the grant in memory and shut the listener down. `IcTools` now
-   serves tools over stdio, minting per-app delegations on demand against mainnet.
+6. On redeem success, answer `{"done": true}` — the callback page renders "Signed in — you
+   can close this tab" (component 4) — record the grant in memory, and shut the listener
+   down. `IcTools` now serves tools over stdio, minting per-app delegations on demand
+   against mainnet.
 
 The loopback listener is the unavoidable minimum, not a design slip: II delivers the
 delegation by *navigating the browser* to the callback (a URL fragment only a served page can
@@ -388,12 +403,18 @@ avoid editing them by hand.
 5. **Absolute paths; stdout = JSON-RPC only** (all diagnostics to stderr). A self-contained
    native binary avoids the frequent wrong-runtime/path failures Node-based servers hit.
 
-*(Implementation: `authenticate`/`auth_status` are **local-only** tools, and construction
-mode alone would not hide them — rmcp's `#[tool_router]` generates the router per impl
-block, type-level. So they live in their **own small router** (a second `#[tool_router]`
-impl in `imcp2-core`) that only the local binary composes onto `IcTools`'s router; the
-hosted server never composes it in, and a hosted-side test asserts its `tools/list` does
-not contain them. Cursor's ~40-tool cap is comfortable: the core exposes ~26 plus these.)*
+*(Implementation: `authenticate`/`auth_status` are **local-only** tools, and they cannot
+live in `imcp2-core` at all — they drive the loopback listener and browser opener, which
+are `imcp2-local` code that core cannot call back into. So `imcp2-local` defines a small
+wrapper handler that owns the login driver and a writing handle to the shared session
+slot (component 7) and wraps
+`IcTools`: its own `#[tool_router]` impl carries the two login tools, and its
+`ServerHandler` answers `tools/list` with the merged list and dispatches `tools/call` to
+that router first, forwarding everything else to the inner `IcTools` handler (rmcp's
+`RequestContext<RoleServer>` is handler-independent, so forwarding is verbatim). The
+hosted server thus contains no login-tool code by construction; a hosted-side test still
+asserts its `tools/list` stays login-free as a regression guard. Cursor's ~40-tool cap is
+comfortable: the core exposes ~26 plus these two.)*
 
 **Serving the cloud clients (hosted `imcp2`).** claude.ai web/mobile and Perplexity-web reach
 only a public HTTPS MCP endpoint with OAuth 2.1 — which hosted `imcp2` already is. Two
