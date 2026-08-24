@@ -55,16 +55,15 @@ machinery is needed.
 - **A component core, two thin binaries.** A new `imcp2-core` library holds the shared
   components (the tools, II sessions, the connect handshake) from which either server is
   composed; `imcp2` keeps its name as the hosted server built on it, and `imcp2-local` is a
-  new small binary built on it whose dependency graph never contains the OAuth/HTTP
-  machinery.
+  new small binary built on it that carries none of the hosted server's OAuth machinery.
 
 ## Design components
 
 1. **Crate layout** — `imcp2-core` (shared components), `imcp2` (hosted library + binary;
    unchanged name and deployments), `imcp2-local` (new minimal binary).
 2. **Dependency profile** — the local closure is the MCP stack (stdio), `ic-agent`/Candid,
-   and the discovery/management essentials; no axum, no CORS layer, no metrics stack, no
-   OAuth persistence.
+   the discovery/management essentials, and axum for the transient login listener alone; no
+   CORS layer, no metrics stack, no OAuth persistence.
 3. **IC + II wiring** — a mainnet agent and production II, env-overridable for staging.
 4. **Auth partition** — keep the II connect-handshake primitives (link builder, callback
    page, delegation parser, the II callback allow-list, a slim redeem); drop the whole

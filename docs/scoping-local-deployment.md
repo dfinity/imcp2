@@ -127,15 +127,17 @@ minimal.
   `imcp2-core`'s public items (`pub use`), so existing embedders' `imcp2::…` imports keep
   compiling — the restructure is a minor version bump, not a break. `cargo build` here
   produces the `imcp2` server exactly as today; deploy configs unchanged.
-- **`imcp2-local`** (bin, new) — depends on **`imcp2-core` only**: a few hundred lines that
-  serve `IcTools` over rmcp's stdio transport (features `["server", "macros",
-  "transport-io"]`), plus the browser-handshake login driver and the transient loopback
-  callback listener. `axum`, `tower-http`, `prometheus`, and every OAuth module are simply
-  **absent from its dependency graph** — under any build invocation, not just `-p` builds.
+- **`imcp2-local`** (bin, new) — depends on `imcp2-core` plus its own small additions: a
+  few hundred lines that serve `IcTools` over rmcp's stdio transport (features `["server",
+  "macros", "transport-io"]`), the browser-handshake login driver, and the transient
+  loopback callback listener (`axum`, serving only the three login routes of component 5 —
+  the MCP tool surface never rides HTTP here). `tower-http`, `prometheus`, and every OAuth
+  module are **absent from its dependency graph** — under any build invocation, not just
+  `-p` builds.
 
 (One benign note: a `--workspace` build compiles rmcp once with both transport features
 unified — harmless, the linker strips the unused transport; the isolation that matters is
-that the OAuth/HTTP code never enters `imcp2-local`'s graph at all.)
+that the hosted OAuth and MCP-transport code never enters `imcp2-local`'s graph at all.)
 
 **Published crates.** `imcp2` is on crates.io (v0.2.0), released from `v*` tags via trusted
 publishing with a tag-equals-version guard (`.github/workflows/publish-crate.yml`). Because
@@ -197,10 +199,9 @@ shutdown on completion — `crates/icp-cli/src/commands/identity/link/web.rs`). 
 is still not needed: the only CORS requirement is one `Access-Control-Allow-Origin` header
 on the `#4091` well-known, set directly on that response.
 
-Net minimal local deps: `imcp2-core` +
-`rmcp{server,macros,transport-io}` + `tokio` +
-`anyhow` + `serde_json` + `url`/`urlencoding` + `tracing`/`tracing-subscriber` + a
-browser-opener (`open` crate, or `std::process::Command`).
+Net minimal local deps: `imcp2-core` + `rmcp{server,macros,transport-io}` + `tokio` +
+`axum` (the transient login listener) + `open` (browser launch) + `anyhow` + `serde_json` +
+`url`/`urlencoding` + `tracing`/`tracing-subscriber`.
 
 ### 3. Mainnet and production II wiring
 
@@ -255,12 +256,13 @@ per `McpConfig::state_dir`, `auth.rs:799-820`), the hosted-redirect allow-list
 (`auth.rs:434-687`), AS/PR discovery metadata (`auth.rs:2223-2262`), the `require_token`
 bearer gate + `bearer_challenge` (`auth.rs:2264,2313`), the front-channel HTML error-screen
 machinery, RFC 8707 resource-indicator enforcement (the `require_resource` flag), RFC 9207
-`iss` emission on redirects, and the bounded/atomically-persisted DCR store. `AuthStore`
-slims to
-`{identities, public_url, authz}` (loses `clients`/`tokens`/`codes`, plus the hosted-only
-`mcp_path` route prefix — the local build replaces it with a plain callback-base value — and
-`require_resource`). With `clients` gone the local binary needs **no `state_dir` at all**:
-it writes no files, and all its state is the in-memory `Identities` session map.
+`iss` emission on redirects, and the bounded/atomically-persisted DCR store. The hosted
+`AuthStore` itself is untouched by the split: it stays in `imcp2`, where the retained OAuth
+routes need all of its state (`clients`/`tokens`/`codes`, the `mcp_path` route prefix,
+`require_resource`), and the extracted primitives carry none of it (component 1). The local
+binary has **no `AuthStore` at all** — its login keeps only a minimal pending-connect state
+(the `state` value and an in-flight flag) beside the in-memory `Identities` session map, so
+it needs **no `state_dir`** and writes no files.
 
 **Consent-Bound Completion / the initiator cookie can be dropped locally.** The `sid` cookie
 (`auth.rs:170`, checked `:1869`) defends a *split-browser confused-deputy* that requires a
