@@ -96,8 +96,8 @@ machinery is needed.
 2. **Ship `imcp2-local`.** The stdio server, the browser-login driver, and the loopback
    callback listener. Exit: a user logs in against II and uses the tools as their accounts.
 3. **Polish.** End-user packaging and setup (the double-click bundle, install links, the
-   `setup` command, the installers + in-place updater, signed binaries) and the wallet-grade
-   trust note; integration tests that
+   `setup` command, the installers + in-place updater, Apple/Windows-signed binaries with
+   supply-chain attestations) and the wallet-grade trust note; integration tests that
    run `imcp2-local` in its local-replica test configuration (against an ICP CLI-spawned
    replica or PocketIC, with an II canister deployed there), extending the existing PocketIC
    end-to-end harness to the local login flow; optional keychain-backed session persistence.

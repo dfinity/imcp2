@@ -476,10 +476,48 @@ identity, the client asks to approve the `authenticate` tool, the browser opens 
 Identity, the user signs in, and the tab says it can be closed. The session lives in memory,
 so quitting the client ends it; the next run repeats the same one-step sign-in.
 
-**Packaging that makes this work:** signed and notarized release binaries (macOS Gatekeeper
-and Windows SmartScreen block unsigned double-click installs), one artifact per platform,
-and the `.mcpb` manifest pointing at the right per-OS binary. Building these artifacts is a
-Stage 3 deliverable.
+**Signing and provenance.** Two distinct layers, for two different verifiers:
+
+- **OS execution gates** (what lets the double-click work at all):
+  - *macOS.* A browser-downloaded file carries the quarantine attribute, and Gatekeeper
+    evaluates it at first execution — **including when an MCP client spawns the binary as a
+    subprocess**, where a block surfaces as an opaque "server failed to start". Gatekeeper
+    accepts exactly one thing: a **Developer ID** signature (Apple is the sole issuer of
+    these certificates, via an Apple Developer Program *organization* membership) plus a
+    **notarization** ticket. Pipeline: `codesign --options runtime --timestamp` on a macOS
+    runner, then `xcrun notarytool submit --key <App Store Connect API key> --wait`. No
+    installer artifact is needed — a bare signed + notarized binary passes (Gatekeeper
+    checks its ticket online; stapling only matters for offline `.pkg`/`.dmg` installs).
+    Without this, macOS blocks the file behind a buried System Settings "Open Anyway" flow
+    (macOS 15 removed the right-click bypass) — unacceptable for a wallet-grade tool.
+  - *Windows.* Authenticode via **Azure Trusted Signing** (Microsoft's managed service:
+    org-validated identity, keys in a managed HSM as the CA/Browser rules require, a
+    first-class GitHub Action, good SmartScreen reputation) — or an EV certificate through
+    a cloud signing service (cargo-dist has built-in SSL.com eSigner support).
+  - *Linux.* No OS gate; the cargo-dist release ships SHA256 checksums.
+  - The shell installer, Homebrew, and npm channels never set the quarantine bit, so they
+    work regardless — the OS-gate signing exists for the browser-download paths: the
+    `.mcpb` and direct release downloads.
+- **Supply-chain provenance**, uniform across every artifact (all three platforms' binaries
+  and the `.mcpb`): **GitHub artifact attestations** — Sigstore-based and keyless (OIDC), so
+  there are no long-lived signing secrets — verifiable with
+  `gh attestation verify imcp2-local -R dfinity/imcp2`. This layer proves an artifact came
+  from this repository's release workflow; it is for humans and auditors, and does not
+  satisfy the OS gates above (Gatekeeper recognizes only Apple-issued signatures).
+- **The `.mcpb` specifically.** Gatekeeper checks the **binary inside** the bundle
+  (extraction inherits quarantine), so the per-OS signing above is the substance. The MCPB
+  format does not currently specify bundle-level signing or install-time verification, so
+  the bundle itself carries a provenance attestation, and trusted distribution comes from
+  listing in Anthropic's extension directory (which also enables automatic updates).
+- **Where it hooks in, and what DFINITY acquires.** The signing steps live in the
+  cargo-dist release pipeline, with secrets in a protected GitHub environment (required
+  reviewers — the same gating the deploy workflow uses). To acquire, with lead time for the
+  org validations: an Apple Developer Program organization membership → a Developer ID
+  Application certificate + an App Store Connect API key; an Azure Trusted Signing account
+  (or an EV certificate); artifact attestations are free to enable.
+
+One artifact per platform, with the `.mcpb` manifest pointing at the right per-OS binary;
+building and signing these artifacts is a Stage 3 deliverable.
 
 ## Implementation Stages
 
@@ -496,8 +534,8 @@ login driver + the loopback callback listener. *Exit:* `cargo build -p imcp2-loc
 logs in against II and runs read/write tools as their accounts.
 
 **Stage 3 — polish.** End-user packaging and setup (component 9: the `.mcpb` bundle, the
-Add-to-Cursor link, the `setup` subcommand, the cargo-dist installers + updater,
-signed/notarized release binaries) and the
+Add-to-Cursor link, the `setup` subcommand, the cargo-dist installers + updater, the
+signing + attestation pipeline) and the
 wallet-grade trust note; integration tests via the local-replica test configuration
 (component 3), extending the PocketIC e2e harness to the local login flow (see
 Verification); optional keychain-backed session persistence.
