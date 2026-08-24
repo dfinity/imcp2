@@ -476,7 +476,9 @@ identity, the client asks to approve the `authenticate` tool, the browser opens 
 Identity, the user signs in, and the tab says it can be closed. The session lives in memory,
 so quitting the client ends it; the next run repeats the same one-step sign-in.
 
-**Signing and provenance.** Two distinct layers, for two different verifiers:
+### 10. Signing and provenance
+
+Two distinct layers, for two different verifiers:
 
 - **OS execution gates** (what lets the double-click work at all):
   - *macOS.* A browser-downloaded file carries the quarantine attribute, and Gatekeeper
@@ -534,8 +536,8 @@ login driver + the loopback callback listener. *Exit:* `cargo build -p imcp2-loc
 logs in against II and runs read/write tools as their accounts.
 
 **Stage 3 — polish.** End-user packaging and setup (component 9: the `.mcpb` bundle, the
-Add-to-Cursor link, the `setup` subcommand, the cargo-dist installers + updater, the
-signing + attestation pipeline) and the
+Add-to-Cursor link, the `setup` subcommand, the cargo-dist installers + updater — and
+component 10's signing + attestation pipeline) and the
 wallet-grade trust note; integration tests via the local-replica test configuration
 (component 3), extending the PocketIC e2e harness to the local login flow (see
 Verification); optional keychain-backed session persistence.

@@ -87,6 +87,10 @@ machinery is needed.
    you. Signing in is one browser round-trip on first use. Upgrading is one command (or a
    new double-click for the Claude Desktop bundle): clients point at a stable path, the
    installer's updater swaps the binary in place, and there is no state to migrate.
+10. **Signing and provenance** — release binaries are Apple-signed + notarized and
+    Windows-signed (the OS gates that make double-click and client-spawned launches work),
+    and every artifact carries a keyless supply-chain attestation proving it came from this
+    repository's release workflow.
 
 ## Implementation Stages
 
