@@ -74,16 +74,16 @@
 //! and `SKILLS_URL` (the IC skills registry).
 
 mod auth;
-mod calls;
 // Docs live in the module itself (`//!` in src/metrics.rs): an outer doc
 // comment here would resolve its intra-doc links in *this* scope rather than
 // the module's, silently breaking the links to `Registry` and `MatchedPath`.
 pub mod metrics;
-mod discover;
-mod identities;
-mod management;
-mod skills;
-mod tools;
+
+// The transport/OAuth-agnostic components — the tool surface, the II session
+// engine, and the connect-handshake primitives — live in the `imcp2-core`
+// crate; this crate composes them with the OAuth 2.1 authorization server and
+// the streamable-HTTP transport.
+use imcp2_core::{identities, skills, tools};
 
 // Real II<>MCP handshake test against a live Internet Identity canister in
 // PocketIC. In-crate (not tests/) so it can use the feature-gated optional
@@ -106,17 +106,10 @@ use rmcp::transport::{
 use tokio_util::sync::CancellationToken;
 
 pub use auth::SharedClients;
-pub use identities::{IiInstance, SessionGauges};
-/// The IC [`Agent`] type the server is built around, re-exported so callers
-/// construct the injected agent from the exact `ic-agent` version this crate
-/// links.
-pub use ic_agent::{self, Agent};
-
-/// A sensible default IC API boundary node (the public mainnet endpoint) for
-/// callers that just want `Agent::builder().with_url(IC_URL).build()`. A host
-/// with its own boundary-node routing supplies an agent built against that
-/// instead.
-pub const IC_URL: &str = "https://icp-api.io";
+/// The components this server is composed from, re-exported so embedders keep
+/// importing everything from `imcp2` (the types are `imcp2-core`'s — one
+/// defining crate, so type identity is preserved).
+pub use imcp2_core::{ic_agent, Agent, IiInstance, SessionGauges, IC_URL};
 
 /// Everything an [`McpServer`] is built from.
 pub struct McpConfig {
@@ -260,7 +253,16 @@ impl McpServer {
             let (agent, identities, skills) =
                 (self.agent.clone(), self.identities.clone(), self.skills.clone());
             StreamableHttpService::new(
-                move || Ok(tools::IcTools::new(agent.clone(), identities.clone(), skills.clone())),
+                move || {
+                    Ok(tools::IcTools::new(
+                        agent.clone(),
+                        identities.clone(),
+                        skills.clone(),
+                        // Multi-user: each request's session comes from the
+                        // bearer-token gate's AuthedSession extension.
+                        imcp2_core::SessionSource::Bearer,
+                    ))
+                },
                 LocalSessionManager::default().into(),
                 // Stateless + plain-JSON responses: our tools are pure
                 // request/response with no server-initiated messages, and this

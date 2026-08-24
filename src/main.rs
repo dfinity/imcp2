@@ -306,7 +306,7 @@ fn openai_apps_challenge_router(token: Option<String>) -> Router {
 /// (`assets/dfinity-logo.svg`), inlined once on first use so the served page
 /// stays fully self-contained (no external fonts, scripts, or images).
 const PRIVACY_POLICY_HTML: &str = include_str!("assets/privacy-policy.html");
-const DFINITY_LOGO_SVG: &str = include_str!("assets/dfinity-logo.svg");
+const DFINITY_LOGO_SVG: &str = imcp2_core::iiconnect::CONNECT_LOGO_SVG;
 
 fn privacy_policy_page() -> &'static str {
     static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();

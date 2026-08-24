@@ -31,8 +31,10 @@
 #   Environment name   release             <- must match the `environment:` below,
 #                                             or be left blank to accept any
 # A trusted publisher can only be configured on a crate that already exists, so the
-# FIRST release (0.1.0) has to be published by hand — `cargo publish --locked` with
-# a personal token — and every release after it goes through this workflow.
+# FIRST release of each crate has to be published by hand — `cargo publish --locked`
+# with a personal token (imcp2's 0.1.0 was; imcp2-core's first release must be, and
+# its trusted publisher configured with this same repository/workflow/environment)
+# — and every release after it goes through this workflow.
 #
 # REQUIRED REPOSITORY SETTINGS, to be in place BEFORE the trusted publisher is
 # enabled. Neither can be expressed in this file, and without them the guards below
@@ -101,20 +103,24 @@ jobs:
           rustup default stable
           rustc --version && cargo --version
 
-      # A tag that disagrees with the manifest publishes a version under a name
-      # nobody can check out — and crates.io cannot take it back. Read the version
-      # from cargo itself rather than grepping the manifest, so the check reads the
-      # same field `cargo publish` will.
-      - name: Check the tag matches Cargo.toml
+      # A tag that disagrees with the manifests publishes a version under a name
+      # nobody can check out — and crates.io cannot take it back. Read the versions
+      # from cargo itself rather than grepping the manifests, so the check reads the
+      # same field `cargo publish` will. Both workspace crates release in lockstep:
+      # one tag, one version, two packages (imcp2 depends on imcp2-core "=version"
+      # semantics via the workspace pin, so a skew would not resolve anyway).
+      - name: Check the tag matches both Cargo.toml versions
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          manifest="$(cargo metadata --format-version 1 --no-deps |
-            jq -er '.packages[] | select(.name == "imcp2") | .version')"
-          echo "tag=$tag manifest=$manifest"
-          if [ "$tag" != "$manifest" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${manifest}" >&2
-            exit 1
-          fi
+          for pkg in imcp2-core imcp2; do
+            manifest="$(cargo metadata --format-version 1 --no-deps |
+              jq -er --arg pkg "$pkg" '.packages[] | select(.name == $pkg) | .version')"
+            echo "tag=$tag $pkg=$manifest"
+            if [ "$tag" != "$manifest" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match ${pkg}'s Cargo.toml version ${manifest}" >&2
+              exit 1
+            fi
+          done
 
       # A tag can name any commit in the repository, including one that never went
       # through review. This catches the mistake — tagging a topic branch, or a
@@ -135,15 +141,21 @@ jobs:
       # immutable public release. `--locked` also guards Cargo.lock from drift, and
       # the lockfile is what ships in the .crate.
       - name: Test
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --workspace --all-targets
 
-      # Rehearses the real thing — packages the crate and compiles the package in
-      # isolation — but stops short of uploading, so a package that only builds
-      # because of something untracked in the working tree fails here rather than
-      # after the upload is already permanent. This is also the verify build that
-      # lets the publish job skip its own; see `--no-verify` below.
+      # Rehearses the real thing — packages each crate, and compiles imcp2-core's
+      # package in isolation — but stops short of uploading, so a package that only
+      # builds because of something untracked in the working tree fails here rather
+      # than after the upload is already permanent. imcp2's package cannot be
+      # compile-verified before this release's imcp2-core exists on crates.io (it
+      # depends on it by version), so its rehearsal is `cargo package` without the
+      # verify build: the workspace test above already compiled exactly these
+      # sources. This is also the verify work that lets the publish job skip its
+      # own; see `--no-verify` below.
       - name: Package
-        run: cargo publish --locked --dry-run
+        run: |
+          cargo publish --locked --dry-run -p imcp2-core
+          cargo package --locked --no-verify -p imcp2
 
   # Holds the credential, and compiles nothing.
   publish:
@@ -177,10 +189,19 @@ jobs:
       # it `cargo publish` compiles the package — running the dependency tree's build
       # scripts and proc macros — while CARGO_REGISTRY_TOKEN sits in their
       # environment. The verify build is not skipped, only moved: the `verify` job
-      # ran `cargo publish --locked --dry-run` over this same commit, which packages
-      # and compiles exactly what is uploaded here. What remains in this job is
-      # reading files into a .crate and an HTTPS upload.
-      - name: Publish
-        run: cargo publish --locked --no-verify
+      # packaged both crates (and compiled imcp2-core's package) over this same
+      # commit, and the workspace test suite compiled exactly these sources. What
+      # remains in this job is reading files into a .crate and an HTTPS upload.
+      #
+      # Order matters: imcp2 depends on imcp2-core by version, so core publishes
+      # first; `cargo publish` waits for the just-published crate to appear in the
+      # index before returning, so the second publish resolves the first.
+      - name: Publish imcp2-core
+        run: cargo publish --locked --no-verify -p imcp2-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Publish imcp2
+        run: cargo publish --locked --no-verify -p imcp2
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

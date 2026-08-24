@@ -1,0 +1,49 @@
+//! imcp2-core — the transport/OAuth-agnostic components of the IMCP2 Internet
+//! Computer MCP server, from which a serving binary is composed:
+//!
+//!   * [`tools::IcTools`] — the complete MCP tool surface (canister reads and
+//!     writes in textual Candid, app/canister discovery, OQL, canister
+//!     management, IC skills), an [`rmcp`] `ServerHandler` ready to serve over
+//!     whichever transport the binary picks (streamable-HTTP in the hosted
+//!     `imcp2` server, stdio in a local one).
+//!   * [`identities`] — the Internet Identity session engine: the per-connection
+//!     session-key grant (registered with II via `mcp_register_v2`) and the
+//!     short-lived per-app account delegations minted from it on demand.
+//!   * [`iiconnect`] — the II connect-handshake primitives (the `/mcp` connect
+//!     link, the pinned fragment-reading callback page, the delegation-chain
+//!     parser, the `#4091` auth-callback allow-list path), parameterised on
+//!     plain values so each binary wraps them in its own HTTP handlers.
+//!
+//! How a tool call finds the II session it acts as is the one seam between
+//! deployments: the hosted server resolves it per request from the
+//! [`AuthedSession`] extension its bearer-token gate injects
+//! ([`SessionSource::Bearer`]), while a single-user local server pins one
+//! session established at login ([`SessionSource::Singleton`]). The tool
+//! implementations are identical in both.
+//!
+//! The IC [`Agent`] is **inherited from the embedding application**, not built
+//! here: the binary passes in its own agent, so anonymous canister calls go
+//! through the host's boundary-node client and the whole process links a
+//! single `ic-agent`.
+
+pub mod identities;
+pub mod iiconnect;
+pub mod skills;
+pub mod tools;
+
+mod calls;
+mod discover;
+mod management;
+
+pub use identities::{IiInstance, SessionGauges};
+pub use tools::{AuthedSession, IcTools, SessionSource};
+/// The IC [`Agent`] type the components are built around, re-exported so
+/// callers construct the injected agent from the exact `ic-agent` version this
+/// crate links.
+pub use ic_agent::{self, Agent};
+
+/// A sensible default IC API boundary node (the public mainnet endpoint) for
+/// callers that just want `Agent::builder().with_url(IC_URL).build()`. A host
+/// with its own boundary-node routing supplies an agent built against that
+/// instead.
+pub const IC_URL: &str = "https://icp-api.io";

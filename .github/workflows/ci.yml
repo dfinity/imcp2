@@ -36,10 +36,10 @@ jobs:
       # `--locked` fails if Cargo.lock is out of date, so CI also guards the
       # dependency pins (e.g. ic-agent / ic-transport-types) from silent drift.
       - name: Build
-        run: cargo build --locked --all-targets
+        run: cargo build --locked --workspace --all-targets
 
       - name: Test
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --workspace --all-targets
 
   # Block new internal network identifiers from entering the repository. Secret
   # scanning and push protection already cover credentials; this covers the
