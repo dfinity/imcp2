@@ -187,7 +187,8 @@ OAuth AS is hand-rolled.
 
 **Added by `imcp2-local`:** rmcp's `transport-io` (`rmcp::transport::stdio()` over tokio
 stdin/stdout, in place of `StreamableHttpService`), `axum` (the transient login listener),
-`open` (browser launch), and `tracing-subscriber` (stderr logging).
+`open` (browser launch), and `tracing-subscriber` (stderr logging); dev-dependency:
+`pocket-ic` (the local-flow integration tests, component 3).
 
 The local binary's one HTTP surface is the transient login callback (component 5) — three
 loopback routes served with **axum**, the same shape as the ICP CLI's web-identity flow
@@ -216,17 +217,18 @@ deployment serves **production II at `/mcp`** (beta is the opt-in `/mcp-beta` st
 instance), so the same II contract this binary relies on is exercised in production (see
 Verification under Implementation Stages).
 
-**Local-replica test configuration (nice-to-have; the integration-test vehicle).** The same
-wiring supports a test build that talks to a **local replica spawned by the ICP CLI**: an
-explicit IC-endpoint override for the agent, plus one `agent.fetch_root_key()` call so
-certificate verification trusts the local replica's key, plus the existing II overrides
-pointed at an II canister deployed on that replica. Guard: `fetch_root_key` is only ever
-called when the endpoint override is explicitly set to a loopback target — refused otherwise
-— so a mis-set environment can never make a binary trust a fetched root key against mainnet.
-Everything downstream already works on a test network: delegation chains are verified against
-the *injected agent's* root key (`new_with_root_key`, `identities.rs:1285-1303`), which is
-the same property the PocketIC e2e harness relies on. This configuration is how integration
-tests exercise the full local flow end-to-end (see Verification).
+**Local-replica test configuration (the integration-test vehicle).** The same wiring
+supports a test build that talks to a local replica: an explicit IC-endpoint override for
+the agent, plus one `agent.fetch_root_key()` call so certificate verification trusts that
+replica's key, plus the existing II overrides pointed at an II canister deployed there.
+Guard: `fetch_root_key` is only ever called when the endpoint override is explicitly set to
+a loopback target — refused otherwise — so a mis-set environment can never make a binary
+trust a fetched root key against mainnet. Everything downstream works on a test network:
+delegation chains are verified against the *injected agent's* root key
+(`new_with_root_key`, `identities.rs:1285-1303`). Integration tests run this configuration
+against **PocketIC** — the `pocket-ic` dev dependency, reusing the e2e harness's
+real-II-canister setup (see Verification); the same override also lets a developer point a
+test build at any other local replica, such as one spawned by the ICP CLI.
 
 ### 4. Dropping OAuth 2.1, keeping the II handshake
 
@@ -566,8 +568,8 @@ the hosted https deployment never exercises:
    cross-origin; `*` is fine with `credentials: omit`).
 
 Verification plan: integration tests run `imcp2-local` in its **local-replica test
-configuration** (component 3) — against an ICP CLI-spawned replica or PocketIC carrying a
-deployed II canister — extending the existing PocketIC e2e harness to drive the local
+configuration** (component 3) against **PocketIC carrying a deployed II canister** — the
+`pocket-ic` dev dependency, extending the existing e2e harness to drive the local
 browser-handshake flow (loopback listener + slim redeem) with no live network. The
 `II_URL_PROD`/`II_CANISTER_ID_PROD` overrides additionally allow pointing a binary at beta II.
 

@@ -102,7 +102,7 @@ machinery is needed.
 3. **Polish.** End-user packaging and setup (the double-click bundle, install links, the
    `setup` command, the installers + in-place updater, Apple/Windows-signed binaries with
    supply-chain attestations) and the wallet-grade trust note; integration tests that
-   run `imcp2-local` in its local-replica test configuration (against an ICP CLI-spawned
-   replica or PocketIC, with an II canister deployed there), extending the existing PocketIC
-   end-to-end harness to the local login flow; optional keychain-backed session persistence.
+   run `imcp2-local` against PocketIC with an II canister deployed there, extending the
+   existing end-to-end harness to the local login flow; optional keychain-backed session
+   persistence.
 
