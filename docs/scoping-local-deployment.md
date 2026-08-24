@@ -46,7 +46,8 @@ fits that slot.
 - **No change to the hosted server's behavior, name, or deployment.** The `imcp2` binary,
   Dockerfile (`CMD ["imcp2"]`, `Dockerfile:23,31`), `imcp2.service`, and deploy scripts stay
   as they are.
-- **No session persistence in v1.** Sessions are in-memory (re-login per run), matching the
+- **No session persistence in v1.** Sessions are in-memory — the user signs in again after
+  a restart, when the grant expires, or if they revoke it — matching the
   hosted model and the existing roadmap; keychain-backed persistence is future work.
 - **Not a path for cloud-only AI surfaces.** claude.ai web/mobile, Perplexity web/Windows,
   and Codex Cloud cannot reach `localhost`; they keep using the hosted server (which is why
@@ -315,7 +316,11 @@ blocking on the callback (Codex times out a tool call at 60 s; Claude Code auto-
 calls over 2 min). A follow-up `auth_status` tool (or simply the next tool call) confirms the
 grant landed. Component 6 covers the per-client specifics.
 
-Sessions are **in-memory** (re-login per run), matching today's model and the roadmap.
+Sessions are **in-memory**: the user signs in again after a restart, when the grant expires
+(the connect link requests a one-hour grant today; the effective TTL is the user's
+consent-time choice), or if they revoke it — matching today's model and the roadmap. The
+replaceable session slot (component 7) makes that re-login a same-process step, not a
+client restart.
 Optional future work: persist the session seed `S` to an OS keychain to survive restarts —
 but `S` is a live capability to the user's real anchor, so never plaintext.
 
@@ -383,10 +388,12 @@ avoid editing them by hand.
 5. **Absolute paths; stdout = JSON-RPC only** (all diagnostics to stderr). A self-contained
    native binary avoids the frequent wrong-runtime/path failures Node-based servers hit.
 
-*(Implementation: `authenticate`/`auth_status` are **local-only** tools — defined in
-`imcp2-core` but included in the tool router only when `IcTools` is constructed with the
-singleton session source, so they never appear on the hosted server, which logs in via OAuth
-instead. Cursor's ~40-tool cap is comfortable: the core exposes ~26 plus these.)*
+*(Implementation: `authenticate`/`auth_status` are **local-only** tools, and construction
+mode alone would not hide them — rmcp's `#[tool_router]` generates the router per impl
+block, type-level. So they live in their **own small router** (a second `#[tool_router]`
+impl in `imcp2-core`) that only the local binary composes onto `IcTools`'s router; the
+hosted server never composes it in, and a hosted-side test asserts its `tools/list` does
+not contain them. Cursor's ~40-tool cap is comfortable: the core exposes ~26 plus these.)*
 
 **Serving the cloud clients (hosted `imcp2`).** claude.ai web/mobile and Perplexity-web reach
 only a public HTTPS MCP endpoint with OAuth 2.1 — which hosted `imcp2` already is. Two
@@ -400,10 +407,16 @@ local binary.
 
 Today a tool gets its `session_id` via bearer → `require_token` → `AuthedSession` injected in
 the request extensions → `authed_session(ctx)` (`tools.rs:1493`). Under stdio there is one
-user and one connection, so this collapses to a **singleton** session id set at login.
+user and one connection, so this collapses to a **singleton** session id, set at login and
+replaced on each re-login.
 
 Minimal, verified seam (no tool-signature changes, no `identities.rs` changes):
-- add `session: SessionSource { Bearer, Singleton(String) }` to `IcTools` (`tools.rs:52`);
+- add `session: SessionSource { Bearer, Singleton(..) }` to `IcTools` (`tools.rs:52`). The
+  `Singleton` arm holds a **shared, replaceable slot** (an `Arc<RwLock<Option<String>>>`-
+  style holder whose exact shape lands with the Stage 2 login driver), not a fixed id: the
+  II contract requires a **fresh session key** after `Unauthorized`, so each successful
+  `authenticate` writes a fresh session id into the slot — same-process reauthentication
+  after grant expiry or revocation, with no client restart;
 - one `current_session_id(&self, &ctx) -> Option<String>` method replacing the free fn;
 - rewrite the **13** lookup call-sites (`tools.rs:351,809,865,1298,1321,1344,1365,1386,1407,
   1428,1446,1464,1482`) to call it; the `.ok_or(…)` handling is unchanged;
@@ -412,7 +425,7 @@ Minimal, verified seam (no tool-signature changes, no `identities.rs` changes):
 
 The seam involves no conditional compilation: the Bearer arm reads `http::request::Parts`
 (the `http` crate — axum merely re-exports it), which core depends on directly. Hosted
-constructs `IcTools` with `Bearer`; local with `Singleton(sid)`.
+constructs `IcTools` with `Bearer`; local with `Singleton`, whose slot the login flow fills.
 
 Tools that are already session-free work unchanged locally: `get_canister_candid`,
 `get_canister_api_doc`, `open_app`, `resolve_app`, `discover_app_canisters`, the skills/lookup
@@ -572,8 +585,13 @@ the hosted https deployment never exercises:
 Verification plan: integration tests run `imcp2-local` in its **local-replica test
 configuration** (component 3) against **PocketIC carrying a deployed II canister** — the
 `pocket-ic` dev dependency, extending the existing e2e harness to drive the local
-browser-handshake flow (loopback listener + slim redeem) with no live network. The
-`II_URL_PROD`/`II_CANISTER_ID_PROD` overrides additionally allow pointing a binary at beta II.
+browser-handshake flow (loopback listener + slim redeem) with no live network. That harness
+exercises the protocol, not browser policy, so it cannot answer the two questions above —
+Stage 2's login exit criterion therefore also includes a **real-browser compatibility
+gate**: an automated Chromium/Firefox run of the full login against the loopback listener
+(Playwright-style), plus a manual Safari and enterprise-policy pass, before the flow is
+declared working on supported clients. The `II_URL_PROD`/`II_CANISTER_ID_PROD` overrides
+additionally allow pointing a binary at beta II.
 
 ## Appendix: evidence index
 

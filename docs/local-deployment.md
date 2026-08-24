@@ -31,7 +31,8 @@ there is no IMCP2 artifact that fits that slot.
 ## Non-goals
 
 - **No change to the hosted server** — its name, behavior, and deployments stay as they are.
-- **No session persistence in v1** — sessions are in-memory; users re-login per run.
+- **No session persistence in v1** — sessions are in-memory; the user signs in again after
+  a restart, when the grant expires, or if they revoke it.
 - **Not for cloud-only AI surfaces** — claude.ai web/mobile, Perplexity web, and Codex Cloud
   cannot reach a local process; they continue to use the hosted server.
 
