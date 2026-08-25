@@ -14,6 +14,13 @@ WorkingDirectory=/opt/imcp2/monitoring/mcp-status
 # can never be steered elsewhere -- including by the server's own /version.
 # Binds to 127.0.0.1; Caddy publishes it under https://<domain>/status/.
 Environment=MCP_STATUS_ALLOWED_HOSTS=__ALLOWED_HOSTS__
+# Optional: mirror the verdict to an Atlassian Statuspage component (e.g. on
+# status.internetcomputer.org). The file holds STATUSPAGE_PAGE_ID,
+# STATUSPAGE_API_KEY and STATUSPAGE_COMPONENT_ID (see the mcp-status README).
+# It is created by the operator (mode 600, owner root), never by deploy.sh, so
+# the API key stays out of this repository and of the rendered unit file. The
+# leading "-" makes it optional: without the file the pusher never starts.
+EnvironmentFile=-/etc/imcp-status/statuspage.env
 ExecStart=/usr/bin/node /opt/imcp2/monitoring/mcp-status/server.js --port 8137 --host 127.0.0.1 --mcp https://__DOMAIN__
 Restart=always
 RestartSec=5

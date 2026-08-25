@@ -22,6 +22,10 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { runDashboard } from "./checks.js";
+import {
+  resolveStatuspageConfig,
+  startStatuspagePusher,
+} from "./statuspage.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -163,3 +167,18 @@ server.listen(port, host, () => {
       `  monitoring: ${defaults.mcpOrigin ?? "https://mcp.beta.id.ai (default)"}\n`,
   );
 });
+
+// Optionally mirror the verdict to an Atlassian Statuspage component (e.g. on
+// status.internetcomputer.org). Off unless the STATUSPAGE_* variables are set —
+// see statuspage.js and the README. The pusher shares getReport's cache with
+// dashboard visitors, so it adds at most one probe run per interval.
+const { config: statuspageConfig, warning: statuspageWarning } =
+  resolveStatuspageConfig();
+if (statuspageWarning) console.error(statuspageWarning);
+if (statuspageConfig) {
+  startStatuspagePusher({ getReport, config: statuspageConfig });
+  process.stdout.write(
+    `  statuspage: pushing to component ${statuspageConfig.componentId} ` +
+      `(page ${statuspageConfig.pageId}) every ${statuspageConfig.intervalMs} ms\n`,
+  );
+}
