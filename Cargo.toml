@@ -20,24 +20,27 @@ categories = [
 # Everything the library and the bundled binary compile from ships; the
 # deployment scaffolding (container, systemd/native deploy, dashboards, CI,
 # submission docs) is repository-only and would just inflate the .crate.
-# `src/assets` and `static` are NOT optional: both are pulled in at compile
-# time with `include_str!`.
+# `src/assets` is NOT optional: it is pulled in at compile time with
+# `include_str!`. `crates/` holds the other workspace members (each packaged
+# on its own), so it is excluded from THIS package.
 exclude = [
     ".github/",
     ".dockerignore",
     "Dockerfile",
+    "crates/",
     "deploy/",
     "docs/",
     "monitoring/",
 ]
 
-[dependencies]
-rmcp = { version = "1.7", features = [
-    "server",
-    "macros",
-    "transport-streamable-http-server",
-    "auth",
-] }
+[workspace]
+members = [".", "crates/imcp2-core"]
+
+# Single source of truth for the version pins both crates share, so the agent,
+# codec, and candid lines can never drift between imcp2-core and imcp2.
+[workspace.dependencies]
+imcp2-core = { path = "crates/imcp2-core", version = "0.2.0" }
+rmcp = "1.7"
 # The Agent is INJECTED by the embedding application (see McpServer::new), so a
 # host shares one boundary-node client and one ic-agent across the process.
 # Deliberately a direct dependency for now: sourcing ic-agent through ic-bn-lib
@@ -51,12 +54,40 @@ ic-agent = "0.49"
 # worker-blocking CPU (ICPBB-382); 0.10.31 made it O(n).
 candid = { version = "0.10.31", features = ["value"] }
 candid_parser = "0.3.2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
-axum = "0.8"
-anyhow = "1"
+tokio = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
+sha2 = "0.11.0"
+base64 = "0.22.1"
+hex = "0.4.3"
+crc32fast = "1"
+regex = "1.12.4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+getrandom = "0.3.4"
+urlencoding = "2.1.3"
+url = "2"
+http = "1"
+
+[dependencies]
+# The transport/OAuth-agnostic components (the tool surface, the II session
+# engine, the connect-handshake primitives) live in imcp2-core; this crate adds
+# the hosted composition: the OAuth 2.1 authorization server, the
+# streamable-HTTP transport, and the axum routers.
+imcp2-core = { workspace = true }
+rmcp = { workspace = true, features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+] }
+ic-agent = { workspace = true }
+candid = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
+axum = "0.8"
+anyhow = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
@@ -67,15 +98,12 @@ tower-http = { version = "0.7", features = ["cors"] }
 # estate. The `process` feature adds CPU / RSS / file-descriptor collectors on
 # Linux, which is the deploy target.
 prometheus = { version = "0.14", features = ["process"] }
-sha2 = "0.11.0"
-base64 = "0.22.1"
-hex = "0.4.3"
-crc32fast = "1"
-regex = "1.12.4"
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-getrandom = "0.3.4"
-urlencoding = "2.1.3"
-url = "2"
+sha2 = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+getrandom = { workspace = true }
+urlencoding = { workspace = true }
+url = { workspace = true }
 # Only for the PocketIC-backed end-to-end test (src/e2e_handshake.rs), behind
 # the `e2e` feature so the default build never compiles it. Client library for a
 # local Internet Identity canister; version tracks the `pocket-ic` server binary.

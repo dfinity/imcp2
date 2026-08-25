@@ -86,7 +86,7 @@ const REDERIVE_MARGIN_NS: u64 = 30 * 1_000_000_000;
 /// entries out instead of blocking sign-in, and granted sessions are never
 /// touched. Also the cap on `AuthStore.authz`, which holds one entry per
 /// pending connect (see `crate::auth`), so the two maps stay in step.
-pub(crate) const MAX_PENDING_CONNECTS: usize = 1_024;
+pub const MAX_PENDING_CONNECTS: usize = 1_024;
 
 /// Hard ceiling on the session map. Only sessions holding a redeemed grant can
 /// push toward it (pending ones are bounded far lower by
@@ -592,7 +592,7 @@ impl Identities {
     /// Errors when the session map is at capacity ([`make_room`]) — the connect
     /// cannot be started, and `/oauth/authorize` surfaces that as a "try again in
     /// a moment" screen rather than handing II a key it isn't tracking.
-    pub(crate) async fn registration_pubkey_b64(&self, session_id: &str) -> Result<String, String> {
+    pub async fn registration_pubkey_b64(&self, session_id: &str) -> Result<String, String> {
         self.ensure_session(session_id).await?;
         let mut sessions = self.sessions.write().await;
         let s = sessions.get_mut(session_id).ok_or("no such session")?;
@@ -933,7 +933,7 @@ impl Identities {
     /// > (decoded as [`McpRegisterV2Reply`]; [`McpRegisterV2Ok`] is the `Ok`
     /// > payload). Re-verify the shapes if II's `.did` ever moves; the read-only
     /// > `opt text`/`variant` outage (#40) is the standing lesson against drift.
-    pub(crate) async fn redeem_registration_delegation(
+    pub async fn redeem_registration_delegation(
         &self,
         session_id: &str,
         reg_user_key: Vec<u8>,
@@ -1327,13 +1327,13 @@ fn map_delegation_error(e: AccountDelegationError) -> String {
 /// what II returned from `mcp_register_v2`. Surfaced to the connect handler so
 /// it can log the access level; the values are also recorded on the session.
 #[derive(Debug)]
-pub(crate) struct RegistrationOutcome {
+pub struct RegistrationOutcome {
     /// Grant expiration (ns since the Unix epoch).
-    pub(crate) expiration_ns: u64,
+    pub expiration_ns: u64,
     /// The recorded access level, in the delegation vocabulary: `"queries"` =
     /// read-only, `"all"` = full (always present — `McpRegistrationV2`'s
     /// `permissions` is non-optional).
-    pub(crate) permissions: &'static str,
+    pub permissions: &'static str,
 }
 
 // ---- II candid contract for the mcp_* delegation methods --------------------

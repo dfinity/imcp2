@@ -55,7 +55,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY static ./static
+COPY crates ./crates
 RUN cargo build --release
 FROM scratch AS bin
 COPY --from=build /app/target/release/imcp2 /imcp2

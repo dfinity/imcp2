@@ -483,10 +483,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
  "serde",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -1779,16 +1777,13 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "candid",
- "candid_parser",
- "crc32fast",
  "getrandom 0.3.4",
  "hex",
  "http-body-util",
  "ic-agent",
+ "imcp2-core",
  "pocket-ic",
  "prometheus",
- "regex",
- "reqwest 0.13.4",
  "rmcp",
  "serde",
  "serde_json",
@@ -1802,6 +1797,30 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+]
+
+[[package]]
+name = "imcp2-core"
+version = "0.2.0"
+dependencies = [
+ "base64 0.22.1",
+ "candid",
+ "candid_parser",
+ "crc32fast",
+ "getrandom 0.3.4",
+ "hex",
+ "http",
+ "ic-agent",
+ "regex",
+ "reqwest 0.13.4",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tracing",
+ "url",
+ "urlencoding",
 ]
 
 [[package]]
@@ -2208,25 +2227,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "oauth2"
-version = "5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
-dependencies = [
- "base64 0.22.1",
- "chrono",
- "getrandom 0.2.17",
- "http",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "url",
 ]
 
 [[package]]
@@ -2931,11 +2931,9 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
- "oauth2",
  "pastey",
  "pin-project-lite",
  "rand 0.10.1",
- "reqwest 0.13.4",
  "rmcp-macros",
  "schemars 1.2.1",
  "serde",
@@ -2947,7 +2945,6 @@ dependencies = [
  "tokio-util",
  "tower-service",
  "tracing",
- "url",
  "uuid",
 ]
 
@@ -4074,7 +4071,6 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
- "serde_derive",
 ]
 
 [[package]]

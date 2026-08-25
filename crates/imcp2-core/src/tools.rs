@@ -17,7 +17,7 @@ use rmcp::{
     schemars, ErrorData as McpError, RoleServer, ServerHandler,
 };
 
-use crate::{auth, calls, discover, identities, identities::Identities, management, skills};
+use crate::{calls, discover, identities, identities::Identities, management, skills};
 
 /// Cap on the per-canister Candid probes open_app / discover_app_canisters run to
 /// fill in OQL / api-doc capability flags (#3). Discovery output is already bounded,
@@ -49,19 +49,44 @@ const OQL_PRIMER_MD: &str = include_str!("../static/oql-primer.md");
 // together.
 
 #[derive(Clone)]
-pub(crate) struct IcTools {
+pub struct IcTools {
     agent: Agent,
     identities: Identities,
     skills: skills::SkillsCatalog,
+    /// Where a tool call finds the Internet Identity session it acts as — the
+    /// one per-deployment seam (see [`SessionSource`]).
+    session: SessionSource,
 }
 
 #[tool_router]
 impl IcTools {
-    pub(crate) fn new(agent: Agent, identities: Identities, skills: skills::SkillsCatalog) -> Self {
+    pub fn new(
+        agent: Agent,
+        identities: Identities,
+        skills: skills::SkillsCatalog,
+        session: SessionSource,
+    ) -> Self {
         Self {
             agent,
             identities,
             skills,
+            session,
+        }
+    }
+
+    /// The session id this tool call acts as, per the deployment's
+    /// [`SessionSource`]: looked up from the request's [`AuthedSession`]
+    /// extension under `Bearer` (multi-user, hosted), or the fixed
+    /// login-established session under `Singleton` (single-user, local).
+    /// `None` means the call is unauthenticated ("needs an authenticated
+    /// session" errors at the call sites are unchanged).
+    fn current_session_id(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
+        match &self.session {
+            SessionSource::Bearer => authed_session(ctx).map(|s| s.session_id),
+            SessionSource::Singleton(id) => {
+                let _ = ctx;
+                Some(id.clone())
+            }
         }
     }
 
@@ -348,9 +373,9 @@ impl IcTools {
         match origin {
             None => Ok((self.agent.clone(), None)),
             Some(origin) => {
-                let session_id = authed_session(ctx)
-                    .ok_or_else(|| format!("{what} as an app needs an authenticated session"))?
-                    .session_id;
+                let session_id = self
+                    .current_session_id(ctx)
+                    .ok_or_else(|| format!("{what} as an app needs an authenticated session"))?;
                 let delegated = self
                     .identities
                     .delegated_identity_for(&session_id, origin, account)
@@ -806,8 +831,8 @@ impl IcTools {
         Parameters(identities::GetPrincipalArgs { derivation_origin, account }): Parameters<identities::GetPrincipalArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let session_id = match authed_session(&ctx) {
-            Some(s) => s.session_id,
+        let session_id = match self.current_session_id(&ctx) {
+            Some(s) => s,
             None => return Ok(err("getting an app principal needs an authenticated session".into())),
         };
         // `derivation_origin` is a required String here, so this always yields a
@@ -862,8 +887,8 @@ impl IcTools {
         Parameters(identities::ListAccountsArgs { derivation_origin }): Parameters<identities::ListAccountsArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let session_id = match authed_session(&ctx) {
-            Some(s) => s.session_id,
+        let session_id = match self.current_session_id(&ctx) {
+            Some(s) => s,
             None => return Ok(err("listing your accounts needs an authenticated session".into())),
         };
         // `derivation_origin` is a required String here, so this always yields a
@@ -1295,8 +1320,8 @@ impl IcTools {
         Parameters(_args): Parameters<management::NoArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let sid = match authed_session(&ctx) {
-            Some(s) => s.session_id,
+        let sid = match self.current_session_id(&ctx) {
+            Some(s) => s,
             None => return Ok(err("checking your cycles balance needs an authenticated session".into())),
         };
         match management::cycles_balance(&self.identities, &sid).await {
@@ -1318,8 +1343,8 @@ impl IcTools {
         Parameters(args): Parameters<management::CreateCanisterArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let sid = match authed_session(&ctx) {
-            Some(s) => s.session_id,
+        let sid = match self.current_session_id(&ctx) {
+            Some(s) => s,
             None => return Ok(err("creating a canister needs an authenticated session".into())),
         };
         match management::create_canister(&self.identities, &sid, args).await {
@@ -1341,8 +1366,8 @@ impl IcTools {
         Parameters(args): Parameters<management::TopUpArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let sid = match authed_session(&ctx) {
-            Some(s) => s.session_id,
+        let sid = match self.current_session_id(&ctx) {
+            Some(s) => s,
             None => return Ok(err("topping up a canister needs an authenticated session".into())),
         };
         let canister_id = args.canister_id.clone();
@@ -1362,8 +1387,8 @@ impl IcTools {
         Parameters(args): Parameters<management::InstallCodeArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let sid = match authed_session(&ctx) {
-            Some(s) => s.session_id,
+        let sid = match self.current_session_id(&ctx) {
+            Some(s) => s,
             None => return Ok(err("installing code needs an authenticated session".into())),
         };
         let canister_id = args.canister_id.clone();
@@ -1383,8 +1408,8 @@ impl IcTools {
         Parameters(args): Parameters<management::CanisterRefArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let sid = match authed_session(&ctx) {
-            Some(s) => s.session_id,
+        let sid = match self.current_session_id(&ctx) {
+            Some(s) => s,
             None => return Ok(err("reading canister status needs an authenticated session".into())),
         };
         let canister_id = args.canister_id.clone();
@@ -1404,8 +1429,8 @@ impl IcTools {
         Parameters(args): Parameters<management::UpdateSettingsArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let sid = match authed_session(&ctx) {
-            Some(s) => s.session_id,
+        let sid = match self.current_session_id(&ctx) {
+            Some(s) => s,
             None => return Ok(err("updating settings needs an authenticated session".into())),
         };
         let canister_id = args.canister_id.clone();
@@ -1425,8 +1450,8 @@ impl IcTools {
         Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let sid = match authed_session(&ctx) {
-            Some(s) => s.session_id,
+        let sid = match self.current_session_id(&ctx) {
+            Some(s) => s,
             None => return Ok(err("starting a canister needs an authenticated session".into())),
         };
         let result = management::start_canister(&self.identities, &sid, &canister_id).await;
@@ -1443,8 +1468,8 @@ impl IcTools {
         Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let sid = match authed_session(&ctx) {
-            Some(s) => s.session_id,
+        let sid = match self.current_session_id(&ctx) {
+            Some(s) => s,
             None => return Ok(err("stopping a canister needs an authenticated session".into())),
         };
         let result = management::stop_canister(&self.identities, &sid, &canister_id).await;
@@ -1461,8 +1486,8 @@ impl IcTools {
         Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let sid = match authed_session(&ctx) {
-            Some(s) => s.session_id,
+        let sid = match self.current_session_id(&ctx) {
+            Some(s) => s,
             None => return Ok(err("uninstalling code needs an authenticated session".into())),
         };
         let result = management::uninstall_code(&self.identities, &sid, &canister_id).await;
@@ -1479,8 +1504,8 @@ impl IcTools {
         Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let sid = match authed_session(&ctx) {
-            Some(s) => s.session_id,
+        let sid = match self.current_session_id(&ctx) {
+            Some(s) => s,
             None => return Ok(err("deleting a canister needs an authenticated session".into())),
         };
         let result = management::delete_canister(&self.identities, &sid, &canister_id).await;
@@ -1488,12 +1513,36 @@ impl IcTools {
     }
 }
 
-/// The authenticated MCP session of the calling request, if it carried a valid
-/// bearer token (injected by [`auth::require_token`]).
-fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<auth::AuthedSession> {
+/// Where [`IcTools`] finds the Internet Identity session a tool call acts as —
+/// the one seam between deployments. The tool implementations are identical
+/// under both variants.
+#[derive(Clone, Debug)]
+pub enum SessionSource {
+    /// Multi-user (the hosted server): resolve the session per request from
+    /// the [`AuthedSession`] extension its bearer-token gate injected.
+    Bearer,
+    /// Single-user (a local server): every call acts as this one session,
+    /// established by the binary's own login flow.
+    Singleton(String),
+}
+
+/// The verified session id of an authenticated MCP session, injected into the
+/// request extensions by the embedding server's auth gate (the hosted binary's
+/// bearer-token middleware) and read back under [`SessionSource::Bearer`].
+#[derive(Clone, Debug)]
+pub struct AuthedSession {
+    pub session_id: String,
+}
+
+/// The authenticated MCP session of the calling request, if the embedding
+/// server's auth gate injected one. The transport surfaces the HTTP request's
+/// `Parts` in the tool context's extensions; `http::request::Parts` is the
+/// same type axum re-exports, so this reads what an axum middleware inserted
+/// without this crate depending on axum.
+fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<AuthedSession> {
     ctx.extensions
-        .get::<axum::http::request::Parts>()
-        .and_then(|parts| parts.extensions.get::<auth::AuthedSession>())
+        .get::<http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<AuthedSession>())
         .cloned()
 }
 

@@ -1,0 +1,36 @@
+[package]
+name = "imcp2-core"
+version = "0.2.0"
+edition = "2021"
+description = "Transport-agnostic components of the IMCP2 Internet Computer MCP server: the tool surface, the Internet Identity session engine, and the II connect-handshake primitives."
+license = "Apache-2.0"
+repository = "https://github.com/dfinity/imcp2"
+homepage = "https://mcp.internetcomputer.org"
+keywords = ["mcp", "internet-computer", "icp", "candid"]
+categories = ["network-programming", "api-bindings"]
+
+[dependencies]
+# No transport feature: each binary picks its own (streamable-HTTP in imcp2,
+# stdio in imcp2-local). `server` + `macros` carry the tool router, the
+# ServerHandler machinery, and the schemars re-export every tool schema
+# derives against.
+rmcp = { workspace = true, features = ["server", "macros"] }
+ic-agent = { workspace = true }
+candid = { workspace = true }
+candid_parser = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "net"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+crc32fast = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+getrandom = { workspace = true }
+urlencoding = { workspace = true }
+url = { workspace = true }
+# The request-extension type the Bearer session lookup reads (axum re-exports
+# this same type; depending on `http` directly keeps axum out of this crate).
+http = { workspace = true }
