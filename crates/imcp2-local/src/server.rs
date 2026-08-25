@@ -38,17 +38,114 @@ pub struct AuthenticateArgs {
     pub refresh: bool,
 }
 
+/// Structured output of `authenticate` and `auth_status` — one shape for the
+/// whole sign-in lifecycle, so both tools honour the same all-tools
+/// `outputSchema` contract as the core surface (every core tool declares an
+/// object-rooted schema and attaches matching `structuredContent`).
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct AuthOutput {
+    /// The sign-in state: `signed_in`, `pending` (a browser handshake is
+    /// waiting to be finished), `expired`, or `signed_out`.
+    pub status: String,
+    /// The id.ai sign-in link to open, present while a handshake is pending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The session principal, when signed in (or the principal whose session
+    /// expired).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    /// The grant's access level, when signed in: `read-only` or `all`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    /// Whole minutes until the grant expires, when signed in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in_minutes: Option<u64>,
+}
+
+impl AuthOutput {
+    fn signed_in(g: &Grant) -> Self {
+        Self {
+            status: "signed_in".into(),
+            url: None,
+            principal: g.principal.clone(),
+            access: Some(access_word(g.permissions).into()),
+            expires_in_minutes: Some(g.minutes_left()),
+        }
+    }
+
+    fn pending(url: String) -> Self {
+        Self {
+            status: "pending".into(),
+            url: Some(url),
+            principal: None,
+            access: None,
+            expires_in_minutes: None,
+        }
+    }
+
+    fn expired(g: &Grant) -> Self {
+        Self {
+            status: "expired".into(),
+            url: None,
+            principal: g.principal.clone(),
+            access: None,
+            expires_in_minutes: None,
+        }
+    }
+
+    fn signed_out() -> Self {
+        Self {
+            status: "signed_out".into(),
+            url: None,
+            principal: None,
+            access: None,
+            expires_in_minutes: None,
+        }
+    }
+}
+
+/// The grant vocabulary (`"queries"`) rendered for humans and the structured
+/// `access` field alike.
+fn access_word(permissions: &str) -> &str {
+    match permissions {
+        "queries" => "read-only",
+        other => other,
+    }
+}
+
+/// Same contract as the core surface's result builder: the human-readable
+/// text plus `structuredContent` conforming to the declared `outputSchema`
+/// (attached only when it serializes to a JSON object, which [`AuthOutput`]
+/// always does).
+fn ok_structured<T: serde::Serialize>(text: String, value: &T) -> CallToolResult {
+    let mut result = CallToolResult::success(vec![Content::text(text)]);
+    result.structured_content = match serde_json::to_value(value) {
+        Ok(v @ serde_json::Value::Object(_)) => Some(v),
+        _ => None,
+    };
+    result
+}
+
+/// Same panic-at-router-construction posture as the core surface: a
+/// non-object output schema is a programming error.
+fn schema_for_output<T: schemars::JsonSchema + std::any::Any>(
+) -> std::sync::Arc<rmcp::model::JsonObject> {
+    rmcp::handler::server::tool::schema_for_output::<T>().unwrap_or_else(|e| {
+        panic!(
+            "output schema for `{}` must be object-rooted: {e}",
+            std::any::type_name::<T>()
+        )
+    })
+}
+
 fn signed_in_line(g: &Grant) -> String {
     let who = match &g.principal {
         Some(p) => format!(" as {p}"),
         None => String::new(),
     };
-    let access = match g.permissions {
-        "queries" => "read-only",
-        other => other,
-    };
     format!(
-        "Signed in{who} (access: {access}; the grant expires in about {}).",
+        "Signed in{who} (access: {}; the grant expires in about {}).",
+        access_word(g.permissions),
         human_minutes(g.minutes_left())
     )
 }
@@ -82,21 +179,25 @@ impl LocalServer {
             read_only_hint = false,
             destructive_hint = false,
             open_world_hint = true
-        )
+        ),
+        output_schema = schema_for_output::<AuthOutput>(),
     )]
     async fn authenticate(
         &self,
         Parameters(AuthenticateArgs { refresh }): Parameters<AuthenticateArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let text = match self.login.begin(refresh).await {
+        let (text, output) = match self.login.begin(refresh).await {
             Err(e) => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
                     "Could not start the sign-in: {e}"
                 ))]))
             }
-            Ok(BeginOutcome::AlreadySignedIn(g)) => format!(
-                "{} Pass refresh=true to sign in again (switch accounts or extend the session).",
-                signed_in_line(&g)
+            Ok(BeginOutcome::AlreadySignedIn(g)) => (
+                format!(
+                    "{} Pass refresh=true to sign in again (switch accounts or extend the session).",
+                    signed_in_line(&g)
+                ),
+                AuthOutput::signed_in(&g),
             ),
             Ok(BeginOutcome::Pending { url, fresh }) => {
                 let opener = if self.auto_open {
@@ -109,14 +210,17 @@ impl LocalServer {
                 } else {
                     "A sign-in is already waiting for you — open this Internet Identity link in your browser"
                 };
-                format!(
-                    "{lead}:\n\n{url}\n\n{opener}The link is valid for 10 minutes. \
-                     After you finish in the browser, call auth_status — or just retry \
-                     the tool you wanted — to confirm the session."
+                (
+                    format!(
+                        "{lead}:\n\n{url}\n\n{opener}The link is valid for 10 minutes. \
+                         After you finish in the browser, call auth_status — or just retry \
+                         the tool you wanted — to confirm the session."
+                    ),
+                    AuthOutput::pending(url),
                 )
             }
         };
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(ok_structured(text, &output))
     }
 
     #[tool(
@@ -126,26 +230,34 @@ impl LocalServer {
             read_only_hint = true,
             destructive_hint = false,
             open_world_hint = false
-        )
+        ),
+        output_schema = schema_for_output::<AuthOutput>(),
     )]
     async fn auth_status(&self) -> Result<CallToolResult, McpError> {
-        let text = match self.login.status().await {
-            LoginStatus::SignedIn(g) => signed_in_line(&g),
-            LoginStatus::Pending { url } => format!(
-                "A sign-in is pending — waiting for the browser handshake to finish at:\n\n{url}"
+        let (text, output) = match self.login.status().await {
+            LoginStatus::SignedIn(g) => (signed_in_line(&g), AuthOutput::signed_in(&g)),
+            LoginStatus::Pending { url } => (
+                format!(
+                    "A sign-in is pending — waiting for the browser handshake to finish at:\n\n{url}"
+                ),
+                AuthOutput::pending(url),
             ),
             LoginStatus::Expired(g) => {
                 let who = match &g.principal {
                     Some(p) => format!(" (was {p})"),
                     None => String::new(),
                 };
-                format!("The session expired{who}. Call authenticate to sign in again.")
+                (
+                    format!("The session expired{who}. Call authenticate to sign in again."),
+                    AuthOutput::expired(&g),
+                )
             }
-            LoginStatus::SignedOut => {
-                "Not signed in. Call authenticate to get a sign-in link.".to_string()
-            }
+            LoginStatus::SignedOut => (
+                "Not signed in. Call authenticate to get a sign-in link.".to_string(),
+                AuthOutput::signed_out(),
+            ),
         };
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(ok_structured(text, &output))
     }
 }
 
@@ -269,6 +381,21 @@ mod tests {
             schema["properties"]["refresh"].is_object(),
             "authenticate must declare its refresh flag: {schema}"
         );
+        // The merged surface keeps the core contract: every tool declares an
+        // object-rooted outputSchema (the core suite enforces it for the 26;
+        // this enforces it for the two added here).
+        for t in &tools {
+            let schema = t
+                .output_schema
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} must declare an outputSchema", t.name));
+            assert_eq!(
+                serde_json::to_value(schema).unwrap()["type"],
+                "object",
+                "{}'s outputSchema must be object-rooted",
+                t.name
+            );
+        }
     }
 
     // Expiry phrasing across the II consent screen's range (minutes → a month):
@@ -339,26 +466,41 @@ mod tests {
                     .flat_map(|c| c.as_text().map(|t| t.text.clone()))
                     .collect::<Vec<_>>()
                     .join("\n");
-                (result.is_error.unwrap_or(false), text)
+                let structured = result.structured_content.clone();
+                (result.is_error.unwrap_or(false), text, structured)
             }
         };
 
-        // Login lifecycle through the MCP layer.
-        let (is_error, text) = call("auth_status", None).await;
+        // Login lifecycle through the MCP layer — text for humans, structured
+        // content (per the declared outputSchema) for typed consumers.
+        let (is_error, text, structured) = call("auth_status", None).await;
         assert!(!is_error, "{text}");
         assert!(text.contains("Not signed in"), "{text}");
+        assert_eq!(
+            structured.expect("structuredContent")["status"],
+            "signed_out"
+        );
 
-        let (is_error, text) = call("authenticate", Some(serde_json::json!({}))).await;
+        let (is_error, text, structured) = call("authenticate", Some(serde_json::json!({}))).await;
         assert!(!is_error, "{text}");
         assert!(text.contains("https://id.ai/mcp#callback="), "{text}");
+        let structured = structured.expect("structuredContent");
+        assert_eq!(structured["status"], "pending");
+        assert!(
+            structured["url"]
+                .as_str()
+                .is_some_and(|u| u.starts_with("https://id.ai/mcp#")),
+            "{structured}"
+        );
 
-        let (is_error, text) = call("auth_status", None).await;
+        let (is_error, text, structured) = call("auth_status", None).await;
         assert!(!is_error, "{text}");
         assert!(text.contains("sign-in is pending"), "{text}");
+        assert_eq!(structured.expect("structuredContent")["status"], "pending");
 
         // Forwarding: a core tool answers through the wrapper (its own error
         // path, so no network is touched).
-        let (is_error, text) = call(
+        let (is_error, text, _) = call(
             "get_canister_candid",
             Some(serde_json::json!({ "canister_id": "not-a-canister" })),
         )
