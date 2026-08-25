@@ -36,7 +36,7 @@ mod discover;
 mod management;
 
 pub use identities::{IiInstance, SessionGauges};
-pub use tools::{AuthedSession, IcTools, SessionSource};
+pub use tools::{AuthedSession, IcTools, SessionSlot, SessionSource};
 /// The IC [`Agent`] type the components are built around, re-exported so
 /// callers construct the injected agent from the exact `ic-agent` version this
 /// crate links.

@@ -1,0 +1,45 @@
+[package]
+name = "imcp2-local"
+version = "0.2.0"
+edition = "2021"
+description = "Local MCP server for the Internet Computer: the imcp2 tool surface over stdio, with a built-in Internet Identity browser login."
+license = "Apache-2.0"
+repository = "https://github.com/dfinity/imcp2"
+# Distributed as signed release binaries (the design's end-user setup and
+# signing components), not through crates.io — flip deliberately if that ever
+# changes. This also keeps the tag-lockstep publish workflow scoped to
+# imcp2-core + imcp2.
+publish = false
+
+[dependencies]
+# The whole server is composed from imcp2-core: the IcTools surface (served
+# over stdio here), the II session engine, and the connect-handshake
+# primitives the login listener wraps. The IC agent is constructed from
+# core's `ic_agent` re-export, so the process links exactly one ic-agent.
+imcp2-core = { workspace = true }
+rmcp = { workspace = true, features = ["server", "macros", "transport-io"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
+# The transient loopback login listener (component 5 of the design): three
+# routes for one handshake, then torn down. The MCP tool surface never rides
+# HTTP here.
+axum = { workspace = true }
+# Best-effort browser launch for the sign-in link, as in the ICP CLI's
+# `icp identity link web`. The flow never depends on it succeeding.
+open = "5"
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# stdout is the JSON-RPC channel, so ALL diagnostics go to stderr.
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+# The login-flow tests play the browser: fetch the callback page, the
+# allow-list, and POST redeems against the loopback listener.
+reqwest = { workspace = true, features = ["json"] }
+# The wrapper tests run a REAL MCP round-trip: the server served over an
+# in-process duplex pipe (the same shape as stdio), driven by rmcp's client.
+rmcp = { workspace = true, features = ["client"] }
+tokio = { workspace = true, features = ["io-util"] }
