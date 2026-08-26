@@ -76,6 +76,13 @@ const FULL_ENV = {
   STATUSPAGE_COMPONENT_ID: "abcdef123456",
 };
 
+/** Response-like stub carrying the fields pushComponentStatus reads. */
+const httpRes = (status, extra = {}) => ({
+  status,
+  ok: status >= 200 && status < 300,
+  ...extra,
+});
+
 test("componentStatusFor maps the overall verdict", () => {
   assert.equal(componentStatusFor(report("pass")), "operational");
   assert.equal(componentStatusFor(report("warn")), "degraded_performance");
@@ -182,7 +189,7 @@ test("pushComponentStatus PATCHes the component with the OAuth header", async ()
   const calls = [];
   await pushComponentStatus(config, "operational", async (url, init) => {
     calls.push({ url, init });
-    return { status: 200 };
+    return httpRes(200);
   });
   assert.equal(calls.length, 1);
   assert.equal(
@@ -204,13 +211,10 @@ test("pushComponentStatus discards the response body on success and error", asyn
   // that would be retried (and so accumulate) every interval.
   const { config } = resolveStatuspageConfig(FULL_ENV);
   const bodyRes = (status) => {
-    const res = {
-      status,
-      cancelled: 0,
-      body: {
-        cancel: async () => {
-          res.cancelled += 1;
-        },
+    const res = httpRes(status, { cancelled: 0 });
+    res.body = {
+      cancel: async () => {
+        res.cancelled += 1;
       },
     };
     return res;
@@ -225,10 +229,15 @@ test("pushComponentStatus discards the response body on success and error", asyn
   assert.equal(err.cancelled, 1);
 });
 
-test("pushComponentStatus throws on a non-200 without leaking details", async () => {
+test("pushComponentStatus accepts any 2xx, not just 200", async () => {
+  const { config } = resolveStatuspageConfig(FULL_ENV);
+  await pushComponentStatus(config, "operational", async () => httpRes(204));
+});
+
+test("pushComponentStatus throws on a non-2xx without leaking details", async () => {
   const { config } = resolveStatuspageConfig(FULL_ENV);
   await assert.rejects(
-    pushComponentStatus(config, "operational", async () => ({ status: 401 })),
+    pushComponentStatus(config, "operational", async () => httpRes(401)),
     (e) => {
       assert.match(e.message, /401/);
       assert.doesNotMatch(e.message, /sk-test-key/);
@@ -246,7 +255,7 @@ test("pusher pushes on change only, and once at startup", async () => {
     config,
     fetchImpl: async (_url, init) => {
       pushes.push(JSON.parse(init.body).component.status);
-      return { status: 200 };
+      return httpRes(200);
     },
     log: () => {},
   });
@@ -268,9 +277,9 @@ test("pusher retries after a failed push instead of marking it done", async () =
     getReport: async () => report("pass"),
     config,
     fetchImpl: async (_url, init) => {
-      if (!apiUp) return { status: 500 };
+      if (!apiUp) return httpRes(500);
       pushes.push(JSON.parse(init.body).component.status);
-      return { status: 200 };
+      return httpRes(200);
     },
     log: (line) => logs.push(line),
   });
@@ -295,7 +304,7 @@ test("pusher redacts the API key even when it straddles the log cap", async () =
       throw new Error("x".repeat(289) + "sk-test-key trailing");
     },
     config,
-    fetchImpl: async () => ({ status: 200 }),
+    fetchImpl: async () => httpRes(200),
     log: (line) => logs.push(line),
   });
   pusher.stop();
@@ -313,7 +322,7 @@ test("pusher survives a probe failure and logs it", async () => {
       throw new Error("probe exploded");
     },
     config,
-    fetchImpl: async () => ({ status: 200 }),
+    fetchImpl: async () => httpRes(200),
     log: (line) => logs.push(line),
   });
   pusher.stop();

@@ -223,7 +223,9 @@ export const pushComponentStatus = async (config, status, fetchImpl = fetch) => 
   } catch {
     // An already-consumed or errored body changes nothing about the outcome.
   }
-  if (res.status !== 200) {
+  // Any 2xx counts as success — the API returns 200 today, but a successful
+  // push must not depend on that staying exact.
+  if (!res.ok) {
     throw new Error(`Statuspage API responded ${res.status}`);
   }
 };
