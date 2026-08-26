@@ -149,13 +149,13 @@ results).
 | `icp_get_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `writing-motoko`, `icp-cli`, `cycles-management`) |
 | `icp_oql_guide` | — | The OQL query-surface dialect guide (for canisters where `get_canister_candid` reports `oql: true`): the JSON query object, predicate grammar, edges, and paged result shape. The entity/field names come from `get_canister_oql_schema` and queries run through `canister_query` (the `oql` argument) |
 | `get_canister_oql_schema` | `canister_id`, `derivation_origin`, `account?` | The canister's OQL schema catalogue (entities, primary keys, fields, edges) as JSON — wraps its `schema` method — plus a ready-to-run `canister_query` example per entity. **`derivation_origin` is required**: the schema is caller-gated, so an anonymous read is rejected (for now) with guidance, rather than returning an empty list |
-| `icp_cycles_balance` | — | Your cycles-ledger balance (the funds `icp_create_canister`/`icp_top_up_canister` spend), as your standing II principal |
+| `icp_cycles_balance` | — | Your cycles-ledger balance (the funds `icp_create_canister` spends), as your standing II principal |
 | `icp_create_canister` | `cycles?` / `icp?`, `controllers?`, `subnet?` | Create + fund a new canister — from your cycles-ledger balance (`cycles`) or by converting ICP from your ICP-ledger account via the CMC (`icp`); returns the new canister id |
 | `icp_install_code` | `canister_id`, `wasm_base64` / `wasm_hex`, `mode?`, `arg?` | Install/reinstall/upgrade a Wasm module (single-shot, or via the chunk store for large modules) |
 | `icp_canister_status` | `canister_id` | Run state, cycle balance, module hash, memory, controllers, allocations |
 | `icp_update_canister_settings` | `canister_id`, `controllers?`, allocations, `freezing_threshold?`, `log_visibility?`, … | Update a canister's settings |
 | `icp_start_canister` / `icp_stop_canister` / `icp_uninstall_code` / `icp_delete_canister` | `canister_id` | Canister lifecycle |
-| `icp_top_up_canister` | `canister_id`, `cycles?` / `icp?` | Add cycles to an existing canister — from your cycles-ledger balance (`cycles`) or by converting ICP from your ICP-ledger account via the CMC (`icp`) |
+| `icp_top_up_canister` | `canister_id`, `cycles?` / `icp?` | **Instructions only — nothing is executed and no funds move.** Returns the step-by-step CLI commands (the `icp` CLI, or `dfx`) for the user to add cycles to a canister themselves; `cycles`/`icp` are substituted into the printed commands. Provided for completeness, to reflect the platform capability |
 
 `open_app` (its `app` argument takes a name **or** a URL) is the one-call entry point
 when the user names or links an app: it resolves the Internet Identity
@@ -383,21 +383,28 @@ conventions.
 
 The management tools let the agent act **on chain as your standing Internet
 Identity principal** — a stable per-connection identity (the one returned when you
-authenticate). Because a user ingress message cannot attach cycles, creation and
-top-ups fund the canister one of two ways, both keyed to that management principal
-(the one `icp_cycles_balance` reports, default subaccount):
+authenticate). Because a user ingress message cannot attach cycles,
+`icp_create_canister` funds the new canister one of two ways, both keyed to that
+management principal (the one `icp_cycles_balance` reports, default subaccount):
 
 - **`cycles`** — drawn from your **cycles-ledger** balance
   (`um5iw-rqaaa-aaaaq-qaaba-cai`); fund it first (e.g. via the `icp` CLI /
   `cycles-management` skill) and check it with `icp_cycles_balance`.
 - **`icp`** — a decimal-ICP amount transferred from that principal's
   **ICP-ledger** account (`ryjl3-tyaaa-aaaaa-aaaba-cai`, default subaccount) to
-  the **CMC**, which mints cycles into the canister (`notify_create_canister` /
-  `notify_top_up`). Best-effort, single attempt: if the transfer lands but the
+  the **CMC**, which mints cycles into the canister (`notify_create_canister`).
+  Best-effort, single attempt: if the transfer lands but the
   mint fails, the ICP is held by the CMC and the error carries the ICP-ledger
   block index. Recovery means re-notifying the CMC for that block **with the same
   arguments the call used** (the block index alone is not enough), not re-running
   the tool: the call is **not** idempotent, so re-running it would transfer ICP again.
+
+**Top-ups are instructions-only.** `icp_top_up_canister` executes nothing and
+moves no funds: it returns the CLI steps (`icp canister top-up …`, or
+`dfx cycles top-up …` / `dfx ledger top-up …`) for the user to run the top-up
+themselves, in their own terminal, with keys they control. The tool exists for
+completeness — to reflect the Internet Computer platform capability — not to
+perform the operation on the user's behalf.
 
 `cycles` takes precedence if both are given. Lifecycle calls
 (`icp_install_code`, `icp_canister_status`, `icp_update_canister_settings`,
