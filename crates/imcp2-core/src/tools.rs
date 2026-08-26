@@ -17,7 +17,7 @@ use rmcp::{
     schemars, ErrorData as McpError, RoleServer, ServerHandler,
 };
 
-use crate::{calls, discover, identities, identities::Identities, management, skills};
+use crate::{calls, compliance, discover, identities, identities::Identities, management, skills};
 
 /// Cap on the per-canister Candid probes open_app / discover_app_canisters run to
 /// fill in OQL / api-doc capability flags (#3). Discovery output is already bounded,
@@ -432,7 +432,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
+        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. FINANCIAL TRANSACTIONS ARE NOT SUPPORTED: for marketplace compliance and user safety, this tool refuses token-ledger transfer and approval methods — the ICRC-1/ICRC-2 (and related ICRC ledger-standard) methods such as icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICP ledger's legacy transfer — on every canister. This server does not move money, tokens, or other financial assets on the user's behalf; for such operations, recommend the user acts themselves in a wallet or frontend they control in their browser (e.g. https://oisy.com). Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
         annotations(title = "Make a canister update call", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterUpdateCallOutput>(),
     )]
@@ -452,6 +452,13 @@ impl IcTools {
             Ok(p) => p,
             Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
         };
+        // The financial-transactions gate (see `compliance`): ledger transfer /
+        // approval methods are refused on every canister, before any network
+        // work, with a redirect to a user-controlled wallet. Queries need no
+        // gate — a query cannot commit state, so it cannot move funds.
+        if let Some(refusal) = compliance::disallowed_update_method(&method) {
+            return Ok(err(refusal));
+        }
         // The interface to encode/decode against: the canister's own
         // candid:service if exposed, else the caller-supplied `candid`. Update calls
         // are never redirected (OQL is read-only), so no oql_query_redirect here.
@@ -2452,6 +2459,24 @@ mod tests {
         let cc = ann("canister_update_call");
         assert_eq!(cc.read_only_hint, Some(false));
         assert_eq!(cc.destructive_hint, Some(true));
+    }
+
+    // canister_update_call is a compliance-sensitive surface: its description
+    // must state that financial transactions are not supported (the ledger
+    // transfer/approval methods the `compliance` module refuses) and point at
+    // the user-controlled wallet, so directory reviewers and calling models
+    // both see the policy. Guards against the wording quietly reverting.
+    #[test]
+    fn update_call_tool_declares_financial_restriction() {
+        let tools = super::IcTools::tool_router().list_all();
+        let tool = tools
+            .iter()
+            .find(|t| &*t.name == "canister_update_call")
+            .expect("canister_update_call tool not found");
+        let desc = tool.description.as_deref().unwrap_or_default();
+        assert!(desc.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED"), "{desc}");
+        assert!(desc.contains("icrc1_transfer"), "{desc}");
+        assert!(desc.contains("https://oisy.com"), "{desc}");
     }
 
     // EVERY tool must declare an outputSchema so a model knows the shape of its

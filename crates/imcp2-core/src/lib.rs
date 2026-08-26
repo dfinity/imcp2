@@ -32,6 +32,7 @@ pub mod skills;
 pub mod tools;
 
 mod calls;
+mod compliance;
 mod discover;
 mod management;
 
