@@ -98,12 +98,12 @@ pub fn disallowed_update_method(method: &str) -> Option<String> {
          https://nns.ic0.app."
     };
     Some(format!(
-        "`{method}` is {what} — a financial transaction — and this tool does not \
-         initiate or execute financial transactions (token transfers, spending \
-         approvals, payments, or trades) on the user's behalf. Methods defined by the \
+        "`{method}` is {what} — a financial transaction — and financial transactions \
+         (token transfers, spending approvals, payments, or trades) are not supported \
+         through this tool, under any method name. Methods defined by the \
          ICRC-1/ICRC-2 and related ledger standards are refused on every canister, \
          for marketplace compliance and user safety. {instead} Do not look for another \
-         route to the same operation through this tool."
+         route to the same operation through this tool or any other method."
     ))
 }
 
