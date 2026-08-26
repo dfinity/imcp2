@@ -298,10 +298,12 @@ test("pusher redacts the API key even when it straddles the log cap", async () =
   const logs = [];
   const pusher = startStatuspagePusher({
     getReport: async () => {
-      // Place the key across the 300-character truncation boundary (chars
-      // 289-300): redaction must run on the full message first, or truncating
-      // first would leave the surviving prefix "sk-test-ke" unredacted.
-      throw new Error("x".repeat(289) + "sk-test-key trailing");
+      // Place the key across the 300-character truncation boundary: with 290
+      // prefix characters the 11-character key occupies indices 290-300, so
+      // truncating BEFORE redacting would leave the unmatchable 10-character
+      // prefix "sk-test-ke" in the log. (289 would let the whole key fit
+      // inside slice(0, 300), and the vulnerable ordering would pass too.)
+      throw new Error("x".repeat(290) + "sk-test-key trailing");
     },
     config,
     fetchImpl: async () => httpRes(200),

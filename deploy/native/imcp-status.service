@@ -5,7 +5,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ec2-user
+# Dedicated system user (created by deploy.sh), NOT the ec2-user the
+# internet-facing imcp2.service runs as: this process can carry a Statuspage
+# API key in its environment, and same-UID processes can read each other's
+# /proc/<pid>/environ — a compromise of the main service must not be able to
+# recover that secret. The shipped files under /opt/imcp2 are world-readable,
+# so no ownership changes are needed.
+User=imcp-status
 WorkingDirectory=/opt/imcp2/monitoring/mcp-status
 # Probe the public deployment end-to-end (through Caddy/TLS). Which Internet
 # Identity instances to probe is read from this server's own /version, so no II

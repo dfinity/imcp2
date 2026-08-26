@@ -106,6 +106,10 @@ node_major="\$(node -v 2>/dev/null | cut -c2- | cut -d. -f1)"
 if [ -z "\$node_major" ] || [ "\$node_major" -lt 20 ] 2>/dev/null; then
   dnf install -y -q nodejs20 >/dev/null 2>&1 || dnf install -y -q nodejs >/dev/null 2>&1 || true
 fi
+# Dedicated UID for the dashboard: it can carry a Statuspage API key in its
+# environment, so it must not share a user with the internet-facing imcp2
+# service (same-UID processes can read each other's /proc/<pid>/environ).
+id imcp-status >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin imcp-status
 cat > /etc/systemd/system/imcp-status.service <<'UNIT'
 $unit_status
 UNIT
