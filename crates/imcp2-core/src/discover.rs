@@ -1778,7 +1778,7 @@ impl From<(String, Vec<Match>)> for FindCanisterOutput {
 /// Arguments for `icp_find_app_by_name`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FindAppArgs {
-    /// The app name to look up, e.g. "Oisy", "NNS", "MULTI/DEX", "ICPSwap".
+    /// The app name to look up, e.g. "Oisy", "NNS".
     pub name: String,
 }
 

@@ -108,13 +108,25 @@ financial-transfers prohibition:
   canisters.
 - Commerce rules ("only for physical goods", no digital-goods selling, no
   embedded checkout) govern *selling through the app*; IMCP2 sells nothing.
-- `canister_update_call` can still, in principle, reach token ledgers at the
-  user's direction. The description should say what the connector is
-  (infrastructure tooling) and what gates actions (explicit "Actions &
-  questions" opt-in, network-enforced), the same honesty posture as the
-  Anthropic submission. There is no published pre-submission contact at
-  OpenAI equivalent to mcp-review@anthropic.com; the attestations step is
-  where this is declared.
+- The attestation "my plugin does not initiate or execute money transfers,
+  crypto transfers, or investment trades on behalf of users" is now
+  supported by shipped behavior: `canister_update_call` refuses the
+  standardized ledger transfer/approval methods (ICRC-1/ICRC-2 and related
+  standards, the ICP ledger's legacy `transfer`, the cycles ledger's
+  `withdraw`) on every canister and says so in its description
+  ([#154](https://github.com/dfinity/imcp2/pull/154)); `icp_top_up_canister`
+  is instructions-only and executes nothing
+  ([#153](https://github.com/dfinity/imcp2/pull/153)); README, landing page,
+  and server instructions state the server is not intended for financial
+  operations. Declare two caveats honestly at the attestations step:
+  `icp_create_canister`'s `icp` argument still executes an ICP→cycles
+  conversion from the user's own ledger account (metered compute funding
+  for the user's own canister — decide explicitly whether to keep, drop, or
+  restrict it before attesting), and the method-name guard covers the
+  standardized ledger surface rather than every bespoke canister. There is
+  no published pre-submission contact at OpenAI equivalent to
+  mcp-review@anthropic.com; the attestations step is where this is
+  declared.
 
 ### 4. Test cases (authoring work)
 
@@ -140,6 +152,10 @@ Negative:
    explicit scheme matters: a bare `multidex.com` is deliberately treated as
    a wrong-TLD guess and *repaired* to the canonical URL rather than refused,
    so the bare form is not a negative case.
+1a. "Send 1 ICP to <principal>" (or any `icrc1_transfer` /
+   `icrc2_approve` attempt via canister_update_call) → refused with the
+   financial-transactions policy message recommending a user-controlled
+   wallet (oisy.com); nothing is executed.
 2. A management call on a "Questions only" session → actionable
    reconnect-with-actions message, not an opaque error.
 3. Any authenticated tool with no sign-in → clean 401 → OAuth flow starts

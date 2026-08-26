@@ -48,7 +48,7 @@ Verified against the live production deployment (2026-07-31):
 | Claude Code loopback redirects (RFC 8252) | ✅ loopback redirects are exempt from the hosted allow-list |
 | Discovery documents (RFC 8414 + RFC 9728, path-scoped + root fallback) | ✅ all four live, `WWW-Authenticate` on the 401 points at the resource metadata |
 | Every tool: `title` + `readOnlyHint`/`destructiveHint` (+ `idempotentHint`, `openWorldHint`) | ✅ on all 26 tools, enforced by a unit test ([`src/tools.rs`](../src/tools.rs)) |
-| No catch-all read/write tool; reads and writes are separate tools | ✅ 17 read-only tools; writes split per operation |
+| No catch-all read/write tool; reads and writes are separate tools | ✅ 18 read-only tools (incl. the instructions-only top-up); writes split per operation |
 | Tool names ≤ 64 chars | ✅ longest is 30 |
 | `outputSchema` + structured content on every tool | ✅ enforced by a unit test |
 | Certificates from a recognized authority | ✅ Let's Encrypt via Caddy |
@@ -133,48 +133,69 @@ by the MCP server itself. The page and its route shipped in
 effective date agree. Then enter that URL in the portal. The reviewed source
 text is [`icp-mcp-privacy-policy-draft.md`](icp-mcp-privacy-policy-draft.md).
 
-### 2. Financial-transactions policy (decision needed)
+### 2. Financial-transactions policy (mitigations shipped; answer pending)
 
 The Directory Policy **prohibits connectors that transfer money,
 cryptocurrency, or other financial assets, or execute financial
 transactions**, and the portal's compliance step requires acknowledging this.
-Three IMCP2 capabilities are exposed to that reading:
 
-- `canister_update_call` can invoke arbitrary update methods as the user —
-  including ICRC ledger `transfer`/`approve` (i.e. token transfers).
-- `icp_create_canister` / `icp_top_up_canister` with the `icp` argument
-  convert ICP from the user's ledger account via the CMC.
+**Shipped (2026-08): the server's stated and enforced posture is that it is
+not a financial tool.**
+
+- `icp_top_up_canister` is **instructions-only**: it executes nothing and
+  moves no funds — it returns the CLI steps for the user to run a top-up
+  themselves, and the server-side execution path (cycles-ledger `withdraw`,
+  CMC `notify_top_up`) is removed from the binary
+  ([#153](https://github.com/dfinity/imcp2/pull/153)).
+- `canister_update_call` **refuses the standardized ledger methods** that
+  move value or grant spending rights — ICRC-1/ICRC-2 (plus ICRC-4/-7/-37),
+  the ICP ledger's legacy `transfer`/`send_dfx`, the cycles ledger's
+  `withdraw` — on every canister; the refusal recommends the user act
+  themselves in a wallet they control (oisy.com), and the tool description
+  states the policy up front
+  ([#154](https://github.com/dfinity/imcp2/pull/154)).
+- The README, the landing page, and the server instructions all state
+  explicitly that the server is not intended for financial operations.
+
+**What honestly remains exposed to the prohibition** — keep both points in
+whatever is declared:
+
+- `icp_create_canister` with the `icp` argument still executes an
+  ICP-ledger transfer (to the CMC, converting the user's own ICP into
+  compute for their own canister). Metered-compute funding rather than a
+  transfer to a third party — but it is a financial transaction the server
+  executes, and it needs an explicit decision before the box is checked.
+- The method disallow list covers the **standardized ledger surface**, where
+  real funds overwhelmingly live; a bespoke canister can expose value-moving
+  methods under other names, which no name-based list can enumerate. Present
+  the posture as *stated policy + guardrail*, never as a hermetic technical
+  guarantee.
 
 **Status: asked.** The email to <mcp-review@anthropic.com> went out on
 2026-07-31 and put **two** questions: whether cycles funding (including the
 ICP-conversion path) is acceptable, and whether the general-purpose
 `canister_update_call` passes review. Awaiting a reply; do not check the
 compliance boxes or submit until it lands, since a truthful acknowledgment
-isn't possible without it.
+isn't possible without it. (The `canister_update_call` mitigation that email
+offered has since shipped as #154 — when replying, present it with the
+guardrail caveat above, not as a complete control.)
 
-Two things that email leaves open:
-
-- **The first-party-API acknowledgment was not asked about.** It needs its
-  own follow-up (see the data-handling draft below).
-- **The mitigation it offers for `canister_update_call` — blocking the
-  well-known ledger `transfer`/`approve` methods — does not actually satisfy
-  the prohibition,** for the reason in option 2 below: the tool can reach a
-  custom ledger, or an intermediary canister that forwards a transfer. If the
-  reply takes that offer up, correct the record before shipping it; committing
-  to a bypassable control is worse than the current position.
+One thing that email leaves open: **the first-party-API acknowledgment was
+not asked about.** It needs its own follow-up (see the data-handling draft
+below).
 
 Options, in increasing order of product impact, once the answer arrives:
 
-1. **Proceed as-is** if cycles funding (compute-resource payment) and generic
-   update calls are cleared.
-2. **Directory-safe profile.** Serve a restricted instance for the
+1. **Proceed with the shipped posture** if the reviewers accept stated
+   policy + ledger-method guardrail, and cycles funding at creation
+   (compute-resource payment) is cleared.
+2. **Directory-safe profile.** Serve a further-restricted instance for the
    directory, keeping the full server available as a custom connector at
-   another path. Note that a blocklist of known ledger canisters or transfer
-   methods is NOT sufficient: `canister_update_call` can reach any custom
-   ledger, or an intermediary canister that forwards a transfer. A profile
-   that actually satisfies the prohibition has to drop the generic update
-   tool and the `icp` conversion paths entirely, or restrict actions to a
-   reviewed allow-list of non-financial operations.
+   another path. To satisfy the strictest reading, such a profile drops the
+   generic update tool and `icp_create_canister`'s `icp` conversion path
+   entirely, or restricts actions to a reviewed allow-list of non-financial
+   operations — the shipped method blocklist alone does not get there, for
+   the guardrail reason above.
 3. **Submit anyway**, arguing in the description that funds movement is gated
    by the explicit access-level choice on the II consent screen ("Questions
    only" vs "Actions & questions"). Only if the reply is inconclusive — the
@@ -253,7 +274,9 @@ Paste-and-adapt; portal limits in parentheses.
   > or OQL, and discover the canisters behind any IC app from its name or URL.
   > With your consent it can also act as your Internet Identity accounts at a
   > specific app, and manage canisters you control: check status, create,
-  > install code, start/stop, and top up with cycles.
+  > install code, and start/stop. It is not a financial tool: token-ledger
+  > transfers and approvals are refused, and cycle top-ups return CLI
+  > instructions for you to run yourself instead of executing anything.
   >
   > On the Internet Identity consent screen you explicitly choose the session
   > duration (10 minutes to 30 days) and the access level: "Questions only"
@@ -310,23 +333,29 @@ Paste-and-adapt; portal limits in parentheses.
 >    Every read-only tool works with any identity, because it reads public
 >    network state.
 > 2. On the consent screen pick a session duration and an access level:
->    "Questions only" exercises the 17 read-only-annotated tools; "Actions &
+>    "Questions only" exercises the 18 read-only-annotated tools; "Actions &
 >    questions" additionally allows state-changing calls.
 > 3. Try the example prompts above. Questions-only sessions cause management
 >    tools to return an actionable reconnect message rather than an opaque
 >    error — that behavior is intended. Access is revocable at any time at
 >    https://id.ai/manage/settings.
-> 4. The canister-management tools act on canisters you control and spend
->    cycles, so a brand-new identity has nothing for them to operate on. Ask
->    us at mcp@dfinity.org if you would like an identity provisioned with a
->    canister and a cycles balance to exercise those.
+> 4. The canister-management tools act on canisters you control and (for
+>    creation) spend cycles, so a brand-new identity has nothing for them to
+>    operate on. Ask us at mcp@dfinity.org if you would like an identity
+>    provisioned with a canister and a cycles balance to exercise those.
+> 5. Financial operations are refused by design: asking the assistant to
+>    transfer tokens (e.g. call `icrc1_transfer`) returns a policy message
+>    directing the user to a wallet they control — that behavior is intended.
 
 ### The seven compliance acknowledgments
 
 Topics: directory guidelines, first-party API usage, financial transactions,
 AI media generation, prompt injection, conversation-data collection, public
 documentation. Two need resolution before the boxes can be checked
-truthfully: **financial transactions** (blocker 2) and **first-party API
+truthfully: **financial transactions** (blocker 2 — the ledger-method
+refusals and the instructions-only top-up have shipped, but
+`icp_create_canister`'s `icp` path and the guardrail caveat still need the
+mcp-review answer or a deliberate decision) and **first-party API
 usage** — DFINITY operates the connector, but it reaches the network through
 DAO-governed infrastructure (`icp-api.io`, `id.ai`) and forwards
 user-directed calls to third-party application canisters, so "first-party"
