@@ -136,8 +136,16 @@ dashboard):
 | ----------------- | --------------------------- |
 | `pass` | `operational` |
 | `warn` | `degraded_performance` |
-| `fail`, but some MCP endpoint checks still pass | `partial_outage` |
-| `fail` with every MCP endpoint check failing | `major_outage` |
+| `fail`, but some service-availability checks still pass | `partial_outage` |
+| `fail` with every service-availability check failing | `major_outage` |
+
+"Service-availability checks" are the endpoint probes that report `fail` on a
+failed request (landing page, discovery documents, the `/mcp` challenge, and
+the OAuth endpoints). Auxiliary checks are excluded from the major-outage
+test on purpose: `version` and `metadata-consistency` only degrade to `warn`
+when the server is unreachable, and the TLS check can stay green while the
+application behind the proxy is down — counting them would make a total
+outage report as merely partial.
 
 The pusher re-evaluates every `STATUSPAGE_PUSH_INTERVAL_MS` (default 60 s,
 floor 15 s), reusing the same cached probe runs as dashboard visitors, and

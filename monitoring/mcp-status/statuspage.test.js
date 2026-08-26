@@ -17,7 +17,21 @@ import {
   startStatuspagePusher,
 } from "./statuspage.js";
 
-/** Minimal report with the fields the mapping reads. */
+/**
+ * Minimal report with the fields the mapping reads. Statuses are assigned to
+ * real service-availability check ids from checks.js, since the mapping keys
+ * the major-outage decision on that explicit set.
+ */
+const AVAILABILITY_IDS = [
+  "root",
+  "protected-resource",
+  "as-metadata",
+  "mcp-challenge",
+  "oauth-register",
+  "oauth-register-allowlist",
+  "oauth-authorize",
+  "oauth-token",
+];
 const report = (overall, endpointStatuses = []) => ({
   overall,
   sections: [
@@ -25,7 +39,33 @@ const report = (overall, endpointStatuses = []) => ({
       id: "endpoints",
       title: "MCP server endpoints",
       status: endpointStatuses.includes("fail") ? "fail" : "pass",
-      checks: endpointStatuses.map((status, i) => ({ id: `c${i}`, status })),
+      checks: endpointStatuses.map((status, i) => ({
+        id: AVAILABILITY_IDS[i] ?? `c${i}`,
+        status,
+      })),
+    },
+  ],
+});
+
+/**
+ * What the endpoints section actually looks like when the server is entirely
+ * unreachable: every availability probe fails, but the auxiliary checks do NOT
+ * — `version` and `metadata-consistency` degrade to "warn", and `mcp-tls` can
+ * stay "pass" (a healthy reverse proxy fronting a dead application).
+ */
+const totalOutageReport = () => ({
+  overall: "fail",
+  sections: [
+    {
+      id: "endpoints",
+      title: "MCP server endpoints",
+      status: "fail",
+      checks: [
+        ...AVAILABILITY_IDS.map((id) => ({ id, status: "fail" })),
+        { id: "version", status: "warn" },
+        { id: "metadata-consistency", status: "warn" },
+        { id: "mcp-tls", status: "pass" },
+      ],
     },
   ],
 });
@@ -48,11 +88,17 @@ test("componentStatusFor: a partial endpoint failure is a partial outage", () =>
   );
 });
 
-test("componentStatusFor: every endpoint check down is a major outage", () => {
+test("componentStatusFor: every availability check down is a major outage", () => {
   assert.equal(
     componentStatusFor(report("fail", ["fail", "fail", "fail"])),
     "major_outage",
   );
+});
+
+test("componentStatusFor: a realistic total outage is a major outage", () => {
+  // Auxiliary checks (version, metadata-consistency, mcp-tls) do not fail when
+  // the server is unreachable; they must not veto the major-outage verdict.
+  assert.equal(componentStatusFor(totalOutageReport()), "major_outage");
 });
 
 test("componentStatusFor: a non-endpoint failure is a partial outage", () => {

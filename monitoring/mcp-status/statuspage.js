@@ -64,15 +64,38 @@ export const PUSH_TIMEOUT_MS = 10_000;
  */
 
 /**
+ * Check ids in the "endpoints" section that directly measure whether the MCP
+ * service is reachable and serving: each of these probes an endpoint and
+ * reports "fail" on a failed request. The section's other checks are
+ * deliberately excluded because they do NOT fail in a total outage — `version`
+ * and `metadata-consistency` degrade to "warn" when the server is unreachable,
+ * and `mcp-tls` inspects the TLS layer, which can stay "pass" (a healthy
+ * reverse proxy in front of a dead application) or degrade to "warn". Testing
+ * "every check failed" over the whole section would therefore be unsatisfiable
+ * in a real total outage, and major_outage would never be published.
+ */
+const AVAILABILITY_CHECK_IDS = new Set([
+  "root",
+  "protected-resource",
+  "as-metadata",
+  "mcp-challenge",
+  "oauth-register",
+  "oauth-register-allowlist",
+  "oauth-authorize",
+  "oauth-token",
+]);
+
+/**
  * Map a dashboard report onto a Statuspage component status.
  *
  * "pass" and "warn" map directly. For "fail" the severity depends on where the
- * failure is: when every check in the "endpoints" section failed, the MCP
- * server itself is down or unreachable (major outage); any other failure —
- * some endpoints broken, or a linked Internet Identity instance unhealthy —
- * degrades the service without taking it out entirely (partial outage).
- * Anything unrecognised also lands in the "fail" branch: a monitor should fail
- * loud, not quietly report green on input it doesn't understand.
+ * failure is: when every service-availability check in the "endpoints" section
+ * failed (see AVAILABILITY_CHECK_IDS), the MCP server itself is down or
+ * unreachable (major outage); any other failure — some endpoints broken, or a
+ * linked Internet Identity instance unhealthy — degrades the service without
+ * taking it out entirely (partial outage). Anything unrecognised also lands in
+ * the "fail" branch: a monitor should fail loud, not quietly report green on
+ * input it doesn't understand.
  *
  * @param {import("./checks.js").DashboardReport | undefined} report
  * @returns {ComponentStatus}
@@ -83,12 +106,13 @@ export const componentStatusFor = (report) => {
   const endpoints = Array.isArray(report?.sections)
     ? report.sections.find((s) => s?.id === "endpoints")
     : undefined;
-  const allEndpointsDown =
-    endpoints !== undefined &&
-    Array.isArray(endpoints.checks) &&
-    endpoints.checks.length > 0 &&
-    endpoints.checks.every((c) => c?.status === "fail");
-  return allEndpointsDown ? "major_outage" : "partial_outage";
+  const availability = Array.isArray(endpoints?.checks)
+    ? endpoints.checks.filter((c) => AVAILABILITY_CHECK_IDS.has(c?.id))
+    : [];
+  const serviceDown =
+    availability.length > 0 &&
+    availability.every((c) => c.status === "fail");
+  return serviceDown ? "major_outage" : "partial_outage";
 };
 
 // Page and component ids are URL path segments; Statuspage ids are plain
