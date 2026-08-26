@@ -277,9 +277,11 @@ Paste-and-adapt; portal limits in parentheses.
   > or OQL, and discover the canisters behind any IC app from its name or URL.
   > With your consent it can also act as your Internet Identity accounts at a
   > specific app, and manage canisters you control: check status, create,
-  > install code, and start/stop. It is not a financial tool: token-ledger
-  > transfers and approvals are refused, and cycle top-ups return CLI
-  > instructions for you to run yourself instead of executing anything.
+  > install code, and start/stop. It is not intended for financial
+  > transactions: as a safety measure, the standardized token-ledger transfer
+  > and approval methods (ICRC-1/ICRC-2 and related) are refused, and cycle
+  > top-ups return CLI instructions for you to run yourself instead of
+  > executing anything.
   >
   > On the Internet Identity consent screen you explicitly choose the session
   > duration (10 minutes to 30 days) and the access level: "Questions only"
@@ -346,9 +348,11 @@ Paste-and-adapt; portal limits in parentheses.
 >    creation) spend cycles, so a brand-new identity has nothing for them to
 >    operate on. Ask us at mcp@dfinity.org if you would like an identity
 >    provisioned with a canister and a cycles balance to exercise those.
-> 5. Financial operations are refused by design: asking the assistant to
->    transfer tokens (e.g. call `icrc1_transfer`) returns a policy message
->    directing the user to a wallet they control — that behavior is intended.
+> 5. Standardized ledger operations are refused by design: asking the
+>    assistant to transfer tokens (e.g. call `icrc1_transfer`) returns a
+>    policy message directing the user to a wallet they control — that
+>    behavior is intended (the connector is not intended for financial
+>    transactions).
 
 ### The seven compliance acknowledgments
 
