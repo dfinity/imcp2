@@ -213,6 +213,16 @@ export const pushComponentStatus = async (config, status, fetchImpl = fetch) => 
     // PATCH must become a retryable error, not an eternally in-flight tick.
     signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
   });
+  // Discard the response body without reading it: Node's fetch (Undici) keeps
+  // the underlying connection associated with an unread body until garbage
+  // collection, so a persistent error response retried every interval would
+  // otherwise accumulate connections. The body is never used — and stays out
+  // of thrown errors, since its content is under the remote service's control.
+  try {
+    await res.body?.cancel();
+  } catch {
+    // An already-consumed or errored body changes nothing about the outcome.
+  }
   if (res.status !== 200) {
     throw new Error(`Statuspage API responded ${res.status}`);
   }

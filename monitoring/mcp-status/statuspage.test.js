@@ -198,6 +198,33 @@ test("pushComponentStatus PATCHes the component with the OAuth header", async ()
   assert.ok(calls[0].init.signal instanceof AbortSignal);
 });
 
+test("pushComponentStatus discards the response body on success and error", async () => {
+  // Node's fetch keeps the connection tied to an unread body until GC, so the
+  // pusher must cancel it — including on error responses, which are the ones
+  // that would be retried (and so accumulate) every interval.
+  const { config } = resolveStatuspageConfig(FULL_ENV);
+  const bodyRes = (status) => {
+    const res = {
+      status,
+      cancelled: 0,
+      body: {
+        cancel: async () => {
+          res.cancelled += 1;
+        },
+      },
+    };
+    return res;
+  };
+  const ok = bodyRes(200);
+  await pushComponentStatus(config, "operational", async () => ok);
+  assert.equal(ok.cancelled, 1);
+  const err = bodyRes(500);
+  await assert.rejects(
+    pushComponentStatus(config, "operational", async () => err),
+  );
+  assert.equal(err.cancelled, 1);
+});
+
 test("pushComponentStatus throws on a non-200 without leaking details", async () => {
   const { config } = resolveStatuspageConfig(FULL_ENV);
   await assert.rejects(
