@@ -17,7 +17,7 @@ use rmcp::{
     schemars, ErrorData as McpError, RoleServer, ServerHandler,
 };
 
-use crate::{calls, discover, identities, identities::Identities, management, skills};
+use crate::{calls, compliance, discover, identities, identities::Identities, management, skills};
 
 /// Cap on the per-canister Candid probes open_app / discover_app_canisters run to
 /// fill in OQL / api-doc capability flags (#3). Discovery output is already bounded,
@@ -432,7 +432,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
+        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. FINANCIAL TRANSACTIONS ARE NOT SUPPORTED: for marketplace compliance and user safety, this tool refuses token-ledger transfer and approval methods — the ICRC-1/ICRC-2 (and related ICRC ledger-standard) methods such as icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICP ledger's legacy transfer — on every canister. Moving money, tokens, or other financial assets on the user's behalf is not supported through this tool and must not be attempted under ANY method name (the refusal list enforces the standardized ledger surface; the policy covers every canister and method); for such operations, recommend the user acts themselves in a wallet or frontend they control in their browser (e.g. https://oisy.com). Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
         annotations(title = "Make a canister update call", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterUpdateCallOutput>(),
     )]
@@ -452,6 +452,13 @@ impl IcTools {
             Ok(p) => p,
             Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
         };
+        // The financial-transactions gate (see `compliance`): ledger transfer /
+        // approval methods are refused on every canister, before any network
+        // work, with a redirect to a user-controlled wallet. Queries need no
+        // gate — a query cannot commit state, so it cannot move funds.
+        if let Some(refusal) = compliance::disallowed_update_method(&method) {
+            return Ok(err(refusal));
+        }
         // The interface to encode/decode against: the canister's own
         // candid:service if exposed, else the caller-supplied `candid`. Update calls
         // are never redirected (OQL is read-only), so no oql_query_redirect here.
@@ -1311,7 +1318,7 @@ impl IcTools {
     // ---- Canister creation & management (as your standing II principal) -----
 
     #[tool(
-        description = "Your cycles-ledger balance — the cycles that icp_create_canister and icp_top_up_canister spend. Acts as your Internet Identity principal (also printed). If it's empty, fund it first (e.g. via the icp CLI / cycles-management skill). Requires an authenticated session.",
+        description = "Your cycles-ledger balance — the cycles that icp_create_canister spends. Acts as your Internet Identity principal (also printed). If it's empty, fund it first (e.g. via the icp CLI / cycles-management skill). Requires an authenticated session.",
         annotations(title = "Check your cycles balance", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CyclesBalance>(),
     )]
@@ -1354,27 +1361,20 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Add cycles to an existing canister (as your Internet Identity). SPENDS FUNDS: this draws cycles or ICP from your accounts and cannot be automatically reversed, so confirm with the user before calling it. Fund EITHER with `cycles` (exact, drawn from your cycles-ledger balance) OR with `icp` (a decimal-ICP string, transferred from your ICP-ledger account and converted via the CMC straight into the target canister). Both accounts belong to your management principal — the one icp_cycles_balance reports (default subaccount). The ICP path is best-effort with no retries: if the transfer lands but the mint fails, the error carries the block index to recover with — do not blindly re-run. `cycles` wins if both are given. Requires an authenticated session.",
-        // destructive_hint = true: same reasoning as icp_create_canister — the cycles
-        // land in the target canister, but the funds leave the user's accounts for
-        // good, and a retry spends again.
-        annotations(title = "Top up a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<management::CanisterActionOutput>(),
+        description = "How to add cycles to an existing canister. PROVIDED FOR COMPLETENESS, to reflect this capability of the Internet Computer platform: the tool does NOT implement the operation on the user's behalf — it never moves cycles or ICP and executes nothing on chain. It returns step-by-step icp CLI instructions (including where to get the CLI) for the USER to run the top-up themselves in their own terminal. Pass `cycles` or `icp` only to have the intended amount substituted into the printed commands. For the full funding guide, load the cycles-management skill (icp_get_skill).",
+        // Instructions-only: no session, no canister call, no funds movement — a
+        // pure read, and closed-world (nothing leaves the server).
+        annotations(title = "How to top up a canister", read_only_hint = true, destructive_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<management::TopUpInstructions>(),
     )]
     async fn icp_top_up_canister(
         &self,
         Parameters(args): Parameters<management::TopUpArgs>,
-        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let sid = match self.current_session_id(&ctx) {
-            Some(s) => s,
-            None => return Ok(err("topping up a canister needs an authenticated session".into())),
-        };
-        let canister_id = args.canister_id.clone();
-        Ok(ok_canister_action(
-            canister_id,
-            management::top_up_canister(&self.identities, &sid, args).await,
-        ))
+        match management::top_up_instructions(args) {
+            Ok(i) => Ok(ok_structured(i.human(), &i)),
+            Err(e) => Ok(err(e)),
+        }
     }
 
     #[tool(
@@ -2080,9 +2080,11 @@ impl ServerHandler for IcTools {
              `icp_cycles_balance` (your cycles-ledger balance), `icp_create_canister` (create + fund from \
              that balance — amount in `cycles` or `icp`), `icp_install_code` (install your compiled \
              Wasm — base64 — single-shot or chunked), `icp_canister_status`, `icp_update_canister_settings`, \
-             `icp_start_canister`/`icp_stop_canister`/`icp_uninstall_code`/`icp_delete_canister`, and \
-             `icp_top_up_canister`. These act as your standing II principal, which must hold cycles in \
-             the cycles ledger first (fund it via the icp CLI / cycles-management skill). So to \
+             `icp_start_canister`/`icp_stop_canister`/`icp_uninstall_code`/`icp_delete_canister`. \
+             These act as your standing II principal, which must hold cycles in \
+             the cycles ledger first (fund it via the icp CLI / cycles-management skill). \
+             `icp_top_up_canister` is instructions-only: it never moves funds — it returns the CLI \
+             steps for the user to run a top-up themselves. So to \
              \"build X and deploy a canister with Y ICP worth of cycles\": read the relevant skills, \
              write & build the Wasm locally, `icp_create_canister(icp=Y)`, then `icp_install_code`."
                 .to_string(),
@@ -2429,6 +2431,9 @@ mod tests {
             "get_canister_candid", "canister_query", "get_canister_oql_schema", "discover_app_canisters", "icp_find_canister_by_name", "icp_find_app_by_name", "icp_lookup_canister_info_by_id",
             "icp_list_skills", "icp_get_skill", "icp_oql_guide",
             "get_canister_api_doc", "open_app", "resolve_app", "list_app_accounts", "icp_cycles_balance", "get_app_principal", "icp_canister_status",
+            // Instructions-only since the marketplace-compliance change: it
+            // executes nothing and moves no funds, so it is a pure read.
+            "icp_top_up_canister",
         ] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");
@@ -2437,16 +2442,16 @@ mod tests {
         // Destructive writes: not read-only, destructive. Two kinds live here.
         // Overwriting/removing state: delete, uninstall, install (reinstall and
         // upgrade replace the running module), settings (can hand control away).
-        // And SPENDING THE USER'S FUNDS: create and top-up add a canister or its
-        // cycles, so "additive" is tempting — but the cycles or ICP leave the user's
-        // ledger accounts irreversibly, no tool here can claw them back, and neither
-        // call is idempotent, so a client retry spends again. `destructiveHint` is
+        // And SPENDING THE USER'S FUNDS: create adds a canister, so "additive" is
+        // tempting — but the cycles or ICP leave the user's
+        // ledger accounts irreversibly, no tool here can claw them back, and the
+        // call is not idempotent, so a client retry spends again. `destructiveHint` is
         // what a client gates its confirmation prompt on and its spec default is
         // `true`, so declaring `false` would be an affirmative (and wrong) promise
         // that a stray call costs the user nothing. Keep them here.
         for name in [
             "icp_delete_canister", "icp_uninstall_code", "icp_install_code", "icp_update_canister_settings",
-            "icp_create_canister", "icp_top_up_canister",
+            "icp_create_canister",
         ] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(false), "{name} should not be read-only");
@@ -2463,6 +2468,41 @@ mod tests {
         let cc = ann("canister_update_call");
         assert_eq!(cc.read_only_hint, Some(false));
         assert_eq!(cc.destructive_hint, Some(true));
+    }
+
+    // canister_update_call is a compliance-sensitive surface: its description
+    // must state that financial transactions are not supported (the ledger
+    // transfer/approval methods the `compliance` module refuses) and point at
+    // the user-controlled wallet, so directory reviewers and calling models
+    // both see the policy. Guards against the wording quietly reverting.
+    #[test]
+    fn update_call_tool_declares_financial_restriction() {
+        let tools = super::IcTools::tool_router().list_all();
+        let tool = tools
+            .iter()
+            .find(|t| &*t.name == "canister_update_call")
+            .expect("canister_update_call tool not found");
+        let desc = tool.description.as_deref().unwrap_or_default();
+        assert!(desc.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED"), "{desc}");
+        assert!(desc.contains("icrc1_transfer"), "{desc}");
+        assert!(desc.contains("https://oisy.com"), "{desc}");
+    }
+
+    // icp_top_up_canister is a compliance-sensitive surface: its description must
+    // present the tool as instructions-only (provided for completeness, executes
+    // nothing on the user's behalf), so directory reviewers and calling models
+    // both see that contract. Guards against a future edit quietly reverting it.
+    #[test]
+    fn top_up_tool_declares_itself_instructions_only() {
+        let tools = super::IcTools::tool_router().list_all();
+        let tool = tools
+            .iter()
+            .find(|t| &*t.name == "icp_top_up_canister")
+            .expect("icp_top_up_canister tool not found");
+        let desc = tool.description.as_deref().unwrap_or_default();
+        assert!(desc.contains("PROVIDED FOR COMPLETENESS"), "{desc}");
+        assert!(desc.contains("does NOT implement the operation"), "{desc}");
+        assert!(desc.contains("never moves cycles or ICP"), "{desc}");
     }
 
     // EVERY tool must declare an outputSchema so a model knows the shape of its

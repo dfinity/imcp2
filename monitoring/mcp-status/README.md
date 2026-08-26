@@ -107,6 +107,63 @@ the host and runs it as the `imcp-status.service` systemd unit (bound to
 publishes it at `https://<domain>/status/`, and the CI workflow runs the unit
 tests below before rolling out. See the deploy README for details.
 
+### Publishing to an Atlassian Statuspage (status.internetcomputer.org)
+
+`server.js` can mirror the dashboard's overall verdict to one component on an
+Atlassian Statuspage — the mechanism that puts MCP health on
+[status.internetcomputer.org](https://status.internetcomputer.org/), which is
+hosted SaaS whose components cannot be served from a repository, only driven
+through its [REST API](https://developer.statuspage.io/). The pusher
+(`statuspage.js`) is **off by default** and starts only when all three of these
+are set:
+
+| Variable | Value |
+| -------- | ----- |
+| `STATUSPAGE_PAGE_ID` | The page id (visible in the Statuspage admin, or as `page.id` in `https://<page>/api/v2/status.json`). |
+| `STATUSPAGE_API_KEY` | An API key minted in the Statuspage admin (read from the environment, never argv; never logged). |
+| `STATUSPAGE_COMPONENT_ID` | The id of the component to drive. |
+
+One-time setup in the Statuspage admin: create the component (e.g. **"ICP MCP
+server"**, optionally inside an existing group), mint an API key, and note the
+page and component ids. On a deployed host, put the three variables in
+`/etc/imcp-status/statuspage.env` (mode `600`, owner root) — the systemd unit
+loads that file if present — and `systemctl restart imcp-status`.
+
+The mapping is intentionally coarse (a public status page is not the detailed
+dashboard):
+
+| Dashboard verdict | Statuspage component status |
+| ----------------- | --------------------------- |
+| `pass` | `operational` |
+| `warn` | `degraded_performance` |
+| `fail`, but some service-availability checks still pass | `partial_outage` |
+| `fail` with every service-availability check failing | `major_outage` |
+
+"Service-availability checks" are the endpoint probes that report `fail` on a
+failed request (landing page, discovery documents, the `/mcp` challenge, and
+the OAuth endpoints). Auxiliary checks are excluded from the major-outage
+test on purpose: `version` and `metadata-consistency` only degrade to `warn`
+when the server is unreachable, and the TLS check can stay green while the
+application behind the proxy is down — counting them would make a total
+outage report as merely partial.
+
+The pusher re-evaluates every `STATUSPAGE_PUSH_INTERVAL_MS` (default 60 s,
+floor 15 s) and PATCHes the component **only when the mapped status changes**
+(plus once at startup, since a restarted process cannot know the remote state)
+— so a healthy steady state costs one API call per process lifetime. A failed
+push is logged and retried on the next interval; it never affects the dashboard
+itself.
+
+Unlike visitor-triggered probe runs, the pusher's own runs are
+**non-mutating**: it reuses a recent visitor-triggered report when one exists,
+and otherwise probes with both registration checks skipped. The loopback
+Dynamic Client Registration probe changes server state on every run (it mints
+and persists a client_id in the server's LRU-bounded registration store), and
+the allow-list probe would do the same whenever the server's guard regressed —
+the very failure it detects — so an unattended periodic loop runs neither.
+Both probes are still exercised by every interactive dashboard visit and CLI
+run.
+
 ## Why a standalone tool (and not a page in the II frontend)?
 
 The II frontend is a **static, prerendered, `ssr: false` SvelteKit app** served
