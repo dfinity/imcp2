@@ -110,6 +110,17 @@ fi
 # environment, so it must not share a user with the internet-facing imcp2
 # service (same-UID processes can read each other's /proc/<pid>/environ).
 id imcp-status >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin imcp-status
+# Execute a ROOT-OWNED copy of the dashboard source, not the staged copy under
+# $REMOTE_DIR: the staging tree is owned (and writable) by the deploy/SSH user,
+# which is also the UID the internet-facing imcp2.service runs as — a
+# compromised main service could edit server.js there and have the next
+# dashboard restart run its code in the secret-bearing service. Refresh the
+# copy on every deploy; strip group/other write (files stay world-readable, so
+# the unprivileged imcp-status user can run them).
+rm -rf /opt/imcp-status
+cp -a $REMOTE_DIR/monitoring/mcp-status /opt/imcp-status
+chown -R root:root /opt/imcp-status
+chmod -R go-w /opt/imcp-status
 cat > /etc/systemd/system/imcp-status.service <<'UNIT'
 $unit_status
 UNIT

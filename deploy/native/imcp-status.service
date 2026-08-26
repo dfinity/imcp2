@@ -9,10 +9,12 @@ Type=simple
 # internet-facing imcp2.service runs as: this process can carry a Statuspage
 # API key in its environment, and same-UID processes can read each other's
 # /proc/<pid>/environ — a compromise of the main service must not be able to
-# recover that secret. The shipped files under /opt/imcp2 are world-readable,
-# so no ownership changes are needed.
+# recover that secret. For the same reason the unit executes the ROOT-OWNED
+# copy deploy.sh installs at /opt/imcp-status, not the ec2-user-writable
+# staging tree under /opt/imcp2/monitoring: code writable by the main
+# service's UID would hand the secret to whoever can modify it.
 User=imcp-status
-WorkingDirectory=/opt/imcp2/monitoring/mcp-status
+WorkingDirectory=/opt/imcp-status
 # Probe the public deployment end-to-end (through Caddy/TLS). Which Internet
 # Identity instances to probe is read from this server's own /version, so no II
 # origin is configured here. The allowlist is pinned to the deployment's own host
@@ -27,7 +29,7 @@ Environment=MCP_STATUS_ALLOWED_HOSTS=__ALLOWED_HOSTS__
 # the API key stays out of this repository and of the rendered unit file. The
 # leading "-" makes it optional: without the file the pusher never starts.
 EnvironmentFile=-/etc/imcp-status/statuspage.env
-ExecStart=/usr/bin/node /opt/imcp2/monitoring/mcp-status/server.js --port 8137 --host 127.0.0.1 --mcp https://__DOMAIN__
+ExecStart=/usr/bin/node /opt/imcp-status/server.js --port 8137 --host 127.0.0.1 --mcp https://__DOMAIN__
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
