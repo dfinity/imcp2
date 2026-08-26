@@ -176,14 +176,15 @@ export const parseCspDirective = (csp, directive) => {
 /**
  * @param {string} mcpOrigin
  * @param {number} timeoutMs
- * @param {{ mutating?: boolean }} [opts] With `mutating: false`, skip the one
- *   check that changes server state — the loopback Dynamic Client Registration
- *   probe, which mints and persists a fresh client_id in the server's
- *   LRU-bounded registration store on every run. Interactive uses (a person
- *   loading the dashboard, a one-off CLI run) keep the default; unattended
- *   periodic callers (the Statuspage pusher) must not grind through that store.
- *   The allow-list check stays in both modes: its non-allow-listed redirect is
- *   rejected before anything is stored, so it never mutates.
+ * @param {{ mutating?: boolean }} [opts] With `mutating: false`, skip both
+ *   registration probes. The loopback Dynamic Client Registration probe mints
+ *   and persists a fresh client_id in the server's LRU-bounded registration
+ *   store on every run. The allow-list probe stores nothing while the server's
+ *   guard holds — but if that guard ever regresses (the exact failure it
+ *   detects), each run would mint a client too, turning an unattended periodic
+ *   caller into a store-grinding loop precisely when the server is broken.
+ *   Interactive uses (a person loading the dashboard, a one-off CLI run) keep
+ *   the default and still exercise both probes.
  * @returns {Promise<{ section: Section, facts: Record<string, unknown> }>}
  */
 export const checkMcpEndpoints = async (
@@ -456,7 +457,11 @@ export const checkMcpEndpoints = async (
   //     uses a reserved `.invalid` host (RFC 2606) that can never be legitimately
   //     allow-listed by a deployment, so this can't false-alert if the allow-list
   //     is widened via OAUTH_ALLOWED_REDIRECT_PREFIXES.
-  {
+  //     Also skipped in non-mutating mode: while the guard holds this stores
+  //     nothing, but if it regressed (exactly what this probe detects) each run
+  //     would mint a client — an unattended periodic caller must not become a
+  //     store-grinding loop at the very moment the server is broken.
+  if (mutating) {
     const url = `${mcpOrigin}/mcp/oauth/register`;
     const r = await probe(url, {
       timeoutMs,

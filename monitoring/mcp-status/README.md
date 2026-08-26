@@ -156,13 +156,13 @@ itself.
 
 Unlike visitor-triggered probe runs, the pusher's own runs are
 **non-mutating**: it reuses a recent visitor-triggered report when one exists,
-and otherwise probes with the loopback Dynamic Client Registration check
-skipped — that is the one probe that changes server state (each run mints and
-persists a client_id in the server's LRU-bounded registration store), and an
-unattended periodic loop must not grind through that store. The allow-list
-check still runs (its non-allow-listed redirect is rejected before anything is
-stored), and DCR health is still verified by every interactive dashboard visit
-and CLI run.
+and otherwise probes with both registration checks skipped. The loopback
+Dynamic Client Registration probe changes server state on every run (it mints
+and persists a client_id in the server's LRU-bounded registration store), and
+the allow-list probe would do the same whenever the server's guard regressed —
+the very failure it detects — so an unattended periodic loop runs neither.
+Both probes are still exercised by every interactive dashboard visit and CLI
+run.
 
 ## Why a standalone tool (and not a page in the II frontend)?
 

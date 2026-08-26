@@ -352,16 +352,17 @@ test("checkMcpEndpoints in non-mutating mode never registers a client", async ()
     const { section } = await checkMcpEndpoints(origin, 2000, {
       mutating: false,
     });
-    // The state-mutating loopback DCR probe is skipped entirely...
+    // Both registration probes are skipped: the loopback DCR probe always
+    // mints, and the allow-list probe would mint whenever the server's guard
+    // regressed — the rest of the suite still runs.
     assert.equal(byId(section, "oauth-register"), undefined);
-    // ...while the allow-list probe (rejected before anything is stored) and
-    // the rest of the suite still run.
-    assert.equal(byId(section, "oauth-register-allowlist").status, "pass");
+    assert.equal(byId(section, "oauth-register-allowlist"), undefined);
     assert.equal(byId(section, "root").status, "pass");
-    assert.equal(registerRedirects.length, 1);
-    assert.ok(
-      !registerRedirects[0].includes("127.0.0.1"),
-      "no loopback (minting) registration may be sent in non-mutating mode",
+    assert.equal(byId(section, "oauth-token").status, "pass");
+    assert.equal(
+      registerRedirects.length,
+      0,
+      "no registration request of any kind may be sent in non-mutating mode",
     );
   } finally {
     restore();
