@@ -37,6 +37,22 @@ export const DEFAULT_PUSH_INTERVAL_MS = 60_000;
 export const MIN_PUSH_INTERVAL_MS = 15_000;
 
 /**
+ * Maximum push-loop interval: Node's timers take a signed 32-bit delay, and
+ * setInterval coerces anything larger to 1 ms (with a TimeoutOverflowWarning) —
+ * so an uncapped oversized value would fire near-continuously, the exact
+ * opposite of what the operator asked for and of the minimum-interval floor.
+ */
+export const MAX_PUSH_INTERVAL_MS = 2 ** 31 - 1;
+
+/**
+ * Timeout for each Statuspage API request. Without one, a stalled request
+ * would keep the tick's in-flight promise pending forever — every later tick
+ * joins the in-flight run rather than starting a new one, so the pusher would
+ * wedge and the public component would stay stale indefinitely.
+ */
+export const PUSH_TIMEOUT_MS = 10_000;
+
+/**
  * @typedef {"operational" | "degraded_performance" | "partial_outage" | "major_outage"} ComponentStatus
  *
  * @typedef {Object} StatuspageConfig
@@ -119,15 +135,19 @@ export const resolveStatuspageConfig = (env = process.env) => {
   }
 
   // Coerce the interval like resolveConfig does for the probe timeout: garbage
-  // falls back to the default, and a too-small value is floored rather than
+  // falls back to the default, a too-small value is floored rather than
   // honoured (each cycle can trigger a full probe run against the monitored
-  // server, and Statuspage rate-limits its API).
+  // server, and Statuspage rate-limits its API), and a too-large value is
+  // capped below Node's 32-bit timer limit (see MAX_PUSH_INTERVAL_MS).
   const rawInterval = env.STATUSPAGE_PUSH_INTERVAL_MS
     ? Number(env.STATUSPAGE_PUSH_INTERVAL_MS)
     : DEFAULT_PUSH_INTERVAL_MS;
   const intervalMs =
     Number.isFinite(rawInterval) && rawInterval > 0
-      ? Math.max(rawInterval, MIN_PUSH_INTERVAL_MS)
+      ? Math.min(
+          Math.max(rawInterval, MIN_PUSH_INTERVAL_MS),
+          MAX_PUSH_INTERVAL_MS,
+        )
       : DEFAULT_PUSH_INTERVAL_MS;
 
   const apiBase = (
@@ -165,6 +185,9 @@ export const pushComponentStatus = async (config, status, fetchImpl = fetch) => 
       "content-type": "application/json",
     },
     body: JSON.stringify({ component: { status } }),
+    // Bound the request like the dashboard probes bound theirs: a stalled
+    // PATCH must become a retryable error, not an eternally in-flight tick.
+    signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
   });
   if (res.status !== 200) {
     throw new Error(`Statuspage API responded ${res.status}`);
@@ -182,7 +205,14 @@ export const pushComponentStatus = async (config, status, fetchImpl = fetch) => 
  * @returns {string}
  */
 const describeError = (e, apiKey) => {
-  const raw = String((e && /** @type {any} */ (e).message) || e).slice(0, 300);
+  // Redact BEFORE truncating: capping first could cut the message in the
+  // middle of an embedded key, and the surviving prefix would no longer match
+  // the full-key replacement below.
+  const full = String((e && /** @type {any} */ (e).message) || e);
+  const raw = (apiKey ? full.split(apiKey).join("[redacted]") : full).slice(
+    0,
+    300,
+  );
   let out = "";
   for (const ch of raw) {
     const code = /** @type {number} */ (ch.codePointAt(0));
@@ -194,7 +224,7 @@ const describeError = (e, apiKey) => {
       code === 0x2029;
     out += dangerous ? " " : ch;
   }
-  return apiKey ? out.split(apiKey).join("[redacted]") : out;
+  return out;
 };
 
 /**

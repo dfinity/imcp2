@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import {
   DEFAULT_PUSH_INTERVAL_MS,
   DEFAULT_STATUSPAGE_API_BASE,
+  MAX_PUSH_INTERVAL_MS,
   MIN_PUSH_INTERVAL_MS,
   componentStatusFor,
   pushComponentStatus,
@@ -110,6 +111,16 @@ test("resolveStatuspageConfig: interval is floored and garbage falls back", () =
   assert.equal(garbage.config?.intervalMs, DEFAULT_PUSH_INTERVAL_MS);
 });
 
+test("resolveStatuspageConfig: an oversized interval is capped, not overflowed", () => {
+  // Node's setInterval coerces delays above 2^31-1 ms to 1 ms, which would turn
+  // a mistyped huge interval into near-continuous probing.
+  const { config } = resolveStatuspageConfig({
+    ...FULL_ENV,
+    STATUSPAGE_PUSH_INTERVAL_MS: "9999999999999",
+  });
+  assert.equal(config?.intervalMs, MAX_PUSH_INTERVAL_MS);
+});
+
 test("resolveStatuspageConfig: a non-id value warns and stays off", () => {
   const { config, warning } = resolveStatuspageConfig({
     ...FULL_ENV,
@@ -137,6 +148,8 @@ test("pushComponentStatus PATCHes the component with the OAuth header", async ()
   assert.deepEqual(JSON.parse(calls[0].init.body), {
     component: { status: "operational" },
   });
+  // A stalled request must abort rather than pin the tick in flight forever.
+  assert.ok(calls[0].init.signal instanceof AbortSignal);
 });
 
 test("pushComponentStatus throws on a non-200 without leaking details", async () => {
@@ -196,6 +209,27 @@ test("pusher retries after a failed push instead of marking it done", async () =
   apiUp = true;
   await pusher.tick(); // same status as the failed attempt: must push now
   assert.deepEqual(pushes, ["operational"]);
+});
+
+test("pusher redacts the API key even when it straddles the log cap", async () => {
+  const { config } = resolveStatuspageConfig(FULL_ENV);
+  const logs = [];
+  const pusher = startStatuspagePusher({
+    getReport: async () => {
+      // Place the key across the 300-character truncation boundary (chars
+      // 289-300): redaction must run on the full message first, or truncating
+      // first would leave the surviving prefix "sk-test-ke" unredacted.
+      throw new Error("x".repeat(289) + "sk-test-key trailing");
+    },
+    config,
+    fetchImpl: async () => ({ status: 200 }),
+    log: (line) => logs.push(line),
+  });
+  pusher.stop();
+  await pusher.tick();
+  assert.equal(logs.length, 1);
+  assert.ok(!logs[0].includes("sk-t"));
+  assert.ok(logs[0].includes("[redacted]"));
 });
 
 test("pusher survives a probe failure and logs it", async () => {
