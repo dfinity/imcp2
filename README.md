@@ -406,7 +406,8 @@ themselves, in their own terminal, with keys they control. The tool exists for
 completeness — to reflect the Internet Computer platform capability — not to
 perform the operation on the user's behalf.
 
-`cycles` takes precedence if both are given. Lifecycle calls
+`cycles` takes precedence if both are given to `icp_create_canister`. Lifecycle
+calls
 (`icp_install_code`, `icp_canister_status`, `icp_update_canister_settings`,
 `start`/`stop`/`uninstall`/`delete`) go to the management canister (`aaaaa-aa`)
 with the effective canister id set to the target. `icp_install_code` takes the

