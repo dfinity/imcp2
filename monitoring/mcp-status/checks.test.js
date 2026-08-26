@@ -303,6 +303,71 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
   }
 });
 
+test("checkMcpEndpoints in non-mutating mode never registers a client", async () => {
+  const origin = "https://mcp.beta.test";
+  /** @type {string[]} */
+  const registerRedirects = [];
+  const restore = stubFetch({
+    [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
+    [`GET ${origin}/version`]: resp(200, {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ version: "0.1.0", commit: "abc123def4567890" }),
+    }),
+    [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        authorization_servers: [`${origin}/mcp`],
+        resource: `${origin}/mcp`,
+      }),
+    }),
+    [`GET ${origin}/.well-known/oauth-authorization-server`]: resp(200, {
+      body: JSON.stringify({
+        issuer: `${origin}/mcp`,
+        authorization_endpoint: `${origin}/mcp/oauth/authorize`,
+        token_endpoint: `${origin}/mcp/oauth/token`,
+        registration_endpoint: `${origin}/mcp/oauth/register`,
+        code_challenge_methods_supported: ["S256"],
+      }),
+    }),
+    [`POST ${origin}/mcp`]: resp(401, {
+      headers: {
+        "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
+      },
+      body: JSON.stringify({ error: "invalid_token" }),
+    }),
+    [`POST ${origin}/mcp/oauth/register`]: (init) => {
+      registerRedirects.push(
+        (JSON.parse(init.body ?? "{}").redirect_uris ?? [])[0] ?? "",
+      );
+      return registerRoute(init);
+    },
+    [`GET ${origin}/mcp/oauth/authorize`]: resp(400, {
+      body: "missing client_id",
+    }),
+    [`POST ${origin}/mcp/oauth/token`]: resp(400, {
+      body: JSON.stringify({ error: "invalid_grant" }),
+    }),
+  });
+  try {
+    const { section } = await checkMcpEndpoints(origin, 2000, {
+      mutating: false,
+    });
+    // The state-mutating loopback DCR probe is skipped entirely...
+    assert.equal(byId(section, "oauth-register"), undefined);
+    // ...while the allow-list probe (rejected before anything is stored) and
+    // the rest of the suite still run.
+    assert.equal(byId(section, "oauth-register-allowlist").status, "pass");
+    assert.equal(byId(section, "root").status, "pass");
+    assert.equal(registerRedirects.length, 1);
+    assert.ok(
+      !registerRedirects[0].includes("127.0.0.1"),
+      "no loopback (minting) registration may be sent in non-mutating mode",
+    );
+  } finally {
+    restore();
+  }
+});
+
 test("checkMcpEndpoints flags a missing OAuth challenge", async () => {
   const origin = "https://mcp.beta.test";
   const restore = stubFetch({

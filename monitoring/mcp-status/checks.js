@@ -176,9 +176,21 @@ export const parseCspDirective = (csp, directive) => {
 /**
  * @param {string} mcpOrigin
  * @param {number} timeoutMs
+ * @param {{ mutating?: boolean }} [opts] With `mutating: false`, skip the one
+ *   check that changes server state — the loopback Dynamic Client Registration
+ *   probe, which mints and persists a fresh client_id in the server's
+ *   LRU-bounded registration store on every run. Interactive uses (a person
+ *   loading the dashboard, a one-off CLI run) keep the default; unattended
+ *   periodic callers (the Statuspage pusher) must not grind through that store.
+ *   The allow-list check stays in both modes: its non-allow-listed redirect is
+ *   rejected before anything is stored, so it never mutates.
  * @returns {Promise<{ section: Section, facts: Record<string, unknown> }>}
  */
-export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
+export const checkMcpEndpoints = async (
+  mcpOrigin,
+  timeoutMs,
+  { mutating = true } = {},
+) => {
   /** @type {CheckResult[]} */
   const checks = [];
   /** @type {Record<string, unknown>} */
@@ -397,7 +409,10 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
   //    with a LOOPBACK redirect: loopback is always permitted (the hosted-redirect
   //    allow-list exempts it), so this is the dependency-free way to confirm a
   //    client can self-register without manual approval, which is what DCR is for.
-  {
+  //    Skipped in non-mutating mode: this is the one probe that changes server
+  //    state (the minted client_id is persisted in the LRU-bounded registration
+  //    store), so an unattended periodic caller must not run it.
+  if (mutating) {
     const url = `${mcpOrigin}/mcp/oauth/register`;
     const r = await probe(url, {
       timeoutMs,
@@ -1003,13 +1018,17 @@ export const buildSuggestions = (sections, facts) => {
 
 /**
  * Run the full dashboard against the resolved configuration.
- * @param {{ mcpOrigin?: string, iiOrigin?: string, timeoutMs?: number }} [overrides]
+ * @param {{ mcpOrigin?: string, iiOrigin?: string, timeoutMs?: number, mutating?: boolean }} [overrides]
+ *   `mutating: false` skips the one probe that changes server state (the
+ *   loopback Dynamic Client Registration check) — see checkMcpEndpoints.
  * @returns {Promise<DashboardReport>}
  */
 export const runDashboard = async (overrides = {}) => {
   const cfg = resolveConfig(overrides);
 
-  const endpoints = await checkMcpEndpoints(cfg.mcpOrigin, cfg.timeoutMs);
+  const endpoints = await checkMcpEndpoints(cfg.mcpOrigin, cfg.timeoutMs, {
+    mutating: overrides.mutating !== false,
+  });
 
   // Which IIs to probe. Normally the ones the server advertises at /version —
   // it is the authority on its own pairing, and it lists every mount, so both a

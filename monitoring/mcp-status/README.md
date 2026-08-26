@@ -148,11 +148,21 @@ application behind the proxy is down — counting them would make a total
 outage report as merely partial.
 
 The pusher re-evaluates every `STATUSPAGE_PUSH_INTERVAL_MS` (default 60 s,
-floor 15 s), reusing the same cached probe runs as dashboard visitors, and
-PATCHes the component **only when the mapped status changes** (plus once at
-startup, since a restarted process cannot know the remote state) — so a healthy
-steady state costs one API call per process lifetime. A failed push is logged
-and retried on the next interval; it never affects the dashboard itself.
+floor 15 s) and PATCHes the component **only when the mapped status changes**
+(plus once at startup, since a restarted process cannot know the remote state)
+— so a healthy steady state costs one API call per process lifetime. A failed
+push is logged and retried on the next interval; it never affects the dashboard
+itself.
+
+Unlike visitor-triggered probe runs, the pusher's own runs are
+**non-mutating**: it reuses a recent visitor-triggered report when one exists,
+and otherwise probes with the loopback Dynamic Client Registration check
+skipped — that is the one probe that changes server state (each run mints and
+persists a client_id in the server's LRU-bounded registration store), and an
+unattended periodic loop must not grind through that store. The allow-list
+check still runs (its non-allow-listed redirect is rejected before anything is
+stored), and DCR health is still verified by every interactive dashboard visit
+and CLI run.
 
 ## Why a standalone tool (and not a page in the II frontend)?
 

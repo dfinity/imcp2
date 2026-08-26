@@ -88,6 +88,32 @@ const getReport = (force = false) => {
   return inFlight;
 };
 
+// Report source for the periodic Statuspage pusher. Unlike visitor-triggered
+// probes, this runs unattended around the clock, and the full suite's Dynamic
+// Client Registration check mints and persists a client_id on the monitored
+// server per run — a 60 s loop would grind ~1,440 junk registrations a day
+// through the server's LRU-bounded client store. So: reuse a recent
+// visitor-triggered full report when one exists (it was already paid for), and
+// otherwise probe with `mutating: false`, which skips only the DCR check. The
+// non-mutating report is deliberately NOT stored in the visitor cache — it is
+// missing that check, and /api/status promises the full suite.
+/** @type {Promise<import("./checks.js").DashboardReport> | null} */
+let pusherInFlight = null;
+/** @param {number} maxAgeMs how recent a full report must be to be reused. */
+const getPusherReport = (maxAgeMs) => {
+  if (cache.report && Date.now() - cache.at < maxAgeMs) {
+    return Promise.resolve(cache.report);
+  }
+  if (!pusherInFlight) {
+    pusherInFlight = runDashboard({ ...defaults, mutating: false }).finally(
+      () => {
+        pusherInFlight = null;
+      },
+    );
+  }
+  return pusherInFlight;
+};
+
 const sendJson = (res, code, body) => {
   const payload = JSON.stringify(body);
   res.writeHead(code, {
@@ -170,13 +196,17 @@ server.listen(port, host, () => {
 
 // Optionally mirror the verdict to an Atlassian Statuspage component (e.g. on
 // status.internetcomputer.org). Off unless the STATUSPAGE_* variables are set —
-// see statuspage.js and the README. The pusher shares getReport's cache with
-// dashboard visitors, so it adds at most one probe run per interval.
+// see statuspage.js and the README. The pusher reuses a recent visitor-triggered
+// report when one exists and otherwise probes without the state-mutating DCR
+// check (see getPusherReport), so it never registers OAuth clients on its own.
 const { config: statuspageConfig, warning: statuspageWarning } =
   resolveStatuspageConfig();
 if (statuspageWarning) console.error(statuspageWarning);
 if (statuspageConfig) {
-  startStatuspagePusher({ getReport, config: statuspageConfig });
+  startStatuspagePusher({
+    getReport: () => getPusherReport(statuspageConfig.intervalMs),
+    config: statuspageConfig,
+  });
   process.stdout.write(
     `  statuspage: pushing to component ${statuspageConfig.componentId} ` +
       `(page ${statuspageConfig.pageId}) every ${statuspageConfig.intervalMs} ms\n`,
