@@ -19,7 +19,8 @@
 //! and `transferFrom` all match, and it applies on ANY target canister:
 //! whether a given canister really is a ledger cannot be established
 //! reliably, and the cost of a false positive is only that the user is
-//! pointed at their own wallet or the app's own frontend.
+//! pointed at their own wallet, the app's own frontend, or (for the
+//! canister-creation spends) the dedicated icp_create_canister tool.
 //!
 //! Two scope notes, so nobody over-claims what this guard does:
 //!
@@ -60,10 +61,15 @@ const DISALLOWED_METHODS: &[(&str, &str)] = &[
     ("transfer", "a ledger token transfer"),
     ("senddfx", "a legacy ICP-ledger transfer"),
     ("notifydfx", "a legacy ICP-ledger transfer notification"),
-    // The cycles ledger's value movement (withdraw, withdraw_from) — the
-    // cycles ledger is ICRC-1/-2 plus these, and they move the user's cycles.
+    // The cycles ledger's value movement (withdraw, withdraw_from, and the
+    // canister-creation spends create_canister / create_canister_from) — the
+    // cycles ledger is ICRC-1/-2 plus these, and they all move the user's
+    // cycles. Creation stays available through the dedicated
+    // icp_create_canister tool; this closes the uncontrolled generic route.
     ("withdraw", "a cycles-ledger withdrawal"),
     ("withdrawfrom", "a cycles-ledger delegated withdrawal"),
+    ("createcanister", "a cycles-ledger spend (canister creation)"),
+    ("createcanisterfrom", "a cycles-ledger delegated spend (canister creation)"),
     // ERC-20-style names fixed by the older IC token standards (DIP20's
     // transferFrom/approve; `transfer` is already listed above).
     ("transferfrom", "a delegated token transfer"),
@@ -78,16 +84,26 @@ pub fn disallowed_update_method(method: &str) -> Option<String> {
     let normalized = normalize(method);
     let (_, what) = DISALLOWED_METHODS.iter().find(|(m, _)| *m == normalized)?;
     let method = method.trim();
+    // Canister creation has a supported, purpose-built route, so its refusal
+    // redirects there; everything else redirects to a user-controlled wallet
+    // or frontend in the user's own browser.
+    let instead = if normalized.starts_with("createcanister") {
+        "For creating and funding the user's own canisters, use the dedicated \
+         icp_create_canister tool (or the icp CLI) instead of calling the cycles \
+         ledger through this generic tool."
+    } else {
+        "Recommend that the user performs this operation themselves, in a wallet \
+         or app frontend they control, in their own web browser — e.g. their \
+         wallet at https://oisy.com, or for governance the NNS dapp at \
+         https://nns.ic0.app."
+    };
     Some(format!(
-        "`{method}` is {what} — a financial transaction — and this server does not \
+        "`{method}` is {what} — a financial transaction — and this tool does not \
          initiate or execute financial transactions (token transfers, spending \
          approvals, payments, or trades) on the user's behalf. Methods defined by the \
          ICRC-1/ICRC-2 and related ledger standards are refused on every canister, \
-         for marketplace compliance and user safety. Recommend that the user performs \
-         this operation themselves, in a wallet or app frontend they control, in \
-         their own web browser — e.g. their wallet at https://oisy.com, or for \
-         governance the NNS dapp at https://nns.ic0.app. Do not look for another \
-         route to the same operation through this server."
+         for marketplace compliance and user safety. {instead} Do not look for another \
+         route to the same operation through this tool."
     ))
 }
 
@@ -144,6 +160,19 @@ mod tests {
                 disallowed_update_method(method).is_some(),
                 "{method} must be refused"
             );
+        }
+    }
+
+    // The cycles ledger's canister-creation spends are refused on the generic
+    // route, and their refusal redirects to the purpose-built tool rather
+    // than to a wallet.
+    #[test]
+    fn refuses_cycles_ledger_creation_spends_with_tool_redirect() {
+        for method in ["create_canister", "create_canister_from", "CreateCanister"] {
+            let msg = disallowed_update_method(method)
+                .unwrap_or_else(|| panic!("{method} must be refused"));
+            assert!(msg.contains("icp_create_canister"), "{msg}");
+            assert!(!msg.contains("oisy.com"), "creation redirects to the tool, not a wallet: {msg}");
         }
     }
 
