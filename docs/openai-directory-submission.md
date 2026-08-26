@@ -109,24 +109,26 @@ financial-transfers prohibition:
 - Commerce rules ("only for physical goods", no digital-goods selling, no
   embedded checkout) govern *selling through the app*; IMCP2 sells nothing.
 - The attestation "my plugin does not initiate or execute money transfers,
-  crypto transfers, or investment trades on behalf of users" is now
-  supported by shipped behavior: `canister_update_call` refuses the
-  standardized ledger transfer/approval methods (ICRC-1/ICRC-2 and related
-  standards, the ICP ledger's legacy `transfer`, the cycles ledger's
-  `withdraw`) on every canister and says so in its description
-  ([#154](https://github.com/dfinity/imcp2/pull/154)); `icp_top_up_canister`
-  is instructions-only and executes nothing
+  crypto transfers, or investment trades on behalf of users" is addressed by
+  two shipped **mitigations** — not yet grounds to check the box:
+  `canister_update_call` refuses the standardized ledger transfer/approval
+  methods (ICRC-1/ICRC-2 and related standards, the ICP ledger's legacy
+  `transfer`, the cycles ledger's `withdraw` and `create_canister` spends) on
+  every canister and says so in its description
+  ([#154](https://github.com/dfinity/imcp2/pull/154)), and
+  `icp_top_up_canister` is instructions-only and executes nothing
   ([#153](https://github.com/dfinity/imcp2/pull/153)); README, landing page,
   and server instructions state the server is not intended for financial
-  operations. Declare two caveats honestly at the attestations step:
-  `icp_create_canister`'s `icp` argument still executes an ICP→cycles
-  conversion from the user's own ledger account (metered compute funding
-  for the user's own canister — decide explicitly whether to keep, drop, or
-  restrict it before attesting), and the method-name guard covers the
-  standardized ledger surface rather than every bespoke canister. There is
-  no published pre-submission contact at OpenAI equivalent to
-  mcp-review@anthropic.com; the attestations step is where this is
-  declared.
+  operations. Two direct counterexamples to the attestation's absolute
+  wording remain open and need a decision BEFORE it can be checked
+  truthfully: `icp_create_canister`'s `icp` argument still executes an
+  ICP→cycles conversion from the user's own ledger account (metered compute
+  funding for the user's own canister — keep, drop, or restrict it), and the
+  method-name guard covers the standardized ledger surface rather than every
+  bespoke canister. Whatever the decision, declare it honestly at the
+  attestations step. There is no published pre-submission contact at OpenAI
+  equivalent to mcp-review@anthropic.com; the attestations step is where
+  this is declared.
 
 ### 4. Test cases (authoring work)
 

@@ -1778,7 +1778,8 @@ impl From<(String, Vec<Match>)> for FindCanisterOutput {
 /// Arguments for `icp_find_app_by_name`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FindAppArgs {
-    /// The app name to look up, e.g. "Oisy", "NNS".
+    /// The app name to look up, e.g. "NNS". For a site you already know
+    /// (e.g. "opencloud.org"), use open_app / resolve_app directly.
     pub name: String,
 }
 
