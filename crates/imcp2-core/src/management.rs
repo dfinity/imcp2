@@ -400,17 +400,14 @@ pub fn top_up_instructions(args: TopUpArgs) -> Result<TopUpInstructions, String>
          execute top-ups on your behalf. This \
          tool exists for completeness — topping up canisters is an Internet \
          Computer platform capability — but the operation itself is yours to run, \
-         from your own terminal:\n\
+         from your own terminal, with the icp CLI:\n\
          \n\
-         Using the icp CLI (recommended):\n\
-         \x20 1. Check your cycles-ledger balance:  icp cycles balance -n ic\n\
-         \x20 2. (If needed) convert ICP to cycles: icp cycles mint --icp {icp} -n ic\n\
-         \x20 3. Deposit cycles onto the canister:  icp canister top-up {target} --amount {cycles} -e ic\n\
+         \x20 1. Get the icp CLI (if needed):       npm install -g @icp-sdk/icp-cli\n\
+         \x20    (Node.js >= 22; other installers: https://github.com/dfinity/icp-cli/releases)\n\
+         \x20 2. Check your cycles-ledger balance:  icp cycles balance -n ic\n\
+         \x20 3. (If needed) convert ICP to cycles: icp cycles mint --icp {icp} -n ic\n\
+         \x20 4. Deposit cycles onto the canister:  icp canister top-up {target} --amount {cycles} -e ic\n\
          \x20    (--amount accepts k/m/b/t suffixes, e.g. --amount 600b)\n\
-         \n\
-         Using dfx:\n\
-         \x20 - From your cycles-ledger balance:    dfx cycles top-up {cycles} {target} --network ic\n\
-         \x20 - By converting ICP via the CMC:      dfx ledger top-up {target} --amount {icp} --network ic\n\
          \n\
          For the full funding guide, load the official cycles-management skill \
          (icp_get_skill with name \"cycles-management\")."
@@ -1230,9 +1227,15 @@ mod tests {
             "{}",
             out.instructions
         );
+        // Where to get the CLI is part of the instructions: an npm one-liner
+        // inline, plus the releases page for the other installers.
         assert!(
+            out.instructions.contains("npm install -g @icp-sdk/icp-cli"),
+            "{}",
             out.instructions
-                .contains("dfx cycles top-up 600000000000 ryjl3-tyaaa-aaaaa-aaaba-cai --network ic"),
+        );
+        assert!(
+            out.instructions.contains("https://github.com/dfinity/icp-cli/releases"),
             "{}",
             out.instructions
         );
@@ -1252,11 +1255,10 @@ mod tests {
         assert!(!out.executed);
         assert!(out.instructions.contains("icp cycles mint --icp 0.5 -n ic"), "{}", out.instructions);
         assert!(
-            out.instructions.contains("dfx ledger top-up aaaaa-aa --amount 0.5 --network ic"),
+            out.instructions.contains("icp canister top-up aaaaa-aa --amount <CYCLES> -e ic"),
             "{}",
             out.instructions
         );
-        assert!(out.instructions.contains("--amount <CYCLES>"), "{}", out.instructions);
     }
 
     // The echoed amounts are advertised as copy-pastable, so junk is rejected

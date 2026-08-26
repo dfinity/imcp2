@@ -1354,7 +1354,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "How to add cycles to an existing canister. PROVIDED FOR COMPLETENESS, to reflect this capability of the Internet Computer platform: the tool does NOT implement the operation on the user's behalf — it never moves cycles or ICP and executes nothing on chain. It returns step-by-step CLI instructions (the icp CLI, or dfx) for the USER to run the top-up themselves in their own terminal. Pass `cycles` or `icp` only to have the intended amount substituted into the printed commands. For the full funding guide, load the cycles-management skill (icp_get_skill).",
+        description = "How to add cycles to an existing canister. PROVIDED FOR COMPLETENESS, to reflect this capability of the Internet Computer platform: the tool does NOT implement the operation on the user's behalf — it never moves cycles or ICP and executes nothing on chain. It returns step-by-step icp CLI instructions (including where to get the CLI) for the USER to run the top-up themselves in their own terminal. Pass `cycles` or `icp` only to have the intended amount substituted into the printed commands. For the full funding guide, load the cycles-management skill (icp_get_skill).",
         // Instructions-only: no session, no canister call, no funds movement — a
         // pure read, and closed-world (nothing leaves the server).
         annotations(title = "How to top up a canister", read_only_hint = true, destructive_hint = false, open_world_hint = false),
