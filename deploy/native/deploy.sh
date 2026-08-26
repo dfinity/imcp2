@@ -110,6 +110,11 @@ fi
 # environment, so it must not share a user with the internet-facing imcp2
 # service (same-UID processes can read each other's /proc/<pid>/environ).
 id imcp-status >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin imcp-status
+# Root-only directory for the optional Statuspage credentials
+# (/etc/imcp-status/statuspage.env, mode 600 — see the mcp-status README).
+# Provisioned here so the documented setup step works on a fresh host; systemd
+# reads the EnvironmentFile as root, so no other user needs access.
+install -d -m 700 -o root -g root /etc/imcp-status
 # Execute a ROOT-OWNED copy of the dashboard source, not the staged copy under
 # $REMOTE_DIR: the staging tree is owned (and writable) by the deploy/SSH user,
 # which is also the UID the internet-facing imcp2.service runs as — a
