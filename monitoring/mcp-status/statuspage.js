@@ -29,6 +29,8 @@
 //   STATUSPAGE_API_BASE          API base URL override — for tests and mocks
 //                                only (default https://api.statuspage.io/v1).
 
+import { sanitizeForLog } from "./log.js";
+
 /** Default Statuspage REST API base URL. */
 export const DEFAULT_STATUSPAGE_API_BASE = "https://api.statuspage.io/v1";
 
@@ -231,36 +233,18 @@ export const pushComponentStatus = async (config, status, fetchImpl = fetch) => 
 };
 
 /**
- * Reduce an error to a single safe log line: message only (no stack), control
- * characters stripped (so a network error cannot forge log entries — same
- * rationale as server.js's sanitiser), capped in length, and with the API key
- * redacted should it ever leak into a message.
+ * Reduce an error to a single safe log line: the API key is redacted first —
+ * BEFORE the shared sanitiser truncates, since capping first could cut the
+ * message in the middle of an embedded key and the surviving prefix would no
+ * longer match the full-key replacement.
  *
  * @param {unknown} e
  * @param {string} apiKey
  * @returns {string}
  */
 const describeError = (e, apiKey) => {
-  // Redact BEFORE truncating: capping first could cut the message in the
-  // middle of an embedded key, and the surviving prefix would no longer match
-  // the full-key replacement below.
   const full = String((e && /** @type {any} */ (e).message) || e);
-  const raw = (apiKey ? full.split(apiKey).join("[redacted]") : full).slice(
-    0,
-    300,
-  );
-  let out = "";
-  for (const ch of raw) {
-    const code = /** @type {number} */ (ch.codePointAt(0));
-    const dangerous =
-      code < 0x20 ||
-      code === 0x7f ||
-      (code >= 0x80 && code <= 0x9f) ||
-      code === 0x2028 ||
-      code === 0x2029;
-    out += dangerous ? " " : ch;
-  }
-  return out;
+  return sanitizeForLog(apiKey ? full.split(apiKey).join("[redacted]") : full);
 };
 
 /**

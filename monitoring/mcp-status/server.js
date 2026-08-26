@@ -22,6 +22,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { runDashboard } from "./checks.js";
+import { sanitizeForLog } from "./log.js";
 import {
   resolveStatuspageConfig,
   startStatuspagePusher,
@@ -101,9 +102,17 @@ const getReport = (force = false) => {
 let pusherInFlight = null;
 /** @param {number} maxAgeMs how recent a full report must be to be reused. */
 const getPusherReport = (maxAgeMs) => {
-  if (cache.report && Date.now() - cache.at < maxAgeMs) {
+  // Bound reuse by the dashboard cache TTL as well as the push interval:
+  // reusing a report /api/status already considers expired would let a tick
+  // publish stale state, delaying an outage by up to two intervals.
+  const maxAge = Math.min(maxAgeMs, CACHE_TTL_MS);
+  if (cache.report && Date.now() - cache.at < maxAge) {
     return Promise.resolve(cache.report);
   }
+  // A visitor-triggered full run that is already in flight satisfies the
+  // pusher too — join it rather than doubling the probe load with a second
+  // concurrent suite.
+  if (inFlight) return inFlight;
   if (!pusherInFlight) {
     pusherInFlight = runDashboard({ ...defaults, mutating: false }).finally(
       () => {
@@ -122,27 +131,6 @@ const sendJson = (res, code, body) => {
     "content-length": Buffer.byteLength(payload),
   });
   res.end(payload);
-};
-
-// Replace control characters with spaces and cap the length, so that a logged
-// error message can never forge or inject additional log entries. Covers C0
-// controls + DEL, the C1 controls (U+0080–U+009F, incl. U+009B the 8-bit CSI),
-// and the Unicode line/paragraph separators (U+2028/U+2029). Implemented with a
-// codepoint filter to avoid embedding control-char literals.
-const sanitizeForLog = (value) => {
-  const input = String((value && value.message) || value).slice(0, 300);
-  let out = "";
-  for (const ch of input) {
-    const code = ch.codePointAt(0);
-    const dangerous =
-      code < 0x20 ||
-      code === 0x7f ||
-      (code >= 0x80 && code <= 0x9f) ||
-      code === 0x2028 ||
-      code === 0x2029;
-    out += dangerous ? " " : ch;
-  }
-  return out;
 };
 
 const server = http.createServer(async (req, res) => {
