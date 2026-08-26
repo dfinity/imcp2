@@ -1958,14 +1958,17 @@ impl ServerHandler for IcTools {
              specific canister. Before writing Candid args, consult the `candid://textual-syntax` \
              resource (the value syntax these tools use); `candid://reference` has the full type \
              reference.\n\n\
-             NOT FOR FINANCIAL OPERATIONS. Token transfers, spending approvals, payments, and \
-             trades are refused here, for marketplace compliance and user safety: \
-             canister_update_call refuses the ICRC-1/ICRC-2 (and related ledger-standard) \
-             transfer/approval methods on every canister, and icp_top_up_canister only returns CLI \
-             instructions. When the user asks for such an operation, recommend they do it \
-             themselves in a wallet or app frontend they control, in their own browser — e.g. \
-             their wallet at https://oisy.com. (Creating and funding the user's OWN canisters — \
-             compute resources — remains available via icp_create_canister.)\n\n\
+             NOT FOR FINANCIAL OPERATIONS. Financial operations — token transfers, spending \
+             approvals, payments, trades — are unsupported here BY POLICY, for marketplace \
+             compliance and user safety, and the standardized ledger surface is refused \
+             mechanically: canister_update_call refuses the ICRC-1/ICRC-2 (and related \
+             ledger-standard) transfer/approval methods on every canister, and \
+             icp_top_up_canister only returns CLI instructions. Never attempt a financial \
+             operation through any other method or route either. When the user asks for one, \
+             recommend they do it themselves in a wallet or app frontend they control, in \
+             their own browser — e.g. their wallet at https://oisy.com. (Creating and funding \
+             the user's OWN canisters — compute resources — remains available via \
+             icp_create_canister.)\n\n\
              START WITH open_app WHEN THE USER NAMES OR LINKS AN APP. `open_app(name-or-URL)` is the \
              one-call entry point: it takes an app NAME (e.g. \"NNS\") or a URL (e.g. \
              \"https://opencloud.org\"), resolves the Internet Identity derivation origin AND discovers the canisters \

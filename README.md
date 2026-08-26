@@ -9,15 +9,16 @@ encoding/decoding and signing against the IC via
 [official Rust SDK](https://github.com/modelcontextprotocol/rust-sdk) (`rmcp`).
 
 **Not for financial operations.** IMCP2 is infrastructure tooling for reading,
-building, and operating canisters — it is not a wallet or trading tool. Token
-transfers, spending approvals, payments, and trades are refused:
-`canister_update_call` rejects the ICRC-1/ICRC-2 (and related ledger-standard)
-transfer/approval methods on every canister, and `icp_top_up_canister` returns
-CLI instructions instead of executing anything. For those operations, users act
-themselves in a wallet or frontend they control (e.g.
-[oisy.com](https://oisy.com)), in their own browser. Creating and funding the
-user's **own** canisters (compute resources) remains available through the
-dedicated `icp_create_canister` tool.
+building, and operating canisters — it is not a wallet or trading tool, and
+financial operations (token transfers, spending approvals, payments, trades)
+are unsupported by policy. The standardized ledger surface is refused
+mechanically: `canister_update_call` rejects the ICRC-1/ICRC-2 (and related
+ledger-standard) transfer/approval methods on every canister, and
+`icp_top_up_canister` returns CLI instructions instead of executing anything.
+For financial operations, users act themselves in a wallet or frontend they
+control (e.g. [oisy.com](https://oisy.com)), in their own browser. Creating and
+funding the user's **own** canisters (compute resources) remains available
+through the dedicated `icp_create_canister` tool.
 
 ## Use as a library
 
