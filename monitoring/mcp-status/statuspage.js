@@ -143,7 +143,20 @@ export const resolveStatuspageConfig = (env = process.env) => {
     ...(apiKey ? [] : ["STATUSPAGE_API_KEY"]),
     ...(componentId ? [] : ["STATUSPAGE_COMPONENT_ID"]),
   ];
-  if (missing.length === 3) return {};
+  if (missing.length === 3) {
+    // Stay silent only when NO Statuspage configuration was supplied at all.
+    // The optional variables count as "supplied": a deployment that sets only
+    // STATUSPAGE_PUSH_INTERVAL_MS or STATUSPAGE_API_BASE clearly intended the
+    // pusher to run, and must get a diagnosis rather than a silent no-op.
+    const optionalSet = [
+      "STATUSPAGE_PUSH_INTERVAL_MS",
+      "STATUSPAGE_API_BASE",
+    ].filter((name) => (env[name] ?? "").trim() !== "");
+    if (optionalSet.length === 0) return {};
+    return {
+      warning: `statuspage: pusher disabled — ${optionalSet.join(", ")} set but the required variables are missing (${missing.join(", ")})`,
+    };
+  }
   if (missing.length > 0) {
     return {
       warning: `statuspage: pusher disabled — partial configuration (missing ${missing.join(", ")})`,

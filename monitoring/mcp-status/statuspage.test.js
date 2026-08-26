@@ -129,6 +129,19 @@ test("resolveStatuspageConfig: unset env means pusher off, silently", () => {
   assert.deepEqual(resolveStatuspageConfig({}), {});
 });
 
+test("resolveStatuspageConfig: only optional variables set warns and stays off", () => {
+  // Silence is reserved for a completely unset configuration: setting only an
+  // optional variable signals intent to run the pusher and must be diagnosable.
+  const { config, warning } = resolveStatuspageConfig({
+    STATUSPAGE_PUSH_INTERVAL_MS: "30000",
+  });
+  assert.equal(config, undefined);
+  assert.match(warning, /STATUSPAGE_PUSH_INTERVAL_MS/);
+  assert.match(warning, /STATUSPAGE_PAGE_ID/);
+  assert.match(warning, /STATUSPAGE_API_KEY/);
+  assert.match(warning, /STATUSPAGE_COMPONENT_ID/);
+});
+
 test("resolveStatuspageConfig: partial config warns and stays off", () => {
   const { config, warning } = resolveStatuspageConfig({
     STATUSPAGE_PAGE_ID: "kc2llmsd16bk",
