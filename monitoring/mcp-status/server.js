@@ -95,9 +95,11 @@ const getReport = (force = false) => {
 // server per run — a 60 s loop would grind ~1,440 junk registrations a day
 // through the server's LRU-bounded client store. So: reuse a recent
 // visitor-triggered full report when one exists (it was already paid for), and
-// otherwise probe with `mutating: false`, which skips only the DCR check. The
-// non-mutating report is deliberately NOT stored in the visitor cache — it is
-// missing that check, and /api/status promises the full suite.
+// otherwise probe with `mutating: false`, which skips both registration probes
+// (the DCR check, and the allow-list check that would mutate if the guard it
+// tests regressed). The non-mutating report is deliberately NOT stored in the
+// visitor cache — it is missing those two checks, and /api/status promises the
+// full suite.
 /** @type {Promise<import("./checks.js").DashboardReport> | null} */
 let pusherInFlight = null;
 /** @param {number} maxAgeMs how recent a full report must be to be reused. */

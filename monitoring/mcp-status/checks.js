@@ -1024,8 +1024,10 @@ export const buildSuggestions = (sections, facts) => {
 /**
  * Run the full dashboard against the resolved configuration.
  * @param {{ mcpOrigin?: string, iiOrigin?: string, timeoutMs?: number, mutating?: boolean }} [overrides]
- *   `mutating: false` skips the one probe that changes server state (the
- *   loopback Dynamic Client Registration check) — see checkMcpEndpoints.
+ *   `mutating: false` skips both registration probes — the loopback Dynamic
+ *   Client Registration check (always mutates) and the allow-list check
+ *   (mutates whenever the guard it tests has regressed) — see
+ *   checkMcpEndpoints. The report then carries neither of those checks.
  * @returns {Promise<DashboardReport>}
  */
 export const runDashboard = async (overrides = {}) => {
