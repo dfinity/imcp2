@@ -685,7 +685,7 @@ mod tests {
             "the script must POST to this listener's redeem"
         );
         assert!(
-            html.contains("d.done"),
+            html.contains("data.done"),
             "the local success arm must be in the shipped page"
         );
 

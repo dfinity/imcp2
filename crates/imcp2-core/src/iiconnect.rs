@@ -99,14 +99,14 @@ const PINNED_PAGE_HTML: &str = include_str!("assets/connect-callback.html");
 /// one dynamic value, the redeem URL, is spliced in by replacing
 /// `__REDEEM_URL__`, which sits inside a quoted JS string literal below.
 const PINNED_PAGE_JS: &str = r#"(function () {
-  // Swap the status line to `t` and move the screen into a terminal state:
-  // 'error' drops the spinner and reveals the contact line, 'done' just drops
-  // the spinner (see connect.css).
-  function show(t, cls) {
-    document.getElementById('m').textContent = t;
-    if (cls) {
-      var c = document.querySelector('.screen');
-      if (c) { c.classList.add(cls); }
+  // Swap the status line to `message` and move the screen into a terminal
+  // state: 'error' drops the spinner and reveals the contact line, 'done'
+  // just drops the spinner (see connect.css).
+  function show(message, stateClass) {
+    document.getElementById('m').textContent = message;
+    if (stateClass) {
+      var screenElement = document.querySelector('.screen');
+      if (screenElement) { screenElement.classList.add(stateClass); }
     }
   }
   // II delivers #delegation=<chain JSON>&state=<state>: the two-hop chain plus
@@ -123,24 +123,24 @@ const PINNED_PAGE_JS: &str = r#"(function () {
   // Scrub the delegation from the address bar, keeping the path and any query
   // string the declared callback carries. Best-effort: the POST below works
   // even if a browser refuses the history call.
-  try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+  try { history.replaceState(null, '', location.pathname + location.search); } catch (ignored) {}
   fetch("__REDEEM_URL__", {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     credentials: 'same-origin',
     body: body
   })
-    .then(function (r) { return r.json().catch(function () { return {}; }); })
-    .then(function (d) {
+    .then(function (response) { return response.json().catch(function () { return {}; }); })
+    .then(function (data) {
       // Two success shapes, per deployment: the hosted redeem answers with the
       // `redirect` that continues its OAuth flow; a local redeem has nothing to
       // navigate to, so it answers `done` and this page IS the terminal state.
-      if (d && d.redirect) {
-        location.replace(d.redirect);
-      } else if (d && d.done) {
+      if (data && data.redirect) {
+        location.replace(data.redirect);
+      } else if (data && data.done) {
         show("Signed in — you can close this tab.", 'done');
       } else {
-        show((d && d.error) || "We couldn't finish the connection. Restart from your client.", 'error');
+        show((data && data.error) || "We couldn't finish the connection. Restart from your client.", 'error');
       }
     })
     .catch(function () {
@@ -505,8 +505,8 @@ mod tests {
     #[test]
     fn pinned_page_script_handles_redirect_done_and_error() {
         let page = super::pinned_callback_page("/redeem", "mcp@dfinity.org");
-        assert!(page.html.contains("d.redirect"), "hosted success arm");
-        assert!(page.html.contains("d.done"), "local success arm");
+        assert!(page.html.contains("data.redirect"), "hosted success arm");
+        assert!(page.html.contains("data.done"), "local success arm");
         assert!(
             page.html.contains("Signed in \u{2014} you can close this tab."),
             "the done arm renders the terminal signed-in state"
