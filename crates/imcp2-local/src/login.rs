@@ -219,7 +219,8 @@ impl LoginDriver {
             .local_addr()
             .map_err(|e| format!("could not read the listener address: {e}"))?
             .port();
-        let callback_url = format!("http://127.0.0.1:{port}/callback");
+        let authority = format!("127.0.0.1:{port}");
+        let callback_url = format!("http://{authority}/callback");
 
         let url = iiconnect::ii_mcp_url(
             &self.inner.identities.instance().ii_url,
@@ -230,7 +231,7 @@ impl LoginDriver {
         );
 
         let shutdown = Arc::new(Notify::new());
-        let app = login_router(self.clone(), callback_url.clone());
+        let app = login_router(self.clone(), callback_url.clone(), authority);
         let sd = shutdown.clone();
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app)
@@ -322,16 +323,51 @@ impl LoginDriver {
 
 /// The three transient loopback routes — the login handshake's whole HTTP
 /// surface. `callback_url` is this listener's own callback, echoed verbatim in
-/// the allow-list document.
-fn login_router(driver: LoginDriver, callback_url: String) -> Router {
+/// the allow-list document; `authority` is its `127.0.0.1:<port>` host, the
+/// only `Host` header the listener accepts.
+fn login_router(driver: LoginDriver, callback_url: String, authority: String) -> Router {
     Router::new()
         .route("/callback", get(callback_page))
         .route("/redeem", post(redeem))
         .route(AUTH_CALLBACKS_WELL_KNOWN, get(auth_callbacks))
+        // Anti-DNS-rebinding, per the design's loopback hardening (the local
+        // analogue of the hosted server's Host allow-list): a page on an
+        // attacker's hostname that rebinds to 127.0.0.1 reaches this port
+        // with `Host: attacker.example` — every URL this flow hands out
+        // carries exactly one authority, so anything else is rejected before
+        // routing. (Even without this the routes are largely inert to a
+        // rebinder — `/redeem` requires the connect `state` and a chain
+        // targeting the in-process `X` — this closes the door outright.)
+        .layer(axum::middleware::from_fn_with_state(
+            authority,
+            require_own_host,
+        ))
         .with_state(RouteCtx {
             driver,
             callback_url,
         })
+}
+
+/// Reject any request whose `Host` header is not this listener's own
+/// `127.0.0.1:<port>` authority (exact string match, like II's allow-list).
+async fn require_own_host(
+    State(expected): State<String>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let ok = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|host| host == expected);
+    if !ok {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "wrong Host for this login listener",
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 #[derive(Clone)]
@@ -805,6 +841,61 @@ mod tests {
         assert!(
             matches!(driver.status().await, LoginStatus::Pending { .. }),
             "a live replacement handshake must outrank the old grant"
+        );
+    }
+
+    // Anti-DNS-rebinding (the design's loopback hardening): a request whose
+    // `Host` names anything but this listener's own `127.0.0.1:<port>` is
+    // rejected before routing — a rebinding page fetches this port with the
+    // attacker's hostname in `Host`, which is exactly what must bounce. The
+    // true authority (what every handed-out URL carries) passes untouched.
+    #[tokio::test]
+    async fn the_listener_rejects_foreign_host_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (driver, _slot) = test_driver();
+        driver.begin(false).await.expect("begin");
+        let (_, callback_url) = driver.pending_handshake().await.expect("pending");
+        let authority = callback_url
+            .strip_prefix("http://")
+            .and_then(|s| s.strip_suffix("/callback"))
+            .expect("authority");
+        let port: u16 = authority.split(':').nth(1).unwrap().parse().unwrap();
+
+        let request = |host: String| async move {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            stream
+                .write_all(
+                    format!("GET /callback HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .expect("write");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.expect("read");
+            response
+                .split_whitespace()
+                .nth(1)
+                .expect("status code")
+                .to_string()
+        };
+
+        assert_eq!(
+            request("attacker.example".into()).await,
+            "403",
+            "rebound hostname"
+        );
+        assert_eq!(
+            request(format!("localhost:{port}")).await,
+            "403",
+            "even localhost: only the one advertised authority is served"
+        );
+        assert_eq!(
+            request(authority.to_string()).await,
+            "200",
+            "the true authority passes"
         );
     }
 
