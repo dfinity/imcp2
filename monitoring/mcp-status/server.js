@@ -22,6 +22,11 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { runDashboard } from "./checks.js";
+import { sanitizeForLog } from "./log.js";
+import {
+  resolveStatuspageConfig,
+  startStatuspagePusher,
+} from "./statuspage.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -84,6 +89,42 @@ const getReport = (force = false) => {
   return inFlight;
 };
 
+// Report source for the periodic Statuspage pusher. Unlike visitor-triggered
+// probes, this runs unattended around the clock, and the full suite's Dynamic
+// Client Registration check mints and persists a client_id on the monitored
+// server per run — a 60 s loop would grind ~1,440 junk registrations a day
+// through the server's LRU-bounded client store. So: reuse a recent
+// visitor-triggered full report when one exists (it was already paid for), and
+// otherwise probe with `mutating: false`, which skips both registration probes
+// (the DCR check, and the allow-list check that would mutate if the guard it
+// tests regressed). The non-mutating report is deliberately NOT stored in the
+// visitor cache — it is missing those two checks, and /api/status promises the
+// full suite.
+/** @type {Promise<import("./checks.js").DashboardReport> | null} */
+let pusherInFlight = null;
+/** @param {number} maxAgeMs how recent a full report must be to be reused. */
+const getPusherReport = (maxAgeMs) => {
+  // Bound reuse by the dashboard cache TTL as well as the push interval:
+  // reusing a report /api/status already considers expired would let a tick
+  // publish stale state, delaying an outage by up to two intervals.
+  const maxAge = Math.min(maxAgeMs, CACHE_TTL_MS);
+  if (cache.report && Date.now() - cache.at < maxAge) {
+    return Promise.resolve(cache.report);
+  }
+  // A visitor-triggered full run that is already in flight satisfies the
+  // pusher too — join it rather than doubling the probe load with a second
+  // concurrent suite.
+  if (inFlight) return inFlight;
+  if (!pusherInFlight) {
+    pusherInFlight = runDashboard({ ...defaults, mutating: false }).finally(
+      () => {
+        pusherInFlight = null;
+      },
+    );
+  }
+  return pusherInFlight;
+};
+
 const sendJson = (res, code, body) => {
   const payload = JSON.stringify(body);
   res.writeHead(code, {
@@ -92,27 +133,6 @@ const sendJson = (res, code, body) => {
     "content-length": Buffer.byteLength(payload),
   });
   res.end(payload);
-};
-
-// Replace control characters with spaces and cap the length, so that a logged
-// error message can never forge or inject additional log entries. Covers C0
-// controls + DEL, the C1 controls (U+0080–U+009F, incl. U+009B the 8-bit CSI),
-// and the Unicode line/paragraph separators (U+2028/U+2029). Implemented with a
-// codepoint filter to avoid embedding control-char literals.
-const sanitizeForLog = (value) => {
-  const input = String((value && value.message) || value).slice(0, 300);
-  let out = "";
-  for (const ch of input) {
-    const code = ch.codePointAt(0);
-    const dangerous =
-      code < 0x20 ||
-      code === 0x7f ||
-      (code >= 0x80 && code <= 0x9f) ||
-      code === 0x2028 ||
-      code === 0x2029;
-    out += dangerous ? " " : ch;
-  }
-  return out;
 };
 
 const server = http.createServer(async (req, res) => {
@@ -163,3 +183,22 @@ server.listen(port, host, () => {
       `  monitoring: ${defaults.mcpOrigin ?? "https://mcp.beta.id.ai (default)"}\n`,
   );
 });
+
+// Optionally mirror the verdict to an Atlassian Statuspage component (e.g. on
+// status.internetcomputer.org). Off unless the STATUSPAGE_* variables are set —
+// see statuspage.js and the README. The pusher reuses a recent visitor-triggered
+// report when one exists and otherwise probes without the state-mutating DCR
+// check (see getPusherReport), so it never registers OAuth clients on its own.
+const { config: statuspageConfig, warning: statuspageWarning } =
+  resolveStatuspageConfig();
+if (statuspageWarning) console.error(statuspageWarning);
+if (statuspageConfig) {
+  startStatuspagePusher({
+    getReport: () => getPusherReport(statuspageConfig.intervalMs),
+    config: statuspageConfig,
+  });
+  process.stdout.write(
+    `  statuspage: pushing to component ${statuspageConfig.componentId} ` +
+      `(page ${statuspageConfig.pageId}) every ${statuspageConfig.intervalMs} ms\n`,
+  );
+}
