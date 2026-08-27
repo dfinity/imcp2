@@ -133,7 +133,7 @@ by the MCP server itself. The page and its route shipped in
 effective date agree. Then enter that URL in the portal. The reviewed source
 text is [`icp-mcp-privacy-policy-draft.md`](icp-mcp-privacy-policy-draft.md).
 
-### 2. Financial-transactions policy (mitigations shipped; answer pending)
+### 2. Financial-transactions policy (resolved in code)
 
 The Directory Policy **prohibits connectors that transfer money,
 cryptocurrency, or other financial assets, or execute financial
