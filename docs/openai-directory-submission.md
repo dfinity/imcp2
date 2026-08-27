@@ -111,10 +111,11 @@ financial-transfers prohibition:
 - The attestation "my plugin does not initiate or execute money transfers,
   crypto transfers, or investment trades on behalf of users" is addressed by
   two shipped **mitigations** — not yet grounds to check the box:
-  `canister_update_call` refuses the standardized ledger transfer/approval
-  methods (ICRC-1/ICRC-2 and related standards, the ICP ledger's legacy
-  `transfer`, the cycles ledger's `withdraw` and `create_canister` spends) on
-  every canister and says so in its description
+  `canister_update_call` refuses the ICRC-standard transfer/approval methods
+  (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents) on every canister, plus
+  the ICP and cycles ledgers' own value-moving methods (the legacy
+  `transfer`, `withdraw`, the `create_canister` spends) on those ledgers,
+  and says so in its description
   ([#154](https://github.com/dfinity/imcp2/pull/154)), and
   `icp_top_up_canister` is instructions-only and executes nothing
   ([#153](https://github.com/dfinity/imcp2/pull/153)); README, landing page,
