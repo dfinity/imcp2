@@ -277,6 +277,64 @@ async fn a_pending_refresh_outranks_the_live_grant_in_status() {
 // rejected before routing — a rebinding page fetches this port with the
 // attacker's hostname in `Host`, which is exactly what must bounce. The
 // true authority (what every handed-out URL carries) passes untouched.
+// II's frontend is a PUBLIC https origin fetching this listener on loopback,
+// which Chrome treats as a private-network request: it preflights with
+// `Access-Control-Request-Private-Network: true` and blocks the fetch unless
+// the answer carries `Access-Control-Allow-Private-Network: true`. A 405 here
+// (routes registered for GET/POST only) makes the #4091 allow-list unreadable
+// from the browser and every connect fails as "missing information" — while
+// curl and the e2e harness, which never preflight, see a healthy 200. Hence a
+// RAW preflight, the only shape that reproduces it.
+#[tokio::test]
+async fn the_listener_answers_the_private_network_preflight() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (driver, _slot) = test_driver();
+    driver.begin(false).await.expect("begin");
+    let (_, callback_url) = driver.pending_handshake().await.expect("pending");
+    let authority = callback_url
+        .strip_prefix("http://")
+        .and_then(|s| s.strip_suffix("/callback"))
+        .expect("authority");
+    let port: u16 = authority.split(':').nth(1).unwrap().parse().unwrap();
+
+    for path in ["/.well-known/ii-auth-callbacks", "/callback"] {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        stream
+            .write_all(
+                format!(
+                    "OPTIONS {path} HTTP/1.1\r\nHost: {authority}\r\n\
+                     Origin: https://id.ai\r\nAccess-Control-Request-Method: GET\r\n\
+                     Access-Control-Request-Private-Network: true\r\n\
+                     Connection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("read response");
+        let lowered = response.to_lowercase();
+        assert!(
+            response.contains("204") || response.contains("200"),
+            "{path} preflight must succeed, got: {response}"
+        );
+        assert!(
+            lowered.contains("access-control-allow-private-network: true"),
+            "{path} preflight must grant private-network access, got: {response}"
+        );
+        assert!(
+            lowered.contains("access-control-allow-origin: *"),
+            "{path} preflight must allow II's origin, got: {response}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_listener_rejects_foreign_host_headers() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

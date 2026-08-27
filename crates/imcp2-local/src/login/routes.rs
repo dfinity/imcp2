@@ -4,6 +4,7 @@
 //! MCP tool surface never rides HTTP.
 
 use axum::extract::State;
+use axum::http::{HeaderName, HeaderValue};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -18,9 +19,12 @@ use super::{Grant, LoginDriver, CONTACT_EMAIL};
 /// only `Host` header the listener accepts.
 pub(super) fn login_router(driver: LoginDriver, callback_url: String, authority: String) -> Router {
     Router::new()
-        .route("/callback", get(callback_page))
-        .route("/redeem", post(redeem))
-        .route(AUTH_CALLBACKS_WELL_KNOWN, get(auth_callbacks))
+        .route("/callback", get(callback_page).options(preflight))
+        .route("/redeem", post(redeem).options(preflight))
+        .route(
+            AUTH_CALLBACKS_WELL_KNOWN,
+            get(auth_callbacks).options(preflight),
+        )
         // Anti-DNS-rebinding, per the design's loopback hardening (the local
         // analogue of the hosted server's Host allow-list): a page on an
         // attacker's hostname that rebinds to 127.0.0.1 reaches this port
@@ -107,6 +111,50 @@ async fn auth_callbacks(State(ctx): State<RouteCtx>) -> Response {
     h.insert(
         axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
         axum::http::HeaderValue::from_static("*"),
+    );
+    resp
+}
+
+/// The header Chrome's Private Network Access check requires on a preflight
+/// response before it will let a PUBLIC page touch a private (loopback) one.
+const ALLOW_PRIVATE_NETWORK: &str = "access-control-allow-private-network";
+
+/// CORS preflight for every route on this listener.
+///
+/// II's frontend runs on the public `https://id.ai` origin and fetches the
+/// #4091 allow-list from `http://127.0.0.1:<port>` — a **private-network
+/// request** in Chrome's Private Network Access rules. Those force an
+/// `OPTIONS` preflight carrying `Access-Control-Request-Private-Network:
+/// true` even though the GET is otherwise "simple", and block the fetch
+/// unless the preflight answers `Access-Control-Allow-Private-Network: true`.
+/// Without this the allow-list is unreachable *from a browser* — `curl` and
+/// the e2e harness's HTTP client never preflight, which is exactly what made
+/// the gap easy to miss — so II cannot validate the callback and rejects
+/// every connect as "missing information". The same applies to the tab
+/// navigation into `/callback` where Chrome enforces PNA for navigations,
+/// hence the preflight on all three routes rather than the allow-list alone.
+async fn preflight() -> Response {
+    let mut resp = axum::http::StatusCode::NO_CONTENT.into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    h.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    h.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("*"),
+    );
+    h.insert(
+        HeaderName::from_static(ALLOW_PRIVATE_NETWORK),
+        HeaderValue::from_static("true"),
+    );
+    h.insert(
+        axum::http::header::ACCESS_CONTROL_MAX_AGE,
+        HeaderValue::from_static("600"),
     );
     resp
 }
