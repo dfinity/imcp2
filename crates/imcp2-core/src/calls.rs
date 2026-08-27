@@ -727,14 +727,20 @@ pub fn decode_reply(did: Option<&str>, method: &str, bytes: &[u8]) -> String {
     if let Some(text) = did.and_then(|d| decode_bytes_with_did(d, method, bytes)) {
         return text;
     }
-    // Type-less fallback on the guarded deep stack (CWE-674). The reply bytes are
-    // attacker-controlled (the caller picks the target canister), and candid's decoder,
-    // `IDLArgs`' `Display`, AND the recursive `Drop` of the decoded tree each recurse
-    // once per nesting level with no depth bound; a recursive reply (`type t = opt t`:
-    // a few KB of `opt` tags) would overflow the ~2 MiB worker stack and abort the
-    // whole process. So decode, render, and drop the tree on the deep stack, exactly as
-    // the DID path already does. Not nested: the DID path's `on_deep_stack` has already
-    // returned by the time we reach here, and only the rendered `String` crosses back.
+    // Type-less fallback, run on the deep stack (CWE-674). The reply bytes are
+    // attacker-controlled (the caller picks the target canister). candid's decoder
+    // recurses once per nesting level, but that recursion is DEPTH-BOUNDED by
+    // candid's own `stacker::remaining_stack()` guard: a recursive reply
+    // (`type t = opt t` — a chain of one-byte `opt` tags) makes it return the
+    // ordinary "not decodable" error before the stack is exhausted, on any stack
+    // size; it does NOT overflow and abort the process (regression-pinned by
+    // `decode_reply_rejects_a_deep_opt_chain_instead_of_aborting`). So
+    // `REPLY_DECODING_QUOTA` bounds breadth and candid's guard bounds depth. The
+    // deep stack is kept as defense-in-depth: it hands that guard generous headroom
+    // and room to render (`Display`) and drop the decoded — already depth-bounded —
+    // tree, both of which also recurse per level. Not nested: the DID path's
+    // `on_deep_stack` has already returned by the time we reach here, and only the
+    // rendered `String` crosses back.
     on_deep_stack(|| match IDLArgs::from_bytes_with_config(bytes, &reply_decoder_config()) {
         Ok(decoded) => decoded.to_string(),
         Err(e) => format!("(call succeeded but reply is not decodable as Candid: {e})"),
@@ -1158,12 +1164,16 @@ enum TableOutcome {
 /// reply rather than guessing.
 pub fn parse_execute_reply(did: Option<&str>, reply: &[u8]) -> OqlResult {
     // Decode the attacker-controlled reply AND walk/render the decoded tree on the
-    // guarded deep stack (CWE-674): `from_bytes`, the recursive `extract_oql`/
-    // `cell_scalar` walk, the `Display` fallback, and the tree's recursive `Drop` all
-    // recurse once per nesting level with no depth bound. The whole thing (creation
-    // through drop of the `IDLArgs`) stays on the deep stack; only the rendered
-    // `OqlResult` (owned strings) crosses back. One `on_deep_stack`, never nested:
-    // `decode_args_with_did` now decodes in place rather than taking its own.
+    // deep stack (CWE-674). candid's `from_bytes*` decode recurses per nesting
+    // level but is depth-bounded by candid's own `stacker::remaining_stack()` guard
+    // (an over-deep reply returns "undecodable", NOT a process abort — see
+    // `decode_reply_rejects_a_deep_opt_chain_instead_of_aborting`). The imcp2 walks
+    // that follow — the recursive `extract_oql`/`cell_scalar`, the `Display`
+    // fallback, and the tree's recursive `Drop` — recurse per level too, but only
+    // over that already depth-bounded tree, with the deep stack as headroom. The
+    // whole thing (creation through drop of the `IDLArgs`) stays on the deep stack;
+    // only the rendered `OqlResult` (owned strings) crosses back. One
+    // `on_deep_stack`, never nested: `decode_args_with_did` decodes in place.
     on_deep_stack(move || {
         let decoded = match did.and_then(|d| decode_args_with_did(d, "execute", reply)) {
             Some(args) => args,
@@ -1186,11 +1196,13 @@ pub fn parse_execute_reply(did: Option<&str>, reply: &[u8]) -> OqlResult {
 /// (so nothing is silently dropped, even though these methods return one value by
 /// contract); an undecodable reply yields an explanatory string.
 pub fn decode_text_reply(reply: &[u8]) -> String {
-    // Decode, match, render, and drop the attacker-controlled reply on the guarded
-    // deep stack (CWE-674): `from_bytes`, the `Display` of a non-text single value or
-    // the whole tuple, and the decoded tree's recursive `Drop` each recurse per nesting
-    // level, so a recursive reply would overflow the ~2 MiB worker stack and abort the
-    // process. Only the resulting `String` crosses back.
+    // Decode, match, render, and drop the attacker-controlled reply on the deep
+    // stack (CWE-674). candid's `from_bytes` decode recurses per nesting level but
+    // is depth-bounded by candid's own `stacker::remaining_stack()` guard (an
+    // over-deep reply returns "undecodable", NOT a process abort). The `Display` of
+    // a non-text single value / the whole tuple and the tree's recursive `Drop`
+    // recurse per level too, but only over that already depth-bounded tree, with
+    // the deep stack as headroom. Only the resulting `String` crosses back.
     on_deep_stack(|| {
         let args = match IDLArgs::from_bytes_with_config(reply, &reply_decoder_config()) {
             Ok(a) => a,
@@ -1525,6 +1537,36 @@ mod tests {
         // Type-less path (did = None). Must return the decode-error string, not abort.
         let out = super::decode_reply(None, "m", &bomb);
         assert!(out.contains("not decodable"), "expected the decode-error path, got: {out:.120}");
+    }
+
+    // CWE-674 DEPTH counterpart to the breadth bomb above. A compact reply can
+    // nest hundreds of thousands of `opt` levels (`type t = opt t`, one wire byte
+    // per level), and candid's decoder, `IDLArgs`' `Display`, and the tree's
+    // recursive `Drop` each recurse once per level — so without a depth bound a
+    // ~300 KB reply would overflow the deep-stack thread and abort the process,
+    // dropping every session. `REPLY_DECODING_QUOTA` bounds BREADTH, not depth;
+    // DEPTH is bounded by candid's own `stacker::remaining_stack()` recursion
+    // guard, which returns a decode error before the stack is exhausted (on any
+    // stack size). This pins that: a 300k-deep `opt` reply must degrade to the
+    // ordinary "not decodable" error, never a crash. It regression-guards against
+    // a candid downgrade/regression that would drop the recursion guard.
+    #[test]
+    fn decode_reply_rejects_a_deep_opt_chain_instead_of_aborting() {
+        // DIDL | 1 type: T0 = opt(6e) T0(00) | 1 arg of T0 (01 00) | value bytes.
+        let mut deep = vec![0x44, 0x49, 0x44, 0x4c, 0x01, 0x6e, 0x00, 0x01, 0x00];
+        deep.extend(std::iter::repeat_n(0x01u8, 300_000)); // 300k `opt` present tags
+        deep.push(0x00); // a final null (opt absent) terminates the chain
+        assert!(deep.len() < 350_000, "compact on the wire: {} bytes", deep.len());
+        // Type-less path (did = None): decode + render + drop on the deep stack.
+        // Require the genuine decode-error string: candid's recursion guard MUST
+        // have run and rejected the chain. Accepting the "(could not spawn …)"
+        // fallback would let a thread-spawn failure — which never reaches the
+        // guard — pass the test, defeating its purpose.
+        let out = super::decode_reply(None, "m", &deep);
+        assert!(
+            out.contains("not decodable"),
+            "deep opt chain must reach candid's guard and decode-error gracefully, got: {out:.120}"
+        );
     }
 
     // CWE-674: the pre-parse guard rejects over-deep / oversized textual Candid
