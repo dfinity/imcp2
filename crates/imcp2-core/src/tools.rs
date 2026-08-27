@@ -2577,6 +2577,10 @@ mod tests {
         assert_eq!(served.len(), 10, "{:?}", served.iter().map(|t| &t.name).collect::<Vec<_>>());
         assert!(served.iter().all(|t| !t.name.starts_with("icp_")));
         assert_eq!(super::IcProtocolTools::tool_router().list_all().len(), 16);
+        // tools/call routes through the canister router alone, so a deferred
+        // name is not just unlisted — it is not routable at all.
+        assert!(!super::IcCanisterTools::tool_router().has_route("icp_get_skill"));
+        assert!(!super::IcCanisterTools::tool_router().has_route("icp_install_code"));
         assert!(super::SERVER_INSTRUCTIONS.contains("future version"));
     }
 
