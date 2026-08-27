@@ -69,6 +69,14 @@ struct Inner {
     /// it succeeding — the link is always returned in-band by `authenticate`.
     auto_open: bool,
     state: Mutex<LoginState>,
+    /// Serializes each redeem's `mcp_register_v2` **and** its local commit,
+    /// across flows. II's register REPLACES the anchor's previous grant (the
+    /// last registration to settle at II is the live one), so the local slot
+    /// must be committed in the same order the registrations settle: without
+    /// this, a timed-out flow's slow register could land at II *after* a
+    /// newer flow's — II would then honor the old session while the slot
+    /// named the new one, and every tool call would come back `Unauthorized`.
+    registration: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -77,19 +85,6 @@ struct LoginState {
     /// The most recent successful login, kept (even past expiry) so
     /// `auth_status` can say *whose* session expired.
     grant: Option<Grant>,
-    /// Flow counter: each `begin`-started flow gets the next number, so a
-    /// redeem that raced a replacement can tell whether something NEWER
-    /// exists (see [`superseded_by_newer`]).
-    epoch: u64,
-}
-
-/// Whether a flow newer than `epoch` exists — a pending handshake or a
-/// completed grant started after the flow that is asking. A stale redeem
-/// (claimed, then outlived by the watchdog while its `mcp_register_v2` call
-/// was in flight) must not overwrite a newer sign-in.
-fn superseded_by_newer(state: &LoginState, epoch: u64) -> bool {
-    state.pending.as_ref().is_some_and(|p| p.epoch > epoch)
-        || state.grant.as_ref().is_some_and(|g| g.epoch > epoch)
 }
 
 struct Pending {
@@ -108,8 +103,6 @@ struct Pending {
     /// Tears the transient listener down (graceful): notified on redeem
     /// success, on handshake timeout, and when a fresh flow replaces this one.
     shutdown: Arc<Notify>,
-    /// This flow's number (see [`LoginState::epoch`]).
-    epoch: u64,
 }
 
 impl Pending {
@@ -130,9 +123,6 @@ pub struct Grant {
     /// Grant expiration, ns since the Unix epoch (the user's consent-time
     /// session choice).
     pub expiration_ns: u64,
-    /// The number of the flow that produced this grant (see
-    /// [`LoginState::epoch`]).
-    epoch: u64,
 }
 
 impl Grant {
@@ -176,6 +166,7 @@ impl LoginDriver {
                 slot,
                 auto_open,
                 state: Mutex::new(LoginState::default()),
+                registration: Mutex::new(()),
             }),
         }
     }
@@ -269,7 +260,6 @@ impl LoginDriver {
             }
         });
 
-        state.epoch += 1;
         state.pending = Some(Pending {
             session_id,
             url: url.clone(),
@@ -277,7 +267,6 @@ impl LoginDriver {
             started: Instant::now(),
             redeeming: false,
             shutdown,
-            epoch: state.epoch,
         });
         drop(state);
 
@@ -460,41 +449,52 @@ async fn redeem(State(ctx): State<RouteCtx>, Json(body): Json<RedeemBody>) -> Re
         }
     };
 
-    // Claim atomically (re-checking: the flow may have moved while parsing),
-    // remembering the claimed flow's number for the commit-time check below.
-    let epoch =
+    // Claim atomically (re-checking: the flow may have moved while parsing).
+    {
+        let mut state = driver.inner.state.lock().await;
+        if state
+            .grant
+            .as_ref()
+            .is_some_and(|g| g.session_id == body.state)
         {
-            let mut state = driver.inner.state.lock().await;
-            if state
-                .grant
-                .as_ref()
-                .is_some_and(|g| g.session_id == body.state)
-            {
-                return done();
-            }
-            match state.pending.as_mut() {
-                Some(p) if p.session_id == body.state => {
-                    if p.expired() {
-                        return redeem_err(
-                            "This sign-in expired. Ask the agent to authenticate again.",
-                        );
-                    }
-                    if p.redeeming {
-                        return redeem_err(
-                            "This sign-in is already being processed. Wait a moment; \
-                         if nothing happens, ask the agent to authenticate again.",
-                        );
-                    }
-                    p.redeeming = true;
-                    p.epoch
+            return done();
+        }
+        match state.pending.as_mut() {
+            Some(p) if p.session_id == body.state => {
+                if p.expired() {
+                    return redeem_err(
+                        "This sign-in expired. Ask the agent to authenticate again.",
+                    );
                 }
-                _ => return redeem_err(
-                    "This sign-in is unknown or already used. Ask the agent to authenticate again.",
-                ),
+                if p.redeeming {
+                    return redeem_err(
+                        "This sign-in is already being processed. Wait a moment; \
+                         if nothing happens, ask the agent to authenticate again.",
+                    );
+                }
+                p.redeeming = true;
             }
-        };
+            _ => {
+                return redeem_err(
+                    "This sign-in is unknown or already used. Ask the agent to authenticate again.",
+                )
+            }
+        }
+    }
 
-    // The one network call, outside the lock.
+    // The network call + local commit, SERIALIZED across flows (see
+    // `Inner::registration`): II's `mcp_register_v2` replaces the anchor's
+    // previous grant, so whichever registration settles at II last is the
+    // live one — and because every register-then-commit runs alone inside
+    // this lock, the commit order equals the settle order, and the local
+    // slot always names the session II actually honors. In particular a
+    // flow that timed out locally while its register was in flight either
+    // settles BEFORE a replacement (which then overwrites it, at II and
+    // here) or AFTER it (and then the late registration is the live grant,
+    // and committing it here is exactly right). The per-flow single-flight
+    // claim above stays: it stops a page double-submit; this lock orders
+    // DISTINCT flows.
+    let _registration = driver.inner.registration.lock().await;
     match driver
         .inner
         .identities
@@ -513,26 +513,12 @@ async fn redeem(State(ctx): State<RouteCtx>, Json(body): Json<RedeemBody>) -> Re
         Ok(outcome) => {
             let principal = driver.inner.identities.session_principal(&body.state).await;
             let mut state = driver.inner.state.lock().await;
-            // Commit-time check: this flow was claimed before the network
-            // call, but the watchdog may have expired it and a NEWER sign-in
-            // (pending or already completed) may exist by now — a stale
-            // success must not overwrite that. A late success with nothing
-            // newer around still lands (II did bind the grant; the watchdog
-            // alone is no reason to make the user redo it).
-            if superseded_by_newer(&state, epoch) {
-                drop(state);
-                return redeem_err(
-                    "This sign-in was superseded by a newer one. Use the most recent \
-                     sign-in tab, or ask the agent to authenticate again.",
-                );
-            }
             driver.inner.slot.set(body.state.clone());
             state.grant = Some(Grant {
                 session_id: body.state.clone(),
                 principal,
                 permissions: outcome.permissions,
                 expiration_ns: outcome.expiration_ns,
-                epoch,
             });
             let ours = matches!(&state.pending, Some(p) if p.session_id == body.state);
             if ours {
@@ -777,7 +763,6 @@ mod tests {
             principal: Some("aaaaa-aa".into()),
             permissions: "queries",
             expiration_ns,
-            epoch: 1,
         };
         driver.inner.state.lock().await.grant = Some(grant(now_ns() + 30 * 60_000_000_000));
         match driver.status().await {
@@ -810,7 +795,6 @@ mod tests {
             principal: Some("aaaaa-aa".into()),
             permissions: "all",
             expiration_ns: now_ns() + 30 * 60_000_000_000,
-            epoch: 1,
         });
         assert!(matches!(driver.status().await, LoginStatus::SignedIn(_)));
 
@@ -824,43 +808,6 @@ mod tests {
         );
     }
 
-    // The stale-redeem guard: a flow that was claimed, then outlived by the
-    // watchdog while its network call ran, must not overwrite a NEWER sign-in
-    // (pending or completed) at commit time — but a late success with nothing
-    // newer around still lands.
-    #[test]
-    fn a_stale_redeem_is_superseded_by_any_newer_flow() {
-        let pending = |epoch: u64| Pending {
-            session_id: "s".into(),
-            url: "u".into(),
-            callback_url: "c".into(),
-            started: Instant::now(),
-            redeeming: false,
-            shutdown: Arc::new(Notify::new()),
-            epoch,
-        };
-        let grant = |epoch: u64| Grant {
-            session_id: "g".into(),
-            principal: None,
-            permissions: "queries",
-            expiration_ns: u64::MAX,
-            epoch,
-        };
-        let state = |p: Option<Pending>, g: Option<Grant>| LoginState {
-            pending: p,
-            grant: g,
-            epoch: 9,
-        };
-        // Nothing newer: the late success lands (watchdog expiry alone is no
-        // reason to make the user redo a login II already bound).
-        assert!(!superseded_by_newer(&state(None, None), 3));
-        assert!(!superseded_by_newer(&state(Some(pending(3)), None), 3));
-        assert!(!superseded_by_newer(&state(None, Some(grant(2))), 3));
-        // A newer pending handshake or completed grant wins over the stale one.
-        assert!(superseded_by_newer(&state(Some(pending(4)), None), 3));
-        assert!(superseded_by_newer(&state(None, Some(grant(4))), 3));
-    }
-
     // The handshake window is exactly HANDSHAKE_TTL: a pending flow older than
     // that is expired (the watchdog and the redeem gate both read this).
     #[test]
@@ -872,7 +819,6 @@ mod tests {
             started: Instant::now() - age,
             redeeming: false,
             shutdown: Arc::new(Notify::new()),
-            epoch: 1,
         };
         assert!(!pending(Duration::from_secs(1)).expired());
         assert!(pending(HANDSHAKE_TTL + Duration::from_secs(1)).expired());
