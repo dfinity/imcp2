@@ -14,7 +14,9 @@
 //!   * Perplexity (macOS) — has no writable config file; its UI-driven steps
 //!     are printed instead
 //!
-//! `setup --remove` undoes exactly those registrations; `setup --print` only
+//! `setup --remove` deletes those `imcp2` registrations — by name, whatever
+//! they hold by then, with the one-time backup keeping the pre-imcp2 state;
+//! `setup --print` only
 //! shows the per-client instructions (nothing is written). The first time an
 //! existing config file is modified, a one-time backup is kept next to it as
 //! `<file>.imcp2-bak`.
@@ -43,8 +45,11 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         }
     }
     let env = Env::from_system()?;
-    let report = run_in(&env, mode);
+    let (report, failed) = run_in(&env, mode);
     println!("{report}");
+    if failed > 0 {
+        anyhow::bail!("{failed} client registration(s) failed — see the report above");
+    }
     Ok(())
 }
 
@@ -114,10 +119,13 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Run one mode over every supported client and render the report the user
-/// reads. Pure with respect to `Env`, so the tests drive it end to end
-/// against a scratch home.
-fn run_in(env: &Env, mode: Mode) -> String {
+/// reads, plus how many clients FAILED (detected and attempted, but not
+/// done), so `run` can exit nonzero where a script would otherwise read
+/// partial failure as success. Pure with respect to `Env`, so the tests
+/// drive it end to end against a scratch home.
+fn run_in(env: &Env, mode: Mode) -> (String, usize) {
     let mut lines: Vec<String> = Vec::new();
+    let mut failed = 0usize;
     let verb = match mode {
         Mode::Apply => "Registering",
         Mode::Remove => "Removing",
@@ -145,6 +153,9 @@ fn run_in(env: &Env, mode: Mode) -> String {
                     } else {
                         remove_json_server(file)
                     };
+                    if result.is_err() {
+                        failed += 1;
+                    }
                     render(client.name, file, result)
                 }
                 Target::CodexToml(file) => {
@@ -153,6 +164,9 @@ fn run_in(env: &Env, mode: Mode) -> String {
                     } else {
                         remove_codex_server(file)
                     };
+                    if result.is_err() {
+                        failed += 1;
+                    }
                     render(client.name, file, result)
                 }
                 Target::ClaudeCli(cli) => {
@@ -175,28 +189,49 @@ fn run_in(env: &Env, mode: Mode) -> String {
                     if mode == Mode::Apply {
                         cmd.arg(&env.exe);
                     }
+                    // The fallback one-liner must match the mode: telling a
+                    // removing user to re-add the server would invert the ask.
+                    let fallback = match mode {
+                        Mode::Remove => format!("claude mcp remove --scope user {SERVER_NAME}"),
+                        _ => client.manual.lines().next().unwrap_or_default().to_string(),
+                    };
                     match cmd.output() {
                         Ok(out) if out.status.success() => {
                             format!("• {}: done (via `claude mcp`, user scope).", client.name)
                         }
-                        Ok(out) => format!(
-                            "• {}: `claude mcp` refused ({}). Run it yourself:\n  {}",
-                            client.name,
-                            String::from_utf8_lossy(&out.stderr).trim(),
-                            client.manual.lines().next().unwrap_or_default()
-                        ),
-                        Err(e) => format!(
-                            "• {}: could not run `claude` ({e}). Run it yourself:\n  {}",
-                            client.name,
-                            client.manual.lines().next().unwrap_or_default()
-                        ),
+                        Ok(out) => {
+                            // A refused removal is usually "never registered"
+                            // — benign, unlike a refused registration.
+                            if mode == Mode::Apply {
+                                failed += 1;
+                            }
+                            format!(
+                                "• {}: `claude mcp` refused ({}). Run it yourself:\n  {fallback}",
+                                client.name,
+                                String::from_utf8_lossy(&out.stderr).trim(),
+                            )
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            format!(
+                                "• {}: could not run `claude` ({e}). Run it yourself:\n  {fallback}",
+                                client.name,
+                            )
+                        }
                     }
                 }
-                Target::Manual => format!(
-                    "• {}: has no config file this tool can write — do it in the app:\n  {}",
-                    client.name,
-                    client.manual.replace('\n', "\n  ")
-                ),
+                Target::Manual => match mode {
+                    Mode::Remove => format!(
+                        "• {}: has no config file this tool can write — remove the \
+                         {SERVER_NAME} connector in the app (Settings → Connectors).",
+                        client.name
+                    ),
+                    _ => format!(
+                        "• {}: has no config file this tool can write — do it in the app:\n  {}",
+                        client.name,
+                        client.manual.replace('\n', "\n  ")
+                    ),
+                },
             },
         };
         lines.push(line);
@@ -213,7 +248,7 @@ fn run_in(env: &Env, mode: Mode) -> String {
             "Run `imcp2-local setup` to apply the writable ones automatically.".to_string()
         }
     });
-    lines.join("\n")
+    (lines.join("\n"), failed)
 }
 
 /// Where (and whether) one client's registration lives on this machine.
@@ -240,9 +275,20 @@ struct Client {
 /// The supported clients, in the design's component-9 order, resolved against
 /// this machine.
 fn clients(env: &Env) -> Vec<Client> {
-    let exe = env.exe.display();
+    // The pasted snippets embed the path as a *literal* of each target
+    // format, so it gets that format's own escaping (Windows `\` in
+    // JSON/TOML, spaces in the shell one-liner) — a raw `display()` would
+    // hand the user an invalid file.
+    let exe_str = env.exe.display().to_string();
+    let exe_json = serde_json::Value::from(exe_str.as_str()).to_string();
+    let exe_toml = toml_edit::Value::from(exe_str.as_str()).to_string();
+    let exe_sh = if exe_str.contains(' ') {
+        format!("\"{}\"", exe_str.replace('"', "\\\""))
+    } else {
+        exe_str.clone()
+    };
     let json_snippet =
-        format!("{{ \"mcpServers\": {{ \"{SERVER_NAME}\": {{ \"command\": \"{exe}\" }} }} }}");
+        format!("{{ \"mcpServers\": {{ \"{SERVER_NAME}\": {{ \"command\": {exe_json} }} }} }}");
 
     let detect_dir = |dir: PathBuf, target_file: PathBuf, label: &str| {
         if dir.is_dir() {
@@ -276,7 +322,7 @@ fn clients(env: &Env) -> Vec<Client> {
                 None => Target::NotDetected("`claude` is not on PATH".into()),
             },
             manual: format!(
-                "claude mcp add --scope user --transport stdio {SERVER_NAME} -- {exe}"
+                "claude mcp add --scope user --transport stdio {SERVER_NAME} -- {exe_sh}"
             ),
         },
         Client {
@@ -287,7 +333,7 @@ fn clients(env: &Env) -> Vec<Client> {
                 Target::NotDetected("~/.codex is missing".into())
             },
             manual: format!(
-                "Add to ~/.codex/config.toml:\n[mcp_servers.{SERVER_NAME}]\ncommand = \"{exe}\""
+                "Add to ~/.codex/config.toml:\n[mcp_servers.{SERVER_NAME}]\ncommand = {exe_toml}"
             ),
         },
         Client {
@@ -316,7 +362,7 @@ fn clients(env: &Env) -> Vec<Client> {
                 Target::NotDetected("Perplexity.app is not in /Applications".into())
             },
             manual: format!(
-                "Settings → Connectors → Add Connector → Advanced, then paste:\n{{ \"command\": \"{exe}\", \"args\": [], \"env\": {{}} }}\n(Needs Perplexity's local-MCP helper; the app prompts to install it once.)"
+                "Settings → Connectors → Add Connector → Advanced, then paste:\n{{ \"command\": {exe_json}, \"args\": [], \"env\": {{}} }}\n(Needs Perplexity's local-MCP helper; the app prompts to install it once.)"
             ),
         },
     ]
@@ -374,10 +420,23 @@ fn upsert_json_server(path: &Path, exe: &Path) -> anyhow::Result<String> {
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
         .with_context(|| format!("`mcpServers` in {} is not an object", path.display()))?;
-    servers.insert(
-        SERVER_NAME.to_string(),
-        serde_json::json!({ "command": exe.to_string_lossy() }),
-    );
+    // Merge, don't replace: `command` is the only key setup owns, so a
+    // user's additions to the entry (say `env` for a local replica) survive
+    // re-runs and upgrades. A non-object under the name is replaced.
+    match servers.get_mut(SERVER_NAME) {
+        Some(serde_json::Value::Object(entry)) => {
+            entry.insert(
+                "command".to_string(),
+                serde_json::Value::from(exe.to_string_lossy().as_ref()),
+            );
+        }
+        _ => {
+            servers.insert(
+                SERVER_NAME.to_string(),
+                serde_json::json!({ "command": exe.to_string_lossy() }),
+            );
+        }
+    }
     let backup = backup_once(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -441,9 +500,18 @@ fn upsert_codex_server(path: &Path, exe: &Path) -> anyhow::Result<String> {
         }))
         .as_table_mut()
         .with_context(|| format!("`mcp_servers` in {} is not a table", path.display()))?;
-    let mut entry = toml_edit::Table::new();
-    entry.insert("command", toml_edit::value(exe.to_string_lossy().as_ref()));
-    servers.insert(SERVER_NAME, toml_edit::Item::Table(entry));
+    // Merge, don't replace — same contract as the JSON path: only `command`
+    // is owned here, user-added keys in the table survive.
+    match servers.get_mut(SERVER_NAME).and_then(|i| i.as_table_mut()) {
+        Some(entry) => {
+            entry.insert("command", toml_edit::value(exe.to_string_lossy().as_ref()));
+        }
+        None => {
+            let mut entry = toml_edit::Table::new();
+            entry.insert("command", toml_edit::value(exe.to_string_lossy().as_ref()));
+            servers.insert(SERVER_NAME, toml_edit::Item::Table(entry));
+        }
+    }
     let backup = backup_once(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -544,7 +612,7 @@ mod tests {
         // Cursor's JSON, comments + another server in Codex's TOML.
         std::fs::write(
             root.path.join(".cursor/mcp.json"),
-            r#"{ "mcpServers": { "other": { "command": "/bin/other" } }, "theme": "dark" }"#,
+            r#"{ "mcpServers": { "other": { "command": "/bin/other" }, "imcp2": { "command": "/old/imcp2-local", "env": { "IMCP2_IC_URL": "http://127.0.0.1:4943" } } }, "theme": "dark" }"#,
         )
         .unwrap();
         std::fs::write(
@@ -553,7 +621,8 @@ mod tests {
         )
         .unwrap();
 
-        let report = run_in(&env, Mode::Apply);
+        let (report, failed) = run_in(&env, Mode::Apply);
+        assert_eq!(failed, 0, "{report}");
         assert!(report.contains("Claude Desktop: registered"), "{report}");
         assert!(report.contains("Cursor: registered; backup at"), "{report}");
         assert!(report.contains("Antigravity: registered"), "{report}");
@@ -585,6 +654,10 @@ mod tests {
             cursor["mcpServers"]["imcp2"]["command"],
             "/opt/imcp2/imcp2-local"
         );
+        assert_eq!(
+            cursor["mcpServers"]["imcp2"]["env"]["IMCP2_IC_URL"], "http://127.0.0.1:4943",
+            "user-added keys survive re-registration"
+        );
         assert_eq!(cursor["mcpServers"]["other"]["command"], "/bin/other");
         assert_eq!(cursor["theme"], "dark");
         assert!(
@@ -603,7 +676,7 @@ mod tests {
         );
 
         // Remove: exactly our entry goes; everything else stays.
-        let report = run_in(&env, Mode::Remove);
+        let (report, _) = run_in(&env, Mode::Remove);
         assert!(report.contains("Cursor: removed"), "{report}");
         assert!(report.contains("Codex: removed"), "{report}");
         let cursor: serde_json::Value = serde_json::from_str(
@@ -618,7 +691,7 @@ mod tests {
         assert!(codex.contains("# my codex config"), "{codex}");
 
         // A second remove is a clean no-op.
-        let report = run_in(&env, Mode::Remove);
+        let (report, _) = run_in(&env, Mode::Remove);
         assert!(report.contains("Cursor: nothing to remove"), "{report}");
     }
 
@@ -627,7 +700,7 @@ mod tests {
     #[test]
     fn undetected_clients_are_skipped_not_invented() {
         let (root, env) = scratch(&[]);
-        let report = run_in(&env, Mode::Apply);
+        let (report, _) = run_in(&env, Mode::Apply);
         for client in [
             "Claude Desktop",
             "Claude Code",
@@ -649,7 +722,7 @@ mod tests {
     #[test]
     fn print_mode_only_prints() {
         let (root, env) = scratch(&[".cursor"]);
-        let report = run_in(&env, Mode::Print);
+        let (report, _) = run_in(&env, Mode::Print);
         assert!(
             report.contains("claude mcp add --scope user --transport stdio imcp2"),
             "{report}"
@@ -673,13 +746,52 @@ mod tests {
         let (root, env) = scratch(&[".cursor"]);
         let file = root.path.join(".cursor/mcp.json");
         std::fs::write(&file, "{ not json").unwrap();
-        let report = run_in(&env, Mode::Apply);
+        let (report, failed) = run_in(&env, Mode::Apply);
+        assert_eq!(failed, 1, "the refusal must reach the exit code: {report}");
         assert!(report.contains("Cursor: FAILED"), "{report}");
         assert!(report.contains("not valid JSON"), "{report}");
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "{ not json",
             "file untouched"
+        );
+    }
+
+    // The pasted snippets must stay valid in their target formats even for an
+    // awkward binary path — Windows backslashes and spaces are the cases a
+    // raw `display()` interpolation used to corrupt.
+    #[test]
+    fn manual_snippets_escape_awkward_paths() {
+        let (_root, mut env) = scratch(&[]);
+        env.exe = PathBuf::from(r"C:\Program Files\imcp2\imcp2-local.exe");
+        let by_name = |name: &str| {
+            clients(&env)
+                .into_iter()
+                .find(|c| c.name == name)
+                .unwrap()
+                .manual
+        };
+
+        let cursor = by_name("Cursor");
+        let snippet = cursor.split_once(":\n").unwrap().1;
+        let parsed: serde_json::Value = serde_json::from_str(snippet).expect(snippet);
+        assert_eq!(
+            parsed["mcpServers"]["imcp2"]["command"],
+            r"C:\Program Files\imcp2\imcp2-local.exe"
+        );
+
+        let codex = by_name("Codex");
+        let toml_body = codex.split_once(":\n").unwrap().1;
+        let doc: toml_edit::DocumentMut = toml_body.parse().expect(toml_body);
+        assert_eq!(
+            doc["mcp_servers"]["imcp2"]["command"].as_str(),
+            Some(r"C:\Program Files\imcp2\imcp2-local.exe")
+        );
+
+        let claude = by_name("Claude Code");
+        assert!(
+            claude.ends_with(r#"-- "C:\Program Files\imcp2\imcp2-local.exe""#),
+            "the one-liner must quote a spaced path: {claude}"
         );
     }
 

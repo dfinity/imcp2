@@ -105,14 +105,17 @@ screen. Concretely:
 
 ## Verifying a download
 
-Every release artifact carries a keyless provenance attestation proving it
+Every platform archive carries a keyless provenance attestation proving it
 was built by this repository's release workflow:
 
 ```sh
 gh attestation verify imcp2-local-<target>.tar.xz -R dfinity/imcp2
 ```
 
-plus a SHA256 checksum alongside each archive. macOS (Developer ID +
+plus a SHA256 checksum alongside each archive. The convenience installers
+(`.sh`/`.ps1`) and the checksum files themselves are assembled by the release
+pipeline without their own attestations — verify the archive, or read an
+installer before running it. macOS (Developer ID +
 notarization) and Windows (Authenticode) code signing for the double-click
 paths hooks into the same release pipeline once the organization's signing
 credentials are in place — until then, install via the shell/PowerShell
