@@ -425,6 +425,15 @@ fn backup_once(path: &Path) -> anyhow::Result<Option<PathBuf>> {
 fn persist(path: &Path, contents: &str) -> anyhow::Result<()> {
     let tmp = path.with_extension("imcp2.tmp");
     std::fs::write(&tmp, contents).with_context(|| format!("write {}", tmp.display()))?;
+    // The rename must not swap the user's permissions for the umask default:
+    // a 0600 config (API keys live in MCP `env` entries) stays 0600. A fresh
+    // file keeps the default. Failing to carry them over fails the write.
+    if let Ok(meta) = std::fs::metadata(path) {
+        if let Err(e) = std::fs::set_permissions(&tmp, meta.permissions()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("carry permissions onto {}", tmp.display()));
+        }
+    }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("replace {}", path.display()));
@@ -544,16 +553,27 @@ fn upsert_codex_server(path: &Path, exe: &Path) -> anyhow::Result<String> {
         .as_table_mut()
         .with_context(|| format!("`mcp_servers` in {} is not a table", path.display()))?;
     // Merge, don't replace — same contract as the JSON path: only `command`
-    // is owned here, user-added keys in the table survive.
-    match servers.get_mut(SERVER_NAME).and_then(|i| i.as_table_mut()) {
-        Some(entry) => {
-            entry.insert("command", toml_edit::value(exe.to_string_lossy().as_ref()));
+    // is owned here, user-added keys survive, whether the entry is a regular
+    // `[mcp_servers.imcp2]` table or an inline `imcp2 = { … }` one.
+    let exe_text = exe.to_string_lossy();
+    let merged = match servers.get_mut(SERVER_NAME) {
+        Some(item) => {
+            if let Some(entry) = item.as_table_mut() {
+                entry.insert("command", toml_edit::value(exe_text.as_ref()));
+                true
+            } else if let Some(entry) = item.as_inline_table_mut() {
+                entry.insert("command", toml_edit::Value::from(exe_text.as_ref()));
+                true
+            } else {
+                false
+            }
         }
-        None => {
-            let mut entry = toml_edit::Table::new();
-            entry.insert("command", toml_edit::value(exe.to_string_lossy().as_ref()));
-            servers.insert(SERVER_NAME, toml_edit::Item::Table(entry));
-        }
+        None => false,
+    };
+    if !merged {
+        let mut entry = toml_edit::Table::new();
+        entry.insert("command", toml_edit::value(exe_text.as_ref()));
+        servers.insert(SERVER_NAME, toml_edit::Item::Table(entry));
     }
     let backup = backup_once(path)?;
     if let Some(parent) = path.parent() {
@@ -665,7 +685,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             root.path.join(".codex/config.toml"),
-            "# my codex config\nmodel = \"o5\"\n\n[mcp_servers.other]\ncommand = \"/bin/other\"\n",
+            "# my codex config\nmodel = \"o5\"\n\n[mcp_servers]\nimcp2 = { command = \"/old/imcp2\", env = { FOO = \"bar\" } }\n\n[mcp_servers.other]\ncommand = \"/bin/other\"\n",
         )
         .unwrap();
 
@@ -717,10 +737,15 @@ mod tests {
         assert!(codex.contains("# my codex config"), "{codex}");
         assert!(codex.contains("model = \"o5\""), "{codex}");
         assert!(codex.contains("[mcp_servers.other]"), "{codex}");
-        assert!(codex.contains("[mcp_servers.imcp2]"), "{codex}");
-        assert!(
-            codex.contains("command = \"/opt/imcp2/imcp2-local\""),
-            "{codex}"
+        let doc: toml_edit::DocumentMut = codex.parse().unwrap();
+        assert_eq!(
+            doc["mcp_servers"]["imcp2"]["command"].as_str(),
+            Some("/opt/imcp2/imcp2-local")
+        );
+        assert_eq!(
+            doc["mcp_servers"]["imcp2"]["env"]["FOO"].as_str(),
+            Some("bar"),
+            "user-added keys survive an inline-table entry too: {codex}"
         );
 
         // Remove: exactly our entry goes; everything else stays.

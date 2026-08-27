@@ -109,6 +109,7 @@ Every platform archive carries a keyless provenance attestation proving it
 was built by this repository's release workflow:
 
 ```sh
+# (Windows archives are .zip — substitute the extension.)
 gh attestation verify imcp2-local-<target>.tar.xz -R dfinity/imcp2 \
   --signer-workflow dfinity/imcp2/.github/workflows/imcp2-local-release.yml
 ```
