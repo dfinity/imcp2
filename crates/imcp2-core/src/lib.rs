@@ -1,7 +1,8 @@
 //! imcp2-core — the transport/OAuth-agnostic components of the IMCP2 Internet
 //! Computer MCP server, from which a serving binary is composed:
 //!
-//!   * [`tools::IcTools`] — the complete MCP tool surface (canister reads and
+//!   * [`tools::IcTools`] — the complete MCP tool surface, composed from
+//!     [`tools::IcCanisterTools`] and [`tools::IcProtocolTools`] (canister reads and
 //!     writes in textual Candid, app/canister discovery, OQL, canister
 //!     management, IC skills), an [`rmcp`] `ServerHandler` ready to serve over
 //!     whichever transport the binary picks (streamable-HTTP in the hosted
@@ -38,7 +39,7 @@ mod discover;
 mod management;
 
 pub use identities::{IiInstance, SessionGauges};
-pub use tools::{IcTools, SessionResolver};
+pub use tools::{IcCanisterTools, IcProtocolTools, IcTools, SessionResolver};
 /// The IC [`Agent`] type the components are built around, re-exported so
 /// callers construct the injected agent from the exact `ic-agent` version this
 /// crate links.

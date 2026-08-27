@@ -10,10 +10,10 @@
 use candid::Principal;
 use ic_agent::{Agent, Identity};
 use rmcp::{
-    handler::server::wrapper::Parameters,
+    handler::server::{tool::ToolCallContext, wrapper::Parameters},
     model::*,
     service::RequestContext,
-    tool, tool_handler, tool_router,
+    tool, tool_router,
     schemars, ErrorData as McpError, RoleServer, ServerHandler,
 };
 
@@ -49,14 +49,44 @@ const OQL_PRIMER_MD: &str = include_str!("../static/oql-primer.md");
 // `discover`, `identities`, `skills`, `management`. main.rs only wires the tools
 // together.
 
+/// The app- and canister-scoped tools: everything that reads, discovers, or
+/// calls ONE app or canister (the `…canister…` / `…_app…` names) — Candid and
+/// OQL reads, update calls, app resolution/discovery, and the per-app
+/// identity tools. Served together with [`IcProtocolTools`] behind
+/// [`IcTools`].
 #[derive(Clone)]
-pub struct IcTools {
+pub struct IcCanisterTools {
     agent: Agent,
+    identities: Identities,
+    /// The authentication seam (see [`SessionResolver`]): asks the embedding
+    /// binary which already-validated session this call acts as.
+    session: SessionResolver,
+}
+
+/// The IC protocol / meta-level tools (the `icp_` prefix): dashboard name/id
+/// lookups, the official IC skills, the OQL dialect guide, and canister
+/// creation/management as the standing management principal. Served together
+/// with [`IcCanisterTools`] behind [`IcTools`].
+#[derive(Clone)]
+pub struct IcProtocolTools {
     identities: Identities,
     skills: skills::SkillsCatalog,
     /// The authentication seam (see [`SessionResolver`]): asks the embedding
     /// binary which already-validated session this call acts as.
     session: SessionResolver,
+}
+
+/// The complete MCP tool surface: [`IcCanisterTools`] and [`IcProtocolTools`]
+/// composed behind one [`ServerHandler`]. The split follows the scope
+/// taxonomy the server instructions teach — an `icp_` prefix marks IC
+/// protocol / meta-level tools, `…_app…`/`…canister…` names act on one app or
+/// canister — while the served surface (tool names, descriptions,
+/// annotations, instructions, resources) is exactly what the single struct
+/// used to serve.
+#[derive(Clone)]
+pub struct IcTools {
+    canister: IcCanisterTools,
+    protocol: IcProtocolTools,
 }
 
 /// The one seam between deployments: how a tool call finds the Internet
@@ -71,7 +101,6 @@ pub struct IcTools {
 pub type SessionResolver =
     Arc<dyn Fn(&RequestContext<RoleServer>) -> Option<String> + Send + Sync>;
 
-#[tool_router]
 impl IcTools {
     pub fn new(
         agent: Agent,
@@ -80,13 +109,30 @@ impl IcTools {
         session: SessionResolver,
     ) -> Self {
         Self {
-            agent,
-            identities,
-            skills,
-            session,
+            canister: IcCanisterTools {
+                agent,
+                identities: identities.clone(),
+                session: session.clone(),
+            },
+            protocol: IcProtocolTools {
+                identities,
+                skills,
+                session,
+            },
         }
     }
 
+    /// Every tool on the served surface — the app/canister tools first, then
+    /// the protocol/meta tools — exactly the list `tools/list` returns.
+    pub fn all_tools() -> Vec<Tool> {
+        let mut tools = IcCanisterTools::tool_router().list_all();
+        tools.extend(IcProtocolTools::tool_router().list_all());
+        tools
+    }
+}
+
+#[tool_router]
+impl IcCanisterTools {
     /// The already-validated session id this tool call acts as, per the
     /// embedding binary's [`SessionResolver`].
     fn current_session_id(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
@@ -166,19 +212,6 @@ impl IcTools {
                 "could not read candid:service metadata: {e}"
             ))),
         }
-    }
-
-    #[tool(
-        description = "Load the OQL query-surface guide: the JSON query dialect for canisters that expose OQL (get_canister_candid reports `oql: true`) — entities/fields/edges via `schema`, and the `execute` query object (filters, aggregation, ordering, edge traversal, paging). This is step ONE of the fixed sequence guide→schema→query: read this once, then `get_canister_oql_schema` for the exact entity/field names (they are the schema's own — often PLURAL and unlike the Candid types/methods, e.g. `bookings` not `Booking`/`getBookings`), then `canister_query` with the `oql` argument. Never guess bespoke per-question methods. The schema read and the query REQUIRE the app's `derivation_origin` (from open_app / resolve_app) — anonymous per-app reads are disabled for now and are rejected with guidance. Both wrap the `schema`/`execute` methods, so you write plain JSON — no Candid escaping.",
-        annotations(title = "Get the OQL query guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
-        output_schema = schema_for_output::<calls::OqlGuideOutput>(),
-    )]
-    async fn icp_oql_guide(
-        &self,
-        Parameters(_args): Parameters<management::NoArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let output = calls::OqlGuideOutput { content: OQL_PRIMER_MD.to_string() };
-        Ok(ok_structured(output.content.clone(), &output))
     }
 
     #[tool(
@@ -1194,6 +1227,29 @@ impl IcTools {
         }
     }
 
+}
+
+#[tool_router]
+impl IcProtocolTools {
+    /// The already-validated session id this tool call acts as, per the
+    /// embedding binary's [`SessionResolver`].
+    fn current_session_id(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
+        (self.session)(ctx)
+    }
+
+    #[tool(
+        description = "Load the OQL query-surface guide: the JSON query dialect for canisters that expose OQL (get_canister_candid reports `oql: true`) — entities/fields/edges via `schema`, and the `execute` query object (filters, aggregation, ordering, edge traversal, paging). This is step ONE of the fixed sequence guide→schema→query: read this once, then `get_canister_oql_schema` for the exact entity/field names (they are the schema's own — often PLURAL and unlike the Candid types/methods, e.g. `bookings` not `Booking`/`getBookings`), then `canister_query` with the `oql` argument. Never guess bespoke per-question methods. The schema read and the query REQUIRE the app's `derivation_origin` (from open_app / resolve_app) — anonymous per-app reads are disabled for now and are rejected with guidance. Both wrap the `schema`/`execute` methods, so you write plain JSON — no Candid escaping.",
+        annotations(title = "Get the OQL query guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<calls::OqlGuideOutput>(),
+    )]
+    async fn icp_oql_guide(
+        &self,
+        Parameters(_args): Parameters<management::NoArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let output = calls::OqlGuideOutput { content: OQL_PRIMER_MD.to_string() };
+        Ok(ok_structured(output.content.clone(), &output))
+    }
+
     #[tool(
         description = "Find Internet Computer canisters by NAME. Searches the IC dashboard's service registries — the ICRC token ledgers (e.g. ckBTC, ckETH, ckUSDC, SNS tokens) by symbol/name, and the SNS project catalog by name — and returns matching canister ids. Use this when the user names a token, project, or service (e.g. \"ckUSDC\") rather than a canister id; then confirm with get_canister_candid, read with canister_query, and write with canister_update_call. (No public name-search exists over arbitrary canisters; this covers the IC's labelled services.)",
         annotations(title = "Find canisters by name", read_only_hint = true, destructive_hint = false, open_world_hint = true),
@@ -2052,8 +2108,42 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              locally, have the user create the canister with the icp CLI (`icp_create_canister` \
              prints the exact steps), then `icp_install_code`.";
 
-#[tool_handler]
 impl ServerHandler for IcTools {
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult {
+            tools: Self::all_tools(),
+            ..Default::default()
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // Dispatch by router membership; an unknown name falls through to the
+        // protocol router, whose miss produces the standard method-not-found
+        // error (same shape the macro-generated handler returned).
+        if IcCanisterTools::tool_router().has_route(&request.name) {
+            let tcc = ToolCallContext::new(&self.canister, request, context);
+            IcCanisterTools::tool_router().call(tcc).await
+        } else {
+            let tcc = ToolCallContext::new(&self.protocol, request, context);
+            IcProtocolTools::tool_router().call(tcc).await
+        }
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        IcCanisterTools::tool_router()
+            .get(name)
+            .cloned()
+            .or_else(|| IcProtocolTools::tool_router().get(name).cloned())
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder().enable_tools().enable_resources().build(),
@@ -2078,7 +2168,7 @@ impl ServerHandler for IcTools {
         // Surface the IC skills as resources too (best-effort: if the registry is
         // unreachable, the candid resources above still list). Each `skill://<name>`
         // is read on demand in read_resource.
-        if let Ok(skills) = self.skills.list().await {
+        if let Ok(skills) = self.protocol.skills.list().await {
             for s in skills {
                 let title = if s.title.is_empty() {
                     format!("IC skill: {}", s.name)
@@ -2104,7 +2194,7 @@ impl ServerHandler for IcTools {
     ) -> Result<ReadResourceResult, McpError> {
         // Skills are fetched live by name; the candid references are static.
         if let Some(name) = request.uri.strip_prefix(SKILL_URI_PREFIX) {
-            return match self.skills.get(name).await {
+            return match self.protocol.skills.get(name).await {
                 Ok(md) => Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     md,
                     request.uri,
@@ -2380,7 +2470,7 @@ mod tests {
     // get_canister_candid as destructive. Assert the read/write classification serializes.
     #[test]
     fn every_tool_has_correct_read_write_annotations() {
-        let tools = super::IcTools::tool_router().list_all();
+        let tools = super::IcTools::all_tools();
         assert_eq!(tools.len(), 26, "expected 26 tools, got {}", tools.len());
         assert!(
             tools.iter().all(|t| t.annotations.is_some()),
@@ -2442,7 +2532,7 @@ mod tests {
     // refused method families, and the user-controlled venue.
     #[test]
     fn financial_policy_is_a_server_instruction_not_a_description() {
-        let tools = super::IcTools::tool_router().list_all();
+        let tools = super::IcTools::all_tools();
         let tool = tools
             .iter()
             .find(|t| &*t.name == "canister_update_call")
@@ -2458,19 +2548,50 @@ mod tests {
     }
 
     // The local binary's login tools (`authenticate`/`auth_status`) live on its
-    // OWN wrapper handler, never in this router: this router IS what the hosted
-    // server advertises on `tools/list`, so a login tool landing here would ship
-    // to every hosted client (which logs in via OAuth instead). Regression guard
-    // for that boundary.
+    // OWN wrapper handler, never on these routers: this surface IS what the
+    // hosted server advertises on `tools/list`, so a login tool landing here
+    // would ship to every hosted client (which logs in via OAuth instead).
+    // Regression guard for that boundary.
     #[test]
     fn the_core_router_carries_no_local_login_tools() {
-        let tools = super::IcTools::tool_router().list_all();
+        let tools = super::IcTools::all_tools();
         for name in ["authenticate", "auth_status"] {
             assert!(
                 tools.iter().all(|t| &*t.name != name),
                 "{name} must not be in the core router (it would ship on the hosted tools/list)"
             );
         }
+    }
+
+    // The tool surface is split by the scope taxonomy the server instructions
+    // teach: every `icp_`-prefixed (protocol / meta-level) tool lives on
+    // IcProtocolTools, everything app-/canister-scoped on IcCanisterTools —
+    // no overlap, nothing dropped, and the composed list is what tools/list
+    // serves.
+    #[test]
+    fn the_split_follows_the_icp_prefix_taxonomy() {
+        let canister = super::IcCanisterTools::tool_router().list_all();
+        let protocol = super::IcProtocolTools::tool_router().list_all();
+        for t in &canister {
+            assert!(
+                !t.name.starts_with("icp_"),
+                "{} is icp_-prefixed and belongs on IcProtocolTools",
+                t.name
+            );
+        }
+        for t in &protocol {
+            assert!(
+                t.name.starts_with("icp_"),
+                "{} is not icp_-prefixed and belongs on IcCanisterTools",
+                t.name
+            );
+        }
+        let all = super::IcTools::all_tools();
+        assert_eq!(all.len(), canister.len() + protocol.len());
+        let mut names: Vec<&str> = all.iter().map(|t| &*t.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), all.len(), "tool names must be unique across the split routers");
     }
 
     // icp_top_up_canister and icp_create_canister are instructions-only, and
@@ -2480,7 +2601,7 @@ mod tests {
     // Guards against a future edit quietly reverting either.
     #[test]
     fn top_up_tool_declares_itself_instructions_only() {
-        let tools = super::IcTools::tool_router().list_all();
+        let tools = super::IcTools::all_tools();
         let tool = tools
             .iter()
             .find(|t| &*t.name == "icp_top_up_canister")
@@ -2493,7 +2614,7 @@ mod tests {
 
     #[test]
     fn create_tool_declares_itself_instructions_only() {
-        let tools = super::IcTools::tool_router().list_all();
+        let tools = super::IcTools::all_tools();
         let tool = tools
             .iter()
             .find(|t| &*t.name == "icp_create_canister")
@@ -2510,7 +2631,7 @@ mod tests {
     // whole surface: a new tool added without an output schema fails here.
     #[test]
     fn every_tool_declares_an_object_output_schema() {
-        let tools = super::IcTools::tool_router().list_all();
+        let tools = super::IcTools::all_tools();
         for t in &tools {
             let schema = t
                 .output_schema
@@ -2528,7 +2649,7 @@ mod tests {
     // Spot-check icp_find_canister_by_name's schema lists the expected properties.
     #[test]
     fn find_canister_declares_output_schema() {
-        let tools = super::IcTools::tool_router().list_all();
+        let tools = super::IcTools::all_tools();
         let tool = tools
             .iter()
             .find(|t| &*t.name == "icp_find_canister_by_name")
