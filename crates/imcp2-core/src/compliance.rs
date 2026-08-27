@@ -27,10 +27,16 @@
 //!   * It is a guardrail enforcing a stated policy, not a hermetic seal — a
 //!     bespoke canister can expose value-moving methods under any name (a
 //!     custom swap method, an intermediary that forwards a transfer), which
-//!     no name-based list can enumerate. The policy itself ("this server
-//!     does not support financial transactions") is stated in the tool
+//!     no name-based list can enumerate. The policy itself ("this tool is
+//!     not intended for financial transactions") is stated in the tool
 //!     description; this guard enforces it for the standardized ledger
-//!     surface, where real funds overwhelmingly live.
+//!     surface, where real funds overwhelmingly live. Why the standardized
+//!     surface is where real funds live: tokens are only valuable if they
+//!     can be exchanged or used, and the ICP ecosystem's financial platforms
+//!     (wallets like Oisy, exchanges like ICP Swap) integrate ledgers
+//!     through these standards — a token on a bespoke, non-standard ledger
+//!     can exist, but the ecosystem's platforms cannot hold or trade it, so
+//!     it carries little exchangeable value.
 //!   * The CMC's `notify_create_canister` / `notify_top_up` are deliberately
 //!     NOT listed: they move no funds out of any account (they finalize a
 //!     mint from ICP the ledger already holds for the CMC), and blocking
