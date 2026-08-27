@@ -54,10 +54,22 @@ pub struct IcTools {
     agent: Agent,
     identities: Identities,
     skills: skills::SkillsCatalog,
-    /// Where a tool call finds the Internet Identity session it acts as — the
-    /// one per-deployment seam (see [`SessionSource`]).
-    session: SessionSource,
+    /// The authentication seam (see [`SessionResolver`]): asks the embedding
+    /// binary which already-validated session this call acts as.
+    session: SessionResolver,
 }
+
+/// The one seam between deployments: how a tool call finds the Internet
+/// Identity session it acts as. **Authentication itself lives in the embedding
+/// binary, not here** — the resolver only reports the outcome of a validation
+/// an earlier layer already performed. The hosted server's bearer middleware
+/// validates the token per request and stashes the session id where its
+/// resolver reads it back; the local binary's login flow keeps the one
+/// signed-in session in a slot its resolver returns. `None` means this call is
+/// unauthenticated (the "needs an authenticated session" errors at the tool
+/// call sites are the caller-facing surface of that).
+pub type SessionResolver =
+    Arc<dyn Fn(&RequestContext<RoleServer>) -> Option<String> + Send + Sync>;
 
 #[tool_router]
 impl IcTools {
@@ -65,7 +77,7 @@ impl IcTools {
         agent: Agent,
         identities: Identities,
         skills: skills::SkillsCatalog,
-        session: SessionSource,
+        session: SessionResolver,
     ) -> Self {
         Self {
             agent,
@@ -75,20 +87,10 @@ impl IcTools {
         }
     }
 
-    /// The session id this tool call acts as, per the deployment's
-    /// [`SessionSource`]: looked up from the request's [`AuthedSession`]
-    /// extension under `Bearer` (multi-user, hosted), or read from the shared
-    /// login-filled [`SessionSlot`] under `Singleton` (single-user, local).
-    /// `None` means the call is unauthenticated ("needs an authenticated
-    /// session" errors at the call sites are unchanged).
+    /// The already-validated session id this tool call acts as, per the
+    /// embedding binary's [`SessionResolver`].
     fn current_session_id(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
-        match &self.session {
-            SessionSource::Bearer => authed_session(ctx).map(|s| s.session_id),
-            SessionSource::Singleton(slot) => {
-                let _ = ctx;
-                slot.get()
-            }
-        }
+        (self.session)(ctx)
     }
 
     #[tool(
@@ -1507,70 +1509,6 @@ impl IcTools {
     }
 }
 
-/// Where [`IcTools`] finds the Internet Identity session a tool call acts as —
-/// the one seam between deployments. The tool implementations are identical
-/// under both variants.
-#[derive(Clone, Debug)]
-pub enum SessionSource {
-    /// Multi-user (the hosted server): resolve the session per request from
-    /// the [`AuthedSession`] extension its bearer-token gate injected.
-    Bearer,
-    /// Single-user (a local server): every call acts as the one session in
-    /// the shared slot, established — and replaced on each re-login — by the
-    /// binary's own login flow.
-    Singleton(SessionSlot),
-}
-
-/// The single-user session holder behind [`SessionSource::Singleton`]: a
-/// shared, **replaceable** slot rather than a fixed id. The Internet Identity
-/// contract requires a FRESH session key after an `Unauthorized` (a reused id
-/// would reuse its keys), so each successful login writes a fresh session id
-/// here — same-process reauthentication after grant expiry or revocation, with
-/// no client restart. Clones share the slot: the login flow holds a writing
-/// handle, [`IcTools`] reads it per call. Starts empty (signed out).
-#[derive(Clone, Debug, Default)]
-pub struct SessionSlot(Arc<std::sync::RwLock<Option<String>>>);
-
-impl SessionSlot {
-    /// A fresh, empty slot (no session — every session-needing tool reports
-    /// "needs an authenticated session" until the login flow fills it).
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The current session id, if a login has completed. The critical section
-    /// is a clone — never held across an await.
-    pub fn get(&self) -> Option<String> {
-        self.0.read().expect("session slot poisoned").clone()
-    }
-
-    /// Replace the session id after a successful login (a fresh id per the II
-    /// fresh-session-key contract).
-    pub fn set(&self, session_id: String) {
-        *self.0.write().expect("session slot poisoned") = Some(session_id);
-    }
-}
-
-/// The verified session id of an authenticated MCP session, injected into the
-/// request extensions by the embedding server's auth gate (the hosted binary's
-/// bearer-token middleware) and read back under [`SessionSource::Bearer`].
-#[derive(Clone, Debug)]
-pub struct AuthedSession {
-    pub session_id: String,
-}
-
-/// The authenticated MCP session of the calling request, if the embedding
-/// server's auth gate injected one. The transport surfaces the HTTP request's
-/// `Parts` in the tool context's extensions; `http::request::Parts` is the
-/// same type axum re-exports, so this reads what an axum middleware inserted
-/// without this crate depending on axum.
-fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<AuthedSession> {
-    ctx.extensions
-        .get::<http::request::Parts>()
-        .and_then(|parts| parts.extensions.get::<AuthedSession>())
-        .cloned()
-}
-
 /// The rejection for an OQL read (`get_canister_oql_schema`, or `canister_query`'s
 /// `oql` path) attempted with NO derivation origin. OQL reads per-app data gated by
 /// the caller's principal, so an anonymous read is signed as 2vxsx-fae and returns
@@ -2498,22 +2436,6 @@ mod tests {
                 "{name} must not be in the core router (it would ship on the hosted tools/list)"
             );
         }
-    }
-
-    // The Singleton session slot is shared and REPLACEABLE: it starts empty
-    // (signed out), a login fills it, and a re-login (fresh session id, per the
-    // II fresh-session-key contract) replaces it — through every clone, since
-    // clones share the holder. This is what makes reauthentication after grant
-    // expiry a same-process step for the local binary.
-    #[test]
-    fn the_session_slot_is_shared_and_replaceable() {
-        let slot = super::SessionSlot::new();
-        let reader = slot.clone();
-        assert_eq!(reader.get(), None, "a fresh slot is signed out");
-        slot.set("sess-1".into());
-        assert_eq!(reader.get(), Some("sess-1".into()), "clones share the slot");
-        slot.set("sess-2".into());
-        assert_eq!(reader.get(), Some("sess-2".into()), "a re-login replaces the id");
     }
 
     // icp_top_up_canister is a compliance-sensitive surface: its description must

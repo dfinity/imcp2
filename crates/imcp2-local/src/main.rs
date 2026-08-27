@@ -33,7 +33,8 @@
 mod login;
 mod server;
 
-use imcp2_core::{identities::Identities, skills, IcTools, IiInstance, SessionSlot, SessionSource};
+use imcp2_core::{identities::Identities, skills, IcTools, IiInstance};
+use login::SessionSlot;
 use rmcp::ServiceExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -106,14 +107,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(ii = %instance.ii_url, "using Internet Identity instance \"{}\"", instance.name);
     let identities = Identities::new(instance, management_origin(), agent.clone());
 
-    // The single-user session seam: the login flow fills (and on re-login
-    // replaces) the slot; every tool call reads it.
+    // The single-user authentication layer, owned by THIS binary: the login
+    // flow fills (and on re-login replaces) the slot, and the resolver it
+    // hands core answers every tool call's "which session?" from it.
     let slot = SessionSlot::new();
     let tools = IcTools::new(
         agent,
         identities.clone(),
         skills::SkillsCatalog::new(),
-        SessionSource::Singleton(slot.clone()),
+        slot.resolver(),
     );
     let auto_open = !truthy("IMCP2_NO_OPEN");
     let login = login::LoginDriver::new(identities, slot, auto_open);

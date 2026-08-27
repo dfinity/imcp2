@@ -1809,7 +1809,6 @@ dependencies = [
  "crc32fast",
  "getrandom 0.3.4",
  "hex",
- "http",
  "ic-agent",
  "regex",
  "reqwest 0.13.4",
