@@ -161,8 +161,8 @@ results).
 | `icp_get_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `writing-motoko`, `icp-cli`, `cycles-management`) |
 | `icp_oql_guide` | — | The OQL query-surface dialect guide (for canisters where `get_canister_candid` reports `oql: true`): the JSON query object, predicate grammar, edges, and paged result shape. The entity/field names come from `get_canister_oql_schema` and queries run through `canister_query` (the `oql` argument) |
 | `get_canister_oql_schema` | `canister_id`, `derivation_origin`, `account?` | The canister's OQL schema catalogue (entities, primary keys, fields, edges) as JSON — wraps its `schema` method — plus a ready-to-run `canister_query` example per entity. **`derivation_origin` is required**: the schema is caller-gated, so an anonymous read is rejected (for now) with guidance, rather than returning an empty list |
-| `icp_cycles_balance` | — | Your cycles-ledger balance (the funds `icp_create_canister` spends), as your standing II principal |
-| `icp_create_canister` | `cycles?` / `icp?`, `controllers?`, `subnet?` | Create + fund a new canister — from your cycles-ledger balance (`cycles`) or by converting ICP from your ICP-ledger account via the CMC (`icp`); returns the new canister id |
+| `icp_cycles_balance` | — | Your cycles-ledger balance and management principal — the principal to add as a controller (via the icp CLI) so the management tools can operate canisters you create |
+| `icp_create_canister` | `cycles?` / `icp?` | **How to** create + fund a new canister: returns `icp` CLI steps for the USER to run themselves (create, fund, and add your management principal as a controller) — executes nothing and moves no funds |
 | `icp_install_code` | `canister_id`, `wasm_base64` / `wasm_hex`, `mode?`, `arg?` | Install/reinstall/upgrade a Wasm module (single-shot, or via the chunk store for large modules) |
 | `icp_canister_status` | `canister_id` | Run state, cycle balance, module hash, memory, controllers, allocations |
 | `icp_update_canister_settings` | `canister_id`, `controllers?`, allocations, `freezing_threshold?`, `log_visibility?`, … | Update a canister's settings |
@@ -394,31 +394,19 @@ conventions.
 
 The management tools let the agent act **on chain as your standing Internet
 Identity principal** — a stable per-connection identity (the one returned when you
-authenticate). Because a user ingress message cannot attach cycles,
-`icp_create_canister` funds the new canister one of two ways, both keyed to that
-management principal (the one `icp_cycles_balance` reports, default subaccount):
+authenticate, printed by `icp_cycles_balance`).
 
-- **`cycles`** — drawn from your **cycles-ledger** balance
-  (`um5iw-rqaaa-aaaaq-qaaba-cai`); fund it first (e.g. via the `icp` CLI /
-  `cycles-management` skill) and check it with `icp_cycles_balance`.
-- **`icp`** — a decimal-ICP amount transferred from that principal's
-  **ICP-ledger** account (`ryjl3-tyaaa-aaaaa-aaaba-cai`, default subaccount) to
-  the **CMC**, which mints cycles into the canister (`notify_create_canister`).
-  Best-effort, single attempt: if the transfer lands but the
-  mint fails, the ICP is held by the CMC and the error carries the ICP-ledger
-  block index. Recovery means re-notifying the CMC for that block **with the same
-  arguments the call used** (the block index alone is not enough), not re-running
-  the tool: the call is **not** idempotent, so re-running it would transfer ICP again.
+**Creation and top-ups are instructions-only.** `icp_create_canister` and
+`icp_top_up_canister` execute nothing and move no funds: each returns the
+[`icp` CLI](https://github.com/dfinity/icp-cli) steps (including where to get
+the CLI) for the user to run the operation themselves, in their own terminal,
+with keys they control. The tools exist for completeness — to reflect the
+Internet Computer platform capabilities — not to perform the operations on the
+user's behalf. The creation steps end with `icp canister settings update …
+--add-controller <PRINCIPAL>`: adding the management principal as a controller
+is what lets the connector's lifecycle tools operate the new canister.
 
-**Top-ups are instructions-only.** `icp_top_up_canister` executes nothing and
-moves no funds: it returns the [`icp` CLI](https://github.com/dfinity/icp-cli)
-steps (`icp canister top-up …`, including where to get the CLI) for the user to
-run the top-up themselves, in their own terminal, with keys they control. The
-tool exists for completeness — to reflect the Internet Computer platform
-capability — not to perform the operation on the user's behalf.
-
-`cycles` takes precedence if both are given to `icp_create_canister`. Lifecycle
-calls
+Lifecycle calls
 (`icp_install_code`, `icp_canister_status`, `icp_update_canister_settings`,
 `start`/`stop`/`uninstall`/`delete`) go to the management canister (`aaaaa-aa`)
 with the effective canister id set to the target. `icp_install_code` takes the
@@ -426,10 +414,11 @@ compiled Wasm as base64/hex and uploads it via the chunk store automatically whe
 it exceeds the single-message limit.
 
 Together these make the end-to-end flow work: *"create a Motoko canister that does
-X and deploy a new canister with Y ICP worth of cycles"* → the agent reads the
-relevant skills, writes and **builds** the Wasm in its own environment, then
-`icp_create_canister(icp = Y)` and `icp_install_code`. (Compiling Motoko/Rust to Wasm
-happens in the agent's environment, not in this server.)
+X and deploy it"* → the agent reads the relevant skills, writes and **builds** the
+Wasm in its own environment, the user creates and funds the canister with the
+`icp` CLI (`icp_create_canister` prints the exact steps), then `icp_install_code`
+puts the Wasm on chain. (Compiling Motoko/Rust to Wasm happens in the agent's
+environment, not in this server.)
 
 ## Connect from an MCP client
 
