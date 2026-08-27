@@ -47,8 +47,8 @@ Verified against the live production deployment (2026-07-31):
 | Claude's hosted callback `https://claude.ai/api/mcp/auth_callback` accepted | ✅ seeded in the redirect allow-list ([`src/auth.rs`](../src/auth.rs), `DEFAULT_ALLOWED_REDIRECTS`) |
 | Claude Code loopback redirects (RFC 8252) | ✅ loopback redirects are exempt from the hosted allow-list |
 | Discovery documents (RFC 8414 + RFC 9728, path-scoped + root fallback) | ✅ all four live, `WWW-Authenticate` on the 401 points at the resource metadata |
-| Every tool: `title` + `readOnlyHint`/`destructiveHint` (+ `idempotentHint`, `openWorldHint`) | ✅ on all 11 served tools (and on the 15 deferred definitions), enforced by a unit test ([`src/tools.rs`](../src/tools.rs)) |
-| No catch-all read/write tool; reads and writes are separate tools | ✅ 10 of the 11 served tools are read-only; the one write is `canister_update_call`. (The protocol/meta group — incl. the instructions-only funding helpers — is deferred to a future version.) |
+| Every tool: `title` + `readOnlyHint`/`destructiveHint` (+ `idempotentHint`, `openWorldHint`) | ✅ on all 11 tools, enforced by a unit test ([`src/tools.rs`](../src/tools.rs)) |
+| No catch-all read/write tool; reads and writes are separate tools | ✅ 10 of the 11 tools are read-only; the one write is `canister_update_call`. |
 | Tool names ≤ 64 chars | ✅ longest is 30 |
 | `outputSchema` + structured content on every tool | ✅ enforced by a unit test |
 | Certificates from a recognized authority | ✅ Let's Encrypt via Caddy |
@@ -145,14 +145,12 @@ transactions**, and the portal's compliance step requires acknowledging this.
 posture is that the server is not a financial tool (this section assumes
 both are merged):**
 
-- **No funding or management tools are served in this version at all.** The
-  execution paths that once moved funds are removed from the binary
+- **The connector has no funding or management tools.** The execution paths
+  that once moved funds are removed from the binary
   ([#153](https://github.com/dfinity/imcp2/pull/153) /
-  [#154](https://github.com/dfinity/imcp2/pull/154) made top-up and creation
-  instructions-only), and the whole protocol/meta tool group — including those
-  instructions-only helpers — is deferred from the served surface; we
-  anticipate it will come in a future version. Creating, funding, and managing
-  canisters is done by the user with the icp CLI in their own terminal.
+  [#154](https://github.com/dfinity/imcp2/pull/154)). Creating, funding, and
+  managing canisters is done by the user with the icp CLI in their own
+  terminal.
 - `canister_update_call` **refuses the standardized ledger methods** that
   move value or grant spending rights — the ICRC-standard names
   (ICRC-1/ICRC-2 plus ICRC-4/-7/-37) on every canister, and the ICP and
@@ -204,9 +202,8 @@ reasonable answer for an authentication system nobody can pre-provision into,
 but a reviewer may still ask for a populated account — most plausibly to
 exercise `canister_update_call` against an app where the identity has data.
 If that comes back, the fallback is a dedicated identity with a recovery
-phrase in the team vault and an account at a demo app. (The
-canister-management tools that would have needed a controlled canister and a
-cycles balance are deferred to a future version.)
+phrase in the team vault and an account at a demo app. (No controlled canister or
+cycles balance is needed: the connector has no canister-management tools.)
 
 ### 4. Production is behind `main`
 
@@ -254,9 +251,8 @@ Paste-and-adapt; portal limits in parentheses.
   > or OQL, and discover the canisters behind any IC app from its name or URL.
   > With your consent it can also act as your Internet Identity accounts at a
   > specific app. Financial transactions are not supported: token-ledger
-  > transfer and approval methods are refused to protect you, and this version
-  > includes no funding or canister-management tools — we anticipate those
-  > will come in a future version.
+  > transfer and approval methods are refused to protect you, and there are
+  > no funding or canister-management tools.
   >
   > On the Internet Identity consent screen you explicitly choose the session
   > duration (10 minutes to 30 days) and the access level: "Questions only"
@@ -324,10 +320,9 @@ Paste-and-adapt; portal limits in parentheses.
 >    recommend reconnecting under "Actions & questions" — that behavior
 >    is intended. Access is revocable at any time at
 >    https://id.ai/manage/settings.
-> 4. Canister-management tools are not part of this version (we anticipate
->    they will come in a future version), so there is nothing to provision:
->    creating and managing canisters happens outside the connector, with the
->    icp CLI.
+> 4. Canister-management tools are not part of this connector, so there is
+>    nothing to provision: creating and managing canisters happens outside
+>    the connector, with the icp CLI.
 > 5. Financial ledger operations are refused by design: asking the assistant
 >    to move tokens returns a policy message directing the user to a wallet
 >    they control — that behavior is intended (financial transactions are
@@ -359,7 +354,7 @@ conversation beyond tool arguments and generates no media.
 
 - [ ] Dedicated ICP MCP privacy policy live at `https://mcp.internetcomputer.org/privacy-policy` (page + landing-page link merged; needs the production release) and entered in the portal (blocker 1)
 - [ ] Reply received from mcp-review@anthropic.com settling the financial-transactions and first-party-API acknowledgments (asked 2026-07-31; blocker 2)
-- [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — if a reviewer asks for a populated account, provision a demo-app account (no funding: the tools that needed it are deferred)
+- [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — if a reviewer asks for a populated account, provision a demo-app account (no funding needed: there are no funding or canister-management tools)
 - [ ] `release-*` tag cut; `/version` on production shows the intended commit (blocker 4)
 - [x] Square PNG icon exported — `docs/assets/icp-logo-{1024,512}.png` (blocker 5)
 - [ ] Every tool exercised once by the submitter (portal asks you to confirm this; MCP Inspector or a custom connector in Claude both count)

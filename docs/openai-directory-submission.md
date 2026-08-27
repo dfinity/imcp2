@@ -54,7 +54,7 @@ add details not published in the docs.
 | Discovery documents (RFC 8414 AS metadata + RFC 9728 protected-resource) | ✅ all live, path-scoped + root fallback |
 | ChatGPT's callback `https://chatgpt.com/connector/oauth/{callback_id}` accepted | ✅ the redirect allow-list pins `("chatgpt.com", "/connector/oauth/")` as a prefix ([`src/auth.rs`](../src/auth.rs), `DEFAULT_ALLOWED_REDIRECTS`) |
 | No machine-to-machine grants (client credentials etc. unsupported by ChatGPT) | ✅ user-consent authorization-code flow only |
-| Tools explicitly annotated `readOnlyHint` / `destructiveHint` / `openWorldHint` — "incorrect or missing action labels are a common cause of rejection" | ✅ set on all 11 served tools (and the 15 deferred definitions). The unit test enforces annotation presence and the `readOnlyHint`/`destructiveHint` values; `openWorldHint` is declared everywhere but not asserted by the test, so re-check it in the portal's Scan Tools step |
+| Tools explicitly annotated `readOnlyHint` / `destructiveHint` / `openWorldHint` — "incorrect or missing action labels are a common cause of rejection" | ✅ set on all 11 tools. The unit test enforces annotation presence and the `readOnlyHint`/`destructiveHint` values; `openWorldHint` is declared everywhere but not asserted by the test, so re-check it in the portal's Scan Tools step |
 | Tool names "human-readable, specific, and descriptive"; accurate descriptions; minimum-information requests | ✅ reviewed against the same bar for the Anthropic listing |
 | Public HTTPS production endpoint, stable and complete ("trial or demo plugins will not be accepted") | ✅ production deployment |
 | Privacy policy disclosing "categories of personal data collected, purposes of use, categories of recipients, data retention timelines" | ⏳ **pending the production release**: the rewritten policy matches these four required disclosures exactly and is live on staging, but `https://mcp.internetcomputer.org/privacy-policy` serves nothing until the next `release-*` tag ships it (see the checklist) |
@@ -93,9 +93,9 @@ and self-serve. Position to state in the Testing tab: reviewers create their
 own Internet Identity in under a minute (instructions on the landing page);
 every read-only tool works with any identity because it reads public network
 state. Have the fallback ready (a provisioned identity with a recovery
-phrase in the team vault and an account at a demo app — the
-canister-management tools that would have needed a controlled canister and a
-cycles balance are deferred to a future version) if review pushes back —
+phrase in the team vault and an account at a demo app — no controlled
+canister or cycles balance is needed: the plugin has no canister-management
+tools) if review pushes back —
 and expect a higher chance of push-back than at Anthropic given the
 login-and-password wording.
 
@@ -120,12 +120,10 @@ financial-transfers prohibition:
   server-level instructions rather than the tool description (which stays
   free of financial language, per maintainer review)
   ([#154](https://github.com/dfinity/imcp2/pull/154)), and
-  no funding or canister-management tools are served in this version at all —
-  the execution paths that once moved funds are removed from the binary
+  the plugin has no funding or canister-management tools at all — the
+  execution paths that once moved funds are removed from the binary
   ([#153](https://github.com/dfinity/imcp2/pull/153),
-  [#154](https://github.com/dfinity/imcp2/pull/154)), and the whole
-  protocol/meta tool group (including the instructions-only funding helpers)
-  is deferred; we anticipate it will come in a future version. README, landing
+  [#154](https://github.com/dfinity/imcp2/pull/154)). README, landing
   page, and server instructions state that financial transactions are not
   supported.
 
