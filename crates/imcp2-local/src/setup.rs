@@ -436,9 +436,10 @@ fn vendor_cli_line(
             .to_lowercase();
             let absent = mode == Mode::Remove
                 && (msg.contains("not found") || msg.contains("no mcp server"));
-            if !absent {
-                *failed += 1;
+            if absent {
+                return format!("• {name}: nothing to remove (per `{via}`).");
             }
+            *failed += 1;
             format!(
                 "• {name}: `{via}` refused ({}). Run it yourself:\n  {fallback}",
                 String::from_utf8_lossy(&out.stderr).trim(),
@@ -488,8 +489,17 @@ fn backup_once(path: &Path) -> anyhow::Result<Option<PathBuf>> {
 fn persist(path: &Path, contents: &str) -> anyhow::Result<()> {
     // A symlinked config (dotfiles managers) must keep being a symlink: write
     // through to the TARGET, so the rename never replaces the link itself
-    // with a regular file. A not-yet-existing path stays as given.
-    let path = &path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // with a regular file. A dangling link cannot be written through, so it
+    // is refused rather than silently replaced; a plain not-yet-existing
+    // path stays as given.
+    let path = &match path.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(_) if path.is_symlink() => anyhow::bail!(
+            "{} is a symlink whose target cannot be resolved — fix the link, then rerun",
+            path.display()
+        ),
+        Err(_) => path.to_path_buf(),
+    };
     let tmp = path.with_extension("imcp2.tmp");
     std::fs::write(&tmp, contents).with_context(|| format!("write {}", tmp.display()))?;
     // The rename must not swap the user's permissions for the umask default:
