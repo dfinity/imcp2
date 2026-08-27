@@ -38,10 +38,10 @@
 //!   * It is a guardrail enforcing a stated policy, not a hermetic seal — a
 //!     bespoke canister can expose value-moving methods under any name (a
 //!     custom swap method, an intermediary that forwards a transfer), which
-//!     no name-based list can enumerate. The policy itself ("this tool is
-//!     not intended for financial transactions") is stated in the tool
-//!     description; this guard enforces it for the standardized ledger
-//!     surface, where real funds overwhelmingly live (see above).
+//!     no name-based list can enumerate. The policy itself ("financial
+//!     transactions are not supported") is stated in the server-level
+//!     instructions (get_info); this guard enforces it for the standardized
+//!     ledger surface, where real funds overwhelmingly live (see above).
 //!   * Legacy pre-ICRC token standards (DIP20/EXT `transfer`/`transferFrom`/
 //!     `approve` on arbitrary canisters) are deliberately NOT matched: the
 //!     names are too abstract to block everywhere without breaking
@@ -136,12 +136,10 @@ pub fn disallowed_update_method(canister_id: &Principal, method: &str) -> Option
          https://nns.ic0.app."
     };
     Some(format!(
-        "`{method}` is {what} — a financial transaction — and this tool is not \
-         intended for financial transactions (token transfers, spending approvals, \
-         payments, or trades) on the user's behalf; such methods are refused as a \
-         reasonable measure for marketplace compliance and user safety. {instead} \
-         Do not route the same operation through this tool under another method \
-         name."
+        "`{method}` is {what} — a financial transaction. Financial transactions \
+         (token transfers, spending approvals, payments, or trades) are not \
+         supported by this server, to protect the user: asset-moving requests \
+         are denied. {instead}"
     ))
 }
 
@@ -270,16 +268,20 @@ mod tests {
     }
 
     // The refusal is the whole story: it names the method, states the policy
-    // (financial transactions, compliance + user safety), and redirects to a
-    // user-controlled wallet in the browser (oisy.com), per the listing
-    // requirements. Pin those pieces so the message can't degrade silently.
+    // in plain terms an agent can relay (not supported, to protect the user —
+    // no marketplace/compliance jargon, and no hint that another route might
+    // work; per review), and redirects to a user-controlled wallet in the
+    // browser (oisy.com). Pin those pieces so the message can't degrade.
     #[test]
     fn refusal_names_method_policy_and_wallet() {
         let msg = disallowed_update_method(&any_canister(), "icrc1_transfer")
             .expect("must be refused");
         assert!(msg.contains("`icrc1_transfer`"), "{msg}");
         assert!(msg.contains("financial transaction"), "{msg}");
-        assert!(msg.contains("marketplace compliance and user safety"), "{msg}");
+        assert!(msg.contains("not supported"), "{msg}");
+        assert!(msg.contains("to protect the user"), "{msg}");
         assert!(msg.contains("https://oisy.com"), "{msg}");
+        assert!(!msg.contains("marketplace"), "{msg}");
+        assert!(!msg.contains("compliance"), "{msg}");
     }
 }

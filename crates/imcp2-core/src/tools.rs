@@ -435,7 +435,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. NOT INTENDED FOR FINANCIAL TRANSACTIONS: this tool is not intended for moving money, tokens, or other financial assets on the user's behalf, and it takes reasonable measures to refuse asset-moving requests — the ICRC-standard transfer/approval methods (icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICRC-4/-7/-37 equivalents) are refused on every canister, and the ICP and cycles ledgers' own transfer/withdrawal/creation methods (e.g. the ICP ledger's legacy transfer) are refused on those ledgers, for marketplace compliance and user safety. Do not send asset-moving requests through it under any other method name either; for such operations, recommend the user acts themselves in a wallet or frontend they control in their browser (e.g. https://oisy.com). Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
+        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
         annotations(title = "Make a canister update call", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterUpdateCallOutput>(),
     )]
@@ -1910,15 +1910,12 @@ fn identity_annotation(target: &IdentityTarget, acted_as: Option<&str>) -> Strin
     s
 }
 
-#[tool_handler]
-impl ServerHandler for IcTools {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder().enable_tools().enable_resources().build(),
-        )
-        .with_server_info(Implementation::from_build_env())
-        .with_instructions(
-            "Internet Computer tools. Every tool speaks TEXTUAL Candid — the `(...)` value \
+/// The server-level instructions every client receives from `get_info`. The
+/// financial-transactions policy lives HERE, server-wide — deliberately not in
+/// any single tool's description (per review: a policy paragraph inside
+/// canister_update_call's description reads as a hint that the tool is usable
+/// for financial transactions, the one thing it must not suggest).
+const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TEXTUAL Candid — the `(...)` value \
              syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`, never \
              the binary form. Tool names signal SCOPE: an `icp_` prefix marks IC protocol / \
              meta-level tools (dashboard name/id lookups, the official IC skills, the OQL dialect \
@@ -1930,17 +1927,16 @@ impl ServerHandler for IcTools {
              specific canister. Before writing Candid args, consult the `candid://textual-syntax` \
              resource (the value syntax these tools use); `candid://reference` has the full type \
              reference.\n\n\
-             NOT FOR FINANCIAL OPERATIONS. Financial operations — token transfers, spending \
-             approvals, payments, trades — are unsupported here BY POLICY, for marketplace \
-             compliance and user safety, and the standardized ledger surface is refused \
-             mechanically: canister_update_call refuses the ICRC-1/ICRC-2 (and related \
-             ledger-standard) transfer/approval methods on every canister, and \
-             icp_top_up_canister only returns CLI instructions. Never attempt a financial \
-             operation through any other method or route either. When the user asks for one, \
-             recommend they do it themselves in a wallet or app frontend they control, in \
-             their own browser — e.g. their wallet at https://oisy.com. (Creating and funding \
-             the user's OWN canisters — compute resources — remains available via \
-             icp_create_canister.)\n\n\
+             FINANCIAL TRANSACTIONS ARE NOT SUPPORTED — asset-moving requests are denied, to \
+             protect the user: canister_update_call refuses the ICRC-standard transfer/approval \
+             methods (icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICRC-4/-7/-37 \
+             equivalents) on every canister, and the ICP and cycles ledgers' own \
+             transfer/withdrawal/creation methods on those ledgers. For financial operations \
+             (token transfers, spending approvals, payments, trades), recommend the user acts \
+             themselves in a wallet or frontend they control, in their own browser — e.g. their \
+             wallet at https://oisy.com, or for governance the NNS dapp at https://nns.ic0.app; a \
+             refused cycles-ledger canister-creation spend points at the user-run icp CLI \
+             instead.\n\n\
              START WITH open_app WHEN THE USER NAMES OR LINKS AN APP. `open_app(name-or-URL)` is the \
              one-call entry point: it takes an app NAME (e.g. \"NNS\") or a URL (e.g. \
              \"https://opencloud.org\"), resolves the Internet Identity derivation origin AND discovers the canisters \
@@ -2058,9 +2054,16 @@ impl ServerHandler for IcTools {
              `icp_top_up_canister` is instructions-only: it never moves funds — it returns the CLI \
              steps for the user to run a top-up themselves. So to \
              \"build X and deploy a canister with Y ICP worth of cycles\": read the relevant skills, \
-             write & build the Wasm locally, `icp_create_canister(icp=Y)`, then `icp_install_code`."
-                .to_string(),
+             write & build the Wasm locally, `icp_create_canister(icp=Y)`, then `icp_install_code`.";
+
+#[tool_handler]
+impl ServerHandler for IcTools {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(
+            ServerCapabilities::builder().enable_tools().enable_resources().build(),
         )
+        .with_server_info(Implementation::from_build_env())
+        .with_instructions(SERVER_INSTRUCTIONS.to_string())
     }
 
     async fn list_resources(
@@ -2442,22 +2445,27 @@ mod tests {
         assert_eq!(cc.destructive_hint, Some(true));
     }
 
-    // canister_update_call is a compliance-sensitive surface: its description
-    // must state that financial transactions are not supported (the ledger
-    // transfer/approval methods the `compliance` module refuses) and point at
-    // the user-controlled wallet, so directory reviewers and calling models
-    // both see the policy. Guards against the wording quietly reverting.
+    // The financial-transactions policy is a SERVER-WIDE instruction, not a
+    // tool-description paragraph: stating it inside canister_update_call's
+    // description would read as a hint that the tool is usable for financial
+    // transactions (per review). Pin both sides — the description carries no
+    // financial language, and the server instructions state the denial, the
+    // refused method families, and the user-controlled venue.
     #[test]
-    fn update_call_tool_declares_financial_restriction() {
+    fn financial_policy_is_a_server_instruction_not_a_description() {
         let tools = super::IcTools::tool_router().list_all();
         let tool = tools
             .iter()
             .find(|t| &*t.name == "canister_update_call")
             .expect("canister_update_call tool not found");
         let desc = tool.description.as_deref().unwrap_or_default();
-        assert!(desc.contains("NOT INTENDED FOR FINANCIAL TRANSACTIONS"), "{desc}");
-        assert!(desc.contains("icrc1_transfer"), "{desc}");
-        assert!(desc.contains("https://oisy.com"), "{desc}");
+        assert!(!desc.to_lowercase().contains("financial"), "{desc}");
+        assert!(!desc.contains("oisy.com"), "{desc}");
+        let ins = super::SERVER_INSTRUCTIONS;
+        assert!(ins.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED"));
+        assert!(ins.contains("asset-moving requests are denied"));
+        assert!(ins.contains("icrc1_transfer"));
+        assert!(ins.contains("https://oisy.com"));
     }
 
     // The local binary's login tools (`authenticate`/`auth_status`) live on its
