@@ -114,7 +114,28 @@ use uuid::Uuid;
 use imcp2_core::identities::Identities;
 use imcp2_core::iiconnect::{self, RedeemBody};
 pub use imcp2_core::iiconnect::AUTH_CALLBACKS_WELL_KNOWN;
-pub use imcp2_core::AuthedSession;
+
+/// The verified session id of an authenticated MCP session: [`require_token`]
+/// validates the bearer token and stashes this on the request; the
+/// [`bearer_session_resolver`] hands it to the tool layer. The whole
+/// authentication step lives HERE, in the hosted binary — `imcp2-core` only
+/// asks its injected [`imcp2_core::SessionResolver`] for the outcome.
+#[derive(Clone, Debug)]
+pub struct AuthedSession {
+    pub session_id: String,
+}
+
+/// The hosted binary's [`imcp2_core::SessionResolver`]: read back the
+/// [`AuthedSession`] that [`require_token`] injected into the request
+/// extensions (rmcp surfaces the HTTP request's `Parts` in the tool context).
+pub fn bearer_session_resolver() -> imcp2_core::SessionResolver {
+    std::sync::Arc::new(|ctx| {
+        ctx.extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<AuthedSession>())
+            .map(|session| session.session_id.clone())
+    })
+}
 
 /// How long an authorization request and its pending II handshake stay valid
 /// before the user must restart.
