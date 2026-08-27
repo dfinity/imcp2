@@ -118,11 +118,13 @@ financial-transfers prohibition:
   server-level instructions rather than the tool description (which stays
   free of financial language, per maintainer review)
   ([#154](https://github.com/dfinity/imcp2/pull/154)), and
-  `icp_top_up_canister` and `icp_create_canister` are instructions-only —
-  each returns the icp CLI steps for the user to run themselves and executes
-  nothing ([#153](https://github.com/dfinity/imcp2/pull/153),
-  [#154](https://github.com/dfinity/imcp2/pull/154)). README, landing page,
-  and server instructions state that financial transactions are not
+  no funding or canister-management tools are served in this version at all —
+  the execution paths that once moved funds are removed from the binary
+  ([#153](https://github.com/dfinity/imcp2/pull/153),
+  [#154](https://github.com/dfinity/imcp2/pull/154)), and the whole
+  protocol/meta tool group (including the instructions-only funding helpers)
+  is deferred; we anticipate it will come in a future version. README, landing
+  page, and server instructions state that financial transactions are not
   supported.
 
 ### 4. Test cases (authoring work)
@@ -133,8 +135,9 @@ and mobile. Draft set:
 Positive:
 1. "What is canister gftcp-myaaa-aaaar-qcaaa-cai?" → identifies the
    canister behind opencloud.org, its controllers and interface.
-2. "How do I add cycles to canister gftcp-myaaa-aaaar-qcaaa-cai?" → returns step-by-step icp CLI
-   instructions; nothing is executed.
+2. "Does the canister behind https://opencloud.org expose an API doc, and
+   what does its interface look like?" → interface + capability flags via
+   get_canister_candid / get_canister_api_doc.
 3. "What canisters are behind https://opencloud.org?" → App Connect
    discovery returns the app's canisters with provenance.
 4. "Open opencloud.org and list my accounts there" (signed in) → resolves

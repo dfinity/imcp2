@@ -48,7 +48,7 @@ Verified against the live production deployment (2026-07-31):
 | Claude Code loopback redirects (RFC 8252) | ✅ loopback redirects are exempt from the hosted allow-list |
 | Discovery documents (RFC 8414 + RFC 9728, path-scoped + root fallback) | ✅ all four live, `WWW-Authenticate` on the 401 points at the resource metadata |
 | Every tool: `title` + `readOnlyHint`/`destructiveHint` (+ `idempotentHint`, `openWorldHint`) | ✅ on all 26 tools, enforced by a unit test ([`src/tools.rs`](../src/tools.rs)) |
-| No catch-all read/write tool; reads and writes are separate tools | ✅ 19 read-only tools (incl. the instructions-only top-up and creation, [#153](https://github.com/dfinity/imcp2/pull/153)/[#154](https://github.com/dfinity/imcp2/pull/154)); writes split per operation |
+| No catch-all read/write tool; reads and writes are separate tools | ✅ 9 of the 10 served tools are read-only; the one write is `canister_update_call`. (The protocol/meta group — incl. the instructions-only funding helpers — is deferred to a future version.) |
 | Tool names ≤ 64 chars | ✅ longest is 30 |
 | `outputSchema` + structured content on every tool | ✅ enforced by a unit test |
 | Certificates from a recognized authority | ✅ Let's Encrypt via Caddy |
@@ -145,17 +145,14 @@ transactions**, and the portal's compliance step requires acknowledging this.
 posture is that the server is not a financial tool (this section assumes
 both are merged):**
 
-- `icp_top_up_canister` is **instructions-only**: it executes nothing and
-  moves no funds — it returns the CLI steps for the user to run a top-up
-  themselves, and the server-side execution path (cycles-ledger `withdraw`,
-  CMC `notify_top_up`) is removed from the binary
-  ([#153](https://github.com/dfinity/imcp2/pull/153)).
-- `icp_create_canister` is likewise **instructions-only**: creating and
-  funding a canister spends the user's ICP or cycles, so the tool returns the
-  icp CLI steps — ending with the controller-handover step that lets the
-  connector's lifecycle tools manage the new canister — and executes nothing;
-  the ICP-ledger transfer, CMC notify, and cycles-ledger creation paths are
-  removed from the binary ([#154](https://github.com/dfinity/imcp2/pull/154)).
+- **No funding or management tools are served in this version at all.** The
+  execution paths that once moved funds are removed from the binary
+  ([#153](https://github.com/dfinity/imcp2/pull/153) /
+  [#154](https://github.com/dfinity/imcp2/pull/154) made top-up and creation
+  instructions-only), and the whole protocol/meta tool group — including those
+  instructions-only helpers — is deferred from the served surface; we
+  anticipate it will come in a future version. Creating, funding, and managing
+  canisters is done by the user with the icp CLI in their own terminal.
 - `canister_update_call` **refuses the standardized ledger methods** that
   move value or grant spending rights — the ICRC-standard names
   (ICRC-1/ICRC-2 plus ICRC-4/-7/-37) on every canister, and the ICP and
@@ -254,11 +251,10 @@ Paste-and-adapt; portal limits in parentheses.
   > canister is, fetch its Candid interface, read app data via typed queries
   > or OQL, and discover the canisters behind any IC app from its name or URL.
   > With your consent it can also act as your Internet Identity accounts at a
-  > specific app, and manage canisters you control: check status, create,
-  > install code, and start/stop. Financial transactions are not supported:
-  > token-ledger transfer and approval methods are refused to protect you,
-  > and cycle top-ups and canister creation return CLI instructions for you
-  > to run yourself instead of executing anything.
+  > specific app. Financial transactions are not supported: token-ledger
+  > transfer and approval methods are refused to protect you, and this version
+  > includes no funding or canister-management tools — we anticipate those
+  > will come in a future version.
   >
   > On the Internet Identity consent screen you explicitly choose the session
   > duration (10 minutes to 30 days) and the access level: "Questions only"
@@ -302,7 +298,8 @@ Paste-and-adapt; portal limits in parentheses.
   1. *"What is canister gftcp-myaaa-aaaar-qcaaa-cai? Who controls it and
      what's its interface?"*
   2. *"Open opencloud.org and list my accounts there."*
-  3. *"How do I add cycles to canister gftcp-myaaa-aaaar-qcaaa-cai?"*
+  3. *"Does the canister behind https://opencloud.org expose an API doc, and
+     what does its interface look like?"*
   4. *"What canisters are behind https://opencloud.org, and which one holds
      the app's data?"*
 
@@ -315,17 +312,17 @@ Paste-and-adapt; portal limits in parentheses.
 >    Every read-only tool works with any identity, because it reads public
 >    network state.
 > 2. On the consent screen pick a session duration and an access level:
->    "Questions only" exercises the 19 read-only-annotated tools; "Actions &
->    questions" additionally allows state-changing calls.
+>    "Questions only" exercises the 9 read-only-annotated tools; "Actions &
+>    questions" additionally allows state-changing calls
+>    (`canister_update_call`).
 > 3. Try the example prompts above. Questions-only sessions cause management
 >    tools to return an actionable reconnect message rather than an opaque
 >    error — that behavior is intended. Access is revocable at any time at
 >    https://id.ai/manage/settings.
-> 4. The canister-management tools act on canisters you control, so a
->    brand-new identity has nothing for them to operate on. Ask us at
->    mcp@dfinity.org if you would like an identity provisioned with a
->    canister to exercise those. Canister creation and top-ups return CLI
->    instructions for the user to run themselves — nothing is executed.
+> 4. Canister-management tools are not part of this version (we anticipate
+>    they will come in a future version), so there is nothing to provision:
+>    creating and managing canisters happens outside the connector, with the
+>    icp CLI.
 > 5. Financial ledger operations are refused by design: asking the assistant
 >    to move tokens returns a policy message directing the user to a wallet
 >    they control — that behavior is intended (financial transactions are
@@ -344,8 +341,8 @@ public Internet Computer infrastructure (`icp-api.io`, `id.ai`) and forwards
 user-directed calls to the application canisters the user names — state
 exactly that in the acknowledgment. The **prompt-injection** acknowledgment needs open disclosure rather
 than a bare yes: tool descriptions are static and contain no hidden
-instructions, but `icp_list_skills`/`icp_get_skill` (and the `skill://`
-resources) intentionally return DFINITY-published how-to documents fetched
+instructions, but the `skill://`
+resources intentionally return DFINITY-published how-to documents fetched
 live from `skills.internetcomputer.org` at the user's request — describe
 this in the submission so reviewers see documented, user-requested
 functionality rather than covertly pulled behavioral instructions. The rest

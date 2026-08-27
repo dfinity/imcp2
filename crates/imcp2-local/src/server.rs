@@ -383,8 +383,8 @@ mod tests {
             "authenticate must declare its refresh flag: {schema}"
         );
         // The merged surface keeps the core contract: every tool declares an
-        // object-rooted outputSchema (the core suite enforces it for the 26;
-        // this enforces it for the two added here).
+        // object-rooted outputSchema (the core suite enforces it for the core
+        // tools; this enforces it for the two added here).
         for t in &tools {
             let schema = t
                 .output_schema
@@ -410,7 +410,7 @@ mod tests {
 
     // A REAL MCP round-trip over an in-process duplex pipe (the same
     // byte-stream shape stdio serves): initialize; tools/list is the merged
-    // surface (all 26 core tools + the 2 login tools); tools/call dispatches
+    // surface (the 10 served core tools + the 2 login tools); tools/call dispatches
     // login tools to the wrapper and everything else to IcTools; the login
     // lifecycle (signed out → link → pending) runs through the MCP layer —
     // all with no network and no browser.
@@ -440,8 +440,8 @@ mod tests {
         let tools = client.list_all_tools().await.expect("tools/list");
         assert_eq!(
             tools.len(),
-            28,
-            "26 core tools + authenticate + auth_status"
+            12,
+            "10 served core tools + authenticate + auth_status"
         );
         for expected in [
             "get_canister_candid",

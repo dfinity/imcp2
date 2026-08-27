@@ -12,13 +12,15 @@ encoding/decoding and signing against the IC via
 building, and operating canisters — it is not a wallet or trading tool, and
 financial operations (token transfers, spending approvals, payments, trades)
 are unsupported by policy. The standardized ledger surface is refused
-mechanically: `canister_update_call` rejects the ICRC-1/ICRC-2 (and related
-ledger-standard) transfer/approval methods on every canister, and
-`icp_top_up_canister` and `icp_create_canister` return `icp` CLI instructions
-for the user to run themselves instead of executing anything — those tools
-create nothing and move no funds. For financial operations, users act
-themselves in a wallet or frontend they control (e.g.
-[oisy.com](https://oisy.com)), in their own browser.
+mechanically (`canister_update_call` rejects the ICRC-1/ICRC-2 and related
+ledger-standard transfer/approval methods on every canister), and this version
+ships no funding or management tools at all: creating, funding, and topping up
+canisters is done by the user with the
+[`icp` CLI](https://github.com/dfinity/icp-cli) in their own terminal
+(instructions-only helper tools are deferred — we anticipate these will come
+in a future version). For financial operations, users act themselves in a
+wallet or frontend they control (e.g. [oisy.com](https://oisy.com)), in their
+own browser.
 
 ## Use as a library
 
@@ -147,27 +149,26 @@ results).
 |------|------|---------|
 | `open_app` | `app` (name **or** URL) | **One-call entry point** when a user names/links an app: resolves the Internet Identity `derivation_origin` *and* discovers the canisters behind it, together. A name or bare host is matched to the known-app registry first (so a wrong-TLD guess repairs to the canonical URL); an explicit `https://` URL is resolved as given. An unknown bare name, or a URL with no IC evidence, is *refused* (never guessed). Also probes the app's own canisters and reports per-canister `oql`/`api_doc_available` capability flags plus a caller-gated data-access note (which canister holds the app data, and the origin to read it as the user). Wraps `resolve_app` + `discover_app_canisters`; no auth |
 | `discover_app_canisters` | `domain` | Canister ids behind a web domain — app-declared App Connect metadata first (`/ai-connect.html`'s `ic:canister-id` meta, `/.well-known/ic-app.json` manifest), then the frontend via `x-ic-canister-id` and backend candidates via `/env.json` + JS-bundle mining — each with provenance, its IC dashboard label/type where known, and (for the app's own canisters) `oql`/`api_doc_available` capability flags from a one-shot Candid probe |
-| `icp_find_canister_by_name` | `query` | Canister ids matching a name/symbol, searched in the IC dashboard's service registries — ICRC token ledgers (e.g. `ckUSDC`) and the SNS project catalog |
-| `icp_find_app_by_name` | `name` | A well-known app's front-end URL + `derivation_origin`, for a small built-in set of well-known IC apps. The **first stop** whenever only an app *name* is known — never guess a domain from a name. Any other name returns no match and a `note` directing a web search for the app's URL (there's no on-chain name→URL directory) |
-| `icp_lookup_canister_info_by_id` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
-| `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus two capability flags: `oql` (`true` when it exposes an OQL query surface — a `schema` + `execute` pair — with a pointer to `icp_oql_guide`) and `api_doc_available` (`true` when it declares a `getApiDoc`/`get_api_doc` method, gating `get_canister_api_doc`) |
+| `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus two capability flags: `oql` (`true` when it exposes an OQL query surface — a `schema` + `execute` pair — with a pointer to the `oql://usage` resource) and `api_doc_available` (`true` when it declares a `getApiDoc`/`get_api_doc` method, gating `get_canister_api_doc`) |
 | `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), from its `getApiDoc`/`get_api_doc` method. Call **only** when `get_canister_candid`/`open_app` report `api_doc_available`. Returns a **structured** result in every case — `available` + the doc on success, else `available:false` with `expected`/`retry`/`next` so an expected absence is distinct from an unreachable canister |
 | `canister_query` | `canister_id`, `method?` **or** `oql?`, `args?` (textual Candid), `derivation_origin?`, `account?`, `candid?` | READ a canister — provide EITHER a Candid `query` `method` (with `args`) OR an `oql` query (a JSON object string, run against `execute`). A Candid `method` query may be anonymous or as your account and returns textual Candid; an `oql` query **requires** `derivation_origin` and returns `columns` + `rows` (a table) with `has_more`, validating `start` against the schema on an empty result. On an OQL canister a Candid `method` query is rejected — use `oql`. `candid` is a fallback: the `.did` interface text to encode/decode against when the canister exposes no `candid:service` metadata. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
 | `canister_update_call` | `canister_id`, `method`, `args` (textual Candid), `derivation_origin?`, `account?`, `candid?` | Make an UPDATE (state-changing) call; reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`/`resolve_app`). **Financial transactions are refused**: the ICRC-standard transfer/approval methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents) are disallowed on every canister, and the ICP and cycles ledgers' own value-moving methods (the legacy `transfer`, `withdraw`, the `create_canister` spends) on those ledgers, to protect the user — the refusal directs the user to act themselves — in a wallet they control (e.g. [oisy.com](https://oisy.com)), or, for canister creation, with the [icp CLI](https://github.com/dfinity/icp-cli) in their own terminal. `candid` is the same `.did` fallback as on `canister_query`, used when the interface isn't published on-chain. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
 | `get_app_principal` | `derivation_origin`, `account?` | The principal you act as at an app, without a call. Identify the app by its `derivation_origin` (from `open_app`/`resolve_app`). Echoes `derived_for_origin` / `requested` so an origin mismatch is visible |
 | `list_app_accounts` | `derivation_origin` | The user's Internet Identity accounts at an app — the default account plus any named ones — with name, number, last-used, and the derivation origin they were listed for. Identify the app by its `derivation_origin` (from `open_app`/`resolve_app`) |
 | `resolve_app` | `app_url` | Resolve an app URL to its Internet Identity derivation context: `application_origin`, the `derivation_origin` to use (declared in `/.well-known/ic-app.json`, else a built-in known-app value, else assumed = app origin — flagged via `derivation_origin_source`: `declared`/`known`/`app_url_default`, with `application_is_ic` echoing the gateway evidence), and the app's `alternative_origins` (informational). An origin with **no IC evidence** that would need the `app_url_default` assumption is **refused** (guessed-domain guard, with a "did you mean" repair when the host resembles a well-known app). Does not return a principal (no account chosen) or require auth — pass the `derivation_origin` to `get_app_principal`/`list_app_accounts` |
-| `icp_list_skills` | — | The official [IC skills](https://skills.internetcomputer.org) (Motoko, mops/icp CLIs, cycles, stable memory, security, …), grouped by category |
-| `icp_get_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `writing-motoko`, `icp-cli`, `cycles-management`) |
-| `icp_oql_guide` | — | The OQL query-surface dialect guide (for canisters where `get_canister_candid` reports `oql: true`): the JSON query object, predicate grammar, edges, and paged result shape. The entity/field names come from `get_canister_oql_schema` and queries run through `canister_query` (the `oql` argument) |
 | `get_canister_oql_schema` | `canister_id`, `derivation_origin`, `account?` | The canister's OQL schema catalogue (entities, primary keys, fields, edges) as JSON — wraps its `schema` method — plus a ready-to-run `canister_query` example per entity. **`derivation_origin` is required**: the schema is caller-gated, so an anonymous read is rejected (for now) with guidance, rather than returning an empty list |
-| `icp_cycles_balance` | — | Your cycles-ledger balance and management principal — the principal to add as a controller (via the icp CLI) so the management tools can operate canisters you create |
-| `icp_create_canister` | `cycles?` / `icp?` | **How to** create + fund a new canister: returns `icp` CLI steps for the USER to run themselves (create, fund, and add your management principal as a controller) — executes nothing and moves no funds |
-| `icp_install_code` | `canister_id`, `wasm_base64` / `wasm_hex`, `mode?`, `arg?` | Install/reinstall/upgrade a Wasm module (single-shot, or via the chunk store for large modules) |
-| `icp_canister_status` | `canister_id` | Run state, cycle balance, module hash, memory, controllers, allocations |
-| `icp_update_canister_settings` | `canister_id`, `controllers?`, allocations, `freezing_threshold?`, `log_visibility?`, … | Update a canister's settings |
-| `icp_start_canister` / `icp_stop_canister` / `icp_uninstall_code` / `icp_delete_canister` | `canister_id` | Canister lifecycle |
-| `icp_top_up_canister` | `canister_id`, `cycles?` / `icp?` | **Instructions only — nothing is executed and no funds move.** Returns the step-by-step [`icp` CLI](https://github.com/dfinity/icp-cli) commands — including where to get the CLI — for the user to add cycles to a canister themselves; `cycles`/`icp` are substituted into the printed commands. Provided for completeness, to reflect the platform capability |
+
+> **Deferred in this version.** The `icp_`-prefixed protocol/meta tools — the
+> dashboard name/id lookups (`icp_find_canister_by_name`, `icp_find_app_by_name`,
+> `icp_lookup_canister_info_by_id`), the skills tools (`icp_list_skills`,
+> `icp_get_skill`), the OQL guide tool (`icp_oql_guide`), and the
+> canister-management group (`icp_cycles_balance`, the instructions-only
+> `icp_create_canister` / `icp_top_up_canister`, `icp_install_code`,
+> `icp_canister_status`, `icp_update_canister_settings`, and the lifecycle
+> tools) — are not served in this version; **we anticipate this will come in a
+> future version.** The OQL dialect guide and the official IC skills remain
+> available as MCP resources (`oql://usage`, `skill://<name>`), and the types
+> stay in the library (`IcProtocolTools`) for embedders and for the return.
 
 `open_app` (its `app` argument takes a name **or** a URL) is the one-call entry point
 when the user names or links an app: it resolves the Internet Identity
@@ -196,8 +197,8 @@ Acting **for the user** at an app:
    gateway header, no `ic-app.json` derivation origin) is refused too; when the host
    resembles a known app the error names it and gives the real URL (a
    "did you mean" repair). For a single step, the narrower tools remain:
-   **`icp_find_app_by_name`** (name→URL only), **`resolve_app(url)`** (origin only),
-   **`discover_app_canisters(url)`** (canisters only).
+   **`resolve_app(url)`** (origin only), **`discover_app_canisters(url)`**
+   (canisters only).
 3. **`list_app_accounts`** — if there's more than one account, ask which to use (and
    remember it).
 4. **`get_app_principal`** — only when you need the principal *value* itself;
@@ -271,15 +272,11 @@ above). It is the only authoritative way for `open_app` / `resolve_app` to learn
 so an app that uses one should declare it here; otherwise the connector assumes
 the derivation origin equals the application origin and flags that assumption.
 
-When the user names a **token, project, or service** (e.g. `ckUSDC`) rather than a
-website or id, `icp_find_canister_by_name` resolves it via
-[`dashboard.internetcomputer.org`](https://dashboard.internetcomputer.org)'s public
-APIs — the ICRC token registry and the SNS catalog — to the matching canister id(s).
-`icp_lookup_canister_info_by_id` goes the other way: given a bare id, it returns the dashboard's
-label, type, controllers, subnet, and module hash, so a raw principal becomes an
-identified service. (`discover_app_canisters` results are annotated with these labels
-inline.) There is no public name-search over arbitrary canisters, so `icp_find_canister_by_name`
-covers the IC's labelled services, which is where the meaningful ones live.
+When the user names a **token, project, or service** rather than a website or
+id, the dedicated dashboard lookup tools are not part of this version — we
+anticipate they will come in a future version. Until then, web search the
+canister id or ask the user for it. (`discover_app_canisters` results are still
+annotated with the dashboard's labels inline.)
 
 `canister_query` and `canister_update_call` run anonymously by default; pass a
 `derivation_origin` to call as
@@ -335,15 +332,17 @@ token (see Auth).
 
 ### Skills awareness
 
-`icp_list_skills` / `icp_get_skill` expose the official Internet Computer
+The official Internet Computer
 [skills](https://skills.internetcomputer.org) — authoritative, current how-to
 guides for authoring and shipping IC apps (the Motoko language, the `mops` and
 `icp` CLIs, cycles management, stable memory & upgrades, canister security,
-auth, …). The catalogue is fetched live from the registry's manifest
-(`/api/skills.json`, cached ~15 min) and each skill's `SKILL.md` on demand;
-nothing is bundled, so the agent always sees the current skills. They are also
-listed as MCP **resources** (`skill://<name>`) alongside the `candid://`
-references. Override the registry origin with `SKILLS_URL`.
+auth, …) — are served as MCP **resources** (`skill://<name>`) alongside the
+`candid://` references. The catalogue is fetched live from the registry's
+manifest (`/api/skills.json`, cached ~15 min) and each skill's `SKILL.md` on
+demand; nothing is bundled, so the agent always sees the current skills.
+Dedicated browsing tools (`icp_list_skills` / `icp_get_skill`) are deferred —
+we anticipate these will come in a future version. Override the registry
+origin with `SKILLS_URL`.
 
 ### OQL query surfaces
 
@@ -366,7 +365,7 @@ individual layer is small.
 The OQL query path is JSON rather than Candid, so it shares the same 1 MiB size cap
 but is parsed by the JSON parser, not this structural guard. Rather than inline the
 whole dialect into every interface read, `get_canister_candid` emits only that flag plus a
-one-line pointer; the full guide is served on demand by `icp_oql_guide` and as
+one-line pointer; the full guide is served on demand as
 the `oql://usage` MCP **resource**.
 
 Two tools drive the surface: **`get_canister_oql_schema`** returns the entity/field
@@ -391,33 +390,21 @@ conventions.
 
 ### Creating & managing canisters
 
-The management tools let the agent act **on chain as your standing Internet
-Identity principal** — a stable per-connection identity (the one returned when you
-authenticate, printed by `icp_cycles_balance`).
+Canister creation, funding, deployment, and lifecycle management are done by
+the **user** with the [`icp` CLI](https://github.com/dfinity/icp-cli) in their
+own terminal, guided by the official skills (`skill://icp-cli`,
+`skill://cycles-management`). The dedicated management tool group — a
+cycles-balance read, instructions-only creation and top-up helpers,
+`icp_install_code`, status/settings, and the lifecycle operations, acting as a
+standing per-connection management principal — is deferred from this version;
+**we anticipate this will come in a future version** (the code remains in the
+library as `IcProtocolTools`).
 
-**Creation and top-ups are instructions-only.** `icp_create_canister` and
-`icp_top_up_canister` execute nothing and move no funds: each returns the
-[`icp` CLI](https://github.com/dfinity/icp-cli) steps (including where to get
-the CLI) for the user to run the operation themselves, in their own terminal,
-with keys they control. The tools exist for completeness — to reflect the
-Internet Computer platform capabilities — not to perform the operations on the
-user's behalf. The creation steps end with `icp canister settings update …
---add-controller <PRINCIPAL>`: adding the management principal as a controller
-is what lets the connector's lifecycle tools operate the new canister.
-
-Lifecycle calls
-(`icp_install_code`, `icp_canister_status`, `icp_update_canister_settings`,
-`start`/`stop`/`uninstall`/`delete`) go to the management canister (`aaaaa-aa`)
-with the effective canister id set to the target. `icp_install_code` takes the
-compiled Wasm as base64/hex and uploads it via the chunk store automatically when
-it exceeds the single-message limit.
-
-Together these make the end-to-end flow work: *"create a Motoko canister that does
-X and deploy it"* → the agent reads the relevant skills, writes and **builds** the
-Wasm in its own environment, the user creates and funds the canister with the
-`icp` CLI (`icp_create_canister` prints the exact steps), then `icp_install_code`
-puts the Wasm on chain. (Compiling Motoko/Rust to Wasm happens in the agent's
-environment, not in this server.)
+The end-to-end flow still works: *"create a Motoko canister that does X and
+deploy it"* → the agent reads the relevant skills (`skill://` resources),
+writes and **builds** the Wasm in its own environment, and the user creates,
+funds, and installs it with the `icp` CLI. (Compiling Motoko/Rust to Wasm
+happens in the agent's environment, not in this server.)
 
 ## Connect from an MCP client
 
@@ -434,9 +421,10 @@ the tools become available. All clients use the same **authorization-code + PKCE
 flow.
 
 > II's consent screen makes you choose an access level: **"Questions only"** or
-> **"Actions & questions"**. Choose **Actions & questions** if you want to create
-> or manage canisters — a Questions-only session makes every management tool
-> inert (see [Read-only sessions](#read-only-sessions) below).
+> **"Actions & questions"**. Choose **Actions & questions** if you want the
+> agent to make state-changing calls (`canister_update_call`) — a
+> Questions-only session rejects them at ingress (see
+> [Read-only sessions](#read-only-sessions) below).
 
 ## Run
 
@@ -848,9 +836,10 @@ can cost in memory and disk, not the request rate. Put a rate limiter in front
 II's consent screen requires an explicit access-level choice: **"Questions
 only"** or **"Actions & questions"**. A user who picks Questions only gets a
 session whose per-app delegations are `permissions = "queries"`,
-and the IC **rejects update calls made through them at ingress**. That makes the
-entire canister-management surface inert — `create`/`install`/`start`/`stop`/
-`uninstall`/`delete`, and even `icp_canister_status`, are update calls. To handle this
+and the IC **rejects update calls made through them at ingress**. That makes
+`canister_update_call` inert — and, when the deferred canister-management
+tools return in a future version, that whole surface too (even a status read
+is an update call there). To handle this
 without opaque low-level errors:
 
 - The `mcp_register_v2` reply carries `permissions: "queries" | "all"`, so the
