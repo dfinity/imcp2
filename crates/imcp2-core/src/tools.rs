@@ -1994,10 +1994,8 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              act on a whole APP, keyed by its Internet Identity derivation origin or app URL, and \
              `…canister…` names (`get_canister_candid`, `get_canister_api_doc`, \
              `get_canister_oql_schema`, `canister_query`, `canister_update_call`) act on ONE \
-             specific canister; `icp_oql_guide` serves the OQL dialect those reads use. (A \
-             further group of IC protocol / meta-level tools — dashboard name/id lookups, the \
-             official IC skills as tools, and canister creation/management — is not part of this \
-             version; we anticipate this will come in a future version.) Before writing Candid \
+             specific canister; `icp_oql_guide` serves the OQL dialect those reads use. \
+             Before writing Candid \
              args, consult the `candid://textual-syntax` \
              resource (the value syntax these tools use); `candid://reference` has the full type \
              reference, and the official IC \
@@ -2023,10 +2021,8 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              and let the connector resolve it, WEB SEARCH the official \
              URL, or ask the user. Lookalike domains are unrelated or squatted sites, and open_app / \
              every URL-taking tool REFUSES an origin that shows no evidence of being an Internet \
-             Computer app instead of resolving it to a wrong identity. (Dedicated dashboard \
-             lookup tools for token/service names and bare canister ids are not part of this \
-             version — we anticipate they will come in a future version; until then, web search \
-             or ask the user for an id you don't have.)\n\n\
+             Computer app instead of resolving it to a wrong identity. (For a token/service \
+             name or a canister id you don't have, web search or ask the user.)\n\n\
              \"MY / OUR …\" IS AN AUTHENTICATED READ. A question about the USER's OWN data in an app \
              (\"who am I meeting with…\", \"my bookings\", \"our open orders\") reads data the app gates \
              by the CALLER's principal. An OQL read (get_canister_oql_schema, and canister_query \
@@ -2116,9 +2112,7 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              (ICP↔cycles & funding), `stable-memory` (upgrades) and `canister-security`. Compiling \
              Motoko/Rust to Wasm happens in YOUR environment (guided by those skills), and \
              CREATING, FUNDING, DEPLOYING and MANAGING canisters is done by the USER with the icp \
-             CLI in their own terminal, guided by the same skills. Dedicated tools for skills \
-             browsing and for canister creation/management as your Internet Identity are not part \
-             of this version — we anticipate this will come in a future version.";
+             CLI in their own terminal, guided by the same skills.";
 
 impl ServerHandler for IcTools {
     async fn list_tools(
@@ -2576,7 +2570,8 @@ mod tests {
 
     // The user-facing contract of THIS version: only the canister/app tools
     // are served; the protocol/meta group is deferred, and the instructions
-    // say a future version brings it.
+    // describe the current surface only (per review: what isn't in this
+    // version isn't mentioned).
     #[test]
     fn the_default_composition_defers_the_protocol_tools() {
         let served = super::IcTools::all_tools();
@@ -2592,7 +2587,7 @@ mod tests {
         // name is not just unlisted — it is not routable at all.
         assert!(!super::IcCanisterTools::tool_router().has_route("icp_get_skill"));
         assert!(!super::IcCanisterTools::tool_router().has_route("icp_install_code"));
-        assert!(super::SERVER_INSTRUCTIONS.contains("future version"));
+        assert!(!super::SERVER_INSTRUCTIONS.contains("future version"));
     }
 
     // The tool surface is split by scope: the protocol / meta-level tools

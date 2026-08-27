@@ -207,7 +207,7 @@ public-metadata tools (`get_canister_candid`, `discover_app_canisters`) skip ste
 3/4 and need no origin; OQL reads always require one. The per-canister inspection (5) is
 independent of the identity steps (3/4), so they can run in parallel. Managing your
 **own** canisters is not part of this connector: create and manage them with the
-icp CLI (see *Creating & managing canisters* below).
+[`icp` CLI](https://github.com/dfinity/icp-cli) in your own terminal.
 
 ### App-declared canister metadata (App Connect)
 
@@ -371,19 +371,6 @@ reply that isn't a recognizable OQL result degrades to the raw Candid rather tha
 erroring. The design mirrors the reference IC connector's OQL primer (detect +
 teach), adding an ergonomic executor suited to this server's structured-output
 conventions.
-
-### Creating & managing canisters
-
-Canister creation, funding, deployment, and lifecycle management are done by
-the **user** with the [`icp` CLI](https://github.com/dfinity/icp-cli) in their
-own terminal, guided by the official skills (`skill://icp-cli`,
-`skill://cycles-management`). This connector has no canister-management tools.
-
-The end-to-end flow: *"create a Motoko canister that does X and
-deploy it"* → the agent reads the relevant skills (`skill://` resources),
-writes and **builds** the Wasm in its own environment, and the user creates,
-funds, and installs it with the `icp` CLI. (Compiling Motoko/Rust to Wasm
-happens in the agent's environment, not in this server.)
 
 ## Connect from an MCP client
 
