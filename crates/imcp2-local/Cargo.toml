@@ -4,12 +4,18 @@ version = "0.2.0"
 edition = "2021"
 description = "Local MCP server for the Internet Computer: the imcp2 tool surface over stdio, with a built-in Internet Identity browser login."
 license = "Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/dfinity/imcp2"
 # Distributed as signed release binaries (the design's end-user setup and
 # signing components), not through crates.io — flip deliberately if that ever
 # changes. This also keeps the tag-lockstep publish workflow scoped to
 # imcp2-core + imcp2.
 publish = false
+
+# The one dist-released app in this workspace: release binaries + installers
+# are built by dist (see dist-workspace.toml) on `imcp2-local-v*` tags.
+[package.metadata.dist]
+dist = true
 
 [dependencies]
 # The whole server is composed from imcp2-core: the IcTools surface (served
@@ -34,6 +40,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
+# `setup` only: locating each client's config home (dirs) and editing Codex's
+# config.toml without destroying the user's comments/formatting (toml_edit).
+dirs = "6"
+toml_edit = "0.23"
 # Only for the PocketIC-backed end-to-end login test (src/e2e_local_login.rs),
 # behind the `e2e` feature so the default build never compiles it — the same
 # gating as the hosted crate's harness. (An optional dependency, not a
@@ -51,12 +61,12 @@ e2e = ["dep:pocket-ic"]
 # The login-flow tests play the browser: fetch the callback page, the
 # allow-list, and POST redeems against the loopback listener.
 reqwest = { workspace = true, features = ["json"] }
-# The wrapper tests run a REAL MCP round-trip: the server served over an
-# in-process duplex pipe (the same shape as stdio), driven by rmcp's client.
-rmcp = { workspace = true, features = ["client"] }
-tokio = { workspace = true, features = ["io-util"] }
 # The e2e login test speaks the II canister's candid interface directly
 # (playing II's frontend) and (de)codes the delegation-chain wire fields.
 candid = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
+# The wrapper tests run a REAL MCP round-trip: the server served over an
+# in-process duplex pipe (the same shape as stdio), driven by rmcp's client.
+rmcp = { workspace = true, features = ["client"] }
+tokio = { workspace = true, features = ["io-util"] }

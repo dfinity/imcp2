@@ -35,6 +35,11 @@ exclude = [
 [workspace]
 members = [".", "crates/imcp2-core", "crates/imcp2-local"]
 
+# The hosted server releases to crates.io (publish-crate.yml), never as dist
+# binaries — dist releases only imcp2-local (see dist-workspace.toml).
+[package.metadata.dist]
+dist = false
+
 # Single source of truth for the version pins the crates share, so the agent,
 # codec, and candid lines can never drift between imcp2-core, imcp2, and
 # imcp2-local.
@@ -125,3 +130,8 @@ e2e = ["dep:pocket-ic"]
 # tower::ServiceExt::oneshot and read bodies via http-body-util.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

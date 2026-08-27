@@ -32,6 +32,7 @@
 
 mod login;
 mod server;
+mod setup;
 
 // The PocketIC-backed end-to-end login test (the design's local-replica test
 // configuration). Compiled only for `cargo test --features e2e`.
@@ -42,6 +43,42 @@ use imcp2_core::{identities::Identities, skills, IcTools, IiInstance};
 use login::SessionSlot;
 use rmcp::ServiceExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+const HELP: &str = "\
+imcp2-local — Internet Computer MCP server for local use (stdio)
+
+Run with no arguments to serve MCP over stdio (this is what an AI client's
+registration invokes). Subcommands:
+
+  setup            Register this binary with the AI tools installed on this
+                   machine (Claude Desktop, Claude Code, Codex, Cursor,
+                   Antigravity; prints Perplexity's UI steps).
+  setup --remove   Undo those registrations.
+  setup --print    Only show the per-client steps; write nothing.
+  --version, -V    Print the version.
+  --help, -h       This text.
+
+Environment (serving): IMCP2_IC_URL, IMCP2_FETCH_ROOT_KEY (loopback only),
+II_URL_PROD / II_CANISTER_ID_PROD, IMCP2_MANAGEMENT_ORIGIN, IMCP2_NO_OPEN —
+see the crate documentation for details.
+";
+
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => serve(),
+        Some("setup") => setup::run(&args[1..]),
+        Some("--version" | "-V") => {
+            println!("imcp2-local {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("--help" | "-h" | "help") => {
+            print!("{HELP}");
+            Ok(())
+        }
+        Some(other) => anyhow::bail!("unknown argument {other:?}\n\n{HELP}"),
+    }
+}
 
 fn truthy(var: &str) -> bool {
     std::env::var(var)
@@ -79,8 +116,10 @@ fn is_loopback_url(url: &str) -> bool {
     }
 }
 
+/// Serve MCP over stdio — the no-argument path an AI client's registration
+/// invokes.
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn serve() -> anyhow::Result<()> {
     // stderr only: stdout carries the MCP JSON-RPC stream, and every client
     // routes a stdio server's stderr to a log file/panel, never the chat.
     tracing_subscriber::registry()
