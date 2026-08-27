@@ -34,7 +34,7 @@ modifies):
 
 ```sh
 imcp2-local setup            # register everywhere it can
-imcp2-local setup --remove   # undo exactly that
+imcp2-local setup --remove   # remove those imcp2 registrations
 imcp2-local setup --print    # only show the per-client steps
 ```
 

@@ -87,6 +87,14 @@ impl Env {
         // ran through a symlink; fall back to the raw path if e.g. a network
         // mount refuses canonicalization.
         let exe = exe.canonicalize().unwrap_or(exe);
+        // Every registration format below carries the path as UTF-8 text; a
+        // lossy conversion would register a command that does not exist.
+        anyhow::ensure!(
+            exe.to_str().is_some(),
+            "this binary's path ({}) is not valid UTF-8 — move the binary to a \
+             UTF-8 path and rerun setup",
+            exe.display()
+        );
         Ok(Self {
             home: dirs::home_dir().context("no home directory")?,
             config_dir: dirs::config_dir().context("no OS config directory")?,
@@ -401,8 +409,27 @@ fn backup_once(path: &Path) -> anyhow::Result<Option<PathBuf>> {
     if backup.exists() {
         return Ok(Some(backup));
     }
-    std::fs::copy(path, &backup).with_context(|| format!("back up {}", path.display()))?;
+    // Copy via a sibling temp + rename: a partial copy (full disk, crash)
+    // must never pass as the valid one-time backup on later runs.
+    let tmp = backup.with_extension("imcp2-bak.tmp");
+    std::fs::copy(path, &tmp).with_context(|| format!("back up {}", path.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, &backup) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("finalize backup {}", backup.display()));
+    }
     Ok(Some(backup))
+}
+
+/// Write a config atomically: sibling temp file, then rename over `path` —
+/// a crash or full disk never leaves the client's live config truncated.
+fn persist(path: &Path, contents: &str) -> anyhow::Result<()> {
+    let tmp = path.with_extension("imcp2.tmp");
+    std::fs::write(&tmp, contents).with_context(|| format!("write {}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("replace {}", path.display()));
+    }
+    Ok(())
 }
 
 // ---- mcpServers JSON files (Claude Desktop, Cursor, Antigravity) -----------
@@ -453,8 +480,7 @@ fn upsert_json_server(path: &Path, exe: &Path) -> anyhow::Result<String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    std::fs::write(path, format!("{:#}\n", root))
-        .with_context(|| format!("write {}", path.display()))?;
+    persist(path, &format!("{:#}\n", root))?;
     Ok(match backup {
         Some(b) => format!("registered; backup at {}", b.display()),
         None => "registered".to_string(),
@@ -479,8 +505,7 @@ fn remove_json_server(path: &Path) -> anyhow::Result<String> {
     // A removal is a modification too: the first one still earns the one-time
     // pre-imcp2 backup (e.g. `--remove` before any apply on this machine).
     let backup = backup_once(path)?;
-    std::fs::write(path, format!("{:#}\n", root))
-        .with_context(|| format!("write {}", path.display()))?;
+    persist(path, &format!("{:#}\n", root))?;
     Ok(match backup {
         Some(b) => format!("removed; backup at {}", b.display()),
         None => "removed".to_string(),
@@ -534,7 +559,7 @@ fn upsert_codex_server(path: &Path, exe: &Path) -> anyhow::Result<String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    std::fs::write(path, doc.to_string()).with_context(|| format!("write {}", path.display()))?;
+    persist(path, &doc.to_string())?;
     Ok(match backup {
         Some(b) => format!("registered; backup at {}", b.display()),
         None => "registered".to_string(),
@@ -567,7 +592,7 @@ fn remove_codex_server(path: &Path) -> anyhow::Result<String> {
     }
     // Same one-time backup contract as the JSON removal above.
     let backup = backup_once(path)?;
-    std::fs::write(path, doc.to_string()).with_context(|| format!("write {}", path.display()))?;
+    persist(path, &doc.to_string())?;
     Ok(match backup {
         Some(b) => format!("removed; backup at {}", b.display()),
         None => "removed".to_string(),
