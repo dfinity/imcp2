@@ -151,14 +151,17 @@ both are merged):**
   CMC `notify_top_up`) is removed from the binary
   ([#153](https://github.com/dfinity/imcp2/pull/153)).
 - `canister_update_call` **refuses the standardized ledger methods** that
-  move value or grant spending rights — ICRC-1/ICRC-2 (plus ICRC-4/-7/-37),
-  the ICP ledger's legacy `transfer`/`send_dfx`, the cycles ledger's
-  `withdraw` — on every canister; the refusal recommends the user act
-  themselves in a wallet they control (oisy.com), and the tool description
-  states the policy up front
+  move value or grant spending rights — the ICRC-standard names
+  (ICRC-1/ICRC-2 plus ICRC-4/-7/-37) on every canister, and the ICP and
+  cycles ledgers' own `transfer`/`send_dfx`/`withdraw`/`create_canister`
+  methods on those ledgers; the refusal recommends the user act themselves
+  in a wallet they control (oisy.com; a refused canister-creation spend
+  points at the user-run icp CLI), and the policy is stated in the
+  server-level instructions — deliberately not in the tool description,
+  which stays free of financial language per maintainer review
   ([#154](https://github.com/dfinity/imcp2/pull/154)).
 - The README, the landing page, and the server instructions all state
-  explicitly that the server is not intended for financial operations.
+  explicitly that financial transactions are not supported.
 
 **What honestly remains exposed to the prohibition** — keep both points in
 whatever is declared:

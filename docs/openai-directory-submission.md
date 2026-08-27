@@ -115,12 +115,13 @@ financial-transfers prohibition:
   (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents) on every canister, plus
   the ICP and cycles ledgers' own value-moving methods (the legacy
   `transfer`, `withdraw`, the `create_canister` spends) on those ledgers,
-  and says so in its description
-  ([#154](https://github.com/dfinity/imcp2/pull/154)), and
+  with the policy stated in the server-level instructions rather than the
+  tool description (which stays free of financial language, per maintainer
+  review) ([#154](https://github.com/dfinity/imcp2/pull/154)), and
   `icp_top_up_canister` is instructions-only and executes nothing
   ([#153](https://github.com/dfinity/imcp2/pull/153)); README, landing page,
-  and server instructions state the server is not intended for financial
-  operations. Two direct counterexamples to the attestation's absolute
+  and server instructions state that financial transactions are not
+  supported. Two direct counterexamples to the attestation's absolute
   wording remain open and need a decision BEFORE it can be checked
   truthfully: `icp_create_canister`'s `icp` argument still executes an
   ICP→cycles conversion from the user's own ledger account (metered compute
