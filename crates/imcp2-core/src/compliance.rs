@@ -49,9 +49,9 @@
 //!     ecosystem's ICRC-integrated platforms. The stated policy covers them.
 //!   * The CMC's `notify_create_canister` / `notify_top_up` are deliberately
 //!     NOT listed: they move no funds out of any account (they finalize a
-//!     mint from ICP the ledger already holds for the CMC), and blocking
-//!     them would strand the documented recovery path for an interrupted
-//!     `icp_create_canister` ICP funding flow.
+//!     mint from ICP the ledger already holds for the CMC), and they are the
+//!     recovery path when a user's own icp-CLI funding flow is interrupted
+//!     mid-mint.
 
 use candid::Principal;
 
@@ -91,9 +91,9 @@ const DISALLOWED_CANISTER_METHODS: &[(&str, &str, &str)] = &[
     // The cycles ledger's value movement beyond ICRC-1/-2 (which group one
     // already covers): withdrawals and the canister-creation spends. The
     // creation refusal points the user at running the operation themselves
-    // with the icp CLI — not at another connector tool (per review: the
-    // refusal must not read as this server creating canisters on the
-    // user's behalf).
+    // with the icp CLI; icp_create_canister is instructions-only (it prints
+    // those steps and executes nothing), so naming it does not offer an
+    // executing route (per review).
     (CYCLES_LEDGER, "withdraw", "a cycles-ledger withdrawal"),
     (CYCLES_LEDGER, "withdraw_from", "a cycles-ledger delegated withdrawal"),
     (CYCLES_LEDGER, "create_canister", "a cycles-ledger spend (canister creation)"),
@@ -125,15 +125,14 @@ pub fn disallowed_update_method(canister_id: &Principal, method: &str) -> Option
     // wallet or frontend in the user's own browser.
     let instead = if method.starts_with("create_canister") {
         "Recommend that the user creates and funds canisters themselves with \
-         the icp CLI in their own terminal (install with `npm install -g \
-         @icp-sdk/icp-cli`, or see https://github.com/dfinity/icp-cli); the \
-         icp-cli and cycles-management skills (icp_get_skill) carry the \
-         current steps."
+         the icp CLI in their own terminal — the icp_create_canister tool \
+         prints the exact steps (it executes nothing and moves no funds), and \
+         the icp-cli and cycles-management skills (icp_get_skill) carry the \
+         full guide."
     } else {
         "Recommend that the user performs this operation themselves, in a wallet \
          or app frontend they control, in their own web browser — e.g. their \
-         wallet at https://oisy.com, or for governance the NNS dapp at \
-         https://nns.ic0.app."
+         wallet at https://oisy.com."
     };
     Some(format!(
         "`{method}` is {what} — a financial transaction. Financial transactions \
@@ -220,19 +219,16 @@ mod tests {
 
     // The cycles ledger's canister-creation spends are refused on the generic
     // route, and their refusal points the user at running creation themselves
-    // with the icp CLI — never at another connector tool (per review, the
-    // refusal must not read as this server creating canisters on the user's
-    // behalf) and not at a wallet (the wrong venue for creation).
+    // with the icp CLI. icp_create_canister may be named because it is
+    // instructions-only — the refusal must say so, and must not point at a
+    // wallet (the wrong venue for creation).
     #[test]
     fn refuses_cycles_ledger_creation_spends_with_cli_redirect() {
         for method in ["create_canister", "create_canister_from"] {
             let msg = disallowed_update_method(&cycles_ledger(), method)
                 .unwrap_or_else(|| panic!("{method} must be refused"));
             assert!(msg.contains("icp CLI"), "{msg}");
-            assert!(
-                !msg.contains("icp_create_canister"),
-                "creation must not redirect to a connector tool: {msg}"
-            );
+            assert!(msg.contains("executes nothing"), "{msg}");
             assert!(!msg.contains("oisy.com"), "a wallet is the wrong venue for creation: {msg}");
         }
     }
