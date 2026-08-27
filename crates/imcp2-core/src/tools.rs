@@ -1343,7 +1343,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "How to create and fund a NEW Internet Computer canister. PROVIDED FOR COMPLETENESS, to reflect this capability of the Internet Computer platform: the tool does NOT implement the operation on the user's behalf — it never spends cycles or ICP and executes nothing on chain. It returns step-by-step icp CLI instructions (including where to get the CLI) for the USER to create and fund the canister themselves in their own terminal, ending with the settings-update step that adds your management principal (printed by icp_cycles_balance) as a controller so icp_install_code and the lifecycle tools can manage the new canister. Pass `cycles` or `icp` only to have the intended amount substituted into the printed commands. For the full guide, load the cycles-management skill (icp_get_skill).",
+        description = "How to create and fund a NEW Internet Computer canister: returns step-by-step icp CLI instructions (including where to get the CLI) for the USER to run themselves in their own terminal, ending with the settings-update step that adds your management principal (printed by icp_cycles_balance) as a controller so icp_install_code and the lifecycle tools can manage the new canister — this tool only prints the steps and never executes the operation. Pass `cycles` or `icp` only to have the intended amount substituted into the printed commands. For the full guide, load the cycles-management skill (icp_get_skill).",
         // Instructions-only: no session, no canister call, no funds movement — a
         // pure read, and closed-world (nothing leaves the server).
         annotations(title = "How to create a canister", read_only_hint = true, destructive_hint = false, open_world_hint = false),
@@ -1360,7 +1360,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "How to add cycles to an existing canister. PROVIDED FOR COMPLETENESS, to reflect this capability of the Internet Computer platform: the tool does NOT implement the operation on the user's behalf — it never moves cycles or ICP and executes nothing on chain. It returns step-by-step icp CLI instructions (including where to get the CLI) for the USER to run the top-up themselves in their own terminal. Pass `cycles` or `icp` only to have the intended amount substituted into the printed commands. For the full funding guide, load the cycles-management skill (icp_get_skill).",
+        description = "How to add cycles to an existing canister: returns step-by-step icp CLI instructions (including where to get the CLI) for the USER to run the top-up themselves in their own terminal — this tool only prints the steps and never executes the operation. Pass `cycles` or `icp` only to have the intended amount substituted into the printed commands. For the full funding guide, load the cycles-management skill (icp_get_skill).",
         // Instructions-only: no session, no canister call, no funds movement — a
         // pure read, and closed-world (nothing leaves the server).
         annotations(title = "How to top up a canister", read_only_hint = true, destructive_hint = false, open_world_hint = false),
@@ -2473,11 +2473,11 @@ mod tests {
         }
     }
 
-    // icp_top_up_canister and icp_create_canister are compliance-sensitive
-    // surfaces: each description must present the tool as instructions-only
-    // (provided for completeness, executes nothing on the user's behalf), so
-    // directory reviewers and calling models both see that contract. Guards
-    // against a future edit quietly reverting either.
+    // icp_top_up_canister and icp_create_canister are instructions-only, and
+    // their descriptions must say so FUNCTIONALLY — the tool prints steps and
+    // never executes — without compliance disclaimers (per review, policy
+    // language lives in the server instructions, not per-tool descriptions).
+    // Guards against a future edit quietly reverting either.
     #[test]
     fn top_up_tool_declares_itself_instructions_only() {
         let tools = super::IcTools::tool_router().list_all();
@@ -2486,9 +2486,9 @@ mod tests {
             .find(|t| &*t.name == "icp_top_up_canister")
             .expect("icp_top_up_canister tool not found");
         let desc = tool.description.as_deref().unwrap_or_default();
-        assert!(desc.contains("PROVIDED FOR COMPLETENESS"), "{desc}");
-        assert!(desc.contains("does NOT implement the operation"), "{desc}");
-        assert!(desc.contains("never moves cycles or ICP"), "{desc}");
+        assert!(desc.contains("only prints the steps"), "{desc}");
+        assert!(desc.contains("never executes the operation"), "{desc}");
+        assert!(!desc.to_lowercase().contains("financial"), "{desc}");
     }
 
     #[test]
@@ -2499,10 +2499,10 @@ mod tests {
             .find(|t| &*t.name == "icp_create_canister")
             .expect("icp_create_canister tool not found");
         let desc = tool.description.as_deref().unwrap_or_default();
-        assert!(desc.contains("PROVIDED FOR COMPLETENESS"), "{desc}");
-        assert!(desc.contains("does NOT implement the operation"), "{desc}");
-        assert!(desc.contains("never spends cycles or ICP"), "{desc}");
-        assert!(desc.contains("--add-controller") || desc.contains("controller"), "{desc}");
+        assert!(desc.contains("only prints the steps"), "{desc}");
+        assert!(desc.contains("never executes the operation"), "{desc}");
+        assert!(desc.contains("controller"), "{desc}");
+        assert!(!desc.to_lowercase().contains("financial"), "{desc}");
     }
 
     // EVERY tool must declare an outputSchema so a model knows the shape of its
