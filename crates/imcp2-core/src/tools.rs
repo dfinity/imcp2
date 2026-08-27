@@ -85,7 +85,9 @@ pub struct IcProtocolTools {
 /// [`ServerHandler`], plus the candid/OQL/skill resources. The IC protocol /
 /// meta-level half ([`IcProtocolTools`]) is split out and deliberately NOT
 /// served in this version — we anticipate this will come in a future version;
-/// re-enabling it is one line in the composition here.
+/// re-enabling it means composing its router back into `all_tools`,
+/// `call_tool`, and `get_tool` here (or serving [`IcProtocolTools`] directly,
+/// which stays fully usable as library code).
 #[derive(Clone)]
 pub struct IcTools {
     canister: IcCanisterTools,
