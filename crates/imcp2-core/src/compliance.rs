@@ -9,20 +9,30 @@
 //! redirects the user to perform the operation themselves in a wallet or
 //! frontend they control (e.g. <https://oisy.com>) in their own browser.
 //!
-//! The list leans on the fact that token ledgers on the Internet Computer
-//! follow the ICRC standards — ICRC-1/ICRC-2 for fungible tokens (ICRC-4 for
-//! batch transfers), ICRC-7/ICRC-37 for NFTs — whose method names are fixed
-//! by the standard; plus the ICP ledger's pre-ICRC methods, the cycles
-//! ledger's withdrawal methods, and the ERC-20-style names older IC token
-//! standards (DIP20, EXT) use. Matching is by NORMALIZED name (lowercased,
-//! separators stripped — see [`normalize`]), so `Transfer`, `transfer_from`,
-//! and `transferFrom` all match, and it applies on ANY target canister:
-//! whether a given canister really is a ledger cannot be established
-//! reliably, and the cost of a false positive is only that the user is
-//! pointed at their own wallet, the app's own frontend, or (for the
-//! canister-creation spends) the dedicated icp_create_canister tool.
+//! The guard has two groups (split per review, so an app that happens to name
+//! a non-financial method `transfer` or `approve` keeps working):
 //!
-//! Two scope notes, so nobody over-claims what this guard does:
+//!   * **ICRC-standard methods, matched literally on every canister.** Token
+//!     ledgers on the Internet Computer follow the ICRC standards —
+//!     ICRC-1/ICRC-2 for fungible tokens (ICRC-4 for batch transfers),
+//!     ICRC-7/ICRC-37 for NFTs — and the standards fix the exact method
+//!     names. Candid method names are case-sensitive, so literal matching is
+//!     both sufficient (the real ledgers use exactly these names) and precise
+//!     (a differently-spelled name is not the standard method).
+//!   * **Abstract names, scoped to the system canister where they are
+//!     financial.** `transfer` on the ICP ledger or `withdraw` on the cycles
+//!     ledger moves the user's funds; the same names on an arbitrary app
+//!     canister are often something else entirely, so they are refused only
+//!     on those specific canister ids.
+//!
+//! Why the standardized surface is where real funds live: tokens are only
+//! valuable if they can be exchanged or used, and the ICP ecosystem's
+//! financial platforms (wallets like Oisy, exchanges like ICP Swap) integrate
+//! ledgers through these standards — a token on a bespoke, non-standard
+//! ledger can exist, but the ecosystem's platforms cannot hold or trade it,
+//! so it carries little exchangeable value.
+//!
+//! Three scope notes, so nobody over-claims what this guard does:
 //!
 //!   * It is a guardrail enforcing a stated policy, not a hermetic seal — a
 //!     bespoke canister can expose value-moving methods under any name (a
@@ -30,70 +40,86 @@
 //!     no name-based list can enumerate. The policy itself ("this tool is
 //!     not intended for financial transactions") is stated in the tool
 //!     description; this guard enforces it for the standardized ledger
-//!     surface, where real funds overwhelmingly live. Why the standardized
-//!     surface is where real funds live: tokens are only valuable if they
-//!     can be exchanged or used, and the ICP ecosystem's financial platforms
-//!     (wallets like Oisy, exchanges like ICP Swap) integrate ledgers
-//!     through these standards — a token on a bespoke, non-standard ledger
-//!     can exist, but the ecosystem's platforms cannot hold or trade it, so
-//!     it carries little exchangeable value.
+//!     surface, where real funds overwhelmingly live (see above).
+//!   * Legacy pre-ICRC token standards (DIP20/EXT `transfer`/`transferFrom`/
+//!     `approve` on arbitrary canisters) are deliberately NOT matched: the
+//!     names are too abstract to block everywhere without breaking
+//!     non-financial apps (per review), and those standards sit outside the
+//!     ecosystem's ICRC-integrated platforms. The stated policy covers them.
 //!   * The CMC's `notify_create_canister` / `notify_top_up` are deliberately
 //!     NOT listed: they move no funds out of any account (they finalize a
 //!     mint from ICP the ledger already holds for the CMC), and blocking
 //!     them would strand the documented recovery path for an interrupted
 //!     `icp_create_canister` ICP funding flow.
 
-/// Disallowed update methods in [`normalize`]d form, each with a short label
-/// used in the refusal message. Grouped by the standard that fixes the name.
-const DISALLOWED_METHODS: &[(&str, &str)] = &[
+use candid::Principal;
+
+/// ICRC-standard value-moving methods, refused on EVERY canister, matched
+/// literally (the standards fix these exact names; Candid method names are
+/// case-sensitive). Each entry carries the label used in the refusal message.
+const DISALLOWED_ICRC_METHODS: &[(&str, &str)] = &[
     // ICRC-1 / ICRC-2 / ICRC-4: fungible-token transfers, spending
-    // approvals, and batch transfers (icrc1_transfer, icrc2_approve,
-    // icrc2_transfer_from, icrc4_transfer_batch).
-    ("icrc1transfer", "an ICRC-1 token transfer"),
-    ("icrc2approve", "an ICRC-2 spending approval"),
-    ("icrc2transferfrom", "an ICRC-2 delegated token transfer"),
-    ("icrc4transferbatch", "an ICRC-4 batch token transfer"),
-    // ICRC-7 / ICRC-37: NFT transfers and approval management
-    // (icrc7_transfer, icrc37_transfer_from, icrc37_approve_tokens,
-    // icrc37_approve_collection, icrc37_revoke_*_approvals).
-    ("icrc7transfer", "an ICRC-7 NFT transfer"),
-    ("icrc37transferfrom", "an ICRC-37 delegated NFT transfer"),
-    ("icrc37approvetokens", "an ICRC-37 NFT spending approval"),
-    ("icrc37approvecollection", "an ICRC-37 collection spending approval"),
-    ("icrc37revoketokenapprovals", "an ICRC-37 NFT approval change"),
-    ("icrc37revokecollectionapprovals", "an ICRC-37 collection approval change"),
-    // The ICP ledger's pre-ICRC surface (transfer, send_dfx, notify_dfx).
-    // `transfer` doubles as the DIP20/EXT transfer method.
-    ("transfer", "a ledger token transfer"),
-    ("senddfx", "a legacy ICP-ledger transfer"),
-    ("notifydfx", "a legacy ICP-ledger transfer notification"),
-    // The cycles ledger's value movement (withdraw, withdraw_from, and the
-    // canister-creation spends create_canister / create_canister_from) — the
-    // cycles ledger is ICRC-1/-2 plus these, and they all move the user's
-    // cycles. Creation stays available through the dedicated
-    // icp_create_canister tool; this closes the uncontrolled generic route.
-    ("withdraw", "a cycles-ledger withdrawal"),
-    ("withdrawfrom", "a cycles-ledger delegated withdrawal"),
-    ("createcanister", "a cycles-ledger spend (canister creation)"),
-    ("createcanisterfrom", "a cycles-ledger delegated spend (canister creation)"),
-    // ERC-20-style names fixed by the older IC token standards (DIP20's
-    // transferFrom/approve; `transfer` is already listed above).
-    ("transferfrom", "a delegated token transfer"),
-    ("approve", "a token spending approval"),
+    // approvals, and batch transfers.
+    ("icrc1_transfer", "an ICRC-1 token transfer"),
+    ("icrc2_approve", "an ICRC-2 spending approval"),
+    ("icrc2_transfer_from", "an ICRC-2 delegated token transfer"),
+    ("icrc4_transfer_batch", "an ICRC-4 batch token transfer"),
+    // ICRC-7 / ICRC-37: NFT transfers and approval management.
+    ("icrc7_transfer", "an ICRC-7 NFT transfer"),
+    ("icrc37_transfer_from", "an ICRC-37 delegated NFT transfer"),
+    ("icrc37_approve_tokens", "an ICRC-37 NFT spending approval"),
+    ("icrc37_approve_collection", "an ICRC-37 collection spending approval"),
+    ("icrc37_revoke_token_approvals", "an ICRC-37 NFT approval change"),
+    ("icrc37_revoke_collection_approvals", "an ICRC-37 collection approval change"),
 ];
 
-/// The financial-transactions gate: `Some(refusal)` when `method` is a
-/// disallowed ledger method, `None` when the call may proceed. The refusal is
-/// the complete tool error text — it names the method, states the policy and
-/// why it exists, and tells the agent what to recommend to the user instead.
-pub fn disallowed_update_method(method: &str) -> Option<String> {
-    let normalized = normalize(method);
-    let (_, what) = DISALLOWED_METHODS.iter().find(|(m, _)| *m == normalized)?;
-    let method = method.trim();
+/// The ICP ledger — its pre-ICRC methods move the user's ICP.
+const ICP_LEDGER: &str = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+/// The cycles ledger — its withdrawal/creation methods move the user's cycles.
+const CYCLES_LEDGER: &str = "um5iw-rqaaa-aaaaq-qaaba-cai";
+
+/// Abstract method names refused only on the specific system canister where
+/// they are financial: (canister id, method, label). On any other canister
+/// these names are allowed — an app's own `transfer` is often not a token
+/// transfer at all.
+const DISALLOWED_CANISTER_METHODS: &[(&str, &str, &str)] = &[
+    // The ICP ledger's pre-ICRC surface.
+    (ICP_LEDGER, "transfer", "the ICP ledger's legacy transfer"),
+    (ICP_LEDGER, "send_dfx", "a legacy ICP-ledger transfer"),
+    (ICP_LEDGER, "notify_dfx", "a legacy ICP-ledger transfer notification"),
+    // The cycles ledger's value movement beyond ICRC-1/-2 (which group one
+    // already covers): withdrawals and the canister-creation spends. Creation
+    // stays available through the dedicated icp_create_canister tool; this
+    // closes the uncontrolled generic route.
+    (CYCLES_LEDGER, "withdraw", "a cycles-ledger withdrawal"),
+    (CYCLES_LEDGER, "withdraw_from", "a cycles-ledger delegated withdrawal"),
+    (CYCLES_LEDGER, "create_canister", "a cycles-ledger spend (canister creation)"),
+    (CYCLES_LEDGER, "create_canister_from", "a cycles-ledger delegated spend (canister creation)"),
+];
+
+/// The financial-transactions gate: `Some(refusal)` when `method` on
+/// `canister_id` is a disallowed ledger call, `None` when the call may
+/// proceed. Matching is literal in both groups — the IC matches method names
+/// by exact bytes, so a differently-spelled name would not reach the ledger
+/// method anyway. The refusal is the complete tool error text — it names the
+/// method, states the policy and why it exists, and tells the agent what to
+/// recommend to the user instead.
+pub fn disallowed_update_method(canister_id: &Principal, method: &str) -> Option<String> {
+    let what = DISALLOWED_ICRC_METHODS
+        .iter()
+        .find(|(m, _)| *m == method)
+        .map(|(_, what)| *what)
+        .or_else(|| {
+            let canister = canister_id.to_text();
+            DISALLOWED_CANISTER_METHODS
+                .iter()
+                .find(|(c, m, _)| *c == canister && *m == method)
+                .map(|(_, _, what)| *what)
+        })?;
     // Canister creation has a supported, purpose-built route, so its refusal
     // redirects there; everything else redirects to a user-controlled wallet
     // or frontend in the user's own browser.
-    let instead = if normalized.starts_with("createcanister") {
+    let instead = if method.starts_with("create_canister") {
         "For creating and funding the user's own canisters, use the dedicated \
          icp_create_canister tool (or the icp CLI) instead of calling the cycles \
          ledger through this generic tool."
@@ -106,66 +132,84 @@ pub fn disallowed_update_method(method: &str) -> Option<String> {
     Some(format!(
         "`{method}` is {what} — a financial transaction — and this tool is not \
          intended for financial transactions (token transfers, spending approvals, \
-         payments, or trades) on the user's behalf. Methods defined by the \
-         ICRC-1/ICRC-2 and related ledger standards are refused on every canister, \
-         as a reasonable measure for marketplace compliance and user safety. \
-         {instead} Do not route the same operation through this tool under another \
-         method name."
+         payments, or trades) on the user's behalf; such methods are refused as a \
+         reasonable measure for marketplace compliance and user safety. {instead} \
+         Do not route the same operation through this tool under another method \
+         name."
     ))
-}
-
-/// Normalize a method name for matching: keep ASCII alphanumerics only,
-/// lowercased. Collapses the spelling variants one method name travels under
-/// (`Transfer`, ` transfer `, `transfer_from`, `transferFrom`) without ever
-/// matching a *different* name — matching is exact on the normalized form,
-/// never a substring test.
-fn normalize(method: &str) -> String {
-    method
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect::<String>()
-        .to_ascii_lowercase()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Every standardized value-moving method is refused, in its canonical
-    // spelling and in the case/separator variants the normalizer collapses.
+    fn any_canister() -> Principal {
+        Principal::management_canister()
+    }
+    fn icp_ledger() -> Principal {
+        Principal::from_text(ICP_LEDGER).unwrap()
+    }
+    fn cycles_ledger() -> Principal {
+        Principal::from_text(CYCLES_LEDGER).unwrap()
+    }
+
+    // Every ICRC-standard value-moving method is refused on ANY canister, in
+    // its exact standard spelling.
     #[test]
-    fn refuses_ledger_transfer_and_approval_methods() {
+    fn refuses_icrc_methods_on_every_canister() {
         for method in [
-            // ICRC fungible + batch
             "icrc1_transfer",
             "icrc2_approve",
             "icrc2_transfer_from",
             "icrc4_transfer_batch",
-            // ICRC NFT
             "icrc7_transfer",
             "icrc37_transfer_from",
             "icrc37_approve_tokens",
             "icrc37_approve_collection",
             "icrc37_revoke_token_approvals",
             "icrc37_revoke_collection_approvals",
-            // ICP ledger legacy + cycles ledger
-            "transfer",
-            "send_dfx",
-            "notify_dfx",
-            "withdraw",
-            "withdraw_from",
-            // ERC-20-style (DIP20/EXT)
-            "transferFrom",
-            "approve",
-            // Variants that must not slip through the normalizer
-            "Transfer",
-            "ICRC1_Transfer",
-            "  icrc2_approve  ",
-            "icrc2-transfer-from",
         ] {
             assert!(
-                disallowed_update_method(method).is_some(),
-                "{method} must be refused"
+                disallowed_update_method(&any_canister(), method).is_some(),
+                "{method} must be refused on any canister"
+            );
+        }
+    }
+
+    // Matching is literal: a differently-spelled name is NOT the standard
+    // method (Candid method names are case-sensitive), so it is allowed here —
+    // it could never reach the ledger method on chain anyway.
+    #[test]
+    fn matching_is_literal_not_normalized() {
+        for method in ["ICRC1_Transfer", "icrc1-transfer", " icrc1_transfer ", "Transfer"] {
+            assert!(
+                disallowed_update_method(&icp_ledger(), method).is_none(),
+                "{method} is not the standard spelling and must not match"
+            );
+        }
+    }
+
+    // Abstract names are refused only on the system canister where they are
+    // financial — and allowed on any other canister, so an app whose own
+    // `transfer`/`withdraw` is non-financial keeps working.
+    #[test]
+    fn abstract_names_are_scoped_to_their_ledger() {
+        for (canister, method) in [
+            (icp_ledger(), "transfer"),
+            (icp_ledger(), "send_dfx"),
+            (icp_ledger(), "notify_dfx"),
+            (cycles_ledger(), "withdraw"),
+            (cycles_ledger(), "withdraw_from"),
+            (cycles_ledger(), "create_canister"),
+            (cycles_ledger(), "create_canister_from"),
+        ] {
+            assert!(
+                disallowed_update_method(&canister, method).is_some(),
+                "{method} must be refused on its ledger"
+            );
+            assert!(
+                disallowed_update_method(&any_canister(), method).is_none(),
+                "{method} must be allowed on an unrelated canister"
             );
         }
     }
@@ -175,17 +219,16 @@ mod tests {
     // than to a wallet.
     #[test]
     fn refuses_cycles_ledger_creation_spends_with_tool_redirect() {
-        for method in ["create_canister", "create_canister_from", "CreateCanister"] {
-            let msg = disallowed_update_method(method)
+        for method in ["create_canister", "create_canister_from"] {
+            let msg = disallowed_update_method(&cycles_ledger(), method)
                 .unwrap_or_else(|| panic!("{method} must be refused"));
             assert!(msg.contains("icp_create_canister"), "{msg}");
             assert!(!msg.contains("oisy.com"), "creation redirects to the tool, not a wallet: {msg}");
         }
     }
 
-    // Reads, fees, metadata, and the CMC recovery methods stay callable: the
-    // guard matches exactly (normalized), never by substring, so a name that
-    // merely CONTAINS a blocked one is not a false positive.
+    // Reads, fees, metadata, the CMC recovery methods, and legacy DIP20-style
+    // names on arbitrary canisters stay callable.
     #[test]
     fn allows_non_financial_methods() {
         for method in [
@@ -200,10 +243,16 @@ mod tests {
             "set_name",
             "register_user",
             "http_request_update",
+            // Abstract names on a non-ledger canister (per review: an app's
+            // own transfer/approve is often not financial at all).
+            "transfer",
+            "transferFrom",
+            "approve",
+            "withdraw",
         ] {
             assert!(
-                disallowed_update_method(method).is_none(),
-                "{method} must be allowed"
+                disallowed_update_method(&any_canister(), method).is_none(),
+                "{method} must be allowed on a non-ledger canister"
             );
         }
     }
@@ -214,14 +263,11 @@ mod tests {
     // requirements. Pin those pieces so the message can't degrade silently.
     #[test]
     fn refusal_names_method_policy_and_wallet() {
-        let msg = disallowed_update_method("icrc1_transfer").expect("must be refused");
+        let msg = disallowed_update_method(&any_canister(), "icrc1_transfer")
+            .expect("must be refused");
         assert!(msg.contains("`icrc1_transfer`"), "{msg}");
         assert!(msg.contains("financial transaction"), "{msg}");
         assert!(msg.contains("marketplace compliance and user safety"), "{msg}");
         assert!(msg.contains("https://oisy.com"), "{msg}");
-        // The method is echoed trimmed, so a padded spelling can't inject
-        // leading/trailing whitespace into the backticked name.
-        let padded = disallowed_update_method("  transfer ").expect("must be refused");
-        assert!(padded.contains("`transfer` is"), "{padded}");
     }
 }
