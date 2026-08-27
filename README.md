@@ -417,7 +417,8 @@ blank — so the endpoint is inert except during a submission window.
 ## Deploy
 
 The deployment binary is **self-contained**: the connect/landing HTML, CSS, and SVG
-(`src/assets/`) and the reference docs (`static/`) are compiled in with `include_str!`,
+(`src/assets/` and `crates/imcp2-core/src/assets/`) and the reference
+docs (`crates/imcp2-core/static/`) are compiled in with `include_str!`,
 so nothing has to ship next to it (both are build-time inputs only). The
 only runtime file is the OAuth clients store, which the server always uses: it reads
 the file on startup and writes it (best-effort) as client registrations change, so
@@ -557,7 +558,8 @@ II handshake renders as a **nicely formatted, on-brand screen** — an editorial
 headline, a best-effort diagnostic ("your client may be out of date; remove and
 re-add the connector", etc.), and always the line *"If this error is unexpected,
 please contact mcp@dfinity.org to report it."* — rather than a raw JSON blob. The
-shared shell lives in `src/assets/connect-error.html` + `src/assets/connect.css` (reused from
+shared shell lives in `src/assets/connect-error.html` +
+`crates/imcp2-core/src/assets/connect.css` (reused from
 the connect callback page: same parchment grid, serif display, foot-of-page "Hosted
 by" mark, light/dark theming) and is fully self-contained under a strict, nonce'd,
 non-scripted, unframeable CSP that reflects no request value. Authorize errors

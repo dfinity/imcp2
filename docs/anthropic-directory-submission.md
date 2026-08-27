@@ -49,7 +49,7 @@ Verified against the live production deployment (2026-07-31):
 | Discovery documents (RFC 8414 + RFC 9728, path-scoped + root fallback) | ✅ all four live, `WWW-Authenticate` on the 401 points at the resource metadata |
 | Every tool: `title` + `readOnlyHint`/`destructiveHint` (+ `idempotentHint`, `openWorldHint`) | ✅ on all 11 tools, enforced by a unit test ([`crates/imcp2-core/src/tools.rs`](../crates/imcp2-core/src/tools.rs)) |
 | No catch-all read/write tool; reads and writes are separate tools | ✅ 10 of the 11 tools are read-only; the one write is `canister_update_call`. |
-| Tool names ≤ 64 chars | ✅ longest is 30 |
+| Tool names ≤ 64 chars | ✅ longest is 23 (`get_canister_oql_schema`) |
 | `outputSchema` + structured content on every tool | ✅ enforced by a unit test |
 | Certificates from a recognized authority | ✅ Let's Encrypt via Caddy |
 | OAuth endpoint latency ≤ 10 s (discovery/registration/token) | ✅ all sub-second in probes |
@@ -127,10 +127,11 @@ server actually does, it should cover at least:
 Publication venue: `https://mcp.internetcomputer.org/privacy-policy`, served
 by the MCP server itself. The page and its route shipped in
 [#112](https://github.com/dfinity/imcp2/pull/112) (effective date August 3,
-2026) and the landing page's footer links it, so what remains is the
-**production release**: staging serves it now, production at the next
-`release-*` tag — cut on or after August 3 so the live page and its stated
-effective date agree. Then enter that URL in the portal. The reviewed source
+2026), the landing page's footer links it, and the page is live on
+production (verified 2026-08-27: HTTP 200). What remains: enter that URL in
+the portal, and cut the next `release-*` first — the live text is one
+revision behind `main` (the current draft's identifier-linkability wording
+lands with that release). The reviewed source
 text is [`icp-mcp-privacy-policy-draft.md`](icp-mcp-privacy-policy-draft.md).
 
 ### 2. Financial-transactions policy (resolved in code)
@@ -207,9 +208,12 @@ cycles balance is needed: the connector has no canister-management tools.)
 
 ### 4. Production is behind `main`
 
-The live server reports commit `48f1ed6`; `main` carries later hardening
-(e.g. #98, #99, #107, #108). Cut a `release-*` tag so the deployment under
-review includes them.
+The live server reports commit `bbf0844` (v0.1.1, tag
+`release-2026-08-18-0.1.1`), which predates the entire compliance chain
+(#153, #154, #155, #157, #158): it still serves the old 26-tool surface,
+including the funding and management tools this document says do not exist.
+Cut a `release-*` tag from current `main` and deploy it BEFORE submitting —
+every attestation here describes `main`, not what is currently live.
 
 ### 5. Icon asset — ready
 
@@ -226,7 +230,7 @@ both light and dark listing backgrounds. Regenerate with the Chromium
 rasteriser if the source ever changes (lighter rasterisers mis-render its
 `linearGradient` with a `rotate` transform). This is the *listing* icon only:
 the served pages keep using the DFINITY wordmark
-([`src/assets/dfinity-logo.svg`](../src/assets/dfinity-logo.svg)) for their
+([`crates/imcp2-core/src/assets/dfinity-logo.svg`](../crates/imcp2-core/src/assets/dfinity-logo.svg)) for their
 "Hosted by" footer.
 
 ## Portal field drafts
@@ -246,8 +250,8 @@ Paste-and-adapt; portal limits in parentheses.
 
   > The official connector between Claude and the Internet Computer, hosted by
   > DFINITY. Sign in once with Internet Identity — no keys or seed phrases in
-  > the chat — and Claude can work with the IC directly: identify what a
-  > canister is, fetch its Candid interface, read app data via typed queries
+  > the chat — and Claude can work with the IC directly: fetch a canister's
+  > Candid interface, read app data via typed queries
   > or OQL, and discover the canisters behind any IC app from its name or URL.
   > With your consent it can also act as your Internet Identity accounts at a
   > specific app. Financial transactions are not supported: token-ledger
@@ -352,8 +356,8 @@ conversation beyond tool arguments and generates no media.
 
 ## Submission-day checklist
 
-- [ ] Dedicated ICP MCP privacy policy live at `https://mcp.internetcomputer.org/privacy-policy` (page + landing-page link merged; needs the production release) and entered in the portal (blocker 1)
-- [ ] Reply received from mcp-review@anthropic.com settling the financial-transactions and first-party-API acknowledgments (asked 2026-07-31; blocker 2)
+- [ ] Privacy policy entered in the portal — the page is already live at `https://mcp.internetcomputer.org/privacy-policy` (verified 2026-08-27); the next `release-*` refreshes its text to the current draft (blocker 1)
+- [x] Financial-transactions question resolved in code (blocker 2) — no mcp-review reply is needed; if one arrives, answer with the shipped posture. The first-party-API/data-handling question was NOT in the 2026-07-31 email: raise it with mcp-review only if the portal's data-handling options don't fit
 - [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — if a reviewer asks for a populated account, provision a demo-app account (no funding needed: there are no funding or canister-management tools)
 - [ ] `release-*` tag cut; `/version` on production shows the intended commit (blocker 4)
 - [x] Square PNG icon exported — `docs/assets/icp-logo-{1024,512}.png` (blocker 5)
