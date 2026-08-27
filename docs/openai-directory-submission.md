@@ -54,7 +54,7 @@ add details not published in the docs.
 | Discovery documents (RFC 8414 AS metadata + RFC 9728 protected-resource) | ✅ all live, path-scoped + root fallback |
 | ChatGPT's callback `https://chatgpt.com/connector/oauth/{callback_id}` accepted | ✅ the redirect allow-list pins `("chatgpt.com", "/connector/oauth/")` as a prefix ([`src/auth.rs`](../src/auth.rs), `DEFAULT_ALLOWED_REDIRECTS`) |
 | No machine-to-machine grants (client credentials etc. unsupported by ChatGPT) | ✅ user-consent authorization-code flow only |
-| Tools explicitly annotated `readOnlyHint` / `destructiveHint` / `openWorldHint` — "incorrect or missing action labels are a common cause of rejection" | ✅ set on all 26 tools. The unit test enforces annotation presence and the `readOnlyHint`/`destructiveHint` values; `openWorldHint` is declared everywhere but not asserted by the test, so re-check it in the portal's Scan Tools step |
+| Tools explicitly annotated `readOnlyHint` / `destructiveHint` / `openWorldHint` — "incorrect or missing action labels are a common cause of rejection" | ✅ set on all 11 tools. The unit test enforces annotation presence and the `readOnlyHint`/`destructiveHint` values; `openWorldHint` is declared everywhere but not asserted by the test, so re-check it in the portal's Scan Tools step |
 | Tool names "human-readable, specific, and descriptive"; accurate descriptions; minimum-information requests | ✅ reviewed against the same bar for the Anthropic listing |
 | Public HTTPS production endpoint, stable and complete ("trial or demo plugins will not be accepted") | ✅ production deployment |
 | Privacy policy disclosing "categories of personal data collected, purposes of use, categories of recipients, data retention timelines" | ⏳ **pending the production release**: the rewritten policy matches these four required disclosures exactly and is live on staging, but `https://mcp.internetcomputer.org/privacy-policy` serves nothing until the next `release-*` tag ships it (see the checklist) |
@@ -93,7 +93,9 @@ and self-serve. Position to state in the Testing tab: reviewers create their
 own Internet Identity in under a minute (instructions on the landing page);
 every read-only tool works with any identity because it reads public network
 state. Have the fallback ready (a provisioned identity with a recovery
-phrase, a controlled canister, and a cycles balance) if review pushes back —
+phrase in the team vault and an account at a demo app — no controlled
+canister or cycles balance is needed: the plugin has no canister-management
+tools) if review pushes back —
 and expect a higher chance of push-back than at Anthropic given the
 login-and-password wording.
 
@@ -118,11 +120,11 @@ financial-transfers prohibition:
   server-level instructions rather than the tool description (which stays
   free of financial language, per maintainer review)
   ([#154](https://github.com/dfinity/imcp2/pull/154)), and
-  `icp_top_up_canister` and `icp_create_canister` are instructions-only —
-  each returns the icp CLI steps for the user to run themselves and executes
-  nothing ([#153](https://github.com/dfinity/imcp2/pull/153),
-  [#154](https://github.com/dfinity/imcp2/pull/154)). README, landing page,
-  and server instructions state that financial transactions are not
+  the plugin has no funding or canister-management tools at all — the
+  execution paths that once moved funds are removed from the binary
+  ([#153](https://github.com/dfinity/imcp2/pull/153),
+  [#154](https://github.com/dfinity/imcp2/pull/154)). README, landing
+  page, and server instructions state that financial transactions are not
   supported.
 
 ### 4. Test cases (authoring work)
@@ -131,29 +133,31 @@ At least 5 positive + 3 negative cases with expected outcomes, passing on web
 and mobile. Draft set:
 
 Positive:
-1. "What is canister gftcp-myaaa-aaaar-qcaaa-cai?" → identifies the
-   canister behind opencloud.org, its controllers and interface.
-2. "How do I add cycles to canister gftcp-myaaa-aaaar-qcaaa-cai?" → returns step-by-step icp CLI
-   instructions; nothing is executed.
+1. "What interface does canister gftcp-myaaa-aaaar-qcaaa-cai expose?" →
+   the Candid interface plus capability flags, via get_canister_candid.
+2. "Does the canister behind https://opencloud.org expose an API doc, and
+   what does its interface look like?" → interface + capability flags via
+   get_canister_candid / get_canister_api_doc.
 3. "What canisters are behind https://opencloud.org?" → App Connect
    discovery returns the app's canisters with provenance.
 4. "Open opencloud.org and list my accounts there" (signed in) → resolves
    the derivation origin, lists II accounts.
-5. "Check the status of canister <test-canister-id>" (signed in, Actions
-   session, identity controls it) → run state, cycles, module hash.
-6. "Get the Motoko skill" → returns the skill document.
+5. "Resolve https://opencloud.org to its Internet Identity derivation
+   origin" → resolve_app returns the origin and how it was determined.
 
 Negative:
 1. "Open https://no-ic.example.com" (a reserved domain with no Internet
    Computer presence) → refused by the IC-evidence gate with guidance
    (web-search or ask the user for the real URL) rather than resolved to a
    wrong identity.
-2. A management call on a "Questions only" session → actionable
-   reconnect-with-actions message, not an opaque error.
+2. A state-changing call (canister_update_call) on a "Questions only"
+   session → the network rejects it and the tool reports the failed call;
+   the server instructions prime the assistant to explain the access level
+   and recommend reconnecting under "Actions & questions".
 3. Any authenticated tool with no sign-in → clean 401 → OAuth flow starts
    (no crash, no hang).
-4. "Delete canister <id I don't control>" → the network rejects it; the
-   error is surfaced legibly.
+4. "Call an update method on a canister that rejects this caller" → the
+   canister/network rejects it; the error is surfaced legibly.
 
 ### 5. Decisions for the submitter
 

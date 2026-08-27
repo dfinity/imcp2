@@ -47,8 +47,8 @@ Verified against the live production deployment (2026-07-31):
 | Claude's hosted callback `https://claude.ai/api/mcp/auth_callback` accepted | ✅ seeded in the redirect allow-list ([`src/auth.rs`](../src/auth.rs), `DEFAULT_ALLOWED_REDIRECTS`) |
 | Claude Code loopback redirects (RFC 8252) | ✅ loopback redirects are exempt from the hosted allow-list |
 | Discovery documents (RFC 8414 + RFC 9728, path-scoped + root fallback) | ✅ all four live, `WWW-Authenticate` on the 401 points at the resource metadata |
-| Every tool: `title` + `readOnlyHint`/`destructiveHint` (+ `idempotentHint`, `openWorldHint`) | ✅ on all 26 tools, enforced by a unit test ([`src/tools.rs`](../src/tools.rs)) |
-| No catch-all read/write tool; reads and writes are separate tools | ✅ 19 read-only tools (incl. the instructions-only top-up and creation, [#153](https://github.com/dfinity/imcp2/pull/153)/[#154](https://github.com/dfinity/imcp2/pull/154)); writes split per operation |
+| Every tool: `title` + `readOnlyHint`/`destructiveHint` (+ `idempotentHint`, `openWorldHint`) | ✅ on all 11 tools, enforced by a unit test ([`crates/imcp2-core/src/tools.rs`](../crates/imcp2-core/src/tools.rs)) |
+| No catch-all read/write tool; reads and writes are separate tools | ✅ 10 of the 11 tools are read-only; the one write is `canister_update_call`. |
 | Tool names ≤ 64 chars | ✅ longest is 30 |
 | `outputSchema` + structured content on every tool | ✅ enforced by a unit test |
 | Certificates from a recognized authority | ✅ Let's Encrypt via Caddy |
@@ -145,17 +145,12 @@ transactions**, and the portal's compliance step requires acknowledging this.
 posture is that the server is not a financial tool (this section assumes
 both are merged):**
 
-- `icp_top_up_canister` is **instructions-only**: it executes nothing and
-  moves no funds — it returns the CLI steps for the user to run a top-up
-  themselves, and the server-side execution path (cycles-ledger `withdraw`,
-  CMC `notify_top_up`) is removed from the binary
-  ([#153](https://github.com/dfinity/imcp2/pull/153)).
-- `icp_create_canister` is likewise **instructions-only**: creating and
-  funding a canister spends the user's ICP or cycles, so the tool returns the
-  icp CLI steps — ending with the controller-handover step that lets the
-  connector's lifecycle tools manage the new canister — and executes nothing;
-  the ICP-ledger transfer, CMC notify, and cycles-ledger creation paths are
-  removed from the binary ([#154](https://github.com/dfinity/imcp2/pull/154)).
+- **The connector has no funding or management tools.** The execution paths
+  that once moved funds are removed from the binary
+  ([#153](https://github.com/dfinity/imcp2/pull/153) /
+  [#154](https://github.com/dfinity/imcp2/pull/154)). Creating, funding, and
+  managing canisters is done by the user with the icp CLI in their own
+  terminal.
 - `canister_update_call` **refuses the standardized ledger methods** that
   move value or grant spending rights — the ICRC-standard names
   (ICRC-1/ICRC-2 plus ICRC-4/-7/-37) on every canister, and the ICP and
@@ -171,9 +166,10 @@ both are merged):**
 
 **Posture, stated plainly — the black-and-white answer the compliance step
 needs:** no tool initiates or executes a transfer of the user's funds.
-Financial ledger methods are refused, and the funding operations — top-up and
-canister creation — are instructions-only. The financial-transactions
-acknowledgment is made on that basis, without qualifications.
+Financial ledger methods are refused, and no funding or management tools are
+served at all — users run those operations themselves with the icp CLI. The
+financial-transactions acknowledgment is made on that basis, without
+qualifications.
 
 **Status: resolved in code.** An email to <mcp-review@anthropic.com>
 (2026-07-31) had asked whether cycles funding and the general-purpose
@@ -204,10 +200,10 @@ One tension to be ready for: the review criteria say *"Test credentials are
 required and must be a fully populated account."* Self-serve sign-up is a
 reasonable answer for an authentication system nobody can pre-provision into,
 but a reviewer may still ask for a populated account — most plausibly to
-exercise the canister-management tools, which need an identity that actually
-controls a canister and holds a cycles balance. If that comes back, the
-fallback is a dedicated identity with a recovery phrase in the team vault, a
-canister it controls, and a small cycles balance.
+exercise `canister_update_call` against an app where the identity has data.
+If that comes back, the fallback is a dedicated identity with a recovery
+phrase in the team vault and an account at a demo app. (No controlled canister or
+cycles balance is needed: the connector has no canister-management tools.)
 
 ### 4. Production is behind `main`
 
@@ -254,11 +250,9 @@ Paste-and-adapt; portal limits in parentheses.
   > canister is, fetch its Candid interface, read app data via typed queries
   > or OQL, and discover the canisters behind any IC app from its name or URL.
   > With your consent it can also act as your Internet Identity accounts at a
-  > specific app, and manage canisters you control: check status, create,
-  > install code, and start/stop. Financial transactions are not supported:
-  > token-ledger transfer and approval methods are refused to protect you,
-  > and cycle top-ups and canister creation return CLI instructions for you
-  > to run yourself instead of executing anything.
+  > specific app. Financial transactions are not supported: token-ledger
+  > transfer and approval methods are refused to protect you, and there are
+  > no funding or canister-management tools.
   >
   > On the Internet Identity consent screen you explicitly choose the session
   > duration (10 minutes to 30 days) and the access level: "Questions only"
@@ -299,10 +293,11 @@ Paste-and-adapt; portal limits in parentheses.
 - **Allowed link URIs:** none needed (no `ui/open-link` usage).
 - **Example prompts** (≥3 required; all work with a fresh Questions-only
   session):
-  1. *"What is canister gftcp-myaaa-aaaar-qcaaa-cai? Who controls it and
-     what's its interface?"*
+  1. *"What interface does canister gftcp-myaaa-aaaar-qcaaa-cai expose,
+     and what can it do?"*
   2. *"Open opencloud.org and list my accounts there."*
-  3. *"How do I add cycles to canister gftcp-myaaa-aaaar-qcaaa-cai?"*
+  3. *"Does the canister behind https://opencloud.org expose an API doc, and
+     what does its interface look like?"*
   4. *"What canisters are behind https://opencloud.org, and which one holds
      the app's data?"*
 
@@ -315,17 +310,19 @@ Paste-and-adapt; portal limits in parentheses.
 >    Every read-only tool works with any identity, because it reads public
 >    network state.
 > 2. On the consent screen pick a session duration and an access level:
->    "Questions only" exercises the 19 read-only-annotated tools; "Actions &
->    questions" additionally allows state-changing calls.
-> 3. Try the example prompts above. Questions-only sessions cause management
->    tools to return an actionable reconnect message rather than an opaque
->    error — that behavior is intended. Access is revocable at any time at
+>    "Questions only" exercises the 10 read-only-annotated tools; "Actions &
+>    questions" additionally allows state-changing calls
+>    (`canister_update_call`).
+> 3. Try the example prompts above. On a Questions-only session a
+>    state-changing call (`canister_update_call`) is rejected by the
+>    network and the tool reports the failed call; the server
+>    instructions prime the assistant to explain the access level and
+>    recommend reconnecting under "Actions & questions" — that behavior
+>    is intended. Access is revocable at any time at
 >    https://id.ai/manage/settings.
-> 4. The canister-management tools act on canisters you control, so a
->    brand-new identity has nothing for them to operate on. Ask us at
->    mcp@dfinity.org if you would like an identity provisioned with a
->    canister to exercise those. Canister creation and top-ups return CLI
->    instructions for the user to run themselves — nothing is executed.
+> 4. Canister-management tools are not part of this connector, so there is
+>    nothing to provision: creating and managing canisters happens outside
+>    the connector, with the icp CLI.
 > 5. Financial ledger operations are refused by design: asking the assistant
 >    to move tokens returns a policy message directing the user to a wallet
 >    they control — that behavior is intended (financial transactions are
@@ -337,15 +334,16 @@ Topics: directory guidelines, first-party API usage, financial transactions,
 AI media generation, prompt injection, conversation-data collection, public
 documentation. **Financial transactions** is a clean acknowledgment: no
 tool initiates or executes a transfer of the user's funds — financial ledger
-methods are refused, and top-up and canister creation are instructions-only.
+methods are refused, and no funding or management tools are served (users run
+those operations with the icp CLI).
 **First-party API usage** is answered by describing the architecture as it
 is: DFINITY operates the connector itself; it reaches the network through
 public Internet Computer infrastructure (`icp-api.io`, `id.ai`) and forwards
 user-directed calls to the application canisters the user names — state
 exactly that in the acknowledgment. The **prompt-injection** acknowledgment needs open disclosure rather
 than a bare yes: tool descriptions are static and contain no hidden
-instructions, but `icp_list_skills`/`icp_get_skill` (and the `skill://`
-resources) intentionally return DFINITY-published how-to documents fetched
+instructions, but the `skill://`
+resources intentionally return DFINITY-published how-to documents fetched
 live from `skills.internetcomputer.org` at the user's request — describe
 this in the submission so reviewers see documented, user-requested
 functionality rather than covertly pulled behavioral instructions. The rest
@@ -356,7 +354,7 @@ conversation beyond tool arguments and generates no media.
 
 - [ ] Dedicated ICP MCP privacy policy live at `https://mcp.internetcomputer.org/privacy-policy` (page + landing-page link merged; needs the production release) and entered in the portal (blocker 1)
 - [ ] Reply received from mcp-review@anthropic.com settling the financial-transactions and first-party-API acknowledgments (asked 2026-07-31; blocker 2)
-- [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — provision a funded identity only if a reviewer asks
+- [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — if a reviewer asks for a populated account, provision a demo-app account (no funding needed: there are no funding or canister-management tools)
 - [ ] `release-*` tag cut; `/version` on production shows the intended commit (blocker 4)
 - [x] Square PNG icon exported — `docs/assets/icp-logo-{1024,512}.png` (blocker 5)
 - [ ] Every tool exercised once by the submitter (portal asks you to confirm this; MCP Inspector or a custom connector in Claude both count)

@@ -1,12 +1,14 @@
 //! imcp2-core — the transport/OAuth-agnostic components of the IMCP2 Internet
 //! Computer MCP server, from which a serving binary is composed:
 //!
-//!   * [`tools::IcTools`] — the complete MCP tool surface, composed from
-//!     [`tools::IcCanisterTools`] and [`tools::IcProtocolTools`] (canister reads and
-//!     writes in textual Candid, app/canister discovery, OQL, canister
-//!     management, IC skills), an [`rmcp`] `ServerHandler` ready to serve over
-//!     whichever transport the binary picks (streamable-HTTP in the hosted
-//!     `imcp2` server, stdio in a local one).
+//!   * [`tools::IcTools`] — the served MCP tool surface: [`tools::IcCanisterTools`]
+//!     (canister reads and writes in textual Candid, app/canister discovery,
+//!     OQL), an [`rmcp`] `ServerHandler` ready to serve over whichever
+//!     transport the binary picks (streamable-HTTP in the hosted `imcp2`
+//!     server, stdio in a local one). The protocol/meta half
+//!     ([`tools::IcProtocolTools`] — dashboard lookups, the IC skills tools,
+//!     canister management) is deferred from the default composition; we
+//!     anticipate it will come in a future version.
 //!   * [`identities`] — the Internet Identity session engine: the per-connection
 //!     session-key grant (registered with II via `mcp_register_v2`) and the
 //!     short-lived per-app account delegations minted from it on demand.

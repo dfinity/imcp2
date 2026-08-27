@@ -91,9 +91,8 @@ const DISALLOWED_CANISTER_METHODS: &[(&str, &str, &str)] = &[
     // The cycles ledger's value movement beyond ICRC-1/-2 (which group one
     // already covers): withdrawals and the canister-creation spends. The
     // creation refusal points the user at running the operation themselves
-    // with the icp CLI; icp_create_canister is instructions-only (it prints
-    // those steps and executes nothing), so naming it does not offer an
-    // executing route (per review).
+    // with the icp CLI directly (the dedicated instructions-only creation
+    // tool is deferred from this version's served surface).
     (CYCLES_LEDGER, "withdraw", "a cycles-ledger withdrawal"),
     (CYCLES_LEDGER, "withdraw_from", "a cycles-ledger delegated withdrawal"),
     (CYCLES_LEDGER, "create_canister", "a cycles-ledger spend (canister creation)"),
@@ -125,9 +124,9 @@ pub fn disallowed_update_method(canister_id: &Principal, method: &str) -> Option
     // wallet or frontend in the user's own browser.
     let instead = if method.starts_with("create_canister") {
         "Recommend that the user creates and funds canisters themselves with \
-         the icp CLI in their own terminal — the icp_create_canister tool \
-         prints the exact steps (it executes nothing and moves no funds), and \
-         the icp-cli and cycles-management skills (icp_get_skill) carry the \
+         the icp CLI in their own terminal (install with `npm install -g \
+         @icp-sdk/icp-cli`, or see https://github.com/dfinity/icp-cli); the \
+         skill://icp-cli and skill://cycles-management resources carry the \
          full guide."
     } else {
         "Recommend that the user performs this operation themselves, in a wallet \
@@ -219,16 +218,17 @@ mod tests {
 
     // The cycles ledger's canister-creation spends are refused on the generic
     // route, and their refusal points the user at running creation themselves
-    // with the icp CLI. icp_create_canister may be named because it is
-    // instructions-only — the refusal must say so, and must not point at a
-    // wallet (the wrong venue for creation).
+    // with the icp CLI (install pointer included) — never at a wallet (the
+    // wrong venue for creation) and never at a connector tool (the dedicated
+    // instructions-only creation tool is deferred from this version).
     #[test]
     fn refuses_cycles_ledger_creation_spends_with_cli_redirect() {
         for method in ["create_canister", "create_canister_from"] {
             let msg = disallowed_update_method(&cycles_ledger(), method)
                 .unwrap_or_else(|| panic!("{method} must be refused"));
             assert!(msg.contains("icp CLI"), "{msg}");
-            assert!(msg.contains("executes nothing"), "{msg}");
+            assert!(msg.contains("npm install -g @icp-sdk/icp-cli"), "{msg}");
+            assert!(!msg.contains("icp_create_canister"), "no connector-tool redirect: {msg}");
             assert!(!msg.contains("oisy.com"), "a wallet is the wrong venue for creation: {msg}");
         }
     }

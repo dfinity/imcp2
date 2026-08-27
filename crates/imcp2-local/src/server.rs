@@ -383,8 +383,8 @@ mod tests {
             "authenticate must declare its refresh flag: {schema}"
         );
         // The merged surface keeps the core contract: every tool declares an
-        // object-rooted outputSchema (the core suite enforces it for the 26;
-        // this enforces it for the two added here).
+        // object-rooted outputSchema (the core suite enforces it for the core
+        // tools; this enforces it for the two added here).
         for t in &tools {
             let schema = t
                 .output_schema
@@ -410,7 +410,7 @@ mod tests {
 
     // A REAL MCP round-trip over an in-process duplex pipe (the same
     // byte-stream shape stdio serves): initialize; tools/list is the merged
-    // surface (all 26 core tools + the 2 login tools); tools/call dispatches
+    // surface (the 11 served core tools + the 2 login tools); tools/call dispatches
     // login tools to the wrapper and everything else to IcTools; the login
     // lifecycle (signed out → link → pending) runs through the MCP layer —
     // all with no network and no browser.
@@ -440,8 +440,8 @@ mod tests {
         let tools = client.list_all_tools().await.expect("tools/list");
         assert_eq!(
             tools.len(),
-            28,
-            "26 core tools + authenticate + auth_status"
+            13,
+            "11 served core tools + authenticate + auth_status"
         );
         for expected in [
             "get_canister_candid",
@@ -508,6 +508,27 @@ mod tests {
         .await;
         assert!(is_error, "an invalid canister id is a tool error");
         assert!(text.contains("invalid canister id"), "{text}");
+
+        // Deferral: a protocol/meta tool is not just unlisted — calling it
+        // fails with the router's standard "tool not found" error (the
+        // invalid-params shape any unknown tool name gets), rather than
+        // running — and rather than dying some other way: a disconnect or a
+        // different error must not pass this regression.
+        let mut params = rmcp::model::CallToolRequestParams::new("icp_get_skill");
+        params.arguments = serde_json::json!({ "name": "writing-motoko" })
+            .as_object()
+            .cloned();
+        let err = client
+            .call_tool(params)
+            .await
+            .expect_err("deferred protocol tools must not be callable");
+        match err {
+            rmcp::ServiceError::McpError(e) => {
+                assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{e:?}");
+                assert!(e.message.contains("tool not found"), "{e:?}");
+            }
+            other => panic!("expected the router's tool-not-found error, got {other:?}"),
+        }
 
         client.cancel().await.expect("client shutdown");
         server.cancel().await.expect("server shutdown");

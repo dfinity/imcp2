@@ -106,9 +106,10 @@ minimal.
     `list_accounts` `:873`).
   - `calls.rs` (Candid textual↔binary codec, `raw_call`), `discover.rs` (discovery + SSRF
     guard), `management.rs`, `skills.rs`.
-  - `tools.rs` — the **entire** MCP tool surface. The `#[tool_router]` / 26×`#[tool]` /
-    `#[tool_handler] impl ServerHandler for IcTools` macros expand into one impl on
-    `IcTools` and **must stay co-located**; both binaries construct `IcTools`, differing
+  - `tools.rs` — the **entire** MCP tool surface. The 26 `#[tool]` definitions live on
+    two `#[tool_router]` impls — `IcCanisterTools` (11 served) and `IcProtocolTools`
+    (15 deferred) — behind a hand-written `impl ServerHandler for IcTools` that serves
+    the canister router; all of it **must stay co-located**; both binaries construct `IcTools`, differing
     in transport + session source (the local binary additionally wraps it in its login
     handler, component 6). The injected `SessionResolver` seam (component 7) lives here —
     authentication itself stays in the binaries.
@@ -360,7 +361,7 @@ requested clients split cleanly along that line (verified against current docs, 
 | claude.ai web / mobile / Cowork | no | remote connectors (OAuth) only | ❌ → hosted |
 | **Codex** CLI / IDE ext / desktop | yes | `~/.codex/config.toml` → `[mcp_servers.<n>]` | ✅ |
 | Codex Cloud | no | HTTP MCP only | ❌ → hosted |
-| **Cursor** | yes | `~/.cursor/mcp.json` or `.cursor/mcp.json` → `mcpServers` | ✅ (≤40 tools total; we expose ~26) |
+| **Cursor** | yes | `~/.cursor/mcp.json` or `.cursor/mcp.json` → `mcpServers` | ✅ (≤40 tools total; we expose 13) |
 | **Perplexity** macOS app | yes (via a `PerplexityXPC` helper) | Settings → Connectors → Add → Advanced JSON | ✅ macOS only |
 | Perplexity web / Windows / remote | no | remote HTTPS URL + OAuth 2.1 + DCR + `/.well-known/mcp-connector.json` | ❌ → hosted |
 | **Antigravity** IDE / CLI / 2.0 | yes | `~/.gemini/config/mcp_config.json` or `.agents/mcp_config.json` → `mcpServers` | ✅ |
@@ -422,7 +423,7 @@ that router first, forwarding everything else to the inner `IcTools` handler (rm
 `RequestContext<RoleServer>` is handler-independent, so forwarding is verbatim). The
 hosted server thus contains no login-tool code by construction; a hosted-side test still
 asserts its `tools/list` stays login-free as a regression guard. Cursor's ~40-tool cap is
-comfortable: the core exposes ~26 plus these two.)*
+comfortable: the core exposes 11 plus these two.)*
 
 **Serving the cloud clients (hosted `imcp2`).** claude.ai web/mobile and Perplexity-web reach
 only a public HTTPS MCP endpoint with OAuth 2.1 — which hosted `imcp2` already is. Two
@@ -466,8 +467,9 @@ middleware; a stdio pipe has no per-request middleware at all), so the middlewar
 with their transports and core only receives their outcome.
 
 Tools that are already session-free work unchanged locally: `get_canister_candid`,
-`get_canister_api_doc`, `open_app`, `resolve_app`, `discover_app_canisters`, the skills/lookup
-tools, and the anonymous path of `canister_query`.
+`get_canister_api_doc`, `open_app`, `resolve_app`, `discover_app_canisters`, `icp_oql_guide`,
+and the anonymous path of `canister_query`. (The skill documents are served as `skill://`
+resources.)
 
 ### 8. Security model
 
@@ -478,8 +480,8 @@ the transient login listener (component 5), and reaching it confers nothing: the
 page and the `#4091` well-known are static, and `/redeem` only advances the connect this
 process started (`state` must match) with a chain targeting the in-process `X` — it can
 neither invoke tools nor read the session. But the client then wields the user's
-**real production II accounts** on mainnet (canister create/install/start/stop/delete, any
-update call / cycles spend, per-app delegations for every origin). This must be stated plainly:
+**real production II accounts** on mainnet (any update call under a per-app delegation, for
+every origin). This must be stated plainly:
 **treat the binary and its client config like a wallet.** There is no revocable token — only
 the II grant (reconnect/expiry).
 
