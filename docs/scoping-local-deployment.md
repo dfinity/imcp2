@@ -110,8 +110,8 @@ minimal.
     `#[tool_handler] impl ServerHandler for IcTools` macros expand into one impl on
     `IcTools` and **must stay co-located**; both binaries construct `IcTools`, differing
     in transport + session source (the local binary additionally wraps it in its login
-    handler, component 6). The `SessionSource` seam and the plain `AuthedSession` struct
-    (component 7) live here.
+    handler, component 6). The injected `SessionResolver` seam (component 7) lives here —
+    authentication itself stays in the binaries.
   - **new `iiconnect` module** — the II connect-handshake primitives lifted out of
     `auth.rs` (component 4), re-parameterised to plain values so they carry no
     `AuthStore`/OAuth state.
@@ -119,13 +119,14 @@ minimal.
     references) and the connect-flow assets under `src/assets/` (page, CSS, logo).
   - The move is not visibility-neutral: workspace packages share no crate-private access,
     so the items the binaries compose against — `IcTools`/`IcTools::new` with
-    `SessionSource`, the `Identities` registration/redeem entry points above, the
+    its `SessionResolver`, the `Identities` registration/redeem entry points above, the
     `iiconnect` builders — graduate from `pub(crate)` behind one binary to core's
     deliberate **public API** (`imcp2` re-exports it below, so embedders see no change).
   - Deps: rmcp `["server", "macros"]` (no transport), `ic-agent`/`candid`/`candid_parser`,
     tokio, serde/serde_json, reqwest/url/regex (discovery), the II-connect and management
     utilities (`base64`, `hex`, `sha2`, `crc32fast`, `getrandom`, `uuid`, `urlencoding`),
-    `http` (the request-extension type the Bearer session arm reads), tracing.
+    tracing — and nothing HTTP- or transport-shaped: authentication is injected
+    (component 7).
 - **`imcp2`** (existing crate: lib + the hosted `imcp2` binary) — depends on `imcp2-core`
   and adds the hosted composition: the OAuth 2.1 AS (the OAuth half of `auth.rs`),
   `McpServer`/`McpConfig`/the routers (`lib.rs`, including `state_dir`/`clients`/
@@ -189,8 +190,7 @@ dependency.
 - canister management: `sha2` (Wasm hash + ledger AccountIdentifier), `crc32fast`, `base64`,
   `hex` (`management.rs`).
 - II connect/delegation: `getrandom` (key seeds + CSP nonce), `urlencoding` (II link),
-  `uuid` (connect `state`), `base64`/`hex` (delegation chain), `http` (the request-extension
-  type the session lookup reads).
+  `uuid` (connect `state`), `base64`/`hex` (delegation chain).
 - foundation: `tokio`, `serde`, `serde_json`, `tracing`, `anyhow`.
 
 **Added by `imcp2` (the hosted stack):** rmcp's `transport-streamable-http-server`; `axum`;
@@ -434,27 +434,36 @@ local binary.
 
 ### 7. Tool / session seam
 
-Today a tool gets its `session_id` via bearer → `require_token` → `AuthedSession` injected in
-the request extensions → `authed_session(ctx)` (`tools.rs:1493`). Under stdio there is one
-user and one connection, so this collapses to a **singleton** session id, set at login and
-replaced on each re-login.
+Every authenticated tool call acts as one Internet Identity session, so the tool layer
+needs an answer to exactly one question per call: *which already-validated session is
+this?* **Everything else about authentication — the transport it rides, how a caller is
+validated, whether the deployment serves many users or one — stays out of `imcp2-core`.**
+`IcTools` takes an injected `SessionResolver` (a `Fn(&RequestContext) -> Option<String>`)
+at construction and asks it through one internal `current_session_id` helper at the 13
+session-using call sites; `None` means unauthenticated, and the existing "needs an
+authenticated session" errors are the caller-facing surface of that. Core carries no HTTP
+types and no transport features for this — it cannot tell bearer from singleton, or
+streamable-HTTP from stdio.
 
-Minimal, verified seam (no tool-signature changes, no `identities.rs` changes):
-- add `session: SessionSource { Bearer, Singleton(..) }` to `IcTools` (`tools.rs:52`). The
-  `Singleton` arm holds a **shared, replaceable slot** (an `Arc<RwLock<Option<String>>>`-
-  style holder whose exact shape lands with the Stage 2 login driver), not a fixed id: the
-  II contract requires a **fresh session key** after `Unauthorized`, so each successful
-  `authenticate` writes a fresh session id into the slot — same-process reauthentication
-  after grant expiry or revocation, with no client restart;
-- one `current_session_id(&self, &ctx) -> Option<String>` method replacing the free fn;
-- rewrite the **13** lookup call-sites (`tools.rs:351,809,865,1298,1321,1344,1365,1386,1407,
-  1428,1446,1464,1482`) to call it; the `.ok_or(…)` handling is unchanged;
-- move the plain `AuthedSession` struct into `imcp2-core` beside the seam; the hosted
-  `require_token` middleware (in `imcp2`) keeps inserting it into the request extensions.
+Each binary then owns its authentication end to end, in its own package:
 
-The seam involves no conditional compilation: the Bearer arm reads `http::request::Parts`
-(the `http` crate — axum merely re-exports it), which core depends on directly. Hosted
-constructs `IcTools` with `Bearer`; local with `Singleton`, whose slot the login flow fills.
+- **Hosted (`imcp2`)** — unchanged mechanics: the `require_token` middleware validates the
+  bearer token per request and stashes the plain `AuthedSession { session_id }` on the
+  request; the resolver it injects reads that back out of the tool context (rmcp surfaces
+  the HTTP request's parts there). Both the struct and the resolver live in `imcp2`'s
+  `auth.rs`, beside the middleware that gives them meaning.
+- **Local (`imcp2-local`)** — the login flow (component 5) owns a `SessionSlot`: a shared,
+  **replaceable** holder for the one signed-in session id, filled on each successful
+  redeem. Replaceable, not fixed: the II contract requires a **fresh session key** after
+  `Unauthorized`, so each re-login writes a fresh session id — same-process
+  reauthentication after grant expiry or revocation, with no client restart. The resolver
+  it injects simply reads the slot — which is expiry-aware: the moment the grant lapses it
+  reports no session, so tools return sign-in guidance instead of acting on a dead session.
+
+The seam is deliberately just a value-returning callback rather than a middleware slot in
+core: a real authentication middleware needs its transport (the hosted validation is HTTP
+middleware; a stdio pipe has no per-request middleware at all), so the middlewares live
+with their transports and core only receives their outcome.
 
 Tools that are already session-free work unchanged locally: `get_canister_candid`,
 `get_canister_api_doc`, `open_app`, `resolve_app`, `discover_app_canisters`, the skills/lookup
@@ -573,7 +582,7 @@ building and signing these artifacts is a Stage 3 deliverable.
 `identities/calls/discover/management/skills/tools` + the new `iiconnect` (extracted from
 `auth.rs`) + `static/` + the connect assets into the new core crate; `imcp2` keeps the OAuth
 AS, `McpServer`/`McpConfig`/`main.rs`, `metrics`, and the `e2e` harness, depends on core, and
-re-exports its public items so embedders keep compiling. Apply the `SessionSource` seam
+re-exports its public items so embedders keep compiling. Apply the `SessionResolver` seam
 (component 7). *Exit:* the `imcp2` binary builds and its tests pass unchanged; `imcp2-core`
 compiles standalone with no `axum`, no `prometheus`, and no OAuth code in its graph —
 `tower-http` remains only as rmcp/reqwest's transitive internal, never as the direct CORS

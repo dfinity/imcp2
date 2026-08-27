@@ -31,6 +31,3 @@ reqwest = { workspace = true }
 getrandom = { workspace = true }
 urlencoding = { workspace = true }
 url = { workspace = true }
-# The request-extension type the Bearer session lookup reads (axum re-exports
-# this same type; depending on `http` directly keeps axum out of this crate).
-http = { workspace = true }

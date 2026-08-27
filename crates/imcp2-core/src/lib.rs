@@ -15,11 +15,12 @@
 //!     plain values so each binary wraps them in its own HTTP handlers.
 //!
 //! How a tool call finds the II session it acts as is the one seam between
-//! deployments: the hosted server resolves it per request from the
-//! [`AuthedSession`] extension its bearer-token gate injects
-//! ([`SessionSource::Bearer`]), while a single-user local server pins one
-//! session established at login ([`SessionSource::Singleton`]). The tool
-//! implementations are identical in both.
+//! deployments, and **authentication itself stays in the embedding binary**:
+//! each binary injects a [`SessionResolver`] reporting the already-validated
+//! session for a call — the hosted server's reads what its bearer-token
+//! middleware stashed on the request, a single-user local server's returns
+//! the one session its login flow established. The tool implementations are
+//! identical in both.
 //!
 //! The IC [`Agent`] is **inherited from the embedding application**, not built
 //! here: the binary passes in its own agent, so anonymous canister calls go
@@ -36,7 +37,7 @@ mod discover;
 mod management;
 
 pub use identities::{IiInstance, SessionGauges};
-pub use tools::{AuthedSession, IcTools, SessionSource};
+pub use tools::{IcTools, SessionResolver};
 /// The IC [`Agent`] type the components are built around, re-exported so
 /// callers construct the injected agent from the exact `ic-agent` version this
 /// crate links.

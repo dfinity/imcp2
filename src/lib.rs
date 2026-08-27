@@ -258,9 +258,10 @@ impl McpServer {
                         agent.clone(),
                         identities.clone(),
                         skills.clone(),
-                        // Multi-user: each request's session comes from the
-                        // bearer-token gate's AuthedSession extension.
-                        imcp2_core::SessionSource::Bearer,
+                        // Multi-user: each request's session is whatever the
+                        // bearer-token gate already validated (auth stays in
+                        // THIS crate; core only asks the injected resolver).
+                        auth::bearer_session_resolver(),
                     ))
                 },
                 LocalSessionManager::default().into(),
