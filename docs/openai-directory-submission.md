@@ -133,7 +133,7 @@ and mobile. Draft set:
 Positive:
 1. "What is canister gftcp-myaaa-aaaar-qcaaa-cai?" → identifies the
    canister behind opencloud.org, its controllers and interface.
-2. "How do I add cycles to my canister?" → returns step-by-step icp CLI
+2. "How do I add cycles to canister gftcp-myaaa-aaaar-qcaaa-cai?" → returns step-by-step icp CLI
    instructions; nothing is executed.
 3. "What canisters are behind https://opencloud.org?" → App Connect
    discovery returns the app's canisters with provenance.

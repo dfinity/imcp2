@@ -15,8 +15,8 @@ are unsupported by policy. The standardized ledger surface is refused
 mechanically: `canister_update_call` rejects the ICRC-1/ICRC-2 (and related
 ledger-standard) transfer/approval methods on every canister, and
 `icp_top_up_canister` and `icp_create_canister` return `icp` CLI instructions
-for the user to run themselves instead of executing anything — the server
-creates nothing and moves no funds. For financial operations, users act
+for the user to run themselves instead of executing anything — those tools
+create nothing and move no funds. For financial operations, users act
 themselves in a wallet or frontend they control (e.g.
 [oisy.com](https://oisy.com)), in their own browser.
 
