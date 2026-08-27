@@ -510,15 +510,25 @@ mod tests {
         assert!(text.contains("invalid canister id"), "{text}");
 
         // Deferral: a protocol/meta tool is not just unlisted — calling it
-        // fails with the router's method-not-found error rather than running.
+        // fails with the router's standard "tool not found" error (the
+        // invalid-params shape any unknown tool name gets), rather than
+        // running — and rather than dying some other way: a disconnect or a
+        // different error must not pass this regression.
         let mut params = rmcp::model::CallToolRequestParams::new("icp_get_skill");
         params.arguments = serde_json::json!({ "name": "writing-motoko" })
             .as_object()
             .cloned();
-        assert!(
-            client.call_tool(params).await.is_err(),
-            "deferred protocol tools must not be callable"
-        );
+        let err = client
+            .call_tool(params)
+            .await
+            .expect_err("deferred protocol tools must not be callable");
+        match err {
+            rmcp::ServiceError::McpError(e) => {
+                assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{e:?}");
+                assert!(e.message.contains("tool not found"), "{e:?}");
+            }
+            other => panic!("expected the router's tool-not-found error, got {other:?}"),
+        }
 
         client.cancel().await.expect("client shutdown");
         server.cancel().await.expect("server shutdown");

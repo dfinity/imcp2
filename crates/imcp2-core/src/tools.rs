@@ -86,8 +86,9 @@ pub struct IcProtocolTools {
 /// meta-level half ([`IcProtocolTools`]) is split out and deliberately NOT
 /// served in this version — we anticipate this will come in a future version;
 /// re-enabling it means composing its router back into `all_tools`,
-/// `call_tool`, and `get_tool` here (or serving [`IcProtocolTools`] directly,
-/// which stays fully usable as library code).
+/// `call_tool`, and `get_tool` here (or dispatching [`IcProtocolTools`]'s
+/// router from an embedder's own [`ServerHandler`] — the type has no handler
+/// of its own but stays fully usable as library code).
 #[derive(Clone)]
 pub struct IcTools {
     canister: IcCanisterTools,
@@ -2138,7 +2139,8 @@ impl ServerHandler for IcTools {
     ) -> Result<CallToolResult, McpError> {
         // Only the canister/app router is served in this version (the
         // protocol/meta tools are deferred); a miss produces the router's
-        // standard method-not-found error.
+        // standard "tool not found" (invalid-params) error — the same shape
+        // any unknown tool name gets.
         let tcc = ToolCallContext::new(&self.canister, request, context);
         IcCanisterTools::tool_router().call(tcc).await
     }
