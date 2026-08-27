@@ -39,10 +39,6 @@ mod setup;
 #[cfg(all(test, feature = "e2e"))]
 mod e2e_local_login;
 
-// The PocketIC-backed end-to-end login test (the design's local-replica test
-// configuration). Compiled only for `cargo test --features e2e`.
-#[cfg(all(test, feature = "e2e"))]
-mod e2e_local_login;
 
 use imcp2_core::{identities::Identities, skills, IcTools, IiInstance};
 use login::SessionSlot;
