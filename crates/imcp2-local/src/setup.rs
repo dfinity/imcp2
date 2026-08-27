@@ -36,13 +36,20 @@ const SERVER_NAME: &str = "imcp2";
 pub fn run(args: &[String]) -> anyhow::Result<()> {
     let mut mode = Mode::Apply;
     for a in args {
-        match a.as_str() {
-            "--remove" => mode = Mode::Remove,
-            "--print" => mode = Mode::Print,
+        let requested = match a.as_str() {
+            "--remove" => Mode::Remove,
+            "--print" => Mode::Print,
             other => anyhow::bail!(
                 "unknown setup flag {other:?} — usage: imcp2-local setup [--remove | --print]"
             ),
-        }
+        };
+        // The usage marks these mutually exclusive; last-flag-wins would let
+        // `--print --remove` write despite `--print` promising it won't.
+        anyhow::ensure!(
+            mode == Mode::Apply || mode == requested,
+            "--remove and --print are mutually exclusive"
+        );
+        mode = requested;
     }
     let env = Env::from_system()?;
     let (report, failed) = run_in(&env, mode);
@@ -423,6 +430,10 @@ fn backup_once(path: &Path) -> anyhow::Result<Option<PathBuf>> {
 /// Write a config atomically: sibling temp file, then rename over `path` —
 /// a crash or full disk never leaves the client's live config truncated.
 fn persist(path: &Path, contents: &str) -> anyhow::Result<()> {
+    // A symlinked config (dotfiles managers) must keep being a symlink: write
+    // through to the TARGET, so the rename never replaces the link itself
+    // with a regular file. A not-yet-existing path stays as given.
+    let path = &path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let tmp = path.with_extension("imcp2.tmp");
     std::fs::write(&tmp, contents).with_context(|| format!("write {}", tmp.display()))?;
     // The rename must not swap the user's permissions for the umask default:
