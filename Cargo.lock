@@ -1828,8 +1828,12 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
+ "candid",
+ "hex",
  "imcp2-core",
  "open",
+ "pocket-ic",
  "reqwest 0.13.4",
  "rmcp",
  "serde",

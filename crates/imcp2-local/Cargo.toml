@@ -34,6 +34,18 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
+# Only for the PocketIC-backed end-to-end login test (src/e2e_local_login.rs),
+# behind the `e2e` feature so the default build never compiles it — the same
+# gating as the hosted crate's harness. (An optional dependency, not a
+# dev-dependency: cargo has no optional dev-dependencies.)
+pocket-ic = { version = "15", optional = true }
+
+[features]
+# Compiles + enables the real II ↔ local-login e2e against a live Internet
+# Identity canister in PocketIC (needs II_WASM + POCKET_IC_BIN at runtime; see
+# src/e2e_local_login.rs). Off by default: the standard `cargo test` neither
+# builds `pocket-ic` nor touches the network.
+e2e = ["dep:pocket-ic"]
 
 [dev-dependencies]
 # The login-flow tests play the browser: fetch the callback page, the
@@ -43,3 +55,8 @@ reqwest = { workspace = true, features = ["json"] }
 # in-process duplex pipe (the same shape as stdio), driven by rmcp's client.
 rmcp = { workspace = true, features = ["client"] }
 tokio = { workspace = true, features = ["io-util"] }
+# The e2e login test speaks the II canister's candid interface directly
+# (playing II's frontend) and (de)codes the delegation-chain wire fields.
+candid = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
