@@ -287,7 +287,10 @@ Internet Identity gives each application a different identity for you, so
 applications cannot recognise you across applications. The Service is a
 participant in that design and we want to be plain about what it can see.
 While a session is live it holds, in memory, the per-application identities
-it has derived for you. Three things limit what the Service could link
+it has derived for you. Internet Identity derives the same identity each time
+for a given application and account, so software holding one of them could in
+principle tell that two separate sessions visiting that application belong to
+the same user. Three things limit what the Service could link
 in practice: none of these identifiers is
 written to logs, which carry only a per-connection identifier that is new
 for every connection (section 5); the applications you visit are not written

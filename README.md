@@ -13,8 +13,8 @@ building, and operating canisters — it is not a wallet or trading tool, and
 financial operations (token transfers, spending approvals, payments, trades)
 are unsupported by policy. The standardized ledger surface is refused
 mechanically (`canister_update_call` rejects the ICRC-1/ICRC-2 and related
-ledger-standard transfer/approval methods on every canister), and there are
-no funding or management tools at all: creating, funding, and topping up
+ledger-standard transfer/approval methods on every canister), and the
+connector serves no funding or management tools: creating, funding, and topping up
 canisters is done by the user with the
 [`icp` CLI](https://github.com/dfinity/icp-cli) in their own terminal.
 For financial operations, users act themselves in a
