@@ -450,10 +450,10 @@ pub struct AccountsOutput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ResolveAppArgs {
     /// The application's URL, e.g. "https://oisy.com". Must be a URL you actually
-    /// have — given by the user, returned by `icp_find_app_by_name`, or found by a
-    /// web search of the app's official site. NEVER a domain guessed from an app's
-    /// name (guessed lookalike domains are unrelated or squatted sites and are
-    /// refused).
+    /// have — given by the user, shown by `open_app` for a well-known app name, or
+    /// found by a web search of the app's official site. NEVER a domain guessed
+    /// from an app's name (guessed lookalike domains are unrelated or squatted
+    /// sites and are refused).
     pub app_url: String,
 }
 

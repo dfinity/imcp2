@@ -932,15 +932,15 @@ impl IcCanisterTools {
             Err(e) => return Ok(err(format!("could not derive principal for {}: {e}", target.origin))),
         };
         // Surface a query-only session (H2) so the LLM won't attempt (and have the
-        // IC reject at ingress) canister-management updates.
+        // IC reject at ingress) state-changing update calls.
         let read_only = self.identities.is_read_only(&session_id).await == Some(true);
         let mut text = format!("{principal}\n\n[{}]", identity_annotation(&target, None));
         if read_only {
             text.push_str(
                 "\n\n(This Internet Identity session was authorized for \"Questions only\": reads work, \
-                 but canister management — create/install/start/stop/delete, and icp_canister_status — \
-                 needs update access. Ask the user to reconnect and choose \"Actions & questions\" on \
-                 Internet Identity's consent screen.)",
+                 but state-changing calls (canister_update_call) are rejected by the network. Ask the \
+                 user to reconnect and choose \"Actions & questions\" on Internet Identity's consent \
+                 screen.)",
             );
         }
         let output = identities::PrincipalOutput {

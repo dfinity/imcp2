@@ -209,7 +209,7 @@ impl SkillsCatalog {
         let entry = skills.iter().find(|s| s.name.eq_ignore_ascii_case(name));
         if entry.is_none() {
             return Err(format!(
-                "no skill named `{name}` — call icp_list_skills to see the available skills"
+                "no skill named `{name}` — list the `skill://` resources to see the available skills"
             ));
         }
         // Use the manifest's markdown URL only when it stays on the configured
