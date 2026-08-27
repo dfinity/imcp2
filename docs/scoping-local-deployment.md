@@ -466,8 +466,10 @@ middleware; a stdio pipe has no per-request middleware at all), so the middlewar
 with their transports and core only receives their outcome.
 
 Tools that are already session-free work unchanged locally: `get_canister_candid`,
-`get_canister_api_doc`, `open_app`, `resolve_app`, `discover_app_canisters`, the skills/lookup
-tools, and the anonymous path of `canister_query`.
+`get_canister_api_doc`, `open_app`, `resolve_app`, `discover_app_canisters`, `icp_oql_guide`,
+and the anonymous path of `canister_query`. (The skills and lookup tools are deferred from
+the served surface — we anticipate they will come in a future version; the skill documents
+stay served as `skill://` resources.)
 
 ### 8. Security model
 
@@ -478,8 +480,10 @@ the transient login listener (component 5), and reaching it confers nothing: the
 page and the `#4091` well-known are static, and `/redeem` only advances the connect this
 process started (`state` must match) with a chain targeting the in-process `X` — it can
 neither invoke tools nor read the session. But the client then wields the user's
-**real production II accounts** on mainnet (canister create/install/start/stop/delete, any
-update call / cycles spend, per-app delegations for every origin). This must be stated plainly:
+**real production II accounts** on mainnet (any update call under a per-app delegation, for
+every origin — and the deferred management tools, if an embedder serves them, add canister
+create/install/start/stop/delete and cycles spend as the management principal). This must be
+stated plainly:
 **treat the binary and its client config like a wallet.** There is no revocable token — only
 the II grant (reconnect/expiry).
 

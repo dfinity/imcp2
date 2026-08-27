@@ -357,7 +357,7 @@ conversation beyond tool arguments and generates no media.
 
 - [ ] Dedicated ICP MCP privacy policy live at `https://mcp.internetcomputer.org/privacy-policy` (page + landing-page link merged; needs the production release) and entered in the portal (blocker 1)
 - [ ] Reply received from mcp-review@anthropic.com settling the financial-transactions and first-party-API acknowledgments (asked 2026-07-31; blocker 2)
-- [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — provision a funded identity only if a reviewer asks
+- [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — if a reviewer asks for a populated account, provision a demo-app account (no funding: the tools that needed it are deferred)
 - [ ] `release-*` tag cut; `/version` on production shows the intended commit (blocker 4)
 - [x] Square PNG icon exported — `docs/assets/icp-logo-{1024,512}.png` (blocker 5)
 - [ ] Every tool exercised once by the submitter (portal asks you to confirm this; MCP Inspector or a custom connector in Claude both count)

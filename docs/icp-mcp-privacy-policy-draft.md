@@ -138,9 +138,10 @@ keeps, for the remainder of the session: the application's domain, the
 account number used, the per-application key it generated, and Internet
 Identity's signed authorization for that application (itself valid for at
 most one hour). Keeping this avoids re-deriving an authorization on every
-call to the same application. The Service's own origin is treated as one
-such application when you use the canister-management tools, and the
-identity derived for it is stable across your connections. All of this is
+call to the same application. (The canister-management tools, which would
+treat the Service's own origin as one such application with an identity that
+is stable across your connections, are not part of this version — we
+anticipate they will come in a future version.) All of this is
 held in memory only, bounded in size, and discarded when the session ends or
 the Service restarts. Legal basis: performance of the service you requested.
 
@@ -289,10 +290,12 @@ Internet Identity gives each application a different identity for you, so
 applications cannot recognise you across applications. The Service is a
 participant in that design and we want to be plain about what it can see.
 While a session is live it holds, in memory, the per-application identities
-it has derived for you, including a stable identity for you at its own
-origin that the canister-management tools act as; software holding that
-stable identity could in principle associate separate sessions with the same
-user. Three things limit that in practice: none of these identifiers is
+it has derived for you. (The canister-management tools, which would also
+derive a stable identity for you at the Service's own origin — one that
+software holding it could in principle use to associate separate sessions
+with the same user — are not part of this version; we anticipate they will
+come in a future version.) Three things limit what the Service could link
+in practice: none of these identifiers is
 written to logs, which carry only a per-connection identifier that is new
 for every connection (section 5); the applications you visit are not written
 to logs either; and nothing the Service discloses to an application lets

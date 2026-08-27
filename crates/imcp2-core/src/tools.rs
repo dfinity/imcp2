@@ -2597,8 +2597,9 @@ mod tests {
 
     // The tool surface is split by scope: the protocol / meta-level tools
     // live on IcProtocolTools, everything app-/canister-scoped on
-    // IcCanisterTools — no overlap, nothing dropped, and the composed list is
-    // what tools/list serves. icp_oql_guide is the one icp_-named exception
+    // IcCanisterTools — no overlap, nothing dropped: every definition lives
+    // on exactly one router, while tools/list serves the canister half alone
+    // in this version. icp_oql_guide is the one icp_-named exception
     // on the canister side: it serves the OQL dialect the canister read flow
     // (guide → schema → query) depends on, so it belongs with those tools.
     #[test]

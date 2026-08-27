@@ -219,9 +219,10 @@ Genuinely public reads via a `canister_query` Candid `method` query or the
 public-metadata tools (`get_canister_candid`, `discover_app_canisters`) skip steps
 3/4 and need no origin; OQL reads always require one. The per-canister inspection (5) is
 independent of the identity steps (3/4), so they can run in parallel. Managing your
-**own** canisters (the `icp_*` create/install/status/… tools) acts as your standing
-**management principal** at this server's origin — a *different* identity than the
-per-app principals above.
+**own** canisters is not part of this version — the `icp_*` create/install/status/… tools
+are deferred (we anticipate they will come in a future version, acting as a standing
+**management principal** at this server's origin, a *different* identity than the
+per-app principals above); today, create and manage canisters with the icp CLI.
 
 ### App-declared canister metadata (App Connect)
 

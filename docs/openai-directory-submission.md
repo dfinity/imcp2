@@ -93,7 +93,9 @@ and self-serve. Position to state in the Testing tab: reviewers create their
 own Internet Identity in under a minute (instructions on the landing page);
 every read-only tool works with any identity because it reads public network
 state. Have the fallback ready (a provisioned identity with a recovery
-phrase, a controlled canister, and a cycles balance) if review pushes back —
+phrase in the team vault and an account at a demo app — the
+canister-management tools that would have needed a controlled canister and a
+cycles balance are deferred to a future version) if review pushes back —
 and expect a higher chance of push-back than at Anthropic given the
 login-and-password wording.
 
