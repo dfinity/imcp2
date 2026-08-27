@@ -318,9 +318,11 @@ Paste-and-adapt; portal limits in parentheses.
 >    questions" additionally allows state-changing calls
 >    (`canister_update_call`).
 > 3. Try the example prompts above. On a Questions-only session a
->    state-changing call (`canister_update_call`) returns an actionable
->    reconnect message rather than an opaque error — that behavior is
->    intended. Access is revocable at any time at
+>    state-changing call (`canister_update_call`) is rejected by the
+>    network and the tool reports the failed call; the server
+>    instructions prime the assistant to explain the access level and
+>    recommend reconnecting under "Actions & questions" — that behavior
+>    is intended. Access is revocable at any time at
 >    https://id.ai/manage/settings.
 > 4. Canister-management tools are not part of this version (we anticipate
 >    they will come in a future version), so there is nothing to provision:

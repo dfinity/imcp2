@@ -398,7 +398,7 @@ own terminal, guided by the official skills (`skill://icp-cli`,
 `skill://cycles-management`). The dedicated management tool group — a
 cycles-balance read, instructions-only creation and top-up helpers,
 `icp_install_code`, status/settings, and the lifecycle operations, acting as a
-standing per-connection management principal — is deferred from this version;
+stable per-user management principal — is deferred from this version;
 **we anticipate this will come in a future version** (the code remains in the
 library as `IcProtocolTools`).
 

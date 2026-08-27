@@ -153,7 +153,9 @@ Negative:
    (web-search or ask the user for the real URL) rather than resolved to a
    wrong identity.
 2. A state-changing call (canister_update_call) on a "Questions only"
-   session → actionable reconnect-with-actions message, not an opaque error.
+   session → the network rejects it and the tool reports the failed call;
+   the server instructions prime the assistant to explain the access level
+   and recommend reconnecting under "Actions & questions".
 3. Any authenticated tool with no sign-in → clean 401 → OAuth flow starts
    (no crash, no hang).
 4. "Call an update method on a canister that rejects this caller" → the
