@@ -338,14 +338,20 @@ fn the_session_slot_is_shared_and_replaceable() {
     let slot = SessionSlot::new();
     let reader = slot.clone();
     assert_eq!(reader.get(), None, "a fresh slot is signed out");
-    slot.set("sess-1".into());
+    let hour_from_now = now_ns() + 3_600_000_000_000;
+    slot.set("sess-1".into(), hour_from_now);
     assert_eq!(reader.get(), Some("sess-1".into()), "clones share the slot");
-    slot.set("sess-2".into());
+    slot.set("sess-2".into(), hour_from_now);
     assert_eq!(
         reader.get(),
         Some("sess-2".into()),
         "a re-login replaces the id"
     );
+    // Expiry-aware: the moment the grant lapses, the slot reports NO session
+    // — tools return sign-in guidance instead of acting on a dead session,
+    // regardless of when the 60-second reaper gets to the server-side state.
+    slot.set("sess-3".into(), now_ns() - 1);
+    assert_eq!(reader.get(), None, "an expired grant is signed out");
 }
 
 // The handshake window is exactly HANDSHAKE_TTL: a pending flow older than

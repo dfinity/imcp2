@@ -457,7 +457,8 @@ Each binary then owns its authentication end to end, in its own package:
   redeem. Replaceable, not fixed: the II contract requires a **fresh session key** after
   `Unauthorized`, so each re-login writes a fresh session id — same-process
   reauthentication after grant expiry or revocation, with no client restart. The resolver
-  it injects simply reads the slot.
+  it injects simply reads the slot — which is expiry-aware: the moment the grant lapses it
+  reports no session, so tools return sign-in guidance instead of acting on a dead session.
 
 The seam is deliberately just a value-returning callback rather than a middleware slot in
 core: a real authentication middleware needs its transport (the hosted validation is HTTP
