@@ -6,9 +6,10 @@
 //!   * Claude Desktop — `claude_desktop_config.json` → `mcpServers.imcp2`
 //!   * Cursor — `~/.cursor/mcp.json` → `mcpServers.imcp2`
 //!   * Antigravity — `~/.gemini/config/mcp_config.json` → `mcpServers.imcp2`
-//!   * Codex — `~/.codex/config.toml` → `[mcp_servers.imcp2]`, edited in
-//!     place rather than via `codex mcp add` (works without `codex` on
-//!     `PATH` or a recent CLI — see the Codex section below)
+//!   * Codex — via its own CLI (`codex mcp add`) when a `codex` recent
+//!     enough to have that subcommand is on `PATH`; otherwise
+//!     `$CODEX_HOME/config.toml` (default `~/.codex`) → `[mcp_servers.imcp2]`
+//!     is edited in place, covering IDE-only and older installs
 //!   * Claude Code — via its own CLI (`claude mcp add --scope user …`), which
 //!     owns that config's format
 //!   * Perplexity (macOS) — has no writable config file; its UI-driven steps
@@ -83,6 +84,10 @@ struct Env {
     exe: PathBuf,
     /// `claude` (Claude Code's CLI) on `PATH`, if present.
     claude_cli: Option<PathBuf>,
+    /// `codex` (Codex's CLI) on `PATH`, if present.
+    codex_cli: Option<PathBuf>,
+    /// Codex's config directory: `$CODEX_HOME`, defaulting to `~/.codex`.
+    codex_home: PathBuf,
     /// Where macOS applications live, for detecting the Perplexity app.
     applications_dir: PathBuf,
 }
@@ -102,11 +107,16 @@ impl Env {
              UTF-8 path and rerun setup",
             exe.display()
         );
+        let home = dirs::home_dir().context("no home directory")?;
         Ok(Self {
-            home: dirs::home_dir().context("no home directory")?,
             config_dir: dirs::config_dir().context("no OS config directory")?,
             exe,
             claude_cli: find_on_path("claude"),
+            codex_cli: find_on_path("codex"),
+            codex_home: std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".codex")),
+            home,
             applications_dir: PathBuf::from("/Applications"),
         })
     }
@@ -173,20 +183,56 @@ fn run_in(env: &Env, mode: Mode) -> (String, usize) {
                     }
                     render(client.name, file, result)
                 }
-                Target::CodexToml(file) => {
-                    let result = if mode == Mode::Apply {
-                        upsert_codex_server(file, &env.exe)
-                    } else {
-                        remove_codex_server(file)
-                    };
-                    if result.is_err() {
-                        failed += 1;
+                Target::Codex { config, cli } => {
+                    // The vendor CLI is preferred when it is recent enough to
+                    // have `codex mcp` (probed here); otherwise — IDE-only
+                    // installs with no binary on `PATH`, or older CLIs — the
+                    // documented config.toml is edited directly.
+                    let capable = cli.as_ref().filter(|c| {
+                        std::process::Command::new(c)
+                            .args(["mcp", "--help"])
+                            .output()
+                            .is_ok_and(|out| out.status.success())
+                    });
+                    match capable {
+                        Some(c) => {
+                            let mut cmd = std::process::Command::new(c);
+                            if mode == Mode::Apply {
+                                cmd.args(["mcp", "add", SERVER_NAME, "--"]);
+                                cmd.arg(&env.exe);
+                            } else {
+                                cmd.args(["mcp", "remove", SERVER_NAME]);
+                            }
+                            let fallback = match mode {
+                                Mode::Remove => format!("codex mcp remove {SERVER_NAME}"),
+                                _ => client.manual.lines().next().unwrap_or_default().to_string(),
+                            };
+                            vendor_cli_line(
+                                client.name,
+                                "codex mcp",
+                                cmd,
+                                &fallback,
+                                mode,
+                                &mut failed,
+                            )
+                        }
+                        None => {
+                            let result = if mode == Mode::Apply {
+                                upsert_codex_server(config, &env.exe)
+                            } else {
+                                remove_codex_server(config)
+                            };
+                            if result.is_err() {
+                                failed += 1;
+                            }
+                            render(client.name, config, result)
+                        }
                     }
-                    render(client.name, file, result)
                 }
                 Target::ClaudeCli(cli) => {
-                    let args: &[&str] = if mode == Mode::Apply {
-                        &[
+                    let mut cmd = std::process::Command::new(cli);
+                    if mode == Mode::Apply {
+                        cmd.args([
                             "mcp",
                             "add",
                             "--scope",
@@ -195,14 +241,10 @@ fn run_in(env: &Env, mode: Mode) -> (String, usize) {
                             "stdio",
                             SERVER_NAME,
                             "--",
-                        ]
-                    } else {
-                        &["mcp", "remove", "--scope", "user", SERVER_NAME]
-                    };
-                    let mut cmd = std::process::Command::new(cli);
-                    cmd.args(args);
-                    if mode == Mode::Apply {
+                        ]);
                         cmd.arg(&env.exe);
+                    } else {
+                        cmd.args(["mcp", "remove", "--scope", "user", SERVER_NAME]);
                     }
                     // The fallback one-liner must match the mode: telling a
                     // removing user to re-add the server would invert the ask.
@@ -210,39 +252,7 @@ fn run_in(env: &Env, mode: Mode) -> (String, usize) {
                         Mode::Remove => format!("claude mcp remove --scope user {SERVER_NAME}"),
                         _ => client.manual.lines().next().unwrap_or_default().to_string(),
                     };
-                    match cmd.output() {
-                        Ok(out) if out.status.success() => {
-                            format!("• {}: done (via `claude mcp`, user scope).", client.name)
-                        }
-                        Ok(out) => {
-                            // On removal, only a recognizably-absent
-                            // registration is benign; any other refusal
-                            // (permissions, corrupt config) must count.
-                            let msg = format!(
-                                "{}{}",
-                                String::from_utf8_lossy(&out.stdout),
-                                String::from_utf8_lossy(&out.stderr)
-                            )
-                            .to_lowercase();
-                            let absent = mode == Mode::Remove
-                                && (msg.contains("not found") || msg.contains("no mcp server"));
-                            if !absent {
-                                failed += 1;
-                            }
-                            format!(
-                                "• {}: `claude mcp` refused ({}). Run it yourself:\n  {fallback}",
-                                client.name,
-                                String::from_utf8_lossy(&out.stderr).trim(),
-                            )
-                        }
-                        Err(e) => {
-                            failed += 1;
-                            format!(
-                                "• {}: could not run `claude` ({e}). Run it yourself:\n  {fallback}",
-                                client.name,
-                            )
-                        }
-                    }
+                    vendor_cli_line(client.name, "claude mcp", cmd, &fallback, mode, &mut failed)
                 }
                 Target::Manual => match mode {
                     Mode::Remove => format!(
@@ -279,8 +289,12 @@ fn run_in(env: &Env, mode: Mode) -> (String, usize) {
 enum Target {
     /// A `mcpServers` JSON file to edit.
     Json(PathBuf),
-    /// Codex's `config.toml` (`[mcp_servers.<name>]`).
-    CodexToml(PathBuf),
+    /// Codex: its CLI when recent enough (`codex mcp`), else its
+    /// `config.toml` (`[mcp_servers.<name>]`).
+    Codex {
+        config: PathBuf,
+        cli: Option<PathBuf>,
+    },
     /// Claude Code: registered through its own CLI.
     ClaudeCli(PathBuf),
     /// Detected, but only registrable through the app's UI (Perplexity).
@@ -328,7 +342,6 @@ fn clients(env: &Env) -> Vec<Client> {
     let claude_dir = env.config_dir.join("Claude");
     let cursor_dir = env.home.join(".cursor");
     let gemini_dir = env.home.join(".gemini");
-    let codex_dir = env.home.join(".codex");
 
     vec![
         Client {
@@ -354,13 +367,18 @@ fn clients(env: &Env) -> Vec<Client> {
         },
         Client {
             name: "Codex",
-            target: if codex_dir.is_dir() {
-                Target::CodexToml(codex_dir.join("config.toml"))
+            target: if env.codex_home.is_dir() || env.codex_cli.is_some() {
+                Target::Codex {
+                    config: env.codex_home.join("config.toml"),
+                    cli: env.codex_cli.clone(),
+                }
             } else {
-                Target::NotDetected("~/.codex is missing".into())
+                Target::NotDetected(
+                    "neither $CODEX_HOME (default ~/.codex) nor `codex` on PATH".into(),
+                )
             },
             manual: format!(
-                "Add to ~/.codex/config.toml:\n[mcp_servers.{SERVER_NAME}]\ncommand = {exe_toml}"
+                "codex mcp add {SERVER_NAME} -- {exe_sh}\nOr add to $CODEX_HOME/config.toml (default ~/.codex/config.toml):\n[mcp_servers.{SERVER_NAME}]\ncommand = {exe_toml}"
             ),
         },
         Client {
@@ -393,6 +411,44 @@ fn clients(env: &Env) -> Vec<Client> {
             ),
         },
     ]
+}
+
+/// Run a vendor CLI registration/removal (`claude mcp …` / `codex mcp …`)
+/// and render the report line, with the shared refusal contract: a removal
+/// refused because the registration is recognizably absent is benign; every
+/// other refusal or spawn failure counts toward the nonzero exit.
+fn vendor_cli_line(
+    name: &str,
+    via: &str,
+    mut cmd: std::process::Command,
+    fallback: &str,
+    mode: Mode,
+    failed: &mut usize,
+) -> String {
+    match cmd.output() {
+        Ok(out) if out.status.success() => format!("• {name}: done (via `{via}`)."),
+        Ok(out) => {
+            let msg = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+            .to_lowercase();
+            let absent = mode == Mode::Remove
+                && (msg.contains("not found") || msg.contains("no mcp server"));
+            if !absent {
+                *failed += 1;
+            }
+            format!(
+                "• {name}: `{via}` refused ({}). Run it yourself:\n  {fallback}",
+                String::from_utf8_lossy(&out.stderr).trim(),
+            )
+        }
+        Err(e) => {
+            *failed += 1;
+            format!("• {name}: could not run `{via}` ({e}). Run it yourself:\n  {fallback}")
+        }
+    }
 }
 
 fn render(name: &str, file: &Path, result: anyhow::Result<String>) -> String {
@@ -534,14 +590,12 @@ fn remove_json_server(path: &Path) -> anyhow::Result<String> {
 
 // ---- Codex config.toml ------------------------------------------------------
 //
-// A direct edit of Codex's documented config file, rather than shelling out
-// to `codex mcp add`: detection keyed on the `~/.codex` directory reaches
-// installs whose `codex` binary isn't on `PATH` (e.g. IDE-extension use),
-// removal here stays cleanly idempotent, and the file format works on Codex
-// versions that predate the `codex mcp` subcommand. (`toml_edit` preserves
-// the user's comments and formatting — a nicety, not the differentiator.)
-// Claude Code gets the opposite treatment because its user-scope config is
-// CLI-owned rather than a documented standalone file.
+// The FALLBACK half of the Codex target: the vendor CLI (`codex mcp add` /
+// `codex mcp remove`) is preferred whenever a `codex` recent enough to have
+// the `mcp` subcommand is on `PATH` (probed per run, in `run_in`), and these
+// direct, atomic edits of the documented config.toml cover the rest —
+// IDE-extension installs that never expose the binary, and older CLIs.
+// `$CODEX_HOME` is respected via `Env::codex_home`.
 
 fn upsert_codex_server(path: &Path, exe: &Path) -> anyhow::Result<String> {
     let mut doc: toml_edit::DocumentMut = if path.exists() {
@@ -646,6 +700,8 @@ mod tests {
             config_dir: root.path.join("config"),
             exe: PathBuf::from("/opt/imcp2/imcp2-local"),
             claude_cli: None,
+            codex_cli: None,
+            codex_home: root.path.join(".codex"),
             applications_dir: root.path.join("Applications"),
         };
         (root, env)
@@ -839,6 +895,64 @@ mod tests {
             "{ not json",
             "file untouched"
         );
+    }
+
+    // The vendor CLI is preferred when it's recent enough: a `codex` that
+    // answers `mcp --help` gets the `mcp add`/`mcp remove` invocations, and
+    // the config file is never touched directly.
+    #[cfg(unix)]
+    #[test]
+    fn a_capable_codex_cli_is_preferred_over_the_file_edit() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, mut env) = scratch(&[".codex"]);
+        let log = root.path.join("codex-calls.log");
+        let script = root.path.join("codex");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        env.codex_cli = Some(script);
+
+        let (report, failed) = run_in(&env, Mode::Apply);
+        assert_eq!(failed, 0, "{report}");
+        assert!(report.contains("Codex: done (via `codex mcp`)"), "{report}");
+        assert!(
+            !root.path.join(".codex/config.toml").exists(),
+            "the CLI path must not write the file"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("mcp --help"), "{calls}");
+        assert!(
+            calls.contains("mcp add imcp2 -- /opt/imcp2/imcp2-local"),
+            "{calls}"
+        );
+
+        let (report, failed) = run_in(&env, Mode::Remove);
+        assert_eq!(failed, 0, "{report}");
+        assert!(report.contains("Codex: done (via `codex mcp`)"), "{report}");
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("mcp remove imcp2"), "{calls}");
+    }
+
+    // An older codex (no `mcp` subcommand) falls back to the direct file
+    // edit, exactly as if only the IDE extension were installed.
+    #[cfg(unix)]
+    #[test]
+    fn an_old_codex_cli_falls_back_to_the_file_edit() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, mut env) = scratch(&[".codex"]);
+        let script = root.path.join("codex");
+        std::fs::write(&script, "#!/bin/sh\nexit 2\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        env.codex_cli = Some(script);
+
+        let (report, failed) = run_in(&env, Mode::Apply);
+        assert_eq!(failed, 0, "{report}");
+        assert!(report.contains("Codex: registered"), "{report}");
+        let written = std::fs::read_to_string(root.path.join(".codex/config.toml")).unwrap();
+        assert!(written.contains("[mcp_servers.imcp2]"), "{written}");
     }
 
     // The pasted snippets must stay valid in their target formats even for an

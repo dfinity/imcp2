@@ -44,7 +44,7 @@ Per client, that amounts to:
 |---|---|
 | Claude Desktop | `claude_desktop_config.json` → `mcpServers.imcp2` |
 | Claude Code | `claude mcp add --scope user --transport stdio imcp2 -- <path>` |
-| Codex | `~/.codex/config.toml` → `[mcp_servers.imcp2]` |
+| Codex | `codex mcp add imcp2 -- <path>` when a recent `codex` is on PATH; else `$CODEX_HOME/config.toml` (default `~/.codex`) → `[mcp_servers.imcp2]` |
 | Cursor | `~/.cursor/mcp.json` → `mcpServers.imcp2` |
 | Antigravity | `~/.gemini/config/mcp_config.json` → `mcpServers.imcp2` |
 | Perplexity (macOS) | Settings → Connectors → Add Connector → Advanced (the app's UI; `setup` prints the JSON to paste) |
