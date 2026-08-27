@@ -23,9 +23,47 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use imcp2_core::identities::Identities;
 use imcp2_core::iiconnect::{self, RedeemBody, AUTH_CALLBACKS_WELL_KNOWN};
-use imcp2_core::SessionSlot;
 use serde_json::json;
 use tokio::sync::{Mutex, Notify};
+
+/// The single-user session holder — a shared, **replaceable** slot rather
+/// than a fixed id. The Internet Identity contract requires a FRESH session
+/// key after an `Unauthorized` (a reused id would reuse its keys), so each
+/// successful login writes a fresh session id here — same-process
+/// reauthentication after grant expiry or revocation, with no client restart.
+/// Clones share the slot: the login flow holds a writing handle, and the slot
+/// answers `IcTools`' session lookups through [`SessionSlot::resolver`] — the
+/// local binary's whole authentication layer, living here rather than in
+/// core, which only asks the injected resolver. Starts empty (signed out).
+#[derive(Clone, Debug, Default)]
+pub struct SessionSlot(Arc<std::sync::RwLock<Option<String>>>);
+
+impl SessionSlot {
+    /// A fresh, empty slot (no session — every session-needing tool reports
+    /// "needs an authenticated session" until the login flow fills it).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The current session id, if a login has completed. The critical section
+    /// is a clone — never held across an await.
+    pub fn get(&self) -> Option<String> {
+        self.0.read().expect("session slot poisoned").clone()
+    }
+
+    /// Replace the session id after a successful login (a fresh id per the II
+    /// fresh-session-key contract).
+    pub fn set(&self, session_id: String) {
+        *self.0.write().expect("session slot poisoned") = Some(session_id);
+    }
+
+    /// This slot as the [`imcp2_core::SessionResolver`] the local binary
+    /// injects into `IcTools`: every call acts as the one signed-in session.
+    pub fn resolver(&self) -> imcp2_core::SessionResolver {
+        let slot = self.clone();
+        Arc::new(move |_ctx| slot.get())
+    }
+}
 
 /// How long one sign-in handshake may take, from the `authenticate` call to
 /// the browser's redeem, before the pending flow and its listener are torn
@@ -60,8 +98,8 @@ pub struct LoginDriver {
 
 struct Inner {
     identities: Identities,
-    /// The shared, replaceable session slot `IcTools` reads under
-    /// `SessionSource::Singleton`: each successful redeem writes the fresh
+    /// The shared, replaceable session slot `IcTools` reads through
+    /// [`SessionSlot::resolver`]: each successful redeem writes the fresh
     /// session id here (the II contract requires a fresh session key after
     /// `Unauthorized`, and a fresh id gets fresh keys).
     slot: SessionSlot,
@@ -896,6 +934,27 @@ mod tests {
             request(authority.to_string()).await,
             "200",
             "the true authority passes"
+        );
+    }
+
+    // The session slot is shared and REPLACEABLE: it starts empty (signed
+    // out), a login fills it, and a re-login (fresh session id, per the II
+    // fresh-session-key contract) replaces it — through every clone and
+    // through the resolver handed to IcTools, since clones share the holder.
+    // This is what makes reauthentication after grant expiry a same-process
+    // step.
+    #[test]
+    fn the_session_slot_is_shared_and_replaceable() {
+        let slot = SessionSlot::new();
+        let reader = slot.clone();
+        assert_eq!(reader.get(), None, "a fresh slot is signed out");
+        slot.set("sess-1".into());
+        assert_eq!(reader.get(), Some("sess-1".into()), "clones share the slot");
+        slot.set("sess-2".into());
+        assert_eq!(
+            reader.get(),
+            Some("sess-2".into()),
+            "a re-login replaces the id"
         );
     }
 
