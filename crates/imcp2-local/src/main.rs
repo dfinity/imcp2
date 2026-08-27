@@ -39,6 +39,11 @@ mod setup;
 #[cfg(all(test, feature = "e2e"))]
 mod e2e_local_login;
 
+// The PocketIC-backed end-to-end login test (the design's local-replica test
+// configuration). Compiled only for `cargo test --features e2e`.
+#[cfg(all(test, feature = "e2e"))]
+mod e2e_local_login;
+
 use imcp2_core::{identities::Identities, skills, IcTools, IiInstance};
 use login::SessionSlot;
 use rmcp::ServiceExt;
@@ -150,6 +155,22 @@ async fn serve() -> anyhow::Result<()> {
     let instance = IiInstance::prod().map_err(anyhow::Error::msg)?;
     tracing::info!(ii = %instance.ii_url, "using Internet Identity instance \"{}\"", instance.name);
     let identities = Identities::new(instance, management_origin(), agent.clone());
+
+    // The same 60-second session reaper the hosted server runs: expired
+    // grants, abandoned sign-in keys, and their cached delegations leave
+    // memory promptly instead of accumulating over a long-lived process.
+    // (No shutdown plumbing needed: the task ends with the runtime.)
+    {
+        let identities = identities.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                identities.reap_expired_sessions().await;
+            }
+        });
+    }
 
     // The single-user authentication layer, owned by THIS binary: the login
     // flow fills (and on re-login replaces) the slot, and the resolver it

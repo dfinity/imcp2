@@ -1851,7 +1851,10 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "candid",
+<<<<<<< HEAD
  "dirs",
+=======
+>>>>>>> claude/secondary-mcp-local-deploy-jpof9i-stage2
  "hex",
  "imcp2-core",
  "open",
