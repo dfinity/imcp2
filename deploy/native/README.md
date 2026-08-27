@@ -8,7 +8,10 @@ managed VPC) and you just want to put the app on it. The repo's
 ```
    build.sh  ─────►  build-out/imcp2        (cross-built linux/arm64 or amd64 binary)
    deploy.sh ─────►  /opt/imcp2/{imcp2,static}   + systemd: imcp2.service
-                     /opt/imcp2/monitoring         + systemd: imcp-status.service (dashboard)
+                     /opt/imcp2/monitoring         (staging copy of the dashboard source)
+                     /opt/imcp-status              + systemd: imcp-status.service (dashboard;
+                                                     root-owned executable copy, run as the
+                                                     dedicated imcp-status user)
                      /usr/local/bin/caddy          + systemd: caddy.service (TLS)
 ```
 

