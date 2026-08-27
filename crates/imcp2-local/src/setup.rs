@@ -200,9 +200,18 @@ fn run_in(env: &Env, mode: Mode) -> (String, usize) {
                             format!("• {}: done (via `claude mcp`, user scope).", client.name)
                         }
                         Ok(out) => {
-                            // A refused removal is usually "never registered"
-                            // — benign, unlike a refused registration.
-                            if mode == Mode::Apply {
+                            // On removal, only a recognizably-absent
+                            // registration is benign; any other refusal
+                            // (permissions, corrupt config) must count.
+                            let msg = format!(
+                                "{}{}",
+                                String::from_utf8_lossy(&out.stdout),
+                                String::from_utf8_lossy(&out.stderr)
+                            )
+                            .to_lowercase();
+                            let absent = mode == Mode::Remove
+                                && (msg.contains("not found") || msg.contains("no mcp server"));
+                            if !absent {
                                 failed += 1;
                             }
                             format!(
@@ -282,10 +291,13 @@ fn clients(env: &Env) -> Vec<Client> {
     let exe_str = env.exe.display().to_string();
     let exe_json = serde_json::Value::from(exe_str.as_str()).to_string();
     let exe_toml = toml_edit::Value::from(exe_str.as_str()).to_string();
-    let exe_sh = if exe_str.contains(' ') {
-        format!("\"{}\"", exe_str.replace('"', "\\\""))
+    // Always single-quote: literal in POSIX shells and PowerShell alike, so
+    // `$`, backticks, and spaces in the path never expand or split. (Double
+    // quotes would interpolate `$USER` in both.)
+    let exe_sh = if cfg!(windows) {
+        format!("'{}'", exe_str.replace('\'', "''"))
     } else {
-        exe_str.clone()
+        format!("'{}'", exe_str.replace('\'', r"'\''"))
     };
     let json_snippet =
         format!("{{ \"mcpServers\": {{ \"{SERVER_NAME}\": {{ \"command\": {exe_json} }} }} }}");
@@ -464,9 +476,15 @@ fn remove_json_server(path: &Path) -> anyhow::Result<String> {
     if !removed {
         return Ok("nothing to remove".to_string());
     }
+    // A removal is a modification too: the first one still earns the one-time
+    // pre-imcp2 backup (e.g. `--remove` before any apply on this machine).
+    let backup = backup_once(path)?;
     std::fs::write(path, format!("{:#}\n", root))
         .with_context(|| format!("write {}", path.display()))?;
-    Ok("removed".to_string())
+    Ok(match backup {
+        Some(b) => format!("removed; backup at {}", b.display()),
+        None => "removed".to_string(),
+    })
 }
 
 // ---- Codex config.toml ------------------------------------------------------
@@ -547,8 +565,13 @@ fn remove_codex_server(path: &Path) -> anyhow::Result<String> {
     {
         doc.remove("mcp_servers");
     }
+    // Same one-time backup contract as the JSON removal above.
+    let backup = backup_once(path)?;
     std::fs::write(path, doc.to_string()).with_context(|| format!("write {}", path.display()))?;
-    Ok("removed".to_string())
+    Ok(match backup {
+        Some(b) => format!("removed; backup at {}", b.display()),
+        None => "removed".to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -790,8 +813,8 @@ mod tests {
 
         let claude = by_name("Claude Code");
         assert!(
-            claude.ends_with(r#"-- "C:\Program Files\imcp2\imcp2-local.exe""#),
-            "the one-liner must quote a spaced path: {claude}"
+            claude.ends_with(r#"-- 'C:\Program Files\imcp2\imcp2-local.exe'"#),
+            "the one-liner must quote a spaced path literally: {claude}"
         );
     }
 
