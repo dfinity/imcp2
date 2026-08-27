@@ -51,8 +51,9 @@ const OQL_PRIMER_MD: &str = include_str!("../static/oql-primer.md");
 
 /// The app- and canister-scoped tools: everything that reads, discovers, or
 /// calls ONE app or canister (the `…canister…` / `…_app…` names) — Candid and
-/// OQL reads, update calls, app resolution/discovery, and the per-app
-/// identity tools. This is the surface [`IcTools`] serves in this version.
+/// OQL reads (with `icp_oql_guide`, the dialect guide those reads use),
+/// update calls, app resolution/discovery, and the per-app identity tools.
+/// This is the surface [`IcTools`] serves in this version.
 #[derive(Clone)]
 pub struct IcCanisterTools {
     agent: Agent,
@@ -62,9 +63,9 @@ pub struct IcCanisterTools {
     session: SessionResolver,
 }
 
-/// The IC protocol / meta-level tools (the `icp_` prefix): dashboard name/id
-/// lookups, the official IC skills, the OQL dialect guide, and canister
-/// creation/management as the standing management principal.
+/// The IC protocol / meta-level tools: dashboard name/id lookups, the
+/// official IC skills, and canister creation/management as the standing
+/// management principal.
 ///
 /// NOT served by the default [`IcTools`] composition in this version — we
 /// anticipate this will come in a future version. Until then the type, its
@@ -158,7 +159,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Fetch the Candid (.did) interface definition of an Internet Computer canister, read from its public `candid:service` metadata. Also reports two capability flags: `oql` (the canister exposes the OQL query surface — READ it via the `oql://usage` resource → get_canister_oql_schema → canister_query with the `oql` argument, since a Candid `method` query is then rejected) and `api_doc_available` (a `getApiDoc`/`get_api_doc` method exists — call get_canister_api_doc for a prose behavior guide; skip that call when this is false).",
+        description = "Fetch the Candid (.did) interface definition of an Internet Computer canister, read from its public `candid:service` metadata. Also reports two capability flags: `oql` (the canister exposes the OQL query surface — READ it via icp_oql_guide → get_canister_oql_schema → canister_query with the `oql` argument, since a Candid `method` query is then rejected) and `api_doc_available` (a `getApiDoc`/`get_api_doc` method exists — call get_canister_api_doc for a prose behavior guide; skip that call when this is false).",
         annotations(title = "Get Candid interface", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::GetCandidOutput>(),
     )]
@@ -199,14 +200,14 @@ impl IcCanisterTools {
                         notes.push(format!(
                             "This canister exposes an OQL query surface (a JSON query language \
                              over its data), so READ it through the OQL tools — a Candid `method` \
-                             query via canister_query is rejected here. Order: the `{OQL_USAGE_URI}` \
-                             resource (dialect, once) → get_canister_oql_schema (entities/fields) → \
+                             query via canister_query is rejected here. Order: icp_oql_guide \
+                             (dialect, once) → get_canister_oql_schema (entities/fields) → \
                              canister_query with the `oql` argument (run a JSON query, get a table). \
                              Those wrap the `schema`/`execute` methods (no Candid escaping). Per-app \
                              data is caller-gated, so the OQL read path REQUIRES the app's \
                              derivation_origin — an anonymous OQL read is rejected (for now), not \
                              silently empty; pass the derivation_origin from open_app / resolve_app. \
-                             See the `{OQL_USAGE_URI}` resource for the dialect. \
+                             See icp_oql_guide (or the `{OQL_USAGE_URI}` resource) for the dialect. \
                              canister_update_call then handles UPDATE calls only."
                         ));
                     }
@@ -233,7 +234,20 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Fetch the OQL schema catalogue of a canister that exposes the OQL surface (get_canister_candid reports `oql: true`): its entities, their primary keys, fields, and edges, as JSON. The MIDDLE step of guide→schema→query: read the `oql://usage` resource once, then call THIS before canister_query so you use the exact entity/field names instead of guessing. Entity names are the schema's own — often PLURAL and different from the Candid types/methods (e.g. `bookings`, not `Booking`/`getBookings`). Returns the schema plus a ready-to-run `canister_query` example per entity (each preserving this call's identity). AUTH: `derivation_origin` is REQUIRED — the schema itself is gated by the caller's principal, so a read with no origin is REJECTED (anonymous per-app reads are disabled for now) with guidance to pass it, rather than returning an empty entity list you'd misread as \"the app has no data model\". Pass the app's canonical `derivation_origin` (from open_app / resolve_app) to read the entities visible to the USER; the reply echoes `derived_for_origin` / `acted_as_principal`.",
+        description = "Load the OQL query-surface guide: the JSON query dialect for canisters that expose OQL (get_canister_candid reports `oql: true`) — entities/fields/edges via `schema`, and the `execute` query object (filters, aggregation, ordering, edge traversal, paging). This is step ONE of the fixed sequence guide→schema→query: read this once, then `get_canister_oql_schema` for the exact entity/field names (they are the schema's own — often PLURAL and unlike the Candid types/methods, e.g. `bookings` not `Booking`/`getBookings`), then `canister_query` with the `oql` argument. Never guess bespoke per-question methods. The schema read and the query REQUIRE the app's `derivation_origin` (from open_app / resolve_app) — anonymous per-app reads are disabled for now and are rejected with guidance. Both wrap the `schema`/`execute` methods, so you write plain JSON — no Candid escaping.",
+        annotations(title = "Get the OQL query guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<calls::OqlGuideOutput>(),
+    )]
+    async fn icp_oql_guide(
+        &self,
+        Parameters(_args): Parameters<management::NoArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let output = calls::OqlGuideOutput { content: OQL_PRIMER_MD.to_string() };
+        Ok(ok_structured(output.content.clone(), &output))
+    }
+
+    #[tool(
+        description = "Fetch the OQL schema catalogue of a canister that exposes the OQL surface (get_canister_candid reports `oql: true`): its entities, their primary keys, fields, and edges, as JSON. The MIDDLE step of guide→schema→query: read `icp_oql_guide` once, then call THIS before canister_query so you use the exact entity/field names instead of guessing. Entity names are the schema's own — often PLURAL and different from the Candid types/methods (e.g. `bookings`, not `Booking`/`getBookings`). Returns the schema plus a ready-to-run `canister_query` example per entity (each preserving this call's identity). AUTH: `derivation_origin` is REQUIRED — the schema itself is gated by the caller's principal, so a read with no origin is REJECTED (anonymous per-app reads are disabled for now) with guidance to pass it, rather than returning an empty entity list you'd misread as \"the app has no data model\". Pass the app's canonical `derivation_origin` (from open_app / resolve_app) to read the entities visible to the USER; the reply echoes `derived_for_origin` / `acted_as_principal`.",
         annotations(title = "Get the OQL schema", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::OqlSchemaOutput>(),
     )]
@@ -1256,19 +1270,6 @@ impl IcProtocolTools {
     }
 
     #[tool(
-        description = "Load the OQL query-surface guide: the JSON query dialect for canisters that expose OQL (get_canister_candid reports `oql: true`) — entities/fields/edges via `schema`, and the `execute` query object (filters, aggregation, ordering, edge traversal, paging). This is step ONE of the fixed sequence guide→schema→query: read this once, then `get_canister_oql_schema` for the exact entity/field names (they are the schema's own — often PLURAL and unlike the Candid types/methods, e.g. `bookings` not `Booking`/`getBookings`), then `canister_query` with the `oql` argument. Never guess bespoke per-question methods. The schema read and the query REQUIRE the app's `derivation_origin` (from open_app / resolve_app) — anonymous per-app reads are disabled for now and are rejected with guidance. Both wrap the `schema`/`execute` methods, so you write plain JSON — no Candid escaping.",
-        annotations(title = "Get the OQL query guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
-        output_schema = schema_for_output::<calls::OqlGuideOutput>(),
-    )]
-    async fn icp_oql_guide(
-        &self,
-        Parameters(_args): Parameters<management::NoArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let output = calls::OqlGuideOutput { content: OQL_PRIMER_MD.to_string() };
-        Ok(ok_structured(output.content.clone(), &output))
-    }
-
-    #[tool(
         description = "Find Internet Computer canisters by NAME. Searches the IC dashboard's service registries — the ICRC token ledgers (e.g. ckBTC, ckETH, ckUSDC, SNS tokens) by symbol/name, and the SNS project catalog by name — and returns matching canister ids. Use this when the user names a token, project, or service (e.g. \"ckUSDC\") rather than a canister id; then confirm with get_canister_candid, read with canister_query, and write with canister_update_call. (No public name-search exists over arbitrary canisters; this covers the IC's labelled services.)",
         annotations(title = "Find canisters by name", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::FindCanisterOutput>(),
@@ -1990,12 +1991,13 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              act on a whole APP, keyed by its Internet Identity derivation origin or app URL, and \
              `…canister…` names (`get_canister_candid`, `get_canister_api_doc`, \
              `get_canister_oql_schema`, `canister_query`, `canister_update_call`) act on ONE \
-             specific canister. (A further `icp_`-prefixed group of IC protocol / meta-level \
-             tools — dashboard name/id lookups, the official IC skills as tools, and canister \
-             creation/management — is not part of this version; we anticipate this will come in \
-             a future version.) Before writing Candid args, consult the `candid://textual-syntax` \
+             specific canister; `icp_oql_guide` serves the OQL dialect those reads use. (A \
+             further group of IC protocol / meta-level tools — dashboard name/id lookups, the \
+             official IC skills as tools, and canister creation/management — is not part of this \
+             version; we anticipate this will come in a future version.) Before writing Candid \
+             args, consult the `candid://textual-syntax` \
              resource (the value syntax these tools use); `candid://reference` has the full type \
-             reference, the OQL dialect guide is the `oql://usage` resource, and the official IC \
+             reference, and the official IC \
              skills are served as `skill://<name>` resources.\n\n\
              FINANCIAL TRANSACTIONS ARE NOT SUPPORTED — asset-moving requests are denied, to \
              protect the user: canister_update_call refuses the ICRC-standard transfer/approval \
@@ -2034,8 +2036,8 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              public canisters like ledgers.)\n\n\
              INSPECTING A CANISTER. `get_canister_candid` fetches the interface and reports two \
              capability flags: `oql` and `api_doc_available` (open_app reports the same per \
-             canister). If `oql: true`, READ the canister via OQL, in order: the `oql://usage` \
-             resource (the JSON dialect, once) → `get_canister_oql_schema` (the entities and fields) → \
+             canister). If `oql: true`, READ the canister via OQL, in order: `icp_oql_guide` (the \
+             JSON dialect, once) → `get_canister_oql_schema` (the entities and fields) → \
              `canister_query` with the `oql` argument \
              (run a JSON query, get a table). These wrap the canister's `schema`/`execute` methods, \
              so you never hand-encode Candid for OQL — and on an OQL canister a Candid `method` query \
@@ -2470,7 +2472,7 @@ mod tests {
     #[test]
     fn every_tool_has_correct_read_write_annotations() {
         let served = super::IcTools::all_tools();
-        assert_eq!(served.len(), 10, "expected 10 served tools, got {}", served.len());
+        assert_eq!(served.len(), 11, "expected 11 served tools, got {}", served.len());
         // The deferred protocol half keeps its annotation contracts too, so
         // wiring it back in a future version can't regress them.
         let mut tools = served;
@@ -2574,9 +2576,14 @@ mod tests {
     #[test]
     fn the_default_composition_defers_the_protocol_tools() {
         let served = super::IcTools::all_tools();
-        assert_eq!(served.len(), 10, "{:?}", served.iter().map(|t| &t.name).collect::<Vec<_>>());
-        assert!(served.iter().all(|t| !t.name.starts_with("icp_")));
-        assert_eq!(super::IcProtocolTools::tool_router().list_all().len(), 16);
+        assert_eq!(served.len(), 11, "{:?}", served.iter().map(|t| &t.name).collect::<Vec<_>>());
+        // icp_oql_guide is the one icp_-named tool that stays served: it is
+        // part of the canister OQL read flow (guide → schema → query).
+        assert!(served
+            .iter()
+            .all(|t| !t.name.starts_with("icp_") || &*t.name == "icp_oql_guide"));
+        assert!(served.iter().any(|t| &*t.name == "icp_oql_guide"));
+        assert_eq!(super::IcProtocolTools::tool_router().list_all().len(), 15);
         // tools/call routes through the canister router alone, so a deferred
         // name is not just unlisted — it is not routable at all.
         assert!(!super::IcCanisterTools::tool_router().has_route("icp_get_skill"));
@@ -2584,18 +2591,19 @@ mod tests {
         assert!(super::SERVER_INSTRUCTIONS.contains("future version"));
     }
 
-    // The tool surface is split by the scope taxonomy the server instructions
-    // teach: every `icp_`-prefixed (protocol / meta-level) tool lives on
-    // IcProtocolTools, everything app-/canister-scoped on IcCanisterTools —
-    // no overlap, nothing dropped, and the composed list is what tools/list
-    // serves.
+    // The tool surface is split by scope: the protocol / meta-level tools
+    // live on IcProtocolTools, everything app-/canister-scoped on
+    // IcCanisterTools — no overlap, nothing dropped, and the composed list is
+    // what tools/list serves. icp_oql_guide is the one icp_-named exception
+    // on the canister side: it serves the OQL dialect the canister read flow
+    // (guide → schema → query) depends on, so it belongs with those tools.
     #[test]
     fn the_split_follows_the_icp_prefix_taxonomy() {
         let canister = super::IcCanisterTools::tool_router().list_all();
         let protocol = super::IcProtocolTools::tool_router().list_all();
         for t in &canister {
             assert!(
-                !t.name.starts_with("icp_"),
+                !t.name.starts_with("icp_") || &*t.name == "icp_oql_guide",
                 "{} is icp_-prefixed and belongs on IcProtocolTools",
                 t.name
             );

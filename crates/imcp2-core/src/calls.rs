@@ -41,8 +41,8 @@ pub struct GetCandidOutput {
     /// The Candid (`.did`) interface text.
     pub candid: String,
     /// True when the interface exposes the standard OQL query surface (both a
-    /// `schema` and an `execute` method). When set, load the `oql://usage`
-    /// resource to learn the JSON query dialect, then call
+    /// `schema` and an `execute` method). When set, load `icp_oql_guide` (or the
+    /// `oql://usage` resource) to learn the JSON query dialect, then call
     /// `get_canister_oql_schema` for the entity/field names and `canister_query`
     /// (its `oql` argument) to run the query.
     pub oql: bool,
@@ -244,8 +244,8 @@ pub struct CanisterQueryArgs {
     /// An OQL query as a JSON object string — passed straight to the canister's
     /// `execute` method, so NO Candid escaping is needed (write plain JSON). E.g.
     /// `{"start":"employee","where":{"icontains":{"field":"lastName","value":"smith"}},"select":["firstName","lastName"],"limit":10}`.
-    /// Provide EITHER `oql` OR `method` — not both. See the `oql://usage` resource for
-    /// the dialect and get_canister_oql_schema for the entity/field names.
+    /// Provide EITHER `oql` OR `method` — not both. See icp_oql_guide for the dialect
+    /// and get_canister_oql_schema for the entity/field names.
     /// The OQL path REQUIRES `derivation_origin` (anonymous per-app reads are disabled).
     #[serde(default)]
     pub oql: Option<String>,
@@ -823,8 +823,8 @@ pub fn oql_query_redirect(did: Option<&str>) -> Option<String> {
     if did.is_some_and(has_oql) {
         Some(
             "this canister exposes an OQL query surface, so its data is READ with an OQL query, \
-             NOT a raw Candid `method` query call. Do this instead, in order: (1) the `oql://usage` \
-             resource for the JSON dialect (once), (2) `get_canister_oql_schema` for the entity and field \
+             NOT a raw Candid `method` query call. Do this instead, in order: (1) `icp_oql_guide` \
+             for the JSON dialect (once), (2) `get_canister_oql_schema` for the entity and field \
              names, (3) call `canister_query` again with the `oql` argument (a JSON query object) \
              instead of `method`. This canister gates data by the caller's principal, so pass the \
              app's `derivation_origin` (from open_app / resolve_app) — an anonymous read is rejected. \
@@ -1854,7 +1854,7 @@ mod tests {
         // Candid `method` query on an OQL canister → redirected, and the message
         // names the full guide→schema→query path (#5) plus the auth hint.
         let msg = oql_query_redirect(Some(oql)).expect("query on OQL canister must be redirected");
-        assert!(msg.contains("oql://usage"), "message must point to the OQL guide: {msg}");
+        assert!(msg.contains("icp_oql_guide"), "message must point to the OQL guide: {msg}");
         assert!(msg.contains("get_canister_oql_schema"), "message must point to the OQL schema tool: {msg}");
         assert!(msg.contains("canister_query"), "message must point to canister_query's oql path: {msg}");
         assert!(msg.contains("`oql`"), "message must name the oql argument: {msg}");

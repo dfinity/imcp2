@@ -47,8 +47,8 @@ Verified against the live production deployment (2026-07-31):
 | Claude's hosted callback `https://claude.ai/api/mcp/auth_callback` accepted | ✅ seeded in the redirect allow-list ([`src/auth.rs`](../src/auth.rs), `DEFAULT_ALLOWED_REDIRECTS`) |
 | Claude Code loopback redirects (RFC 8252) | ✅ loopback redirects are exempt from the hosted allow-list |
 | Discovery documents (RFC 8414 + RFC 9728, path-scoped + root fallback) | ✅ all four live, `WWW-Authenticate` on the 401 points at the resource metadata |
-| Every tool: `title` + `readOnlyHint`/`destructiveHint` (+ `idempotentHint`, `openWorldHint`) | ✅ on all 10 served tools (and on the 16 deferred definitions), enforced by a unit test ([`src/tools.rs`](../src/tools.rs)) |
-| No catch-all read/write tool; reads and writes are separate tools | ✅ 9 of the 10 served tools are read-only; the one write is `canister_update_call`. (The protocol/meta group — incl. the instructions-only funding helpers — is deferred to a future version.) |
+| Every tool: `title` + `readOnlyHint`/`destructiveHint` (+ `idempotentHint`, `openWorldHint`) | ✅ on all 11 served tools (and on the 15 deferred definitions), enforced by a unit test ([`src/tools.rs`](../src/tools.rs)) |
+| No catch-all read/write tool; reads and writes are separate tools | ✅ 10 of the 11 served tools are read-only; the one write is `canister_update_call`. (The protocol/meta group — incl. the instructions-only funding helpers — is deferred to a future version.) |
 | Tool names ≤ 64 chars | ✅ longest is 30 |
 | `outputSchema` + structured content on every tool | ✅ enforced by a unit test |
 | Certificates from a recognized authority | ✅ Let's Encrypt via Caddy |
@@ -314,7 +314,7 @@ Paste-and-adapt; portal limits in parentheses.
 >    Every read-only tool works with any identity, because it reads public
 >    network state.
 > 2. On the consent screen pick a session duration and an access level:
->    "Questions only" exercises the 9 read-only-annotated tools; "Actions &
+>    "Questions only" exercises the 10 read-only-annotated tools; "Actions &
 >    questions" additionally allows state-changing calls
 >    (`canister_update_call`).
 > 3. Try the example prompts above. On a Questions-only session a
