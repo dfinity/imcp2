@@ -6,8 +6,9 @@
 //!   * Claude Desktop — `claude_desktop_config.json` → `mcpServers.imcp2`
 //!   * Cursor — `~/.cursor/mcp.json` → `mcpServers.imcp2`
 //!   * Antigravity — `~/.gemini/config/mcp_config.json` → `mcpServers.imcp2`
-//!   * Codex — `~/.codex/config.toml` → `[mcp_servers.imcp2]` (edited with
-//!     `toml_edit`, so the user's comments and formatting survive)
+//!   * Codex — `~/.codex/config.toml` → `[mcp_servers.imcp2]`, edited in
+//!     place rather than via `codex mcp add` (works without `codex` on
+//!     `PATH` or a recent CLI — see the Codex section below)
 //!   * Claude Code — via its own CLI (`claude mcp add --scope user …`), which
 //!     owns that config's format
 //!   * Perplexity (macOS) — has no writable config file; its UI-driven steps
@@ -410,6 +411,15 @@ fn remove_json_server(path: &Path) -> anyhow::Result<String> {
 }
 
 // ---- Codex config.toml ------------------------------------------------------
+//
+// A direct edit of Codex's documented config file, rather than shelling out
+// to `codex mcp add`: detection keyed on the `~/.codex` directory reaches
+// installs whose `codex` binary isn't on `PATH` (e.g. IDE-extension use),
+// removal here stays cleanly idempotent, and the file format works on Codex
+// versions that predate the `codex mcp` subcommand. (`toml_edit` preserves
+// the user's comments and formatting — a nicety, not the differentiator.)
+// Claude Code gets the opposite treatment because its user-scope config is
+// CLI-owned rather than a documented standalone file.
 
 fn upsert_codex_server(path: &Path, exe: &Path) -> anyhow::Result<String> {
     let mut doc: toml_edit::DocumentMut = if path.exists() {
