@@ -39,7 +39,6 @@ mod setup;
 #[cfg(all(test, feature = "e2e"))]
 mod e2e_local_login;
 
-
 use imcp2_core::{identities::Identities, skills, IcTools, IiInstance};
 use login::SessionSlot;
 use rmcp::ServiceExt;

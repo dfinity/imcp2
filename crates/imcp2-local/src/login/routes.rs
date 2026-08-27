@@ -240,7 +240,10 @@ async fn redeem(State(ctx): State<RouteCtx>, Json(body): Json<RedeemBody>) -> Re
         Ok(outcome) => {
             let principal = driver.inner.identities.session_principal(&body.state).await;
             let mut state = driver.inner.state.lock().await;
-            driver.inner.slot.set(body.state.clone(), outcome.expiration_ns);
+            driver
+                .inner
+                .slot
+                .set(body.state.clone(), outcome.expiration_ns);
             state.grant = Some(Grant {
                 session_id: body.state.clone(),
                 principal,
