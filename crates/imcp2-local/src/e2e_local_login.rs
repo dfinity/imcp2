@@ -41,10 +41,10 @@ use candid::{CandidType, Decode, Encode, Principal};
 use serde::Deserialize;
 use std::time::SystemTime;
 
-use crate::login::{BeginOutcome, LoginDriver, LoginStatus};
+use crate::login::{BeginOutcome, LoginDriver, LoginStatus, SessionSlot};
 use imcp2_core::identities::Identities;
 use imcp2_core::iiconnect::AUTH_CALLBACKS_WELL_KNOWN;
-use imcp2_core::{IiInstance, SessionSlot};
+use imcp2_core::IiInstance;
 
 // ---- II candid interface (subset), as in the hosted harness ----------------
 
