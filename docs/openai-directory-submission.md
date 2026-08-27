@@ -144,9 +144,10 @@ Positive:
 6. "Get the Motoko skill" → returns the skill document.
 
 Negative:
-1. "Open https://<a site with no Internet Computer presence>" → refused by
-   the IC-evidence gate with guidance (web-search or ask the user for the
-   real URL) rather than resolved to a wrong identity.
+1. "Open https://no-ic.example.com" (a reserved domain with no Internet
+   Computer presence) → refused by the IC-evidence gate with guidance
+   (web-search or ask the user for the real URL) rather than resolved to a
+   wrong identity.
 2. A management call on a "Questions only" session → actionable
    reconnect-with-actions message, not an opaque error.
 3. Any authenticated tool with no sign-in → clean 401 → OAuth flow starts
