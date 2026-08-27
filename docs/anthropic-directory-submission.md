@@ -48,7 +48,7 @@ Verified against the live production deployment (2026-07-31):
 | Claude Code loopback redirects (RFC 8252) | ✅ loopback redirects are exempt from the hosted allow-list |
 | Discovery documents (RFC 8414 + RFC 9728, path-scoped + root fallback) | ✅ all four live, `WWW-Authenticate` on the 401 points at the resource metadata |
 | Every tool: `title` + `readOnlyHint`/`destructiveHint` (+ `idempotentHint`, `openWorldHint`) | ✅ on all 26 tools, enforced by a unit test ([`src/tools.rs`](../src/tools.rs)) |
-| No catch-all read/write tool; reads and writes are separate tools | ✅ 17 read-only tools; writes split per operation |
+| No catch-all read/write tool; reads and writes are separate tools | ✅ 19 read-only tools (incl. the instructions-only top-up and creation, [#153](https://github.com/dfinity/imcp2/pull/153)/[#154](https://github.com/dfinity/imcp2/pull/154)); writes split per operation |
 | Tool names ≤ 64 chars | ✅ longest is 30 |
 | `outputSchema` + structured content on every tool | ✅ enforced by a unit test |
 | Certificates from a recognized authority | ✅ Let's Encrypt via Caddy |
@@ -133,52 +133,54 @@ by the MCP server itself. The page and its route shipped in
 effective date agree. Then enter that URL in the portal. The reviewed source
 text is [`icp-mcp-privacy-policy-draft.md`](icp-mcp-privacy-policy-draft.md).
 
-### 2. Financial-transactions policy (decision needed)
+### 2. Financial-transactions policy (resolved in code)
 
 The Directory Policy **prohibits connectors that transfer money,
 cryptocurrency, or other financial assets, or execute financial
 transactions**, and the portal's compliance step requires acknowledging this.
-Three IMCP2 capabilities are exposed to that reading:
 
-- `canister_update_call` can invoke arbitrary update methods as the user —
-  including ICRC ledger `transfer`/`approve` (i.e. token transfers).
-- `icp_create_canister` / `icp_top_up_canister` with the `icp` argument
-  convert ICP from the user's ledger account via the CMC.
+**Mitigations shipped across
+[#153](https://github.com/dfinity/imcp2/pull/153) /
+[#154](https://github.com/dfinity/imcp2/pull/154) — the stated and enforced
+posture is that the server is not a financial tool (this section assumes
+both are merged):**
 
-**Status: asked.** The email to <mcp-review@anthropic.com> went out on
-2026-07-31 and put **two** questions: whether cycles funding (including the
-ICP-conversion path) is acceptable, and whether the general-purpose
-`canister_update_call` passes review. Awaiting a reply; do not check the
-compliance boxes or submit until it lands, since a truthful acknowledgment
-isn't possible without it.
+- `icp_top_up_canister` is **instructions-only**: it executes nothing and
+  moves no funds — it returns the CLI steps for the user to run a top-up
+  themselves, and the server-side execution path (cycles-ledger `withdraw`,
+  CMC `notify_top_up`) is removed from the binary
+  ([#153](https://github.com/dfinity/imcp2/pull/153)).
+- `icp_create_canister` is likewise **instructions-only**: creating and
+  funding a canister spends the user's ICP or cycles, so the tool returns the
+  icp CLI steps — ending with the controller-handover step that lets the
+  connector's lifecycle tools manage the new canister — and executes nothing;
+  the ICP-ledger transfer, CMC notify, and cycles-ledger creation paths are
+  removed from the binary ([#154](https://github.com/dfinity/imcp2/pull/154)).
+- `canister_update_call` **refuses the standardized ledger methods** that
+  move value or grant spending rights — the ICRC-standard names
+  (ICRC-1/ICRC-2 plus ICRC-4/-7/-37) on every canister, and the ICP and
+  cycles ledgers' own `transfer`/`send_dfx`/`withdraw`/`create_canister`
+  methods on those ledgers; the refusal recommends the user act themselves
+  in a wallet they control (oisy.com; a refused canister-creation spend
+  points at the user-run icp CLI), and the policy is stated in the
+  server-level instructions — deliberately not in the tool description,
+  which stays free of financial language per maintainer review
+  ([#154](https://github.com/dfinity/imcp2/pull/154)).
+- The README, the landing page, and the server instructions all state
+  explicitly that financial transactions are not supported.
 
-Two things that email leaves open:
+**Posture, stated plainly — the black-and-white answer the compliance step
+needs:** no tool initiates or executes a transfer of the user's funds.
+Financial ledger methods are refused, and the funding operations — top-up and
+canister creation — are instructions-only. The financial-transactions
+acknowledgment is made on that basis, without qualifications.
 
-- **The first-party-API acknowledgment was not asked about.** It needs its
-  own follow-up (see the data-handling draft below).
-- **The mitigation it offers for `canister_update_call` — blocking the
-  well-known ledger `transfer`/`approve` methods — does not actually satisfy
-  the prohibition,** for the reason in option 2 below: the tool can reach a
-  custom ledger, or an intermediary canister that forwards a transfer. If the
-  reply takes that offer up, correct the record before shipping it; committing
-  to a bypassable control is worse than the current position.
-
-Options, in increasing order of product impact, once the answer arrives:
-
-1. **Proceed as-is** if cycles funding (compute-resource payment) and generic
-   update calls are cleared.
-2. **Directory-safe profile.** Serve a restricted instance for the
-   directory, keeping the full server available as a custom connector at
-   another path. Note that a blocklist of known ledger canisters or transfer
-   methods is NOT sufficient: `canister_update_call` can reach any custom
-   ledger, or an intermediary canister that forwards a transfer. A profile
-   that actually satisfies the prohibition has to drop the generic update
-   tool and the `icp` conversion paths entirely, or restrict actions to a
-   reviewed allow-list of non-financial operations.
-3. **Submit anyway**, arguing in the description that funds movement is gated
-   by the explicit access-level choice on the II consent screen ("Questions
-   only" vs "Actions & questions"). Only if the reply is inconclusive — the
-   risk is rejection at the automated scan, burning review-queue time.
+**Status: resolved in code.** An email to <mcp-review@anthropic.com>
+(2026-07-31) had asked whether cycles funding and the general-purpose
+`canister_update_call` pass review; the changes above made both questions
+moot — funding no longer executes at all, and the update tool refuses
+financial ledger methods. No open compliance question remains on this topic;
+if a reply arrives, answer with the shipped posture.
 
 Related honesty point for the same step: there is **no per-call confirmation**
 for sensitive methods server-side today (an open roadmap item in the README) —
@@ -253,7 +255,10 @@ Paste-and-adapt; portal limits in parentheses.
   > or OQL, and discover the canisters behind any IC app from its name or URL.
   > With your consent it can also act as your Internet Identity accounts at a
   > specific app, and manage canisters you control: check status, create,
-  > install code, start/stop, and top up with cycles.
+  > install code, and start/stop. Financial transactions are not supported:
+  > token-ledger transfer and approval methods are refused to protect you,
+  > and cycle top-ups and canister creation return CLI instructions for you
+  > to run yourself instead of executing anything.
   >
   > On the Internet Identity consent screen you explicitly choose the session
   > duration (10 minutes to 30 days) and the access level: "Questions only"
@@ -294,12 +299,12 @@ Paste-and-adapt; portal limits in parentheses.
 - **Allowed link URIs:** none needed (no `ui/open-link` usage).
 - **Example prompts** (≥3 required; all work with a fresh Questions-only
   session):
-  1. *"What is canister ryjl3-tyaaa-aaaaa-aaaba-cai? Who controls it and
+  1. *"What is canister gftcp-myaaa-aaaar-qcaaa-cai? Who controls it and
      what's its interface?"*
-  2. *"Open the NNS app and list my accounts there."*
-  3. *"Find the ckUSDC ledger and show me its Candid interface."*
-  4. *"What canisters are behind https://oisy.com, and which one holds the
-     app's data?"*
+  2. *"Open opencloud.org and list my accounts there."*
+  3. *"How do I add cycles to canister gftcp-myaaa-aaaar-qcaaa-cai?"*
+  4. *"What canisters are behind https://opencloud.org, and which one holds
+     the app's data?"*
 
 ### Reviewer test instructions (draft for the test-credentials field)
 
@@ -310,27 +315,34 @@ Paste-and-adapt; portal limits in parentheses.
 >    Every read-only tool works with any identity, because it reads public
 >    network state.
 > 2. On the consent screen pick a session duration and an access level:
->    "Questions only" exercises the 17 read-only-annotated tools; "Actions &
+>    "Questions only" exercises the 19 read-only-annotated tools; "Actions &
 >    questions" additionally allows state-changing calls.
 > 3. Try the example prompts above. Questions-only sessions cause management
 >    tools to return an actionable reconnect message rather than an opaque
 >    error — that behavior is intended. Access is revocable at any time at
 >    https://id.ai/manage/settings.
-> 4. The canister-management tools act on canisters you control and spend
->    cycles, so a brand-new identity has nothing for them to operate on. Ask
->    us at mcp@dfinity.org if you would like an identity provisioned with a
->    canister and a cycles balance to exercise those.
+> 4. The canister-management tools act on canisters you control, so a
+>    brand-new identity has nothing for them to operate on. Ask us at
+>    mcp@dfinity.org if you would like an identity provisioned with a
+>    canister to exercise those. Canister creation and top-ups return CLI
+>    instructions for the user to run themselves — nothing is executed.
+> 5. Financial ledger operations are refused by design: asking the assistant
+>    to move tokens returns a policy message directing the user to a wallet
+>    they control — that behavior is intended (financial transactions are
+>    not supported).
 
 ### The seven compliance acknowledgments
 
 Topics: directory guidelines, first-party API usage, financial transactions,
 AI media generation, prompt injection, conversation-data collection, public
-documentation. Two need resolution before the boxes can be checked
-truthfully: **financial transactions** (blocker 2) and **first-party API
-usage** — DFINITY operates the connector, but it reaches the network through
-DAO-governed infrastructure (`icp-api.io`, `id.ai`) and forwards
-user-directed calls to third-party application canisters, so "first-party"
-is not a clean yes; fold both questions into the mcp-review email. The **prompt-injection** acknowledgment needs open disclosure rather
+documentation. **Financial transactions** is a clean acknowledgment: no
+tool initiates or executes a transfer of the user's funds — financial ledger
+methods are refused, and top-up and canister creation are instructions-only.
+**First-party API usage** is answered by describing the architecture as it
+is: DFINITY operates the connector itself; it reaches the network through
+public Internet Computer infrastructure (`icp-api.io`, `id.ai`) and forwards
+user-directed calls to the application canisters the user names — state
+exactly that in the acknowledgment. The **prompt-injection** acknowledgment needs open disclosure rather
 than a bare yes: tool descriptions are static and contain no hidden
 instructions, but `icp_list_skills`/`icp_get_skill` (and the `skill://`
 resources) intentionally return DFINITY-published how-to documents fetched

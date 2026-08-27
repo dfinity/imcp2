@@ -1778,7 +1778,8 @@ impl From<(String, Vec<Match>)> for FindCanisterOutput {
 /// Arguments for `icp_find_app_by_name`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FindAppArgs {
-    /// The app name to look up, e.g. "Oisy", "NNS", "MULTI/DEX", "ICPSwap".
+    /// The app name to look up, as the user said it. For a site you already know
+    /// (e.g. "opencloud.org"), use open_app / resolve_app directly.
     pub name: String,
 }
 
@@ -1810,9 +1811,9 @@ pub struct FindAppOutput {
 /// Arguments for `open_app`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OpenAppArgs {
-    /// An app NAME (e.g. "MULTI/DEX", "Oisy", "NNS") OR its URL (e.g.
-    /// "https://oisy.com"). A name — or a bare host — is matched against the
-    /// built-in known-app registry first, so a wrong-TLD guess like "multidex.com"
+    /// An app NAME as the user said it OR its URL (e.g.
+    /// "https://opencloud.org"). A name — or a bare host — is matched against the
+    /// built-in known-app registry first, so a wrong-TLD guess
     /// repairs to the canonical URL; an explicit `https://…` URL is resolved as
     /// given. NEVER pass a domain you fabricated from a name: an unknown bare name
     /// is refused with instructions to find the real URL, and a URL with no
