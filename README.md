@@ -14,11 +14,11 @@ financial operations (token transfers, spending approvals, payments, trades)
 are unsupported by policy. The standardized ledger surface is refused
 mechanically: `canister_update_call` rejects the ICRC-1/ICRC-2 (and related
 ledger-standard) transfer/approval methods on every canister, and
-`icp_top_up_canister` returns CLI instructions instead of executing anything.
-For financial operations, users act themselves in a wallet or frontend they
-control (e.g. [oisy.com](https://oisy.com)), in their own browser. Creating and
-funding the user's **own** canisters (compute resources) remains available
-through the dedicated `icp_create_canister` tool.
+`icp_top_up_canister` and `icp_create_canister` return `icp` CLI instructions
+for the user to run themselves instead of executing anything — the server
+creates nothing and moves no funds. For financial operations, users act
+themselves in a wallet or frontend they control (e.g.
+[oisy.com](https://oisy.com)), in their own browser.
 
 ## Use as a library
 
@@ -148,7 +148,7 @@ results).
 | `open_app` | `app` (name **or** URL) | **One-call entry point** when a user names/links an app: resolves the Internet Identity `derivation_origin` *and* discovers the canisters behind it, together. A name or bare host is matched to the known-app registry first (so a wrong-TLD guess repairs to the canonical URL); an explicit `https://` URL is resolved as given. An unknown bare name, or a URL with no IC evidence, is *refused* (never guessed). Also probes the app's own canisters and reports per-canister `oql`/`api_doc_available` capability flags plus a caller-gated data-access note (which canister holds the app data, and the origin to read it as the user). Wraps `resolve_app` + `discover_app_canisters`; no auth |
 | `discover_app_canisters` | `domain` | Canister ids behind a web domain — app-declared App Connect metadata first (`/ai-connect.html`'s `ic:canister-id` meta, `/.well-known/ic-app.json` manifest), then the frontend via `x-ic-canister-id` and backend candidates via `/env.json` + JS-bundle mining — each with provenance, its IC dashboard label/type where known, and (for the app's own canisters) `oql`/`api_doc_available` capability flags from a one-shot Candid probe |
 | `icp_find_canister_by_name` | `query` | Canister ids matching a name/symbol, searched in the IC dashboard's service registries — ICRC token ledgers (e.g. `ckUSDC`) and the SNS project catalog |
-| `icp_find_app_by_name` | `name` | A well-known app's front-end URL + `derivation_origin`, for a small built-in set of well-known IC apps (e.g. NNS). The **first stop** whenever only an app *name* is known — never guess a domain from a name. Any other name returns no match and a `note` directing a web search for the app's URL (there's no on-chain name→URL directory) |
+| `icp_find_app_by_name` | `name` | A well-known app's front-end URL + `derivation_origin`, for a small built-in set of well-known IC apps. The **first stop** whenever only an app *name* is known — never guess a domain from a name. Any other name returns no match and a `note` directing a web search for the app's URL (there's no on-chain name→URL directory) |
 | `icp_lookup_canister_info_by_id` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
 | `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus two capability flags: `oql` (`true` when it exposes an OQL query surface — a `schema` + `execute` pair — with a pointer to `icp_oql_guide`) and `api_doc_available` (`true` when it declares a `getApiDoc`/`get_api_doc` method, gating `get_canister_api_doc`) |
 | `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), from its `getApiDoc`/`get_api_doc` method. Call **only** when `get_canister_candid`/`open_app` report `api_doc_available`. Returns a **structured** result in every case — `available` + the doc on success, else `available:false` with `expected`/`retry`/`next` so an expected absence is distinct from an unreachable canister |
@@ -186,7 +186,7 @@ candidates, pick by label, prefer production/`IC_` ids, and confirm with
 Acting **for the user** at an app:
 
 0–2. **`open_app(name-or-URL)`** — the one-call entry point. Pass the *name* the user
-   said (well-known apps, e.g. NNS, resolve offline) or a URL you have (e.g.
+   said (well-known apps resolve offline) or a URL you have (e.g.
    `https://opencloud.org`); it returns the `derivation_origin` **and** the app's canisters in one shot
    (it runs `resolve_app` + `discover_app_canisters` concurrently under the hood).
    **Never guess a domain from a name** — a lookalike like `<name>.com` is an
@@ -309,9 +309,8 @@ token (see Auth).
 > and reuse it: `open_app` (or `resolve_app`) turns an app name/URL into it and
 > reports how — `derivation_origin_source`: **declared**
 > (`/.well-known/ic-app.json` → `derivation_origin`), else a built-in **known-app**
-> value for a few apps that pin a custom origin without declaring it (e.g. NNS →
-> `https://nns.ic0.app`; an app's own
-> declaration always overrides this), else the app origin *assumed*
+> value for a few apps that pin a custom origin without declaring it (an app's
+> own declaration always overrides this), else the app origin *assumed*
 > (**app_url_default**). Feeding that resolved origin to an identity tool records
 > `derivation_origin_source` = **explicit**. Every identity result echoes
 > `derived_for_origin` (the origin actually used) alongside `requested` (what you

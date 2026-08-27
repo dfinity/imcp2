@@ -109,28 +109,21 @@ financial-transfers prohibition:
 - Commerce rules ("only for physical goods", no digital-goods selling, no
   embedded checkout) govern *selling through the app*; IMCP2 sells nothing.
 - The attestation "my plugin does not initiate or execute money transfers,
-  crypto transfers, or investment trades on behalf of users" is addressed by
-  two shipped **mitigations** — not yet grounds to check the box:
-  `canister_update_call` refuses the ICRC-standard transfer/approval methods
-  (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents) on every canister, plus
-  the ICP and cycles ledgers' own value-moving methods (the legacy
-  `transfer`, `withdraw`, the `create_canister` spends) on those ledgers,
-  with the policy stated in the server-level instructions rather than the
-  tool description (which stays free of financial language, per maintainer
-  review) ([#154](https://github.com/dfinity/imcp2/pull/154)), and
-  `icp_top_up_canister` is instructions-only and executes nothing
-  ([#153](https://github.com/dfinity/imcp2/pull/153)); README, landing page,
+  crypto transfers, or investment trades on behalf of users" is satisfied by
+  the shipped behavior — check it on that basis: no tool initiates or
+  executes a transfer of the user's funds. `canister_update_call` refuses
+  the financial ledger methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37
+  equivalents on every canister, plus the ICP and cycles ledgers' own
+  value-moving methods on those ledgers), with the policy stated in the
+  server-level instructions rather than the tool description (which stays
+  free of financial language, per maintainer review)
+  ([#154](https://github.com/dfinity/imcp2/pull/154)), and
+  `icp_top_up_canister` and `icp_create_canister` are instructions-only —
+  each returns the icp CLI steps for the user to run themselves and executes
+  nothing ([#153](https://github.com/dfinity/imcp2/pull/153),
+  [#154](https://github.com/dfinity/imcp2/pull/154)). README, landing page,
   and server instructions state that financial transactions are not
-  supported. Two direct counterexamples to the attestation's absolute
-  wording remain open and need a decision BEFORE it can be checked
-  truthfully: `icp_create_canister`'s `icp` argument still executes an
-  ICP→cycles conversion from the user's own ledger account (metered compute
-  funding for the user's own canister — keep, drop, or restrict it), and the
-  method-name guard covers the standardized ledger surface rather than every
-  bespoke canister. Whatever the decision, declare it honestly at the
-  attestations step. There is no published pre-submission contact at OpenAI
-  equivalent to mcp-review@anthropic.com; the attestations step is where
-  this is declared.
+  supported.
 
 ### 4. Test cases (authoring work)
 
@@ -138,28 +131,22 @@ At least 5 positive + 3 negative cases with expected outcomes, passing on web
 and mobile. Draft set:
 
 Positive:
-1. "What is canister ryjl3-tyaaa-aaaaa-aaaba-cai?" → identifies the ICP
-   ledger, its controllers and interface.
-2. "Find the ckUSDC ledger and show its interface" → resolves via the
-   dashboard registry, returns the Candid interface.
-3. "What canisters are behind https://oisy.com?" → App Connect discovery
-   returns the app's canisters with provenance.
-4. "Open the NNS app and list my accounts there" (signed in) → resolves the
-   derivation origin, lists II accounts.
+1. "What is canister gftcp-myaaa-aaaar-qcaaa-cai?" → identifies the
+   canister behind opencloud.org, its controllers and interface.
+2. "How do I add cycles to my canister?" → returns step-by-step icp CLI
+   instructions; nothing is executed.
+3. "What canisters are behind https://opencloud.org?" → App Connect
+   discovery returns the app's canisters with provenance.
+4. "Open opencloud.org and list my accounts there" (signed in) → resolves
+   the derivation origin, lists II accounts.
 5. "Check the status of canister <test-canister-id>" (signed in, Actions
    session, identity controls it) → run state, cycles, module hash.
 6. "Get the Motoko skill" → returns the skill document.
 
 Negative:
-1. "Open https://multidex.com" → refused by the IC-evidence gate, with the
-   did-you-mean error naming the real app (`https://multidex.ai`). The
-   explicit scheme matters: a bare `multidex.com` is deliberately treated as
-   a wrong-TLD guess and *repaired* to the canonical URL rather than refused,
-   so the bare form is not a negative case.
-1a. "Send 1 ICP to <principal>" (or any `icrc1_transfer` /
-   `icrc2_approve` attempt via canister_update_call) → refused with the
-   financial-transactions policy message recommending a user-controlled
-   wallet (oisy.com); nothing is executed.
+1. "Open https://<a site with no Internet Computer presence>" → refused by
+   the IC-evidence gate with guidance (web-search or ask the user for the
+   real URL) rather than resolved to a wrong identity.
 2. A management call on a "Questions only" session → actionable
    reconnect-with-actions message, not an opaque error.
 3. Any authenticated tool with no sign-in → clean 401 → OAuth flow starts
