@@ -435,7 +435,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. NOT INTENDED FOR FINANCIAL TRANSACTIONS: this tool is not intended for moving money, tokens, or other financial assets on the user's behalf, and it takes reasonable measures to refuse asset-moving requests — the ICRC-1/ICRC-2 (and related ICRC ledger-standard) transfer/approval methods such as icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICP ledger's legacy transfer are refused on every canister, for marketplace compliance and user safety. Do not send asset-moving requests through it under any other method name either; for such operations, recommend the user acts themselves in a wallet or frontend they control in their browser (e.g. https://oisy.com). Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
+        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. NOT INTENDED FOR FINANCIAL TRANSACTIONS: this tool is not intended for moving money, tokens, or other financial assets on the user's behalf, and it takes reasonable measures to refuse asset-moving requests — the ICRC-standard transfer/approval methods (icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICRC-4/-7/-37 equivalents) are refused on every canister, and the ICP and cycles ledgers' own transfer/withdrawal/creation methods (e.g. the ICP ledger's legacy transfer) are refused on those ledgers, for marketplace compliance and user safety. Do not send asset-moving requests through it under any other method name either; for such operations, recommend the user acts themselves in a wallet or frontend they control in their browser (e.g. https://oisy.com). Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
         annotations(title = "Make a canister update call", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterUpdateCallOutput>(),
     )]
@@ -455,11 +455,13 @@ impl IcTools {
             Ok(p) => p,
             Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
         };
-        // The financial-transactions gate (see `compliance`): ledger transfer /
-        // approval methods are refused on every canister, before any network
-        // work, with a redirect to a user-controlled wallet. Queries need no
-        // gate — a query cannot commit state, so it cannot move funds.
-        if let Some(refusal) = compliance::disallowed_update_method(&method) {
+        // The financial-transactions gate (see `compliance`): ICRC-standard
+        // transfer/approval methods are refused on every canister, and the
+        // ICP/cycles ledgers' own value-moving methods on those ledgers,
+        // before any network work, with a redirect to a user-controlled
+        // wallet. Queries need no gate — a query cannot commit state, so it
+        // cannot move funds.
+        if let Some(refusal) = compliance::disallowed_update_method(&principal, &method) {
             return Ok(err(refusal));
         }
         // The interface to encode/decode against: the canister's own
