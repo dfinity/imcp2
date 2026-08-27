@@ -132,6 +132,10 @@ body {
 /* Terminal error: the spinner tile is dropped and the message carries the state.
    The pinned page's script adds `.error` to `.screen`; the error page ships it. */
 .screen.error .spinner-tile { display: none; }
+/* Terminal success ("Signed in — you can close this tab", the local redeem's
+   `done` answer): the spinner is likewise dropped, but the contact line stays
+   hidden — nothing went wrong. */
+.screen.done .spinner-tile { display: none; }
 @keyframes connect-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
 @media (prefers-color-scheme: dark) {

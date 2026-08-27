@@ -18,6 +18,7 @@ use rmcp::{
 };
 
 use crate::{calls, compliance, discover, identities, identities::Identities, management, skills};
+use std::sync::Arc;
 
 /// Cap on the per-canister Candid probes open_app / discover_app_canisters run to
 /// fill in OQL / api-doc capability flags (#3). Discovery output is already bounded,
@@ -53,10 +54,22 @@ pub struct IcTools {
     agent: Agent,
     identities: Identities,
     skills: skills::SkillsCatalog,
-    /// Where a tool call finds the Internet Identity session it acts as — the
-    /// one per-deployment seam (see [`SessionSource`]).
-    session: SessionSource,
+    /// The authentication seam (see [`SessionResolver`]): asks the embedding
+    /// binary which already-validated session this call acts as.
+    session: SessionResolver,
 }
+
+/// The one seam between deployments: how a tool call finds the Internet
+/// Identity session it acts as. **Authentication itself lives in the embedding
+/// binary, not here** — the resolver only reports the outcome of a validation
+/// an earlier layer already performed. The hosted server's bearer middleware
+/// validates the token per request and stashes the session id where its
+/// resolver reads it back; the local binary's login flow keeps the one
+/// signed-in session in a slot its resolver returns. `None` means this call is
+/// unauthenticated (the "needs an authenticated session" errors at the tool
+/// call sites are the caller-facing surface of that).
+pub type SessionResolver =
+    Arc<dyn Fn(&RequestContext<RoleServer>) -> Option<String> + Send + Sync>;
 
 #[tool_router]
 impl IcTools {
@@ -64,7 +77,7 @@ impl IcTools {
         agent: Agent,
         identities: Identities,
         skills: skills::SkillsCatalog,
-        session: SessionSource,
+        session: SessionResolver,
     ) -> Self {
         Self {
             agent,
@@ -74,20 +87,10 @@ impl IcTools {
         }
     }
 
-    /// The session id this tool call acts as, per the deployment's
-    /// [`SessionSource`]: looked up from the request's [`AuthedSession`]
-    /// extension under `Bearer` (multi-user, hosted), or the fixed
-    /// login-established session under `Singleton` (single-user, local).
-    /// `None` means the call is unauthenticated ("needs an authenticated
-    /// session" errors at the call sites are unchanged).
+    /// The already-validated session id this tool call acts as, per the
+    /// embedding binary's [`SessionResolver`].
     fn current_session_id(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
-        match &self.session {
-            SessionSource::Bearer => authed_session(ctx).map(|s| s.session_id),
-            SessionSource::Singleton(id) => {
-                let _ = ctx;
-                Some(id.clone())
-            }
-        }
+        (self.session)(ctx)
     }
 
     #[tool(
@@ -432,7 +435,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. FINANCIAL TRANSACTIONS ARE NOT SUPPORTED: for marketplace compliance and user safety, this tool refuses token-ledger transfer and approval methods — the ICRC-1/ICRC-2 (and related ICRC ledger-standard) methods such as icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICP ledger's legacy transfer — on every canister. Moving money, tokens, or other financial assets on the user's behalf is not supported through this tool and must not be attempted under ANY method name (the refusal list enforces the standardized ledger surface; the policy covers every canister and method); for such operations, recommend the user acts themselves in a wallet or frontend they control in their browser (e.g. https://oisy.com). Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
+        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. NOT INTENDED FOR FINANCIAL TRANSACTIONS: this tool is not intended for moving money, tokens, or other financial assets on the user's behalf, and it takes reasonable measures to refuse asset-moving requests — the ICRC-1/ICRC-2 (and related ICRC ledger-standard) transfer/approval methods such as icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICP ledger's legacy transfer are refused on every canister, for marketplace compliance and user safety. Do not send asset-moving requests through it under any other method name either; for such operations, recommend the user acts themselves in a wallet or frontend they control in their browser (e.g. https://oisy.com). Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
         annotations(title = "Make a canister update call", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterUpdateCallOutput>(),
     )]
@@ -1513,39 +1516,6 @@ impl IcTools {
     }
 }
 
-/// Where [`IcTools`] finds the Internet Identity session a tool call acts as —
-/// the one seam between deployments. The tool implementations are identical
-/// under both variants.
-#[derive(Clone, Debug)]
-pub enum SessionSource {
-    /// Multi-user (the hosted server): resolve the session per request from
-    /// the [`AuthedSession`] extension its bearer-token gate injected.
-    Bearer,
-    /// Single-user (a local server): every call acts as this one session,
-    /// established by the binary's own login flow.
-    Singleton(String),
-}
-
-/// The verified session id of an authenticated MCP session, injected into the
-/// request extensions by the embedding server's auth gate (the hosted binary's
-/// bearer-token middleware) and read back under [`SessionSource::Bearer`].
-#[derive(Clone, Debug)]
-pub struct AuthedSession {
-    pub session_id: String,
-}
-
-/// The authenticated MCP session of the calling request, if the embedding
-/// server's auth gate injected one. The transport surfaces the HTTP request's
-/// `Parts` in the tool context's extensions; `http::request::Parts` is the
-/// same type axum re-exports, so this reads what an axum middleware inserted
-/// without this crate depending on axum.
-fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<AuthedSession> {
-    ctx.extensions
-        .get::<http::request::Parts>()
-        .and_then(|parts| parts.extensions.get::<AuthedSession>())
-        .cloned()
-}
-
 /// The rejection for an OQL read (`get_canister_oql_schema`, or `canister_query`'s
 /// `oql` path) attempted with NO derivation origin. OQL reads per-app data gated by
 /// the caller's principal, so an anonymous read is signed as 2vxsx-fae and returns
@@ -2483,9 +2453,25 @@ mod tests {
             .find(|t| &*t.name == "canister_update_call")
             .expect("canister_update_call tool not found");
         let desc = tool.description.as_deref().unwrap_or_default();
-        assert!(desc.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED"), "{desc}");
+        assert!(desc.contains("NOT INTENDED FOR FINANCIAL TRANSACTIONS"), "{desc}");
         assert!(desc.contains("icrc1_transfer"), "{desc}");
         assert!(desc.contains("https://oisy.com"), "{desc}");
+    }
+
+    // The local binary's login tools (`authenticate`/`auth_status`) live on its
+    // OWN wrapper handler, never in this router: this router IS what the hosted
+    // server advertises on `tools/list`, so a login tool landing here would ship
+    // to every hosted client (which logs in via OAuth instead). Regression guard
+    // for that boundary.
+    #[test]
+    fn the_core_router_carries_no_local_login_tools() {
+        let tools = super::IcTools::tool_router().list_all();
+        for name in ["authenticate", "auth_status"] {
+            assert!(
+                tools.iter().all(|t| &*t.name != name),
+                "{name} must not be in the core router (it would ship on the hosted tools/list)"
+            );
+        }
     }
 
     // icp_top_up_canister is a compliance-sensitive surface: its description must
