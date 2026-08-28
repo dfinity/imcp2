@@ -98,6 +98,7 @@ POST /mcp/oauth/register          ─┘
 GET  /.well-known/oauth-authorization-server/mcp   (+ root + /mcp/.well-known/… alternates)
 GET  /.well-known/oauth-protected-resource/mcp     (+ root fallback)
 GET  /.well-known/ii-auth-callbacks                (origin-global, all instances)
+GET  /.well-known/ii-app-metadata                  (origin-global: name + legal links shown by II)
 ```
 
 Several instances share one origin by giving each its own `McpServer` (one

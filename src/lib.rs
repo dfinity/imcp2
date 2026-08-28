@@ -96,8 +96,9 @@ use std::path::{Path, PathBuf};
 use axum::{
     middleware,
     routing::{get, post},
-    Router,
+    Json, Router,
 };
+use serde_json::json;
 use rmcp::transport::{
     streamable_http_server::{session::local::LocalSessionManager, tower::StreamableHttpService},
     StreamableHttpServerConfig,
@@ -505,6 +506,50 @@ pub fn auth_callbacks_router(servers: &[&McpServer]) -> Router {
     Router::new()
         .route(auth::AUTH_CALLBACKS_WELL_KNOWN, get(auth::auth_callbacks))
         .with_state(stores)
+        .layer(permissive_cors())
+}
+
+/// This deployment's display name on Internet Identity's screens, and the legal
+/// documents it links there — the product's own pages on `internetcomputer.org`,
+/// not this origin's `/privacy-policy` and `/terms`. II never fetches them (it
+/// renders links the user opens), so they may live on any origin, but they must
+/// be `https`: II rejects the whole document otherwise, which would cost the
+/// name too.
+const II_APP_NAME: &str = "ICP MCP";
+const II_PRIVACY_POLICY_URL: &str = "https://internetcomputer.org/icp-mcp/privacy-policy";
+const II_TERMS_OF_SERVICE_URL: &str = "https://internetcomputer.org/icp-mcp/terms";
+
+/// The origin-global **II app metadata** document. Any origin can name itself
+/// and link its own privacy policy and terms of service on Internet Identity's
+/// screens — permissionlessly, with no involvement from the II team — by
+/// serving them here; II reads the document when the user connects this server
+/// and shows the name beside the origin it has verified. The metadata is only
+/// as trustworthy as the origin serving it, so it identifies this deployment,
+/// it does not authenticate it.
+///
+/// Validation is all-or-nothing: a field II rejects discards the document
+/// whole, so a bad URL costs the name as well. Like the auth-callback
+/// allow-list, the path carries no instance prefix (well-known URIs are
+/// origin-scoped), so ONE document covers every instance — merge this router at
+/// the application root. CORS-open (II's frontend fetches it cross-origin).
+///
+/// The document names THIS deployment: an embedder serving imcp2 on its own
+/// origin publishes its own metadata rather than merging this router, which is
+/// why the crate's usage example leaves it out.
+///
+/// <https://github.com/dfinity/internet-identity/blob/main/docs/ii-spec.mdx#app-metadata>
+pub fn ii_app_metadata_router() -> Router {
+    Router::new()
+        .route(
+            "/.well-known/ii-app-metadata",
+            get(|| async {
+                Json(json!({
+                    "name": II_APP_NAME,
+                    "privacyPolicyUrl": II_PRIVACY_POLICY_URL,
+                    "termsOfServiceUrl": II_TERMS_OF_SERVICE_URL,
+                }))
+            }),
+        )
         .layer(permissive_cors())
 }
 
