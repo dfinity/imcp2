@@ -176,7 +176,20 @@ pub struct CanisterUpdateCallArgs {
     /// several frontends can share one derivation origin, and the manifest
     /// lives at the application origin. Reads (canister_query) need no
     /// application origin.
-    #[serde(default)]
+    ///
+    /// `Option` + `schemars(required)` deliberately: the SCHEMA marks it
+    /// required, so a client sends it rather than discovering the requirement
+    /// from an error, while the type still lets a client that omits it anyway
+    /// reach the gate's own refusal — which names the argument, says where to
+    /// get it, and distinguishes it from `derivation_origin` — instead of an
+    /// opaque invalid-params protocol error rmcp would raise for a missing
+    /// required `String`.
+    ///
+    /// No `#[serde(default)]`: schemars treats a defaulted field as optional
+    /// regardless of `required` (schemars_derive `schema_exprs.rs`), and serde
+    /// already deserializes a missing `Option` field to `None` without it — so
+    /// the pair only works this way round. Pinned by a test on both halves.
+    #[schemars(required)]
     pub application_origin: Option<String>,
     /// Arguments in textual Candid syntax, e.g. `()` or `(record { owner = principal "..." })`.
     #[serde(default = "default_args")]

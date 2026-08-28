@@ -11,11 +11,14 @@
 //!      the application the call belongs to.
 //!   3. That origin appears in [`REGISTERED_APPLICATIONS`] with an acceptance
 //!      of the **current** ICP MCP Developer Terms
-//!      ([`DEVELOPER_TERMS_VERSION`]).
+//!      ([`DEVELOPER_TERMS_VERSION`]), and any `derivation_origin` the call
+//!      would be signed as is one that registration records for it.
 //!   4. That exact origin serves a well-formed
 //!      `/.well-known/ic-architecture` manifest — the composition layer of
 //!      the [ICP service-discoverability protocol].
-//!   5. The **target canister is declared in that manifest**.
+//!   5. The target canister is **pinned by the registration** AND **declared
+//!      in that live manifest** — so the manifest can narrow the reviewed
+//!      surface but never widen it.
 //!   6. Only then does the call execute.
 //!
 //! All six must pass, so the ORDER only decides which refusal the caller
@@ -54,6 +57,10 @@
 //! So the two are separate arguments with separate jobs:
 //! `application_origin` says *which application this call belongs to* (and is
 //! what authorizes it); `derivation_origin` says *whose identity to act as*.
+//! Separate, but not unrelated: because nothing in the identity path ties them
+//! together, this gate requires the pair to match what registration recorded —
+//! otherwise a registered application could borrow an unrelated app's identity
+//! to write to a canister it had listed.
 //!
 //! ### What the protocol does NOT establish
 //!
@@ -114,6 +121,27 @@ pub struct RegisteredApplication {
     pub accepted_terms_version: &'static str,
     /// When the acceptance was recorded (ISO date).
     pub accepted_on: &'static str,
+    /// The canisters REVIEWED at registration, pinned here. A call must clear
+    /// both this list and the application's live manifest, so the manifest can
+    /// **narrow** the surface (dropping a canister stops writes to it at once,
+    /// on the app's own signal) but can never **widen** it: a publisher that
+    /// later adds a canister — its own, someone else's, or one it was
+    /// compromised into listing — gains nothing until a reviewed change adds it
+    /// here too. Without this pin, "reviewed at registration" would mean
+    /// reviewed against a document the registrant can rewrite at will.
+    pub canisters: &'static [&'static str],
+    /// The Internet Identity derivation origins this application legitimately
+    /// acts as, in the CANONICAL EFFECTIVE form [`crate::identities::target_origin`]
+    /// produces (so the gateway remap is already applied). A call passing a
+    /// `derivation_origin` outside this list is refused.
+    ///
+    /// This is what stops one registered origin from borrowing another app's
+    /// identity: nothing else ties `application_origin` to `derivation_origin`
+    /// — they are separate arguments resolved independently — so without it a
+    /// registered application could have the server sign a call to a canister
+    /// it lists as the user's principal AT AN UNRELATED APP, which that
+    /// canister may well trust. Usually one entry, equal to `origin`.
+    pub derivation_origins: &'static [&'static str],
 }
 
 /// Applications whose publishers have accepted the ICP MCP Developer Terms,
@@ -134,7 +162,11 @@ pub struct RegisteredApplication {
 ///     financial and data policies;
 ///   * the origin is exactly the one whose `/.well-known/ic-architecture` was
 ///     reviewed, in canonical form;
-///   * the manifest's canisters are the application's own.
+///   * every id in `canisters` is one the publisher operates, taken from the
+///     manifest as reviewed — not copied from it unread;
+///   * every entry in `derivation_origins` is an origin this application really
+///     derives against (check `resolve_app`'s `derivation_origin` for it), in
+///     the canonical effective form.
 ///
 /// One row is one ORIGIN. An application served at several origins (its own
 /// domain and its `<canister>.icp0.io` gateway origin, say) needs a row per
@@ -148,14 +180,14 @@ pub struct RegisteredApplication {
 /// what "no cache" buys is that nothing survives the release — there is no
 /// TTL to wait out and no state to reconcile.
 ///
-/// **What review cannot pin down**: a row is reviewed once, against the
-/// manifest as it stood then, and the application can rewrite that manifest
-/// afterwards — adding a canister widens its own write scope without asking.
-/// That is deliberately not enforced here (the manifest must stay live, or a
-/// legitimate deploy would break writes) and is instead an obligation under the
-/// Developer Terms: the publisher warrants it is entitled to expose every
-/// canister the manifest lists. Layer 2 still applies to whatever it adds, and
-/// removing the row remains the remedy.
+/// A row pins what was reviewed: `canisters` and `derivation_origins`. The live
+/// manifest can only ever NARROW that pin, never widen it, so a publisher who
+/// later edits its manifest — or is compromised into editing it — cannot grant
+/// itself a canister nobody reviewed, and cannot have the server act as the
+/// user's identity at an application it does not own. The Developer Terms carry
+/// the matching promise (that the publisher may expose everything it lists), and
+/// removing the row remains the remedy; but the pins mean the code no longer
+/// depends on that promise holding.
 pub const REGISTERED_APPLICATIONS: &[RegisteredApplication] = &[];
 
 /// What authorized a call, echoed back to the caller so an agent can see
@@ -207,7 +239,11 @@ fn not_registered(registry: &[RegisteredApplication], origin: &str) -> String {
     // single-origin refusal as "try another origin" and burns a loop
     // rediscovering the same answer.
     let scope = if registry.is_empty() {
-        " No applications are registered with this server at present, so this is the answer for          every application — do not retry with a different origin or canister id."
+        concat!(
+            " No applications are registered with this server at present, so this is the",
+            " answer for every application — do not retry with a different origin or",
+            " canister id."
+        )
     } else {
         ""
     };
@@ -266,6 +302,7 @@ fn authorized_origin_in<'a>(
 /// (or failed to be). Separated from the fetch so the whole decision is
 /// testable offline — the fetch itself adds no policy.
 fn decide(
+    app: &RegisteredApplication,
     application_origin: &str,
     fetched: &ArchitectureFetch,
     canister_id: &Principal,
@@ -298,6 +335,23 @@ fn decide(
     //    This is the step that makes discovery non-authorizing: an id mined
     //    from a bundle, an `/env.json`, or a response header reaches this
     //    check with no standing whatsoever.
+    // 5a. The pin from the registration review. Checked BEFORE the manifest so
+    //     an id nobody reviewed is refused as unreviewed, whatever the live
+    //     manifest now says about it — the manifest may narrow this list, never
+    //     widen it.
+    let pinned = canister_id.to_text();
+    if !app.canisters.iter().any(|c| *c == pinned) {
+        return Err(format!(
+            "{canister_id} is not among the canisters reviewed for {application_origin}. A \
+             state-changing call is authorized only against the canisters recorded when the \
+             application was registered — an application cannot widen that set by editing its \
+             own `{ARCHITECTURE_WELL_KNOWN}` manifest afterwards. If the application has added a \
+             canister, its developer needs it reviewed and recorded ({DEVELOPER_TERMS_URL}). \
+             Reading this canister is unaffected — use canister_query."
+        ));
+    }
+    // 5b. …and the application's LIVE manifest must still declare it, so
+    //     removing it from the manifest stops writes at once.
     let Some(canister_role) = arch.role_of(canister_id) else {
         let declared = declared_ids(arch);
         return Err(format!(
@@ -345,12 +399,14 @@ fn declared_ids(arch: &Architecture) -> String {
 /// re-implements the chain this function walks.
 pub async fn authorize_update_call(
     application_origin: Option<&str>,
+    derivation_origin: Option<&str>,
     canister_id: &Principal,
     method: &str,
 ) -> Result<Authorization, String> {
     authorize_with(
         REGISTERED_APPLICATIONS,
         application_origin,
+        derivation_origin,
         canister_id,
         method,
         |origin| async move { architecture::fetch_architecture(&origin).await },
@@ -368,6 +424,7 @@ pub async fn authorize_update_call(
 async fn authorize_with<F, Fut>(
     registry: &[RegisteredApplication],
     application_origin: Option<&str>,
+    derivation_origin: Option<&str>,
     canister_id: &Principal,
     method: &str,
     fetch: F,
@@ -384,10 +441,28 @@ where
     }
     // 2–3. The argument, and a current acceptance on that exact origin.
     let (origin, app) = authorized_origin_in(registry, application_origin)?;
+    // 3a. The identity the call would be signed as must be one this application
+    //     actually acts as. `application_origin` and `derivation_origin` are
+    //     resolved independently and nothing else relates them, so without this
+    //     a registered application could have the server sign a call to a
+    //     canister it lists as the user's principal at an UNRELATED app — an
+    //     identity that app's canisters may trust. Offline, and before the fetch.
+    if let Some(acting_as) = derivation_origin {
+        if !app.derivation_origins.contains(&acting_as) {
+            return Err(format!(
+                "{origin} does not act as the identity {acting_as}. An update call is signed as \
+                 your account at the application being called, so `derivation_origin` must be one \
+                 of the origins recorded for {origin} when it was registered — pairing one \
+                 application's origin with another application's identity is refused. Use the \
+                 `derivation_origin` that open_app / resolve_app returns for {origin}, or omit it \
+                 to call anonymously. Reads are unaffected."
+            ));
+        }
+    }
     // 4–5. The manifest, fetched fresh with no cache — so a manifest change or
     //      a revocation takes effect on the next call, not at the end of a TTL.
     let fetched = fetch(origin.clone()).await;
-    let authorization = match decide(&origin, &fetched, canister_id) {
+    let authorization = match decide(app, &origin, &fetched, canister_id) {
         Ok(a) => a,
         Err(refusal) => {
             // Refused after the caller cleared registration: the operator's
@@ -432,12 +507,16 @@ mod tests {
             publisher: "Example App GmbH",
             accepted_terms_version: DEVELOPER_TERMS_VERSION,
             accepted_on: "2026-08-28",
+            canisters: &[APP_BACKEND, APP_FRONTEND, ICP_LEDGER],
+            derivation_origins: &["https://example-app.test"],
         },
         RegisteredApplication {
             origin: "https://stale-app.test",
             publisher: "Stale App GmbH",
             accepted_terms_version: "2026-01-01",
             accepted_on: "2026-01-01",
+            canisters: &[APP_BACKEND],
+            derivation_origins: &["https://stale-app.test"],
         },
     ];
 
@@ -482,11 +561,24 @@ mod tests {
         canister_id: &Principal,
         method: &str,
     ) -> (Result<Authorization, String>, usize) {
+        gate_as(registry, application_origin, None, fetched, canister_id, method).await
+    }
+
+    /// As [`gate`], but signing as a specific derivation origin.
+    async fn gate_as(
+        registry: &[RegisteredApplication],
+        application_origin: Option<&str>,
+        derivation_origin: Option<&str>,
+        fetched: ArchitectureFetch,
+        canister_id: &Principal,
+        method: &str,
+    ) -> (Result<Authorization, String>, usize) {
         let fetches = std::rc::Rc::new(std::cell::Cell::new(0usize));
         let counter = std::rc::Rc::clone(&fetches);
         let result = authorize_with(
             registry,
             application_origin,
+            derivation_origin,
             canister_id,
             method,
             |origin| async move {
@@ -580,6 +672,8 @@ mod tests {
         // manifest. It is a real canister, reachable, and the app it belongs to
         // is not the one being called.
         let mined = p("be2us-64aaa-aaaaa-qaabq-cai");
+        // Neither reviewed nor declared: refused, and the id is named so the
+        // caller can see which canister it asked for.
         let msg = authorize(
             Some(REGISTERED),
             manifest(&[APP_FRONTEND, APP_BACKEND]),
@@ -587,19 +681,27 @@ mod tests {
             "set_name",
         )
         .await
-        .expect_err("an undeclared canister must be refused");
+        .expect_err("an unreviewed, undeclared canister must be refused");
         assert!(msg.contains(&mined.to_text()), "the refusal names the id: {msg}");
-        assert!(msg.contains(ARCHITECTURE_WELL_KNOWN), "and the manifest path: {msg}");
+        // Even if the application ADDS it to its live manifest — the case a
+        // mined id most plausibly reaches — the registration pin still refuses.
+        let msg = authorize(
+            Some(REGISTERED),
+            manifest(&[APP_BACKEND, "be2us-64aaa-aaaaa-qaabq-cai"]),
+            &mined,
+            "set_name",
+        )
+        .await
+        .expect_err("declaring it after review must not authorize it");
+        assert!(msg.contains("not among the canisters reviewed"), "{msg}");
+        // A REVIEWED canister the application does not declare is refused too,
+        // by the manifest half — so the two checks are independent, and the
+        // "provenance authorizes nothing" property does not rest on either alone.
+        let msg = authorize(Some(REGISTERED), manifest(&[APP_BACKEND]), &p(APP_FRONTEND), "set_name")
+            .await
+            .expect_err("reviewed but undeclared must be refused");
+        assert!(msg.contains(ARCHITECTURE_WELL_KNOWN), "the manifest path: {msg}");
         assert!(msg.contains("does not authorize writing"), "and why: {msg}");
-        // The same canister IS writable from the application that declares it —
-        // so what the previous assertion caught is the missing declaration, not
-        // something incidental about the id.
-        assert!(
-            authorize(Some(REGISTERED), manifest(&[mined.to_text().as_str()]), &mined, "set_name")
-                .await
-                .is_ok(),
-            "declared by the application, the same id authorizes"
-        );
         // An application declaring NOTHING authorizes nothing.
         assert!(authorize(Some(REGISTERED), manifest(&[]), &p(APP_BACKEND), "set_name")
             .await
@@ -841,6 +943,40 @@ mod tests {
             seen.push(app.origin);
             assert!(!app.publisher.trim().is_empty(), "{}: publisher required", app.origin);
             assert!(!app.accepted_on.trim().is_empty(), "{}: acceptance date required", app.origin);
+            // A row with no pinned canisters authorizes nothing, so it is dead
+            // weight that reads like a registration; an empty derivation-origin
+            // list means the app can only ever be called anonymously, which is
+            // almost certainly an oversight rather than an intent.
+            assert!(
+                !app.canisters.is_empty(),
+                "{}: pin the canisters reviewed at registration, or remove the row",
+                app.origin
+            );
+            assert!(
+                !app.derivation_origins.is_empty(),
+                "{}: record the derivation origin(s) this application acts as",
+                app.origin
+            );
+            for id in app.canisters {
+                let parsed = Principal::from_text(id)
+                    .unwrap_or_else(|e| panic!("{}: pinned id {id:?}: {e}", app.origin));
+                assert_eq!(
+                    &parsed.to_text(),
+                    id,
+                    "{}: pinned ids must be in canonical text form",
+                    app.origin
+                );
+            }
+            for d in app.derivation_origins {
+                // Stored in the canonical EFFECTIVE form, so the comparison in
+                // the gate — which receives an already-remapped origin — matches.
+                assert_eq!(
+                    &crate::identities::target_origin(d),
+                    d,
+                    "{}: derivation origins must be stored in canonical effective form",
+                    app.origin
+                );
+            }
             assert_eq!(
                 app.accepted_terms_version, DEVELOPER_TERMS_VERSION,
                 "{}: a row that does not carry the current Terms revision authorizes nothing — \
@@ -888,6 +1024,166 @@ mod tests {
         assert!(!msg.contains("No applications are registered"), "{msg}");
     }
 
+    // The registration PIN bounds the live manifest: a canister the manifest
+    // declares but the registration never recorded is refused. Without this, a
+    // publisher (or whoever compromised it) could widen its own write scope by
+    // editing a document only it controls, after the review that admitted it.
+    #[tokio::test]
+    async fn the_manifest_cannot_widen_the_reviewed_surface() {
+        // An id nobody reviewed — the registration lists APP_BACKEND,
+        // APP_FRONTEND and ICP_LEDGER, not this.
+        let unreviewed = p("be2us-64aaa-aaaaa-qaabq-cai");
+        let msg = authorize(
+            Some(REGISTERED),
+            manifest(&[APP_BACKEND, "be2us-64aaa-aaaaa-qaabq-cai"]),
+            &unreviewed,
+            "set_name",
+        )
+        .await
+        .expect_err("a canister the manifest added after review must be refused");
+        assert!(msg.contains("not among the canisters reviewed"), "{msg}");
+        assert!(msg.contains("cannot widen"), "and say why: {msg}");
+        // The manifest may still NARROW: a pinned canister the app has dropped
+        // from its manifest stops working immediately.
+        let msg = authorize(Some(REGISTERED), manifest(&[APP_FRONTEND]), &p(APP_BACKEND), "ping")
+            .await
+            .expect_err("dropped from the live manifest: refused");
+        assert!(msg.contains("is not declared by"), "{msg}");
+        // Pinned AND declared: authorized.
+        assert!(authorize(Some(REGISTERED), manifest(&[APP_BACKEND]), &p(APP_BACKEND), "ping")
+            .await
+            .is_ok());
+    }
+
+    // The identity a call is signed as must be one the named application acts
+    // as. `application_origin` and `derivation_origin` are separate arguments
+    // resolved independently, so without this check a registered application
+    // could have the server sign a call to a canister it lists as the user's
+    // principal AT AN UNRELATED APP — an identity that canister may trust.
+    #[tokio::test]
+    async fn an_application_cannot_borrow_another_apps_identity() {
+        // The registered application acting as its own identity: fine.
+        let (result, fetches) = gate_as(
+            TEST_REGISTRY,
+            Some(REGISTERED),
+            Some("https://example-app.test"),
+            manifest(&[APP_BACKEND]),
+            &p(APP_BACKEND),
+            "place_order",
+        )
+        .await;
+        assert!(result.is_ok(), "its own identity must be allowed: {result:?}");
+        assert_eq!(fetches, 1);
+
+        // The same application asking to sign as a DIFFERENT app's identity:
+        // refused, offline, before the manifest is even read.
+        for victim in ["https://victim.test", "https://nns.ic0.app", "https://oisy.com"] {
+            let (result, fetches) = gate_as(
+                TEST_REGISTRY,
+                Some(REGISTERED),
+                Some(victim),
+                manifest(&[APP_BACKEND]),
+                &p(APP_BACKEND),
+                "place_order",
+            )
+            .await;
+            let msg = result.expect_err("borrowing another app's identity must be refused");
+            assert!(msg.contains("does not act as the identity"), "{msg}");
+            assert!(msg.contains(victim), "the refusal names the identity asked for: {msg}");
+            assert_eq!(fetches, 0, "and it is refused before any fetch");
+        }
+
+        // An anonymous call (no identity at all) is unaffected by this check.
+        assert!(gate_as(
+            TEST_REGISTRY,
+            Some(REGISTERED),
+            None,
+            manifest(&[APP_BACKEND]),
+            &p(APP_BACKEND),
+            "place_order"
+        )
+        .await
+        .0
+        .is_ok());
+    }
+
+    // Every refusal this module produces is prose a user reads, so none of them
+    // may carry a run of whitespace. Pinned because the bug is invisible in
+    // source: a `\`-continued literal that rustfmt later joins onto one line
+    // keeps the continuation's indentation as literal spaces, and the assertions
+    // above all match single-line substrings that straddle no continuation.
+    #[tokio::test]
+    async fn no_refusal_carries_stray_whitespace() {
+        let mut refusals = vec![
+            // Step 2: the argument is missing.
+            gate(TEST_REGISTRY, None, manifest(&[APP_BACKEND]), &p(APP_BACKEND), "ping").await.0,
+            // Step 2: the argument is not an origin.
+            gate(TEST_REGISTRY, Some("not a url"), manifest(&[APP_BACKEND]), &p(APP_BACKEND), "ping")
+                .await
+                .0,
+            // Step 3: not registered, against a NON-empty registry…
+            gate(
+                TEST_REGISTRY,
+                Some("https://unregistered.test"),
+                manifest(&[APP_BACKEND]),
+                &p(APP_BACKEND),
+                "ping",
+            )
+            .await
+            .0,
+            // …and against an empty one, which appends the extra sentence.
+            gate(&[], Some(REGISTERED), manifest(&[APP_BACKEND]), &p(APP_BACKEND), "ping").await.0,
+            // Step 4: unreachable, and not served.
+            gate(
+                TEST_REGISTRY,
+                Some(REGISTERED),
+                ArchitectureFetch::Unreachable("dns failure".into()),
+                &p(APP_BACKEND),
+                "ping",
+            )
+            .await
+            .0,
+            gate(
+                TEST_REGISTRY,
+                Some(REGISTERED),
+                ArchitectureFetch::NotDeclared("answered 404".into()),
+                &p(APP_BACKEND),
+                "ping",
+            )
+            .await
+            .0,
+            // Step 5: declared by nobody, and a long list that hits the cap.
+            gate(TEST_REGISTRY, Some(REGISTERED), manifest(&[]), &p(APP_BACKEND), "ping").await.0,
+            gate(
+                TEST_REGISTRY,
+                Some(REGISTERED),
+                manifest(&[APP_FRONTEND]),
+                &p(APP_BACKEND),
+                "ping",
+            )
+            .await
+            .0,
+        ];
+        // Layer 2's refusals travel the same path, so hold them to it too.
+        refusals.push(
+            gate(
+                TEST_REGISTRY,
+                Some(REGISTERED),
+                manifest(&[APP_BACKEND]),
+                &p(APP_BACKEND),
+                "icrc1_transfer",
+            )
+            .await
+            .0,
+        );
+        for r in refusals {
+            let msg = r.expect_err("every case above must refuse");
+            assert!(!msg.contains("  "), "a refusal carries a run of spaces: {msg:?}");
+            assert!(!msg.contains('\n'), "a refusal carries a newline: {msg:?}");
+            assert!(!msg.contains('\t'), "a refusal carries a tab: {msg:?}");
+        }
+    }
+
     // The fixture registry is held to the same shape as the shipped one, so it
     // can't drift into testing something the real table could never be. (The
     // deliberately-stale row is exempt from the revision rule — it exists to
@@ -901,6 +1197,15 @@ mod tests {
                 "{}: fixture origins must be canonical too",
                 app.origin
             );
+            assert!(!app.canisters.is_empty(), "{}: fixture rows are pinned too", app.origin);
+            for d in app.derivation_origins {
+                assert_eq!(
+                    &crate::identities::target_origin(d),
+                    d,
+                    "{}: fixture derivation origins must be canonical effective form too",
+                    app.origin
+                );
+            }
         }
     }
 }

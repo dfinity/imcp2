@@ -250,8 +250,10 @@ const FETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 /// `origin` must already be canonical (see [`discover::normalize_origin`]).
 /// Reuses the site-fetch guards every caller-supplied fetch in this crate
 /// carries: the target is resolved to public addresses and pinned into the
-/// client before the request (SSRF, CWE-918), the body is size-capped, and the
-/// response must have come from the origin we asked — the shared redirect
+/// client before the request (SSRF, CWE-918), the body is size-capped — and read
+/// STRICTLY, so an incomplete or over-cap body is an error rather than a prefix
+/// this gate would decide on — and the response must have come from the origin we
+/// asked — the shared redirect
 /// policy permits same-host different-PORT hops, so a manifest served after a
 /// redirect could otherwise come from a neighbouring origin and be read as
 /// this one's declaration.
@@ -302,7 +304,17 @@ async fn read_architecture(origin: &str) -> ArchitectureFetch {
             resp.status().as_u16()
         ));
     }
-    let text = discover::read_capped(resp, discover::MAX_META_BYTES).await;
+    // STRICTLY read: an incomplete body is an error here, not a prefix. A
+    // truncated manifest could only ever deny a canister (a prefix cannot add an
+    // entry), but a gate must not decide on a document it did not fully receive.
+    let text = match discover::read_strict(resp, discover::MAX_META_BYTES).await {
+        Ok(text) => text,
+        Err(e) => {
+            return ArchitectureFetch::Unreachable(format!(
+                "{expected}{ARCHITECTURE_WELL_KNOWN} could not be read in full: {e}"
+            ))
+        }
+    };
     match parse_architecture(&text) {
         Ok(arch) => ArchitectureFetch::Served(arch),
         Err(e) => ArchitectureFetch::NotDeclared(format!(

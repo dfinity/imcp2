@@ -293,10 +293,13 @@ is refused, with no fallback path.
 1. Layer 2 (below) does not refuse the method.
 2. `application_origin` is supplied (an https origin, canonicalized).
 3. That exact origin is in the server's registry of applications whose
-   developers accepted the current [ICP MCP Developer Terms](#the-developer-terms).
+   developers accepted the current [ICP MCP Developer Terms](#the-developer-terms) —
+   and any `derivation_origin` the call would be signed as is one that
+   registration records for that application.
 4. That origin serves a well-formed `/.well-known/ic-architecture` manifest,
    fetched fresh on **every** call — nothing is cached.
-5. The manifest **declares the target canister**.
+5. The target canister is **pinned by the registration** *and* **declared in
+   that live manifest**.
 6. Only then does the call execute.
 
 All six must pass, so the order decides only which refusal the caller reads.
@@ -327,6 +330,13 @@ one cannot stand in for the other:
 So they do separate jobs: `application_origin` says *which application this call
 belongs to* (and authorizes it), `derivation_origin` says *whose identity to act
 as*. `open_app` and `resolve_app` return both.
+
+Separate, but not unrelated. Nothing in the identity path ties them together, so
+the gate requires the *pair* to match what registration recorded: a registered
+application may only act as an identity recorded for it. Otherwise a registered
+application could have the server sign a call — to a canister it had listed — as
+the user's principal at an unrelated app, which that app's canisters may well
+trust.
 
 Refusals distinguish their causes, because the fixes differ: no
 `application_origin` supplied; the origin's developer has no current Terms
@@ -374,12 +384,15 @@ revision. Because the table is compiled in, either is a *release* rather than a
 runtime switch; what "nothing is cached" buys is that the change is complete the
 moment it is deployed — no TTL to wait out, no state to reconcile.
 
-What review cannot pin down: a row is reviewed once, against the manifest as it
-stood then, and the application can rewrite that manifest afterwards — adding a
-canister widens its own write scope without asking. Enforcing otherwise would
-break a legitimate deploy, so it is an obligation under the Developer Terms
-instead (the publisher warrants it may expose everything it lists), with Layer 2
-still applying to whatever is added and removal of the row as the remedy.
+A row **pins what was reviewed** — the canister ids, and the derivation origins
+the application acts as. The live manifest can then only ever *narrow* that pin,
+never widen it: dropping a canister from the manifest stops writes to it at once
+(the app's own signal), while adding one grants nothing until a reviewed change
+records it too. So a publisher that later edits its manifest — or is compromised
+into editing it — cannot give itself a canister nobody reviewed, and cannot have
+the server act as the user's identity at an application it does not own. The
+Developer Terms carry the matching promise, but the code no longer depends on
+that promise holding.
 
 Canister *management* (installing code, settings, lifecycle) is a different
 surface with a different basis — it acts on canisters the **user** controls,
@@ -401,11 +414,17 @@ mid-flight. Fixed public-host enrichment (the IC dashboard, the skills registry)
 uses the redirect guard but is not separately address-pinned. No JavaScript is
 executed, and every extracted id is validated as a principal.
 
-The authorization manifest fetch reuses exactly those guards, and adds one more:
+The authorization manifest fetch reuses exactly those guards, and adds two more.
+The body is read **strictly** — an incomplete or over-cap body is an error, not a
+prefix the gate would decide on (a truncated manifest could only ever deny a
+canister, but a gate should not rule on a document it did not fully receive). And
 the response must have come from the origin that was asked, not a redirect
 target — the shared redirect policy permits same-host different-port hops, so
 without that check a neighbouring origin's manifest could be read as this one's
-declaration. Because the fetch happens only *after* the registry check, the set
+declaration. The same attribution rule now applies to the identity files
+(`/.well-known/ii-derivation-origin` and the superseded manifest's key): a
+declaration served by a different origin is ignored rather than read as this
+application's. Because the fetch happens only *after* the registry check, the set
 of origins the **authorization path** will fetch is the curated registry: a
 caller cannot use an update call to steer this server's client at an origin of
 their choosing. (Discovery still reads the same path from any origin a caller

@@ -717,11 +717,18 @@ struct DeclaredResolution {
 
 /// Read one well-known document from the application origin and extract a
 /// declared derivation origin from it with `parse`. Returns `(ic_evidence,
-/// declared)`; both an unreachable origin and a non-success status yield
-/// `(evidence-so-far, None)` — a declaration this server can't read is simply
-/// no declaration, since the spec has an app that derives against its own
-/// origin serve no file at all. The response doubles as IC-hosting evidence
-/// (attributed to this exact origin, not a redirect target).
+/// declared)`; an unreachable origin, a non-success status, and a response that
+/// came from somewhere else all yield `(evidence-so-far, None)` — a declaration
+/// this server can't attribute to this exact origin is simply no declaration,
+/// since the spec has an app that derives against its own origin serve no file
+/// at all.
+///
+/// The body is parsed ONLY when the response came from `application_origin`
+/// itself. The shared redirect policy permits a same-host different-PORT hop and
+/// hops to global IP literals, so without that check a neighbouring origin's
+/// file could be read as this application's declaration — the same attribution
+/// rule [`crate::architecture::fetch_architecture`] applies to the manifest, and
+/// the one `ic_evidence_from` already applies to the evidence.
 async fn read_declared_origin_file(
     client: &reqwest::Client,
     application_origin: &str,
@@ -733,6 +740,15 @@ async fn read_declared_origin_file(
     };
     let ic_evidence = ic_evidence_from(&resp, application_origin);
     if !resp.status().is_success() {
+        return (ic_evidence, None);
+    }
+    if resp.url().origin().ascii_serialization() != application_origin {
+        tracing::debug!(
+            application_origin = %application_origin,
+            served_by = %resp.url().origin().ascii_serialization(),
+            path = %path,
+            "ignoring a derivation-origin declaration served by a different origin"
+        );
         return (ic_evidence, None);
     }
     let text = read_capped(resp, MAX_META_BYTES).await;
@@ -1202,6 +1218,31 @@ pub(crate) async fn read_capped(mut resp: reqwest::Response, max: usize) -> Stri
         }
     }
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Read a response body of at most `max` bytes, STRICTLY: a mid-stream error is
+/// an error, and a body that exceeds the cap is an error rather than a silent
+/// prefix. The counterpart to [`read_capped`], for callers that must fail closed
+/// on an incomplete read instead of treating what arrived as the whole document
+/// (see [`crate::architecture::fetch_architecture`]). Reading a truncated
+/// manifest could only ever DENY a canister — a prefix cannot add an entry — but
+/// a gate should not decide on a document it did not fully receive, and "the body
+/// is capped" should mean refused, not quietly shortened.
+pub(crate) async fn read_strict(mut resp: reqwest::Response, max: usize) -> Result<String, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if buf.len() + chunk.len() > max {
+                    return Err(format!("the body is larger than the {max}-byte limit"));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("the body could not be read in full: {e}")),
+        }
+    }
+    String::from_utf8(buf).map_err(|e| format!("the body is not valid UTF-8: {e}"))
 }
 
 /// Accumulator for discovered canister ids, with a hard ceiling on the number of

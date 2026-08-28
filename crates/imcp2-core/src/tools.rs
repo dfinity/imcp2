@@ -526,17 +526,29 @@ impl IcCanisterTools {
             Ok(p) => p,
             Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
         };
+        // Resolve which principal to act as BEFORE the gate: none = anonymous;
+        // else the app's effective (canonical) II derivation origin, from the
+        // caller's explicit `derivation_origin` (obtained once via open_app /
+        // resolve_app). Pure string work, no I/O — and the gate needs the
+        // canonical effective form to check that this application is one that
+        // acts as that identity.
+        let target = match resolve_identity_target(derivation_origin) {
+            Ok(t) => t,
+            Err(e) => return Ok(err(e)),
+        };
         // The write gate, in full (see `crate::authorization`): the call must
         // name a registered application whose developer accepted the current
-        // ICP MCP Developer Terms, that application's own
-        // /.well-known/ic-architecture manifest must declare this canister,
-        // and the financial guard (`crate::compliance`) must not refuse the
-        // method — every check, or no call. Runs before ANY canister work, so
-        // an unauthorized call reaches neither the canister's interface nor
-        // its method. Queries need no gate: a query cannot commit state, so it
-        // cannot move funds or change anything.
+        // ICP MCP Developer Terms and which acts as the identity being signed
+        // as; this canister must be both pinned by that registration and
+        // declared in the application's own live /.well-known/ic-architecture
+        // manifest; and the financial guard (`crate::compliance`) must not
+        // refuse the method — every check, or no call. Runs before ANY canister
+        // work, so an unauthorized call reaches neither the canister's
+        // interface nor its method. Queries need no gate: a query cannot commit
+        // state, so it cannot move funds or change anything.
         let authorization = match authorization::authorize_update_call(
             application_origin.as_deref(),
+            target.as_ref().map(|t| t.origin.as_str()),
             &principal,
             &method,
         )
@@ -551,13 +563,6 @@ impl IcCanisterTools {
         let did = calls::resolve_did(&self.agent, principal, candid.as_deref()).await;
         let arg_bytes = match calls::encode_args(did.as_deref(), &method, &args) {
             Ok(b) => b,
-            Err(e) => return Ok(err(e)),
-        };
-        // Resolve which principal to act as: none = anonymous; else the app's
-        // effective (canonical) II derivation origin, from the caller's explicit
-        // `derivation_origin` (obtained once via open_app / resolve_app).
-        let target = match resolve_identity_target(derivation_origin) {
-            Ok(t) => t,
             Err(e) => return Ok(err(e)),
         };
         let origin = target.as_ref().map(|t| t.origin.as_str());
@@ -2026,8 +2031,11 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              a write is authorized ONLY when every check passes: the origin is a REGISTERED \
              application (its developer having accepted the ICP MCP Developer Terms), its own \
              `/.well-known/ic-architecture` manifest — the ICP service-discoverability protocol's \
-             composition layer, re-read on every call — DECLARES the target canister, and the \
-             financial guard below does not refuse the method. Otherwise the call is REFUSED; there \
+             composition layer, re-read on every call — DECLARES the target canister, that canister \
+             was recorded when the application registered (its manifest can narrow that set, never \
+             widen it), the `derivation_origin` you sign as is one recorded for THAT application \
+             (one app cannot act as another's identity), and the financial guard below does not \
+             refuse the method. Otherwise the call is REFUSED; there \
              is no fallback. Finding a canister id behind a domain some other way (the gateway's \
              x-ic-canister-id header, an /env.json, a JS bundle) lets you READ it, never write to \
              it. `application_origin` is a DIFFERENT value from `derivation_origin` — apps can share \
@@ -2620,10 +2628,36 @@ mod tests {
                 "the description must teach {expected:?}: {desc}"
             );
         }
-        // The argument is in the schema, so a client can discover it without
-        // reading prose.
-        let schema = serde_json::to_string(&tool.input_schema).expect("input schema");
-        assert!(schema.contains("application_origin"), "{schema}");
+        // The argument is REQUIRED in the schema, not merely present in it — so
+        // a client sends it rather than discovering the requirement from a tool
+        // error. (The Rust type stays `Option` so a client that omits it anyway
+        // reaches the gate's instructive refusal instead of rmcp's opaque
+        // invalid-params error; see `calls::CanisterUpdateCallArgs`.)
+        let schema = serde_json::to_value(&tool.input_schema).expect("input schema");
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("the schema declares required arguments")
+            .iter()
+            .map(|v| v.as_str().expect("a required name"))
+            .collect();
+        for expected in ["canister_id", "method", "application_origin"] {
+            assert!(required.contains(&expected), "{expected} must be required: {required:?}");
+        }
+        assert!(
+            schema["properties"]["application_origin"].is_object(),
+            "and described as a property: {schema}"
+        );
+        // …while a client that omits it anyway still DESERIALIZES, so it reaches
+        // the gate's instructive refusal rather than rmcp's invalid-params error.
+        // This is the half `#[serde(default)]` would have provided; serde gives
+        // it for an `Option` field for free, and adding `default` back would
+        // silently undo the `required` above.
+        let args: crate::calls::CanisterUpdateCallArgs = serde_json::from_value(serde_json::json!({
+            "canister_id": "dmp3l-2yaaa-aaaae-aamva-cai",
+            "method": "set_name",
+        }))
+        .expect("omitting application_origin must still deserialize");
+        assert!(args.application_origin.is_none());
 
         let ins = super::SERVER_INSTRUCTIONS;
         for expected in [
