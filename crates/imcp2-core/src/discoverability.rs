@@ -213,8 +213,9 @@ fn no_manifest_refusal(
          it IS the app's origin, the app has not adopted the protocol, and re-running open_app \
          will not change that: STOP retrying, tell the user this write cannot be made for them \
          here, and that the app's operators enable it by publishing the manifest \
-         ({SERVICE_DISCOVERABILITY_GUIDE}); they can also perform the action themselves in the \
-         app's own frontend. {READS_ARE_FINE}"
+         ({SERVICE_DISCOVERABILITY_GUIDE}); the skill://service-discoverability resource carries \
+         the deploy-time recipe for generating it, if the user is the one who can ship it. They \
+         can also perform the action themselves in the app's own frontend. {READS_ARE_FINE}"
     ));
     msg
 }
@@ -460,12 +461,16 @@ mod tests {
 
     // An app that publishes no manifest will still publish none after another
     // open_app, so the refusal must break the loop rather than send the agent
-    // back to re-resolve an origin it already has right.
+    // back to re-resolve an origin it already has right. It also points at the
+    // served how-to skill: the user hitting this refusal is sometimes the very
+    // person who can ship the manifest, and "publish a manifest" is a much
+    // weaker handoff than the deploy-time recipe for generating one.
     #[test]
     fn no_manifest_refusal_stops_the_agent_retrying() {
         let msg = no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None);
         assert!(msg.contains("will not change that"), "{msg}");
         assert!(msg.contains("STOP retrying"), "{msg}");
+        assert!(msg.contains("skill://service-discoverability"), "names the how-to skill: {msg}");
     }
 
     // Entries past the read cap ARE declared by the app; refusing one as "not
