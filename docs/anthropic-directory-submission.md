@@ -138,34 +138,32 @@ revision behind `main` (the current draft's identifier-linkability wording
 lands with that release). The reviewed source
 text is [`icp-mcp-privacy-policy-draft.md`](icp-mcp-privacy-policy-draft.md).
 
-### 2. Financial-transactions policy (resolved in code)
+### 2. Financial-transactions policy
 
 The Directory Policy **prohibits connectors that transfer money,
 cryptocurrency, or other financial assets, or execute financial
 transactions**, and the portal's compliance step requires acknowledging this.
 
-**Mitigations shipped across
-[#153](https://github.com/dfinity/imcp2/pull/153) /
-[#154](https://github.com/dfinity/imcp2/pull/154) — the stated and enforced
-posture is that the server is not a financial tool (this section assumes
-both are merged):**
+**The server is not a financial tool, and does not support financial
+transactions:**
 
-- **The connector has no funding or management tools.** The execution paths
-  that once moved funds are removed from the binary
-  ([#153](https://github.com/dfinity/imcp2/pull/153) /
-  [#154](https://github.com/dfinity/imcp2/pull/154)). Creating, funding, and
-  managing canisters is done by the user with the icp CLI in their own
+- **The connector has no funding or management tools.** Creating, funding,
+  and managing canisters is done by the user with the icp CLI in their own
   terminal.
-- `canister_update_call` **refuses the standardized ledger methods** that
-  move value or grant spending rights — the ICRC-standard names
-  (ICRC-1/ICRC-2 plus ICRC-4/-7/-37) on every canister, and the ICP and
+- `canister_update_call` **refuses the standardized value-moving methods** —
+  the ICRC-standard transfer/approval names
+  (ICRC-1/ICRC-2 plus ICRC-4/-7/-37) and the NNS/SNS governance method
+  `manage_neuron` (neuron staking and disbursement, on every SNS DAO's
+  governance as well as the NNS's) on every canister, and the ICP and
   cycles ledgers' own `transfer`/`send_dfx`/`withdraw`/`create_canister`
-  methods on those ledgers; the refusal recommends the user act themselves
+  methods on those ledgers, and refuses **every** update call on a curated,
+  dashboard-verified list of known financial-service canisters (token ledgers
+  and minters, exchanges, wallet backends, staking/governance canisters and
+  their frontends); the refusal recommends the user act themselves
   in a wallet they control (oisy.com; a refused canister-creation spend
   points at the user-run icp CLI), and the policy is stated in the
-  server-level instructions — deliberately not in the tool description,
-  which stays free of financial language per maintainer review
-  ([#154](https://github.com/dfinity/imcp2/pull/154)).
+  server-level instructions — deliberately not in the tool descriptions,
+  which stay free of financial language.
 - The README, the landing page, and the server instructions all state
   explicitly that financial transactions are not supported.
 
@@ -176,12 +174,9 @@ served at all — users run those operations themselves with the icp CLI. The
 financial-transactions acknowledgment is made on that basis, without
 qualifications.
 
-**Status: resolved in code.** An email to <mcp-review@anthropic.com>
-(2026-07-31) had asked whether cycles funding and the general-purpose
-`canister_update_call` pass review; the changes above made both questions
-moot — funding no longer executes at all, and the update tool refuses
-financial ledger methods. No open compliance question remains on this topic;
-if a reply arrives, answer with the shipped posture.
+**mcp-review thread:** an email to <mcp-review@anthropic.com> (2026-07-31)
+asked ahead about this acknowledgment. No reply is needed to submit; if one
+arrives, answer with the posture above.
 
 Related honesty point for the same step: there is **no per-call confirmation**
 for sensitive methods server-side today —
@@ -214,10 +209,10 @@ cycles balance is needed: the connector has no canister-management tools.)
 
 The live server reports commit `bbf0844` (v0.1.1, tag
 `release-2026-08-18-0.1.1`), which predates the entire compliance chain
-(#153, #154, #155, #157, #158): it still serves the old 26-tool surface,
-including the funding and management tools this document says do not exist.
-Cut a `release-*` tag from current `main` and deploy it BEFORE submitting —
-every attestation here describes `main`, not what is currently live.
+(#153–#158): it still serves the old 26-tool surface rather than the
+current one. Cut a `release-*` tag from current `main` and deploy it BEFORE
+submitting — everything this document describes is `main`, not what is
+currently live.
 
 ### 5. Icon asset — ready
 
@@ -361,7 +356,7 @@ conversation beyond tool arguments and generates no media.
 ## Submission-day checklist
 
 - [ ] Privacy policy entered in the portal — the page is already live at `https://mcp.internetcomputer.org/privacy-policy` (verified 2026-08-27); the next `release-*` refreshes its text to the current draft (blocker 1)
-- [x] Financial-transactions question resolved in code (blocker 2) — no mcp-review reply is needed; if one arrives, answer with the shipped posture. The first-party-API/data-handling question was NOT in the 2026-07-31 email: raise it with mcp-review only if the portal's data-handling options don't fit
+- [x] Financial-transactions acknowledgment is a clean yes (blocker 2): the server does not support financial transactions. No mcp-review reply is needed; if one arrives, answer with the stated posture. The first-party-API/data-handling question was NOT in the 2026-07-31 email: raise it with mcp-review only if the portal's data-handling options don't fit
 - [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — if a reviewer asks for a populated account, provision a demo-app account (no funding needed: there are no funding or canister-management tools)
 - [ ] `release-*` tag cut; `/version` on production shows the intended commit (blocker 4)
 - [x] Square PNG icon exported — `docs/assets/icp-logo-{1024,512}.png` (blocker 5)
