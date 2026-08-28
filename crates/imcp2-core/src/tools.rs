@@ -1939,12 +1939,14 @@ fn identity_annotation(target: &IdentityTarget, acted_as: Option<&str>) -> Strin
 }
 
 /// The server-level instructions every client receives from `get_info`. The
-/// financial-transactions policy is stated HERE in full, server-wide, because
-/// it governs the whole surface rather than one tool; `canister_update_call`'s
-/// own description carries a one-sentence disclosure of it, so the description
-/// matches the tool's actual behavior (both directories require that, and a
-/// refusal is a side effect a caller must be able to see from the description
-/// alone). Neither surface names a venue for a refused operation.
+/// financial-transactions policy is stated HERE in full, server-wide — it
+/// governs the whole surface rather than one tool — and deliberately in NO
+/// tool description (per review): a policy paragraph inside
+/// `canister_update_call`'s description reads as a hint that the tool is
+/// usable for financial transactions, which is the one thing it must not
+/// suggest. `financial_policy_is_a_server_instruction_not_a_description`
+/// holds that line across every served description. Neither surface names a
+/// venue for a refused operation.
 const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TEXTUAL Candid — the `(...)` value \
              syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`, never \
              the binary form. Tool names signal SCOPE: `…_app…` names \
