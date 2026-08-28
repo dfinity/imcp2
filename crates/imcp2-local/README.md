@@ -5,9 +5,9 @@ AI tool (Claude Desktop, Claude Code, Codex, Cursor, Antigravity, the
 Perplexity macOS app, …) spawns on your machine and talks to over **stdio**.
 It serves the same tools as the hosted server at
 [mcp.internetcomputer.org](https://mcp.internetcomputer.org) — canister reads
-and writes in textual Candid, app discovery, OQL, canister management —
-against the same **IC mainnet** and the same **production Internet
-Identity**. What it drops is the hosted server's entire OAuth 2.1 layer: a
+in textual Candid, app discovery, OQL, and writes **under the same
+authorization gate** (see below) — against the same **IC mainnet** and the same
+**production Internet Identity**. What it drops is the hosted server's entire OAuth 2.1 layer: a
 single-user process reached over a pipe needs no bearer tokens, so your II
 login never passes through a third-party server.
 

@@ -828,6 +828,10 @@ mod tests {
             "the page must carry revision {revision}"
         );
         assert!(
+            page.contains(&format!("in effect from {revision}")),
+            "the page's effective date must be the revision itself, so the two cannot drift"
+        );
+        assert!(
             !page.contains("__REVISION__"),
             "every placeholder must be substituted"
         );

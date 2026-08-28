@@ -191,15 +191,32 @@ pub fn parse_architecture(text: &str) -> Result<Architecture, String> {
 /// The app's declared Internet Identity derivation origin from a
 /// `/.well-known/ii-derivation-origin` body: the file's single line, reduced
 /// to a canonical bare `https://host[:port]` origin. `None` when the file is
-/// blank or the line is not a valid https origin — so a malformed declaration
-/// falls back to the application origin instead of deriving against garbage.
+/// blank or the line is not an explicit https origin — so a malformed
+/// declaration falls back to the application origin instead of deriving
+/// against garbage.
+///
+/// The `https://` scheme is REQUIRED here, unlike the scheme-tolerant
+/// [`discover::normalize_origin`] used for interactively-supplied origins. The
+/// spec's file holds a full origin, and accepting a bare host would read any
+/// one-word 200 body as a declaration: an SPA catch-all answering this path
+/// with a single token would become a bogus CROSS-origin claim, which the
+/// alternative-origins check then refuses — turning a missing file into a hard
+/// failure to resolve the app at all, instead of the application-origin default
+/// the spec prescribes.
 pub fn parse_derivation_origin(text: &str) -> Option<String> {
-    // "Single line" per the spec; tolerate a trailing newline and stray
-    // surrounding whitespace, but not a second line of content — a file with
-    // more than one origin in it is not something to guess at.
-    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    // "Single line" per the spec; tolerate a trailing newline, a UTF-8 BOM, and
+    // stray surrounding whitespace, but not a second line of content — a file
+    // with more than one origin in it is not something to guess at.
+    let mut lines =
+        text.trim_start_matches('\u{feff}').lines().map(str::trim).filter(|l| !l.is_empty());
     let first = lines.next()?;
     if lines.next().is_some() {
+        return None;
+    }
+    // The `https://` scheme is REQUIRED (`get`, not slicing, so a multi-byte
+    // first character can't panic). See the doc above for why a bare host must
+    // not be accepted here.
+    if !first.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://")) {
         return None;
     }
     discover::normalize_origin(first)
@@ -220,7 +237,15 @@ pub enum ArchitectureFetch {
     Unreachable(String),
 }
 
-/// Fetch `origin`'s architecture manifest from the **exact** origin.
+/// How long the whole manifest read may take before the call is refused as
+/// unreadable. Deliberately shorter than the shared site-fetch timeout: this
+/// one sits in front of every state-changing call, so a slow origin must cost
+/// the caller a prompt "retry" rather than a long stall. The refusal says it is
+/// retryable, so a transient slow patch costs a round trip, not a wrong answer.
+const FETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Fetch `origin`'s architecture manifest from the **exact** origin, within
+/// [`FETCH_BUDGET`].
 ///
 /// `origin` must already be canonical (see [`discover::normalize_origin`]).
 /// Reuses the site-fetch guards every caller-supplied fetch in this crate
@@ -231,6 +256,16 @@ pub enum ArchitectureFetch {
 /// redirect could otherwise come from a neighbouring origin and be read as
 /// this one's declaration.
 pub async fn fetch_architecture(origin: &str) -> ArchitectureFetch {
+    match tokio::time::timeout(FETCH_BUDGET, read_architecture(origin)).await {
+        Ok(fetched) => fetched,
+        Err(_) => ArchitectureFetch::Unreachable(format!(
+            "reading {origin}{ARCHITECTURE_WELL_KNOWN} took longer than {}s",
+            FETCH_BUDGET.as_secs()
+        )),
+    }
+}
+
+async fn read_architecture(origin: &str) -> ArchitectureFetch {
     let (url, pinned) = match discover::resolve_public_url(origin).await {
         Ok(v) => v,
         Err(e) => return ArchitectureFetch::Unreachable(e),
@@ -409,6 +444,11 @@ mod tests {
             parse_derivation_origin("HTTPS://Example.COM:443").as_deref(),
             Some("https://example.com")
         );
+        // A BOM-prefixed file still reads (deployment tooling adds them).
+        assert_eq!(
+            parse_derivation_origin("\u{feff}https://example.com\n").as_deref(),
+            Some("https://example.com")
+        );
         for bad in [
             "",
             "\n\n",
@@ -416,6 +456,13 @@ mod tests {
             "https://user@example.com",     // user-info
             "not a url",                    // unparseable
             "https://a.com\nhttps://b.com", // two origins: don't guess
+            // A bare host is NOT accepted here: an SPA catch-all answering this
+            // path with one token would otherwise become a bogus cross-origin
+            // claim, and the alternative-origins check would then refuse to
+            // resolve the app at all rather than defaulting to its own origin.
+            "example.com",
+            "maintenance",
+            "<!doctype html><html><body>app</body></html>",
         ] {
             assert!(
                 parse_derivation_origin(bad).is_none(),

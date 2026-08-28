@@ -147,7 +147,7 @@ results).
 | Tool | Args | Returns |
 |------|------|---------|
 | `open_app` | `app` (name **or** URL) | **One-call entry point** when a user names/links an app: resolves the Internet Identity `derivation_origin` *and* discovers the canisters behind it, together. A name or bare host is matched to the known-app registry first (so a wrong-TLD guess repairs to the canonical URL); an explicit `https://` URL is resolved as given. An unknown bare name, or a URL with no IC evidence, is *refused* (never guessed). Also probes the app's own canisters and reports per-canister `oql`/`api_doc_available` capability flags plus a caller-gated data-access note (which canister holds the app data, and the origin to read it as the user). Wraps `resolve_app` + `discover_app_canisters`; no auth |
-| `discover_app_canisters` | `domain` | Canister ids behind a web domain — the app's own `/.well-known/ic-architecture` manifest first (the [ICP service-discoverability protocol](#the-icp-service-discoverability-protocol)'s composition layer: every canister the app *declares*, with names and roles), then the frontend via `x-ic-canister-id` and backend candidates via `/env.json` + JS-bundle mining — each with provenance, its IC dashboard label/type where known, and (for the app's own canisters) `oql`/`api_doc_available` capability flags from a one-shot Candid probe. Only the manifest is a declaration; the rest are read-only hints and [cannot authorize a write](#update-call-authorization) |
+| `discover_app_canisters` | `domain` | Canister ids behind a web domain — the app's own `/.well-known/ic-architecture` manifest first (the [ICP service-discoverability protocol](#the-icp-service-discoverability-protocol)'s composition layer: every canister the app *declares*, with names and roles), then the superseded `/.well-known/ic-app.json` as a read-only fallback, then the frontend via `x-ic-canister-id` and backend candidates via `/env.json` + JS-bundle mining — each with provenance, its IC dashboard label/type where known, and (for the app's own canisters) `oql`/`api_doc_available` capability flags from a one-shot Candid probe. Only the manifest is a declaration; the rest are read-only hints and [cannot authorize a write](#update-call-authorization) |
 | `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus two capability flags: `oql` (`true` when it exposes an OQL query surface — a `schema` + `execute` pair — with a pointer to `icp_oql_guide`) and `api_doc_available` (`true` when it declares a `getApiDoc`/`get_api_doc` method, gating `get_canister_api_doc`) |
 | `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), from its `getApiDoc`/`get_api_doc` method. Call **only** when `get_canister_candid`/`open_app` report `api_doc_available`. Returns a **structured** result in every case — `available` + the doc on success, else `available:false` with `expected`/`retry`/`next` so an expected absence is distinct from an unreachable canister |
 | `canister_query` | `canister_id`, `method?` **or** `oql?`, `args?` (textual Candid), `derivation_origin?`, `account?`, `candid?` | READ a canister — provide EITHER a Candid `query` `method` (with `args`) OR an `oql` query (a JSON object string, run against `execute`). A Candid `method` query may be anonymous or as your account and returns textual Candid; an `oql` query **requires** `derivation_origin` and returns `columns` + `rows` (a table) with `has_more`, validating `start` against the schema on an empty result. On an OQL canister a Candid `method` query is rejected — use `oql`. `candid` is a fallback: the `.did` interface text to encode/decode against when the canister exposes no `candid:service` metadata. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
@@ -226,7 +226,7 @@ its layers:
 | **Interface** | the canister's `candid:service` metadata | `get_canister_candid` fetches it; args and replies are encoded against it |
 | **Behaviour** | the `getApiDoc` / `get_api_doc` query method | `get_canister_api_doc`, gated on the `api_doc_available` flag |
 | **Data** | the OQL `schema` / `execute` query convention | `icp_oql_guide` → `get_canister_oql_schema` → `canister_query` with `oql` (see [OQL query surfaces](#oql-query-surfaces)) |
-| **Identity** | `/.well-known/ii-derivation-origin` at the application origin | `open_app` / `resolve_app` read the app's declared Internet Identity derivation origin from it (`derivation_origin_source: declared`) |
+| **Identity** | `/.well-known/ii-derivation-origin` at the application origin | `open_app` / `resolve_app` read the app's declared Internet Identity derivation origin from it (`derivation_origin_source: declared`), falling back to the superseded `ic-app.json` key when an app serves no such file |
 
 The composition manifest is a JSON document the app serves itself:
 
@@ -240,6 +240,14 @@ The composition manifest is a JSON document the app serves itself:
   ]
 }
 ```
+
+DFINITY's earlier `/.well-known/ic-app.json` proposal is superseded by this
+document. It is still *read*, as a read-only discovery fallback so apps that
+shipped it stay discoverable while they migrate (findings from it are stamped
+`ic-app.json` and rank below `ic-architecture`), and its top-level
+`derivation_origin` key is still consulted when an app serves no
+`ii-derivation-origin` — but it authorizes nothing: only `ic-architecture` can
+[authorize a write](#update-call-authorization).
 
 `version` and each entry's `id` are required; `name`, `role`, and `description`
 are optional and become the finding's label. Unknown fields are ignored (the
@@ -256,11 +264,14 @@ the user's principal against:
 https://<frontend-canister>.icp.net
 ```
 
-Omit it when the app derives against its own visible origin. It is the only
-authoritative way for `open_app` / `resolve_app` to learn a **custom** derivation
-origin from an app URL — there is no reverse lookup — so an app that pins one
-should serve it; otherwise the connector assumes the derivation origin equals
-the application origin and flags that assumption. A **cross-origin** declaration
+Omit it when the app derives against its own visible origin. The `https://`
+scheme is required — a bare host is *not* accepted here, so an SPA catch-all
+answering this path with a single token is read as "no declaration" rather than
+as a bogus origin. It is the only authoritative way for `open_app` /
+`resolve_app` to learn a **custom** derivation origin from an app URL — there is
+no reverse lookup — so an app that pins one should serve it; otherwise the
+connector assumes the derivation origin equals the application origin and flags
+that assumption. A **cross-origin** declaration
 is honoured only when the declared origin's own
 `/.well-known/ii-alternative-origins` lists the application origin (the
 browser/II rule); an unauthorized claim is refused rather than resolved to a
@@ -279,14 +290,22 @@ is refused, with no fallback path.
 **Layer 1 — the registration gate.** An update call must name an
 `application_origin`, and that application must be *registered*:
 
-1. `application_origin` is supplied (an https origin, canonicalized).
-2. That exact origin is in the server's registry of applications whose
+1. Layer 2 (below) does not refuse the method.
+2. `application_origin` is supplied (an https origin, canonicalized).
+3. That exact origin is in the server's registry of applications whose
    developers accepted the current [ICP MCP Developer Terms](#the-developer-terms).
-3. That origin serves a well-formed `/.well-known/ic-architecture` manifest,
+4. That origin serves a well-formed `/.well-known/ic-architecture` manifest,
    fetched fresh on **every** call — nothing is cached.
-4. The manifest **declares the target canister**.
-5. Layer 2 does not refuse the method.
+5. The manifest **declares the target canister**.
 6. Only then does the call execute.
+
+All six must pass, so the order decides only which refusal the caller reads.
+Layer 2 is evaluated first because it is offline and its refusal is the more
+useful one: "transfer 1 ICP" should be answered with *do it in a wallet you
+control*, not with *that application isn't registered* — the latter reads as
+though registering would make the transfer possible. A value-moving request
+therefore also never triggers an outbound fetch, and never reveals whether the
+named origin is registered.
 
 The consequence is the point: **discovery does not authorize writes.** A
 canister id from the `x-ic-canister-id` header, from an `/env.json`, or mined out
@@ -345,9 +364,22 @@ recorded here). The registry lives in `authorization.rs` as a reviewed table —
 who accepted, which revision, when — so the set of applications that may receive
 writes is public and auditable. **It ships empty**, which means no application
 can receive an update call until a publisher accepts the Terms and a reviewed
-change adds it. Revocation is removal of the row, and a Terms revision bump
-invalidates every acceptance stamped against the old revision; either takes
-effect on the very next call, since nothing is cached.
+change adds it.
+
+One row is one **origin**: an app served at both its own domain and its
+`<canister>.icp0.io` gateway origin needs a row (and a manifest) at each — an
+acceptance is not inherited across origins. Revocation is removal of the row,
+and a Terms revision bump invalidates every acceptance stamped against the old
+revision. Because the table is compiled in, either is a *release* rather than a
+runtime switch; what "nothing is cached" buys is that the change is complete the
+moment it is deployed — no TTL to wait out, no state to reconcile.
+
+What review cannot pin down: a row is reviewed once, against the manifest as it
+stood then, and the application can rewrite that manifest afterwards — adding a
+canister widens its own write scope without asking. Enforcing otherwise would
+break a legitimate deploy, so it is an obligation under the Developer Terms
+instead (the publisher warrants it may expose everything it lists), with Layer 2
+still applying to whatever is added and removal of the row as the remedy.
 
 Canister *management* (installing code, settings, lifecycle) is a different
 surface with a different basis — it acts on canisters the **user** controls,
@@ -374,8 +406,11 @@ the response must have come from the origin that was asked, not a redirect
 target — the shared redirect policy permits same-host different-port hops, so
 without that check a neighbouring origin's manifest could be read as this one's
 declaration. Because the fetch happens only *after* the registry check, the set
-of origins this server will ever fetch a manifest from is the curated registry —
-a caller cannot steer it at an origin of their choosing.
+of origins the **authorization path** will fetch is the curated registry: a
+caller cannot use an update call to steer this server's client at an origin of
+their choosing. (Discovery still reads the same path from any origin a caller
+names — that is its job, under the same guards — so the property is about the
+write path, not about the process never fetching an arbitrary origin.)
 
 When the user names a **token, project, or service** rather than a website or
 id, web search the canister id or ask the user for it.

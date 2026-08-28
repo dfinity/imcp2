@@ -359,10 +359,11 @@ Paste-and-adapt; portal limits in parentheses.
 >    they control — that behavior is intended (financial transactions are
 >    not supported).
 > 6. State-changing calls to an application that is not registered with us are
->    refused by design, with a message naming the ICP MCP Developer Terms. The
->    registry ships empty, so a reviewer testing an update call against an
->    arbitrary app will see that refusal; reads are unaffected and are what the
->    walkthrough above exercises.
+>    also refused by design, with a message naming the ICP MCP Developer Terms
+>    and offering the read instead. The registry ships empty, so **every**
+>    update call a reviewer tries will be refused — that is the intended
+>    posture, not a defect. Reads are unaffected, and are what the walkthrough
+>    above exercises.
 
 ### The seven compliance acknowledgments
 

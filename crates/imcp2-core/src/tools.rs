@@ -1210,7 +1210,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). The domain must be one you actually have (from the user, open_app's known-app resolution, or a web search) — NEVER a domain guessed from an app's name; when you only know a NAME, call open_app with the name first. Returns every canister id found, with provenance, most authoritative first: the app's own /.well-known/ic-architecture manifest (the ICP service-discoverability protocol's composition layer — ALL the canisters it declares, with names and roles), then the `x-ic-canister-id` header (the frontend/asset canister), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. The manifest is the app's own DECLARATION about its composition and is the only source an update call can be authorized against; header/env.json/bundle entries are mined candidates good for reading only — pick by label (prefer production/IC ids) and confirm with get_canister_candid before calling.",
+        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). The domain must be one you actually have (from the user, open_app's known-app resolution, or a web search) — NEVER a domain guessed from an app's name; when you only know a NAME, call open_app with the name first. Returns every canister id found, with provenance, most authoritative first: the app's own /.well-known/ic-architecture manifest (the ICP service-discoverability protocol's composition layer — ALL the canisters it declares, with names and roles), then the superseded /.well-known/ic-app.json manifest (read-only fallback for apps that have not migrated), then the `x-ic-canister-id` header (the frontend/asset canister), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. The manifest is the app's own DECLARATION about its composition and is the only source an update call can be authorized against; header/env.json/bundle entries are mined candidates good for reading only — pick by label (prefer production/IC ids) and confirm with get_canister_candid before calling.",
         annotations(title = "Discover canisters behind a domain", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::DiscoverOutput>(),
     )]
@@ -1240,11 +1240,12 @@ impl IcCanisterTools {
                 out.push_str(
                     "\n`ic-architecture` entries are DECLARED by the app itself, in its own \
                      manifest with names and roles — the app's claim about its composition, and \
-                     the only provenance a state-changing call can be authorized against. The \
-                     `header` (x-ic-canister-id) entry is the frontend/asset canister. Others come \
-                     from env.json or the JS bundle. All three of those are READ-ONLY hints — they \
-                     may include multiple environments (prefer the production/IC ids) and cannot \
-                     authorize an update call. A \
+                     the ONLY provenance a state-changing call can be authorized against. \
+                     `ic-app.json` is the superseded manifest, read as a fallback. The `header` \
+                     (x-ic-canister-id) entry is the frontend/asset canister; others come from \
+                     env.json or the JS bundle. Everything except `ic-architecture` is a \
+                     READ-ONLY hint — such entries may include multiple environments (prefer the \
+                     production/IC ids) and cannot authorize an update call. A \
                      «name» (type) is the IC dashboard's label for that id. `[oql]`/`[api-doc]` \
                      flags are from a Candid probe of the app's own canisters. Confirm an interface \
                      with get_canister_candid before calling.",
@@ -2123,7 +2124,10 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              Internet Identity's consent screen asks the user to choose an access level, \
              \"Questions only\" or \"Actions & questions\". On a Questions-only session reads work, but \
              state-changing calls (canister_update_call) are rejected by the network — if one fails \
-             that way, ask the user to reconnect and choose \"Actions & questions\".\n\n\
+             that way, ask the user to reconnect and choose \"Actions & questions\". That is a \
+             DIFFERENT failure from the write gate above: a gate refusal names the application \
+             origin or the Developer Terms and reconnecting cannot help it, while a \
+             Questions-only rejection comes from the network after the gate has passed.\n\n\
              Typical flow (acting FOR THE USER at an app): (0-2) `open_app(name-or-URL)` in ONE \
              call gives the `derivation_origin` AND the app's canisters (with `oql`/`api_doc_available` \
              flags) — pass the NAME the user said (well-known apps resolve \

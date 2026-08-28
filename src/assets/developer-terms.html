@@ -115,7 +115,7 @@ code {
 <main class=doc>
 <p class=eyebrow><a href="/">ICP MCP</a></p>
 <h1>ICP MCP Developer Terms</h1>
-<p class=effective>Revision __REVISION__ &middot; Effective date: August 28, 2026</p>
+<p class=effective>Revision __REVISION__ &middot; in effect from __REVISION__</p>
 
 <p>These Developer Terms ("Developer Terms") govern the registration of an
 <strong>application</strong> for state-changing access through the ICP MCP
@@ -168,8 +168,8 @@ a system canister &mdash; in order to reach it through the Service.</li>
 <code>name</code>, <code>role</code>, and <code>description</code> fields do not
 misdescribe what a canister is or does.</li>
 <li>You keep it current: a canister you no longer operate, or no longer intend
-to be reachable, is removed promptly. Removal takes effect on the Service's
-next call.</li>
+to be reachable, is removed promptly. Because the Service re-reads your manifest
+on every state-changing call, your removal takes effect on its next one.</li>
 <li>The origin you register is one you control, served over HTTPS.</li>
 </ul>
 
@@ -226,8 +226,8 @@ those calls. Reads are unaffected.</p>
 
 <p>We may suspend or remove a registration at any time, with or without notice
 where a security risk, a breach of these Developer Terms, or a legal obligation
-requires it. Removal takes effect on the Service's next call; there is nothing
-cached that would keep a removed registration alive. You may ask us to remove
+requires it. Removal takes effect from the first call after we deploy it, and
+nothing cached can keep a removed registration alive past that point. You may ask us to remove
 your registration at any time. Registration is free of charge, gives you no
 entitlement to the Service's availability, and grants no rights to DFINITY
 Foundation's names, logos, or other trademarks.</p>

@@ -551,13 +551,12 @@ mod tests {
             "the refusal names the current revision: {text}"
         );
 
-        // Layer ordering, end to end: registration is the OUTER gate, so an
-        // unregistered origin is turned away before the method is even
-        // considered — a value-moving method on the ICP ledger is refused here
-        // for not being registered, not for being financial. (That the
-        // financial guard still refuses it INSIDE an authorized surface is
-        // pinned in imcp2-core's authorization tests, which can stand up a
-        // registered application.)
+        // Layer ordering, end to end: the financial guard is evaluated FIRST,
+        // so a value-moving request gets the answer it actually needs — do it
+        // in a wallet you control — rather than a registration message that
+        // would read as though registering could make the transfer possible.
+        // The refusal is therefore the same whether or not the named
+        // application is registered.
         let (is_error, text, _) = call(
             "canister_update_call",
             Some(serde_json::json!({
@@ -570,8 +569,16 @@ mod tests {
         .await;
         assert!(is_error, "a value-moving method must be refused");
         assert!(
-            text.contains("Developer Terms"),
-            "registration is the outer gate: {text}"
+            text.contains("icrc1_transfer"),
+            "the financial guard answers first: {text}"
+        );
+        assert!(
+            text.contains("oisy.com"),
+            "and redirects to a wallet the user controls: {text}"
+        );
+        assert!(
+            !text.contains("Developer Terms"),
+            "a transfer must not be answered with a registration message: {text}"
         );
 
         // Deferral: a protocol/meta tool is not just unlisted — calling it

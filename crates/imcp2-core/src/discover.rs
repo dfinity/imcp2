@@ -9,24 +9,28 @@
 //!      roles. This is the app *declaring* its composition at its own origin,
 //!      which is why it is also the only source that can authorize a
 //!      state-changing call ([`crate::authorization`]).
-//!   2. `x-ic-canister-id` response header — the frontend/asset canister. The
+//!   2. `/.well-known/ic-app.json` — the earlier, DFINITY-proposed manifest
+//!      the protocol's layer 1 supersedes. Still read, so apps that shipped it
+//!      keep being discovered while they migrate, but it is a **read-only
+//!      fallback**: it authorizes nothing.
+//!   3. `x-ic-canister-id` response header — the frontend/asset canister. The
 //!      one universal signal (the HTTP gateway sets it).
-//!   3. a runtime config asset (`/env.json`) carrying `*canister_id*` keys —
+//!   4. a runtime config asset (`/env.json`) carrying `*canister_id*` keys —
 //!      e.g. Caffeine apps expose `backend_canister_id` here.
-//!   4. canister-id literals in the JS bundle, preferring labelled
+//!   5. canister-id literals in the JS bundle, preferring labelled
 //!      `*_CANISTER_ID` constants — e.g. dfx/Vite apps like OISY bake
 //!      `IC_BACKEND_CANISTER_ID`, `IC_SIGNER_CANISTER_ID`, etc.
 //!
-//! There is NO authoritative reverse lookup for "this site's backend". (1) is
-//! declared by the app itself and (2) is certain for the frontend; (3) and (4)
-//! are mined from client code, so each result carries its provenance and the
-//! caller decides (and should confirm with `get_canister_candid`).
+//! There is NO authoritative reverse lookup for "this site's backend". (1) and
+//! (2) are declared by the app itself and (3) is certain for the frontend; (4)
+//! and (5) are mined from client code, so each result carries its provenance
+//! and the caller decides (and should confirm with `get_canister_candid`).
 //!
-//! **Provenance is not permission.** (2)–(4) are read-only hints: they say a
-//! canister id appeared in bytes served behind a domain, not that the
-//! application claims it. They are useful for finding what to *read* and can
-//! authorize nothing — an update call is authorized only against (1). See
-//! [`crate::authorization`].
+//! **Provenance is not permission.** Only (1) can authorize a state-changing
+//! call; (2)–(5) are read-only hints. (3)–(5) say a canister id appeared in
+//! bytes served behind a domain, not that the application claims it, and even
+//! (2) — a real app declaration — is not the protocol's manifest, so it is not
+//! what a write is checked against. See [`crate::authorization`].
 //!
 //! [ICP service-discoverability protocol]: https://docs.internetcomputer.org/guides/frontends/service-discoverability/
 
@@ -52,8 +56,8 @@ pub struct Found {
     /// env.json key, a bundle constant name, or "frontend"); None for a bare
     /// bundle literal.
     pub label: Option<String>,
-    /// Where it was found: "ic-architecture", "header", "env.json",
-    /// "bundle:<LABEL>", "bundle".
+    /// Where it was found: "ic-architecture", "ic-app.json", "header",
+    /// "env.json", "bundle:<LABEL>", "bundle".
     pub sources: Vec<String>,
     /// IC dashboard label (e.g. "ICP Ledger"), filled in when the id is a known
     /// canister; None otherwise. Set during dashboard enrichment.
@@ -81,10 +85,11 @@ pub struct DiscoveredCanister {
     /// Where it was found: "ic-architecture" (the app's own
     /// `/.well-known/ic-architecture` manifest — the app DECLARING which
     /// canisters it comprises, and the only source a state-changing call can
-    /// be authorized against), "header" (the IC gateway's x-ic-canister-id —
-    /// the frontend), "env.json", "bundle:<LABEL>", or "bundle". Only the
-    /// first is a declaration; the rest are read-only hints mined from served
-    /// bytes and authorize nothing.
+    /// be authorized against), "ic-app.json" (the superseded manifest, read as
+    /// a fallback while apps migrate), "header" (the IC gateway's
+    /// x-ic-canister-id — the frontend), "env.json", "bundle:<LABEL>", or
+    /// "bundle". Only "ic-architecture" can authorize an update call; every
+    /// other provenance is a read-only hint.
     pub sources: Vec<String>,
     /// Whether this canister exposes the OQL query surface — filled in for the
     /// app's OWN data canisters by a single Candid fetch during open_app /
@@ -128,14 +133,18 @@ impl From<&Found> for DiscoveredCanister {
 /// canisters to a state-changing call.
 pub fn is_app_data_candidate(c: &DiscoveredCanister) -> bool {
     // Declared or mined as the app's own backend (not merely the gateway header).
-    let app_owned = c
-        .sources
-        .iter()
-        .any(|s| s == "ic-architecture" || s == "env.json" || s.starts_with("bundle"));
-    // The frontend / asset canister: an explicit "frontend" label, or found ONLY
-    // via the gateway `x-ic-canister-id` header.
-    let is_frontend =
-        c.label.as_deref() == Some("frontend") || c.sources == ["header"];
+    let app_owned = c.sources.iter().any(|s| {
+        s == "ic-architecture" || s == "ic-app.json" || s == "env.json" || s.starts_with("bundle")
+    });
+    // The frontend / asset canister: a label that SAYS frontend, or found ONLY
+    // via the gateway `x-ic-canister-id` header. Matched as a word rather than
+    // by equality, because a declared label is prose the app wrote: the
+    // protocol's own example manifest labels its frontend `"the frontend
+    // (frontend)"` once name and role are folded, and an equality test against
+    // "frontend" would miss it and hand the asset canister out as a data
+    // backend.
+    let is_frontend = c.label.as_deref().is_some_and(label_says_frontend)
+        || c.sources == ["header"];
     // A dashboard-classified shared system canister (ledger, governance, …).
     let is_system = c.kind.as_deref().is_some_and(|k| {
         let k = k.to_ascii_lowercase();
@@ -144,6 +153,22 @@ pub fn is_app_data_candidate(c: &DiscoveredCanister) -> bool {
             .any(|s| k.contains(s))
     });
     app_owned && !is_frontend && !is_system
+}
+
+/// Whether a discovered canister's label identifies it as the app's frontend /
+/// asset canister. A whole-WORD match on the app-supplied prose, so "frontend",
+/// "the frontend (frontend)", "Frontend assets", and "asset canister" all count.
+///
+/// Words are split on whitespace only, with surrounding punctuation trimmed —
+/// deliberately NOT on `-`/`_`, which are identifier separators rather than
+/// prose: a backend an app names `frontend-orders-api` or `frontend_api` is the
+/// API *for* the frontend, not the frontend, and misreading it as one would
+/// quietly drop it from the OQL/api-doc capability probe.
+fn label_says_frontend(label: &str) -> bool {
+    label.split_whitespace().any(|w| {
+        let w = w.trim_matches(|c: char| !c.is_alphanumeric());
+        ["frontend", "asset", "assets"].iter().any(|k| w.eq_ignore_ascii_case(k))
+    })
 }
 
 /// Arguments for `discover_app_canisters`.
@@ -209,11 +234,88 @@ fn canisters_from_env_json(text: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Cap on how many entries we honour in an app-served list — an app-declared
-/// list is small; this just bounds a hostile document. (The architecture
-/// manifest has its own, larger cap in [`crate::architecture`], because there
-/// truncation would silently deny a declared canister.)
+/// Cap on how many entries we honour in a list an app serves us — an
+/// app-declared list is small, so this only bounds a hostile document. Applies
+/// to the superseded `ic-app.json` manifest and to `ii-alternative-origins`.
+///
+/// The ARCHITECTURE manifest deliberately does not share this cap: it has its
+/// own, far larger one in [`crate::architecture`], because there a truncated
+/// list would silently deny a canister the app really declared — a wrong
+/// answer, where here it is merely a shorter list of read hints.
 const MAX_MANIFEST_CANISTERS: usize = 100;
+
+/// The superseded `/.well-known/ic-app.json` manifest: DFINITY's own earlier
+/// proposal for app-declared composition, which the ICP
+/// service-discoverability protocol's `/.well-known/ic-architecture` replaces
+/// (see [`crate::architecture`]).
+///
+/// Still parsed, for exactly one reason: apps that shipped it should keep being
+/// DISCOVERABLE while they migrate. It is a read-only fallback — findings from
+/// it are stamped `ic-app.json`, rank below the architecture manifest, and
+/// authorize nothing ([`crate::authorization`] admits only ids the architecture
+/// manifest declares). Unknown fields are ignored; entries whose `id` isn't a
+/// valid principal are dropped downstream by `add`.
+///
+/// ```json
+/// { "derivation_origin": "https://<frontend-canister>.icp0.io",
+///   "canisters": [
+///     { "id": "aaaaa-…-cai", "role": "backend", "description": "orders API" },
+///     { "id": "bbbbb-…-cai", "role": "ledger" } ] }
+/// ```
+#[derive(Deserialize)]
+struct AppManifest {
+    #[serde(default)]
+    canisters: Vec<AppManifestEntry>,
+    #[serde(default)]
+    derivation_origin: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AppManifestEntry {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// Extract `(canister_id, label)` pairs from an `/.well-known/ic-app.json`
+/// body; the label is "role — description", whichever parts are present.
+/// Fail-SOFT (an empty list) on any malformed body: this is a discovery hint,
+/// so an unreadable one costs a finding, never a refusal.
+fn canisters_from_app_manifest(text: &str) -> Vec<(String, Option<String>)> {
+    let Ok(m) = serde_json::from_str::<AppManifest>(text) else {
+        return Vec::new();
+    };
+    m.canisters
+        .into_iter()
+        .filter(|e| !e.id.trim().is_empty())
+        .take(MAX_MANIFEST_CANISTERS)
+        .map(|e| {
+            let role = e.role.as_deref().map(clean_label).filter(|s| !s.is_empty());
+            let desc = e.description.as_deref().map(clean_label).filter(|s| !s.is_empty());
+            let label = match (role, desc) {
+                (Some(r), Some(d)) => Some(format!("{r} — {d}")),
+                (Some(r), None) => Some(r),
+                (None, Some(d)) => Some(d),
+                (None, None) => None,
+            };
+            (e.id.trim().to_string(), label)
+        })
+        .collect()
+}
+
+/// The derivation origin the superseded manifest declares in its optional
+/// top-level `derivation_origin`, reduced to a bare `https://host[:port]`
+/// origin. Consulted only when the protocol's own
+/// `/.well-known/ii-derivation-origin` names none, so an app that has migrated
+/// is never second-guessed by its old file. `None` if absent, blank, an
+/// explicit non-https scheme, user-info, or not a parseable URL.
+fn declared_derivation_origin(manifest_text: &str) -> Option<String> {
+    let m = serde_json::from_str::<AppManifest>(manifest_text).ok()?;
+    normalize_origin(m.derivation_origin?.as_str())
+}
 
 /// Reduce a raw origin string to a canonical bare `https://host[:port]` origin,
 /// accepting https with a real (tuple) host and no user-info. A scheme-less value
@@ -613,57 +715,71 @@ struct DeclaredResolution {
     alt_origins: Option<Vec<String>>,
 }
 
-impl DeclaredResolution {
-    /// The application-origin default (no usable declaration), carrying whatever
-    /// IC evidence the response showed.
-    fn app_default(application_origin: &str, ic_evidence: bool) -> Self {
-        Self {
-            derivation_origin: application_origin.to_string(),
-            source: DerivationSource::AppUrlDefault,
-            ic_evidence,
-            alt_origins: None,
-        }
+/// Read one well-known document from the application origin and extract a
+/// declared derivation origin from it with `parse`. Returns `(ic_evidence,
+/// declared)`; both an unreachable origin and a non-success status yield
+/// `(evidence-so-far, None)` — a declaration this server can't read is simply
+/// no declaration, since the spec has an app that derives against its own
+/// origin serve no file at all. The response doubles as IC-hosting evidence
+/// (attributed to this exact origin, not a redirect target).
+async fn read_declared_origin_file(
+    client: &reqwest::Client,
+    application_origin: &str,
+    path: &str,
+    parse: fn(&str) -> Option<String>,
+) -> (bool, Option<String>) {
+    let Ok(resp) = client.get(format!("{application_origin}{path}")).send().await else {
+        return (false, None);
+    };
+    let ic_evidence = ic_evidence_from(&resp, application_origin);
+    if !resp.status().is_success() {
+        return (ic_evidence, None);
     }
+    let text = read_capped(resp, MAX_META_BYTES).await;
+    (ic_evidence, parse(&text))
 }
 
-/// Resolve the app's declared derivation origin from
-/// `/.well-known/ii-derivation-origin` — the identity layer of the ICP
-/// service-discoverability protocol, whose whole content is the one origin
-/// Internet Identity derives against (see [`crate::architecture`]) — and
-/// authorize a cross-origin claim against the declared origin's own
-/// `ii-alternative-origins` (the browser/II rule; the decision is
-/// [`decide_declared_origin`]). Flat, with early guards. A missing/unsuccessful/
-/// unparseable file legitimately yields the application-origin default: the
-/// spec says an app that derives against its own visible origin omits the file
-/// entirely.
+/// Resolve the app's declared derivation origin, then authorize a cross-origin
+/// claim against the declared origin's own `ii-alternative-origins` (the
+/// browser/II rule; the decision is [`decide_declared_origin`]).
+///
+/// Two sources, in precedence order: the protocol's identity layer
+/// `/.well-known/ii-derivation-origin` (one line naming the origin Internet
+/// Identity derives against — see [`crate::architecture`]), then, only if that
+/// names none, the superseded `ic-app.json` manifest's `derivation_origin` key,
+/// so an app that hasn't migrated still resolves. An app that HAS migrated is
+/// never second-guessed by its old file. Nothing declared at all legitimately
+/// yields the application-origin default.
 ///
 /// A cross-origin claim that CANNOT be authorized is an `Err`, not a silent
 /// fall-back: falling back to the application origin there would derive the WRONG
 /// principal for an app that deliberately pins a custom derivation origin (and
 /// would mask a spoof, a misconfiguration, or an unreachable `ii-alternative-origins`).
 /// Surfacing it lets the caller refuse rather than act as an unintended identity
-/// (ICPBB-430). The response doubles as IC-hosting evidence, captured for the
+/// (ICPBB-430). The responses double as IC-hosting evidence, captured for the
 /// caller's later gate.
 async fn resolve_declared_origin(
     client: &reqwest::Client,
     application_origin: &str,
 ) -> Result<DeclaredResolution, String> {
-    let Ok(resp) = client
-        .get(format!(
-            "{application_origin}{}",
-            architecture::II_DERIVATION_ORIGIN_WELL_KNOWN
-        ))
-        .send()
-        .await
-    else {
-        return Ok(DeclaredResolution::app_default(application_origin, false));
-    };
-    let ic_evidence = ic_evidence_from(&resp, application_origin);
-    if !resp.status().is_success() {
-        return Ok(DeclaredResolution::app_default(application_origin, ic_evidence));
+    let (mut ic_evidence, mut declared) = read_declared_origin_file(
+        client,
+        application_origin,
+        architecture::II_DERIVATION_ORIGIN_WELL_KNOWN,
+        architecture::parse_derivation_origin,
+    )
+    .await;
+    if declared.is_none() {
+        let (evidence, fallback) = read_declared_origin_file(
+            client,
+            application_origin,
+            "/.well-known/ic-app.json",
+            declared_derivation_origin,
+        )
+        .await;
+        ic_evidence |= evidence;
+        declared = fallback;
     }
-    let text = read_capped(resp, MAX_META_BYTES).await;
-    let declared = architecture::parse_derivation_origin(&text);
 
     // The declared origin's ii-alternative-origins is the authorization list, and
     // only a CROSS-origin claim needs it — no declaration and a self-declaration
@@ -1199,9 +1315,21 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
             }
         }
     }
+    // 2. The superseded ic-app.json manifest, as a read-only fallback so apps
+    // that shipped it stay discoverable while they migrate. Ranked and probed
+    // after the architecture manifest, so a migrated app's own labels win
+    // first-label-wins; authorizes nothing either way.
+    if let Ok(resp) = client.get(format!("{origin}/.well-known/ic-app.json")).send().await {
+        if resp.status().is_success() {
+            let text = read_capped(resp, MAX_META_BYTES).await;
+            for (id, label) in canisters_from_app_manifest(&text) {
+                found.add(&id, label, "ic-app.json".into());
+            }
+        }
+    }
 
-    // 2. Frontend via the gateway header (and keep the HTML for bundle mining).
-    // This is also the reachability gate: the two probes above are best-effort,
+    // 3. Frontend via the gateway header (and keep the HTML for bundle mining).
+    // This is also the reachability gate: the probes above are best-effort,
     // but an unreachable base is a hard error.
     let resp = client
         .get(&base)
@@ -1217,7 +1345,7 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
     }
     let html = read_capped(resp, MAX_BODY_BYTES).await;
 
-    // 3. Runtime config: /env.json with *canister_id* keys (e.g. Caffeine apps).
+    // 4. Runtime config: /env.json with *canister_id* keys (e.g. Caffeine apps).
     if let Ok(resp) = client.get(format!("{origin}/env.json")).send().await {
         if resp.status().is_success() {
             let text = read_capped(resp, MAX_ENV_JSON_BYTES).await;
@@ -1227,7 +1355,7 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
         }
     }
 
-    // 4. JS bundle: labelled constants first, then any bare canister literals.
+    // 5. JS bundle: labelled constants first, then any bare canister literals.
     let mut blob = html.clone();
     let script_re = Regex::new(r#"["'](/[^"'<> ]+?\.js)["']"#).unwrap();
     // Only the first 20 (sorted) paths are fetched below, and no real page has
@@ -1278,21 +1406,26 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
         found.add(m.as_str(), None, "bundle".into());
     }
 
-    // Order: the app's own declaration first (the architecture manifest), then
-    // the mined hints — header (frontend), env.json, labelled bundle, bare.
-    // Authority tier of a finding (lower = more authoritative). Kept as a helper
-    // so the sort can compare it without cloning `canister_id` into a key.
+    // Order: the protocol's own declaration first (the architecture manifest),
+    // then the superseded manifest, then the mined hints — header (frontend),
+    // env.json, labelled bundle, bare. Authority tier of a finding (lower = more
+    // authoritative). Kept as a helper so the sort can compare it without
+    // cloning `canister_id` into a key. Note this is DISPLAY/cap authority, not
+    // permission: only tier 0 can authorize a write, and no tier below it can,
+    // however high it sorts.
     let rank = |f: &Found| {
         if f.sources.iter().any(|s| s == "ic-architecture") {
             0
-        } else if f.sources.iter().any(|s| s == "header") {
+        } else if f.sources.iter().any(|s| s == "ic-app.json") {
             1
-        } else if f.sources.iter().any(|s| s == "env.json") {
+        } else if f.sources.iter().any(|s| s == "header") {
             2
-        } else if f.sources.iter().any(|s| s.starts_with("bundle:")) {
+        } else if f.sources.iter().any(|s| s == "env.json") {
             3
-        } else {
+        } else if f.sources.iter().any(|s| s.starts_with("bundle:")) {
             4
+        } else {
+            5
         }
     };
     let dropped = found.dropped;
@@ -2628,16 +2761,34 @@ mod tests {
             oql: None,
             api_doc_available: None,
         };
-        // App-declared / app-mined backends → candidates. Retired provenances
-        // are not: a source string this server no longer produces must not
-        // qualify a canister for anything.
+        // App-declared / app-mined backends → candidates.
         assert!(is_app_data_candidate(&dc(Some("the backend"), &["ic-architecture"], None)));
+        assert!(is_app_data_candidate(&dc(Some("backend"), &["ic-app.json"], None)));
         assert!(is_app_data_candidate(&dc(Some("backend_canister_id"), &["env.json"], None)));
         assert!(is_app_data_candidate(&dc(Some("BACKEND"), &["bundle:BACKEND"], None)));
+        // A retired provenance qualifies a canister for nothing: this server no
+        // longer produces the string, so a finding carrying it is not ours.
         assert!(!is_app_data_candidate(&dc(None, &["ai-connect.html"], None)));
-        assert!(!is_app_data_candidate(&dc(Some("backend"), &["ic-app.json"], None)));
-        // The frontend / asset canister → NOT a candidate.
-        assert!(!is_app_data_candidate(&dc(Some("frontend"), &["ic-architecture"], None)));
+        // The frontend / asset canister → NOT a candidate. The label is prose
+        // the APP wrote, so the match is on words, not equality: the protocol's
+        // own example manifest labels its frontend "the frontend (frontend)"
+        // once name and role are folded, and an equality test against
+        // "frontend" would hand the asset canister out as a data backend.
+        for label in ["frontend", "the frontend (frontend)", "Frontend assets", "asset canister"] {
+            assert!(
+                !is_app_data_candidate(&dc(Some(label), &["ic-architecture"], None)),
+                "{label:?} is the frontend, not a data backend"
+            );
+        }
+        // …but an identifier that merely STARTS with the word is a backend: an
+        // app naming one `frontend-orders-api` means the API for the frontend,
+        // and reading it as the frontend would drop it from the capability probe.
+        for label in ["frontend-orders-api", "frontend_api", "assets_index"] {
+            assert!(
+                is_app_data_candidate(&dc(Some(label), &["ic-architecture"], None)),
+                "{label:?} is a backend, not the frontend"
+            );
+        }
         assert!(!is_app_data_candidate(&dc(None, &["header"], None)));
         // A shared system canister (dashboard-classified) → NOT a candidate, even
         // if it slipped in via a bundle literal.

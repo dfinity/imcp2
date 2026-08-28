@@ -164,20 +164,25 @@ Negative:
    Computer presence) → refused by the IC-evidence gate with guidance
    (web-search or ask the user for the real URL) rather than resolved to a
    wrong identity.
-2. A state-changing call (canister_update_call) on a "Questions only"
-   session → the network rejects it and the tool reports the failed call;
-   the server instructions prime the assistant to explain the access level
-   and recommend reconnecting under "Actions & questions".
+2. "Transfer 1 ICP" → refused before any network call, with the financial
+   policy and a pointer to a wallet the user controls. The financial guard is
+   evaluated first, so this is the answer whatever `application_origin` is
+   passed.
 3. Any authenticated tool with no sign-in → clean 401 → OAuth flow starts
    (no crash, no hang).
-4. "Call an update method on a canister that rejects this caller" → the
-   canister/network rejects it; the error is surfaced legibly.
-5. "Transfer 1 ICP" / "call an update method on an app of your choosing" →
-   refused before any network call: an update needs an `application_origin`
-   that is a registered application whose manifest declares the canister, and
-   the refusal says so and offers the read instead. With the registry shipping
-   empty, this is the expected outcome for every application; reads (cases 1-5
-   above) are unaffected.
+4. "Call an update method on an app of your choosing" → refused, naming the
+   ICP MCP Developer Terms: a state-changing call needs an
+   `application_origin` that is a registered application whose own
+   `/.well-known/ic-architecture` manifest declares the canister. With the
+   registry shipping empty this is the outcome for every application, so it is
+   the reviewer's expected result; the refusal offers the read path instead,
+   and reads (positive cases 1-5) are unaffected.
+5. A state-changing call on a "Questions only" session → refused by the
+   registration gate above, before the access level is ever tested. Once an
+   application is registered, a Questions-only session's update is rejected by
+   the network instead, and the server instructions prime the assistant to
+   explain the access level and recommend reconnecting under "Actions &
+   questions".
 
 ### 5. Decisions for the submitter
 
