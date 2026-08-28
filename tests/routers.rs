@@ -65,6 +65,7 @@ fn app() -> Router {
         .merge(beta.well_known_router())
         .merge(prod.root_well_known_router())
         .merge(imcp2::auth_callbacks_router(&[&prod, &beta]))
+        .merge(imcp2::ii_app_metadata_router())
 }
 
 async fn get_json(app: Router, path: &str) -> (StatusCode, serde_json::Value) {
@@ -157,6 +158,31 @@ async fn auth_callbacks_document_declares_every_mount() {
         ],
         "one entry per instance, under each mount"
     );
+}
+
+/// The app-metadata document has to meet Internet Identity's requirements or
+/// it is discarded whole — silently, on a screen this server never sees.
+#[tokio::test]
+async fn ii_app_metadata_document_meets_ii_requirements() {
+    let (status, doc) = get_json(app(), "/.well-known/ii-app-metadata").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let name = doc["name"].as_str().expect("name is a string");
+    assert!(!name.trim().is_empty(), "a blank name reads as absent to II");
+    assert!(
+        name.chars().count() <= 40,
+        "name must fit II's 40-code-point cap, got {} in {name:?}",
+        name.chars().count()
+    );
+
+    for field in ["privacyPolicyUrl", "termsOfServiceUrl"] {
+        let url = doc[field].as_str().unwrap_or_else(|| panic!("{field} is a string"));
+        // II takes `https` only, and refuses userinfo (which would let a URL
+        // read as one host and resolve to another).
+        assert!(url.starts_with("https://"), "{field} must be https, got {url}");
+        let authority = url.trim_start_matches("https://").split('/').next().unwrap_or_default();
+        assert!(!authority.contains('@'), "{field} must not carry userinfo, got {url}");
+    }
 }
 
 #[tokio::test]
