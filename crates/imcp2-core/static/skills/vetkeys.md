@@ -29,9 +29,9 @@ Also required: Rust `ic-cdk = "0.20"` + `ic-cdk-management-canister = "0.1"` (an
 | You want to… | Use |
 |--------------|-----|
 | Store & share encrypted key-value data (password manager, notes, vault) | **`encrypted-maps` skill** (higher-level, start there) |
-| Encrypt to a principal so only they can decrypt (messaging) | **IBE** → `references/ibe.md` |
-| Reveal data only after a deadline (sealed-bid auction, timelock) | **Timelock IBE** → `references/ibe.md` |
-| Have the canister produce a signature verifiable by anyone | **Threshold BLS** → `references/bls-signing.md` |
+| Encrypt to a principal so only they can decrypt (messaging) | **IBE** → `skill://vetkeys/references/ibe.md` |
+| Reveal data only after a deadline (sealed-bid auction, timelock) | **Timelock IBE** → `skill://vetkeys/references/ibe.md` |
+| Have the canister produce a signature verifiable by anyone | **Threshold BLS** → `skill://vetkeys/references/bls-signing.md` |
 | Derive a per-user/per-resource symmetric (AES) key | **Symmetric derivation** → this file |
 | Encrypt to a principal without any canister call | **Offline public-key derivation** → this file |
 | Produce on-chain verifiable randomness | **Verifiable randomness (VRF)** → this file |
@@ -224,8 +224,8 @@ A vetKey can be turned into **verifiable randomness**: a Rust canister calls `ic
 
 ## Feature guides
 
-- **Identity-Based Encryption (IBE) & timelock** — encrypt with `IbeCiphertext.encrypt(publicKey, IbeIdentity.fromPrincipal(recipient), plaintext, IbeSeed.random())`; the recipient decrypts with `IbeCiphertext.deserialize(ct).decrypt(vetKey)`. Full backend + frontend + timelock: `references/ibe.md`.
-- **Threshold BLS signatures** — sign with `ic_vetkeys::management_canister::sign_with_bls` (Rust) / `ManagementCanister.signWithBls` (Motoko); verify with `verifyBlsSignature(derivedPublicKey, message, signature)`. Details: `references/bls-signing.md`.
+- **Identity-Based Encryption (IBE) & timelock** — encrypt with `IbeCiphertext.encrypt(publicKey, IbeIdentity.fromPrincipal(recipient), plaintext, IbeSeed.random())`; the recipient decrypts with `IbeCiphertext.deserialize(ct).decrypt(vetKey)`. Full backend + frontend + timelock: `skill://vetkeys/references/ibe.md`.
+- **Threshold BLS signatures** — sign with `ic_vetkeys::management_canister::sign_with_bls` (Rust) / `ManagementCanister.signWithBls` (Motoko); verify with `verifyBlsSignature(derivedPublicKey, message, signature)`. Details: `skill://vetkeys/references/bls-signing.md`.
 - **Encrypted key-value storage (EncryptedMaps / KeyManager)** — the **`encrypted-maps`** skill.
 
 ## Deploy & verify

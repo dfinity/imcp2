@@ -16,7 +16,7 @@ The **`@dfinity/static-site` recipe** deploys a static site — a built frontend
 
 **This is the recommended way to host a frontend on the IC going forward.** The recipe bundles a matched pair — the canister and its sync plugin — pinned together by one version. You point it at your build directory; `icp deploy` uploads, certifies, and serves.
 
-> The older **`@dfinity/asset-canister` recipe** (the SDK asset canister, configured with `.ic-assets.json5`) is still supported for existing projects but is no longer the recommended path. It is a *different canister* with a different config format and API — see [`references/legacy-asset-canister.md`](skill://static-site/references/legacy-asset-canister.md). To move an existing project over, see [`references/migrating-from-asset-canister.md`](skill://static-site/references/migrating-from-asset-canister.md).
+> The older **`@dfinity/asset-canister` recipe** (the SDK asset canister, configured with `.ic-assets.json5`) is still supported for existing projects but is no longer the recommended path. It is a *different canister* with a different config format and API — see [`skill://static-site/references/legacy-asset-canister.md`](skill://static-site/references/legacy-asset-canister.md). To move an existing project over, see [`skill://static-site/references/migrating-from-asset-canister.md`](skill://static-site/references/migrating-from-asset-canister.md).
 
 ## Prerequisites
 
@@ -295,8 +295,8 @@ icp canister call frontend http_request '(record {
 
 ## Legacy Asset Canister and Migration
 
-- **Maintaining an existing `@dfinity/asset-canister` project** (`.ic-assets.json5`, `AssetManager` uploads, `grant_permission` roles, `allow_raw_access`): see [`references/legacy-asset-canister.md`](skill://static-site/references/legacy-asset-canister.md).
-- **Moving an existing asset-canister project to certified-assets / static-site**: see [`references/migrating-from-asset-canister.md`](skill://static-site/references/migrating-from-asset-canister.md) for the config mapping and the reinstall-mode caveat.
+- **Maintaining an existing `@dfinity/asset-canister` project** (`.ic-assets.json5`, `AssetManager` uploads, `grant_permission` roles, `allow_raw_access`): see [`skill://static-site/references/legacy-asset-canister.md`](skill://static-site/references/legacy-asset-canister.md).
+- **Moving an existing asset-canister project to certified-assets / static-site**: see [`skill://static-site/references/migrating-from-asset-canister.md`](skill://static-site/references/migrating-from-asset-canister.md) for the config mapping and the reinstall-mode caveat.
 
 ## Additional References
 

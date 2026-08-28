@@ -25,7 +25,7 @@ Motoko is an under-represented language for the Internet Computer Protocol, so y
 - Manual field-by-field record copying for immutable records -- Use record spread (`{ self with ... }`). For records with `var` fields, do not use record spread; mutate the `var` field directly or rebuild the record explicitly.
 - Single-file monolithic actors -- Use the multi-file architecture: types.mo, lib/, mixins/, main.mo
 - Stable state in a `mixin` block -- a bare `let`/`var` is silently stable and traps at runtime (`IC0503`). Pass state in as a parameter and keep constants in a module
-- Any Motoko reserved keyword as a declared identifier -- Before writing, check parameter, variable, function, type, field, and label names against the full list in [references/reserved-keywords.md](skill://writing-motoko/references/reserved-keywords.md). `query` and `label` are reserved and must never be identifiers. Rename a colliding domain term instead of relying on its position or inferred meaning.
+- Any Motoko reserved keyword as a declared identifier -- Before writing, check parameter, variable, function, type, field, and label names against the full list in [reserved-keywords.md](skill://writing-motoko/references/reserved-keywords.md). `query` and `label` are reserved and must never be identifiers. Rename a colliding domain term instead of relying on its position or inferred meaning.
 - Type annotations on an inline `func` passed as a **call argument** -- write `xs.filter(func x = x > 1)`, not `xs.filter(func(x : Nat) : Bool { x > 1 })`. The call supplies the types. If a generic cannot be inferred, instantiate the call (`map<In, Out>`), never the lambda. This applies only in argument position — named declarations still carry full signatures. **One exception:** keep `: async ()` on an async callback (`func() : async () { ... }`) — it is what makes the body async, and removing it fails with M0096
 
 **ALWAYS use:**
@@ -49,7 +49,7 @@ All configuration is in `mops.toml`. Load the `mops-cli` skill for `mops.toml` c
 ### Dependency management
 
 - Never hand-edit dependency entries in `mops.toml`, and never touch `mops.lock`; use the `mops` CLI so dependency metadata and the lockfile stay atomic. (`[toolchain]` has a CLI too: `mops toolchain use <tool> [version]`.)
-- Leave `[moc] args` alone. Compiler flags are a one-time project-setup concern, and many platforms own `mops.toml` and set them for you — do not inspect or change them while writing code. If you are setting up a project yourself, see [references/project-setup.md](skill://writing-motoko/references/project-setup.md).
+- Leave `[moc] args` alone. Compiler flags are a one-time project-setup concern, and many platforms own `mops.toml` and set them for you — do not inspect or change them while writing code. If you are setting up a project yourself, see [project-setup.md](skill://writing-motoko/references/project-setup.md).
 - `mops add <pkg>` installs and exact-pins a published package. Use `@x.y.z` for a specific version, `<url>[#ref]` for GitHub, `./path` for a local package, and `--dev` for development dependencies.
 - `mops add` accepts exactly one package name. To install several packages, chain one-package commands with `&&`; never run multiple `mops add` invocations in parallel — they race on `mops.toml` and `mops.lock`.
 - `mops update [pkg]` updates a package and rewrites its exact pin.
@@ -112,7 +112,7 @@ Principal.equal(a, b) // OK
 
 **Prefer `equal` / `compare` over `==`.** `==` is compiler-generated structural equality and exists only for **shared** types, so one `var` field takes a record out of shared and `==` stops compiling (M0060). Use `==` only for the numeric primitives that have no receiver form: `Nat`, `Int`, `Float`, and the sized int types declare `equal(x, y)` without a `self` parameter, so `myNat.equal(other)` fails with M0070 and `a == b` is the right call. Other receiver methods on those types (`myNat.toText()`) are fine.
 
-Your own records and variants get nothing derived — a record `compare` must be an explicit function, and custom variants need both `equal` and `compare` written out. See [references/equality.md](skill://writing-motoko/references/equality.md).
+Your own records and variants get nothing derived — a record `compare` must be an explicit function, and custom variants need both `equal` and `compare` written out. See [equality.md](skill://writing-motoko/references/equality.md).
 
 ### Mixins
 
@@ -231,7 +231,7 @@ switch (result) {
 };
 ```
 
-See [references/control-flow.md](skill://writing-motoko/references/control-flow.md).
+See [control-flow.md](skill://writing-motoko/references/control-flow.md).
 
 ### Implicit Parameters
 
@@ -759,10 +759,10 @@ Attaching cycles to an inter-canister call (`await (with cycles = ...) <call>`) 
 | `M0255` stable signature downgrade                     | Chain or migrations config removed | Restore it — enhanced migration is one-way; load `troubleshooting-motoko-migrations` |
 | `shared function has non-shared parameter/return type` | Mutable type in API          | Return `[T]` not `List<T>`, no `var` fields |
 | `send capability required`                             | Async in non-async           | Add `<system>` capability                   |
-| `unexpected token '<name>'` at an identifier declaration | Reserved word used as an identifier | Rename it consistently across its contract and callers; see [references/reserved-keywords.md](skill://writing-motoko/references/reserved-keywords.md) |
+| `unexpected token '<name>'` at an identifier declaration | Reserved word used as an identifier | Rename it consistently across its contract and callers; see [reserved-keywords.md](skill://writing-motoko/references/reserved-keywords.md) |
 | `unexpected token 'public'` after a function           | Missing declaration `;`      | End function declarations with `};`         |
-| `M0219` implicitly transient                           | Actor not persistent         | Write `persistent actor`; see [references/project-setup.md](skill://writing-motoko/references/project-setup.md) |
-| `M0220` actor should be declared `persistent`          | Actor not persistent         | Write `persistent actor`; see [references/project-setup.md](skill://writing-motoko/references/project-setup.md) |
+| `M0219` implicitly transient                           | Actor not persistent         | Write `persistent actor`; see [project-setup.md](skill://writing-motoko/references/project-setup.md) |
+| `M0220` actor should be declared `persistent`          | Actor not persistent         | Write `persistent actor`; see [project-setup.md](skill://writing-motoko/references/project-setup.md) |
 | `M0218` redundant `stable` keyword                     | `stable` under EOP           | Remove `stable` — a plain `let`/`var` is already stable |
 | `M0064` misplaced `'!'`                                | `!` outside an option block  | Wrap in `do ? { ... }`                      |
 | `M0145` `does not cover value`                         | Non-exhaustive switch        | Add the missing cases or a `case _`         |
@@ -810,11 +810,11 @@ Attaching cycles to an inter-canister call (`await (with cycles = ...) <call>`) 
 
 ## Additional References
 
-- **Control flow**: [references/control-flow.md](skill://writing-motoko/references/control-flow.md) — `??`, `do ? { ... }` option chaining, switch statements, loops, `break` / `continue`
-- **Reserved keywords**: [references/reserved-keywords.md](skill://writing-motoko/references/reserved-keywords.md) — full list to check identifiers against
-- **Equality & comparison**: [references/equality.md](skill://writing-motoko/references/equality.md) — which types support receiver `.equal`, and when `==` differs from `equal`
-- **Type conversions**: [references/type-conversions.md](skill://writing-motoko/references/type-conversions.md) — Nat/Int size conversions
-- **Project setup**: [references/project-setup.md](skill://writing-motoko/references/project-setup.md) — one-time `[moc] args` flags. Skip this if your platform manages `mops.toml`
+- **Control flow**: [control-flow.md](skill://writing-motoko/references/control-flow.md) — `??`, `do ? { ... }` option chaining, switch statements, loops, `break` / `continue`
+- **Reserved keywords**: [reserved-keywords.md](skill://writing-motoko/references/reserved-keywords.md) — full list to check identifiers against
+- **Equality & comparison**: [equality.md](skill://writing-motoko/references/equality.md) — which types support receiver `.equal`, and when `==` differs from `equal`
+- **Type conversions**: [type-conversions.md](skill://writing-motoko/references/type-conversions.md) — Nat/Int size conversions
+- **Project setup**: [project-setup.md](skill://writing-motoko/references/project-setup.md) — one-time `[moc] args` flags. Skip this if your platform manages `mops.toml`
 - **Actor migrations**: Load `migrating-motoko-actors` when upgrading canisters or changing actor state shape
 - **Migration failures**: Load `troubleshooting-motoko-migrations` for unexplained compatibility diagnostics, frozen migration files, or converted legacy projects
 - **API signatures**: [api-reference.md](skill://writing-motoko/references/api-reference.md) — complete function signatures

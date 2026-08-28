@@ -24,7 +24,7 @@ The EVM RPC canister is an IC system canister that proxies JSON-RPC calls to Eth
 |---|---|---|
 | EVM RPC (mainnet) | `7hfb6-caaaa-aaaar-qadga-cai` | 34-node fiduciary |
 
-Candid interface: `https://github.com/dfinity/evm-rpc-canister/releases/latest/download/evm_rpc.did` — or use the `canhelp` skill to fetch it directly from the mainnet canister.
+Candid interface: `https://github.com/dfinity/evm-rpc-canister/releases/latest/download/evm_rpc.did` — or read it from the mainnet canister with this server's get_canister_candid tool.
 
 ## Supported Chains
 

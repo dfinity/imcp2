@@ -1,6 +1,6 @@
 # Legacy: the `@dfinity/asset-canister` recipe
 
-This reference documents the **legacy SDK asset canister** (`@dfinity/asset-canister` recipe, the `dfinity/sdk` `ic-asset` canister). It is **still supported** for existing projects but is **no longer the recommended path** — new frontends should use the `@dfinity/static-site` recipe (certified-assets canister) described in the main SKILL.md. Use this reference to understand and maintain a project that is already on the asset canister, or to read its behavior before [migrating](skill://static-site/references/migrating-from-asset-canister.md).
+This reference documents the **legacy SDK asset canister** (`@dfinity/asset-canister` recipe, the `dfinity/sdk` `ic-asset` canister). It is **still supported** for existing projects but is **no longer the recommended path** — new frontends should use the `@dfinity/static-site` recipe (certified-assets canister) described in the main SKILL.md. Use this reference to understand and maintain a project that is already on the asset canister, or to read its behavior before [migrating](migrating-from-asset-canister.md).
 
 The legacy asset canister is a **different canister** from certified-assets: different config file (`.ic-assets.json5` vs `_headers`/`_redirects`), different upload API (`store`/`create_batch`/`commit_batch` vs `upload_chunks`/`execute_operations`), and a different permission model (`grant_permission` roles vs `authorize`). Config and code are not interchangeable between the two.
 

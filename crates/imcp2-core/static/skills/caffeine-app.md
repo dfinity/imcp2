@@ -89,12 +89,12 @@ my-app/
     │       └── aaaaa-aa.did     #   IC management canister interface
     └── frontend/               # the assets canister (React + Vite)
         ├── caffeine.toml        #   canister manifest: type = "assets"
-        ├── package.json         #   frontend deps + scripts (see references/frontend-template.md)
-        ├── vite.config.js       #   (see references/frontend-template.md)
-        ├── tsconfig.json        #   (see references/frontend-template.md)
-        ├── biome.json           #   (see references/frontend-template.md)
-        ├── tailwind.config.js   #   (see references/frontend-template.md)
-        ├── postcss.config.js    #   (see references/frontend-template.md)
+        ├── package.json         #   frontend deps + scripts (see skill://caffeine-app/references/frontend-template.md)
+        ├── vite.config.js       #   (see skill://caffeine-app/references/frontend-template.md)
+        ├── tsconfig.json        #   (see skill://caffeine-app/references/frontend-template.md)
+        ├── biome.json           #   (see skill://caffeine-app/references/frontend-template.md)
+        ├── tailwind.config.js   #   (see skill://caffeine-app/references/frontend-template.md)
+        ├── postcss.config.js    #   (see skill://caffeine-app/references/frontend-template.md)
         ├── index.html
         ├── env.json             #   runtime config — copied into dist/ on build
         └── src/
@@ -109,7 +109,7 @@ Only the **root** manifest, the two **canister** manifests, `mops.toml`, `main.m
 the small root config files are shown inline below. The full frontend boilerplate
 (`package.json`, `vite.config.js`, the Tailwind/PostCSS/Biome configs, `index.html`,
 `env.json`, `main.tsx`, a starter `App.tsx`) is in
-[`references/frontend-template.md`](skill://caffeine-app/references/frontend-template.md) — read it when you
+[`skill://caffeine-app/references/frontend-template.md`](skill://caffeine-app/references/frontend-template.md) — read it when you
 create the frontend.
 
 ## Manifests
@@ -336,7 +336,7 @@ compiler-error pitfalls that an agent will otherwise hallucinate.
 ## The frontend
 
 **Fetch this skill's companion reference file** —
-[`references/frontend-template.md`](skill://caffeine-app/references/frontend-template.md), which sits next to
+[`skill://caffeine-app/references/frontend-template.md`](skill://caffeine-app/references/frontend-template.md), which sits next to
 this `SKILL.md` (i.e. `…/skills/caffeine-app/references/frontend-template.md`) — and create
 the frontend files from it; it holds the verified `package.json`, the Vite/Tailwind/Biome
 configs, `main.tsx`, and the worked `useActor(createActor)` backend call. The essentials:
@@ -351,7 +351,7 @@ configs, `main.tsx`, and the worked `useActor(createActor)` backend call. The es
   `useActor(createActor)` from `@caffeineai/core-infrastructure` (the same package provides
   the auth provider used in `main.tsx`); you do **not** hand-write the actor/config/storage
   glue. See the worked example in
-  [`references/frontend-template.md`](skill://caffeine-app/references/frontend-template.md).
+  [`skill://caffeine-app/references/frontend-template.md`](skill://caffeine-app/references/frontend-template.md).
 - `env.json` holds runtime config placeholders (`backend_host`, `backend_canister_id`,
   `project_id`, `ii_derivation_origin`, `storage_gateway_url`), all `"undefined"` locally;
   the frontend `build` script copies it into `dist/` (`cp env.json dist/`). Caffeine
@@ -458,7 +458,7 @@ having no deploy command. This skill is for the **local, hand-authored** path.
 
 ## Additional references
 
-- [`references/frontend-template.md`](skill://caffeine-app/references/frontend-template.md) — the full,
+- [`skill://caffeine-app/references/frontend-template.md`](skill://caffeine-app/references/frontend-template.md) — the full,
   verbatim frontend boilerplate (`package.json`, `vite.config.js`, Tailwind/PostCSS/Biome
   configs, `tsconfig.json`, `index.html`, `env.json`, `main.tsx`, a starter `App.tsx`,
   and the backend-actor wiring pattern). Read it when you create `src/frontend/`.

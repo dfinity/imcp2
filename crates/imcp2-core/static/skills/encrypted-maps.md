@@ -155,7 +155,7 @@ Caveat: there is **no ready-made canister generator for KeyManager yet** ([dfini
 
 6. **`mapName` and `mapKey` are byte arrays, ≤ 32 bytes each** — encode strings with `TextEncoder`.
 
-7. **Keep per-value app state consistent via the control-plane variant.** If you store metadata alongside each value, use `custom_value_endpoints` (Rust) / `EncryptedMapsControlPlaneCanister` (Motoko) and own the value endpoints — see `references/metadata.md`. Don't also expose the library's raw value mutators, or the two stores desync.
+7. **Keep per-value app state consistent via the control-plane variant.** If you store metadata alongside each value, use `custom_value_endpoints` (Rust) / `EncryptedMapsControlPlaneCanister` (Motoko) and own the value endpoints — see `skill://encrypted-maps/references/metadata.md`. Don't also expose the library's raw value mutators, or the two stores desync.
 
 8. **Don't re-init state on upgrade.** The macro/mixin generate the lifecycle hooks; stable memory survives upgrades. Adding your own `post_upgrade` that rebuilds state corrupts it.
 
@@ -163,7 +163,7 @@ Caveat: there is **no ready-made canister generator for KeyManager yet** ([dfini
 
 ## Additional References
 
-- Metadata / custom value endpoints: `references/metadata.md`
+- Metadata / custom value endpoints: `skill://encrypted-maps/references/metadata.md`
 - Lower-level vetKeys (IBE, BLS, timelock, symmetric, offline derivation): the **`vetkeys`** skill
 - Canonical examples: `motoko/vetkeys/password_manager`, `rust/vetkeys/password_manager` in [dfinity/examples](https://github.com/dfinity/examples/tree/master/rust/vetkeys)
 

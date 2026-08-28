@@ -68,9 +68,16 @@ pub const BUNDLED_SKILLS: &[(&str, &str, &str)] = &[
 /// removes back in the agent's path.
 pub const BUNDLED_SKILL_REFERENCES: &[(&str, &str, &str)] = &[
     ("caffeine-app", "frontend-template.md", include_str!("../static/skills/references/caffeine-app/frontend-template.md")),
+    ("encrypted-maps", "metadata.md", include_str!("../static/skills/references/encrypted-maps/metadata.md")),
+    ("icp-cli", "binding-generation.md", include_str!("../static/skills/references/icp-cli/binding-generation.md")),
+    ("icp-cli", "canister-env-vars.md", include_str!("../static/skills/references/icp-cli/canister-env-vars.md")),
+    ("icp-cli", "dev-server.md", include_str!("../static/skills/references/icp-cli/dev-server.md")),
+    ("icp-cli", "dfx-migration.md", include_str!("../static/skills/references/icp-cli/dfx-migration.md")),
     ("migrating-motoko-actors", "examples.md", include_str!("../static/skills/references/migrating-motoko-actors/examples.md")),
     ("static-site", "legacy-asset-canister.md", include_str!("../static/skills/references/static-site/legacy-asset-canister.md")),
     ("static-site", "migrating-from-asset-canister.md", include_str!("../static/skills/references/static-site/migrating-from-asset-canister.md")),
+    ("vetkeys", "bls-signing.md", include_str!("../static/skills/references/vetkeys/bls-signing.md")),
+    ("vetkeys", "ibe.md", include_str!("../static/skills/references/vetkeys/ibe.md")),
     ("writing-motoko", "api-reference.md", include_str!("../static/skills/references/writing-motoko/api-reference.md")),
     ("writing-motoko", "control-flow.md", include_str!("../static/skills/references/writing-motoko/control-flow.md")),
     ("writing-motoko", "equality.md", include_str!("../static/skills/references/writing-motoko/equality.md")),
@@ -415,7 +422,9 @@ mod tests {
             // ...and every skill:// link it does carry must be served.
             for link in md.match_indices("skill://").map(|(i, _)| {
                 md[i + "skill://".len()..]
-                    .split(|c: char| c.is_whitespace() || matches!(c, ')' | '`' | '>' | ',' | '"'))
+                    .split(|c: char| {
+                        c.is_whitespace() || matches!(c, ')' | '(' | ']' | '[' | '`' | '>' | ',' | '"')
+                    })
                     .next()
                     .unwrap_or_default()
             }) {
@@ -425,6 +434,19 @@ mod tests {
                     None => bundled_skill(target).is_some(),
                 };
                 assert!(found, "{where_} links to `skill://{target}`, which is not bundled");
+            }
+            // ...and no document may name a companion by bare relative path,
+            // which a client has no way to open. A path preceded by `/` is
+            // already inside a URI — this scheme's, or an ordinary docs link —
+            // so only the bare mentions are flagged. Markdown-link syntax is
+            // not the only form these take, which is how the first pass missed
+            // nine of them.
+            for (i, _) in md.match_indices("references/") {
+                assert!(
+                    md[..i].ends_with('/'),
+                    "{where_} names a companion by bare path: {:?}",
+                    &md[i..md.len().min(i + 60)]
+                );
             }
         }
     }
