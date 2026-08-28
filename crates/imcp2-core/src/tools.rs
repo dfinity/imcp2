@@ -503,7 +503,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. Financial operations and update calls to known financial-service canisters are not supported and return an error. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
+        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
         annotations(title = "Make a canister update call", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterUpdateCallOutput>(),
     )]
@@ -1416,40 +1416,6 @@ impl IcProtocolTools {
         };
         match management::cycles_balance(&self.identities, &sid).await {
             Ok(b) => Ok(ok_structured(b.human(), &b)),
-            Err(e) => Ok(err(e)),
-        }
-    }
-
-    #[tool(
-        description = "How to create and fund a NEW Internet Computer canister: returns step-by-step icp CLI instructions (including where to get the CLI) for the USER to run themselves in their own terminal, ending with the settings-update step that adds your management principal (printed by icp_cycles_balance) as a controller so icp_install_code and the lifecycle tools can manage the new canister — this tool only prints the steps and never executes the operation. Pass `cycles` or `icp` only to have the intended amount substituted into the printed commands. For the full guide, load the cycles-management skill (icp_get_skill).",
-        // Instructions-only: no session, no canister call, no funds movement — a
-        // pure read, and closed-world (nothing leaves the server).
-        annotations(title = "How to create a canister", read_only_hint = true, destructive_hint = false, open_world_hint = false),
-        output_schema = schema_for_output::<management::CreateCanisterInstructions>(),
-    )]
-    async fn icp_create_canister(
-        &self,
-        Parameters(args): Parameters<management::CreateCanisterArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        match management::create_canister_instructions(args) {
-            Ok(i) => Ok(ok_structured(i.human(), &i)),
-            Err(e) => Ok(err(e)),
-        }
-    }
-
-    #[tool(
-        description = "How to add cycles to an existing canister: returns step-by-step icp CLI instructions (including where to get the CLI) for the USER to run the top-up themselves in their own terminal — this tool only prints the steps and never executes the operation. Pass `cycles` or `icp` only to have the intended amount substituted into the printed commands. For the full funding guide, load the cycles-management skill (icp_get_skill).",
-        // Instructions-only: no session, no canister call, no funds movement — a
-        // pure read, and closed-world (nothing leaves the server).
-        annotations(title = "How to top up a canister", read_only_hint = true, destructive_hint = false, open_world_hint = false),
-        output_schema = schema_for_output::<management::TopUpInstructions>(),
-    )]
-    async fn icp_top_up_canister(
-        &self,
-        Parameters(args): Parameters<management::TopUpArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        match management::top_up_instructions(args) {
-            Ok(i) => Ok(ok_structured(i.human(), &i)),
             Err(e) => Ok(err(e)),
         }
     }
@@ -2481,7 +2447,7 @@ mod tests {
         // wiring it back in a future version can't regress them.
         let mut tools = served;
         tools.extend(super::IcProtocolTools::tool_router().list_all());
-        assert_eq!(tools.len(), 26, "expected 26 tools across both halves, got {}", tools.len());
+        assert_eq!(tools.len(), 24, "expected 24 tools across both halves, got {}", tools.len());
         assert!(
             tools.iter().all(|t| t.annotations.is_some()),
             "every tool must carry annotations (else clients assume write/destructive)"
@@ -2504,7 +2470,6 @@ mod tests {
             "get_canister_api_doc", "open_app", "resolve_app", "list_app_accounts", "icp_cycles_balance", "get_app_principal", "icp_canister_status",
             // Instructions-only since the marketplace-compliance changes: they
             // execute nothing and move no funds, so they are pure reads.
-            "icp_top_up_canister", "icp_create_canister",
         ] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");
@@ -2534,30 +2499,27 @@ mod tests {
         assert_eq!(cc.destructive_hint, Some(true));
     }
 
-    // The description must match the behavior: a caller reading
-    // canister_update_call's description learns that financial operations and
-    // known financial-service canisters are refused (a refusal is a side
-    // effect that must not be implicit), while the full policy — the refused
-    // method families and the reason — stays in the server-wide instructions
-    // rather than being restated per tool. Neither surface names a venue for
-    // a refused operation: metadata answering a refused financial operation
-    // with a specific transactional service would read as a redirect from one
-    // such route to another.
+    // The financial-transactions policy is a SERVER-WIDE instruction, never a
+    // tool-description paragraph (per review): stating it inside
+    // canister_update_call's description reads as a hint that the tool is
+    // usable for financial transactions, which is the one thing it must not
+    // suggest. Pin both sides — no tool description carries financial
+    // language, and the instructions state the denial, the refused method
+    // families, and the reason. Neither surface names a venue for a refused
+    // operation: metadata answering a refused financial operation with a
+    // specific transactional service would read as a redirect from one such
+    // route to another.
     #[test]
-    fn update_call_description_discloses_the_refusal() {
-        let tools = super::IcTools::all_tools();
-        let tool = tools
-            .iter()
-            .find(|t| &*t.name == "canister_update_call")
-            .expect("canister_update_call tool not found");
-        let desc = tool.description.as_deref().unwrap_or_default();
-        assert!(
-            desc.contains(
-                "Financial operations and update calls to known financial-service canisters are not supported and return an error."
-            ),
-            "{desc}"
-        );
-        assert!(!desc.contains(".com"), "the description names no venue: {desc}");
+    fn financial_policy_is_a_server_instruction_not_a_description() {
+        for tool in super::IcTools::all_tools() {
+            let desc = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                !desc.to_lowercase().contains("financial"),
+                "{}: {desc}",
+                tool.name
+            );
+            assert!(!desc.contains(".com"), "{} names a venue: {desc}", tool.name);
+        }
         let ins = super::SERVER_INSTRUCTIONS;
         assert!(ins.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED"));
         assert!(ins.contains("asset-moving requests are denied"));
@@ -2597,7 +2559,7 @@ mod tests {
             .iter()
             .all(|t| !t.name.starts_with("icp_") || &*t.name == "icp_oql_guide"));
         assert!(served.iter().any(|t| &*t.name == "icp_oql_guide"));
-        assert_eq!(super::IcProtocolTools::tool_router().list_all().len(), 15);
+        assert_eq!(super::IcProtocolTools::tool_router().list_all().len(), 13);
         // tools/call routes through the canister router alone, so a deferred
         // name is not just unlisted — it is not routable at all.
         assert!(!super::IcCanisterTools::tool_router().has_route("icp_get_skill"));
@@ -2641,38 +2603,6 @@ mod tests {
         let total = names.len();
         names.dedup();
         assert_eq!(names.len(), total, "tool names must be unique across the split routers");
-    }
-
-    // icp_top_up_canister and icp_create_canister are instructions-only, and
-    // their descriptions must say so FUNCTIONALLY — the tool prints steps and
-    // never executes — without compliance disclaimers (per review, policy
-    // language lives in the server instructions, not per-tool descriptions).
-    // Guards against a future edit quietly reverting either.
-    #[test]
-    fn top_up_tool_declares_itself_instructions_only() {
-        let tools = super::IcProtocolTools::tool_router().list_all();
-        let tool = tools
-            .iter()
-            .find(|t| &*t.name == "icp_top_up_canister")
-            .expect("icp_top_up_canister tool not found");
-        let desc = tool.description.as_deref().unwrap_or_default();
-        assert!(desc.contains("only prints the steps"), "{desc}");
-        assert!(desc.contains("never executes the operation"), "{desc}");
-        assert!(!desc.to_lowercase().contains("financial"), "{desc}");
-    }
-
-    #[test]
-    fn create_tool_declares_itself_instructions_only() {
-        let tools = super::IcProtocolTools::tool_router().list_all();
-        let tool = tools
-            .iter()
-            .find(|t| &*t.name == "icp_create_canister")
-            .expect("icp_create_canister tool not found");
-        let desc = tool.description.as_deref().unwrap_or_default();
-        assert!(desc.contains("only prints the steps"), "{desc}");
-        assert!(desc.contains("never executes the operation"), "{desc}");
-        assert!(desc.contains("controller"), "{desc}");
-        assert!(!desc.to_lowercase().contains("financial"), "{desc}");
     }
 
     // EVERY tool must declare an outputSchema so a model knows the shape of its
