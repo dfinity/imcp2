@@ -244,6 +244,10 @@ serves:
 Each entry needs an `id` (a canister principal); `name`, `role`, and
 `description` are optional and become the finding's label (`role — description`,
 falling back to `name`). Unknown fields are ignored, so the format can grow.
+The write gate holds `id` to the protocol's own type rule — an entry must be a
+**canister** principal (a 10-byte opaque id) to authorize anything, so a manifest
+cannot declare a user principal, the anonymous principal, or the management
+canister `aaaaa-aa` (all of which parse as principals) and have a write follow.
 This manifest is also the **only** thing that permits a write — see
 [Writes are gated on the discoverability manifest](#writes-are-gated-on-the-discoverability-manifest).
 

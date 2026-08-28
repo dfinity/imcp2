@@ -440,6 +440,23 @@ pub(crate) struct ManifestCanisters {
     pub omitted: usize,
 }
 
+/// Whether `p` is a CANISTER principal, which the protocol requires every
+/// manifest `id` to be ("`id` is required and must be a canister principal").
+/// Opaque ids are 10 bytes with the `0x01` type tag; that excludes user
+/// principals (29 bytes, `0x02`), the anonymous principal (1 byte, `0x04`) and —
+/// the one that matters here — the management canister `aaaaa-aa`, whose blob is
+/// EMPTY and which `Principal::from_text` otherwise accepts happily.
+///
+/// Enforcing the spec's own type rule is what keeps a manifest from declaring,
+/// and so authorizing a write to, something that is not an app canister at all.
+/// It is deliberately the spec's rule and not a policy list of our own: which
+/// canisters an app may legitimately declare is the app's business, but WHAT
+/// KIND of principal an `id` may be is the protocol's.
+fn is_canister_principal(p: &Principal) -> bool {
+    let bytes = p.as_slice();
+    bytes.len() == 10 && bytes.last() == Some(&0x01)
+}
+
 /// The canister ids a manifest body DECLARES, as validated principals — the
 /// authorization set the update-call gate checks a target against (see
 /// [`crate::discoverability`]). `None` when the body is not a manifest document
@@ -451,8 +468,9 @@ pub(crate) struct ManifestCanisters {
 /// Deliberately separate from [`canisters_from_app_manifest`]: that one feeds a
 /// human-readable discovery listing and keeps ids as the app spelled them,
 /// whereas a gate must compare PARSED principals, so two spellings of one id
-/// can't disagree with each other. Ids that aren't principals are dropped, so a
-/// junk entry can never authorize anything.
+/// can't disagree with each other. Ids that aren't CANISTER principals (see
+/// [`is_canister_principal`]) are dropped, so a junk entry — or one naming the
+/// management canister — can never authorize anything.
 pub(crate) fn manifest_canister_ids(text: &str) -> Option<ManifestCanisters> {
     let m = serde_json::from_str::<StrictManifest>(text).ok()?;
     let omitted = m.canisters.len().saturating_sub(MAX_MANIFEST_CANISTERS);
@@ -462,6 +480,7 @@ pub(crate) fn manifest_canister_ids(text: &str) -> Option<ManifestCanisters> {
             .into_iter()
             .take(MAX_MANIFEST_CANISTERS)
             .filter_map(|e| Principal::from_text(e.id.trim()).ok())
+            .filter(is_canister_principal)
             .collect(),
         omitted,
     })
@@ -2851,7 +2870,9 @@ mod tests {
           "canisters": [
             {"id": "hmxr2-pqaaa-aaabq-qaaaa-cai", "role": "backend"},
             {"id": "  hcv4s-uaaaa-aaabq-qaaba-cai  ", "role": "frontend"},
-            {"id": "not-a-principal", "role": "junk"}
+            {"id": "not-a-principal", "role": "junk"},
+            {"id": "aaaaa-aa", "role": "the management canister"},
+            {"id": "2vxsx-fae", "role": "the anonymous principal"}
           ]
         }"#;
         let got = manifest_canister_ids(manifest).expect("a manifest document");
@@ -2861,7 +2882,10 @@ mod tests {
                 Principal::from_text("hmxr2-pqaaa-aaabq-qaaaa-cai").unwrap(),
                 Principal::from_text("hcv4s-uaaaa-aaabq-qaaba-cai").unwrap(),
             ],
-            "ids are trimmed, parsed, and a non-principal entry authorizes nothing"
+            "ids are trimmed and parsed; a non-principal entry authorizes nothing, and \
+             neither does one naming something that is not a CANISTER principal — the \
+             management canister (an empty blob) and the anonymous principal both parse \
+             as principals, and the protocol requires an `id` to be a canister"
         );
         assert_eq!(got.omitted, 0, "nothing was past the cap");
 
