@@ -429,28 +429,42 @@ struct StrictManifest {
     canisters: Vec<AppManifestEntry>,
 }
 
+/// The canisters a manifest body declares, as the gate reads them.
+pub(crate) struct ManifestCanisters {
+    /// The declared ids, as validated principals.
+    pub ids: Vec<Principal>,
+    /// Entries past [`MAX_MANIFEST_CANISTERS`] that were not read at all. Carried
+    /// rather than dropped silently: entry 101 of an over-long manifest IS
+    /// declared by the app, so refusing it as "not declared" would be a false
+    /// statement about the app. The refusal reports the overflow instead.
+    pub omitted: usize,
+}
+
 /// The canister ids a manifest body DECLARES, as validated principals — the
 /// authorization set the update-call gate checks a target against (see
 /// [`crate::discoverability`]). `None` when the body is not a manifest document
 /// at all (an SPA catch-all's HTML, a JSON array, an error envelope, an empty
 /// response), which is what lets the gate tell "this app publishes no manifest"
 /// apart from "it publishes one that doesn't list your canister" — two different
-/// things to tell an agent. `Some(vec![])` is a real, empty declaration.
+/// things to tell an agent. An empty `ids` is a real, empty declaration.
 ///
 /// Deliberately separate from [`canisters_from_app_manifest`]: that one feeds a
 /// human-readable discovery listing and keeps ids as the app spelled them,
 /// whereas a gate must compare PARSED principals, so two spellings of one id
 /// can't disagree with each other. Ids that aren't principals are dropped, so a
 /// junk entry can never authorize anything.
-pub(crate) fn manifest_canister_ids(text: &str) -> Option<Vec<Principal>> {
+pub(crate) fn manifest_canister_ids(text: &str) -> Option<ManifestCanisters> {
     let m = serde_json::from_str::<StrictManifest>(text).ok()?;
-    Some(
-        m.canisters
+    let omitted = m.canisters.len().saturating_sub(MAX_MANIFEST_CANISTERS);
+    Some(ManifestCanisters {
+        ids: m
+            .canisters
             .into_iter()
             .take(MAX_MANIFEST_CANISTERS)
             .filter_map(|e| Principal::from_text(e.id.trim()).ok())
             .collect(),
-    )
+        omitted,
+    })
 }
 
 /// Reduce a raw origin string to a canonical bare `https://host[:port]` origin,
@@ -1389,18 +1403,40 @@ async fn get_document(
     client: &reqwest::Client,
     url: &str,
     max: usize,
-) -> Result<Option<String>, String> {
+) -> Result<Option<FetchedDocument>, String> {
     let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Ok(None);
     }
-    Ok(Some(read_capped(resp, max).await))
+    // Captured BEFORE the body is consumed: which origin actually answered (a
+    // redirect may have moved it) and what it claimed to be.
+    let served_from = resp.url().origin().ascii_serialization();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        // The essence only, lowercased: `application/json; charset=utf-8` and
+        // `application/json` are the same claim.
+        .map(|v| v.split(';').next().unwrap_or(v).trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    Ok(Some(FetchedDocument { served_from, content_type, body: read_capped(resp, max).await }))
+}
+
+/// One fetched well-known document, plus the facts a gate needs about HOW it
+/// arrived rather than only its bytes: which origin answered (so a redirect
+/// cannot let one origin borrow another's declaration) and what the response
+/// claimed to be (so a refusal can name an SPA catch-all by its signature
+/// instead of reporting a document that is right there as absent).
+pub(crate) struct FetchedDocument {
+    pub served_from: String,
+    pub content_type: String,
+    pub body: String,
 }
 
 /// [`get_document`] for the opportunistic discovery probes, where a missing
 /// document and an unreachable one are the same thing: no findings either way.
 async fn fetch_success_body(client: &reqwest::Client, url: &str, max: usize) -> Option<String> {
-    get_document(client, url, max).await.ok().flatten()
+    get_document(client, url, max).await.ok().flatten().map(|d| d.body)
 }
 
 /// An app's own declaration of the canisters it comprises, as read from its
@@ -1414,21 +1450,44 @@ pub(crate) struct DeclaredManifest {
     /// The declared canisters, as validated principals. May legitimately be
     /// empty: an app can publish a manifest that lists nothing.
     pub canisters: Vec<Principal>,
+    /// Declared entries past [`MAX_MANIFEST_CANISTERS`] that were not read (see
+    /// [`ManifestCanisters::omitted`]).
+    pub omitted: usize,
+}
+
+/// The outcome of probing an app origin for its canister manifest.
+pub(crate) enum ManifestProbe {
+    /// A manifest document was served at one of the well-known paths and parsed.
+    Declared(DeclaredManifest),
+    /// The origin answered, but neither path served a manifest.
+    Absent {
+        /// What the PROTOCOL path answered with, when it answered 2xx with
+        /// something that is not a manifest. `Some("text/html")` is the exact
+        /// signature of the SPA catch-all the protocol guide calls out as the
+        /// most common failure, and naming it turns "your app publishes nothing"
+        /// into a refusal its operator can act on from a relayed transcript.
+        served_non_manifest: Option<String>,
+    },
 }
 
 /// Fetch the canister manifest an app declares at `app_url`'s ORIGIN — the
-/// protocol path first, the legacy path only as a fallback. `Ok(None)` when the
-/// origin answered but serves no manifest at either path (the app has not adopted
-/// the protocol); `Err` when the origin could not be reached at all, or the URL
-/// itself is refused by the SSRF guard, so the caller can say "unknown" rather
-/// than "not adopted".
+/// protocol path first, the legacy path only as a fallback.
+/// [`ManifestProbe::Absent`] when the origin answered but serves no manifest at
+/// either path (the app has not adopted the protocol); `Err` when the origin
+/// could not be reached at all, or the URL itself is refused by the SSRF guard,
+/// so the caller can say "unknown" rather than "not adopted".
+///
+/// A document is only honoured when it came from the origin we PROBED, not from
+/// a redirect target. The shared redirect policy already refuses a cross-domain
+/// hop, but it permits same-host different-port hops and hops to global IP
+/// literals — so without this check an origin could serve a 3xx and have another
+/// origin's declaration attributed to it, making the `declared_by` provenance the
+/// caller is shown a true-looking but wrong statement.
 ///
 /// Both paths are probed CONCURRENTLY: one round trip, and an app that has
 /// adopted the protocol is never the slower path. The same SSRF-pinned client and
 /// capped reads as the rest of this module — `app_url` is caller-controlled.
-pub(crate) async fn fetch_declared_manifest(
-    app_url: &str,
-) -> Result<Option<DeclaredManifest>, String> {
+pub(crate) async fn fetch_declared_manifest(app_url: &str) -> Result<ManifestProbe, String> {
     let base = normalize(app_url);
     let (base_url, pinned) = resolve_public_url(&base).await?;
     let host = base_url.host_str().unwrap_or_default().to_ascii_lowercase();
@@ -1447,14 +1506,43 @@ pub(crate) async fn fetch_declared_manifest(
     if let (Err(e), Err(_)) = (&architecture, &legacy) {
         return Err(format!("could not reach {origin}: {e}"));
     }
-    for (path, body) in
-        [(ARCHITECTURE_PATH, &architecture), (LEGACY_MANIFEST_PATH, &legacy)]
-    {
-        let Ok(Some(text)) = body else { continue };
-        let Some(canisters) = manifest_canister_ids(text) else { continue };
-        return Ok(Some(DeclaredManifest { origin, path, canisters }));
+    let mut served_non_manifest = None;
+    for (path, doc) in [(ARCHITECTURE_PATH, &architecture), (LEGACY_MANIFEST_PATH, &legacy)] {
+        let Ok(Some(doc)) = doc else { continue };
+        if doc.served_from != origin {
+            tracing::warn!(
+                probed = %origin,
+                served_from = %doc.served_from,
+                path,
+                "ignoring a manifest served by a redirect target rather than the probed origin"
+            );
+            continue;
+        }
+        let Some(canisters) = manifest_canister_ids(&doc.body) else {
+            // Answered, but not with a manifest. Remember what the PROTOCOL path
+            // claimed to be so the refusal can name the misconfiguration.
+            if path == ARCHITECTURE_PATH && served_non_manifest.is_none() {
+                served_non_manifest = Some(doc.content_type.clone());
+            }
+            continue;
+        };
+        if path == LEGACY_MANIFEST_PATH {
+            // Adoption of the standard path is what lets the legacy fallback be
+            // retired on evidence rather than on a guess, so make every use of it
+            // visible in the server's own logs.
+            tracing::warn!(
+                origin = %origin,
+                "authorizing from the LEGACY manifest path; this app has not adopted {ARCHITECTURE_PATH}"
+            );
+        }
+        return Ok(ManifestProbe::Declared(DeclaredManifest {
+            origin,
+            path,
+            canisters: canisters.ids,
+            omitted: canisters.omitted,
+        }));
     }
-    Ok(None)
+    Ok(ManifestProbe::Absent { served_non_manifest })
 }
 
 /// Accumulator for discovered canister ids, with a hard ceiling on the number of
@@ -2766,19 +2854,35 @@ mod tests {
             {"id": "not-a-principal", "role": "junk"}
           ]
         }"#;
-        let ids = manifest_canister_ids(manifest).expect("a manifest document");
+        let got = manifest_canister_ids(manifest).expect("a manifest document");
         assert_eq!(
-            ids,
+            got.ids,
             vec![
                 Principal::from_text("hmxr2-pqaaa-aaabq-qaaaa-cai").unwrap(),
                 Principal::from_text("hcv4s-uaaaa-aaabq-qaaba-cai").unwrap(),
             ],
             "ids are trimmed, parsed, and a non-principal entry authorizes nothing"
         );
+        assert_eq!(got.omitted, 0, "nothing was past the cap");
 
         // An app that publishes a manifest declaring nothing HAS adopted the
         // protocol — that is a real, empty declaration, not a missing document.
-        assert_eq!(manifest_canister_ids(r#"{"canisters":[]}"#), Some(Vec::new()));
+        let empty = manifest_canister_ids(r#"{"canisters":[]}"#).expect("a manifest document");
+        assert!(empty.ids.is_empty() && empty.omitted == 0);
+
+        // An over-long manifest is REPORTED, not silently truncated: entry 101 is
+        // declared by the app, so a "not declared" refusal about it would be a
+        // false statement — the count is carried so the refusal can say so.
+        let over = format!(
+            r#"{{"canisters":[{}]}}"#,
+            std::iter::repeat(r#"{"id":"hmxr2-pqaaa-aaabq-qaaaa-cai"}"#)
+                .take(MAX_MANIFEST_CANISTERS + 7)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let over = manifest_canister_ids(&over).expect("a manifest document");
+        assert_eq!(over.ids.len(), MAX_MANIFEST_CANISTERS);
+        assert_eq!(over.omitted, 7, "the overflow is counted, not dropped silently");
 
         // Not a manifest document → None, so the gate fails closed and reports
         // absence rather than an empty declaration.
@@ -2789,7 +2893,10 @@ mod tests {
             "[1,2,3]",                     // JSON, wrong shape
             "",                            // empty body
         ] {
-            assert_eq!(manifest_canister_ids(body), None, "must not read {body:?} as a manifest");
+            assert!(
+                manifest_canister_ids(body).is_none(),
+                "must not read {body:?} as a manifest"
+            );
         }
     }
 

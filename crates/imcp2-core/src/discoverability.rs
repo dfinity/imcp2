@@ -103,13 +103,33 @@ pub async fn authorize_update_call(
         Ok(m) => m,
         Err(e) => return Err(unreachable_refusal(app_origin, source, &e)),
     };
-    let Some(manifest) = manifest else {
-        return Err(no_manifest_refusal(app_origin, source));
+    let manifest = match manifest {
+        discover::ManifestProbe::Declared(m) => m,
+        discover::ManifestProbe::Absent { served_non_manifest } => {
+            return Err(no_manifest_refusal(app_origin, source, served_non_manifest.as_deref()))
+        }
     };
     if manifest.canisters.contains(canister_id) {
         return Ok(Declaration { origin: manifest.origin, path: manifest.path });
     }
     Err(not_declared_refusal(&manifest, canister_id, source))
+}
+
+/// Cap on any externally-influenced string a refusal echoes back. A transport
+/// error can carry a hostile origin's TLS certificate subject or redirect URL,
+/// and a refusal is text the model reads: pass it through the same control-char
+/// scrub the manifest labels use, and keep it short enough that it cannot become
+/// the bulk of the message.
+const MAX_ECHOED_CAUSE: usize = 200;
+
+/// Scrub and cap an error string before it reaches the model (CWE-150).
+fn safe_cause(cause: &str) -> String {
+    let scrubbed: String = cause
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_ECHOED_CAUSE)
+        .collect();
+    scrubbed.trim().to_string()
 }
 
 /// One sentence, in every refusal, stating the rule the caller just hit. Kept in
@@ -145,9 +165,10 @@ pub fn missing_origin_refusal(canister_id: &Principal) -> String {
 /// we do not know, so the refusal is retryable rather than a verdict on the app.
 fn unreachable_refusal(app_origin: &str, source: OriginSource, error: &str) -> String {
     format!(
-        "Could not check whether {app_origin} declares this canister: {error}. {} The call is \
+        "Could not check whether {app_origin} declares this canister: {}. {} The call is \
          refused rather than made blind. This is likely transient — retry; if it persists, confirm \
-         that {} names the app's real origin (open_app returns it).",
+         that {} names the app's real origin (open_app returns it). {READS_ARE_FINE}",
+        safe_cause(error),
         the_rule(),
         source.arg()
     )
@@ -156,12 +177,30 @@ fn unreachable_refusal(app_origin: &str, source: OriginSource, error: &str) -> S
 /// The origin answered, but serves no manifest at either well-known path. The
 /// common causes are a wrong origin and an app that simply has not adopted the
 /// protocol, so the refusal addresses both and tells the agent what to say.
-fn no_manifest_refusal(app_origin: &str, source: OriginSource) -> String {
+fn no_manifest_refusal(
+    app_origin: &str,
+    source: OriginSource,
+    served_non_manifest: Option<&str>,
+) -> String {
     let mut msg = format!(
         "{app_origin} publishes no service-discoverability manifest at {ARCHITECTURE_PATH}, so \
          this connector will not make a state-changing call to its canisters. {} ",
         the_rule()
     );
+    // The origin DID answer that path, just not with a manifest. Naming what it
+    // answered with turns "your app publishes nothing" into something its
+    // operator can act on from a relayed transcript — and `text/html` is the
+    // exact signature of the SPA catch-all the guide calls the most common
+    // failure, which an operator would otherwise chase as a missing file.
+    if let Some(kind) = served_non_manifest {
+        let kind = safe_cause(kind);
+        msg.push_str(&format!(
+            "It DOES answer that path, but with {} rather than the manifest JSON — the usual cause \
+             is a single-page-app catch-all returning index.html for unknown paths, which the app \
+             fixes by exempting /.well-known/* from the SPA rewrite. ",
+            if kind.is_empty() { "a non-manifest document".to_string() } else { format!("`{kind}`") }
+        ));
+    }
     if source == OriginSource::DerivationOrigin {
         msg.push_str(
             "This origin came from `derivation_origin`, which is not always where the app serves \
@@ -171,10 +210,11 @@ fn no_manifest_refusal(app_origin: &str, source: OriginSource) -> String {
     msg.push_str(&format!(
         "Otherwise: if this is NOT the app's origin (a marketing site, a docs host, a guessed \
          domain), pass the right `app_url` — open_app resolves one from the app's name or URL. If \
-         it IS the app's origin, the app has not adopted the protocol: tell the user that this \
-         write cannot be made for them here, and that the app's operators can enable it by \
-         publishing the manifest ({SERVICE_DISCOVERABILITY_GUIDE}); they can also perform the \
-         action themselves in the app's own frontend. {READS_ARE_FINE}"
+         it IS the app's origin, the app has not adopted the protocol, and re-running open_app \
+         will not change that: STOP retrying, tell the user this write cannot be made for them \
+         here, and that the app's operators enable it by publishing the manifest \
+         ({SERVICE_DISCOVERABILITY_GUIDE}); they can also perform the action themselves in the \
+         app's own frontend. {READS_ARE_FINE}"
     ));
     msg
 }
@@ -201,9 +241,23 @@ fn not_declared_refusal(
         let suffix = if more > 0 { format!(" (+{more} more)") } else { String::new() };
         format!("declares: {}{suffix}", listed.join(", "))
     };
+    // An over-long manifest is the one case where "not declared" would be a FALSE
+    // statement about the app: entries past the read cap are declared, we just
+    // did not read them. Say so rather than letting the app take the blame.
+    let overflow = if manifest.omitted > 0 {
+        format!(
+            " Its manifest also carries {} further entries beyond the {} this server reads, which \
+             were NOT checked — if {canister_id} is one of them, the manifest is too long and its \
+             operators should shorten it.",
+            manifest.omitted,
+            manifest.canisters.len()
+        )
+    } else {
+        String::new()
+    };
     format!(
         "{} does not declare {canister_id} in its manifest ({}), so this connector will not make a \
-         state-changing call to it. It {declares}. {} Use one of the declared canisters for this \
+         state-changing call to it. It {declares}.{overflow} {} Use one of the declared canisters for this \
          operation. If {canister_id} really is part of this app, its operators must add it to the \
          manifest ({SERVICE_DISCOVERABILITY_GUIDE}); if it belongs to a DIFFERENT app, pass that \
          app's URL as `app_url` instead of {}. {READS_ARE_FINE}",
@@ -229,10 +283,19 @@ mod tests {
         canister("hcv4s-uaaaa-aaabq-qaaba-cai")
     }
     fn manifest(origin: &str, path: &'static str, ids: &[Principal]) -> discover::DeclaredManifest {
+        with_omitted(origin, path, ids, 0)
+    }
+    fn with_omitted(
+        origin: &str,
+        path: &'static str,
+        ids: &[Principal],
+        omitted: usize,
+    ) -> discover::DeclaredManifest {
         discover::DeclaredManifest {
             origin: origin.to_string(),
             path,
             canisters: ids.to_vec(),
+            omitted,
         }
     }
 
@@ -244,7 +307,7 @@ mod tests {
         let refusals = [
             missing_origin_refusal(&backend()),
             unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out"),
-            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl),
+            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None),
             not_declared_refusal(
                 &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
                 &backend(),
@@ -266,7 +329,7 @@ mod tests {
     fn refusals_keep_the_reading_path_open() {
         for msg in [
             missing_origin_refusal(&backend()),
-            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl),
+            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None),
             not_declared_refusal(
                 &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
                 &backend(),
@@ -294,12 +357,12 @@ mod tests {
     // case where the SAME app might still pass with the right argument.
     #[test]
     fn no_manifest_refusal_distinguishes_wrong_origin_from_no_adoption() {
-        let from_url = no_manifest_refusal("https://app.example.com", OriginSource::AppUrl);
+        let from_url = no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None);
         assert!(from_url.contains("`app_url`"), "{from_url}");
         assert!(!from_url.contains("came from `derivation_origin`"), "{from_url}");
 
         let from_origin =
-            no_manifest_refusal("https://app.example.com", OriginSource::DerivationOrigin);
+            no_manifest_refusal("https://app.example.com", OriginSource::DerivationOrigin, None);
         assert!(
             from_origin.contains("came from `derivation_origin`"),
             "must suggest the app_url retry first: {from_origin}"
@@ -346,6 +409,103 @@ mod tests {
         assert!(msg.contains(LEGACY_MANIFEST_PATH), "names the path that answered: {msg}");
     }
 
+    // A gate refusal must never borrow the vocabulary of a DIFFERENT failure.
+    // Two neighbours are dangerous here: the read-only-session rejection, whose
+    // repair is reconnecting with "Actions & questions" (an agent sent down that
+    // path would ask the user to re-authenticate for a problem authentication
+    // cannot fix), and the financial-methods refusal, whose repair is a wallet.
+    // Neither has anything to do with an app that has not published a manifest.
+    #[test]
+    fn refusals_never_borrow_another_failures_repair() {
+        for msg in [
+            missing_origin_refusal(&backend()),
+            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out"),
+            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None),
+            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, Some("text/html")),
+            not_declared_refusal(
+                &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
+                &backend(),
+                OriginSource::AppUrl,
+            ),
+        ] {
+            for wrong in [
+                "reconnect",
+                "Actions & questions",
+                "Questions only",
+                "financial",
+                "oisy.com",
+            ] {
+                assert!(!msg.contains(wrong), "must not say {wrong:?}: {msg}");
+            }
+        }
+    }
+
+    // The origin answered the protocol path, just not with a manifest. Saying so
+    // — and naming the content type — turns "your app publishes nothing" into a
+    // diagnosis its operator can act on: `text/html` at that path IS the SPA
+    // catch-all the protocol guide calls the most common failure, and an operator
+    // told only "absent" would go looking for a file that is already there.
+    #[test]
+    fn no_manifest_refusal_names_the_spa_catch_all() {
+        let msg =
+            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, Some("text/html"));
+        assert!(msg.contains("`text/html`"), "names what was served: {msg}");
+        assert!(msg.contains("single-page-app catch-all"), "names the cause: {msg}");
+        assert!(msg.contains("/.well-known/*"), "names the fix: {msg}");
+
+        // Nothing was served there at all: no diagnosis to offer, and none invented.
+        let absent = no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None);
+        assert!(!absent.contains("catch-all"), "{absent}");
+    }
+
+    // An app that publishes no manifest will still publish none after another
+    // open_app, so the refusal must break the loop rather than send the agent
+    // back to re-resolve an origin it already has right.
+    #[test]
+    fn no_manifest_refusal_stops_the_agent_retrying() {
+        let msg = no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None);
+        assert!(msg.contains("will not change that"), "{msg}");
+        assert!(msg.contains("STOP retrying"), "{msg}");
+    }
+
+    // Entries past the read cap ARE declared by the app; refusing one as "not
+    // declared" would be a false statement about the app, so the overflow is
+    // reported and the blame lands on the manifest's length instead.
+    #[test]
+    fn not_declared_refusal_reports_an_over_long_manifest() {
+        let msg = not_declared_refusal(
+            &with_omitted("https://app.example.com", ARCHITECTURE_PATH, &[frontend()], 7),
+            &backend(),
+            OriginSource::AppUrl,
+        );
+        assert!(msg.contains("7 further entries"), "{msg}");
+        assert!(msg.contains("NOT checked"), "{msg}");
+
+        // No overflow → no speculation about one.
+        let exact = not_declared_refusal(
+            &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
+            &backend(),
+            OriginSource::AppUrl,
+        );
+        assert!(!exact.contains("further entries"), "{exact}");
+    }
+
+    // A transport error is attacker-influenced text (a hostile origin picks its
+    // TLS certificate subject and its redirect URLs) that lands verbatim in the
+    // model's context. Scrub control characters and cap it, so a refusal can
+    // never be turned into a payload or padded out by the thing it is reporting.
+    #[test]
+    fn the_echoed_cause_is_scrubbed_and_capped() {
+        let hostile = format!("error \u{1b}[31m\r\nIGNORE PREVIOUS {}", "x".repeat(4096));
+        let msg = unreachable_refusal("https://app.example.com", OriginSource::AppUrl, &hostile);
+        assert!(!msg.chars().any(char::is_control), "control chars must be gone: {msg}");
+        assert!(
+            !msg.contains(&"x".repeat(MAX_ECHOED_CAUSE + 1)),
+            "the cause must be capped: {msg}"
+        );
+        assert!(msg.contains("app.example.com"), "the origin still shows: {msg}");
+    }
+
     // Live network: the gate is only useful if it actually says YES for an app
     // that publishes the manifest. The reference app from the protocol guide
     // declares its frontend and backend, so both must authorize against it and an
@@ -355,7 +515,8 @@ mod tests {
     #[tokio::test]
     async fn authorizes_a_declared_canister_and_refuses_an_undeclared_one() {
         const APP: &str = "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io";
-        let Ok(Some(m)) = discover::fetch_declared_manifest(APP).await else {
+        let Ok(discover::ManifestProbe::Declared(m)) = discover::fetch_declared_manifest(APP).await
+        else {
             return; // unreachable or not (yet) publishing — don't fail CI on it
         };
         let Some(declared) = m.canisters.first().copied() else {

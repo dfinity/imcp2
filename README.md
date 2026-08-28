@@ -310,13 +310,21 @@ host are fetched, and every outbound fetch runs under a redirect guard (a 3xx ma
 go to a **globally-routable** IP or the same host, never a different private
 target; capped at 10 hops) with per-body and aggregate size caps, so a hostile or
 accidental large body can't exhaust memory. The untrusted **user-supplied** site
-fetches (an app origin from `discover_app_canisters`, `open_app`, or `resolve_app`)
+fetches (an app origin from `discover_app_canisters`, `open_app`, `resolve_app`, or
+the `app_url` the write gate checks in `canister_update_call`)
 additionally resolve the target host up front and **pin** the connection to that
 validated globally-routable address, so a name resolving to a
 private/loopback/link-local address is refused and re-resolution can't rebind
 mid-flight. Fixed public-host enrichment (the IC dashboard, the skills registry)
 uses the redirect guard but is not separately address-pinned. No JavaScript is
 executed, and every extracted id is validated as a principal.
+
+Note that the write gate makes `canister_update_call` an **outbound-fetching**
+tool: acting at an app now contacts that app's website (once per write) to read
+its manifest, where previously only the discovery/resolution tools did. A
+manifest is only honoured when the origin the connector **probed** is the origin
+that **answered** — a redirect can't let one origin borrow another's declaration
+and have `declared_by` name the wrong app.
 
 The optional top-level **`derivation_origin`** is the app's declaration of the
 Internet Identity derivation origin its frontends pin (see the identity section
@@ -332,7 +340,9 @@ inline.)
 
 `canister_query` and `canister_update_call` run anonymously by default; pass a
 `derivation_origin` to call as
-your account at that app. The server mints a **short-lived account delegation on
+your account at that app. (Anonymous still means anonymous *identity* — a write
+additionally needs an app origin, via `app_url` or `derivation_origin`, for the
+manifest check above; there is no origin-less write.) The server mints a **short-lived account delegation on
 demand** using the connection's registered Internet Identity session key (see
 [Domain identities](#domain-identities-on-demand)) — there is no per-app sign-in
 step. `get_app_principal` returns that account's principal
