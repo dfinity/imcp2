@@ -14,13 +14,18 @@
 //! app that happens to name a non-financial method `transfer` or `approve`
 //! keeps working):
 //!
-//!   * **ICRC-standard methods, matched literally on every canister.** Token
+//!   * **Standardized methods, matched literally on every canister.** Token
 //!     ledgers on the Internet Computer follow the ICRC standards —
 //!     ICRC-1/ICRC-2 for fungible tokens (ICRC-4 for batch transfers),
 //!     ICRC-7/ICRC-37 for NFTs — and the standards fix the exact method
-//!     names. Candid method names are case-sensitive, so literal matching is
-//!     both sufficient (the real ledgers use exactly these names) and precise
-//!     (a differently-spelled name is not the standard method).
+//!     names; likewise the NNS/SNS governance interface fixes
+//!     `manage_neuron`, the one method through which staked neurons are
+//!     disbursed, split, and spawned. That covers every SNS DAO's governance
+//!     (dozens exist and more launch by NNS proposal, so no per-DAO
+//!     enumeration could stay current) as well as the NNS's. Candid method
+//!     names are case-sensitive, so literal matching is both sufficient (the
+//!     real ledgers and governances use exactly these names) and precise (a
+//!     differently-spelled name is not the standard method).
 //!   * **Abstract names, scoped to the system canister where they are
 //!     financial.** `transfer` on the ICP ledger or `withdraw` on the cycles
 //!     ledger moves the user's funds; the same names on an arbitrary app
@@ -56,8 +61,8 @@
 //!     create per-pair pool/farm canisters dynamically and new services
 //!     launch: entries cover each service's central canisters (verified
 //!     against the IC dashboard's registry and the services' own published
-//!     sources), and the ICRC method group plus the stated policy cover the
-//!     rest.
+//!     sources), and the standardized-methods group plus the stated policy
+//!     cover the rest.
 //!   * Legacy pre-ICRC token standards (DIP20/EXT `transfer`/`transferFrom`/
 //!     `approve` on arbitrary canisters) are deliberately NOT matched: the
 //!     names are too abstract to block everywhere without breaking
@@ -71,10 +76,11 @@
 
 use candid::Principal;
 
-/// ICRC-standard value-moving methods, refused on EVERY canister, matched
-/// literally (the standards fix these exact names; Candid method names are
-/// case-sensitive). Each entry carries the label used in the refusal message.
-const DISALLOWED_ICRC_METHODS: &[(&str, &str)] = &[
+/// Standardized value-moving methods, refused on EVERY canister, matched
+/// literally (the ICRC token standards and the NNS/SNS governance interface
+/// fix these exact names; Candid method names are case-sensitive). Each entry
+/// carries the label used in the refusal message.
+const DISALLOWED_STANDARD_METHODS: &[(&str, &str)] = &[
     // ICRC-1 / ICRC-2 / ICRC-4: fungible-token transfers, spending
     // approvals, and batch transfers.
     ("icrc1_transfer", "an ICRC-1 token transfer"),
@@ -88,6 +94,14 @@ const DISALLOWED_ICRC_METHODS: &[(&str, &str)] = &[
     ("icrc37_approve_collection", "an ICRC-37 collection spending approval"),
     ("icrc37_revoke_token_approvals", "an ICRC-37 NFT approval change"),
     ("icrc37_revoke_collection_approvals", "an ICRC-37 collection approval change"),
+    // The NNS/SNS governance interface: every neuron operation — including
+    // disbursing, splitting, and spawning staked tokens — goes through this
+    // one method, on the NNS and on every SNS DAO alike.
+    (
+        "manage_neuron",
+        "a neuron-management call on an NNS/SNS governance interface (its operations include \
+         disbursing staked tokens)",
+    ),
 ];
 
 /// The ICP ledger — its pre-ICRC methods move the user's ICP.
@@ -169,9 +183,9 @@ const DISALLOWED_FINANCE_CANISTERS: &[(&str, &str, &str)] = &[
         "the ckDOGE minter",
         "its retrieve_doge calls burn ckDOGE and send real DOGE out",
     ),
-    // --- Chain-key token ledgers (the ICRC method group already refuses the
-    // standard transfer/approval names on these; listing the canisters closes
-    // the rest of their update surface too) ---
+    // --- Chain-key token ledgers (the standardized-methods group already
+    // refuses the transfer/approval names on these; listing the canisters
+    // closes the rest of their update surface too) ---
     ("mxzaz-hqaaa-aaaar-qaada-cai", "the ckBTC ledger", CK_LEDGER_WHY),
     ("ss2fx-dyaaa-aaaar-qacoq-cai", "the ckETH ledger", CK_LEDGER_WHY),
     ("xevnm-gaaaa-aaaar-qafnq-cai", "the ckUSDC ledger", CK_LEDGER_WHY),
@@ -186,28 +200,6 @@ const DISALLOWED_FINANCE_CANISTERS: &[(&str, &str, &str)] = &[
     ("nza5v-qaaaa-aaaar-qahzq-cai", "the ckXAUT ledger", CK_LEDGER_WHY),
     ("ebo5g-cyaaa-aaaar-qagla-cai", "the ckOCT ledger", CK_LEDGER_WHY),
     ("efmc5-wyaaa-aaaar-qb3wa-cai", "the ckDOGE ledger", CK_LEDGER_WHY),
-    // --- Prominent SNS DAO governance canisters (the same disburse pattern
-    // as NNS Governance; per-SNS ledgers are covered by the ICRC group) ---
-    (
-        "2jvtu-yqaaa-aaaaq-aaama-cai",
-        "OpenChat's SNS governance",
-        "its manage_neuron call disburses staked CHAT",
-    ),
-    (
-        "tr3th-kiaaa-aaaaq-aab6q-cai",
-        "Gold DAO's SNS governance",
-        "its manage_neuron call disburses staked GLDGov",
-    ),
-    (
-        "jfnic-kaaaa-aaaaq-aadla-cai",
-        "WaterNeuron's SNS governance (an ICP liquid-staking protocol)",
-        "its manage_neuron call disburses staked WTN",
-    ),
-    (
-        "zqfso-syaaa-aaaaq-aaafq-cai",
-        "Dragginz's SNS governance",
-        "its manage_neuron call disburses staked DKP",
-    ),
     // --- Wallets and the signer behind them ---
     (
         "doked-biaaa-aaaar-qag2a-cai",
@@ -217,7 +209,7 @@ const DISALLOWED_FINANCE_CANISTERS: &[(&str, &str, &str)] = &[
     (
         "grghe-syaaa-aaaar-qabyq-cai",
         "the Chain Fusion Signer (the signer behind Oisy)",
-        "its btc_caller_send call signs and broadcasts Bitcoin transactions, and its eth/ecdsa/schnorr          signing calls move funds on other chains",
+        "its btc_caller_send call signs and broadcasts Bitcoin transactions, and its eth/ecdsa/schnorr signing calls move funds on other chains",
     ),
     (
         "sy2xe-miaaa-aaaar-qb7sq-cai",
@@ -335,20 +327,25 @@ const DISALLOWED_FINANCE_CANISTERS: &[(&str, &str, &str)] = &[
 /// [`DISALLOWED_FINANCE_CANISTERS`].
 const CK_LEDGER_WHY: &str = "its update surface transfers the token or grants spending approvals";
 
-/// The financial-transactions gate: `Some(refusal)` when `method` on
-/// `canister_id` is a disallowed ledger call, `None` when the call may
-/// proceed. Matching is literal in both groups — the IC matches method names
-/// by exact bytes, so a differently-spelled name would not reach the ledger
-/// method anyway. The refusal is the complete tool error text — it names the
-/// method, states the policy and why it exists, and tells the agent what to
-/// recommend to the user instead.
+/// The financial-transactions gate: `Some(refusal)` when the call is
+/// disallowed, `None` when it may proceed. Three scopes, checked in order:
+/// the standardized value-moving method names (refused on every canister),
+/// the abstract names scoped to the system ledger where they are financial,
+/// and the finance-canister list — on a listed canister EVERY update method
+/// is refused, so `None` never depends on the method name alone. Method
+/// matching is literal — the IC matches method names by exact bytes, so a
+/// differently-spelled name would not reach the real method anyway. The
+/// refusal is the complete tool error text — it names the method (and, on a
+/// listed canister, the service and how it is financial), states the policy
+/// and why it exists, and tells the agent what to recommend to the user
+/// instead.
 pub fn disallowed_update_method(canister_id: &Principal, method: &str) -> Option<String> {
     let canister = canister_id.to_text();
     // Method-level matches run first: their refusals carry the more specific
     // label and redirect (a creation spend points at the icp CLI). The
     // canister-level blanket below then catches every other update call on a
     // listed finance canister.
-    let what = DISALLOWED_ICRC_METHODS
+    let what = DISALLOWED_STANDARD_METHODS
         .iter()
         .find(|(m, _)| *m == method)
         .map(|(_, what)| *what)
@@ -407,11 +404,13 @@ mod tests {
         Principal::from_text(CYCLES_LEDGER).unwrap()
     }
 
-    // Every ICRC-standard value-moving method is refused on ANY canister, in
-    // its exact standard spelling.
+    // Every standardized value-moving method is refused on ANY canister, in
+    // its exact standard spelling — the ICRC token surface and the NNS/SNS
+    // governance interface's manage_neuron alike.
     #[test]
-    fn refuses_icrc_methods_on_every_canister() {
+    fn refuses_standard_methods_on_every_canister() {
         for method in [
+            "manage_neuron",
             "icrc1_transfer",
             "icrc2_approve",
             "icrc2_transfer_from",
@@ -525,7 +524,7 @@ mod tests {
     fn refuses_every_update_on_finance_canisters() {
         for (id, service, why) in DISALLOWED_FINANCE_CANISTERS {
             let canister = Principal::from_text(id).unwrap_or_else(|e| panic!("{id}: {e}"));
-            for method in ["greet", "swap", "manage_neuron", "store", "http_request_update"] {
+            for method in ["greet", "swap", "set_name", "store", "http_request_update"] {
                 let msg = disallowed_update_method(&canister, method)
                     .unwrap_or_else(|| panic!("{method} on {service} ({id}) must be refused"));
                 assert!(msg.contains(service), "{msg}");
