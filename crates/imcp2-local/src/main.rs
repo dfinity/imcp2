@@ -39,7 +39,7 @@ mod setup;
 #[cfg(all(test, feature = "e2e"))]
 mod e2e_local_login;
 
-use imcp2_core::{identities::Identities, skills, IcTools, IiInstance};
+use imcp2_core::{identities::Identities, IcTools, IiInstance};
 use login::SessionSlot;
 use rmcp::ServiceExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -171,12 +171,7 @@ async fn serve() -> anyhow::Result<()> {
     // flow fills (and on re-login replaces) the slot, and the resolver it
     // hands core answers every tool call's "which session?" from it.
     let slot = SessionSlot::new();
-    let tools = IcTools::new(
-        agent,
-        identities.clone(),
-        skills::SkillsCatalog::new(),
-        slot.resolver(),
-    );
+    let tools = IcTools::new(agent, identities.clone(), slot.resolver());
     let auto_open = !truthy("IMCP2_NO_OPEN");
     let login = login::LoginDriver::new(identities, slot, auto_open);
 
