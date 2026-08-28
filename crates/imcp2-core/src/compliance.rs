@@ -10,8 +10,9 @@
 //! frontend they control (e.g. <https://oisy.com>) in their own browser, or,
 //! for canister creation, with the icp CLI in their own terminal.
 //!
-//! The guard has two groups (split per review, so an app that happens to name
-//! a non-financial method `transfer` or `approve` keeps working):
+//! The guard has three groups (the method groups are split per review, so an
+//! app that happens to name a non-financial method `transfer` or `approve`
+//! keeps working):
 //!
 //!   * **ICRC-standard methods, matched literally on every canister.** Token
 //!     ledgers on the Internet Computer follow the ICRC standards —
@@ -25,6 +26,15 @@
 //!     ledger moves the user's funds; the same names on an arbitrary app
 //!     canister are often something else entirely, so they are refused only
 //!     on those specific canister ids.
+//!   * **Finance-related canisters, refused entirely.** A curated list of
+//!     canisters whose purpose is holding, staking, exchanging, or moving
+//!     value — token ledgers and chain-key minters, exchanges, wallet
+//!     backends, staking/governance canisters, and the frontends that serve
+//!     them. On these, EVERY update call is refused: their update surface
+//!     acts on the user's assets (or administers the service that does), so
+//!     there is no non-financial update call worth allowing. Each entry
+//!     carries a label saying what the service is and how it is financial,
+//!     used verbatim in the refusal.
 //!
 //! Why the standardized surface is where real funds live: tokens are only
 //! valuable if they can be exchanged or used, and the ICP ecosystem's
@@ -42,6 +52,12 @@
 //!     transactions are not supported") is stated in the server-level
 //!     instructions (get_info); this guard enforces it for the standardized
 //!     ledger surface, where real funds overwhelmingly live (see above).
+//!     Likewise the canister list is curated and static, while exchanges
+//!     create per-pair pool/farm canisters dynamically and new services
+//!     launch: entries cover each service's central canisters (verified
+//!     against the IC dashboard's registry and the services' own published
+//!     sources), and the ICRC method group plus the stated policy cover the
+//!     rest.
 //!   * Legacy pre-ICRC token standards (DIP20/EXT `transfer`/`transferFrom`/
 //!     `approve` on arbitrary canisters) are deliberately NOT matched: the
 //!     names are too abstract to block everywhere without breaking
@@ -99,6 +115,247 @@ const DISALLOWED_CANISTER_METHODS: &[(&str, &str, &str)] = &[
     (CYCLES_LEDGER, "create_canister_from", "a cycles-ledger delegated spend (canister creation)"),
 ];
 
+/// Finance-related canisters where EVERY update call is refused: (canister
+/// id, what the service is, how it is financial). The service and reason are
+/// used verbatim in the refusal message. Every id was verified against the IC
+/// dashboard's canister registry (ic-api.internetcomputer.org) and the
+/// service's own published sources (canister_ids.json / docs / on-chain SNS
+/// records) on 2026-08-28.
+const DISALLOWED_FINANCE_CANISTERS: &[(&str, &str, &str)] = &[
+    // --- The network's own staking, funds, and token infrastructure ---
+    (
+        "rrkah-fqaaa-aaaaa-aaaaq-cai",
+        "NNS Governance",
+        "its manage_neuron call stakes, splits, and disburses neuron-held ICP",
+    ),
+    (
+        "qoctq-giaaa-aaaaa-aaaea-cai",
+        "the NNS dapp frontend (the network's staking and transfer UI, classic origin)",
+        "its update surface is the content store behind that UI",
+    ),
+    (
+        "mc7vh-sqaaa-aaaai-q33na-cai",
+        "the NNS dapp frontend (the network's staking and transfer UI, current origin)",
+        "its update surface is the content store behind that UI",
+    ),
+    (
+        "renrk-eyaaa-aaaaa-aaada-cai",
+        "the NNS Genesis Token canister",
+        "its claim_neurons call hands control of genesis neurons (staked ICP) to a caller-supplied key",
+    ),
+    (
+        ICP_LEDGER,
+        "the ICP ledger",
+        "its update surface transfers ICP or grants spending approvals",
+    ),
+    (
+        CYCLES_LEDGER,
+        "the cycles ledger",
+        "its update surface moves cycles (prepaid compute value) or spends them on canister creation",
+    ),
+    // --- Chain-key token minters: they move REAL assets on other chains ---
+    (
+        "mqygn-kiaaa-aaaar-qaadq-cai",
+        "the ckBTC minter",
+        "its retrieve_btc calls burn ckBTC and send real BTC to a Bitcoin address",
+    ),
+    (
+        "sv3dd-oaaaa-aaaar-qacoa-cai",
+        "the ckETH and ckERC20 minter",
+        "its withdraw_eth / withdraw_erc20 calls burn ck-tokens and submit real Ethereum withdrawals",
+    ),
+    (
+        "eqltq-xqaaa-aaaar-qb3vq-cai",
+        "the ckDOGE minter",
+        "its retrieve_doge calls burn ckDOGE and send real DOGE out",
+    ),
+    // --- Chain-key token ledgers (the ICRC method group already refuses the
+    // standard transfer/approval names on these; listing the canisters closes
+    // the rest of their update surface too) ---
+    ("mxzaz-hqaaa-aaaar-qaada-cai", "the ckBTC ledger", CK_LEDGER_WHY),
+    ("ss2fx-dyaaa-aaaar-qacoq-cai", "the ckETH ledger", CK_LEDGER_WHY),
+    ("xevnm-gaaaa-aaaar-qafnq-cai", "the ckUSDC ledger", CK_LEDGER_WHY),
+    ("cngnf-vqaaa-aaaar-qag4q-cai", "the ckUSDT ledger", CK_LEDGER_WHY),
+    ("pe5t5-diaaa-aaaar-qahwa-cai", "the ckEURC ledger", CK_LEDGER_WHY),
+    ("bptq2-faaaa-aaaar-qagxq-cai", "the ckWBTC ledger", CK_LEDGER_WHY),
+    ("j2tuh-yqaaa-aaaar-qahcq-cai", "the ckWSTETH ledger", CK_LEDGER_WHY),
+    ("g4tto-rqaaa-aaaar-qageq-cai", "the ckLINK ledger", CK_LEDGER_WHY),
+    ("ilzky-ayaaa-aaaar-qahha-cai", "the ckUNI ledger", CK_LEDGER_WHY),
+    ("fxffn-xiaaa-aaaar-qagoa-cai", "the ckSHIB ledger", CK_LEDGER_WHY),
+    ("etik7-oiaaa-aaaar-qagia-cai", "the ckPEPE ledger", CK_LEDGER_WHY),
+    ("nza5v-qaaaa-aaaar-qahzq-cai", "the ckXAUT ledger", CK_LEDGER_WHY),
+    ("ebo5g-cyaaa-aaaar-qagla-cai", "the ckOCT ledger", CK_LEDGER_WHY),
+    ("efmc5-wyaaa-aaaar-qb3wa-cai", "the ckDOGE ledger", CK_LEDGER_WHY),
+    // --- Prominent SNS DAO governance canisters (the same disburse pattern
+    // as NNS Governance; per-SNS ledgers are covered by the ICRC group) ---
+    (
+        "2jvtu-yqaaa-aaaaq-aaama-cai",
+        "OpenChat's SNS governance",
+        "its manage_neuron call disburses staked CHAT",
+    ),
+    (
+        "tr3th-kiaaa-aaaaq-aab6q-cai",
+        "Gold DAO's SNS governance",
+        "its manage_neuron call disburses staked GLDGov",
+    ),
+    (
+        "jfnic-kaaaa-aaaaq-aadla-cai",
+        "WaterNeuron's SNS governance (an ICP liquid-staking protocol)",
+        "its manage_neuron call disburses staked WTN",
+    ),
+    (
+        "oypg6-faaaa-aaaaq-aadza-cai",
+        "KongSwap's SNS governance",
+        "its manage_neuron call disburses staked KONG",
+    ),
+    (
+        "zqfso-syaaa-aaaaq-aaafq-cai",
+        "Dragginz's SNS governance",
+        "its manage_neuron call disburses staked DKP",
+    ),
+    // --- Wallets and the signer behind them ---
+    (
+        "doked-biaaa-aaaar-qag2a-cai",
+        "the Oisy wallet backend",
+        "it grants the signing allowances and tracks the pending transactions behind the wallet's transfers",
+    ),
+    (
+        "grghe-syaaa-aaaar-qabyq-cai",
+        "the Chain Fusion Signer (the signer behind Oisy)",
+        "its btc_caller_send call signs and broadcasts Bitcoin transactions, and its eth/ecdsa/schnorr          signing calls move funds on other chains",
+    ),
+    (
+        "sy2xe-miaaa-aaaar-qb7sq-cai",
+        "Oisy Trade",
+        "an in-wallet trading engine — its update surface places and fills orders",
+    ),
+    (
+        "nynz6-haaaa-aaaan-qzqda-cai",
+        "the Oisy rewards canister",
+        "its update surface drives reward-token payouts",
+    ),
+    (
+        "cha4i-riaaa-aaaan-qeccq-cai",
+        "the Oisy wallet frontend",
+        "its update surface is the content store behind the wallet UI",
+    ),
+    // --- Exchanges: ICPSwap ---
+    (
+        "4mmnk-kiaaa-aaaag-qbllq-cai",
+        "the ICPSwap SwapFactory",
+        "it creates and administers the per-pair swap pools that hold user funds",
+    ),
+    (
+        "7eikv-2iaaa-aaaag-qdgwa-cai",
+        "the ICPSwap PasscodeManager",
+        "its depositFrom call pulls ICP from the caller as the pool-creation fee",
+    ),
+    (
+        "c5jrt-yaaaa-aaaag-qb5ra-cai",
+        "the ICPSwap farm factory",
+        "it creates the farms where users stake liquidity positions for rewards",
+    ),
+    (
+        "34ovl-syaaa-aaaag-qkanq-cai",
+        "the ICPSwap staking-pool factory",
+        "it creates the pools where users stake one token to earn another",
+    ),
+    (
+        "bplw4-cqaaa-aaaag-qcb7q-cai",
+        "the ICPSwap frontend",
+        "its update surface is the content store behind the exchange UI",
+    ),
+    // --- Exchanges: KongSwap (single-canister design) ---
+    (
+        "2ipq2-uqaaa-aaaar-qailq-cai",
+        "the KongSwap exchange backend",
+        "swaps, liquidity, and pool transfers all execute inside this one canister",
+    ),
+    (
+        "kxhyf-dyaaa-aaaar-qbwza-cai",
+        "KongSwap's treasury-liquidity extension",
+        "it deploys DAO treasury funds into liquidity pools",
+    ),
+    (
+        "3ldz4-aiaaa-aaaar-qaina-cai",
+        "the KongSwap frontend",
+        "its update surface is the content store behind the exchange UI",
+    ),
+    // --- Exchanges: Sonic (plus the legacy DIP-20 ledgers its DAO operates,
+    // whose transfer names the ICRC group deliberately does not match) ---
+    (
+        "3xwpq-ziaaa-aaaah-qcn4a-cai",
+        "the Sonic exchange swap canister",
+        "its deposit, swap, and liquidity calls move tokens between user subaccounts and pools",
+    ),
+    (
+        "lfzsk-7qaaa-aaaah-adk2q-cai",
+        "the Sonic LBP registry",
+        "it manages liquidity-bootstrapping token launches, taking deposits and purchases",
+    ),
+    (
+        "eo2vl-tyaaa-aaaah-adtfa-cai",
+        "the Sonic vesting canister",
+        "it holds and releases vested token allocations",
+    ),
+    (
+        "aanaa-xaaaa-aaaah-aaeiq-cai",
+        "the XTC cycles-token ledger (DIP-20)",
+        "its legacy transfer, burn, and mint calls move cycles-backed value under non-ICRC names",
+    ),
+    (
+        "utozz-siaaa-aaaam-qaaxq-cai",
+        "the WICP wrapped-ICP ledger (DIP-20)",
+        "its legacy mint, transfer, and unwrap calls move wrapped ICP under non-ICRC names",
+    ),
+    // --- Exchanges: ICDex / ICLighthouse ---
+    (
+        "i5jcx-ziaaa-aaaar-qaazq-cai",
+        "the ICDex router (ICLighthouse)",
+        "it creates and administers the per-pair orderbook canisters that hold user funds",
+    ),
+    (
+        "i2ied-uqaaa-aaaar-qaaza-cai",
+        "the ICLighthouse DexAggregator",
+        "a cross-exchange listing registry whose update surface includes staking and treasury withdrawals",
+    ),
+    (
+        "3yss5-5qaaa-aaaar-qad7a-cai",
+        "the ICLighthouse DAO trader",
+        "it holds treasury ICP and places orders on ICDex",
+    ),
+    (
+        "odhfn-cqaaa-aaaar-qaana-cai",
+        "the ICDex trading-mining canister",
+        "it runs trading and liquidity mining rounds and pays token rewards",
+    ),
+    (
+        "7vkf4-jqaaa-aaaaj-azrua-cai",
+        "the ICLighthouse frontend",
+        "its update surface is the content store behind the exchange UI",
+    ),
+    // --- Exchanges: ICPEx ---
+    (
+        "2ackz-dyaaa-aaaam-ab5eq-cai",
+        "the ICPEx router",
+        "its update surface creates pools, moves liquidity, and executes swaps",
+    ),
+    (
+        "24gqi-uyaaa-aaaam-ab5gq-cai",
+        "the ICPEx token-creation service",
+        "it mints new tokens for a fee taken from the caller",
+    ),
+    (
+        "gdz52-oaaaa-aaaam-ab7ea-cai",
+        "the ICPEx frontend",
+        "its update surface is the content store behind the exchange UI",
+    ),
+];
+
+/// The shared label for chain-key token ledgers in
+/// [`DISALLOWED_FINANCE_CANISTERS`].
+const CK_LEDGER_WHY: &str = "its update surface transfers the token or grants spending approvals";
+
 /// The financial-transactions gate: `Some(refusal)` when `method` on
 /// `canister_id` is a disallowed ledger call, `None` when the call may
 /// proceed. Matching is literal in both groups — the IC matches method names
@@ -107,37 +364,53 @@ const DISALLOWED_CANISTER_METHODS: &[(&str, &str, &str)] = &[
 /// method, states the policy and why it exists, and tells the agent what to
 /// recommend to the user instead.
 pub fn disallowed_update_method(canister_id: &Principal, method: &str) -> Option<String> {
+    let canister = canister_id.to_text();
+    // Method-level matches run first: their refusals carry the more specific
+    // label and redirect (a creation spend points at the icp CLI). The
+    // canister-level blanket below then catches every other update call on a
+    // listed finance canister.
     let what = DISALLOWED_ICRC_METHODS
         .iter()
         .find(|(m, _)| *m == method)
         .map(|(_, what)| *what)
         .or_else(|| {
-            let canister = canister_id.to_text();
             DISALLOWED_CANISTER_METHODS
                 .iter()
                 .find(|(c, m, _)| *c == canister && *m == method)
                 .map(|(_, _, what)| *what)
-        })?;
-    // Every refusal points the user at doing the operation themselves:
-    // canister creation at the user-run icp CLI (deliberately NOT at another
-    // connector tool, per review), everything else at a user-controlled
-    // wallet or frontend in the user's own browser.
-    let instead = if method.starts_with("create_canister") {
-        "Recommend that the user creates and funds canisters themselves with \
-         the icp CLI in their own terminal (install with `npm install -g \
-         @icp-sdk/icp-cli`, or see https://github.com/dfinity/icp-cli); the \
-         skill://icp-cli and skill://cycles-management resources carry the \
-         full guide."
-    } else {
-        "Recommend that the user performs this operation themselves, in a wallet \
-         or app frontend they control, in their own web browser — e.g. their \
-         wallet at https://oisy.com."
-    };
+        });
+    if let Some(what) = what {
+        // Every refusal points the user at doing the operation themselves:
+        // canister creation at the user-run icp CLI (deliberately NOT at another
+        // connector tool, per review), everything else at a user-controlled
+        // wallet or frontend in the user's own browser.
+        let instead = if method.starts_with("create_canister") {
+            "Recommend that the user creates and funds canisters themselves with \
+             the icp CLI in their own terminal (install with `npm install -g \
+             @icp-sdk/icp-cli`, or see https://github.com/dfinity/icp-cli); the \
+             skill://icp-cli and skill://cycles-management resources carry the \
+             full guide."
+        } else {
+            "Recommend that the user performs this operation themselves, in a wallet \
+             or app frontend they control, in their own web browser — e.g. their \
+             wallet at https://oisy.com."
+        };
+        return Some(format!(
+            "`{method}` is {what} — a financial transaction. Financial transactions \
+             (token transfers, spending approvals, payments, or trades) are not \
+             supported by this server, to protect the user: asset-moving requests \
+             are denied. {instead}"
+        ));
+    }
+    let (_, service, why) = DISALLOWED_FINANCE_CANISTERS
+        .iter()
+        .find(|(c, _, _)| *c == canister)?;
     Some(format!(
-        "`{method}` is {what} — a financial transaction. Financial transactions \
-         (token transfers, spending approvals, payments, or trades) are not \
-         supported by this server, to protect the user: asset-moving requests \
-         are denied. {instead}"
+        "`{method}` is an update call to {service} — {why}. State-changing calls \
+         to financial services are not supported by this server, to protect the \
+         user: asset-moving requests are denied. Recommend that the user performs \
+         this operation themselves, in the service's own web frontend (or a \
+         wallet they control), in their own browser."
     ))
 }
 
@@ -179,13 +452,15 @@ mod tests {
     }
 
     // Matching is literal: a differently-spelled name is NOT the standard
-    // method (Candid method names are case-sensitive), so it is allowed here —
-    // it could never reach the ledger method on chain anyway.
+    // method (Candid method names are case-sensitive), so it is allowed on an
+    // unlisted canister — it could never reach the ledger method on chain
+    // anyway. (On a finance-listed canister every update call is refused
+    // regardless of spelling, so the property is observable only off the list.)
     #[test]
     fn matching_is_literal_not_normalized() {
         for method in ["ICRC1_Transfer", "icrc1-transfer", " icrc1_transfer ", "Transfer"] {
             assert!(
-                disallowed_update_method(&icp_ledger(), method).is_none(),
+                disallowed_update_method(&any_canister(), method).is_none(),
                 "{method} is not the standard spelling and must not match"
             );
         }
@@ -261,6 +536,59 @@ mod tests {
                 "{method} must be allowed on a non-ledger canister"
             );
         }
+    }
+
+    // Every listed finance canister refuses EVERY update call — arbitrary
+    // names included — and the refusal names the service, its finance
+    // relation, and the policy, in the same plain protective register as the
+    // method refusals (no marketplace/compliance jargon).
+    #[test]
+    fn refuses_every_update_on_finance_canisters() {
+        for (id, service, why) in DISALLOWED_FINANCE_CANISTERS {
+            let canister = Principal::from_text(id).unwrap_or_else(|e| panic!("{id}: {e}"));
+            for method in ["greet", "swap", "manage_neuron", "store", "http_request_update"] {
+                let msg = disallowed_update_method(&canister, method)
+                    .unwrap_or_else(|| panic!("{method} on {service} ({id}) must be refused"));
+                assert!(msg.contains(service), "{msg}");
+                assert!(msg.contains(why), "{msg}");
+                assert!(msg.contains("not supported"), "{msg}");
+                assert!(msg.contains("to protect the user"), "{msg}");
+                assert!(!msg.contains("marketplace"), "{msg}");
+                assert!(!msg.contains("compliance"), "{msg}");
+            }
+        }
+    }
+
+    // The list itself stays well-formed: every id parses as a principal, ids
+    // are unique, and every entry carries both labels (what the service is,
+    // how it is financial) — the shape the refusal message interpolates.
+    #[test]
+    fn finance_canister_list_is_well_formed() {
+        let mut ids: Vec<&str> =
+            DISALLOWED_FINANCE_CANISTERS.iter().map(|(id, _, _)| *id).collect();
+        for (id, service, why) in DISALLOWED_FINANCE_CANISTERS {
+            Principal::from_text(id).unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert!(!service.is_empty() && !why.is_empty(), "{id} needs both labels");
+        }
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "duplicate canister ids in the finance list");
+    }
+
+    // Method-level refusals keep precedence on listed canisters, so the
+    // tailored messages (and their redirects) survive the canister blanket:
+    // a creation spend still points at the icp CLI, an ICRC hit still names
+    // the standard method.
+    #[test]
+    fn method_refusals_take_precedence_on_listed_canisters() {
+        let msg = disallowed_update_method(&cycles_ledger(), "create_canister").unwrap();
+        assert!(msg.contains("icp CLI"), "{msg}");
+        let msg = disallowed_update_method(&icp_ledger(), "icrc1_transfer").unwrap();
+        assert!(msg.contains("ICRC-1"), "{msg}");
+        // ...and anything else on those ledgers now falls to the blanket.
+        let msg = disallowed_update_method(&icp_ledger(), "greet").unwrap();
+        assert!(msg.contains("the ICP ledger"), "{msg}");
     }
 
     // The refusal is the whole story: it names the method, states the policy

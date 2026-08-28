@@ -1993,8 +1993,10 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              FINANCIAL TRANSACTIONS ARE NOT SUPPORTED — asset-moving requests are denied, to \
              protect the user: canister_update_call refuses the ICRC-standard transfer/approval \
              methods (icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICRC-4/-7/-37 \
-             equivalents) on every canister, and the ICP and cycles ledgers' own \
-             transfer/withdrawal/creation methods on those ledgers. For financial operations \
+             equivalents) on every canister, the ICP and cycles ledgers' own \
+             transfer/withdrawal/creation methods on those ledgers, and EVERY update call on a \
+             curated list of known financial-service canisters (token ledgers and minters, \
+             exchanges, wallet backends, and staking/governance canisters). For financial operations \
              (token transfers, spending approvals, payments, trades), recommend the user acts \
              themselves in a wallet or frontend they control, in their own browser — e.g. their \
              wallet at https://oisy.com; a refused cycles-ledger canister-creation spend points \
