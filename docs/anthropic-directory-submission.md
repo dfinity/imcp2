@@ -164,10 +164,8 @@ transactions:**
   outside the connector, in a trusted interface they control, and names no
   venue (a refused canister-creation or funding-completion call points at the
   user-run icp CLI). The policy is stated in full in the server-level
-  instructions — the field the directories scan — and deliberately in no tool
-  description: a policy paragraph inside `canister_update_call`'s description
-  would read as a hint that the tool is usable for financial transactions. A
-  unit test holds that line across the whole served surface.
+  instructions — the field the directories scan — where it covers the whole
+  surface at once. A unit test holds it there.
 - The README, the landing page, and the server instructions all state
   explicitly that financial transactions are not supported.
 

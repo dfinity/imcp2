@@ -133,11 +133,8 @@ submission states, not from a narrower reading:
   canister, a URL with no Internet-Computer evidence). The
   financial-transactions policy is a separate, server-wide matter and is
   stated where the scan reads it: in full in the server-level instructions,
-  and deliberately in no description — a policy paragraph inside
-  `canister_update_call`'s description would read as a hint that the tool is
-  usable for financial transactions. So no description promises a behavior
-  the tool does not have, and no refusal is hidden: it is stated once, for
-  the whole surface.
+  covering the whole surface at once. So no description promises a behavior
+  the tool does not have, and no refusal is hidden.
 - **The commerce and speculation rules have nothing to attach to.** The
   plugin sells nothing (no physical goods, no digital goods or
   subscriptions, no checkout) and offers no speculation product: no trading,
