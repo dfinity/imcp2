@@ -57,9 +57,9 @@ add details not published in the docs.
 | Tools explicitly annotated `readOnlyHint` / `destructiveHint` / `openWorldHint` — "incorrect or missing action labels are a common cause of rejection" | ✅ set on all 11 tools. The unit test enforces annotation presence and the `readOnlyHint`/`destructiveHint` values; `openWorldHint` is declared everywhere but not asserted by the test, so re-check it in the portal's Scan Tools step |
 | Tool names "human-readable, specific, and descriptive"; accurate descriptions; minimum-information requests | ✅ reviewed against the same bar for the Anthropic listing |
 | Public HTTPS production endpoint, stable and complete ("trial or demo plugins will not be accepted") | ✅ production deployment |
-| Privacy policy disclosing "categories of personal data collected, purposes of use, categories of recipients, data retention timelines" | ⏳ **pending the production release**: the rewritten policy matches these four required disclosures exactly and is live on staging, but `https://mcp.internetcomputer.org/privacy-policy` serves nothing until the next `release-*` tag ships it (see the checklist) |
-| Customer support contact (OpenAI asks for a URL) | ✅ `https://mcp.internetcomputer.org/support` — ships with this PR (live at the next release); routes users to <mcp@dfinity.org>, the status dashboard, id.ai access management, GitHub issues, and the security policy |
-| Terms of Service URL | ✅ `https://mcp.internetcomputer.org/terms` — ships with this PR (live at the next release); Swiss-law terms covering the non-custodial model, user responsibility for authorized actions, irreversibility of network actions, as-is/liability limits with the Art. 100 CO carve-out. Needs the same legal pass as the privacy policy |
+| Privacy policy disclosing "categories of personal data collected, purposes of use, categories of recipients, data retention timelines" | ✅ the rewritten policy matches these four required disclosures exactly and `https://mcp.internetcomputer.org/privacy-policy` is live (verified 2026-08-27); the next `release-*` refreshes its text to the current draft |
+| Customer support contact (OpenAI asks for a URL) | ✅ `https://mcp.internetcomputer.org/support` — merged and live on production; routes users to <mcp@dfinity.org>, the status dashboard, id.ai access management, GitHub issues, and the security policy |
+| Terms of Service URL | ✅ `https://mcp.internetcomputer.org/terms` — merged and live on production; Swiss-law terms covering the non-custodial model, user responsibility for authorized actions, irreversibility of network actions, as-is/liability limits with the Art. 100 CO carve-out. Needs the same legal pass as the privacy policy |
 | Logo | ✅ [`docs/assets/icp-logo-1024.png`](assets/icp-logo-1024.png) |
 
 Note the legacy redirect `chatgpt.com/connector_platform_oauth_redirect` is
@@ -75,7 +75,7 @@ if a reviewer reports a failure.
 The portal requires proving control of the host: an endpoint at
 `https://<host>/.well-known/openai-apps-challenge` must return **only** the
 verification token revealed during submission ("do not return JSON, a list of
-tokens, or multiple tokens"). The route ships with this PR: it serves
+tokens, or multiple tokens"). The route is merged and deployed: it serves
 `$OPENAI_APPS_CHALLENGE_TOKEN` verbatim as `text/plain` (trimmed, so unit-file
 whitespace can't break OpenAI's exact-match check) and 404s while the variable
 is unset, so it is inert until a submission is in flight. When the portal
@@ -106,8 +106,7 @@ financial-transfers prohibition:
 
 - Prohibited: "Crypto or NFT offerings involving **speculation, consumer
   deception**". IMCP2 offers no speculation product — no trading, prices, or
-  markets. Cycles funding is metered compute credit for the user's own
-  canisters.
+  markets.
 - Commerce rules ("only for physical goods", no digital-goods selling, no
   embedded checkout) govern *selling through the app*; IMCP2 sells nothing.
 - The attestation "my plugin does not initiate or execute money transfers,
@@ -177,8 +176,9 @@ Negative:
 
 - [ ] OpenAI Platform organization verified (business verification)
 - [ ] Submitter holds the Apps Management write permission
-- [ ] Repository secret `OPENAI_APPS_CHALLENGE_TOKEN` set to the portal's token and deployed; `curl https://mcp.internetcomputer.org/.well-known/openai-apps-challenge` returns exactly the token (blocker 1 — the route itself ships with this PR)
-- [ ] Privacy policy live at `https://mcp.internetcomputer.org/privacy-policy` (same release as the Anthropic listing needs)
+- [ ] Production runs a release cut from current `main`: `curl https://mcp.internetcomputer.org/version` reports a commit that contains #153–#158 — verify immediately before submitting, since the deploy workflow also accepts older tags/SHAs (rollbacks), so a deployed challenge token alone does not prove the compliant build is live
+- [ ] Repository secret `OPENAI_APPS_CHALLENGE_TOKEN` set to the portal's token and deployed; `curl https://mcp.internetcomputer.org/.well-known/openai-apps-challenge` returns exactly the token (blocker 1 — the route is merged and deployed; it 404s until the variable is set, by design)
+- [x] Privacy policy live at `https://mcp.internetcomputer.org/privacy-policy` (verified 2026-08-27; the next release refreshes its text to the current draft)
 - [ ] Tools re-scanned in the portal after any server change; annotations verified in the scan
 - [ ] 5+ positive and 3+ negative test cases entered, verified on web and mobile
 - [ ] Starter prompts entered; country availability chosen
