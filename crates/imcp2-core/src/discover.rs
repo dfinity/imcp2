@@ -537,16 +537,18 @@ struct KnownApp {
     app_url: &'static str,
 }
 
-// Name resolution is a READ convenience: it turns a name a user said into an
-// app URL and derivation origin, so `open_app` can read interfaces, discover
-// canisters, and derive the user's per-app principal. It confers no ability to
-// act — every update call to these apps' canisters is refused by
-// [`crate::compliance`], which carries all three of them — so an entry here is
-// discovery-neutral rather than a route to a transaction. NNS was dropped from
-// this list at the author's request; that was an editorial choice about which
-// names the server advertises, not a safety criterion, and its derivation
-// origins are deliberately kept below so reads still resolve to the right
-// identity.
+// Name resolution writes nothing: it turns a name a user said into an app URL
+// and derivation origin, so `open_app` can read interfaces, discover
+// canisters, and derive the user's per-app principal. An entry here is
+// therefore not itself a route to a transaction — a later update call is a
+// separate request, and goes through [`crate::compliance`] like any other,
+// under exactly the scope that module documents (the standardized
+// value-moving methods everywhere, every update method on the canisters it
+// lists, and its own note on what a static list cannot cover, such as an
+// exchange's dynamically created pool canisters). NNS was dropped from this
+// list at the author's request; that was an editorial choice about which names
+// the server advertises, not a safety criterion, and its derivation origins
+// are deliberately kept below so reads still resolve to the right identity.
 const KNOWN_APPS: &[KnownApp] = &[
     KnownApp { name: "Oisy", aliases: &["oisy", "oisywallet"], app_url: "https://oisy.com" },
     KnownApp { name: "MULTI/DEX", aliases: &["multidex"], app_url: "https://multidex.ai" },
