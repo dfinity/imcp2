@@ -121,18 +121,19 @@ submission states, not from a narrower reading:
   governance method `manage_neuron` — neuron staking and disbursement) on
   every canister, the ICP and cycles ledgers' own value-moving methods and
   the cycles-minting canister's funding-completion methods on those
-  canisters, and every update call on a curated list of known
-  financial-service canisters (token ledgers and minters, exchanges, wallet
-  backends, staking/governance). The refusal tells the user to perform the
+  canisters, and every update call on the financial-service canisters it
+  carries. The refusal tells the user to perform the
   operation outside the connector, in a trusted interface they control, and
   names no venue.
 - **The descriptions match the behavior**, as the guidelines require ("tools
   should behave exactly as their names, descriptions, and inputs indicate";
   "side effects should never be hidden or implicit"):
-  `canister_update_call`'s description states that financial operations and
-  update calls to known financial-service canisters are not supported and
-  return an error, and the full policy — refused method families and the
-  reason — is in the server-level instructions.
+  every tool description says what its tool does, what it returns, and what
+  it rejects. The financial-transactions policy is not restated there: it is
+  stated in full in the server-level instructions, which is the field the
+  scan reads, and kept out of the descriptions deliberately — a policy
+  paragraph inside `canister_update_call`'s description would read as a hint
+  that the tool is usable for financial transactions.
 - **The commerce and speculation rules have nothing to attach to.** The
   plugin sells nothing (no physical goods, no digital goods or
   subscriptions, no checkout) and offers no speculation product: no trading,
