@@ -172,7 +172,13 @@ const FAVICON_SVG: &str = include_str!("assets/favicon.svg");
 /// unauthenticated fetch, `/version` is an operations probe, `/status/` is the
 /// dashboard, and `/.well-known/*` documents are for clients, not readers.
 /// Keep in step with the page routes registered in `main`.
-const PUBLIC_PAGES: &[&str] = &["/", "/privacy-policy", "/terms", "/support"];
+const PUBLIC_PAGES: &[&str] = &[
+    "/",
+    "/privacy-policy",
+    "/terms",
+    "/developer-terms",
+    "/support",
+];
 
 /// Escape the five XML metacharacters. `PUBLIC_URL` is operator-supplied, so a
 /// stray `&` in it must not produce a malformed sitemap that a crawler rejects
@@ -337,6 +343,28 @@ fn terms_page() -> &'static str {
     PAGE.get_or_init(|| TERMS_HTML.replace("__LOGO__", DFINITY_LOGO_SVG))
 }
 
+/// The **Developer** Terms served at `/developer-terms` — the agreement an
+/// application's publisher accepts to have its origin registered for
+/// state-changing calls, and the layer the ICP service-discoverability protocol
+/// cannot itself provide: the protocol proves an app's composition, these Terms
+/// carry the publisher's promises about it (that it may expose every canister it
+/// lists, and that its MCP-reachable operations stay inside this server's
+/// financial and data policies). Same construction as the other pages, plus one
+/// more substitution: the Terms **revision** is interpolated from
+/// [`imcp2_core::DEVELOPER_TERMS_VERSION`], the same constant the write gate
+/// compares a registration's acceptance against — so the served page and the
+/// enforced revision cannot drift apart (pinned by a test).
+const DEVELOPER_TERMS_HTML: &str = include_str!("assets/developer-terms.html");
+
+fn developer_terms_page() -> &'static str {
+    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PAGE.get_or_init(|| {
+        DEVELOPER_TERMS_HTML
+            .replace("__REVISION__", imcp2_core::DEVELOPER_TERMS_VERSION)
+            .replace("__LOGO__", DFINITY_LOGO_SVG)
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // When this process started — i.e. when the deployment last (re)started.
@@ -453,6 +481,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/privacy-policy", get(|| async { Html(privacy_policy_page()) }))
         .route("/support", get(|| async { Html(support_page()) }))
         .route("/terms", get(|| async { Html(terms_page()) }))
+        .route(
+            "/developer-terms",
+            get(|| async { Html(developer_terms_page()) }),
+        )
         // Unauthenticated build/version probe so operators and the status
         // dashboard can confirm exactly which deployment is live: the running
         // commit (baked in at build time via GIT_SHA), the build time
@@ -780,13 +812,55 @@ mod tests {
         assert!(!svg.contains("<rect"), "the mark must stay transparent: {svg}");
     }
 
+    // The Developer Terms page and the write gate must name the SAME revision:
+    // the gate authorizes a state-changing call only when a registration's
+    // acceptance matches [`imcp2_core::DEVELOPER_TERMS_VERSION`], so a page
+    // still advertising the previous revision would ask publishers to accept
+    // something that no longer authorizes anything. The revision is
+    // interpolated rather than written into the markup, and this pins that it
+    // landed and that no placeholder survived.
+    #[test]
+    fn the_developer_terms_page_names_the_enforced_revision() {
+        let page = super::developer_terms_page();
+        let revision = imcp2_core::DEVELOPER_TERMS_VERSION;
+        assert!(
+            page.contains(&format!("Revision {revision}")),
+            "the page must carry revision {revision}"
+        );
+        assert!(
+            !page.contains("__REVISION__"),
+            "every placeholder must be substituted"
+        );
+        assert!(
+            !page.contains("__LOGO__"),
+            "every placeholder must be substituted"
+        );
+        // The page has to state the two obligations the protocol cannot: that
+        // the publisher may expose every canister it lists, and that its
+        // MCP-reachable operations stay inside the financial and data policies.
+        for expected in [
+            "entitled to expose every canister",
+            "does not transfer, trade, or move value",
+            "lawfully",
+        ] {
+            assert!(
+                page.contains(expected),
+                "the Developer Terms must state {expected:?}"
+            );
+        }
+        // And that it is addressed to publishers, not end users — the user ToS
+        // is a different document, linked from here.
+        assert!(page.contains("/terms"), "the end-user Terms must be linked");
+    }
+
     #[test]
     fn every_served_page_links_the_favicon() {
-        let pages: [(&str, &str); 4] = [
+        let pages: [(&str, &str); 5] = [
             ("/", super::INDEX_HTML),
             ("/privacy-policy", super::privacy_policy_page()),
             ("/support", super::support_page()),
             ("/terms", super::terms_page()),
+            ("/developer-terms", super::developer_terms_page()),
         ];
         assert_eq!(pages.len(), PUBLIC_PAGES.len());
         for (path, html) in pages {

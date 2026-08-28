@@ -112,8 +112,19 @@ financial-transfers prohibition:
 - The attestation "my plugin does not initiate or execute money transfers,
   crypto transfers, or investment trades on behalf of users" is satisfied by
   the shipped behavior — check it on that basis: no tool initiates or
-  executes a transfer of the user's funds. `canister_update_call` refuses
-  the financial ledger methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37
+  executes a transfer of the user's funds. Two independent reasons, either
+  sufficient. First, `canister_update_call` executes only against a
+  **registered application**: it requires an `application_origin` whose
+  developer accepted the ICP MCP Developer Terms (published at
+  `/developer-terms`) and whose own `/.well-known/ic-architecture` manifest —
+  published under the [ICP service-discoverability protocol][protocol] and
+  re-read on every call — declares the target canister; every failure refuses,
+  and the registry ships empty. A ledger, minter, or exchange canister is never
+  a registered application, so it is unreachable by a state-changing call
+  whatever the method is named, and a canister id the plugin can otherwise
+  discover behind a domain (gateway header, `/env.json`, JS bundle) is
+  read-only. Second, within that registered surface `canister_update_call`
+  refuses the financial ledger methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37
   equivalents on every canister, plus the NNS/SNS governance method
   `manage_neuron` — neuron staking and disbursement — on every canister,
   plus the ICP and cycles ledgers' own
@@ -124,7 +135,10 @@ financial-transfers prohibition:
   free of financial language), and the plugin has no funding or
   canister-management tools at all. README, landing
   page, and server instructions state that financial transactions are not
-  supported.
+  supported; the README and the server instructions additionally state the
+  registration requirement for state-changing calls.
+
+[protocol]: https://docs.internetcomputer.org/guides/frontends/service-discoverability/
 
 ### 4. Test cases (authoring work)
 
@@ -137,8 +151,9 @@ Positive:
 2. "Does the canister behind https://opencloud.org expose an API doc, and
    what does its interface look like?" → interface + capability flags via
    get_canister_candid / get_canister_api_doc.
-3. "What canisters are behind https://opencloud.org?" → App Connect
-   discovery returns the app's canisters with provenance.
+3. "What canisters are behind https://opencloud.org?" → discovery returns
+   the app's canisters with provenance, its own `/.well-known/ic-architecture`
+   manifest first.
 4. "Open opencloud.org and list my accounts there" (signed in) → resolves
    the derivation origin, lists II accounts.
 5. "Resolve https://opencloud.org to its Internet Identity derivation
@@ -157,6 +172,12 @@ Negative:
    (no crash, no hang).
 4. "Call an update method on a canister that rejects this caller" → the
    canister/network rejects it; the error is surfaced legibly.
+5. "Transfer 1 ICP" / "call an update method on an app of your choosing" →
+   refused before any network call: an update needs an `application_origin`
+   that is a registered application whose manifest declares the canister, and
+   the refusal says so and offers the read instead. With the registry shipping
+   empty, this is the expected outcome for every application; reads (cases 1-5
+   above) are unaffected.
 
 ### 5. Decisions for the submitter
 

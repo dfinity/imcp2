@@ -150,7 +150,22 @@ transactions:**
 - **The connector has no funding or management tools.** Creating, funding,
   and managing canisters is done by the user with the icp CLI in their own
   terminal.
-- `canister_update_call` **refuses the standardized value-moving methods** —
+- **State-changing calls reach a registered surface only.** `canister_update_call`
+  requires an `application_origin`, and executes only when that origin is a
+  registered application — its developer having accepted the ICP MCP Developer
+  Terms (published at `/developer-terms`) — whose own
+  `/.well-known/ic-architecture` manifest, published under the
+  [ICP service-discoverability protocol][protocol] and re-read on every call,
+  declares the target canister. Every failure refuses; there is no fallback. A
+  canister the connector can otherwise discover behind a domain (the gateway's
+  `x-ic-canister-id` header, an `/env.json`, a JavaScript bundle) can be **read**
+  and never **written to**. So an arbitrary ledger, minter, or exchange canister
+  is out of reach of a state-changing call regardless of method name: none of
+  them is a registered application, and none declares a manifest naming itself.
+  The registry ships empty and grows only by reviewed change, so the set of
+  applications that may receive writes is public and auditable.
+- Within that registered surface, `canister_update_call` **refuses the
+  standardized value-moving methods** —
   the ICRC-standard transfer/approval names
   (ICRC-1/ICRC-2 plus ICRC-4/-7/-37) and the NNS/SNS governance method
   `manage_neuron` (neuron staking and disbursement, on every SNS DAO's
@@ -163,13 +178,24 @@ transactions:**
   in a wallet they control (oisy.com; a refused canister-creation spend
   points at the user-run icp CLI), and the policy is stated in the
   server-level instructions — deliberately not in the tool descriptions,
-  which stay free of financial language.
+  which stay free of financial language. This guard is deliberately
+  origin-blind, so registration cannot launder a financial call through it: a
+  registered application gets access to its own declared canisters, never the
+  right to move value.
 - The README, the landing page, and the server instructions all state
-  explicitly that financial transactions are not supported.
+  explicitly that financial transactions are not supported, and the README and
+  the server instructions additionally state the registration requirement for
+  state-changing calls.
+
+[protocol]: https://docs.internetcomputer.org/guides/frontends/service-discoverability/
 
 **Posture, stated plainly — the black-and-white answer the compliance step
-needs:** no tool initiates or executes a transfer of the user's funds.
-Financial ledger methods are refused, and no funding or management tools are
+needs:** no tool initiates or executes a transfer of the user's funds. Two
+independent reasons, either sufficient: state-changing calls reach only
+applications registered under the ICP service-discoverability protocol whose
+developers accepted the ICP MCP Developer Terms (no ledger, minter, or exchange
+is one), and within that surface the standardized financial methods and known
+finance-related canisters are refused anyway. No funding or management tools are
 served at all — users run those operations themselves with the icp CLI. The
 financial-transactions acknowledgment is made on that basis, without
 qualifications.
@@ -255,7 +281,9 @@ Paste-and-adapt; portal limits in parentheses.
   > With your consent it can also act as your Internet Identity accounts at a
   > specific app. Financial transactions are not supported: token-ledger
   > transfer and approval methods are refused to protect you, and there are
-  > no funding or canister-management tools.
+  > no funding or canister-management tools. Actions are limited to
+  > applications registered with DFINITY for that purpose; anything else is
+  > read-only.
   >
   > On the Internet Identity consent screen you explicitly choose the session
   > duration (10 minutes to 30 days) and the access level: "Questions only"
@@ -330,15 +358,21 @@ Paste-and-adapt; portal limits in parentheses.
 >    to move tokens returns a policy message directing the user to a wallet
 >    they control — that behavior is intended (financial transactions are
 >    not supported).
+> 6. State-changing calls to an application that is not registered with us are
+>    refused by design, with a message naming the ICP MCP Developer Terms. The
+>    registry ships empty, so a reviewer testing an update call against an
+>    arbitrary app will see that refusal; reads are unaffected and are what the
+>    walkthrough above exercises.
 
 ### The seven compliance acknowledgments
 
 Topics: directory guidelines, first-party API usage, financial transactions,
 AI media generation, prompt injection, conversation-data collection, public
 documentation. **Financial transactions** is a clean acknowledgment: no
-tool initiates or executes a transfer of the user's funds — financial ledger
-methods are refused, and no funding or management tools are served (users run
-those operations with the icp CLI).
+tool initiates or executes a transfer of the user's funds — state-changing calls
+reach only registered applications (a ledger or exchange is never one), financial
+ledger methods are refused within that surface as well, and no funding or
+management tools are served (users run those operations with the icp CLI).
 **First-party API usage** is answered by describing the architecture as it
 is: DFINITY operates the connector itself; it reaches the network through
 public Internet Computer infrastructure (`icp-api.io`, `id.ai`) and forwards

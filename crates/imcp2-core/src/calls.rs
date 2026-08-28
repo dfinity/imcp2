@@ -164,6 +164,20 @@ pub struct CanisterUpdateCallArgs {
     pub canister_id: String,
     /// Update method name to invoke.
     pub method: String,
+    /// REQUIRED. The https origin of the application this call belongs to —
+    /// scheme and host only, e.g. `https://example.com` (no path). This is
+    /// what AUTHORIZES the call: the origin must be a registered application
+    /// whose developer accepted the ICP MCP Developer Terms, its
+    /// `/.well-known/ic-architecture` manifest is read fresh on every call,
+    /// and the target canister must be one the manifest declares. A canister
+    /// id found any other way (a response header, an `/env.json`, a JS
+    /// bundle) cannot be written to. Get the value from open_app / resolve_app
+    /// (`application_origin`). NOT interchangeable with `derivation_origin`:
+    /// several frontends can share one derivation origin, and the manifest
+    /// lives at the application origin. Reads (canister_query) need no
+    /// application origin.
+    #[serde(default)]
+    pub application_origin: Option<String>,
     /// Arguments in textual Candid syntax, e.g. `()` or `(record { owner = principal "..." })`.
     #[serde(default = "default_args")]
     pub args: String,
@@ -196,6 +210,16 @@ pub struct CanisterUpdateCallOutput {
     pub canister_id: String,
     /// The method that was invoked.
     pub method: String,
+    /// The registered application origin the call was authorized against, in
+    /// canonical form. Compare it with what you passed to catch an origin that
+    /// canonicalized to a different application than you meant.
+    pub application_origin: String,
+    /// How that application's own `/.well-known/ic-architecture` manifest
+    /// describes the canister that was called (its name/role) — null when the
+    /// manifest declares the id with no labels. Read it as confirmation that
+    /// the canister you called is the one the application says it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_as: Option<String>,
     /// The decoded reply in textual Candid.
     pub reply: String,
     /// The principal the call was signed as — null for an anonymous call.

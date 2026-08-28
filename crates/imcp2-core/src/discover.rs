@@ -1,24 +1,34 @@
-//! Best-effort discovery of the canisters behind a web domain served from the
-//! Internet Computer, folding together the patterns we've seen across apps:
+//! Discovery of the canisters behind a web domain served from the Internet
+//! Computer: one **declaration** and three **heuristics**, in that order of
+//! authority.
 //!
-//!   1. **App-declared metadata** (most authoritative — the app says so):
-//!      the `ic:canister-id` `<meta>` on `/ai-connect.html` (the App Connect
-//!      bridge page, spec §4.7/§6.1 — the app's MAIN backend), and the
-//!      `/.well-known/ic-app.json` manifest enumerating ALL the app's
-//!      canisters with roles (our proposed convention for the spec's deferred
-//!      §6.3 "multi-canister applications" — see README).
-//!   2. `x-ic-canister-id` response header — the frontend/asset canister. This
-//!      is the one universal signal (the HTTP gateway sets it).
+//!   1. **The app's own architecture manifest** —
+//!      `/.well-known/ic-architecture`, the composition layer of the [ICP
+//!      service-discoverability protocol] ([`crate::architecture`]): the
+//!      application enumerates the canisters it comprises, with names and
+//!      roles. This is the app *declaring* its composition at its own origin,
+//!      which is why it is also the only source that can authorize a
+//!      state-changing call ([`crate::authorization`]).
+//!   2. `x-ic-canister-id` response header — the frontend/asset canister. The
+//!      one universal signal (the HTTP gateway sets it).
 //!   3. a runtime config asset (`/env.json`) carrying `*canister_id*` keys —
 //!      e.g. Caffeine apps expose `backend_canister_id` here.
 //!   4. canister-id literals in the JS bundle, preferring labelled
 //!      `*_CANISTER_ID` constants — e.g. dfx/Vite apps like OISY bake
 //!      `IC_BACKEND_CANISTER_ID`, `IC_SIGNER_CANISTER_ID`, etc.
 //!
-//! There is NO authoritative reverse lookup for "this site's backend" — (1)
-//! is declared by the app itself and (2) is certain for the frontend; (3) and
-//! (4) are mined from client code, so each result carries its provenance and
-//! the caller decides (and should confirm with `get_canister_candid`).
+//! There is NO authoritative reverse lookup for "this site's backend". (1) is
+//! declared by the app itself and (2) is certain for the frontend; (3) and (4)
+//! are mined from client code, so each result carries its provenance and the
+//! caller decides (and should confirm with `get_canister_candid`).
+//!
+//! **Provenance is not permission.** (2)–(4) are read-only hints: they say a
+//! canister id appeared in bytes served behind a domain, not that the
+//! application claims it. They are useful for finding what to *read* and can
+//! authorize nothing — an update call is authorized only against (1). See
+//! [`crate::authorization`].
+//!
+//! [ICP service-discoverability protocol]: https://docs.internetcomputer.org/guides/frontends/service-discoverability/
 
 use std::{
     collections::BTreeMap,
@@ -33,14 +43,17 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
+use crate::architecture;
+
 #[derive(Serialize, Clone, Debug)]
 pub struct Found {
     pub canister_id: String,
-    /// A human label if one was attached (App Connect role, env.json key,
-    /// bundle constant name, or "frontend"); None for a bare bundle literal.
+    /// A human label if one was attached (the manifest's name/role, an
+    /// env.json key, a bundle constant name, or "frontend"); None for a bare
+    /// bundle literal.
     pub label: Option<String>,
-    /// Where it was found: "ai-connect.html", "ic-app.json", "header",
-    /// "env.json", "bundle:<LABEL>", "bundle".
+    /// Where it was found: "ic-architecture", "header", "env.json",
+    /// "bundle:<LABEL>", "bundle".
     pub sources: Vec<String>,
     /// IC dashboard label (e.g. "ICP Ledger"), filled in when the id is a known
     /// canister; None otherwise. Set during dashboard enrichment.
@@ -57,17 +70,21 @@ pub struct Found {
 pub struct DiscoveredCanister {
     /// The canister's principal id.
     pub canister_id: String,
-    /// A human label if one was attached (App Connect role, env.json key,
-    /// bundle constant, or "frontend"); null for a bare bundle literal.
+    /// A human label if one was attached (the manifest's name/role, an
+    /// env.json key, a bundle constant, or "frontend"); null for a bare
+    /// bundle literal.
     pub label: Option<String>,
     /// IC dashboard label (e.g. "ICP Ledger"), when the id is a known canister.
     pub name: Option<String>,
     /// IC dashboard classification (e.g. "ledger"), when known.
     pub kind: Option<String>,
-    /// Where it was found: "ai-connect.html" (the App Connect page's declared
-    /// main canister), "ic-app.json" (the app's own canister manifest),
-    /// "header", "env.json", "bundle:<LABEL>", or "bundle". The first two are
-    /// declared by the app itself and are the most authoritative.
+    /// Where it was found: "ic-architecture" (the app's own
+    /// `/.well-known/ic-architecture` manifest — the app DECLARING which
+    /// canisters it comprises, and the only source a state-changing call can
+    /// be authorized against), "header" (the IC gateway's x-ic-canister-id —
+    /// the frontend), "env.json", "bundle:<LABEL>", or "bundle". Only the
+    /// first is a declaration; the rest are read-only hints mined from served
+    /// bytes and authorize nothing.
     pub sources: Vec<String>,
     /// Whether this canister exposes the OQL query surface — filled in for the
     /// app's OWN data canisters by a single Candid fetch during open_app /
@@ -104,11 +121,17 @@ impl From<&Found> for DiscoveredCanister {
 /// canister or a shared system canister (a ledger, II, NNS…). Scopes the
 /// per-canister capability probe and the caller-gated data-access handle (#3) so
 /// they never attach to II/NNS/ledger/frontend, per the security guardrail.
+///
+/// This is a READ-capability hint (which canisters are worth probing for OQL /
+/// an API doc), not an authorization: the mined sources stay in the set for
+/// that purpose, while [`crate::authorization`] admits only manifest-declared
+/// canisters to a state-changing call.
 pub fn is_app_data_candidate(c: &DiscoveredCanister) -> bool {
     // Declared or mined as the app's own backend (not merely the gateway header).
-    let app_owned = c.sources.iter().any(|s| {
-        s == "ai-connect.html" || s == "ic-app.json" || s == "env.json" || s.starts_with("bundle")
-    });
+    let app_owned = c
+        .sources
+        .iter()
+        .any(|s| s == "ic-architecture" || s == "env.json" || s.starts_with("bundle"));
     // The frontend / asset canister: an explicit "frontend" label, or found ONLY
     // via the gateway `x-ic-canister-id` header.
     let is_frontend =
@@ -186,176 +209,11 @@ fn canisters_from_env_json(text: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Pull `content` out of the first `<meta name="…">` tag with the given name,
-/// reading the RAW served markup — like an App Connect connector, we fetch the
-/// page and parse it, never executing its JavaScript (spec §6.1). Tolerates
-/// attribute order and single or double quotes.
-fn parse_meta(html: &str, name: &str) -> Option<String> {
-    let bytes = html.as_bytes();
-    let mut i = 0;
-    while i + 5 <= bytes.len() {
-        // Find the next `<meta` — tag names are ASCII-case-insensitive in HTML,
-        // so `<META`/`<Meta` count too.
-        if bytes[i] != b'<' || !bytes[i + 1..i + 5].eq_ignore_ascii_case(b"meta") {
-            i += 1;
-            continue;
-        }
-        let after = i + 5;
-        // Tag-name boundary: `<metadata …` (or any longer name) is not <meta>.
-        if !matches!(bytes.get(after), Some(b' ' | b'\t' | b'\n' | b'\r' | b'/' | b'>')) {
-            i = after;
-            continue;
-        }
-        let rest = &html[after..];
-        let Some(end) = rest.find('>') else {
-            // No '>' anywhere in the remainder — no complete tag can follow.
-            break;
-        };
-        let tag = &rest[..end];
-        if attr(tag, "name").as_deref() == Some(name) {
-            if let Some(content) = attr(tag, "content") {
-                return Some(content);
-            }
-        }
-        i = after + end;
-    }
-    None
-}
-
-/// A `key="value"` (or `key='value'`) attribute inside a tag body. Scans the
-/// tag left-to-right as a sequence of attributes, consuming each quoted value
-/// whole — so a key can never be matched inside another attribute's VALUE
-/// (e.g. `data="… name='x' …"`), `data-name` can never match `name` (names
-/// compare whole, ASCII-case-insensitively per HTML), and whitespace is
-/// tolerated around the `=`. Only quoted values are returned.
-fn attr(tag: &str, key: &str) -> Option<String> {
-    let bytes = tag.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Skip whitespace between attributes.
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        // Read one attribute name (stop at whitespace, '=', or a quote).
-        let name_start = i;
-        while i < bytes.len()
-            && !bytes[i].is_ascii_whitespace()
-            && bytes[i] != b'='
-            && bytes[i] != b'"'
-            && bytes[i] != b'\''
-        {
-            i += 1;
-        }
-        let name = &tag[name_start..i];
-        // Optional `= value`, with whitespace tolerated around the '='.
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i < bytes.len() && bytes[i] == b'=' {
-            i += 1;
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
-                // Quoted value: consume it whole (to the matching quote).
-                let quote = bytes[i];
-                let vstart = i + 1;
-                let mut j = vstart;
-                while j < bytes.len() && bytes[j] != quote {
-                    j += 1;
-                }
-                if j >= bytes.len() {
-                    return None; // unterminated quote — malformed tag, bail
-                }
-                if name.eq_ignore_ascii_case(key) {
-                    return Some(tag[vstart..j].to_string());
-                }
-                i = j + 1;
-            } else {
-                // Unquoted value: consume the token; never returned.
-                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-                    i += 1;
-                }
-            }
-        }
-        // Guarantee progress on stray bytes (e.g. a bare quote at name position).
-        if i == name_start {
-            i += 1;
-        }
-    }
-    None
-}
-
-/// Cap on how many manifest entries we honour — an app-declared list is small;
-/// this just bounds a hostile manifest.
+/// Cap on how many entries we honour in an app-served list — an app-declared
+/// list is small; this just bounds a hostile document. (The architecture
+/// manifest has its own, larger cap in [`crate::architecture`], because there
+/// truncation would silently deny a declared canister.)
 const MAX_MANIFEST_CANISTERS: usize = 100;
-
-/// The `/.well-known/ic-app.json` manifest — our proposed convention for App
-/// Connect's deferred §6.3 (multi-canister applications): the app itself
-/// enumerates ALL its canisters and their roles, so an agent doesn't have to
-/// mine them out of the frontend bundle. Unknown fields are ignored
-/// (forward-compatible); entries whose `id` isn't a valid principal are
-/// dropped downstream by `add`.
-///
-/// ```json
-/// { "derivation_origin": "https://<frontend-canister>.icp0.io",
-///   "canisters": [
-///     { "id": "aaaaa-…-cai", "role": "backend", "description": "orders API" },
-///     { "id": "bbbbb-…-cai", "role": "ledger" } ] }
-/// ```
-///
-/// The optional top-level `derivation_origin` is the app's own declaration of
-/// the Internet Identity derivation origin its frontends pin (via
-/// `derivationOrigin` + `/.well-known/ii-alternative-origins`). It is the ONLY
-/// authoritative way to learn a custom derivation origin: there is no reverse
-/// lookup from an app URL to it (the app's own alternative-origins file lists
-/// the inverse relation, and the frontend's `derivationOrigin` config is
-/// typically minified out of reach). When absent, a consumer must fall back to
-/// the application origin and say so.
-#[derive(Deserialize)]
-struct AppManifest {
-    #[serde(default)]
-    canisters: Vec<AppManifestEntry>,
-    #[serde(default)]
-    derivation_origin: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct AppManifestEntry {
-    #[serde(default)]
-    id: String,
-    #[serde(default)]
-    role: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-}
-
-/// Extract `(canister_id, label)` pairs from an `/.well-known/ic-app.json`
-/// body; the label is "role — description", whichever parts are present.
-fn canisters_from_app_manifest(text: &str) -> Vec<(String, Option<String>)> {
-    let Ok(m) = serde_json::from_str::<AppManifest>(text) else {
-        return Vec::new();
-    };
-    m.canisters
-        .into_iter()
-        .filter(|e| !e.id.trim().is_empty())
-        .take(MAX_MANIFEST_CANISTERS)
-        .map(|e| {
-            let role = e.role.as_deref().map(clean_label).filter(|s| !s.is_empty());
-            let desc = e.description.as_deref().map(clean_label).filter(|s| !s.is_empty());
-            let label = match (role, desc) {
-                (Some(r), Some(d)) => Some(format!("{r} — {d}")),
-                (Some(r), None) => Some(r),
-                (None, Some(d)) => Some(d),
-                (None, None) => None,
-            };
-            (e.id.trim().to_string(), label)
-        })
-        .collect()
-}
 
 /// Reduce a raw origin string to a canonical bare `https://host[:port]` origin,
 /// accepting https with a real (tuple) host and no user-info. A scheme-less value
@@ -366,7 +224,7 @@ fn canisters_from_app_manifest(text: &str) -> Vec<(String, Option<String>)> {
 /// (incl. `http://`, which `target_origin` would silently upgrade downstream,
 /// masking a wrong origin), user-info, host-less, or unparseable — so callers fail
 /// closed with no hidden scheme rewrite.
-fn normalize_origin(raw: &str) -> Option<String> {
+pub(crate) fn normalize_origin(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
@@ -394,15 +252,6 @@ fn normalize_origin(raw: &str) -> Option<String> {
         return None;
     }
     Some(origin.ascii_serialization())
-}
-
-/// The app's declared Internet Identity derivation origin, from the manifest's
-/// optional top-level `derivation_origin`, reduced to a bare `https://host[:port]`
-/// origin (a scheme-less bare host is accepted and gets `https://`). `None` if
-/// absent, blank, an explicit non-https scheme, user-info, or not a parseable URL.
-fn declared_derivation_origin(manifest_text: &str) -> Option<String> {
-    let m = serde_json::from_str::<AppManifest>(manifest_text).ok()?;
-    normalize_origin(m.derivation_origin?.as_str())
 }
 
 /// Which origins Internet Identity permits to derive from this origin, from its
@@ -433,7 +282,7 @@ fn parse_alternative_origins(text: &str) -> Vec<String> {
 /// Where a resolved derivation origin came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DerivationSource {
-    /// The app declared it in `/.well-known/ic-app.json` (`derivation_origin`).
+    /// The app declared it in `/.well-known/ii-derivation-origin`.
     Declared,
     /// Not declared by the app, but the app is in the built-in registry of
     /// well-known custom-derivation-origin apps ([`KNOWN_DERIVATION_ORIGINS`]).
@@ -455,7 +304,7 @@ impl DerivationSource {
 
 /// Built-in derivation origins for well-known apps that pin a CUSTOM Internet
 /// Identity derivation origin (so the visible URL is NOT what II derives against)
-/// but don't yet declare it in `/.well-known/ic-app.json`. Verified from each app's
+/// but don't yet declare it in `/.well-known/ii-derivation-origin`. Verified from each app's
 /// frontend `derivationOrigin` and the derivation origin's own
 /// `/.well-known/ii-alternative-origins`. This is a stopgap so an agent gets the
 /// right principal from the app URL alone; an app's own manifest declaration ALWAYS
@@ -696,7 +545,7 @@ fn ic_evidence_from(resp: &reqwest::Response, expected_origin: &str) -> bool {
 
 /// Resolve an app URL to its Internet Identity derivation context, WITHOUT
 /// guessing: the derivation origin is the app's declared one
-/// (`/.well-known/ic-app.json` → `derivation_origin`) if present, else a built-in
+/// (`/.well-known/ii-derivation-origin`) if present, else a built-in
 /// known-app registry entry ([`KNOWN_DERIVATION_ORIGINS`]) if the app is one, else
 /// the application origin (a clearly-flagged default). Uses the same SSRF-pinned
 /// client and capped reads as `discover`; the app URL is user-controlled.
@@ -752,10 +601,10 @@ fn decide_declared_origin(
     ))
 }
 
-/// What the app's `/.well-known/ic-app.json` resolved to: its declared (and
-/// authorized) derivation origin or the application-origin default, whether the
-/// manifest response carried IC-hosting evidence (`x-ic-canister-id`), and — when
-/// an accepted CROSS-origin declaration fetched them — that origin's alt-origins
+/// What the app's `/.well-known/ii-derivation-origin` resolved to: its declared
+/// (and authorized) derivation origin or the application-origin default, whether
+/// the response carried IC-hosting evidence (`x-ic-canister-id`), and — when an
+/// accepted CROSS-origin declaration fetched them — that origin's alt-origins
 /// (reused for the display list so it isn't fetched twice).
 struct DeclaredResolution {
     derivation_origin: String,
@@ -766,7 +615,7 @@ struct DeclaredResolution {
 
 impl DeclaredResolution {
     /// The application-origin default (no usable declaration), carrying whatever
-    /// IC evidence the manifest response showed.
+    /// IC evidence the response showed.
     fn app_default(application_origin: &str, ic_evidence: bool) -> Self {
         Self {
             derivation_origin: application_origin.to_string(),
@@ -777,26 +626,33 @@ impl DeclaredResolution {
     }
 }
 
-/// Resolve the app's declared derivation origin from `/.well-known/ic-app.json`,
-/// authorizing a cross-origin claim against the declared origin's own
+/// Resolve the app's declared derivation origin from
+/// `/.well-known/ii-derivation-origin` — the identity layer of the ICP
+/// service-discoverability protocol, whose whole content is the one origin
+/// Internet Identity derives against (see [`crate::architecture`]) — and
+/// authorize a cross-origin claim against the declared origin's own
 /// `ii-alternative-origins` (the browser/II rule; the decision is
 /// [`decide_declared_origin`]). Flat, with early guards. A missing/unsuccessful/
-/// undeclared manifest legitimately yields the application-origin default (the app
-/// derives against its own origin).
+/// unparseable file legitimately yields the application-origin default: the
+/// spec says an app that derives against its own visible origin omits the file
+/// entirely.
 ///
 /// A cross-origin claim that CANNOT be authorized is an `Err`, not a silent
 /// fall-back: falling back to the application origin there would derive the WRONG
 /// principal for an app that deliberately pins a custom derivation origin (and
 /// would mask a spoof, a misconfiguration, or an unreachable `ii-alternative-origins`).
 /// Surfacing it lets the caller refuse rather than act as an unintended identity
-/// (ICPBB-430). The manifest response doubles as IC-hosting evidence, captured for
-/// the caller's later gate.
+/// (ICPBB-430). The response doubles as IC-hosting evidence, captured for the
+/// caller's later gate.
 async fn resolve_declared_origin(
     client: &reqwest::Client,
     application_origin: &str,
 ) -> Result<DeclaredResolution, String> {
     let Ok(resp) = client
-        .get(format!("{application_origin}/.well-known/ic-app.json"))
+        .get(format!(
+            "{application_origin}{}",
+            architecture::II_DERIVATION_ORIGIN_WELL_KNOWN
+        ))
         .send()
         .await
     else {
@@ -807,7 +663,7 @@ async fn resolve_declared_origin(
         return Ok(DeclaredResolution::app_default(application_origin, ic_evidence));
     }
     let text = read_capped(resp, MAX_META_BYTES).await;
-    let declared = declared_derivation_origin(&text);
+    let declared = architecture::parse_derivation_origin(&text);
 
     // The declared origin's ii-alternative-origins is the authorization list, and
     // only a CROSS-origin claim needs it — no declaration and a self-declaration
@@ -1018,7 +874,7 @@ pub fn classify_app_query(query: &str) -> AppQuery {
 /// Tidy an app-supplied label for display: control characters (ANSI escapes,
 /// CR/LF tricks) become spaces, then trim and cap — manifest roles and
 /// descriptions are untrusted server text (CWE-150).
-fn clean_label(s: &str) -> String {
+pub(crate) fn clean_label(s: &str) -> String {
     const MAX_LABEL_CHARS: usize = 120;
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -1107,7 +963,7 @@ fn ipv6_is_global(ip: &Ipv6Addr) -> bool {
 /// Validate a user-supplied discovery URL against SSRF and return the parsed URL
 /// plus the socket addresses to PIN the client to. https only; every resolved
 /// address must be global. Async DNS (no blocking of the executor).
-async fn resolve_public_url(raw: &str) -> Result<(url::Url, Vec<SocketAddr>), String> {
+pub(crate) async fn resolve_public_url(raw: &str) -> Result<(url::Url, Vec<SocketAddr>), String> {
     let url = url::Url::parse(raw).map_err(|e| format!("invalid discovery URL {raw}: {e}"))?;
     if url.scheme() != "https" {
         return Err(format!(
@@ -1183,7 +1039,7 @@ fn ssrf_redirect_policy() -> reqwest::redirect::Policy {
 /// rebind the connection to an internal address between validation and connect.
 /// (Pinning only overrides this host; requests to other hosts — e.g. the
 /// dashboard — resolve normally, still under the redirect guard.)
-fn site_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, String> {
+pub(crate) fn site_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent("ic-mcp-discover/0.1")
         .timeout(std::time::Duration::from_secs(15))
@@ -1205,13 +1061,13 @@ fn site_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, Stri
 // per-file value only decides how deep into one file we can see.
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024; // one document (HTML, one JS file)
 const MAX_ENV_JSON_BYTES: usize = 256 * 1024; // /env.json is tiny in practice
-const MAX_META_BYTES: usize = 256 * 1024; // ai-connect.html head / ic-app.json manifest
+pub(crate) const MAX_META_BYTES: usize = 256 * 1024; // a well-known document (manifest, origin file)
 const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024; // aggregate bundle text mined for ids
 
 /// Read up to `max` bytes of a response body, then stop — dropping the response
 /// (and so the connection) rather than draining the remainder. Best-effort: a
 /// mid-stream error just returns what we have (discovery is opportunistic).
-async fn read_capped(mut resp: reqwest::Response, max: usize) -> String {
+pub(crate) async fn read_capped(mut resp: reqwest::Response, max: usize) -> String {
     let mut buf: Vec<u8> = Vec::new();
     loop {
         if buf.len() >= max {
@@ -1311,41 +1167,35 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
     let client = site_client(&host, &pinned)?;
     // Well-known paths and root-relative script paths live at the ORIGIN, not
     // under whatever path the caller's URL carried (e.g. https://x.com/app must
-    // probe https://x.com/ai-connect.html) — only the initial page fetch below
-    // uses the URL as given.
+    // probe https://x.com/.well-known/ic-architecture) — only the initial page
+    // fetch below uses the URL as given.
     let origin = base_url.origin().ascii_serialization();
 
     let mut found = Findings::default();
 
-    // 1. App-declared metadata — the app saying, in bytes it serves itself,
-    // which canisters it comprises. Most authoritative of all sources, and
+    // 1. The app's own architecture manifest: /.well-known/ic-architecture, the
+    // composition layer of the ICP service-discoverability protocol — the app
+    // DECLARING, in bytes it serves itself, which canisters it comprises. The
+    // only source that is a declaration rather than a hint (and so the only one
+    // an update call can be authorized against, see `crate::authorization`);
     // probed FIRST so its labels win `add`'s first-label-wins rule (a
     // single-canister app's id would otherwise keep the header's generic
-    // "frontend" label instead of the declared one).
-    //   a. The App Connect bridge page's ic:canister-id meta: the app's MAIN
-    //      backend (spec §4.7/§6.1). Read from raw markup, no JS execution.
-    //      An SPA catch-all serving index.html here fails closed: no such
-    //      meta, no finding.
-    //   b. /.well-known/ic-app.json: the app's own canister manifest with
-    //      roles (proposed convention for the spec's deferred §6.3). A
-    //      catch-all HTML response fails JSON parsing → no findings.
-    if let Ok(resp) = client.get(format!("{origin}/ai-connect.html")).send().await {
-        if resp.status().is_success() {
-            let page = read_capped(resp, MAX_META_BYTES).await;
-            if let Some(id) = parse_meta(&page, "ic:canister-id") {
-                found.add(
-                    id.trim(),
-                    Some("main backend (App Connect)".into()),
-                    "ai-connect.html".into(),
-                );
-            }
-        }
-    }
-    if let Ok(resp) = client.get(format!("{origin}/.well-known/ic-app.json")).send().await {
+    // "frontend" label instead of the declared one). A catch-all HTML response
+    // fails JSON parsing → no findings, i.e. it fails closed.
+    //
+    // Discovery reads it best-effort: an unreachable or malformed manifest just
+    // yields no findings here, while the authorization path treats the very
+    // same outcome as a refusal. Same document, two postures — reads stay
+    // opportunistic, writes fail closed.
+    if let Ok(resp) =
+        client.get(format!("{origin}{}", architecture::ARCHITECTURE_WELL_KNOWN)).send().await
+    {
         if resp.status().is_success() {
             let text = read_capped(resp, MAX_META_BYTES).await;
-            for (id, label) in canisters_from_app_manifest(&text) {
-                found.add(&id, label, "ic-app.json".into());
+            if let Ok(arch) = architecture::parse_architecture(&text) {
+                for (id, label) in arch.findings() {
+                    found.add(&id, label, "ic-architecture".into());
+                }
             }
         }
     }
@@ -1428,23 +1278,21 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
         found.add(m.as_str(), None, "bundle".into());
     }
 
-    // Order: app-declared metadata first (App Connect main, then the manifest
-    // siblings), then header (frontend), env.json, labelled bundle, bare.
+    // Order: the app's own declaration first (the architecture manifest), then
+    // the mined hints — header (frontend), env.json, labelled bundle, bare.
     // Authority tier of a finding (lower = more authoritative). Kept as a helper
     // so the sort can compare it without cloning `canister_id` into a key.
     let rank = |f: &Found| {
-        if f.sources.iter().any(|s| s == "ai-connect.html") {
+        if f.sources.iter().any(|s| s == "ic-architecture") {
             0
-        } else if f.sources.iter().any(|s| s == "ic-app.json") {
-            1
         } else if f.sources.iter().any(|s| s == "header") {
-            2
+            1
         } else if f.sources.iter().any(|s| s == "env.json") {
-            3
+            2
         } else if f.sources.iter().any(|s| s.starts_with("bundle:")) {
-            4
+            3
         } else {
-            5
+            4
         }
     };
     let dropped = found.dropped;
@@ -2135,7 +1983,7 @@ mod tests {
         // Authority-ordered, as discover() produces: labelled tiers first, then
         // a long tail of bare bundle literals.
         let mut found = vec![
-            mk(0, Some("main backend (App Connect)"), "ai-connect.html"),
+            mk(0, Some("the backend"), "ic-architecture"),
             mk(1, Some("frontend"), "header"),
             mk(2, Some("IC_BACKEND_CANISTER_ID"), "bundle:IC_BACKEND_CANISTER_ID"),
         ];
@@ -2151,7 +1999,9 @@ mod tests {
         assert_eq!(d.canisters[22].canister_id, "id-022");
 
         // The global cap backstops labelled tiers too, and still reports.
-        let many_labelled: Vec<Found> = (0..60).map(|i| mk(i, Some("x"), "ic-app.json")).collect();
+        let many_labelled: Vec<Found> = (0..60)
+            .map(|i| mk(i, Some("x"), "ic-architecture"))
+            .collect();
         let d = bound_findings(many_labelled, 0);
         assert_eq!(d.canisters.len(), 50);
         assert_eq!(d.omitted, 10);
@@ -2356,154 +2206,68 @@ mod tests {
         assert_eq!(got[0].1, "backend_canister_id");
     }
 
-    // App Connect discovery metadata (spec §4.7/§6.1): the ic:canister-id meta
-    // is read from the RAW markup, tolerating attribute order and quote style;
-    // an SPA catch-all page without the meta yields nothing.
+    // The app's own declared label must win over the header's generic
+    // "frontend" for the SAME canister (single-canister apps): `add` keeps the
+    // FIRST label, so discover() probes the architecture manifest before the
+    // header. This pins the first-label-wins semantics that ordering relies on
+    // — and, with the manifest now the FIRST probe, that it is the manifest's
+    // label a reader sees.
     #[test]
-    fn parse_meta_reads_app_connect_canister_id() {
-        // The shipped ai-connect.html shape (name first, double quotes).
-        let page = r#"<!doctype html><html><head><meta charset="utf-8">
-            <meta name="ic:canister-id" content="dmp3l-2yaaa-aaaae-aamva-cai">
-            <title>Connect</title></head><body></body></html>"#;
-        assert_eq!(
-            parse_meta(page, "ic:canister-id").as_deref(),
-            Some("dmp3l-2yaaa-aaaae-aamva-cai")
-        );
-        // Attribute order flipped + single quotes.
-        let flipped = r#"<meta content='aaaaa-aa' name='ic:canister-id'>"#;
-        assert_eq!(parse_meta(flipped, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
-        // Other metas don't match; absent meta yields None.
-        let other = r#"<meta name="viewport" content="width=device-width">"#;
-        assert_eq!(parse_meta(other, "ic:canister-id"), None);
-        assert_eq!(parse_meta("<html>no metas</html>", "ic:canister-id"), None);
-        // The right meta is found among several.
-        let multi = format!("{other}\n<meta name=\"ic:network\" content=\"ic\">\n{flipped}");
-        assert_eq!(parse_meta(&multi, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
-        assert_eq!(parse_meta(&multi, "ic:network").as_deref(), Some("ic"));
-        // Attribute boundaries (per review): `data-name` must NOT match `name`,
-        // and whitespace around `=` is legal HTML that must still parse.
-        let trap = r#"<meta data-name="ic:canister-id" content="evil-id">"#;
-        assert_eq!(parse_meta(trap, "ic:canister-id"), None, "data-name must not match name");
-        let spaced = r#"<meta name = "ic:canister-id" content =  "aaaaa-aa">"#;
-        assert_eq!(parse_meta(spaced, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
-        // Both shapes on one tag: the boundary-checked real `name` wins.
-        let both = r#"<meta data-name="decoy" name="ic:canister-id" content="aaaaa-aa">"#;
-        assert_eq!(parse_meta(both, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
-        // An unquoted value is not accepted (we only read the quoted shape).
-        assert_eq!(attr("name=bare content=\"x\"", "name"), None);
-        // Tag-name boundary (per review): `<metadata …>` is not a <meta> tag,
-        // and must not shadow a real meta that follows it.
-        let metadata = r#"<metadata name="ic:canister-id" content="evil-id">"#;
-        assert_eq!(parse_meta(metadata, "ic:canister-id"), None, "<metadata> must not match");
-        let after = format!("{metadata}\n<meta name=\"ic:canister-id\" content=\"aaaaa-aa\">");
-        assert_eq!(parse_meta(&after, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
-        // A malformed, never-closed `<meta` can't panic or loop; it just ends
-        // the scan (no '>' remains, so no complete tag can follow anyway).
-        assert_eq!(parse_meta("<meta name=\"ic:canister-id\" content=\"x\"", "ic:canister-id"), None);
-        // A key inside another attribute's quoted VALUE must not match (per
-        // review): the tokenizer consumes values whole, so `name=…` embedded in
-        // `data="…"` is invisible, and the tag's REAL name attribute is used.
-        let embedded = r#"<meta data="junk name='ic:canister-id' content='evil'" name="viewport" content="w">"#;
-        assert_eq!(parse_meta(embedded, "ic:canister-id"), None, "key inside a value must not match");
-        assert_eq!(attr(r#"data="x name='inner' y" name="real""#, "name").as_deref(), Some("real"));
-        // HTML tag and attribute names are ASCII-case-insensitive (per review):
-        // <META NAME=… CONTENT=…> parses; a mixed-case <MetaData> still doesn't.
-        let upper = r#"<META NAME="ic:canister-id" CONTENT="aaaaa-aa">"#;
-        assert_eq!(parse_meta(upper, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
-        let mixed_decoy = r#"<MetaData name="ic:canister-id" content="evil">"#;
-        assert_eq!(parse_meta(mixed_decoy, "ic:canister-id"), None, "<MetaData> must not match");
-    }
-
-    // App-declared labels must win over the header's generic "frontend" for the
-    // SAME canister (single-canister apps): `add` keeps the FIRST label, so
-    // discover() probes the declared metadata before the header. This pins the
-    // first-label-wins semantics that ordering relies on.
-    #[test]
-    fn add_keeps_first_label_so_declared_probes_run_first() {
+    fn add_keeps_first_label_so_the_manifest_probe_runs_first() {
         let mut found = Findings::default();
         let id = "dmp3l-2yaaa-aaaae-aamva-cai";
-        found.add(id, Some("main backend (App Connect)".into()), "ai-connect.html".into());
+        found.add(id, Some("the backend".into()), "ic-architecture".into());
         found.add(id, Some("frontend".into()), "header".into());
         let f = &found.map[id];
-        assert_eq!(f.label.as_deref(), Some("main backend (App Connect)"));
-        assert_eq!(f.sources, vec!["ai-connect.html", "header"], "both provenances kept");
+        assert_eq!(f.label.as_deref(), Some("the backend"));
+        assert_eq!(f.sources, vec!["ic-architecture", "header"], "both provenances kept");
     }
 
-    // The proposed /.well-known/ic-app.json manifest: entries yield (id, label)
-    // pairs with "role — description" labels; unknown fields are ignored;
-    // hostile shapes (non-JSON / HTML catch-all / huge lists / control chars in
-    // labels) fail closed or are bounded.
+    // The architecture manifest as a DISCOVERY source: entries yield (id, label)
+    // pairs folding name/role/description, unknown fields are ignored, and
+    // non-principal / blank ids drop out. (The manifest's parse-level
+    // fail-closed behaviour, version handling, and entry cap are pinned in
+    // `crate::architecture`; this test covers what discovery does with it.)
     #[test]
-    fn app_manifest_parses_and_fails_closed() {
+    fn architecture_manifest_yields_labelled_findings() {
         let manifest = r#"{
-          "name": "Example DEX",
+          "version": "1.0.0",
           "canisters": [
-            {"id": "dmp3l-2yaaa-aaaae-aamva-cai", "role": "backend", "description": "orders API"},
+            {"id": "dmp3l-2yaaa-aaaae-aamva-cai", "name": "backend", "role": "the backend",
+             "description": "orders API"},
             {"id": "ryjl3-tyaaa-aaaaa-aaaba-cai", "role": "ledger"},
             {"id": "qoctq-giaaa-aaaaa-aaaea-cai", "description": "governance"},
             {"id": "aaaaa-aa", "future_field": {"nested": true}},
             {"id": "  "},
-            {"role": "orphan-no-id"}
+            {"id": "not-a-principal", "role": "orphan"}
           ]
         }"#;
-        let got = canisters_from_app_manifest(manifest);
-        assert_eq!(got.len(), 4, "blank/missing ids are skipped: {got:?}");
-        assert_eq!(got[0], ("dmp3l-2yaaa-aaaae-aamva-cai".into(), Some("backend — orders API".into())));
+        let arch = architecture::parse_architecture(manifest).expect("parses");
+        let got = arch.findings();
+        assert_eq!(got.len(), 4, "blank and non-principal ids are skipped: {got:?}");
+        assert_eq!(
+            got[0],
+            (
+                "dmp3l-2yaaa-aaaae-aamva-cai".into(),
+                Some("the backend (backend) — orders API".into())
+            )
+        );
         assert_eq!(got[1], ("ryjl3-tyaaa-aaaaa-aaaba-cai".into(), Some("ledger".into())));
         assert_eq!(got[2], ("qoctq-giaaa-aaaaa-aaaea-cai".into(), Some("governance".into())));
         assert_eq!(got[3], ("aaaaa-aa".into(), None), "unknown fields are ignored");
 
-        // Fail closed: not JSON (an SPA catch-all serving HTML) or wrong shape.
-        assert!(canisters_from_app_manifest("<!doctype html><html>app</html>").is_empty());
-        assert!(canisters_from_app_manifest("[1,2,3]").is_empty());
-        assert!(canisters_from_app_manifest("").is_empty());
-
-        // Bounded: a hostile manifest can't produce unbounded findings.
-        let huge = format!(
-            r#"{{"canisters":[{}]}}"#,
-            std::iter::repeat(r#"{"id":"aaaaa-aa"}"#)
-                .take(500)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        assert_eq!(canisters_from_app_manifest(&huge).len(), MAX_MANIFEST_CANISTERS);
-
         // Labels are sanitized: control chars (ANSI/CR) become spaces, length capped.
-        let sneaky = r#"{"canisters":[{"id":"aaaaa-aa","role":"ok\u001b[31mEVIL\r\nline"}]}"#;
-        let got = canisters_from_app_manifest(sneaky);
-        let label = got[0].1.as_deref().unwrap();
+        let sneaky = r#"{"version":"1.0.0","canisters":[
+            {"id":"aaaaa-aa","role":"ok\u001b[31mEVIL\r\nline"}]}"#;
+        let arch = architecture::parse_architecture(sneaky).expect("parses");
+        let label = arch.findings()[0].1.clone().expect("a label");
         assert!(!label.chars().any(char::is_control), "control chars must be gone: {label:?}");
-        let long = format!(r#"{{"canisters":[{{"id":"aaaaa-aa","role":"{}"}}]}}"#, "x".repeat(1000));
-        assert!(canisters_from_app_manifest(&long)[0].1.as_deref().unwrap().len() <= 120);
-    }
-
-    // The manifest's optional declared derivation origin is read and reduced to a
-    // bare origin; absent / blank / non-http values yield None (fail-closed).
-    #[test]
-    fn declared_derivation_origin_parses_and_fails_closed() {
-        let declared = r#"{"derivation_origin":"https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io","canisters":[]}"#;
-        assert_eq!(
-            declared_derivation_origin(declared).as_deref(),
-            Some("https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io")
+        let long = format!(
+            r#"{{"version":"1.0.0","canisters":[{{"id":"aaaaa-aa","role":"{}"}}]}}"#,
+            "x".repeat(1000)
         );
-        // Reduced to a bare origin (path/query/trailing slash dropped).
-        let with_path = r#"{"derivation_origin":"https://app.example.com/x?y=1"}"#;
-        assert_eq!(declared_derivation_origin(with_path).as_deref(), Some("https://app.example.com"));
-        // A scheme-less bare host is accepted (https assumed), matching the
-        // interactive `derivation_origin` param, so a good-faith bare-host
-        // declaration resolves instead of being silently dropped.
-        let bare = r#"{"derivation_origin":"app.example.com"}"#;
-        assert_eq!(declared_derivation_origin(bare).as_deref(), Some("https://app.example.com"));
-        // Absent, blank, non-http, or non-JSON → None.
-        assert_eq!(declared_derivation_origin(r#"{"canisters":[]}"#), None);
-        assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"  "}"#), None);
-        assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"ftp://x/"}"#), None);
-        // Non-https is rejected (https-only; else target_origin would silently
-        // upgrade an http:// declaration while still reporting source=declared).
-        assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"http://example.com"}"#), None);
-        // User-info is rejected (url.origin() would silently drop it).
-        assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"https://u:p@example.com"}"#), None);
-        assert_eq!(declared_derivation_origin("<!doctype html>"), None);
+        let arch = architecture::parse_architecture(&long).expect("parses");
+        assert!(arch.findings()[0].1.as_deref().unwrap().len() <= 120);
     }
 
     // ii-alternative-origins parsing is tolerant and bounded, and sanitizes
@@ -2864,17 +2628,25 @@ mod tests {
             oql: None,
             api_doc_available: None,
         };
-        // App-declared / app-mined backends → candidates.
-        assert!(is_app_data_candidate(&dc(None, &["ai-connect.html"], None)));
-        assert!(is_app_data_candidate(&dc(Some("backend"), &["ic-app.json"], None)));
+        // App-declared / app-mined backends → candidates. Retired provenances
+        // are not: a source string this server no longer produces must not
+        // qualify a canister for anything.
+        assert!(is_app_data_candidate(&dc(Some("the backend"), &["ic-architecture"], None)));
         assert!(is_app_data_candidate(&dc(Some("backend_canister_id"), &["env.json"], None)));
         assert!(is_app_data_candidate(&dc(Some("BACKEND"), &["bundle:BACKEND"], None)));
+        assert!(!is_app_data_candidate(&dc(None, &["ai-connect.html"], None)));
+        assert!(!is_app_data_candidate(&dc(Some("backend"), &["ic-app.json"], None)));
         // The frontend / asset canister → NOT a candidate.
-        assert!(!is_app_data_candidate(&dc(Some("frontend"), &["ic-app.json"], None)));
+        assert!(!is_app_data_candidate(&dc(Some("frontend"), &["ic-architecture"], None)));
         assert!(!is_app_data_candidate(&dc(None, &["header"], None)));
         // A shared system canister (dashboard-classified) → NOT a candidate, even
         // if it slipped in via a bundle literal.
         assert!(!is_app_data_candidate(&dc(None, &["bundle"], Some("ledger"))));
-        assert!(!is_app_data_candidate(&dc(None, &["ic-app.json"], Some("governance"))));
+        assert!(!is_app_data_candidate(&dc(None, &["ic-architecture"], Some("governance"))));
+
+        // Being an app-data candidate is a READ hint and nothing more: it never
+        // implies a canister may be written to. `crate::authorization` decides
+        // that from the manifest alone, and this function is not part of that
+        // decision (its input type has no path into the gate).
     }
 }

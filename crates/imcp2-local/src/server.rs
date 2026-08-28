@@ -509,6 +509,71 @@ mod tests {
         assert!(is_error, "an invalid canister id is a tool error");
         assert!(text.contains("invalid canister id"), "{text}");
 
+        // The write gate, end to end through a real MCP client: an update call
+        // with no `application_origin` is refused with the recovery, before any
+        // network work (this test touches no network, so a refusal that came
+        // later would hang or fail differently).
+        let (is_error, text, _) = call(
+            "canister_update_call",
+            Some(serde_json::json!({
+                "canister_id": "dmp3l-2yaaa-aaaae-aamva-cai",
+                "method": "set_name",
+                "args": "()",
+            })),
+        )
+        .await;
+        assert!(
+            is_error,
+            "an update call with no application_origin must be refused"
+        );
+        assert!(text.contains("`application_origin` is required"), "{text}");
+
+        // …and an application origin with no accepted Developer Terms on file is
+        // refused too, however real the canister is: discovery cannot authorize
+        // a write.
+        let (is_error, text, _) = call(
+            "canister_update_call",
+            Some(serde_json::json!({
+                "canister_id": "dmp3l-2yaaa-aaaae-aamva-cai",
+                "method": "set_name",
+                "args": "()",
+                "application_origin": "https://unregistered.example",
+            })),
+        )
+        .await;
+        assert!(
+            is_error,
+            "an unregistered application origin must be refused"
+        );
+        assert!(text.contains("Developer Terms"), "{text}");
+        assert!(
+            text.contains(imcp2_core::DEVELOPER_TERMS_VERSION),
+            "the refusal names the current revision: {text}"
+        );
+
+        // Layer ordering, end to end: registration is the OUTER gate, so an
+        // unregistered origin is turned away before the method is even
+        // considered — a value-moving method on the ICP ledger is refused here
+        // for not being registered, not for being financial. (That the
+        // financial guard still refuses it INSIDE an authorized surface is
+        // pinned in imcp2-core's authorization tests, which can stand up a
+        // registered application.)
+        let (is_error, text, _) = call(
+            "canister_update_call",
+            Some(serde_json::json!({
+                "canister_id": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+                "method": "icrc1_transfer",
+                "args": "()",
+                "application_origin": "https://unregistered.example",
+            })),
+        )
+        .await;
+        assert!(is_error, "a value-moving method must be refused");
+        assert!(
+            text.contains("Developer Terms"),
+            "registration is the outer gate: {text}"
+        );
+
         // Deferral: a protocol/meta tool is not just unlisted — calling it
         // fails with the router's standard "tool not found" error (the
         // invalid-params shape any unknown tool name gets), rather than

@@ -14,6 +14,21 @@ login never passes through a third-party server.
 Cloud-only AI surfaces (claude.ai web/mobile, Perplexity web, Codex Cloud)
 cannot spawn local processes; they keep using the hosted server.
 
+**Update calls carry the hosted server's authorization gate.** "The same tools"
+includes the same write policy: `canister_update_call` requires an
+`application_origin` that is a *registered* application — its developer having
+accepted the [ICP MCP Developer Terms](https://mcp.internetcomputer.org/developer-terms)
+— whose own `/.well-known/ic-architecture` manifest declares the target
+canister, plus the financial guard inside that surface (see
+[Update-call authorization](../../README.md#update-call-authorization)). The gate
+lives in the shared `imcp2-core` tool implementation, so this binary cannot opt
+out of it, and there is no local-mode bypass: **writing to your own canister
+through this binary is refused unless it is registered.** Reads —
+`canister_query`, `get_canister_candid`, the OQL tools, discovery — are
+unaffected and need no registration. To install code, change settings, or run
+lifecycle operations on canisters you control, use the
+[`icp` CLI](https://github.com/dfinity/icp-cli).
+
 ## Install
 
 Release binaries (macOS arm64/x64, Linux x64/arm64, Windows x64) ship from

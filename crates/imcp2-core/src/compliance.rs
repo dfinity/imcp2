@@ -1,4 +1,20 @@
-//! The financial-transactions guard for the generic update-call tool.
+//! **Layer 2 of the write gate: the financial-transactions guard.**
+//!
+//! `canister_update_call` is authorized in two layers, and this is the inner
+//! one. [`crate::authorization`] decides *whether the application may be
+//! written to at all* — it must be registered under the ICP
+//! service-discoverability protocol, with its developer's acceptance of the
+//! ICP MCP Developer Terms on file, and must declare the target canister in
+//! its own `/.well-known/ic-architecture` manifest. This module then refuses
+//! value-moving calls **inside** that authorized surface.
+//!
+//! The two layers answer different questions and neither substitutes for the
+//! other. Layer 1 is what keeps arbitrary canisters — a ledger a user names by
+//! hand, a canister mined out of a frontend bundle — out of reach entirely, so
+//! this list is not the thing standing between an agent and the ICP ledger.
+//! Layer 2 is what keeps a *registered* application from moving value through
+//! its own authorized surface, which registration must never buy: it is
+//! deliberately origin-blind, so no registration state can reach it.
 //!
 //! This server is not a financial tool: its purpose is reading, building, and
 //! operating canisters, and the marketplace directories it is listed in
@@ -57,6 +73,11 @@
 //!     transactions are not supported") is stated in the server-level
 //!     instructions (get_info); this guard enforces it for the standardized
 //!     ledger surface, where real funds overwhelmingly live (see above).
+//!     What bounds the un-enumerable remainder is Layer 1, not this list: an
+//!     update call can only reach a canister a registered application
+//!     declares as its own, so a bespoke value-moving method is reachable
+//!     only inside an application whose developer accepted Terms that forbid
+//!     exposing one.
 //!     Likewise the canister list is curated and static, while exchanges
 //!     create per-pair pool/farm canisters dynamically and new services
 //!     launch: entries cover each service's central canisters (verified
@@ -72,7 +93,9 @@
 //!     NOT listed: they move no funds out of any account (they finalize a
 //!     mint from ICP the ledger already holds for the CMC), and they are the
 //!     recovery path when a user's own icp-CLI funding flow is interrupted
-//!     mid-mint.
+//!     mid-mint. Layer 1 makes this moot in practice: the CMC is not a
+//!     registered application and declares no architecture manifest, so
+//!     `canister_update_call` cannot reach it at all.
 
 use candid::Principal;
 
@@ -243,7 +266,7 @@ const DISALLOWED_FINANCE_CANISTERS: &[(&str, &str, &str)] = &[
         "its update surface is the content store behind the staking UI",
     ),
     // --- Exchanges: MULTI/DEX (canisters self-declared by the app's own
-    // /.well-known/ic-app.json manifest) ---
+    // published manifest at the time of verification) ---
     (
         "hmxr2-pqaaa-aaabq-qaaaa-cai",
         "the MULTI/DEX exchange backend",

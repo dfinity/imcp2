@@ -29,17 +29,30 @@
 //! here: the binary passes in its own agent, so anonymous canister calls go
 //! through the host's boundary-node client and the whole process links a
 //! single `ic-agent`.
+//!
+//! **Who may write** is decided in one place for every deployment:
+//! `authorization` gates `canister_update_call` on the application being
+//! registered under the [ICP service-discoverability protocol] with its
+//! developer's acceptance of the ICP MCP Developer Terms on file, and
+//! `compliance` refuses value-moving calls inside that surface. Both are
+//! part of the shared tool implementation, so a binary composing these
+//! components cannot opt out of them.
+//!
+//! [ICP service-discoverability protocol]: https://docs.internetcomputer.org/guides/frontends/service-discoverability/
 
 pub mod identities;
 pub mod iiconnect;
 pub mod skills;
 pub mod tools;
 
+mod architecture;
+mod authorization;
 mod calls;
 mod compliance;
 mod discover;
 mod management;
 
+pub use authorization::{DEVELOPER_TERMS_URL, DEVELOPER_TERMS_VERSION};
 pub use identities::{IiInstance, SessionGauges};
 pub use tools::{IcCanisterTools, IcProtocolTools, IcTools, SessionResolver};
 /// The IC [`Agent`] type the components are built around, re-exported so

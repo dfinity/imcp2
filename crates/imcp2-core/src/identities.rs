@@ -466,7 +466,7 @@ pub struct ResolveAppOutput {
     /// as `derivation_origin` to the identity tools.
     pub derivation_origin: String,
     /// How `derivation_origin` was determined: "declared" (the app declared it
-    /// in /.well-known/ic-app.json — authoritative), "known" (from the connector's
+    /// in /.well-known/ii-derivation-origin — authoritative), "known" (from the connector's
     /// built-in registry of well-known custom-derivation-origin apps, used only
     /// when the app declares none), or "app_url_default" (assumed to equal the
     /// application origin — correct only if the app has no custom derivation
