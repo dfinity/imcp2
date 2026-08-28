@@ -204,11 +204,6 @@ const DISALLOWED_FINANCE_CANISTERS: &[(&str, &str, &str)] = &[
         "its manage_neuron call disburses staked WTN",
     ),
     (
-        "oypg6-faaaa-aaaaq-aadza-cai",
-        "KongSwap's SNS governance",
-        "its manage_neuron call disburses staked KONG",
-    ),
-    (
         "zqfso-syaaa-aaaaq-aaafq-cai",
         "Dragginz's SNS governance",
         "its manage_neuron call disburses staked DKP",
@@ -263,22 +258,6 @@ const DISALLOWED_FINANCE_CANISTERS: &[(&str, &str, &str)] = &[
     (
         "bplw4-cqaaa-aaaag-qcb7q-cai",
         "the ICPSwap frontend",
-        "its update surface is the content store behind the exchange UI",
-    ),
-    // --- Exchanges: KongSwap (single-canister design) ---
-    (
-        "2ipq2-uqaaa-aaaar-qailq-cai",
-        "the KongSwap exchange backend",
-        "swaps, liquidity, and pool transfers all execute inside this one canister",
-    ),
-    (
-        "kxhyf-dyaaa-aaaar-qbwza-cai",
-        "KongSwap's treasury-liquidity extension",
-        "it deploys DAO treasury funds into liquidity pools",
-    ),
-    (
-        "3ldz4-aiaaa-aaaar-qaina-cai",
-        "the KongSwap frontend",
         "its update surface is the content store behind the exchange UI",
     ),
     // --- Exchanges: Sonic (plus the legacy DIP-20 ledgers its DAO operates,
