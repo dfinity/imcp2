@@ -1819,9 +1819,9 @@ pub struct OpenAppArgs {
     /// "https://opencloud.org"). A name — or a bare host — is matched against the
     /// built-in known-app registry first, so a wrong-TLD guess
     /// repairs to the canonical URL; an explicit `https://…` URL is resolved as
-    /// given. A domain derived from a name rather than known is not resolvable
-    /// here: an unknown bare name is refused with instructions for finding the
-    /// real URL, and a URL with no Internet-Computer evidence is refused.
+    /// given. Two refusals: an unknown bare name is refused with instructions
+    /// for finding the real URL, and a URL whose origin shows no
+    /// Internet-Computer evidence is refused.
     pub app: String,
 }
 
@@ -1845,8 +1845,9 @@ pub struct OpenAppOutput {
     /// "app_url_default" (see resolve_app).
     pub derivation_origin_source: String,
     /// Origins the derivation origin's `ii-alternative-origins` permits to derive
-    /// from it. Informational only — the INVERSE relation; never infer the
-    /// derivation origin from it.
+    /// from it — the INVERSE relation, so an entry here is an origin that may
+    /// derive from `derivation_origin`, not a derivation origin itself.
+    /// Informational.
     pub alternative_origins: Vec<String>,
     /// Whether the origin showed Internet-Computer evidence (gateway
     /// `x-ic-canister-id`); null unless the derivation origin was assumed. See

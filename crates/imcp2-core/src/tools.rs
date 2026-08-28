@@ -1191,7 +1191,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"opencloud.org\"). `domain` is a domain the caller already has — from the user, from open_app's known-app resolution, or from the app's official site — rather than one derived from an app's name; open_app takes a name directly. Returns every canister id found, with provenance, most authoritative first: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's main backend) and the app's own /.well-known/ic-app.json manifest (all its canisters, with roles) — then the `x-ic-canister-id` header (the frontend/asset canister), an `/env.json` runtime config (e.g. `backend_canister_id`), and labelled or bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json and bundle entries are mined candidates, distinguished by label (production and IC ids) and confirmable with get_canister_candid.",
+        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"opencloud.org\"). `domain` is a domain, not an app name; open_app takes a name directly. A domain with no Internet-Computer evidence is refused. Returns up to 50 canister ids, with provenance, most authoritative first (unlabelled ids mined from the JS bundle are capped at 20); any id dropped by those bounds is counted in `omitted` rather than left out silently: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's main backend) and the app's own /.well-known/ic-app.json manifest (all its canisters, with roles) — then the `x-ic-canister-id` header (the frontend/asset canister), an `/env.json` runtime config (e.g. `backend_canister_id`), and labelled or bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json and bundle entries are mined candidates, distinguished by label (production and IC ids) and confirmable with get_canister_candid.",
         annotations(title = "Discover canisters behind a domain", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::DiscoverOutput>(),
     )]
@@ -2510,7 +2510,28 @@ mod tests {
                 tool.name.to_string(),
                 tool.description.as_deref().unwrap_or_default().to_string(),
             ));
+            // The schemas are model-readable too: a directive hidden in an
+            // argument or reply field's doc comment reaches the model exactly
+            // like one in the description, and scanning descriptions alone let
+            // one through review ("never infer", on an output field).
+            surfaces.push((
+                format!("{} input schema", tool.name),
+                serde_json::to_string(&tool.input_schema).expect("input schema serializes"),
+            ));
+            if let Some(schema) = &tool.output_schema {
+                surfaces.push((
+                    format!("{} output schema", tool.name),
+                    serde_json::to_string(schema).expect("output schema serializes"),
+                ));
+            }
         }
+        // The scan must actually reach into the schemas — a serialization that
+        // stopped carrying field docs would make every assertion below vacuous.
+        assert!(
+            surfaces.iter().any(|(what, text)| what == "open_app output schema"
+                && text.contains("INVERSE relation")),
+            "the schema scan no longer sees field documentation"
+        );
         for (what, text) in surfaces {
             let lower = text.to_lowercase();
             for directive in [
