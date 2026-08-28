@@ -38,6 +38,7 @@ pub mod tools;
 mod calls;
 mod compliance;
 mod discover;
+mod discoverability;
 mod management;
 
 pub use identities::{IiInstance, SessionGauges};

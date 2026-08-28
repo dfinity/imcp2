@@ -167,6 +167,15 @@ pub struct CanisterUpdateCallArgs {
     /// Arguments in textual Candid syntax, e.g. `()` or `(record { owner = principal "..." })`.
     #[serde(default = "default_args")]
     pub args: String,
+    /// The WEBSITE URL of the app that owns `canister_id` (e.g.
+    /// "https://app.example.com") — open_app returns it as `app_url`. An update
+    /// call is only made to a canister the app DECLARES in its
+    /// service-discoverability manifest (`/.well-known/ic-architecture`), and this
+    /// is the origin that manifest is read from. Omit it only when
+    /// `derivation_origin` is the same origin as the app's website (the common
+    /// case); if the check fails, pass this explicitly.
+    #[serde(default)]
+    pub app_url: Option<String>,
     /// Call AS the user's account at an app, identified by its exact canonical
     /// Internet Identity derivation origin — NOT necessarily the visible URL (do
     /// not infer it from an alternativeOrigins list). Get it from open_app /
@@ -221,6 +230,14 @@ pub struct CanisterUpdateCallOutput {
     /// Always present so a text-only client can tell an anonymous call from an
     /// authenticated one.
     pub is_anonymous: bool,
+    /// The app origin whose service-discoverability manifest DECLARES this
+    /// canister — the app whose published manifest authorized this write. Always
+    /// present on a successful call: without a declaration the call is refused.
+    pub declared_by: String,
+    /// The well-known path that declaration was read from:
+    /// `/.well-known/ic-architecture` (the protocol) or `/.well-known/ic-app.json`
+    /// (this server's legacy pre-protocol path).
+    pub declared_at: String,
 }
 
 /// Arguments for `canister_query` — a READ that runs EITHER a Candid `query` method

@@ -17,7 +17,10 @@ use rmcp::{
     schemars, ErrorData as McpError, RoleServer, ServerHandler,
 };
 
-use crate::{calls, compliance, discover, identities, identities::Identities, management, skills};
+use crate::{
+    calls, compliance, discoverability, discoverability::OriginSource, discover, identities,
+    identities::Identities, management, skills,
+};
 use std::sync::Arc;
 
 /// Cap on the per-canister Candid probes open_app / discover_app_canisters run to
@@ -503,7 +506,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
+        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. WRITES ARE RESTRICTED TO APPS THAT OPTED IN: the call is made only when the owning app DECLARES this canister in its service-discoverability manifest at /.well-known/ic-architecture, so pass the app's website URL as `app_url` (open_app returns it as `app_url`) — that is the origin the manifest is read from. Omit `app_url` only when `derivation_origin` is the app's website origin too; if the check fails, pass `app_url` explicitly. An app that publishes no manifest cannot be written to through this server (its canisters stay fully READABLE — canister_query, get_canister_candid and the OQL tools are unaffected — so answer what you can by reading, and tell the user the app's operators enable writes by publishing the manifest). The reply echoes `declared_by`/`declared_at`: which app origin declared this canister, and at which path. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
         annotations(title = "Make a canister update call", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterUpdateCallOutput>(),
     )]
@@ -513,6 +516,7 @@ impl IcCanisterTools {
             canister_id,
             method,
             args,
+            app_url,
             derivation_origin,
             account,
             candid,
@@ -532,19 +536,33 @@ impl IcCanisterTools {
         if let Some(refusal) = compliance::disallowed_update_method(&principal, &method) {
             return Ok(err(refusal));
         }
+        // Resolve which principal to act as: none = anonymous; else the app's
+        // effective (canonical) II derivation origin, from the caller's explicit
+        // `derivation_origin` (obtained once via open_app / resolve_app).
+        let target = match resolve_identity_target(derivation_origin) {
+            Ok(t) => t,
+            Err(e) => return Ok(err(e)),
+        };
+        // The service-discoverability gate (see `discoverability`): a write only
+        // goes to a canister the owning app DECLARES in its manifest. Run BEFORE
+        // fetching the target's Candid and encoding args — a canister we will not
+        // write to shouldn't be touched at all, and the caller gets the actionable
+        // refusal instead of an argument error it would have to fix twice.
+        let declaration = match declaration_origin(app_url, target.as_ref(), &principal) {
+            Ok((origin, source)) => {
+                match discoverability::authorize_update_call(&origin, source, &principal).await {
+                    Ok(d) => d,
+                    Err(refusal) => return Ok(err(refusal)),
+                }
+            }
+            Err(refusal) => return Ok(err(refusal)),
+        };
         // The interface to encode/decode against: the canister's own
         // candid:service if exposed, else the caller-supplied `candid`. Update calls
         // are never redirected (OQL is read-only), so no oql_query_redirect here.
         let did = calls::resolve_did(&self.agent, principal, candid.as_deref()).await;
         let arg_bytes = match calls::encode_args(did.as_deref(), &method, &args) {
             Ok(b) => b,
-            Err(e) => return Ok(err(e)),
-        };
-        // Resolve which principal to act as: none = anonymous; else the app's
-        // effective (canonical) II derivation origin, from the caller's explicit
-        // `derivation_origin` (obtained once via open_app / resolve_app).
-        let target = match resolve_identity_target(derivation_origin) {
-            Ok(t) => t,
             Err(e) => return Ok(err(e)),
         };
         let origin = target.as_ref().map(|t| t.origin.as_str());
@@ -574,10 +592,20 @@ impl IcCanisterTools {
             let acted = acted_as_principal.as_deref().unwrap_or("<unknown>");
             blocks.push(format!("[{}]", identity_annotation(t, Some(acted))));
         }
+        // The write's provenance, as its own block: which app's published manifest
+        // declared this canister, and where that manifest was read from. A user
+        // asking "why did it write there?" gets the answer in every client, not
+        // just the ones that read structured output.
+        blocks.push(format!(
+            "[declared by {} in {}]",
+            declaration.origin, declaration.path
+        ));
         let output = calls::CanisterUpdateCallOutput {
             canister_id, method, reply,
             acted_as_principal, derived_for_origin, requested, derivation_origin_source,
             is_anonymous,
+            declared_by: declaration.origin,
+            declared_at: declaration.path.to_string(),
         };
         Ok(ok_structured_blocks(blocks, &output))
     }
@@ -994,7 +1022,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "ROUTING. Run this chain before answering anything that names, or implies, a specific app or the user's own data in one app (bookings, appointments, orders, a profile, or \"what can it do\"): (1) Is the request about a specific APP's functionality or the user's data in it, rather than the IC protocol itself? (2) Is that app on the Internet Computer? If unsure, THIS tool is how you find out: a known app or an IC-verifiable URL resolves, while an unrecognized app name, or a URL with no Internet Computer evidence, is refused rather than guessed. (3) If so, START HERE: one open_app call resolves the app AND discovers its service. An app feature is almost never a single named tool (there is no \"get_bookings\"); you COMPOSE it from what open_app returns, reading the discovered canisters and their `oql`/`api_doc_available` flags to see how to READ (canister_query, including OQL) or ACT (canister_update_call). So never conclude \"there's no tool for that\" from the flat tool list without opening the app first. Open an Internet Computer app in ONE call, given its NAME or its URL — the recommended entry point when a user names an app. It resolves the app's Internet Identity derivation origin (like resolve_app) AND discovers the canisters behind it (like discover_app_canisters) together, so you don't chain those yourself. Pass a NAME as the user said it, or a URL (e.g. \"https://opencloud.org\"): a name or bare host is matched to the built-in known-app registry FIRST (so even a wrong-TLD guess repairs to the canonical URL), and an explicit https:// URL is resolved as given. NEVER fabricate a domain from a name — an unknown bare name is refused with instructions to find the real URL (web search / ask the user), and a URL with no Internet Computer evidence is refused, both instead of guessing a wrong identity. Returns `app_url` (the one used), `derivation_origin` (+ its source) to act with, `alternative_origins`, and the discovered `canisters` (with provenance/labels AND per-canister `oql`/`api_doc_available` capability flags, from a one-shot Candid probe of the app's own canisters). A canister flagged `oql` holds the app's data, GATED BY THE CALLER's principal: to read the USER's own data (\"my …\", \"our …\") pass the returned `derivation_origin` to get_canister_oql_schema (for the entity/field names) and to canister_query (with the `oql` argument, to run the query). Those OQL reads REQUIRE `derivation_origin` — not `app_url` — and reject an anonymous read for now. No authenticated session required for open_app itself (no principal is derived here). Narrower tools remain for single steps: resolve_app (origin only), discover_app_canisters (canisters only).",
+        description = "ROUTING. Run this chain before answering anything that names, or implies, a specific app or the user's own data in one app (bookings, appointments, orders, a profile, or \"what can it do\"): (1) Is the request about a specific APP's functionality or the user's data in it, rather than the IC protocol itself? (2) Is that app on the Internet Computer? If unsure, THIS tool is how you find out: a known app or an IC-verifiable URL resolves, while an unrecognized app name, or a URL with no Internet Computer evidence, is refused rather than guessed. (3) If so, START HERE: one open_app call resolves the app AND discovers its service. An app feature is almost never a single named tool (there is no \"get_bookings\"); you COMPOSE it from what open_app returns, reading the discovered canisters and their `oql`/`api_doc_available` flags to see how to READ (canister_query, including OQL) or ACT (canister_update_call). So never conclude \"there's no tool for that\" from the flat tool list without opening the app first. Open an Internet Computer app in ONE call, given its NAME or its URL — the recommended entry point when a user names an app. It resolves the app's Internet Identity derivation origin (like resolve_app) AND discovers the canisters behind it (like discover_app_canisters) together, so you don't chain those yourself. Pass a NAME as the user said it, or a URL (e.g. \"https://opencloud.org\"): a name or bare host is matched to the built-in known-app registry FIRST (so even a wrong-TLD guess repairs to the canonical URL), and an explicit https:// URL is resolved as given. NEVER fabricate a domain from a name — an unknown bare name is refused with instructions to find the real URL (web search / ask the user), and a URL with no Internet Computer evidence is refused, both instead of guessing a wrong identity. Returns `app_url` (the one used — KEEP IT: canister_update_call needs it to check the app's service-discoverability manifest before any write), `derivation_origin` (+ its source) to act with, `alternative_origins`, and the discovered `canisters` (with provenance/labels AND per-canister `oql`/`api_doc_available` capability flags, from a one-shot Candid probe of the app's own canisters). A canister flagged `oql` holds the app's data, GATED BY THE CALLER's principal: to read the USER's own data (\"my …\", \"our …\") pass the returned `derivation_origin` to get_canister_oql_schema (for the entity/field names) and to canister_query (with the `oql` argument, to run the query). Those OQL reads REQUIRE `derivation_origin` — not `app_url` — and reject an anonymous read for now. No authenticated session required for open_app itself (no principal is derived here). Narrower tools remain for single steps: resolve_app (origin only), discover_app_canisters (canisters only).",
         annotations(title = "Open an app (resolve origin + discover canisters)", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::OpenAppOutput>(),
     )]
@@ -1115,7 +1143,9 @@ impl IcCanisterTools {
             "\n\nNext: inspect a canister with get_canister_candid — its oql / api_doc_available \
              flags say whether to read via OQL and whether get_canister_api_doc has a doc \
              (only call it when api_doc_available). To act as the user, pass the derivation_origin \
-             above to canister_query (read) and canister_update_call (write); for an OQL canister, \
+             above to canister_query (read) and canister_update_call (write) — and for a WRITE also \
+             pass the app_url above, which canister_update_call checks against the app's declared \
+             /.well-known/ic-architecture manifest before making the call; for an OQL canister, \
              call get_canister_oql_schema for the entity/field names, then canister_query with \
              the `oql` argument — plus an optional account from list_app_accounts. A \"my/our…\" \
              question is an AUTHENTICATED read: pass the origin.",
@@ -1137,7 +1167,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Resolve an application URL to its Internet Identity derivation context, so you don't have to figure out the derivation origin yourself. `app_url` must be a URL you actually HAVE — from the user, from open_app's known-app resolution, or from a web search of the app's official site. NEVER guess or fabricate a domain from an app's name (when you only know a NAME, call open_app with the name first): a lookalike domain is an unrelated or squatted site, and this tool REFUSES to resolve an origin that shows no evidence of being an Internet Computer app rather than hand back a wrong identity. Returns the `application_origin`, the `derivation_origin` to pass to the identity tools, how it was determined (`derivation_origin_source`: \"declared\" — the app published it in /.well-known/ic-app.json, authoritative; \"known\" — from the connector's built-in registry of well-known custom-derivation-origin apps, used only when the app declares none; or \"app_url_default\" — the origin IS IC-served but declares nothing, so it was assumed to be its own derivation origin, correct only if the app has no custom one), and the app's `alternative_origins` (informational — the INVERSE relation, never use it to infer the derivation origin). This does NOT return a principal — it resolves the origin only, since you haven't picked an account; to get the principal you act as, pass the returned `derivation_origin` to get_app_principal (choosing an `account`) or list_app_accounts. Use this first when you only know an app's URL; no authenticated session is required.",
+        description = "Resolve an application URL to its Internet Identity derivation context, so you don't have to figure out the derivation origin yourself. `app_url` must be a URL you actually HAVE — from the user, from open_app's known-app resolution, or from a web search of the app's official site. NEVER guess or fabricate a domain from an app's name (when you only know a NAME, call open_app with the name first): a lookalike domain is an unrelated or squatted site, and this tool REFUSES to resolve an origin that shows no evidence of being an Internet Computer app rather than hand back a wrong identity. Returns the `application_origin`, the `derivation_origin` to pass to the identity tools, how it was determined (`derivation_origin_source`: \"declared\" — the app published it, in /.well-known/ii-derivation-origin (the protocol's own file) or the legacy /.well-known/ic-app.json, authoritative; \"known\" — from the connector's built-in registry of well-known custom-derivation-origin apps, used only when the app declares none; or \"app_url_default\" — the origin IS IC-served but declares nothing, so it was assumed to be its own derivation origin, correct only if the app has no custom one), and the app's `alternative_origins` (informational — the INVERSE relation, never use it to infer the derivation origin). This does NOT return a principal — it resolves the origin only, since you haven't picked an account; to get the principal you act as, pass the returned `derivation_origin` to get_app_principal (choosing an `account`) or list_app_accounts. Use this first when you only know an app's URL; no authenticated session is required.",
         annotations(title = "Resolve an app's derivation origin", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::ResolveAppOutput>(),
     )]
@@ -1191,7 +1221,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). The domain must be one you actually have (from the user, open_app's known-app resolution, or a web search) — NEVER a domain guessed from an app's name; when you only know a NAME, call open_app with the name first. Returns every canister id found, with provenance, most authoritative first: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's MAIN backend) and the app's own /.well-known/ic-app.json manifest (ALL its canisters, with roles) — then the `x-ic-canister-id` header (the frontend/asset canister), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json/bundle entries are mined candidates: pick by label (prefer production/IC ids) and confirm with get_canister_candid before calling.",
+        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). The domain must be one you actually have (from the user, open_app's known-app resolution, or a web search) — NEVER a domain guessed from an app's name; when you only know a NAME, call open_app with the name first. Returns every canister id found, with provenance, most authoritative first: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's MAIN backend), the app's service-discoverability manifest at /.well-known/ic-architecture (ALL its canisters, with roles — and the ONLY provenance that permits an update call), and the same manifest at the legacy /.well-known/ic-app.json path — then the `x-ic-canister-id` header (the frontend/asset canister), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json/bundle entries are mined candidates: pick by label (prefer production/IC ids) and confirm with get_canister_candid before calling. Every entry is READABLE; only a canister declared in the app's manifest can be written to with canister_update_call.",
         annotations(title = "Discover canisters behind a domain", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::DiscoverOutput>(),
     )]
@@ -1765,6 +1795,35 @@ fn resolve_identity_target(
     }
 }
 
+/// The origin whose service-discoverability manifest decides whether an update
+/// call may proceed, and which argument it came from (so a refusal can name the
+/// one to fix). Precedence: the caller's `app_url` — the argument that exists for
+/// exactly this — else the `derivation_origin`, as the caller SPELLED it.
+///
+/// Why the derivation origin's `requested` form and not its canonical `origin`:
+/// the canonical form carries the `*.icp0.io`/`*.icp.net` → `*.ic0.app` gateway
+/// remap, which exists so Internet Identity derives ONE principal across an app's
+/// gateway aliases. That is an identity concern. A manifest is an ordinary HTTP
+/// document served by whichever host the caller actually named, so remapping the
+/// host before fetching would go looking for the file on an alias the app may not
+/// serve at all — and report "publishes no manifest" about an app that does.
+///
+/// Neither argument present is a REFUSAL, not a default: with no origin there is
+/// nothing to check against, and defaulting to "allow" would be the whole gate.
+fn declaration_origin(
+    app_url: Option<String>,
+    target: Option<&IdentityTarget>,
+    canister_id: &Principal,
+) -> Result<(String, OriginSource), String> {
+    if let Some(url) = app_url {
+        return clean_app_url(&url).map(|u| (u, OriginSource::AppUrl));
+    }
+    match target {
+        Some(t) => Ok((t.requested.clone(), OriginSource::DerivationOrigin)),
+        None => Err(discoverability::missing_origin_refusal(canister_id)),
+    }
+}
+
 /// Append guess-repair guidance to an `app_url` resolution failure (DNS, TLS,
 /// timeout, SSRF refusal): a fetch error on a domain FABRICATED from an app name
 /// (e.g. "multi.dex") must redirect the caller to the name→URL tools — the same
@@ -2000,6 +2059,19 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              resource (the value syntax these tools use); `candid://reference` has the full type \
              reference, and the official IC \
              skills are served as `skill://<name>` resources.\n\n\
+             WRITES GO ONLY TO APPS THAT OPTED IN. Reading the Internet Computer is open: any \
+             canister's interface, metadata and query methods are public, and every read tool here \
+             works on any canister. A STATE-CHANGING call (canister_update_call) is different — it \
+             runs against someone's live application — so it is made ONLY to a canister the owning \
+             app DECLARES in its service-discoverability manifest at /.well-known/ic-architecture. \
+             Publishing that manifest is how an app's operators opt in \
+             (https://docs.internetcomputer.org/guides/frontends/service-discoverability/). In \
+             practice: keep the `app_url` open_app gave you and pass it to canister_update_call, \
+             which reads the manifest at that origin. If an app publishes none, do NOT keep \
+             retrying or hunt for another route: answer what you can by READING, then tell the \
+             user this app has not enabled agent writes, that its operators can by publishing the \
+             manifest, and that they can perform the action themselves in the app's own \
+             frontend.\n\n\
              FINANCIAL TRANSACTIONS ARE NOT SUPPORTED — asset-moving requests are denied, to \
              protect the user: canister_update_call refuses the ICRC-standard transfer/approval \
              methods (icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICRC-4/-7/-37 \
@@ -2100,7 +2172,8 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              `oql` argument when `oql: true` (get the entity/field names from get_canister_oql_schema; \
              an anonymous OQL read is rejected for now, and a Candid `method` \
              query is REJECTED on an OQL canister), else a Candid `method` query; (7) ACT with \
-             `canister_update_call`, passing `derivation_origin` + `account` to act as the \
+             `canister_update_call`, passing the `app_url` from step 0-2 (it gates the write on the \
+             app's declared manifest) plus `derivation_origin` + `account` to act as the \
              user. Public metadata (get_canister_candid, discover_app_canisters) and public \
              canister_query Candid `method` queries need no origin; OQL reads always require one. The \
              per-canister inspection (5) is independent of the identity steps (1/3/4), so they can \
@@ -2526,6 +2599,88 @@ mod tests {
         let cc = ann("canister_update_call");
         assert_eq!(cc.read_only_hint, Some(false));
         assert_eq!(cc.destructive_hint, Some(true));
+    }
+
+    // The origin the discoverability gate checks: `app_url` is the argument that
+    // exists for it and always wins; the derivation origin fills in only when no
+    // app_url was given; neither is a REFUSAL, never an implicit allow.
+    #[test]
+    fn declaration_origin_prefers_app_url_and_refuses_with_neither() {
+        let canister = candid::Principal::from_text("hmxr2-pqaaa-aaabq-qaaaa-cai").unwrap();
+        let target = super::resolve_identity_target(Some("https://nns.ic0.app".into()))
+            .expect("valid origin")
+            .expect("some target");
+
+        // app_url wins even when a derivation origin is also present: the two are
+        // NOT interchangeable (an app can pin a derivation origin it doesn't serve
+        // its manifest from), so the explicit argument decides.
+        let (origin, source) =
+            super::declaration_origin(Some("https://app.example.com".into()), Some(&target), &canister)
+                .expect("app_url is accepted");
+        assert_eq!(origin, "https://app.example.com");
+        assert_eq!(source, super::OriginSource::AppUrl);
+
+        // No app_url: fall back to the derivation origin AS THE CALLER SPELLED IT
+        // — not the canonical form, whose *.icp0.io -> *.ic0.app gateway remap is
+        // an identity concern and would send the manifest fetch to an alias the
+        // app may not serve.
+        let gateway = super::resolve_identity_target(Some("https://x.icp0.io".into()))
+            .expect("valid origin")
+            .expect("some target");
+        assert_eq!(gateway.origin, "https://x.ic0.app", "the identity path remaps");
+        let (origin, source) =
+            super::declaration_origin(None, Some(&gateway), &canister).expect("falls back");
+        assert_eq!(origin, "https://x.icp0.io", "the manifest fetch does not");
+        assert_eq!(source, super::OriginSource::DerivationOrigin);
+
+        // Neither: refused, with the guidance that names the missing argument.
+        let e = super::declaration_origin(None, None, &canister).expect_err("must refuse");
+        assert!(e.contains("`app_url`"), "{e}");
+        assert!(e.contains(&canister.to_text()), "{e}");
+
+        // A malformed app_url is rejected by the same validation every other
+        // URL-taking argument uses, rather than being fetched.
+        assert!(super::declaration_origin(Some("http://x.example".into()), None, &canister).is_err());
+        assert!(super::declaration_origin(Some("   ".into()), None, &canister).is_err());
+    }
+
+    // The discoverability gate is the opposite of the financial policy below: it
+    // is a property of THIS tool (it needs `app_url`, and it changes what the call
+    // does), so it belongs in the description, where an agent reads it before
+    // composing the call — and in the server instructions, which frame why. Pin
+    // both, plus the rule that reads stay open, so a future edit can't quietly
+    // turn the refusal into "this app is off limits".
+    #[test]
+    fn discoverability_gate_is_stated_on_the_tool_and_server_wide() {
+        let tools = super::IcTools::all_tools();
+        let desc = tools
+            .iter()
+            .find(|t| &*t.name == "canister_update_call")
+            .and_then(|t| t.description.as_deref())
+            .expect("canister_update_call tool not found");
+        assert!(desc.contains("/.well-known/ic-architecture"), "names the manifest path: {desc}");
+        assert!(desc.contains("`app_url`"), "names the argument that carries the origin: {desc}");
+        assert!(desc.contains("READABLE"), "says reads are unaffected: {desc}");
+
+        // The argument is really on the schema, not just in the prose.
+        let schema = tools
+            .iter()
+            .find(|t| &*t.name == "canister_update_call")
+            .map(|t| serde_json::to_string(&t.input_schema).unwrap())
+            .unwrap();
+        assert!(schema.contains("app_url"), "app_url must be a declared argument: {schema}");
+
+        let ins = super::SERVER_INSTRUCTIONS;
+        assert!(ins.contains("WRITES GO ONLY TO APPS THAT OPTED IN"));
+        assert!(ins.contains("/.well-known/ic-architecture"));
+        assert!(
+            ins.contains(super::discover::SERVICE_DISCOVERABILITY_GUIDE),
+            "the instructions must link the guide so an agent can relay it"
+        );
+        assert!(
+            ins.contains("answer what you can by READING"),
+            "a refused write must not read as 'give up on this app'"
+        );
     }
 
     // The financial-transactions policy is a SERVER-WIDE instruction, not a
