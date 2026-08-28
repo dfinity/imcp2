@@ -27,7 +27,10 @@
 //! `/favicon.svg` (the tab icon the connect screens link).
 
 use axum::{routing::get, Json, Router};
-use imcp2::{auth_callbacks_router, Agent, IiInstance, McpConfig, McpServer, SharedClients, IC_URL};
+use imcp2::{
+    auth_callbacks_router, ii_app_metadata_router, Agent, IiInstance, McpConfig, McpServer,
+    SharedClients, IC_URL,
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Bind address. Honours `$PORT` (set by most PaaS), defaulting to 8000.
@@ -457,8 +460,10 @@ async fn main() -> anyhow::Result<()> {
 
     // The II auth-callback allow-list is origin-global: one document declares
     // every served instance's callbacks (prod always, beta only on staging).
+    // So is the app-metadata document, which names this origin on II's screens.
     let app = app
         .merge(auth_callbacks_router(&servers))
+        .merge(ii_app_metadata_router())
         // Request metrics and a per-request debug log line, as separate layers so
         // an embedder can take either alone. The log keeps the full path (never
         // the query string); the metrics bound every label — see imcp2::metrics.
