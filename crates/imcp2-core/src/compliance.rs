@@ -135,8 +135,8 @@ const DISALLOWED_CANISTER_METHODS: &[(&str, &str, &str)] = &[
     // The cycles ledger's value movement beyond ICRC-1/-2 (which group one
     // already covers): withdrawals and the canister-creation spends. The
     // creation refusal points the user at running the operation themselves
-    // with the icp CLI directly (the dedicated instructions-only creation
-    // tool is deferred from this version's served surface).
+    // with the icp CLI, which is where creating and funding canisters
+    // happens — this server serves no tool for either.
     (CYCLES_LEDGER, "withdraw", "a cycles-ledger withdrawal"),
     (CYCLES_LEDGER, "withdraw_from", "a cycles-ledger delegated withdrawal"),
     (CYCLES_LEDGER, "create_canister", "a cycles-ledger spend (canister creation)"),
@@ -552,8 +552,7 @@ mod tests {
     // refused on the generic route, and their refusal points the user at
     // doing it themselves with the icp CLI (install pointer included), which
     // is also the recovery path for an interrupted mint. Never at a connector
-    // tool (the dedicated instructions-only creation tool is deferred from
-    // this version).
+    // tool: this server serves none for creating or funding a canister.
     #[test]
     fn refuses_creation_and_funding_completions_with_cli_redirect() {
         for (canister, method) in [
