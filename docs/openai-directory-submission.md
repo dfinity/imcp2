@@ -128,12 +128,16 @@ submission states, not from a narrower reading:
 - **The descriptions match the behavior**, as the guidelines require ("tools
   should behave exactly as their names, descriptions, and inputs indicate";
   "side effects should never be hidden or implicit"):
-  every tool description says what its tool does, what it returns, and what
-  it rejects. The financial-transactions policy is not restated there: it is
-  stated in full in the server-level instructions, which is the field the
-  scan reads, and kept out of the descriptions deliberately — a policy
-  paragraph inside `canister_update_call`'s description would read as a hint
-  that the tool is usable for financial transactions.
+  every tool description says what its tool does, what it returns, and which
+  inputs it rejects (an anonymous OQL read, a Candid data query on an OQL
+  canister, a URL with no Internet-Computer evidence). The
+  financial-transactions policy is a separate, server-wide matter and is
+  stated where the scan reads it: in full in the server-level instructions,
+  and deliberately in no description — a policy paragraph inside
+  `canister_update_call`'s description would read as a hint that the tool is
+  usable for financial transactions. So no description promises a behavior
+  the tool does not have, and no refusal is hidden: it is stated once, for
+  the whole surface.
 - **The commerce and speculation rules have nothing to attach to.** The
   plugin sells nothing (no physical goods, no digital goods or
   subscriptions, no checkout) and offers no speculation product: no trading,
