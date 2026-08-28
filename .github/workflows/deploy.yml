@@ -3,7 +3,7 @@
 # Staging tracks main continuously so changes get exercised on a real host before a
 # release is cut. Production is a separate host that only moves on a `release-*`
 # tag — see deploy-release.yml. Both share the mechanics in deploy-native.yml, which
-# cross-builds the binary and ships it + static/ over SSH to systemd services. See
+# cross-builds the binary and ships it over SSH to systemd services. See
 # deploy/native/README.md for the deploy model.
 #
 # Required repository secrets (Settings -> Secrets and variables -> Actions):
