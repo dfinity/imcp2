@@ -17,7 +17,7 @@ you can produce a buildable Caffeine app from nothing.
 
 **This skill owns the project shape and the build workflow. It does NOT own the Motoko
 language.** Before you write or edit any backend code, fetch and follow the `writing-motoko`
-skill: <https://skills.internetcomputer.org/skills/writing-motoko/SKILL.md>. That skill is
+skill: the `skill://writing-motoko` resource. That skill is
 authoritative for actor syntax, stable state, `mo:core`, and compiler errors. This
 skill only shows the minimal empty actor and where it lives.
 
@@ -109,7 +109,7 @@ Only the **root** manifest, the two **canister** manifests, `mops.toml`, `main.m
 the small root config files are shown inline below. The full frontend boilerplate
 (`package.json`, `vite.config.js`, the Tailwind/PostCSS/Biome configs, `index.html`,
 `env.json`, `main.tsx`, a starter `App.tsx`) is in
-[`references/frontend-template.md`](references/frontend-template.md) — read it when you
+[`references/frontend-template.md`](skill://caffeine-app/references/frontend-template.md) — read it when you
 create the frontend.
 
 ## Manifests
@@ -336,7 +336,7 @@ compiler-error pitfalls that an agent will otherwise hallucinate.
 ## The frontend
 
 **Fetch this skill's companion reference file** —
-[`references/frontend-template.md`](references/frontend-template.md), which sits next to
+[`references/frontend-template.md`](skill://caffeine-app/references/frontend-template.md), which sits next to
 this `SKILL.md` (i.e. `…/skills/caffeine-app/references/frontend-template.md`) — and create
 the frontend files from it; it holds the verified `package.json`, the Vite/Tailwind/Biome
 configs, `main.tsx`, and the worked `useActor(createActor)` backend call. The essentials:
@@ -351,7 +351,7 @@ configs, `main.tsx`, and the worked `useActor(createActor)` backend call. The es
   `useActor(createActor)` from `@caffeineai/core-infrastructure` (the same package provides
   the auth provider used in `main.tsx`); you do **not** hand-write the actor/config/storage
   glue. See the worked example in
-  [`references/frontend-template.md`](references/frontend-template.md).
+  [`references/frontend-template.md`](skill://caffeine-app/references/frontend-template.md).
 - `env.json` holds runtime config placeholders (`backend_host`, `backend_canister_id`,
   `project_id`, `ii_derivation_origin`, `storage_gateway_url`), all `"undefined"` locally;
   the frontend `build` script copies it into `dist/` (`cp env.json dist/`). Caffeine
@@ -431,7 +431,7 @@ having no deploy command. This skill is for the **local, hand-authored** path.
    into `dist/` so the served frontend can read its runtime config.
 8. **Writing Motoko without the `writing-motoko` skill.** Modern Caffeine Motoko uses
    `mo:core`, persistent actors, and specific patterns. Guessing produces compiler
-   errors. Load <https://skills.internetcomputer.org/skills/writing-motoko/SKILL.md> first.
+   errors. Load the `skill://writing-motoko` resource first.
 9. **Using `npm`/`yarn` instead of `pnpm`.** The workspace is pnpm-based
    (`pnpm-workspace.yaml`, `pnpm -r` scripts). `caffeine install` uses pnpm + mops.
 10. **`caffeine install`/`build` fails with `ERR_PNPM_NO_LOCKFILE` on a fresh project.**
@@ -451,14 +451,14 @@ having no deploy command. This skill is for the **local, hand-authored** path.
 ## Related skills
 
 - **`writing-motoko`** — REQUIRED companion. Authoritative for all backend Motoko code:
-  <https://skills.internetcomputer.org/skills/writing-motoko/SKILL.md>. Always load it before
+  the `skill://writing-motoko` resource. Always load it before
   editing `src/backend/main.mo`.
 - **`icp-cli`** — for raw Internet Computer / `dfx` / `icp` projects. Not used by
   Caffeine; reach for it only when the user is *not* building a Caffeine app.
 
 ## Additional references
 
-- [`references/frontend-template.md`](references/frontend-template.md) — the full,
+- [`references/frontend-template.md`](skill://caffeine-app/references/frontend-template.md) — the full,
   verbatim frontend boilerplate (`package.json`, `vite.config.js`, Tailwind/PostCSS/Biome
   configs, `tsconfig.json`, `index.html`, `env.json`, `main.tsx`, a starter `App.tsx`,
   and the backend-actor wiring pattern). Read it when you create `src/frontend/`.

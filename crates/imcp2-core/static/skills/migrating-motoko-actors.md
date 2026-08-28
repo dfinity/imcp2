@@ -263,7 +263,7 @@ To derive `OldActor` deterministically: your `OldActor` equals the `NewActor` of
 
 ## Additional References
 
-- **Migration examples**: See [examples.md](references/examples.md) for minimal, self-contained examples (add field, map over collection, add optional field)
+- **Migration examples**: See [examples.md](skill://migrating-motoko-actors/references/examples.md) for minimal, self-contained examples (add field, map over collection, add optional field)
 - **When something does not add up**: Load `troubleshooting-motoko-migrations` for compatibility diagnostics you cannot explain, write failures on frozen files, projects converted from legacy persistence, and requests to remove the chain. Not needed on the normal path.
 - **General Motoko development**: Use `writing-motoko` for language fundamentals, core library reference, and architecture patterns
 - **mops tooling**: Load `mops-cli` for `mops.toml` configuration, `mops check`, `mops build`, and toolchain setup

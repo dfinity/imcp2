@@ -327,7 +327,11 @@ auth, …) — are served as MCP **resources** (`skill://<name>`) alongside the
 compiled into the binary at build time (`crates/imcp2-core/static/skills/`,
 provenance and refresh procedure in the bundle's README); the server
 retrieves no instructions over the network, so what an agent reads is
-exactly what was reviewed at release.
+exactly what was reviewed at release. The companion documents a skill links
+to are bundled and served the same way, as
+`skill://<name>/references/<file>`, so following a link inside a skill
+resolves to another served resource rather than sending the agent back to
+the network.
 
 ### OQL query surfaces
 

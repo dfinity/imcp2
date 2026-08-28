@@ -2164,6 +2164,18 @@ impl ServerHandler for IcTools {
                     .no_annotation(),
             );
         }
+        // The companion documents those skills link to, listed so a client can
+        // see the whole bundle: every link inside a served skill resolves to
+        // another served resource, never to a fetch.
+        for (name, file, _) in skills::BUNDLED_SKILL_REFERENCES {
+            resources.push(
+                RawResource::new(
+                    format!("{SKILL_URI_PREFIX}{name}/references/{file}"),
+                    format!("IC skill reference: {name} / {file}"),
+                )
+                .no_annotation(),
+            );
+        }
         Ok(ListResourcesResult {
             resources,
             next_cursor: None,
@@ -2179,8 +2191,10 @@ impl ServerHandler for IcTools {
         // Every resource is served from content compiled into this binary —
         // the skills from the reviewed bundle, the candid/OQL references from
         // their static documents.
-        if let Some(name) = request.uri.strip_prefix(SKILL_URI_PREFIX) {
-            return match skills::bundled_skill(name) {
+        if let Some(path) = request.uri.strip_prefix(SKILL_URI_PREFIX) {
+            // `skill://<name>` is the skill itself; `skill://<name>/references/<file>`
+            // is one of its companion documents, which its own links point at.
+            return match skills::bundled_skill_document(path) {
                 Some(md) => Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     md,
                     request.uri,
@@ -2190,8 +2204,8 @@ impl ServerHandler for IcTools {
                     Some(serde_json::json!({
                         "uri": request.uri,
                         "error": format!(
-                            "no skill named `{}` — list the `skill://` resources to see the available skills",
-                            name.trim()
+                            "no bundled skill document at `{}` — list the `skill://` resources to see the available skills and their references",
+                            path.trim()
                         ),
                     })),
                 )),
