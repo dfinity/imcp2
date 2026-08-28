@@ -37,7 +37,11 @@ details (e.g. exact icon dimensions) not published in the docs.
 
 ## Readiness: requirements already met
 
-Verified against the live production deployment (2026-07-31):
+Transport and auth rows were verified against the live production
+deployment (2026-07-31). The tool-surface rows (annotations, counts, names,
+schemas) describe `main` — the build the next release deploys and the one
+under submission; the live pre-release build still serves the old surface
+(see blocker 4), so re-verify them against production after that release:
 
 | Requirement | Status |
 |---|---|
