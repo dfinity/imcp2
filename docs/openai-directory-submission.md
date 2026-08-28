@@ -114,7 +114,9 @@ financial-transfers prohibition:
   the shipped behavior — check it on that basis: no tool initiates or
   executes a transfer of the user's funds. `canister_update_call` refuses
   the financial ledger methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37
-  equivalents on every canister, plus the ICP and cycles ledgers' own
+  equivalents on every canister, plus the NNS/SNS governance method
+  `manage_neuron` — neuron staking and disbursement — on every canister,
+  plus the ICP and cycles ledgers' own
   value-moving methods on those ledgers, plus every update call on a curated
   list of known financial-service canisters: token ledgers and minters,
   exchanges, wallet backends, staking/governance), with the policy stated in
