@@ -1,8 +1,10 @@
 # ICP MCP Privacy Policy (source text)
 
 > This is the source text for the page served at
-> `https://mcp.internetcomputer.org/privacy-policy`
-> (`src/assets/privacy-policy.html`). Keep the two in sync: the served page is
+> `https://internetcomputer.org/icp-mcp/privacy-policy/`
+> (dfinity/internetcomputer-org, `public/icp-mcp/privacy-policy/index.html`;
+> the old `https://mcp.internetcomputer.org/privacy-policy` permanently
+> redirects there). Keep the two in sync: the served page is
 > what users and directory reviews actually see. Technical claims are drawn
 > from this repository's behaviour; re-verify them against the deployed
 > release whenever the policy is republished (and update section 3 if the

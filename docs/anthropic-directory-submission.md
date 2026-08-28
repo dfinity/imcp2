@@ -59,7 +59,7 @@ under submission; the live pre-release build still serves the old surface
 | OAuth endpoint latency ≤ 10 s (discovery/registration/token) | ✅ all sub-second in probes |
 | Support channel | ✅ <mcp@dfinity.org> (shown on every error screen) |
 | Security-vulnerability reporting mechanism (a Software Directory Terms obligation) | ✅ [`SECURITY.md`](../SECURITY.md) → Hackenproof bug bounty |
-| Public documentation by publish date | ✅ this repo's README + the landing page at <https://mcp.internetcomputer.org> |
+| Public documentation by publish date | ✅ this repo's README + the landing page at <https://internetcomputer.org/icp-mcp/> (its one home, maintained in dfinity/internetcomputer-org; `https://mcp.internetcomputer.org` permanently redirects there from the release that ships #165) |
 | Status/health visibility | ✅ <https://mcp.internetcomputer.org/status/> |
 
 Notes on auth mode: pure M2M `client_credentials` is unsupported by Claude
@@ -128,14 +128,16 @@ server actually does, it should cover at least:
   explicitly, or disclose them if added).
 - **Controller and contact:** DFINITY Stiftung; <mcp@dfinity.org>.
 
-Publication venue: `https://mcp.internetcomputer.org/privacy-policy`, served
-by the MCP server itself. The page and its route shipped in
-[#112](https://github.com/dfinity/imcp2/pull/112) (effective date August 3,
-2026), the landing page's footer links it, and the page is live on
-production (verified 2026-08-27: HTTP 200). What remains: enter that URL in
-the portal, and cut the next `release-*` first — the live text is one
-revision behind `main` (the current draft's identifier-linkability wording
-lands with that release). The reviewed source
+Publication venue: `https://internetcomputer.org/icp-mcp/privacy-policy/` —
+the page's one home, maintained in dfinity/internetcomputer-org
+(`public/icp-mcp/privacy-policy/`) and live there
+(dfinity/internetcomputer-org#77 refreshes its text to the current draft).
+The MCP server no longer serves a copy: from the release that ships
+[#165](https://github.com/dfinity/imcp2/pull/165),
+`https://mcp.internetcomputer.org/privacy-policy` answers with a permanent
+redirect to that home (until that release it still serves the previous
+revision itself). Either URL works in the portal; prefer the canonical one.
+The reviewed source
 text is [`icp-mcp-privacy-policy-draft.md`](icp-mcp-privacy-policy-draft.md).
 
 ### 2. Financial-transactions policy (resolved in code)
@@ -274,10 +276,13 @@ Paste-and-adapt; portal limits in parentheses.
   > lookalike domains are refused rather than resolved.
 - **Categories** (1–5): Developer tools; plus whatever the portal offers
   closest to data/productivity/web3.
-- **Documentation URL:** `https://mcp.internetcomputer.org` (landing page;
-  README as backup: `https://github.com/dfinity/imcp2#readme`)
-- **Privacy policy URL:** `https://mcp.internetcomputer.org/privacy-policy`
-  — enter it only once the page is live (blocker 1); a missing or incomplete
+- **Documentation URL:** `https://internetcomputer.org/icp-mcp/` (the landing
+  page's home; `https://mcp.internetcomputer.org` permanently redirects there
+  from the release that ships #165. README as backup:
+  `https://github.com/dfinity/imcp2#readme`)
+- **Privacy policy URL:** `https://internetcomputer.org/icp-mcp/privacy-policy/`
+  (live; the old `https://mcp.internetcomputer.org/privacy-policy` permanently
+  redirects there from the release that ships #165). A missing or incomplete
   policy is documented as immediate rejection. Do not substitute the
   foundation-wide `dfinity.org/privacy`.
 - **Support contact:** `mcp@dfinity.org`
@@ -360,7 +365,7 @@ conversation beyond tool arguments and generates no media.
 
 ## Submission-day checklist
 
-- [ ] Privacy policy entered in the portal — the page is already live at `https://mcp.internetcomputer.org/privacy-policy` (verified 2026-08-27); the next `release-*` refreshes its text to the current draft (blocker 1)
+- [ ] Privacy policy entered in the portal — enter `https://internetcomputer.org/icp-mcp/privacy-policy/`, the page's one home (live; dfinity/internetcomputer-org#77 refreshes its text to the current draft, and the old mcp.internetcomputer.org URL redirects there from the release that ships #165) (blocker 1)
 - [x] Financial-transactions question resolved in code (blocker 2) — no mcp-review reply is needed; if one arrives, answer with the shipped posture. The first-party-API/data-handling question was NOT in the 2026-07-31 email: raise it with mcp-review only if the portal's data-handling options don't fit
 - [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — if a reviewer asks for a populated account, provision a demo-app account (no funding needed: there are no funding or canister-management tools)
 - [ ] `release-*` tag cut; `/version` on production shows the intended commit (blocker 4)
