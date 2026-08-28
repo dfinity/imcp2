@@ -176,6 +176,7 @@ Negative:
 
 - [ ] OpenAI Platform organization verified (business verification)
 - [ ] Submitter holds the Apps Management write permission
+- [ ] Production runs a release cut from current `main`: `curl https://mcp.internetcomputer.org/version` reports a commit that contains #153–#158 — verify immediately before submitting, since the deploy workflow also accepts older tags/SHAs (rollbacks), so a deployed challenge token alone does not prove the compliant build is live
 - [ ] Repository secret `OPENAI_APPS_CHALLENGE_TOKEN` set to the portal's token and deployed; `curl https://mcp.internetcomputer.org/.well-known/openai-apps-challenge` returns exactly the token (blocker 1 — the route is merged and deployed; it 404s until the variable is set, by design)
 - [x] Privacy policy live at `https://mcp.internetcomputer.org/privacy-policy` (verified 2026-08-27; the next release refreshes its text to the current draft)
 - [ ] Tools re-scanned in the portal after any server change; annotations verified in the scan

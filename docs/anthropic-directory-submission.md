@@ -49,7 +49,7 @@ Verified against the live production deployment (2026-07-31):
 | Discovery documents (RFC 8414 + RFC 9728, path-scoped + root fallback) | ✅ all four live, `WWW-Authenticate` on the 401 points at the resource metadata |
 | Every tool: `title` + `readOnlyHint`/`destructiveHint` (+ `idempotentHint`, `openWorldHint`) | ✅ on all 11 tools, enforced by a unit test ([`crates/imcp2-core/src/tools.rs`](../crates/imcp2-core/src/tools.rs)) |
 | No catch-all read/write tool; reads and writes are separate tools | ✅ 10 of the 11 tools are read-only; the one write is `canister_update_call`. |
-| Tool names ≤ 64 chars | ✅ longest is 23 (`get_canister_oql_schema`) |
+| Tool names ≤ 64 chars | ✅ longest on `main` (the build to submit) is 23 (`get_canister_oql_schema`); the live pre-release build's longest is 30 — both within the limit |
 | `outputSchema` + structured content on every tool | ✅ enforced by a unit test |
 | Certificates from a recognized authority | ✅ Let's Encrypt via Caddy |
 | OAuth endpoint latency ≤ 10 s (discovery/registration/token) | ✅ all sub-second in probes |
