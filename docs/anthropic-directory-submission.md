@@ -150,9 +150,11 @@ transactions:**
 - **The connector has no funding or management tools.** Creating, funding,
   and managing canisters is done by the user with the icp CLI in their own
   terminal.
-- `canister_update_call` **refuses the standardized ledger methods** that
-  move value or grant spending rights — the ICRC-standard names
-  (ICRC-1/ICRC-2 plus ICRC-4/-7/-37) on every canister, and the ICP and
+- `canister_update_call` **refuses the standardized value-moving methods** —
+  the ICRC-standard transfer/approval names
+  (ICRC-1/ICRC-2 plus ICRC-4/-7/-37) and the NNS/SNS governance method
+  `manage_neuron` (neuron staking and disbursement, on every SNS DAO's
+  governance as well as the NNS's) on every canister, and the ICP and
   cycles ledgers' own `transfer`/`send_dfx`/`withdraw`/`create_canister`
   methods on those ledgers, and refuses **every** update call on a curated,
   dashboard-verified list of known financial-service canisters (token ledgers
