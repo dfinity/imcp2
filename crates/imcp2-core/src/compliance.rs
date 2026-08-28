@@ -65,9 +65,11 @@
 //!     custom swap method, an intermediary that forwards a transfer), which
 //!     no name-based list can enumerate. The policy itself ("financial
 //!     transactions are not supported") is stated in the server-level
-//!     instructions (get_info) and disclosed in `canister_update_call`'s own
-//!     description; this guard enforces it for the standardized
-//!     ledger surface, where real funds overwhelmingly live (see above).
+//!     instructions (get_info), and deliberately in no tool description —
+//!     a policy paragraph inside `canister_update_call`'s description would
+//!     read as a hint that the tool is usable for financial transactions.
+//!     This guard enforces the policy for the standardized ledger surface,
+//!     where real funds overwhelmingly live (see above).
 //!     Likewise the canister list is curated and static, while exchanges
 //!     create per-pair pool/farm canisters dynamically and new services
 //!     launch: entries cover each service's central canisters (verified

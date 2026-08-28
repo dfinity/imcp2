@@ -523,12 +523,16 @@ impl IcCanisterTools {
             Ok(p) => p,
             Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
         };
-        // The financial-transactions gate (see `compliance`): ICRC-standard
-        // transfer/approval methods are refused on every canister, and the
+        // The financial-transactions gate (see `compliance`), in three
+        // scopes, before any network work: the standardized value-moving
+        // method names — the ICRC transfer/approval surface and the NNS/SNS
+        // governance method manage_neuron — refused on EVERY canister; the
         // system ledgers'/cycles-minting canister's own value-moving methods
-        // on those canisters, before any network work, pointing the user
-        // outside this connector. Queries need no gate — a query cannot
-        // commit state, so it cannot move funds.
+        // on those canisters; and EVERY update method on a listed
+        // financial-service canister, so a refusal here does not depend on
+        // the method name alone. The refusal points the user outside this
+        // connector. Queries need no gate — a query cannot commit state, so
+        // it cannot move funds.
         if let Some(refusal) = compliance::disallowed_update_method(&principal, &method) {
             return Ok(err(refusal));
         }
@@ -1958,19 +1962,21 @@ fn identity_annotation(target: &IdentityTarget, acted_as: Option<&str>) -> Strin
 /// should be free to choose its own approach from an accurate description of
 /// the tools.
 ///
-/// The financial-transactions policy is stated here in full, server-wide,
-/// because it governs the whole surface rather than one tool;
-/// `canister_update_call`'s own description carries a one-sentence disclosure
-/// of it, so the description matches the tool's actual behavior (both
-/// directories require that, and a refusal is a side effect a caller must be
-/// able to see from the description alone). Neither surface names a venue for
-/// a refused operation.
+/// The financial-transactions policy is stated here in full, server-wide —
+/// it governs the whole surface rather than one tool — and deliberately in NO
+/// tool description (per review): a policy paragraph inside
+/// `canister_update_call`'s description reads as a hint that the tool is
+/// usable for financial transactions, which is the one thing it must not
+/// suggest. `financial_policy_is_a_server_instruction_not_a_description`
+/// holds that line across every served description, and the directive scan
+/// covers the schemas too. Neither surface names a venue for a refused
+/// operation.
 const SERVER_INSTRUCTIONS: &str = "Internet Computer tools: read canister interfaces and data, resolve apps and the user's identity at them, and make calls on the user's behalf.\n\n\
     Values are textual Candid — the `(...)` syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`, never the binary form. The `candid://textual-syntax` resource documents that syntax and `candid://reference` the type system; IC how-to guides are served as `skill://<name>` resources.\n\n\
     Tool names signal scope. The `…_app…` names (open_app, discover_app_canisters, get_app_principal, list_app_accounts, resolve_app) act on a whole app, keyed by its Internet Identity derivation origin or its URL; the `…canister…` names (get_canister_candid, get_canister_api_doc, get_canister_oql_schema, canister_query, canister_update_call) act on one canister. `icp_oql_guide` documents the OQL dialect the canister reads use. An app's features are reached through its canisters rather than through per-feature tools, and open_app resolves an app name or URL to both its derivation origin and its canisters in one call.\n\n\
     An app's derivation origin is the exact origin Internet Identity derives the user's principal from. It is not necessarily the app's visible URL, and an alternative-origins entry does not identify it; open_app and resolve_app resolve it, and the identity-bearing tools take the origin itself rather than a URL. There is no on-chain name-to-URL directory: open_app matches a name against a built-in registry of well-known apps, and the URL-taking tools refuse an origin with no evidence of being an Internet Computer app. Per-app data is gated by the calling principal, so OQL reads require a derivation origin and reject an anonymous read. Account delegations are short-lived and derived on demand from this connection's standing Internet Identity credential, which is obtained at connect time and lasts for the chosen session duration (up to 30 days). Internet Identity's consent screen offers two access levels: on a \"Questions only\" session reads work and update calls are rejected by the network, while \"Actions & questions\" permits both.\n\n\
     Canister values are stored in canonical, locale-neutral forms: timestamps are usually nanoseconds since the Unix epoch in UTC (IC time), and physical quantities are SI or app-defined units, which `get_canister_api_doc` documents for canisters that publish a doc.\n\n\
-    FINANCIAL TRANSACTIONS ARE NOT SUPPORTED — asset-moving requests are denied, to protect the user: canister_update_call refuses the ICRC-standard transfer/approval methods (icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICRC-4/-7/-37 equivalents) and the governance method manage_neuron (neuron staking and disbursement, on the NNS and every SNS) on every canister, the ICP and cycles ledgers\' own transfer/withdrawal/creation methods and the cycles-minting canister\'s funding-completion methods on those canisters, and every update call on a curated list of known financial-service canisters (token ledgers and minters, exchanges, wallet backends, and staking/governance canisters). Financial operations (token transfers, spending approvals, payments, trades) are the user\'s to perform outside this connector, in a trusted interface they control; a refused canister-creation or funding-completion call points at the user-run icp CLI instead.\n\n\
+    FINANCIAL TRANSACTIONS ARE NOT SUPPORTED — asset-moving requests are denied, to protect the user: canister_update_call refuses the ICRC-standard transfer/approval methods (icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICRC-4/-7/-37 equivalents) and the governance method manage_neuron (neuron staking and disbursement, on the NNS and every SNS) on every canister, the ICP and cycles ledgers\' own transfer/withdrawal/creation methods and the cycles-minting canister\'s funding-completion methods on those canisters, and every update call on the financial-service canisters it carries (token ledgers and minters, exchanges, wallet backends, staking and governance). Financial operations (token transfers, spending approvals, payments, trades) are the user\'s to perform outside this connector, in a trusted interface they control; a refused canister-creation or funding-completion call points at the user-run icp CLI instead.\n\n\
     Compiling Motoko or Rust to Wasm happens in the client\'s own environment, and creating, funding, deploying, and managing canisters is done by the user with the icp CLI in their own terminal.";
 
 impl ServerHandler for IcTools {
