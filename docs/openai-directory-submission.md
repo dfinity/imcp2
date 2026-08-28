@@ -115,7 +115,9 @@ financial-transfers prohibition:
   executes a transfer of the user's funds. `canister_update_call` refuses
   the financial ledger methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37
   equivalents on every canister, plus the ICP and cycles ledgers' own
-  value-moving methods on those ledgers), with the policy stated in the
+  value-moving methods on those ledgers, plus every update call on a curated
+  list of known financial-service canisters: token ledgers and minters,
+  exchanges, wallet backends, staking/governance), with the policy stated in the
   server-level instructions rather than the tool description (which stays
   free of financial language, per maintainer review)
   ([#154](https://github.com/dfinity/imcp2/pull/154)), and

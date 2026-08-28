@@ -160,7 +160,10 @@ both are merged):**
   move value or grant spending rights — the ICRC-standard names
   (ICRC-1/ICRC-2 plus ICRC-4/-7/-37) on every canister, and the ICP and
   cycles ledgers' own `transfer`/`send_dfx`/`withdraw`/`create_canister`
-  methods on those ledgers; the refusal recommends the user act themselves
+  methods on those ledgers, and refuses **every** update call on a curated,
+  dashboard-verified list of known financial-service canisters (token ledgers
+  and minters, exchanges, wallet backends, staking/governance canisters and
+  their frontends); the refusal recommends the user act themselves
   in a wallet they control (oisy.com; a refused canister-creation spend
   points at the user-run icp CLI), and the policy is stated in the
   server-level instructions — deliberately not in the tool description,
