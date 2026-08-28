@@ -120,7 +120,7 @@ server actually does, it should cover at least:
   its provider); the Internet Computer's public API boundary nodes
   (`icp-api.io`) and Internet Identity (`id.ai`), both **DAO-governed via
   the NNS, not DFINITY-operated**; the DFINITY-operated
-  `dashboard.internetcomputer.org` and `skills.internetcomputer.org`; and,
+  `dashboard.internetcomputer.org`; and,
   at the user's direction, the applications the user chooses to interact
   with — a call carries its arguments and the user's per-app principal to
   that application's operator, and app discovery fetches metadata from
@@ -131,7 +131,8 @@ server actually does, it should cover at least:
 Publication venue: `https://internetcomputer.org/icp-mcp/privacy-policy/` —
 the page's one home, maintained in dfinity/internetcomputer-org
 (`public/icp-mcp/privacy-policy/`) and live there
-(dfinity/internetcomputer-org#77 refreshes its text to the current draft).
+(dfinity/internetcomputer-org#77 refreshes its text to the current draft:
+the identifier-linkability wording and the updated third-party list).
 The MCP server no longer serves a copy: from the release that ships
 [#165](https://github.com/dfinity/imcp2/pull/165),
 `https://mcp.internetcomputer.org/privacy-policy` answers with a permanent
@@ -289,8 +290,8 @@ Paste-and-adapt; portal limits in parentheses.
 - **Company:** DFINITY Foundation / DFINITY Stiftung, `https://dfinity.org`,
   plus a named primary contact for review updates.
 - **Data handling:** declare the gateway model honestly. DFINITY operates
-  the server itself plus `dashboard.internetcomputer.org` and
-  `skills.internetcomputer.org`, but **not** the rest of what it talks to:
+  the server itself plus `dashboard.internetcomputer.org`, but **not** the
+  rest of what it talks to:
   the API boundary nodes (`icp-api.io`) and Internet Identity (`id.ai`) are
   DAO-governed through the NNS. So this is not "first-party APIs only" on
   two counts: that, and user-directed calls being forwarded to third-party
@@ -353,13 +354,11 @@ those operations with the icp CLI).
 is: DFINITY operates the connector itself; it reaches the network through
 public Internet Computer infrastructure (`icp-api.io`, `id.ai`) and forwards
 user-directed calls to the application canisters the user names — state
-exactly that in the acknowledgment. The **prompt-injection** acknowledgment needs open disclosure rather
-than a bare yes: tool descriptions are static and contain no hidden
-instructions, but the `skill://`
-resources intentionally return DFINITY-published how-to documents fetched
-live from `skills.internetcomputer.org` at the user's request — describe
-this in the submission so reviewers see documented, user-requested
-functionality rather than covertly pulled behavioral instructions. The rest
+exactly that in the acknowledgment. The **prompt-injection** acknowledgment is a clean yes: tool
+descriptions are static and contain no hidden instructions, and the
+`skill://` resources return DFINITY-authored how-to documents from a
+reviewed, versioned bundle compiled into the binary at build time — the
+server retrieves no instructions over the network. The rest
 are straightforwardly true: the server collects nothing from the
 conversation beyond tool arguments and generates no media.
 

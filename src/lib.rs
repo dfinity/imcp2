@@ -70,8 +70,7 @@
 //! The operational-files location is [`McpConfig::state_dir`] (the embedder
 //! supplies it; the `imcp2` binary reads `$IMCP2_STATE_DIR`). Remaining knobs are
 //! environment variables read where they are used: `II_URL` / `II_CANISTER_ID`
-//! and `II_URL_PROD` / `II_CANISTER_ID_PROD` (the Internet Identity instances)
-//! and `SKILLS_URL` (the IC skills registry).
+//! and `II_URL_PROD` / `II_CANISTER_ID_PROD` (the Internet Identity instances).
 
 mod auth;
 // Docs live in the module itself (`//!` in src/metrics.rs): an outer doc
@@ -83,7 +82,7 @@ pub mod metrics;
 // engine, and the connect-handshake primitives — live in the `imcp2-core`
 // crate; this crate composes them with the OAuth 2.1 authorization server and
 // the streamable-HTTP transport.
-use imcp2_core::{identities, skills, tools};
+use imcp2_core::{identities, tools};
 
 // Real II<>MCP handshake test against a live Internet Identity canister in
 // PocketIC. In-crate (not tests/) so it can use the feature-gated optional
@@ -157,7 +156,6 @@ pub struct McpConfig {
 pub struct McpServer {
     agent: Agent,
     identities: identities::Identities,
-    skills: skills::SkillsCatalog,
     store: auth::AuthStore,
     public_url: String,
     mcp_path: String,
@@ -192,7 +190,6 @@ impl McpServer {
         Self {
             agent: config.agent,
             identities,
-            skills: skills::SkillsCatalog::new(),
             store,
             public_url,
             mcp_path,
@@ -250,14 +247,12 @@ impl McpServer {
     /// and set `mcp_path: "".into()`.
     pub fn mcp_router(&self) -> Router {
         let mcp_service = {
-            let (agent, identities, skills) =
-                (self.agent.clone(), self.identities.clone(), self.skills.clone());
+            let (agent, identities) = (self.agent.clone(), self.identities.clone());
             StreamableHttpService::new(
                 move || {
                     Ok(tools::IcTools::new(
                         agent.clone(),
                         identities.clone(),
-                        skills.clone(),
                         // Multi-user: each request's session is whatever the
                         // bearer-token gate already validated (auth stays in
                         // THIS crate; core only asks the injected resolver).

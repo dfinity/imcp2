@@ -15,7 +15,7 @@
 
 ## ICP MCP Privacy Policy
 
-**Effective Date: August 3, 2026**
+**Effective Date: August 28, 2026**
 
 We, DFINITY Stiftung, Genferstrasse 11, 8002 Zürich, Switzerland ("DFINITY
 Foundation") disclose in this ICP MCP Privacy Policy ("Privacy Policy") how we
@@ -193,9 +193,8 @@ of that application's state on a public network.
 application behind a web address, the Service fetches metadata from that
 address, which discloses the request to whoever runs that site.
 
-**Two services DFINITY Foundation operates**: the public canister-metadata
-service at `dashboard.internetcomputer.org` and the developer-skills service
-at `skills.internetcomputer.org`.
+**A service DFINITY Foundation operates**: the public canister-metadata
+service at `dashboard.internetcomputer.org`.
 
 **Our hosting provider.** The Service runs on servers we rent from Amazon Web
 Services, which processes data on our behalf as a processor under its
