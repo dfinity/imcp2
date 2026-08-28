@@ -156,14 +156,19 @@ transactions:**
   `manage_neuron` (neuron staking and disbursement, on every SNS DAO's
   governance as well as the NNS's) on every canister, and the ICP and
   cycles ledgers' own `transfer`/`send_dfx`/`withdraw`/`create_canister`
-  methods on those ledgers, and refuses **every** update call on a curated,
+  methods on those ledgers, the cycles-minting canister's funding-completion
+  methods (`notify_top_up`, `notify_create_canister`, `notify_mint_cycles`,
+  `create_canister`), and refuses **every** update call on a curated,
   dashboard-verified list of known financial-service canisters (token ledgers
   and minters, exchanges, wallet backends, staking/governance canisters and
-  their frontends); the refusal recommends the user act themselves
-  in a wallet they control (oisy.com; a refused canister-creation spend
-  points at the user-run icp CLI), and the policy is stated in the
-  server-level instructions — deliberately not in the tool descriptions,
-  which stay free of financial language.
+  their frontends); the refusal tells the user to perform the operation
+  outside the connector, in a trusted interface they control, and names no
+  venue (a refused canister-creation or funding-completion call points at the
+  user-run icp CLI). The policy is stated in full in the server-level
+  instructions, and `canister_update_call`'s own description discloses that
+  financial operations and update calls to known financial-service canisters
+  are not supported and return an error — so the description matches the
+  behavior.
 - The README, the landing page, and the server instructions all state
   explicitly that financial transactions are not supported.
 

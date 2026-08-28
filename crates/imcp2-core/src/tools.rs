@@ -493,7 +493,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
+        description = "Make an UPDATE call (a state-changing call) on an Internet Computer canister method, with textual Candid in and out. Financial operations and update calls to known financial-service canisters are not supported and return an error. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `derivation_origin` to call anonymously, or pass it to call AS your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. `derivation_origin` is the app's EXACT canonical II derivation origin (not necessarily its visible URL; don't infer it from alternativeOrigins). Get it once from open_app / resolve_app (which turn an app name or URL into the derivation origin under the guessed-domain gate) and reuse it here — this tool does NOT accept a raw website URL. By default this uses the app's default account; pass `account` (a name from list_app_accounts) for a specific one. The result echoes `derived_for_origin` + `requested` + `acted_as_principal` so you can catch an origin mismatch. For READ-only calls (Candid query methods or OQL queries) use canister_query instead. If get_canister_candid couldn't fetch the interface, pass the `.did` text as `candid` so args/replies are still typed.",
         annotations(title = "Make a canister update call", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterUpdateCallOutput>(),
     )]
@@ -515,10 +515,10 @@ impl IcCanisterTools {
         };
         // The financial-transactions gate (see `compliance`): ICRC-standard
         // transfer/approval methods are refused on every canister, and the
-        // ICP/cycles ledgers' own value-moving methods on those ledgers,
-        // before any network work, with a redirect to a user-controlled
-        // wallet. Queries need no gate — a query cannot commit state, so it
-        // cannot move funds.
+        // system ledgers'/cycles-minting canister's own value-moving methods
+        // on those canisters, before any network work, pointing the user
+        // outside this connector. Queries need no gate — a query cannot
+        // commit state, so it cannot move funds.
         if let Some(refusal) = compliance::disallowed_update_method(&principal, &method) {
             return Ok(err(refusal));
         }
@@ -1181,7 +1181,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). The domain must be one you actually have (from the user, open_app's known-app resolution, or a web search) — NEVER a domain guessed from an app's name; when you only know a NAME, call open_app with the name first. Returns every canister id found, with provenance, most authoritative first: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's MAIN backend) and the app's own /.well-known/ic-app.json manifest (ALL its canisters, with roles) — then the `x-ic-canister-id` header (the frontend/asset canister), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json/bundle entries are mined candidates: pick by label (prefer production/IC ids) and confirm with get_canister_candid before calling.",
+        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"opencloud.org\"). The domain must be one you actually have (from the user, open_app's known-app resolution, or a web search) — NEVER a domain guessed from an app's name; when you only know a NAME, call open_app with the name first. Returns every canister id found, with provenance, most authoritative first: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's MAIN backend) and the app's own /.well-known/ic-app.json manifest (ALL its canisters, with roles) — then the `x-ic-canister-id` header (the frontend/asset canister), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json/bundle entries are mined candidates: pick by label (prefer production/IC ids) and confirm with get_canister_candid before calling.",
         annotations(title = "Discover canisters behind a domain", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::DiscoverOutput>(),
     )]
@@ -1973,10 +1973,12 @@ fn identity_annotation(target: &IdentityTarget, acted_as: Option<&str>) -> Strin
 }
 
 /// The server-level instructions every client receives from `get_info`. The
-/// financial-transactions policy lives HERE, server-wide — deliberately not in
-/// any single tool's description (per review: a policy paragraph inside
-/// canister_update_call's description reads as a hint that the tool is usable
-/// for financial transactions, the one thing it must not suggest).
+/// financial-transactions policy is stated HERE in full, server-wide, because
+/// it governs the whole surface rather than one tool; `canister_update_call`'s
+/// own description carries a one-sentence disclosure of it, so the description
+/// matches the tool's actual behavior (both directories require that, and a
+/// refusal is a side effect a caller must be able to see from the description
+/// alone). Neither surface names a venue for a refused operation.
 const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TEXTUAL Candid — the `(...)` value \
              syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`, never \
              the binary form. Tool names signal SCOPE: `…_app…` names \
@@ -1995,13 +1997,14 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              methods (icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICRC-4/-7/-37 \
              equivalents) AND the governance method manage_neuron (neuron staking/disbursement, \
              on the NNS and every SNS) on every canister, the ICP and cycles ledgers' own \
-             transfer/withdrawal/creation methods on those ledgers, and EVERY update call on a \
+             transfer/withdrawal/creation methods and the cycles-minting canister's \
+             funding-completion methods on those canisters, and EVERY update call on a \
              curated list of known financial-service canisters (token ledgers and minters, \
              exchanges, wallet backends, and staking/governance canisters). For financial operations \
-             (token transfers, spending approvals, payments, trades), recommend the user acts \
-             themselves in a wallet or frontend they control, in their own browser — e.g. their \
-             wallet at https://oisy.com; a refused cycles-ledger canister-creation spend points \
-             at the user-run icp CLI instead.\n\n\
+             (token transfers, spending approvals, payments, trades), recommend the user performs \
+             the operation outside this connector, in a trusted interface they control; a refused \
+             canister-creation or funding-completion call points at the user-run icp CLI \
+             instead.\n\n\
              START WITH open_app WHEN THE USER NAMES OR LINKS AN APP. `open_app(name-or-URL)` is the \
              one-call entry point: it takes an app NAME as the user said it, or a URL (e.g. \
              \"https://opencloud.org\"), resolves the Internet Identity derivation origin AND discovers the canisters \
@@ -2538,27 +2541,36 @@ mod tests {
         assert_eq!(cc.destructive_hint, Some(true));
     }
 
-    // The financial-transactions policy is a SERVER-WIDE instruction, not a
-    // tool-description paragraph: stating it inside canister_update_call's
-    // description would read as a hint that the tool is usable for financial
-    // transactions (per review). Pin both sides — the description carries no
-    // financial language, and the server instructions state the denial, the
-    // refused method families, and the user-controlled venue.
+    // The description must match the behavior: a caller reading
+    // canister_update_call's description learns that financial operations and
+    // known financial-service canisters are refused (a refusal is a side
+    // effect that must not be implicit), while the full policy — the refused
+    // method families and the reason — stays in the server-wide instructions
+    // rather than being restated per tool. Neither surface names a venue for
+    // a refused operation: metadata answering a refused financial operation
+    // with a specific transactional service would read as a redirect from one
+    // such route to another.
     #[test]
-    fn financial_policy_is_a_server_instruction_not_a_description() {
+    fn update_call_description_discloses_the_refusal() {
         let tools = super::IcTools::all_tools();
         let tool = tools
             .iter()
             .find(|t| &*t.name == "canister_update_call")
             .expect("canister_update_call tool not found");
         let desc = tool.description.as_deref().unwrap_or_default();
-        assert!(!desc.to_lowercase().contains("financial"), "{desc}");
-        assert!(!desc.contains("oisy.com"), "{desc}");
+        assert!(
+            desc.contains(
+                "Financial operations and update calls to known financial-service canisters are not supported and return an error."
+            ),
+            "{desc}"
+        );
+        assert!(!desc.contains(".com"), "the description names no venue: {desc}");
         let ins = super::SERVER_INSTRUCTIONS;
         assert!(ins.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED"));
         assert!(ins.contains("asset-moving requests are denied"));
         assert!(ins.contains("icrc1_transfer"));
-        assert!(ins.contains("https://oisy.com"));
+        assert!(ins.contains("outside this connector, in a trusted interface they control"));
+        assert!(!ins.contains("oisy.com"), "the instructions name no venue: {ins}");
     }
 
     // The local binary's login tools (`authenticate`/`auth_status`) live on its

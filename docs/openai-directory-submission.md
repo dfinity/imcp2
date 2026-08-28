@@ -99,32 +99,47 @@ tools) if review pushes back —
 and expect a higher chance of push-back than at Anthropic given the
 login-and-password wording.
 
-### 3. Policy check: commerce and crypto
+### 3. Policy check: financial activity and commerce
 
-OpenAI's restrictions differ usefully from Anthropic's blanket
-financial-transfers prohibition:
+OpenAI's restriction is the same prohibition Anthropic's is, not a narrower
+one. The [app
+guidelines](https://developers.openai.com/plugins/app-guidelines) prohibit
+"execution of money transfers, crypto transfers, or investment trades"
+outright, alongside "crypto or NFT offerings involving speculation, consumer
+deception, or financial abuse" — so answer the attestation ("my plugin does
+not initiate or execute money transfers, crypto transfers, or investment
+trades on behalf of users") from the same non-financial posture the Anthropic
+submission states, not from a narrower reading:
 
-- Prohibited: "Crypto or NFT offerings involving **speculation, consumer
-  deception**". IMCP2 offers no speculation product — no trading, prices, or
-  markets.
-- Commerce rules ("only for physical goods", no digital-goods selling, no
-  embedded checkout) govern *selling through the app*; IMCP2 sells nothing.
-- The attestation "my plugin does not initiate or execute money transfers,
-  crypto transfers, or investment trades on behalf of users" is satisfied by
-  the shipped behavior — check it on that basis: no tool initiates or
-  executes a transfer of the user's funds. `canister_update_call` refuses
-  the financial ledger methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37
-  equivalents on every canister, plus the NNS/SNS governance method
-  `manage_neuron` — neuron staking and disbursement — on every canister,
-  plus the ICP and cycles ledgers' own
-  value-moving methods on those ledgers, plus every update call on a curated
-  list of known financial-service canisters: token ledgers and minters,
-  exchanges, wallet backends, staking/governance), with the policy stated in
-  the server-level instructions rather than the tool descriptions (which stay
-  free of financial language), and the plugin has no funding or
-  canister-management tools at all. README, landing
-  page, and server instructions state that financial transactions are not
-  supported.
+- **The plugin is not a financial tool.** Its purpose is reading, building,
+  and operating canisters. It has no funding, trading, or canister-management
+  tools at all — creating, funding, and managing canisters is done by the
+  user with the icp CLI in their own terminal.
+- **No tool initiates or executes a transfer of the user's funds.**
+  `canister_update_call` refuses the standardized value-moving methods
+  (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents, plus the NNS/SNS
+  governance method `manage_neuron` — neuron staking and disbursement) on
+  every canister, the ICP and cycles ledgers' own value-moving methods and
+  the cycles-minting canister's funding-completion methods on those
+  canisters, and every update call on a curated list of known
+  financial-service canisters (token ledgers and minters, exchanges, wallet
+  backends, staking/governance). The refusal tells the user to perform the
+  operation outside the connector, in a trusted interface they control, and
+  names no venue.
+- **The descriptions match the behavior**, as the guidelines require ("tools
+  should behave exactly as their names, descriptions, and inputs indicate";
+  "side effects should never be hidden or implicit"):
+  `canister_update_call`'s description states that financial operations and
+  update calls to known financial-service canisters are not supported and
+  return an error, and the full policy — refused method families and the
+  reason — is in the server-level instructions.
+- **The commerce and speculation rules have nothing to attach to.** The
+  plugin sells nothing (no physical goods, no digital goods or
+  subscriptions, no checkout) and offers no speculation product: no trading,
+  prices, or markets.
+
+So the attestation is a clean yes. README, landing page, and server
+instructions all state that financial transactions are not supported.
 
 ### 4. Test cases (authoring work)
 
