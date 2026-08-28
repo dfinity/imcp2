@@ -448,6 +448,21 @@ mod tests {
                     &md[i..md.len().min(i + 60)]
                 );
             }
+            // The same holds for a markdown link straight at a sibling file,
+            // which carries no `references/` segment to catch it by: inside a
+            // companion, `](migrating-from-asset-canister.md)` addresses a
+            // document the client cannot open either. Every markdown target
+            // ending in `.md` must be an absolute URI.
+            for (i, _) in md.match_indices("](") {
+                let target = md[i + 2..].split(')').next().unwrap_or_default();
+                if !target.ends_with(".md") {
+                    continue;
+                }
+                assert!(
+                    target.contains("://"),
+                    "{where_} links to the bare relative target `{target}`"
+                );
+            }
         }
     }
 

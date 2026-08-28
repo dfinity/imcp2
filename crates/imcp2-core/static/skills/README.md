@@ -66,5 +66,5 @@ instructs live re-syncing, the opposite of this bundle's point).
 
 Also `canhelp`: it is a slash-command skill (`allowed-tools:` frontmatter)
 whose steps run `./scripts/*.sh` from a local checkout, which no MCP client
-has. Its job — reading a canister's interface from an id or a name — is what
-`get_canister_candid` and `icp_lookup_canister_info_by_id` already do here.
+has. Its job — reading a canister's interface — is what `get_canister_candid`
+already does here.
