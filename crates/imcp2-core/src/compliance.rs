@@ -102,11 +102,15 @@ const DISALLOWED_STANDARD_METHODS: &[(&str, &str)] = &[
     ("icrc37_revoke_collection_approvals", "an ICRC-37 collection approval change"),
     // The NNS/SNS governance interface: every neuron operation — including
     // disbursing, splitting, and spawning staked tokens — goes through this
-    // one method, on the NNS and on every SNS DAO alike.
+    // one method, on the NNS and on every SNS DAO alike. Its non-financial
+    // commands (voting, following, dissolve delay) share that entry point, so
+    // the label says the method is refused wholesale rather than calling the
+    // caller's particular command a transfer.
     (
         "manage_neuron",
-        "a neuron-management call on an NNS/SNS governance interface (its operations include \
-         disbursing staked tokens)",
+        "the single entry point for every neuron operation on an NNS/SNS governance interface — \
+         disbursing, splitting, and spawning staked tokens among them — so it is refused as a \
+         whole rather than per command",
     ),
 ];
 
@@ -439,7 +443,7 @@ pub fn disallowed_update_method(canister_id: &Principal, method: &str) -> Option
              connector, in a trusted interface they control."
         };
         return Some(format!(
-            "`{method}` is {what} — a financial transaction. Financial transactions \
+            "`{method}` is {what}. Financial transactions \
              (token transfers, spending approvals, payments, or trades) are not \
              supported by this server, to protect the user: asset-moving requests \
              are denied. {instead}"
@@ -668,7 +672,8 @@ mod tests {
         let msg = disallowed_update_method(&any_canister(), "icrc1_transfer")
             .expect("must be refused");
         assert!(msg.contains("`icrc1_transfer`"), "{msg}");
-        assert!(msg.contains("financial transaction"), "{msg}");
+        assert!(msg.contains("an ICRC-1 token transfer"), "{msg}");
+        assert!(msg.contains("Financial transactions"), "{msg}");
         assert!(msg.contains("not supported"), "{msg}");
         assert!(msg.contains("to protect the user"), "{msg}");
         assert!(msg.contains("outside this connector"), "{msg}");
@@ -677,5 +682,23 @@ mod tests {
         assert!(!msg.contains(".com"), "no venue may be named: {msg}");
         assert!(!msg.contains("marketplace"), "{msg}");
         assert!(!msg.contains("compliance"), "{msg}");
+    }
+
+    // manage_neuron is refused for its whole surface, not because the caller's
+    // particular command moves value: the same method votes, follows, and sets
+    // dissolve delays as well as disbursing. The refusal says that, instead of
+    // classifying every invocation as a transfer (per review) — the policy
+    // sentence that follows states what is not supported, and the label states
+    // why the method as a whole is out.
+    #[test]
+    fn manage_neuron_refusal_explains_the_whole_surface() {
+        let msg = disallowed_update_method(&any_canister(), "manage_neuron")
+            .expect("must be refused");
+        assert!(msg.contains("refused as a whole rather than per command"), "{msg}");
+        assert!(msg.contains("disbursing, splitting, and spawning staked tokens"), "{msg}");
+        assert!(
+            !msg.contains("is a financial transaction") && !msg.contains("— a financial transaction"),
+            "the caller's command is not classified as a transfer: {msg}"
+        );
     }
 }
