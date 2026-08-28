@@ -92,10 +92,6 @@ pub struct IcProtocolTools {
 #[derive(Clone)]
 pub struct IcTools {
     canister: IcCanisterTools,
-    /// Backs the `skill://` resources (the skills TOOLS live on the deferred
-    /// [`IcProtocolTools`]; the documents themselves stay served as
-    /// resources).
-    skills: skills::SkillsCatalog,
 }
 
 /// The one seam between deployments: how a tool call finds the Internet
@@ -111,19 +107,13 @@ pub type SessionResolver =
     Arc<dyn Fn(&RequestContext<RoleServer>) -> Option<String> + Send + Sync>;
 
 impl IcTools {
-    pub fn new(
-        agent: Agent,
-        identities: Identities,
-        skills: skills::SkillsCatalog,
-        session: SessionResolver,
-    ) -> Self {
+    pub fn new(agent: Agent, identities: Identities, session: SessionResolver) -> Self {
         Self {
             canister: IcCanisterTools {
                 agent,
                 identities,
                 session,
             },
-            skills,
         }
     }
 
@@ -2164,20 +2154,15 @@ impl ServerHandler for IcTools {
             RawResource::new(OQL_USAGE_URI, "OQL query surface usage guide")
                 .no_annotation(),
         ];
-        // Surface the IC skills as resources too (best-effort: if the registry is
-        // unreachable, the candid resources above still list). Each `skill://<name>`
-        // is read on demand in read_resource.
-        if let Ok(skills) = self.skills.list().await {
-            for s in skills {
-                let title = if s.title.is_empty() {
-                    format!("IC skill: {}", s.name)
-                } else {
-                    format!("IC skill: {}", s.title)
-                };
-                resources.push(
-                    RawResource::new(format!("{SKILL_URI_PREFIX}{}", s.name), title).no_annotation(),
-                );
-            }
+        // The IC skills, from the reviewed bundle compiled into this binary
+        // ([`skills::BUNDLED_SKILLS`]) — the served surface retrieves nothing
+        // dynamically. Each `skill://<name>` is read from the same bundle in
+        // read_resource.
+        for (name, title, _) in skills::BUNDLED_SKILLS {
+            resources.push(
+                RawResource::new(format!("{SKILL_URI_PREFIX}{name}"), format!("IC skill: {title}"))
+                    .no_annotation(),
+            );
         }
         Ok(ListResourcesResult {
             resources,
@@ -2191,16 +2176,24 @@ impl ServerHandler for IcTools {
         request: ReadResourceRequestParams,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
-        // Skills are fetched live by name; the candid references are static.
+        // Every resource is served from content compiled into this binary —
+        // the skills from the reviewed bundle, the candid/OQL references from
+        // their static documents.
         if let Some(name) = request.uri.strip_prefix(SKILL_URI_PREFIX) {
-            return match self.skills.get(name).await {
-                Ok(md) => Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            return match skills::bundled_skill(name) {
+                Some(md) => Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     md,
                     request.uri,
                 )])),
-                Err(e) => Err(McpError::resource_not_found(
+                None => Err(McpError::resource_not_found(
                     "resource_not_found",
-                    Some(serde_json::json!({ "uri": request.uri, "error": e })),
+                    Some(serde_json::json!({
+                        "uri": request.uri,
+                        "error": format!(
+                            "no skill named `{}` — list the `skill://` resources to see the available skills",
+                            name.trim()
+                        ),
+                    })),
                 )),
             };
         }

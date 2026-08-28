@@ -333,7 +333,7 @@ impl ServerHandler for LocalServer {
 mod tests {
     use super::*;
     use crate::login::SessionSlot;
-    use imcp2_core::{identities::Identities, skills, IiInstance};
+    use imcp2_core::{identities::Identities, IiInstance};
     use rmcp::ServiceExt;
 
     fn test_server() -> LocalServer {
@@ -347,12 +347,7 @@ mod tests {
             agent.clone(),
         );
         let slot = SessionSlot::new();
-        let tools = IcTools::new(
-            agent,
-            identities.clone(),
-            skills::SkillsCatalog::new(),
-            slot.resolver(),
-        );
+        let tools = IcTools::new(agent, identities.clone(), slot.resolver());
         let login = crate::login::LoginDriver::new(identities, slot, /* auto_open */ false);
         LocalServer::new(tools, login, /* auto_open */ false)
     }

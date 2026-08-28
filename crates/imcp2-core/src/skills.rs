@@ -5,11 +5,14 @@
 //! Motoko, build with mops, deploy with the `icp` CLI, manage cycles, etc. —
 //! the knowledge that complements the on-chain canister-management tools.
 //!
-//! The skill catalogue is fetched live from the registry's JSON manifest
-//! (`/api/skills.json`) and cached briefly; individual skills are returned from
-//! their `SKILL.md` markdown URL on demand. Nothing is bundled, so the agent
-//! always sees the current skills (mirroring the registry's own auto-sync
-//! philosophy).
+//! Two surfaces live here. The served `skill://` resources come from
+//! [`BUNDLED_SKILLS`]: reviewed, versioned copies of the documents compiled
+//! into the binary (`static/skills/`, provenance in its README) — the served
+//! endpoint retrieves nothing dynamically, so what a client reads is exactly
+//! what was reviewed at build time. The live [`SkillsCatalog`] below (registry
+//! manifest at `/api/skills.json`, `SKILL.md` fetched on demand) remains
+//! library code backing the unserved [`crate::tools::IcProtocolTools`] skills
+//! tools, for embedders that choose to serve them.
 
 use std::{
     sync::Arc,
@@ -24,6 +27,48 @@ use tokio::sync::RwLock;
 
 const SKILLS_BASE_DEFAULT: &str = "https://skills.internetcomputer.org";
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// The reviewed, versioned skill documents served as `skill://<name>`
+/// resources: (name, title, SKILL.md). Compiled in from `static/skills/`
+/// (see that directory's README for provenance, the bundle date, and the
+/// refresh procedure); updates ship like any other code change, through
+/// review and a release.
+pub const BUNDLED_SKILLS: &[(&str, &str, &str)] = &[
+    ("agent-web-identity", "Agent Web Identity Sign-In", include_str!("../static/skills/agent-web-identity.md")),
+    ("caffeine-app", "Caffeine App (build from scratch)", include_str!("../static/skills/caffeine-app.md")),
+    ("canhelp", "Canister Help", include_str!("../static/skills/canhelp.md")),
+    ("canister-security", "Canister Security", include_str!("../static/skills/canister-security.md")),
+    ("certified-variables", "Certified Variables", include_str!("../static/skills/certified-variables.md")),
+    ("cloud-engine-canisters", "Cloud Engine Canisters", include_str!("../static/skills/cloud-engine-canisters.md")),
+    ("custom-domains", "Custom Domains", include_str!("../static/skills/custom-domains.md")),
+    ("cycles-management", "Cycles Management", include_str!("../static/skills/cycles-management.md")),
+    ("deploy-to-cloud-engine", "Deploy to Cloud Engine", include_str!("../static/skills/deploy-to-cloud-engine.md")),
+    ("encrypted-maps", "Encrypted Maps", include_str!("../static/skills/encrypted-maps.md")),
+    ("evm-rpc", "EVM RPC", include_str!("../static/skills/evm-rpc.md")),
+    ("https-outcalls", "HTTPS Outcalls", include_str!("../static/skills/https-outcalls.md")),
+    ("ic-dashboard", "IC Dashboard APIs", include_str!("../static/skills/ic-dashboard.md")),
+    ("icp-cli", "ICP CLI", include_str!("../static/skills/icp-cli.md")),
+    ("internet-identity", "Internet Identity", include_str!("../static/skills/internet-identity.md")),
+    ("migrating-motoko-actors", "Motoko Actor Migrations", include_str!("../static/skills/migrating-motoko-actors.md")),
+    ("mops-cli", "Mops CLI", include_str!("../static/skills/mops-cli.md")),
+    ("multi-canister", "Multi-Canister Architecture", include_str!("../static/skills/multi-canister.md")),
+    ("service-discoverability", "Service Discoverability", include_str!("../static/skills/service-discoverability.md")),
+    ("stable-memory", "Stable Memory & Upgrades", include_str!("../static/skills/stable-memory.md")),
+    ("static-site", "Static Site (Certified Assets)", include_str!("../static/skills/static-site.md")),
+    ("troubleshooting-motoko-migrations", "Troubleshooting Motoko Migrations", include_str!("../static/skills/troubleshooting-motoko-migrations.md")),
+    ("vetkeys", "vetKeys", include_str!("../static/skills/vetkeys.md")),
+    ("writing-motoko", "Writing Motoko", include_str!("../static/skills/writing-motoko.md")),
+];
+
+/// The bundled `SKILL.md` for `name` (trimmed, ASCII case-insensitive), if
+/// any — the lookup behind `skill://<name>` reads.
+pub fn bundled_skill(name: &str) -> Option<&'static str> {
+    let name = name.trim();
+    BUNDLED_SKILLS
+        .iter()
+        .find(|(n, _, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, _, md)| *md)
+}
 
 /// Registry origin (no trailing slash). Override with `SKILLS_URL`.
 fn skills_base() -> String {
@@ -262,6 +307,28 @@ impl SkillsCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The served bundle stays well-formed: names unique and lookup-friendly,
+    // every document non-empty, and the two skills the financial refusal
+    // message points at (skill://icp-cli, skill://cycles-management) present.
+    #[test]
+    fn bundled_skills_are_well_formed() {
+        let mut names: Vec<&str> = BUNDLED_SKILLS.iter().map(|(n, _, _)| *n).collect();
+        for (name, title, md) in BUNDLED_SKILLS {
+            assert!(!name.is_empty() && *name == name.trim() && !title.is_empty(), "{name}");
+            assert!(!md.trim().is_empty(), "{name} must carry its document");
+            assert_eq!(bundled_skill(name), Some(*md), "{name} must be readable");
+        }
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "bundled skill names must be unique");
+        for referenced in ["icp-cli", "cycles-management"] {
+            assert!(bundled_skill(referenced).is_some(), "{referenced} is referenced by the financial refusal");
+        }
+        assert!(bundled_skill("no-such-skill").is_none());
+        assert_eq!(bundled_skill(" ICP-CLI "), bundled_skill("icp-cli"));
+    }
 
     #[test]
     fn parses_manifest_and_groups_by_category() {
