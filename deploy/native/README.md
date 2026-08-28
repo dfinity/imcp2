@@ -7,7 +7,7 @@ managed VPC) and you just want to put the app on it. The repo's
 
 ```
    build.sh  ─────►  build-out/imcp2        (cross-built linux/arm64 or amd64 binary)
-   deploy.sh ─────►  /opt/imcp2/{imcp2,static}   + systemd: imcp2.service
+   deploy.sh ─────►  /opt/imcp2/imcp2            + systemd: imcp2.service
                      /opt/imcp2/monitoring         (staging copy of the dashboard source)
                      /opt/imcp-status              + systemd: imcp-status.service (dashboard;
                                                      root-owned executable copy, run as the
@@ -346,7 +346,7 @@ extend its SSRF allowlist, edit `Environment=`/`ExecStart=` in
 | File | Purpose |
 |---|---|
 | `build.sh` | Cross-build `build-out/imcp2` (linux/arm64, bullseye glibc) |
-| `deploy.sh` | Ship binary + `static/` + `monitoring/`, render & install units/Caddyfile, (re)start services |
+| `deploy.sh` | Ship binary + `monitoring/`, render & install units/Caddyfile, (re)start services |
 | `imcp2.service` | systemd unit for the app (`__PUBLIC_URL__` substituted at deploy) |
 | `imcp-status.service` | systemd unit for the status dashboard (`__DOMAIN__`, `__ALLOWED_HOSTS__` substituted at deploy) |
 | `caddy.service` | systemd unit for Caddy |
