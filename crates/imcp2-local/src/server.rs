@@ -528,4 +528,90 @@ mod tests {
         client.cancel().await.expect("client shutdown");
         server.cancel().await.expect("server shutdown");
     }
+
+    // The resource surface over the same real MCP round-trip: every URI the
+    // server advertises is readable through the handler, and an unknown one
+    // fails as not-found rather than as something else. The bundle's own test
+    // (imcp2-core, skills.rs) checks the documents and rebuilds the URIs from
+    // the same tables, so it stays green if the handler is miswired — this is
+    // the test that would not. No network: every resource is compiled in.
+    #[tokio::test]
+    async fn a_real_mcp_client_can_read_every_advertised_resource() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = test_server().serve(server_io);
+        let client = ().serve(client_io);
+        let (server, client) = tokio::join!(server, client);
+        let (server, client) = (server.expect("server up"), client.expect("client up"));
+
+        let resources = client.list_all_resources().await.expect("resources/list");
+        let skills: Vec<String> = resources
+            .iter()
+            .map(|r| r.uri.clone())
+            .filter(|u| u.starts_with("skill://"))
+            .collect();
+        assert_eq!(
+            skills.len(),
+            imcp2_core::skills::BUNDLED_SKILLS.len()
+                + imcp2_core::skills::BUNDLED_SKILL_REFERENCES.len(),
+            "every bundled document must be advertised: {skills:?}"
+        );
+
+        for uri in &skills {
+            let read = client
+                .read_resource(rmcp::model::ReadResourceRequestParams::new(uri.clone()))
+                .await
+                .unwrap_or_else(|e| panic!("advertised {uri} must be readable: {e}"));
+            let text = read
+                .contents
+                .iter()
+                .filter_map(|c| match c {
+                    rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            assert!(!text.trim().is_empty(), "{uri} served an empty document");
+        }
+
+        // Spot-check that a document arrives whole, and that a companion is
+        // reachable at the child URI its parent's links point at.
+        let one = |uri: &str| {
+            let client = &client;
+            let uri = uri.to_string();
+            async move {
+                let read = client
+                    .read_resource(rmcp::model::ReadResourceRequestParams::new(uri.clone()))
+                    .await
+                    .unwrap_or_else(|e| panic!("{uri}: {e}"));
+                match &read.contents[0] {
+                    rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.clone(),
+                    other => panic!("{uri} served non-text contents: {other:?}"),
+                }
+            }
+        };
+        let motoko = one("skill://writing-motoko").await;
+        assert!(motoko.contains("skill://writing-motoko/references/api-reference.md"), "{motoko:.400}");
+        let api_reference = one("skill://writing-motoko/references/api-reference.md").await;
+        assert!(!api_reference.trim().is_empty());
+
+        // An unknown skill, and an unknown companion of a real skill, are both
+        // resource-not-found — not a panic, a disconnect, or a silent empty.
+        for missing in ["skill://no-such-skill", "skill://writing-motoko/references/no-such.md"] {
+            let err = client
+                .read_resource(rmcp::model::ReadResourceRequestParams::new(missing))
+                .await
+                .expect_err("unknown resources must fail");
+            match err {
+                rmcp::ServiceError::McpError(e) => {
+                    assert_eq!(e.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND, "{e:?}");
+                }
+                other => panic!("expected resource_not_found for {missing}, got {other:?}"),
+            }
+        }
+
+        client.cancel().await.expect("client shutdown");
+        server.cancel().await.expect("server shutdown");
+    }
 }
