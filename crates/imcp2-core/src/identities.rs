@@ -449,11 +449,11 @@ pub struct AccountsOutput {
 /// Arguments for `resolve_app`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ResolveAppArgs {
-    /// The application's URL, e.g. "https://oisy.com". Must be a URL you actually
-    /// have — given by the user, shown by `open_app` for a well-known app name, or
-    /// found by a web search of the app's official site. NEVER a domain guessed
-    /// from an app's name (guessed lookalike domains are unrelated or squatted
-    /// sites and are refused).
+    /// The application's URL, e.g. "https://opencloud.org". A URL the caller
+    /// already has — given by the user, shown by `open_app` for a well-known app
+    /// name, or from the app's official site. A domain derived from an app's name
+    /// is not resolvable here: lookalike domains are unrelated or squatted sites
+    /// and are refused.
     pub app_url: String,
 }
 

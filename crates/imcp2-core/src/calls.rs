@@ -167,14 +167,13 @@ pub struct CanisterUpdateCallArgs {
     /// Arguments in textual Candid syntax, e.g. `()` or `(record { owner = principal "..." })`.
     #[serde(default = "default_args")]
     pub args: String,
-    /// Call AS the user's account at an app, identified by its exact canonical
-    /// Internet Identity derivation origin — NOT necessarily the visible URL (do
-    /// not infer it from an alternativeOrigins list). Get it from open_app /
-    /// resolve_app, which resolve an app NAME or URL to the derivation origin under
-    /// the guessed-domain gate; then reuse it here. This does NOT accept a raw
-    /// website URL — a derivation origin is a stable per-app value, resolved once
-    /// and reused. Accepts the legacy name `domain`. Omit to call anonymously. The
-    /// account delegation is derived on demand for this connection.
+    /// Call as the user's account at an app, identified by its exact canonical
+    /// Internet Identity derivation origin — not necessarily the visible URL, and
+    /// not an alternativeOrigins entry. open_app and resolve_app resolve an app
+    /// name or URL to it under the guessed-domain gate. This does not accept a raw
+    /// website URL — a derivation origin is a stable per-app value. Accepts the
+    /// legacy name `domain`. Omitted, the call is anonymous. The account
+    /// delegation is derived on demand for this connection.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
     /// Which of your accounts to act as, by account name (see list_app_accounts).
@@ -184,7 +183,8 @@ pub struct CanisterUpdateCallArgs {
     /// Optional Candid service definition (`.did` text) for the canister. Used to
     /// encode the args to the method's declared types and decode the reply, for
     /// when the canister's own `candid:service` metadata can't be read (e.g.
-    /// access-restricted) — get it from get_canister_candid, or ask the user for it.
+    /// access-restricted); get_canister_candid returns it when the canister
+    /// publishes it.
     #[serde(default)]
     pub candid: Option<String>,
 }
@@ -230,11 +230,11 @@ pub struct CanisterUpdateCallOutput {
 pub struct CanisterQueryArgs {
     /// Target canister principal.
     pub canister_id: String,
-    /// A `query` METHOD name from the canister's Candid interface, invoked as a
-    /// read-only query call. Provide EITHER `method` (a Candid query) OR `oql` (an
-    /// OQL query) — not both. On a canister that exposes an OQL query surface
+    /// A `query` method name from the canister's Candid interface, invoked as a
+    /// read-only query call. Exactly one of `method` (a Candid query) and `oql` (an
+    /// OQL query) is accepted. On a canister that exposes an OQL query surface
     /// (get_canister_candid reports `oql: true`), data reads are rejected on this
-    /// path — use `oql` instead.
+    /// path; `oql` is that canister's read path.
     #[serde(default)]
     pub method: Option<String>,
     /// Arguments for `method` in textual Candid syntax, e.g. `()` or
@@ -242,18 +242,18 @@ pub struct CanisterQueryArgs {
     #[serde(default = "default_args")]
     pub args: String,
     /// An OQL query as a JSON object string — passed straight to the canister's
-    /// `execute` method, so NO Candid escaping is needed (write plain JSON). E.g.
+    /// `execute` method, so no Candid escaping is needed (plain JSON). E.g.
     /// `{"start":"employee","where":{"icontains":{"field":"lastName","value":"smith"}},"select":["firstName","lastName"],"limit":10}`.
-    /// Provide EITHER `oql` OR `method` — not both. See icp_oql_guide for the dialect
-    /// and get_canister_oql_schema for the entity/field names.
-    /// The OQL path REQUIRES `derivation_origin` (anonymous per-app reads are disabled).
+    /// Exactly one of `oql` and `method` is accepted. icp_oql_guide documents the
+    /// dialect and get_canister_oql_schema returns the entity/field names.
+    /// The OQL path requires `derivation_origin` (anonymous per-app reads are disabled).
     #[serde(default)]
     pub oql: Option<String>,
-    /// Read AS the user's account at an app, given its exact canonical Internet
-    /// Identity derivation origin — NOT necessarily the visible URL. Get it from
-    /// open_app / resolve_app; this does NOT accept a raw website URL. Accepts the
-    /// legacy name `domain`. REQUIRED for an `oql` query; optional for a Candid
-    /// `method` query (omit to query anonymously).
+    /// Read as the user's account at an app, given its exact canonical Internet
+    /// Identity derivation origin — not necessarily the visible URL. open_app and
+    /// resolve_app resolve it; this does not accept a raw website URL. Accepts the
+    /// legacy name `domain`. Required for an `oql` query; optional for a Candid
+    /// `method` query (omitted, the query is anonymous).
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
     /// Which of your accounts to act as, by account name (see list_app_accounts).
@@ -262,8 +262,9 @@ pub struct CanisterQueryArgs {
     pub account: Option<String>,
     /// Optional Candid service definition (`.did` text) for the canister. Used to
     /// encode the args to a Candid `method`'s declared types and decode the reply,
-    /// for when the canister's own `candid:service` metadata can't be read — get it
-    /// from get_canister_candid, or ask the user for it. Ignored for an OQL query.
+    /// for when the canister's own `candid:service` metadata can't be read;
+    /// get_canister_candid returns it when the canister publishes it. Ignored for
+    /// an OQL query.
     #[serde(default)]
     pub candid: Option<String>,
 }

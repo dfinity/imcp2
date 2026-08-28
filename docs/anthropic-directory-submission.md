@@ -183,8 +183,17 @@ qualifications.
 asked ahead about this acknowledgment. No reply is needed to submit; if one
 arrives, answer with the posture above.
 
+Related point for the same step: the **model-readable metadata describes the
+surface rather than steering Claude**. The server instructions and all 11 tool
+descriptions are factual capability statements — what each tool does, returns,
+and rejects — with no ordering rules, no "call this first", no per-request
+routing chains, and no instruction to search the web; a unit test
+(`model_readable_metadata_states_capabilities_not_directives`) pins that across
+both surfaces. Each description also matches the tool's behavior, refusals
+included, so no side effect is implicit.
+
 Related honesty point for the same step: there is **no per-call confirmation**
-for sensitive methods server-side today (an open roadmap item in the README) —
+for sensitive methods server-side today —
 mitigations are the explicit access-level choice on the II consent screen
 ("Questions only" vs "Actions & questions", enforced at IC ingress),
 revocability at any time via id.ai/manage/settings (≤5 min latency), and

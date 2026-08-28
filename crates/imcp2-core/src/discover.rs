@@ -126,7 +126,7 @@ pub fn is_app_data_candidate(c: &DiscoveredCanister) -> bool {
 /// Arguments for `discover_app_canisters`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DiscoverCanistersArgs {
-    /// A web domain or URL served from the IC, e.g. "oisy.com".
+    /// A web domain or URL served from the IC, e.g. "opencloud.org".
     pub domain: String,
 }
 
@@ -1815,13 +1815,13 @@ pub struct FindAppOutput {
 /// Arguments for `open_app`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OpenAppArgs {
-    /// An app NAME as the user said it OR its URL (e.g.
+    /// An app name as the user said it, or its URL (e.g.
     /// "https://opencloud.org"). A name — or a bare host — is matched against the
     /// built-in known-app registry first, so a wrong-TLD guess
     /// repairs to the canonical URL; an explicit `https://…` URL is resolved as
-    /// given. NEVER pass a domain you fabricated from a name: an unknown bare name
-    /// is refused with instructions to find the real URL, and a URL with no
-    /// Internet-Computer evidence is refused — both instead of guessing.
+    /// given. A domain derived from a name rather than known is not resolvable
+    /// here: an unknown bare name is refused with instructions for finding the
+    /// real URL, and a URL with no Internet-Computer evidence is refused.
     pub app: String,
 }
 

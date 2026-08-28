@@ -56,6 +56,8 @@ add details not published in the docs.
 | No machine-to-machine grants (client credentials etc. unsupported by ChatGPT) | ✅ user-consent authorization-code flow only |
 | Tools explicitly annotated `readOnlyHint` / `destructiveHint` / `openWorldHint` — "incorrect or missing action labels are a common cause of rejection" | ✅ set on all 11 tools. The unit test enforces annotation presence and the `readOnlyHint`/`destructiveHint` values; `openWorldHint` is declared everywhere but not asserted by the test, so re-check it in the portal's Scan Tools step |
 | Tool names "human-readable, specific, and descriptive"; accurate descriptions; minimum-information requests | ✅ reviewed against the same bar for the Anthropic listing |
+| "Tools should behave exactly as their names, descriptions, and inputs indicate"; "side effects should never be hidden or implicit" | ✅ each description states what the tool does, returns, and rejects — `canister_update_call`'s names its refusal of financial operations and known financial-service canisters |
+| Model-readable fields must not manipulate how the model works | ✅ the server instructions and every served description are factual capability statements: no ordering rules, no "call this first", no per-request routing chains, no instruction to search the web. A unit test (`model_readable_metadata_states_capabilities_not_directives`) pins this across the instructions and all 11 descriptions |
 | Public HTTPS production endpoint, stable and complete ("trial or demo plugins will not be accepted") | ✅ production deployment |
 | Privacy policy disclosing "categories of personal data collected, purposes of use, categories of recipients, data retention timelines" | ✅ the rewritten policy matches these four required disclosures exactly and `https://mcp.internetcomputer.org/privacy-policy` is live (verified 2026-08-27); the next `release-*` refreshes its text to the current draft |
 | Customer support contact (OpenAI asks for a URL) | ✅ `https://mcp.internetcomputer.org/support` — merged and live on production; routes users to <mcp@dfinity.org>, the status dashboard, id.ai access management, GitHub issues, and the security policy |
@@ -166,8 +168,8 @@ Negative:
    wrong identity.
 2. A state-changing call (canister_update_call) on a "Questions only"
    session → the network rejects it and the tool reports the failed call;
-   the server instructions prime the assistant to explain the access level
-   and recommend reconnecting under "Actions & questions".
+   the server instructions describe the two Internet Identity access levels,
+   so the assistant can explain why and what reconnecting changes.
 3. Any authenticated tool with no sign-in → clean 401 → OAuth flow starts
    (no crash, no hang).
 4. "Call an update method on a canister that rejects this caller" → the
