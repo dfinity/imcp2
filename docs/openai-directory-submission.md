@@ -117,14 +117,10 @@ financial-transfers prohibition:
   equivalents on every canister, plus the ICP and cycles ledgers' own
   value-moving methods on those ledgers, plus every update call on a curated
   list of known financial-service canisters: token ledgers and minters,
-  exchanges, wallet backends, staking/governance), with the policy stated in the
-  server-level instructions rather than the tool description (which stays
-  free of financial language, per maintainer review)
-  ([#154](https://github.com/dfinity/imcp2/pull/154)), and
-  the plugin has no funding or canister-management tools at all — the
-  execution paths that once moved funds are removed from the binary
-  ([#153](https://github.com/dfinity/imcp2/pull/153),
-  [#154](https://github.com/dfinity/imcp2/pull/154)). README, landing
+  exchanges, wallet backends, staking/governance), with the policy stated in
+  the server-level instructions rather than the tool descriptions (which stay
+  free of financial language), and the plugin has no funding or
+  canister-management tools at all. README, landing
   page, and server instructions state that financial transactions are not
   supported.
 
