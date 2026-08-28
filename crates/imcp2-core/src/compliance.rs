@@ -226,6 +226,39 @@ const DISALLOWED_FINANCE_CANISTERS: &[(&str, &str, &str)] = &[
         "the Oisy wallet frontend",
         "its update surface is the content store behind the wallet UI",
     ),
+    // --- Liquid staking: WaterNeuron ---
+    (
+        "tsbvt-pyaaa-aaaar-qafva-cai",
+        "the WaterNeuron liquid-staking protocol",
+        "it takes ICP deposits, mints nICP, and processes unstaking withdrawals",
+    ),
+    (
+        "buwm7-7yaaa-aaaar-qagva-cai",
+        "the WaterNeuron nICP ledger",
+        "its update surface transfers the liquid-staking token or grants spending approvals",
+    ),
+    (
+        "n3i53-gyaaa-aaaam-acfaq-cai",
+        "the WaterNeuron frontend",
+        "its update surface is the content store behind the staking UI",
+    ),
+    // --- Exchanges: MULTI/DEX (canisters self-declared by the app's own
+    // /.well-known/ic-app.json manifest) ---
+    (
+        "hmxr2-pqaaa-aaabq-qaaaa-cai",
+        "the MULTI/DEX exchange backend",
+        "its update surface executes the exchange's trading operations",
+    ),
+    (
+        "hlwxo-ciaaa-aaabq-qaaaq-cai",
+        "the MULTI/DEX bridge",
+        "it moves tokens in and out of the exchange",
+    ),
+    (
+        "hcv4s-uaaaa-aaabq-qaaba-cai",
+        "the MULTI/DEX frontend",
+        "its update surface is the content store behind the exchange UI",
+    ),
     // --- Exchanges: ICPSwap ---
     (
         "4mmnk-kiaaa-aaaag-qbllq-cai",
