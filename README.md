@@ -98,6 +98,7 @@ POST /mcp/oauth/register          ─┘
 GET  /.well-known/oauth-authorization-server/mcp   (+ root + /mcp/.well-known/… alternates)
 GET  /.well-known/oauth-protected-resource/mcp     (+ root fallback)
 GET  /.well-known/ii-auth-callbacks                (origin-global, all instances)
+GET  /.well-known/ii-app-metadata                  (origin-global: name + legal links shown by II)
 ```
 
 Several instances share one origin by giving each its own `McpServer` (one
@@ -410,7 +411,7 @@ fetches (an app origin from `discover_app_canisters`, `open_app`, or `resolve_ap
 additionally resolve the target host up front and **pin** the connection to that
 validated globally-routable address, so a name resolving to a
 private/loopback/link-local address is refused and re-resolution can't rebind
-mid-flight. Fixed public-host enrichment (the IC dashboard, the skills registry)
+mid-flight. Fixed public-host enrichment (the IC dashboard)
 uses the redirect guard but is not separately address-pinned. No JavaScript is
 executed, and every extracted id is validated as a principal.
 
@@ -495,14 +496,19 @@ token (see Auth).
 ### Skills awareness
 
 The official Internet Computer
-[skills](https://skills.internetcomputer.org) — authoritative, current how-to
+[skills](https://skills.internetcomputer.org) — DFINITY-authored how-to
 guides for authoring and shipping IC apps (the Motoko language, the `mops` and
 `icp` CLIs, cycles management, stable memory & upgrades, canister security,
 auth, …) — are served as MCP **resources** (`skill://<name>`) alongside the
-`candid://` references. The catalogue is fetched live from the registry's
-manifest (`/api/skills.json`, cached ~15 min) and each skill's `SKILL.md` on
-demand; nothing is bundled, so the agent always sees the current skills.
-Override the registry origin with `SKILLS_URL`.
+`candid://` references. The documents come from a reviewed, versioned bundle
+compiled into the binary at build time (`crates/imcp2-core/static/skills/`,
+provenance and refresh procedure in the bundle's README); the server
+retrieves no instructions over the network, so what an agent reads is
+exactly what was reviewed at release. The companion documents a skill links
+to are bundled and served the same way, as
+`skill://<name>/references/<file>`, so following a link inside a skill
+resolves to another served resource rather than sending the agent back to
+the network.
 
 ### OQL query surfaces
 
