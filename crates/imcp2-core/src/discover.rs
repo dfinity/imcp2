@@ -537,6 +537,16 @@ struct KnownApp {
     app_url: &'static str,
 }
 
+// Name resolution is a READ convenience: it turns a name a user said into an
+// app URL and derivation origin, so `open_app` can read interfaces, discover
+// canisters, and derive the user's per-app principal. It confers no ability to
+// act — every update call to these apps' canisters is refused by
+// [`crate::compliance`], which carries all three of them — so an entry here is
+// discovery-neutral rather than a route to a transaction. NNS was dropped from
+// this list at the author's request; that was an editorial choice about which
+// names the server advertises, not a safety criterion, and its derivation
+// origins are deliberately kept below so reads still resolve to the right
+// identity.
 const KNOWN_APPS: &[KnownApp] = &[
     KnownApp { name: "Oisy", aliases: &["oisy", "oisywallet"], app_url: "https://oisy.com" },
     KnownApp { name: "MULTI/DEX", aliases: &["multidex"], app_url: "https://multidex.ai" },
