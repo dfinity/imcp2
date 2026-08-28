@@ -184,7 +184,7 @@ financial ledger methods. No open compliance question remains on this topic;
 if a reply arrives, answer with the shipped posture.
 
 Related honesty point for the same step: there is **no per-call confirmation**
-for sensitive methods server-side today (an open roadmap item in the README) —
+for sensitive methods server-side today —
 mitigations are the explicit access-level choice on the II consent screen
 ("Questions only" vs "Actions & questions", enforced at IC ingress),
 revocability at any time via id.ai/manage/settings (≤5 min latency), and
