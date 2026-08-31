@@ -61,13 +61,16 @@ pub struct OqlSchemaArgs {
     /// Canister principal that exposes the OQL surface (get_canister_candid reports
     /// `oql: true`).
     pub canister_id: String,
-    /// Read AS the user's account at an app, given its canonical Internet
-    /// Identity derivation origin (not necessarily the visible URL). Accepts the
-    /// legacy name `domain`. Omit to read anonymously.
+    /// The app's canonical Internet Identity derivation origin (not necessarily the
+    /// visible URL), which this read is made as the user's account at. Accepts the
+    /// legacy name `domain`. Required in practice: the schema is caller-gated, so a
+    /// read with no origin is rejected with guidance instead of returning an empty
+    /// catalogue. Optional in the type only, so that omitting it produces that
+    /// guidance rather than a bare schema-validation failure.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
-    /// Which of your accounts to act as (see list_app_accounts). Ignored when reading
-    /// anonymously.
+    /// Which of your accounts to act as (see list_app_accounts). Omit to use that
+    /// app's default account.
     #[serde(default)]
     pub account: Option<String>,
 }
@@ -80,25 +83,24 @@ pub struct OqlSchemaOutput {
     /// The entity/field/edge catalogue returned by `schema` (JSON text,
     /// pretty-printed when it parses).
     pub schema: String,
-    /// The principal the read was signed as — null for an anonymous read.
+    /// The principal the read was signed as — the user's account at the app, since
+    /// this read is always made as one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acted_as_principal: Option<String>,
-    /// When reading as an app account: the effective Internet Identity derivation
-    /// origin used (after canonicalization). Null for anonymous reads.
+    /// The effective Internet Identity derivation origin used, after
+    /// canonicalization.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_for_origin: Option<String>,
-    /// When reading as an app account: exactly what you supplied as
-    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` (from
-    /// canonicalization) is visible. Null for anonymous reads.
+    /// Exactly what you supplied as `derivation_origin`, echoed so a mismatch with
+    /// `derived_for_origin` (from canonicalization) is visible.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
-    /// True when the schema was read as the ANONYMOUS principal (no
-    /// `derivation_origin`). Always present: the schema is itself caller-gated, so
-    /// an anonymous read commonly returns NO entities — which means "not
-    /// authenticated as your account", not "the app has no data model".
+    /// Whether the schema was read as the ANONYMOUS principal. Always false here,
+    /// because a read with no `derivation_origin` is rejected rather than made
+    /// anonymously; the field keeps the same shape as the other tools' replies,
+    /// where an anonymous read is possible.
     pub is_anonymous: bool,
-    /// A note when the schema came back with NO entities: the anonymous-read auth
-    /// remediation (#1) when anonymous, else a note that this principal can see no
+    /// A note when the schema came back with NO entities: this principal can see no
     /// entities here. Null when entities were returned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
