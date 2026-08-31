@@ -123,15 +123,14 @@ pub async fn authorize_update_call(
     }
 }
 
-/// The gate's decision, separated from the fetch that feeds it (per review): with
-/// no app publishing the standard path yet, every live test of the YES branch can
-/// only skip, so the branch that MATTERS — a declared canister authorizes, and
-/// each way of not being declared refuses differently — needs to be provable
-/// without a network. It cannot be tested by pointing the fetch at a local server
-/// either: the SSRF guard resolves and pins public addresses before any request,
-/// so a loopback origin is refused before a fixture could answer. Splitting the
-/// decision out is what makes it testable at all, and every case below is pinned
-/// on constructed input.
+/// The gate's decision, separated from the fetch that feeds it (per review). The
+/// live tests cover the YES path against a real adopter, but they depend on
+/// someone else's deploy staying up and publishing; the decision itself — a
+/// declared canister authorizes, and each way of not being declared refuses
+/// differently — is pinned here on constructed input, where no network can make
+/// it skip. It cannot be tested by pointing the fetch at a local server either:
+/// the SSRF guard resolves and pins public addresses before any request, so a
+/// loopback origin is refused before a fixture could answer.
 fn decide(
     probe: discover::ManifestProbe,
     app_origin: &str,
@@ -208,6 +207,32 @@ pub async fn bind_identity(
 /// the bulk of the message.
 const MAX_ECHOED_CAUSE: usize = 200;
 
+/// Whether a check failure is one retrying cannot clear. Telling a caller to
+/// retry a permanent configuration is advice that cannot work, and the two need
+/// different next steps.
+///
+/// The strings matched here are OURS — the fetch helpers format `HTTP {status}`
+/// and the over-size message a few lines apart — not anything a remote origin
+/// controls, so this is coupling inside the crate rather than parsing hostile
+/// input. A typed error carried up from the fetch would be sturdier; that is a
+/// larger change than the defect warrants, and this is documented in its place
+/// (per review: the previous check looked for the word "redirect", which a
+/// stopped redirect never contains — it keeps its 3xx status).
+fn cause_is_persistent(cause: &str) -> bool {
+    // The two client statuses that DO clear on their own.
+    if cause.contains("HTTP 408") || cause.contains("HTTP 429") {
+        return false;
+    }
+    // A stopped redirect keeps its 3xx; a 4xx is the origin declining to serve
+    // the path rather than failing to; an over-size document will not shrink; and
+    // a cross-origin claim its declared origin does not authorize is a
+    // misconfiguration at the app.
+    cause.contains("HTTP 3")
+        || cause.contains("HTTP 4")
+        || cause.contains("larger than")
+        || cause.contains("ii-alternative-origins")
+}
+
 /// Scrub and cap an ORIGIN before it reaches the model. `app_url` is
 /// caller-supplied and only its origin is ever fetched, so the origin is what a
 /// refusal should name — but the value reaching a refusal has been through
@@ -262,13 +287,9 @@ pub fn missing_origin_refusal(canister_id: &Principal) -> String {
 fn unreachable_refusal(app_origin: &str, source: OriginSource, error: &str) -> String {
     let app_origin = safe_origin(app_origin);
     // Not every check failure clears on its own: an origin answering 401/403 on
-    // the path is denying it deliberately, and a blocked redirect is a
-    // configuration this server will not follow. Telling those callers to retry
-    // is advice that cannot work, so they get the fix instead (per review).
-    let persistent = ["HTTP 401", "HTTP 403", "redirect"]
-        .iter()
-        .any(|marker| error.contains(marker));
-    let next = if persistent {
+    // the path is denying it deliberately, a stopped redirect is a configuration
+    // this server will not follow, and an over-size document stays over-size.
+    let next = if cause_is_persistent(error) {
         "Retrying will not clear this one: the origin is refusing to serve that path, or serving \
          it from somewhere this server will not follow. Its operators fix it by making the \
          manifest publicly readable at that exact path on this origin."
@@ -424,6 +445,11 @@ fn identity_unresolvable_refusal(app_origin: &str, cause: &str) -> String {
         "This one does not resolve itself: the app claims a derivation origin that does not \
          authorize it back, which its operators fix by listing this origin in that file. \
          Retrying will not change it."
+    } else if cause_is_persistent(cause) {
+        "Retrying will not clear this one either: the origin is refusing to serve the path this \
+         check reads, serving it from somewhere this server will not follow, or serving something \
+         too large to read. Its operators fix it by making that well-known path publicly readable \
+         at this exact origin."
     } else {
         "This is likely transient — retry; if it persists, confirm that `app_url` names the app \
          you are acting at (open_app returns its `app_url` and `derivation_origin` together)."
@@ -468,7 +494,7 @@ fn not_declared_refusal(
     if manifest.omitted > 0 {
         return format!(
             "Could not determine whether {} declares {canister_id}: its manifest ({}) carries {} \
-             entries beyond the {} this server reads, which were NOT checked, so this connector \
+             entries beyond the limit this server reads, which were NOT checked, so this connector \
              will not make a state-changing call to it. {} Of what WAS read, it {declares}. If \
              {canister_id} is one of the unread entries, the manifest is too long and its \
              operators should shorten it ({SERVICE_DISCOVERABILITY_GUIDE}); if it belongs to a \
@@ -476,7 +502,6 @@ fn not_declared_refusal(
             manifest.origin,
             manifest.path,
             manifest.omitted,
-            manifest.canisters.len(),
             the_rule(),
             source.arg()
         );
@@ -895,6 +920,48 @@ mod tests {
         assert!(!unresolved.contains("is not the app"), "must not assert a mismatch: {unresolved}");
     }
 
+    // Which failures are permanent. The previous version of this check looked for
+    // the word "redirect", which a stopped redirect never contains — it keeps its
+    // 3xx status — so the case it was written for fell through to "retry" (per
+    // review). Pinned against the exact strings the fetch helpers produce.
+    #[test]
+    fn a_permanent_failure_is_not_described_as_transient() {
+        for permanent in [
+            "HTTP 302 Found",        // a stopped redirect
+            "HTTP 401 Unauthorized", // the origin declining
+            "HTTP 403 Forbidden",
+            "document is larger than the 4096-byte limit this server reads",
+            "https://a.example does not authorize it in its ii-alternative-origins",
+        ] {
+            assert!(cause_is_persistent(permanent), "must not read as transient: {permanent}");
+        }
+        for transient in [
+            "HTTP 429 Too Many Requests",
+            "HTTP 408 Request Timeout",
+            "HTTP 500 Internal Server Error",
+            "HTTP 503 Service Unavailable",
+            "error sending request: operation timed out",
+        ] {
+            assert!(!cause_is_persistent(transient), "must stay retryable: {transient}");
+        }
+
+        // And the refusals say different things for the two.
+        let stopped = unreachable_refusal(
+            "https://app.example.com",
+            OriginSource::AppUrl,
+            "HTTP 302 Found",
+        );
+        assert!(stopped.contains("Retrying will not clear this one"), "{stopped}");
+        let blip =
+            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out");
+        assert!(blip.contains("likely transient"), "{blip}");
+
+        // Same on the identity side, where the previous check only knew about an
+        // unauthorized cross-origin claim.
+        let denied = identity_unresolvable_refusal("https://app.example.com", "HTTP 403 Forbidden");
+        assert!(denied.contains("Retrying will not clear this one either"), "{denied}");
+    }
+
     // Everything a refusal echoes stays bounded, whatever the caller passed: the
     // origin is capped like the error causes are, so a valid-but-enormous argument
     // cannot flood the reply (per review).
@@ -915,29 +982,32 @@ mod tests {
         }
     }
 
-    // Live network: the gate is only useful if it actually says YES for an app
-    // that publishes the manifest at the standard path, so this asserts the YES
-    // against a real origin — and an unrelated canister (the ICP ledger) must
-    // still be refused there. It SKIPS on anything else, which today includes the
-    // origin it names: nothing published on {ARCHITECTURE_PATH} at the time of
-    // writing, so this test is a tripwire for adoption rather than live coverage.
-    // (The unit tests above cover the YES path's shape.) Skipping is also what
-    // keeps a network blip from failing CI.
+    // Live network: the YES path, against a real adopter. Apps built with
+    // caffeine.ai publish the Layer 1 manifest, and svault.tech is one — it
+    // declares its frontend and backend at the standard path AND pins a
+    // cross-origin derivation origin, so between this test and the next the whole
+    // chain a write depends on is exercised against something real: manifest read,
+    // authorization, and an identity binding to an origin that is not the app's
+    // own. Skips if it stops publishing, rather than failing CI on someone else's
+    // deploy; the unit tests above pin the same decisions on constructed input.
     #[tokio::test]
     async fn authorizes_a_declared_canister_and_refuses_an_undeclared_one() {
-        const APP: &str = "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io";
+        const APP: &str = "https://svault.tech";
         let Ok(discover::ManifestProbe::Declared(m)) = discover::fetch_declared_manifest(APP).await
         else {
-            return; // unreachable or not (yet) publishing — don't fail CI on it
+            return; // unreachable, or no longer publishing
         };
+        assert_eq!(m.path, ARCHITECTURE_PATH, "only the standard path may authorize");
         let Some(declared) = m.canisters.first().copied() else {
-            return; // publishes an empty manifest — nothing to authorize
+            return; // an empty manifest authorizes nothing
         };
         let ok = authorize_update_call(APP, OriginSource::AppUrl, &declared)
             .await
             .expect("a declared canister must authorize");
         assert_eq!(ok.origin, m.origin);
+        assert_eq!(ok.path, ARCHITECTURE_PATH);
 
+        // An unrelated canister is refused at the same origin.
         let ledger = canister("ryjl3-tyaaa-aaaaa-aaaba-cai");
         if !m.canisters.contains(&ledger) {
             let err = authorize_update_call(APP, OriginSource::AppUrl, &ledger)
@@ -947,37 +1017,31 @@ mod tests {
         }
     }
 
-    // Live network: two real apps, deliberately crossed. Reading MULTI/DEX's
-    // manifest while signing as the user's identity at OISY is exactly the pairing
-    // the binding exists to refuse — before it, the attacker-controlled half was
-    // the manifest, and the valuable half was the identity. Skips only if the
-    // origin cannot be resolved at all, which is a different (also refusing)
-    // outcome rather than a pass.
+    // Live network: the binding accepts a CROSS-ORIGIN declared identity — the
+    // case a literal `app_url == derivation_origin` comparison would have
+    // false-refused, and the reason the binding resolves the app instead. It also
+    // means Internet Identity's own authorization ran: svault.tech's declared
+    // origin lists it back in /.well-known/ii-alternative-origins, without which
+    // resolution refuses outright.
     #[tokio::test]
-    async fn crossing_an_app_with_another_apps_identity_is_refused() {
-        let err = bind_identity("https://multidex.ai", "https://oisy.com", &backend())
-            .await
-            .expect_err("a crossed pair must never bind");
-        if err.contains("Could not establish") {
-            return; // unreachable — the refusal is right either way
-        }
-        assert!(err.contains("is not the app this call would be signed as"), "{err}");
-        assert!(err.contains("oisy.com"), "names the identity: {err}");
-    }
-
-    // The other side of the same coin: an app paired with its OWN resolved
-    // identity binds. multidex.ai declares no custom derivation origin, so its
-    // identity is its own origin.
-    #[tokio::test]
-    async fn an_app_paired_with_its_own_identity_binds() {
-        const APP: &str = "https://multidex.ai";
+    async fn a_cross_origin_declared_identity_binds() {
+        const APP: &str = "https://svault.tech";
         let Ok(identity) = discover::resolve_app_identity(APP, false).await else {
-            return; // unreachable — nothing to assert
+            return; // unreachable
         };
         let canonical = crate::identities::target_origin(&identity.derivation_origin);
+        if canonical == APP {
+            return; // no longer cross-origin; nothing distinctive left to assert
+        }
         bind_identity(APP, &canonical, &backend())
             .await
-            .expect("an app must bind to its own resolved identity");
+            .expect("an app must bind to the identity it declares, at any origin");
+
+        // And a different app's identity is still refused against it.
+        let err = bind_identity(APP, "https://oisy.com", &backend())
+            .await
+            .expect_err("a crossed pair must never bind");
+        assert!(err.contains("is not the app this call would be signed as"), "{err}");
     }
 
     // Live network, the case this gate deliberately gives up: an origin serving
