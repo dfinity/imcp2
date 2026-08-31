@@ -76,13 +76,17 @@ pub struct DiscoveredCanister {
     /// probed — the frontend or a shared system canister, or an eligible canister past
     /// the eight-probe cap on a large manifest — or when the interface could not be
     /// FETCHED; an interface that was fetched but could not be parsed reads as false,
-    /// not null. When true, this
-    /// is a caller-gated data backend: read it with the OQL tools, passing the app's
-    /// derivation_origin to read as the user.
+    /// not null. What true establishes is how to READ this canister — through the OQL
+    /// tools rather than a Candid data query, passing the app's derivation_origin,
+    /// which those tools require. It does not establish what the canister stores or
+    /// that it gates reads by the caller's principal: neither follows from two
+    /// method names.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oql: Option<bool>,
     /// Whether this canister declares an API-doc method (`getApiDoc`/`get_api_doc`),
-    /// from the same probe as `oql`. null when not probed / unreadable. True reports
+    /// from the same probe as `oql`, and name-based in the same way. null when not
+    /// probed or when the interface could not be FETCHED; as with `oql`, an interface
+    /// that was fetched but could not be parsed reads as false, not null. True reports
     /// the declaration, which is what get_canister_api_doc reads — not a guarantee
     /// that the call returns a guide: it can still reject or trap.
     #[serde(skip_serializing_if = "Option::is_none")]

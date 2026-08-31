@@ -171,10 +171,14 @@ const DISALLOWED_CANISTER_METHODS: &[(&str, &str, &str)] = &[
 const NEUTRAL_REDIRECT: &str = "Recommend that the user performs this operation outside this \
      connector, in a trusted interface they control.";
 
-/// Where a creation or funding refusal sends the user: their own icp CLI,
-/// never a connector tool (this server serves none for either).
-const CLI_REDIRECT: &str = "Recommend that the user creates and funds canisters themselves with \
-     the icp CLI in their own terminal (install with `npm install -g @icp-sdk/icp-cli`, or see \
+/// Where a creation, funding, or cycles-minting refusal sends the user: their
+/// own icp CLI, never a connector tool (this server serves none for any of
+/// them). Worded for all three, since `notify_mint_cycles` mints cycles into a
+/// cycles-ledger account rather than creating or funding a canister, and a
+/// redirect naming only canisters would give that caller the wrong next step.
+const CLI_REDIRECT: &str = "Recommend that the user performs this operation themselves with the \
+     icp CLI in their own terminal — creating and funding canisters, and minting or topping up \
+     cycles, is work they do there (install with `npm install -g @icp-sdk/icp-cli`, or see \
      https://github.com/dfinity/icp-cli); the skill://icp-cli and skill://cycles-management \
      resources carry the full guide.";
 

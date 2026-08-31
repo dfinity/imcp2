@@ -1003,7 +1003,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Open an Internet Computer app in one call, given its name or its URL: resolves the app's Internet Identity derivation origin (as resolve_app does) and discovers the canisters behind it (as discover_app_canisters does) in a single step. If the user supplied only an app name, pass that name unchanged; only pass a URL supplied by the user or obtained from a verified official source, and do not construct a domain from the name. A name — or a bare host — is matched against the built-in registry of well-known apps first, so a wrong-TLD guess repairs to the canonical URL; an explicit `https://` URL is resolved as given. There is no on-chain name-to-URL directory, so an unknown bare name is refused with instructions for finding the real URL, and a URL that would need its own origin assumed as the derivation origin — no usable declaration was read from the app and the registry has no entry — is refused when that origin shows no evidence of being an Internet Computer app, rather than resolved to a wrong identity. That evidence establishes that a domain is served from the Internet Computer, not that it is the app the user meant, which is why a constructed domain is not an acceptable input. Returns `app_url` (the one used), `derivation_origin` and its source, `alternative_origins`, and the discovered `canisters`, with provenance, labels, and per-canister `oql`/`api_doc_available` capability flags from a one-shot Candid probe of the app's own canisters — `api_doc_available` reports that a canister DECLARES the doc method get_canister_api_doc reads, not that the call returns a guide. The probe covers at most the first eight eligible canisters, so on a larger manifest the later entries carry neither flag; both are then absent rather than false, and get_canister_candid reports them for a specific canister. An app's features are reached through those canisters rather than through per-feature tools: a canister flagged `oql` holds the app's data, gated by the caller's principal, and is read with get_canister_oql_schema and canister_query's `oql` argument, both of which take the returned `derivation_origin` and reject an anonymous read. No authenticated session is required, since no principal is derived here. resolve_app and discover_app_canisters perform the two halves separately.",
+        description = "Open an Internet Computer app in one call, given its name or its URL: resolves the app's Internet Identity derivation origin (as resolve_app does) and discovers the canisters behind it (as discover_app_canisters does) in a single step. If the user supplied only an app name, pass that name unchanged; only pass a URL supplied by the user or obtained from a verified official source, and do not construct a domain from the name. A name — or a bare host — is matched against the built-in registry of well-known apps first, so a wrong-TLD guess repairs to the canonical URL; an explicit `https://` URL is resolved as given. There is no on-chain name-to-URL directory, so an unknown bare name is refused with instructions for finding the real URL, and a URL that would need its own origin assumed as the derivation origin — no usable declaration was read from the app and the registry has no entry — is refused when that origin shows no evidence of being an Internet Computer app, rather than resolved to a wrong identity. That evidence establishes that a domain is served from the Internet Computer, not that it is the app the user meant, which is why a constructed domain is not an acceptable input. Returns `app_url` (the one used), `derivation_origin` and its source, `alternative_origins`, and the discovered `canisters`, with provenance, labels, and per-canister `oql`/`api_doc_available` capability flags from a one-shot Candid probe of the app's own canisters — `api_doc_available` reports that a canister DECLARES the doc method get_canister_api_doc reads, not that the call returns a guide. The probe covers at most the first eight eligible canisters, so on a larger manifest the later entries carry neither flag; both are then absent rather than false, and get_canister_candid reports them for a specific canister. An app's features are reached through those canisters rather than through per-feature tools: a canister flagged `oql` is read through get_canister_oql_schema and canister_query's `oql` argument rather than a Candid data query, and both of those take the returned `derivation_origin` and reject an anonymous read — the flag reports that routing, not what the canister stores or how it gates reads. No authenticated session is required, since no principal is derived here. resolve_app and discover_app_canisters perform the two halves separately.",
         annotations(title = "Open an app (resolve origin + discover canisters)", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::OpenAppOutput>(),
     )]
@@ -1074,8 +1074,8 @@ impl IcCanisterTools {
             Err(join_err) => (Vec::new(), 0, Some(format!("discovery task error: {join_err}"))),
         };
         // Enrich the app's OWN data canisters with OQL / api-doc capability flags
-        // (#3), so open_app hands back a ready-to-use handle: which canister holds
-        // the (caller-gated) data, and the origin to read it as the user.
+        // (#3), so open_app hands back a ready-to-use handle: which canister is read
+        // through the OQL path, and the origin that path requires.
         let mut discovered: Vec<discover::DiscoveredCanister> =
             canisters.iter().map(discover::DiscoveredCanister::from).collect();
         self.enrich_capabilities(&mut discovered).await;
@@ -2141,10 +2141,12 @@ fn render_canister_line(c: &discover::DiscoveredCanister) -> String {
     )
 }
 
-/// The caller-gated data-access note (#3): when discovery surfaced OQL data
-/// canister(s), spell out that their data is gated by the CALLER's principal (an OQL
-/// read requires the origin — an anonymous read is rejected for now) and how to read
-/// as the user. `handle` is the ready-to-use origin clause when the origin is
+/// The data-access note (#3): when discovery surfaced OQL data canister(s), spell
+/// out how they are READ — through the OQL tools, on a path that requires the origin
+/// (an anonymous read is rejected for now) — and how to read as the user. It states
+/// the read path, which is this server's own behaviour, rather than what the canister
+/// stores or how it gates reads: the `oql` flag is name-based and establishes
+/// neither. `handle` is the ready-to-use origin clause when the origin is
 /// already resolved (open_app), or `None` when it isn't (discover_app_canisters), in
 /// which case the note points at resolve_app / open_app to obtain it.
 fn data_access_note(canisters: &[discover::DiscoveredCanister], handle: Option<&str>) -> Option<String> {
@@ -2162,8 +2164,10 @@ fn data_access_note(canisters: &[discover::DiscoveredCanister], handle: Option<&
             .to_string(),
     };
     Some(format!(
-        "Data access: the canister(s) flagged [oql] hold this app's data, gated by the CALLER's \
-         principal — an OQL read REQUIRES the origin (an anonymous read is rejected for now). {how}"
+        "Data access: the canister(s) flagged [oql] are read through the OQL tools rather than a \
+         Candid data query, and that path REQUIRES the origin — an anonymous OQL read is rejected \
+         for now. The flag reports the interface's `schema`/`execute` declaration, not what the \
+         canister stores. {how}"
     ))
 }
 

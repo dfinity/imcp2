@@ -134,9 +134,11 @@ pub struct ApiDocArgs {
 
 /// Output of `get_canister_api_doc` — every documentation outcome is STRUCTURED
 /// (not an error when the doc simply isn't there), so the agent can distinguish
-/// "this app has no prose doc" (expected, don't retry) from "no answer was
-/// obtained" (a retry may help). An unusable `canister_id` is rejected before any
-/// lookup and is a plain error, not this shape.
+/// "no compatible method was detected" (expected, don't retry) from "no answer
+/// was obtained" (a retry may help). The first is not proof of absence: the same
+/// detection comes up empty on an interface the parser cannot read. An unusable
+/// `canister_id` is rejected before any lookup and is a plain error, not this
+/// shape.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ApiDocOutput {
     /// The canister the doc was requested from.
@@ -152,17 +154,23 @@ pub struct ApiDocOutput {
     /// Null when unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    /// When `available` is false: whether absence is EXPECTED — the interface read
-    /// fine and the canister simply declares no api-doc method (most canisters
-    /// don't). True on the normal "no such method" path; false when we couldn't tell
-    /// (interface unreadable / the call failed). Meaningless when `available`.
+    /// When `available` is false: whether this is the EXPECTED outcome — no
+    /// compatible api-doc method was detected in the interface text, which is the
+    /// normal case (most canisters declare none). True does NOT prove the canister
+    /// declares one nowhere: the same detection returns nothing for an interface that
+    /// was fetched but could not be parsed, or that exceeded the parser's limits, and
+    /// that path sets true as well. False when no answer was obtained at all (the
+    /// interface could not be FETCHED, or the call failed). Meaningless when
+    /// `available`.
     pub expected: bool,
-    /// When `available` is false: whether retrying might help. False when the method
-    /// genuinely isn't declared (retrying won't conjure one); true when no answer was
-    /// obtained — either the Candid interface could not be read, so whether a doc
-    /// method exists is unknown, or the call to a declared method did not return. That
-    /// covers a transient failure, but also a rejection or trap from the canister,
-    /// which no retry will change. Meaningless when `available`.
+    /// When `available` is false: whether retrying might help. False when no
+    /// compatible method was detected in the interface text — retrying will not
+    /// change that reading, whether the canister declares none or the parser could
+    /// not read what it declares. True when no answer was obtained — either the
+    /// Candid interface could not be FETCHED, so whether a doc method exists is
+    /// unknown, or the call to a declared method did not return. That covers a
+    /// transient failure, but also a rejection or trap from the canister, which no
+    /// retry will change. Meaningless when `available`.
     pub retry: bool,
     /// What to do next — e.g. "use get_canister_candid for the interface" when there
     /// is no doc, or "retry" on a transient failure. Null when `available`.
