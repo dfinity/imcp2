@@ -449,11 +449,11 @@ pub struct AccountsOutput {
 /// Arguments for `resolve_app`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ResolveAppArgs {
-    /// The application's URL, e.g. "https://oisy.com". Must be a URL you actually
-    /// have — given by the user, shown by `open_app` for a well-known app name, or
-    /// found by a web search of the app's official site. NEVER a domain guessed
-    /// from an app's name (guessed lookalike domains are unrelated or squatted
-    /// sites and are refused).
+    /// The application's URL, e.g. "https://opencloud.org". When the derivation
+    /// origin has to be assumed from this URL, the origin is checked for
+    /// Internet-Computer evidence (a gateway `x-ic-canister-id`) and the call is
+    /// refused without it — so a lookalike domain that is not an IC app does not
+    /// resolve. `open_app` turns an app name into this URL.
     pub app_url: String,
 }
 
@@ -472,10 +472,14 @@ pub struct ResolveAppOutput {
     /// application origin — correct only if the app has no custom derivation
     /// origin, which this connector cannot verify).
     pub derivation_origin_source: String,
-    /// Origins the application origin's `/.well-known/ii-alternative-origins`
-    /// permits to derive from it. Informational only — this is the INVERSE of
-    /// "which derivation origin the app uses", so do not infer the derivation
-    /// origin from it.
+    /// Origins the resolved DERIVATION origin's `/.well-known/ii-alternative-origins`
+    /// permits to derive against it — that origin is where the list is authoritative,
+    /// and where this one was read. Read best-effort and reported as a list, so an
+    /// empty one means "none were read", not "none exist": a fetch, HTTP, parse, or
+    /// origin-validation failure yields an empty list, and at most 100 valid entries
+    /// are kept. Informational only either way: it is the INVERSE of "which
+    /// derivation origin the app uses", so the derivation origin does not follow from
+    /// it.
     pub alternative_origins: Vec<String>,
     /// Whether the application origin showed evidence of being served from the
     /// Internet Computer (the gateway's `x-ic-canister-id` header). Only probed
