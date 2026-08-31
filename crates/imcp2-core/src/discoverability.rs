@@ -43,11 +43,15 @@
 //!     protocol exists to make apps *more* legible to agents, and it would be a
 //!     strange reading of it to make this server see less.
 //!
-//! The legacy `/.well-known/ic-app.json` path counts too (see
-//! [`discover::LEGACY_MANIFEST_PATH`]): it is the same document at the path this server
-//! proposed before the protocol was published, so the handful of apps that
-//! adopted the proposal are not cut off the day the standard path lands. New
-//! apps should publish [`ARCHITECTURE_PATH`].
+//! Only [`ARCHITECTURE_PATH`] authorizes. This server proposed the same document
+//! at [`discover::LEGACY_MANIFEST_PATH`] before the protocol was published, and
+//! discovery still READS it — but it cannot authorize a write, because the
+//! operators who adopted that proposal published it against different terms and
+//! never agreed to the ones publishing the protocol manifest now signifies
+//! (<https://internetcomputer.org/icp-mcp/terms/>). Consent that was never given
+//! cannot be inherited from a path this server invented, so an early adopter is
+//! refused — and told, precisely, that serving the same JSON at the standard
+//! path is all that is required.
 
 use candid::Principal;
 
@@ -105,7 +109,14 @@ pub async fn authorize_update_call(
     };
     let manifest = match manifest {
         discover::ManifestProbe::Declared(m) => m,
-        discover::ManifestProbe::Absent { served_non_manifest } => {
+        // An origin still on the pre-protocol path gets its own refusal: it HAS
+        // published something, so reporting it as publishing nothing would send
+        // its operators looking for a file that is already there, when what they
+        // actually have to do is serve it at the standard path.
+        discover::ManifestProbe::Absent { legacy: Some(legacy), .. } => {
+            return Err(legacy_only_refusal(&legacy, canister_id, source))
+        }
+        discover::ManifestProbe::Absent { served_non_manifest, legacy: None } => {
             return Err(no_manifest_refusal(app_origin, source, served_non_manifest.as_deref()))
         }
     };
@@ -220,6 +231,53 @@ fn no_manifest_refusal(
     msg
 }
 
+/// The origin still serves this server's PRE-PROTOCOL document and nothing at
+/// the standard path. It has published something, so the "publishes no manifest"
+/// verdict would be wrong and would send its operators hunting for a file that is
+/// already there. What it has not done is opt in under the terms the protocol
+/// manifest now carries, and that consent cannot be back-filled from a path this
+/// server invented — so the refusal names the document it found, says plainly
+/// that serving the same JSON at the standard path is the whole fix, and (when
+/// the older document does list the target) makes clear the refusal is about
+/// WHERE the declaration lives, not about the canister being unknown.
+fn legacy_only_refusal(
+    legacy: &discover::DeclaredManifest,
+    canister_id: &Principal,
+    source: OriginSource,
+) -> String {
+    let mut msg = format!(
+        "{} serves this connector's older, pre-protocol document at {} but publishes no \
+         service-discoverability manifest at {ARCHITECTURE_PATH}, so this connector will not make \
+         a state-changing call to its canisters. {} ",
+        legacy.origin,
+        legacy.path,
+        the_rule()
+    );
+    msg.push_str(if legacy.canisters.contains(canister_id) {
+        "That older document DOES list this canister, but it cannot authorize the write: it \
+         predates the protocol, and its publishers never accepted the terms that publishing the \
+         standard manifest now signifies (https://internetcomputer.org/icp-mcp/terms/). "
+    } else {
+        "That older document does not list this canister either. "
+    });
+    if source == OriginSource::DerivationOrigin {
+        msg.push_str(
+            "This origin came from `derivation_origin`, which is not always where the app serves \
+             its manifest — if the app publishes one elsewhere, pass that website URL as `app_url` \
+             and try again. ",
+        );
+    }
+    msg.push_str(&format!(
+        "For the app's operators the fix is small and entirely theirs to make: serve the same JSON \
+         at {ARCHITECTURE_PATH}, which is how they opt the app in \
+         ({SERVICE_DISCOVERABILITY_GUIDE}); the skill://service-discoverability resource carries \
+         the deploy-time recipe. Until they do, STOP retrying: tell the user this write cannot be \
+         made for them here, and that they can perform the action themselves in the app's own \
+         frontend. {READS_ARE_FINE}"
+    ));
+    msg
+}
+
 /// The app publishes a manifest, but this canister is not in it. The most useful
 /// thing a refusal can do here is show what the app DOES declare, so an agent
 /// that picked the wrong id out of a discovery listing can correct itself in one
@@ -314,6 +372,11 @@ mod tests {
                 &backend(),
                 OriginSource::AppUrl,
             ),
+            legacy_only_refusal(
+                &manifest("https://app.example.com", LEGACY_MANIFEST_PATH, &[backend()]),
+                &backend(),
+                OriginSource::AppUrl,
+            ),
         ];
         for msg in refusals {
             assert!(msg.contains(ARCHITECTURE_PATH), "must name the standard path: {msg}");
@@ -333,6 +396,11 @@ mod tests {
             no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None),
             not_declared_refusal(
                 &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
+                &backend(),
+                OriginSource::AppUrl,
+            ),
+            legacy_only_refusal(
+                &manifest("https://app.example.com", LEGACY_MANIFEST_PATH, &[backend()]),
                 &backend(),
                 OriginSource::AppUrl,
             ),
@@ -402,12 +470,12 @@ mod tests {
     #[test]
     fn empty_manifest_is_reported_as_declaring_nothing() {
         let msg = not_declared_refusal(
-            &manifest("https://app.example.com", LEGACY_MANIFEST_PATH, &[]),
+            &manifest("https://app.example.com", ARCHITECTURE_PATH, &[]),
             &backend(),
             OriginSource::AppUrl,
         );
         assert!(msg.contains("declares no canisters at all"), "{msg}");
-        assert!(msg.contains(LEGACY_MANIFEST_PATH), "names the path that answered: {msg}");
+        assert!(msg.contains(ARCHITECTURE_PATH), "names the path that answered: {msg}");
     }
 
     // A gate refusal must never borrow the vocabulary of a DIFFERENT failure.
@@ -425,6 +493,11 @@ mod tests {
             no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, Some("text/html")),
             not_declared_refusal(
                 &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
+                &backend(),
+                OriginSource::AppUrl,
+            ),
+            legacy_only_refusal(
+                &manifest("https://app.example.com", LEGACY_MANIFEST_PATH, &[backend()]),
                 &backend(),
                 OriginSource::AppUrl,
             ),
@@ -511,12 +584,53 @@ mod tests {
         assert!(msg.contains("app.example.com"), "the origin still shows: {msg}");
     }
 
+    // The pre-protocol document does NOT authorize, and the refusal has to be
+    // useful to the one population that hits it: operators who adopted this
+    // server's own earlier proposal. It must name the document they DO serve (so
+    // they don't hunt for a missing file), name the standard path as the fix, and
+    // — when the older document lists the target — make clear the refusal is
+    // about where the declaration lives rather than about an unknown canister.
+    #[test]
+    fn a_legacy_only_origin_is_refused_with_the_path_to_adopt() {
+        let listed = legacy_only_refusal(
+            &manifest("https://app.example.com", LEGACY_MANIFEST_PATH, &[backend(), frontend()]),
+            &backend(),
+            OriginSource::AppUrl,
+        );
+        assert!(listed.contains(LEGACY_MANIFEST_PATH), "names what it found: {listed}");
+        assert!(listed.contains(ARCHITECTURE_PATH), "names the path to adopt: {listed}");
+        assert!(listed.contains("DOES list this canister"), "{listed}");
+        assert!(listed.contains("terms"), "says why the older document cannot stand in: {listed}");
+        assert!(listed.contains("app.example.com"), "names the origin: {listed}");
+
+        // The other branch: the older document doesn't list it either, and the
+        // refusal must not claim it does.
+        let unlisted = legacy_only_refusal(
+            &manifest("https://app.example.com", LEGACY_MANIFEST_PATH, &[frontend()]),
+            &backend(),
+            OriginSource::AppUrl,
+        );
+        assert!(unlisted.contains("does not list this canister either"), "{unlisted}");
+        assert!(!unlisted.contains("DOES list"), "{unlisted}");
+
+        // It stays distinguishable from the never-adopted verdict, whose repair
+        // is a different conversation with a different person. Both messages do
+        // say the standard manifest is missing — that part is simply true — so
+        // what separates them is that this one leads with the document the origin
+        // DOES serve, before naming the one it doesn't.
+        let older = listed.find("older, pre-protocol document").expect("names it: {listed}");
+        let missing = listed.find("publishes no service-discoverability manifest").unwrap();
+        assert!(older < missing, "the document it DOES serve comes first: {listed}");
+    }
+
     // Live network: the gate is only useful if it actually says YES for an app
-    // that publishes the manifest. The reference app from the protocol guide
-    // declares its frontend and backend, so both must authorize against it and an
-    // unrelated canister (the ICP ledger) must not. Best-effort on reachability:
-    // a network blip must not fail CI, so an unreachable origin is skipped rather
-    // than asserted on.
+    // that publishes the manifest at the standard path, so this asserts the YES
+    // against a real origin — and an unrelated canister (the ICP ledger) must
+    // still be refused there. It SKIPS on anything else, which today includes the
+    // origin it names: nothing published on {ARCHITECTURE_PATH} at the time of
+    // writing, so this test is a tripwire for adoption rather than live coverage.
+    // (The unit tests above cover the YES path's shape.) Skipping is also what
+    // keeps a network blip from failing CI.
     #[tokio::test]
     async fn authorizes_a_declared_canister_and_refuses_an_undeclared_one() {
         const APP: &str = "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io";
@@ -539,6 +653,32 @@ mod tests {
                 .expect_err("an undeclared canister must be refused");
             assert!(err.contains(&ledger.to_text()), "{err}");
         }
+    }
+
+    // Live network, the case this gate deliberately gives up: an origin serving
+    // only the pre-protocol document is REFUSED, however complete that document
+    // is. MULTI/DEX is the real instance — it declares three canisters at the
+    // legacy path — so the refusal is checked against the id its own document
+    // lists, which is the exact write that used to be allowed. Skips once the
+    // origin adopts the standard path (at which point it should authorize, and
+    // the test above is the one that will say so).
+    #[tokio::test]
+    async fn a_legacy_only_origin_is_refused_live() {
+        const APP: &str = "https://multidex.ai";
+        let Ok(discover::ManifestProbe::Absent { legacy: Some(legacy), .. }) =
+            discover::fetch_declared_manifest(APP).await
+        else {
+            return; // unreachable, or it has adopted the standard path
+        };
+        let Some(declared) = legacy.canisters.first().copied() else {
+            return; // an empty legacy document proves nothing here
+        };
+        let err = authorize_update_call(APP, OriginSource::AppUrl, &declared)
+            .await
+            .expect_err("the legacy path must not authorize");
+        assert!(err.contains(ARCHITECTURE_PATH), "names the path to adopt: {err}");
+        assert!(err.contains(LEGACY_MANIFEST_PATH), "names what the origin does serve: {err}");
+        assert!(err.contains("DOES list this canister"), "{err}");
     }
 
     // Live network: an origin that publishes no manifest is refused with the

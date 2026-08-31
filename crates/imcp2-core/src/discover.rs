@@ -1370,8 +1370,9 @@ async fn fetch_success_body(client: &reqwest::Client, url: &str, max: usize) -> 
 pub(crate) struct DeclaredManifest {
     /// The origin the manifest was served from (canonical `https://host[:port]`).
     pub origin: String,
-    /// Which well-known path answered: [`ARCHITECTURE_PATH`] (the protocol) or
-    /// [`LEGACY_MANIFEST_PATH`] (this server's pre-protocol proposal).
+    /// Which well-known path served it: [`ARCHITECTURE_PATH`] for the manifest
+    /// that authorizes a write, [`LEGACY_MANIFEST_PATH`] for the pre-protocol
+    /// document, which is carried only to explain a refusal.
     pub path: &'static str,
     /// The declared canisters, as validated principals. May legitimately be
     /// empty: an app can publish a manifest that lists nothing.
@@ -1383,9 +1384,10 @@ pub(crate) struct DeclaredManifest {
 
 /// The outcome of probing an app origin for its canister manifest.
 pub(crate) enum ManifestProbe {
-    /// A manifest document was served at one of the well-known paths and parsed.
+    /// The PROTOCOL manifest was served at [`ARCHITECTURE_PATH`] and parsed —
+    /// the only document that can authorize a write.
     Declared(DeclaredManifest),
-    /// The origin answered, but neither path served a manifest.
+    /// No protocol manifest at this origin.
     Absent {
         /// What the PROTOCOL path answered with, when it answered 2xx with
         /// something that is not a manifest. `Some("text/html")` is the exact
@@ -1393,15 +1395,23 @@ pub(crate) enum ManifestProbe {
         /// most common failure, and naming it turns "your app publishes nothing"
         /// into a refusal its operator can act on from a relayed transcript.
         served_non_manifest: Option<String>,
+        /// The pre-protocol document, when the origin still serves one at
+        /// [`LEGACY_MANIFEST_PATH`]. It does NOT authorize anything; it is
+        /// carried so a refusal can tell an early adopter what changed and what
+        /// to publish, rather than reporting their app as publishing nothing.
+        legacy: Option<DeclaredManifest>,
     },
 }
 
-/// Fetch the canister manifest an app declares at `app_url`'s ORIGIN — the
-/// protocol path first, the legacy path only as a fallback.
-/// [`ManifestProbe::Absent`] when the origin answered but serves no manifest at
-/// either path (the app has not adopted the protocol); `Err` when the origin
-/// could not be reached at all, or the URL itself is refused by the SSRF guard,
-/// so the caller can say "unknown" rather than "not adopted".
+/// Fetch the service-discoverability manifest an app declares at `app_url`'s
+/// ORIGIN. Only [`ARCHITECTURE_PATH`] yields [`ManifestProbe::Declared`]:
+/// publishing there is the act that opts an app in under this connector's terms,
+/// and the operators who adopted this server's pre-protocol
+/// [`LEGACY_MANIFEST_PATH`] proposal never made that statement. The legacy
+/// document is still read, and returned alongside the absence, purely so a
+/// refusal can tell an early adopter what changed. `Err` when the origin could
+/// not be reached at all, or the URL itself is refused by the SSRF guard, so the
+/// caller can say "unknown" rather than "not adopted".
 ///
 /// A document is only honoured when it came from the origin we PROBED, not from
 /// a redirect target. The shared redirect policy already refuses a cross-domain
@@ -1433,6 +1443,7 @@ pub(crate) async fn fetch_declared_manifest(app_url: &str) -> Result<ManifestPro
         return Err(format!("could not reach {origin}: {e}"));
     }
     let mut served_non_manifest = None;
+    let (mut declared, mut legacy_declared) = (None, None);
     for (path, doc) in [(ARCHITECTURE_PATH, &architecture), (LEGACY_MANIFEST_PATH, &legacy)] {
         let Ok(Some(doc)) = doc else { continue };
         if doc.served_from != origin {
@@ -1452,23 +1463,31 @@ pub(crate) async fn fetch_declared_manifest(app_url: &str) -> Result<ManifestPro
             }
             continue;
         };
-        if path == LEGACY_MANIFEST_PATH {
-            // Adoption of the standard path is what lets the legacy fallback be
-            // retired on evidence rather than on a guess, so make every use of it
-            // visible in the server's own logs.
-            tracing::warn!(
-                origin = %origin,
-                "authorizing from the LEGACY manifest path; this app has not adopted {ARCHITECTURE_PATH}"
-            );
-        }
-        return Ok(ManifestProbe::Declared(DeclaredManifest {
-            origin,
+        let parsed = DeclaredManifest {
+            origin: origin.clone(),
             path,
             canisters: canisters.ids,
             omitted: canisters.omitted,
-        }));
+        };
+        if path == ARCHITECTURE_PATH {
+            declared = Some(parsed);
+        } else {
+            legacy_declared = Some(parsed);
+        }
     }
-    Ok(ManifestProbe::Absent { served_non_manifest })
+    if let Some(m) = declared {
+        return Ok(ManifestProbe::Declared(m));
+    }
+    if legacy_declared.is_some() {
+        // The population still on the pre-protocol path is what says whether
+        // that document can eventually stop being read at all, so make each one
+        // visible in the server's own logs rather than inferring it later.
+        tracing::warn!(
+            origin = %origin,
+            "origin publishes only the LEGACY manifest; it does not authorize writes"
+        );
+    }
+    Ok(ManifestProbe::Absent { served_non_manifest, legacy: legacy_declared })
 }
 
 /// Accumulator for discovered canister ids, with a hard ceiling on the number of
