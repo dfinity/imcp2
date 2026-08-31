@@ -66,10 +66,12 @@ pub struct OqlSchemaArgs {
     pub canister_id: String,
     /// The app's canonical Internet Identity derivation origin (not necessarily the
     /// visible URL), which this read is made as the user's account at. Accepts the
-    /// legacy name `domain`. Required in practice: the schema is caller-gated, so a
-    /// read with no origin is rejected with guidance instead of returning an empty
-    /// catalogue. Optional in the type only, so that omitting it produces that
-    /// guidance rather than a bare schema-validation failure.
+    /// legacy name `domain`. Required in practice: this server rejects a read with no
+    /// origin, with guidance, rather than calling `schema` anonymously and returning
+    /// an empty catalogue. That is the connector's own rule — it is not a claim that
+    /// the canister gates its schema by caller. Optional in the type only, so that
+    /// omitting it produces that guidance rather than a bare schema-validation
+    /// failure.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
     /// Which of your accounts to act as (see list_app_accounts). Omit to use that
@@ -337,8 +339,10 @@ pub struct CanisterQueryOutput {
     pub derivation_origin_source: Option<String>,
     /// True when the query ran as the ANONYMOUS principal (no `derivation_origin`).
     /// Always present so a text-only client can tell an anonymous read from an
-    /// authenticated one even on an empty result — per-app data is caller-gated, so
-    /// an anonymous empty result usually means "not authenticated", not "no data".
+    /// authenticated one even on an empty result: where an app does gate its data by
+    /// caller, an anonymous empty result means "not authenticated" rather than "no
+    /// data", and this flag is what lets a client tell the two apart. It does not
+    /// establish that the canister gates anything.
     pub is_anonymous: bool,
     /// A diagnostic note for an EMPTY result: the anonymous-read auth remediation
     /// (#1), an unknown-`start` repair (#7, oql mode), or a note that the query
