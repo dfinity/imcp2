@@ -107,8 +107,10 @@ pub struct OqlSchemaOutput {
     /// One ready-to-run `canister_query` invocation per entity — a COMPLETE call
     /// (canister_id + a minimal `{start, limit}` OQL query in the `oql` argument) that
     /// PRESERVES the identity this schema was read under (same
-    /// `derivation_origin`/`account`), so copying an example doesn't silently drop
-    /// back to anonymous. Read-only. Empty when the schema exposes no entities.
+    /// `derivation_origin`/`account`), so copying an example keeps that identity
+    /// rather than losing the origin the OQL path requires — which would be
+    /// rejected, not run anonymously. Read-only. Empty when the schema exposes no
+    /// entities.
     pub example_queries: Vec<String>,
 }
 
