@@ -57,25 +57,23 @@ pub struct Found {
 pub struct DiscoveredCanister {
     /// The canister's principal id.
     pub canister_id: String,
-    /// A human label if one was attached (App Connect role, env.json key,
-    /// bundle constant, or "frontend"); null for a bare bundle literal.
+    /// A human label for this canister's role, when one was attached; null when
+    /// the id carried none.
     pub label: Option<String>,
     /// IC dashboard label (e.g. "ICP Ledger"), when the id is a known canister.
     pub name: Option<String>,
     /// IC dashboard classification (e.g. "ledger"), when known.
     pub kind: Option<String>,
-    /// Where it was found: "ai-connect.html" (the App Connect page's declared
-    /// main canister), "ic-app.json" (the app's own canister manifest),
-    /// "header", "env.json", "bundle:<LABEL>", or "bundle". The first two are
-    /// declared by the app itself and are the most authoritative.
+    /// Where the id came from, and how far to trust it. "ai-connect.html" and
+    /// "ic-app.json" are the app's own declarations and the most authoritative;
+    /// "header" is the frontend canister; "env.json", "bundle" and
+    /// "bundle:<LABEL>" are candidates to confirm with get_canister_candid.
     pub sources: Vec<String>,
     /// Whether this canister declares an OQL query surface, so this server reads it with the
-    /// OQL tools rather than a Candid `method` query. Null when it was not probed, or its
-    /// interface could not be read.
+    /// OQL tools rather than a Candid `method` query. Null when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oql: Option<bool>,
-    /// Whether this canister declares the method get_canister_api_doc reads. Null when it was
-    /// not probed, or its interface could not be read.
+    /// Whether this canister declares the method get_canister_api_doc reads. Null when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_doc_available: Option<bool>,
 }
@@ -135,8 +133,8 @@ pub struct DiscoverOutput {
     pub domain: String,
     /// Canisters found behind the domain (empty if none).
     pub canisters: Vec<DiscoveredCanister>,
-    /// How many further findings the output caps dropped. The list is authority-ordered, so
-    /// the least authoritative were cut first.
+    /// How many further findings were dropped. The list is ordered by how authoritative each
+    /// id is, so the least authoritative went first.
     pub omitted: usize,
 }
 
@@ -1855,8 +1853,8 @@ pub struct OpenAppOutput {
     /// shape/provenance as discover_app_canisters). Empty when the app declares
     /// none OR when discovery failed — disambiguated by `discovery_error`.
     pub canisters: Vec<DiscoveredCanister>,
-    /// How many further findings the output caps dropped. The list is authority-ordered, so
-    /// the least authoritative were cut first.
+    /// How many further findings were dropped. The list is ordered by how authoritative each
+    /// id is, so the least authoritative went first.
     pub omitted: usize,
     /// Set when canister discovery failed rather than merely finding nothing, so an empty
     /// `canisters` list is not mistaken for an app that declares none. The derivation origin

@@ -368,8 +368,7 @@ pub struct GetPrincipalArgs {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct PrincipalOutput {
     /// The effective Internet Identity derivation origin the principal was
-    /// derived for (after canonicalization). Compare against `requested` to spot
-    /// an origin mismatch.
+    /// derived for. Compare against `requested` to spot an origin mismatch.
     pub derived_for_origin: String,
     /// Exactly what you supplied as `derivation_origin`.
     pub requested: String,
@@ -454,8 +453,7 @@ pub struct ResolveAppOutput {
     /// an empty list means none were read.
     pub alternative_origins: Vec<String>,
     /// Whether the app's origin showed evidence of being served from the Internet Computer.
-    /// Only probed when the derivation origin was assumed, and then always true, since an
-    /// origin without that evidence is refused.
+    /// Null unless the derivation origin had to be assumed.
     pub application_is_ic: Option<bool>,
     /// A human note, e.g. flagging that the derivation origin was assumed.
     pub note: Option<String>,

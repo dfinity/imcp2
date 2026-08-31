@@ -77,15 +77,14 @@ pub struct OqlSchemaOutput {
     /// this read is always made as one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acted_as_principal: Option<String>,
-    /// The effective Internet Identity derivation origin used, after
-    /// canonicalization.
+    /// The effective Internet Identity derivation origin used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_for_origin: Option<String>,
     /// Exactly what you supplied as `derivation_origin`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
-    /// Whether the schema was read as the anonymous principal. Always false here, since a
-    /// read without a derivation origin is rejected.
+    /// Whether the schema was read as the anonymous principal. False here: a read with no derivation origin is rejected rather than made
+    /// anonymously.
     pub is_anonymous: bool,
     /// Set when the schema came back with no entities: this account sees none here. Null when
     /// entities were returned.
@@ -99,8 +98,7 @@ pub struct OqlSchemaOutput {
 /// Output of `icp_oql_guide`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct OqlGuideOutput {
-    /// The OQL usage guide (markdown): the `schema`/`execute` methods, the JSON
-    /// query object, the predicate grammar, edges, and the result shape.
+    /// The OQL usage guide (markdown): the JSON query object, the predicate grammar, edges, and the result shape.
     pub content: String,
 }
 
@@ -118,8 +116,7 @@ pub struct ApiDocOutput {
     pub canister_id: String,
     /// True when an API-doc method was found and returned a doc (`doc` is set).
     pub available: bool,
-    /// The method the doc was read from (`getApiDoc`/`get_api_doc`) — null when
-    /// unavailable.
+    /// The method the doc was read from; null when unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
     /// The API documentation (markdown): how the app behaves — units, auth,
@@ -182,8 +179,7 @@ pub struct CanisterUpdateCallOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_for_origin: Option<String>,
     /// When called as an app account: exactly what you supplied as
-    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` (from
-    /// canonicalization) is visible.
+    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` is visible.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
     /// How `derived_for_origin` was determined.
@@ -234,8 +230,8 @@ pub struct CanisterQueryArgs {
 /// Output of `canister_query`. The populated fields depend on `mode`: a Candid
 /// `method` query sets `method` + `reply`; an `oql` query sets `columns` + `rows`
 /// (+ `has_more`). `valid_entities` and `did_you_mean` are optional even on an
-/// empty result: they appear only when the schema re-read returns entities and the
-/// query's `start` is not one of them.
+/// empty result: they appear only when the query's `start` is not one of the
+/// entities visible to this caller.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CanisterQueryOutput {
     /// The canister that was queried.
@@ -267,8 +263,7 @@ pub struct CanisterQueryOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_for_origin: Option<String>,
     /// When querying as an app account: exactly what you supplied as
-    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` (from
-    /// canonicalization) is visible.
+    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` is visible.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
     /// How `derived_for_origin` was determined.

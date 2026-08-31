@@ -1203,7 +1203,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Find the canisters behind a web domain, most authoritative first. Use this when you have a domain and need only its canister ids; open_app takes a name and also resolves the app's identity. Each result says where it came from: declared by the app itself, the frontend canister seen at the gateway, or an id mined from the site's runtime config or scripts, which is a candidate to confirm with get_canister_candid. A reachable domain with no sign of the Internet Computer returns an empty list; an unreachable one is an error.",
+        description = "Find the canisters behind a web domain, most authoritative first. Use this when you have a domain and need only its canister ids; open_app takes a name and also resolves the app's identity. Each result says where the id came from and how far to trust it: the app's own declarations are authoritative, the rest are candidates to confirm with get_canister_candid. A reachable domain with no sign of the Internet Computer returns an empty list; an unreachable one is an error.",
         annotations(title = "Discover canisters behind a domain", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::DiscoverOutput>(),
     )]
