@@ -1974,14 +1974,17 @@ fn identity_annotation(target: &IdentityTarget, acted_as: Option<&str>) -> Strin
 /// should be free to choose its own approach from an accurate description of
 /// the tools.
 ///
-/// The financial-transactions policy is stated here in full, server-wide —
-/// it governs the whole surface rather than one tool — and deliberately in NO
-/// tool description (per review): a policy paragraph inside
+/// The financial-transactions policy is stated here, server-wide — it governs
+/// the whole surface rather than one tool — and deliberately in NO tool
+/// description (per review): a policy paragraph inside
 /// `canister_update_call`'s description reads as a hint that the tool is
 /// usable for financial transactions, which is the one thing it must not
 /// suggest. `financial_policy_is_a_server_instruction_not_a_description`
 /// holds that line across every served description, and the directive scan
-/// covers the schemas too. Neither surface names a venue for a refused
+/// covers the schemas too. What the paragraph does NOT do is restate
+/// [`crate::compliance`]'s method families and canister scopes: that list would
+/// have to be kept in sync forever, and a refused call already gets a refusal
+/// accurate for its own scope. Neither surface names a venue for a refused
 /// operation.
 const SERVER_INSTRUCTIONS: &str = "Internet Computer tools: read canister interfaces and data, resolve apps and the user's identity at them, and make calls on the user's behalf.\n\n\
     Candid values — the arguments and replies of a canister's own methods, on canister_query's `method` path and on canister_update_call — are textual Candid, the `(...)` syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`, never the binary form. The `candid://textual-syntax` resource documents that syntax and `candid://reference` the type system; IC how-to guides are served as `skill://<name>` resources. Nothing else uses it: an OQL query is plain JSON, the canister-scoped reads take a canister id, and the app and identity tools take app URLs and derivation origins.\n\n\
