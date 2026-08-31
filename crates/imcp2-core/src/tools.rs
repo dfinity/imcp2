@@ -1975,19 +1975,11 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              resource (the value syntax these tools use); `candid://reference` has the full type \
              reference, and the official IC \
              skills are served as `skill://<name>` resources.\n\n\
-             FINANCIAL TRANSACTIONS ARE NOT SUPPORTED — asset-moving requests are denied, to \
-             protect the user: canister_update_call refuses the ICRC-standard transfer/approval \
-             methods (icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICRC-4/-7/-37 \
-             equivalents) AND the governance method manage_neuron (neuron staking/disbursement, \
-             on the NNS and every SNS) on every canister, the ICP and cycles ledgers' own \
-             transfer/withdrawal/creation methods and the cycles-minting canister's \
-             funding-completion methods on those canisters, and EVERY update call on a \
-             curated list of known financial-service canisters (token ledgers and minters, \
-             exchanges, wallet backends, and staking/governance canisters). For financial operations \
-             (token transfers, spending approvals, payments, trades), recommend the user performs \
-             the operation outside this connector, in a trusted interface they control; a refused \
-             canister-creation or funding-completion call points at the user-run icp CLI \
-             instead.\n\n\
+             FINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user: \
+             canister_update_call refuses them, and the refusal says why. For financial \
+             operations (token transfers, spending approvals, payments, trades), recommend \
+             the user performs the operation outside this connector, in a trusted interface \
+             they control.\n\n\
              START WITH open_app WHEN THE USER NAMES OR LINKS AN APP. `open_app(name-or-URL)` is the \
              one-call entry point: it takes an app NAME as the user said it, or a URL (e.g. \
              \"https://opencloud.org\"), resolves the Internet Identity derivation origin AND discovers the canisters \
@@ -2475,8 +2467,6 @@ mod tests {
             "get_canister_candid", "canister_query", "get_canister_oql_schema", "discover_app_canisters", "icp_find_canister_by_name", "icp_find_app_by_name", "icp_lookup_canister_info_by_id",
             "icp_list_skills", "icp_get_skill", "icp_oql_guide",
             "get_canister_api_doc", "open_app", "resolve_app", "list_app_accounts", "icp_cycles_balance", "get_app_principal", "icp_canister_status",
-            // Instructions-only since the marketplace-compliance changes: they
-            // execute nothing and move no funds, so they are pure reads.
         ] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");
@@ -2528,9 +2518,7 @@ mod tests {
             assert!(!desc.contains(".com"), "{} names a venue: {desc}", tool.name);
         }
         let ins = super::SERVER_INSTRUCTIONS;
-        assert!(ins.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED"));
-        assert!(ins.contains("asset-moving requests are denied"));
-        assert!(ins.contains("icrc1_transfer"));
+        assert!(ins.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user"));
         assert!(ins.contains("outside this connector, in a trusted interface they control"));
         assert!(!ins.contains("oisy.com"), "the instructions name no venue: {ins}");
     }
