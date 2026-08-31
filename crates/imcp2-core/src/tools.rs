@@ -912,7 +912,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Return the principal the user acts as at one app, without calling the app's canisters. Use this to answer who the user is at an app, or to check an identity before making calls.",
+        description = "Return the principal the user acts as at one app, without calling the app's canisters. Use this to answer who the user is at an app, to check an identity before making calls, or to learn whether this session is query-only, which the reply reports.",
         annotations(title = "Get your principal at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::PrincipalOutput>(),
     )]
@@ -1149,7 +1149,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Resolve an app URL to the derivation origin the user's identity there is derived from. Use this when you already have the app's URL; open_app takes a name as well, and also returns the app's canisters. The reply says how the origin was determined: declared by the app, taken from a built-in registry, or assumed to equal the app's own origin, which holds only for apps that pin no custom one. A URL whose origin would have to be assumed and that shows no sign of being an Internet Computer app is refused rather than resolved. No account is chosen here, so no principal is returned.",
+        description = "Resolve an app URL to the derivation origin the user's identity there is derived from. Use this when you have the app's URL and need only its derivation origin; open_app takes a name as well, and also returns the app's canisters. The reply says how the origin was determined: declared by the app, taken from a built-in registry, or assumed to equal the app's own origin, which holds only for apps that pin no custom one. A URL whose origin would have to be assumed and that shows no sign of being an Internet Computer app is refused rather than resolved. No account is chosen here, so no principal is returned.",
         annotations(title = "Resolve an app's derivation origin", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::ResolveAppOutput>(),
     )]
@@ -1203,7 +1203,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Find the canisters behind a web domain, most authoritative first. Use this when you have a domain rather than an app name. Each result says where it came from: declared by the app itself, the frontend canister seen at the gateway, or an id mined from the site's runtime config or scripts, which is a candidate to confirm with get_canister_candid. A reachable domain with no sign of the Internet Computer returns an empty list; an unreachable one is an error.",
+        description = "Find the canisters behind a web domain, most authoritative first. Use this when you have a domain and need only its canister ids; open_app takes a name and also resolves the app's identity. Each result says where it came from: declared by the app itself, the frontend canister seen at the gateway, or an id mined from the site's runtime config or scripts, which is a candidate to confirm with get_canister_candid. A reachable domain with no sign of the Internet Computer returns an empty list; an unreachable one is an error.",
         annotations(title = "Discover canisters behind a domain", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::DiscoverOutput>(),
     )]
