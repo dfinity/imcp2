@@ -513,16 +513,17 @@ impl IcCanisterTools {
             Ok(p) => p,
             Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
         };
-        // The financial-transactions gate (see `compliance`), in three
-        // scopes, before any network work: the standardized value-moving
-        // method names — the ICRC transfer/approval surface and the NNS/SNS
-        // governance method manage_neuron — refused on EVERY canister; the
-        // system ledgers'/cycles-minting canister's own value-moving methods
-        // on those canisters; and EVERY update method on a listed
-        // financial-service canister, so a refusal here does not depend on
-        // the method name alone. The refusal points the user outside this
-        // connector. Queries need no gate — a query cannot commit state, so
-        // it cannot move funds.
+        // The financial-transactions gate (see `compliance`), in four scopes,
+        // before any network work: the standardized value-moving method names
+        // (the ICRC transfer/approval surface) and the mixed-purpose
+        // governance entry point manage_neuron, both refused on EVERY
+        // canister; the system ledgers'/cycles-minting canister's own
+        // value-moving methods on those canisters; and EVERY update method on
+        // a listed financial-service canister, so a refusal here does not
+        // depend on the method name alone. Each scope's refusal claims only
+        // what that scope knows about the call, and points the user outside
+        // this connector. Queries need no gate — a query cannot commit state,
+        // so it cannot move funds.
         if let Some(refusal) = compliance::disallowed_update_method(&principal, &method) {
             return Ok(err(refusal));
         }
