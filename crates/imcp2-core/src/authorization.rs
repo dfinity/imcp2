@@ -68,7 +68,7 @@
 //! establish that the publisher accepted any terms, that it is entitled to
 //! expose every canister it lists, which of its update methods are safe to
 //! call, or that its behaviour stays inside this server's policies. Those
-//! come from the **ICP MCP Developer Terms** (`/developer-terms`), which the
+//! come from the **ICP MCP Developer Terms** ([`DEVELOPER_TERMS_URL`]), which the
 //! publisher accepts out of band; [`REGISTERED_APPLICATIONS`] is this
 //! server's record of who has. Hence step 2: the protocol proves composition,
 //! the Terms carry the obligations, and an update call needs both.
@@ -94,14 +94,19 @@ use crate::{
 /// acceptance stamped with an older revision** — each publisher's row has to
 /// be re-stamped after they accept the new revision, which is the intended
 /// behaviour: a materially changed obligation nobody has agreed to yet must
-/// not keep authorizing writes. Kept in step with the effective date on the
-/// served `/developer-terms` page (pinned by a test in the serving binary).
+/// not keep authorizing writes. Kept in step with the revision and effective
+/// date of the published Terms, whose source text is
+/// `docs/icp-mcp-developer-terms-draft.md` in this repository (pinned by a test
+/// in the serving binary, so the two cannot drift).
 pub const DEVELOPER_TERMS_VERSION: &str = "2026-08-28";
 
 /// Where a publisher reads the obligations it is accepting. Named in every
 /// refusal this module produces, so an agent can tell the user what the
-/// application's developer would have to do.
-pub const DEVELOPER_TERMS_URL: &str = "https://mcp.internetcomputer.org/developer-terms";
+/// application's developer would have to do. The page is served from the
+/// landing site, which is where every human-facing page moved; this origin's
+/// own `/developer-terms` permanently redirects there, so either spelling
+/// reaches it.
+pub const DEVELOPER_TERMS_URL: &str = "https://internetcomputer.org/icp-mcp/developer-terms/";
 
 /// One application whose publisher has accepted the ICP MCP Developer Terms.
 pub struct RegisteredApplication {
@@ -852,8 +857,8 @@ mod tests {
     // an application access to its OWN declared canisters; it does not make a
     // value-moving call acceptable — even when the application declares the
     // ledger in its own manifest. Layer 2 is also evaluated FIRST, so the caller
-    // gets the wallet redirect rather than a registration message, and the call
-    // costs no fetch.
+    // gets the do-it-yourself redirect rather than a registration message, and
+    // the call costs no fetch.
     #[tokio::test]
     async fn the_financial_guard_still_refuses_inside_an_authorized_surface() {
         // A standardized transfer is refused on any canister…
@@ -867,7 +872,10 @@ mod tests {
         .await;
         let msg = result.expect_err("a standardized transfer must stay refused");
         assert!(msg.contains("icrc1_transfer"), "{msg}");
-        assert!(msg.contains("oisy.com"), "the redirect is to a wallet the user controls: {msg}");
+        assert!(
+            msg.contains("outside this connector, in a trusted interface they control"),
+            "the redirect sends the user outside this connector: {msg}"
+        );
         assert_eq!(fetches, 0, "a value-moving call is refused without reaching the network");
         // …and every update on a known finance canister is refused, whatever the
         // application says about it.

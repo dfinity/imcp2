@@ -17,9 +17,8 @@ ledger-standard transfer/approval methods on every canister), and the
 connector serves no funding or management tools: creating, funding, and topping up
 canisters is done by the user with the
 [`icp` CLI](https://github.com/dfinity/icp-cli) in their own terminal.
-For financial operations, users act themselves in a
-wallet or frontend they control (e.g. [oisy.com](https://oisy.com)), in their
-own browser.
+For financial operations, users act themselves outside the connector, in a
+trusted interface they control.
 
 ## Use as a library
 
@@ -147,17 +146,17 @@ results).
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `open_app` | `app` (name **or** URL) | **One-call entry point** when a user names/links an app: resolves the Internet Identity `derivation_origin` *and* discovers the canisters behind it, together. A name or bare host is matched to the known-app registry first (so a wrong-TLD guess repairs to the canonical URL); an explicit `https://` URL is resolved as given. An unknown bare name, or a URL with no IC evidence, is *refused* (never guessed). Also probes the app's own canisters and reports per-canister `oql`/`api_doc_available` capability flags plus a caller-gated data-access note (which canister holds the app data, and the origin to read it as the user). Wraps `resolve_app` + `discover_app_canisters`; no auth |
-| `discover_app_canisters` | `domain` | Canister ids behind a web domain — the app's own `/.well-known/ic-architecture` manifest first (the [ICP service-discoverability protocol](#the-icp-service-discoverability-protocol)'s composition layer: every canister the app *declares*, with names and roles), then the superseded `/.well-known/ic-app.json` as a read-only fallback, then the frontend via `x-ic-canister-id` and backend candidates via `/env.json` + JS-bundle mining — each with provenance, its IC dashboard label/type where known, and (for the app's own canisters) `oql`/`api_doc_available` capability flags from a one-shot Candid probe. Only the manifest is a declaration; the rest are read-only hints and [cannot authorize a write](#update-call-authorization) |
+| `open_app` | `app` (name **or** URL) | **One-call entry point** when a user names/links an app: resolves the Internet Identity `derivation_origin` *and* discovers the canisters behind it, together. A name or bare host is matched to the known-app registry first (so a wrong-TLD guess repairs to the canonical URL); an explicit `https://` URL is resolved as given. An unknown bare name is *refused*, and so is a URL that would need its own origin assumed as the derivation origin while showing no IC evidence (never guessed). Also probes the app's own canisters and reports per-canister `oql`/`api_doc_available` capability flags — for **up to eight** eligible canisters, with both fields *omitted* (not false) on any beyond that — plus a data-access note (which canister is read through the OQL path, and the origin that path requires). Wraps `resolve_app` + `discover_app_canisters`; no auth |
+| `discover_app_canisters` | `domain` | Canister ids behind a web domain — the app's own `/.well-known/ic-architecture` manifest first (the [ICP service-discoverability protocol](#the-icp-service-discoverability-protocol)'s composition layer: every canister the app *declares*, with names and roles), then the superseded `/.well-known/ic-app.json` manifest as a read-only fallback, then the frontend via `x-ic-canister-id` and backend candidates via `/env.json` + JS-bundle mining — each with provenance, its IC dashboard label/type where known, and (for the app's own canisters) `oql`/`api_doc_available` capability flags from a one-shot Candid probe. Only the `ic-architecture` manifest is a declaration the write gate accepts; every other source here is a read-only hint that [cannot authorize a write](#update-call-authorization) |
 | `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus two capability flags: `oql` (`true` when it exposes an OQL query surface — a `schema` + `execute` pair — with a pointer to `icp_oql_guide`) and `api_doc_available` (`true` when it declares a `getApiDoc`/`get_api_doc` method, gating `get_canister_api_doc`) |
-| `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), from its `getApiDoc`/`get_api_doc` method. Call **only** when `get_canister_candid`/`open_app` report `api_doc_available`. Returns a **structured** result in every case — `available` + the doc on success, else `available:false` with `expected`/`retry`/`next` so an expected absence is distinct from an unreachable canister |
+| `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), from its `getApiDoc`/`get_api_doc` method. Call **only** when `get_canister_candid`/`open_app` report `api_doc_available`. Returns a **structured** result for every documentation outcome — `available` + the doc on success, else `available:false` with `expected`/`retry`/`next`, so "no compatible method was detected" is distinct from "no answer was obtained". An unusable `canister_id` is rejected before any lookup and is a plain error, not that shape; and `expected:true` is not proof of absence, since an interface the parser cannot read also comes up empty |
 | `canister_query` | `canister_id`, `method?` **or** `oql?`, `args?` (textual Candid), `derivation_origin?`, `account?`, `candid?` | READ a canister — provide EITHER a Candid `query` `method` (with `args`) OR an `oql` query (a JSON object string, run against `execute`). A Candid `method` query may be anonymous or as your account and returns textual Candid; an `oql` query **requires** `derivation_origin` and returns `columns` + `rows` (a table) with `has_more`, validating `start` against the schema on an empty result. On an OQL canister a Candid `method` query is rejected — use `oql`. `candid` is a fallback: the `.did` interface text to encode/decode against when the canister exposes no `candid:service` metadata. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
-| `canister_update_call` | `canister_id`, `method`, `args` (textual Candid), **`application_origin`**, `derivation_origin?`, `account?`, `candid?` | Make an UPDATE (state-changing) call; reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`/`resolve_app`). **Two layers of authorization, both of which must pass** (see [Update-call authorization](#update-call-authorization)). *Layer 1 — registration:* `application_origin` is **required**; the origin must be a registered application whose developer accepted the [ICP MCP Developer Terms](#the-developer-terms), and its own `/.well-known/ic-architecture` manifest — re-read on every call — must declare the target canister. A canister id found any other way (header, `/env.json`, JS bundle) cannot be written to, and every failure refuses. *Layer 2 — financial transactions are refused* even inside that surface: the ICRC-standard transfer/approval methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents) and the NNS/SNS governance method `manage_neuron` (neuron staking and disbursement) are disallowed on every canister, and the ICP and cycles ledgers' own value-moving methods (the legacy `transfer`, `withdraw`, the `create_canister` spends) on those ledgers; and **every** update call is refused on a curated list of known financial-service canisters (token ledgers and minters, exchanges, wallet backends, staking/governance) — all to protect the user. The refusal directs the user to act themselves — in a wallet they control (e.g. [oisy.com](https://oisy.com)), or, for canister creation, with the [icp CLI](https://github.com/dfinity/icp-cli) in their own terminal. `candid` is the same `.did` fallback as on `canister_query`, used when the interface isn't published on-chain. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
+| `canister_update_call` | `canister_id`, `method`, `args` (textual Candid), **`application_origin`**, `derivation_origin?`, `account?`, `candid?` | Make an UPDATE (state-changing) call; reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`/`resolve_app`). **Two layers of authorization, both of which must pass** (see [Update-call authorization](#update-call-authorization)). *Layer 1 — registration:* `application_origin` is **required**; the origin must be a registered application whose developer accepted the [ICP MCP Developer Terms](#the-developer-terms), and its own `/.well-known/ic-architecture` manifest — re-read on every call — must declare the target canister. A canister id found any other way (header, `/env.json`, JS bundle) cannot be written to, and every failure refuses. *Layer 2 — financial transactions are refused* even inside that surface: the ICRC-standard transfer/approval methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents) and the NNS/SNS governance method `manage_neuron` (neuron staking and disbursement) are disallowed on every canister, and the ICP and cycles ledgers' own value-moving methods (the legacy `transfer`, `withdraw`, the `create_canister` spends) on those ledgers; and **every** update call is refused on a curated list of known financial-service canisters (token ledgers and minters, exchanges, wallet backends, staking/governance) — all to protect the user. The refusal directs the user to perform the operation outside this connector, in a trusted interface they control — or, for canister creation and funding, with the [icp CLI](https://github.com/dfinity/icp-cli) in their own terminal — and deliberately names no venue. `candid` is the same `.did` fallback as on `canister_query`, used when the interface isn't published on-chain. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
 | `get_app_principal` | `derivation_origin`, `account?` | The principal you act as at an app, without a call. Identify the app by its `derivation_origin` (from `open_app`/`resolve_app`). Echoes `derived_for_origin` / `requested` so an origin mismatch is visible |
 | `list_app_accounts` | `derivation_origin` | The user's Internet Identity accounts at an app — the default account plus any named ones — with name, number, last-used, and the derivation origin they were listed for. Identify the app by its `derivation_origin` (from `open_app`/`resolve_app`) |
 | `resolve_app` | `app_url` | Resolve an app URL to its Internet Identity derivation context: `application_origin`, the `derivation_origin` to use (declared in `/.well-known/ii-derivation-origin`, else a built-in known-app value, else assumed = app origin — flagged via `derivation_origin_source`: `declared`/`known`/`app_url_default`, with `application_is_ic` echoing the gateway evidence), and the app's `alternative_origins` (informational). An origin with **no IC evidence** that would need the `app_url_default` assumption is **refused** (guessed-domain guard, with a "did you mean" repair when the host resembles a well-known app). Does not return a principal (no account chosen) or require auth — pass the `derivation_origin` to `get_app_principal`/`list_app_accounts` |
 | `icp_oql_guide` | — | The OQL query-surface dialect guide (for canisters where `get_canister_candid` reports `oql: true`): the JSON query object, predicate grammar, edges, and paged result shape. The entity/field names come from `get_canister_oql_schema` and queries run through `canister_query` (the `oql` argument) |
-| `get_canister_oql_schema` | `canister_id`, `derivation_origin`, `account?` | The canister's OQL schema catalogue (entities, primary keys, fields, edges) as JSON — wraps its `schema` method — plus a ready-to-run `canister_query` example per entity. **`derivation_origin` is required**: the schema is caller-gated, so an anonymous read is rejected (for now) with guidance, rather than returning an empty list |
+| `get_canister_oql_schema` | `canister_id`, `derivation_origin`, `account?` | The canister's OQL schema catalogue (entities, primary keys, fields, edges) as JSON — wraps its `schema` method — plus a ready-to-run `canister_query` example per entity. **`derivation_origin` is required**: this server rejects an anonymous read (for now) with guidance — its own rule, not an inference about the canister — rather than calling `schema` anonymously and returning an empty list |
 
 `open_app` (its `app` argument takes a name **or** a URL) is the one-call entry point
 when the user names or links an app: it resolves the Internet Identity
@@ -363,8 +362,8 @@ The protocol proves *composition* and nothing more. Serving a manifest does not
 establish that the publisher accepted any terms, that it is entitled to expose
 every canister it lists, which of its update methods are safe to call, or that
 its behaviour stays inside this server's policies. That is what the
-[ICP MCP Developer Terms](https://mcp.internetcomputer.org/developer-terms)
-(served at `/developer-terms`) carry: registering an application is the
+[ICP MCP Developer Terms](https://internetcomputer.org/icp-mcp/developer-terms/)
+carry: registering an application is the
 publisher's representation that it may expose every canister its manifest lists,
 and that the operations reachable through this server move no value, are safe
 for an assistant to call on a user's behalf, and handle personal data lawfully.
@@ -541,8 +540,9 @@ its `oql` argument as a plain JSON object string, wraps it as `execute`'s single
 decodes the reply into `columns` + `rows` — rendered as a markdown table, with
 `has_more` for paging. Both **require** a
 `derivation_origin` (with an optional `account`) to query as the user's account —
-the schema and rows are caller-gated, so an anonymous per-app read is **rejected**
-(for now) with guidance to pass the origin rather than silently returning empty
+this server **rejects** an anonymous per-app read (for now) with guidance to pass
+the origin rather than silently returning empty — the connector's rule, not a claim
+about how any given canister authorizes callers
 (same on-demand delegation as a `canister_query` Candid `method` query, which stays
 permissive so genuinely public canisters can still be read anonymously). Because OQL
 is the preferred read path when a canister offers it, a Candid `method` **query**
@@ -578,27 +578,33 @@ flow.
 
 ```bash
 cargo run
-# serves http://0.0.0.0:8000  (MCP at /mcp against production II, OAuth under it, info page at /)
+# serves http://0.0.0.0:8000  (MCP at /mcp against production II, OAuth under it; / redirects to the landing site)
 # honours $PORT (default 8000), $PUBLIC_URL (default http://localhost:8000),
 # $MCP_SERVE_BETA (set it to also serve the beta II instance at /mcp-beta, for staging),
 # and $MCP_SERVE_METRICS (set it to serve the Prometheus exposition at /metrics)
 ```
 
-`GET /` serves a self-contained, ICP-styled landing page that names the
-production `/mcp` endpoint (staging also serves beta II at `/mcp-beta`) and lists
-the tools grouped by purpose. `GET /version` is the operations probe (see [Auth](#auth-oauth-21-login-via-internet-identity)).
+The human-facing pages — the landing page, the `/privacy-policy`, `/support`,
+and `/terms` documents the connector directories require, and the publisher-facing
+`/developer-terms` — are maintained in [dfinity/internetcomputer-org]
+(`public/icp-mcp/`) and served at <https://internetcomputer.org/icp-mcp/>, so the
+content exists exactly once. This origin answers their paths (`/`,
+`/privacy-policy`, `/support`, `/terms`, `/developer-terms`) with permanent
+redirects there, keeping every published link working. The Developer Terms'
+source text lives here, in [`docs/icp-mcp-developer-terms-draft.md`](docs/icp-mcp-developer-terms-draft.md),
+alongside the privacy policy's: it carries the revision the write gate enforces,
+and a test fails if the two drift apart. `GET /version` is the operations probe (see [Auth](#auth-oauth-21-login-via-internet-identity)).
 
-The binary also serves the official pages the connector directories require:
-`/privacy-policy` (linked from the landing page's footer), `/support`, and
-`/terms` — self-contained documents compiled in like every other asset. For the
-OpenAI directory's domain-verification check, `GET
+[dfinity/internetcomputer-org]: https://github.com/dfinity/internetcomputer-org
+
+For the OpenAI directory's domain-verification check, `GET
 /.well-known/openai-apps-challenge` returns `$OPENAI_APPS_CHALLENGE_TOKEN`
 verbatim as `text/plain` (trimmed), and 404s while the variable is unset or
 blank — so the endpoint is inert except during a submission window.
 
 ## Deploy
 
-The deployment binary is **self-contained**: the connect/landing HTML, CSS, and SVG
+The deployment binary is **self-contained**: the connect HTML, CSS, and SVG
 (`src/assets/` and `crates/imcp2-core/src/assets/`) and the reference
 docs (`crates/imcp2-core/static/`) are compiled in with `include_str!`,
 so nothing has to ship next to it (both are build-time inputs only). The

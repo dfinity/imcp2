@@ -59,7 +59,7 @@ under submission; the live pre-release build still serves the old surface
 | OAuth endpoint latency ≤ 10 s (discovery/registration/token) | ✅ all sub-second in probes |
 | Support channel | ✅ <mcp@dfinity.org> (shown on every error screen) |
 | Security-vulnerability reporting mechanism (a Software Directory Terms obligation) | ✅ [`SECURITY.md`](../SECURITY.md) → Hackenproof bug bounty |
-| Public documentation by publish date | ✅ this repo's README + the landing page at <https://mcp.internetcomputer.org> |
+| Public documentation by publish date | ✅ this repo's README + the landing page at <https://internetcomputer.org/icp-mcp/> (its one home, maintained in dfinity/internetcomputer-org; `https://mcp.internetcomputer.org` permanently redirects there from the release that ships #165) |
 | Status/health visibility | ✅ <https://mcp.internetcomputer.org/status/> |
 
 Notes on auth mode: pure M2M `client_credentials` is unsupported by Claude
@@ -128,14 +128,17 @@ server actually does, it should cover at least:
   explicitly, or disclose them if added).
 - **Controller and contact:** DFINITY Stiftung; <mcp@dfinity.org>.
 
-Publication venue: `https://mcp.internetcomputer.org/privacy-policy`, served
-by the MCP server itself. The page and its route shipped in
-[#112](https://github.com/dfinity/imcp2/pull/112) (effective date August 3,
-2026), the landing page's footer links it, and the page is live on
-production (verified 2026-08-27: HTTP 200). What remains: enter that URL in
-the portal, and cut the next `release-*` first — the live text is behind
-`main` (the current draft's identifier-linkability wording and the updated
-third-party list land with that release). The reviewed source
+Publication venue: `https://internetcomputer.org/icp-mcp/privacy-policy/` —
+the page's one home, maintained in dfinity/internetcomputer-org
+(`public/icp-mcp/privacy-policy/`) and live there
+(dfinity/internetcomputer-org#77 refreshes its text to the current draft:
+the identifier-linkability wording and the updated third-party list).
+The MCP server no longer serves a copy: from the release that ships
+[#165](https://github.com/dfinity/imcp2/pull/165),
+`https://mcp.internetcomputer.org/privacy-policy` answers with a permanent
+redirect to that home (until that release it still serves the previous
+revision itself). Either URL works in the portal; prefer the canonical one.
+The reviewed source
 text is [`icp-mcp-privacy-policy-draft.md`](icp-mcp-privacy-policy-draft.md).
 
 ### 2. Financial-transactions policy
@@ -147,47 +150,62 @@ transactions**, and the portal's compliance step requires acknowledging this.
 **The server is not a financial tool, and does not support financial
 transactions:**
 
-- **The connector has no funding or management tools.** Creating, funding,
-  and managing canisters is done by the user with the icp CLI in their own
-  terminal.
-- **State-changing calls reach a registered surface only.** `canister_update_call`
-  requires an `application_origin`, and executes only when that origin is a
-  registered application — its developer having accepted the ICP MCP Developer
-  Terms (published at `/developer-terms`) — whose own
+- **The connector serves no funding, creation, or canister-management
+  tools.** Creating, funding, and deploying canisters is work the user does
+  with the icp CLI in their own terminal. The generic `canister_update_call`
+  is not a way around that either: management-canister lifecycle calls must
+  carry the TARGET canister as the request's effective canister id, which the
+  update-call path does not set (it defaults to the callee, `aaaaa-aa`), so
+  the boundary node rejects them. No dedicated management tooling is served,
+  and
+  none of this moves funds.
+- **State-changing calls reach a registered surface only.**
+  `canister_update_call` requires an `application_origin`, and executes only
+  when that origin is a registered application — its developer having accepted
+  the ICP MCP Developer Terms
+  (<https://internetcomputer.org/icp-mcp/developer-terms/>) — whose own
   `/.well-known/ic-architecture` manifest, published under the
   [ICP service-discoverability protocol][protocol] and re-read on every call,
   declares the target canister. Every failure refuses; there is no fallback. A
   canister the connector can otherwise discover behind a domain (the gateway's
-  `x-ic-canister-id` header, an `/env.json`, a JavaScript bundle) can be **read**
-  and never **written to**. So an arbitrary ledger, minter, or exchange canister
-  is out of reach of a state-changing call regardless of method name: none of
-  them is a registered application, and none declares a manifest naming itself.
-  The registry ships empty and grows only by reviewed change, so the set of
-  applications that may receive writes is public and auditable.
-- Within that registered surface, `canister_update_call` **refuses the
-  standardized value-moving methods** —
+  `x-ic-canister-id` header, an `/env.json`, a JavaScript bundle) can be
+  **read** and never **written to**. So an arbitrary ledger, minter, or
+  exchange canister is out of reach of a state-changing call regardless of
+  method name: none of them is a registered application, and none declares a
+  manifest naming itself. The registry ships empty and grows only by reviewed
+  change, so the set of applications that may receive writes is public and
+  auditable.
+- Within that registered surface, `canister_update_call`
+  **refuses the standardized value-moving methods** —
   the ICRC-standard transfer/approval names
   (ICRC-1/ICRC-2 plus ICRC-4/-7/-37) and the NNS/SNS governance method
   `manage_neuron` (neuron staking and disbursement, on every SNS DAO's
   governance as well as the NNS's) on every canister, and the ICP and
   cycles ledgers' own `transfer`/`send_dfx`/`withdraw`/`create_canister`
-  methods on those ledgers, and refuses **every** update call on a curated,
-  dashboard-verified list of known financial-service canisters (token ledgers
-  and minters, exchanges, wallet backends, staking/governance canisters and
-  their frontends); the refusal recommends the user act themselves
-  in a wallet they control (oisy.com; a refused canister-creation spend
-  points at the user-run icp CLI), and the policy is stated in the
-  server-level instructions — deliberately not in the tool descriptions,
-  which stay free of financial language. This guard is deliberately
-  origin-blind, so registration cannot launder a financial call through it: a
-  registered application gets access to its own declared canisters, never the
-  right to move value.
-- The README, the landing page, and the server instructions all state
-  explicitly that financial transactions are not supported, and the README and
-  the server instructions additionally state the registration requirement for
-  state-changing calls.
-
-[protocol]: https://docs.internetcomputer.org/guides/frontends/service-discoverability/
+  methods on those ledgers, the cycles-minting canister's funding-completion
+  methods (`notify_top_up`, `notify_create_canister`, `notify_mint_cycles`,
+  `create_canister`), and refuses **every** update call on the
+  financial-service canisters it carries; the refusal tells the user to
+  perform the operation
+  outside the connector, in a trusted interface they control, and names no
+  venue (a refused canister-creation or funding-completion call points at the
+  user-run icp CLI). The policy is stated in the server-level instructions —
+  the field the directories scan — where it covers the whole surface at once,
+  and a unit test holds it there. What those instructions state is the policy
+  itself, not its implementation: the method families and canister scopes are
+  in the guard and in the refusal an attempted call receives, so the
+  instructions carry no copy of that list to keep in sync. This guard is
+  deliberately origin-blind, so registration cannot launder a financial call
+  through it: a registered application gets access to its own declared
+  canisters, never the right to move value.
+- The README and the server instructions both state explicitly that
+  financial transactions are not supported, and both additionally state the
+  registration requirement for state-changing calls. The landing page is no longer one
+  of them: #165 moved it to <https://internetcomputer.org/icp-mcp/>,
+  maintained in dfinity/internetcomputer-org, and the page committed there
+  carries no policy text. Stating otherwise here would be a claim about
+  content this repository cannot keep true, so adding the posture to that
+  page belongs in that repository.
 
 **Posture, stated plainly — the black-and-white answer the compliance step
 needs:** no tool initiates or executes a transfer of the user's funds. Two
@@ -203,6 +221,32 @@ qualifications.
 **mcp-review thread:** an email to <mcp-review@anthropic.com> (2026-07-31)
 asked ahead about this acknowledgment. No reply is needed to submit; if one
 arrives, answer with the posture above.
+
+Related point for the same step: the **model-readable metadata describes the
+surface and the constraints on using it, without attempting to manipulate
+Claude**. The server instructions, all 11 tool descriptions, and every
+argument and reply schema each say what their tool does, returns, rejects, and
+requires — the guidance a caller needs to use it correctly and safely, which
+both directories expect a description to carry, including `open_app`'s "do not
+construct a domain from the name". What none of them carries is the set of
+manipulations the directories prohibit: unrelated behavioral instructions,
+overly broad triggering, preference over or interference with other tools,
+calls to unrelated external software, and hidden or obfuscated instructions. A
+unit test (`model_readable_metadata_respects_marketplace_policy`) guards that
+across every one of those surfaces, and what it guarantees is worth stating
+exactly: it rejects an enumerated set of phrasings — the ones that appeared here
+before, plus the ones review named — and, completely, any character outside a
+small allowlist, so nothing invisible can ride along in a field doc. Judging a
+novel phrasing of a prohibited intent stays human review's job.
+`the_policy_gate_catches_what_it_lists` keeps the gate live from both sides, and
+`open_app_metadata_forbids_a_constructed_domain` pins the safeguard itself.
+Each description also matches the tool's behavior, so no side effect is
+implicit — with one deliberate exception: the financial-transactions policy is
+stated in the server-level instructions and in no tool description (a policy
+paragraph inside `canister_update_call`'s description would read as a hint that
+the tool is usable for financial transactions), and a test
+(`financial_policy_is_a_server_instruction_not_a_description`) keeps it that
+way. The refusal itself is the tool's error text at call time.
 
 Related honesty point for the same step: there is **no per-call confirmation**
 for sensitive methods server-side today —
@@ -297,10 +341,13 @@ Paste-and-adapt; portal limits in parentheses.
   > lookalike domains are refused rather than resolved.
 - **Categories** (1–5): Developer tools; plus whatever the portal offers
   closest to data/productivity/web3.
-- **Documentation URL:** `https://mcp.internetcomputer.org` (landing page;
-  README as backup: `https://github.com/dfinity/imcp2#readme`)
-- **Privacy policy URL:** `https://mcp.internetcomputer.org/privacy-policy`
-  — enter it only once the page is live (blocker 1); a missing or incomplete
+- **Documentation URL:** `https://internetcomputer.org/icp-mcp/` (the landing
+  page's home; `https://mcp.internetcomputer.org` permanently redirects there
+  from the release that ships #165. README as backup:
+  `https://github.com/dfinity/imcp2#readme`)
+- **Privacy policy URL:** `https://internetcomputer.org/icp-mcp/privacy-policy/`
+  (live; the old `https://mcp.internetcomputer.org/privacy-policy` permanently
+  redirects there from the release that ships #165). A missing or incomplete
   policy is documented as immediate rejection. Do not substitute the
   foundation-wide `dfinity.org/privacy`.
 - **Support contact:** `mcp@dfinity.org`
@@ -345,19 +392,31 @@ Paste-and-adapt; portal limits in parentheses.
 >    questions" additionally allows state-changing calls
 >    (`canister_update_call`).
 > 3. Try the example prompts above. On a Questions-only session a
->    state-changing call (`canister_update_call`) is rejected by the
->    network and the tool reports the failed call; the server
->    instructions prime the assistant to explain the access level and
->    recommend reconnecting under "Actions & questions" — that behavior
->    is intended. Access is revocable at any time at
->    https://id.ai/manage/settings.
-> 4. Canister-management tools are not part of this connector, so there is
->    nothing to provision: creating and managing canisters happens outside
->    the connector, with the icp CLI.
+>    state-changing call made AS YOUR APP ACCOUNT (`canister_update_call`
+>    with a `derivation_origin`, so it is signed with that session's
+>    delegation) is rejected by the network, and the tool reports the
+>    failed call — that behavior is intended, and reconnecting under
+>    "Actions & questions" is what permits such calls. A call with no
+>    `derivation_origin` is not signed with the delegation at all: it runs
+>    as the anonymous principal, so the access level does not decide it.
+>    The connector's own checks still do — the financial-transactions guard
+>    runs before any identity resolution or network I/O, so a call it refuses
+>    is refused with or without an origin — and past that the canister
+>    decides. The server instructions describe both, so the assistant can
+>    explain which case a call is in. Access is revocable at
+>    any time at https://id.ai/manage/settings.
+> 4. No canister creation, funding, or dedicated management tool is served,
+>    so there is nothing to provision: that work happens outside the
+>    connector, with the icp CLI. (`canister_update_call` is not a substitute:
+>    management-canister lifecycle calls need the target as the effective
+>    canister id, which that path does not set, so the boundary node rejects
+>    them.)
 > 5. Financial ledger operations are refused by design: asking the assistant
->    to move tokens returns a policy message directing the user to a wallet
->    they control — that behavior is intended (financial transactions are
->    not supported).
+>    to move tokens returns a policy message saying financial transactions
+>    are not supported and recommending the operation be performed outside
+>    this connector, in a trusted interface you control — that behavior is
+>    intended. The message names no specific venue, and a test enforces
+>    that, so do not expect it to name a wallet.
 > 6. State-changing calls to an application that is not registered with us are
 >    also refused by design, with a message naming the ICP MCP Developer Terms
 >    and offering the read instead. The registry ships empty, so **every**
@@ -388,7 +447,7 @@ conversation beyond tool arguments and generates no media.
 
 ## Submission-day checklist
 
-- [ ] Privacy policy entered in the portal — the page is already live at `https://mcp.internetcomputer.org/privacy-policy` (verified 2026-08-27); the next `release-*` refreshes its text to the current draft (blocker 1)
+- [ ] Privacy policy entered in the portal — enter `https://internetcomputer.org/icp-mcp/privacy-policy/`, the page's one home (live; dfinity/internetcomputer-org#77 refreshes its text to the current draft, and the old mcp.internetcomputer.org URL redirects there from the release that ships #165) (blocker 1)
 - [x] Financial-transactions acknowledgment is a clean yes (blocker 2): the server does not support financial transactions. No mcp-review reply is needed; if one arrives, answer with the stated posture. The first-party-API/data-handling question was NOT in the 2026-07-31 email: raise it with mcp-review only if the portal's data-handling options don't fit
 - [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — if a reviewer asks for a populated account, provision a demo-app account (no funding needed: there are no funding or canister-management tools)
 - [ ] `release-*` tag cut; `/version` on production shows the intended commit (blocker 4)

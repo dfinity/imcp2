@@ -548,8 +548,9 @@ mod tests {
 
         // Layer ordering, end to end: the financial guard is evaluated FIRST,
         // so a value-moving request gets the answer it actually needs — do it
-        // in a wallet you control — rather than a registration message that
-        // would read as though registering could make the transfer possible.
+        // yourself, outside this connector — rather than a registration message
+        // that would read as though registering could make the transfer
+        // possible.
         // The refusal is therefore the same whether or not the named
         // application is registered.
         let (is_error, text, _) = call(
@@ -568,8 +569,8 @@ mod tests {
             "the financial guard answers first: {text}"
         );
         assert!(
-            text.contains("oisy.com"),
-            "and redirects to a wallet the user controls: {text}"
+            text.contains("outside this connector, in a trusted interface they control"),
+            "and redirects the user outside this connector: {text}"
         );
         assert!(
             !text.contains("Developer Terms"),

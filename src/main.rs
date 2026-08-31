@@ -1,7 +1,8 @@
 //! Deployment binary for the [`imcp2`] library: serves the production Internet
-//! Identity instance at `/mcp` and adds the deployment niceties (the landing
-//! page, a `/version` probe with live-session gauges, request logging,
-//! env-driven config, drained graceful shutdown).
+//! Identity instance at `/mcp` and adds the deployment niceties (permanent
+//! redirects to the landing site's home on internetcomputer.org, a `/version`
+//! probe with live-session gauges, request logging, env-driven config, drained
+//! graceful shutdown).
 //!
 //!   * `/mcp`: the MCP endpoint against **production** Internet Identity, with
 //!     its OAuth AS at `/mcp/oauth/*` (issuer `<PUBLIC_URL>/mcp`). Always
@@ -22,10 +23,10 @@
 //! `$OPENAI_APPS_CHALLENGE_TOKEN` (serve the OpenAI Apps domain-verification
 //! token at `/.well-known/openai-apps-challenge`; 404 while unset).
 //!
-//! Also serves `/sitemap.xml` and `/robots.txt`, both built from `$PUBLIC_URL`
-//! so each deployment advertises its own origin.
+//! Also serves `/robots.txt` (keeping crawlers off the machine surface) and
+//! `/favicon.svg` (the tab icon the connect screens link).
 
-use axum::{response::Html, routing::get, Json, Router};
+use axum::{routing::get, Json, Router};
 use imcp2::{
     auth_callbacks_router, ii_app_metadata_router, Agent, IiInstance, McpConfig, McpServer,
     SharedClients, IC_URL,
@@ -93,21 +94,43 @@ fn serve_metrics() -> bool {
         .unwrap_or(false)
 }
 
-/// The landing page served at `/`: a self-contained design bundle exported from
-/// Claude Design (`assets/index.html`, compiled in via `include_str!`, no
-/// runtime file I/O). It is a single HTML document that inlines its own fonts,
-/// images, styles, and render runtime as an embedded resource bundle and unpacks
-/// itself client-side — so it stays self-contained (no external fonts, scripts,
-/// or images) despite the richer look. It shares the connect flow's ICP identity
-/// — parchment grid, editorial serif, rust accent, "Hosted by DFINITY" mark — so
-/// the root page and the connect screens read as one product, and walks through
-/// what an agent can do: discovery, identity, on-network queries, actions, skills.
-///
-/// Patched over the raw export with the `<link rel=icon>` for [`FAVICON_SVG`],
-/// in the shell `<head>` and again in the head fragment the unpack routine
-/// injects — the unpack replaces `documentElement`, so only the second copy
-/// survives to render. A re-export drops both.
-const INDEX_HTML: &str = include_str!("assets/index.html");
+/// The landing site's home. The human-facing pages this origin used to serve
+/// itself — the landing page and its `/privacy-policy`, `/support` and
+/// `/terms` subpages — are maintained in one place, dfinity/internetcomputer-org
+/// (`public/icp-mcp/`), and served at internetcomputer.org under this prefix.
+/// `/developer-terms` — the publisher-facing agreement the write gate enforces
+/// (see [`imcp2_core::DEVELOPER_TERMS_URL`]) — lives there too, and never had a
+/// copy here: its source text is `docs/icp-mcp-developer-terms-draft.md`.
+/// This origin answers their old paths with permanent redirects instead of
+/// copies, so every published link keeps working — the directory listings'
+/// policy URLs, old bookmarks, search results — while the content exists
+/// exactly once. `/status/` is unaffected: the live dashboard is this
+/// deployment's own monitoring surface, published by the fronting proxy.
+const LANDING_SITE: &str = "https://internetcomputer.org/icp-mcp";
+
+/// The page paths this origin used to serve, each answered with a permanent
+/// redirect (308) to its home under [`LANDING_SITE`]. The targets carry the
+/// trailing slash the static site canonicalizes to, so a client lands in one
+/// hop.
+fn landing_redirects_router() -> Router {
+    const PAGES: &[(&str, &str)] = &[
+        ("/", "/"),
+        ("/privacy-policy", "/privacy-policy/"),
+        ("/support", "/support/"),
+        ("/terms", "/terms/"),
+        ("/developer-terms", "/developer-terms/"),
+    ];
+    let mut router = Router::new();
+    for (path, target) in PAGES {
+        router = router.route(
+            path,
+            get(move || async move {
+                axum::response::Redirect::permanent(&format!("{LANDING_SITE}{target}"))
+            }),
+        );
+    }
+    router
+}
 
 /// `GET /metrics` — the Prometheus exposition for `registry`. Its own router so
 /// the gate stays one line at the call site (see [`serve_metrics`]) and the
@@ -168,84 +191,25 @@ fn metrics_router(registry: prometheus::Registry, metrics: imcp2::metrics::Metri
 /// reads against both the light and dark browser chrome.
 const FAVICON_SVG: &str = include_str!("assets/favicon.svg");
 
-/// The public, human-facing pages this origin serves, as absolute-path
-/// suffixes. This is the sitemap's and robots.txt's shared idea of "content":
-/// every other route is machine surface that a crawler has no use for and that
-/// we do not want indexed — `/mcp` (+ `/mcp-beta`) answer 401 to an
-/// unauthenticated fetch, `/version` is an operations probe, `/status/` is the
-/// dashboard, and `/.well-known/*` documents are for clients, not readers.
-/// Keep in step with the page routes registered in `main`.
-const PUBLIC_PAGES: &[&str] = &[
-    "/",
-    "/privacy-policy",
-    "/terms",
-    "/developer-terms",
-    "/support",
-];
+/// `GET /robots.txt` — keeps crawlers off the machine surface. Nothing here is
+/// a security control: the paths it names are already either authenticated or
+/// harmless, and robots.txt is advisory. There is no sitemap any more — the
+/// human-facing pages moved to [`LANDING_SITE`] and this origin answers their
+/// paths with redirects a crawler may follow — so this exists purely so the
+/// MCP and probe endpoints stay out of search results.
+const ROBOTS_TXT: &str = "User-agent: *\n\
+    Allow: /\n\
+    Disallow: /mcp\n\
+    Disallow: /mcp-beta\n\
+    Disallow: /version\n\
+    Disallow: /status/\n\
+    Disallow: /.well-known/\n";
 
-/// Escape the five XML metacharacters. `PUBLIC_URL` is operator-supplied, so a
-/// stray `&` in it must not produce a malformed sitemap that a crawler rejects
-/// wholesale.
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-/// `GET /sitemap.xml` — a [sitemaps.org] 0.9 urlset naming the public pages.
-///
-/// The entries must be absolute, so they are built from `PUBLIC_URL` at
-/// startup rather than baked in: staging and production then each advertise
-/// their own origin instead of both claiming production's. A trailing slash on
-/// the configured value is trimmed so the joins can't yield `//privacy-policy`.
-///
-/// Deliberately `<loc>`-only: `<lastmod>` would have to come from build time,
-/// which changes on every redeploy whether or not a page did, and `changefreq`
-/// and `priority` are ignored by the major crawlers.
-///
-/// [sitemaps.org]: https://www.sitemaps.org/protocol.html
-fn sitemap_xml(public_url: &str) -> String {
-    let origin = xml_escape(public_url.trim_end_matches('/'));
-    let urls: String = PUBLIC_PAGES
-        .iter()
-        .map(|p| format!("  <url><loc>{origin}{}</loc></url>\n", if *p == "/" { "/" } else { p }))
-        .collect();
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n\
-         {urls}</urlset>\n"
-    )
-}
-
-/// `GET /robots.txt` — points crawlers at the sitemap (its only discovery
-/// path, short of submitting it to each search console by hand) and keeps them
-/// off the machine surface. Nothing here is a security control: the paths it
-/// names are already either authenticated or harmless, and robots.txt is
-/// advisory. It exists so crawl budget goes to the four pages that are worth
-/// reading and so the MCP and probe endpoints stay out of search results.
-fn robots_txt(public_url: &str) -> String {
-    let origin = public_url.trim_end_matches('/');
-    format!(
-        "User-agent: *\n\
-         Allow: /\n\
-         Disallow: /mcp\n\
-         Disallow: /mcp-beta\n\
-         Disallow: /version\n\
-         Disallow: /status/\n\
-         Disallow: /.well-known/\n\
-         \n\
-         Sitemap: {origin}/sitemap.xml\n"
-    )
-}
-
-/// Serve `/sitemap.xml`, `/robots.txt` and `/favicon.svg` for the given public
-/// origin, each with the content type its consumers expect (`application/xml`,
-/// `text/plain` and `image/svg+xml`).
-fn site_metadata_router(public_url: &str) -> Router {
-    let sitemap = sitemap_xml(public_url);
-    let robots = robots_txt(public_url);
+/// Serve `/robots.txt` and `/favicon.svg`, each with the content type its
+/// consumers expect (`text/plain` and `image/svg+xml`). The favicon stays
+/// served with the landing pages gone: the connect and error screens link
+/// `/favicon.svg` for their tab icon.
+fn site_metadata_router() -> Router {
     Router::new()
         .route(
             "/favicon.svg",
@@ -260,19 +224,9 @@ fn site_metadata_router(public_url: &str) -> Router {
             }),
         )
         .route(
-            "/sitemap.xml",
-            get(move || {
-                let sitemap = sitemap.clone();
-                async move { ([(axum::http::header::CONTENT_TYPE, "application/xml")], sitemap) }
-            }),
-        )
-        .route(
             "/robots.txt",
-            get(move || {
-                let robots = robots.clone();
-                async move {
-                    ([(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], robots)
-                }
+            get(|| async {
+                ([(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], ROBOTS_TXT)
             }),
         )
 }
@@ -304,68 +258,6 @@ fn openai_apps_challenge_router(token: Option<String>) -> Router {
             }
         }),
     )
-}
-
-/// The privacy policy served at `/privacy-policy` — the URL the Anthropic
-/// connectors-directory listing points at, and the target of the landing
-/// page's footer link. The markup lives in
-/// `assets/privacy-policy.html` (compiled in via `include_str!`, no runtime
-/// file I/O) and shares the connect flow's ICP identity so it reads as the
-/// same product. Its one substitution is the shared DFINITY wordmark
-/// (`assets/dfinity-logo.svg`), inlined once on first use so the served page
-/// stays fully self-contained (no external fonts, scripts, or images).
-const PRIVACY_POLICY_HTML: &str = include_str!("assets/privacy-policy.html");
-const DFINITY_LOGO_SVG: &str = imcp2_core::iiconnect::CONNECT_LOGO_SVG;
-
-fn privacy_policy_page() -> &'static str {
-    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PAGE.get_or_init(|| PRIVACY_POLICY_HTML.replace("__LOGO__", DFINITY_LOGO_SVG))
-}
-
-/// The support page served at `/support` — the customer-support URL the
-/// directory listings (OpenAI requires a URL, not just an address) point at.
-/// Same construction as `/privacy-policy`: a self-contained document sharing
-/// the connect flow's ICP identity, with the DFINITY wordmark as its one
-/// substitution. It routes users to mcp@dfinity.org, the status dashboard,
-/// id.ai's access management, GitHub issues, and the security policy.
-const SUPPORT_HTML: &str = include_str!("assets/support.html");
-
-fn support_page() -> &'static str {
-    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PAGE.get_or_init(|| SUPPORT_HTML.replace("__LOGO__", DFINITY_LOGO_SVG))
-}
-
-/// The Terms of Service served at `/terms` — the terms URL the directory
-/// listings point at, and the usage contract the privacy policy's
-/// performance-of-service legal basis rests on. Same construction as
-/// `/privacy-policy` and `/support`.
-const TERMS_HTML: &str = include_str!("assets/terms.html");
-
-fn terms_page() -> &'static str {
-    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PAGE.get_or_init(|| TERMS_HTML.replace("__LOGO__", DFINITY_LOGO_SVG))
-}
-
-/// The **Developer** Terms served at `/developer-terms` — the agreement an
-/// application's publisher accepts to have its origin registered for
-/// state-changing calls, and the layer the ICP service-discoverability protocol
-/// cannot itself provide: the protocol proves an app's composition, these Terms
-/// carry the publisher's promises about it (that it may expose every canister it
-/// lists, and that its MCP-reachable operations stay inside this server's
-/// financial and data policies). Same construction as the other pages, plus one
-/// more substitution: the Terms **revision** is interpolated from
-/// [`imcp2_core::DEVELOPER_TERMS_VERSION`], the same constant the write gate
-/// compares a registration's acceptance against — so the served page and the
-/// enforced revision cannot drift apart (pinned by a test).
-const DEVELOPER_TERMS_HTML: &str = include_str!("assets/developer-terms.html");
-
-fn developer_terms_page() -> &'static str {
-    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PAGE.get_or_init(|| {
-        DEVELOPER_TERMS_HTML
-            .replace("__REVISION__", imcp2_core::DEVELOPER_TERMS_VERSION)
-            .replace("__LOGO__", DFINITY_LOGO_SVG)
-    })
 }
 
 #[tokio::main]
@@ -480,14 +372,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut app = Router::new()
-        .route("/", get(|| async { Html(INDEX_HTML) }))
-        .route("/privacy-policy", get(|| async { Html(privacy_policy_page()) }))
-        .route("/support", get(|| async { Html(support_page()) }))
-        .route("/terms", get(|| async { Html(terms_page()) }))
-        .route(
-            "/developer-terms",
-            get(|| async { Html(developer_terms_page()) }),
-        )
+        // The old landing-site paths: permanent redirects to their one home.
+        .merge(landing_redirects_router())
         // Unauthenticated build/version probe so operators and the status
         // dashboard can confirm exactly which deployment is live: the running
         // commit (baked in at build time via GIT_SHA), the build time
@@ -553,8 +439,8 @@ async fn main() -> anyhow::Result<()> {
         .merge(openai_apps_challenge_router(
             std::env::var("OPENAI_APPS_CHALLENGE_TOKEN").ok(),
         ))
-        // /sitemap.xml + /robots.txt, built from this deployment's PUBLIC_URL.
-        .merge(site_metadata_router(&public_url));
+        // /robots.txt + /favicon.svg (the icon the connect screens link).
+        .merge(site_metadata_router());
 
     // Prometheus exposition, only when $MCP_SERVE_METRICS opts in — see
     // `serve_metrics()`. The recording middleware below stays on either way, so
@@ -664,8 +550,8 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        metrics_router, openai_apps_challenge_router, serve_metrics, site_metadata_router,
-        sitemap_xml, PUBLIC_PAGES,
+        landing_redirects_router, metrics_router, openai_apps_challenge_router, serve_metrics,
+        site_metadata_router,
     };
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
@@ -735,8 +621,8 @@ mod tests {
         assert!(body.contains("imcp2_metrics_scrape_duration_seconds_count 1"), "{body}");
     }
 
-    async fn fetch(public_url: &str, path: &str) -> (StatusCode, String, Option<String>) {
-        let resp = site_metadata_router(public_url)
+    async fn fetch(path: &str) -> (StatusCode, String, Option<String>) {
+        let resp = site_metadata_router()
             .oneshot(Request::get(path).body(axum::body::Body::empty()).unwrap())
             .await
             .unwrap();
@@ -747,62 +633,92 @@ mod tests {
         (status, String::from_utf8(body.to_vec()).unwrap(), content_type)
     }
 
-    // Every public page must appear exactly once, as an ABSOLUTE url on the
-    // configured origin: a sitemap of relative paths, or one naming another
-    // deployment's origin, is rejected or ignored by crawlers.
+    // With the pages moved out, robots.txt only keeps crawlers off the machine
+    // surface — and must no longer advertise a sitemap this origin doesn't
+    // serve.
     #[tokio::test]
-    async fn sitemap_lists_every_public_page_as_an_absolute_url() {
-        let (status, body, content_type) =
-            fetch("https://mcp.internetcomputer.org", "/sitemap.xml").await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(content_type.as_deref(), Some("application/xml"));
-        for page in PUBLIC_PAGES {
-            let loc = format!("<loc>https://mcp.internetcomputer.org{page}</loc>");
-            assert_eq!(body.matches(&loc).count(), 1, "{page} should appear once in:\n{body}");
-        }
-        assert_eq!(body.matches("<loc>").count(), PUBLIC_PAGES.len());
-        // The machine surface stays out: these must never be advertised.
-        for hidden in ["/version", "/status/", "/.well-known", "/mcp<", "/mcp-beta"] {
-            assert!(!body.contains(hidden), "sitemap must not list {hidden}:\n{body}");
-        }
-    }
-
-    // A trailing slash on PUBLIC_URL must not produce `//privacy-policy`, and
-    // the root entry must stay exactly one slash.
-    #[tokio::test]
-    async fn sitemap_normalizes_a_trailing_slash_on_the_public_url() {
-        let body = sitemap_xml("https://example.test/");
-        assert!(body.contains("<loc>https://example.test/</loc>"));
-        assert!(body.contains("<loc>https://example.test/terms</loc>"));
-        assert!(!body.contains("//terms"));
-    }
-
-    // An operator-supplied origin is escaped, so a stray metacharacter cannot
-    // emit a malformed document that a crawler discards wholesale.
-    #[tokio::test]
-    async fn sitemap_escapes_xml_metacharacters_in_the_origin() {
-        let body = sitemap_xml("https://example.test/?a=1&b=2");
-        assert!(body.contains("&amp;b=2"), "{body}");
-        assert!(!body.contains("&b=2"));
-    }
-
-    // robots.txt is the sitemap's only discovery path for a crawler that was
-    // never handed the URL directly, so the absolute reference must be there.
-    #[tokio::test]
-    async fn robots_points_at_the_sitemap_and_excludes_the_machine_surface() {
-        let (status, body, content_type) =
-            fetch("https://mcp.internetcomputer.org/", "/robots.txt").await;
+    async fn robots_excludes_the_machine_surface_and_names_no_sitemap() {
+        let (status, body, content_type) = fetch("/robots.txt").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(content_type.as_deref(), Some("text/plain; charset=utf-8"));
-        assert!(body.contains("Sitemap: https://mcp.internetcomputer.org/sitemap.xml"), "{body}");
         for path in ["/mcp", "/mcp-beta", "/version", "/status/", "/.well-known/"] {
             assert!(body.contains(&format!("Disallow: {path}\n")), "{path} missing:\n{body}");
         }
+        assert!(!body.contains("Sitemap:"), "no sitemap is served any more:\n{body}");
+    }
+
+    // Every page this origin used to serve itself answers with a permanent
+    // redirect to its one home on the landing site — canonical trailing-slash
+    // form, so a client lands in one hop. The absolute targets are pinned: a
+    // typo'd LANDING_SITE would otherwise ship a working-looking 308 to
+    // nowhere.
+    #[tokio::test]
+    async fn old_page_paths_redirect_permanently_to_the_landing_site() {
+        for (path, target) in [
+            ("/", "https://internetcomputer.org/icp-mcp/"),
+            ("/privacy-policy", "https://internetcomputer.org/icp-mcp/privacy-policy/"),
+            ("/support", "https://internetcomputer.org/icp-mcp/support/"),
+            ("/terms", "https://internetcomputer.org/icp-mcp/terms/"),
+            (
+                "/developer-terms",
+                "https://internetcomputer.org/icp-mcp/developer-terms/",
+            ),
+        ] {
+            let resp = landing_redirects_router()
+                .oneshot(Request::get(path).body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT, "{path}");
+            let location =
+                resp.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or("");
+            assert_eq!(location, target, "{path}");
+        }
+    }
+
+    // The Developer Terms the write gate enforces, the text publishers accept,
+    // and the URL every registration refusal names must all be the same thing.
+    // The page itself lives on the landing site now (see [`LANDING_SITE`]), so
+    // the pin is on the two things this repository still owns: the source text
+    // carries the revision the gate compares acceptances against, and the URL
+    // the gate hands out is the one this origin's `/developer-terms` redirects
+    // to. A revision bump therefore fails here until the text is updated too.
+    #[test]
+    fn the_developer_terms_source_matches_the_enforced_revision() {
+        const SOURCE: &str = include_str!("../docs/icp-mcp-developer-terms-draft.md");
+        let revision = imcp2_core::DEVELOPER_TERMS_VERSION;
+        // Matched on collapsed whitespace, so a phrase the markdown wraps
+        // across lines still counts as present.
+        let flat = SOURCE.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(&format!("**Revision {revision} · in effect from {revision}**")),
+            "the source text must carry revision {revision} as its effective revision"
+        );
+        assert!(
+            flat.contains(&format!("acceptance of revision {revision} of these Developer Terms")),
+            "and ask registrants to confirm that same revision"
+        );
+        // The obligations the protocol itself cannot establish, which is why
+        // these Terms exist at all: entitlement to the canisters listed, no
+        // value movement, lawful data handling.
+        for expected in [
+            "entitled to expose every canister",
+            "does not transfer, trade, or move value",
+            "lawfully",
+        ] {
+            assert!(flat.contains(expected), "the Developer Terms must state {expected:?}");
+        }
+        // Addressed to publishers, with the end-user Terms a separate document.
+        assert!(flat.contains("/icp-mcp/terms/"), "the end-user Terms must be linked");
+        assert_eq!(
+            imcp2_core::DEVELOPER_TERMS_URL,
+            format!("{}/developer-terms/", super::LANDING_SITE),
+            "the URL refusals name must be the page this origin redirects to"
+        );
     }
 
     #[tokio::test]
     async fn favicon_is_served_as_a_cacheable_svg() {
-        let resp = site_metadata_router("https://mcp.internetcomputer.org")
+        let resp = site_metadata_router()
             .oneshot(Request::get("/favicon.svg").body(axum::body::Body::empty()).unwrap())
             .await
             .unwrap();
@@ -815,76 +731,6 @@ mod tests {
         assert!(svg.contains("<svg"), "{svg}");
         // Transparent, so the browser's own chrome shows through in either theme.
         assert!(!svg.contains("<rect"), "the mark must stay transparent: {svg}");
-    }
-
-    // The Developer Terms page and the write gate must name the SAME revision:
-    // the gate authorizes a state-changing call only when a registration's
-    // acceptance matches [`imcp2_core::DEVELOPER_TERMS_VERSION`], so a page
-    // still advertising the previous revision would ask publishers to accept
-    // something that no longer authorizes anything. The revision is
-    // interpolated rather than written into the markup, and this pins that it
-    // landed and that no placeholder survived.
-    #[test]
-    fn the_developer_terms_page_names_the_enforced_revision() {
-        let page = super::developer_terms_page();
-        let revision = imcp2_core::DEVELOPER_TERMS_VERSION;
-        assert!(
-            page.contains(&format!("Revision {revision}")),
-            "the page must carry revision {revision}"
-        );
-        assert!(
-            page.contains(&format!("in effect from {revision}")),
-            "the page's effective date must be the revision itself, so the two cannot drift"
-        );
-        assert!(
-            !page.contains("__REVISION__"),
-            "every placeholder must be substituted"
-        );
-        assert!(
-            !page.contains("__LOGO__"),
-            "every placeholder must be substituted"
-        );
-        // The page has to state the two obligations the protocol cannot: that
-        // the publisher may expose every canister it lists, and that its
-        // MCP-reachable operations stay inside the financial and data policies.
-        for expected in [
-            "entitled to expose every canister",
-            "does not transfer, trade, or move value",
-            "lawfully",
-        ] {
-            assert!(
-                page.contains(expected),
-                "the Developer Terms must state {expected:?}"
-            );
-        }
-        // And that it is addressed to publishers, not end users — the user ToS
-        // is a different document, linked from here.
-        assert!(page.contains("/terms"), "the end-user Terms must be linked");
-    }
-
-    #[test]
-    fn every_served_page_links_the_favicon() {
-        let pages: [(&str, &str); 5] = [
-            ("/", super::INDEX_HTML),
-            ("/privacy-policy", super::privacy_policy_page()),
-            ("/support", super::support_page()),
-            ("/terms", super::terms_page()),
-            ("/developer-terms", super::developer_terms_page()),
-        ];
-        assert_eq!(pages.len(), PUBLIC_PAGES.len());
-        for (path, html) in pages {
-            assert!(
-                html.contains("rel=icon href=/favicon.svg")
-                    || html.contains(r#"rel="icon" href="/favicon.svg""#),
-                "{path} does not link /favicon.svg"
-            );
-        }
-        // Both copies — see [`INDEX_HTML`].
-        assert_eq!(
-            super::INDEX_HTML.matches(r#"rel="icon" href="/favicon.svg""#).count(),
-            2,
-            "the landing bundle must link the icon in the shell head AND the injected head"
-        );
     }
 
     async fn challenge(token: Option<&str>) -> (StatusCode, String, Option<String>) {

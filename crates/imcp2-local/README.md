@@ -17,7 +17,7 @@ cannot spawn local processes; they keep using the hosted server.
 **Update calls carry the hosted server's authorization gate.** "The same tools"
 includes the same write policy: `canister_update_call` requires an
 `application_origin` that is a *registered* application — its developer having
-accepted the [ICP MCP Developer Terms](https://mcp.internetcomputer.org/developer-terms)
+accepted the [ICP MCP Developer Terms](https://internetcomputer.org/icp-mcp/developer-terms/)
 — whose own `/.well-known/ic-architecture` manifest declares the target
 canister, plus the financial guard inside that surface (see
 [Update-call authorization](../../README.md#update-call-authorization)). The gate
