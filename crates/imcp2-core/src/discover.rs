@@ -930,8 +930,18 @@ enum WellKnown {
 
 /// Fetch one `.well-known` document from the application origin, plus whether the
 /// exchange carried IC-hosting evidence. Every well-known probe on the identity
-/// path goes through here so the evidence capture, the success check, and the size
-/// cap can't drift apart between them.
+/// path goes through here so the evidence capture, the success check, the origin
+/// pin, and the size cap can't drift apart between them.
+///
+/// A body is this origin's declaration only when THIS origin answered. The shared
+/// redirect policy refuses a cross-domain hop but permits same-host different-port
+/// hops and hops to global IP literals, so a 3xx could otherwise hand another
+/// origin's bytes to the identity path — and on Layer 5 those bytes decide which
+/// principal every call is signed as. [`fetch_declared_manifest`] already pins the
+/// manifest that way; this is the same rule on the path where getting it wrong is
+/// worse (per review). A redirected answer is `Unreachable`, not `Absent`: `Absent`
+/// means "the app declares nothing, derive against the default", and a document we
+/// deliberately ignored is not a document the app does not have.
 async fn fetch_well_known(
     client: &reqwest::Client,
     application_origin: &str,
@@ -959,6 +969,21 @@ async fn fetch_well_known(
         } else {
             (WellKnown::Unreachable(format!("HTTP {status}")), ic_evidence)
         };
+    }
+    let served_from = resp.url().origin().ascii_serialization();
+    if served_from != application_origin {
+        tracing::warn!(
+            probed = %application_origin,
+            served_from = %served_from,
+            path,
+            "ignoring a well-known document served by a redirect target rather than the probed origin"
+        );
+        return (
+            WellKnown::Unreachable(format!(
+                "{path} was answered by {served_from}, not the origin that was probed"
+            )),
+            ic_evidence,
+        );
     }
     match read_capped_strict(resp, max_bytes).await {
         StrictRead::Body(body) => (WellKnown::Served(body), ic_evidence),
@@ -3374,7 +3399,10 @@ mod tests {
     // presence — so an unrelated site echoing an empty/junk `x-ic-canister-id`
     // can't fake IC hosting and slip past the guessed-domain guard. (The
     // same-host attribution in ic_evidence_from — evidence must come from the
-    // probed origin, not a redirect target — is exercised by the live tests.)
+    // probed origin, not a redirect target — is exercised by the live tests, as
+    // is the matching body pin in fetch_well_known: both need a response whose
+    // final URL differs from the probed one, and the SSRF guard refuses loopback,
+    // so neither can be driven from a local server here.)
     #[test]
     fn ic_gateway_header_requires_valid_principal_value() {
         use reqwest::header::{HeaderMap, HeaderValue};
