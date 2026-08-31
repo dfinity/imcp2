@@ -34,7 +34,6 @@ use crate::identities::Identities;
 
 /// Cycles ledger — read for `icp_cycles_balance`.
 const CYCLES_LEDGER: &str = "um5iw-rqaaa-aaaaq-qaaba-cai";
-/// 1 ICP = 100_000_000 e8s.
 /// Above this, install via the chunk store rather than a single ingress message
 /// (the ingress arg limit is ~2 MiB and must also hold the mode/id/arg).
 const MAX_SINGLE_SHOT_WASM: usize = 1_900_000;
