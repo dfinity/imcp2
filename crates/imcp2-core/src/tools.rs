@@ -1944,7 +1944,7 @@ fn identity_annotation(target: &IdentityTarget, acted_as: Option<&str>) -> Strin
 }
 
 /// The server-level instructions every client receives from `get_info`. The
-/// financial-transactions policy is stated HERE in full, server-wide — it
+/// financial-transactions policy is stated HERE, server-wide — it
 /// governs the whole surface rather than one tool — and deliberately in NO
 /// tool description (per review): a policy paragraph inside
 /// `canister_update_call`'s description reads as a hint that the tool is
@@ -1965,11 +1965,13 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              resource (the value syntax these tools use); `candid://reference` has the full type \
              reference, and the official IC \
              skills are served as `skill://<name>` resources.\n\n\
-             FINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user: \
-             canister_update_call refuses them, and the refusal says why. For financial \
-             operations (token transfers, spending approvals, payments, trades), recommend \
-             the user performs the operation outside this connector, in a trusted interface \
-             they control.\n\n\
+             FINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user: do not use \
+             canister_update_call to move assets. Recognized asset-moving calls are refused \
+             before they reach the network, and the refusal says why — but that guard is a \
+             safeguard, not a complete filter, so treat this policy, rather than the absence \
+             of a refusal, as the limit. For financial operations (token transfers, spending \
+             approvals, payments, trades), recommend the user performs the operation outside \
+             this connector, in a trusted interface they control.\n\n\
              START WITH open_app WHEN THE USER NAMES OR LINKS AN APP. `open_app(name-or-URL)` is the \
              one-call entry point: it takes an app NAME as the user said it, or a URL (e.g. \
              \"https://opencloud.org\"), resolves the Internet Identity derivation origin AND discovers the canisters \
@@ -2508,11 +2510,16 @@ mod tests {
     // canister_update_call's description reads as a hint that the tool is
     // usable for financial transactions, which is the one thing it must not
     // suggest. Pin both sides — no tool description carries financial
-    // language, and the instructions state the denial, the refused method
-    // families, and the reason. Neither surface names a venue for a refused
-    // operation: metadata answering a refused financial operation with a
-    // specific transactional service would read as a redirect from one such
-    // route to another.
+    // language, and the instructions state the denial, the limit of the guard
+    // that backs it, and the redirect. The refused method families are
+    // deliberately NOT restated here or in the instructions: they were a copy
+    // of `compliance` that had to be kept in sync, and an attempted call is
+    // refused with a message accurate for its own scope. What the instructions
+    // must not do is promise more than the guard delivers, so the
+    // safeguard-not-a-filter clause is pinned in its place. Neither surface
+    // names a venue for a refused operation: metadata answering a refused
+    // financial operation with a specific transactional service would read as
+    // a redirect from one such route to another.
     #[test]
     fn financial_policy_is_a_server_instruction_not_a_description() {
         for tool in super::IcTools::all_tools() {
@@ -2526,6 +2533,10 @@ mod tests {
         }
         let ins = super::SERVER_INSTRUCTIONS;
         assert!(ins.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user"));
+        assert!(
+            ins.contains("a safeguard, not a complete filter"),
+            "the instructions must not present the guard as complete coverage: {ins}"
+        );
         assert!(ins.contains("outside this connector, in a trusted interface they control"));
         assert!(!ins.contains("oisy.com"), "the instructions name no venue: {ins}");
     }

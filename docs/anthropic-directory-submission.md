@@ -163,9 +163,12 @@ transactions:**
   perform the operation
   outside the connector, in a trusted interface they control, and names no
   venue (a refused canister-creation or funding-completion call points at the
-  user-run icp CLI). The policy is stated in full in the server-level
-  instructions — the field the directories scan — where it covers the whole
-  surface at once. A unit test holds it there.
+  user-run icp CLI). The policy is stated in the server-level instructions —
+  the field the directories scan — where it covers the whole surface at once,
+  and a unit test holds it there. What those instructions state is the policy
+  itself, not its implementation: the method families and canister scopes are
+  in the guard and in the refusal an attempted call receives, so the
+  instructions carry no copy of that list to keep in sync.
 - The README, the landing page, and the server instructions all state
   explicitly that financial transactions are not supported.
 
