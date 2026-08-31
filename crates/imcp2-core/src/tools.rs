@@ -233,7 +233,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Return the guide to OQL: the JSON query language some canisters expose, through which this server reads them. It covers the query object: filters, aggregation, ordering, edge traversal and paging. Use this before writing a first OQL query; get_canister_oql_schema then gives one canister's entity and field names.",
+        description = "Return the guide to OQL, the JSON query language behind canister_query's `oql` argument. It covers the query object: filters, aggregation, ordering, edge traversal and paging. Use this before writing a first OQL query; get_canister_oql_schema then gives one canister's entity and field names.",
         annotations(title = "Get the OQL query guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
         output_schema = schema_for_output::<calls::OqlGuideOutput>(),
     )]
@@ -246,7 +246,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "List what a canister's OQL surface holds: its entities, their keys, fields and edges, with a ready-to-run query for each. Use this to get the entity and field names before writing an OQL query, since they are the schema's own names and often differ from the canister's Candid types. The schema is read as the user's account, so it needs a derivation origin and an authenticated session.",
+        description = "List what a canister's OQL surface holds: its entities, their keys, fields and edges, with a ready-to-run query for each. Use this to get the entity and field names before writing an OQL query, since they are the schema's own names and often differ from the canister's Candid types. The schema is read as the user's account, so it needs a derivation origin.",
         annotations(title = "Get the OQL schema", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::OqlSchemaOutput>(),
     )]
@@ -332,7 +332,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Read a canister's own API documentation: prose on how the app behaves, covering units, authentication, lifecycle, mutation safety and other things its types do not show. Use this when Candid types alone do not explain how to use a canister. Most canisters publish none, and the reply says whether an absent doc is expected or worth retrying.",
+        description = "Read the documentation a canister publishes about itself: how the app behaves, typically units, authentication, lifecycle, mutation safety and other things its types do not show. Use this when Candid types alone do not explain how to use a canister. Most canisters publish none, and the reply says whether an absent doc is expected or worth retrying.",
         annotations(title = "Get a canister's API documentation", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::ApiDocOutput>(),
     )]
@@ -508,7 +508,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Change a canister's state by calling one of its update methods. Use this when the user asks for something a canister must record; read-only requests go through canister_query. Method names and argument types come from the canister's Candid interface, which get_canister_candid returns. Runs anonymously unless given a derivation origin, which acts as the user's account at that app and needs an authenticated session.",
+        description = "Change a canister's state by calling one of its update methods. Use this when the user asks for something a canister must record; read-only requests go through canister_query. Method names and argument types come from the canister's Candid interface, which get_canister_candid returns. Runs anonymously unless given a derivation origin, which acts as the user's account at that app.",
         annotations(title = "Make a canister update call", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterUpdateCallOutput>(),
     )]
@@ -593,7 +593,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Read from a canister, either by calling a Candid `query` method or by running an OQL query. Pass exactly one of the two. get_canister_candid says which path a canister uses; a Candid `method` query to an OQL canister is refused here. Use this when nothing needs to change; writes go through canister_update_call. A Candid query may run anonymously; an OQL query needs a derivation origin and an authenticated session.",
+        description = "Read from a canister, either by calling a Candid `query` method or by running an OQL query. Pass exactly one of the two. get_canister_candid says which path a canister uses; a Candid `method` query to an OQL canister is refused here. Use this when nothing needs to change; writes go through canister_update_call. A Candid query may run anonymously; an OQL query needs a derivation origin.",
         annotations(title = "Query a canister (Candid method or OQL)", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterQueryOutput>(),
     )]
@@ -912,7 +912,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Return the principal the user acts as at one app, without calling the app's canisters. Use this to answer who the user is at an app, or to check an identity before making calls. Requires an authenticated session.",
+        description = "Return the principal the user acts as at one app, without calling the app's canisters. Use this to answer who the user is at an app, or to check an identity before making calls.",
         annotations(title = "Get your principal at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::PrincipalOutput>(),
     )]
@@ -968,7 +968,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "List the user's Internet Identity accounts at one app: the default account, plus any they have named. Use this when a call should act as a specific account rather than the default, or to confirm which accounts exist there. Requires an authenticated session.",
+        description = "List the user's Internet Identity accounts at one app: the default account, plus any they have named. Use this when a call should act as a specific account rather than the default, or to confirm which accounts exist there.",
         annotations(title = "List your accounts at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::AccountsOutput>(),
     )]
@@ -1004,7 +1004,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Open an app from its name or its URL: resolves the derivation origin the user's identity there is derived from, and discovers the canisters behind it, in one call. Use this when the user names an app and you have no URL for it. If the user supplied only an app name, pass that name unchanged; only pass a URL supplied by the user or obtained from a verified official source, and do not construct a domain from the name. Names are matched against a built-in registry of well-known apps. There is no directory mapping an arbitrary app name to a URL, so an unknown name is refused rather than guessed, as is a URL whose origin would have to be assumed and that shows no sign of being an Internet Computer app. resolve_app and discover_app_canisters do the two halves separately.",
+        description = "Open an app from its name or its URL: resolves the derivation origin the user's identity there is derived from, and discovers the canisters behind it, in one call. Use this when the user names an app and you have no URL for it. If the user supplied only an app name, pass that name unchanged; only pass a URL supplied by the user or obtained from a verified official source, and do not construct a domain from the name. A name or a bare host is matched against a built-in registry of well-known apps first, so a wrong-TLD guess repairs to the canonical URL. There is no directory mapping an arbitrary app name to a URL, so an unmatched bare name is refused rather than guessed, as is a URL whose origin would have to be assumed and that shows no sign of being an Internet Computer app. resolve_app and discover_app_canisters do the two halves separately.",
         annotations(title = "Open an app (resolve origin + discover canisters)", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::OpenAppOutput>(),
     )]
@@ -1413,7 +1413,7 @@ impl IcProtocolTools {
     // ---- Canister management (as your standing II principal) --------------
 
     #[tool(
-        description = "Return the cycles-ledger balance of the user's principal, and the principal itself. Use this to check whether canister operations can be funded, or to get the principal to add as a controller when the user creates a canister with the icp CLI. Requires an authenticated session.",
+        description = "Return the cycles-ledger balance of the principal this connector manages canisters as, and that principal. Use this to check whether canister operations can be funded, or to get the principal to add as a controller when the user creates a canister with the icp CLI.",
         annotations(title = "Check your cycles balance", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CyclesBalance>(),
     )]
@@ -1433,7 +1433,7 @@ impl IcProtocolTools {
     }
 
     #[tool(
-        description = "Install a compiled Wasm module on a canister the user controls. Use this when the user has already built a module; `mode` selects install, reinstall or upgrade. Requires an authenticated session.",
+        description = "Install a compiled Wasm module on a canister the user controls. Use this when the user has already built a module; `mode` selects install, reinstall or upgrade.",
         annotations(title = "Install code on a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
@@ -1475,7 +1475,7 @@ impl IcProtocolTools {
     }
 
     #[tool(
-        description = "Change a canister's settings: controllers, compute and memory allocation, freezing threshold, reserved-cycles limit, Wasm memory limit, or log visibility. Only the fields passed are changed. Passing `controllers` replaces the whole set, so it must include every principal that should keep control. Requires an authenticated session.",
+        description = "Change a canister's settings: controllers, compute and memory allocation, freezing threshold, reserved-cycles limit, Wasm memory limit, or log visibility. Only the fields passed are changed. Passing `controllers` replaces the whole set, so it must include every principal that should keep control.",
         annotations(title = "Update canister settings", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
@@ -1496,7 +1496,7 @@ impl IcProtocolTools {
     }
 
     #[tool(
-        description = "Start a stopped canister the user controls. Requires an authenticated session.",
+        description = "Start a stopped canister the user controls.",
         annotations(title = "Start a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
@@ -1514,7 +1514,7 @@ impl IcProtocolTools {
     }
 
     #[tool(
-        description = "Stop a running canister the user controls. Use this before deleting one. Requires an authenticated session.",
+        description = "Stop a running canister the user controls. Use this before deleting one.",
         annotations(title = "Stop a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
@@ -1532,7 +1532,7 @@ impl IcProtocolTools {
     }
 
     #[tool(
-        description = "Remove a canister's code and state, leaving it empty with its id and cycles intact. Use this to clear a canister without deleting it. Requires an authenticated session.",
+        description = "Remove a canister's code and state, leaving it empty with its id and cycles intact. Use this to clear a canister without deleting it.",
         annotations(title = "Uninstall code from a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
@@ -1550,7 +1550,7 @@ impl IcProtocolTools {
     }
 
     #[tool(
-        description = "Delete a canister permanently. It must be stopped first, and any cycles left in it are burned. Requires an authenticated session.",
+        description = "Delete a canister permanently. It must be stopped first, and any cycles left in it are burned.",
         annotations(title = "Delete a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
