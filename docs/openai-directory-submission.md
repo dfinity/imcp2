@@ -135,8 +135,11 @@ submission states, not from a narrower reading:
   inputs it rejects (an anonymous OQL read, a Candid data query on an OQL
   canister, a URL with no Internet-Computer evidence). The
   financial-transactions policy is a separate, server-wide matter and is
-  stated where the scan reads it: in full in the server-level instructions,
-  covering the whole surface at once. So no description promises a behavior
+  stated where the scan reads it: in the server-level instructions, covering
+  the whole surface at once. Those instructions state the policy, not its
+  implementation — the method families and canister scopes live in the guard
+  and in the refusal each attempted call receives, rather than in a copy that
+  would have to be kept in sync. So no description promises a behavior
   the tool does not have, and no refusal is hidden.
 - **The commerce and speculation rules have nothing to attach to.** The
   plugin sells nothing (no physical goods, no digital goods or
