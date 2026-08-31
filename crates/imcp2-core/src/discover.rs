@@ -71,9 +71,12 @@ pub struct DiscoveredCanister {
     pub sources: Vec<String>,
     /// Whether this canister exposes the OQL query surface — filled in for the
     /// app's OWN data canisters by a single Candid fetch during open_app /
-    /// discover_app_canisters (#3). null when not probed — the frontend or a shared
-    /// system canister, or an eligible canister past the eight-probe cap on a large
-    /// manifest — or when the interface couldn't be read. When true, this
+    /// discover_app_canisters (#3). Name-based: it reports that the interface declares
+    /// both `schema` and `execute`, without checking their signatures. null when not
+    /// probed — the frontend or a shared system canister, or an eligible canister past
+    /// the eight-probe cap on a large manifest — or when the interface could not be
+    /// FETCHED; an interface that was fetched but could not be parsed reads as false,
+    /// not null. When true, this
     /// is a caller-gated data backend: read it with the OQL tools, passing the app's
     /// derivation_origin to read as the user.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,7 +131,9 @@ pub fn is_app_data_candidate(c: &DiscoveredCanister) -> bool {
 /// Arguments for `discover_app_canisters`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DiscoverCanistersArgs {
-    /// A web domain or URL served from the IC, e.g. "opencloud.org".
+    /// A web domain or URL to inspect, e.g. "opencloud.org". It does not have to be
+    /// known to be IC-served: a reachable domain with no Internet-Computer evidence
+    /// yields an empty result rather than a refusal.
     pub domain: String,
 }
 
@@ -1835,8 +1840,10 @@ pub struct OpenAppArgs {
     /// so a wrong-TLD guess repairs to the canonical URL; an explicit `https://…`
     /// URL is resolved as given. Two refusals: an unknown bare name is refused with
     /// instructions for finding the real URL, and a URL that would need its own
-    /// origin assumed as the derivation origin (nothing declared, no registry entry)
-    /// is refused when that origin shows no Internet-Computer evidence — and that
+    /// origin assumed as the derivation origin (no usable declaration was read — a
+    /// failed or non-success fetch, malformed JSON and an unusable declaration all
+    /// count — and no registry entry) is refused when that origin shows no
+    /// Internet-Computer evidence — and that
     /// evidence shows a domain is served from the Internet Computer, not that it
     /// belongs to the app the user meant.
     pub app: String,
