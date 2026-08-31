@@ -906,6 +906,7 @@ async fn fetch_well_known(
     application_origin: &str,
     path: &str,
     max_bytes: usize,
+    overflow: Overflow,
 ) -> (WellKnown, bool) {
     let resp = match client.get(format!("{application_origin}{path}")).send().await {
         Ok(resp) => resp,
@@ -929,9 +930,18 @@ async fn fetch_well_known(
         };
     }
     match read_capped_strict(resp, max_bytes).await {
-        Ok(body) => (WellKnown::Served(body), ic_evidence),
+        StrictRead::Body(body) => (WellKnown::Served(body), ic_evidence),
+        StrictRead::TooLarge => match overflow {
+            Overflow::NotTheDocument => (WellKnown::Absent, ic_evidence),
+            Overflow::Unknown => (
+                WellKnown::Unreachable(format!(
+                    "document is larger than the {max_bytes}-byte limit this server reads"
+                )),
+                ic_evidence,
+            ),
+        },
         // A body that died mid-read is not a document that says nothing.
-        Err(e) => (WellKnown::Unreachable(e), ic_evidence),
+        StrictRead::Failed(e) => (WellKnown::Unreachable(e), ic_evidence),
     }
 }
 
@@ -965,9 +975,18 @@ async fn resolve_declared_origin(
             client,
             application_origin,
             DERIVATION_ORIGIN_PATH,
-            MAX_DERIVATION_ORIGIN_BYTES
+            MAX_DERIVATION_ORIGIN_BYTES,
+            // One canonical origin on one line cannot exceed this cap, so a body
+            // that does is not the Layer 5 document at all.
+            Overflow::NotTheDocument,
         ),
-        fetch_well_known(client, application_origin, LEGACY_MANIFEST_PATH, MAX_META_BYTES),
+        fetch_well_known(
+            client,
+            application_origin,
+            LEGACY_MANIFEST_PATH,
+            MAX_META_BYTES,
+            Overflow::Unknown,
+        ),
     );
     // Either probe reaching the origin and showing the gateway header is enough:
     // the question is whether THIS origin is IC-served, not which path answered.
@@ -1418,8 +1437,44 @@ async fn read_capped(resp: reqwest::Response, max: usize) -> String {
 /// retrying" verdict — a false statement about an app that may serve a perfectly
 /// good manifest. Hitting the size cap is NOT an error: that is a bounded read
 /// this server chose, not a failed one.
-async fn read_capped_strict(resp: reqwest::Response, max: usize) -> Result<String, String> {
-    read_capped_inner(resp, max).await.map_err(|(_, e)| e)
+async fn read_capped_strict(resp: reqwest::Response, max: usize) -> StrictRead {
+    // Read ONE byte past the cap so overflow is DETECTABLE (per review): a
+    // truncated body is not a shorter document, and letting it through would draw
+    // a conclusion from bytes we chose not to read — a manifest over the cap
+    // parsing as "not JSON", or a Layer 5 file hiding a second non-empty line past
+    // it and slipping the one-line rule. What overflow MEANS differs by document,
+    // so that judgement belongs to the caller rather than here.
+    match read_capped_inner(resp, max + 1).await {
+        Ok(body) if body.len() > max => StrictRead::TooLarge,
+        Ok(body) => StrictRead::Body(body),
+        Err((_, e)) => StrictRead::Failed(e),
+    }
+}
+
+/// The outcome of a strict read, with overflow kept apart from failure because
+/// they license different conclusions.
+enum StrictRead {
+    Body(String),
+    /// More bytes arrived than the cap allows. For a document with a size-bounded
+    /// FORM — the one-line Layer 5 file — this is positive evidence that what was
+    /// served is not that document. For an open-ended one (a JSON manifest) it
+    /// only means we could not read it all.
+    TooLarge,
+    /// The transfer failed part-way.
+    Failed(String),
+}
+
+/// What an over-cap body means for a particular well-known document.
+#[derive(Clone, Copy)]
+enum Overflow {
+    /// The document's form bounds its size, so an over-cap body is NOT it: the
+    /// app declares nothing here. An SPA catch-all's index.html at the Layer 5
+    /// path is the live case — OISY serves exactly that, and treating it as a
+    /// failed check would refuse to resolve a perfectly healthy app.
+    NotTheDocument,
+    /// The document has no size bound of its own, so an over-cap body is a read
+    /// we could not finish, not a verdict.
+    Unknown,
 }
 
 /// The shared read. `Err((partial, error))` carries what had arrived before the
@@ -1495,7 +1550,15 @@ async fn get_document(
         // `application/json` are the same claim.
         .map(|v| v.split(';').next().unwrap_or(v).trim().to_ascii_lowercase())
         .unwrap_or_default();
-    let body = read_capped_strict(resp, max).await?;
+    // A manifest has no bounded form, so an over-cap body is "could not read",
+    // never "publishes none": refusing to conclude is the honest outcome.
+    let body = match read_capped_strict(resp, max).await {
+        StrictRead::Body(body) => body,
+        StrictRead::TooLarge => {
+            return Err(format!("document is larger than the {max}-byte limit this server reads"))
+        }
+        StrictRead::Failed(e) => return Err(e),
+    };
     Ok(Some(FetchedDocument { served_from, content_type, body }))
 }
 
@@ -2238,9 +2301,10 @@ pub struct OpenAppArgs {
     /// so a wrong-TLD guess repairs to the canonical URL; an explicit `https://…`
     /// URL is resolved as given. Two refusals: an unknown bare name is refused with
     /// instructions for finding the real URL, and a URL that would need its own
-    /// origin assumed as the derivation origin (no usable declaration was read — a
-    /// failed or non-success fetch, malformed JSON and an unusable declaration all
-    /// count — and no registry entry) is refused when that origin shows no
+    /// origin assumed as the derivation origin (the app answered but no usable
+    /// declaration was read — a 404 or 410, malformed JSON, or a declaration this
+    /// server cannot use; a probe that did not complete is an error rather than an
+    /// assumption — and no registry entry) is refused when that origin shows no
     /// Internet-Computer evidence — and that
     /// evidence shows a domain is served from the Internet Computer, not that it
     /// belongs to the app the user meant.
@@ -3357,6 +3421,13 @@ mod tests {
     // Live network: a KNOWN app skips the IC probe entirely (the registry answers).
     #[tokio::test]
     async fn resolve_app_identity_skips_probe_for_known_apps() {
+        // Also the regression pin for over-cap Layer 5 bodies: oisy.com answers
+        // /.well-known/ii-derivation-origin with its SPA shell, which is larger
+        // than MAX_DERIVATION_ORIGIN_BYTES. That must read as "declares nothing"
+        // (Overflow::NotTheDocument — a one-line origin cannot be that big, so
+        // what was served is not the Layer 5 document), NOT as a failed check.
+        // Treating it as a failure refused to resolve a perfectly healthy app,
+        // which is how this test caught it.
         let r = resolve_app_identity("oisy.com", false).await.expect("resolve");
         assert_eq!(r.derivation_origin_source, DerivationSource::Known);
         assert_eq!(r.application_is_ic, None, "known apps are not probed");

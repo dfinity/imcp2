@@ -261,10 +261,24 @@ pub fn missing_origin_refusal(canister_id: &Principal) -> String {
 /// we do not know, so the refusal is retryable rather than a verdict on the app.
 fn unreachable_refusal(app_origin: &str, source: OriginSource, error: &str) -> String {
     let app_origin = safe_origin(app_origin);
+    // Not every check failure clears on its own: an origin answering 401/403 on
+    // the path is denying it deliberately, and a blocked redirect is a
+    // configuration this server will not follow. Telling those callers to retry
+    // is advice that cannot work, so they get the fix instead (per review).
+    let persistent = ["HTTP 401", "HTTP 403", "redirect"]
+        .iter()
+        .any(|marker| error.contains(marker));
+    let next = if persistent {
+        "Retrying will not clear this one: the origin is refusing to serve that path, or serving \
+         it from somewhere this server will not follow. Its operators fix it by making the \
+         manifest publicly readable at that exact path on this origin."
+    } else {
+        "This is likely transient — retry; if it persists, confirm that the origin is right."
+    };
     format!(
         "Could not check whether {app_origin} declares this canister: {}. {} The call is \
-         refused rather than made blind. This is likely transient — retry; if it persists, confirm \
-         that {} names the app's real origin (open_app returns it). {READS_ARE_FINE}",
+         refused rather than made blind. {next} Confirm that {} names the app's real origin \
+         (open_app returns it). {READS_ARE_FINE}",
         safe_cause(error),
         the_rule(),
         source.arg()
