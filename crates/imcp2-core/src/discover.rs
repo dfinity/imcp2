@@ -78,8 +78,9 @@ pub struct DiscoveredCanister {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oql: Option<bool>,
     /// Whether this canister declares an API-doc method (`getApiDoc`/`get_api_doc`),
-    /// from the same probe as `oql`. null when not probed / unreadable. When true,
-    /// get_canister_api_doc returns a prose behavior guide.
+    /// from the same probe as `oql`. null when not probed / unreadable. True reports
+    /// the declaration, which is what get_canister_api_doc reads — not a guarantee
+    /// that the call returns a guide: it can still reject or trap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_doc_available: Option<bool>,
 }

@@ -594,7 +594,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Read from an Internet Computer canister with either a Candid `query` method or an OQL query — exactly one of the two. `method` is a query function from the canister's Candid interface, invoked with textual-Candid `args`; `oql` is an OQL query as a JSON object string, run against the canister's `execute` method as plain JSON with no Candid escaping. Canisters that expose OQL (get_canister_candid reports `oql: true`) reject a Candid `method` data query and are read through `oql`; a plain query canister such as a ledger takes `method`. The `oql` path requires `derivation_origin` — per-app data is gated by the caller's principal, and an anonymous OQL read is rejected — and returns `columns` and `rows` (a markdown table) with `has_more` for paging; on an empty result it validates the query's `start` against the schema and returns `valid_entities` plus a did-you-mean repair. The `method` path may be anonymous, or take `derivation_origin` and `account` to read as the user's account, and returns the decoded reply in textual Candid. Reading as the user's account — the whole `oql` path, and the `method` path when given a `derivation_origin` — requires an authenticated session; an anonymous `method` read does not. `derivation_origin` is resolved by open_app or resolve_app rather than being a raw URL, and the OQL entity and field names come from get_canister_oql_schema. State changes go through canister_update_call.",
+        description = "Read from an Internet Computer canister with either a Candid `query` method or an OQL query — exactly one of the two. `method` is a query function from the canister's Candid interface, invoked with textual-Candid `args`; `oql` is an OQL query as a JSON object string, run against the canister's `execute` method as plain JSON with no Candid escaping. Canisters that expose OQL (get_canister_candid reports `oql: true`) reject a Candid `method` data query and are read through `oql`; a plain query canister such as a ledger takes `method`. The `oql` path requires `derivation_origin` — per-app data is gated by the caller's principal, and an anonymous OQL read is rejected — and returns `columns` and `rows` (a markdown table) with `has_more` for paging; on an empty result it re-reads the schema for this principal and, when that read returns entities and the query's `start` is not one of them, returns `valid_entities` plus a did-you-mean repair; a `start` that does exist, an empty schema, or a schema read that fails leave both out. The `method` path may be anonymous, or take `derivation_origin` and `account` to read as the user's account, and returns the decoded reply in textual Candid. Reading as the user's account — the whole `oql` path, and the `method` path when given a `derivation_origin` — requires an authenticated session; an anonymous `method` read does not. `derivation_origin` is resolved by open_app or resolve_app rather than being a raw URL, and the OQL entity and field names come from get_canister_oql_schema. State changes go through canister_update_call.",
         annotations(title = "Query a canister (Candid method or OQL)", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterQueryOutput>(),
     )]
@@ -1005,7 +1005,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Open an Internet Computer app in one call, given its name or its URL: resolves the app's Internet Identity derivation origin (as resolve_app does) and discovers the canisters behind it (as discover_app_canisters does) in a single step. If the user supplied only an app name, pass that name unchanged; only pass a URL supplied by the user or obtained from a verified official source, and do not construct a domain from the name. A name — or a bare host — is matched against the built-in registry of well-known apps first, so a wrong-TLD guess repairs to the canonical URL; an explicit `https://` URL is resolved as given. There is no on-chain name-to-URL directory, so an unknown bare name is refused with instructions for finding the real URL, and a URL that would need its own origin assumed as the derivation origin — the app declares none and the registry has no entry — is refused when that origin shows no evidence of being an Internet Computer app, rather than resolved to a wrong identity. That evidence establishes that a domain is served from the Internet Computer, not that it is the app the user meant, which is why a constructed domain is not an acceptable input. Returns `app_url` (the one used), `derivation_origin` and its source, `alternative_origins`, and the discovered `canisters`, with provenance, labels, and per-canister `oql`/`api_doc_available` capability flags from a one-shot Candid probe of the app's own canisters. An app's features are reached through those canisters rather than through per-feature tools: a canister flagged `oql` holds the app's data, gated by the caller's principal, and is read with get_canister_oql_schema and canister_query's `oql` argument, both of which take the returned `derivation_origin` and reject an anonymous read. No authenticated session is required, since no principal is derived here. resolve_app and discover_app_canisters perform the two halves separately.",
+        description = "Open an Internet Computer app in one call, given its name or its URL: resolves the app's Internet Identity derivation origin (as resolve_app does) and discovers the canisters behind it (as discover_app_canisters does) in a single step. If the user supplied only an app name, pass that name unchanged; only pass a URL supplied by the user or obtained from a verified official source, and do not construct a domain from the name. A name — or a bare host — is matched against the built-in registry of well-known apps first, so a wrong-TLD guess repairs to the canonical URL; an explicit `https://` URL is resolved as given. There is no on-chain name-to-URL directory, so an unknown bare name is refused with instructions for finding the real URL, and a URL that would need its own origin assumed as the derivation origin — the app declares none and the registry has no entry — is refused when that origin shows no evidence of being an Internet Computer app, rather than resolved to a wrong identity. That evidence establishes that a domain is served from the Internet Computer, not that it is the app the user meant, which is why a constructed domain is not an acceptable input. Returns `app_url` (the one used), `derivation_origin` and its source, `alternative_origins`, and the discovered `canisters`, with provenance, labels, and per-canister `oql`/`api_doc_available` capability flags from a one-shot Candid probe of the app's own canisters — `api_doc_available` reports that a canister DECLARES the doc method get_canister_api_doc reads, not that the call returns a guide. An app's features are reached through those canisters rather than through per-feature tools: a canister flagged `oql` holds the app's data, gated by the caller's principal, and is read with get_canister_oql_schema and canister_query's `oql` argument, both of which take the returned `derivation_origin` and reject an anonymous read. No authenticated session is required, since no principal is derived here. resolve_app and discover_app_canisters perform the two halves separately.",
         annotations(title = "Open an app (resolve origin + discover canisters)", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::OpenAppOutput>(),
     )]
@@ -2525,6 +2525,34 @@ mod tests {
     // expected content and stay: "an anonymous OQL read is rejected", "pass
     // the canonical derivation origin, not the website URL", "do not construct
     // a domain from the name".
+    /// Every string inside a JSON schema — object keys and values alike, at any
+    /// depth — as its own surface, DECODED. Scanning `to_string` output instead
+    /// would hand the checks JSON-escaped text (see the call site).
+    fn push_schema_strings(
+        label: &str,
+        schema: &impl serde::Serialize,
+        out: &mut Vec<(String, String)>,
+    ) {
+        fn walk(label: &str, v: &serde_json::Value, out: &mut Vec<(String, String)>) {
+            match v {
+                serde_json::Value::String(s) => out.push((label.to_string(), s.clone())),
+                serde_json::Value::Array(a) => {
+                    for (i, x) in a.iter().enumerate() {
+                        walk(&format!("{label}[{i}]"), x, out);
+                    }
+                }
+                serde_json::Value::Object(m) => {
+                    for (k, x) in m {
+                        out.push((label.to_string(), k.clone()));
+                        walk(&format!("{label}.{k}"), x, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(label, &serde_json::to_value(schema).expect("schema serializes"), out);
+    }
+
     #[test]
     fn model_readable_metadata_respects_marketplace_policy() {
         let mut surfaces =
@@ -2538,26 +2566,28 @@ mod tests {
             // argument or reply field's doc comment reaches the model exactly
             // like one in the description, and scanning descriptions alone let
             // one through review ("never infer", on an output field).
-            surfaces.push((
-                format!("{} input schema", tool.name),
-                serde_json::to_string(&tool.input_schema).expect("input schema serializes"),
-            ));
+            //
+            // Scan each DECODED string, not the JSON serialization: JSON turns a
+            // control or zero-width character into printable ASCII (a literal
+            // vertical tab becomes the six characters `\u000b`), which would both
+            // split a banned phrase and sail past the character allowlist below,
+            // while the model still reads the invisible original (per review).
+            push_schema_strings(&format!("{} input schema", tool.name), &tool.input_schema, &mut surfaces);
             if let Some(schema) = &tool.output_schema {
-                surfaces.push((
-                    format!("{} output schema", tool.name),
-                    serde_json::to_string(schema).expect("output schema serializes"),
-                ));
+                push_schema_strings(&format!("{} output schema", tool.name), schema, &mut surfaces);
             }
         }
         // The scan must actually reach into the schemas — a serialization that
         // stopped carrying field docs would make every assertion below vacuous.
         assert!(
-            surfaces.iter().any(|(what, text)| what == "open_app output schema"
+            surfaces.iter().any(|(what, text)| what.starts_with("open_app output schema")
                 && text.contains("INVERSE relation")),
             "the schema scan no longer sees field documentation"
         );
         for (what, text) in surfaces {
-            let lower = text.to_lowercase();
+            // Phrases are matched on collapsed whitespace, so a line break inside
+            // a doc comment (or inserted between two words) cannot hide one.
+            let lower = text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
             // 1. Instructions about the model rather than about this surface.
             for banned in [
                 "you should",
@@ -2980,5 +3010,6 @@ mod tests {
         assert_eq!(t.origin, "https://example.com", "valid input trims + canonicalizes");
     }
 }
+
 
 
