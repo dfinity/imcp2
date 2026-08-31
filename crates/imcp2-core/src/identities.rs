@@ -472,10 +472,11 @@ pub struct ResolveAppOutput {
     /// application origin — correct only if the app has no custom derivation
     /// origin, which this connector cannot verify).
     pub derivation_origin_source: String,
-    /// Origins the application origin's `/.well-known/ii-alternative-origins`
-    /// permits to derive from it. Informational only — this is the INVERSE of
-    /// "which derivation origin the app uses", so do not infer the derivation
-    /// origin from it.
+    /// Origins the resolved DERIVATION origin's `/.well-known/ii-alternative-origins`
+    /// permits to derive against it — that origin is where the list is authoritative,
+    /// and where this one was read. Informational only: it is the INVERSE of "which
+    /// derivation origin the app uses", so the derivation origin does not follow from
+    /// it.
     pub alternative_origins: Vec<String>,
     /// Whether the application origin showed evidence of being served from the
     /// Internet Computer (the gateway's `x-ic-canister-id` header). Only probed

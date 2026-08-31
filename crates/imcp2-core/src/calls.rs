@@ -48,9 +48,10 @@ pub struct GetCandidOutput {
     pub oql: bool,
     /// True when the canister declares an API-documentation method
     /// (`getApiDoc`/`get_api_doc`) — computed with the SAME predicate
-    /// get_canister_api_doc uses, so it tells you up front whether that call will
-    /// return anything. Only call get_canister_api_doc when this is true; when it's
-    /// false the canister has no prose doc and the Candid types here are the interface.
+    /// get_canister_api_doc uses, so it tells you up front whether that call has a
+    /// method to read at all. It reports the declaration, not the outcome: the call
+    /// can still reject or trap. When false the canister has no prose doc and the
+    /// Candid types here are the interface.
     pub api_doc_available: bool,
 }
 
@@ -124,9 +125,11 @@ pub struct ApiDocArgs {
     pub canister_id: String,
 }
 
-/// Output of `get_canister_api_doc` — a STRUCTURED result in every case (not an
-/// error when the doc simply isn't there), so the agent can distinguish "this app
-/// has no prose doc" (expected, don't retry) from "couldn't reach it" (retry).
+/// Output of `get_canister_api_doc` — every documentation outcome is STRUCTURED
+/// (not an error when the doc simply isn't there), so the agent can distinguish
+/// "this app has no prose doc" (expected, don't retry) from "no answer was
+/// obtained" (a retry may help). An unusable `canister_id` is rejected before any
+/// lookup and is a plain error, not this shape.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ApiDocOutput {
     /// The canister the doc was requested from.

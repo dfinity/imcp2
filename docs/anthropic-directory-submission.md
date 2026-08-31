@@ -182,8 +182,8 @@ arrives, answer with the posture above.
 
 Related point for the same step: the **model-readable metadata describes the
 surface and the constraints on using it, without attempting to manipulate
-Claude**. Each of the server instructions, all 11 tool descriptions, and the
-argument and reply schemas says what the tool does, returns, rejects, and
+Claude**. The server instructions, all 11 tool descriptions, and every
+argument and reply schema each say what their tool does, returns, rejects, and
 requires — the guidance a caller needs to use it correctly and safely, which
 both directories expect a description to carry, including `open_app`'s "do not
 construct a domain from the name". What none of them carries is the set of

@@ -162,7 +162,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Fetch the Candid (`.did`) interface definition of an Internet Computer canister, read from its public `candid:service` metadata. Also reports two capability flags: `oql` (the canister exposes the OQL query surface, so its data reads go through get_canister_oql_schema and canister_query's `oql` argument, and a Candid `method` data query is rejected) and `api_doc_available` (the canister exposes a `getApiDoc`/`get_api_doc` method, whose prose behavior guide get_canister_api_doc returns).",
+        description = "Fetch the Candid (`.did`) interface definition of an Internet Computer canister, read from its public `candid:service` metadata. Also reports two capability flags: `oql` (the canister exposes the OQL query surface, so its data reads go through get_canister_oql_schema and canister_query's `oql` argument, and a Candid `method` data query is rejected) and `api_doc_available` (the canister DECLARES a `getApiDoc`/`get_api_doc` method, which get_canister_api_doc reads — a declaration, not a guarantee that the call returns a guide: it can still reject or trap).",
         annotations(title = "Get Candid interface", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::GetCandidOutput>(),
     )]
@@ -1202,7 +1202,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"opencloud.org\"). `domain` is a domain, not an app name; open_app takes a name directly. A domain with no Internet-Computer evidence yields an empty `canisters` list with a note saying so, rather than a guess — open_app and resolve_app are the tools that refuse such an origin outright. Returns up to 50 canister ids, with provenance, most authoritative first (unlabelled ids mined from the JS bundle are capped at 20); any id dropped by those bounds is counted in `omitted` rather than left out silently: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's main backend) and the app's own /.well-known/ic-app.json manifest (all its canisters, with roles) — then the `x-ic-canister-id` header (the frontend/asset canister), an `/env.json` runtime config (e.g. `backend_canister_id`), and labelled or bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json and bundle entries are mined candidates, distinguished by label (production and IC ids) and confirmable with get_canister_candid.",
+        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"opencloud.org\"). `domain` is a domain, not an app name; open_app takes a name directly. A domain with no Internet-Computer evidence yields an empty `canisters` list with a note saying so, rather than a guess — open_app and resolve_app are the tools that refuse such an origin, and then only where the derivation origin would have to be assumed from the URL itself. Returns up to 50 canister ids, with provenance, most authoritative first (unlabelled ids mined from the JS bundle are capped at 20); any id dropped by those bounds is counted in `omitted` rather than left out silently: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's main backend) and the app's own /.well-known/ic-app.json manifest (all its canisters, with roles) — then the `x-ic-canister-id` header (the frontend/asset canister), an `/env.json` runtime config (e.g. `backend_canister_id`), and labelled or bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json and bundle entries are mined candidates, distinguished by label (production and IC ids) and confirmable with get_canister_candid.",
         annotations(title = "Discover canisters behind a domain", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::DiscoverOutput>(),
     )]
@@ -2623,29 +2623,25 @@ mod tests {
                 );
             }
             // 5. Nothing a human reading the field would miss: no markup
-            //    comments, and no invisible or direction-flipping characters.
+            //    comments, and nothing that renders as nothing.
+            //
+            //    This is an ALLOWLIST, not a list of invisible characters to
+            //    reject, because that list cannot be kept complete — review
+            //    found U+061C, then U+034F and U+FE0F, none of them a control
+            //    character, any of which could sit inside a banned phrase and
+            //    slip the `contains` checks above while staying invisible. The
+            //    metadata is prose about an API, so the allowed set is printable
+            //    ASCII plus the punctuation it actually uses; anything else has
+            //    to be added here deliberately, where a human reviewing the
+            //    diff will see it.
             for banned in ["<!--", "-->"] {
                 assert!(!text.contains(banned), "{what} hides text in markup: {text}");
             }
             for c in text.chars() {
                 assert!(
-                    !matches!(
-                        c,
-                        // Soft hyphen, the Arabic letter mark and the Mongolian
-                        // vowel separator are format characters that `is_control`
-                        // does not catch.
-                        '\u{00ad}' | '\u{061c}' | '\u{180e}'
-                            | '\u{200b}'..='\u{200f}'
-                            | '\u{202a}'..='\u{202e}'
-                            | '\u{2060}'..='\u{2064}'
-                            | '\u{2066}'..='\u{2069}'
-                            | '\u{feff}'
-                            // Interlinear annotation, and the tag block — text
-                            // that renders as nothing at all.
-                            | '\u{fff9}'..='\u{fffb}'
-                            | '\u{e0000}'..='\u{e007f}'
-                    ) && (!c.is_control() || c == '\n' || c == '\t'),
-                    "{what} carries an invisible character (U+{:04X}): {text}",
+                    matches!(c, ' '..='~' | '\n' | '\t' | '—' | '…' | '→'),
+                    "{what} carries U+{:04X}, which is not in the allowed set — it may \
+                     render as nothing. Add it above if it is deliberate: {text}",
                     c as u32
                 );
             }
@@ -2984,3 +2980,4 @@ mod tests {
         assert_eq!(t.origin, "https://example.com", "valid input trims + canonicalizes");
     }
 }
+
