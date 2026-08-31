@@ -147,9 +147,13 @@ transactions**, and the portal's compliance step requires acknowledging this.
 **The server is not a financial tool, and does not support financial
 transactions:**
 
-- **The connector has no funding or management tools.** Creating, funding,
-  and managing canisters is done by the user with the icp CLI in their own
-  terminal.
+- **The connector serves no funding, creation, or canister-management
+  tools.** Creating, funding, and deploying canisters is work the user does
+  with the icp CLI in their own terminal. What stays reachable is the generic
+  `canister_update_call`: a caller whose principal controls a canister can
+  call the management canister's lifecycle methods through it. Those are
+  non-financial operations — no dedicated management tooling is served, and
+  none of this moves funds.
 - `canister_update_call` **refuses the standardized value-moving methods** —
   the ICRC-standard transfer/approval names
   (ICRC-1/ICRC-2 plus ICRC-4/-7/-37) and the NNS/SNS governance method
@@ -328,13 +332,16 @@ Paste-and-adapt; portal limits in parentheses.
 >    recommend reconnecting under "Actions & questions" — that behavior
 >    is intended. Access is revocable at any time at
 >    https://id.ai/manage/settings.
-> 4. Canister-management tools are not part of this connector, so there is
->    nothing to provision: creating and managing canisters happens outside
->    the connector, with the icp CLI.
+> 4. No canister creation, funding, or dedicated management tool is served,
+>    so there is nothing to provision: that work happens outside the
+>    connector, with the icp CLI. (The generic `canister_update_call` can
+>    still reach management methods on a canister your principal controls.)
 > 5. Financial ledger operations are refused by design: asking the assistant
->    to move tokens returns a policy message directing the user to a wallet
->    they control — that behavior is intended (financial transactions are
->    not supported).
+>    to move tokens returns a policy message saying financial transactions
+>    are not supported and recommending the operation be performed outside
+>    this connector, in a trusted interface you control — that behavior is
+>    intended. The message names no specific venue, and a test enforces
+>    that, so do not expect it to name a wallet.
 
 ### The seven compliance acknowledgments
 

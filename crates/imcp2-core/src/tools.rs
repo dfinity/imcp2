@@ -64,8 +64,10 @@ pub struct IcCanisterTools {
 }
 
 /// The IC protocol / meta-level tools: dashboard name/id lookups, the
-/// official IC skills, and canister creation/management as the standing
-/// management principal.
+/// official IC skills, and canister MANAGEMENT as the standing management
+/// principal — lifecycle and settings for a canister that already exists.
+/// Creating and funding canisters is not among them: those tools were
+/// dropped, and the user does that work with the icp CLI.
 ///
 /// NOT served by the default [`IcTools`] composition in this version — we
 /// anticipate this will come in a future version. Until then the type, its
@@ -1393,7 +1395,7 @@ impl IcProtocolTools {
         }
     }
 
-    // ---- Canister creation & management (as your standing II principal) -----
+    // ---- Canister management (as your standing II principal) --------------
 
     #[tool(
         description = "Your cycles-ledger balance, as your standing Internet Identity management principal (also printed). That principal is the one to add as a controller when you create a canister with the icp CLI, so this connector's management tools can operate it. Requires an authenticated session.",
@@ -2073,9 +2075,10 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              `writing-motoko` (language), `mops-cli` (deps/build), `icp-cli` (build & deploy), \
              `cycles-management` \
              (ICP↔cycles & funding), `stable-memory` (upgrades) and `canister-security`. Compiling \
-             Motoko/Rust to Wasm happens in YOUR environment (guided by those skills), and \
-             CREATING, FUNDING, DEPLOYING and MANAGING canisters is done by the USER with the icp \
-             CLI in their own terminal, guided by the same skills.";
+             Motoko/Rust to Wasm happens in YOUR environment (guided by those skills), and this \
+             connector serves NO tools for CREATING, FUNDING, DEPLOYING or MANAGING canisters — \
+             the USER does that with the icp CLI in their own terminal, guided by the same \
+             skills.";
 
 impl ServerHandler for IcTools {
     async fn list_tools(
