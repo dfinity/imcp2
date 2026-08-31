@@ -774,6 +774,19 @@ async fn fetch_alternative_origins(origin: &str) -> Vec<String> {
     let origin = url.origin().ascii_serialization();
     match client.get(format!("{origin}/.well-known/ii-alternative-origins")).send().await {
         Ok(resp) if resp.status().is_success() => {
+            // This list AUTHORIZES: a cross-origin derivation-origin claim is
+            // accepted only because the declared origin names the app back here.
+            // A redirect target's answer is not that origin's statement, so it
+            // cannot grant the claim (per review). Empty is the fail-closed
+            // value every other failure here already returns.
+            if !answered_by(&resp, &origin) {
+                tracing::warn!(
+                    probed = %origin,
+                    served_from = %resp.url().origin().ascii_serialization(),
+                    "ignoring an ii-alternative-origins list served by a redirect target rather than the probed origin"
+                );
+                return Vec::new();
+            }
             parse_alternative_origins(&read_capped(resp, MAX_META_BYTES).await)
         }
         _ => Vec::new(),
@@ -808,8 +821,19 @@ fn header_is_ic_principal(headers: &reqwest::header::HeaderMap) -> bool {
 /// are canonical `Url::origin().ascii_serialization()` forms, so the compare is exact
 /// (host case- and default-port-normalized) rather than a host-only match.
 fn ic_evidence_from(resp: &reqwest::Response, expected_origin: &str) -> bool {
-    header_is_ic_principal(resp.headers())
-        && resp.url().origin().ascii_serialization() == expected_origin
+    header_is_ic_principal(resp.headers()) && answered_by(resp, expected_origin)
+}
+
+/// Whether `expected_origin` is the origin that actually answered, rather than a
+/// redirect target. Every well-known fetch in this module asks this before it
+/// treats a response as a statement BY the app it probed — the shared redirect
+/// policy refuses a cross-domain hop but permits same-host different-port hops
+/// and hops to global IP literals, so a 3xx can otherwise put another origin's
+/// bytes behind this app's name. Both sides are canonical
+/// `Url::origin().ascii_serialization()` forms, so the compare is exact (host
+/// case- and default-port-normalized) rather than a host-only match.
+fn answered_by(resp: &reqwest::Response, expected_origin: &str) -> bool {
+    resp.url().origin().ascii_serialization() == expected_origin
 }
 
 /// Resolve an app URL to its Internet Identity derivation context, WITHOUT
@@ -963,8 +987,8 @@ async fn fetch_well_known(
     // first cut of this check ran after the status and turned exactly that into
     // an `Absent`, i.e. "derive against the default"). Nothing a foreign origin
     // says about this path is an answer about this app.
-    let served_from = resp.url().origin().ascii_serialization();
-    if served_from != application_origin {
+    if !answered_by(&resp, application_origin) {
+        let served_from = resp.url().origin().ascii_serialization();
         tracing::warn!(
             probed = %application_origin,
             served_from = %served_from,
