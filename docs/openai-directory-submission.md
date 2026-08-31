@@ -115,9 +115,12 @@ trades on behalf of users") from the same non-financial posture the Anthropic
 submission states, not from a narrower reading:
 
 - **The plugin is not a financial tool.** Its purpose is reading, building,
-  and operating canisters. It has no funding, trading, or canister-management
-  tools at all — creating, funding, and managing canisters is done by the
-  user with the icp CLI in their own terminal.
+  and operating canisters. It serves no funding, trading, creation, or
+  dedicated canister-management tools — creating, funding, and deploying
+  canisters is work the user does with the icp CLI in their own terminal. The
+  generic `canister_update_call` can still reach the management canister's
+  lifecycle methods for a caller whose principal controls the target; those
+  are non-financial operations and move no funds.
 - **No tool initiates or executes a transfer of the user's funds.**
   `canister_update_call` refuses the standardized value-moving methods
   (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents, plus the NNS/SNS
