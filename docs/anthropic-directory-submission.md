@@ -190,8 +190,13 @@ construct a domain from the name". What none of them carries is the set of
 manipulations the directories prohibit: unrelated behavioral instructions,
 overly broad triggering, preference over or interference with other tools,
 calls to unrelated external software, and hidden or obfuscated instructions. A
-unit test (`model_readable_metadata_respects_marketplace_policy`) pins that set
-across every one of those surfaces, and
+unit test (`model_readable_metadata_respects_marketplace_policy`) guards that
+across every one of those surfaces, and what it guarantees is worth stating
+exactly: it rejects an enumerated set of phrasings — the ones that appeared here
+before, plus the ones review named — and, completely, any character outside a
+small allowlist, so nothing invisible can ride along in a field doc. Judging a
+novel phrasing of a prohibited intent stays human review's job.
+`the_policy_gate_catches_what_it_lists` keeps the gate live from both sides, and
 `open_app_metadata_forbids_a_constructed_domain` pins the safeguard itself.
 Each description also matches the tool's behavior, so no side effect is
 implicit — with one deliberate exception: the financial-transactions policy is
