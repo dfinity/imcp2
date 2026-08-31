@@ -724,6 +724,11 @@ server serves it for both instances (one origin-global document listing each
 instance's `{mcp_path}/oauth/connect/callback`), built from the same helper that
 builds the II links' callback URLs so the two can never drift.
 
+The check applies to this hosted server only. II exempts a server on loopback,
+because browsers block its https document from fetching a `http://127.0.0.1`
+URL and the check would fail closed on every local sign-in — so `imcp2-local`
+serves no such document.
+
 The wire shapes match the **merged II contract** (verified against the
 beta II canister's live `.did`, `fgte5-ciaaa-aaaad-aaatq-cai`): the connect
 link carries `registration_key` = base64url(DER(`pub(X)`)); II navigates back

@@ -67,9 +67,9 @@ machinery is needed.
    CORS layer, no metrics stack, no OAuth persistence.
 3. **IC + II wiring** — a mainnet agent and production II, env-overridable for staging.
 4. **Auth partition** — keep the II connect-handshake primitives (link builder, callback
-   page, delegation parser, the II callback allow-list, a slim redeem); drop the whole
-   OAuth authorization server.
-5. **Browser login** — three transient loopback routes during the handshake; the grant then
+   page, delegation parser, a slim redeem); drop the whole OAuth authorization server and
+   the II callback allow-list, which II exempts a local server from.
+5. **Browser login** — two transient loopback routes during the handshake; the grant then
    lives in memory only.
 6. **AI tool clients** — Claude Desktop, Claude Code, Codex, Cursor, Antigravity, and the
    Perplexity macOS app run `imcp2-local` directly; cloud surfaces keep using hosted.

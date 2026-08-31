@@ -6,13 +6,15 @@
 //! only.
 //!
 //! The listener is the unavoidable minimum, not a design slip: II delivers the
-//! delegation by *navigating the browser* to the callback (a URL fragment only
-//! a served page can read and POST back), and II's #4091 check fetches
-//! `/.well-known/ii-auth-callbacks` from the callback's origin before honoring
-//! it — both require a real HTTP origin. This is the standard native-app
-//! loopback redirect (RFC 8252 §7.3), the same shape as the ICP CLI's
-//! `icp identity link web`. It serves exactly three routes for one handshake
-//! and never serves the MCP tool surface, which rides stdio.
+//! delegation by *navigating the browser* to the callback, in a URL fragment
+//! only a served page can read and POST back — which takes a real HTTP origin.
+//! This is the standard native-app loopback redirect (RFC 8252 §7.3), the same
+//! shape as the ICP CLI's `icp identity link web`. It serves two routes for one
+//! handshake and never serves the MCP tool surface, which rides stdio.
+//!
+//! The user has to trust a local connector in II Settings first; II stores that
+//! as a port-less `http://127.0.0.1`, precisely because the port below is
+//! chosen per handshake and can't be promised in advance.
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -90,6 +92,14 @@ struct LoginState {
 struct Pending {
     /// Doubles as the connect `state` in the II link — II echoes it to the
     /// callback, and the redeem accepts only this value.
+    ///
+    /// Unguessable on purpose (a v4 UUID), and load-bearing in a way a hosted
+    /// server's `state` is not: a hosted callback sits on a domain a random
+    /// page can't reach, while this listener is reachable by any page in the
+    /// browser and any process on the machine. `state` is what stops a forged
+    /// POST to `/redeem` from injecting an identity the user never chose. II
+    /// treats it as opaque and only echoes it, so keeping it unpredictable is
+    /// entirely this side's job.
     session_id: String,
     url: String,
     /// This flow's loopback callback (`http://127.0.0.1:<port>/callback`) —
@@ -209,9 +219,9 @@ impl LoginDriver {
             .registration_pubkey_b64(&session_id)
             .await?;
 
-        // Port 0: the OS picks a free port; both the II link's `callback` and
-        // the #4091 allow-list entry derive from the ONE resulting origin, so
-        // they cannot drift (II matches by exact string equality).
+        // Port 0: the OS picks a free port. II trusts a local server by
+        // loopback host rather than by exact origin, so a fresh port per
+        // handshake is expected rather than something to keep stable.
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .map_err(|e| format!("could not bind the login callback listener: {e}"))?;
@@ -231,7 +241,7 @@ impl LoginDriver {
         );
 
         let shutdown = Arc::new(Notify::new());
-        let app = routes::login_router(self.clone(), callback_url.clone(), authority);
+        let app = routes::login_router(self.clone(), authority);
         let sd = shutdown.clone();
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app)

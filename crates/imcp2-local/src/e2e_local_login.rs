@@ -5,13 +5,13 @@
 //! handshake. Nothing is mocked: II runs its production wasm and issues a
 //! genuine canister-signed registration delegation; the login driver binds
 //! its real loopback listener; this test plays the browser over **real HTTP**
-//! (the pinned callback page, II's #4091 allow-list fetch, the redeem POST);
+//! (the pinned callback page, the redeem POST);
 //! and the driver redeems via `mcp_register_v2` on the live II, verifying the
 //! canister signature against PocketIC's fetched root key.
 //!
 //! ## What it exercises for real
 //! `authenticate` (a fresh session + the id.ai-shaped link + the transient
-//! listener) → the pinned page and the allow-list served over the wire → the
+//! listener) → the pinned page served over the wire → the
 //! II registration-delegation ceremony (`prepare_mcp_registration_delegation`
 //! + `get_mcp_registration_delegation`, playing II's frontend) → the **real**
 //! delegation POSTed to the listener's `/redeem` → `{"done": true}` → the
@@ -43,7 +43,6 @@ use std::time::SystemTime;
 
 use crate::login::{BeginOutcome, LoginDriver, LoginStatus, SessionSlot};
 use imcp2_core::identities::Identities;
-use imcp2_core::iiconnect::AUTH_CALLBACKS_WELL_KNOWN;
 use imcp2_core::IiInstance;
 
 // ---- II candid interface (subset), as in the hosted harness ----------------
@@ -341,8 +340,7 @@ async fn local_login_end_to_end() {
     .expect("decode registration_key");
     let (pending_sid, callback_url) = driver.pending_handshake().await.expect("pending");
     assert_eq!(pending_sid, state, "the link's state IS the session id");
-    // The link's percent-encoded callback and the listener's own callback are
-    // the same one value (II matches the allow-list by exact string equality).
+    // The link's percent-encoded callback is the listener's own callback.
     let encoded_callback = field(fragment, "callback").expect("callback");
     assert_eq!(
         encoded_callback.replace("%3A", ":").replace("%2F", "/"),
@@ -355,27 +353,21 @@ async fn local_login_end_to_end() {
         .to_string();
     let http = reqwest::Client::new();
 
-    // --- 2. The browser lands on the pinned page; II fetches the allow-list ---
+    // --- 2. The browser lands on the pinned page ---
     let page = http.get(&callback_url).send().await.expect("GET /callback");
     assert_eq!(page.status(), 200);
     assert!(
         page.headers().get("content-security-policy").is_some(),
         "the pinned page ships its CSP"
     );
-    let wk = http
-        .get(format!("{origin}{AUTH_CALLBACKS_WELL_KNOWN}"))
-        .send()
-        .await
-        .expect("GET allow-list");
-    assert_eq!(
-        wk.json::<serde_json::Value>().await.unwrap(),
-        serde_json::json!({ "callbacks": [callback_url] }),
-        "the #4091 allow-list must declare this callback verbatim"
-    );
 
     // --- 3. The II-side ceremony (browser/frontend role) ---
     let anchor = register_anchor(&pic, ii).await;
-    // Trust an MCP server for the anchor (precondition for `prepare`).
+    // Trust a local server for the anchor (precondition for `prepare`). II
+    // stores a local connector port-less, because the listener above binds a
+    // fresh port per handshake; the canister keeps the string as given and
+    // hashes it onto the registration entry, and it is II's frontend that
+    // matches a callback against it.
     let set_cfg = pic
         .update_call(
             ii,
@@ -385,7 +377,7 @@ async fn local_login_end_to_end() {
                 &anchor,
                 &McpConfig {
                     enabled: true,
-                    url: Some("http://localhost:8000/mcp".into()),
+                    url: Some("http://127.0.0.1".into()),
                 }
             )
             .unwrap(),
