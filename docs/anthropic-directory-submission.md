@@ -152,10 +152,12 @@ transactions:**
 
 - **The connector serves no funding, creation, or canister-management
   tools.** Creating, funding, and deploying canisters is work the user does
-  with the icp CLI in their own terminal. What stays reachable is the generic
-  `canister_update_call`: a caller whose principal controls a canister can
-  call the management canister's lifecycle methods through it. Those are
-  non-financial operations — no dedicated management tooling is served, and
+  with the icp CLI in their own terminal. The generic `canister_update_call`
+  is not a way around that either: management-canister lifecycle calls must
+  carry the TARGET canister as the request's effective canister id, which the
+  update-call path does not set (it defaults to the callee, `aaaaa-aa`), so
+  the boundary node rejects them. No dedicated management tooling is served,
+  and
   none of this moves funds.
 - `canister_update_call` **refuses the standardized value-moving methods** —
   the ICRC-standard transfer/approval names
@@ -345,8 +347,10 @@ Paste-and-adapt; portal limits in parentheses.
 >    https://id.ai/manage/settings.
 > 4. No canister creation, funding, or dedicated management tool is served,
 >    so there is nothing to provision: that work happens outside the
->    connector, with the icp CLI. (The generic `canister_update_call` can
->    still reach management methods on a canister your principal controls.)
+>    connector, with the icp CLI. (`canister_update_call` is not a substitute:
+>    management-canister lifecycle calls need the target as the effective
+>    canister id, which that path does not set, so the boundary node rejects
+>    them.)
 > 5. Financial ledger operations are refused by design: asking the assistant
 >    to move tokens returns a policy message saying financial transactions
 >    are not supported and recommending the operation be performed outside

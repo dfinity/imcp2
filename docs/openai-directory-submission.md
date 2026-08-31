@@ -115,9 +115,10 @@ submission states, not from a narrower reading:
   and operating canisters. It serves no funding, trading, creation, or
   dedicated canister-management tools — creating, funding, and deploying
   canisters is work the user does with the icp CLI in their own terminal. The
-  generic `canister_update_call` can still reach the management canister's
-  lifecycle methods for a caller whose principal controls the target; those
-  are non-financial operations and move no funds.
+  generic `canister_update_call` does not reach management-canister lifecycle
+  methods either: those calls must carry the target canister as the request's
+  effective canister id, and the update-call path does not set one, so the
+  boundary node rejects them.
 - **No tool initiates or executes a transfer of the user's funds.**
   `canister_update_call` refuses the standardized value-moving methods
   (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents, plus the NNS/SNS
