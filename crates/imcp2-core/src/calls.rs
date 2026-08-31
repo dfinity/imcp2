@@ -144,8 +144,9 @@ pub struct CanisterUpdateCallArgs {
     pub canister_id: String,
     /// Update method name to invoke.
     pub method: String,
-    /// Arguments in textual Candid, e.g. `()` or `(record { owner = principal "..." })`.
-    /// Encoded against the method's declared types when the interface is available,
+    /// Arguments in textual Candid, e.g. `()` or `(record { owner = principal "..." })`; the
+    /// `candid://textual-syntax` resource documents that syntax and `candid://reference` its
+    /// type system. Encoded against the method's declared types when the interface is available,
     /// published or supplied in `candid`, so plain literals need no `: type` annotation.
     /// Without an interface they are encoded as written and need their own annotations.
     #[serde(default = "default_args")]
@@ -204,7 +205,8 @@ pub struct CanisterQueryArgs {
     #[serde(default)]
     pub method: Option<String>,
     /// Arguments for `method` in textual Candid, e.g. `()` or `(record { owner = principal
-    /// "..." })`. Plain literals need no `: type` annotation when the interface is available.
+    /// "..." })`; the `candid://textual-syntax` resource documents that syntax. Plain literals
+    /// need no `: type` annotation when the interface is available.
     /// Ignored for an OQL query.
     #[serde(default = "default_args")]
     pub args: String,
