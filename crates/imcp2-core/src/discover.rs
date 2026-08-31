@@ -477,12 +477,7 @@ impl DerivationSource {
 const KNOWN_DERIVATION_ORIGINS: &[(&str, &str)] = &[
     // NNS dapp: served at nns.internetcomputer.org (canister mc7vh-…) but pins the
     // classic https://nns.ic0.app (canister qoctq-…) as its derivation origin. The
-    // rest are nns.ic0.app's ii-alternative-origins. Deliberately NOT in
-    // [`KNOWN_APPS`]: the connector offers no name resolution or repair guidance
-    // toward a staking/funds frontend (and update calls to its canisters are
-    // refused, see `compliance`). The mappings stay so a user who brings an NNS
-    // URL themselves still derives the CORRECT per-app identity for reads,
-    // rather than a silently wrong (empty-looking) one.
+    // rest are nns.ic0.app's ii-alternative-origins.
     ("nns.ic0.app", "https://nns.ic0.app"),
     ("nns.internetcomputer.org", "https://nns.ic0.app"),
     ("beta.nns.internetcomputer.org", "https://nns.ic0.app"),
@@ -545,11 +540,14 @@ struct KnownApp {
 // under exactly the scope that module documents (the standardized
 // value-moving methods everywhere, every update method on the canisters it
 // lists, and its own note on what a static list cannot cover, such as an
-// exchange's dynamically created pool canisters). NNS was dropped from this
-// list at the author's request; that was an editorial choice about which names
-// the server advertises, not a safety criterion, and its derivation origins
-// are deliberately kept below so reads still resolve to the right identity.
+// exchange's dynamically created pool canisters). So the criterion for an
+// entry is only whether the name is one users say and the mapping is one this
+// server can state correctly — the NNS included, per review: resolving its
+// name yields a URL and a derivation origin for reads, and every update call
+// to its canisters is refused by that guard regardless of how the URL was
+// reached.
 const KNOWN_APPS: &[KnownApp] = &[
+    KnownApp { name: "NNS", aliases: &["nns", "nnsdapp"], app_url: "https://nns.internetcomputer.org" },
     KnownApp { name: "Oisy", aliases: &["oisy", "oisywallet"], app_url: "https://oisy.com" },
     KnownApp { name: "MULTI/DEX", aliases: &["multidex"], app_url: "https://multidex.ai" },
     KnownApp { name: "ICPSwap", aliases: &["icpswap"], app_url: "https://app.icpswap.com" },
@@ -2677,10 +2675,8 @@ mod tests {
             );
         }
         assert_eq!(find_app_by_name("Oisy").matches[0].app_url, "https://oisy.com");
+        assert_eq!(find_app_by_name("nns").matches[0].app_url, "https://nns.internetcomputer.org");
         assert_eq!(find_app_by_name("ICPSwap").matches[0].app_url, "https://app.icpswap.com");
-        // Deliberately NOT a known app (a staking/funds frontend): no name
-        // resolution — the query falls through to the unknown-app guidance.
-        assert!(find_app_by_name("nns").matches.is_empty());
 
         // The derivation origin is DERIVED from KNOWN_DERIVATION_ORIGINS (single
         // source of truth), so every app_url host must be a registry key — otherwise
@@ -2754,11 +2750,9 @@ mod tests {
         assert_eq!(similar_known_app("icpswap.com").map(|m| m.app_url).as_deref(), Some("https://app.icpswap.com"));
         assert_eq!(similar_known_app("oisy.org").map(|m| m.name).as_deref(), Some("Oisy"));
         // A REAL known-app host is not a lookalike — nothing to repair.
-        for real in ["multidex.ai", "https://oisy.com", "app.icpswap.com"] {
+        for real in ["multidex.ai", "https://oisy.com", "app.icpswap.com", "nns.internetcomputer.org"] {
             assert!(similar_known_app(real).is_none(), "{real} is a real host, no suggestion");
         }
-        // Deliberately no repair guidance toward the NNS (not a known app).
-        assert!(similar_known_app("nns.internetcomputer.org").is_none());
         // Token boundaries hold (no substring false positives), and unrelated or
         // unparseable inputs yield nothing.
         for other in ["noisy.com", "multidexchange.org", "example.com", ""] {
@@ -2783,8 +2777,7 @@ mod tests {
         known("multi dex", "https://multidex.ai");
         known("multidex.com", "https://multidex.ai"); // wrong-TLD guess, no scheme
         known("Oisy", "https://oisy.com");
-        // Deliberately not a known app: a bare "nns" is an unknown NAME.
-        assert!(matches!(classify_app_query("nns"), UnknownName));
+        known("nns", "https://nns.internetcomputer.org");
         // An explicit scheme is honoured as a URL (NOT registry-rewritten) — so a
         // deliberately-typed guess reaches the IC-evidence gate on that origin.
         match classify_app_query("https://multidex.com") {
