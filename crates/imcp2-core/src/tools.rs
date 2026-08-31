@@ -215,9 +215,10 @@ impl IcCanisterTools {
                         ));
                     }
                     notes.push(if api_doc_available {
-                        "This canister exposes an API-doc method (api_doc_available=true): call \
-                         get_canister_api_doc for a prose \"how this app behaves\" guide (units, \
-                         auth, lifecycle, gotchas)."
+                        "This canister declares an API-doc method (api_doc_available=true): \
+                         get_canister_api_doc reads it for a prose \"how this app behaves\" guide \
+                         (units, auth, lifecycle, gotchas) — the declaration is what was detected, \
+                         so the call can still come back empty."
                             .to_string()
                     } else {
                         "This canister declares no API-doc method (api_doc_available=false) — don't \
@@ -1124,8 +1125,9 @@ impl IcCanisterTools {
         }
         text.push_str(
             "\n\nNext: inspect a canister with get_canister_candid — its oql / api_doc_available \
-             flags say whether to read via OQL and whether get_canister_api_doc has a doc \
-             (only call it when api_doc_available). To act as the user, pass the derivation_origin \
+             flags say whether to read via OQL and whether a canister declares a doc for \
+             get_canister_api_doc to read (there is nothing to read when api_doc_available is \
+             false). To act as the user, pass the derivation_origin \
              above to canister_query (read) and canister_update_call (write); for an OQL canister, \
              call get_canister_oql_schema for the entity/field names, then canister_query with \
              the `oql` argument — plus an optional account from list_app_accounts. A \"my/our…\" \
@@ -1979,7 +1981,7 @@ fn identity_annotation(target: &IdentityTarget, acted_as: Option<&str>) -> Strin
 /// covers the schemas too. Neither surface names a venue for a refused
 /// operation.
 const SERVER_INSTRUCTIONS: &str = "Internet Computer tools: read canister interfaces and data, resolve apps and the user's identity at them, and make calls on the user's behalf.\n\n\
-    Values are textual Candid — the `(...)` syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`, never the binary form. The `candid://textual-syntax` resource documents that syntax and `candid://reference` the type system; IC how-to guides are served as `skill://<name>` resources.\n\n\
+    Candid values — the arguments and replies of a canister's own methods, on canister_query's `method` path and on canister_update_call — are textual Candid, the `(...)` syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`, never the binary form. The `candid://textual-syntax` resource documents that syntax and `candid://reference` the type system; IC how-to guides are served as `skill://<name>` resources. Nothing else uses it: an OQL query is plain JSON, and the app and identity tools take URLs and derivation origins.\n\n\
     Tool names signal scope. The `…_app…` names (open_app, discover_app_canisters, get_app_principal, list_app_accounts, resolve_app) act on a whole app, keyed by its Internet Identity derivation origin or its URL; the `…canister…` names (get_canister_candid, get_canister_api_doc, get_canister_oql_schema, canister_query, canister_update_call) act on one canister. `icp_oql_guide` documents the OQL dialect the canister reads use. An app's features are reached through its canisters rather than through per-feature tools, and open_app resolves an app name or URL to both its derivation origin and its canisters in one call.\n\n\
     An app's derivation origin is the exact origin Internet Identity derives the user's principal from. It is not necessarily the app's visible URL, and an alternative-origins entry does not identify it; open_app and resolve_app resolve it, and the identity-bearing tools take the origin itself rather than a URL. There is no on-chain name-to-URL directory: open_app matches a name against a built-in registry of well-known apps, and where the derivation origin would have to be assumed from the URL itself, open_app and resolve_app refuse an origin with no evidence of being an Internet Computer app, while discover_app_canisters returns an empty result for such a domain. Per-app data is gated by the calling principal, so OQL reads require a derivation origin and reject an anonymous read. Account delegations are short-lived and derived on demand from this connection's standing Internet Identity credential, which is obtained at connect time and lasts for the chosen session duration (up to 30 days). Internet Identity's consent screen offers two access levels, and they govern the calls signed with that session's account delegation — the ones that carry a derivation origin: on a \"Questions only\" session those reads work and those update calls are rejected by the network, while \"Actions & questions\" permits both. A call made with no derivation origin is not signed with the delegation at all; it runs as the anonymous principal, and the canister decides whether to accept it.\n\n\
     Canister values are stored in canonical, locale-neutral forms: timestamps are usually nanoseconds since the Unix epoch in UTC (IC time), and physical quantities are SI or app-defined units, which `get_canister_api_doc` documents for canisters that publish a doc.\n\n\
