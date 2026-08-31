@@ -336,11 +336,11 @@ Paste-and-adapt; portal limits in parentheses.
 >    (`canister_update_call`).
 > 3. Try the example prompts above. On a Questions-only session a
 >    state-changing call (`canister_update_call`) is rejected by the
->    network and the tool reports the failed call; the server
->    instructions prime the assistant to explain the access level and
->    recommend reconnecting under "Actions & questions" — that behavior
->    is intended. Access is revocable at any time at
->    https://id.ai/manage/settings.
+>    network and the tool reports the failed call — that behavior is
+>    intended, and reconnecting under "Actions & questions" is what
+>    permits such calls. The server instructions describe the two access
+>    levels, so the assistant can explain which one a session has.
+>    Access is revocable at any time at https://id.ai/manage/settings.
 > 4. Canister-management tools are not part of this connector, so there is
 >    nothing to provision: creating and managing canisters happens outside
 >    the connector, with the icp CLI.
