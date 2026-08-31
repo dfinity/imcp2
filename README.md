@@ -401,27 +401,30 @@ flow.
 
 ```bash
 cargo run
-# serves http://0.0.0.0:8000  (MCP at /mcp against production II, OAuth under it, info page at /)
+# serves http://0.0.0.0:8000  (MCP at /mcp against production II, OAuth under it; / redirects to the landing site)
 # honours $PORT (default 8000), $PUBLIC_URL (default http://localhost:8000),
 # $MCP_SERVE_BETA (set it to also serve the beta II instance at /mcp-beta, for staging),
 # and $MCP_SERVE_METRICS (set it to serve the Prometheus exposition at /metrics)
 ```
 
-`GET /` serves a self-contained, ICP-styled landing page that names the
-production `/mcp` endpoint (staging also serves beta II at `/mcp-beta`) and lists
-the tools grouped by purpose. `GET /version` is the operations probe (see [Auth](#auth-oauth-21-login-via-internet-identity)).
+The human-facing pages — the landing page and the `/privacy-policy`,
+`/support`, and `/terms` documents the connector directories require — are
+maintained in [dfinity/internetcomputer-org] (`public/icp-mcp/`) and served at
+<https://internetcomputer.org/icp-mcp/>, so the content exists exactly once.
+This origin answers their old paths (`/`, `/privacy-policy`, `/support`,
+`/terms`) with permanent redirects there, keeping every published link
+working. `GET /version` is the operations probe (see [Auth](#auth-oauth-21-login-via-internet-identity)).
 
-The binary also serves the official pages the connector directories require:
-`/privacy-policy` (linked from the landing page's footer), `/support`, and
-`/terms` — self-contained documents compiled in like every other asset. For the
-OpenAI directory's domain-verification check, `GET
+[dfinity/internetcomputer-org]: https://github.com/dfinity/internetcomputer-org
+
+For the OpenAI directory's domain-verification check, `GET
 /.well-known/openai-apps-challenge` returns `$OPENAI_APPS_CHALLENGE_TOKEN`
 verbatim as `text/plain` (trimmed), and 404s while the variable is unset or
 blank — so the endpoint is inert except during a submission window.
 
 ## Deploy
 
-The deployment binary is **self-contained**: the connect/landing HTML, CSS, and SVG
+The deployment binary is **self-contained**: the connect HTML, CSS, and SVG
 (`src/assets/` and `crates/imcp2-core/src/assets/`) and the reference
 docs (`crates/imcp2-core/static/`) are compiled in with `include_str!`,
 so nothing has to ship next to it (both are build-time inputs only). The
