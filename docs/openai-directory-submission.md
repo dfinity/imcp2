@@ -137,8 +137,8 @@ Positive:
 2. "Does the canister behind https://opencloud.org expose an API doc, and
    what does its interface look like?" → interface + capability flags via
    get_canister_candid / get_canister_api_doc.
-3. "What canisters are behind https://opencloud.org?" → App Connect
-   discovery returns the app's canisters with provenance.
+3. "What canisters are behind https://opencloud.org?" → discovery returns
+   the app's canisters with provenance.
 4. "Open opencloud.org and list my accounts there" (signed in) → resolves
    the derivation origin, lists II accounts.
 5. "Resolve https://opencloud.org to its Internet Identity derivation

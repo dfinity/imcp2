@@ -158,7 +158,7 @@ results).
 | Tool | Args | Returns |
 |------|------|---------|
 | `open_app` | `app` (name **or** URL) | **One-call entry point** when a user names/links an app: resolves the Internet Identity `derivation_origin` *and* discovers the canisters behind it, together. A name or bare host is matched to the known-app registry first (so a wrong-TLD guess repairs to the canonical URL); an explicit `https://` URL is resolved as given. An unknown bare name, or a URL with no IC evidence, is *refused* (never guessed). Also probes the app's own canisters and reports per-canister `oql`/`api_doc_available` capability flags plus a caller-gated data-access note (which canister holds the app data, and the origin to read it as the user). Returns the `app_url` it used — keep it: `canister_update_call` needs it to read the app's discoverability manifest before any write. Wraps `resolve_app` + `discover_app_canisters`; no auth |
-| `discover_app_canisters` | `domain` | Canister ids behind a web domain — app-declared metadata first (`/ai-connect.html`'s `ic:canister-id` meta, the `/.well-known/ic-architecture` service-discoverability manifest, and the same manifest at the legacy `/.well-known/ic-app.json` path), then the frontend via `x-ic-canister-id` and backend candidates via `/env.json` + JS-bundle mining — each with provenance, its IC dashboard label/type where known, and (for the app's own canisters) `oql`/`api_doc_available` capability flags from a one-shot Candid probe |
+| `discover_app_canisters` | `domain` | Canister ids behind a web domain — app-declared metadata first (the `/.well-known/ic-architecture` service-discoverability manifest, and the same manifest at the legacy `/.well-known/ic-app.json` path), then the frontend via `x-ic-canister-id` and backend candidates via `/env.json` + JS-bundle mining — each with provenance, its IC dashboard label/type where known, and (for the app's own canisters) `oql`/`api_doc_available` capability flags from a one-shot Candid probe |
 | `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus two capability flags: `oql` (`true` when it exposes an OQL query surface — a `schema` + `execute` pair — with a pointer to `icp_oql_guide`) and `api_doc_available` (`true` when it declares a `getApiDoc`/`get_api_doc` method, gating `get_canister_api_doc`) |
 | `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), from its `getApiDoc`/`get_api_doc` method. Call **only** when `get_canister_candid`/`open_app` report `api_doc_available`. Returns a **structured** result in every case — `available` + the doc on success, else `available:false` with `expected`/`retry`/`next` so an expected absence is distinct from an unreachable canister |
 | `canister_query` | `canister_id`, `method?` **or** `oql?`, `args?` (textual Candid), `derivation_origin?`, `account?`, `candid?` | READ a canister — provide EITHER a Candid `query` `method` (with `args`) OR an `oql` query (a JSON object string, run against `execute`). A Candid `method` query may be anonymous or as your account and returns textual Candid; an `oql` query **requires** `derivation_origin` and returns `columns` + `rows` (a table) with `has_more`, validating `start` against the schema on an empty result. On an OQL canister a Candid `method` query is rejected — use `oql`. `candid` is a fallback: the `.did` interface text to encode/decode against when the canister exposes no `candid:service` metadata. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
@@ -260,18 +260,11 @@ and, if they pin a custom derivation origin, `/.well-known/ii-derivation-origin`
 (the protocol's Layer 5 — one canonical `https://host` on a single line, which
 takes precedence over the legacy field).
 
-**Internet Computer App Connect** (`/ai-connect.html`) is the third source: its
-`<meta name="ic:canister-id">` declares the app's **main backend** canister
-(spec §4.7/§6.1). Discovery reads that meta from the raw served markup (no
-JavaScript is executed) and reports it as the top-priority finding, labelled
-`main backend (App Connect)`. App Connect **defers** multi-canister enumeration
-(§6.3), which is the gap the manifest above fills.
-
-All three are the app's own claim about its composition — stronger than anything
-mined from client code. All three also **fail closed** on the most common
-misconfiguration, an SPA catch-all serving `index.html` at these paths: there is
-no meta tag to find, the JSON parse fails, and the derivation-origin file's first
-line is not an origin. Every id is validated as a principal before it is kept.
+Both are the app's own claim about its composition — stronger than anything
+mined from client code. Both also **fail closed** on the most common
+misconfiguration, an SPA catch-all serving `index.html` at these paths: the JSON
+parse fails, and the derivation-origin file's first line is not an origin. Every
+id is validated as a principal before it is kept.
 
 ### Writes are gated on the discoverability manifest
 

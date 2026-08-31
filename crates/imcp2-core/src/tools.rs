@@ -1211,7 +1211,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). The domain must be one you actually have (from the user, open_app's known-app resolution, or a web search) — NEVER a domain guessed from an app's name; when you only know a NAME, call open_app with the name first. Returns every canister id found, with provenance, most authoritative first: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's MAIN backend), the app's service-discoverability manifest at /.well-known/ic-architecture (ALL its canisters, with roles — and the ONLY provenance that permits an update call), and the same manifest at the legacy /.well-known/ic-app.json path — then the `x-ic-canister-id` header (the frontend/asset canister), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json/bundle entries are mined candidates: pick by label (prefer production/IC ids) and confirm with get_canister_candid before calling. Every entry is READABLE; only a canister declared in the app's manifest can be written to with canister_update_call.",
+        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). The domain must be one you actually have (from the user, open_app's known-app resolution, or a web search) — NEVER a domain guessed from an app's name; when you only know a NAME, call open_app with the name first. Returns every canister id found, with provenance, most authoritative first: app-declared metadata — the app's service-discoverability manifest at /.well-known/ic-architecture (ALL its canisters, with roles — and the ONLY provenance that permits an update call), and the same manifest at the legacy /.well-known/ic-app.json path — then the `x-ic-canister-id` header (the frontend/asset canister), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json/bundle entries are mined candidates: pick by label (prefer production/IC ids) and confirm with get_canister_candid before calling. Every entry is READABLE; only a canister declared in the app's manifest can be written to with canister_update_call.",
         annotations(title = "Discover canisters behind a domain", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::DiscoverOutput>(),
     )]
@@ -1239,9 +1239,9 @@ impl IcCanisterTools {
                     ));
                 }
                 out.push_str(
-                    "\n`ai-connect.html` and `ic-app.json` entries are DECLARED by the app itself \
-                     (its main backend, and its own canister manifest with roles) — treat them as \
-                     the app's claim about its composition. The `header` (x-ic-canister-id) entry \
+                    "\n`ic-architecture` and `ic-app.json` entries are DECLARED by the app itself \
+                     (its own canister manifest, with roles) — treat them as the app's claim about \
+                     its composition. The `header` (x-ic-canister-id) entry \
                      is the frontend/asset canister. Others come from env.json or the JS bundle \
                      and may include multiple environments (prefer the production/IC ids). A \
                      «name» (type) is the IC dashboard's label for that id. `[oql]`/`[api-doc]` \
