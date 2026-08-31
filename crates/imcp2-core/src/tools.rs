@@ -92,10 +92,6 @@ pub struct IcProtocolTools {
 #[derive(Clone)]
 pub struct IcTools {
     canister: IcCanisterTools,
-    /// Backs the `skill://` resources (the skills TOOLS live on the deferred
-    /// [`IcProtocolTools`]; the documents themselves stay served as
-    /// resources).
-    skills: skills::SkillsCatalog,
 }
 
 /// The one seam between deployments: how a tool call finds the Internet
@@ -111,19 +107,13 @@ pub type SessionResolver =
     Arc<dyn Fn(&RequestContext<RoleServer>) -> Option<String> + Send + Sync>;
 
 impl IcTools {
-    pub fn new(
-        agent: Agent,
-        identities: Identities,
-        skills: skills::SkillsCatalog,
-        session: SessionResolver,
-    ) -> Self {
+    pub fn new(agent: Agent, identities: Identities, session: SessionResolver) -> Self {
         Self {
             canister: IcCanisterTools {
                 agent,
                 identities,
                 session,
             },
-            skills,
         }
     }
 
@@ -1994,7 +1984,7 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools: read canister interf
     Tool names signal scope. The `…_app…` names (open_app, discover_app_canisters, get_app_principal, list_app_accounts, resolve_app) act on a whole app, keyed by its Internet Identity derivation origin or its URL; the `…canister…` names (get_canister_candid, get_canister_api_doc, get_canister_oql_schema, canister_query, canister_update_call) act on one canister. `icp_oql_guide` documents the OQL dialect the canister reads use. An app's features are reached through its canisters rather than through per-feature tools, and open_app resolves an app name or URL to both its derivation origin and its canisters in one call.\n\n\
     An app's derivation origin is the exact origin Internet Identity derives the user's principal from. It is not necessarily the app's visible URL, and an alternative-origins entry does not identify it; open_app and resolve_app resolve it, and the identity-bearing tools take the origin itself rather than a URL. There is no on-chain name-to-URL directory: open_app matches a name against a built-in registry of well-known apps, and where the derivation origin would have to be assumed from the URL itself, open_app and resolve_app refuse an origin with no evidence of being an Internet Computer app, while discover_app_canisters returns an empty result for such a domain. Per-app data is gated by the calling principal, so OQL reads require a derivation origin and reject an anonymous read. Account delegations are short-lived and derived on demand from this connection's standing Internet Identity credential, which is obtained at connect time and lasts for the chosen session duration (up to 30 days). Internet Identity's consent screen offers two access levels, and they govern the calls signed with that session's account delegation — the ones that carry a derivation origin: on a \"Questions only\" session those reads work and those update calls are rejected by the network, while \"Actions & questions\" permits both. A call made with no derivation origin is not signed with the delegation at all; it runs as the anonymous principal, and the canister decides whether to accept it.\n\n\
     Canister values are stored in canonical, locale-neutral forms: timestamps are usually nanoseconds since the Unix epoch in UTC (IC time), and physical quantities are SI or app-defined units, which `get_canister_api_doc` documents for canisters that publish a doc.\n\n\
-    FINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user: canister_update_call refuses them, and the refusal says why. For financial operations (token transfers, spending approvals, payments, trades), recommend the user performs the operation outside this connector, in a trusted interface they control.\n\n\
+    FINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user: do not use canister_update_call to move assets. Recognized asset-moving calls are refused before they reach the network, and the refusal says why — but that guard is a safeguard, not a complete filter, so treat this policy, rather than the absence of a refusal, as the limit. For financial operations (token transfers, spending approvals, payments, trades), recommend the user performs the operation outside this connector, in a trusted interface they control.\n\n\
     Compiling Motoko or Rust to Wasm happens in the client\'s own environment, and creating, funding, deploying, and managing canisters is done by the user with the icp CLI in their own terminal.";
 
 impl ServerHandler for IcTools {
@@ -2047,20 +2037,27 @@ impl ServerHandler for IcTools {
             RawResource::new(OQL_USAGE_URI, "OQL query surface usage guide")
                 .no_annotation(),
         ];
-        // Surface the IC skills as resources too (best-effort: if the registry is
-        // unreachable, the candid resources above still list). Each `skill://<name>`
-        // is read on demand in read_resource.
-        if let Ok(skills) = self.skills.list().await {
-            for s in skills {
-                let title = if s.title.is_empty() {
-                    format!("IC skill: {}", s.name)
-                } else {
-                    format!("IC skill: {}", s.title)
-                };
-                resources.push(
-                    RawResource::new(format!("{SKILL_URI_PREFIX}{}", s.name), title).no_annotation(),
-                );
-            }
+        // The IC skills, from the reviewed bundle compiled into this binary
+        // ([`skills::BUNDLED_SKILLS`]) — the served surface retrieves nothing
+        // dynamically. Each `skill://<name>` is read from the same bundle in
+        // read_resource.
+        for (name, title, _) in skills::BUNDLED_SKILLS {
+            resources.push(
+                RawResource::new(format!("{SKILL_URI_PREFIX}{name}"), format!("IC skill: {title}"))
+                    .no_annotation(),
+            );
+        }
+        // The companion documents those skills link to, listed so a client can
+        // see the whole bundle: every link inside a served skill resolves to
+        // another served resource, never to a fetch.
+        for (name, file, _) in skills::BUNDLED_SKILL_REFERENCES {
+            resources.push(
+                RawResource::new(
+                    format!("{SKILL_URI_PREFIX}{name}/references/{file}"),
+                    format!("IC skill reference: {name} / {file}"),
+                )
+                .no_annotation(),
+            );
         }
         Ok(ListResourcesResult {
             resources,
@@ -2074,16 +2071,26 @@ impl ServerHandler for IcTools {
         request: ReadResourceRequestParams,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
-        // Skills are fetched live by name; the candid references are static.
-        if let Some(name) = request.uri.strip_prefix(SKILL_URI_PREFIX) {
-            return match self.skills.get(name).await {
-                Ok(md) => Ok(ReadResourceResult::new(vec![ResourceContents::text(
+        // Every resource is served from content compiled into this binary —
+        // the skills from the reviewed bundle, the candid/OQL references from
+        // their static documents.
+        if let Some(path) = request.uri.strip_prefix(SKILL_URI_PREFIX) {
+            // `skill://<name>` is the skill itself; `skill://<name>/references/<file>`
+            // is one of its companion documents, which its own links point at.
+            return match skills::bundled_skill_document(path) {
+                Some(md) => Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     md,
                     request.uri,
                 )])),
-                Err(e) => Err(McpError::resource_not_found(
+                None => Err(McpError::resource_not_found(
                     "resource_not_found",
-                    Some(serde_json::json!({ "uri": request.uri, "error": e })),
+                    Some(serde_json::json!({
+                        "uri": request.uri,
+                        "error": format!(
+                            "no bundled skill document at `{}` — list the `skill://` resources to see the available skills and their references",
+                            path.trim()
+                        ),
+                    })),
                 )),
             };
         }
@@ -2413,11 +2420,16 @@ mod tests {
     // canister_update_call's description reads as a hint that the tool is
     // usable for financial transactions, which is the one thing it must not
     // suggest. Pin both sides — no tool description carries financial
-    // language, and the instructions state the denial, the refused method
-    // families, and the reason. Neither surface names a venue for a refused
-    // operation: metadata answering a refused financial operation with a
-    // specific transactional service would read as a redirect from one such
-    // route to another.
+    // language, and the instructions state the denial, the limit of the guard
+    // that backs it, and the redirect. The refused method families are
+    // deliberately NOT restated here or in the instructions: they were a copy
+    // of `compliance` that had to be kept in sync, and an attempted call is
+    // refused with a message accurate for its own scope. What the instructions
+    // must not do is promise more than the guard delivers, so the
+    // safeguard-not-a-filter clause is pinned in its place. Neither surface
+    // names a venue for a refused operation: metadata answering a refused
+    // financial operation with a specific transactional service would read as
+    // a redirect from one such route to another.
     #[test]
     fn financial_policy_is_a_server_instruction_not_a_description() {
         for tool in super::IcTools::all_tools() {
@@ -2431,6 +2443,10 @@ mod tests {
         }
         let ins = super::SERVER_INSTRUCTIONS;
         assert!(ins.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user"));
+        assert!(
+            ins.contains("a safeguard, not a complete filter"),
+            "the instructions must not present the guard as complete coverage: {ins}"
+        );
         assert!(ins.contains("outside this connector, in a trusted interface they control"));
         assert!(!ins.contains("oisy.com"), "the instructions name no venue: {ins}");
     }

@@ -97,6 +97,7 @@ POST /mcp/oauth/register          ─┘
 GET  /.well-known/oauth-authorization-server/mcp   (+ root + /mcp/.well-known/… alternates)
 GET  /.well-known/oauth-protected-resource/mcp     (+ root fallback)
 GET  /.well-known/ii-auth-callbacks                (origin-global, all instances)
+GET  /.well-known/ii-app-metadata                  (origin-global: name + legal links shown by II)
 ```
 
 Several instances share one origin by giving each its own `McpServer` (one
@@ -247,7 +248,7 @@ fetches (an app origin from `discover_app_canisters`, `open_app`, or `resolve_ap
 additionally resolve the target host up front and **pin** the connection to that
 validated globally-routable address, so a name resolving to a
 private/loopback/link-local address is refused and re-resolution can't rebind
-mid-flight. Fixed public-host enrichment (the IC dashboard, the skills registry)
+mid-flight. Fixed public-host enrichment (the IC dashboard)
 uses the redirect guard but is not separately address-pinned. No JavaScript is
 executed, and every extracted id is validated as a principal.
 
@@ -318,14 +319,19 @@ token (see Auth).
 ### Skills awareness
 
 The official Internet Computer
-[skills](https://skills.internetcomputer.org) — authoritative, current how-to
+[skills](https://skills.internetcomputer.org) — DFINITY-authored how-to
 guides for authoring and shipping IC apps (the Motoko language, the `mops` and
 `icp` CLIs, cycles management, stable memory & upgrades, canister security,
 auth, …) — are served as MCP **resources** (`skill://<name>`) alongside the
-`candid://` references. The catalogue is fetched live from the registry's
-manifest (`/api/skills.json`, cached ~15 min) and each skill's `SKILL.md` on
-demand; nothing is bundled, so the agent always sees the current skills.
-Override the registry origin with `SKILLS_URL`.
+`candid://` references. The documents come from a reviewed, versioned bundle
+compiled into the binary at build time (`crates/imcp2-core/static/skills/`,
+provenance and refresh procedure in the bundle's README); the server
+retrieves no instructions over the network, so what an agent reads is
+exactly what was reviewed at release. The companion documents a skill links
+to are bundled and served the same way, as
+`skill://<name>/references/<file>`, so following a link inside a skill
+resolves to another served resource rather than sending the agent back to
+the network.
 
 ### OQL query surfaces
 
@@ -955,32 +961,9 @@ delegation. Omitting `account` uses the default account.
 > (the server is built against that candid contract). #4086 renames the on-demand
 > delegation methods from the earlier `mcp_prepare_account_delegation` /
 > `mcp_get_account_delegation` and removes `mcp_set_access` / `mcp_access_enabled`.
-> The live round-trip works once that II build is deployed to the configured
-> `II_URL`. Passing `account_number = null` resolves to the anchor's current
+> Passing `account_number = null` resolves to the anchor's current
 > (user-controllable) default account at the origin — which may be a named account
 > the user set as their default there, not necessarily the anchor's base account.
-
-## Roadmap
-
-- [x] Candid tools over MCP streamable-HTTP; `discover_app_canisters`; Candid
-      reference resources.
-- [x] OAuth 2.1 auth (authorization-code + PKCE): II's `/mcp` **registration-delegation**
-      handshake binds the connection's session key (a fragment-delivered, canister-signed
-      delegation redeemed via `mcp_register_v2`), with **Consent-Bound Completion** binding
-      `…/oauth/connect/redeem` to both the initiator (`mcp_connect` cookie) and the consenter (the
-      fragment delegation); expiring tokens. The same-browser phishing variant is closed
-      by a hosted-redirect allow-list (see Auth). (The RFC 8628 device grant was dropped.)
-- [x] On-demand **domain identities**: the registered session key mints per-app
-      account delegations directly via II canister methods
-      (`canister_query`/`canister_update_call`/`get_app_principal` `derivation_origin`); no per-app browser flow.
-- [x] **Per-app accounts**: `list_app_accounts(derivation_origin)` lists the user's accounts at
-      an app (via `mcp_get_accounts`), and `canister_query`/`canister_update_call`/`get_app_principal` take an
-      `account` name to act as a specific (non-default) account.
-- [ ] Deploy the `mcp_register_v2` + `mcp_get_accounts` + `mcp_prepare_delegation` +
-      `mcp_get_delegation` canister methods (server is built against the merged II
-      candid contract; the live round-trip lands with the II side).
-- [ ] Persist sessions/delegations (currently in-memory, lost on restart).
-- [ ] Scoped delegations / per-call confirmation for sensitive methods.
 
 ## License
 

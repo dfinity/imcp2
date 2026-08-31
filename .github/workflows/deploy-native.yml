@@ -158,8 +158,8 @@ jobs:
     environment: ${{ inputs.environment }}
     steps:
       # Check out the exact commit the build job resolved, not inputs.ref. The
-      # binary arrives as an artifact from that commit, but deploy.sh ships static/
-      # and monitoring/ straight from this checkout — so if inputs.ref is a branch
+      # binary arrives as an artifact from that commit, but deploy.sh ships
+      # monitoring/ straight from this checkout — so if inputs.ref is a branch
       # (or a retagged tag) that moved while the build ran or while this job waited
       # on the environment's approval gate, the host would get assets from one
       # commit and a binary from another. The /version assertion below would not
