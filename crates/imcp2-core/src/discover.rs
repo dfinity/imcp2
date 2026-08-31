@@ -71,8 +71,9 @@ pub struct DiscoveredCanister {
     pub sources: Vec<String>,
     /// Whether this canister exposes the OQL query surface — filled in for the
     /// app's OWN data canisters by a single Candid fetch during open_app /
-    /// discover_app_canisters (#3). null when not probed (e.g. the frontend or a
-    /// shared system canister) or the interface couldn't be read. When true, this
+    /// discover_app_canisters (#3). null when not probed — the frontend or a shared
+    /// system canister, or an eligible canister past the eight-probe cap on a large
+    /// manifest — or when the interface couldn't be read. When true, this
     /// is a caller-gated data backend: read it with the OQL tools, passing the app's
     /// derivation_origin to read as the user.
     #[serde(skip_serializing_if = "Option::is_none")]
