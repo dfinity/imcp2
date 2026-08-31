@@ -37,7 +37,21 @@
 //!     stops a determined attacker: an agent that has been talked into writing
 //!     somewhere now has to be talked into naming an origin that declares the
 //!     target as well, and the vast majority of the ~1.2M canisters on the IC are
-//!     declared by no manifest at all.
+//!     declared by no manifest at all. Two limits of that, spelled out because
+//!     they are the ones a reader is most likely to assume away (per review):
+//!     an ANONYMOUS write skips [`bind_identity`] entirely — there is no app
+//!     identity to protect — so an attacker who declares a victim canister in
+//!     their own manifest can have this connector make an anonymous call to it;
+//!     and an AUTHENTICATED write binds to the attacker's own app identity while
+//!     still reaching any victim method that accepts an arbitrary principal.
+//!     Neither grants a capability the attacker did not already have — anyone can
+//!     send either call to a public canister with an ordinary agent, since the IC
+//!     accepts ingress from anywhere — so what the gate withholds is this
+//!     connector's willingness to make such a call ON A USER'S BEHALF, and the
+//!     binding is what keeps the user's OWN app principals out of it. Closing the
+//!     rest would take an association the TARGET attests to, which the protocol
+//!     does not define today (nothing a canister publishes names its app's
+//!     origin); it is raised on the pull request rather than invented here.
 //!   * It gates **writes only**. Reads (`canister_query`, `get_canister_candid`,
 //!     the OQL surface) and discovery are unchanged on every canister: the
 //!     protocol exists to make apps *more* legible to agents, and it would be a

@@ -322,7 +322,15 @@ Three things this gate is not:
   manifest says, so a manifest can name a canister its publisher does not own.
   What the gate establishes is that *someone* published a document, at an origin
   the caller named, claiming that canister as part of their app — and that a
-  write can be traced back to that claim.
+  write can be traced back to that claim. Two limits worth stating outright: an
+  anonymous write skips the identity binding (there is no app identity to
+  protect), and an authenticated one binds to the *caller's* app while still
+  reaching any victim method that accepts an arbitrary principal. Neither grants
+  a capability an attacker lacked — the IC accepts ingress from anywhere, so both
+  calls can be sent with an ordinary agent — so what the gate withholds is this
+  connector's willingness to make them **on a user's behalf**, and the binding is
+  what keeps the user's own app principals out of it. Closing the rest needs an
+  association the *target* attests to, which the protocol does not define today.
 - **It is not a substitute for the canister's own authorization.** The IC still
   decides what the calling principal may do; this only decides what this server
   is willing to send.
