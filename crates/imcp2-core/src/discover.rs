@@ -891,9 +891,15 @@ const MAX_DERIVATION_ORIGIN_BYTES: usize = 4 * 1024;
 enum WellKnown {
     /// A success response, with its (capped) body.
     Served(String),
-    /// The origin answered, but not with this document (any non-2xx).
+    /// The origin said this document is NOT THERE — a 404 or 410, the only
+    /// statuses that mean it (see [`means_not_published`]). Every other
+    /// non-success status is `Unreachable`, not this: an origin declining or
+    /// failing to serve the path has not told us the app declares nothing.
     Absent,
-    /// The exchange never completed (DNS, TLS, connect, timeout).
+    /// We could not find out. The exchange never completed (DNS, TLS, connect,
+    /// timeout, a body that died mid-read), or it completed with a status that
+    /// answers nothing (401/403, 429, 5xx…), or the document exceeded a cap that
+    /// its documented form does not bound.
     Unreachable(String),
 }
 
@@ -947,11 +953,14 @@ async fn fetch_well_known(
 
 /// Resolve the app's declared derivation origin, authorizing a cross-origin claim
 /// against the declared origin's own `ii-alternative-origins` (the browser/II
-/// rule; the decision is [`decide_declared_origin`]). A
-/// missing/unsuccessful/undeclared declaration legitimately yields the
-/// application-origin default (the app derives against its own origin) — for
-/// Layer 5 that is not merely tolerated but SPECIFIED: "if you use the default,
-/// you may omit the file".
+/// rule; the decision is [`decide_declared_origin`]). A declaration the app
+/// ANSWERED without providing — a 404 or 410, or a document that is not the one
+/// specified — legitimately yields the application-origin default (the app
+/// derives against its own origin); for Layer 5 that is not merely tolerated but
+/// SPECIFIED: "if you use the default, you may omit the file". A probe that did
+/// not complete is an `Err` instead: a declaration we could not read is not a
+/// declaration that is absent, and defaulting past it would derive — and sign as
+/// — a principal the app does not pin.
 ///
 /// Two sources, in protocol order: the standard [`DERIVATION_ORIGIN_PATH`] file
 /// wins, and the legacy manifest's top-level `derivation_origin` fills in for the
