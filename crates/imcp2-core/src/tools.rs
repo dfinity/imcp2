@@ -233,6 +233,19 @@ impl IcCanisterTools {
     }
 
     #[tool(
+        description = "Return the guide to textual Candid, the value syntax that canister_query's and canister_update_call's `args` take and that their replies come back in. It covers the `(...)` form and the literal for each type. Use this before writing a first argument value; the `candid://reference` resource carries the full type system.",
+        annotations(title = "Get the textual Candid guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<calls::CandidGuideOutput>(),
+    )]
+    async fn candid_syntax_guide(
+        &self,
+        Parameters(_args): Parameters<management::NoArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let output = calls::CandidGuideOutput { content: CANDID_TEXTUAL_MD.to_string() };
+        Ok(ok_structured(output.content.clone(), &output))
+    }
+
+    #[tool(
         description = "Return the guide to OQL, the JSON query language behind canister_query's `oql` argument. It covers the query object: filters, aggregation, ordering, edge traversal and paging. Use this before writing a first OQL query; get_canister_oql_schema then gives one canister's entity and field names.",
         annotations(title = "Get the OQL query guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
         output_schema = schema_for_output::<calls::OqlGuideOutput>(),
@@ -2361,12 +2374,12 @@ mod tests {
     #[test]
     fn every_tool_has_correct_read_write_annotations() {
         let served = super::IcTools::all_tools();
-        assert_eq!(served.len(), 11, "expected 11 served tools, got {}", served.len());
+        assert_eq!(served.len(), 12, "expected 12 served tools, got {}", served.len());
         // The deferred protocol half keeps its annotation contracts too, so
         // wiring it back in a future version can't regress them.
         let mut tools = served;
         tools.extend(super::IcProtocolTools::tool_router().list_all());
-        assert_eq!(tools.len(), 24, "expected 24 tools across both halves, got {}", tools.len());
+        assert_eq!(tools.len(), 25, "expected 25 tools across both halves, got {}", tools.len());
         assert!(
             tools.iter().all(|t| t.annotations.is_some()),
             "every tool must carry annotations (else clients assume write/destructive)"
@@ -2476,7 +2489,7 @@ mod tests {
     #[test]
     fn the_default_composition_defers_the_protocol_tools() {
         let served = super::IcTools::all_tools();
-        assert_eq!(served.len(), 11, "{:?}", served.iter().map(|t| &t.name).collect::<Vec<_>>());
+        assert_eq!(served.len(), 12, "{:?}", served.iter().map(|t| &t.name).collect::<Vec<_>>());
         // icp_oql_guide is the one icp_-named tool that stays served: it is
         // part of the canister OQL read flow (guide → schema → query).
         assert!(served

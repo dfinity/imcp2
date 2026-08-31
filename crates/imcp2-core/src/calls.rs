@@ -102,6 +102,14 @@ pub struct OqlGuideOutput {
     pub content: String,
 }
 
+/// Output of `candid_syntax_guide`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CandidGuideOutput {
+    /// The textual-Candid guide (markdown): the `(...)` value syntax the canister
+    /// tools take and return, with the literal forms for each type.
+    pub content: String,
+}
+
 /// Arguments for `get_canister_api_doc`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ApiDocArgs {
