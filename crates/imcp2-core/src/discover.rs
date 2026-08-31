@@ -823,6 +823,26 @@ fn decide_declared_origin(
     ))
 }
 
+/// The legacy manifest's `derivation_origin` field, once Layer 5 has answered
+/// without pinning one. `Ok(None)` is a real absence (no field, or nothing there
+/// to read); an unreachable probe is an `Err`, for the same reason Layer 5's is:
+/// the field might be there, and defaulting past it would derive the wrong
+/// principal for an app that pins a custom origin.
+fn declared_from_legacy(
+    legacy: &WellKnown,
+    application_origin: &str,
+) -> Result<Option<String>, String> {
+    match legacy {
+        WellKnown::Served(body) => Ok(declared_derivation_origin(body)),
+        WellKnown::Absent => Ok(None),
+        WellKnown::Unreachable(e) => Err(format!(
+            "could not read {LEGACY_MANIFEST_PATH} at {application_origin}: {e}. Refusing to \
+             assume this app derives against its own origin while a declaration it may publish is \
+             unreadable — this is likely transient, so retry."
+        )),
+    }
+}
+
 /// What the app's own derivation-origin declaration resolved to: its declared (and
 /// authorized) derivation origin or the application-origin default, whether either
 /// well-known probe carried IC-hosting evidence (`x-ic-canister-id`), and — when
@@ -840,29 +860,43 @@ struct DeclaredResolution {
 /// catch-all's HTML), so a misconfigured app costs a few KiB, not a page.
 const MAX_DERIVATION_ORIGIN_BYTES: usize = 4 * 1024;
 
-/// Fetch one `.well-known` document from the application origin, returning its
-/// body when the response was a success, plus whether the exchange carried
-/// IC-hosting evidence. Every well-known probe on the identity path goes through
-/// here so the evidence capture, the success check, and the size cap can't drift
-/// apart between them. A transport failure is `(None, false)` — the probes are
-/// best-effort, and the caller's reachability gate is a separate, hard fetch.
+/// One well-known probe's outcome on the IDENTITY path, where "the origin says
+/// this document is not there" and "we never got an answer" must not collapse
+/// into the same value: the first legitimately means "derive against the default"
+/// (Layer 5 specifies omitting the file), while the second means we do not know
+/// what the app declares — and defaulting on a timeout can derive, and sign as,
+/// the wrong principal.
+enum WellKnown {
+    /// A success response, with its (capped) body.
+    Served(String),
+    /// The origin answered, but not with this document (any non-2xx).
+    Absent,
+    /// The exchange never completed (DNS, TLS, connect, timeout).
+    Unreachable(String),
+}
+
+/// Fetch one `.well-known` document from the application origin, plus whether the
+/// exchange carried IC-hosting evidence. Every well-known probe on the identity
+/// path goes through here so the evidence capture, the success check, and the size
+/// cap can't drift apart between them.
 async fn fetch_well_known(
     client: &reqwest::Client,
     application_origin: &str,
     path: &str,
     max_bytes: usize,
-) -> (Option<String>, bool) {
-    let Ok(resp) = client.get(format!("{application_origin}{path}")).send().await else {
-        return (None, false);
+) -> (WellKnown, bool) {
+    let resp = match client.get(format!("{application_origin}{path}")).send().await {
+        Ok(resp) => resp,
+        Err(e) => return (WellKnown::Unreachable(e.to_string()), false),
     };
     // Captured even on a NON-success response: the IC HTTP gateway stamps
     // `x-ic-canister-id` on everything it serves, 404s included, so an app that
     // simply doesn't publish this document still proves it is IC-hosted here.
     let ic_evidence = ic_evidence_from(&resp, application_origin);
     if !resp.status().is_success() {
-        return (None, ic_evidence);
+        return (WellKnown::Absent, ic_evidence);
     }
-    (Some(read_capped(resp, max_bytes).await), ic_evidence)
+    (WellKnown::Served(read_capped(resp, max_bytes).await), ic_evidence)
 }
 
 /// Resolve the app's declared derivation origin, authorizing a cross-origin claim
@@ -902,10 +936,36 @@ async fn resolve_declared_origin(
     // Either probe reaching the origin and showing the gateway header is enough:
     // the question is whether THIS origin is IC-served, not which path answered.
     let ic_evidence = layer5_is_ic || legacy_is_ic;
-    let declared = layer5
-        .as_deref()
-        .and_then(parse_derivation_origin_file)
-        .or_else(|| legacy.as_deref().and_then(declared_derivation_origin));
+    // Precedence only means something if the higher-priority probe actually
+    // ANSWERED. A Layer 5 file we failed to fetch is not "no Layer 5 file": using
+    // the legacy field, or the application-origin default, because a request timed
+    // out would silently derive a different principal than the app pins — and
+    // this connector would sign as it. So an unreachable probe is an error, not a
+    // fallback, at each step: refusing is recoverable (the caller retries), while
+    // acting as the wrong identity is not. Both probes hit the same origin through
+    // the same client, so in practice an unreachable one means the origin is down
+    // rather than that this costs a reachable app anything.
+    let declared = match &layer5 {
+        WellKnown::Served(body) => match parse_derivation_origin_file(body) {
+            // Layer 5 answered and pinned an origin: legacy cannot override it,
+            // and its own outcome no longer matters.
+            Some(origin) => Some(origin),
+            // Answered, but not with a usable origin (the SPA catch-all serves
+            // index.html here): the legacy field may still carry one.
+            None => declared_from_legacy(&legacy, application_origin)?,
+        },
+        // The origin says there is no Layer 5 file — which the protocol
+        // SPECIFIES as "derive against the default" — so the legacy field is the
+        // only remaining source.
+        WellKnown::Absent => declared_from_legacy(&legacy, application_origin)?,
+        WellKnown::Unreachable(e) => {
+            return Err(format!(
+                "could not read {DERIVATION_ORIGIN_PATH} at {application_origin}: {e}. Refusing to \
+                 derive an identity from a lower-priority source while the app's own declaration \
+                 is unknown — this is likely transient, so retry."
+            ))
+        }
+    };
 
     // The declared origin's ii-alternative-origins is the authorization list, and
     // only a CROSS-origin claim needs it — no declaration and a self-declaration

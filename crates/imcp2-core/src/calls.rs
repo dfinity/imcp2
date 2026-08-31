@@ -196,7 +196,10 @@ pub struct CanisterUpdateCallArgs {
     /// service-discoverability manifest (`/.well-known/ic-architecture`), and this
     /// is the origin that manifest is read from. Omitted, `derivation_origin` is
     /// used as that origin instead, which is the same value when the app serves
-    /// its manifest at the origin it derives identities from.
+    /// its manifest at the origin it derives identities from. Given together with
+    /// `derivation_origin`, the two must belong to the same app: this app is
+    /// resolved to the derivation origin Internet Identity derives its users from,
+    /// and a mismatch is refused rather than signed.
     #[serde(default)]
     pub app_url: Option<String>,
     /// Call as the user's account at an app, identified by its exact canonical

@@ -103,11 +103,28 @@ pub async fn authorize_update_call(
     source: OriginSource,
     canister_id: &Principal,
 ) -> Result<Declaration, String> {
-    let manifest = match discover::fetch_declared_manifest(app_origin).await {
-        Ok(m) => m,
-        Err(e) => return Err(unreachable_refusal(app_origin, source, &e)),
-    };
-    let manifest = match manifest {
+    match discover::fetch_declared_manifest(app_origin).await {
+        Ok(probe) => decide(probe, app_origin, source, canister_id),
+        Err(e) => Err(unreachable_refusal(app_origin, source, &e)),
+    }
+}
+
+/// The gate's decision, separated from the fetch that feeds it (per review): with
+/// no app publishing the standard path yet, every live test of the YES branch can
+/// only skip, so the branch that MATTERS — a declared canister authorizes, and
+/// each way of not being declared refuses differently — needs to be provable
+/// without a network. It cannot be tested by pointing the fetch at a local server
+/// either: the SSRF guard resolves and pins public addresses before any request,
+/// so a loopback origin is refused before a fixture could answer. Splitting the
+/// decision out is what makes it testable at all, and every case below is pinned
+/// on constructed input.
+fn decide(
+    probe: discover::ManifestProbe,
+    app_origin: &str,
+    source: OriginSource,
+    canister_id: &Principal,
+) -> Result<Declaration, String> {
+    let manifest = match probe {
         discover::ManifestProbe::Declared(m) => m,
         // An origin still on the pre-protocol path gets its own refusal: it HAS
         // published something, so reporting it as publishing nothing would send
@@ -126,12 +143,66 @@ pub async fn authorize_update_call(
     Err(not_declared_refusal(&manifest, canister_id, source))
 }
 
+/// The identity half of the gate: the app whose manifest authorizes the write
+/// must be the app the write is SIGNED as.
+///
+/// The manifest gate alone establishes that someone published a document at the
+/// origin the caller named. It says nothing about whose identity the call goes
+/// out under, and those are separable inputs: `app_url` picks the manifest,
+/// `derivation_origin` picks the principal. Left unbound, an origin the attacker
+/// controls could declare any canister — declaring one is free, and the gate
+/// deliberately does not prove ownership — while the call was signed with the
+/// principal the user holds at a DIFFERENT app they actually trusted. Requiring
+/// the app to resolve to the identity being used removes that pairing: an
+/// attacker's manifest can only ever authorize writes made as the attacker's own
+/// app identity, which is worth nothing to them.
+///
+/// The comparison is against what the app ITSELF resolves to — its declared Layer
+/// 5 origin, else a known-app value, else its own origin — not against the app URL
+/// literally, so the many apps whose derivation origin differs from their website
+/// (13 of 17 in the built-in registry) still pass. `resolve_app_identity` also
+/// enforces Internet Identity's own rule on the way: a cross-origin declaration
+/// counts only if the declared origin authorizes this app in its
+/// `ii-alternative-origins`, so an app cannot simply claim another's identity to
+/// satisfy this check.
+///
+/// Fails CLOSED: an origin that cannot be resolved refuses, rather than being
+/// treated as a match.
+pub async fn bind_identity(
+    app_origin: &str,
+    requested_identity: &str,
+    canister_id: &Principal,
+) -> Result<(), String> {
+    let identity = discover::resolve_app_identity(app_origin, false)
+        .await
+        .map_err(|e| identity_unresolvable_refusal(app_origin, &e))?;
+    // Compare canonical forms: `requested_identity` has been through the identity
+    // path's canonicalization (which remaps the *.icp0.io / *.icp.net gateway
+    // hosts to *.ic0.app), so put the resolved value through the same one or the
+    // same app spelled two ways would read as two apps.
+    let app_identity = crate::identities::target_origin(&identity.derivation_origin);
+    if app_identity.eq_ignore_ascii_case(requested_identity) {
+        return Ok(());
+    }
+    Err(identity_mismatch_refusal(app_origin, &app_identity, requested_identity, canister_id))
+}
+
 /// Cap on any externally-influenced string a refusal echoes back. A transport
 /// error can carry a hostile origin's TLS certificate subject or redirect URL,
 /// and a refusal is text the model reads: pass it through the same control-char
 /// scrub the manifest labels use, and keep it short enough that it cannot become
 /// the bulk of the message.
 const MAX_ECHOED_CAUSE: usize = 200;
+
+/// Scrub and cap an ORIGIN before it reaches the model. `app_url` is
+/// caller-supplied and only its origin is ever fetched, so the origin is what a
+/// refusal should name — but the value reaching a refusal has been through
+/// validation, not necessarily through origin reduction, and this module claims a
+/// bound on every externally-influenced string it echoes. Applying the same cap
+/// here makes that claim hold whatever the caller passed (per review).
+fn safe_origin(origin: &str) -> String {
+    safe_cause(origin)
+}
 
 /// Scrub and cap an error string before it reaches the model (CWE-150).
 fn safe_cause(cause: &str) -> String {
@@ -175,6 +246,7 @@ pub fn missing_origin_refusal(canister_id: &Principal) -> String {
 /// The origin could not be reached at all. Distinct from "publishes no manifest":
 /// we do not know, so the refusal is retryable rather than a verdict on the app.
 fn unreachable_refusal(app_origin: &str, source: OriginSource, error: &str) -> String {
+    let app_origin = safe_origin(app_origin);
     format!(
         "Could not check whether {app_origin} declares this canister: {}. {} The call is \
          refused rather than made blind. This is likely transient — retry; if it persists, confirm \
@@ -193,6 +265,7 @@ fn no_manifest_refusal(
     source: OriginSource,
     served_non_manifest: Option<&str>,
 ) -> String {
+    let app_origin = safe_origin(app_origin);
     let mut msg = format!(
         "{app_origin} publishes no service-discoverability manifest at {ARCHITECTURE_PATH}, so \
          this connector will not make a state-changing call to its canisters. {} ",
@@ -278,6 +351,39 @@ fn legacy_only_refusal(
     msg
 }
 
+/// The caller named an app whose manifest authorizes the write, but asked to sign
+/// as a DIFFERENT app's identity. Without this check the manifest gate could be
+/// satisfied by an origin the attacker controls while the call went out under the
+/// principal the user holds somewhere else: any site can publish a manifest naming
+/// any canister, so a declaration only means something when it comes from the app
+/// whose identity is signing. The refusal names both origins, because which one is
+/// wrong depends on what the caller meant to do.
+fn identity_mismatch_refusal(
+    app_origin: &str,
+    app_identity: &str,
+    requested_identity: &str,
+    canister_id: &Principal,
+) -> String {
+    let (app_origin, app_identity, requested_identity) =
+        (safe_origin(app_origin), safe_origin(app_identity), safe_origin(requested_identity));
+    format!(
+        "The app at {app_origin} is not the app this call would be signed as. Internet Identity          derives that app's users from {app_identity}, while this call asks to act as          {requested_identity}. Writing to {canister_id} on that combination is refused: a manifest          published at one origin does not authorize a write made under another app's identity, or          any site could declare a canister and have this connector write to it as you, at an app          you trusted for something else. If {canister_id} belongs to the app you are acting at,          pass THAT app's URL as `app_url` — open_app returns the `app_url` and the          `derivation_origin` of one app together, so a pair from a single open_app call always          matches. If you meant to act at {app_origin} instead, pass its own derivation origin.          {READS_ARE_FINE}"
+    )
+}
+
+/// The binding above could not be established at all — the app origin would not
+/// resolve to a derivation origin (unreachable, or a cross-origin declaration its
+/// declared origin does not authorize). Distinct from a mismatch: we do not know
+/// that the two disagree, only that we cannot show they agree, and the call is
+/// refused rather than made blind.
+fn identity_unresolvable_refusal(app_origin: &str, cause: &str) -> String {
+    format!(
+        "Could not establish that {} is the app this call would be signed as: {}. The call is          refused rather than made blind, because a manifest only authorizes a write when it comes          from the app whose identity is signing. This is likely transient — retry; if it persists,          confirm that `app_url` names the app you are acting at (open_app returns its `app_url`          and `derivation_origin` together). {READS_ARE_FINE}",
+        safe_origin(app_origin),
+        safe_cause(cause)
+    )
+}
+
 /// The app publishes a manifest, but this canister is not in it. The most useful
 /// thing a refusal can do here is show what the app DOES declare, so an agent
 /// that picked the wrong id out of a discovery listing can correct itself in one
@@ -358,11 +464,18 @@ mod tests {
         }
     }
 
-    // Every refusal states the SAME rule, names the standard path, and links the
-    // guide — an app owner reading a relayed refusal must be able to act on it
-    // without anyone explaining the protocol to them first.
+    // Every MANIFEST refusal states the same rule, names the standard path, and
+    // links the guide — an app owner reading a relayed refusal must be able to act
+    // on it without anyone explaining the protocol to them first.
+    //
+    // The two identity refusals are deliberately not in this list: their repair
+    // belongs to the CALLER (pass an `app_url` and `derivation_origin` from one
+    // open_app call), not to the app's operators, and quoting the adoption rule at
+    // someone whose app already publishes a manifest would send them to fix
+    // something that is not broken. What they must say instead is pinned by
+    // `the_identity_mismatch_refusal_names_both_apps`.
     #[test]
-    fn every_refusal_states_the_rule_and_links_the_guide() {
+    fn every_manifest_refusal_states_the_rule_and_links_the_guide() {
         let refusals = [
             missing_origin_refusal(&backend()),
             unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out"),
@@ -404,6 +517,13 @@ mod tests {
                 &backend(),
                 OriginSource::AppUrl,
             ),
+            identity_mismatch_refusal(
+                "https://evil.example",
+                "https://evil.example",
+                "https://gooddapp.com",
+                &backend(),
+            ),
+            identity_unresolvable_refusal("https://app.example.com", "timed out"),
         ] {
             assert!(msg.contains("canister_query"), "must point at the read path: {msg}");
         }
@@ -501,6 +621,13 @@ mod tests {
                 &backend(),
                 OriginSource::AppUrl,
             ),
+            identity_mismatch_refusal(
+                "https://evil.example",
+                "https://evil.example",
+                "https://gooddapp.com",
+                &backend(),
+            ),
+            identity_unresolvable_refusal("https://app.example.com", "timed out"),
         ] {
             for wrong in [
                 "reconnect",
@@ -623,6 +750,103 @@ mod tests {
         assert!(older < missing, "the document it DOES serve comes first: {listed}");
     }
 
+    // The gate's decision, on constructed input: the YES branch and each way of
+    // failing, with no network involved (per review — the live YES test can only
+    // skip until an app publishes the standard path, and a local fixture is
+    // unreachable behind the SSRF guard).
+    #[test]
+    fn the_decision_authorizes_only_a_declared_canister() {
+        let declared = |ids: &[Principal]| {
+            discover::ManifestProbe::Declared(manifest(
+                "https://app.example.com",
+                ARCHITECTURE_PATH,
+                ids,
+            ))
+        };
+        let call = |probe| decide(probe, "https://app.example.com", OriginSource::AppUrl, &backend());
+
+        // Declared at the standard path: authorized, and the provenance echoed
+        // back is the origin and path that authorized it.
+        let ok = call(declared(&[frontend(), backend()])).expect("a declared canister authorizes");
+        assert_eq!(ok.origin, "https://app.example.com");
+        assert_eq!(ok.path, ARCHITECTURE_PATH);
+
+        // The same manifest without this canister: refused, and the refusal shows
+        // what the app does declare.
+        let err = call(declared(&[frontend()])).expect_err("an undeclared canister is refused");
+        assert!(err.contains(&frontend().to_text()), "lists what IS declared: {err}");
+
+        // An empty manifest is adoption without declaration — still a refusal.
+        assert!(call(declared(&[])).is_err());
+
+        // No manifest at all, and the SPA catch-all variant that answers the path
+        // with something else: the never-adopted verdict, naming the catch-all
+        // when there is one to name.
+        let absent = |served: Option<&str>, legacy: Option<discover::DeclaredManifest>| {
+            discover::ManifestProbe::Absent {
+                served_non_manifest: served.map(str::to_string),
+                legacy,
+            }
+        };
+        let err = call(absent(None, None)).expect_err("no manifest is refused");
+        assert!(err.contains("publishes no service-discoverability manifest"), "{err}");
+        let err = call(absent(Some("text/html"), None)).expect_err("refused");
+        assert!(err.contains("single-page-app catch-all"), "names the misconfiguration: {err}");
+
+        // The legacy document does NOT authorize, however complete it is — this is
+        // the precedence the gate turns on, so it is pinned here rather than only
+        // against a live origin that may adopt the standard path at any time.
+        let legacy = manifest("https://app.example.com", LEGACY_MANIFEST_PATH, &[backend()]);
+        let err = call(absent(None, Some(legacy))).expect_err("the legacy path must not authorize");
+        assert!(err.contains(ARCHITECTURE_PATH), "names the path to adopt: {err}");
+        assert!(err.contains("DOES list this canister"), "{err}");
+    }
+
+    // The identity binding: a manifest at one origin must not authorize a write
+    // signed as a different app. The refusal has to name both origins — which one
+    // is wrong depends on what the caller meant — and point at the one call that
+    // returns a matching pair.
+    #[test]
+    fn the_identity_mismatch_refusal_names_both_apps() {
+        let msg = identity_mismatch_refusal(
+            "https://evil.example",
+            "https://evil.example",
+            "https://gooddapp.com",
+            &backend(),
+        );
+        assert!(msg.contains("evil.example"), "names the app whose manifest was read: {msg}");
+        assert!(msg.contains("gooddapp.com"), "names the identity it would sign as: {msg}");
+        assert!(msg.contains(&backend().to_text()), "names the target: {msg}");
+        assert!(msg.contains("open_app"), "points at the call that returns a matching pair: {msg}");
+
+        // Not knowing is not the same as knowing they differ: the unresolvable
+        // refusal reads as a check that failed, not as a verdict on the caller.
+        let unresolved = identity_unresolvable_refusal("https://app.example.com", "timed out");
+        assert!(unresolved.contains("Could not establish"), "{unresolved}");
+        assert!(unresolved.contains("retry"), "{unresolved}");
+        assert!(!unresolved.contains("is not the app"), "must not assert a mismatch: {unresolved}");
+    }
+
+    // Everything a refusal echoes stays bounded, whatever the caller passed: the
+    // origin is capped like the error causes are, so a valid-but-enormous argument
+    // cannot flood the reply (per review).
+    #[test]
+    fn refusals_cap_the_echoed_origin() {
+        let flood = format!("https://app.example.com/{}", "a".repeat(10_000));
+        for msg in [
+            unreachable_refusal(&flood, OriginSource::AppUrl, "timed out"),
+            no_manifest_refusal(&flood, OriginSource::AppUrl, None),
+            identity_unresolvable_refusal(&flood, "timed out"),
+            identity_mismatch_refusal(&flood, &flood, &flood, &backend()),
+        ] {
+            assert!(
+                !msg.contains(&"a".repeat(MAX_ECHOED_CAUSE + 1)),
+                "the echoed origin must be capped: {msg}"
+            );
+            assert!(msg.contains("app.example.com"), "and still name the origin: {msg}");
+        }
+    }
+
     // Live network: the gate is only useful if it actually says YES for an app
     // that publishes the manifest at the standard path, so this asserts the YES
     // against a real origin — and an unrelated canister (the ICP ledger) must
@@ -653,6 +877,39 @@ mod tests {
                 .expect_err("an undeclared canister must be refused");
             assert!(err.contains(&ledger.to_text()), "{err}");
         }
+    }
+
+    // Live network: two real apps, deliberately crossed. Reading MULTI/DEX's
+    // manifest while signing as the user's identity at OISY is exactly the pairing
+    // the binding exists to refuse — before it, the attacker-controlled half was
+    // the manifest, and the valuable half was the identity. Skips only if the
+    // origin cannot be resolved at all, which is a different (also refusing)
+    // outcome rather than a pass.
+    #[tokio::test]
+    async fn crossing_an_app_with_another_apps_identity_is_refused() {
+        let err = bind_identity("https://multidex.ai", "https://oisy.com", &backend())
+            .await
+            .expect_err("a crossed pair must never bind");
+        if err.contains("Could not establish") {
+            return; // unreachable — the refusal is right either way
+        }
+        assert!(err.contains("is not the app this call would be signed as"), "{err}");
+        assert!(err.contains("oisy.com"), "names the identity: {err}");
+    }
+
+    // The other side of the same coin: an app paired with its OWN resolved
+    // identity binds. multidex.ai declares no custom derivation origin, so its
+    // identity is its own origin.
+    #[tokio::test]
+    async fn an_app_paired_with_its_own_identity_binds() {
+        const APP: &str = "https://multidex.ai";
+        let Ok(identity) = discover::resolve_app_identity(APP, false).await else {
+            return; // unreachable — nothing to assert
+        };
+        let canonical = crate::identities::target_origin(&identity.derivation_origin);
+        bind_identity(APP, &canonical, &backend())
+            .await
+            .expect("an app must bind to its own resolved identity");
     }
 
     // Live network, the case this gate deliberately gives up: an origin serving
