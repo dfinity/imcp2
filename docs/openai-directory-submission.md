@@ -99,32 +99,59 @@ tools) if review pushes back —
 and expect a higher chance of push-back than at Anthropic given the
 login-and-password wording.
 
-### 3. Policy check: commerce and crypto
+### 3. Policy check: financial activity and commerce
 
-OpenAI's restrictions differ usefully from Anthropic's blanket
-financial-transfers prohibition:
+OpenAI's restriction is the same prohibition Anthropic's is, not a narrower
+one. The [app
+guidelines](https://developers.openai.com/plugins/app-guidelines) prohibit
+"execution of money transfers, crypto transfers, or investment trades"
+outright, alongside "crypto or NFT offerings involving speculation, consumer
+deception, or financial abuse" — so answer the attestation ("my plugin does
+not initiate or execute money transfers, crypto transfers, or investment
+trades on behalf of users") from the same non-financial posture the Anthropic
+submission states, not from a narrower reading:
 
-- Prohibited: "Crypto or NFT offerings involving **speculation, consumer
-  deception**". IMCP2 offers no speculation product — no trading, prices, or
-  markets.
-- Commerce rules ("only for physical goods", no digital-goods selling, no
-  embedded checkout) govern *selling through the app*; IMCP2 sells nothing.
-- The attestation "my plugin does not initiate or execute money transfers,
-  crypto transfers, or investment trades on behalf of users" is satisfied by
-  the shipped behavior — check it on that basis: no tool initiates or
-  executes a transfer of the user's funds. `canister_update_call` refuses
-  the financial ledger methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37
-  equivalents on every canister, plus the ICP and cycles ledgers' own
-  value-moving methods on those ledgers), with the policy stated in the
-  server-level instructions rather than the tool description (which stays
-  free of financial language, per maintainer review)
-  ([#154](https://github.com/dfinity/imcp2/pull/154)), and
-  the plugin has no funding or canister-management tools at all — the
-  execution paths that once moved funds are removed from the binary
-  ([#153](https://github.com/dfinity/imcp2/pull/153),
-  [#154](https://github.com/dfinity/imcp2/pull/154)). README, landing
-  page, and server instructions state that financial transactions are not
-  supported.
+- **The plugin is not a financial tool.** Its purpose is reading, building,
+  and operating canisters. It serves no funding, trading, creation, or
+  dedicated canister-management tools — creating, funding, and deploying
+  canisters is work the user does with the icp CLI in their own terminal. The
+  generic `canister_update_call` does not reach management-canister lifecycle
+  methods either: those calls must carry the target canister as the request's
+  effective canister id, and the update-call path does not set one, so the
+  boundary node rejects them.
+- **No tool initiates or executes a transfer of the user's funds.**
+  `canister_update_call` refuses the standardized value-moving methods
+  (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents, plus the NNS/SNS
+  governance method `manage_neuron` — neuron staking and disbursement) on
+  every canister, the ICP and cycles ledgers' own value-moving methods and
+  the cycles-minting canister's funding-completion methods on those
+  canisters, and every update call on the financial-service canisters it
+  carries. The refusal tells the user to perform the
+  operation outside the connector, in a trusted interface they control, and
+  names no venue.
+- **The descriptions match the behavior**, as the guidelines require ("tools
+  should behave exactly as their names, descriptions, and inputs indicate";
+  "side effects should never be hidden or implicit"):
+  every tool description says what its tool does, what it returns, and which
+  inputs it rejects (an anonymous OQL read, a Candid data query on an OQL
+  canister, a URL with no Internet-Computer evidence). The
+  financial-transactions policy is a separate, server-wide matter and is
+  stated where the scan reads it: in the server-level instructions, covering
+  the whole surface at once. Those instructions state the policy, not its
+  implementation — the method families and canister scopes live in the guard
+  and in the refusal each attempted call receives, rather than in a copy that
+  would have to be kept in sync. So no description promises a behavior
+  the tool does not have, and no refusal is hidden.
+- **The commerce and speculation rules have nothing to attach to.** The
+  plugin sells nothing (no physical goods, no digital goods or
+  subscriptions, no checkout) and offers no speculation product: no trading,
+  prices, or markets.
+
+So the attestation is a clean yes. The README and the server instructions
+both state that financial transactions are not supported. The landing page is
+not a third: #165 moved it to <https://internetcomputer.org/icp-mcp/>,
+maintained in dfinity/internetcomputer-org, and it carries no policy text of
+its own — adding it there is a separate change in that repository.
 
 ### 4. Test cases (authoring work)
 

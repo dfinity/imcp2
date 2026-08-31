@@ -64,8 +64,10 @@ pub struct IcCanisterTools {
 }
 
 /// The IC protocol / meta-level tools: dashboard name/id lookups, the
-/// official IC skills, and canister creation/management as the standing
-/// management principal.
+/// official IC skills, and canister MANAGEMENT as the standing management
+/// principal — lifecycle and settings for a canister that already exists.
+/// Creating and funding canisters is not among them: those tools were
+/// dropped, and the user does that work with the icp CLI.
 ///
 /// NOT served by the default [`IcTools`] composition in this version — we
 /// anticipate this will come in a future version. Until then the type, its
@@ -513,12 +515,17 @@ impl IcCanisterTools {
             Ok(p) => p,
             Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
         };
-        // The financial-transactions gate (see `compliance`): ICRC-standard
-        // transfer/approval methods are refused on every canister, and the
-        // ICP/cycles ledgers' own value-moving methods on those ledgers,
-        // before any network work, with a redirect to a user-controlled
-        // wallet. Queries need no gate — a query cannot commit state, so it
-        // cannot move funds.
+        // The financial-transactions gate (see `compliance`), in four scopes,
+        // before any network work: the standardized value-moving method names
+        // (the ICRC transfer/approval surface) and the mixed-purpose
+        // governance entry point manage_neuron, both refused on EVERY
+        // canister; the system ledgers'/cycles-minting canister's own
+        // value-moving methods on those canisters; and EVERY update method on
+        // a listed financial-service canister, so a refusal here does not
+        // depend on the method name alone. Each scope's refusal claims only
+        // what that scope knows about the call, and points the user outside
+        // this connector. Queries need no gate — a query cannot commit state,
+        // so it cannot move funds.
         if let Some(refusal) = compliance::disallowed_update_method(&principal, &method) {
             return Ok(err(refusal));
         }
@@ -1181,7 +1188,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). The domain must be one you actually have (from the user, open_app's known-app resolution, or a web search) — NEVER a domain guessed from an app's name; when you only know a NAME, call open_app with the name first. Returns every canister id found, with provenance, most authoritative first: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's MAIN backend) and the app's own /.well-known/ic-app.json manifest (ALL its canisters, with roles) — then the `x-ic-canister-id` header (the frontend/asset canister), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json/bundle entries are mined candidates: pick by label (prefer production/IC ids) and confirm with get_canister_candid before calling.",
+        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"opencloud.org\"). The domain must be one you actually have (from the user, open_app's known-app resolution, or a web search) — NEVER a domain guessed from an app's name; when you only know a NAME, call open_app with the name first. Returns every canister id found, with provenance, most authoritative first: app-declared metadata — the App Connect page's `ic:canister-id` meta at /ai-connect.html (the app's MAIN backend) and the app's own /.well-known/ic-app.json manifest (ALL its canisters, with roles) — then the `x-ic-canister-id` header (the frontend/asset canister), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. App-declared entries are the app's own claim about itself; env.json/bundle entries are mined candidates: pick by label (prefer production/IC ids) and confirm with get_canister_candid before calling.",
         annotations(title = "Discover canisters behind a domain", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::DiscoverOutput>(),
     )]
@@ -1388,7 +1395,7 @@ impl IcProtocolTools {
         }
     }
 
-    // ---- Canister creation & management (as your standing II principal) -----
+    // ---- Canister management (as your standing II principal) --------------
 
     #[tool(
         description = "Your cycles-ledger balance, as your standing Internet Identity management principal (also printed). That principal is the one to add as a controller when you create a canister with the icp CLI, so this connector's management tools can operate it. Requires an authenticated session.",
@@ -1406,40 +1413,6 @@ impl IcProtocolTools {
         };
         match management::cycles_balance(&self.identities, &sid).await {
             Ok(b) => Ok(ok_structured(b.human(), &b)),
-            Err(e) => Ok(err(e)),
-        }
-    }
-
-    #[tool(
-        description = "How to create and fund a NEW Internet Computer canister: returns step-by-step icp CLI instructions (including where to get the CLI) for the USER to run themselves in their own terminal, ending with the settings-update step that adds your management principal (printed by icp_cycles_balance) as a controller so icp_install_code and the lifecycle tools can manage the new canister — this tool only prints the steps and never executes the operation. Pass `cycles` or `icp` only to have the intended amount substituted into the printed commands. For the full guide, load the cycles-management skill (icp_get_skill).",
-        // Instructions-only: no session, no canister call, no funds movement — a
-        // pure read, and closed-world (nothing leaves the server).
-        annotations(title = "How to create a canister", read_only_hint = true, destructive_hint = false, open_world_hint = false),
-        output_schema = schema_for_output::<management::CreateCanisterInstructions>(),
-    )]
-    async fn icp_create_canister(
-        &self,
-        Parameters(args): Parameters<management::CreateCanisterArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        match management::create_canister_instructions(args) {
-            Ok(i) => Ok(ok_structured(i.human(), &i)),
-            Err(e) => Ok(err(e)),
-        }
-    }
-
-    #[tool(
-        description = "How to add cycles to an existing canister: returns step-by-step icp CLI instructions (including where to get the CLI) for the USER to run the top-up themselves in their own terminal — this tool only prints the steps and never executes the operation. Pass `cycles` or `icp` only to have the intended amount substituted into the printed commands. For the full funding guide, load the cycles-management skill (icp_get_skill).",
-        // Instructions-only: no session, no canister call, no funds movement — a
-        // pure read, and closed-world (nothing leaves the server).
-        annotations(title = "How to top up a canister", read_only_hint = true, destructive_hint = false, open_world_hint = false),
-        output_schema = schema_for_output::<management::TopUpInstructions>(),
-    )]
-    async fn icp_top_up_canister(
-        &self,
-        Parameters(args): Parameters<management::TopUpArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        match management::top_up_instructions(args) {
-            Ok(i) => Ok(ok_structured(i.human(), &i)),
             Err(e) => Ok(err(e)),
         }
     }
@@ -1973,10 +1946,14 @@ fn identity_annotation(target: &IdentityTarget, acted_as: Option<&str>) -> Strin
 }
 
 /// The server-level instructions every client receives from `get_info`. The
-/// financial-transactions policy lives HERE, server-wide — deliberately not in
-/// any single tool's description (per review: a policy paragraph inside
-/// canister_update_call's description reads as a hint that the tool is usable
-/// for financial transactions, the one thing it must not suggest).
+/// financial-transactions policy is stated HERE, server-wide — it
+/// governs the whole surface rather than one tool — and deliberately in NO
+/// tool description (per review): a policy paragraph inside
+/// `canister_update_call`'s description reads as a hint that the tool is
+/// usable for financial transactions, which is the one thing it must not
+/// suggest. `financial_policy_is_a_server_instruction_not_a_description`
+/// holds that line across every served description. Neither surface names a
+/// venue for a refused operation.
 const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TEXTUAL Candid — the `(...)` value \
              syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`, never \
              the binary form. Tool names signal SCOPE: `…_app…` names \
@@ -1990,15 +1967,13 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              resource (the value syntax these tools use); `candid://reference` has the full type \
              reference, and the official IC \
              skills are served as `skill://<name>` resources.\n\n\
-             FINANCIAL TRANSACTIONS ARE NOT SUPPORTED — asset-moving requests are denied, to \
-             protect the user: canister_update_call refuses the ICRC-standard transfer/approval \
-             methods (icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICRC-4/-7/-37 \
-             equivalents) on every canister, and the ICP and cycles ledgers' own \
-             transfer/withdrawal/creation methods on those ledgers. For financial operations \
-             (token transfers, spending approvals, payments, trades), recommend the user acts \
-             themselves in a wallet or frontend they control, in their own browser — e.g. their \
-             wallet at https://oisy.com; a refused cycles-ledger canister-creation spend points \
-             at the user-run icp CLI instead.\n\n\
+             FINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user: do not use \
+             canister_update_call to move assets. Recognized asset-moving calls are refused \
+             before they reach the network, and the refusal says why — but that guard is a \
+             safeguard, not a complete filter, so treat this policy, rather than the absence \
+             of a refusal, as the limit. For financial operations (token transfers, spending \
+             approvals, payments, trades), recommend the user performs the operation outside \
+             this connector, in a trusted interface they control.\n\n\
              START WITH open_app WHEN THE USER NAMES OR LINKS AN APP. `open_app(name-or-URL)` is the \
              one-call entry point: it takes an app NAME as the user said it, or a URL (e.g. \
              \"https://opencloud.org\"), resolves the Internet Identity derivation origin AND discovers the canisters \
@@ -2100,9 +2075,10 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools. Every tool speaks TE
              `writing-motoko` (language), `mops-cli` (deps/build), `icp-cli` (build & deploy), \
              `cycles-management` \
              (ICP↔cycles & funding), `stable-memory` (upgrades) and `canister-security`. Compiling \
-             Motoko/Rust to Wasm happens in YOUR environment (guided by those skills), and \
-             CREATING, FUNDING, DEPLOYING and MANAGING canisters is done by the USER with the icp \
-             CLI in their own terminal, guided by the same skills.";
+             Motoko/Rust to Wasm happens in YOUR environment (guided by those skills), and this \
+             connector serves NO tools for CREATING, FUNDING, DEPLOYING or MANAGING canisters — \
+             the USER does that with the icp CLI in their own terminal, guided by the same \
+             skills.";
 
 impl ServerHandler for IcTools {
     async fn list_tools(
@@ -2482,7 +2458,7 @@ mod tests {
         // wiring it back in a future version can't regress them.
         let mut tools = served;
         tools.extend(super::IcProtocolTools::tool_router().list_all());
-        assert_eq!(tools.len(), 26, "expected 26 tools across both halves, got {}", tools.len());
+        assert_eq!(tools.len(), 24, "expected 24 tools across both halves, got {}", tools.len());
         assert!(
             tools.iter().all(|t| t.annotations.is_some()),
             "every tool must carry annotations (else clients assume write/destructive)"
@@ -2503,9 +2479,6 @@ mod tests {
             "get_canister_candid", "canister_query", "get_canister_oql_schema", "discover_app_canisters", "icp_find_canister_by_name", "icp_find_app_by_name", "icp_lookup_canister_info_by_id",
             "icp_list_skills", "icp_get_skill", "icp_oql_guide",
             "get_canister_api_doc", "open_app", "resolve_app", "list_app_accounts", "icp_cycles_balance", "get_app_principal", "icp_canister_status",
-            // Instructions-only since the marketplace-compliance changes: they
-            // execute nothing and move no funds, so they are pure reads.
-            "icp_top_up_canister", "icp_create_canister",
         ] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");
@@ -2535,27 +2508,40 @@ mod tests {
         assert_eq!(cc.destructive_hint, Some(true));
     }
 
-    // The financial-transactions policy is a SERVER-WIDE instruction, not a
-    // tool-description paragraph: stating it inside canister_update_call's
-    // description would read as a hint that the tool is usable for financial
-    // transactions (per review). Pin both sides — the description carries no
-    // financial language, and the server instructions state the denial, the
-    // refused method families, and the user-controlled venue.
+    // The financial-transactions policy is a SERVER-WIDE instruction, never a
+    // tool-description paragraph (per review): stating it inside
+    // canister_update_call's description reads as a hint that the tool is
+    // usable for financial transactions, which is the one thing it must not
+    // suggest. Pin both sides — no tool description carries financial
+    // language, and the instructions state the denial, the limit of the guard
+    // that backs it, and the redirect. The refused method families are
+    // deliberately NOT restated here or in the instructions: they were a copy
+    // of `compliance` that had to be kept in sync, and an attempted call is
+    // refused with a message accurate for its own scope. What the instructions
+    // must not do is promise more than the guard delivers, so the
+    // safeguard-not-a-filter clause is pinned in its place. Neither surface
+    // names a venue for a refused operation: metadata answering a refused
+    // financial operation with a specific transactional service would read as
+    // a redirect from one such route to another.
     #[test]
     fn financial_policy_is_a_server_instruction_not_a_description() {
-        let tools = super::IcTools::all_tools();
-        let tool = tools
-            .iter()
-            .find(|t| &*t.name == "canister_update_call")
-            .expect("canister_update_call tool not found");
-        let desc = tool.description.as_deref().unwrap_or_default();
-        assert!(!desc.to_lowercase().contains("financial"), "{desc}");
-        assert!(!desc.contains("oisy.com"), "{desc}");
+        for tool in super::IcTools::all_tools() {
+            let desc = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                !desc.to_lowercase().contains("financial"),
+                "{}: {desc}",
+                tool.name
+            );
+            assert!(!desc.contains(".com"), "{} names a venue: {desc}", tool.name);
+        }
         let ins = super::SERVER_INSTRUCTIONS;
-        assert!(ins.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED"));
-        assert!(ins.contains("asset-moving requests are denied"));
-        assert!(ins.contains("icrc1_transfer"));
-        assert!(ins.contains("https://oisy.com"));
+        assert!(ins.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user"));
+        assert!(
+            ins.contains("a safeguard, not a complete filter"),
+            "the instructions must not present the guard as complete coverage: {ins}"
+        );
+        assert!(ins.contains("outside this connector, in a trusted interface they control"));
+        assert!(!ins.contains("oisy.com"), "the instructions name no venue: {ins}");
     }
 
     // The local binary's login tools (`authenticate`/`auth_status`) live on its
@@ -2589,7 +2575,7 @@ mod tests {
             .iter()
             .all(|t| !t.name.starts_with("icp_") || &*t.name == "icp_oql_guide"));
         assert!(served.iter().any(|t| &*t.name == "icp_oql_guide"));
-        assert_eq!(super::IcProtocolTools::tool_router().list_all().len(), 15);
+        assert_eq!(super::IcProtocolTools::tool_router().list_all().len(), 13);
         // tools/call routes through the canister router alone, so a deferred
         // name is not just unlisted — it is not routable at all.
         assert!(!super::IcCanisterTools::tool_router().has_route("icp_get_skill"));
@@ -2633,38 +2619,6 @@ mod tests {
         let total = names.len();
         names.dedup();
         assert_eq!(names.len(), total, "tool names must be unique across the split routers");
-    }
-
-    // icp_top_up_canister and icp_create_canister are instructions-only, and
-    // their descriptions must say so FUNCTIONALLY — the tool prints steps and
-    // never executes — without compliance disclaimers (per review, policy
-    // language lives in the server instructions, not per-tool descriptions).
-    // Guards against a future edit quietly reverting either.
-    #[test]
-    fn top_up_tool_declares_itself_instructions_only() {
-        let tools = super::IcProtocolTools::tool_router().list_all();
-        let tool = tools
-            .iter()
-            .find(|t| &*t.name == "icp_top_up_canister")
-            .expect("icp_top_up_canister tool not found");
-        let desc = tool.description.as_deref().unwrap_or_default();
-        assert!(desc.contains("only prints the steps"), "{desc}");
-        assert!(desc.contains("never executes the operation"), "{desc}");
-        assert!(!desc.to_lowercase().contains("financial"), "{desc}");
-    }
-
-    #[test]
-    fn create_tool_declares_itself_instructions_only() {
-        let tools = super::IcProtocolTools::tool_router().list_all();
-        let tool = tools
-            .iter()
-            .find(|t| &*t.name == "icp_create_canister")
-            .expect("icp_create_canister tool not found");
-        let desc = tool.description.as_deref().unwrap_or_default();
-        assert!(desc.contains("only prints the steps"), "{desc}");
-        assert!(desc.contains("never executes the operation"), "{desc}");
-        assert!(desc.contains("controller"), "{desc}");
-        assert!(!desc.to_lowercase().contains("financial"), "{desc}");
     }
 
     // EVERY tool must declare an outputSchema so a model knows the shape of its
