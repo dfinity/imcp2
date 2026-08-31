@@ -957,26 +957,19 @@ async fn fetch_well_known(
     // `x-ic-canister-id` on everything it serves, 404s included, so an app that
     // simply doesn't publish this document still proves it is IC-hosted here.
     let ic_evidence = ic_evidence_from(&resp, application_origin);
-    let status = resp.status();
-    if !status.is_success() {
-        // Same rule as the gate's probe, for the same reason and with more at
-        // stake: only a definitive "not here" may mean the app declares nothing.
-        // A 429 or 5xx during an outage would otherwise fall through to the
-        // legacy field or the application-origin default and sign as a different
-        // principal (per review).
-        return if means_not_published(status) {
-            (WellKnown::Absent, ic_evidence)
-        } else {
-            (WellKnown::Unreachable(format!("HTTP {status}")), ic_evidence)
-        };
-    }
+    // The origin pin comes FIRST, before the status is read as an answer at all:
+    // a 404 from a redirect target is that origin saying the document is not
+    // there, which is not the probed app declaring nothing (per review — the
+    // first cut of this check ran after the status and turned exactly that into
+    // an `Absent`, i.e. "derive against the default"). Nothing a foreign origin
+    // says about this path is an answer about this app.
     let served_from = resp.url().origin().ascii_serialization();
     if served_from != application_origin {
         tracing::warn!(
             probed = %application_origin,
             served_from = %served_from,
             path,
-            "ignoring a well-known document served by a redirect target rather than the probed origin"
+            "ignoring a well-known response served by a redirect target rather than the probed origin"
         );
         return (
             WellKnown::Unreachable(format!(
@@ -984,6 +977,18 @@ async fn fetch_well_known(
             )),
             ic_evidence,
         );
+    }
+    let status = resp.status();
+    if !status.is_success() {
+        // Only a definitive "not here" may mean the app declares nothing. A 429
+        // or 5xx during an outage would otherwise fall through to the legacy
+        // field or the application-origin default and sign as a different
+        // principal (per review).
+        return if means_not_published(status) {
+            (WellKnown::Absent, ic_evidence)
+        } else {
+            (WellKnown::Unreachable(format!("HTTP {status}")), ic_evidence)
+        };
     }
     match read_capped_strict(resp, max_bytes).await {
         StrictRead::Body(body) => (WellKnown::Served(body), ic_evidence),
@@ -1632,8 +1637,26 @@ pub(crate) struct FetchedDocument {
 
 /// [`get_document`] for the opportunistic discovery probes, where a missing
 /// document and an unreachable one are the same thing: no findings either way.
+///
+/// Discards a document a REDIRECT TARGET answered with. Discovery does not
+/// authorize anything, but it does attribute what it finds — a manifest read
+/// here is reported as declared by this app at the protocol path, the top
+/// authority tier, and the model picks a canister on that basis. A 3xx would
+/// otherwise let one origin's manifest be published under another's name, which
+/// is the same true-looking-but-wrong provenance [`fetch_declared_manifest`]
+/// pins against (per review).
 async fn fetch_success_body(client: &reqwest::Client, url: &str, max: usize) -> Option<String> {
-    get_document(client, url, max).await.ok().flatten().map(|d| d.body)
+    let probed = url::Url::parse(url).ok()?.origin().ascii_serialization();
+    let doc = get_document(client, url, max).await.ok().flatten()?;
+    if doc.served_from != probed {
+        tracing::warn!(
+            probed = %probed,
+            served_from = %doc.served_from,
+            "ignoring a discovery document served by a redirect target rather than the probed origin"
+        );
+        return None;
+    }
+    Some(doc.body)
 }
 
 /// An app's own declaration of the canisters it comprises, as read from its
