@@ -27,9 +27,8 @@ ledger-standard transfer/approval methods on every canister), and the
 connector serves no funding or management tools: creating, funding, and topping up
 canisters is done by the user with the
 [`icp` CLI](https://github.com/dfinity/icp-cli) in their own terminal.
-For financial operations, users act themselves in a
-wallet or frontend they control (e.g. [oisy.com](https://oisy.com)), in their
-own browser.
+For financial operations, users act themselves outside the connector, in a
+trusted interface they control.
 
 ## Use as a library
 
@@ -162,7 +161,7 @@ results).
 | `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus two capability flags: `oql` (`true` when it exposes an OQL query surface — a `schema` + `execute` pair — with a pointer to `icp_oql_guide`) and `api_doc_available` (`true` when it declares a `getApiDoc`/`get_api_doc` method, gating `get_canister_api_doc`) |
 | `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), from its `getApiDoc`/`get_api_doc` method. Call **only** when `get_canister_candid`/`open_app` report `api_doc_available`. Returns a **structured** result in every case — `available` + the doc on success, else `available:false` with `expected`/`retry`/`next` so an expected absence is distinct from an unreachable canister |
 | `canister_query` | `canister_id`, `method?` **or** `oql?`, `args?` (textual Candid), `derivation_origin?`, `account?`, `candid?` | READ a canister — provide EITHER a Candid `query` `method` (with `args`) OR an `oql` query (a JSON object string, run against `execute`). A Candid `method` query may be anonymous or as your account and returns textual Candid; an `oql` query **requires** `derivation_origin` and returns `columns` + `rows` (a table) with `has_more`, validating `start` against the schema on an empty result. On an OQL canister a Candid `method` query is rejected — use `oql`. `candid` is a fallback: the `.did` interface text to encode/decode against when the canister exposes no `candid:service` metadata. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
-| `canister_update_call` | `canister_id`, `method`, `args` (textual Candid), `app_url?`, `derivation_origin?`, `account?`, `candid?` | Make an UPDATE (state-changing) call; reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`/`resolve_app`). **The target must be declared by its app**: the call is made only when the app at `app_url` (from `open_app`; falling back to `derivation_origin` when no `app_url` is given) declares `canister_id` in its `/.well-known/ic-architecture` manifest — see [Writes are gated on the discoverability manifest](#writes-are-gated-on-the-discoverability-manifest). The reply echoes `declared_by` / `declared_at` (which origin authorized the write, and at which path). **Financial transactions are refused**: the ICRC-standard transfer/approval methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents) are disallowed on every canister, and the ICP and cycles ledgers' own value-moving methods (the legacy `transfer`, `withdraw`, the `create_canister` spends) on those ledgers, to protect the user — the refusal directs the user to act themselves — in a wallet they control (e.g. [oisy.com](https://oisy.com)), or, for canister creation, with the [icp CLI](https://github.com/dfinity/icp-cli) in their own terminal. `candid` is the same `.did` fallback as on `canister_query`, used when the interface isn't published on-chain. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
+| `canister_update_call` | `canister_id`, `method`, `args` (textual Candid), `app_url?`, `derivation_origin?`, `account?`, `candid?` | Make an UPDATE (state-changing) call; reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`/`resolve_app`). **The target must be declared by its app**: the call is made only when the app at `app_url` (from `open_app`; falling back to `derivation_origin` when no `app_url` is given) declares `canister_id` in its `/.well-known/ic-architecture` manifest — see [Writes are gated on the discoverability manifest](#writes-are-gated-on-the-discoverability-manifest). The reply echoes `declared_by` / `declared_at` (which origin authorized the write, and at which path). **Financial transactions are refused**: the ICRC-standard transfer/approval methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents) and the NNS/SNS governance method `manage_neuron` (neuron staking and disbursement) are disallowed on every canister, and the ICP and cycles ledgers' own value-moving methods (the legacy `transfer`, `withdraw`, the `create_canister` spends) and the cycles-minting canister's funding-completion methods (`notify_top_up`, `notify_create_canister`, `notify_mint_cycles`, `create_canister`) on those canisters; and **every** update call is refused on the financial-service canisters the guard carries — all to protect the user. The refusal directs the user to perform the operation outside the connector, in a trusted interface they control — or, for canister creation and funding, with the [icp CLI](https://github.com/dfinity/icp-cli) in their own terminal. The policy is stated in the server-level instructions, deliberately not in any tool description. `candid` is the same `.did` fallback as on `canister_query`, used when the interface isn't published on-chain. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
 | `get_app_principal` | `derivation_origin`, `account?` | The principal you act as at an app, without a call. Identify the app by its `derivation_origin` (from `open_app`/`resolve_app`). Echoes `derived_for_origin` / `requested` so an origin mismatch is visible |
 | `list_app_accounts` | `derivation_origin` | The user's Internet Identity accounts at an app — the default account plus any named ones — with name, number, last-used, and the derivation origin they were listed for. Identify the app by its `derivation_origin` (from `open_app`/`resolve_app`) |
 | `resolve_app` | `app_url` | Resolve an app URL to its Internet Identity derivation context: `application_origin`, the `derivation_origin` to use (declared by the app in `/.well-known/ii-derivation-origin`, else in the legacy `/.well-known/ic-app.json`, else a built-in known-app value, else assumed = app origin — flagged via `derivation_origin_source`: `declared`/`known`/`app_url_default`, with `application_is_ic` echoing the gateway evidence), and the app's `alternative_origins` (informational). An origin with **no IC evidence** that would need the `app_url_default` assumption is **refused** (guessed-domain guard, with a "did you mean" repair when the host resembles a well-known app). Does not return a principal (no account chosen) or require auth — pass the `derivation_origin` to `get_app_principal`/`list_app_accounts` |
@@ -476,27 +475,30 @@ flow.
 
 ```bash
 cargo run
-# serves http://0.0.0.0:8000  (MCP at /mcp against production II, OAuth under it, info page at /)
+# serves http://0.0.0.0:8000  (MCP at /mcp against production II, OAuth under it; / redirects to the landing site)
 # honours $PORT (default 8000), $PUBLIC_URL (default http://localhost:8000),
 # $MCP_SERVE_BETA (set it to also serve the beta II instance at /mcp-beta, for staging),
 # and $MCP_SERVE_METRICS (set it to serve the Prometheus exposition at /metrics)
 ```
 
-`GET /` serves a self-contained, ICP-styled landing page that names the
-production `/mcp` endpoint (staging also serves beta II at `/mcp-beta`) and lists
-the tools grouped by purpose. `GET /version` is the operations probe (see [Auth](#auth-oauth-21-login-via-internet-identity)).
+The human-facing pages — the landing page and the `/privacy-policy`,
+`/support`, and `/terms` documents the connector directories require — are
+maintained in [dfinity/internetcomputer-org] (`public/icp-mcp/`) and served at
+<https://internetcomputer.org/icp-mcp/>, so the content exists exactly once.
+This origin answers their old paths (`/`, `/privacy-policy`, `/support`,
+`/terms`) with permanent redirects there, keeping every published link
+working. `GET /version` is the operations probe (see [Auth](#auth-oauth-21-login-via-internet-identity)).
 
-The binary also serves the official pages the connector directories require:
-`/privacy-policy` (linked from the landing page's footer), `/support`, and
-`/terms` — self-contained documents compiled in like every other asset. For the
-OpenAI directory's domain-verification check, `GET
+[dfinity/internetcomputer-org]: https://github.com/dfinity/internetcomputer-org
+
+For the OpenAI directory's domain-verification check, `GET
 /.well-known/openai-apps-challenge` returns `$OPENAI_APPS_CHALLENGE_TOKEN`
 verbatim as `text/plain` (trimmed), and 404s while the variable is unset or
 blank — so the endpoint is inert except during a submission window.
 
 ## Deploy
 
-The deployment binary is **self-contained**: the connect/landing HTML, CSS, and SVG
+The deployment binary is **self-contained**: the connect HTML, CSS, and SVG
 (`src/assets/` and `crates/imcp2-core/src/assets/`) and the reference
 docs (`crates/imcp2-core/static/`) are compiled in with `include_str!`,
 so nothing has to ship next to it (both are build-time inputs only). The

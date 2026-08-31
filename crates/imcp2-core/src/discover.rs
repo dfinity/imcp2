@@ -581,6 +581,20 @@ struct KnownApp {
     app_url: &'static str,
 }
 
+// Name resolution writes nothing: it turns a name a user said into an app URL
+// and derivation origin, so `open_app` can read interfaces, discover
+// canisters, and derive the user's per-app principal. An entry here is
+// therefore not itself a route to a transaction — a later update call is a
+// separate request, and goes through [`crate::compliance`] like any other,
+// under exactly the scope that module documents (the standardized
+// value-moving methods everywhere, every update method on the canisters it
+// lists, and its own note on what a static list cannot cover, such as an
+// exchange's dynamically created pool canisters). So the criterion for an
+// entry is only whether the name is one users say and the mapping is one this
+// server can state correctly — the NNS included, per review: resolving its
+// name yields a URL and a derivation origin for reads, and every update call
+// to its canisters is refused by that guard regardless of how the URL was
+// reached.
 const KNOWN_APPS: &[KnownApp] = &[
     KnownApp { name: "NNS", aliases: &["nns", "nnsdapp"], app_url: "https://nns.internetcomputer.org" },
     KnownApp { name: "Oisy", aliases: &["oisy", "oisywallet"], app_url: "https://oisy.com" },

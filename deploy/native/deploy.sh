@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Deploy imcp2 to an existing Amazon Linux 2023 (arm64) host WITHOUT Docker on the
-# box: ships the prebuilt binary + static assets, then runs the app and Caddy as
+# box: ships the prebuilt binary, then runs the app and Caddy as
 # native systemd services. Re-runnable (idempotent) — also use it to push updates.
 #
 # Prereqs:
@@ -69,9 +69,11 @@ echo ">> architecture ok ($built_for -> $HOST)"
 echo ">> staging $REMOTE_DIR"
 $SSH "sudo install -d -o \$(id -un) -g \$(id -gn) $REMOTE_DIR"
 
-echo ">> shipping binary + static assets"
+# Only the binary: every asset the server serves (landing page, favicon,
+# privacy policy, support, terms, connect-error page, the skill:// bundle) is
+# compiled into it with `include_str!`, so there is nothing to place beside it.
+echo ">> shipping binary"
 tar -C "$repo_root/build-out" -cf - imcp2 | $SSH "tar -C $REMOTE_DIR -xf - && chmod +x $REMOTE_DIR/imcp2"
-tar -C "$repo_root" -cf - static | $SSH "tar -C $REMOTE_DIR -xf -"
 # Status dashboard (Node tool): shipped as source — it has no build step.
 tar -C "$repo_root" -cf - monitoring | $SSH "tar -C $REMOTE_DIR -xf -"
 
