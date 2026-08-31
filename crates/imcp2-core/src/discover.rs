@@ -596,6 +596,31 @@ fn known_derivation_origin(host: &str) -> Option<&'static str> {
         .map(|(_, origin)| *origin)
 }
 
+/// The built-in derivation origin for a well-known app URL, if any — the
+/// registry lookup for anything derived from a URL rather than from a static
+/// registry entry.
+///
+/// A NON-DEFAULT PORT never matches, even though the registry is keyed by host.
+/// `https://oisy.com:8443` is a DIFFERENT origin from `https://oisy.com`
+/// everywhere else in this codebase — Internet Identity derives a different
+/// principal for it, and `identities::target_origin` keeps the port rather than
+/// stripping it the way it strips `:443`. Letting the port fall out of the key
+/// would let whatever answers on another port of a registered host inherit that
+/// app's identity, and at the write gate
+/// ([`crate::discoverability::bind_identity`]) that is the whole comparison: a
+/// manifest served there would authorize a write signed as the user's principal
+/// at the real app. Dropping to `AppUrlDefault` instead makes the origin stand
+/// on its own — which, being a distinct origin, then fails the binding.
+///
+/// (Reaching that case at all needs control of the registered host, so this is
+/// closing the gap rather than a live break; raised in review.)
+fn known_derivation_origin_for_url(url: &url::Url) -> Option<&'static str> {
+    if url.port().is_some() {
+        return None;
+    }
+    known_derivation_origin(&url.host_str()?.to_ascii_lowercase())
+}
+
 /// A well-known IC app, for NAME → app resolution by the `icp_find_app_by_name`
 /// tool. There is no on-chain directory mapping an app name to its front-end URL,
 /// so this covers only a small curated set; anything else is directed to a web
@@ -1103,7 +1128,7 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
     // well-known custom-derivation-origin apps (the app's own declaration always
     // wins, so this only fills the gap for apps that haven't shipped one yet).
     if derivation_origin_source == DerivationSource::AppUrlDefault {
-        if let Some(known) = known_derivation_origin(&host) {
+        if let Some(known) = known_derivation_origin_for_url(&base_url) {
             derivation_origin = known.to_string();
             derivation_origin_source = DerivationSource::Known;
         }
@@ -1169,11 +1194,9 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
 /// the host IS a registered known-app host (nothing to repair) or resembles no
 /// known app. Offline (registry lookup only).
 pub fn similar_known_app(app_url: &str) -> Option<AppMatch> {
-    let host = url::Url::parse(&normalize(app_url))
-        .ok()?
-        .host_str()?
-        .to_ascii_lowercase();
-    if known_derivation_origin(&host).is_some() {
+    let url = url::Url::parse(&normalize(app_url)).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if known_derivation_origin_for_url(&url).is_some() {
         return None; // a real known-app host — not a lookalike
     }
     // Token-window alias matching (see find_known_app): "multidex.com" tokenizes
@@ -3250,6 +3273,33 @@ mod tests {
                 "registry origin for {host} must be a canonical bare https origin"
             );
         }
+    }
+
+    // A registered host on a NON-DEFAULT PORT is a different origin, and must not
+    // inherit the registry entry: `identities::target_origin` keeps the port (it
+    // strips only `:443`), so the write gate's identity binding compares the two as
+    // different apps — but only if the fallback stops handing out the real app's
+    // derivation origin first. Raised in review on #166.
+    #[test]
+    fn known_registry_does_not_match_a_non_default_port() {
+        let url = |u: &str| url::Url::parse(&normalize(u)).unwrap();
+        // The bare origin and its explicit default port still resolve.
+        assert_eq!(known_derivation_origin_for_url(&url("https://oisy.com")), Some("https://oisy.com"));
+        assert_eq!(known_derivation_origin_for_url(&url("https://oisy.com:443")), Some("https://oisy.com"));
+        // A non-default port does not, on any registered host.
+        for u in ["https://oisy.com:8443", "https://nns.ic0.app:8443", "https://multidex.ai:8080"] {
+            assert_eq!(
+                known_derivation_origin_for_url(&url(u)),
+                None,
+                "{u} is not the registered origin and must fall through to app_url_default",
+            );
+        }
+        // Falling through means the lookalike repair now has something to say: the
+        // agent is pointed at the canonical origin rather than left with the port.
+        assert_eq!(
+            similar_known_app("https://oisy.com:8443").map(|m| m.app_url),
+            Some("https://oisy.com".to_string()),
+        );
     }
 
     // Closure (offline): every derivation-origin VALUE in the registry is itself a
