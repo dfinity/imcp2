@@ -148,8 +148,10 @@ pub struct ApiDocOutput {
     /// (interface unreadable / the call failed). Meaningless when `available`.
     pub expected: bool,
     /// When `available` is false: whether retrying might help. False when the method
-    /// genuinely isn't declared (retrying won't conjure one); true for a transient
-    /// failure (interface/method call unreachable). Meaningless when `available`.
+    /// genuinely isn't declared (retrying won't conjure one); true when the call to a
+    /// declared method did not return — a transient failure, but also a rejection or
+    /// trap from the canister, which no retry will change. Meaningless when
+    /// `available`.
     pub retry: bool,
     /// What to do next — e.g. "use get_canister_candid for the interface" when there
     /// is no doc, or "retry" on a transient failure. Null when `available`.

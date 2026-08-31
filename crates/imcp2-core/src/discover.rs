@@ -1832,10 +1832,11 @@ pub struct OpenAppArgs {
     /// or a bare host — is matched against the built-in known-app registry first,
     /// so a wrong-TLD guess repairs to the canonical URL; an explicit `https://…`
     /// URL is resolved as given. Two refusals: an unknown bare name is refused with
-    /// instructions for finding the real URL, and a URL whose origin shows no
-    /// Internet-Computer evidence is refused — and that evidence shows a domain is
-    /// served from the Internet Computer, not that it belongs to the app the user
-    /// meant.
+    /// instructions for finding the real URL, and a URL that would need its own
+    /// origin assumed as the derivation origin (nothing declared, no registry entry)
+    /// is refused when that origin shows no Internet-Computer evidence — and that
+    /// evidence shows a domain is served from the Internet Computer, not that it
+    /// belongs to the app the user meant.
     pub app: String,
 }
 
