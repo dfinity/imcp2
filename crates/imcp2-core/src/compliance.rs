@@ -13,22 +13,25 @@
 //! creation and funding are the one exception — they point at the user's own
 //! icp CLI, which is where this connector already says that work happens.
 //!
-//! The guard has three groups (the method groups are split per review, so an
+//! The guard has four groups (the method groups are split per review, so an
 //! app that happens to name a non-financial method `transfer` or `approve`
 //! keeps working):
 //!
-//!   * **Standardized methods, matched literally on every canister.** Token
-//!     ledgers on the Internet Computer follow the ICRC standards —
-//!     ICRC-1/ICRC-2 for fungible tokens (ICRC-4 for batch transfers),
-//!     ICRC-7/ICRC-37 for NFTs — and the standards fix the exact method
-//!     names; likewise the NNS/SNS governance interface fixes
-//!     `manage_neuron`, the one method through which staked neurons are
-//!     disbursed, split, and spawned. That covers every SNS DAO's governance
-//!     (dozens exist and more launch by NNS proposal, so no per-DAO
-//!     enumeration could stay current) as well as the NNS's. Candid method
-//!     names are case-sensitive, so literal matching is both sufficient (the
-//!     real ledgers and governances use exactly these names) and precise (a
-//!     differently-spelled name is not the standard method).
+//!   * **Standardized value-moving methods, matched literally on every
+//!     canister.** Token ledgers on the Internet Computer follow the ICRC
+//!     standards — ICRC-1/ICRC-2 for fungible tokens (ICRC-4 for batch
+//!     transfers), ICRC-7/ICRC-37 for NFTs — and the standards fix the exact
+//!     method names. Candid method names are case-sensitive, so literal
+//!     matching is both sufficient (the real ledgers use exactly these names)
+//!     and precise (a differently-spelled name is not the standard method).
+//!   * **Mixed-purpose entry points, matched literally on every canister.**
+//!     The NNS/SNS governance interface fixes `manage_neuron`, the one method
+//!     through which staked neurons are disbursed, split, and spawned — but
+//!     also voted with, followed, and re-delayed. That covers every SNS DAO's
+//!     governance (dozens exist and more launch by NNS proposal, so no
+//!     per-DAO enumeration could stay current) as well as the NNS's. The
+//!     method is refused as a whole rather than per command, so its refusal
+//!     says exactly that instead of calling the caller's command a transfer.
 //!   * **Abstract names, scoped to the system canister where they are
 //!     financial.** `transfer` on the ICP ledger or `withdraw` on the cycles
 //!     ledger moves the user's funds; the same names on an arbitrary app
@@ -49,7 +52,10 @@
 //!     acts on the user's assets (or administers the service that does), so
 //!     there is no non-financial update call worth allowing. Each entry
 //!     carries a label saying what the service is and how it is financial,
-//!     used verbatim in the refusal.
+//!     used verbatim in the refusal. Because the rule is about the
+//!     destination, the refusal says so and claims nothing about the call
+//!     itself: `store` on a wallet backend is refused for where it goes, not
+//!     for what it does (per review).
 //!
 //! Why the standardized surface is where real funds live: tokens are only
 //! valuable if they can be exchanged or used, and the ICP ecosystem's
@@ -85,9 +91,11 @@
 use candid::Principal;
 
 /// Standardized value-moving methods, refused on EVERY canister, matched
-/// literally (the ICRC token standards and the NNS/SNS governance interface
-/// fix these exact names; Candid method names are case-sensitive). Each entry
-/// carries the label used in the refusal message.
+/// literally (the ICRC token standards fix these exact names; Candid method
+/// names are case-sensitive). Each entry carries the label used in the refusal
+/// message, which says the call itself carries out that operation — so only
+/// methods that do belong here (a mixed-purpose entry point goes in
+/// [`MIXED_PURPOSE_METHODS`] instead).
 const DISALLOWED_STANDARD_METHODS: &[(&str, &str)] = &[
     // ICRC-1 / ICRC-2 / ICRC-4: fungible-token transfers, spending
     // approvals, and batch transfers.
@@ -102,19 +110,20 @@ const DISALLOWED_STANDARD_METHODS: &[(&str, &str)] = &[
     ("icrc37_approve_collection", "an ICRC-37 collection spending approval"),
     ("icrc37_revoke_token_approvals", "an ICRC-37 NFT approval change"),
     ("icrc37_revoke_collection_approvals", "an ICRC-37 collection approval change"),
-    // The NNS/SNS governance interface: every neuron operation — including
-    // disbursing, splitting, and spawning staked tokens — goes through this
-    // one method, on the NNS and on every SNS DAO alike. Its non-financial
-    // commands (voting, following, dissolve delay) share that entry point, so
-    // the label says the method is refused wholesale rather than calling the
-    // caller's particular command a transfer.
-    (
-        "manage_neuron",
-        "the single entry point for every neuron operation on an NNS/SNS governance interface — \
-         disbursing, splitting, and spawning staked tokens among them — so it is refused as a \
-         whole rather than per command",
-    ),
 ];
+
+/// Methods that are one entry point for both financial and non-financial
+/// operations, refused on EVERY canister like the standardized names above but
+/// with their own refusal register: the label says what the method covers, and
+/// the message adds that the method is disabled as a whole rather than per
+/// command, so the refusal is not a claim about the caller's particular call
+/// (per review).
+const MIXED_PURPOSE_METHODS: &[(&str, &str)] = &[(
+    "manage_neuron",
+    "the single entry point for every neuron operation on an NNS/SNS governance interface — \
+     voting, following, and dissolve delay as well as disbursing, splitting, and spawning \
+     staked tokens",
+)];
 
 /// The ICP ledger — its pre-ICRC methods move the user's ICP.
 const ICP_LEDGER: &str = "ryjl3-tyaaa-aaaaa-aaaba-cai";
@@ -155,6 +164,19 @@ const DISALLOWED_CANISTER_METHODS: &[(&str, &str, &str)] = &[
     (CYCLES_MINTING_CANISTER, "notify_mint_cycles", "a cycles mint to a cycles-ledger account"),
     (CYCLES_MINTING_CANISTER, "create_canister", "a canister creation paid with attached cycles"),
 ];
+
+/// Where a refusal sends the user when the operation is not creation or
+/// funding: outside this connector, deliberately without naming a venue (see
+/// the module doc).
+const NEUTRAL_REDIRECT: &str = "Recommend that the user performs this operation outside this \
+     connector, in a trusted interface they control.";
+
+/// Where a creation or funding refusal sends the user: their own icp CLI,
+/// never a connector tool (this server serves none for either).
+const CLI_REDIRECT: &str = "Recommend that the user creates and funds canisters themselves with \
+     the icp CLI in their own terminal (install with `npm install -g @icp-sdk/icp-cli`, or see \
+     https://github.com/dfinity/icp-cli); the skill://icp-cli and skill://cycles-management \
+     resources carry the full guide.";
 
 /// The refused methods whose "do it yourself" pointer is the icp CLI rather
 /// than the neutral wording: creating and funding canisters is work this
@@ -400,25 +422,48 @@ const DISALLOWED_FINANCE_CANISTERS: &[(&str, &str, &str)] = &[
 const CK_LEDGER_WHY: &str = "its update surface transfers the token or grants spending approvals";
 
 /// The financial-transactions gate: `Some(refusal)` when the call is
-/// disallowed, `None` when it may proceed. Three scopes, checked in order:
-/// the standardized value-moving method names (refused on every canister),
-/// the abstract names scoped to the system ledger where they are financial,
-/// and the finance-canister list — on a listed canister EVERY update method
-/// is refused, so `None` never depends on the method name alone. Method
-/// matching is literal — the IC matches method names by exact bytes, so a
-/// differently-spelled name would not reach the real method anyway. The
-/// refusal is the complete tool error text — it names the method (and, on a
-/// listed canister, the service and how it is financial), states the policy
-/// and why it exists, and tells the agent what to recommend to the user
-/// instead: performing the operation outside this connector in a trusted
-/// interface they control, or, for the creation/funding methods, with their
-/// own icp CLI.
+/// disallowed, `None` when it may proceed. Four scopes, checked in order: the
+/// mixed-purpose entry points and the standardized value-moving method names
+/// (both refused on every canister), the abstract names scoped to the system
+/// ledger where they are financial, and the finance-canister list — on a
+/// listed canister EVERY update method is refused, so `None` never depends on
+/// the method name alone. Method matching is literal — the IC matches method
+/// names by exact bytes, so a differently-spelled name would not reach the
+/// real method anyway.
+///
+/// The refusal is the complete tool error text, and each scope gets the
+/// register that is true of it (per review — a refusal must not say more about
+/// the caller's call than the guard actually knows):
+///
+///   * a value-moving method: the call itself carries out that operation;
+///   * a mixed-purpose entry point: some of its commands move assets and the
+///     method is disabled as a whole, so this call is not classified;
+///   * a listed canister: every state-changing call to that service is
+///     refused, which again says nothing about this particular call.
+///
+/// All three name the method, state the policy and why it exists, and tell the
+/// agent what to recommend to the user instead: performing the operation
+/// outside this connector in a trusted interface they control, or, for the
+/// creation/funding methods, with their own icp CLI.
 pub fn disallowed_update_method(canister_id: &Principal, method: &str) -> Option<String> {
     let canister = canister_id.to_text();
     // Method-level matches run first: their refusals carry the more specific
     // label and redirect (a creation spend points at the icp CLI). The
     // canister-level blanket below then catches every other update call on a
     // listed finance canister.
+    //
+    // The mixed-purpose entry points come first of all, so a governance call
+    // gets the "disabled as a whole" wording even on a listed canister rather
+    // than either message that would read as a finding about this call.
+    if let Some((_, what)) = MIXED_PURPOSE_METHODS.iter().find(|(m, _)| *m == method) {
+        return Some(format!(
+            "`{method}` is {what}. Some of those commands move staked assets, so the \
+             method is disabled as a whole rather than per command — this refusal does \
+             not mean this particular call moves assets. Financial transactions (token \
+             transfers, spending approvals, payments, or trades) are not supported by \
+             this server, to protect the user. {NEUTRAL_REDIRECT}"
+        ));
+    }
     let what = DISALLOWED_STANDARD_METHODS
         .iter()
         .find(|(m, _)| *m == method)
@@ -434,32 +479,28 @@ pub fn disallowed_update_method(canister_id: &Principal, method: &str) -> Option
         // canister creation and funding at the user-run icp CLI (deliberately
         // NOT at another connector tool, per review), everything else outside
         // this connector without naming a venue (see the module doc).
-        let instead = if CLI_REDIRECT_METHODS.contains(&method) {
-            "Recommend that the user creates and funds canisters themselves with \
-             the icp CLI in their own terminal (install with `npm install -g \
-             @icp-sdk/icp-cli`, or see https://github.com/dfinity/icp-cli); the \
-             skill://icp-cli and skill://cycles-management resources carry the \
-             full guide."
-        } else {
-            "Recommend that the user performs this operation outside this \
-             connector, in a trusted interface they control."
-        };
+        let instead =
+            if CLI_REDIRECT_METHODS.contains(&method) { CLI_REDIRECT } else { NEUTRAL_REDIRECT };
+        // These are the methods that ARE the operation, so the message says so
+        // — the one register that may state what the call does.
         return Some(format!(
-            "`{method}` is {what}. Financial transactions \
-             (token transfers, spending approvals, payments, or trades) are not \
-             supported by this server, to protect the user: asset-moving requests \
-             are denied. {instead}"
+            "`{method}` is {what} — the call itself carries out that operation. \
+             Financial transactions (token transfers, spending approvals, payments, \
+             or trades) are not supported by this server, to protect the user. \
+             {instead}"
         ));
     }
     let (_, service, why) = DISALLOWED_FINANCE_CANISTERS
         .iter()
         .find(|(c, _, _)| *c == canister)?;
+    // The blanket: what is disallowed here is the destination, not this call,
+    // so the message says that and claims nothing about the method (per
+    // review — `store` on a wallet backend is not a transfer).
     Some(format!(
-        "`{method}` is an update call to {service} — {why}. State-changing calls \
-         to financial services are not supported by this server, to protect the \
-         user: asset-moving requests are denied. Recommend that the user performs \
-         this operation outside this connector, in a trusted interface they \
-         control."
+        "`{method}` is an update call to {service} — {why}. Every state-changing \
+         call to that service is refused, so this refusal does not mean this \
+         particular call moves assets. State-changing calls to financial services \
+         are not supported by this server, to protect the user. {NEUTRAL_REDIRECT}"
     ))
 }
 
@@ -479,6 +520,10 @@ mod tests {
     fn cmc() -> Principal {
         Principal::from_text(CYCLES_MINTING_CANISTER).unwrap()
     }
+
+    /// The clause a listed-canister refusal must carry: the rule is about the
+    /// destination, so the message states that rather than the call.
+    const DESTINATION_RULE: &str = "Every state-changing call to that service is refused";
 
     // Every standardized value-moving method is refused on ANY canister, in
     // its exact standard spelling — the ICRC token surface and the NNS/SNS
@@ -610,7 +655,10 @@ mod tests {
     // names included — and the refusal names the service, its finance
     // relation, and the policy, in the same plain protective register as the
     // method refusals (no marketplace/compliance jargon), recommending the
-    // operation happen outside this connector without naming a venue.
+    // operation happen outside this connector without naming a venue. What it
+    // must NOT do is classify the call: `store` on a wallet backend is refused
+    // because of where it goes, not because it moves anything (per review), so
+    // the message says the destination rule out loud and says so explicitly.
     #[test]
     fn refuses_every_update_on_finance_canisters() {
         for (id, service, why) in DISALLOWED_FINANCE_CANISTERS {
@@ -625,6 +673,12 @@ mod tests {
                 assert!(msg.contains("outside this connector"), "{msg}");
                 assert!(!msg.contains("marketplace"), "{msg}");
                 assert!(!msg.contains("compliance"), "{msg}");
+                assert!(msg.contains(DESTINATION_RULE), "{msg}");
+                assert!(
+                    msg.contains("does not mean this particular call moves assets"),
+                    "the destination rule must not be stated as a finding about \
+                     this call: {msg}"
+                );
             }
         }
     }
@@ -674,6 +728,7 @@ mod tests {
             .expect("must be refused");
         assert!(msg.contains("`icrc1_transfer`"), "{msg}");
         assert!(msg.contains("an ICRC-1 token transfer"), "{msg}");
+        assert!(msg.contains("the call itself carries out that operation"), "{msg}");
         assert!(msg.contains("Financial transactions"), "{msg}");
         assert!(msg.contains("not supported"), "{msg}");
         assert!(msg.contains("to protect the user"), "{msg}");
@@ -687,19 +742,63 @@ mod tests {
 
     // manage_neuron is refused for its whole surface, not because the caller's
     // particular command moves value: the same method votes, follows, and sets
-    // dissolve delays as well as disbursing. The refusal says that, instead of
-    // classifying every invocation as a transfer (per review) — the policy
-    // sentence that follows states what is not supported, and the label states
-    // why the method as a whole is out.
+    // dissolve delays as well as disbursing. The refusal says both halves —
+    // what the entry point covers, and that it is disabled wholesale — and then
+    // says in as many words that this call is not being classified (per
+    // review), instead of calling every invocation a transfer.
     #[test]
     fn manage_neuron_refusal_explains_the_whole_surface() {
         let msg = disallowed_update_method(&any_canister(), "manage_neuron")
             .expect("must be refused");
-        assert!(msg.contains("refused as a whole rather than per command"), "{msg}");
+        assert!(msg.contains("voting, following, and dissolve delay"), "{msg}");
         assert!(msg.contains("disbursing, splitting, and spawning staked tokens"), "{msg}");
+        assert!(msg.contains("disabled as a whole rather than per command"), "{msg}");
+        assert!(msg.contains("does not mean this particular call moves assets"), "{msg}");
         assert!(
             !msg.contains("is a financial transaction") && !msg.contains("— a financial transaction"),
             "the caller's command is not classified as a transfer: {msg}"
         );
+    }
+
+    // One register per scope, and no scope borrows another's claim (per
+    // review): only a value-moving method's refusal says the call carries out
+    // the operation, while the mixed-purpose entry point and the listed
+    // destination both disclaim it. Read the three side by side so a future
+    // edit that collapses them back into one message fails here.
+    #[test]
+    fn each_scope_gets_the_refusal_register_that_is_true_of_it() {
+        const ITSELF: &str = "the call itself carries out that operation";
+        const NOT_THIS_CALL: &str = "does not mean this particular call moves assets";
+
+        // A method that IS the operation: transfers, approvals, and the
+        // funding completions that finish a payment.
+        for (canister, method) in [
+            (any_canister(), "icrc1_transfer"),
+            (icp_ledger(), "transfer"),
+            (cmc(), "notify_top_up"),
+        ] {
+            let msg = disallowed_update_method(&canister, method).expect("must be refused");
+            assert!(msg.contains(ITSELF), "{msg}");
+            assert!(!msg.contains(NOT_THIS_CALL), "{msg}");
+        }
+
+        // A mixed-purpose entry point: disabled as a whole, so the call is not
+        // classified — and that holds even on a listed canister, where the
+        // method-level register must win over the blanket.
+        let listed = Principal::from_text(DISALLOWED_FINANCE_CANISTERS[0].0).unwrap();
+        for canister in [any_canister(), listed] {
+            let msg =
+                disallowed_update_method(&canister, "manage_neuron").expect("must be refused");
+            assert!(msg.contains("disabled as a whole rather than per command"), "{msg}");
+            assert!(msg.contains(NOT_THIS_CALL), "{msg}");
+            assert!(!msg.contains(ITSELF), "{msg}");
+        }
+
+        // A listed destination reached by an arbitrary method: the rule is
+        // about the service, and the message says only that.
+        let msg = disallowed_update_method(&listed, "store").expect("must be refused");
+        assert!(msg.contains(DESTINATION_RULE), "{msg}");
+        assert!(msg.contains(NOT_THIS_CALL), "{msg}");
+        assert!(!msg.contains(ITSELF), "{msg}");
     }
 }
