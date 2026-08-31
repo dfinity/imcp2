@@ -1864,7 +1864,9 @@ pub struct OpenAppOutput {
     /// Origins the derivation origin's `ii-alternative-origins` permits to derive
     /// from it — the INVERSE relation, so an entry here is an origin that may
     /// derive from `derivation_origin`, not a derivation origin itself.
-    /// Informational.
+    /// Informational, and read best-effort: an empty list means none were read (a
+    /// fetch, HTTP, parse, or origin-validation failure yields one), and at most 100
+    /// valid entries are kept.
     pub alternative_origins: Vec<String>,
     /// Whether the origin showed Internet-Computer evidence (gateway
     /// `x-ic-canister-id`); null unless the derivation origin was assumed. See

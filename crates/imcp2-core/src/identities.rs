@@ -474,7 +474,10 @@ pub struct ResolveAppOutput {
     pub derivation_origin_source: String,
     /// Origins the resolved DERIVATION origin's `/.well-known/ii-alternative-origins`
     /// permits to derive against it — that origin is where the list is authoritative,
-    /// and where this one was read. Informational only: it is the INVERSE of "which
+    /// and where this one was read. Read best-effort and reported as a list, so an
+    /// empty one means "none were read", not "none exist": a fetch, HTTP, parse, or
+    /// origin-validation failure yields an empty list, and at most 100 valid entries
+    /// are kept. Informational only either way: it is the INVERSE of "which
     /// derivation origin the app uses", so the derivation origin does not follow from
     /// it.
     pub alternative_origins: Vec<String>,

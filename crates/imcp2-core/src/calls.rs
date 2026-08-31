@@ -50,8 +50,11 @@ pub struct GetCandidOutput {
     /// (`getApiDoc`/`get_api_doc`) — computed with the SAME predicate
     /// get_canister_api_doc uses, so it tells you up front whether that call has a
     /// method to read at all. It reports the declaration, not the outcome: the call
-    /// can still reject or trap. When false the canister has no prose doc and the
-    /// Candid types here are the interface.
+    /// can still reject or trap. False means no compatible method was DETECTED — the
+    /// same predicate also comes up empty when the published interface cannot be
+    /// parsed or exceeds the parser's limits, and `candid` here is accepted as any
+    /// UTF-8 text — so it is not proof that the canister has no doc, though for most
+    /// canisters the Candid types are indeed the whole interface.
     pub api_doc_available: bool,
 }
 

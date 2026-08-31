@@ -221,8 +221,10 @@ impl IcCanisterTools {
                          so the call can still come back empty."
                             .to_string()
                     } else {
-                        "This canister declares no API-doc method (api_doc_available=false) — don't \
-                         call get_canister_api_doc; the Candid types above are the interface."
+                        "No API-doc method was detected on this canister \
+                         (api_doc_available=false) — usually there is none, and the Candid types \
+                         above are the interface; an interface this parser cannot read looks the \
+                         same."
                             .to_string()
                     });
                     let mut blocks = vec![did];
@@ -337,7 +339,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Read a canister's own API documentation — a prose guide to how the app behaves, covering units, auth, lifecycle, non-obvious semantics, mutation safety, polling rules, and gotchas — from its `getApiDoc`/`get_api_doc` method. get_canister_candid and open_app report `api_doc_available` for the canisters that expose one; most canisters have none, and their Candid types are the whole interface. Every documentation outcome is structured rather than a bare error — an unusable `canister_id` is still a plain error: on success `available: true` plus the reply rendered as text in `doc` — the method's declaration and its reply are what was checked, so a canister that declares the method and returns something other than prose yields that rendering rather than a guide; otherwise `available: false` with `expected` (the interface read fine and there is no such method) and `retry` (no answer was obtained — either the Candid interface could not be read, so whether a doc method exists is unknown, or the call to a declared method did not return; a retry may help, and a deterministic rejection or trap from the canister lands here too), plus a `next` hint.",
+        description = "Read a canister's own API documentation — a prose guide to how the app behaves, covering units, auth, lifecycle, non-obvious semantics, mutation safety, polling rules, and gotchas — from its `getApiDoc`/`get_api_doc` method. get_canister_candid and open_app report `api_doc_available` for the canisters that expose one; most canisters have none, and their Candid types are the whole interface. Every documentation outcome is structured rather than a bare error — an unusable `canister_id` is still a plain error: on success `available: true` plus the reply rendered as text in `doc` — the method's declaration and its reply are what was checked, so a canister that declares the method and returns something other than prose yields that rendering rather than a guide; otherwise `available: false` with `expected` (the interface was read and no compatible method was detected — for most canisters there is none, though an interface that cannot be parsed or exceeds the parser's limits reads the same way) and `retry` (no answer was obtained — either the Candid interface could not be read, so whether a doc method exists is unknown, or the call to a declared method did not return; a retry may help, and a deterministic rejection or trap from the canister lands here too), plus a `next` hint.",
         annotations(title = "Get a canister's API documentation", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::ApiDocOutput>(),
     )]
@@ -1126,8 +1128,9 @@ impl IcCanisterTools {
         text.push_str(
             "\n\nNext: inspect a canister with get_canister_candid — its oql / api_doc_available \
              flags say whether to read via OQL and whether a canister declares a doc for \
-             get_canister_api_doc to read (there is nothing to read when api_doc_available is \
-             false). To act as the user, pass the derivation_origin \
+             get_canister_api_doc to read (api_doc_available=false means no compatible method \
+             was detected — usually there is none, though an unparsable interface reads the \
+             same way). To act as the user, pass the derivation_origin \
              above to canister_query (read) and canister_update_call (write); for an OQL canister, \
              call get_canister_oql_schema for the entity/field names, then canister_query with \
              the `oql` argument — plus an optional account from list_app_accounts. A \"my/our…\" \
