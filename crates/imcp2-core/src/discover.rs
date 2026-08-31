@@ -1826,12 +1826,16 @@ pub struct FindAppOutput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OpenAppArgs {
     /// An app name as the user said it, or its URL (e.g.
-    /// "https://opencloud.org"). A name — or a bare host — is matched against the
-    /// built-in known-app registry first, so a wrong-TLD guess
-    /// repairs to the canonical URL; an explicit `https://…` URL is resolved as
-    /// given. Two refusals: an unknown bare name is refused with instructions
-    /// for finding the real URL, and a URL whose origin shows no
-    /// Internet-Computer evidence is refused.
+    /// "https://opencloud.org"). If the user supplied only an app name, pass that
+    /// name unchanged. Only pass a URL supplied by the user or obtained from a
+    /// verified official source; do not construct a domain from the name. A name —
+    /// or a bare host — is matched against the built-in known-app registry first,
+    /// so a wrong-TLD guess repairs to the canonical URL; an explicit `https://…`
+    /// URL is resolved as given. Two refusals: an unknown bare name is refused with
+    /// instructions for finding the real URL, and a URL whose origin shows no
+    /// Internet-Computer evidence is refused — and that evidence shows a domain is
+    /// served from the Internet Computer, not that it belongs to the app the user
+    /// meant.
     pub app: String,
 }
 

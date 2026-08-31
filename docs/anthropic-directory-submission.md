@@ -181,13 +181,20 @@ asked ahead about this acknowledgment. No reply is needed to submit; if one
 arrives, answer with the posture above.
 
 Related point for the same step: the **model-readable metadata describes the
-surface rather than steering Claude**. The server instructions and all 11 tool
-descriptions are factual capability statements — what each tool does, returns,
-and rejects — with no ordering rules, no "call this first", no per-request
-routing chains, and no instruction to search the web; a unit test
-(`model_readable_metadata_states_capabilities_not_directives`) pins that across
-both surfaces. Each description also matches the tool's behavior, refusals
-included, so no side effect is implicit.
+surface and the constraints on using it, without attempting to manipulate
+Claude**. Each of the server instructions, all 11 tool descriptions, and the
+argument and reply schemas says what the tool does, returns, rejects, and
+requires — the guidance a caller needs to use it correctly and safely, which
+both directories expect a description to carry, including `open_app`'s "do not
+construct a domain from the name". What none of them carries is the set of
+manipulations the directories prohibit: unrelated behavioral instructions,
+overly broad triggering, preference over or interference with other tools,
+calls to unrelated external software, and hidden or obfuscated instructions. A
+unit test (`model_readable_metadata_respects_marketplace_policy`) pins that set
+across every one of those surfaces, and
+`open_app_metadata_forbids_a_constructed_domain` pins the safeguard itself.
+Each description also matches the tool's behavior, refusals included, so no
+side effect is implicit.
 
 Related honesty point for the same step: there is **no per-call confirmation**
 for sensitive methods server-side today —

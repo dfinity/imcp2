@@ -999,7 +999,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Open an Internet Computer app in one call, given its name or its URL: resolves the app's Internet Identity derivation origin (as resolve_app does) and discovers the canisters behind it (as discover_app_canisters does) in a single step. A name — or a bare host — is matched against the built-in registry of well-known apps first, so a wrong-TLD guess repairs to the canonical URL; an explicit `https://` URL is resolved as given. There is no on-chain name-to-URL directory, so an unknown bare name is refused with instructions for finding the real URL, and a URL with no evidence of being an Internet Computer app is refused rather than resolved to a wrong identity. Returns `app_url` (the one used), `derivation_origin` and its source, `alternative_origins`, and the discovered `canisters`, with provenance, labels, and per-canister `oql`/`api_doc_available` capability flags from a one-shot Candid probe of the app's own canisters. An app's features are reached through those canisters rather than through per-feature tools: a canister flagged `oql` holds the app's data, gated by the caller's principal, and is read with get_canister_oql_schema and canister_query's `oql` argument, both of which take the returned `derivation_origin` and reject an anonymous read. No authenticated session is required, since no principal is derived here. resolve_app and discover_app_canisters perform the two halves separately.",
+        description = "Open an Internet Computer app in one call, given its name or its URL: resolves the app's Internet Identity derivation origin (as resolve_app does) and discovers the canisters behind it (as discover_app_canisters does) in a single step. If the user supplied only an app name, pass that name unchanged; only pass a URL supplied by the user or obtained from a verified official source, and do not construct a domain from the name. A name — or a bare host — is matched against the built-in registry of well-known apps first, so a wrong-TLD guess repairs to the canonical URL; an explicit `https://` URL is resolved as given. There is no on-chain name-to-URL directory, so an unknown bare name is refused with instructions for finding the real URL, and a URL with no evidence of being an Internet Computer app is refused rather than resolved to a wrong identity — that evidence establishes that a domain is served from the Internet Computer, not that it is the app the user meant, which is why a constructed domain is not an acceptable input. Returns `app_url` (the one used), `derivation_origin` and its source, `alternative_origins`, and the discovered `canisters`, with provenance, labels, and per-canister `oql`/`api_doc_available` capability flags from a one-shot Candid probe of the app's own canisters. An app's features are reached through those canisters rather than through per-feature tools: a canister flagged `oql` holds the app's data, gated by the caller's principal, and is read with get_canister_oql_schema and canister_query's `oql` argument, both of which take the returned `derivation_origin` and reject an anonymous read. No authenticated session is required, since no principal is derived here. resolve_app and discover_app_canisters perform the two halves separately.",
         annotations(title = "Open an app (resolve origin + discover canisters)", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::OpenAppOutput>(),
     )]
@@ -2499,17 +2499,28 @@ mod tests {
         assert_eq!(names.len(), total, "tool names must be unique across the split routers");
     }
 
-    // The model-readable metadata — the server instructions and every served
-    // tool description — says what this surface IS and how it behaves, not how
-    // a model should behave. Both directories read these fields, and a
-    // client's model should be free to pick its own approach from an accurate
-    // description of the tools. This pins the phrasings that had crept in: an
-    // entry point announced as a first step, blanket always/never rules aimed
-    // at the caller, a suggestion to go search the web, and a scripted flow
-    // across tools. Behavior stated as fact ("an anonymous OQL read is
-    // rejected") is the point of these fields and stays.
+    // The model-readable metadata — the server instructions, every served tool
+    // description, and the schemas — is where both directories expect a
+    // connector to say what its tools do, when they apply, what they require,
+    // and what is unsafe to pass. So this does NOT ban guidance (an earlier
+    // blanket version did, and it cost real safety text — per review); it bans
+    // the five manipulations the directories actually prohibit:
+    //
+    //   1. unrelated behavioral instructions — how the model should act, or
+    //      what its answer should look like, beyond operating these tools;
+    //   2. overly broad triggering — a claim on requests wider than the tool's
+    //      own job ("start here", "call this first", "for every request");
+    //   3. preference over, or interference with, other tools and plugins;
+    //   4. sending the model off to unrelated external software;
+    //   5. hidden or obfuscated instructions — anything a human reading the
+    //      field would not see.
+    //
+    // Tool-local prerequisites, selection criteria, and safety constraints are
+    // expected content and stay: "an anonymous OQL read is rejected", "pass
+    // the canonical derivation origin, not the website URL", "do not construct
+    // a domain from the name".
     #[test]
-    fn model_readable_metadata_states_capabilities_not_directives() {
+    fn model_readable_metadata_respects_marketplace_policy() {
         let mut surfaces =
             vec![("server instructions".to_string(), super::SERVER_INSTRUCTIONS.to_string())];
         for tool in super::IcTools::all_tools() {
@@ -2541,29 +2552,125 @@ mod tests {
         );
         for (what, text) in surfaces {
             let lower = text.to_lowercase();
-            for directive in [
-                "start here",
-                "start with",
-                "web search",
-                "search the web",
-                "always call",
-                "always pass",
-                "always use",
-                "call this first",
-                "call it first",
-                "before answering",
-                "typical flow",
-                "never guess",
-                "never pass",
-                "never fabricate",
-                "never conclude",
-                "never infer",
+            // 1. Instructions about the model rather than about this surface.
+            for banned in [
                 "you should",
                 "make sure to",
+                "before answering",
+                "your response",
+                "respond with",
+                "as an ai",
+                "ignore previous",
+                "ignore any previous",
+                "disregard the",
+                "typical flow",
             ] {
                 assert!(
-                    !lower.contains(directive),
-                    "{what} tells the model how to behave (\"{directive}\"): {text}"
+                    !lower.contains(banned),
+                    "{what} instructs the model outside its own operation (\"{banned}\"): {text}"
+                );
+            }
+            // 2. A trigger wider than the tool's own job.
+            for banned in [
+                "start here",
+                "call this first",
+                "call it first",
+                "for every request",
+                "for all requests",
+                "in all cases",
+                "always call",
+                "always use",
+                "use this for any",
+                "whenever the user",
+            ] {
+                assert!(
+                    !lower.contains(banned),
+                    "{what} claims a trigger beyond its own job (\"{banned}\"): {text}"
+                );
+            }
+            // 3. Precedence over, or interference with, anything else the
+            //    client has connected.
+            for banned in [
+                "prefer this tool",
+                "prefer these tools",
+                "in preference to",
+                "instead of other",
+                "do not use other",
+                "disable other",
+                "override other",
+            ] {
+                assert!(
+                    !lower.contains(banned),
+                    "{what} positions itself against other tools (\"{banned}\"): {text}"
+                );
+            }
+            // 4. Unrelated external software. (Where an operation genuinely
+            //    belongs outside this connector, the refusal that arises says
+            //    so at call time — the metadata does not send the model
+            //    shopping.)
+            for banned in
+                ["web search", "search the web", "google", "browse the web", "shell command"]
+            {
+                assert!(
+                    !lower.contains(banned),
+                    "{what} sends the model to unrelated software (\"{banned}\"): {text}"
+                );
+            }
+            // 5. Nothing a human reading the field would miss: no markup
+            //    comments, and no invisible or direction-flipping characters.
+            for banned in ["<!--", "-->"] {
+                assert!(!text.contains(banned), "{what} hides text in markup: {text}");
+            }
+            for c in text.chars() {
+                assert!(
+                    !matches!(
+                        c,
+                        '\u{200b}'..='\u{200f}'
+                            | '\u{202a}'..='\u{202e}'
+                            | '\u{2060}'..='\u{2064}'
+                            | '\u{2066}'..='\u{2069}'
+                            | '\u{feff}'
+                    ) && (!c.is_control() || c == '\n' || c == '\t'),
+                    "{what} carries an invisible character (U+{:04X}): {text}",
+                    c as u32
+                );
+            }
+        }
+    }
+
+    // The one constraint the runtime cannot enforce, so the metadata has to
+    // carry it (per review): a domain built out of an app name is not an
+    // acceptable input. The IC-evidence gate proves a domain is served from the
+    // Internet Computer — not that an IC-hosted lookalike is the app the user
+    // meant — and a required identifier must not depend on the model guessing.
+    // It belongs on both surfaces a model reads before calling: `open_app`'s
+    // description and the `app` argument's own schema.
+    #[test]
+    fn open_app_metadata_forbids_a_constructed_domain() {
+        let open_app = super::IcTools::all_tools()
+            .into_iter()
+            .find(|t| t.name == "open_app")
+            .expect("open_app is served");
+        let schema =
+            serde_json::to_string(&open_app.input_schema).expect("input schema serializes");
+        for (surface, text) in [
+            ("description", open_app.description.as_deref().unwrap_or_default().to_string()),
+            ("input schema", schema),
+        ] {
+            // A schema carries the doc comment with its line breaks (escaped,
+            // since this is JSON), so compare on collapsed whitespace — the
+            // clause must be present, not identically wrapped.
+            let flat = text.replace("\\n", " ").replace('\n', " ");
+            let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+            for clause in [
+                "supplied only an app name, pass that name unchanged",
+                "obtained from a verified official source",
+                "not construct a domain from the name",
+            ] {
+                assert!(
+                    flat.contains(clause),
+                    "open_app {surface} dropped the no-constructed-domain safeguard \
+                     (\"{clause}\"): {text}"
                 );
             }
         }
