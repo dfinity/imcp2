@@ -71,15 +71,24 @@ pub struct DiscoveredCanister {
     pub sources: Vec<String>,
     /// Whether this canister exposes the OQL query surface — filled in for the
     /// app's OWN data canisters by a single Candid fetch during open_app /
-    /// discover_app_canisters (#3). null when not probed (e.g. the frontend or a
-    /// shared system canister) or the interface couldn't be read. When true, this
-    /// is a caller-gated data backend: read it with the OQL tools, passing the app's
-    /// derivation_origin to read as the user.
+    /// discover_app_canisters (#3). Name-based: it reports that the interface declares
+    /// both `schema` and `execute`, without checking their signatures. null when not
+    /// probed — the frontend or a shared system canister, or an eligible canister past
+    /// the eight-probe cap on a large manifest — or when the interface could not be
+    /// FETCHED; an interface that was fetched but could not be parsed reads as false,
+    /// not null. What true establishes is how to READ this canister — through the OQL
+    /// tools rather than a Candid data query, passing the app's derivation_origin,
+    /// which those tools require. It does not establish what the canister stores or
+    /// that it gates reads by the caller's principal: neither follows from two
+    /// method names.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oql: Option<bool>,
     /// Whether this canister declares an API-doc method (`getApiDoc`/`get_api_doc`),
-    /// from the same probe as `oql`. null when not probed / unreadable. When true,
-    /// get_canister_api_doc returns a prose behavior guide.
+    /// from the same probe as `oql`, and name-based in the same way. null when not
+    /// probed or when the interface could not be FETCHED; as with `oql`, an interface
+    /// that was fetched but could not be parsed reads as false, not null. True reports
+    /// the declaration, which is what get_canister_api_doc reads — not a guarantee
+    /// that the call returns a guide: it can still reject or trap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_doc_available: Option<bool>,
 }
@@ -126,7 +135,9 @@ pub fn is_app_data_candidate(c: &DiscoveredCanister) -> bool {
 /// Arguments for `discover_app_canisters`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DiscoverCanistersArgs {
-    /// A web domain or URL served from the IC, e.g. "oisy.com".
+    /// A web domain or URL to inspect, e.g. "opencloud.org". It does not have to be
+    /// known to be IC-served: a reachable domain with no Internet-Computer evidence
+    /// yields an empty result rather than a refusal.
     pub domain: String,
 }
 
@@ -1825,13 +1836,20 @@ pub struct FindAppOutput {
 /// Arguments for `open_app`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OpenAppArgs {
-    /// An app NAME as the user said it OR its URL (e.g.
-    /// "https://opencloud.org"). A name — or a bare host — is matched against the
-    /// built-in known-app registry first, so a wrong-TLD guess
-    /// repairs to the canonical URL; an explicit `https://…` URL is resolved as
-    /// given. NEVER pass a domain you fabricated from a name: an unknown bare name
-    /// is refused with instructions to find the real URL, and a URL with no
-    /// Internet-Computer evidence is refused — both instead of guessing.
+    /// An app name as the user said it, or its URL (e.g.
+    /// "https://opencloud.org"). If the user supplied only an app name, pass that
+    /// name unchanged. Only pass a URL supplied by the user or obtained from a
+    /// verified official source; do not construct a domain from the name. A name —
+    /// or a bare host — is matched against the built-in known-app registry first,
+    /// so a wrong-TLD guess repairs to the canonical URL; an explicit `https://…`
+    /// URL is resolved as given. Two refusals: an unknown bare name is refused with
+    /// instructions for finding the real URL, and a URL that would need its own
+    /// origin assumed as the derivation origin (no usable declaration was read — a
+    /// failed or non-success fetch, malformed JSON and an unusable declaration all
+    /// count — and no registry entry) is refused when that origin shows no
+    /// Internet-Computer evidence — and that
+    /// evidence shows a domain is served from the Internet Computer, not that it
+    /// belongs to the app the user meant.
     pub app: String,
 }
 
@@ -1855,8 +1873,11 @@ pub struct OpenAppOutput {
     /// "app_url_default" (see resolve_app).
     pub derivation_origin_source: String,
     /// Origins the derivation origin's `ii-alternative-origins` permits to derive
-    /// from it. Informational only — the INVERSE relation; never infer the
-    /// derivation origin from it.
+    /// from it — the INVERSE relation, so an entry here is an origin that may
+    /// derive from `derivation_origin`, not a derivation origin itself.
+    /// Informational, and read best-effort: an empty list means none were read (a
+    /// fetch, HTTP, parse, or origin-validation failure yields one), and at most 100
+    /// valid entries are kept.
     pub alternative_origins: Vec<String>,
     /// Whether the origin showed Internet-Computer evidence (gateway
     /// `x-ic-canister-id`); null unless the derivation origin was assumed. See

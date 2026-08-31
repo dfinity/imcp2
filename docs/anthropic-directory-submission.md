@@ -197,6 +197,32 @@ qualifications.
 asked ahead about this acknowledgment. No reply is needed to submit; if one
 arrives, answer with the posture above.
 
+Related point for the same step: the **model-readable metadata describes the
+surface and the constraints on using it, without attempting to manipulate
+Claude**. The server instructions, all 11 tool descriptions, and every
+argument and reply schema each say what their tool does, returns, rejects, and
+requires — the guidance a caller needs to use it correctly and safely, which
+both directories expect a description to carry, including `open_app`'s "do not
+construct a domain from the name". What none of them carries is the set of
+manipulations the directories prohibit: unrelated behavioral instructions,
+overly broad triggering, preference over or interference with other tools,
+calls to unrelated external software, and hidden or obfuscated instructions. A
+unit test (`model_readable_metadata_respects_marketplace_policy`) guards that
+across every one of those surfaces, and what it guarantees is worth stating
+exactly: it rejects an enumerated set of phrasings — the ones that appeared here
+before, plus the ones review named — and, completely, any character outside a
+small allowlist, so nothing invisible can ride along in a field doc. Judging a
+novel phrasing of a prohibited intent stays human review's job.
+`the_policy_gate_catches_what_it_lists` keeps the gate live from both sides, and
+`open_app_metadata_forbids_a_constructed_domain` pins the safeguard itself.
+Each description also matches the tool's behavior, so no side effect is
+implicit — with one deliberate exception: the financial-transactions policy is
+stated in the server-level instructions and in no tool description (a policy
+paragraph inside `canister_update_call`'s description would read as a hint that
+the tool is usable for financial transactions), and a test
+(`financial_policy_is_a_server_instruction_not_a_description`) keeps it that
+way. The refusal itself is the tool's error text at call time.
+
 Related honesty point for the same step: there is **no per-call confirmation**
 for sensitive methods server-side today —
 mitigations are the explicit access-level choice on the II consent screen
@@ -339,12 +365,19 @@ Paste-and-adapt; portal limits in parentheses.
 >    questions" additionally allows state-changing calls
 >    (`canister_update_call`).
 > 3. Try the example prompts above. On a Questions-only session a
->    state-changing call (`canister_update_call`) is rejected by the
->    network and the tool reports the failed call; the server
->    instructions prime the assistant to explain the access level and
->    recommend reconnecting under "Actions & questions" — that behavior
->    is intended. Access is revocable at any time at
->    https://id.ai/manage/settings.
+>    state-changing call made AS YOUR APP ACCOUNT (`canister_update_call`
+>    with a `derivation_origin`, so it is signed with that session's
+>    delegation) is rejected by the network, and the tool reports the
+>    failed call — that behavior is intended, and reconnecting under
+>    "Actions & questions" is what permits such calls. A call with no
+>    `derivation_origin` is not signed with the delegation at all: it runs
+>    as the anonymous principal, so the access level does not decide it.
+>    The connector's own checks still do — the financial-transactions guard
+>    runs before any identity resolution or network I/O, so a call it refuses
+>    is refused with or without an origin — and past that the canister
+>    decides. The server instructions describe both, so the assistant can
+>    explain which case a call is in. Access is revocable at
+>    any time at https://id.ai/manage/settings.
 > 4. No canister creation, funding, or dedicated management tool is served,
 >    so there is nothing to provision: that work happens outside the
 >    connector, with the icp CLI. (`canister_update_call` is not a substitute:
