@@ -915,10 +915,24 @@ async fn fetch_well_known(
     // `x-ic-canister-id` on everything it serves, 404s included, so an app that
     // simply doesn't publish this document still proves it is IC-hosted here.
     let ic_evidence = ic_evidence_from(&resp, application_origin);
-    if !resp.status().is_success() {
-        return (WellKnown::Absent, ic_evidence);
+    let status = resp.status();
+    if !status.is_success() {
+        // Same rule as the gate's probe, for the same reason and with more at
+        // stake: only a definitive "not here" may mean the app declares nothing.
+        // A 429 or 5xx during an outage would otherwise fall through to the
+        // legacy field or the application-origin default and sign as a different
+        // principal (per review).
+        return if means_not_published(status) {
+            (WellKnown::Absent, ic_evidence)
+        } else {
+            (WellKnown::Unreachable(format!("HTTP {status}")), ic_evidence)
+        };
     }
-    (WellKnown::Served(read_capped(resp, max_bytes).await), ic_evidence)
+    match read_capped_strict(resp, max_bytes).await {
+        Ok(body) => (WellKnown::Served(body), ic_evidence),
+        // A body that died mid-read is not a document that says nothing.
+        Err(e) => (WellKnown::Unreachable(e), ic_evidence),
+    }
 }
 
 /// Resolve the app's declared derivation origin, authorizing a cross-origin claim
@@ -1391,7 +1405,30 @@ const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024; // aggregate bundle text mined fo
 /// Read up to `max` bytes of a response body, then stop — dropping the response
 /// (and so the connection) rather than draining the remainder. Best-effort: a
 /// mid-stream error just returns what we have (discovery is opportunistic).
-async fn read_capped(mut resp: reqwest::Response, max: usize) -> String {
+async fn read_capped(resp: reqwest::Response, max: usize) -> String {
+    // Fail-soft by design here: for the discovery crawl a half-read body is
+    // still worth mining, and there is no verdict riding on it.
+    read_capped_inner(resp, max).await.unwrap_or_else(|(partial, _)| partial)
+}
+
+/// [`read_capped`] for the callers that draw a CONCLUSION from the body, where a
+/// truncated read must not pass as a complete one (per review). A connection that
+/// drops mid-body would otherwise hand the gate a partial document, which parses
+/// as "not a manifest" and becomes the permanent "publishes no manifest; stop
+/// retrying" verdict — a false statement about an app that may serve a perfectly
+/// good manifest. Hitting the size cap is NOT an error: that is a bounded read
+/// this server chose, not a failed one.
+async fn read_capped_strict(resp: reqwest::Response, max: usize) -> Result<String, String> {
+    read_capped_inner(resp, max).await.map_err(|(_, e)| e)
+}
+
+/// The shared read. `Err((partial, error))` carries what had arrived before the
+/// transfer failed, so the fail-soft caller can keep it and the strict one can
+/// report the failure.
+async fn read_capped_inner(
+    mut resp: reqwest::Response,
+    max: usize,
+) -> Result<String, (String, String)> {
     let mut buf: Vec<u8> = Vec::new();
     loop {
         if buf.len() >= max {
@@ -1406,10 +1443,12 @@ async fn read_capped(mut resp: reqwest::Response, max: usize) -> String {
                 }
             }
             Ok(None) => break,
-            Err(_) => break,
+            Err(e) => {
+                return Err((String::from_utf8_lossy(&buf).into_owned(), e.to_string()))
+            }
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// GET `url` and return up to `max` bytes of its body, distinguishing "this app
@@ -1456,7 +1495,8 @@ async fn get_document(
         // `application/json` are the same claim.
         .map(|v| v.split(';').next().unwrap_or(v).trim().to_ascii_lowercase())
         .unwrap_or_default();
-    Ok(Some(FetchedDocument { served_from, content_type, body: read_capped(resp, max).await }))
+    let body = read_capped_strict(resp, max).await?;
+    Ok(Some(FetchedDocument { served_from, content_type, body }))
 }
 
 /// One fetched well-known document, plus the facts a gate needs about HOW it

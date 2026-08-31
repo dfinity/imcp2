@@ -367,7 +367,16 @@ fn identity_mismatch_refusal(
     let (app_origin, app_identity, requested_identity) =
         (safe_origin(app_origin), safe_origin(app_identity), safe_origin(requested_identity));
     format!(
-        "The app at {app_origin} is not the app this call would be signed as. Internet Identity          derives that app's users from {app_identity}, while this call asks to act as          {requested_identity}. Writing to {canister_id} on that combination is refused: a manifest          published at one origin does not authorize a write made under another app's identity, or          any site could declare a canister and have this connector write to it as you, at an app          you trusted for something else. If {canister_id} belongs to the app you are acting at,          pass THAT app's URL as `app_url` — open_app returns the `app_url` and the          `derivation_origin` of one app together, so a pair from a single open_app call always          matches. If you meant to act at {app_origin} instead, pass its own derivation origin.          {READS_ARE_FINE}"
+        "The app at {app_origin} is not the app this call would be signed as. Internet \
+         Identity derives that app's users from {app_identity}, while this call asks to act as \
+         {requested_identity}. Writing to {canister_id} on that combination is refused: a \
+         manifest published at one origin does not authorize a write made under another app's \
+         identity, or any site could declare a canister and have this connector write to it as \
+         you, at an app you trusted for something else. If {canister_id} belongs to the app you \
+         are acting at, pass THAT app's URL as `app_url` — open_app returns the `app_url` and \
+         the `derivation_origin` of one app together, so a pair from a single open_app call \
+         always matches. If you meant to act at {app_origin} instead, pass its own derivation \
+         origin. {READS_ARE_FINE}"
     )
 }
 
@@ -377,8 +386,24 @@ fn identity_mismatch_refusal(
 /// that the two disagree, only that we cannot show they agree, and the call is
 /// refused rather than made blind.
 fn identity_unresolvable_refusal(app_origin: &str, cause: &str) -> String {
+    // Not every failure here is a blip: `resolve_app_identity` also refuses a
+    // cross-origin derivation-origin declaration that the declared origin does
+    // not authorize in its ii-alternative-origins, and no amount of retrying
+    // repairs that — it is a misconfiguration (or a spoof) at the app. Telling a
+    // caller to retry it would be advice that cannot work, so the two cases get
+    // different next steps (per review).
+    let next = if cause.contains("ii-alternative-origins") {
+        "This one does not resolve itself: the app claims a derivation origin that does not \
+         authorize it back, which its operators fix by listing this origin in that file. \
+         Retrying will not change it."
+    } else {
+        "This is likely transient — retry; if it persists, confirm that `app_url` names the app \
+         you are acting at (open_app returns its `app_url` and `derivation_origin` together)."
+    };
     format!(
-        "Could not establish that {} is the app this call would be signed as: {}. The call is          refused rather than made blind, because a manifest only authorizes a write when it comes          from the app whose identity is signing. This is likely transient — retry; if it persists,          confirm that `app_url` names the app you are acting at (open_app returns its `app_url`          and `derivation_origin` together). {READS_ARE_FINE}",
+        "Could not establish that {} is the app this call would be signed as: {}. The call is \
+         refused rather than made blind, because a manifest only authorizes a write when it \
+         comes from the app whose identity is signing. {next} {READS_ARE_FINE}",
         safe_origin(app_origin),
         safe_cause(cause)
     )
@@ -407,22 +432,30 @@ fn not_declared_refusal(
         format!("declares: {}{suffix}", listed.join(", "))
     };
     // An over-long manifest is the one case where "not declared" would be a FALSE
-    // statement about the app: entries past the read cap are declared, we just
-    // did not read them. Say so rather than letting the app take the blame.
-    let overflow = if manifest.omitted > 0 {
-        format!(
-            " Its manifest also carries {} further entries beyond the {} this server reads, which \
-             were NOT checked — if {canister_id} is one of them, the manifest is too long and its \
-             operators should shorten it.",
+    // statement about the app: entries past the read cap ARE declared, we just did
+    // not read them. So the VERDICT changes rather than being qualified after the
+    // fact — leading with "does not declare" and admitting two sentences later
+    // that we never looked is the same false assertion this handling exists to
+    // avoid (per review).
+    if manifest.omitted > 0 {
+        return format!(
+            "Could not determine whether {} declares {canister_id}: its manifest ({}) carries {} \
+             entries beyond the {} this server reads, which were NOT checked, so this connector \
+             will not make a state-changing call to it. {} Of what WAS read, it {declares}. If \
+             {canister_id} is one of the unread entries, the manifest is too long and its \
+             operators should shorten it ({SERVICE_DISCOVERABILITY_GUIDE}); if it belongs to a \
+             DIFFERENT app, pass that app's URL as `app_url` instead of {}. {READS_ARE_FINE}",
+            manifest.origin,
+            manifest.path,
             manifest.omitted,
-            manifest.canisters.len()
-        )
-    } else {
-        String::new()
-    };
+            manifest.canisters.len(),
+            the_rule(),
+            source.arg()
+        );
+    }
     format!(
         "{} does not declare {canister_id} in its manifest ({}), so this connector will not make a \
-         state-changing call to it. It {declares}.{overflow} {} Use one of the declared canisters for this \
+         state-changing call to it. It {declares}. {} Use one of the declared canisters for this \
          operation. If {canister_id} really is part of this app, its operators must add it to the \
          manifest ({SERVICE_DISCOVERABILITY_GUIDE}); if it belongs to a DIFFERENT app, pass that \
          app's URL as `app_url` instead of {}. {READS_ARE_FINE}",
@@ -683,16 +716,23 @@ mod tests {
             &backend(),
             OriginSource::AppUrl,
         );
-        assert!(msg.contains("7 further entries"), "{msg}");
+        assert!(msg.contains("7 entries beyond"), "reports how many were unread: {msg}");
         assert!(msg.contains("NOT checked"), "{msg}");
+        // And the VERDICT itself is indeterminate, not an assertion withdrawn a
+        // sentence later (per review): if the target is one of the unread
+        // entries, "does not declare" is simply false.
+        assert!(msg.contains("Could not determine whether"), "{msg}");
+        assert!(!msg.contains("does not declare"), "must not assert what it did not check: {msg}");
 
-        // No overflow → no speculation about one.
+        // No overflow → the whole manifest was read, so the verdict is definite
+        // and there is no speculation about entries that don't exist.
         let exact = not_declared_refusal(
             &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
             &backend(),
             OriginSource::AppUrl,
         );
-        assert!(!exact.contains("further entries"), "{exact}");
+        assert!(!exact.contains("entries beyond"), "{exact}");
+        assert!(exact.contains("does not declare"), "a fully read manifest is definite: {exact}");
     }
 
     // A transport error is attacker-influenced text (a hostile origin picks its
