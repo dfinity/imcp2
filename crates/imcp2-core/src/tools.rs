@@ -154,7 +154,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Fetch a canister's Candid interface: the `.did` text declaring its methods and their types. Use this to learn what a canister offers before calling it. Also reports whether the canister declares an OQL surface instead of Candid queries, and whether it declares the API doc get_canister_api_doc reads.",
+        description = "Fetch a canister's Candid interface: the `.did` text declaring its methods and their types. Use this to learn what a canister offers before calling it. Also reports whether the canister declares an OQL surface, which this server reads through the OQL tools rather than with a Candid query, and whether it declares the API doc get_canister_api_doc reads.",
         annotations(title = "Get Candid interface", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::GetCandidOutput>(),
     )]
@@ -233,7 +233,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Return the guide to OQL: the JSON query language some canisters expose in place of Candid data queries. It covers the query object: filters, aggregation, ordering, edge traversal and paging. Use this before writing a first OQL query; get_canister_oql_schema then gives one canister's entity and field names.",
+        description = "Return the guide to OQL: the JSON query language some canisters expose, through which this server reads them. It covers the query object: filters, aggregation, ordering, edge traversal and paging. Use this before writing a first OQL query; get_canister_oql_schema then gives one canister's entity and field names.",
         annotations(title = "Get the OQL query guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
         output_schema = schema_for_output::<calls::OqlGuideOutput>(),
     )]
@@ -2160,7 +2160,7 @@ fn data_access_note(canisters: &[discover::DiscoveredCanister], handle: Option<&
     };
     Some(format!(
         "Data access: the canister(s) flagged [oql] are read through the OQL tools rather than a \
-         Candid data query, and that path REQUIRES the origin — an anonymous OQL read is rejected \
+         Candid `method` query, and that path REQUIRES the origin — an anonymous OQL read is rejected \
          for now. The flag reports the interface's `schema`/`execute` declaration, not what the \
          canister stores. {how}"
     ))

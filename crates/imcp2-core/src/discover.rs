@@ -69,9 +69,9 @@ pub struct DiscoveredCanister {
     /// "header", "env.json", "bundle:<LABEL>", or "bundle". The first two are
     /// declared by the app itself and are the most authoritative.
     pub sources: Vec<String>,
-    /// Whether this canister exposes an OQL query surface, so its data is read with the OQL
-    /// tools rather than a Candid data query. Null when it was not probed, or its interface
-    /// could not be read.
+    /// Whether this canister declares an OQL query surface, so this server reads it with the
+    /// OQL tools rather than a Candid `method` query. Null when it was not probed, or its
+    /// interface could not be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oql: Option<bool>,
     /// Whether this canister declares the method get_canister_api_doc reads. Null when it was

@@ -40,9 +40,9 @@ pub struct GetCandidOutput {
     pub canister_id: String,
     /// The Candid (`.did`) interface text.
     pub candid: String,
-    /// True when the canister exposes an OQL query surface. Its data is then read with
-    /// get_canister_oql_schema and canister_query's `oql` argument; a Candid data query is
-    /// rejected.
+    /// True when the canister declares an OQL query surface. Reads then go through
+    /// get_canister_oql_schema and canister_query's `oql` argument, and this server refuses
+    /// a Candid `method` query on the canister. Update calls are unaffected.
     pub oql: bool,
     /// True when the canister declares the method get_canister_api_doc reads. It reports the
     /// declaration, so that call can still come back without a doc.
