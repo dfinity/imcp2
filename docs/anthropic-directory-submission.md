@@ -193,8 +193,13 @@ calls to unrelated external software, and hidden or obfuscated instructions. A
 unit test (`model_readable_metadata_respects_marketplace_policy`) pins that set
 across every one of those surfaces, and
 `open_app_metadata_forbids_a_constructed_domain` pins the safeguard itself.
-Each description also matches the tool's behavior, refusals included, so no
-side effect is implicit.
+Each description also matches the tool's behavior, so no side effect is
+implicit — with one deliberate exception: the financial-transactions policy is
+stated in the server-level instructions and in no tool description (a policy
+paragraph inside `canister_update_call`'s description would read as a hint that
+the tool is usable for financial transactions), and a test
+(`financial_policy_is_a_server_instruction_not_a_description`) keeps it that
+way. The refusal itself is the tool's error text at call time.
 
 Related honesty point for the same step: there is **no per-call confirmation**
 for sensitive methods server-side today —

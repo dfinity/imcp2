@@ -281,7 +281,9 @@ pub struct CanisterQueryArgs {
 
 /// Output of `canister_query`. The populated fields depend on `mode`: a Candid
 /// `method` query sets `method` + `reply`; an `oql` query sets `columns` + `rows`
-/// (+ `has_more` and, on an empty result, `valid_entities` / `did_you_mean`).
+/// (+ `has_more`). `valid_entities` and `did_you_mean` are optional even on an
+/// empty result: they appear only when the schema re-read returns entities and the
+/// query's `start` is not one of them.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CanisterQueryOutput {
     /// The canister that was queried.
