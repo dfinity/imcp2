@@ -2631,11 +2631,19 @@ mod tests {
                 assert!(
                     !matches!(
                         c,
-                        '\u{200b}'..='\u{200f}'
+                        // Soft hyphen, the Arabic letter mark and the Mongolian
+                        // vowel separator are format characters that `is_control`
+                        // does not catch.
+                        '\u{00ad}' | '\u{061c}' | '\u{180e}'
+                            | '\u{200b}'..='\u{200f}'
                             | '\u{202a}'..='\u{202e}'
                             | '\u{2060}'..='\u{2064}'
                             | '\u{2066}'..='\u{2069}'
                             | '\u{feff}'
+                            // Interlinear annotation, and the tag block — text
+                            // that renders as nothing at all.
+                            | '\u{fff9}'..='\u{fffb}'
+                            | '\u{e0000}'..='\u{e007f}'
                     ) && (!c.is_control() || c == '\n' || c == '\t'),
                     "{what} carries an invisible character (U+{:04X}): {text}",
                     c as u32

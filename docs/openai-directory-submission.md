@@ -169,10 +169,14 @@ Negative:
    Computer presence) → refused by the IC-evidence gate with guidance
    (web-search or ask the user for the real URL) rather than resolved to a
    wrong identity.
-2. A state-changing call (canister_update_call) on a "Questions only"
-   session → the network rejects it and the tool reports the failed call;
-   the server instructions describe the two Internet Identity access levels,
-   so the assistant can explain why and what reconnecting changes.
+2. A state-changing call as your app account (canister_update_call with a
+   `derivation_origin`, so it is signed with the session's delegation) on a
+   "Questions only" session → the network rejects it and the tool reports the
+   failed call; the server instructions describe the two Internet Identity
+   access levels, so the assistant can explain why and what reconnecting
+   changes. (Without a `derivation_origin` the call runs as the anonymous
+   principal and the access level does not apply, so pass one to exercise
+   this gate.)
 3. Any authenticated tool with no sign-in → clean 401 → OAuth flow starts
    (no crash, no hang).
 4. "Call an update method on a canister that rejects this caller" → the
