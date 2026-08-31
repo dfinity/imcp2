@@ -1988,7 +1988,7 @@ const SERVER_INSTRUCTIONS: &str = "Internet Computer tools: read canister interf
     Tool names signal scope. The `…_app…` names (open_app, discover_app_canisters, get_app_principal, list_app_accounts, resolve_app) act on a whole app, keyed by its Internet Identity derivation origin or its URL; the `…canister…` names (get_canister_candid, get_canister_api_doc, get_canister_oql_schema, canister_query, canister_update_call) act on one canister. `icp_oql_guide` documents the OQL dialect the canister reads use. An app's features are reached through its canisters rather than through per-feature tools, and open_app resolves an app name or URL to both its derivation origin and its canisters in one call.\n\n\
     An app's derivation origin is the exact origin Internet Identity derives the user's principal from. It is not necessarily the app's visible URL, and an alternative-origins entry does not identify it; open_app and resolve_app resolve it, and the identity-bearing tools take the origin itself rather than a URL. There is no on-chain name-to-URL directory: open_app matches a name against a built-in registry of well-known apps, and where the derivation origin would have to be assumed from the URL itself, open_app and resolve_app refuse an origin with no evidence of being an Internet Computer app, while discover_app_canisters returns an empty result for such a domain. Per-app data is gated by the calling principal, so OQL reads require a derivation origin and reject an anonymous read. Account delegations are short-lived and derived on demand from this connection's standing Internet Identity credential, which is obtained at connect time and lasts for the chosen session duration (up to 30 days). Internet Identity's consent screen offers two access levels, and they govern the calls signed with that session's account delegation — the ones that carry a derivation origin: on a \"Questions only\" session those reads work and those update calls are rejected by the network, while \"Actions & questions\" permits both. A call made with no derivation origin is not signed with the delegation at all; it runs as the anonymous principal, and the canister decides whether to accept it.\n\n\
     Canister values are stored in canonical, locale-neutral forms: timestamps are usually nanoseconds since the Unix epoch in UTC (IC time), and physical quantities are SI or app-defined units, which `get_canister_api_doc` documents for canisters that publish a doc.\n\n\
-    FINANCIAL TRANSACTIONS ARE NOT SUPPORTED — asset-moving requests are denied, to protect the user: canister_update_call refuses the ICRC-standard transfer/approval methods (icrc1_transfer, icrc2_approve, icrc2_transfer_from, and the ICRC-4/-7/-37 equivalents) and the governance method manage_neuron (neuron staking and disbursement, on the NNS and every SNS) on every canister, the ICP and cycles ledgers\' own transfer/withdrawal/creation methods and the cycles-minting canister\'s funding-completion methods on those canisters, and every update call on the financial-service canisters it carries (token ledgers and minters, exchanges, wallet backends, staking and governance). Financial operations (token transfers, spending approvals, payments, trades) are the user\'s to perform outside this connector, in a trusted interface they control; a refused canister-creation or funding-completion call points at the user-run icp CLI instead.\n\n\
+    FINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user: canister_update_call refuses them, and the refusal says why. For financial operations (token transfers, spending approvals, payments, trades), recommend the user performs the operation outside this connector, in a trusted interface they control.\n\n\
     Compiling Motoko or Rust to Wasm happens in the client\'s own environment, and creating, funding, deploying, and managing canisters is done by the user with the icp CLI in their own terminal.";
 
 impl ServerHandler for IcTools {
@@ -2373,8 +2373,6 @@ mod tests {
             "get_canister_candid", "canister_query", "get_canister_oql_schema", "discover_app_canisters", "icp_find_canister_by_name", "icp_find_app_by_name", "icp_lookup_canister_info_by_id",
             "icp_list_skills", "icp_get_skill", "icp_oql_guide",
             "get_canister_api_doc", "open_app", "resolve_app", "list_app_accounts", "icp_cycles_balance", "get_app_principal", "icp_canister_status",
-            // Instructions-only since the marketplace-compliance changes: they
-            // execute nothing and move no funds, so they are pure reads.
         ] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");
@@ -2426,9 +2424,7 @@ mod tests {
             assert!(!desc.contains(".com"), "{} names a venue: {desc}", tool.name);
         }
         let ins = super::SERVER_INSTRUCTIONS;
-        assert!(ins.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED"));
-        assert!(ins.contains("asset-moving requests are denied"));
-        assert!(ins.contains("icrc1_transfer"));
+        assert!(ins.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user"));
         assert!(ins.contains("outside this connector, in a trusted interface they control"));
         assert!(!ins.contains("oisy.com"), "the instructions name no venue: {ins}");
     }
