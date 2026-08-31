@@ -449,21 +449,43 @@ const MAX_DERIVATION_ORIGIN_LINE: usize = 512;
 /// Layer 5 of the protocol: the app's derivation origin as served at
 /// [`DERIVATION_ORIGIN_PATH`] — one canonical `https://host` on a single line.
 ///
-/// Only the FIRST non-empty line is considered, capped at
-/// [`MAX_DERIVATION_ORIGIN_LINE`], and it must reduce to a bare https origin
-/// ([`normalize_origin`]). That combination is what makes the common
-/// misconfiguration fail closed rather than dangerously: an SPA catch-all
-/// answering this path with `index.html` yields `<!doctype html>` as its first
-/// line, which is not a parseable origin, so the app reads as "declares nothing"
-/// (derive for the visible origin) instead of resolving to garbage. `None` for a
-/// blank body, an over-long line, a non-https scheme, user-info, or anything
-/// unparseable.
+/// The documented format is enforced rather than coerced (per review): exactly
+/// ONE non-empty line, capped at [`MAX_DERIVATION_ORIGIN_LINE`], carrying an
+/// EXPLICIT `https://` URL with no path, query, fragment or user-info. This file
+/// decides which principal the user acts as, and coercion is the wrong instinct
+/// for that: reading `example.com` as an origin, or quietly discarding the `/path`
+/// off a malformed line, would turn a file its author got wrong into an
+/// authoritative identity declaration — and the resulting wrong principal fails
+/// silently, as a call that simply isn't the user. Anything that is not the
+/// documented form reads as "declares nothing", which lands the app on its own
+/// visible origin: the safe default the protocol already specifies for an absent
+/// file.
+///
+/// It is also what makes the common misconfiguration harmless: an SPA catch-all
+/// answering this path with `index.html` yields `<!doctype html>`, not an origin.
 fn parse_derivation_origin_file(text: &str) -> Option<String> {
-    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
-    if line.len() > MAX_DERIVATION_ORIGIN_LINE {
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let line = lines.next()?;
+    // A second non-empty line means this is not the documented one-line document,
+    // and guessing which line was meant is exactly the coercion above.
+    if lines.next().is_some() || line.len() > MAX_DERIVATION_ORIGIN_LINE {
         return None;
     }
-    normalize_origin(line)
+    // The form is an origin, so the scheme is written out — a bare host is not it.
+    if !line.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://")) {
+        return None;
+    }
+    let url = url::Url::parse(line).ok()?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return None;
+    }
+    let origin = url.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
 }
 
 /// Which origins Internet Identity permits to derive from this origin, from its
@@ -1390,21 +1412,38 @@ async fn read_capped(mut resp: reqwest::Response, max: usize) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// GET `url` and return up to `max` bytes of its body, distinguishing "the origin
-/// answered, but not with this document" (`Ok(None)` — any non-2xx) from "the
-/// origin could not be reached at all" (`Err`). The discovery crawl doesn't need
-/// that distinction, but the update-call gate does: a 404 means the app does not
-/// publish a manifest, while a timeout means we do not know, and the two must not
-/// produce the same refusal. Folding "send, check status, read capped" into one
-/// future is also what lets callers `join!` several probes.
+/// GET `url` and return up to `max` bytes of its body, distinguishing "this app
+/// does not publish this document" (`Ok(None)`) from "we could not find out"
+/// (`Err`). The discovery crawl doesn't need that distinction, but the
+/// update-call gate does: the first becomes a refusal telling the app's operators
+/// to publish a manifest and the agent to stop retrying, so only a status that
+/// really means "not here" may produce it. A 404 or 410 does. A 429 or a 5xx does
+/// NOT — an overloaded origin would otherwise be reported as an app that has not
+/// adopted the protocol (per review) — and neither does any other non-success
+/// status: a 403 on the path is the origin declining to say, not saying no.
+/// Folding "send, check status, read capped" into one future is also what lets
+/// callers `join!` several probes.
+/// Whether a non-success status is the origin saying "this document is not here"
+/// — the only answer that may become a verdict on the app — or merely a failure
+/// to find out. Kept separate from the fetch so the rule can be pinned without a
+/// network (see the tests).
+fn means_not_published(status: reqwest::StatusCode) -> bool {
+    matches!(status, reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE)
+}
+
 async fn get_document(
     client: &reqwest::Client,
     url: &str,
     max: usize,
 ) -> Result<Option<FetchedDocument>, String> {
     let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Ok(None);
+    let status = resp.status();
+    if !status.is_success() {
+        return if means_not_published(status) {
+            Ok(None)
+        } else {
+            Err(format!("HTTP {status}"))
+        };
     }
     // Captured BEFORE the body is consumed: which origin actually answered (a
     // redirect may have moved it) and what it claimed to be.
@@ -1509,10 +1548,13 @@ pub(crate) async fn fetch_declared_manifest(app_url: &str) -> Result<ManifestPro
         get_document(&client, &architecture_url, MAX_META_BYTES),
         get_document(&client, &legacy_url, MAX_META_BYTES),
     );
-    // Unreachable on BOTH probes: we cannot tell "publishes no manifest" from
-    // "we could not ask", so report the failure instead of the absence.
-    if let (Err(e), Err(_)) = (&architecture, &legacy) {
-        return Err(format!("could not reach {origin}: {e}"));
+    // Only the standard path can authorize, so only ITS failure is fatal: without
+    // an answer there we cannot tell "publishes no manifest" from "we could not
+    // ask", and the first of those is a verdict on the app that tells the agent to
+    // stop retrying. A legacy probe that failed costs nothing — it can only enrich
+    // a refusal that is happening anyway.
+    if let Err(e) = &architecture {
+        return Err(format!("could not read {ARCHITECTURE_PATH} at {origin}: {e}"));
     }
     let mut served_non_manifest = None;
     let (mut declared, mut legacy_declared) = (None, None);
@@ -2858,6 +2900,33 @@ mod tests {
         }
     }
 
+    // Which non-success statuses may become "this app publishes no manifest" — a
+    // refusal that tells the app's operators to publish one and the agent to stop
+    // retrying. Only a definitive "not here" qualifies: an overloaded or rate-
+    // limited origin is a failure to find out, and reporting it as non-adoption
+    // would be a false statement about the app (per review).
+    #[test]
+    fn only_a_definitive_absence_reads_as_not_published() {
+        use reqwest::StatusCode;
+        for definitive in [StatusCode::NOT_FOUND, StatusCode::GONE] {
+            assert!(means_not_published(definitive), "{definitive} means not published");
+        }
+        for transient in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::REQUEST_TIMEOUT,
+            // Not transient, but still not an answer: the origin is declining to
+            // say, which is not the same as saying no.
+            StatusCode::FORBIDDEN,
+            StatusCode::UNAUTHORIZED,
+        ] {
+            assert!(!means_not_published(transient), "{transient} must not read as not published");
+        }
+    }
+
     // Layer 5: one canonical origin on one line. The SPA catch-all case matters
     // most here — a wrongly-parsed derivation origin does not fail loudly, it
     // silently derives the WRONG principal — so an HTML body must yield None (the
@@ -2869,15 +2938,35 @@ mod tests {
             parse_derivation_origin_file("https://hcv4s-uaaaa-aaabq-qaaba-cai.icp.net\n").as_deref(),
             Some("https://hcv4s-uaaaa-aaabq-qaaba-cai.icp.net")
         );
-        // Leading blank lines and surrounding whitespace are tolerated; only the
-        // first non-empty line is read, so a trailing comment can't leak in.
+        // Leading blank lines and surrounding whitespace are tolerated — they are
+        // not a claim about the content.
         assert_eq!(
-            parse_derivation_origin_file("\n\n  https://app.example.com  \nignored\n").as_deref(),
+            parse_derivation_origin_file("\n\n  https://app.example.com  \n").as_deref(),
             Some("https://app.example.com")
         );
-        // Reduced to a bare origin, exactly like every other origin input here.
+        // But the documented form is ENFORCED, not coerced (per review). This file
+        // decides which principal the user acts as, and a wrong one fails silently
+        // — as a call that simply isn't them — so a file its author got wrong reads
+        // as "declares nothing" (the app derives against its own origin, the
+        // protocol's own default for an absent file) rather than as an
+        // authoritative declaration of whatever we could salvage.
+        for malformed in [
+            "app.example.com",                              // bare host, not an origin
+            "https://app.example.com/path",                 // a URL, not an origin
+            "https://app.example.com/?x=1",                 // query
+            "https://app.example.com#f",                    // fragment
+            "https://app.example.com\nhttps://other.example", // two claims, not one
+            "https://app.example.com\nignored",             // a trailing comment
+        ] {
+            assert_eq!(
+                parse_derivation_origin_file(malformed),
+                None,
+                "must not coerce {malformed:?} into a declaration"
+            );
+        }
+        // A trailing slash is the same origin written the other way, not a path.
         assert_eq!(
-            parse_derivation_origin_file("https://app.example.com/x?y=1").as_deref(),
+            parse_derivation_origin_file("https://app.example.com/").as_deref(),
             Some("https://app.example.com")
         );
         // Fail closed: an SPA catch-all's HTML, a blank body, a non-https scheme,

@@ -260,9 +260,11 @@ pub struct CanisterUpdateCallOutput {
     /// canister — the app whose published manifest authorized this write. Always
     /// present on a successful call: without a declaration the call is refused.
     pub declared_by: String,
-    /// The well-known path that declaration was read from:
-    /// `/.well-known/ic-architecture` (the protocol) or `/.well-known/ic-app.json`
-    /// (this server's legacy pre-protocol path).
+    /// The well-known path that declaration was read from. Always
+    /// `/.well-known/ic-architecture`: it is the only document that authorizes a
+    /// write, so no other value can appear on a successful call. Echoed anyway, so
+    /// a reply says where the authorization came from rather than leaving it
+    /// implied.
     pub declared_at: String,
 }
 
