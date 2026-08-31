@@ -81,8 +81,7 @@ pub struct OqlSchemaOutput {
     /// canonicalization.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_for_origin: Option<String>,
-    /// Exactly what you supplied as `derivation_origin`, echoed so a mismatch with
-    /// `derived_for_origin` (from canonicalization) is visible.
+    /// Exactly what you supplied as `derivation_origin`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
     /// Whether the schema was read as the anonymous principal. Always false here, since a
@@ -112,13 +111,7 @@ pub struct ApiDocArgs {
     pub canister_id: String,
 }
 
-/// Output of `get_canister_api_doc` — every documentation outcome is STRUCTURED
-/// (not an error when the doc simply isn't there), so the agent can distinguish
-/// "no compatible method was detected" (expected, don't retry) from "no answer
-/// was obtained" (a retry may help). The first is not proof of absence: the same
-/// detection comes up empty on an interface the parser cannot read. An unusable
-/// `canister_id` is rejected before any lookup and is a plain error, not this
-/// shape.
+/// Output of `get_canister_api_doc`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ApiDocOutput {
     /// The canister the doc was requested from.
@@ -152,8 +145,9 @@ pub struct CanisterUpdateCallArgs {
     /// Update method name to invoke.
     pub method: String,
     /// Arguments in textual Candid, e.g. `()` or `(record { owner = principal "..." })`.
-    /// Encoded against the method's declared types, so plain literals need no `: type`
-    /// annotation: `42` takes the declared numeric type.
+    /// Encoded against the method's declared types when the interface is available,
+    /// published or supplied in `candid`, so plain literals need no `: type` annotation.
+    /// Without an interface they are encoded as written and need their own annotations.
     #[serde(default = "default_args")]
     pub args: String,
     /// The app's derivation origin, from open_app or resolve_app, to call as the user's
@@ -179,19 +173,19 @@ pub struct CanisterUpdateCallOutput {
     pub method: String,
     /// The decoded reply in textual Candid.
     pub reply: String,
-    /// The principal the call was signed as — null for an anonymous call.
+    /// The principal the call was signed as.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acted_as_principal: Option<String>,
     /// When called as an app account: the effective Internet Identity derivation
-    /// origin used (after canonicalization). Null for anonymous calls.
+    /// origin used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_for_origin: Option<String>,
     /// When called as an app account: exactly what you supplied as
     /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` (from
-    /// canonicalization) is visible. Null for anonymous calls.
+    /// canonicalization) is visible.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
-    /// How `derived_for_origin` was determined. Null for anonymous calls.
+    /// How `derived_for_origin` was determined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derivation_origin_source: Option<String>,
     /// True when the call ran as the anonymous principal.
@@ -206,11 +200,12 @@ pub struct CanisterQueryArgs {
     /// Target canister principal.
     pub canister_id: String,
     /// A `query` method from the canister's Candid interface. Pass either this or `oql`,
-    /// never both. Canisters with an OQL surface do not answer Candid data queries.
+    /// never both. A Candid `method` query to an OQL canister is refused here.
     #[serde(default)]
     pub method: Option<String>,
     /// Arguments for `method` in textual Candid, e.g. `()` or `(record { owner = principal
-    /// "..." })`. Plain literals need no `: type` annotation. Ignored for an OQL query.
+    /// "..." })`. Plain literals need no `: type` annotation when the interface is available.
+    /// Ignored for an OQL query.
     #[serde(default = "default_args")]
     pub args: String,
     /// An OQL query as a JSON object string, e.g.
@@ -262,25 +257,26 @@ pub struct CanisterQueryOutput {
     /// (oql mode) true when more rows remain — re-query with a higher `offset` to page.
     #[serde(default)]
     pub has_more: bool,
-    /// The principal the query was signed as — null for an anonymous query.
+    /// The principal the query was signed as.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acted_as_principal: Option<String>,
     /// When querying as an app account: the effective Internet Identity derivation
-    /// origin used (after canonicalization). Null for anonymous queries.
+    /// origin used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_for_origin: Option<String>,
     /// When querying as an app account: exactly what you supplied as
     /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` (from
-    /// canonicalization) is visible. Null for anonymous queries.
+    /// canonicalization) is visible.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
-    /// How `derived_for_origin` was determined. Null for anonymous reads.
+    /// How `derived_for_origin` was determined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derivation_origin_source: Option<String>,
     /// Whether the read ran as the anonymous principal. On an empty result this separates
     /// "not authenticated" from "no data" where an app gates its data by caller.
     pub is_anonymous: bool,
-    /// A diagnosis for an empty result. Null when data was returned.
+    /// A diagnosis for an empty result, or a warning that an OQL reply could not be
+    /// parsed as a table.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// (oql mode) when an empty result was diagnosed as an unknown `start` entity:

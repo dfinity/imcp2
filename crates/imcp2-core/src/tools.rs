@@ -154,7 +154,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Fetch a canister's Candid interface: the `.did` text declaring its methods and their types. Use this to learn what a canister offers before calling it. Also reports whether the canister's data is read through OQL rather than Candid queries, and whether it publishes an API doc for get_canister_api_doc to read.",
+        description = "Fetch a canister's Candid interface: the `.did` text declaring its methods and their types. Use this to learn what a canister offers before calling it. Also reports whether the canister declares an OQL surface instead of Candid queries, and whether it declares the API doc get_canister_api_doc reads.",
         annotations(title = "Get Candid interface", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::GetCandidOutput>(),
     )]
@@ -593,7 +593,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Read from a canister, either by calling a Candid `query` method or by running an OQL query. Pass exactly one of the two. get_canister_candid says which path a canister uses; a canister with an OQL surface does not answer Candid data queries. Use this when nothing needs to change; writes go through canister_update_call. A Candid query may run anonymously; an OQL query needs a derivation origin and an authenticated session.",
+        description = "Read from a canister, either by calling a Candid `query` method or by running an OQL query. Pass exactly one of the two. get_canister_candid says which path a canister uses; a Candid `method` query to an OQL canister is refused here. Use this when nothing needs to change; writes go through canister_update_call. A Candid query may run anonymously; an OQL query needs a derivation origin and an authenticated session.",
         annotations(title = "Query a canister (Candid method or OQL)", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterQueryOutput>(),
     )]
@@ -912,7 +912,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Return the principal the user acts as at one app, without calling any canister. Use this to answer who the user is at an app, or to check an identity before making calls. Requires an authenticated session.",
+        description = "Return the principal the user acts as at one app, without calling the app's canisters. Use this to answer who the user is at an app, or to check an identity before making calls. Requires an authenticated session.",
         annotations(title = "Get your principal at an app", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<identities::PrincipalOutput>(),
     )]
@@ -1004,7 +1004,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Open an app from its name or its URL: resolves the derivation origin the user's identity there is derived from, and discovers the canisters behind it, in one call. Use this when the user names an app and you have no URL for it. If the user supplied only an app name, pass that name unchanged; only pass a URL supplied by the user or obtained from a verified official source, and do not construct a domain from the name. Names are matched against a built-in registry of well-known apps. There is no directory mapping an arbitrary app name to a URL, so an unknown name is refused rather than guessed, as is a URL that shows no sign of being an Internet Computer app. resolve_app and discover_app_canisters do the two halves separately.",
+        description = "Open an app from its name or its URL: resolves the derivation origin the user's identity there is derived from, and discovers the canisters behind it, in one call. Use this when the user names an app and you have no URL for it. If the user supplied only an app name, pass that name unchanged; only pass a URL supplied by the user or obtained from a verified official source, and do not construct a domain from the name. Names are matched against a built-in registry of well-known apps. There is no directory mapping an arbitrary app name to a URL, so an unknown name is refused rather than guessed, as is a URL whose origin would have to be assumed and that shows no sign of being an Internet Computer app. resolve_app and discover_app_canisters do the two halves separately.",
         annotations(title = "Open an app (resolve origin + discover canisters)", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::OpenAppOutput>(),
     )]
@@ -1328,7 +1328,7 @@ impl IcProtocolTools {
     }
 
     #[tool(
-        description = "Look up a well-known app by name and return its URL and the derivation origin the user's identity there is derived from. Use this when the user names an app and you have no URL for it. Offline and instant, but it covers only a small built-in set of apps; there is no directory mapping an arbitrary name to a URL, so an unknown name returns no match rather than a guess.",
+        description = "Look up a well-known app by name and return its URL and the derivation origin the user's identity there is derived from. Use this for the registry entry alone, with no network call. It covers only a small built-in set of apps; there is no directory mapping an arbitrary name to a URL, so an unknown name returns no match rather than a guess.",
         annotations(title = "Find a well-known app by name", read_only_hint = true, destructive_hint = false, open_world_hint = false),
         output_schema = schema_for_output::<discover::FindAppOutput>(),
     )]
@@ -1374,8 +1374,8 @@ impl IcProtocolTools {
     // ---- ICP skills awareness ----------------------------------------------
 
     #[tool(
-        description = "List the official Internet Computer skills: how-to guides for authoring and shipping IC apps, covering the Motoko language, the mops and icp CLIs, cycles, stable memory and upgrades, security and authentication. Returns each skill's name with a one-line summary. Use this when a task involves writing, building or deploying code for the Internet Computer; icp_get_skill returns one skill in full.",
-        annotations(title = "List Internet Computer skills", read_only_hint = true, destructive_hint = false, open_world_hint = false),
+        description = "List the skills published at skills.internetcomputer.org: how-to guides for authoring and shipping Internet Computer apps. Returns each skill's name with a one-line summary. Use this when a task involves writing, building or deploying code for the Internet Computer; icp_get_skill returns one skill in full.",
+        annotations(title = "List Internet Computer skills", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<skills::SkillsOutput>(),
     )]
     async fn icp_list_skills(
@@ -1393,8 +1393,8 @@ impl IcProtocolTools {
     }
 
     #[tool(
-        description = "Return one Internet Computer skill in full, by name. Use this when a skill listed by icp_list_skills covers the task at hand.",
-        annotations(title = "Get an Internet Computer skill", read_only_hint = true, destructive_hint = false, open_world_hint = false),
+        description = "Fetch one skill in full from skills.internetcomputer.org, by name. Use this when a skill listed by icp_list_skills covers the task at hand.",
+        annotations(title = "Get an Internet Computer skill", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<skills::SkillOutput>(),
     )]
     async fn icp_get_skill(
@@ -1413,7 +1413,7 @@ impl IcProtocolTools {
     // ---- Canister management (as your standing II principal) --------------
 
     #[tool(
-        description = "Return the cycles-ledger balance of the user's management principal, and the principal itself. Use this to check whether canister operations can be funded, or to get the principal to add as a controller when the user creates a canister with the icp CLI. Requires an authenticated session.",
+        description = "Return the cycles-ledger balance of the user's principal, and the principal itself. Use this to check whether canister operations can be funded, or to get the principal to add as a controller when the user creates a canister with the icp CLI. Requires an authenticated session.",
         annotations(title = "Check your cycles balance", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CyclesBalance>(),
     )]
@@ -1433,7 +1433,7 @@ impl IcProtocolTools {
     }
 
     #[tool(
-        description = "Install a compiled Wasm module on a canister the user controls. `mode` chooses whether the canister must be empty (\"install\"), has its state wiped (\"reinstall\"), or keeps its stable memory (\"upgrade\"). Use this when the user has already built a module; building happens in their own environment. Requires an authenticated session.",
+        description = "Install a compiled Wasm module on a canister the user controls. Use this when the user has already built a module; `mode` selects install, reinstall or upgrade. Requires an authenticated session.",
         annotations(title = "Install code on a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<management::CanisterActionOutput>(),
     )]
@@ -1982,7 +1982,7 @@ fn identity_annotation(target: &IdentityTarget, acted_as: Option<&str>) -> Strin
 /// have to be kept in sync forever, and a refused call already gets a refusal
 /// accurate for its own scope. Neither surface names a venue for a refused
 /// operation.
-const SERVER_INSTRUCTIONS: &str = "Tools for the Internet Computer: read what a canister offers, read and write its data, and act as the user's own identity at an app.\n\nThree things carry across the whole surface.\n\nCANISTERS. Each canister publishes a Candid interface declaring its methods and their types. Method arguments and replies are textual Candid, the `(...)` syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`. The `candid://textual-syntax` and `candid://reference` resources document that syntax. Some canisters expose OQL instead, a JSON query language documented by `oql://usage`. IC how-to guides are served as `skill://<name>` resources.\n\nAPPS AND IDENTITY. An app is a website backed by canisters. Internet Identity gives the user a different principal at each app, derived from that app's derivation origin, which is not always the app's visible URL; open_app and resolve_app resolve it, and the tools that act as the user take the resolved value. Within one app the user may hold several accounts. A call made without a derivation origin runs as the anonymous principal.\n\nSESSIONS. Authenticated calls are signed with short-lived delegations derived from the Internet Identity credential this connection was authorized with, for a session duration of up to 30 days. Internet Identity offers two access levels at that point: \"Questions only\", where reads work and state-changing calls are rejected by the network, and \"Actions & questions\", which permits both.\n\nFINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user: do not use canister_update_call to move assets. Recognized asset-moving calls are refused before they reach the network, and the refusal says why, but that guard is a safeguard, not a complete filter, so treat this policy, rather than the absence of a refusal, as the limit. For financial operations (token transfers, spending approvals, payments, trades), recommend the user performs the operation outside this connector, in a trusted interface they control.\n\nBuilding and deploying canisters happens in the user's own environment with the icp CLI; no tool here creates, funds or deploys one.";
+const SERVER_INSTRUCTIONS: &str = "Tools for the Internet Computer: read what a canister offers, read and write its data, and act as the user's own identity at an app.\n\nCANISTERS. Each canister publishes a Candid interface declaring its methods and their types. Method arguments and replies are textual Candid, the `(...)` syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`. The `candid://textual-syntax` and `candid://reference` resources document that syntax. Some canisters expose OQL instead, a JSON query language documented by `oql://usage`. IC how-to guides are served as `skill://<name>` resources.\n\nAPPS AND IDENTITY. An app is a website backed by canisters. Internet Identity gives the user a different principal at each app, derived from that app's derivation origin, which is not always the app's visible URL; open_app and resolve_app resolve it, and the tools that act as the user take the resolved value. Within one app the user may hold several accounts.\n\nSESSIONS. Calls that act as the user are signed with the Internet Identity credential this connection was authorized with. Internet Identity offers two access levels at that point: \"Questions only\", where reads work and state-changing calls are rejected by the network, and \"Actions & questions\", which permits both.\n\nFINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user: do not use canister_update_call to move assets. Value-moving methods, neuron management, and every update call to a known wallet, ledger, exchange or staking canister are refused before they reach the network; that guard is a safeguard, not a complete filter, so treat this policy, rather than the absence of a refusal, as the limit. For financial operations (token transfers, spending approvals, payments, trades), the user works outside this connector, in a trusted interface they control.\n\nBuilding and deploying canisters happens in the user's own environment with the icp CLI; no tool here creates, funds or deploys one.";
 
 impl ServerHandler for IcTools {
     async fn list_tools(
@@ -2597,7 +2597,13 @@ mod tests {
     fn model_readable_metadata_respects_marketplace_policy() {
         let mut surfaces =
             vec![("server instructions".to_string(), super::SERVER_INSTRUCTIONS.to_string())];
-        for tool in super::IcTools::all_tools() {
+        // Every tool DEFINED here, not just the 11 served: a deferred description
+        // still ships in the crate, and scanning the served set alone is how
+        // `ALWAYS call this FIRST` and a hyphenated `web-search` errand survived
+        // on the protocol half.
+        let mut defined = super::IcTools::all_tools();
+        defined.extend(super::IcProtocolTools::tool_router().list_all());
+        for tool in defined {
             surfaces.push((
                 tool.name.to_string(),
                 tool.description.as_deref().unwrap_or_default().to_string(),
@@ -2687,13 +2693,18 @@ mod tests {
                 ],
             ),
             (
+                // The INSTRUCTION to decode, not the name of an encoding: a tool that
+                // legitimately takes base64 (icp_install_code's `wasm_base64`) says so in
+                // its schema, and banning the bare word would force that parameter to lie
+                // about its own format. The smuggling shapes below stay.
                 "smuggles an encoded instruction",
-                &["base64", "b64decode", "rot13", "decode and", "decode the following"],
+                &["b64decode", "rot13", "decode and", "decode the following"],
             ),
             (
                 "sends the model to unrelated software",
                 &[
                     "web search",
+                    "web-search",
                     "search the web",
                     "search online",
                     "search the internet",

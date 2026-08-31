@@ -38,10 +38,8 @@ pub struct AuthenticateArgs {
     pub refresh: bool,
 }
 
-/// Structured output of `authenticate` and `auth_status` — one shape for the
-/// whole sign-in lifecycle, so both tools honour the same all-tools
-/// `outputSchema` contract as the core surface (every core tool declares an
-/// object-rooted schema and attaches matching `structuredContent`).
+/// Structured output of `authenticate` and `auth_status`: one shape for the
+/// whole sign-in lifecycle.
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 pub struct AuthOutput {
     /// The sign-in state: `signed_in`, `pending` (a browser handshake is
@@ -173,7 +171,7 @@ impl LocalServer {
     }
 
     #[tool(
-        description = "Return an id.ai sign-in link for the user to open, so tool calls can act as their Internet Identity. Use this when a tool answers that it needs an authenticated session. It returns at once without waiting for the browser; auth_status, or retrying the original tool, confirms the result. Repeat calls during a pending sign-in return the same link.",
+        description = "Return an id.ai sign-in link for the user to open, so tool calls can act as their Internet Identity, or report the session already active. Use this when a tool answers that it needs an authenticated session. It returns at once without waiting for the browser; auth_status, or retrying the original tool, confirms the result. Repeat calls during a pending sign-in return the same link.",
         annotations(
             title = "Sign in with Internet Identity",
             read_only_hint = false,

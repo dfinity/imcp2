@@ -52,7 +52,7 @@ pub struct Found {
 }
 
 /// One canister discovered behind a web domain — the `discover_app_canisters` MCP
-/// output shape (a serialization mirror of [`Found`]).
+/// output shape.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DiscoveredCanister {
     /// The canister's principal id.
@@ -1597,7 +1597,7 @@ pub struct LookupCanisterArgs {
 }
 
 /// The `icp_lookup_canister_info_by_id` MCP output shape — the IC dashboard's identity for a
-/// canister id (a serialization mirror of [`CanisterInfo`]).
+/// canister id.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CanisterIdentityOutput {
     /// The canister that was identified.
@@ -1811,8 +1811,8 @@ pub struct FindAppOutput {
     /// Matching well-known apps (usually zero or one). Empty when the app isn't in
     /// the connector's built-in set.
     pub matches: Vec<AppMatch>,
-    /// Next-step guidance: how to proceed on a match, or an instruction to web-search
-    /// the app's URL when there's no match.
+    /// What the lookup found: the next tool to call on a match, or why an unknown name
+    /// has no URL here.
     pub note: String,
 }
 
@@ -1822,13 +1822,12 @@ pub struct OpenAppArgs {
     /// An app name as the user said it, or its URL. If the user supplied only an app name,
     /// pass that name unchanged; only pass a URL supplied by the user or obtained from a
     /// verified official source, and do not construct a domain from the name. An unknown bare
-    /// name is refused, as is a URL that shows no sign of being an Internet Computer app.
+    /// name is refused, as is a URL whose origin would have to be assumed and that shows
+    /// no sign of being an Internet Computer app.
     pub app: String,
 }
 
-/// Structured output of `open_app` — an app's whole context in one shot: its
-/// Internet Identity derivation origin (as `resolve_app`) plus the canisters
-/// behind it (as `discover_app_canisters`).
+/// Structured output of `open_app`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct OpenAppOutput {
     /// The app URL that was used — the canonical registry URL when the query

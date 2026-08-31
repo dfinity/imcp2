@@ -350,8 +350,7 @@ pub struct AccountInfo {
     pub last_used: Option<u64>,
 }
 
-/// Arguments for `get_app_principal`. Identify the app by its canonical derivation
-/// origin (`derivation_origin`), obtained from `open_app` / `resolve_app`.
+/// Arguments for `get_app_principal`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetPrincipalArgs {
     /// The app's derivation origin, from open_app or resolve_app. This is the origin Internet
@@ -372,8 +371,7 @@ pub struct PrincipalOutput {
     /// derived for (after canonicalization). Compare against `requested` to spot
     /// an origin mismatch.
     pub derived_for_origin: String,
-    /// Exactly what you supplied as `derivation_origin`, echoed so a mismatch with
-    /// `derived_for_origin` (from canonicalization) is immediately visible.
+    /// Exactly what you supplied as `derivation_origin`.
     pub requested: String,
     /// How `derived_for_origin` was determined.
     pub derivation_origin_source: String,
@@ -381,13 +379,12 @@ pub struct PrincipalOutput {
     pub account: Option<String>,
     /// The principal you act as at that app.
     pub principal: String,
-    /// True if this Internet Identity session is query-only (canister management
-    /// is unavailable until reconnected under "Actions & questions").
+    /// True if this session is query-only, so state-changing calls are rejected by the
+    /// network. False also covers a session whose access level is not known.
     pub read_only: bool,
 }
 
-/// Arguments for `list_app_accounts`. Identify the app by its canonical derivation
-/// origin (`derivation_origin`), obtained from `open_app` / `resolve_app`.
+/// Arguments for `list_app_accounts`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListAccountsArgs {
     /// The app's derivation origin, from open_app or resolve_app. This is the origin Internet
@@ -397,8 +394,7 @@ pub struct ListAccountsArgs {
     pub derivation_origin: String,
 }
 
-/// One account in the `list_app_accounts` MCP output (a serialization mirror of
-/// [`AccountInfo`]).
+/// One account in the `list_app_accounts` MCP output.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct AccountEntry {
     /// The user-given account name, or null for the default account.
@@ -424,8 +420,7 @@ impl From<&AccountInfo> for AccountEntry {
 pub struct AccountsOutput {
     /// The effective Internet Identity derivation origin the accounts belong to.
     pub derived_for_origin: String,
-    /// Exactly what you supplied as `derivation_origin`, echoed so a mismatch with
-    /// `derived_for_origin` (from canonicalization) is immediately visible.
+    /// Exactly what you supplied as `derivation_origin`.
     pub requested: String,
     /// How `derived_for_origin` was determined.
     pub derivation_origin_source: String,
