@@ -173,7 +173,7 @@ impl LocalServer {
     }
 
     #[tool(
-        description = "Sign in with Internet Identity. Returns an id.ai sign-in link for the USER to open in their browser (the server also tries to open it for them), and returns immediately — it never waits for the browser. After the user finishes, auth_status (or simply retrying the tool that needed a session) confirms the session. Call this when a tool answers that it needs an authenticated session. Repeat calls while a sign-in is pending return the same link.",
+        description = "Return an id.ai sign-in link for the user to open, so tool calls can act as their Internet Identity. Use this when a tool answers that it needs an authenticated session. It returns at once without waiting for the browser; auth_status, or retrying the original tool, confirms the result. Repeat calls during a pending sign-in return the same link.",
         annotations(
             title = "Sign in with Internet Identity",
             read_only_hint = false,
@@ -224,7 +224,7 @@ impl LocalServer {
     }
 
     #[tool(
-        description = "Report the Internet Identity sign-in state of this local server: signed in (with the session principal, access level, and time to expiry), sign-in pending (with the link to finish it), expired, or signed out.",
+        description = "Report this server's Internet Identity sign-in state: signed in, with the session principal, access level and time to expiry; pending, with the link to finish it; expired; or signed out.",
         annotations(
             title = "Check sign-in status",
             read_only_hint = true,
@@ -272,12 +272,10 @@ impl ServerHandler for LocalServer {
         let core = info.instructions.take().unwrap_or_default();
         info.instructions = Some(format!(
             "{core}\n\n\
-             SIGNING IN (this local server). Tool calls act as the USER's Internet Identity. \
-             When a tool answers that it needs an authenticated session, call `authenticate`: \
-             it returns an id.ai sign-in link (and best-effort opens the browser) and never \
-             blocks — after the user finishes in the browser, `auth_status` or simply retrying \
-             the original tool confirms. Sessions are in-memory: the user signs in again after \
-             a restart, when the grant expires, or if they revoke it at id.ai."
+             SIGNING IN. On this local server the user signs in through `authenticate`, which \
+             returns an id.ai link for them to open. Sessions are held in memory, so the user \
+             signs in again after a restart, when the grant expires, or if they revoke it at \
+             id.ai."
         ));
         info
     }

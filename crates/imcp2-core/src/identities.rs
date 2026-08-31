@@ -354,19 +354,13 @@ pub struct AccountInfo {
 /// origin (`derivation_origin`), obtained from `open_app` / `resolve_app`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetPrincipalArgs {
-    /// The exact canonical origin Internet Identity uses to derive this app's
-    /// principal — NOT necessarily the website's visible URL. For an app that
-    /// pins a custom derivation origin (via `derivationOrigin` +
-    /// `/.well-known/ii-alternative-origins`), pass that canonical origin here
-    /// (e.g. "https://<frontend-canister>.icp0.io"). Do NOT infer it from an
-    /// alternativeOrigins list, and do NOT pass a raw website URL — get the
-    /// derivation origin from open_app / resolve_app (which resolve an app name or
-    /// URL to it under the guessed-domain gate) and reuse it. Accepts the legacy
-    /// name `domain`. Required — this tool always acts as an app account.
+    /// The app's derivation origin, from open_app or resolve_app. This is the origin Internet
+    /// Identity derives the principal from, which is not always the app's website URL, and
+    /// never an alternative-origins entry.
     #[serde(alias = "domain")]
     pub derivation_origin: String,
-    /// Which of your accounts to resolve, by account name (see list_app_accounts).
-    /// Omit to use that app's default account.
+    /// Which of the user's accounts to resolve, by name (see list_app_accounts). Omit for the
+    /// app's default account.
     #[serde(default)]
     pub account: Option<String>,
 }
@@ -381,10 +375,7 @@ pub struct PrincipalOutput {
     /// Exactly what you supplied as `derivation_origin`, echoed so a mismatch with
     /// `derived_for_origin` (from canonicalization) is immediately visible.
     pub requested: String,
-    /// How `derived_for_origin` was determined — always "explicit" here, since this
-    /// tool takes the canonical derivation origin directly. (The "declared" /
-    /// "known" / "app_url_default" sources are reported by the resolver tools
-    /// open_app / resolve_app, which turn a URL into a derivation origin.)
+    /// How `derived_for_origin` was determined.
     pub derivation_origin_source: String,
     /// The account name resolved, or null for the app's default account.
     pub account: Option<String>,
@@ -399,11 +390,9 @@ pub struct PrincipalOutput {
 /// origin (`derivation_origin`), obtained from `open_app` / `resolve_app`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListAccountsArgs {
-    /// The exact canonical Internet Identity derivation origin (NOT necessarily the
-    /// visible URL). Do NOT pass a raw website URL — get the derivation origin from
-    /// open_app / resolve_app (which resolve an app name or URL to it under the
-    /// guessed-domain gate) and reuse it. Accepts the legacy name `domain`. Required
-    /// to identify the app.
+    /// The app's derivation origin, from open_app or resolve_app. This is the origin Internet
+    /// Identity derives the principal from, which is not always the app's website URL, and
+    /// never an alternative-origins entry.
     #[serde(alias = "domain")]
     pub derivation_origin: String,
 }
@@ -438,9 +427,7 @@ pub struct AccountsOutput {
     /// Exactly what you supplied as `derivation_origin`, echoed so a mismatch with
     /// `derived_for_origin` (from canonicalization) is immediately visible.
     pub requested: String,
-    /// How `derived_for_origin` was determined — always "explicit" here, since this
-    /// tool takes the canonical derivation origin directly. (The "declared" /
-    /// "known" / "app_url_default" sources are reported by open_app / resolve_app.)
+    /// How `derived_for_origin` was determined.
     pub derivation_origin_source: String,
     /// The user's accounts at that origin (empty if none).
     pub accounts: Vec<AccountEntry>,
@@ -449,11 +436,9 @@ pub struct AccountsOutput {
 /// Arguments for `resolve_app`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ResolveAppArgs {
-    /// The application's URL, e.g. "https://opencloud.org". When the derivation
-    /// origin has to be assumed from this URL, the origin is checked for
-    /// Internet-Computer evidence (a gateway `x-ic-canister-id`) and the call is
-    /// refused without it — so a lookalike domain that is not an IC app does not
-    /// resolve. `open_app` turns an app name into this URL.
+    /// The app's URL, e.g. "https://opencloud.org". When the derivation origin has to be
+    /// assumed from this URL, an origin showing no sign of being an Internet Computer app is
+    /// refused, so a lookalike domain does not resolve.
     pub app_url: String,
 }
 
@@ -465,33 +450,19 @@ pub struct ResolveAppOutput {
     /// The Internet Identity derivation origin to use for this app — pass this
     /// as `derivation_origin` to the identity tools.
     pub derivation_origin: String,
-    /// How `derivation_origin` was determined: "declared" (the app declared it
-    /// in /.well-known/ic-app.json — authoritative), "known" (from the connector's
-    /// built-in registry of well-known custom-derivation-origin apps, used only
-    /// when the app declares none), or "app_url_default" (assumed to equal the
-    /// application origin — correct only if the app has no custom derivation
-    /// origin, which this connector cannot verify).
+    /// How `derivation_origin` was determined: "declared" (the app published it), "known"
+    /// (from the built-in registry), or "app_url_default" (assumed to equal the app's own
+    /// origin, correct only for apps that pin no custom one).
     pub derivation_origin_source: String,
-    /// Origins the resolved DERIVATION origin's `/.well-known/ii-alternative-origins`
-    /// permits to derive against it — that origin is where the list is authoritative,
-    /// and where this one was read. Read best-effort and reported as a list, so an
-    /// empty one means "none were read", not "none exist": a fetch, HTTP, parse, or
-    /// origin-validation failure yields an empty list, and at most 100 valid entries
-    /// are kept. Informational only either way: it is the INVERSE of "which
-    /// derivation origin the app uses", so the derivation origin does not follow from
-    /// it.
+    /// Origins that the resolved derivation origin permits to derive against it. This is the
+    /// inverse relation, so the derivation origin does not follow from it. Read best-effort:
+    /// an empty list means none were read.
     pub alternative_origins: Vec<String>,
-    /// Whether the application origin showed evidence of being served from the
-    /// Internet Computer (the gateway's `x-ic-canister-id` header). Only probed
-    /// when `derivation_origin_source` is "app_url_default" (and then always
-    /// true here — an origin with NO IC evidence is refused instead of resolved);
-    /// null when the probe wasn't needed (declared/known origins).
+    /// Whether the app's origin showed evidence of being served from the Internet Computer.
+    /// Only probed when the derivation origin was assumed, and then always true, since an
+    /// origin without that evidence is refused.
     pub application_is_ic: Option<bool>,
     /// A human note, e.g. flagging that the derivation origin was assumed.
-    /// This tool deliberately does NOT return a principal: it resolves the
-    /// derivation origin only, since the caller hasn't chosen an account. Get the
-    /// principal with `get_app_principal` (or `list_app_accounts`) for a specific
-    /// account, passing this `derivation_origin`.
     pub note: Option<String>,
 }
 
