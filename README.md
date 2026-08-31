@@ -253,8 +253,9 @@ This manifest is also the **only** thing that permits a write — see
 
 Before the protocol was published this server proposed the same document at
 `/.well-known/ic-app.json`, with an extra top-level `derivation_origin` field.
-That path is still read, at lower authority, so the apps that adopted the
-proposal keep working; new apps should publish `/.well-known/ic-architecture`
+That path is still read for discovery, at lower authority, so those apps stay
+legible — but it does not authorize a write (see below); new apps should publish
+`/.well-known/ic-architecture`
 and, if they pin a custom derivation origin, `/.well-known/ii-derivation-origin`
 (the protocol's Layer 5 — one canonical `https://host` on a single line, which
 takes precedence over the legacy field).
@@ -271,10 +272,19 @@ Reading is open; writing is not. A state-changing call runs against someone's
 live application, and a canister being publicly callable is not a statement by
 its operators that they want an agent driving it. So `canister_update_call` is
 restricted to canisters an app **declares** in its `/.well-known/ic-architecture`
-manifest (or its legacy `/.well-known/ic-app.json` equivalent). Publishing that
-manifest is a deliberate act, and per the protocol guide it is exactly how an
-app's operators say "these are my canisters; an agent handed my URL may work them
-out and use them".
+manifest. Publishing that manifest is a deliberate act, and per the protocol guide
+it is exactly how an app's operators say "these are my canisters; an agent handed
+my URL may work them out and use them".
+
+**Only the standard path authorizes.** The legacy `/.well-known/ic-app.json`
+document is still read during discovery, but it does not permit a write: the apps
+serving it adopted a proposal this server made before the protocol existed, under
+different terms, and never agreed to the ones publishing the standard manifest now
+signifies. Consent that was never given cannot be inherited from a path this server
+invented. An origin serving only the older document gets a refusal of its own,
+naming the document it *does* publish — reporting it as publishing nothing would
+send its operators hunting for a file that is already there — and saying that
+serving the same JSON at `/.well-known/ic-architecture` is the whole fix.
 
 The manifest lives at the app's origin, not on chain, so the tool has to be told
 which app owns the target: that is the `app_url` argument (`open_app` returns it),
@@ -282,8 +292,9 @@ falling back to `derivation_origin` when the app serves its manifest at that sam
 origin. The gate then fetches the manifest — under the same SSRF hardening and
 size caps as the rest of discovery — and refuses unless the target is listed.
 Every refusal names the standard path, links the guide, distinguishes its cause
-(no origin given / origin unreachable / no manifest published / published but this
-canister is not in it — that last one lists what the app *does* declare), and says
+(no origin given / origin unreachable / no manifest published / only the legacy
+document published / published but this canister is not in it — that last one lists
+what the app *does* declare), and says
 explicitly that reads are unaffected, so an agent answers what it can rather than
 concluding the whole app is off limits. A successful call echoes `declared_by` and
 `declared_at`, so a write's provenance is visible in the reply.

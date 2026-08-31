@@ -7,8 +7,8 @@
 //!      protocol ([`SERVICE_DISCOVERABILITY_GUIDE`]) and the ONE signal the
 //!      update-call gate in `discoverability` keys on; and the legacy
 //!      `/.well-known/ic-app.json` manifest of the same shape (this server's
-//!      pre-protocol proposal, still read so the apps that adopted it keep
-//!      working).
+//!      pre-protocol proposal, still read for DISCOVERY so the apps that adopted
+//!      it stay legible, though it no longer authorizes a write).
 //!   2. `x-ic-canister-id` response header — the frontend/asset canister. This
 //!      is the one universal signal (the HTTP gateway sets it).
 //!   3. a runtime config asset (`/env.json`) carrying `*canister_id*` keys —
@@ -69,8 +69,9 @@ pub struct DiscoveredCanister {
     /// Where it was found: "ic-architecture" (the app's service-discoverability
     /// manifest), "ic-app.json" (the same manifest at this server's legacy
     /// pre-protocol path), "header", "env.json", "bundle:<LABEL>", or "bundle".
-    /// The first two are declared by the app itself: the most authoritative
-    /// sources, and the only ones that authorize an update call (see
+    /// The first two are declared by the app itself and are the most
+    /// authoritative; only "ic-architecture" authorizes an update call, the
+    /// legacy path having been published under different terms (see
     /// `discoverability`).
     pub sources: Vec<String>,
     /// Whether this canister exposes the OQL query surface — filled in for the
