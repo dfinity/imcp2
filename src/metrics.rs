@@ -80,10 +80,36 @@ pub struct Metrics {
     duration: HistogramVec,
     live_sessions: IntGaugeVec,
     active_sessions: IntGaugeVec,
+    /// Shared with `SessionCollector`; see [`SessionSampling`].
+    sampling: SessionSampling,
     scrapes: Histogram,
     /// Servers whose session gauges [`Metrics::refresh`] republishes. Fixed at
     /// construction.
     servers: Vec<crate::McpServer>,
+}
+
+/// Serializes everything that samples, writes, or reads the two session gauges,
+/// so the exported pair always comes from ONE snapshot.
+///
+/// Both gauges live in their own independently-locked [`IntGaugeVec`], so
+/// sample-set-set-collect is four separate operations on shared state. Two
+/// concurrent gathers — the IC is scraped by more than one Prometheus — or a
+/// gather racing [`Metrics::refresh`] can interleave them and encode `live` from
+/// one snapshot with `active` from another: across an expiry that publishes
+/// `live=0, active=1`, breaking the documented `active <= live` invariant and
+/// tripping any alert written on it.
+///
+/// A `std` mutex, not an async one: the writer that matters is
+/// [`Collector::collect`], a synchronous `fn`. The critical section is a session-map
+/// pass plus two gauge writes — no I/O, no await — and it contends only with
+/// another scrape, which is the case being made correct.
+type SessionSampling = std::sync::Arc<std::sync::Mutex<()>>;
+
+/// Take [`SessionSampling`], ignoring poisoning: the guarded data is `()`, so a
+/// panic under the lock leaves nothing inconsistent behind, and refusing to
+/// serve metrics afterwards would only hide whatever panicked.
+fn sampling_guard(lock: &SessionSampling) -> std::sync::MutexGuard<'_, ()> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Metrics {
@@ -156,10 +182,12 @@ impl Metrics {
         // registry gathers — see `SessionCollector`. Registering the collector
         // (not the two gauge vecs) is what makes the numbers self-maintaining;
         // the clones kept in `Self` share the same series.
+        let sampling = SessionSampling::default();
         registry.register(Box::new(SessionCollector {
             live_sessions: live_sessions.clone(),
             active_sessions: active_sessions.clone(),
             servers: servers.iter().map(|s| (*s).clone()).collect(),
+            sampling: sampling.clone(),
         }))?;
 
         // Self-observability: a scrape that quietly got slow is how a target
@@ -210,6 +238,7 @@ impl Metrics {
             duration,
             live_sessions,
             active_sessions,
+            sampling,
             scrapes,
             servers: servers.iter().map(|s| (*s).clone()).collect(),
         })
@@ -238,8 +267,11 @@ impl Metrics {
     /// falls back to the previous values.
     pub async fn refresh(&self) {
         for server in &self.servers {
+            // Sample outside the guard (this one awaits), publish inside it: the
+            // pair must not land half-written under a concurrent gather.
             let g = server.session_gauges().await;
             let name = server.instance().name;
+            let _sampling = sampling_guard(&self.sampling);
             self.live_sessions.with_label_values(&[name]).set(g.live as i64);
             self.active_sessions.with_label_values(&[name]).set(g.active as i64);
         }
@@ -273,6 +305,7 @@ struct SessionCollector {
     live_sessions: IntGaugeVec,
     active_sessions: IntGaugeVec,
     servers: Vec<crate::McpServer>,
+    sampling: SessionSampling,
 }
 
 impl Collector for SessionCollector {
@@ -281,6 +314,10 @@ impl Collector for SessionCollector {
     }
 
     fn collect(&self) -> Vec<MetricFamily> {
+        // Held across the writes AND the reads below: a scrape that encoded
+        // `live` before another gather's write and `active` after it would
+        // publish a pair from two different snapshots. See [`SessionSampling`].
+        let _sampling = sampling_guard(&self.sampling);
         for server in &self.servers {
             if let Some(g) = server.try_session_gauges() {
                 let name = server.instance().name;
@@ -662,6 +699,47 @@ mod tests {
                 "{out}"
             );
         }
+    }
+
+    /// The pair a scrape publishes must come from ONE snapshot: `active <= live`
+    /// is in the metric's own help text, so an alert may be written on it, and
+    /// the two gauges are separately-locked shared state that a second gather (the
+    /// IC is scraped by more than one Prometheus) or a concurrent `refresh` could
+    /// otherwise interleave — across an expiry, publishing `live=0, active=1`.
+    ///
+    /// A torn read is a nanoseconds-wide window that hammering does not reliably
+    /// reproduce, so this asserts the property that closes it instead: a gather
+    /// cannot proceed while the sampling guard is held, and completes once it is
+    /// released.
+    // Holding the guard across an await is precisely what is under test here.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gather_waits_for_the_sampling_guard() {
+        let r = std::sync::Arc::new(Registry::new());
+        let m = Metrics::new(&r, "1.2.3", "abc1234", 0, &[&server()]).unwrap();
+        let sampling = sampling_guard(&m.sampling);
+
+        // `spawn_blocking`: this gather is meant to block, which is what a
+        // registry gather on a runtime worker would do.
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let gather = {
+            let r = r.clone();
+            tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("receiver alive");
+                r.gather();
+            })
+        };
+        started.await.expect("gather task started");
+        // Give the blocked gather every chance to finish if it were not waiting.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !gather.is_finished(),
+            "a gather completed while the sampling guard was held: the collector \
+             is not serializing, so a scrape can mix two snapshots"
+        );
+
+        drop(sampling);
+        gather.await.expect("gather completes once the guard is released");
     }
 
     /// With no servers, refresh is a harmless no-op.
