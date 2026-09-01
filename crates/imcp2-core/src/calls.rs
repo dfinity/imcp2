@@ -105,8 +105,8 @@ pub struct OqlGuideOutput {
 /// Output of `candid_syntax_guide`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CandidGuideOutput {
-    /// The textual-Candid guide (markdown): the `(...)` value syntax the canister
-    /// tools take and return, with the literal forms for each type.
+    /// The textual-Candid guide (markdown): the literal form for each Candid type,
+    /// and when a value needs an explicit `: type` annotation.
     pub content: String,
 }
 
@@ -156,6 +156,13 @@ pub struct CanisterUpdateCallArgs {
     /// Without an interface they are encoded as written and need their own annotations.
     #[serde(default = "default_args")]
     pub args: String,
+    /// The website URL of the app that owns `canister_id`, which open_app returns.
+    /// A write is made only to a canister that app declares in its
+    /// service-discoverability manifest at `/.well-known/ic-architecture`, read from
+    /// this origin. Omitted, `derivation_origin` is used as that origin instead.
+    /// Given both, they must name the same app; a mismatch is refused.
+    #[serde(default)]
+    pub app_url: Option<String>,
     /// The app's derivation origin, from open_app or resolve_app, to call as the user's
     /// account there. Not the app's website URL. Omit to call anonymously.
     #[serde(default, alias = "domain")]
@@ -195,6 +202,16 @@ pub struct CanisterUpdateCallOutput {
     pub derivation_origin_source: Option<String>,
     /// True when the call ran as the anonymous principal.
     pub is_anonymous: bool,
+    /// The app origin whose service-discoverability manifest DECLARES this
+    /// canister — the app whose published manifest authorized this write. Always
+    /// present on a successful call: without a declaration the call is refused.
+    pub declared_by: String,
+    /// The well-known path that declaration was read from. Always
+    /// `/.well-known/ic-architecture`: it is the only document that authorizes a
+    /// write, so no other value can appear on a successful call. Echoed anyway, so
+    /// a reply says where the authorization came from rather than leaving it
+    /// implied.
+    pub declared_at: String,
 }
 
 /// Arguments for `canister_query` — a READ that runs EITHER a Candid `query` method
