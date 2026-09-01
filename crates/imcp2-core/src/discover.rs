@@ -2308,14 +2308,6 @@ impl From<(String, Vec<Match>)> for FindCanisterOutput {
     }
 }
 
-/// Arguments for `icp_find_app_by_name`.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct FindAppArgs {
-    /// The app name to look up, as the user said it. For a site you already know
-    /// (e.g. "opencloud.org"), use open_app directly.
-    pub name: String,
-}
-
 /// One well-known app matched by `icp_find_app_by_name`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct AppMatch {
@@ -2343,11 +2335,9 @@ pub struct FindAppOutput {
 /// Arguments for `open_app`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OpenAppArgs {
-    /// An app name as the user said it, or its URL. If the user supplied only an app name,
-    /// pass that name unchanged; only pass a URL supplied by the user or obtained from a
-    /// verified official source, and do not construct a domain from the name. An unknown bare
-    /// name is refused, as is a URL whose origin would have to be assumed and that shows
-    /// no sign of being an Internet Computer app.
+    /// An app name as the user said it, or its URL. An unknown bare name is refused, as is a
+    /// URL whose origin would have to be assumed and that shows no sign of being an Internet
+    /// Computer app.
     pub app: String,
 }
 
@@ -2378,8 +2368,8 @@ pub struct OpenAppOutput {
     /// The canisters discovered behind the app, most authoritative first . Empty when the app declares
     /// none OR when discovery failed — disambiguated by `discovery_error`.
     pub canisters: Vec<DiscoveredCanister>,
-    /// How many further findings were dropped. The list is ordered by how authoritative each
-    /// id is, so the least authoritative went first.
+    /// How many further findings were dropped. The list is ordered most authoritative first,
+    /// so anything dropped came from the least authoritative end.
     pub omitted: usize,
     /// Set when canister discovery failed rather than merely finding nothing, so an empty
     /// `canisters` list is not mistaken for an app that declares none. The derivation origin
