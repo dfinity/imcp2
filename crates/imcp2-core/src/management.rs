@@ -86,7 +86,7 @@ pub struct UpdateSettingsArgs {
     /// Freezing threshold in seconds.
     #[serde(default)]
     pub freezing_threshold: Option<u64>,
-    /// Reserved-cycles limit.
+    /// Reserved-cycles limit, in cycles.
     #[serde(default)]
     pub reserved_cycles_limit: Option<u64>,
     /// Wasm heap memory limit in bytes.

@@ -53,47 +53,31 @@ pub struct Found {
     pub kind: Option<String>,
 }
 
-/// One canister discovered behind a web domain — the `discover_app_canisters` MCP
-/// output shape (a serialization mirror of [`Found`]).
+/// One canister discovered behind a web domain — the `open_app` MCP
+/// output shape.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DiscoveredCanister {
     /// The canister's principal id.
     pub canister_id: String,
-    /// A human label if one was attached (manifest role, env.json key,
-    /// bundle constant, or "frontend"); null for a bare bundle literal.
+    /// A human label for this canister's role, when one was attached; null when
+    /// the id carried none.
     pub label: Option<String>,
     /// IC dashboard label (e.g. "ICP Ledger"), when the id is a known canister.
     pub name: Option<String>,
     /// IC dashboard classification (e.g. "ledger"), when known.
     pub kind: Option<String>,
-    /// Where it was found: "ic-architecture" (the app's service-discoverability
-    /// manifest), "ic-app.json" (the same manifest at this server's legacy
-    /// pre-protocol path), "header", "env.json", "bundle:<LABEL>", or "bundle".
-    /// The first two are declared by the app itself and are the most
-    /// authoritative; only "ic-architecture" authorizes an update call, the
-    /// legacy path having been published under different terms (see
-    /// `discoverability`).
+    /// Where the id came from, and how far to trust it. "ic-architecture" is the
+    /// app's service-discoverability manifest and the only source that authorizes a
+    /// write; "ic-app.json" is the same manifest at a legacy path, declared by the
+    /// app but not sufficient for a write; "header" is the frontend canister;
+    /// "env.json", "bundle" and "bundle:<LABEL>" are candidates to confirm with
+    /// get_canister_candid.
     pub sources: Vec<String>,
-    /// Whether this canister exposes the OQL query surface — filled in for the
-    /// app's OWN data canisters by a single Candid fetch during open_app /
-    /// discover_app_canisters (#3). Name-based: it reports that the interface declares
-    /// both `schema` and `execute`, without checking their signatures. null when not
-    /// probed — the frontend or a shared system canister, or an eligible canister past
-    /// the eight-probe cap on a large manifest — or when the interface could not be
-    /// FETCHED; an interface that was fetched but could not be parsed reads as false,
-    /// not null. What true establishes is how to READ this canister — through the OQL
-    /// tools rather than a Candid data query, passing the app's derivation_origin,
-    /// which those tools require. It does not establish what the canister stores or
-    /// that it gates reads by the caller's principal: neither follows from two
-    /// method names.
+    /// Whether this canister declares an OQL query surface, so this server reads it with the
+    /// OQL tools rather than a Candid `method` query. Null when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oql: Option<bool>,
-    /// Whether this canister declares an API-doc method (`getApiDoc`/`get_api_doc`),
-    /// from the same probe as `oql`, and name-based in the same way. null when not
-    /// probed or when the interface could not be FETCHED; as with `oql`, an interface
-    /// that was fetched but could not be parsed reads as false, not null. True reports
-    /// the declaration, which is what get_canister_api_doc reads — not a guarantee
-    /// that the call returns a guide: it can still reject or trap.
+    /// Whether this canister declares the method get_canister_api_doc reads. Null when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_doc_available: Option<bool>,
 }
@@ -140,48 +124,12 @@ pub fn is_app_data_candidate(c: &DiscoveredCanister) -> bool {
     app_owned && !is_frontend && !is_system
 }
 
-/// Arguments for `discover_app_canisters`.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct DiscoverCanistersArgs {
-    /// A web domain or URL to inspect, e.g. "opencloud.org". It does not have to be
-    /// known to be IC-served: a reachable domain with no Internet-Computer evidence
-    /// yields an empty result rather than a refusal.
-    pub domain: String,
-}
-
-/// Structured output of `discover_app_canisters`.
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct DiscoverOutput {
-    /// The domain that was probed.
-    pub domain: String,
-    /// Canisters found behind the domain (empty if none).
-    pub canisters: Vec<DiscoveredCanister>,
-    /// How many additional findings were dropped by the output caps (see
-    /// [`bound_findings`]). The list is authority-ordered and the cut takes the
-    /// tail, so the dropped entries are always the least authoritative present:
-    /// in practice unlabelled JS-bundle literals, though with a very large
-    /// declared manifest the global cap can trim labelled entries too.
-    /// 0 = nothing cut.
-    pub omitted: usize,
-}
-
 /// The bounded result of [`discover`]: the canisters kept (authority-ordered)
 /// plus how many findings the output caps dropped.
 #[derive(Debug)]
 pub struct Discovery {
     pub canisters: Vec<Found>,
     pub omitted: usize,
-}
-
-impl From<(String, Discovery)> for DiscoverOutput {
-    /// `(domain, discovery)` → the structured `discover_app_canisters` reply.
-    fn from((domain, d): (String, Discovery)) -> Self {
-        Self {
-            domain,
-            canisters: d.canisters.iter().map(DiscoveredCanister::from).collect(),
-            omitted: d.omitted,
-        }
-    }
 }
 
 /// Canister textual principals: four 5-char base32 groups + the `cai` suffix.
@@ -554,7 +502,7 @@ impl DerivationSource {
 ///
 /// Each app's ENTIRE set of frontends — the derivation origin plus every origin in
 /// that origin's `/.well-known/ii-alternative-origins` — is listed, all mapping to
-/// the SAME derivation origin, so `resolve_app` yields the same result for any of an
+/// the SAME derivation origin, so open_app yields the same result for any of an
 /// app's origins (not just its primary host). `known_apps_are_closed_over_their_alt_origins`
 /// verifies this against the live lists (and flags drift when an app adds one).
 const KNOWN_DERIVATION_ORIGINS: &[(&str, &str)] = &[
@@ -635,8 +583,7 @@ struct KnownApp {
     /// token (e.g. "oisy" in "the oisy wallet") or adjacent tokens joined (e.g.
     /// "multi dex" / "MULTI/DEX" → "multidex").
     aliases: &'static [&'static str],
-    /// The app's canonical front-end URL (feed to `discover_app_canisters` /
-    /// `resolve_app`). Its host keys the derivation origin in [`KNOWN_DERIVATION_ORIGINS`].
+    /// The app's canonical front-end URL. Its host keys the derivation origin in [`KNOWN_DERIVATION_ORIGINS`].
     app_url: &'static str,
 }
 
@@ -1147,7 +1094,7 @@ async fn resolve_declared_origin(
 
 /// `want_alt_origins` controls whether the resolved derivation origin's
 /// `ii-alternative-origins` list is surfaced in the returned [`AppIdentity`]: the
-/// `resolve_app` tool passes `true`; identity-bearing tools that resolve an
+/// `open_app` passes `true`; identity-bearing tools that resolve an
 /// `app_url` only to derive against it pass `false`. Note this list is ALSO the
 /// authorization check for a cross-origin declared derivation origin (see
 /// [`derivation_origin_authorized`]), so it is fetched regardless of this flag
@@ -1215,7 +1162,7 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
         None
     };
 
-    // The alternative-origins list surfaced to the caller (resolve_app). It is
+    // The alternative-origins list surfaced to the caller (open_app). It is
     // authoritative at the DERIVATION ORIGIN (which declares the frontends allowed
     // to derive against it), and is the same list the authorization check above
     // already consulted — so reuse it when a cross-origin declaration was accepted,
@@ -2175,7 +2122,7 @@ pub struct LookupCanisterArgs {
 }
 
 /// The `icp_lookup_canister_info_by_id` MCP output shape — the IC dashboard's identity for a
-/// canister id (a serialization mirror of [`CanisterInfo`]).
+/// canister id.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CanisterIdentityOutput {
     /// The canister that was identified.
@@ -2361,23 +2308,14 @@ impl From<(String, Vec<Match>)> for FindCanisterOutput {
     }
 }
 
-/// Arguments for `icp_find_app_by_name`.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct FindAppArgs {
-    /// The app name to look up, as the user said it. For a site you already know
-    /// (e.g. "opencloud.org"), use open_app / resolve_app directly.
-    pub name: String,
-}
-
 /// One well-known app matched by `icp_find_app_by_name`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct AppMatch {
     /// The app's display name.
     pub name: String,
-    /// The app's canonical front-end URL — feed it to `discover_app_canisters` /
-    /// `resolve_app`.
+    /// The app's canonical front-end URL.
     pub app_url: String,
-    /// The app's Internet Identity derivation origin (lets you skip `resolve_app`).
+    /// The app's Internet Identity derivation origin.
     pub derivation_origin: String,
 }
 
@@ -2389,35 +2327,21 @@ pub struct FindAppOutput {
     /// Matching well-known apps (usually zero or one). Empty when the app isn't in
     /// the connector's built-in set.
     pub matches: Vec<AppMatch>,
-    /// Next-step guidance: how to proceed on a match, or an instruction to web-search
-    /// the app's URL when there's no match.
+    /// What the lookup found: the next tool to call on a match, or why an unknown name
+    /// has no URL here.
     pub note: String,
 }
 
 /// Arguments for `open_app`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OpenAppArgs {
-    /// An app name as the user said it, or its URL (e.g.
-    /// "https://opencloud.org"). If the user supplied only an app name, pass that
-    /// name unchanged. Only pass a URL supplied by the user or obtained from a
-    /// verified official source; do not construct a domain from the name. A name —
-    /// or a bare host — is matched against the built-in known-app registry first,
-    /// so a wrong-TLD guess repairs to the canonical URL; an explicit `https://…`
-    /// URL is resolved as given. Two refusals: an unknown bare name is refused with
-    /// instructions for finding the real URL, and a URL that would need its own
-    /// origin assumed as the derivation origin (the app answered but no usable
-    /// declaration was read — a 404 or 410, malformed JSON, or a declaration this
-    /// server cannot use; a probe that did not complete is an error rather than an
-    /// assumption — and no registry entry) is refused when that origin shows no
-    /// Internet-Computer evidence — and that
-    /// evidence shows a domain is served from the Internet Computer, not that it
-    /// belongs to the app the user meant.
+    /// An app name as the user said it, or its URL. An unknown bare name is refused, as is a
+    /// URL whose origin would have to be assumed and that shows no sign of being an Internet
+    /// Computer app.
     pub app: String,
 }
 
-/// Structured output of `open_app` — an app's whole context in one shot: its
-/// Internet Identity derivation origin (as `resolve_app`) plus the canisters
-/// behind it (as `discover_app_canisters`).
+/// Structured output of `open_app`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct OpenAppOutput {
     /// The app URL that was used — the canonical registry URL when the query
@@ -2432,31 +2356,24 @@ pub struct OpenAppOutput {
     /// get_app_principal / list_app_accounts / canister_query / canister_update_call.
     pub derivation_origin: String,
     /// How `derivation_origin` was determined: "declared", "known", or
-    /// "app_url_default" (see resolve_app).
+    /// "app_url_default" (see open_app).
     pub derivation_origin_source: String,
-    /// Origins the derivation origin's `ii-alternative-origins` permits to derive
-    /// from it — the INVERSE relation, so an entry here is an origin that may
-    /// derive from `derivation_origin`, not a derivation origin itself.
-    /// Informational, and read best-effort: an empty list means none were read (a
-    /// fetch, HTTP, parse, or origin-validation failure yields one), and at most 100
-    /// valid entries are kept.
+    /// Origins that the derivation origin permits to derive against it. This is the INVERSE
+    /// relation, so an entry here is not itself a derivation origin. Informational, and read
+    /// best-effort: an empty list means none were read.
     pub alternative_origins: Vec<String>,
-    /// Whether the origin showed Internet-Computer evidence (gateway
-    /// `x-ic-canister-id`); null unless the derivation origin was assumed. See
-    /// resolve_app's field of the same name.
+    /// Whether the origin showed evidence of being served from the Internet Computer. Null
+    /// unless the derivation origin had to be assumed.
     pub application_is_ic: Option<bool>,
-    /// The canisters discovered behind the app, most authoritative first (same
-    /// shape/provenance as discover_app_canisters). Empty when the app declares
+    /// The canisters discovered behind the app, most authoritative first . Empty when the app declares
     /// none OR when discovery failed — disambiguated by `discovery_error`.
     pub canisters: Vec<DiscoveredCanister>,
-    /// How many additional findings the discovery output caps dropped (same
-    /// meaning as discover_app_canisters' field); 0 = nothing cut.
+    /// How many further findings were dropped. The list is ordered most authoritative first,
+    /// so anything dropped came from the least authoritative end.
     pub omitted: usize,
-    /// If canister discovery FAILED (DNS/TLS/SSRF refusal/timeout) rather than
-    /// merely finding nothing, the error string — so an empty `canisters` meaning
-    /// "the app declares none" is distinguishable from "discovery didn't run".
-    /// null when discovery succeeded (whether or not it found anything). The
-    /// derivation context is valid regardless (origin resolution succeeded first).
+    /// Set when canister discovery failed rather than merely finding nothing, so an empty
+    /// `canisters` list is not mistaken for an app that declares none. The derivation origin
+    /// is valid either way.
     pub discovery_error: Option<String>,
     /// A human note — the derivation-origin caveat and any lookalike caution.
     pub note: Option<String>,
@@ -2478,8 +2395,8 @@ pub fn find_app_by_name(query: &str) -> FindAppOutput {
                     derivation_origin: derivation_origin.to_string(),
                 }],
                 note: format!(
-                    "Well-known app. Use discover_app_canisters(\"{}\") to find its canisters; its \
-                     derivation origin is already {} (no resolve_app needed).",
+                    "Well-known app. open_app(\"{}\") returns its canisters; its derivation \
+                     origin is already {}.",
                     app.app_url, derivation_origin
                 ),
             }
@@ -2495,7 +2412,7 @@ pub fn find_app_by_name(query: &str) -> FindAppOutput {
                     "\"{query}\" is not in the connector's small built-in set of well-known apps \
                      ({known}). There is no on-chain directory mapping an app NAME to its URL, so \
                      do a WEB SEARCH for the app's official front-end URL (or ask the user for it), \
-                     then call resolve_app / discover_app_canisters with that URL. Do NOT guess or \
+                     then call open_app with that URL. Do NOT guess or \
                      fabricate a domain from the name — a lookalike domain (e.g. <name>.com/.app) is \
                      typically an unrelated or squatted site, and an identity derived there would be \
                      wrong."
@@ -3376,7 +3293,7 @@ mod tests {
 
     // Closure (offline): every derivation-origin VALUE in the registry is itself a
     // key mapping to itself — so resolving a known app's derivation origin returns
-    // that same origin (source `known`), i.e. resolve_app is idempotent on it.
+    // that same origin (source `known`), i.e. resolution is idempotent on it.
     #[test]
     fn registry_is_closed_under_its_derivation_origins() {
         for (host, origin) in KNOWN_DERIVATION_ORIGINS {
@@ -3569,7 +3486,7 @@ mod tests {
 
     // Consistency (networked): every origin in a known app's LIVE
     // ii-alternative-origins must map, in the registry, to the SAME derivation
-    // origin — so resolve_app yields the same result for any of an app's frontends,
+    // origin — so resolution yields the same result for any of an app's frontends,
     // not just its primary host. A failure flags registry drift (the app added a new
     // alternative origin we should include). Best-effort on fetch: an unreachable /
     // offline endpoint (empty list) is skipped so a network blip doesn't fail CI.

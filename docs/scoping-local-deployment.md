@@ -467,7 +467,7 @@ middleware; a stdio pipe has no per-request middleware at all), so the middlewar
 with their transports and core only receives their outcome.
 
 Tools that are already session-free work unchanged locally: `get_canister_candid`,
-`get_canister_api_doc`, `open_app`, `resolve_app`, `discover_app_canisters`, `icp_oql_guide`,
+`get_canister_api_doc`, `open_app`, `candid_syntax_guide`, `icp_oql_guide`,
 and the anonymous path of `canister_query`. (The skill documents are served as `skill://`
 resources.)
 
