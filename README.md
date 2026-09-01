@@ -156,15 +156,14 @@ results).
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `open_app` | `app` (name **or** URL) | **One-call entry point** when a user names/links an app: resolves the Internet Identity `derivation_origin` *and* discovers the canisters behind it, together. A name or bare host is matched to the known-app registry first (so a wrong-TLD guess repairs to the canonical URL); an explicit `https://` URL is resolved as given. An unknown bare name is *refused*, and so is a URL that would need its own origin assumed as the derivation origin while showing no IC evidence (never guessed). Also probes the app's own canisters and reports per-canister `oql`/`api_doc_available` capability flags — for **up to eight** eligible canisters, with both fields *omitted* (not false) on any beyond that — plus a data-access note (which canister is read through the OQL path, and the origin that path requires). Wraps `resolve_app` + `discover_app_canisters`; no auth |
-| `discover_app_canisters` | `domain` | Canister ids behind a web domain — app-declared metadata first (the `/.well-known/ic-architecture` service-discoverability manifest, and the same manifest at the legacy `/.well-known/ic-app.json` path), then the frontend via `x-ic-canister-id` and backend candidates via `/env.json` + JS-bundle mining — each with provenance, its IC dashboard label/type where known, and (for the app's own canisters) `oql`/`api_doc_available` capability flags from a one-shot Candid probe |
+| `open_app` | `app` (name **or** URL) | **One-call entry point** when a user names/links an app: resolves the Internet Identity `derivation_origin` *and* discovers the canisters behind it, together. A name or bare host is matched to the known-app registry first (so a wrong-TLD guess repairs to the canonical URL); an explicit `https://` URL is resolved as given. An unknown bare name is *refused*, and so is a URL that would need its own origin assumed as the derivation origin while showing no IC evidence (never guessed). Also probes the app's own canisters and reports per-canister `oql`/`api_doc_available` capability flags — for **up to eight** eligible canisters, with both fields *omitted* (not false) on any beyond that — plus a data-access note (which canister is read through the OQL path, and the origin that path requires). No auth |
 | `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus two capability flags: `oql` (`true` when it exposes an OQL query surface — a `schema` + `execute` pair — with a pointer to `icp_oql_guide`) and `api_doc_available` (`true` when it declares a `getApiDoc`/`get_api_doc` method, gating `get_canister_api_doc`) |
 | `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), from its `getApiDoc`/`get_api_doc` method. Call **only** when `get_canister_candid`/`open_app` report `api_doc_available`. Returns a **structured** result for every documentation outcome — `available` + the doc on success, else `available:false` with `expected`/`retry`/`next`, so "no compatible method was detected" is distinct from "no answer was obtained". An unusable `canister_id` is rejected before any lookup and is a plain error, not that shape; and `expected:true` is not proof of absence, since an interface the parser cannot read also comes up empty |
 | `canister_query` | `canister_id`, `method?` **or** `oql?`, `args?` (textual Candid), `derivation_origin?`, `account?`, `candid?` | READ a canister — provide EITHER a Candid `query` `method` (with `args`) OR an `oql` query (a JSON object string, run against `execute`). A Candid `method` query may be anonymous or as your account and returns textual Candid; an `oql` query **requires** `derivation_origin` and returns `columns` + `rows` (a table) with `has_more`, validating `start` against the schema on an empty result. On an OQL canister a Candid `method` query is rejected — use `oql`. `candid` is a fallback: the `.did` interface text to encode/decode against when the canister exposes no `candid:service` metadata. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
-| `canister_update_call` | `canister_id`, `method`, `args` (textual Candid), `app_url?`, `derivation_origin?`, `account?`, `candid?` | Make an UPDATE (state-changing) call; reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`/`resolve_app`). **The target must be declared by its app**: the call is made only when the app at `app_url` (from `open_app`; falling back to `derivation_origin` when no `app_url` is given) declares `canister_id` in its `/.well-known/ic-architecture` manifest — see [Writes are gated on the discoverability manifest](#writes-are-gated-on-the-discoverability-manifest). When `derivation_origin` is also given, the two must belong to the same app — the app at `app_url` is resolved to the derivation origin II derives its users from, and a mismatch is refused rather than signed. The reply echoes `declared_by` / `declared_at` (which origin authorized the write, and at which path). **Financial transactions are refused**: the ICRC-standard transfer/approval methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents) and the NNS/SNS governance method `manage_neuron` (neuron staking and disbursement) are disallowed on every canister, and the ICP and cycles ledgers' own value-moving methods (the legacy `transfer`, `withdraw`, the `create_canister` spends) and the cycles-minting canister's funding-completion methods (`notify_top_up`, `notify_create_canister`, `notify_mint_cycles`, `create_canister`) on those canisters; and **every** update call is refused on the financial-service canisters the guard carries — all to protect the user. The refusal directs the user to perform the operation outside the connector, in a trusted interface they control — or, for canister creation and funding, with the [icp CLI](https://github.com/dfinity/icp-cli) in their own terminal. The policy is stated in the server-level instructions, deliberately not in any tool description. `candid` is the same `.did` fallback as on `canister_query`, used when the interface isn't published on-chain. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
-| `get_app_principal` | `derivation_origin`, `account?` | The principal you act as at an app, without a call. Identify the app by its `derivation_origin` (from `open_app`/`resolve_app`). Echoes `derived_for_origin` / `requested` so an origin mismatch is visible |
-| `list_app_accounts` | `derivation_origin` | The user's Internet Identity accounts at an app — the default account plus any named ones — with name, number, last-used, and the derivation origin they were listed for. Identify the app by its `derivation_origin` (from `open_app`/`resolve_app`) |
-| `resolve_app` | `app_url` | Resolve an app URL to its Internet Identity derivation context: `application_origin`, the `derivation_origin` to use (declared by the app in `/.well-known/ii-derivation-origin`, else in the legacy `/.well-known/ic-app.json`, else a built-in known-app value, else assumed = app origin — flagged via `derivation_origin_source`: `declared`/`known`/`app_url_default`, with `application_is_ic` echoing the gateway evidence), and the app's `alternative_origins` (informational). An origin with **no IC evidence** that would need the `app_url_default` assumption is **refused** (guessed-domain guard, with a "did you mean" repair when the host resembles a well-known app). Does not return a principal (no account chosen) or require auth — pass the `derivation_origin` to `get_app_principal`/`list_app_accounts` |
+| `canister_update_call` | `canister_id`, `method`, `args` (textual Candid), `app_url?`, `derivation_origin?`, `account?`, `candid?` | Make an UPDATE (state-changing) call; reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`). **The target must be declared by its app**: the call is made only when the app at `app_url` (from `open_app`; falling back to `derivation_origin` when no `app_url` is given) declares `canister_id` in its `/.well-known/ic-architecture` manifest — see [Writes are gated on the discoverability manifest](#writes-are-gated-on-the-discoverability-manifest). When `derivation_origin` is also given, the two must belong to the same app — the app at `app_url` is resolved to the derivation origin II derives its users from, and a mismatch is refused rather than signed. The reply echoes `declared_by` / `declared_at` (which origin authorized the write, and at which path). **Financial transactions are refused**: the ICRC-standard transfer/approval methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents) and the NNS/SNS governance method `manage_neuron` (neuron staking and disbursement) are disallowed on every canister, and the ICP and cycles ledgers' own value-moving methods (the legacy `transfer`, `withdraw`, the `create_canister` spends) and the cycles-minting canister's funding-completion methods (`notify_top_up`, `notify_create_canister`, `notify_mint_cycles`, `create_canister`) on those canisters; and **every** update call is refused on the financial-service canisters the guard carries — all to protect the user. The refusal directs the user to perform the operation outside the connector, in a trusted interface they control — or, for canister creation and funding, with the [icp CLI](https://github.com/dfinity/icp-cli) in their own terminal. The policy is stated in the server-level instructions, deliberately not in any tool description. `candid` is the same `.did` fallback as on `canister_query`, used when the interface isn't published on-chain. Echoes `derived_for_origin` / `requested` / `acted_as_principal` |
+| `get_app_principal` | `derivation_origin`, `account?` | The principal you act as at an app, without a call. Identify the app by its `derivation_origin` (from `open_app`). Echoes `derived_for_origin` / `requested` so an origin mismatch is visible |
+| `list_app_accounts` | `derivation_origin` | The user's Internet Identity accounts at an app — the default account plus any named ones — with name, number, last-used, and the derivation origin they were listed for. Identify the app by its `derivation_origin` (from `open_app`) |
+| `candid_syntax_guide` | — | The textual-Candid value syntax the `args` of `canister_query` / `canister_update_call` take and their replies come back in: the literal form for each Candid type, and when a value needs an explicit `: type` annotation. The full type system stays available as the `candid://reference` MCP resource |
 | `icp_oql_guide` | — | The OQL query-surface dialect guide (for canisters where `get_canister_candid` reports `oql: true`): the JSON query object, predicate grammar, edges, and paged result shape. The entity/field names come from `get_canister_oql_schema` and queries run through `canister_query` (the `oql` argument) |
 | `get_canister_oql_schema` | `canister_id`, `derivation_origin`, `account?` | The canister's OQL schema catalogue (entities, primary keys, fields, edges) as JSON — wraps its `schema` method — plus a ready-to-run `canister_query` example per entity. **`derivation_origin` is required**: this server rejects an anonymous read (for now) with guidance — its own rule, not an inference about the canister — rather than calling `schema` anonymously and returning an empty list |
 
@@ -172,13 +171,10 @@ results).
 when the user names or links an app: it resolves the Internet Identity
 `derivation_origin` **and** discovers the
 canisters behind the app together (see [Typical flow](#typical-flow)).
-`discover_app_canisters` is the canister-only path underneath it, used directly
-when you already have the app's domain or URL (its `domain` argument accepts
-either) and only need the canister ids. Its sources are listed in the table row
-above (app-declared metadata first, then the `x-ic-canister-id` frontend header,
-then backend candidates mined from `/env.json` + the JS bundle); among the mined
-candidates, pick by label, prefer production/`IC_` ids, and confirm with
-`get_canister_candid`.
+Its canister sources are listed in the table row above (app-declared metadata
+first, then the `x-ic-canister-id` frontend header, then backend candidates
+mined from `/env.json` + the JS bundle); among the mined candidates, pick by
+label, prefer production/`IC_` ids, and confirm with `get_canister_candid`.
 
 ### Typical flow
 
@@ -187,16 +183,14 @@ Acting **for the user** at an app:
 0–2. **`open_app(name-or-URL)`** — the one-call entry point. Pass the *name* the user
    said (well-known apps resolve offline) or a URL you have (e.g.
    `https://opencloud.org`); it returns the `derivation_origin` **and** the app's canisters in one shot
-   (it runs `resolve_app` + `discover_app_canisters` concurrently under the hood).
+   (it resolves the origin and discovers the canisters concurrently under the hood).
    **Never guess a domain from a name** — a lookalike like `<name>.com` is an
    unrelated or squatted site. The tool enforces this: a bare *unknown* name is
    refused (find the real URL — web-search or ask the user), and a URL that resolves
    to `app_url_default` while showing **no IC evidence** (no valid `x-ic-canister-id`
    gateway header, no declared derivation origin) is refused too; when the host
    resembles a known app the error names it and gives the real URL (a
-   "did you mean" repair). For a single step, the narrower tools remain:
-   **`resolve_app(url)`** (origin only), **`discover_app_canisters(url)`**
-   (canisters only).
+   "did you mean" repair).
 3. **`list_app_accounts`** — if there's more than one account, ask which to use (and
    remember it).
 4. **`get_app_principal`** — only when you need the principal *value* itself;
@@ -214,7 +208,7 @@ Acting **for the user** at an app:
    `account` to act as the user.
 
 Genuinely public reads via a `canister_query` Candid `method` query or the
-public-metadata tools (`get_canister_candid`, `discover_app_canisters`) skip steps
+public-metadata tools (`get_canister_candid`, `open_app`) skip steps
 3/4 and need no origin; OQL reads always require one. The per-canister inspection (5) is
 independent of the identity steps (3/4), so they can run in parallel. Managing your
 **own** canisters is not part of this connector: create and manage them with the
@@ -343,7 +337,7 @@ host are fetched, and every outbound fetch runs under a redirect guard (a 3xx ma
 go to a **globally-routable** IP or the same host, never a different private
 target; capped at 10 hops) with per-body and aggregate size caps, so a hostile or
 accidental large body can't exhaust memory. The untrusted **user-supplied** site
-fetches (an app origin from `discover_app_canisters`, `open_app`, `resolve_app`, or
+fetches (an app origin from `open_app`, or
 the `app_url` the write gate checks in `canister_update_call`)
 additionally resolve the target host up front and **pin** the connection to that
 validated globally-routable address, so a name resolving to a
@@ -365,14 +359,14 @@ identity section above). The protocol moved that declaration to its own file, so
 **a new app should publish `/.well-known/ii-derivation-origin`** instead — one
 canonical `https://host` on a single line, which takes precedence over this field.
 The field is still read for the apps that shipped against it. Either is the only
-authoritative way for `open_app` / `resolve_app` to learn a **custom** derivation
+authoritative way for `open_app` to learn a **custom** derivation
 origin from an app URL — there is no reverse lookup from an app URL to it — so an
 app that pins one should declare it; otherwise the connector assumes the
 derivation origin equals the application origin and flags that assumption.
 
 When the user names a **token, project, or service** rather than a website or
 id, web search the canister id or ask the user for it.
-(`discover_app_canisters` results are annotated with the dashboard's labels
+(`open_app` results are annotated with the dashboard's labels
 inline.)
 
 `canister_query` and `canister_update_call` run anonymously by default; pass a
@@ -387,7 +381,7 @@ without a call. A user may hold several accounts at an app — a default account
 everyone gets automatically (the anchor's current, user-controllable default at
 that origin), plus any they have named — so `list_app_accounts` lists them (via II's
 `get_accounts`), and `canister_query`/`canister_update_call`/`get_app_principal`/`list_app_accounts` identify the
-app by its `derivation_origin` (obtained once from `open_app`/`resolve_app` — see the
+app by its `derivation_origin` (obtained once from `open_app` — see the
 note below), and take an optional `account` (a name from that list) to act as a
 specific one; omit it for the default account. All these tools require a bearer
 token (see Auth).
@@ -402,7 +396,7 @@ token (see Auth).
 > exact canonical origin — never inferred from an alternative-origins list, which is
 > the *inverse* relation), and **only** that — they do **not** accept a raw website
 > URL. A derivation origin is a *stable per-app value*, so you **resolve it once**
-> and reuse it: `open_app` (or `resolve_app`) turns an app name/URL into it and
+> and reuse it: `open_app` turns an app name/URL into it and
 > reports how — `derivation_origin_source`: **declared**
 > (`/.well-known/ii-derivation-origin`, else the legacy `/.well-known/ic-app.json`
 > → `derivation_origin`), else a built-in **known-app**
@@ -414,9 +408,9 @@ token (see Auth).
 > passed), so a canonicalization mismatch is **immediately visible**. Why not accept
 > a URL directly on every tool? Because the server is **stateless** — resolving a
 > URL costs a network round-trip each call, and the derivation origin never changes
-> per-app; forcing a single up-front `open_app`/`resolve_app` avoids re-resolving on
+> per-app; forcing a single up-front `open_app` avoids re-resolving on
 > every invocation and gives the agent **one** way to identify an app. The
-> **guessed-domain gate** lives at that resolution step: `open_app`/`resolve_app`
+> **guessed-domain gate** lives at that resolution step: `open_app`
 > *refuse* an `app_url` whose `app_url_default` assumption would apply while the
 > origin shows **no IC evidence** — the gateway's `x-ic-canister-id` header (a valid
 > canister principal, from the origin itself, not a redirect target; checked on the
@@ -996,7 +990,7 @@ There is no per-app browser sign-in. Instead the model is:
   calls directly with that key (its principal `self_authenticating(session_pubkey)`
   is what the grant is bound to). Reconnect when the grant expires or is revoked.
 - **App delegations minted on demand.** When `canister_query` / `canister_update_call` (or `get_app_principal`)
-  is invoked with a `derivation_origin` (resolved once via `open_app`/`resolve_app`), the backend mints a **short-lived
+  is invoked with a `derivation_origin` (resolved once via `open_app`), the backend mints a **short-lived
   per-app account delegation on demand**: signing *as the session key*, it calls
   Internet Identity's account-derivation methods directly — no browser round-trip
   — with the app's target origin and a fresh **per-app key** as `session_key`.
@@ -1026,13 +1020,13 @@ mcp_get_delegation :
   `*.icp0.io` / `*.icp.net` → `*.ic0.app`. `target_origin` replicates only II's
   *domain-based* derivation: a raw `derivation_origin` is canonicalized and used
   verbatim, with no recovery of a custom derivation origin from it. When an
-  `app_url` is passed instead, `resolve_app` resolves the derivation origin by
+  `app_url` is passed instead, the server resolves the derivation origin by
   precedence **declared** (`/.well-known/ii-derivation-origin`, else the legacy
   `/.well-known/ic-app.json` `derivation_origin`) >
   built-in **known-app** registry > application origin, so a custom origin an app
   declares (or that ships in the registry, e.g. `oisy.com`) **is** honoured, and
   the app's `/.well-known/ii-alternative-origins` list is fetched and surfaced by
-  `resolve_app` (see the caveat under [Tools](#tools)). The one genuine limitation:
+  `open_app` (see the caveat under [Tools](#tools)). The one genuine limitation:
   there is no reverse lookup from an app URL to a custom origin the app has not
   declared.
 - `account_number` names which of the anchor's accounts at `target_origin` to act
