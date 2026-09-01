@@ -32,9 +32,10 @@
 #                                             or be left blank to accept any
 # A trusted publisher can only be configured on a crate that already exists, so the
 # FIRST release of each crate has to be published by hand — `cargo publish --locked`
-# with a personal token (imcp2's 0.1.0 was; imcp2-core's first release must be, and
-# its trusted publisher configured with this same repository/workflow/environment)
-# — and every release after it goes through this workflow.
+# with a personal token — and every release after it goes through this workflow.
+# imcp2's 0.1.0 and imcp2-core's 0.2.0 were both published that way, so both crates
+# now exist; each still needs its OWN trusted publisher configured against this same
+# repository/workflow/environment, or its upload below 403s.
 #
 # REQUIRED REPOSITORY SETTINGS, to be in place BEFORE the trusted publisher is
 # enabled. Neither can be expressed in this file, and without them the guards below
@@ -143,19 +144,28 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace --all-targets
 
-      # Rehearses the real thing — packages each crate, and compiles imcp2-core's
-      # package in isolation — but stops short of uploading, so a package that only
-      # builds because of something untracked in the working tree fails here rather
-      # than after the upload is already permanent. imcp2's package cannot be
-      # compile-verified before this release's imcp2-core exists on crates.io (it
-      # depends on it by version), so its rehearsal is `cargo package` without the
-      # verify build: the workspace test above already compiled exactly these
-      # sources. This is also the verify work that lets the publish job skip its
-      # own; see `--no-verify` below.
+      # Rehearses the real thing — packages both crates and compiles each package in
+      # isolation — but stops short of uploading, so a package that only builds
+      # because of something untracked in the working tree fails here rather than
+      # after the upload is already permanent.
+      #
+      # `--workspace` is what makes rehearsing imcp2 possible at all. Packaged one
+      # at a time, imcp2 cannot even be PACKAGED before this release's imcp2-core
+      # exists on crates.io: it depends on it by version, and packaging resolves
+      # that requirement against the registry, where only the PREVIOUS release
+      # exists — the new one is uploaded by the publish job below, which this job
+      # gates. (`--no-verify` does not help: it skips the compile, not the
+      # resolution.) A workspace publish resolves the two together — cargo packages
+      # imcp2-core first and verifies imcp2 against a temporary local registry
+      # holding it — so the rehearsal covers the same crates, in the same order, as
+      # the upload. It also restores the verify build for imcp2, which the previous
+      # per-crate form had to give up.
+      #
+      # This is also the verify work that lets the publish job skip its own; see
+      # `--no-verify` below. imcp2-local is `publish = false`, so `--workspace`
+      # leaves it out on its own.
       - name: Package
-        run: |
-          cargo publish --locked --dry-run -p imcp2-core
-          cargo package --locked --no-verify -p imcp2
+        run: cargo publish --locked --dry-run --workspace
 
   # Holds the credential, and compiles nothing.
   publish:
@@ -189,19 +199,17 @@ jobs:
       # it `cargo publish` compiles the package — running the dependency tree's build
       # scripts and proc macros — while CARGO_REGISTRY_TOKEN sits in their
       # environment. The verify build is not skipped, only moved: the `verify` job
-      # packaged both crates (and compiled imcp2-core's package) over this same
-      # commit, and the workspace test suite compiled exactly these sources. What
-      # remains in this job is reading files into a .crate and an HTTPS upload.
+      # packaged and compiled both crates over this same commit, and the workspace
+      # test suite compiled exactly these sources. What remains in this job is
+      # reading files into a .crate and an HTTPS upload — with `--no-verify` a
+      # workspace publish emits no Compiling/Verifying step at all, so no dependency
+      # code runs anywhere near the credential.
       #
-      # Order matters: imcp2 depends on imcp2-core by version, so core publishes
-      # first; `cargo publish` waits for the just-published crate to appear in the
-      # index before returning, so the second publish resolves the first.
-      - name: Publish imcp2-core
-        run: cargo publish --locked --no-verify -p imcp2-core
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
-      - name: Publish imcp2
-        run: cargo publish --locked --no-verify -p imcp2
+      # Order matters: imcp2 depends on imcp2-core by version, so core must be
+      # uploaded first. `--workspace` sequences that itself, publishing in dependency
+      # order and waiting for each crate to appear in the index before the next, so
+      # the two uploads no longer have to be spelled out (and cannot drift apart).
+      - name: Publish imcp2-core and imcp2
+        run: cargo publish --locked --no-verify --workspace
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
