@@ -437,6 +437,16 @@ impl McpServer {
         self.identities.session_gauges().await
     }
 
+    /// [`Self::session_gauges`] without awaiting: `None` when the session map is
+    /// momentarily locked, in which case the caller must keep its previous sample
+    /// rather than report zero. For a synchronous sampler — this is what lets
+    /// [`metrics`]' session gauges recompute themselves inside Prometheus's
+    /// `Collector::collect`, so a host that only gathers its registry still
+    /// publishes live numbers.
+    pub fn try_session_gauges(&self) -> Option<SessionGauges> {
+        self.identities.try_session_gauges()
+    }
+
     /// Cancel the MCP transport's live sessions and the session reaper; call
     /// AFTER draining in-flight requests on graceful shutdown (cancelling
     /// first would cut the very requests the drain is waiting on).

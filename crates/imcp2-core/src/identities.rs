@@ -238,6 +238,25 @@ pub struct SessionGauges {
     pub active: usize,
 }
 
+/// Count both gauges from ONE snapshot of the session map — the shared body of
+/// [`Identities::session_gauges`] and [`Identities::try_session_gauges`], which
+/// differ only in how they take the lock. One pass, so the pair is consistent
+/// (`active <= live`); `now` is the caller's single instant, read before locking.
+fn count_sessions(sessions: &HashMap<String, Session>, now: u64) -> SessionGauges {
+    let mut g = SessionGauges { live: 0, active: 0 };
+    for s in sessions.values() {
+        if s.grant_expiration_ns.is_some_and(|e| e > now) {
+            g.live += 1;
+            if now.saturating_sub(s.last_seen_ns.load(Ordering::Relaxed))
+                <= ACTIVE_SESSION_WINDOW_NS
+            {
+                g.active += 1;
+            }
+        }
+    }
+    g
+}
+
 /// Remap a domain to the `target_origin` II expects for account derivation.
 /// IC gateway domains (`*.icp0.io`, `*.icp.net`) map to the canonical
 /// `*.ic0.app` origin; any other domain is passed through as `https://<host>`.
@@ -673,20 +692,25 @@ impl Identities {
     /// straddle a grant expiry and momentarily report `active > live`. A cheap
     /// read-lock snapshot.
     pub async fn session_gauges(&self) -> SessionGauges {
+        // Read the clock before taking the lock, as everywhere else here.
         let now = now_ns();
-        let sessions = self.sessions.read().await;
-        let mut g = SessionGauges { live: 0, active: 0 };
-        for s in sessions.values() {
-            if s.grant_expiration_ns.is_some_and(|e| e > now) {
-                g.live += 1;
-                if now.saturating_sub(s.last_seen_ns.load(Ordering::Relaxed))
-                    <= ACTIVE_SESSION_WINDOW_NS
-                {
-                    g.active += 1;
-                }
-            }
-        }
-        g
+        count_sessions(&*self.sessions.read().await, now)
+    }
+
+    /// [`Self::session_gauges`] without awaiting: `None` when the session map is
+    /// momentarily locked.
+    ///
+    /// For a SYNCHRONOUS sampler — chiefly Prometheus's `Collector::collect`,
+    /// which a registry calls from a plain `fn` that is typically running on a
+    /// runtime worker thread, where blocking on this async lock would stall that
+    /// worker (and `blocking_read` would panic outright). Lock holders here are
+    /// short and never await while holding, so in practice this succeeds.
+    ///
+    /// A caller that gets `None` must KEEP ITS PREVIOUS SAMPLE, not report zero:
+    /// the map was contended, not empty.
+    pub fn try_session_gauges(&self) -> Option<SessionGauges> {
+        let now = now_ns();
+        Some(count_sessions(&*self.sessions.try_read().ok()?, now))
     }
 
     /// Single-gauge test conveniences over [`Self::session_gauges`] (which is what
@@ -1847,6 +1871,12 @@ mod tests {
         // session_gauges reports the same pair from one snapshot (what /version uses).
         let g = ids.session_gauges().await;
         assert_eq!((g.live, g.active), (2, 1));
+        // try_session_gauges agrees — it is the same count, taken without
+        // awaiting, and is what the Prometheus collector samples through.
+        assert_eq!(
+            ids.try_session_gauges().map(|g| (g.live, g.active)),
+            Some((2, 1))
+        );
 
         // A fresh authenticated request brings it back onto the active gauge.
         ids.touch_session("quiet").await;
@@ -2377,5 +2407,25 @@ mod tests {
             .await
             .expect_err("empty chain => error");
         assert!(err.contains("chain is empty"), "got: {err}");
+    }
+
+    /// `try_session_gauges` never blocks: with the session map write-locked it
+    /// reports `None` so the caller keeps its previous sample, rather than
+    /// stalling the thread that is gathering metrics — or reporting a zero that
+    /// would read as "no sessions".
+    #[tokio::test]
+    async fn try_session_gauges_declines_a_locked_map_instead_of_blocking() {
+        let ids = test_ids();
+        ids.set_grant_expiration("live", now_ns() + 60_000_000_000).await;
+        assert_eq!(ids.try_session_gauges().map(|g| g.live), Some(1));
+
+        let held = ids.sessions.write().await;
+        assert!(
+            ids.try_session_gauges().is_none(),
+            "a contended map must decline, not block or count zero"
+        );
+        drop(held);
+
+        assert_eq!(ids.try_session_gauges().map(|g| g.live), Some(1));
     }
 }

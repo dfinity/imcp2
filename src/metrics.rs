@@ -8,6 +8,13 @@
 //! caller's job too — gather your own registry (the bundled binary's `/metrics`
 //! handler is the standalone case).
 //!
+//! Gathering is ALL that is required: the derived session gauges recompute
+//! themselves from the served instances as the registry is gathered (see
+//! `SessionCollector`), so a host that merely exposes its registry publishes
+//! current counts. [`Metrics::refresh`] remains as an optional exactness step,
+//! not a prerequisite — the one thing a caller must get right is passing
+//! [`Metrics::new`] the same [`crate::McpServer`] handles it serves.
+//!
 //! ## Label cardinality
 //!
 //! Every series is a row Prometheus keeps in memory, so a label whose value an
@@ -28,6 +35,8 @@ use axum::{
     response::Response,
 };
 use prometheus::{
+    core::{Collector, Desc},
+    proto::MetricFamily,
     Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
 };
 
@@ -80,11 +89,15 @@ pub struct Metrics {
 impl Metrics {
     /// Register this crate's collectors into `registry` and return the handle.
     ///
-    /// `servers` are the instances whose session gauges [`Self::refresh`]
-    /// publishes — pass every served [`crate::McpServer`], one per Internet
-    /// Identity instance (duplicate instance names overwrite each other).
-    /// Their gauges read 0 until the first refresh; an unserved instance is
-    /// simply absent.
+    /// `servers` are the instances whose session gauges this handle publishes —
+    /// pass every served [`crate::McpServer`], one per Internet Identity
+    /// instance (duplicate instance names overwrite each other). The gauges
+    /// resample themselves from these servers on every gather, so they need no
+    /// call of yours to stay current (see `SessionCollector` and
+    /// [`Self::refresh`]); they read 0 from construction until the first gather,
+    /// and an unserved instance is simply absent. Pass the SAME handles you
+    /// serve: an `McpServer` is cheap to clone and shares its session map, but a
+    /// separately constructed one has a map of its own and would read 0 forever.
     ///
     /// `version` and `commit` become the labels of a `build_info` gauge.
     ///
@@ -128,18 +141,26 @@ impl Metrics {
             ),
             &[SESSION_LABEL],
         )?;
-        registry.register(Box::new(live_sessions.clone()))?;
 
         let active_sessions = IntGaugeVec::new(
             Opts::new(
                 metric!("active_sessions"),
                 "Live sessions that also made a request within the activity window (~15 min). \
-                 Sampled independently of imcp2_live_sessions, so a scrape may briefly \
-                 observe it above live.",
+                 Recomputed per scrape from the same snapshot as imcp2_live_sessions, so the \
+                 pair is consistent (active <= live).",
             ),
             &[SESSION_LABEL],
         )?;
-        registry.register(Box::new(active_sessions.clone()))?;
+
+        // The two together, behind a collector that resamples them as the
+        // registry gathers — see `SessionCollector`. Registering the collector
+        // (not the two gauge vecs) is what makes the numbers self-maintaining;
+        // the clones kept in `Self` share the same series.
+        registry.register(Box::new(SessionCollector {
+            live_sessions: live_sessions.clone(),
+            active_sessions: active_sessions.clone(),
+            servers: servers.iter().map(|s| (*s).clone()).collect(),
+        }))?;
 
         // Self-observability: a scrape that quietly got slow is how a target
         // starts being dropped for timing out.
@@ -206,9 +227,15 @@ impl Metrics {
         self.duration.with_label_values(&[route, method]).observe(elapsed);
     }
 
-    /// Recompute the session gauges from each server's session map. They are
-    /// derived state, so something must decide when to pull them: call this
-    /// from your exposition path just before gathering, or on a timer.
+    /// Recompute the session gauges from each server's session map, awaiting the
+    /// lock.
+    ///
+    /// OPTIONAL: the gauges resample themselves as the registry is gathered (see
+    /// `SessionCollector`), so a host that just exposes its registry already
+    /// publishes current numbers. Call this from an async exposition path (as the
+    /// bundled binary's `/metrics` does) or on a timer to make a scrape exact
+    /// even under lock contention, where the non-blocking in-collector sample
+    /// falls back to the previous values.
     pub async fn refresh(&self) {
         for server in &self.servers {
             let g = server.session_gauges().await;
@@ -222,6 +249,46 @@ impl Metrics {
     /// [`Self::refresh`] included — the refresh is the part that can get slow.
     pub fn observe_scrape(&self, seconds: f64) {
         self.scrapes.observe(seconds);
+    }
+}
+
+/// The session gauges, wrapped so they RESAMPLE THEMSELVES whenever the
+/// registry is gathered.
+///
+/// Registering the two [`IntGaugeVec`]s directly would make them inert state
+/// that only [`Metrics::refresh`] ever moves — and an embedder registering into
+/// a registry the host application gathers has no natural place to call it, so
+/// the gauges sat at their startup zero-fill and a healthy service looked like
+/// one with no sessions. That failure mode is silent (a zero is a plausible
+/// reading), so the fix is to remove the coupling rather than document it:
+/// gathering the registry is now sufficient, and [`Metrics::refresh`] is an
+/// optional exactness step for a host that has an async hook.
+///
+/// [`Collector::collect`] is a synchronous `fn` the registry calls on whatever
+/// thread gathers — typically a runtime worker — so this samples through
+/// [`crate::McpServer::try_session_gauges`], which never blocks. A momentarily
+/// contended session map leaves the previous values in place (one scrape stale
+/// at worst), because the map was contended, not empty.
+struct SessionCollector {
+    live_sessions: IntGaugeVec,
+    active_sessions: IntGaugeVec,
+    servers: Vec<crate::McpServer>,
+}
+
+impl Collector for SessionCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        self.live_sessions.desc().into_iter().chain(self.active_sessions.desc()).collect()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        for server in &self.servers {
+            if let Some(g) = server.try_session_gauges() {
+                let name = server.instance().name;
+                self.live_sessions.with_label_values(&[name]).set(g.live as i64);
+                self.active_sessions.with_label_values(&[name]).set(g.active as i64);
+            }
+        }
+        self.live_sessions.collect().into_iter().chain(self.active_sessions.collect()).collect()
     }
 }
 
@@ -527,7 +594,9 @@ mod tests {
 
     /// `refresh` reads through to the server's session map. The gauges are
     /// poisoned first — a fresh server has no sessions, so only a refresh that
-    /// actually reached it can restore the zeros.
+    /// actually reached it can restore the zeros. Read straight off the gauges,
+    /// not through `encode`: gathering resamples them too, which would let this
+    /// pass with no refresh at all.
     #[tokio::test]
     async fn refresh_reads_through_to_a_server() {
         let r = Registry::new();
@@ -535,15 +604,64 @@ mod tests {
         m.live_sessions.with_label_values(&["prod"]).set(99);
         m.active_sessions.with_label_values(&["prod"]).set(42);
         m.refresh().await;
+        assert_eq!(m.live_sessions.with_label_values(&["prod"]).get(), 0);
+        assert_eq!(m.active_sessions.with_label_values(&["prod"]).get(), 0);
+    }
+
+    /// The regression this exists for: a host that only GATHERS its registry —
+    /// no `refresh` call anywhere, which is every embedder registering into a
+    /// registry the host application owns — must still see real session counts.
+    /// Before the gauges resampled themselves in `Collector::collect`, such a
+    /// deployment published the startup zero-fill forever, so a busy server was
+    /// indistinguishable from an idle one.
+    #[tokio::test]
+    async fn gathering_alone_publishes_the_session_counts() {
+        let r = Registry::new();
+        let s = server();
+        // Deliberately NOT kept as a `Metrics` the test could refresh through:
+        // gathering is the only thing that happens below.
+        let _m = Metrics::new(&r, "1.2.3", "abc1234", 0, &[&s]).unwrap();
+
+        // One redeemed grant, an hour out: live, and active because redeeming
+        // stamps `last_seen`.
+        let hour_out = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+            + 3_600_000_000_000;
+        s.identities.set_grant_expiration("sess", hour_out).await;
+
         let out = encode(&r);
         assert!(
-            out.contains(concat!(metric!("live_sessions"), r#"{ii_instance="prod"} 0"#)),
+            out.contains(concat!(metric!("live_sessions"), r#"{ii_instance="prod"} 1"#)),
             "{out}"
         );
         assert!(
-            out.contains(concat!(metric!("active_sessions"), r#"{ii_instance="prod"} 0"#)),
+            out.contains(concat!(metric!("active_sessions"), r#"{ii_instance="prod"} 1"#)),
             "{out}"
         );
+    }
+
+    /// Two gathers in a row keep reporting the same live session: the collector
+    /// resamples rather than draining anything.
+    #[tokio::test]
+    async fn repeated_gathers_stay_correct() {
+        let r = Registry::new();
+        let s = server();
+        let _m = Metrics::new(&r, "1.2.3", "abc1234", 0, &[&s]).unwrap();
+        let hour_out = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+            + 3_600_000_000_000;
+        s.identities.set_grant_expiration("sess", hour_out).await;
+        let (first, second) = (encode(&r), encode(&r));
+        for out in [&first, &second] {
+            assert!(
+                out.contains(concat!(metric!("live_sessions"), r#"{ii_instance="prod"} 1"#)),
+                "{out}"
+            );
+        }
     }
 
     /// With no servers, refresh is a harmless no-op.

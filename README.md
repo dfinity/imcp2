@@ -130,16 +130,23 @@ let app = app
     .layer(axum::middleware::from_fn_with_state(
         metrics.clone(), imcp2::metrics::write_request_metrics))
     .layer(axum::middleware::from_fn(imcp2::metrics::write_request_logs));
-// in your exposition path (or on a timer): metrics.refresh().await
+// Nothing else to wire: the session gauges resample themselves from the
+// `&[&server]` handles above whenever the registry is gathered. Pass the
+// SAME handles you serve (an `McpServer` clone shares its session map; a
+// separately built one has an empty map of its own). `metrics.refresh().await`
+// is optional — it makes one scrape exact under lock contention.
 ```
 
 Published as `imcp2_*`: request counts and a latency histogram (`route` and
 `method` labels are bounded — a label an outsider picks is a memory-exhaustion
 primitive; see the module docs), `live_sessions` / `active_sessions` per II
 instance (labelled `ii_instance`, because Prometheus's own `instance` target
-label renames a colliding exposed one to `exported_instance`), `build_info`, and
-process start time. `register_process_collector(&registry)` adds CPU/RSS/fd
-separately — un-namespaced `process_*` belongs to the application, not the crate.
+label renames a colliding exposed one to `exported_instance`, and recomputed
+from the served instances' session maps on every gather, so a host that only
+exposes its registry still publishes current counts rather than the startup
+zeros), `build_info`, and process start time.
+`register_process_collector(&registry)` adds CPU/RSS/fd separately —
+un-namespaced `process_*` belongs to the application, not the crate.
 
 The bundled binary serves `/metrics` only when `$MCP_SERVE_METRICS` is set: the
 native deployment sets it and has Caddy hide the path publicly; a PaaS deployment
