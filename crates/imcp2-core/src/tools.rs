@@ -291,7 +291,7 @@ impl IcCanisterTools {
         };
         let requested = Some(target.requested.clone());
         let origin = Some(target.origin.clone());
-        let (agent, acted_as) = match self
+        let agent = match self
             .resolve_agent(&ctx, Some(target.origin.as_str()), account.as_deref(), "reading the schema")
             .await
         {
@@ -333,11 +333,10 @@ impl IcCanisterTools {
                 example_queries.join("\n")
             ));
         }
-        blocks.push(format!("[{}]", identity_annotation(&target, acted_as.as_deref())));
+        blocks.push(format!("[{}]", identity_annotation(&target)));
         let output = calls::OqlSchemaOutput {
             canister_id,
             schema,
-            acted_as_principal: acted_as,
             derived_for_origin: origin,
             requested,
             is_anonymous,
@@ -442,13 +441,15 @@ impl IcCanisterTools {
         Ok(ok_structured(doc, &output))
     }
 
-    /// The agent to sign calls with for a request, and the principal it signs as:
-    /// the shared anonymous agent (principal `None`) when `origin` is `None`, else
-    /// one backed by a short-lived account delegation for that Internet Identity
-    /// derivation `origin`, derived on demand from this connection's standing
-    /// credential. `origin` must be a VALIDATED derivation origin: the canonical one
-    /// from [`resolve_identity_target`], which every caller here now passes
-    /// (canister_update_call, both of canister_query's paths, and
+    /// The agent to sign calls with for a request: the shared anonymous agent
+    /// when `origin` is `None`, else one backed by a short-lived account
+    /// delegation for that Internet Identity derivation `origin`, derived on
+    /// demand from this connection's standing credential. The principal it
+    /// signs as is deliberately NOT returned: routine replies no longer echo
+    /// the per-app principal (data minimization — get_app_principal returns it
+    /// on request). `origin` must be a VALIDATED derivation origin: the
+    /// canonical one from [`resolve_identity_target`], which every caller here
+    /// now passes (canister_update_call, both of canister_query's paths, and
     /// get_canister_oql_schema). (get_app_principal and
     /// list_app_accounts don't use this helper — they call
     /// `Identities::delegated_identity_for` / `list_accounts` directly with a
@@ -461,9 +462,9 @@ impl IcCanisterTools {
         origin: Option<&str>,
         account: Option<&str>,
         what: &str,
-    ) -> Result<(Agent, Option<String>), String> {
+    ) -> Result<Agent, String> {
         match origin {
-            None => Ok((self.agent.clone(), None)),
+            None => Ok(self.agent.clone()),
             Some(origin) => {
                 let session_id = self
                     .current_session_id(ctx)
@@ -472,13 +473,12 @@ impl IcCanisterTools {
                     .identities
                     .delegated_identity_for(&session_id, origin, account)
                     .await?;
-                let principal = delegated.sender().ok().map(|p| p.to_text());
                 // Clone the injected agent and swap in the delegated identity:
                 // authenticated calls ride the host's boundary-node routing,
                 // never a second hard-coded endpoint.
                 let mut agent = self.agent.clone();
                 agent.set_identity(delegated);
-                Ok((agent, principal))
+                Ok(agent)
             }
         }
     }
@@ -614,7 +614,7 @@ impl IcCanisterTools {
             Err(e) => return Ok(err(e)),
         };
         let origin = target.as_ref().map(|t| t.origin.as_str());
-        let (agent, acted_as_principal) = match self
+        let agent = match self
             .resolve_agent(&ctx, origin, account.as_deref(), "calling")
             .await
         {
@@ -633,12 +633,13 @@ impl IcCanisterTools {
         };
         let is_anonymous = target.is_none();
         // Keep the primary text block pure textual Candid (paste-able); surface the
-        // identity note (so a wrong-principal is visible to text-only clients) as a
-        // SEPARATE block rather than contaminating the reply.
+        // identity note (so a wrong-origin is visible to text-only clients) as a
+        // SEPARATE block rather than contaminating the reply. The note names the
+        // derivation origin, not the principal: routine replies don't echo the
+        // per-app principal (get_app_principal returns it on request).
         let mut blocks = vec![reply.clone()];
         if let Some(t) = &target {
-            let acted = acted_as_principal.as_deref().unwrap_or("<unknown>");
-            blocks.push(format!("[{}]", identity_annotation(t, Some(acted))));
+            blocks.push(format!("[{}]", identity_annotation(t)));
         }
         // The write's provenance, as its own block: which app's published manifest
         // declared this canister, and where that manifest was read from. A user
@@ -650,7 +651,7 @@ impl IcCanisterTools {
         ));
         let output = calls::CanisterUpdateCallOutput {
             canister_id, method, reply,
-            acted_as_principal, derived_for_origin, requested, derivation_origin_source,
+            derived_for_origin, requested, derivation_origin_source,
             is_anonymous,
             declared_by: declaration.origin,
             declared_at: declaration.path.to_string(),
@@ -758,7 +759,7 @@ impl IcCanisterTools {
             Err(e) => return Ok(err(e)),
         };
         let origin = target.as_ref().map(|t| t.origin.as_str());
-        let (agent, acted_as_principal) = match self
+        let agent = match self
             .resolve_agent(ctx, origin, account.as_deref(), "querying")
             .await
         {
@@ -790,8 +791,7 @@ impl IcCanisterTools {
             blocks.push(n.clone());
         }
         if let Some(t) = &target {
-            let acted = acted_as_principal.as_deref().unwrap_or("<unknown>");
-            blocks.push(format!("[{}]", identity_annotation(t, Some(acted))));
+            blocks.push(format!("[{}]", identity_annotation(t)));
         }
         let output = calls::CanisterQueryOutput {
             canister_id,
@@ -801,7 +801,6 @@ impl IcCanisterTools {
             columns: Vec::new(),
             rows: Vec::new(),
             has_more: false,
-            acted_as_principal,
             derived_for_origin,
             requested,
             derivation_origin_source,
@@ -849,14 +848,14 @@ impl IcCanisterTools {
         let requested = Some(target.requested.clone());
         let origin = Some(target.origin.clone());
         let derivation_origin_source = Some(target.source.clone());
-        let (agent, acted_as) = match self
+        let agent = match self
             .resolve_agent(ctx, Some(target.origin.as_str()), account.as_deref(), "querying")
             .await
         {
             Ok(a) => a,
             Err(e) => return Ok(err(e)),
         };
-        let identity_note = format!("[{}]", identity_annotation(&target, acted_as.as_deref()));
+        let identity_note = format!("[{}]", identity_annotation(&target));
         // An origin is required (rejected above if absent), so this is never anonymous.
         let is_anonymous = false;
         let reply = match calls::raw_call(&agent, principal, "execute", arg_bytes, true).await {
@@ -908,7 +907,6 @@ impl IcCanisterTools {
                     columns,
                     rows,
                     has_more,
-                    acted_as_principal: acted_as,
                     derived_for_origin: origin,
                     requested,
                     derivation_origin_source,
@@ -963,7 +961,6 @@ impl IcCanisterTools {
                     columns: Vec::new(),
                     rows: Vec::new(),
                     has_more: false,
-                    acted_as_principal: acted_as,
                     derived_for_origin: origin,
                     requested,
                     derivation_origin_source,
@@ -1013,7 +1010,7 @@ impl IcCanisterTools {
         // Surface a query-only session (H2) so the LLM won't attempt (and have the
         // IC reject at ingress) state-changing update calls.
         let read_only = self.identities.is_read_only(&session_id).await == Some(true);
-        let mut text = format!("{principal}\n\n[{}]", identity_annotation(&target, None));
+        let mut text = format!("{principal}\n\n[{}]", identity_annotation(&target));
         if read_only {
             text.push_str(
                 "\n\n(This Internet Identity session was authorized for \"Questions only\": reads work, \
@@ -1924,13 +1921,11 @@ fn clean_app_url(raw: &str) -> Result<String, String> {
 /// tools now that they take the canonical origin directly), and — whenever it
 /// differs from the derived origin (canonicalization, http→https, a stripped path)
 /// — the caller's `requested` value, so a requested≠derived mismatch stays visible
-/// in every client. `acted_as` prefixes the signed-as principal when known.
-fn identity_annotation(target: &IdentityTarget, acted_as: Option<&str>) -> String {
-    let mut s = String::new();
-    if let Some(p) = acted_as {
-        s.push_str(&format!("signed as {p} — "));
-    }
-    s.push_str(&format!("derived for {} (source: {})", target.origin, target.source));
+/// in every client. Deliberately names no principal: the origin is what carries
+/// the mismatch safeguard, and routine replies don't disclose the per-app
+/// principal (get_app_principal returns it on request).
+fn identity_annotation(target: &IdentityTarget) -> String {
+    let mut s = format!("derived for {} (source: {})", target.origin, target.source);
     if target.requested != target.origin {
         s.push_str(&format!("; requested {}", target.requested));
     }
@@ -2177,13 +2172,15 @@ fn format_canister_info(info: &discover::CanisterInfo) -> String {
 fn format_accounts(target: &IdentityTarget, accounts: &[identities::AccountInfo]) -> String {
     // A one-line derivation-origin header so a wrong origin (or requested≠derived
     // mismatch) is visible even to text-only clients.
-    let header = format!("Accounts {}", identity_annotation(target, None));
+    let header = format!("Accounts {}", identity_annotation(target));
     if accounts.is_empty() {
         return format!("{header}\n\nNo Internet Identity accounts found there.");
     }
     let mut out = format!("{header}\n\nYour accounts:\n");
     for a in accounts {
         // The default account (anchor's current default) has no name/number.
+        // Nothing beyond name/number is rendered: the listing exists to pick an
+        // account, so it carries no principals and no last-used timestamps.
         let label = match &a.name {
             Some(name) => format!("\"{name}\""),
             None => "(default account — no name)".to_string(),
@@ -2192,11 +2189,7 @@ fn format_accounts(target: &IdentityTarget, accounts: &[identities::AccountInfo]
             Some(n) => format!("account #{n}"),
             None => "default".to_string(),
         };
-        let last_used = a
-            .last_used
-            .map(|ns| format!(", last used {ns} ns since epoch"))
-            .unwrap_or_default();
-        out.push_str(&format!("- {label} [{number}{last_used}]\n"));
+        out.push_str(&format!("- {label} [{number}]\n"));
     }
     if accounts.len() == 1 {
         out.push_str(
@@ -3081,7 +3074,9 @@ mod tests {
     }
 
     // The human-readable identity annotation must surface a requested≠derived
-    // mismatch (and the source) in ALL clients.
+    // mismatch (and the source) in ALL clients — while never carrying a
+    // principal: the origin is the mismatch safeguard, and routine replies
+    // are kept free of per-app principals by design.
     #[test]
     fn identity_annotation_surfaces_mismatch_and_source() {
         // requested == origin: origin + source, but no redundant `requested` echo.
@@ -3090,7 +3085,7 @@ mod tests {
             requested: "https://nns.ic0.app".to_string(),
             source: "explicit".to_string(),
         };
-        let a = super::identity_annotation(&t, None);
+        let a = super::identity_annotation(&t);
         assert!(a.contains("derived for https://nns.ic0.app"), "{a}");
         assert!(a.contains("source: explicit"), "{a}");
         assert!(!a.contains("requested"), "no mismatch must not echo requested: {a}");
@@ -3101,9 +3096,9 @@ mod tests {
             requested: "https://app.example.com/some/path".to_string(),
             source: "explicit".to_string(),
         };
-        let a2 = super::identity_annotation(&t2, Some("aaaaa-aa"));
-        assert!(a2.contains("signed as aaaaa-aa"), "{a2}");
+        let a2 = super::identity_annotation(&t2);
         assert!(a2.contains("requested https://app.example.com/some/path"), "{a2}");
+        assert!(!a2.contains("signed as"), "the annotation must not carry a principal: {a2}");
     }
 
     // resolve_identity_target backs every identity-bearing path now — including

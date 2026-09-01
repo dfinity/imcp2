@@ -346,8 +346,6 @@ pub struct AccountInfo {
     pub account_number: Option<u64>,
     /// User-given account name — `None` for the default account.
     pub name: Option<String>,
-    /// When the account was last used (ns since the Unix epoch), if known.
-    pub last_used: Option<u64>,
 }
 
 /// Arguments for `get_app_principal`.
@@ -393,24 +391,21 @@ pub struct ListAccountsArgs {
     pub derivation_origin: String,
 }
 
-/// One account in the `list_app_accounts` MCP output.
+/// One account in the `list_app_accounts` MCP output. Deliberately carries no
+/// last-used timestamp and no principal: the name (and number) is all a caller
+/// needs to select an account, and the routine listing should not disclose
+/// more than that (get_app_principal returns the principal on request).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct AccountEntry {
     /// The user-given account name, or null for the default account.
     pub name: Option<String>,
     /// The II account number, or null for the default account.
     pub account_number: Option<u64>,
-    /// When the account was last used (ns since the Unix epoch), if known.
-    pub last_used: Option<u64>,
 }
 
 impl From<&AccountInfo> for AccountEntry {
     fn from(a: &AccountInfo) -> Self {
-        Self {
-            name: a.name.clone(),
-            account_number: a.account_number,
-            last_used: a.last_used,
-        }
+        Self { name: a.name.clone(), account_number: a.account_number }
     }
 }
 
@@ -831,11 +826,7 @@ impl Identities {
 
         Ok(accounts
             .into_iter()
-            .map(|a| AccountInfo {
-                account_number: a.account_number,
-                name: a.name,
-                last_used: a.last_used,
-            })
+            .map(|a| AccountInfo { account_number: a.account_number, name: a.name })
             .collect())
     }
 
@@ -1347,12 +1338,13 @@ struct McpRegisterV2Ok {
 type McpRegisterV2Reply = std::result::Result<McpRegisterV2Ok, String>;
 
 /// One of an anchor's accounts at an origin (II `AccountInfo`). Decoded by name,
-/// so field order is irrelevant and the wire record's `origin` field is skipped
-/// (we already know the origin we queried).
+/// so field order is irrelevant and the wire record's `origin` and `last_used`
+/// fields are skipped — the origin because we already know the one we queried,
+/// the last-used timestamp so it is dropped at the decode boundary and never
+/// carried into a tool reply (data minimization: the listing doesn't need it).
 #[derive(CandidType, Deserialize)]
 struct IiAccountInfo {
     account_number: Option<u64>,
-    last_used: Option<u64>,
     name: Option<String>,
 }
 
@@ -1861,8 +1853,10 @@ mod tests {
     }
 
     // Lock in the mcp_get_accounts Candid contract: a `vec AccountInfo` (with the
-    // full record incl. `origin`) decodes into our subset `IiAccountInfo` (origin
-    // skipped), and the Ok/Err variant maps to a Rust Result over the error type.
+    // full record incl. `origin` and `last_used`) decodes into our subset
+    // `IiAccountInfo` (origin and last_used skipped — the timestamp is dropped at
+    // the decode boundary by design), and the Ok/Err variant maps to a Rust
+    // Result over the error type.
     #[test]
     fn mcp_get_accounts_reply_decodes_account_records() {
         #[derive(CandidType)]
@@ -1887,10 +1881,11 @@ mod tests {
         // Default account (the anchor's current default): no number, no name.
         assert_eq!(decoded[0].account_number, None);
         assert_eq!(decoded[0].name, None);
-        // Named account: number, name, and last_used recovered (origin ignored).
+        // Named account: number and name recovered (origin and last_used ignored —
+        // `IiAccountInfo` deliberately declares neither, so the wire's timestamp
+        // never leaves the decoder).
         assert_eq!(decoded[1].account_number, Some(7));
         assert_eq!(decoded[1].name.as_deref(), Some("savings"));
-        assert_eq!(decoded[1].last_used, Some(123));
     }
 
     // II's `SignedDelegation` / `Delegation` Candid contract, mirrored so tests can

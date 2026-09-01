@@ -10,6 +10,16 @@ where a requirement matches Anthropic's, the same evidence applies.
 Verified against OpenAI's official docs on **2026-08-01**. The portal UI may
 add details not published in the docs.
 
+> **Server-state claims re-verified 2026-09-01.** Tool-surface numbers below
+> were regenerated from a live scan of a deployed instance of the current
+> build plus the code at `main` (the count is unit-pinned in
+> [`crates/imcp2-core/src/tools.rs`](../crates/imcp2-core/src/tools.rs)).
+> Production probes the same day found `mcp.internetcomputer.org` fronted by
+> Internet Computer HTTP-gateway infrastructure that forwards only the MCP
+> and OAuth paths — `/version`, `/status/` and, critically for this
+> submission, `/.well-known/openai-apps-challenge` answer with a redirect at
+> that edge. The rows and steps below that rely on them say so inline.
+
 ## Where and how submission happens
 
 - **Portal:** <https://platform.openai.com/plugins> (the plugin submission
@@ -54,10 +64,10 @@ add details not published in the docs.
 | Discovery documents (RFC 8414 AS metadata + RFC 9728 protected-resource) | ✅ all live, path-scoped + root fallback |
 | ChatGPT's callback `https://chatgpt.com/connector/oauth/{callback_id}` accepted | ✅ the redirect allow-list pins `("chatgpt.com", "/connector/oauth/")` as a prefix ([`src/auth.rs`](../src/auth.rs), `DEFAULT_ALLOWED_REDIRECTS`) |
 | No machine-to-machine grants (client credentials etc. unsupported by ChatGPT) | ✅ user-consent authorization-code flow only |
-| Tools explicitly annotated `readOnlyHint` / `destructiveHint` / `openWorldHint` — "incorrect or missing action labels are a common cause of rejection" | ✅ set on all 11 tools. The unit test enforces annotation presence and the `readOnlyHint`/`destructiveHint` values; `openWorldHint` is declared everywhere but not asserted by the test, so re-check it in the portal's Scan Tools step |
-| Tool names "human-readable, specific, and descriptive"; accurate descriptions; minimum-information requests | ✅ reviewed against the same bar for the Anthropic listing |
+| Tools explicitly annotated `readOnlyHint` / `destructiveHint` / `openWorldHint` — "incorrect or missing action labels are a common cause of rejection" | ✅ set on all 10 tools (9 read-only; the one write is `canister_update_call`). The unit test enforces annotation presence and the `readOnlyHint`/`destructiveHint` values; `openWorldHint` is declared everywhere but not asserted by the test, so re-check it in the portal's Scan Tools step |
+| Tool names "human-readable, specific, and descriptive"; accurate descriptions; minimum-information requests | ✅ reviewed against the same bar for the Anthropic listing. Replies are minimized to match: the account listing carries names and numbers only (no last-used timestamps), and no routine reply echoes the user's per-app principal — `get_app_principal` returns it on request |
 | "Tools should behave exactly as their names, descriptions, and inputs indicate"; "side effects should never be hidden or implicit" | ✅ each description states what the tool does, returns, and rejects; the financial-transactions policy is stated in the server-level instructions rather than in any description |
-| Descriptions explain when a tool applies, and must not attempt to manipulate the model: no unrelated behavioral instructions, no overly broad triggering, no preference over or interference with other plugins, no calls to unrelated external software, no hidden or obfuscated instructions | ✅ each description states what its tool does, returns, rejects, and requires — including the constraints a caller needs, such as `open_app`'s "do not construct a domain from the name" — while none of the five prohibited manipulations appears. A unit test (`model_readable_metadata_respects_marketplace_policy`) guards this across the server instructions, all 11 descriptions, and the argument and reply schemas — precisely: it rejects an enumerated set of phrasings (those that appeared here before, plus what review named) and, completely, any character outside a small allowlist, so no invisible character can ride along; judging a novel phrasing of a prohibited intent is human review's job, not the test's. `the_policy_gate_catches_what_it_lists` keeps it live from both sides, and `open_app_metadata_forbids_a_constructed_domain` pins the safeguard itself |
+| Descriptions explain when a tool applies, and must not attempt to manipulate the model: no unrelated behavioral instructions, no overly broad triggering, no preference over or interference with other plugins, no calls to unrelated external software, no hidden or obfuscated instructions | ✅ each description states what its tool does, returns, rejects, and requires — including the constraints a caller needs, such as `open_app`'s "do not construct a domain from the name" — while none of the five prohibited manipulations appears. A unit test (`model_readable_metadata_respects_marketplace_policy`) guards this across the server instructions, all 10 descriptions, and the argument and reply schemas — precisely: it rejects an enumerated set of phrasings (those that appeared here before, plus what review named) and, completely, any character outside a small allowlist, so no invisible character can ride along; judging a novel phrasing of a prohibited intent is human review's job, not the test's. `the_policy_gate_catches_what_it_lists` keeps it live from both sides, and `open_app_metadata_forbids_a_constructed_domain` pins the safeguard itself |
 | Required identifiers must not depend on the model guessing them | ✅ `open_app` refuses an unknown bare name, and refuse a URL that would need its own origin assumed as the derivation origin when that origin shows no Internet Computer evidence, rather than resolving a guess (an app that declares its derivation origin is taken at its declaration, so that path is not gated by the evidence probe — but a CROSS-origin declaration is accepted only when the declared origin authorizes this app in its `/.well-known/ii-alternative-origins`, and an unauthorized one is refused outright rather than falling back, so a declaration is not a way around the identity checks); the description and the `app` schema both say to pass the user's name unchanged and to pass only a user-supplied or officially sourced URL. The IC-evidence check is stated for what it is — evidence that a domain is served from the Internet Computer, not that it is the intended app |
 | Public HTTPS production endpoint, stable and complete ("trial or demo plugins will not be accepted") | ✅ production deployment |
 | Privacy policy disclosing "categories of personal data collected, purposes of use, categories of recipients, data retention timelines" | ✅ the rewritten policy matches these four required disclosures exactly; its one home is `https://internetcomputer.org/icp-mcp/privacy-policy/` (dfinity/internetcomputer-org#77 refreshes its text to the current draft, and the old mcp.internetcomputer.org URL permanently redirects there from the release that ships #165) |
@@ -73,19 +83,29 @@ if a reviewer reports a failure.
 
 ## Blockers and open items
 
-### 1. Domain-verification endpoint — implemented, awaits the token
+### 1. Domain-verification endpoint — implemented, but currently cut off by the gateway front
 
 The portal requires proving control of the host: an endpoint at
 `https://<host>/.well-known/openai-apps-challenge` must return **only** the
 verification token revealed during submission ("do not return JSON, a list of
-tokens, or multiple tokens"). The route is merged and deployed: it serves
-`$OPENAI_APPS_CHALLENGE_TOKEN` verbatim as `text/plain` (trimmed, so unit-file
-whitespace can't break OpenAI's exact-match check) and 404s while the variable
-is unset, so it is inert until a submission is in flight. When the portal
-reveals the token: set the **repository secret**
-`OPENAI_APPS_CHALLENGE_TOKEN` (Settings → Secrets and variables → Actions →
-Secrets, repository level — both deploy callers pass the same one) and
-deploy. Then have the portal run its check.
+tokens, or multiple tokens"). The route is merged and deployed in the app: it
+serves `$OPENAI_APPS_CHALLENGE_TOKEN` verbatim as `text/plain` (trimmed, so
+unit-file whitespace can't break OpenAI's exact-match check) and 404s while
+the variable is unset, so it is inert until a submission is in flight.
+
+**New blocker in front of it (2026-09-01):** the gateway front now serving
+`mcp.internetcomputer.org` forwards only the MCP and OAuth paths, and answers
+`/.well-known/openai-apps-challenge` with a redirect to the landing page —
+the app's route never sees the request, so the portal's exact-match check
+cannot pass today. Before submission-day: have the fronting layer forward
+this path to the application (it already forwards
+`/.well-known/oauth-*` and `/.well-known/ii-auth-callbacks`, so it is an
+allowlist entry, not a new mechanism).
+
+When the path is forwarded and the portal reveals the token: set the
+**repository secret** `OPENAI_APPS_CHALLENGE_TOKEN` (Settings → Secrets and
+variables → Actions → Secrets, repository level — both deploy callers pass
+the same one) and deploy. Then have the portal run its check.
 
 ### 2. Demo account (same tension as Anthropic, stricter wording)
 
@@ -210,7 +230,8 @@ Negative:
 
 - [ ] OpenAI Platform organization verified (business verification)
 - [ ] Submitter holds the Apps Management write permission
-- [ ] Production runs a release cut from current `main`: `curl https://mcp.internetcomputer.org/version` reports a commit that contains #153–#158 — verify immediately before submitting, since the deploy workflow also accepts older tags/SHAs (rollbacks), so a deployed challenge token alone does not prove the compliant build is live
+- [ ] Production runs a release cut from current `main`, containing #153–#158 — confirmed by the operators immediately before submitting (externally `/version` is cut off by the gateway front; on-host `curl localhost:8000/version`, or the deploy workflow's record). The check still matters: the deploy workflow also accepts older tags/SHAs (rollbacks), so a deployed challenge token alone does not prove the compliant build is live
+- [ ] Gateway front forwards `/.well-known/openai-apps-challenge` to the application (blocker 1 — today that path answers with a redirect at the edge, so the portal's check cannot reach the route)
 - [ ] Repository secret `OPENAI_APPS_CHALLENGE_TOKEN` set to the portal's token and deployed; `curl https://mcp.internetcomputer.org/.well-known/openai-apps-challenge` returns exactly the token (blocker 1 — the route is merged and deployed; it 404s until the variable is set, by design)
 - [x] Privacy policy live at `https://internetcomputer.org/icp-mcp/privacy-policy/`, its one home (dfinity/internetcomputer-org#77 refreshes its text to the current draft; the old mcp.internetcomputer.org URL redirects there from the release that ships #165)
 - [ ] Tools re-scanned in the portal after any server change; annotations verified in the scan

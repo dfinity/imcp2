@@ -10,6 +10,29 @@
 > release whenever the policy is republished (and update section 3 if the
 > hosting region ever changes). Operational and review notes are maintained
 > outside this repository.
+>
+> **Pending legal review (2026-09-01, #174):** two write-gate wording updates
+> below bring this source text up to #166's behaviour — every state-changing
+> call now fetches the target application's published declarations first.
+> They are the widened trigger "Websites you ask the Service to look up, or
+> act on" (section 2) and the action-reach clarification under "The
+> authorization is not restricted to particular applications". Both replace
+> legally reviewed sentences, so the served page must not be updated to them
+> until legal signs them off.
+>
+> **Hosting model to re-verify before the next republication (2026-09-01,
+> #122):** the public origin `mcp.internetcomputer.org` is now fronted by
+> Internet Computer HTTP-gateway infrastructure, which terminates TLS for
+> client connections (observed 2026-09-01: the origin resolves to
+> gateway-fleet addresses registered to DFINITY Stiftung and serves the
+> gateway fleet's certificate; only the MCP and OAuth paths reach the
+> application, other paths answer with redirects at that edge). Sections 2
+> ("Our hosting provider"), 3 and 5 still describe the application host alone
+> (Amazon Web Services in Frankfurt, our web server's logging posture, the
+> hosts' journal). Whether the application host itself moved, and what the
+> fronting layer logs and where, is operator knowledge this repository does
+> not hold — reconcile those sections with the operators and legal before
+> republishing.
 
 ---
 
@@ -86,8 +109,13 @@ rejects action requests; the restriction does not depend on the Service alone.
 **The authorization is not restricted to particular applications.** Whichever
 level you choose applies to any application your assistant is directed to: the
 Service derives a per-application identity on demand for whichever application
-is named at the time. Combined with a duration of up to 30 days, that is a
-broad credential, so choose the shortest duration that suits your task, and
+is named at the time. That describes the credential, not an unlimited reach
+for actions: an action that changes state reaches only an application whose
+operator has published the standard declaration naming the services it exposes
+(see "Websites you ask the Service to look up, or act on" in section 2), and
+it is signed with the identity derived for that application alone. Even so,
+combined with a duration of up to 30 days the authorization is a broad
+credential, so choose the shortest duration that suits your task, and
 revoke connections you are no longer using at
 [id.ai/manage/settings](https://id.ai/manage/settings).
 
@@ -189,9 +217,12 @@ retains, or publishes is governed by that application, not by this Privacy
 Policy, and may be publicly accessible. Actions that change state become part
 of that application's state on a public network.
 
-**Websites you ask the Service to look up.** When you ask it to find the
-application behind a web address, the Service fetches metadata from that
-address, which discloses the request to whoever runs that site.
+**Websites you ask the Service to look up, or act on.** When you ask it to
+find the application behind a web address, and again when you ask it to act
+at an application, the Service fetches metadata from that application's web
+address — for an action, the application's published service declarations
+and identity configuration, read before the action is submitted — which
+discloses the request to whoever runs that site.
 
 **A service DFINITY Foundation operates**: the public canister-metadata
 service at `dashboard.internetcomputer.org`.

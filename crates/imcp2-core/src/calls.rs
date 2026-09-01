@@ -73,10 +73,6 @@ pub struct OqlSchemaOutput {
     /// The entity/field/edge catalogue returned by `schema` (JSON text,
     /// pretty-printed when it parses).
     pub schema: String,
-    /// The principal the read was signed as — the user's account at the app, since
-    /// this read is always made as one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub acted_as_principal: Option<String>,
     /// The effective Internet Identity derivation origin used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_for_origin: Option<String>,
@@ -186,9 +182,6 @@ pub struct CanisterUpdateCallOutput {
     pub method: String,
     /// The decoded reply in textual Candid.
     pub reply: String,
-    /// The principal the call was signed as.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub acted_as_principal: Option<String>,
     /// When called as an app account: the effective Internet Identity derivation
     /// origin used.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -280,9 +273,6 @@ pub struct CanisterQueryOutput {
     /// (oql mode) true when more rows remain — re-query with a higher `offset` to page.
     #[serde(default)]
     pub has_more: bool,
-    /// The principal the query was signed as.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub acted_as_principal: Option<String>,
     /// When querying as an app account: the effective Internet Identity derivation
     /// origin used.
     #[serde(skip_serializing_if = "Option::is_none")]
