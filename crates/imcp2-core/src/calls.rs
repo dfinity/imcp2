@@ -55,7 +55,7 @@ pub struct OqlSchemaArgs {
     /// Canister principal that exposes the OQL surface (get_canister_candid reports
     /// `oql: true`).
     pub canister_id: String,
-    /// The app's derivation origin, from open_app or resolve_app. The schema is read as the
+    /// The app's derivation origin, from open_app. The schema is read as the
     /// user's account there, and this server does not read it anonymously.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
@@ -163,7 +163,7 @@ pub struct CanisterUpdateCallArgs {
     /// Given both, they must name the same app; a mismatch is refused.
     #[serde(default)]
     pub app_url: Option<String>,
-    /// The app's derivation origin, from open_app or resolve_app, to call as the user's
+    /// The app's derivation origin, from open_app, to call as the user's
     /// account there. Not the app's website URL. Omit to call anonymously.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
@@ -237,7 +237,7 @@ pub struct CanisterQueryArgs {
     /// returns the entity and field names. Requires `derivation_origin`.
     #[serde(default)]
     pub oql: Option<String>,
-    /// The app's derivation origin, from open_app or resolve_app, to read as the user's
+    /// The app's derivation origin, from open_app, to read as the user's
     /// account there. Not the app's website URL. Required for an OQL query; omit on a Candid
     /// query to read anonymously.
     #[serde(default, alias = "domain")]
@@ -813,7 +813,7 @@ pub fn oql_query_redirect(did: Option<&str>) -> Option<String> {
              for the JSON dialect (once), (2) `get_canister_oql_schema` for the entity and field \
              names, (3) call `canister_query` again with the `oql` argument (a JSON query object) \
              instead of `method`. This canister gates data by the caller's principal, so pass the \
-             app's `derivation_origin` (from open_app / resolve_app) — an anonymous read is rejected. \
+             app's `derivation_origin` (from open_app) — an anonymous read is rejected. \
              UPDATE calls (state changes) go through `canister_update_call`."
                 .to_string(),
         )
@@ -859,7 +859,7 @@ pub fn anonymous_empty_note(what: &str, add_hint: &str) -> String {
         "Read anonymously (as principal 2vxsx-fae) and {what} came back empty. This canister \
          gates data by the CALLER's principal, so empty here most likely means \"not authenticated \
          as your account\", NOT \"no data\". Re-run this exact call adding {add_hint} to read as \
-         your account — if you don't have it yet, open_app / resolve_app resolves it from the app's \
+         your account — if you don't have it yet, open_app resolves it from the app's \
          URL or name."
     )
 }

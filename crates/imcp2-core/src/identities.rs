@@ -353,7 +353,7 @@ pub struct AccountInfo {
 /// Arguments for `get_app_principal`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetPrincipalArgs {
-    /// The app's derivation origin, from open_app or resolve_app. This is the origin Internet
+    /// The app's derivation origin, from open_app. This is the origin Internet
     /// Identity derives the principal from, which is not always the app's website URL, and
     /// never an alternative-origins entry.
     #[serde(alias = "domain")]
@@ -386,7 +386,7 @@ pub struct PrincipalOutput {
 /// Arguments for `list_app_accounts`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListAccountsArgs {
-    /// The app's derivation origin, from open_app or resolve_app. This is the origin Internet
+    /// The app's derivation origin, from open_app. This is the origin Internet
     /// Identity derives the principal from, which is not always the app's website URL, and
     /// never an alternative-origins entry.
     #[serde(alias = "domain")]
@@ -425,38 +425,6 @@ pub struct AccountsOutput {
     pub derivation_origin_source: String,
     /// The user's accounts at that origin (empty if none).
     pub accounts: Vec<AccountEntry>,
-}
-
-/// Arguments for `resolve_app`.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ResolveAppArgs {
-    /// The app's URL, e.g. "https://opencloud.org". When the derivation origin has to be
-    /// assumed from this URL, an origin showing no sign of being an Internet Computer app is
-    /// refused, so a lookalike domain does not resolve.
-    pub app_url: String,
-}
-
-/// Structured output of `resolve_app`.
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct ResolveAppOutput {
-    /// The normalized application origin of `app_url`.
-    pub application_origin: String,
-    /// The Internet Identity derivation origin to use for this app — pass this
-    /// as `derivation_origin` to the identity tools.
-    pub derivation_origin: String,
-    /// How `derivation_origin` was determined: "declared" (the app published it), "known"
-    /// (from the built-in registry), or "app_url_default" (assumed to equal the app's own
-    /// origin, correct only for apps that pin no custom one).
-    pub derivation_origin_source: String,
-    /// Origins that the resolved derivation origin permits to derive against it. This is the
-    /// inverse relation, so the derivation origin does not follow from it. Read best-effort:
-    /// an empty list means none were read.
-    pub alternative_origins: Vec<String>,
-    /// Whether the app's origin showed evidence of being served from the Internet Computer.
-    /// Null unless the derivation origin had to be assumed.
-    pub application_is_ic: Option<bool>,
-    /// A human note, e.g. flagging that the derivation origin was assumed.
-    pub note: Option<String>,
 }
 
 #[derive(Clone)]

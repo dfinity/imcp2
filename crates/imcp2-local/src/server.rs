@@ -431,8 +431,8 @@ mod tests {
         let tools = client.list_all_tools().await.expect("tools/list");
         assert_eq!(
             tools.len(),
-            14,
-            "12 served core tools + authenticate + auth_status"
+            12,
+            "10 served core tools + authenticate + auth_status"
         );
         for expected in [
             "get_canister_candid",
