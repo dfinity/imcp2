@@ -9,6 +9,16 @@ deployment; paste and adapt them in the portal.
 Verified against the official docs on **2026-07-31**. The portal UI may add
 details (e.g. exact icon dimensions) not published in the docs.
 
+> **Server-state claims re-verified 2026-09-01.** Tool-surface numbers below
+> were regenerated from a live scan of a deployed instance of the current
+> build plus the code at `main` (the count is unit-pinned in
+> [`crates/imcp2-core/src/tools.rs`](../crates/imcp2-core/src/tools.rs),
+> `the_default_composition_defers_the_protocol_tools`). Production probes the
+> same day found `mcp.internetcomputer.org` now fronted by Internet Computer
+> HTTP-gateway infrastructure: `/mcp` and the OAuth discovery documents pass
+> through, but `/version` and `/status/` answer with a redirect at that edge —
+> the rows and steps below that relied on them say so inline.
+
 ## Where and how submission happens
 
 - **Portal:** <https://claude.ai/admin-settings/directory/submissions/new>
@@ -38,10 +48,11 @@ details (e.g. exact icon dimensions) not published in the docs.
 ## Readiness: requirements already met
 
 Transport and auth rows were verified against the live production
-deployment (2026-07-31). The tool-surface rows (annotations, counts, names,
-schemas) describe `main` — the build the next release deploys and the one
-under submission; the live pre-release build still serves the old surface
-(see blocker 4), so re-verify them against production after that release:
+deployment (2026-07-31, re-probed 2026-09-01). The tool-surface rows
+(annotations, counts, names, schemas) describe `main` — the build under
+submission — and match a live scan of a deployed instance of that build
+(2026-09-01); production's exact commit can no longer be read externally
+(see blocker 4), so have the operators confirm it before submitting:
 
 | Requirement | Status |
 |---|---|
@@ -51,16 +62,16 @@ under submission; the live pre-release build still serves the old surface
 | Claude's hosted callback `https://claude.ai/api/mcp/auth_callback` accepted | ✅ seeded in the redirect allow-list ([`src/auth.rs`](../src/auth.rs), `DEFAULT_ALLOWED_REDIRECTS`) |
 | Claude Code loopback redirects (RFC 8252) | ✅ loopback redirects are exempt from the hosted allow-list |
 | Discovery documents (RFC 8414 + RFC 9728, path-scoped + root fallback) | ✅ all four live, `WWW-Authenticate` on the 401 points at the resource metadata |
-| Every tool: `title` + `readOnlyHint`/`destructiveHint` (+ `idempotentHint`, `openWorldHint`) | ✅ on all 11 tools, enforced by a unit test ([`crates/imcp2-core/src/tools.rs`](../crates/imcp2-core/src/tools.rs)) |
-| No catch-all read/write tool; reads and writes are separate tools | ✅ 10 of the 11 tools are read-only; the one write is `canister_update_call`. |
-| Tool names ≤ 64 chars | ✅ longest on `main` (the build to submit) is 23 (`get_canister_oql_schema`); the live pre-release build's longest is 30 — both within the limit |
+| Every tool: `title` + `readOnlyHint`/`destructiveHint` (+ `idempotentHint`, `openWorldHint`) | ✅ on all 10 tools, enforced by a unit test ([`crates/imcp2-core/src/tools.rs`](../crates/imcp2-core/src/tools.rs)) |
+| No catch-all read/write tool; reads and writes are separate tools | ✅ 9 of the 10 tools are read-only; the one write is `canister_update_call`. |
+| Tool names ≤ 64 chars | ✅ longest is 23 (`get_canister_oql_schema`) |
 | `outputSchema` + structured content on every tool | ✅ enforced by a unit test |
 | Certificates from a recognized authority | ✅ Let's Encrypt via Caddy |
 | OAuth endpoint latency ≤ 10 s (discovery/registration/token) | ✅ all sub-second in probes |
 | Support channel | ✅ <mcp@dfinity.org> (shown on every error screen) |
 | Security-vulnerability reporting mechanism (a Software Directory Terms obligation) | ✅ [`SECURITY.md`](../SECURITY.md) → Hackenproof bug bounty |
 | Public documentation by publish date | ✅ this repo's README + the landing page at <https://internetcomputer.org/icp-mcp/> (its one home, maintained in dfinity/internetcomputer-org; `https://mcp.internetcomputer.org` permanently redirects there from the release that ships #165) |
-| Status/health visibility | ✅ <https://mcp.internetcomputer.org/status/> |
+| Status/health visibility | ⚠️ <https://mcp.internetcomputer.org/status/> is currently cut off: since the origin moved behind the gateway front it answers with a redirect to the landing page instead of the dashboard (observed 2026-09-01). Have the fronting layer forward `/status/` (and `/version`, which the dashboard and the health workflow read), or point the listing at a reachable status page, before submitting |
 
 Notes on auth mode: pure M2M `client_credentials` is unsupported by Claude
 (every connection needs a user in the loop) — IMCP2's user-consent flow via
@@ -199,7 +210,7 @@ arrives, answer with the posture above.
 
 Related point for the same step: the **model-readable metadata describes the
 surface and the constraints on using it, without attempting to manipulate
-Claude**. The server instructions, all 11 tool descriptions, and every
+Claude**. The server instructions, all 10 tool descriptions, and every
 argument and reply schema each say what their tool does, returns, rejects, and
 requires — the guidance a caller needs to use it correctly and safely, which
 both directories expect a description to carry, including `open_app`'s "do not
@@ -250,14 +261,21 @@ If that comes back, the fallback is a dedicated identity with a recovery
 phrase in the team vault and an account at a demo app. (No controlled canister or
 cycles balance is needed: the connector has no canister-management tools.)
 
-### 4. Production is behind `main`
+### 4. Production build can no longer be verified from outside
 
-The live server reports commit `bbf0844` (v0.1.1, tag
-`release-2026-08-18-0.1.1`), which predates the entire compliance chain
-(#153–#158): it still serves the old 26-tool surface rather than the
-current one. Cut a `release-*` tag from current `main` and deploy it BEFORE
-submitting — everything this document describes is `main`, not what is
-currently live.
+Production has been redeployed since this document first flagged it as
+behind `main` (it then reported `bbf0844`, v0.1.1, the old 26-tool surface):
+as of 2026-09-01 the live `/mcp` endpoint, the OAuth discovery documents,
+and the II callbacks document all match the current codebase's shape, and a
+deployed instance of the current build serves the 10-tool surface this
+document describes. What can NO longer be confirmed externally is the exact
+commit: `mcp.internetcomputer.org` now sits behind Internet Computer
+HTTP-gateway infrastructure that forwards only the MCP and OAuth paths, so
+`/version` answers with a redirect at that edge instead of the build report.
+Before submitting, have the operators confirm production runs a `release-*`
+tag cut from current `main` (on-host `curl localhost:8000/version`, or the
+deploy workflow's record) — or have the fronting layer forward `/version`
+again so the check works from anywhere.
 
 ### 5. Icon asset — ready
 
@@ -361,7 +379,7 @@ Paste-and-adapt; portal limits in parentheses.
 >    Every read-only tool works with any identity, because it reads public
 >    network state.
 > 2. On the consent screen pick a session duration and an access level:
->    "Questions only" exercises the 10 read-only-annotated tools; "Actions &
+>    "Questions only" exercises the 9 read-only-annotated tools; "Actions &
 >    questions" additionally allows state-changing calls
 >    (`canister_update_call`).
 > 3. Try the example prompts above. On a Questions-only session a
@@ -416,7 +434,7 @@ conversation beyond tool arguments and generates no media.
 - [ ] Privacy policy entered in the portal — enter `https://internetcomputer.org/icp-mcp/privacy-policy/`, the page's one home (live; dfinity/internetcomputer-org#77 refreshes its text to the current draft, and the old mcp.internetcomputer.org URL redirects there from the release that ships #165) (blocker 1)
 - [x] Financial-transactions acknowledgment is a clean yes (blocker 2): the server does not support financial transactions. No mcp-review reply is needed; if one arrives, answer with the stated posture. The first-party-API/data-handling question was NOT in the 2026-07-31 email: raise it with mcp-review only if the portal's data-handling options don't fit
 - [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — if a reviewer asks for a populated account, provision a demo-app account (no funding needed: there are no funding or canister-management tools)
-- [ ] `release-*` tag cut; `/version` on production shows the intended commit (blocker 4)
+- [ ] `release-*` tag cut; production confirmed to run the intended commit by the operators — externally `/version` is cut off by the gateway front, so the check is on-host or via the deploy workflow's record (blocker 4)
 - [x] Square PNG icon exported — `docs/assets/icp-logo-{1024,512}.png` (blocker 5)
 - [ ] Every tool exercised once by the submitter (portal asks you to confirm this; MCP Inspector or a custom connector in Claude both count)
 - [ ] Submitter has Owner / Directory-management access in DFINITY's Claude Team/Enterprise org
