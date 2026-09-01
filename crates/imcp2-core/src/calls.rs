@@ -190,6 +190,18 @@ pub struct CanisterUpdateCallArgs {
     /// Arguments in textual Candid syntax, e.g. `()` or `(record { owner = principal "..." })`.
     #[serde(default = "default_args")]
     pub args: String,
+    /// The website URL of the app that owns `canister_id` (e.g.
+    /// "https://app.example.com"), which open_app returns as `app_url`. An update
+    /// call is made only to a canister the app declares in its
+    /// service-discoverability manifest (`/.well-known/ic-architecture`), and this
+    /// is the origin that manifest is read from. Omitted, `derivation_origin` is
+    /// used as that origin instead, which is the same value when the app serves
+    /// its manifest at the origin it derives identities from. Given together with
+    /// `derivation_origin`, the two must belong to the same app: this app is
+    /// resolved to the derivation origin Internet Identity derives its users from,
+    /// and a mismatch is refused rather than signed.
+    #[serde(default)]
+    pub app_url: Option<String>,
     /// Call as the user's account at an app, identified by its exact canonical
     /// Internet Identity derivation origin — not necessarily the visible URL, and
     /// not an alternativeOrigins entry. open_app and resolve_app resolve an app
@@ -244,6 +256,16 @@ pub struct CanisterUpdateCallOutput {
     /// Always present so a text-only client can tell an anonymous call from an
     /// authenticated one.
     pub is_anonymous: bool,
+    /// The app origin whose service-discoverability manifest DECLARES this
+    /// canister — the app whose published manifest authorized this write. Always
+    /// present on a successful call: without a declaration the call is refused.
+    pub declared_by: String,
+    /// The well-known path that declaration was read from. Always
+    /// `/.well-known/ic-architecture`: it is the only document that authorizes a
+    /// write, so no other value can appear on a successful call. Echoed anyway, so
+    /// a reply says where the authorization came from rather than leaving it
+    /// implied.
+    pub declared_at: String,
 }
 
 /// Arguments for `canister_query` — a READ that runs EITHER a Candid `query` method

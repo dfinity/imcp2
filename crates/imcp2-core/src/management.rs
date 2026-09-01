@@ -315,6 +315,16 @@ async fn management_agent(ids: &Identities, session_id: &str) -> Result<(Agent, 
 
 /// A management-canister (`aaaaa-aa`) update call with the effective canister id
 /// set to the TARGET — the boundary node requires this for lifecycle methods.
+///
+/// NOTE — these writes do NOT go through the service-discoverability gate that
+/// `canister_update_call` runs (see [`crate::discoverability`]). That is correct
+/// as things stand: these tools act on the USER'S OWN canisters as their
+/// management principal, not on a third party's app, and an app manifest has
+/// nothing to say about them. It is also currently moot — [`crate::IcProtocolTools`]
+/// is not part of the served composition. If that group is ever composed back
+/// in, revisit whether any of it can reach a canister the user does not control;
+/// the gate's premise is that a write to someone else's app needs that app's
+/// published consent.
 async fn mgmt_call(
     agent: &Agent,
     target: Principal,

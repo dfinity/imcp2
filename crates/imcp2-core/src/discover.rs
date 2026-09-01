@@ -2,11 +2,13 @@
 //! Internet Computer, folding together the patterns we've seen across apps:
 //!
 //!   1. **App-declared metadata** (most authoritative — the app says so):
-//!      the `ic:canister-id` `<meta>` on `/ai-connect.html` (the App Connect
-//!      bridge page, spec §4.7/§6.1 — the app's MAIN backend), and the
-//!      `/.well-known/ic-app.json` manifest enumerating ALL the app's
-//!      canisters with roles (our proposed convention for the spec's deferred
-//!      §6.3 "multi-canister applications" — see README).
+//!      the `/.well-known/ic-architecture` manifest enumerating ALL the app's
+//!      canisters with roles — Layer 1 of the IC service-discoverability
+//!      protocol ([`SERVICE_DISCOVERABILITY_GUIDE`]) and the ONE signal the
+//!      update-call gate in `discoverability` keys on; and the legacy
+//!      `/.well-known/ic-app.json` manifest of the same shape (this server's
+//!      pre-protocol proposal, still read for DISCOVERY so the apps that adopted
+//!      it stay legible, though it no longer authorizes a write).
 //!   2. `x-ic-canister-id` response header — the frontend/asset canister. This
 //!      is the one universal signal (the HTTP gateway sets it).
 //!   3. a runtime config asset (`/env.json`) carrying `*canister_id*` keys —
@@ -36,10 +38,10 @@ use tokio::task::JoinSet;
 #[derive(Serialize, Clone, Debug)]
 pub struct Found {
     pub canister_id: String,
-    /// A human label if one was attached (App Connect role, env.json key,
+    /// A human label if one was attached (manifest role, env.json key,
     /// bundle constant name, or "frontend"); None for a bare bundle literal.
     pub label: Option<String>,
-    /// Where it was found: "ai-connect.html", "ic-app.json", "header",
+    /// Where it was found: "ic-architecture", "ic-app.json", "header",
     /// "env.json", "bundle:<LABEL>", "bundle".
     pub sources: Vec<String>,
     /// IC dashboard label (e.g. "ICP Ledger"), filled in when the id is a known
@@ -57,17 +59,20 @@ pub struct Found {
 pub struct DiscoveredCanister {
     /// The canister's principal id.
     pub canister_id: String,
-    /// A human label if one was attached (App Connect role, env.json key,
+    /// A human label if one was attached (manifest role, env.json key,
     /// bundle constant, or "frontend"); null for a bare bundle literal.
     pub label: Option<String>,
     /// IC dashboard label (e.g. "ICP Ledger"), when the id is a known canister.
     pub name: Option<String>,
     /// IC dashboard classification (e.g. "ledger"), when known.
     pub kind: Option<String>,
-    /// Where it was found: "ai-connect.html" (the App Connect page's declared
-    /// main canister), "ic-app.json" (the app's own canister manifest),
-    /// "header", "env.json", "bundle:<LABEL>", or "bundle". The first two are
-    /// declared by the app itself and are the most authoritative.
+    /// Where it was found: "ic-architecture" (the app's service-discoverability
+    /// manifest), "ic-app.json" (the same manifest at this server's legacy
+    /// pre-protocol path), "header", "env.json", "bundle:<LABEL>", or "bundle".
+    /// The first two are declared by the app itself and are the most
+    /// authoritative; only "ic-architecture" authorizes an update call, the
+    /// legacy path having been published under different terms (see
+    /// `discoverability`).
     pub sources: Vec<String>,
     /// Whether this canister exposes the OQL query surface — filled in for the
     /// app's OWN data canisters by a single Candid fetch during open_app /
@@ -116,7 +121,10 @@ impl From<&Found> for DiscoveredCanister {
 pub fn is_app_data_candidate(c: &DiscoveredCanister) -> bool {
     // Declared or mined as the app's own backend (not merely the gateway header).
     let app_owned = c.sources.iter().any(|s| {
-        s == "ai-connect.html" || s == "ic-app.json" || s == "env.json" || s.starts_with("bundle")
+        s == "ic-architecture"
+            || s == "ic-app.json"
+            || s == "env.json"
+            || s.starts_with("bundle")
     });
     // The frontend / asset canister: an explicit "frontend" label, or found ONLY
     // via the gateway `x-ic-canister-id` header.
@@ -197,135 +205,65 @@ fn canisters_from_env_json(text: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Pull `content` out of the first `<meta name="…">` tag with the given name,
-/// reading the RAW served markup — like an App Connect connector, we fetch the
-/// page and parse it, never executing its JavaScript (spec §6.1). Tolerates
-/// attribute order and single or double quotes.
-fn parse_meta(html: &str, name: &str) -> Option<String> {
-    let bytes = html.as_bytes();
-    let mut i = 0;
-    while i + 5 <= bytes.len() {
-        // Find the next `<meta` — tag names are ASCII-case-insensitive in HTML,
-        // so `<META`/`<Meta` count too.
-        if bytes[i] != b'<' || !bytes[i + 1..i + 5].eq_ignore_ascii_case(b"meta") {
-            i += 1;
-            continue;
-        }
-        let after = i + 5;
-        // Tag-name boundary: `<metadata …` (or any longer name) is not <meta>.
-        if !matches!(bytes.get(after), Some(b' ' | b'\t' | b'\n' | b'\r' | b'/' | b'>')) {
-            i = after;
-            continue;
-        }
-        let rest = &html[after..];
-        let Some(end) = rest.find('>') else {
-            // No '>' anywhere in the remainder — no complete tag can follow.
-            break;
-        };
-        let tag = &rest[..end];
-        if attr(tag, "name").as_deref() == Some(name) {
-            if let Some(content) = attr(tag, "content") {
-                return Some(content);
-            }
-        }
-        i = after + end;
-    }
-    None
-}
-
-/// A `key="value"` (or `key='value'`) attribute inside a tag body. Scans the
-/// tag left-to-right as a sequence of attributes, consuming each quoted value
-/// whole — so a key can never be matched inside another attribute's VALUE
-/// (e.g. `data="… name='x' …"`), `data-name` can never match `name` (names
-/// compare whole, ASCII-case-insensitively per HTML), and whitespace is
-/// tolerated around the `=`. Only quoted values are returned.
-fn attr(tag: &str, key: &str) -> Option<String> {
-    let bytes = tag.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Skip whitespace between attributes.
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        // Read one attribute name (stop at whitespace, '=', or a quote).
-        let name_start = i;
-        while i < bytes.len()
-            && !bytes[i].is_ascii_whitespace()
-            && bytes[i] != b'='
-            && bytes[i] != b'"'
-            && bytes[i] != b'\''
-        {
-            i += 1;
-        }
-        let name = &tag[name_start..i];
-        // Optional `= value`, with whitespace tolerated around the '='.
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i < bytes.len() && bytes[i] == b'=' {
-            i += 1;
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
-                // Quoted value: consume it whole (to the matching quote).
-                let quote = bytes[i];
-                let vstart = i + 1;
-                let mut j = vstart;
-                while j < bytes.len() && bytes[j] != quote {
-                    j += 1;
-                }
-                if j >= bytes.len() {
-                    return None; // unterminated quote — malformed tag, bail
-                }
-                if name.eq_ignore_ascii_case(key) {
-                    return Some(tag[vstart..j].to_string());
-                }
-                i = j + 1;
-            } else {
-                // Unquoted value: consume the token; never returned.
-                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-                    i += 1;
-                }
-            }
-        }
-        // Guarantee progress on stray bytes (e.g. a bare quote at name position).
-        if i == name_start {
-            i += 1;
-        }
-    }
-    None
-}
-
 /// Cap on how many manifest entries we honour — an app-declared list is small;
 /// this just bounds a hostile manifest.
 const MAX_MANIFEST_CANISTERS: usize = 100;
 
-/// The `/.well-known/ic-app.json` manifest — our proposed convention for App
-/// Connect's deferred §6.3 (multi-canister applications): the app itself
-/// enumerates ALL its canisters and their roles, so an agent doesn't have to
-/// mine them out of the frontend bundle. Unknown fields are ignored
-/// (forward-compatible); entries whose `id` isn't a valid principal are
-/// dropped downstream by `add`.
+/// The published guide to the Internet Computer **service-discoverability
+/// protocol** — what an app serves so an agent handed only its URL can work out
+/// the rest. Cited verbatim in the update-call refusal (see `discoverability`)
+/// so an app owner reading it knows exactly what to adopt, and in the tool
+/// descriptions so an agent can relay it.
+pub const SERVICE_DISCOVERABILITY_GUIDE: &str =
+    "https://docs.internetcomputer.org/guides/frontends/service-discoverability/";
+
+/// **Layer 1 of the protocol**: the canister manifest an app serves at its
+/// origin, enumerating every canister it comprises and each one's role. This is
+/// the signal the update-call gate keys on — publishing it is how an app opts
+/// into being operated by this connector. Extensionless by the IC's
+/// `.well-known` convention (compare `ic-domains`, `ii-alternative-origins`),
+/// even though the body is JSON.
+pub(crate) const ARCHITECTURE_PATH: &str = "/.well-known/ic-architecture";
+
+/// The manifest path this server proposed BEFORE the protocol was published, so
+/// an agent could enumerate a multi-canister app at all. Same document shape,
+/// plus a `derivation_origin` field the protocol moved to its own
+/// [`DERIVATION_ORIGIN_PATH`] file. Still read — at lower authority than
+/// [`ARCHITECTURE_PATH`] — so the apps that adopted the proposal keep working
+/// rather than being cut off the day the standard path landed.
+pub(crate) const LEGACY_MANIFEST_PATH: &str = "/.well-known/ic-app.json";
+
+/// **Layer 5 of the protocol**: the app's Internet Identity derivation origin,
+/// as one canonical `https://host` on a single line. An ABSENT file means "derive
+/// for the visible origin itself", which is why a 404 here is not an error.
+pub(crate) const DERIVATION_ORIGIN_PATH: &str = "/.well-known/ii-derivation-origin";
+
+/// The canister manifest an app serves about itself, at either
+/// [`ARCHITECTURE_PATH`] (the protocol) or [`LEGACY_MANIFEST_PATH`] (this
+/// server's pre-protocol proposal). One `serde` shape covers both: the documents
+/// are the same object, and unknown fields are ignored either way
+/// (forward-compatible per the spec's "unknown fields must be ignored"). Entries
+/// whose `id` isn't a valid principal are dropped downstream by `add` /
+/// [`manifest_canister_ids`].
 ///
 /// ```json
-/// { "derivation_origin": "https://<frontend-canister>.icp0.io",
+/// { "version": "1.0.0",
 ///   "canisters": [
-///     { "id": "aaaaa-…-cai", "role": "backend", "description": "orders API" },
-///     { "id": "bbbbb-…-cai", "role": "ledger" } ] }
+///     { "id": "aaaaa-…-cai", "name": "backend", "role": "the backend",
+///       "description": "orders API; call getApiDoc() first" },
+///     { "id": "bbbbb-…-cai", "name": "frontend", "role": "the frontend" } ] }
 /// ```
 ///
-/// The optional top-level `derivation_origin` is the app's own declaration of
-/// the Internet Identity derivation origin its frontends pin (via
-/// `derivationOrigin` + `/.well-known/ii-alternative-origins`). It is the ONLY
-/// authoritative way to learn a custom derivation origin: there is no reverse
-/// lookup from an app URL to it (the app's own alternative-origins file lists
-/// the inverse relation, and the frontend's `derivationOrigin` config is
-/// typically minified out of reach). When absent, a consumer must fall back to
-/// the application origin and say so.
+/// `derivation_origin` is the LEGACY document's top-level declaration of the
+/// Internet Identity derivation origin the app's frontends pin (via
+/// `derivationOrigin` + `/.well-known/ii-alternative-origins`). The protocol
+/// gives that its own file ([`DERIVATION_ORIGIN_PATH`]), which takes precedence;
+/// the field is still read here for the apps that shipped against the proposal.
+/// Either way it is the ONLY authoritative way to learn a custom derivation
+/// origin: there is no reverse lookup from an app URL to it (the app's own
+/// alternative-origins file lists the inverse relation, and the frontend's
+/// `derivationOrigin` config is typically minified out of reach). When neither
+/// is present, a consumer must fall back to the application origin and say so.
 #[derive(Deserialize)]
 struct AppManifest {
     #[serde(default)]
@@ -338,14 +276,22 @@ struct AppManifest {
 struct AppManifestEntry {
     #[serde(default)]
     id: String,
+    /// The protocol's short label for the canister ("backend", "frontend"). Used
+    /// as the display label when `role` is absent — untrusted app text either
+    /// way, so it goes through [`clean_label`].
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     role: Option<String>,
     #[serde(default)]
     description: Option<String>,
 }
 
-/// Extract `(canister_id, label)` pairs from an `/.well-known/ic-app.json`
-/// body; the label is "role — description", whichever parts are present.
+/// Extract `(canister_id, label)` pairs from a manifest body (either well-known
+/// path — the shape is identical). The label is "role — description", falling
+/// back to the protocol's `name` when no `role` is given, whichever parts are
+/// present. `role`/`name`/`description` are UNTRUSTED app text, so each is
+/// sanitized and length-capped by [`clean_label`] before it can reach a reply.
 fn canisters_from_app_manifest(text: &str) -> Vec<(String, Option<String>)> {
     let Ok(m) = serde_json::from_str::<AppManifest>(text) else {
         return Vec::new();
@@ -355,7 +301,16 @@ fn canisters_from_app_manifest(text: &str) -> Vec<(String, Option<String>)> {
         .filter(|e| !e.id.trim().is_empty())
         .take(MAX_MANIFEST_CANISTERS)
         .map(|e| {
-            let role = e.role.as_deref().map(clean_label).filter(|s| !s.is_empty());
+            // `role` is the descriptive field ("the backend"); `name` is the
+            // short handle ("backend"). Prefer the former, fall back to the
+            // latter, so a spec manifest that labels only with `name` still
+            // yields a label instead of a bare principal.
+            let role = e
+                .role
+                .as_deref()
+                .or(e.name.as_deref())
+                .map(clean_label)
+                .filter(|s| !s.is_empty());
             let desc = e.description.as_deref().map(clean_label).filter(|s| !s.is_empty());
             let label = match (role, desc) {
                 (Some(r), Some(d)) => Some(format!("{r} — {d}")),
@@ -366,6 +321,74 @@ fn canisters_from_app_manifest(text: &str) -> Vec<(String, Option<String>)> {
             (e.id.trim().to_string(), label)
         })
         .collect()
+}
+
+/// The gate's stricter view of a manifest body: `canisters` is REQUIRED here,
+/// where [`AppManifest`] defaults it. The difference matters only to the gate:
+/// discovery just wants whatever ids it can find, but the gate must not read a
+/// body that merely happens to be a JSON object (`{}`, an error envelope, some
+/// unrelated config) as "an app that publishes a manifest and declares nothing".
+/// Unknown fields are still ignored, as the protocol requires.
+#[derive(Deserialize)]
+struct StrictManifest {
+    canisters: Vec<AppManifestEntry>,
+}
+
+/// The canisters a manifest body declares, as the gate reads them.
+pub(crate) struct ManifestCanisters {
+    /// The declared ids, as validated principals.
+    pub ids: Vec<Principal>,
+    /// Entries past [`MAX_MANIFEST_CANISTERS`] that were not read at all. Carried
+    /// rather than dropped silently: entry 101 of an over-long manifest IS
+    /// declared by the app, so refusing it as "not declared" would be a false
+    /// statement about the app. The refusal reports the overflow instead.
+    pub omitted: usize,
+}
+
+/// Whether `p` is a CANISTER principal, which the protocol requires every
+/// manifest `id` to be ("`id` is required and must be a canister principal").
+/// Opaque ids are 10 bytes with the `0x01` type tag; that excludes user
+/// principals (29 bytes, `0x02`), the anonymous principal (1 byte, `0x04`) and —
+/// the one that matters here — the management canister `aaaaa-aa`, whose blob is
+/// EMPTY and which `Principal::from_text` otherwise accepts happily.
+///
+/// Enforcing the spec's own type rule is what keeps a manifest from declaring,
+/// and so authorizing a write to, something that is not an app canister at all.
+/// It is deliberately the spec's rule and not a policy list of our own: which
+/// canisters an app may legitimately declare is the app's business, but WHAT
+/// KIND of principal an `id` may be is the protocol's.
+fn is_canister_principal(p: &Principal) -> bool {
+    let bytes = p.as_slice();
+    bytes.len() == 10 && bytes.last() == Some(&0x01)
+}
+
+/// The canister ids a manifest body DECLARES, as validated principals — the
+/// authorization set the update-call gate checks a target against (see
+/// [`crate::discoverability`]). `None` when the body is not a manifest document
+/// at all (an SPA catch-all's HTML, a JSON array, an error envelope, an empty
+/// response), which is what lets the gate tell "this app publishes no manifest"
+/// apart from "it publishes one that doesn't list your canister" — two different
+/// things to tell an agent. An empty `ids` is a real, empty declaration.
+///
+/// Deliberately separate from [`canisters_from_app_manifest`]: that one feeds a
+/// human-readable discovery listing and keeps ids as the app spelled them,
+/// whereas a gate must compare PARSED principals, so two spellings of one id
+/// can't disagree with each other. Ids that aren't CANISTER principals (see
+/// [`is_canister_principal`]) are dropped, so a junk entry — or one naming the
+/// management canister — can never authorize anything.
+pub(crate) fn manifest_canister_ids(text: &str) -> Option<ManifestCanisters> {
+    let m = serde_json::from_str::<StrictManifest>(text).ok()?;
+    let omitted = m.canisters.len().saturating_sub(MAX_MANIFEST_CANISTERS);
+    Some(ManifestCanisters {
+        ids: m
+            .canisters
+            .into_iter()
+            .take(MAX_MANIFEST_CANISTERS)
+            .filter_map(|e| Principal::from_text(e.id.trim()).ok())
+            .filter(is_canister_principal)
+            .collect(),
+        omitted,
+    })
 }
 
 /// Reduce a raw origin string to a canonical bare `https://host[:port]` origin,
@@ -407,13 +430,62 @@ fn normalize_origin(raw: &str) -> Option<String> {
     Some(origin.ascii_serialization())
 }
 
-/// The app's declared Internet Identity derivation origin, from the manifest's
-/// optional top-level `derivation_origin`, reduced to a bare `https://host[:port]`
-/// origin (a scheme-less bare host is accepted and gets `https://`). `None` if
-/// absent, blank, an explicit non-https scheme, user-info, or not a parseable URL.
+/// The app's declared Internet Identity derivation origin, from the LEGACY
+/// manifest's optional top-level `derivation_origin`, reduced to a bare
+/// `https://host[:port]` origin (a scheme-less bare host is accepted and gets
+/// `https://`). `None` if absent, blank, an explicit non-https scheme, user-info,
+/// or not a parseable URL. The protocol's own Layer 5 file
+/// ([`parse_derivation_origin_file`]) takes precedence over this.
 fn declared_derivation_origin(manifest_text: &str) -> Option<String> {
     let m = serde_json::from_str::<AppManifest>(manifest_text).ok()?;
     normalize_origin(m.derivation_origin?.as_str())
+}
+
+/// Cap on how much of [`DERIVATION_ORIGIN_PATH`] we will look at. The protocol
+/// says the body is ONE origin on ONE line; anything longer is either an SPA
+/// catch-all's HTML or a hostile body, and neither deserves a parse.
+const MAX_DERIVATION_ORIGIN_LINE: usize = 512;
+
+/// Layer 5 of the protocol: the app's derivation origin as served at
+/// [`DERIVATION_ORIGIN_PATH`] — one canonical `https://host` on a single line.
+///
+/// The documented format is enforced rather than coerced (per review): exactly
+/// ONE non-empty line, capped at [`MAX_DERIVATION_ORIGIN_LINE`], carrying an
+/// EXPLICIT `https://` URL with no path, query, fragment or user-info. This file
+/// decides which principal the user acts as, and coercion is the wrong instinct
+/// for that: reading `example.com` as an origin, or quietly discarding the `/path`
+/// off a malformed line, would turn a file its author got wrong into an
+/// authoritative identity declaration — and the resulting wrong principal fails
+/// silently, as a call that simply isn't the user. Anything that is not the
+/// documented form reads as "declares nothing", which lands the app on its own
+/// visible origin: the safe default the protocol already specifies for an absent
+/// file.
+///
+/// It is also what makes the common misconfiguration harmless: an SPA catch-all
+/// answering this path with `index.html` yields `<!doctype html>`, not an origin.
+fn parse_derivation_origin_file(text: &str) -> Option<String> {
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let line = lines.next()?;
+    // A second non-empty line means this is not the documented one-line document,
+    // and guessing which line was meant is exactly the coercion above.
+    if lines.next().is_some() || line.len() > MAX_DERIVATION_ORIGIN_LINE {
+        return None;
+    }
+    // The form is an origin, so the scheme is written out — a bare host is not it.
+    if !line.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://")) {
+        return None;
+    }
+    let url = url::Url::parse(line).ok()?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return None;
+    }
+    let origin = url.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
 }
 
 /// Which origins Internet Identity permits to derive from this origin, from its
@@ -522,6 +594,31 @@ fn known_derivation_origin(host: &str) -> Option<&'static str> {
         .iter()
         .find(|(h, _)| *h == host)
         .map(|(_, origin)| *origin)
+}
+
+/// The built-in derivation origin for a well-known app URL, if any — the
+/// registry lookup for anything derived from a URL rather than from a static
+/// registry entry.
+///
+/// A NON-DEFAULT PORT never matches, even though the registry is keyed by host.
+/// `https://oisy.com:8443` is a DIFFERENT origin from `https://oisy.com`
+/// everywhere else in this codebase — Internet Identity derives a different
+/// principal for it, and `identities::target_origin` keeps the port rather than
+/// stripping it the way it strips `:443`. Letting the port fall out of the key
+/// would let whatever answers on another port of a registered host inherit that
+/// app's identity, and at the write gate
+/// ([`crate::discoverability::bind_identity`]) that is the whole comparison: a
+/// manifest served there would authorize a write signed as the user's principal
+/// at the real app. Dropping to `AppUrlDefault` instead makes the origin stand
+/// on its own — which, being a distinct origin, then fails the binding.
+///
+/// (Reaching that case at all needs control of the registered host, so this is
+/// closing the gap rather than a live break; raised in review.)
+fn known_derivation_origin_for_url(url: &url::Url) -> Option<&'static str> {
+    if url.port().is_some() {
+        return None;
+    }
+    known_derivation_origin(&url.host_str()?.to_ascii_lowercase())
 }
 
 /// A well-known IC app, for NAME → app resolution by the `icp_find_app_by_name`
@@ -677,6 +774,19 @@ async fn fetch_alternative_origins(origin: &str) -> Vec<String> {
     let origin = url.origin().ascii_serialization();
     match client.get(format!("{origin}/.well-known/ii-alternative-origins")).send().await {
         Ok(resp) if resp.status().is_success() => {
+            // This list AUTHORIZES: a cross-origin derivation-origin claim is
+            // accepted only because the declared origin names the app back here.
+            // A redirect target's answer is not that origin's statement, so it
+            // cannot grant the claim (per review). Empty is the fail-closed
+            // value every other failure here already returns.
+            if !answered_by(&resp, &origin) {
+                tracing::warn!(
+                    probed = %origin,
+                    served_from = %resp.url().origin().ascii_serialization(),
+                    "ignoring an ii-alternative-origins list served by a redirect target rather than the probed origin"
+                );
+                return Vec::new();
+            }
             parse_alternative_origins(&read_capped(resp, MAX_META_BYTES).await)
         }
         _ => Vec::new(),
@@ -711,8 +821,19 @@ fn header_is_ic_principal(headers: &reqwest::header::HeaderMap) -> bool {
 /// are canonical `Url::origin().ascii_serialization()` forms, so the compare is exact
 /// (host case- and default-port-normalized) rather than a host-only match.
 fn ic_evidence_from(resp: &reqwest::Response, expected_origin: &str) -> bool {
-    header_is_ic_principal(resp.headers())
-        && resp.url().origin().ascii_serialization() == expected_origin
+    header_is_ic_principal(resp.headers()) && answered_by(resp, expected_origin)
+}
+
+/// Whether `expected_origin` is the origin that actually answered, rather than a
+/// redirect target. Every well-known fetch in this module asks this before it
+/// treats a response as a statement BY the app it probed — the shared redirect
+/// policy refuses a cross-domain hop but permits same-host different-port hops
+/// and hops to global IP literals, so a 3xx can otherwise put another origin's
+/// bytes behind this app's name. Both sides are canonical
+/// `Url::origin().ascii_serialization()` forms, so the compare is exact (host
+/// case- and default-port-normalized) rather than a host-only match.
+fn answered_by(resp: &reqwest::Response, expected_origin: &str) -> bool {
+    resp.url().origin().ascii_serialization() == expected_origin
 }
 
 /// Resolve an app URL to its Internet Identity derivation context, WITHOUT
@@ -773,9 +894,29 @@ fn decide_declared_origin(
     ))
 }
 
-/// What the app's `/.well-known/ic-app.json` resolved to: its declared (and
-/// authorized) derivation origin or the application-origin default, whether the
-/// manifest response carried IC-hosting evidence (`x-ic-canister-id`), and — when
+/// The legacy manifest's `derivation_origin` field, once Layer 5 has answered
+/// without pinning one. `Ok(None)` is a real absence (no field, or nothing there
+/// to read); an unreachable probe is an `Err`, for the same reason Layer 5's is:
+/// the field might be there, and defaulting past it would derive the wrong
+/// principal for an app that pins a custom origin.
+fn declared_from_legacy(
+    legacy: &WellKnown,
+    application_origin: &str,
+) -> Result<Option<String>, String> {
+    match legacy {
+        WellKnown::Served(body) => Ok(declared_derivation_origin(body)),
+        WellKnown::Absent => Ok(None),
+        WellKnown::Unreachable(e) => Err(format!(
+            "could not read {LEGACY_MANIFEST_PATH} at {application_origin}: {e}. Refusing to \
+             assume this app derives against its own origin while a declaration it may publish is \
+             unreadable — this is likely transient, so retry."
+        )),
+    }
+}
+
+/// What the app's own derivation-origin declaration resolved to: its declared (and
+/// authorized) derivation origin or the application-origin default, whether either
+/// well-known probe carried IC-hosting evidence (`x-ic-canister-id`), and — when
 /// an accepted CROSS-origin declaration fetched them — that origin's alt-origins
 /// (reused for the display list so it isn't fetched twice).
 struct DeclaredResolution {
@@ -785,50 +926,189 @@ struct DeclaredResolution {
     alt_origins: Option<Vec<String>>,
 }
 
-impl DeclaredResolution {
-    /// The application-origin default (no usable declaration), carrying whatever
-    /// IC evidence the manifest response showed.
-    fn app_default(application_origin: &str, ic_evidence: bool) -> Self {
-        Self {
-            derivation_origin: application_origin.to_string(),
-            source: DerivationSource::AppUrlDefault,
+/// Cap on the Layer 5 body we buffer. The document is one line; this only has to
+/// be big enough to see the first line of whatever was served instead (an SPA
+/// catch-all's HTML), so a misconfigured app costs a few KiB, not a page.
+const MAX_DERIVATION_ORIGIN_BYTES: usize = 4 * 1024;
+
+/// One well-known probe's outcome on the IDENTITY path, where "the origin says
+/// this document is not there" and "we never got an answer" must not collapse
+/// into the same value: the first legitimately means "derive against the default"
+/// (Layer 5 specifies omitting the file), while the second means we do not know
+/// what the app declares — and defaulting on a timeout can derive, and sign as,
+/// the wrong principal.
+enum WellKnown {
+    /// A success response, with its (capped) body.
+    Served(String),
+    /// The origin said this document is NOT THERE — a 404 or 410, the only
+    /// statuses that mean it (see [`means_not_published`]). Every other
+    /// non-success status is `Unreachable`, not this: an origin declining or
+    /// failing to serve the path has not told us the app declares nothing.
+    Absent,
+    /// We could not find out. The exchange never completed (DNS, TLS, connect,
+    /// timeout, a body that died mid-read), or it completed with a status that
+    /// answers nothing (401/403, 429, 5xx…), or the document exceeded a cap that
+    /// its documented form does not bound.
+    Unreachable(String),
+}
+
+/// Fetch one `.well-known` document from the application origin, plus whether the
+/// exchange carried IC-hosting evidence. Every well-known probe on the identity
+/// path goes through here so the evidence capture, the success check, the origin
+/// pin, and the size cap can't drift apart between them.
+///
+/// A body is this origin's declaration only when THIS origin answered. The shared
+/// redirect policy refuses a cross-domain hop but permits same-host different-port
+/// hops and hops to global IP literals, so a 3xx could otherwise hand another
+/// origin's bytes to the identity path — and on Layer 5 those bytes decide which
+/// principal every call is signed as. [`fetch_declared_manifest`] already pins the
+/// manifest that way; this is the same rule on the path where getting it wrong is
+/// worse (per review). A redirected answer is `Unreachable`, not `Absent`: `Absent`
+/// means "the app declares nothing, derive against the default", and a document we
+/// deliberately ignored is not a document the app does not have.
+async fn fetch_well_known(
+    client: &reqwest::Client,
+    application_origin: &str,
+    path: &str,
+    max_bytes: usize,
+    overflow: Overflow,
+) -> (WellKnown, bool) {
+    let resp = match client.get(format!("{application_origin}{path}")).send().await {
+        Ok(resp) => resp,
+        Err(e) => return (WellKnown::Unreachable(e.to_string()), false),
+    };
+    // Captured even on a NON-success response: the IC HTTP gateway stamps
+    // `x-ic-canister-id` on everything it serves, 404s included, so an app that
+    // simply doesn't publish this document still proves it is IC-hosted here.
+    let ic_evidence = ic_evidence_from(&resp, application_origin);
+    // The origin pin comes FIRST, before the status is read as an answer at all:
+    // a 404 from a redirect target is that origin saying the document is not
+    // there, which is not the probed app declaring nothing (per review — the
+    // first cut of this check ran after the status and turned exactly that into
+    // an `Absent`, i.e. "derive against the default"). Nothing a foreign origin
+    // says about this path is an answer about this app.
+    if !answered_by(&resp, application_origin) {
+        let served_from = resp.url().origin().ascii_serialization();
+        tracing::warn!(
+            probed = %application_origin,
+            served_from = %served_from,
+            path,
+            "ignoring a well-known response served by a redirect target rather than the probed origin"
+        );
+        return (
+            WellKnown::Unreachable(format!(
+                "{path} was answered by {served_from}, not the origin that was probed"
+            )),
             ic_evidence,
-            alt_origins: None,
-        }
+        );
+    }
+    let status = resp.status();
+    if !status.is_success() {
+        // Only a definitive "not here" may mean the app declares nothing. A 429
+        // or 5xx during an outage would otherwise fall through to the legacy
+        // field or the application-origin default and sign as a different
+        // principal (per review).
+        return if means_not_published(status) {
+            (WellKnown::Absent, ic_evidence)
+        } else {
+            (WellKnown::Unreachable(format!("HTTP {status}")), ic_evidence)
+        };
+    }
+    match read_capped_strict(resp, max_bytes).await {
+        StrictRead::Body(body) => (WellKnown::Served(body), ic_evidence),
+        StrictRead::TooLarge => match overflow {
+            Overflow::NotTheDocument => (WellKnown::Absent, ic_evidence),
+            Overflow::Unknown => (
+                WellKnown::Unreachable(format!(
+                    "document is larger than the {max_bytes}-byte limit this server reads"
+                )),
+                ic_evidence,
+            ),
+        },
+        // A body that died mid-read is not a document that says nothing.
+        StrictRead::Failed(e) => (WellKnown::Unreachable(e), ic_evidence),
     }
 }
 
-/// Resolve the app's declared derivation origin from `/.well-known/ic-app.json`,
-/// authorizing a cross-origin claim against the declared origin's own
-/// `ii-alternative-origins` (the browser/II rule; the decision is
-/// [`decide_declared_origin`]). Flat, with early guards. A missing/unsuccessful/
-/// undeclared manifest legitimately yields the application-origin default (the app
-/// derives against its own origin).
+/// Resolve the app's declared derivation origin, authorizing a cross-origin claim
+/// against the declared origin's own `ii-alternative-origins` (the browser/II
+/// rule; the decision is [`decide_declared_origin`]). A declaration the app
+/// ANSWERED without providing — a 404 or 410, or a document that is not the one
+/// specified — legitimately yields the application-origin default (the app
+/// derives against its own origin); for Layer 5 that is not merely tolerated but
+/// SPECIFIED: "if you use the default, you may omit the file". A probe that did
+/// not complete is an `Err` instead: a declaration we could not read is not a
+/// declaration that is absent, and defaulting past it would derive — and sign as
+/// — a principal the app does not pin.
+///
+/// Two sources, in protocol order: the standard [`DERIVATION_ORIGIN_PATH`] file
+/// wins, and the legacy manifest's top-level `derivation_origin` fills in for the
+/// apps that shipped against this server's pre-protocol proposal. They are
+/// fetched CONCURRENTLY, so honouring both costs one round trip rather than two
+/// and an app that adopts the protocol is never the slower path.
 ///
 /// A cross-origin claim that CANNOT be authorized is an `Err`, not a silent
 /// fall-back: falling back to the application origin there would derive the WRONG
 /// principal for an app that deliberately pins a custom derivation origin (and
 /// would mask a spoof, a misconfiguration, or an unreachable `ii-alternative-origins`).
 /// Surfacing it lets the caller refuse rather than act as an unintended identity
-/// (ICPBB-430). The manifest response doubles as IC-hosting evidence, captured for
-/// the caller's later gate.
+/// (ICPBB-430). Both responses double as IC-hosting evidence, captured for the
+/// caller's later gate.
 async fn resolve_declared_origin(
     client: &reqwest::Client,
     application_origin: &str,
 ) -> Result<DeclaredResolution, String> {
-    let Ok(resp) = client
-        .get(format!("{application_origin}/.well-known/ic-app.json"))
-        .send()
-        .await
-    else {
-        return Ok(DeclaredResolution::app_default(application_origin, false));
+    let ((layer5, layer5_is_ic), (legacy, legacy_is_ic)) = tokio::join!(
+        fetch_well_known(
+            client,
+            application_origin,
+            DERIVATION_ORIGIN_PATH,
+            MAX_DERIVATION_ORIGIN_BYTES,
+            // One canonical origin on one line cannot exceed this cap, so a body
+            // that does is not the Layer 5 document at all.
+            Overflow::NotTheDocument,
+        ),
+        fetch_well_known(
+            client,
+            application_origin,
+            LEGACY_MANIFEST_PATH,
+            MAX_META_BYTES,
+            Overflow::Unknown,
+        ),
+    );
+    // Either probe reaching the origin and showing the gateway header is enough:
+    // the question is whether THIS origin is IC-served, not which path answered.
+    let ic_evidence = layer5_is_ic || legacy_is_ic;
+    // Precedence only means something if the higher-priority probe actually
+    // ANSWERED. A Layer 5 file we failed to fetch is not "no Layer 5 file": using
+    // the legacy field, or the application-origin default, because a request timed
+    // out would silently derive a different principal than the app pins — and
+    // this connector would sign as it. So an unreachable probe is an error, not a
+    // fallback, at each step: refusing is recoverable (the caller retries), while
+    // acting as the wrong identity is not. Both probes hit the same origin through
+    // the same client, so in practice an unreachable one means the origin is down
+    // rather than that this costs a reachable app anything.
+    let declared = match &layer5 {
+        WellKnown::Served(body) => match parse_derivation_origin_file(body) {
+            // Layer 5 answered and pinned an origin: legacy cannot override it,
+            // and its own outcome no longer matters.
+            Some(origin) => Some(origin),
+            // Answered, but not with a usable origin (the SPA catch-all serves
+            // index.html here): the legacy field may still carry one.
+            None => declared_from_legacy(&legacy, application_origin)?,
+        },
+        // The origin says there is no Layer 5 file — which the protocol
+        // SPECIFIES as "derive against the default" — so the legacy field is the
+        // only remaining source.
+        WellKnown::Absent => declared_from_legacy(&legacy, application_origin)?,
+        WellKnown::Unreachable(e) => {
+            return Err(format!(
+                "could not read {DERIVATION_ORIGIN_PATH} at {application_origin}: {e}. Refusing to \
+                 derive an identity from a lower-priority source while the app's own declaration \
+                 is unknown — this is likely transient, so retry."
+            ))
+        }
     };
-    let ic_evidence = ic_evidence_from(&resp, application_origin);
-    if !resp.status().is_success() {
-        return Ok(DeclaredResolution::app_default(application_origin, ic_evidence));
-    }
-    let text = read_capped(resp, MAX_META_BYTES).await;
-    let declared = declared_derivation_origin(&text);
 
     // The declared origin's ii-alternative-origins is the authorization list, and
     // only a CROSS-origin claim needs it — no declaration and a self-declaration
@@ -883,15 +1163,15 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
     let client = site_client(&host, &pinned)?;
     let application_origin = base_url.origin().ascii_serialization();
 
-    // Declared derivation origin from the app's manifest. The manifest response
-    // also doubles as IC-ness evidence: the IC HTTP gateway stamps
+    // Declared derivation origin from the app's own declaration — the protocol's
+    // /.well-known/ii-derivation-origin, else the legacy manifest's field. Those
+    // responses also double as IC-ness evidence: the IC HTTP gateway stamps
     // `x-ic-canister-id` (a canister principal) on every response it serves
     // (including 404s), so capture it here — value-validated AND attributed to this
     // origin (not a redirect target), not just present — before any fallback decision.
-    // Resolve (and, for a cross-origin claim, authorize) the app's declared
-    // derivation origin from its manifest — see [`resolve_declared_origin`]. The
-    // alt-origins of an accepted cross-origin declaration are reused for the
-    // display list below so it isn't fetched twice.
+    // Resolve (and, for a cross-origin claim, authorize) the declaration — see
+    // [`resolve_declared_origin`]. The alt-origins of an accepted cross-origin
+    // declaration are reused for the display list below so it isn't fetched twice.
     let resolved = resolve_declared_origin(&client, &application_origin).await?;
     let mut derivation_origin = resolved.derivation_origin;
     let mut derivation_origin_source = resolved.source;
@@ -902,7 +1182,7 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
     // well-known custom-derivation-origin apps (the app's own declaration always
     // wins, so this only fills the gap for apps that haven't shipped one yet).
     if derivation_origin_source == DerivationSource::AppUrlDefault {
-        if let Some(known) = known_derivation_origin(&host) {
+        if let Some(known) = known_derivation_origin_for_url(&base_url) {
             derivation_origin = known.to_string();
             derivation_origin_source = DerivationSource::Known;
         }
@@ -968,11 +1248,9 @@ pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Resu
 /// the host IS a registered known-app host (nothing to repair) or resembles no
 /// known app. Offline (registry lookup only).
 pub fn similar_known_app(app_url: &str) -> Option<AppMatch> {
-    let host = url::Url::parse(&normalize(app_url))
-        .ok()?
-        .host_str()?
-        .to_ascii_lowercase();
-    if known_derivation_origin(&host).is_some() {
+    let url = url::Url::parse(&normalize(app_url)).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if known_derivation_origin_for_url(&url).is_some() {
         return None; // a real known-app host — not a lookalike
     }
     // Token-window alias matching (see find_known_app): "multidex.com" tokenizes
@@ -1226,13 +1504,72 @@ fn site_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, Stri
 // per-file value only decides how deep into one file we can see.
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024; // one document (HTML, one JS file)
 const MAX_ENV_JSON_BYTES: usize = 256 * 1024; // /env.json is tiny in practice
-const MAX_META_BYTES: usize = 256 * 1024; // ai-connect.html head / ic-app.json manifest
+const MAX_META_BYTES: usize = 256 * 1024; // a small well-known metadata document
 const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024; // aggregate bundle text mined for ids
 
 /// Read up to `max` bytes of a response body, then stop — dropping the response
 /// (and so the connection) rather than draining the remainder. Best-effort: a
 /// mid-stream error just returns what we have (discovery is opportunistic).
-async fn read_capped(mut resp: reqwest::Response, max: usize) -> String {
+async fn read_capped(resp: reqwest::Response, max: usize) -> String {
+    // Fail-soft by design here: for the discovery crawl a half-read body is
+    // still worth mining, and there is no verdict riding on it.
+    read_capped_inner(resp, max).await.unwrap_or_else(|(partial, _)| partial)
+}
+
+/// [`read_capped`] for the callers that draw a CONCLUSION from the body, where a
+/// truncated read must not pass as a complete one (per review). A connection that
+/// drops mid-body would otherwise hand the gate a partial document, which parses
+/// as "not a manifest" and becomes the permanent "publishes no manifest; stop
+/// retrying" verdict — a false statement about an app that may serve a perfectly
+/// good manifest. Hitting the size cap is NOT an error: that is a bounded read
+/// this server chose, not a failed one.
+async fn read_capped_strict(resp: reqwest::Response, max: usize) -> StrictRead {
+    // Read ONE byte past the cap so overflow is DETECTABLE (per review): a
+    // truncated body is not a shorter document, and letting it through would draw
+    // a conclusion from bytes we chose not to read — a manifest over the cap
+    // parsing as "not JSON", or a Layer 5 file hiding a second non-empty line past
+    // it and slipping the one-line rule. What overflow MEANS differs by document,
+    // so that judgement belongs to the caller rather than here.
+    match read_capped_inner(resp, max + 1).await {
+        Ok(body) if body.len() > max => StrictRead::TooLarge,
+        Ok(body) => StrictRead::Body(body),
+        Err((_, e)) => StrictRead::Failed(e),
+    }
+}
+
+/// The outcome of a strict read, with overflow kept apart from failure because
+/// they license different conclusions.
+enum StrictRead {
+    Body(String),
+    /// More bytes arrived than the cap allows. For a document with a size-bounded
+    /// FORM — the one-line Layer 5 file — this is positive evidence that what was
+    /// served is not that document. For an open-ended one (a JSON manifest) it
+    /// only means we could not read it all.
+    TooLarge,
+    /// The transfer failed part-way.
+    Failed(String),
+}
+
+/// What an over-cap body means for a particular well-known document.
+#[derive(Clone, Copy)]
+enum Overflow {
+    /// The document's form bounds its size, so an over-cap body is NOT it: the
+    /// app declares nothing here. An SPA catch-all's index.html at the Layer 5
+    /// path is the live case — OISY serves exactly that, and treating it as a
+    /// failed check would refuse to resolve a perfectly healthy app.
+    NotTheDocument,
+    /// The document has no size bound of its own, so an over-cap body is a read
+    /// we could not finish, not a verdict.
+    Unknown,
+}
+
+/// The shared read. `Err((partial, error))` carries what had arrived before the
+/// transfer failed, so the fail-soft caller can keep it and the strict one can
+/// report the failure.
+async fn read_capped_inner(
+    mut resp: reqwest::Response,
+    max: usize,
+) -> Result<String, (String, String)> {
     let mut buf: Vec<u8> = Vec::new();
     loop {
         if buf.len() >= max {
@@ -1247,10 +1584,231 @@ async fn read_capped(mut resp: reqwest::Response, max: usize) -> String {
                 }
             }
             Ok(None) => break,
-            Err(_) => break,
+            Err(e) => {
+                return Err((String::from_utf8_lossy(&buf).into_owned(), e.to_string()))
+            }
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// GET `url` and return up to `max` bytes of its body, distinguishing "this app
+/// does not publish this document" (`Ok(None)`) from "we could not find out"
+/// (`Err`). The discovery crawl doesn't need that distinction, but the
+/// update-call gate does: the first becomes a refusal telling the app's operators
+/// to publish a manifest and the agent to stop retrying, so only a status that
+/// really means "not here" may produce it. A 404 or 410 does. A 429 or a 5xx does
+/// NOT — an overloaded origin would otherwise be reported as an app that has not
+/// adopted the protocol (per review) — and neither does any other non-success
+/// status: a 403 on the path is the origin declining to say, not saying no.
+/// Folding "send, check status, read capped" into one future is also what lets
+/// callers `join!` several probes.
+/// Whether a non-success status is the origin saying "this document is not here"
+/// — the only answer that may become a verdict on the app — or merely a failure
+/// to find out. Kept separate from the fetch so the rule can be pinned without a
+/// network (see the tests).
+fn means_not_published(status: reqwest::StatusCode) -> bool {
+    matches!(status, reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE)
+}
+
+async fn get_document(
+    client: &reqwest::Client,
+    url: &str,
+    max: usize,
+) -> Result<Option<FetchedDocument>, String> {
+    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        return if means_not_published(status) {
+            Ok(None)
+        } else {
+            Err(format!("HTTP {status}"))
+        };
+    }
+    // Captured BEFORE the body is consumed: which origin actually answered (a
+    // redirect may have moved it) and what it claimed to be.
+    let served_from = resp.url().origin().ascii_serialization();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        // The essence only, lowercased: `application/json; charset=utf-8` and
+        // `application/json` are the same claim.
+        .map(|v| v.split(';').next().unwrap_or(v).trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    // A manifest has no bounded form, so an over-cap body is "could not read",
+    // never "publishes none": refusing to conclude is the honest outcome.
+    let body = match read_capped_strict(resp, max).await {
+        StrictRead::Body(body) => body,
+        StrictRead::TooLarge => {
+            return Err(format!("document is larger than the {max}-byte limit this server reads"))
+        }
+        StrictRead::Failed(e) => return Err(e),
+    };
+    Ok(Some(FetchedDocument { served_from, content_type, body }))
+}
+
+/// One fetched well-known document, plus the facts a gate needs about HOW it
+/// arrived rather than only its bytes: which origin answered (so a redirect
+/// cannot let one origin borrow another's declaration) and what the response
+/// claimed to be (so a refusal can name an SPA catch-all by its signature
+/// instead of reporting a document that is right there as absent).
+pub(crate) struct FetchedDocument {
+    pub served_from: String,
+    pub content_type: String,
+    pub body: String,
+}
+
+/// [`get_document`] for the opportunistic discovery probes, where a missing
+/// document and an unreachable one are the same thing: no findings either way.
+///
+/// Discards a document a REDIRECT TARGET answered with. Discovery does not
+/// authorize anything, but it does attribute what it finds — a manifest read
+/// here is reported as declared by this app at the protocol path, the top
+/// authority tier, and the model picks a canister on that basis. A 3xx would
+/// otherwise let one origin's manifest be published under another's name, which
+/// is the same true-looking-but-wrong provenance [`fetch_declared_manifest`]
+/// pins against (per review).
+async fn fetch_success_body(client: &reqwest::Client, url: &str, max: usize) -> Option<String> {
+    let probed = url::Url::parse(url).ok()?.origin().ascii_serialization();
+    let doc = get_document(client, url, max).await.ok().flatten()?;
+    if doc.served_from != probed {
+        tracing::warn!(
+            probed = %probed,
+            served_from = %doc.served_from,
+            "ignoring a discovery document served by a redirect target rather than the probed origin"
+        );
+        return None;
+    }
+    Some(doc.body)
+}
+
+/// An app's own declaration of the canisters it comprises, as read from its
+/// origin — what the update-call gate checks a write target against.
+pub(crate) struct DeclaredManifest {
+    /// The origin the manifest was served from (canonical `https://host[:port]`).
+    pub origin: String,
+    /// Which well-known path served it: [`ARCHITECTURE_PATH`] for the manifest
+    /// that authorizes a write, [`LEGACY_MANIFEST_PATH`] for the pre-protocol
+    /// document, which is carried only to explain a refusal.
+    pub path: &'static str,
+    /// The declared canisters, as validated principals. May legitimately be
+    /// empty: an app can publish a manifest that lists nothing.
+    pub canisters: Vec<Principal>,
+    /// Declared entries past [`MAX_MANIFEST_CANISTERS`] that were not read (see
+    /// [`ManifestCanisters::omitted`]).
+    pub omitted: usize,
+}
+
+/// The outcome of probing an app origin for its canister manifest.
+pub(crate) enum ManifestProbe {
+    /// The PROTOCOL manifest was served at [`ARCHITECTURE_PATH`] and parsed —
+    /// the only document that can authorize a write.
+    Declared(DeclaredManifest),
+    /// No protocol manifest at this origin.
+    Absent {
+        /// What the PROTOCOL path answered with, when it answered 2xx with
+        /// something that is not a manifest. `Some("text/html")` is the exact
+        /// signature of the SPA catch-all the protocol guide calls out as the
+        /// most common failure, and naming it turns "your app publishes nothing"
+        /// into a refusal its operator can act on from a relayed transcript.
+        served_non_manifest: Option<String>,
+        /// The pre-protocol document, when the origin still serves one at
+        /// [`LEGACY_MANIFEST_PATH`]. It does NOT authorize anything; it is
+        /// carried so a refusal can tell an early adopter what changed and what
+        /// to publish, rather than reporting their app as publishing nothing.
+        legacy: Option<DeclaredManifest>,
+    },
+}
+
+/// Fetch the service-discoverability manifest an app declares at `app_url`'s
+/// ORIGIN. Only [`ARCHITECTURE_PATH`] yields [`ManifestProbe::Declared`]:
+/// publishing there is the act that opts an app in under this connector's terms,
+/// and the operators who adopted this server's pre-protocol
+/// [`LEGACY_MANIFEST_PATH`] proposal never made that statement. The legacy
+/// document is still read, and returned alongside the absence, purely so a
+/// refusal can tell an early adopter what changed. `Err` when the origin could
+/// not be reached at all, or the URL itself is refused by the SSRF guard, so the
+/// caller can say "unknown" rather than "not adopted".
+///
+/// A document is only honoured when it came from the origin we PROBED, not from
+/// a redirect target. The shared redirect policy already refuses a cross-domain
+/// hop, but it permits same-host different-port hops and hops to global IP
+/// literals — so without this check an origin could serve a 3xx and have another
+/// origin's declaration attributed to it, making the `declared_by` provenance the
+/// caller is shown a true-looking but wrong statement.
+///
+/// Both paths are probed CONCURRENTLY: one round trip, and an app that has
+/// adopted the protocol is never the slower path. The same SSRF-pinned client and
+/// capped reads as the rest of this module — `app_url` is caller-controlled.
+pub(crate) async fn fetch_declared_manifest(app_url: &str) -> Result<ManifestProbe, String> {
+    let base = normalize(app_url);
+    let (base_url, pinned) = resolve_public_url(&base).await?;
+    let host = base_url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let client = site_client(&host, &pinned)?;
+    // Well-known paths live at the ORIGIN, never under whatever path the caller's
+    // URL carried (https://x.com/app must still probe https://x.com/.well-known/…).
+    let origin = base_url.origin().ascii_serialization();
+    let (architecture_url, legacy_url) =
+        (format!("{origin}{ARCHITECTURE_PATH}"), format!("{origin}{LEGACY_MANIFEST_PATH}"));
+    let (architecture, legacy) = tokio::join!(
+        get_document(&client, &architecture_url, MAX_META_BYTES),
+        get_document(&client, &legacy_url, MAX_META_BYTES),
+    );
+    // Only the standard path can authorize, so only ITS failure is fatal: without
+    // an answer there we cannot tell "publishes no manifest" from "we could not
+    // ask", and the first of those is a verdict on the app that tells the agent to
+    // stop retrying. A legacy probe that failed costs nothing — it can only enrich
+    // a refusal that is happening anyway.
+    if let Err(e) = &architecture {
+        return Err(format!("could not read {ARCHITECTURE_PATH} at {origin}: {e}"));
+    }
+    let mut served_non_manifest = None;
+    let (mut declared, mut legacy_declared) = (None, None);
+    for (path, doc) in [(ARCHITECTURE_PATH, &architecture), (LEGACY_MANIFEST_PATH, &legacy)] {
+        let Ok(Some(doc)) = doc else { continue };
+        if doc.served_from != origin {
+            tracing::warn!(
+                probed = %origin,
+                served_from = %doc.served_from,
+                path,
+                "ignoring a manifest served by a redirect target rather than the probed origin"
+            );
+            continue;
+        }
+        let Some(canisters) = manifest_canister_ids(&doc.body) else {
+            // Answered, but not with a manifest. Remember what the PROTOCOL path
+            // claimed to be so the refusal can name the misconfiguration.
+            if path == ARCHITECTURE_PATH && served_non_manifest.is_none() {
+                served_non_manifest = Some(doc.content_type.clone());
+            }
+            continue;
+        };
+        let parsed = DeclaredManifest {
+            origin: origin.clone(),
+            path,
+            canisters: canisters.ids,
+            omitted: canisters.omitted,
+        };
+        if path == ARCHITECTURE_PATH {
+            declared = Some(parsed);
+        } else {
+            legacy_declared = Some(parsed);
+        }
+    }
+    if let Some(m) = declared {
+        return Ok(ManifestProbe::Declared(m));
+    }
+    if legacy_declared.is_some() {
+        // The population still on the pre-protocol path is what says whether
+        // that document can eventually stop being read at all, so make each one
+        // visible in the server's own logs rather than inferring it later.
+        tracing::warn!(
+            origin = %origin,
+            "origin publishes only the LEGACY manifest; it does not authorize writes"
+        );
+    }
+    Ok(ManifestProbe::Absent { served_non_manifest, legacy: legacy_declared })
 }
 
 /// Accumulator for discovered canister ids, with a hard ceiling on the number of
@@ -1332,8 +1890,8 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
     let client = site_client(&host, &pinned)?;
     // Well-known paths and root-relative script paths live at the ORIGIN, not
     // under whatever path the caller's URL carried (e.g. https://x.com/app must
-    // probe https://x.com/ai-connect.html) — only the initial page fetch below
-    // uses the URL as given.
+    // probe https://x.com/.well-known/ic-architecture) — only the initial page
+    // fetch below uses the URL as given.
     let origin = base_url.origin().ascii_serialization();
 
     let mut found = Findings::default();
@@ -1343,37 +1901,40 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
     // probed FIRST so its labels win `add`'s first-label-wins rule (a
     // single-canister app's id would otherwise keep the header's generic
     // "frontend" label instead of the declared one).
-    //   a. The App Connect bridge page's ic:canister-id meta: the app's MAIN
-    //      backend (spec §4.7/§6.1). Read from raw markup, no JS execution.
-    //      An SPA catch-all serving index.html here fails closed: no such
-    //      meta, no finding.
-    //   b. /.well-known/ic-app.json: the app's own canister manifest with
-    //      roles (proposed convention for the spec's deferred §6.3). A
-    //      catch-all HTML response fails JSON parsing → no findings.
-    if let Ok(resp) = client.get(format!("{origin}/ai-connect.html")).send().await {
-        if resp.status().is_success() {
-            let page = read_capped(resp, MAX_META_BYTES).await;
-            if let Some(id) = parse_meta(&page, "ic:canister-id") {
-                found.add(
-                    id.trim(),
-                    Some("main backend (App Connect)".into()),
-                    "ai-connect.html".into(),
-                );
-            }
-        }
-    }
-    if let Ok(resp) = client.get(format!("{origin}/.well-known/ic-app.json")).send().await {
-        if resp.status().is_success() {
-            let text = read_capped(resp, MAX_META_BYTES).await;
-            for (id, label) in canisters_from_app_manifest(&text) {
-                found.add(&id, label, "ic-app.json".into());
-            }
+    //   a. /.well-known/ic-architecture: the app's canister manifest with roles
+    //      — Layer 1 of the service-discoverability protocol, and the ONLY
+    //      source that authorizes an update call (see `discoverability`).
+    //   b. /.well-known/ic-app.json: the same manifest at this server's legacy
+    //      pre-protocol path, still read so early adopters keep working.
+    // Both fail closed on a catch-all HTML response — JSON parsing yields no
+    // findings.
+    //
+    // The two run CONCURRENTLY: they are independent GETs against one origin,
+    // and serializing them would put two round trips on the front of every
+    // discovery. Their findings are recorded in authority order afterwards, so
+    // `add`'s first-label-wins rule still resolves ties deterministically rather
+    // than by whichever response happened to land first.
+    let (architecture_url, legacy_url) = (
+        format!("{origin}{ARCHITECTURE_PATH}"),
+        format!("{origin}{LEGACY_MANIFEST_PATH}"),
+    );
+    let (architecture, legacy_manifest) = tokio::join!(
+        fetch_success_body(&client, &architecture_url, MAX_META_BYTES),
+        fetch_success_body(&client, &legacy_url, MAX_META_BYTES),
+    );
+    for (source, body) in [
+        ("ic-architecture", &architecture),
+        ("ic-app.json", &legacy_manifest),
+    ] {
+        let Some(text) = body.as_deref() else { continue };
+        for (id, label) in canisters_from_app_manifest(text) {
+            found.add(&id, label, source.into());
         }
     }
 
     // 2. Frontend via the gateway header (and keep the HTML for bundle mining).
-    // This is also the reachability gate: the two probes above are best-effort,
-    // but an unreachable base is a hard error.
+    // This is also the reachability gate: the probes above are best-effort, but
+    // an unreachable base is a hard error.
     let resp = client
         .get(&base)
         .send()
@@ -1449,12 +2010,12 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
         found.add(m.as_str(), None, "bundle".into());
     }
 
-    // Order: app-declared metadata first (App Connect main, then the manifest
-    // siblings), then header (frontend), env.json, labelled bundle, bare.
+    // Order: app-declared metadata first (the protocol manifest, then its
+    // legacy sibling), then header (frontend), env.json, labelled bundle, bare.
     // Authority tier of a finding (lower = more authoritative). Kept as a helper
     // so the sort can compare it without cloning `canister_id` into a key.
     let rank = |f: &Found| {
-        if f.sources.iter().any(|s| s == "ai-connect.html") {
+        if f.sources.iter().any(|s| s == "ic-architecture") {
             0
         } else if f.sources.iter().any(|s| s == "ic-app.json") {
             1
@@ -1844,9 +2405,10 @@ pub struct OpenAppArgs {
     /// so a wrong-TLD guess repairs to the canonical URL; an explicit `https://…`
     /// URL is resolved as given. Two refusals: an unknown bare name is refused with
     /// instructions for finding the real URL, and a URL that would need its own
-    /// origin assumed as the derivation origin (no usable declaration was read — a
-    /// failed or non-success fetch, malformed JSON and an unusable declaration all
-    /// count — and no registry entry) is refused when that origin shows no
+    /// origin assumed as the derivation origin (the app answered but no usable
+    /// declaration was read — a 404 or 410, malformed JSON, or a declaration this
+    /// server cannot use; a probe that did not complete is an error rather than an
+    /// assumption — and no registry entry) is refused when that origin shows no
     /// Internet-Computer evidence — and that
     /// evidence shows a domain is served from the Internet Computer, not that it
     /// belongs to the app the user meant.
@@ -2166,7 +2728,7 @@ mod tests {
         // Authority-ordered, as discover() produces: labelled tiers first, then
         // a long tail of bare bundle literals.
         let mut found = vec![
-            mk(0, Some("main backend (App Connect)"), "ai-connect.html"),
+            mk(0, Some("backend — main canister"), "ic-architecture"),
             mk(1, Some("frontend"), "header"),
             mk(2, Some("IC_BACKEND_CANISTER_ID"), "bundle:IC_BACKEND_CANISTER_ID"),
         ];
@@ -2387,64 +2949,6 @@ mod tests {
         assert_eq!(got[0].1, "backend_canister_id");
     }
 
-    // App Connect discovery metadata (spec §4.7/§6.1): the ic:canister-id meta
-    // is read from the RAW markup, tolerating attribute order and quote style;
-    // an SPA catch-all page without the meta yields nothing.
-    #[test]
-    fn parse_meta_reads_app_connect_canister_id() {
-        // The shipped ai-connect.html shape (name first, double quotes).
-        let page = r#"<!doctype html><html><head><meta charset="utf-8">
-            <meta name="ic:canister-id" content="dmp3l-2yaaa-aaaae-aamva-cai">
-            <title>Connect</title></head><body></body></html>"#;
-        assert_eq!(
-            parse_meta(page, "ic:canister-id").as_deref(),
-            Some("dmp3l-2yaaa-aaaae-aamva-cai")
-        );
-        // Attribute order flipped + single quotes.
-        let flipped = r#"<meta content='aaaaa-aa' name='ic:canister-id'>"#;
-        assert_eq!(parse_meta(flipped, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
-        // Other metas don't match; absent meta yields None.
-        let other = r#"<meta name="viewport" content="width=device-width">"#;
-        assert_eq!(parse_meta(other, "ic:canister-id"), None);
-        assert_eq!(parse_meta("<html>no metas</html>", "ic:canister-id"), None);
-        // The right meta is found among several.
-        let multi = format!("{other}\n<meta name=\"ic:network\" content=\"ic\">\n{flipped}");
-        assert_eq!(parse_meta(&multi, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
-        assert_eq!(parse_meta(&multi, "ic:network").as_deref(), Some("ic"));
-        // Attribute boundaries (per review): `data-name` must NOT match `name`,
-        // and whitespace around `=` is legal HTML that must still parse.
-        let trap = r#"<meta data-name="ic:canister-id" content="evil-id">"#;
-        assert_eq!(parse_meta(trap, "ic:canister-id"), None, "data-name must not match name");
-        let spaced = r#"<meta name = "ic:canister-id" content =  "aaaaa-aa">"#;
-        assert_eq!(parse_meta(spaced, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
-        // Both shapes on one tag: the boundary-checked real `name` wins.
-        let both = r#"<meta data-name="decoy" name="ic:canister-id" content="aaaaa-aa">"#;
-        assert_eq!(parse_meta(both, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
-        // An unquoted value is not accepted (we only read the quoted shape).
-        assert_eq!(attr("name=bare content=\"x\"", "name"), None);
-        // Tag-name boundary (per review): `<metadata …>` is not a <meta> tag,
-        // and must not shadow a real meta that follows it.
-        let metadata = r#"<metadata name="ic:canister-id" content="evil-id">"#;
-        assert_eq!(parse_meta(metadata, "ic:canister-id"), None, "<metadata> must not match");
-        let after = format!("{metadata}\n<meta name=\"ic:canister-id\" content=\"aaaaa-aa\">");
-        assert_eq!(parse_meta(&after, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
-        // A malformed, never-closed `<meta` can't panic or loop; it just ends
-        // the scan (no '>' remains, so no complete tag can follow anyway).
-        assert_eq!(parse_meta("<meta name=\"ic:canister-id\" content=\"x\"", "ic:canister-id"), None);
-        // A key inside another attribute's quoted VALUE must not match (per
-        // review): the tokenizer consumes values whole, so `name=…` embedded in
-        // `data="…"` is invisible, and the tag's REAL name attribute is used.
-        let embedded = r#"<meta data="junk name='ic:canister-id' content='evil'" name="viewport" content="w">"#;
-        assert_eq!(parse_meta(embedded, "ic:canister-id"), None, "key inside a value must not match");
-        assert_eq!(attr(r#"data="x name='inner' y" name="real""#, "name").as_deref(), Some("real"));
-        // HTML tag and attribute names are ASCII-case-insensitive (per review):
-        // <META NAME=… CONTENT=…> parses; a mixed-case <MetaData> still doesn't.
-        let upper = r#"<META NAME="ic:canister-id" CONTENT="aaaaa-aa">"#;
-        assert_eq!(parse_meta(upper, "ic:canister-id").as_deref(), Some("aaaaa-aa"));
-        let mixed_decoy = r#"<MetaData name="ic:canister-id" content="evil">"#;
-        assert_eq!(parse_meta(mixed_decoy, "ic:canister-id"), None, "<MetaData> must not match");
-    }
-
     // App-declared labels must win over the header's generic "frontend" for the
     // SAME canister (single-canister apps): `add` keeps the FIRST label, so
     // discover() probes the declared metadata before the header. This pins the
@@ -2453,11 +2957,11 @@ mod tests {
     fn add_keeps_first_label_so_declared_probes_run_first() {
         let mut found = Findings::default();
         let id = "dmp3l-2yaaa-aaaae-aamva-cai";
-        found.add(id, Some("main backend (App Connect)".into()), "ai-connect.html".into());
+        found.add(id, Some("backend — main canister".into()), "ic-architecture".into());
         found.add(id, Some("frontend".into()), "header".into());
         let f = &found.map[id];
-        assert_eq!(f.label.as_deref(), Some("main backend (App Connect)"));
-        assert_eq!(f.sources, vec!["ai-connect.html", "header"], "both provenances kept");
+        assert_eq!(f.label.as_deref(), Some("backend — main canister"));
+        assert_eq!(f.sources, vec!["ic-architecture", "header"], "both provenances kept");
     }
 
     // The proposed /.well-known/ic-app.json manifest: entries yield (id, label)
@@ -2506,6 +3010,187 @@ mod tests {
         assert!(!label.chars().any(char::is_control), "control chars must be gone: {label:?}");
         let long = format!(r#"{{"canisters":[{{"id":"aaaaa-aa","role":"{}"}}]}}"#, "x".repeat(1000));
         assert!(canisters_from_app_manifest(&long)[0].1.as_deref().unwrap().len() <= 120);
+    }
+
+    // The protocol's `name` labels a canister when no `role` is given, so a
+    // spec-shaped manifest (which uses both) still yields a readable label
+    // instead of a bare principal.
+    #[test]
+    fn manifest_labels_fall_back_to_the_protocol_name() {
+        // The example from the service-discoverability guide, verbatim.
+        let spec = r#"{
+          "version": "1.0.0",
+          "canisters": [
+            {"id": "hcv4s-uaaaa-aaabq-qaaba-cai", "name": "frontend", "role": "the frontend"},
+            {"id": "hmxr2-pqaaa-aaabq-qaaaa-cai", "name": "backend", "role": "the backend",
+             "description": "orders + inventory API; call getApiDoc() first"}
+          ]
+        }"#;
+        let got = canisters_from_app_manifest(spec);
+        assert_eq!(got[0].1.as_deref(), Some("the frontend"), "role wins over name");
+        assert_eq!(
+            got[1].1.as_deref(),
+            Some("the backend — orders + inventory API; call getApiDoc() first")
+        );
+        // `name` alone still labels the entry (role absent).
+        let name_only = r#"{"canisters":[{"id":"aaaaa-aa","name":"backend"}]}"#;
+        assert_eq!(canisters_from_app_manifest(name_only)[0].1.as_deref(), Some("backend"));
+        // …and it is sanitized like every other untrusted manifest string.
+        let sneaky = "{\"canisters\":[{\"id\":\"aaaaa-aa\",\"name\":\"ok\\u001b[31mEVIL\"}]}";
+        let label = canisters_from_app_manifest(sneaky)[0].1.clone().unwrap();
+        assert!(!label.chars().any(char::is_control), "{label:?}");
+    }
+
+    // The GATE's view of a manifest: `None` means "not a manifest document at
+    // all", which is what lets a refusal say "this app publishes none" instead of
+    // "it declares nothing". The distinction is not academic — the SPA catch-all
+    // that answers /.well-known/* with index.html (the failure the protocol guide
+    // calls out as the most common one) is exactly the case that must land in
+    // `None`, and it answers 200, so status alone would not catch it.
+    #[test]
+    fn manifest_canister_ids_are_parsed_principals_and_fail_closed() {
+        let manifest = r#"{
+          "version": "1.0.0",
+          "canisters": [
+            {"id": "hmxr2-pqaaa-aaabq-qaaaa-cai", "role": "backend"},
+            {"id": "  hcv4s-uaaaa-aaabq-qaaba-cai  ", "role": "frontend"},
+            {"id": "not-a-principal", "role": "junk"},
+            {"id": "aaaaa-aa", "role": "the management canister"},
+            {"id": "2vxsx-fae", "role": "the anonymous principal"}
+          ]
+        }"#;
+        let got = manifest_canister_ids(manifest).expect("a manifest document");
+        assert_eq!(
+            got.ids,
+            vec![
+                Principal::from_text("hmxr2-pqaaa-aaabq-qaaaa-cai").unwrap(),
+                Principal::from_text("hcv4s-uaaaa-aaabq-qaaba-cai").unwrap(),
+            ],
+            "ids are trimmed and parsed; a non-principal entry authorizes nothing, and \
+             neither does one naming something that is not a CANISTER principal — the \
+             management canister (an empty blob) and the anonymous principal both parse \
+             as principals, and the protocol requires an `id` to be a canister"
+        );
+        assert_eq!(got.omitted, 0, "nothing was past the cap");
+
+        // An app that publishes a manifest declaring nothing HAS adopted the
+        // protocol — that is a real, empty declaration, not a missing document.
+        let empty = manifest_canister_ids(r#"{"canisters":[]}"#).expect("a manifest document");
+        assert!(empty.ids.is_empty() && empty.omitted == 0);
+
+        // An over-long manifest is REPORTED, not silently truncated: entry 101 is
+        // declared by the app, so a "not declared" refusal about it would be a
+        // false statement — the count is carried so the refusal can say so.
+        let over = format!(
+            r#"{{"canisters":[{}]}}"#,
+            std::iter::repeat(r#"{"id":"hmxr2-pqaaa-aaabq-qaaaa-cai"}"#)
+                .take(MAX_MANIFEST_CANISTERS + 7)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let over = manifest_canister_ids(&over).expect("a manifest document");
+        assert_eq!(over.ids.len(), MAX_MANIFEST_CANISTERS);
+        assert_eq!(over.omitted, 7, "the overflow is counted, not dropped silently");
+
+        // Not a manifest document → None, so the gate fails closed and reports
+        // absence rather than an empty declaration.
+        for body in [
+            "<!DOCTYPE html>\n<html lang=\"en\"><head><title>App</title></head></html>", // the SPA catch-all
+            "{}",                          // a JSON object with no canisters key
+            r#"{"error":"not found"}"#,    // an API error envelope
+            "[1,2,3]",                     // JSON, wrong shape
+            "",                            // empty body
+        ] {
+            assert!(
+                manifest_canister_ids(body).is_none(),
+                "must not read {body:?} as a manifest"
+            );
+        }
+    }
+
+    // Which non-success statuses may become "this app publishes no manifest" — a
+    // refusal that tells the app's operators to publish one and the agent to stop
+    // retrying. Only a definitive "not here" qualifies: an overloaded or rate-
+    // limited origin is a failure to find out, and reporting it as non-adoption
+    // would be a false statement about the app (per review).
+    #[test]
+    fn only_a_definitive_absence_reads_as_not_published() {
+        use reqwest::StatusCode;
+        for definitive in [StatusCode::NOT_FOUND, StatusCode::GONE] {
+            assert!(means_not_published(definitive), "{definitive} means not published");
+        }
+        for transient in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::REQUEST_TIMEOUT,
+            // Not transient, but still not an answer: the origin is declining to
+            // say, which is not the same as saying no.
+            StatusCode::FORBIDDEN,
+            StatusCode::UNAUTHORIZED,
+        ] {
+            assert!(!means_not_published(transient), "{transient} must not read as not published");
+        }
+    }
+
+    // Layer 5: one canonical origin on one line. The SPA catch-all case matters
+    // most here — a wrongly-parsed derivation origin does not fail loudly, it
+    // silently derives the WRONG principal — so an HTML body must yield None (the
+    // app derives against its visible origin), never a garbage origin.
+    #[test]
+    fn derivation_origin_file_parses_one_line_and_fails_closed() {
+        // The guide's example.
+        assert_eq!(
+            parse_derivation_origin_file("https://hcv4s-uaaaa-aaabq-qaaba-cai.icp.net\n").as_deref(),
+            Some("https://hcv4s-uaaaa-aaabq-qaaba-cai.icp.net")
+        );
+        // Leading blank lines and surrounding whitespace are tolerated — they are
+        // not a claim about the content.
+        assert_eq!(
+            parse_derivation_origin_file("\n\n  https://app.example.com  \n").as_deref(),
+            Some("https://app.example.com")
+        );
+        // But the documented form is ENFORCED, not coerced (per review). This file
+        // decides which principal the user acts as, and a wrong one fails silently
+        // — as a call that simply isn't them — so a file its author got wrong reads
+        // as "declares nothing" (the app derives against its own origin, the
+        // protocol's own default for an absent file) rather than as an
+        // authoritative declaration of whatever we could salvage.
+        for malformed in [
+            "app.example.com",                              // bare host, not an origin
+            "https://app.example.com/path",                 // a URL, not an origin
+            "https://app.example.com/?x=1",                 // query
+            "https://app.example.com#f",                    // fragment
+            "https://app.example.com\nhttps://other.example", // two claims, not one
+            "https://app.example.com\nignored",             // a trailing comment
+        ] {
+            assert_eq!(
+                parse_derivation_origin_file(malformed),
+                None,
+                "must not coerce {malformed:?} into a declaration"
+            );
+        }
+        // A trailing slash is the same origin written the other way, not a path.
+        assert_eq!(
+            parse_derivation_origin_file("https://app.example.com/").as_deref(),
+            Some("https://app.example.com")
+        );
+        // Fail closed: an SPA catch-all's HTML, a blank body, a non-https scheme,
+        // user-info, or an implausibly long line.
+        for body in [
+            "<!DOCTYPE html>\n<html lang=\"en\">",
+            "",
+            "   \n\n",
+            "http://app.example.com",
+            "ftp://app.example.com",
+            "https://u:p@app.example.com",
+        ] {
+            assert_eq!(parse_derivation_origin_file(body), None, "must reject {body:?}");
+        }
+        let long = format!("https://{}.example.com", "x".repeat(MAX_DERIVATION_ORIGIN_LINE));
+        assert_eq!(parse_derivation_origin_file(&long), None, "an over-long line is refused");
     }
 
     // The manifest's optional declared derivation origin is read and reduced to a
@@ -2662,6 +3347,33 @@ mod tests {
         }
     }
 
+    // A registered host on a NON-DEFAULT PORT is a different origin, and must not
+    // inherit the registry entry: `identities::target_origin` keeps the port (it
+    // strips only `:443`), so the write gate's identity binding compares the two as
+    // different apps — but only if the fallback stops handing out the real app's
+    // derivation origin first. Raised in review on #166.
+    #[test]
+    fn known_registry_does_not_match_a_non_default_port() {
+        let url = |u: &str| url::Url::parse(&normalize(u)).unwrap();
+        // The bare origin and its explicit default port still resolve.
+        assert_eq!(known_derivation_origin_for_url(&url("https://oisy.com")), Some("https://oisy.com"));
+        assert_eq!(known_derivation_origin_for_url(&url("https://oisy.com:443")), Some("https://oisy.com"));
+        // A non-default port does not, on any registered host.
+        for u in ["https://oisy.com:8443", "https://nns.ic0.app:8443", "https://multidex.ai:8080"] {
+            assert_eq!(
+                known_derivation_origin_for_url(&url(u)),
+                None,
+                "{u} is not the registered origin and must fall through to app_url_default",
+            );
+        }
+        // Falling through means the lookalike repair now has something to say: the
+        // agent is pointed at the canonical origin rather than left with the port.
+        assert_eq!(
+            similar_known_app("https://oisy.com:8443").map(|m| m.app_url),
+            Some("https://oisy.com".to_string()),
+        );
+    }
+
     // Closure (offline): every derivation-origin VALUE in the registry is itself a
     // key mapping to itself — so resolving a known app's derivation origin returns
     // that same origin (source `known`), i.e. resolve_app is idempotent on it.
@@ -2734,7 +3446,10 @@ mod tests {
     // presence — so an unrelated site echoing an empty/junk `x-ic-canister-id`
     // can't fake IC hosting and slip past the guessed-domain guard. (The
     // same-host attribution in ic_evidence_from — evidence must come from the
-    // probed origin, not a redirect target — is exercised by the live tests.)
+    // probed origin, not a redirect target — is exercised by the live tests, as
+    // is the matching body pin in fetch_well_known: both need a response whose
+    // final URL differs from the probed one, and the SSRF guard refuses loopback,
+    // so neither can be driven from a local server here.)
     #[test]
     fn ic_gateway_header_requires_valid_principal_value() {
         use reqwest::header::{HeaderMap, HeaderValue};
@@ -2840,6 +3555,13 @@ mod tests {
     // Live network: a KNOWN app skips the IC probe entirely (the registry answers).
     #[tokio::test]
     async fn resolve_app_identity_skips_probe_for_known_apps() {
+        // Also the regression pin for over-cap Layer 5 bodies: oisy.com answers
+        // /.well-known/ii-derivation-origin with its SPA shell, which is larger
+        // than MAX_DERIVATION_ORIGIN_BYTES. That must read as "declares nothing"
+        // (Overflow::NotTheDocument — a one-line origin cannot be that big, so
+        // what was served is not the Layer 5 document), NOT as a failed check.
+        // Treating it as a failure refused to resolve a perfectly healthy app,
+        // which is how this test caught it.
         let r = resolve_app_identity("oisy.com", false).await.expect("resolve");
         assert_eq!(r.derivation_origin_source, DerivationSource::Known);
         assert_eq!(r.application_is_ic, None, "known apps are not probed");
@@ -2891,7 +3613,7 @@ mod tests {
             api_doc_available: None,
         };
         // App-declared / app-mined backends → candidates.
-        assert!(is_app_data_candidate(&dc(None, &["ai-connect.html"], None)));
+        assert!(is_app_data_candidate(&dc(None, &["ic-architecture"], None)));
         assert!(is_app_data_candidate(&dc(Some("backend"), &["ic-app.json"], None)));
         assert!(is_app_data_candidate(&dc(Some("backend_canister_id"), &["env.json"], None)));
         assert!(is_app_data_candidate(&dc(Some("BACKEND"), &["bundle:BACKEND"], None)));
