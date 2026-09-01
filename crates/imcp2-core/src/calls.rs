@@ -164,7 +164,7 @@ pub struct CanisterUpdateCallArgs {
     #[serde(default)]
     pub app_url: Option<String>,
     /// The app's derivation origin, from open_app, to call as the user's
-    /// account there. Not the app's website URL. Omit to call anonymously.
+    /// account there. Not necessarily the app's website URL. Omit to call anonymously.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
     /// Which of the user's accounts to act as, by name (see list_app_accounts). Omit for the
@@ -238,7 +238,7 @@ pub struct CanisterQueryArgs {
     #[serde(default)]
     pub oql: Option<String>,
     /// The app's derivation origin, from open_app, to read as the user's
-    /// account there. Not the app's website URL. Required for an OQL query; omit on a Candid
+    /// account there. Not necessarily the app's website URL. Required for an OQL query; omit on a Candid
     /// query to read anonymously.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
