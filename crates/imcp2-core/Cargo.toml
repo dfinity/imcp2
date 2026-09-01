@@ -1,6 +1,6 @@
 [package]
 name = "imcp2-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Transport-agnostic components of the IMCP2 Internet Computer MCP server: the tool surface, the Internet Identity session engine, and the II connect-handshake primitives."
 license = "Apache-2.0"
