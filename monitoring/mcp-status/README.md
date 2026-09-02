@@ -107,14 +107,15 @@ plus loopback hosts for local development, may be probed. To monitor a
 deployment on another domain, extend the allowlist via the
 `MCP_STATUS_ALLOWED_HOSTS` environment variable (comma-separated host suffixes).
 
-Redirects are followed only **within the origin the probe started on**, and
-only for `GET`, at most a few hops, never re-fetching a URL already fetched in
-that probe. A same-origin hop (a frontend canonicalising `/mcp` to `/mcp/`, say)
-is followed so the check reports the page that was actually served; a
-cross-origin `Location` is reported but never requested, so a monitored server
-cannot steer these probes past the allowlist above — not even at a loopback
-service on the monitoring host, whose response would be quoted back in a
-publicly served report.
+Redirects are **reported, never followed**. A `3xx` comes back as itself with
+its destination in the detail line (`302 → https://…`), and each check decides
+what that means: for the landing page a destination is the healthy answer; for
+everything else it is a finding that says where the endpoint went. Two reasons.
+A followed `Location` is a request the monitored server chose rather than the
+operator, which is precisely what the allowlist above exists to prevent — and
+following would blur the one distinction some checks exist to draw: an II that
+has removed its `/mcp` connect page and redirects unknown paths to `/` would
+land on a `200` and read as "connect page served".
 
 `server.js` binds to `127.0.0.1` by default; override with `--host` /
 `MCP_STATUS_HOST` only when you really mean to expose the port directly.

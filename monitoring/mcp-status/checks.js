@@ -98,8 +98,8 @@ const redirectTarget = (headers, from) => {
 /**
  * A URL's request identity: the part a request is actually made of. `fetch`
  * never sends the fragment, so two URLs differing only there address the same
- * resource — and a `Location: #elsewhere` would otherwise look like a new
- * destination to the loop guard while re-fetching what was just fetched.
+ * resource — a `Location: #elsewhere` names the resource just requested, not
+ * a new destination, however different the two strings look.
  *
  * @param {string} url
  * @returns {string}
@@ -118,115 +118,49 @@ const requestKey = (url) => {
  * Perform an HTTP request with a timeout, capturing status, headers, body and
  * latency without ever throwing (network errors are returned as `error`).
  *
- * Redirects are never followed implicitly (`redirect: "manual"`): a probe that
- * silently followed one could not tell an endpoint serving a document from an
- * endpoint pointing elsewhere. Pass `follow: n` to follow up to `n` hops,
- * subject to three guards:
- *
- *   - only `GET` (a 301/302/303 hop rewrites the method, and re-sending a POST
- *     body on a 307/308 could repeat a state-changing call);
- *   - only within the origin the probe started on, so a monitored server can
- *     never steer the dashboard's requests anywhere the operator did not fix as
- *     a target — the SSRF guard in config.js pins the origins at startup, and a
- *     followed `Location` would otherwise reach past it (including at loopback
- *     services on the monitoring host, whose responses are quoted back in a
- *     publicly served report);
- *   - never to a URL already fetched in this probe, compared by request identity
- *     (see `requestKey`), so a redirect loop ends however it is dressed up.
- *
- * A hop that fails a guard is not an error: the 3xx response is returned as-is,
- * with `location` naming where it pointed, and the caller decides whether that
- * is healthy — for the landing page, an off-origin redirect IS the healthy
- * answer. `cycle` marks the one shape no caller should read as healthy: a
- * destination this probe already fetched, so the chain leads nowhere new.
- * `timeoutMs` bounds the whole probe, hops included, not each hop.
+ * Redirects are reported, never followed (`redirect: "manual"`). A probe that
+ * followed one could not tell an endpoint serving a page from an endpoint
+ * pointing at some other page that happens to be served — for the II's `/mcp`
+ * connect page that is exactly the difference between healthy and gone — and a
+ * followed `Location` is a request the monitored server chose, not the
+ * operator, which the SSRF guard in config.js exists to prevent. So a 3xx comes
+ * back as itself, with `location` naming where it points (resolved, http(s)
+ * only; null when the header is missing or unusable), and each check decides
+ * what that means: for the landing page a destination is the healthy answer,
+ * for everything else it is a finding that says where the endpoint went.
  *
  * @param {string} url
- * @param {RequestInit & { timeoutMs?: number, follow?: number }} [init]
+ * @param {RequestInit & { timeoutMs?: number }} [init]
  */
 const probe = async (url, init = {}) => {
-  const { timeoutMs = 10_000, follow = 0, ...rest } = init;
+  const { timeoutMs = 10_000, ...rest } = init;
   const start = Date.now();
-  const deadline = start + timeoutMs;
-  const followable = !rest.method || rest.method.toUpperCase() === "GET";
-  const startOrigin = (() => {
-    try {
-      return new URL(url).origin;
-    } catch {
-      return null;
-    }
-  })();
-  /** Hops actually followed, oldest first. */
-  const redirects = /** @type {{ status: number, location: string }[]} */ ([]);
-  // Keyed by request identity, not URL string: what fetch sends is what decides
-  // whether a hop leads somewhere new.
-  const seen = new Set([requestKey(url)]);
-  let current = url;
   try {
-    for (;;) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) throw new Error("timed out following redirects");
-      const res = await fetch(current, {
-        redirect: "manual",
-        ...rest,
-        signal: AbortSignal.timeout(remaining),
-      });
-      const location = isRedirect(res.status)
-        ? redirectTarget(res.headers, current)
-        : null;
-      const next =
-        location &&
-        followable &&
-        redirects.length < follow &&
-        !seen.has(requestKey(location)) &&
-        new URL(location).origin === startOrigin
-          ? location
-          : null;
-      if (next) {
-        seen.add(requestKey(next));
-        // Release the hop before opening the next one. A 3xx may carry a body —
-        // and may still be streaming it — so abandoning it unread leaves that
-        // request active (and its connection checked out) long after this probe
-        // has returned its verdict. Cancelling is best-effort: a body that has
-        // already errored is one we no longer need either way.
-        await res.body?.cancel().catch(() => {});
-        redirects.push({ status: res.status, location: next });
-        current = next;
-        continue;
-      }
-      const bodyText = await res.text().catch(() => "");
-      return {
-        ok: true,
-        status: res.status,
-        headers: res.headers,
-        bodyText,
-        /** The URL this response answered — the last hop, when any were followed. */
-        url: current,
-        /** Where this response points, when it is itself an unfollowed redirect. */
-        location,
-        /**
-         * That `location` addresses something this probe already fetched — the
-         * chain loops. Reported rather than inferred from `url`, because a loop
-         * can close on any earlier hop (`/` → `/landing` → `/`), not just the
-         * last one, and by request identity, because `/` → `/#landing` is the
-         * same resource twice however different the two strings look.
-         */
-        cycle: !!location && seen.has(requestKey(location)),
-        redirects,
-        latencyMs: Date.now() - start,
-        error: /** @type {Error | null} */ (null),
-      };
-    }
+    const res = await fetch(url, {
+      redirect: "manual",
+      ...rest,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const bodyText = await res.text().catch(() => "");
+    return {
+      ok: true,
+      status: res.status,
+      headers: res.headers,
+      bodyText,
+      /** Where a 3xx points, when it names somewhere usable; null otherwise. */
+      location: isRedirect(res.status)
+        ? redirectTarget(res.headers, url)
+        : null,
+      latencyMs: Date.now() - start,
+      error: /** @type {Error | null} */ (null),
+    };
   } catch (err) {
     return {
       ok: false,
       status: /** @type {number | null} */ (null),
       headers: new Headers(),
       bodyText: "",
-      url: current,
       location: /** @type {string | null} */ (null),
-      cycle: false,
-      redirects,
       latencyMs: Date.now() - start,
       error: /** @type {Error} */ (err),
     };
@@ -234,14 +168,11 @@ const probe = async (url, init = {}) => {
 };
 
 /**
- * `" (after 2 redirects)"` for a probe that followed hops, `""` otherwise — so
- * a detail line says when the reported status came from somewhere else.
- * @param {{ redirects: { status: number, location: string }[] }} r
+ * `" → <where>"` for a response that is a redirect with a usable target, `""`
+ * otherwise — so a detail line that prints a 3xx also says where it went.
+ * @param {{ location: string | null }} r
  */
-const hopSuffix = (r) => {
-  const n = r.redirects.length;
-  return n === 0 ? "" : ` (after ${n} redirect${n > 1 ? "s" : ""})`;
-};
+const redirectNote = (r) => (r.location ? ` → ${r.location}` : "");
 
 /** Safely JSON-parse a string, returning undefined on failure. */
 const tryJson = (text) => {
@@ -348,19 +279,22 @@ export const checkMcpEndpoints = async (
   //    as a 200 with the page — what is not healthy is a 4xx/5xx, an
   //    unreachable server, or a 3xx that names nowhere to go.
   //
-  //    An off-origin destination is reported rather than followed — probe()
-  //    only follows within the origin it started on, so a monitored server
-  //    cannot steer these requests (see probe) — while a deployment that
-  //    redirects to a page on its own origin is followed to it.
+  //    The destination is reported, not followed (see probe): the check takes
+  //    the redirect's word for where the page went, and says so.
   {
-    const r = await probe(`${mcpOrigin}/`, { timeoutMs, follow: 3 });
+    const target = `${mcpOrigin}/`;
+    const r = await probe(target, { timeoutMs });
     const ct = r.headers.get("content-type") ?? "";
     const servedHere = r.ok && r.status === 200 && /text\/html/i.test(ct);
-    // A redirect closing a loop is not a landing page, however many hops it
-    // takes to close (`/` → `/` or `/` → `/landing` → `/`): probe() leaves it
-    // unfollowed and flags the cycle, and it must not read as healthy.
+    // A redirect back at the resource just requested is a loop, not a landing
+    // page. Compared by request identity: `/` → `/#landing` re-fetches `/`.
     const movedTo =
-      r.ok && isRedirect(r.status) && r.location && !r.cycle ? r.location : null;
+      r.ok &&
+      isRedirect(r.status) &&
+      r.location &&
+      requestKey(r.location) !== requestKey(target)
+        ? r.location
+        : null;
     const pass = servedHere || !!movedTo;
     facts.landing = { status: r.status, servedHere, movedTo };
     checks.push({
@@ -377,22 +311,21 @@ export const checkMcpEndpoints = async (
       detail: r.error
         ? `request failed: ${r.error.message}`
         : movedTo
-          ? `${r.status} → ${movedTo}${hopSuffix(r)}`
-          : `${r.status}, content-type: ${ct || "(none)"}${hopSuffix(r)}`,
+          ? `${r.status} → ${movedTo}`
+          : `${r.status}${redirectNote(r)}, content-type: ${ct || "(none)"}`,
     });
   }
 
   // 1b. Build/version: which commit is actually running. Surfaced prominently
   //     in the report (with a GitHub link) so operators can confirm the live
   //     deployment; older builds without /version are treated as informational.
-  //     What matters is the JSON, not which hop served it, so a same-origin
-  //     redirect on the way to it is followed. The protocol documents below
-  //     deliberately do not follow: for those the status code IS the contract
-  //     an MCP client depends on, and a 3xx where a 200 is specified is a
-  //     finding, not a detour.
+  //     A redirect here, as on every probe below, is reported with where it
+  //     points rather than followed — for the protocol documents the status
+  //     code IS the contract an MCP client depends on, and for the rest a
+  //     detour is worth knowing about, not hiding.
   {
     const url = `${mcpOrigin}/version`;
-    const r = await probe(url, { timeoutMs, follow: 3 });
+    const r = await probe(url, { timeoutMs });
     const json = tryJson(r.bodyText);
     const commit =
       json && typeof json.commit === "string" ? json.commit : undefined;
@@ -428,8 +361,8 @@ export const checkMcpEndpoints = async (
       detail: r.error
         ? `request failed: ${r.error.message}`
         : exposed
-          ? `version ${version ?? "?"}, commit ${commit}${hopSuffix(r)}`
-          : `${r.status}, no version info exposed${hopSuffix(r)}`,
+          ? `version ${version ?? "?"}, commit ${commit}`
+          : `${r.status}${redirectNote(r)}, no version info exposed`,
     });
   }
 
@@ -460,7 +393,7 @@ export const checkMcpEndpoints = async (
       detail: !pass
         ? r.error
           ? `request failed: ${r.error.message}`
-          : `${r.status}, missing required fields`
+          : `${r.status}${redirectNote(r)}, missing required fields`
         : resourceOk
           ? `resource=${protectedResource.resource}, AS=${protectedResource.authorization_servers.join(", ")}`
           : `resource=${protectedResource.resource} (expected ${mcpOrigin}/mcp)`,
@@ -497,7 +430,7 @@ export const checkMcpEndpoints = async (
       detail: !pass
         ? r.error
           ? `request failed: ${r.error.message}`
-          : `${r.status}, missing fields: ${missing.join(", ") || "n/a"}`
+          : `${r.status}${redirectNote(r)}, missing fields: ${missing.join(", ") || "n/a"}`
         : `issuer=${asMeta.issuer}, PKCE=${(asMeta.code_challenge_methods_supported || []).join(",") || "none"}`,
     });
   }
@@ -571,7 +504,7 @@ export const checkMcpEndpoints = async (
       latencyMs: r.latencyMs,
       detail: r.error
         ? `request failed: ${r.error.message}`
-        : `${r.status}, www-authenticate: ${wwwAuth || "(missing)"}`,
+        : `${r.status}${redirectNote(r)}, www-authenticate: ${wwwAuth || "(missing)"}`,
     });
   }
 
@@ -615,7 +548,7 @@ export const checkMcpEndpoints = async (
         ? `request failed: ${r.error.message}`
         : pass
           ? `registered client_id=${json.client_id}`
-          : `${r.status}, body: ${r.bodyText.slice(0, 120)}`,
+          : `${r.status}${redirectNote(r)}, body: ${r.bodyText.slice(0, 120)}`,
     });
   }
 
@@ -660,7 +593,7 @@ export const checkMcpEndpoints = async (
         ? `request failed: ${r.error.message}`
         : pass
           ? "rejected non-allow-listed hosted redirect_uri"
-          : `expected 400 invalid_redirect_uri, got ${r.status}: ${r.bodyText.slice(0, 120)}`,
+          : `expected 400 invalid_redirect_uri, got ${r.status}${redirectNote(r)}: ${r.bodyText.slice(0, 120)}`,
     });
   }
 
@@ -683,7 +616,7 @@ export const checkMcpEndpoints = async (
       latencyMs: r.latencyMs,
       detail: r.error
         ? `request failed: ${r.error.message}`
-        : `${r.status}, ${r.bodyText.slice(0, 100)}`,
+        : `${r.status}${redirectNote(r)}, ${r.bodyText.slice(0, 100)}`,
     });
   }
 
@@ -710,7 +643,7 @@ export const checkMcpEndpoints = async (
       latencyMs: r.latencyMs,
       detail: r.error
         ? `request failed: ${r.error.message}`
-        : `${r.status}, error: ${json?.error ?? r.bodyText.slice(0, 80)}`,
+        : `${r.status}${redirectNote(r)}, error: ${json?.error ?? r.bodyText.slice(0, 80)}`,
     });
   }
 
@@ -912,11 +845,7 @@ export const checkIiHealth = async (
   }
 
   facts.origin = iiOrigin;
-  // The II is a canister-served frontend behind a boundary node; whether it
-  // canonicalises the root through a redirect is not a health signal, so
-  // same-origin hops are followed and the checks below read the response that
-  // actually served the page.
-  const r = await probe(`${iiOrigin}/`, { timeoutMs, follow: 3 });
+  const r = await probe(`${iiOrigin}/`, { timeoutMs });
   const csp = r.headers.get("content-security-policy");
   const canisterId = r.headers.get("x-ic-canister-id");
   const icCertificate = r.headers.get("ic-certificate");
@@ -929,13 +858,13 @@ export const checkIiHealth = async (
     description:
       "Confirms the linked Internet Identity frontend is reachable and returns HTTP 200.",
     target: `GET ${iiOrigin}/`,
-    expected: "200 (redirects followed)",
+    expected: "200",
     status: r.ok && r.status === 200 ? "pass" : "fail",
     httpStatus: r.status,
     latencyMs: r.latencyMs,
     detail: r.error
       ? `request failed: ${r.error.message}`
-      : `${r.status}${canisterId ? `, canister ${canisterId}` : ""}${hopSuffix(r)}`,
+      : `${r.status}${redirectNote(r)}${canisterId ? `, canister ${canisterId}` : ""}`,
   });
 
   // 2. Served & certified by the Internet Computer (canister is live).
@@ -950,8 +879,8 @@ export const checkIiHealth = async (
     httpStatus: r.status,
     latencyMs: r.latencyMs,
     detail: icCertificate
-      ? `ic-certificate present${canisterId ? ` for canister ${canisterId}` : ""}${hopSuffix(r)}`
-      : `no ic-certificate header (response not certified by the IC?)${hopSuffix(r)}`,
+      ? `ic-certificate present${canisterId ? ` for canister ${canisterId}` : ""}`
+      : "no ic-certificate header (response not certified by the IC?)",
   });
 
   // 3. /mcp connect page. Since dfinity/internet-identity#4052 the II no longer
@@ -973,7 +902,7 @@ export const checkIiHealth = async (
   //    signal left is that the /mcp connect page is served.
   {
     const url = `${iiOrigin}/mcp`;
-    const mr = await probe(url, { timeoutMs, follow: 3 });
+    const mr = await probe(url, { timeoutMs });
     const served = mr.ok && mr.status === 200;
     checks.push({
       id: `ii-mcp-flow${sfx}`,
@@ -981,15 +910,15 @@ export const checkIiHealth = async (
       description:
         "Confirms the II serves its /mcp connect page. The connect flow runs on a top-level navigation back to the server's pinned callback page and a fetch() from that page to the server (governed by CSP connect-src, which allows the https MCP origin) — neither is gated by form-action — so serving the page is the health signal. Since #4052 trust is per-user (each identity adds its trusted server in II Settings, synced on-chain), which servers a given identity trusts is not globally inspectable; this checks the instance-wide flow is enabled.",
       target: `GET ${url}`,
-      expected: "200 (connect page served, redirects followed)",
+      expected: "200 (connect page served)",
       status: served ? "pass" : "fail",
       httpStatus: mr.status,
       latencyMs: mr.latencyMs,
       detail: mr.error
         ? `request failed: ${mr.error.message}`
         : served
-          ? `${mr.status}, /mcp connect page served${hopSuffix(mr)}`
-          : `${mr.status}, /mcp connect page not served${hopSuffix(mr)}`,
+          ? `${mr.status}, /mcp connect page served`
+          : `${mr.status}${redirectNote(mr)}, /mcp connect page not served`,
     });
   }
 
@@ -1000,7 +929,7 @@ export const checkIiHealth = async (
   //     surface the backend canister id.
   {
     const url = `${iiOrigin}/.config`;
-    const cr = await probe(url, { timeoutMs, follow: 3 });
+    const cr = await probe(url, { timeoutMs });
     // The config is text/plain Candid, so bodyText is the real content; prefer
     // the server-reported content-length for the byte count when present. (Guard
     // against a missing header: Number(null) is 0, which would wrongly win here.)
@@ -1035,8 +964,8 @@ export const checkIiHealth = async (
       detail: cr.error
         ? `request failed: ${cr.error.message}`
         : present
-          ? `${cr.status}, ${bytes} bytes${backendCanisterId ? `, backend ${backendCanisterId}` : ""}${hopSuffix(cr)}`
-          : `${cr.status}, ${cr.bodyText.slice(0, 80) || "(empty)"}${hopSuffix(cr)}`,
+          ? `${cr.status}, ${bytes} bytes${backendCanisterId ? `, backend ${backendCanisterId}` : ""}`
+          : `${cr.status}${redirectNote(cr)}, ${cr.bodyText.slice(0, 80) || "(empty)"}`,
     });
   }
 

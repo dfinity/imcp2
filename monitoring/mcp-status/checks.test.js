@@ -355,24 +355,22 @@ test("checkMcpEndpoints tolerates a landing page that redirects off-origin", asy
   }
 });
 
-// A redirect that stays on the origin is followed to the page, so the check
-// still reports what was actually served rather than the hop.
-test("checkMcpEndpoints follows a same-origin landing-page redirect", async () => {
+// A redirect that stays on the origin is taken at its word too — reported with
+// its destination, not followed. The stub throws on any route it does not know,
+// so leaving `/landing/` undefined asserts it is never requested.
+test("checkMcpEndpoints reports a same-origin landing-page redirect without following it", async () => {
   const origin = "https://mcp.beta.test";
   const restore = stubFetch({
     ...healthyRoutes(origin),
     [`GET ${origin}/`]: resp(301, { headers: { location: "/landing/" } }),
-    [`GET ${origin}/landing/`]: resp(200, {
-      headers: { "content-type": "text/html; charset=utf-8" },
-    }),
   });
   try {
     const { section, facts } = await checkMcpEndpoints(origin, 2000);
     const root = byId(section, "root");
     assert.equal(root.status, "pass");
-    assert.equal(root.httpStatus, 200);
-    assert.match(root.detail, /after 1 redirect/);
-    assert.equal(facts.landing.servedHere, true);
+    assert.equal(root.httpStatus, 301);
+    assert.equal(root.detail, `301 → ${origin}/landing/`);
+    assert.equal(facts.landing.movedTo, `${origin}/landing/`);
   } finally {
     restore();
   }
@@ -401,8 +399,7 @@ test("checkMcpEndpoints fails a landing-page redirect that goes nowhere", async 
       const { section } = await checkMcpEndpoints(origin, 2000);
       assert.equal(byId(section, "root").status, "fail", label);
       assert.equal(section.status, "fail", label);
-      // The self-redirect must not be chased: a URL already fetched in this
-      // probe is never re-fetched, so a loop ends at the first hop.
+      // Nothing is followed, so the self-redirect is never chased.
       assert.equal(rootRequests, 1, label);
     } finally {
       restore();
@@ -410,117 +407,28 @@ test("checkMcpEndpoints fails a landing-page redirect that goes nowhere", async 
   }
 });
 
-// A loop closes on any URL the probe already fetched, not only on the one it
-// just asked for: `/ → /landing/ → /` leads nowhere new, so the last hop naming
-// a *different* URL than the one it answered does not make it a destination.
-test("checkMcpEndpoints fails a multi-hop landing-page redirect loop", async () => {
-  const origin = "https://mcp.beta.test";
-  /** @type {Record<string, number>} */
-  const fetched = { "/": 0, "/landing/": 0 };
-  const restore = stubFetch({
-    ...healthyRoutes(origin),
-    [`GET ${origin}/`]: () => {
-      fetched["/"] += 1;
-      return resp(308, { headers: { location: "/landing/" } });
-    },
-    [`GET ${origin}/landing/`]: () => {
-      fetched["/landing/"] += 1;
-      return resp(308, { headers: { location: "/" } });
-    },
-  });
-  try {
-    const { section, facts } = await checkMcpEndpoints(origin, 2000);
-    assert.equal(byId(section, "root").status, "fail");
-    assert.equal(facts.landing.movedTo, null);
-    // Each URL in the cycle is fetched once and the loop is not chased.
-    assert.deepEqual(fetched, { "/": 1, "/landing/": 1 });
-  } finally {
-    restore();
-  }
-});
-
-// Following a redirect must be visible wherever the reported result came from a
-// hop, not only on the landing-page check.
-test("checkMcpEndpoints reports the hop that served /version", async () => {
-  const origin = "https://mcp.beta.test";
-  const restore = stubFetch({
-    ...healthyRoutes(origin),
-    [`GET ${origin}/version`]: resp(307, { headers: { location: "/v1/version" } }),
-    [`GET ${origin}/v1/version`]: resp(200, {
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ version: "0.1.0", commit: "abc123def4567890" }),
-    }),
-  });
-  try {
-    const { section } = await checkMcpEndpoints(origin, 2000);
-    const version = byId(section, "version");
-    assert.equal(version.status, "pass");
-    assert.match(version.detail, /commit abc123def4567890 \(after 1 redirect\)/);
-  } finally {
-    restore();
-  }
-});
-
 // A fragment is not part of a request — `fetch` never sends one — so a
-// `Location` differing only there re-fetches what was just fetched. Varying the
-// fragment each time made every URL string look new, so the loop guard let the
-// chain run and the final 3xx was accepted as a destination.
+// `Location` differing only there names the resource just requested, not a new
+// destination, however different the two strings look.
 test("checkMcpEndpoints fails a fragment-only landing-page redirect", async () => {
   const origin = "https://mcp.beta.test";
-  let rootRequests = 0;
-  let hop = 0;
   const restore = stubFetch({
     ...healthyRoutes(origin),
-    [`GET ${origin}/`]: () => {
-      rootRequests += 1;
-      return resp(308, { headers: { location: `#hop${hop++}` } });
-    },
+    [`GET ${origin}/`]: resp(308, { headers: { location: "#landing" } }),
   });
   try {
     const { section, facts } = await checkMcpEndpoints(origin, 2000);
     assert.equal(byId(section, "root").status, "fail");
     assert.equal(facts.landing.movedTo, null);
-    // The same resource is never re-fetched under a different fragment.
-    assert.equal(rootRequests, 1);
   } finally {
     restore();
   }
 });
 
-// A 3xx may carry a body, and may still be streaming it. Abandoning it unread
-// leaves that request active — and its connection checked out — after the probe
-// has returned its verdict, so a followed hop's body has to be released.
-test("checkMcpEndpoints releases the body of a followed redirect", async () => {
-  const origin = "https://mcp.beta.test";
-  let cancelled = 0;
-  const restore = stubFetch({
-    ...healthyRoutes(origin),
-    [`GET ${origin}/`]: {
-      status: 308,
-      headers: new Headers({ location: "/landing/" }),
-      body: {
-        cancel: async () => {
-          cancelled += 1;
-        },
-      },
-      text: async () => "",
-    },
-    [`GET ${origin}/landing/`]: resp(200, {
-      headers: { "content-type": "text/html" },
-    }),
-  });
-  try {
-    const { section } = await checkMcpEndpoints(origin, 2000);
-    assert.equal(byId(section, "root").status, "pass");
-    assert.equal(cancelled, 1, "the followed hop's body must be cancelled");
-  } finally {
-    restore();
-  }
-});
-
-// The protocol documents are a different contract: MCP clients read the status
-// code itself, so a 3xx where the spec says 200 stays a finding.
-test("checkMcpEndpoints does not follow redirects on the protocol documents", async () => {
+// Everywhere else a redirect is a finding, reported with where it went: for the
+// protocol documents MCP clients read the status code itself, so a 3xx where
+// the spec says 200 is the contract broken, not a detour to take.
+test("checkMcpEndpoints reports a redirected protocol document as a failure", async () => {
   const origin = "https://mcp.beta.test";
   const restore = stubFetch({
     ...healthyRoutes(origin),
@@ -530,8 +438,13 @@ test("checkMcpEndpoints does not follow redirects on the protocol documents", as
   });
   try {
     const { section } = await checkMcpEndpoints(origin, 2000);
-    assert.equal(byId(section, "protected-resource").status, "fail");
-    assert.equal(byId(section, "protected-resource").httpStatus, 302);
+    const doc = byId(section, "protected-resource");
+    assert.equal(doc.status, "fail");
+    assert.equal(doc.httpStatus, 302);
+    assert.equal(
+      doc.detail,
+      `302 → ${origin}/.well-known/oauth-protected-resource/mcp, missing required fields`,
+    );
   } finally {
     restore();
   }
@@ -694,40 +607,26 @@ test("checkIiHealth verifies the /mcp delegation flow and config", async () => {
   }
 });
 
-// A frontend that canonicalises /mcp to /mcp/ is serving the connect page; the
-// check reads the page it lands on, not the hop.
-test("checkIiHealth follows a redirect to the served /mcp connect page", async () => {
+// The case that decides why redirects are never followed: an II that has
+// removed its /mcp connect page and, like most single-page apps, answers unknown
+// paths with a redirect to /. Following would land on a 200 and call the page
+// served; the check has to say the page is gone, and where the request went.
+test("checkIiHealth fails a redirected /mcp connect page and says where it went", async () => {
   const ii = "https://beta.test";
-  const mcp = "https://mcp.beta.test";
   const restore = stubFetch({
-    [`GET ${ii}/`]: resp(308, { headers: { location: "/index.html" } }),
-    [`GET ${ii}/index.html`]: resp(200, {
-      headers: {
-        "x-ic-canister-id": "gjxif-ryaaa-aaaad-ae4ka-cai",
-        "ic-certificate": "certificate=:abc:",
-      },
-    }),
-    [`GET ${ii}/mcp`]: resp(308, { headers: { location: `${ii}/mcp/` } }),
-    [`GET ${ii}/mcp/`]: resp(200),
-    [`GET ${ii}/.config`]: resp(307, { headers: { location: "/.config/" } }),
-    [`GET ${ii}/.config/`]: resp(200, {
+    [`GET ${ii}/`]: resp(200, { headers: { "ic-certificate": "certificate=:a:" } }),
+    [`GET ${ii}/mcp`]: resp(302, { headers: { location: "/" } }),
+    [`GET ${ii}/.config`]: resp(200, {
       headers: { "content-type": "text/plain" },
       body: `record { backend_canister_id = principal "fgte5-ciaaa-aaaad-aaatq-cai"; }`,
     }),
   });
   try {
-    const { section, facts } = await checkIiHealth(ii, mcp, 2000);
-    assert.equal(byId(section, "ii-reachable").status, "pass");
-    assert.match(byId(section, "ii-reachable").detail, /after 1 redirect/);
-    // Headers come from the response that actually served the page.
-    assert.equal(byId(section, "ii-certified").status, "pass");
-    assert.equal(facts.canisterId, "gjxif-ryaaa-aaaad-ae4ka-cai");
-    assert.match(byId(section, "ii-certified").detail, /after 1 redirect/);
-    assert.equal(byId(section, "ii-mcp-flow").status, "pass");
-    assert.match(byId(section, "ii-mcp-flow").detail, /after 1 redirect/);
-    assert.equal(byId(section, "ii-config").status, "pass");
-    assert.match(byId(section, "ii-config").detail, /after 1 redirect/);
-    assert.equal(facts.config.backendCanisterId, "fgte5-ciaaa-aaaad-aaatq-cai");
+    const { section } = await checkIiHealth(ii, "https://mcp.beta.test", 2000);
+    const flow = byId(section, "ii-mcp-flow");
+    assert.equal(flow.status, "fail");
+    assert.equal(flow.httpStatus, 302);
+    assert.equal(flow.detail, `302 → ${ii}/, /mcp connect page not served`);
   } finally {
     restore();
   }
