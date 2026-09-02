@@ -922,26 +922,36 @@ pub fn anonymous_empty_note(what: &str, add_hint: &str) -> String {
     )
 }
 
-/// The `entities[].name` list of a parsed OQL `schema` JSON — in order,
-/// de-duplicated, capped at [`MAX_OQL_ENTITIES`] — or `None` when the document has
+/// The `entities` array of a parsed OQL `schema` JSON: how many elements it
+/// declares, and the string `name`s extracted from them (in order, de-duplicated,
+/// capped at [`MAX_OQL_ENTITIES`]). The count is kept apart from the names so
+/// "declares no entities" (`declared == 0`) is never confused with "declares
+/// entities in a shape we can't read" (`declared > 0`, no names).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaEntities {
+    declared: usize,
+    names: Vec<String>,
+}
+
+/// The `entities` of a parsed OQL `schema` JSON, or `None` when the document has
 /// no `entities` array at all (an unrecognized shape, kept apart from "an empty
 /// list" so callers never raise the auth hint on it). Feeds `start` validation
 /// (#7) and the per-entity examples (#8) through [`DecodedSchema`]; the one place
 /// the schema tree is walked, so a schema is parsed exactly once.
-fn schema_entity_names(v: &serde_json::Value) -> Option<Vec<String>> {
+fn schema_entities(v: &serde_json::Value) -> Option<SchemaEntities> {
     let arr = v.get("entities").and_then(|e| e.as_array())?;
-    let mut out: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
     for e in arr {
         if let Some(name) = e.get("name").and_then(|n| n.as_str()) {
-            if !out.iter().any(|n| n == name) {
-                out.push(name.to_string());
-                if out.len() >= MAX_OQL_ENTITIES {
+            if !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+                if names.len() >= MAX_OQL_ENTITIES {
                     break;
                 }
             }
         }
     }
-    Some(out)
+    Some(SchemaEntities { declared: arr.len(), names })
 }
 
 /// The `start` entity of a normalized OQL query JSON, if present. Used to
@@ -1259,12 +1269,9 @@ fn try_decode_text_reply(reply: &[u8]) -> Result<String, String> {
 /// of fields and edges) is a few KB; the IC lets a reply carry ~2 MiB. Everything
 /// downstream of [`decode_schema_reply`] — the JSON parse, the text block, the
 /// structured content, the response body — is a small multiple of this bound.
-///
-/// Today candid's UNTYPED decode ([`decode_text_reply`]) charges a 50× penalty
-/// per byte against [`REPLY_DECODING_QUOTA`], so it already refuses a text over
-/// ~60 KB as "undecodable" — this cap is the explicit contract, so the bound no
-/// longer rests on that cost model (a typed decode would charge 1× and admit the
-/// full 2 MiB).
+/// The reply is decoded against its declared `(text)` type first (see
+/// [`try_decode_schema_text`]) so that this cap, not candid's decoding quota, is
+/// the operative bound on the schema's size.
 pub(crate) const MAX_OQL_SCHEMA_BYTES: usize = 256 * 1024;
 
 /// Pretty-printing is offered only to a schema no larger than this AND no deeper
@@ -1286,25 +1293,38 @@ pub struct DecodedSchema {
     /// shallow (see [`MAX_PRETTY_SCHEMA_BYTES`]); otherwise the reply verbatim,
     /// whether or not it parsed as JSON.
     pub text: String,
-    /// `Some(names)` when the JSON carries an `entities` array (possibly empty);
-    /// `None` when it doesn't parse or lacks the key (an unrecognized shape).
-    entities: Option<Vec<String>>,
+    /// `Some` when the JSON carries an `entities` array (possibly empty); `None`
+    /// when it doesn't parse or lacks the key (an unrecognized shape).
+    entities: Option<SchemaEntities>,
 }
 
 impl DecodedSchema {
-    /// The declared entity names (see [`schema_entity_names`]) — empty for an
+    /// The declared entity names (see [`schema_entities`]) — empty for an
     /// unparseable/unrecognized schema as well as for one that lists none.
     pub fn entity_names(&self) -> &[String] {
-        self.entities.as_deref().unwrap_or(&[])
+        self.entities.as_ref().map(|e| e.names.as_slice()).unwrap_or(&[])
     }
 
-    /// Whether the schema exposes NO entities — the caller-gated "empty schema" an
-    /// anonymous read yields when the app shows a principal only the entities it
-    /// may see. Conservative: a schema that doesn't parse as the expected
-    /// `{"entities":[...]}` shape is NOT empty (so we never raise a false auth hint
-    /// on an unrecognized shape).
+    /// The entity names, or `None` when the schema was NOT recognized: no
+    /// `entities` array (unparseable text, or a document without the key), or an
+    /// array whose elements carry no string `name` at all. `Some(&[])` therefore
+    /// means exactly "declares zero entities" — the one case a caller may report as
+    /// "this account sees no entities" rather than leave undiagnosed.
+    pub fn recognized_entity_names(&self) -> Option<&[String]> {
+        match &self.entities {
+            Some(e) if e.declared == 0 || !e.names.is_empty() => Some(e.names.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Whether the schema declares NO entities (an `entities` array with zero
+    /// elements) — the caller-gated "empty schema" an anonymous read yields when
+    /// the app shows a principal only the entities it may see. Conservative: a
+    /// schema that doesn't parse as the expected `{"entities":[...]}` shape, or
+    /// whose elements we can't read names from, is NOT empty (so we never raise a
+    /// false auth hint on an unrecognized shape).
     pub fn is_empty(&self) -> bool {
-        self.entities.as_ref().is_some_and(|e| e.is_empty())
+        self.entities.as_ref().is_some_and(|e| e.declared == 0)
     }
 }
 
@@ -1315,9 +1335,33 @@ impl DecodedSchema {
 /// string for a reply that doesn't decode at all (linear in the reply, and what
 /// every text-reply tool surfaces for one).
 pub fn decode_schema_reply(reply: &[u8]) -> Result<DecodedSchema, String> {
-    match try_decode_text_reply(reply) {
+    match try_decode_schema_text(reply) {
         Ok(text) => schema_from_text(text),
         Err(explanation) => Ok(DecodedSchema { text: explanation, entities: None }),
+    }
+}
+
+/// The text of a `schema` reply, decoded as its declared `(text)` return type
+/// straight into a `String`. Decoding into a concrete Rust type charges
+/// [`REPLY_DECODING_QUOTA`] once per byte, whereas decoding into a dynamic
+/// `IDLValue` (what [`decode_text_reply`] does — candid costs that as "untyped"
+/// even when a type is supplied) charges 50× and so calls any text over ~60 KB
+/// "undecodable", which would make [`MAX_OQL_SCHEMA_BYTES`] unreachable and hand a
+/// merely large schema on as an error dump. A reply that isn't exactly one `text`
+/// falls back to the rendering every text-reply tool gives (so a
+/// contract-violating reply still surfaces as before).
+fn try_decode_schema_text(reply: &[u8]) -> Result<String, String> {
+    let typed = on_deep_stack(|| {
+        let mut de = candid::de::IDLDeserialize::new_with_config(reply, &reply_decoder_config()).ok()?;
+        let text: String = de.get_value().ok()?;
+        de.done().ok()?;
+        Some(text)
+    })
+    .flatten();
+    match typed {
+        Some(text) => Ok(text),
+        // Sequential, not nested: the typed decode's deep-stack call has returned.
+        None => try_decode_text_reply(reply),
     }
 }
 
@@ -1334,7 +1378,7 @@ pub(crate) fn schema_from_text(text: String) -> Result<DecodedSchema, String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Ok(DecodedSchema { text, entities: None });
     };
-    let entities = schema_entity_names(&v);
+    let entities = schema_entities(&v);
     let text = if text.len() <= MAX_PRETTY_SCHEMA_BYTES && json_depth_within(&v, MAX_PRETTY_SCHEMA_DEPTH) {
         serde_json::to_string_pretty(&v).unwrap_or(text)
     } else {
@@ -2365,7 +2409,7 @@ mod tests {
     }
 
     // The entity names come out of the SAME parse as the text (no re-parse), with
-    // the same de-duplication/cap semantics as `schema_entity_names`; a shape without
+    // the same de-duplication/cap semantics as `schema_entities`; a shape without
     // `entities` is "unrecognized", not empty.
     #[test]
     fn decode_schema_reply_extracts_entities_once() {
@@ -2377,56 +2421,67 @@ mod tests {
         assert_eq!(out.entity_names(), ["bookings".to_string(), "users".to_string()]);
         assert!(!out.is_empty());
 
+        assert_eq!(out.recognized_entity_names(), Some(&["bookings".to_string(), "users".to_string()][..]));
+
         let unrecognized = decode_schema_reply(&encode_text_reply("{}")).expect("accepted");
         assert!(unrecognized.entity_names().is_empty());
         assert!(!unrecognized.is_empty(), "no entities key → not treated as empty");
+        assert_eq!(unrecognized.recognized_entity_names(), None, "no entities key → unrecognized");
+
+        // An `entities` array whose elements carry no string `name` declares
+        // entities we can't read: NOT empty (no false auth hint), and unrecognized
+        // for the diagnosis — only a zero-element array is "declares no entities".
+        let nameless = decode_schema_reply(&encode_text_reply(r#"{"entities":[{}]}"#)).expect("accepted");
+        assert!(nameless.entity_names().is_empty());
+        assert!(!nameless.is_empty(), "elements without names → not treated as empty");
+        assert_eq!(nameless.recognized_entity_names(), None, "elements without names → unrecognized");
+        let empty = decode_schema_reply(&encode_text_reply(r#"{"entities":[]}"#)).expect("accepted");
+        assert!(empty.is_empty());
+        assert_eq!(empty.recognized_entity_names(), Some(&[][..]), "zero elements → recognized as empty");
 
         let not_json = decode_schema_reply(&encode_text_reply("not json")).expect("accepted");
         assert_eq!(not_json.text, "not json", "non-JSON text passes through verbatim");
         assert!(not_json.entity_names().is_empty());
         assert!(!not_json.is_empty());
+        assert_eq!(not_json.recognized_entity_names(), None);
     }
 
     // A `schema` reply of deeply nested arrays must NOT be pretty-printed —
     // indentation would expand it ~2·depth× (a 2 MiB reply of 126-deep nests
     // renders to ~255 MiB). Deep or large JSON is handed on verbatim (linear in
-    // the input), and a text over MAX_OQL_SCHEMA_BYTES is refused outright.
+    // the input), and a text over MAX_OQL_SCHEMA_BYTES is refused outright. All
+    // of it end-to-end through the reply decoder: the schema is decoded against
+    // its `(text)` type, so a reply up to the cap gets through the candid quota
+    // (the untyped decode would call anything over ~60 KB undecodable).
     #[test]
     fn decode_schema_reply_bounds_expansion_and_size() {
-        use super::{decode_schema_reply, schema_from_text, MAX_OQL_SCHEMA_BYTES};
-        // 126-deep nests inside one outer array: the maximal-expansion shape, sized
-        // to pass the candid decoding quota (the untyped decode charges 50×/byte,
-        // so ~60 KB is the most text a reply can carry today). Pretty-printed this
-        // would be ~6 MB; it must come back byte-for-byte.
+        use super::{decode_schema_reply, MAX_OQL_SCHEMA_BYTES};
+        // 126-deep nests inside one outer array: the maximal-expansion shape, just
+        // under the byte cap. Pretty-printed this would be ~32 MB; it must come
+        // back byte-for-byte.
         let nest = format!("{}{}", "[".repeat(126), "]".repeat(126));
-        let nests: Vec<&str> = std::iter::repeat_n(nest.as_str(), 190).collect();
+        let nests: Vec<&str> = std::iter::repeat_n(nest.as_str(), 1000).collect();
         let deep = format!("[{}]", nests.join(","));
-        assert!(deep.len() < 59_000, "input must fit the decoding quota: {}", deep.len());
+        assert!(deep.len() < MAX_OQL_SCHEMA_BYTES, "input must fit the byte cap: {}", deep.len());
         let out = decode_schema_reply(&encode_text_reply(&deep)).expect("within the byte cap → accepted");
         assert_eq!(out.text, deep, "deep JSON is passed through verbatim, never indented");
         assert!(out.entity_names().is_empty());
 
-        // The same shape at the byte cap, through the text half directly (candid's
-        // quota stops a reply this large before it gets here): still verbatim.
-        let nests: Vec<&str> = std::iter::repeat_n(nest.as_str(), 1000).collect();
-        let deep = format!("[{}]", nests.join(","));
-        assert!(deep.len() < MAX_OQL_SCHEMA_BYTES, "input must fit the byte cap: {}", deep.len());
-        let out = schema_from_text(deep.clone()).expect("within the byte cap → accepted");
-        assert_eq!(out.text, deep);
-
-        // Shallow but larger than the pretty-print budget: also verbatim.
+        // Shallow but larger than the pretty-print budget (and larger than the
+        // untyped decode would admit): accepted, and passed through verbatim.
         let wide = format!(
             "{{\"entities\":[{}]}}",
             (0..3000).map(|i| format!("{{\"name\":\"entity_{i:04}\"}}")).collect::<Vec<_>>().join(",")
         );
         assert!(wide.len() > super::MAX_PRETTY_SCHEMA_BYTES && wide.len() < MAX_OQL_SCHEMA_BYTES);
-        let out = schema_from_text(wide.clone()).expect("accepted");
+        let out = decode_schema_reply(&encode_text_reply(&wide)).expect("accepted");
         assert_eq!(out.text, wide, "large JSON is passed through verbatim");
         assert_eq!(out.entity_names().len(), super::MAX_OQL_ENTITIES, "entity list is capped");
 
-        // Over the byte cap: refused before any parse.
+        // Over the byte cap: refused before any parse, as an error (not handed on
+        // as an explanatory "schema").
         let huge = format!("[{}]", "0,".repeat(MAX_OQL_SCHEMA_BYTES / 2));
-        let err = schema_from_text(huge).expect_err("over the cap → refused");
+        let err = decode_schema_reply(&encode_text_reply(&huge)).expect_err("over the cap → refused");
         assert!(err.contains("too large"), "{err}");
 
         // A reply that doesn't decode at all is surfaced as before (its explanation,

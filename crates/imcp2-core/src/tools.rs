@@ -1666,10 +1666,11 @@ enum EmptyContext {
 ///    misdescribe it):
 ///     - Anonymous + empty → the #1 auth remediation (empty is almost certainly
 ///       "not authenticated as your account", not "no data").
-///     - Authenticated + the schema read SUCCEEDED and shows no entities → this
-///       account sees no entities here. (A schema read that FAILED is left
-///       undiagnosed — the caller falls back to a benign "0 rows" note — rather
-///       than mislabeled "no entities".)
+///     - Authenticated + the schema read SUCCEEDED and declares no entities → this
+///       account sees no entities here. (A schema read that FAILED, or that came
+///       back in a shape we don't recognize, is left undiagnosed — the caller
+///       falls back to a benign "0 rows" note — rather than mislabeled "no
+///       entities".)
 ///     - `start` valid but 0 rows → authenticated gets no note here (the caller
 ///       adds the benign "0 rows"); anonymous still gets the auth hint.
 async fn diagnose_empty_oql(
@@ -1683,14 +1684,18 @@ async fn diagnose_empty_oql(
     // never fill with a guessed origin (#1).
     const ADD_HINT: &str = "the app's `derivation_origin` (its canonical Internet Identity origin)";
     // Re-read the schema for THIS principal (same agent). `None` = the read FAILED
-    // (unknown, not "empty"); `Some(vec)` = it succeeded (possibly with no entities).
+    // or came back in an unrecognized shape (unknown, not "empty"); `Some(vec)` =
+    // it succeeded (possibly with no entities).
     // Keeping the two apart stops a transient schema failure from being mislabeled
     // "this account sees no entities".
     let entities: Option<Vec<String>> = match calls::encode_unit_arg() {
         Ok(arg) => match calls::raw_call(agent, principal, "schema", arg, true).await {
-            // An over-large schema is refused by the decoder — treat it like a failed
-            // read (unknown), not as "no entities".
-            Ok(reply) => calls::decode_schema_reply(&reply).ok().map(|s| s.entity_names().to_vec()),
+            // An over-large schema is refused by the decoder, and a schema in a shape
+            // we don't recognize yields no names — treat both like a failed read
+            // (unknown), never as "no entities".
+            Ok(reply) => calls::decode_schema_reply(&reply)
+                .ok()
+                .and_then(|s| s.recognized_entity_names().map(<[String]>::to_vec)),
             Err(_) => None,
         },
         Err(_) => None,
