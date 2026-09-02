@@ -38,12 +38,16 @@ const resp = (status, { headers = {}, body = "" } = {}) => ({
  * Install a fetch stub that dispatches on "METHOD url". A route value is either a
  * `resp(...)` object or a function `(init) => resp(...)` that answers by request
  * (used to mirror the /oauth/register allow-list, which branches on the body).
+ *
+ * The fragment is stripped along with the query, because `fetch` never sends
+ * one: a probe asking for `/#landing` reaches the server as `/`, and a stub that
+ * routed them separately would hide exactly that.
  * @param {Record<string, ReturnType<typeof resp> | ((init: RequestInit) => ReturnType<typeof resp>)>} routes
  */
 const stubFetch = (routes) => {
   const original = globalThis.fetch;
   globalThis.fetch = async (url, init = {}) => {
-    const key = `${init.method ?? "GET"} ${url.split("?")[0]}`;
+    const key = `${init.method ?? "GET"} ${url.split(/[?#]/)[0]}`;
     const route = routes[key];
     if (route) return typeof route === "function" ? route(init) : route;
     throw new Error(`unexpected fetch: ${key}`);
@@ -452,6 +456,32 @@ test("checkMcpEndpoints reports the hop that served /version", async () => {
     const version = byId(section, "version");
     assert.equal(version.status, "pass");
     assert.match(version.detail, /commit abc123def4567890 \(after 1 redirect\)/);
+  } finally {
+    restore();
+  }
+});
+
+// A fragment is not part of a request — `fetch` never sends one — so a
+// `Location` differing only there re-fetches what was just fetched. Varying the
+// fragment each time made every URL string look new, so the loop guard let the
+// chain run and the final 3xx was accepted as a destination.
+test("checkMcpEndpoints fails a fragment-only landing-page redirect", async () => {
+  const origin = "https://mcp.beta.test";
+  let rootRequests = 0;
+  let hop = 0;
+  const restore = stubFetch({
+    ...healthyRoutes(origin),
+    [`GET ${origin}/`]: () => {
+      rootRequests += 1;
+      return resp(308, { headers: { location: `#hop${hop++}` } });
+    },
+  });
+  try {
+    const { section, facts } = await checkMcpEndpoints(origin, 2000);
+    assert.equal(byId(section, "root").status, "fail");
+    assert.equal(facts.landing.movedTo, null);
+    // The same resource is never re-fetched under a different fragment.
+    assert.equal(rootRequests, 1);
   } finally {
     restore();
   }

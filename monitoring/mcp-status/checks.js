@@ -96,6 +96,25 @@ const redirectTarget = (headers, from) => {
 };
 
 /**
+ * A URL's request identity: the part a request is actually made of. `fetch`
+ * never sends the fragment, so two URLs differing only there address the same
+ * resource — and a `Location: #elsewhere` would otherwise look like a new
+ * destination to the loop guard while re-fetching what was just fetched.
+ *
+ * @param {string} url
+ * @returns {string}
+ */
+const requestKey = (url) => {
+  try {
+    const u = new URL(url);
+    u.hash = "";
+    return u.toString();
+  } catch {
+    return url;
+  }
+};
+
+/**
  * Perform an HTTP request with a timeout, capturing status, headers, body and
  * latency without ever throwing (network errors are returned as `error`).
  *
@@ -112,7 +131,8 @@ const redirectTarget = (headers, from) => {
  *     followed `Location` would otherwise reach past it (including at loopback
  *     services on the monitoring host, whose responses are quoted back in a
  *     publicly served report);
- *   - never to a URL already fetched in this probe, so a redirect loop ends.
+ *   - never to a URL already fetched in this probe, compared by request identity
+ *     (see `requestKey`), so a redirect loop ends however it is dressed up.
  *
  * A hop that fails a guard is not an error: the 3xx response is returned as-is,
  * with `location` naming where it pointed, and the caller decides whether that
@@ -138,7 +158,9 @@ const probe = async (url, init = {}) => {
   })();
   /** Hops actually followed, oldest first. */
   const redirects = /** @type {{ status: number, location: string }[]} */ ([]);
-  const seen = new Set([url]);
+  // Keyed by request identity, not URL string: what fetch sends is what decides
+  // whether a hop leads somewhere new.
+  const seen = new Set([requestKey(url)]);
   let current = url;
   try {
     for (;;) {
@@ -156,11 +178,12 @@ const probe = async (url, init = {}) => {
         location &&
         followable &&
         redirects.length < follow &&
-        !seen.has(location) &&
+        !seen.has(requestKey(location)) &&
         new URL(location).origin === startOrigin
           ? location
           : null;
       if (next) {
+        seen.add(requestKey(next));
         // Release the hop before opening the next one. A 3xx may carry a body —
         // and may still be streaming it — so abandoning it unread leaves that
         // request active (and its connection checked out) long after this probe
@@ -168,7 +191,6 @@ const probe = async (url, init = {}) => {
         // already errored is one we no longer need either way.
         await res.body?.cancel().catch(() => {});
         redirects.push({ status: res.status, location: next });
-        seen.add(next);
         current = next;
         continue;
       }
@@ -183,11 +205,13 @@ const probe = async (url, init = {}) => {
         /** Where this response points, when it is itself an unfollowed redirect. */
         location,
         /**
-         * That `location` is a URL this probe already fetched — the chain loops.
-         * Reported rather than inferred from `url`, because a loop can close on
-         * any earlier hop (`/` → `/landing` → `/`), not just the last one.
+         * That `location` addresses something this probe already fetched — the
+         * chain loops. Reported rather than inferred from `url`, because a loop
+         * can close on any earlier hop (`/` → `/landing` → `/`), not just the
+         * last one, and by request identity, because `/` → `/#landing` is the
+         * same resource twice however different the two strings look.
          */
-        cycle: !!location && seen.has(location),
+        cycle: !!location && seen.has(requestKey(location)),
         redirects,
         latencyMs: Date.now() - start,
         error: /** @type {Error | null} */ (null),
