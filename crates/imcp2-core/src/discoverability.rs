@@ -62,7 +62,7 @@
 //! discovery still READS it — but it cannot authorize a write, because the
 //! operators who adopted that proposal published it against different terms and
 //! never agreed to the ones publishing the protocol manifest now signifies
-//! (<https://internetcomputer.org/icp-mcp/terms/>). Consent that was never given
+//! (<https://internetcomputer.org/icp-mcp/app-operator-terms/>). Consent that was never given
 //! cannot be inherited from a path this server invented, so an early adopter is
 //! refused — and told, precisely, that serving the same JSON at the standard
 //! path is all that is required.
@@ -378,7 +378,8 @@ fn legacy_only_refusal(
     msg.push_str(if legacy.canisters.contains(canister_id) {
         "That older document DOES list this canister, but it cannot authorize the write: it \
          predates the protocol, and its publishers never accepted the terms that publishing the \
-         standard manifest now signifies (https://internetcomputer.org/icp-mcp/terms/). "
+         standard manifest now signifies \
+         (https://internetcomputer.org/icp-mcp/app-operator-terms/). "
     } else {
         "That older document does not list this canister either. "
     });
