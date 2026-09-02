@@ -343,8 +343,15 @@ impl IcCanisterTools {
         let is_anonymous = false;
         // #8: a COMPLETE canister_query per entity, carrying the SAME identity this
         // schema was read under (so copying one doesn't drop to anon).
-        let example_queries =
-            calls::oql_query_examples(&canister_id, &schema, Some(target.origin.as_str()), account.as_deref());
+        // Each example carries the authorizing origin as well as the identity: a
+        // copied example must pass the same gate this schema read just passed.
+        let example_queries = calls::oql_query_examples(
+            &canister_id,
+            &schema,
+            Some(declaration.origin.as_str()),
+            Some(target.origin.as_str()),
+            account.as_deref(),
+        );
         // #1: an EMPTY schema (no visible entities) for this authenticated account is
         // "nothing visible here", not "the app has no data model".
         let empty_note = if calls::oql_schema_is_empty(&schema) {

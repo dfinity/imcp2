@@ -1053,13 +1053,19 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 /// One ready-to-run `canister_query` invocation per entity (#8) — a COMPLETE call
 /// (canister_id + a minimal `{"start":<entity>,"limit":10}` OQL query in the `oql`
-/// argument) that PRESERVES the identity the schema was read under (the same
-/// `derivation_origin` / `account`), so copying an example doesn't silently drop
-/// back to anonymous. Read-only. Empty when the schema exposes no entities. Each
-/// line is `canister_query <compact-json-args>`.
+/// argument) that PRESERVES both halves of the call the schema was read under:
+/// the identity (the same `derivation_origin` / `account`), so copying an example
+/// doesn't silently drop back to anonymous, and the AUTHORIZATION (`app_url` —
+/// the origin whose manifest declared this canister), so it doesn't fall back to
+/// checking the manifest at the derivation origin. Those two differ for most apps
+/// (13 of 17 in the built-in registry), and an example missing `app_url` is one
+/// that gets refused for the very apps the fallback was meant to cover (per
+/// review). Read-only. Empty when the schema exposes no entities. Each line is
+/// `canister_query <compact-json-args>`.
 pub fn oql_query_examples(
     canister_id: &str,
     schema_json: &str,
+    app_url: Option<&str>,
     derivation_origin: Option<&str>,
     account: Option<&str>,
 ) -> Vec<String> {
@@ -1074,6 +1080,9 @@ pub fn oql_query_examples(
             // escaped and the example stays valid JSON.
             let query = serde_json::json!({ "start": entity, "limit": 10 }).to_string();
             args.insert("oql".into(), serde_json::Value::String(query));
+            if let Some(u) = app_url {
+                args.insert("app_url".into(), serde_json::Value::String(u.to_string()));
+            }
             if let Some(o) = derivation_origin {
                 args.insert("derivation_origin".into(), serde_json::Value::String(o.to_string()));
             }
@@ -2455,32 +2464,52 @@ mod tests {
         );
     }
 
-    // #8: one COMPLETE canister_query per entity, each preserving the identity the
-    // schema was read under (derivation_origin + account), so copying an example
-    // doesn't silently drop back to anonymous.
+    // #8: one COMPLETE canister_query per entity, each preserving BOTH halves of
+    // the call the schema was read under — the identity (derivation_origin +
+    // account), so copying an example doesn't drop back to anonymous, and the
+    // authorizing `app_url`, so it doesn't get refused by the discoverability
+    // gate. The two are different origins for most apps, so an example carrying
+    // only the identity would fail exactly where the fallback was supposed to help.
     #[test]
-    fn oql_query_examples_are_complete_and_preserve_identity() {
+    fn oql_query_examples_are_complete_and_preserve_identity_and_authorization() {
         use super::oql_query_examples;
         let schema = r#"{"entities":[{"name":"bookings"},{"name":"users"}]}"#;
-        let ex = oql_query_examples("aaaaa-aa", schema, Some("https://app.example.com"), Some("work"));
+        let ex = oql_query_examples(
+            "aaaaa-aa",
+            schema,
+            Some("https://nns.internetcomputer.org"),
+            Some("https://nns.ic0.app"),
+            Some("work"),
+        );
         assert_eq!(ex.len(), 2, "one example per entity");
         assert!(ex[0].starts_with("canister_query "), "names the tool: {}", ex[0]);
         assert!(ex[0].contains("aaaaa-aa"), "carries the canister id: {}", ex[0]);
         assert!(ex[0].contains("bookings"), "uses the entity as start: {}", ex[0]);
-        assert!(ex[0].contains("https://app.example.com"), "preserves derivation_origin: {}", ex[0]);
+        assert!(ex[0].contains("https://nns.ic0.app"), "preserves derivation_origin: {}", ex[0]);
         assert!(ex[0].contains("work"), "preserves account: {}", ex[0]);
+        // The authorizing origin travels too, and as its OWN argument — the whole
+        // point is that it is not the derivation origin.
+        let args_json = ex[0].strip_prefix("canister_query ").expect("tool prefix");
+        let args: serde_json::Value = serde_json::from_str(args_json).expect("valid JSON args");
+        assert_eq!(
+            args.get("app_url").and_then(|u| u.as_str()),
+            Some("https://nns.internetcomputer.org"),
+            "the example must carry the origin that authorized the schema read: {}",
+            ex[0]
+        );
         // Anonymous schema read → examples carry no identity args (stay anonymous).
-        let anon = oql_query_examples("aaaaa-aa", schema, None, None);
+        let anon = oql_query_examples("aaaaa-aa", schema, None, None, None);
         assert!(!anon[0].contains("derivation_origin"), "no origin when read anonymously: {}", anon[0]);
+        assert!(!anon[0].contains("app_url"), "and no app_url when none was used: {}", anon[0]);
         // No entities → no examples.
-        assert!(oql_query_examples("aaaaa-aa", "{}", None, None).is_empty());
+        assert!(oql_query_examples("aaaaa-aa", "{}", None, None, None).is_empty());
 
         // Escaping: an entity name with a quote/backslash (the schema is
         // canister-supplied, hence untrusted) must still yield a VALID-JSON example.
         // The example line is `canister_query <json-args>`; the `oql` arg is itself a
         // JSON-object string — both must parse.
         let weird = r#"{"entities":[{"name":"we\"ird"}]}"#;
-        let wex = oql_query_examples("aaaaa-aa", weird, None, None);
+        let wex = oql_query_examples("aaaaa-aa", weird, None, None, None);
         assert_eq!(wex.len(), 1);
         let args_json = wex[0].strip_prefix("canister_query ").expect("tool prefix");
         let args: serde_json::Value = serde_json::from_str(args_json).expect("args must be valid JSON");
