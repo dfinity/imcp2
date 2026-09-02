@@ -1091,6 +1091,63 @@ impl Identities {
             app_key_seed,
         })
     }
+
+    /// Test-only (the `e2e` cargo feature, which no release build enables):
+    /// establish a session holding a per-app delegation for `domain`, so an
+    /// end-to-end test can act as an app identity without an Internet Identity
+    /// canister to mint one.
+    ///
+    /// The delegation is GENUINE, not a stub: an Ed25519 anchor key signs a real
+    /// [`Delegation`] to a fresh per-app key, and the pair is stored in the same
+    /// cache a live `mcp_prepare_delegation` fills, so every layer above —
+    /// [`Self::delegated_identity_for`], [`build_identity`], the agent's request
+    /// signing, and the replica's own chain verification at ingress — runs
+    /// exactly as it does in production. The one thing it is not is
+    /// II-certified: the chain roots in a plain self-authenticating principal
+    /// rather than a canister signature, which the replica accepts on the same
+    /// terms.
+    ///
+    /// Returns the principal the session now signs as at `domain`.
+    #[cfg(all(test, feature = "e2e"))]
+    pub(crate) async fn seed_app_identity(
+        &self,
+        session_id: &str,
+        domain: &str,
+    ) -> Result<Principal, String> {
+        let (anchor_seed, anchor_der) = fresh_ed25519();
+        let (app_seed, app_der) = fresh_ed25519();
+        // Well past the re-derive margin, so the cached entry is `fresh()` for
+        // the whole test and nothing tries to re-derive it against an II that
+        // isn't there.
+        let expiration = now_ns() + 3_600_000_000_000;
+        let delegation = Delegation {
+            pubkey: app_der,
+            expiration,
+            targets: None,
+            // Unrestricted: `queries` is the read-only scope, and these tests
+            // exercise update calls too.
+            permissions: None,
+        };
+        let signature = BasicIdentity::from_raw_key(&anchor_seed)
+            .sign_delegation(&delegation)
+            .map_err(|e| format!("could not sign the test delegation: {e}"))?
+            .signature
+            .ok_or("the test delegation carried no signature")?;
+        let app = AppDelegation {
+            user_key: anchor_der,
+            chain: vec![SignedDelegation { delegation, signature }],
+            expiration_ns: expiration,
+            app_key_seed: app_seed,
+        };
+        let principal = build_identity(&app)?
+            .sender()
+            .map_err(|e| format!("the test delegation has no sender: {e}"))?;
+        self.ensure_session(session_id).await?;
+        self.set_grant_expiration(session_id, expiration).await;
+        // Keyed the way every reader keys it: the canonical origin.
+        self.store(session_id, &target_origin(domain), None, app).await;
+        Ok(principal)
+    }
 }
 
 /// Drop every session that no longer serves anyone, returning the ids of each

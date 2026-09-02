@@ -58,6 +58,51 @@ Test the status dashboard:
 npm test --prefix monitoring/mcp-status
 ```
 
+### End-to-end tests
+
+Three suites run against a real replica in
+[PocketIC](https://github.com/dfinity/pocketic) rather than against mocks. Each
+is behind its crate's `e2e` cargo feature, so the commands above compile
+neither them nor `pocket-ic`, and each skips cleanly when the artifacts it
+needs — which cargo does not fetch — are absent.
+
+Fetch the PocketIC server once. Its version must satisfy the `pocket-ic` crate
+the workspace pins (v15 today), and the asset below is the Linux x86-64 build:
+
+```sh
+curl -fL -o pocket-ic.gz \
+  https://github.com/dfinity/pocketic/releases/download/15.0.0/pocket-ic-x86_64-linux.gz
+gunzip pocket-ic.gz && chmod +x pocket-ic
+```
+
+**The canister tools** — every tool that reaches a canister, driven over a real
+MCP session against canisters installed in PocketIC
+(`crates/imcp2-core/src/e2e_canister_tools.rs`). CI runs this one:
+
+```sh
+POCKET_IC_BIN=$PWD/pocket-ic cargo test -p imcp2-core --features e2e
+```
+
+The other two drive the Internet Identity connect ceremony against a live
+Internet Identity canister, so they additionally need an Internet Identity
+release wasm — which is why CI runs neither.
+
+**The hosted server's handshake** (`src/e2e_handshake.rs`), which redeems a
+real registration delegation through the OAuth connect flow:
+
+```sh
+II_WASM=/abs/internet_identity_backend.wasm.gz POCKET_IC_BIN=$PWD/pocket-ic \
+  cargo test --features e2e
+```
+
+**The local binary's login** (`crates/imcp2-local/src/e2e_local_login.rs`),
+which does the same through `imcp2-local`'s browser login flow:
+
+```sh
+II_WASM=/abs/internet_identity_backend.wasm.gz POCKET_IC_BIN=$PWD/pocket-ic \
+  cargo test -p imcp2-local --features e2e
+```
+
 See the [README](README.md) for the tool surface, the auth flow, and deploy
 instructions.
 

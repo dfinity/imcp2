@@ -41,6 +41,13 @@ mod discover;
 mod discoverability;
 mod management;
 
+// End-to-end tests for the canister tools, against real canisters in PocketIC.
+// In-crate (not tests/) so they can use the feature-gated optional `pocket-ic`
+// dependency and the crate internals; gated so the default build compiles
+// neither them nor `pocket-ic`. See the module docs to run them.
+#[cfg(all(test, feature = "e2e"))]
+mod e2e_canister_tools;
+
 pub use identities::{IiInstance, SessionGauges};
 pub use tools::{IcCanisterTools, IcProtocolTools, IcTools, SessionResolver};
 /// The IC [`Agent`] type the components are built around, re-exported so
