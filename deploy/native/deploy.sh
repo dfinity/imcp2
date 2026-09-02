@@ -83,14 +83,37 @@ echo ">> rendering + installing units and Caddyfile, then (re)starting services"
 unit_mcp="$(sed -e "s#__PUBLIC_URL__#https://$DOMAIN#g" -e "s#__MCP_SERVE_BETA__#${MCP_SERVE_BETA:-}#g" -e "s#__OPENAI_APPS_CHALLENGE_TOKEN__#${OPENAI_APPS_CHALLENGE_TOKEN:-}#g" "$here/imcp2.service")"
 caddyfile="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__ACME_EMAIL__#$ACME_EMAIL#g" "$here/Caddyfile")"
 caddy_unit="$(cat "$here/caddy.service")"
-# Pin the dashboard's SSRF allowlist to this deployment's own host. It used to be
-# the PARENT domain (${DOMAIN#*.}) because the dashboard guessed the II origin by
-# stripping the `mcp.` label — on mcp.internetcomputer.org that silently
-# allowlisted all of internetcomputer.org. The II origins now come from the
-# server's /version and are covered by the dashboard's built-in id.ai suffixes,
-# so only the MCP host itself needs adding.
+# The dashboard shows the monitored instances side by side. Every host renders
+# the same set by default -- staging and production -- so the page reads the same
+# wherever it is served. STATUS_TARGETS replaces the set (whitespace-separated
+# name=origin entries, see monitoring/mcp-status/README.md), and STATUS_TARGET_II
+# the II pins. The default pin belongs to the default set: production's II is
+# pinned because that origin's edge answers /version with a redirect, so its
+# pairing cannot be read from the server (drop the pin once the edge forwards
+# /version) -- but a custom set gets no pin it did not ask for, since a pin for a
+# target that is not in the list makes the dashboard refuse to start. `-` rather
+# than `:-`, so an explicit empty STATUS_TARGET_II clears the default pin.
+if [ "${STATUS_TARGETS+set}" = set ]; then
+  status_targets="$STATUS_TARGETS"
+  status_target_ii="${STATUS_TARGET_II-}"
+else
+  status_targets="staging=https://mcp.beta.id.ai production=https://mcp.internetcomputer.org"
+  status_target_ii="${STATUS_TARGET_II-production=https://id.ai}"
+fi
+# The dashboard's SSRF allowlist: this host plus each target's host. Entries are
+# matched as suffixes (like the built-in id.ai), so a listed host also admits its
+# own subdomains -- the rule this deployment's own host has always been under.
+# It used to be the PARENT domain (${DOMAIN#*.}) because the dashboard guessed
+# the II origin by stripping the `mcp.` label -- on mcp.internetcomputer.org that
+# silently allowlisted all of internetcomputer.org. The II origins now come from
+# each server's /version (or a pin) and are covered by the built-in id.ai
+# suffixes, so only the MCP hosts need adding.
 status_allowed="$DOMAIN"
-unit_status="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__ALLOWED_HOSTS__#$status_allowed#g" "$here/imcp-status.service")"
+for entry in $status_targets; do
+  h="${entry#*=}"; h="${h#*://}"; h="${h%%[/:]*}"
+  case ",$status_allowed," in *",$h,"*) ;; *) status_allowed="$status_allowed,$h" ;; esac
+done
+unit_status="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__TARGETS__#$status_targets#g" -e "s#__TARGET_II__#$status_target_ii#g" -e "s#__ALLOWED_HOSTS__#$status_allowed#g" "$here/imcp-status.service")"
 
 $SSH "sudo bash -s" <<EOF
 set -e

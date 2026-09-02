@@ -22,7 +22,9 @@ import {
   isAllowedOrigin,
   normaliseOrigin,
   parseAdvertisedInstances,
+  parseTargetList,
   resolveConfig,
+  resolveTargets,
 } from "./config.js";
 
 const byId = (section, id) => section.checks.find((c) => c.id === id);
@@ -271,6 +273,133 @@ test("resolveConfig rejects a disallowed origin", () => {
     () => resolveConfig({ mcpOrigin: "http://169.254.169.254" }),
     (e) => e.code === "DISALLOWED_ORIGIN",
   );
+});
+
+/** Run `fn` with the given variables set (undefined = unset), restoring afterwards. */
+const withEnv = (vars, fn) => {
+  const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  for (const [k, v] of Object.entries(vars)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  try {
+    fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+};
+
+test("parseTargetList reads name=origin entries from a string or repeated flags", () => {
+  assert.deepEqual(
+    parseTargetList("staging=https://mcp.beta.id.ai  production=https://mcp.internetcomputer.org"),
+    [
+      { name: "staging", origin: "https://mcp.beta.id.ai" },
+      { name: "production", origin: "https://mcp.internetcomputer.org" },
+    ],
+  );
+  // Repeated --target flags arrive as an array; an unset variable as nothing.
+  assert.deepEqual(parseTargetList(["a=https://a.id.ai", "b=https://b.id.ai"]).length, 2);
+  assert.deepEqual(parseTargetList(undefined), []);
+  assert.deepEqual(parseTargetList("   "), []);
+  // Malformed entries and duplicate names are errors, not silently dropped: a
+  // dashboard monitoring fewer instances than configured must not look whole.
+  assert.throws(() => parseTargetList("https://mcp.beta.id.ai"), /name=origin/);
+  assert.throws(() => parseTargetList("bad name=https://x.id.ai"), /name=origin/);
+  assert.throws(() => parseTargetList("a/b=https://x.id.ai"), /name=origin/);
+  assert.throws(() => parseTargetList("x="), /name=origin/);
+  assert.throws(() => parseTargetList("a=https://x.id.ai a=https://y.id.ai"), /Duplicate/);
+});
+
+test("resolveTargets builds the instance set, pins per target, and allowlists each", () => {
+  const { targets } = resolveTargets({
+    targets: "staging=https://mcp.beta.id.ai production=https://mcp.id.ai",
+    targetIi: "production=https://id.ai",
+  });
+  assert.deepEqual(targets, [
+    { name: "staging", mcpOrigin: "https://mcp.beta.id.ai", iiOrigin: undefined },
+    { name: "production", mcpOrigin: "https://mcp.id.ai", iiOrigin: "https://id.ai" },
+  ]);
+  // A pin has to name a configured target.
+  assert.throws(
+    () => resolveTargets({ targets: "a=https://mcp.beta.id.ai", targetIi: "b=https://id.ai" }),
+    /unknown target "b"/,
+  );
+  // The SSRF allowlist applies to every configured instance, not just the first.
+  assert.throws(
+    () => resolveTargets({ targets: "a=https://mcp.beta.id.ai b=https://evil.example" }),
+    (e) => e.code === "DISALLOWED_ORIGIN",
+  );
+  assert.throws(
+    () => resolveTargets({ targets: "a=https://mcp.beta.id.ai", targetIi: "a=https://evil.example" }),
+    (e) => e.code === "DISALLOWED_ORIGIN",
+  );
+  // Naming instances two ways at once is a configuration error, not a merge —
+  // for the MCP origin AND for the II pin: a global --ii / II_ORIGIN alongside a
+  // list would silently pin every unpinned target to the same II.
+  assert.throws(
+    () => resolveTargets({ targets: "a=https://mcp.beta.id.ai", mcpOrigin: "https://mcp.id.ai" }),
+    /--mcp cannot be combined/,
+  );
+  assert.throws(
+    () => resolveTargets({ targets: "a=https://mcp.beta.id.ai", iiOrigin: "https://id.ai" }),
+    /--ii cannot be combined/,
+  );
+  withEnv({ II_ORIGIN: "https://id.ai" }, () => {
+    assert.throws(
+      () => resolveTargets({ targets: "a=https://mcp.beta.id.ai b=https://mcp.id.ai" }),
+      /II_ORIGIN cannot be combined/,
+    );
+  });
+  withEnv({ MCP_ORIGIN: "https://mcp.id.ai" }, () => {
+    assert.throws(
+      () => resolveTargets({ targets: "a=https://mcp.beta.id.ai" }),
+      /MCP_ORIGIN cannot be combined/,
+    );
+  });
+  // An unpinned target stays unpinned: nothing falls through to the environment.
+  withEnv({ II_ORIGIN: undefined }, () => {
+    const { targets: t } = resolveTargets({
+      targets: "a=https://mcp.beta.id.ai b=https://mcp.id.ai",
+      targetIi: "b=https://id.ai",
+    });
+    assert.deepEqual(t.map((x) => x.iiOrigin), [undefined, "https://id.ai"]);
+  });
+});
+
+test("resolveTargets refuses a pin that has no target list to pin into", () => {
+  // A half-typed multi-target invocation must not quietly become the
+  // single-target fallback monitoring a different pairing.
+  assert.throws(
+    () => resolveTargets({ targetIi: "production=https://id.ai" }),
+    /no --target \/ MCP_STATUS_TARGETS is set/,
+  );
+  withEnv({ MCP_STATUS_TARGET_II: "production=https://id.ai" }, () => {
+    assert.throws(() => resolveTargets(), /no --target \/ MCP_STATUS_TARGETS is set/);
+  });
+  // Empty pin settings are not pins.
+  withEnv({ MCP_STATUS_TARGET_II: "  " }, () => {
+    assert.equal(resolveTargets({ mcpOrigin: "https://mcp.beta.id.ai" }).targets.length, 1);
+  });
+});
+
+test("resolveTargets falls back to the single-target configuration, named by host", () => {
+  const { targets } = resolveTargets({
+    mcpOrigin: "https://mcp.beta.id.ai",
+    iiOrigin: "https://beta.id.ai",
+  });
+  assert.deepEqual(targets, [
+    { name: "mcp.beta.id.ai", mcpOrigin: "https://mcp.beta.id.ai", iiOrigin: "https://beta.id.ai" },
+  ]);
+  // MCP_STATUS_TARGETS in the environment defines the set the same way a flag does.
+  withEnv({ MCP_STATUS_TARGETS: "one=https://mcp.beta.id.ai two=https://mcp.id.ai" }, () => {
+    assert.deepEqual(
+      resolveTargets().targets.map((t) => t.name),
+      ["one", "two"],
+    );
+  });
 });
 
 test("checkMcpEndpoints passes for a well-behaved server", async () => {
