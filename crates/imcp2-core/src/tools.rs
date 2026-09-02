@@ -338,7 +338,14 @@ impl IcCanisterTools {
             Ok(b) => b,
             Err(e) => return Ok(err(format!("OQL schema call failed: {e}"))),
         };
-        let schema = calls::decode_schema_reply(&reply);
+        // `decode_schema_reply` bounds the schema's size, parses it ONCE (the entity
+        // names below come from that parse) and only pretty-prints a small, shallow
+        // document — an over-large reply is refused here rather than expanded and
+        // copied through the result.
+        let schema = match calls::decode_schema_reply(&reply) {
+            Ok(s) => s,
+            Err(e) => return Ok(err(format!("OQL schema call failed: {e}"))),
+        };
         // An origin is required (rejected above if absent), so this is never anonymous.
         let is_anonymous = false;
         // #8: a COMPLETE canister_query per entity, carrying the SAME identity this
@@ -347,14 +354,14 @@ impl IcCanisterTools {
         // copied example must pass the same gate this schema read just passed.
         let example_queries = calls::oql_query_examples(
             &canister_id,
-            &schema,
+            schema.entity_names(),
             Some(declaration.origin.as_str()),
             Some(target.origin.as_str()),
             account.as_deref(),
         );
         // #1: an EMPTY schema (no visible entities) for this authenticated account is
         // "nothing visible here", not "the app has no data model".
-        let empty_note = if calls::oql_schema_is_empty(&schema) {
+        let empty_note = if schema.is_empty() {
             Some(
                 "This account sees no OQL entities on this canister — confirm the \
                  derivation_origin/account are the ones the user uses in their browser."
@@ -366,6 +373,7 @@ impl IcCanisterTools {
         // Keep the primary block as the raw schema JSON (paste-able); surface the
         // empty-note, the ready-to-run examples, and the identity note as SEPARATE
         // blocks so none of them break the JSON for a copy-paste consumer.
+        let schema = schema.text;
         let mut blocks = vec![schema.clone()];
         if let Some(note) = &empty_note {
             blocks.push(note.clone());
@@ -1680,7 +1688,9 @@ async fn diagnose_empty_oql(
     // "this account sees no entities".
     let entities: Option<Vec<String>> = match calls::encode_unit_arg() {
         Ok(arg) => match calls::raw_call(agent, principal, "schema", arg, true).await {
-            Ok(reply) => Some(calls::oql_entity_names(&calls::decode_schema_reply(&reply))),
+            // An over-large schema is refused by the decoder — treat it like a failed
+            // read (unknown), not as "no entities".
+            Ok(reply) => calls::decode_schema_reply(&reply).ok().map(|s| s.entity_names().to_vec()),
             Err(_) => None,
         },
         Err(_) => None,
