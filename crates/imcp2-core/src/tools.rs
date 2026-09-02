@@ -163,11 +163,32 @@ impl IcCanisterTools {
     )]
     async fn get_canister_candid(
         &self,
-        Parameters(calls::GetCandidArgs { canister_id }): Parameters<calls::GetCandidArgs>,
+        Parameters(calls::GetCandidArgs { canister_id, app_url, derivation_origin }): Parameters<
+            calls::GetCandidArgs,
+        >,
     ) -> Result<CallToolResult, McpError> {
         let principal = match Principal::from_text(&canister_id) {
             Ok(p) => p,
             Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
+        };
+        // `derivation_origin` is accepted here only as the origin fallback: the
+        // interface read below is anonymous, so there is no identity to bind.
+        let target = match resolve_identity_target(derivation_origin) {
+            Ok(t) => t,
+            Err(e) => return Ok(err(e)),
+        };
+        let declaration = match authorize_canister_call(
+            "get_canister_candid",
+            discoverability::CallKind::Read,
+            app_url,
+            target.as_ref(),
+            None,
+            &principal,
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(refusal) => return Ok(err(refusal)),
         };
         match self
             .agent
@@ -190,6 +211,8 @@ impl IcCanisterTools {
                         candid: did.clone(),
                         oql,
                         api_doc_available,
+                        declared_by: declaration.origin.clone(),
+                        declared_at: declaration.path.to_string(),
                     };
                     // Assemble any capability notes as separate blocks so the first
                     // block stays the raw, paste-able `.did`.
@@ -268,7 +291,7 @@ impl IcCanisterTools {
     )]
     async fn get_canister_oql_schema(
         &self,
-        Parameters(calls::OqlSchemaArgs { canister_id, derivation_origin, account }): Parameters<calls::OqlSchemaArgs>,
+        Parameters(calls::OqlSchemaArgs { canister_id, derivation_origin, app_url, account }): Parameters<calls::OqlSchemaArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let principal = match Principal::from_text(&canister_id) {
@@ -288,6 +311,19 @@ impl IcCanisterTools {
         };
         let Some(target) = target else {
             return Ok(err(oql_needs_origin_error("Reading the OQL schema")));
+        };
+        let declaration = match authorize_canister_call(
+            "get_canister_oql_schema",
+            discoverability::CallKind::Read,
+            app_url,
+            Some(&target),
+            Some(&target),
+            &principal,
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(refusal) => return Ok(err(refusal)),
         };
         let requested = Some(target.requested.clone());
         let origin = Some(target.origin.clone());
@@ -342,6 +378,8 @@ impl IcCanisterTools {
             is_anonymous,
             note: empty_note,
             example_queries,
+            declared_by: declaration.origin,
+            declared_at: declaration.path.to_string(),
         };
         Ok(ok_structured_blocks(blocks, &output))
     }
@@ -353,12 +391,37 @@ impl IcCanisterTools {
     )]
     async fn get_canister_api_doc(
         &self,
-        Parameters(calls::ApiDocArgs { canister_id }): Parameters<calls::ApiDocArgs>,
+        Parameters(calls::ApiDocArgs { canister_id, app_url, derivation_origin }): Parameters<
+            calls::ApiDocArgs,
+        >,
     ) -> Result<CallToolResult, McpError> {
         let principal = match Principal::from_text(&canister_id) {
             Ok(p) => p,
             Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
         };
+        // `derivation_origin` is accepted here only as the origin fallback: the doc
+        // read below is anonymous, so there is no identity to bind.
+        let target = match resolve_identity_target(derivation_origin) {
+            Ok(t) => t,
+            Err(e) => return Ok(err(e)),
+        };
+        let declaration = match authorize_canister_call(
+            "get_canister_api_doc",
+            discoverability::CallKind::Read,
+            app_url,
+            target.as_ref(),
+            None,
+            &principal,
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(refusal) => return Ok(err(refusal)),
+        };
+        // Every outcome below — the doc, and each way of not having one — happens
+        // AFTER the gate, so all of them can state which app declared this canister.
+        let (declared_by, declared_at) =
+            (declaration.origin.clone(), declaration.path.to_string());
         // Read the interface to learn which naming the canister uses
         // (getApiDoc vs get_api_doc); the doc is public, so call anonymously.
         let did = calls::candid_service(&self.agent, principal).await;
@@ -375,6 +438,8 @@ impl IcCanisterTools {
                 expected,
                 retry,
                 next: Some(next.to_string()),
+                declared_by: declared_by.clone(),
+                declared_at: declared_at.clone(),
             };
             ok_structured(next.to_string(), &output)
         };
@@ -437,6 +502,8 @@ impl IcCanisterTools {
             expected: false,
             retry: false,
             next: None,
+            declared_by,
+            declared_at,
         };
         Ok(ok_structured(doc, &output))
     }
@@ -484,18 +551,26 @@ impl IcCanisterTools {
     }
 
     /// Probe the app's OWN data canisters once (#3): fetch each candidate's Candid
-    /// anonymously (the interface is public) and record its OQL / api-doc capability
-    /// flags on the `DiscoveredCanister`. Only app-owned data candidates are probed
-    /// — never the frontend or a shared system canister (ledger/II/NNS) — so the
-    /// caller-gated data-access handle the flags feed stays correctly scoped. Probes
-    /// run CONCURRENTLY and fail soft: an unreadable interface just leaves the flags
-    /// null. Bounded by `MAX_CAPABILITY_PROBES` so a large manifest can't fan out
-    /// unboundedly.
+    /// and record its OQL / api-doc capability flags on the `DiscoveredCanister`.
+    /// Only app-owned data candidates are probed — never the frontend or a shared
+    /// system canister (ledger/II/NNS) — so the caller-gated data-access handle the
+    /// flags feed stays correctly scoped. Probes run CONCURRENTLY and fail soft: an
+    /// unreadable interface just leaves the flags null. Bounded by
+    /// `MAX_CAPABILITY_PROBES` so a large manifest can't fan out unboundedly.
+    ///
+    /// DECLARED candidates only ([`discover::is_declared`]). Reading a canister's
+    /// interface through this connector requires the owning app to declare it, and
+    /// this probe is that same read made on the agent's behalf — probing an
+    /// undeclared candidate here would hand back, as a capability flag, exactly what
+    /// `get_canister_candid` would refuse to return. A mined candidate (`env.json`,
+    /// the JS bundle) therefore keeps null flags: not "no capabilities", but "this
+    /// app has not put this canister within reach". That is the discovery-path cost
+    /// of gating reads, and it is named in [`crate::discoverability`]'s scope notes.
     async fn enrich_capabilities(&self, canisters: &mut [discover::DiscoveredCanister]) {
         let targets: Vec<(usize, Principal)> = canisters
             .iter()
             .enumerate()
-            .filter(|(_, c)| discover::is_app_data_candidate(c))
+            .filter(|(_, c)| discover::is_app_data_candidate(c) && discover::is_declared(c))
             .filter_map(|(i, c)| Principal::from_text(&c.canister_id).ok().map(|p| (i, p)))
             .take(MAX_CAPABILITY_PROBES)
             .collect();
@@ -567,41 +642,18 @@ impl IcCanisterTools {
             Err(e) => return Ok(err(e)),
         };
         // The service-discoverability gate (see `discoverability`): a write only
-        // goes to a canister the owning app DECLARES in its manifest. Run BEFORE
-        // fetching the target's Candid and encoding args — a canister we will not
-        // write to shouldn't be touched at all, and the caller gets the actionable
-        // refusal instead of an argument error it would have to fix twice.
-        let (origin, source) = match declaration_origin(app_url, target.as_ref(), &principal) {
-            Ok(v) => v,
-            Err(refusal) => return Ok(err(refusal)),
-        };
-        // Two independent questions about the same call: does this app declare the
-        // canister, and is this app the one the call is signed as. Both fetch the
-        // app's origin, so they run CONCURRENTLY — one round trip, not two.
-        //
-        // The binding applies only when the caller named an app AND is acting as
-        // someone: with no `app_url` the manifest is read at the identity's own
-        // origin, so the two are the same app by construction, and an anonymous
-        // call carries no app identity for a foreign manifest to misuse.
-        let binding = async {
-            match (source, target.as_ref()) {
-                (OriginSource::AppUrl, Some(t)) => {
-                    discoverability::bind_identity(&origin, &t.origin, &principal).await
-                }
-                _ => Ok(()),
-            }
-        };
-        let (bound, authorized) = tokio::join!(
-            binding,
-            discoverability::authorize_update_call(&origin, source, &principal)
-        );
-        // The mismatch is reported first when both fail: "this is not the app you
-        // are signing as" tells the caller something a "not declared" refusal
-        // would send them off to fix in the wrong place.
-        if let Err(refusal) = bound {
-            return Ok(err(refusal));
-        }
-        let declaration = match authorized {
+        // goes to a canister the owning app DECLARES in its manifest, and only
+        // under the identity of the app that declared it.
+        let declaration = match authorize_canister_call(
+            "canister_update_call",
+            discoverability::CallKind::Update,
+            app_url,
+            target.as_ref(),
+            target.as_ref(),
+            &principal,
+        )
+        .await
+        {
             Ok(d) => d,
             Err(refusal) => return Ok(err(refusal)),
         };
@@ -674,6 +726,7 @@ impl IcCanisterTools {
             derivation_origin,
             account,
             candid,
+            app_url,
         }): Parameters<calls::CanisterQueryArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
@@ -699,12 +752,15 @@ impl IcCanisterTools {
             (Some(method), None) => {
                 self.canister_candid_query(
                     &ctx, principal, canister_id, method, args, derivation_origin, account, candid,
+                    app_url,
                 )
                 .await
             }
             (None, Some(oql)) => {
-                self.canister_oql_query(&ctx, principal, canister_id, oql, derivation_origin, account)
-                    .await
+                self.canister_oql_query(
+                    &ctx, principal, canister_id, oql, derivation_origin, account, app_url,
+                )
+                .await
             }
         }
     }
@@ -723,7 +779,31 @@ impl IcCanisterTools {
         derivation_origin: Option<String>,
         account: Option<String>,
         candid: Option<String>,
+        app_url: Option<String>,
     ) -> Result<CallToolResult, McpError> {
+        // Who this read acts as: none = anonymous, else the app's canonical II
+        // derivation origin. Resolved FIRST because the gate below falls back to it
+        // when no `app_url` was given.
+        let target = match resolve_identity_target(derivation_origin) {
+            Ok(t) => t,
+            Err(e) => return Ok(err(e)),
+        };
+        // The service-discoverability gate (see `discoverability`): this connector
+        // reads only a canister the owning app DECLARES. Before any contact with the
+        // canister — including reading its interface.
+        let declaration = match authorize_canister_call(
+            "canister_query",
+            discoverability::CallKind::Read,
+            app_url,
+            target.as_ref(),
+            target.as_ref(),
+            &principal,
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(refusal) => return Ok(err(refusal)),
+        };
         // The interface to encode/decode against: the canister's own candid:service
         // if exposed, else the caller-supplied `candid`.
         let did = calls::resolve_did(&self.agent, principal, candid.as_deref()).await;
@@ -752,10 +832,6 @@ impl IcCanisterTools {
         }
         let arg_bytes = match calls::encode_args(did.as_deref(), &method, &args) {
             Ok(b) => b,
-            Err(e) => return Ok(err(e)),
-        };
-        let target = match resolve_identity_target(derivation_origin) {
-            Ok(t) => t,
             Err(e) => return Ok(err(e)),
         };
         let origin = target.as_ref().map(|t| t.origin.as_str());
@@ -808,6 +884,8 @@ impl IcCanisterTools {
             note,
             valid_entities: None,
             did_you_mean: None,
+            declared_by: declaration.origin,
+            declared_at: declaration.path.to_string(),
         };
         Ok(ok_structured_blocks(blocks, &output))
     }
@@ -817,6 +895,7 @@ impl IcCanisterTools {
     /// reply. Anonymous per-app OQL reads are disabled, so a `derivation_origin` is
     /// REQUIRED; an empty/failed result is diagnosed against the schema for the SAME
     /// principal (#1/#7).
+    #[allow(clippy::too_many_arguments)]
     async fn canister_oql_query(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -825,6 +904,7 @@ impl IcCanisterTools {
         oql: String,
         derivation_origin: Option<String>,
         account: Option<String>,
+        app_url: Option<String>,
     ) -> Result<CallToolResult, McpError> {
         // Validate the query is a JSON object and wrap it as `execute`'s single text
         // arg — the model writes plain JSON, we do the Candid encoding.
@@ -844,6 +924,21 @@ impl IcCanisterTools {
         };
         let Some(target) = target else {
             return Ok(err(oql_needs_origin_error("Running an OQL query")));
+        };
+        // The service-discoverability gate (see `discoverability`): this connector
+        // reads only a canister the owning app DECLARES.
+        let declaration = match authorize_canister_call(
+            "canister_query",
+            discoverability::CallKind::Read,
+            app_url,
+            Some(&target),
+            Some(&target),
+            &principal,
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(refusal) => return Ok(err(refusal)),
         };
         let requested = Some(target.requested.clone());
         let origin = Some(target.origin.clone());
@@ -914,6 +1009,8 @@ impl IcCanisterTools {
                     note: diag.note,
                     valid_entities: diag.valid_entities,
                     did_you_mean: diag.did_you_mean,
+                    declared_by: declaration.origin,
+                    declared_at: declaration.path.to_string(),
                 };
                 Ok(ok_structured_blocks(blocks, &output))
             }
@@ -968,6 +1065,8 @@ impl IcCanisterTools {
                     note: Some(unparsed_note),
                     valid_entities: None,
                     did_you_mean: None,
+                    declared_by: declaration.origin,
+                    declared_at: declaration.path.to_string(),
                 };
                 Ok(ok_structured_blocks(blocks, &output))
             }
@@ -1145,11 +1244,13 @@ impl IcCanisterTools {
         self.enrich_capabilities(&mut discovered).await;
         // The ready-to-use data-access handle: the resolved origin, scoped (by
         // is_app_data_candidate) to the app's own OQL canisters — never a guessed
-        // origin, never II/NNS/ledger/frontend. `derivation_origin` only: the
-        // data-access note names the OQL read tools (get_canister_oql_schema,
-        // canister_query), which take `derivation_origin`, not a website URL, so
-        // offering app_url here would send the agent to a param those tools don't accept.
-        let handle = format!("derivation_origin=\"{effective}\"");
+        // origin, never II/NNS/ledger/frontend. BOTH arguments, because a read now
+        // takes both: `derivation_origin` picks whose principal reads, `app_url`
+        // picks whose manifest authorizes it, and for most apps those are different
+        // origins (13 of 17 in the built-in registry), so handing back only the
+        // derivation origin would send the gate to look for a manifest where the app
+        // does not serve one.
+        let handle = format!("derivation_origin=\"{effective}\" app_url=\"{app_url}\"");
 
         let mut text = format!(
             "app_url: {app_url} ({app_url_source})\nderivation_origin: {effective} ({})\n",
@@ -1189,14 +1290,15 @@ impl IcCanisterTools {
              flags say whether to read via OQL and whether a canister declares a doc for \
              get_canister_api_doc to read (api_doc_available=false means no compatible method \
              was detected — usually there is none, though an unparsable interface reads the \
-             same way). To act as the user, pass the derivation_origin \
-             above to canister_query (read) and canister_update_call (write) \
-             — a write also takes the app_url above, whose \
-             /.well-known/ic-architecture manifest is what authorizes it; \
-             for an OQL canister, \
-             call get_canister_oql_schema for the entity/field names, then canister_query with \
-             the `oql` argument — plus an optional account from list_app_accounts. A \"my/our…\" \
-             question is an AUTHENTICATED read: pass the origin.",
+             same way). Every one of those tools takes the app_url above, whose \
+             /.well-known/ic-architecture manifest is what authorizes reaching a canister at \
+             all: the [declared] canisters listed above are the ones within reach, and a \
+             candidate found only in the app's env.json or bundle is not (which is also why \
+             its capability flags are blank). To act as the user, pass the derivation_origin \
+             above to canister_query (read) and canister_update_call (write); for an OQL \
+             canister, call get_canister_oql_schema for the entity/field names, then \
+             canister_query with the `oql` argument — plus an optional account from \
+             list_app_accounts. A \"my/our…\" question is an AUTHENTICATED read: pass the origin.",
         );
         let output = discover::OpenAppOutput {
             app_url,
@@ -1502,7 +1604,8 @@ fn oql_needs_origin_error(what: &str) -> String {
          cannot be done anonymously — pass `derivation_origin`, the app's canonical Internet \
          Identity origin, to read as your account. If you don't have it, resolve it from the \
          app's URL or name with open_app, then retry. (Anonymous per-app reads are \
-         disabled for now; public metadata such as get_canister_candid still works without an origin.)"
+         disabled for now. That is a separate rule from the declaration check every canister \
+         read runs — open_app returns the `app_url` that check needs alongside the origin.)"
     )
 }
 
@@ -1684,14 +1787,63 @@ fn declaration_origin(
     app_url: Option<String>,
     target: Option<&IdentityTarget>,
     canister_id: &Principal,
+    kind: discoverability::CallKind,
+    tool: &str,
 ) -> Result<(String, OriginSource), String> {
     if let Some(url) = app_url {
         return clean_app_url(&url).and_then(|u| app_origin_of(&u)).map(|u| (u, OriginSource::AppUrl));
     }
     match target {
         Some(t) => app_origin_of(&t.requested).map(|o| (o, OriginSource::DerivationOrigin)),
-        None => Err(discoverability::missing_origin_refusal(canister_id)),
+        None => Err(discoverability::missing_origin_refusal(tool, canister_id, kind)),
     }
+}
+
+/// The service-discoverability gate, for every tool that reaches a canister.
+///
+/// One place, so a read and a write can never drift into checking different
+/// things: pick the origin whose manifest decides (`app_url`, else the
+/// derivation origin as spelled), then run the manifest check and — when the
+/// call is SIGNED as someone at an app the caller named — the identity binding.
+/// Both fetch that same origin, so they run CONCURRENTLY: one round trip, not
+/// two.
+///
+/// `signing_as` is the identity the call actually goes out under, which is not
+/// always where the checked origin came from: `get_canister_candid` and
+/// `get_canister_api_doc` read anonymously and pass `None` here while still
+/// accepting a `derivation_origin` as the origin fallback. An anonymous call
+/// carries no app identity for a foreign manifest to misuse, so it skips the
+/// binding — exactly as an anonymous write does.
+///
+/// Run this BEFORE touching the target: a canister this connector will not reach
+/// should not be contacted at all, and the caller gets the actionable refusal
+/// instead of an argument error it would have to fix twice.
+async fn authorize_canister_call(
+    tool: &'static str,
+    kind: discoverability::CallKind,
+    app_url: Option<String>,
+    origin_from: Option<&IdentityTarget>,
+    signing_as: Option<&IdentityTarget>,
+    canister_id: &Principal,
+) -> Result<discoverability::Declaration, String> {
+    let (origin, source) = declaration_origin(app_url, origin_from, canister_id, kind, tool)?;
+    let binding = async {
+        match (source, signing_as) {
+            (OriginSource::AppUrl, Some(t)) => {
+                discoverability::bind_identity(&origin, &t.origin, canister_id, kind).await
+            }
+            _ => Ok(()),
+        }
+    };
+    let (bound, authorized) = tokio::join!(
+        binding,
+        discoverability::authorize_call(&origin, source, canister_id, kind)
+    );
+    // The mismatch is reported first when both fail: "this is not the app you
+    // are signing as" tells the caller something a "not declared" refusal would
+    // send them off to fix in the wrong place.
+    bound?;
+    authorized
 }
 
 /// Append guess-repair guidance to an `app_url` resolution failure (DNS, TLS,
@@ -1954,7 +2106,7 @@ fn identity_annotation(target: &IdentityTarget) -> String {
 /// have to be kept in sync forever, and a refused call already gets a refusal
 /// accurate for its own scope. Neither surface names a venue for a refused
 /// operation.
-const SERVER_INSTRUCTIONS: &str = "Tools for the Internet Computer: read what a canister offers, read and write its data, and act as the user's own identity at an app.\n\nCANISTERS. Each canister publishes a Candid interface declaring its methods and their types. Method arguments and replies are textual Candid, the `(...)` syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`; candid_syntax_guide returns that syntax; the full type system is served as an MCP resource, `candid://reference`. Some canisters additionally declare an OQL surface. This server reads those through OQL and refuses a Candid `method` query on them; update calls are unaffected. icp_oql_guide documents the dialect. IC how-to guides are served as `skill://<name>` resources.\n\nAPPS AND IDENTITY. An app is a website backed by canisters. Internet Identity gives the user a different principal at each app, derived from that app's derivation origin, which is not always the app's visible URL; open_app resolve it, and the tools that act as the user take the resolved value. Within one app the user may hold several accounts.\n\nWRITES. State-changing calls reach only apps that publish a service-discoverability manifest: canister_update_call is made to a canister only when the app that owns it declares that canister at /.well-known/ic-architecture (https://docs.internetcomputer.org/guides/frontends/service-discoverability/), which is how its operators opt in. `app_url` names that app and open_app returns it; where a call carries both an `app_url` and a derivation origin, the two must belong to the same app. Reading is not gated that way: every read tool works on any canister, declared or not.\n\nSESSIONS. Calls that act as the user are signed with the Internet Identity credential this connection was authorized with. Internet Identity offers two access levels at that point: \"Questions only\", where reads work and state-changing calls are rejected by the network, and \"Actions & questions\", which permits both.\n\nFINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user: do not use canister_update_call to move assets. Value-moving methods, neuron management, and every update call to a known wallet, ledger, exchange or staking canister are refused before they reach the network; that guard is a safeguard, not a complete filter, so treat this policy, rather than the absence of a refusal, as the limit. For financial operations (token transfers, spending approvals, payments, trades), the user works outside this connector, in a trusted interface they control.\n\nBuilding and deploying canisters happens in the user's own environment with the icp CLI; no tool here creates, funds or deploys one.";
+const SERVER_INSTRUCTIONS: &str = "Tools for the Internet Computer: read what a canister offers, read and write its data, and act as the user's own identity at an app.\n\nCANISTERS. Each canister publishes a Candid interface declaring its methods and their types. Method arguments and replies are textual Candid, the `(...)` syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`; candid_syntax_guide returns that syntax; the full type system is served as an MCP resource, `candid://reference`. Some canisters additionally declare an OQL surface. This server reads those through OQL and refuses a Candid `method` query on them; update calls are unaffected. icp_oql_guide documents the dialect. IC how-to guides are served as `skill://<name>` resources.\n\nAPPS AND IDENTITY. An app is a website backed by canisters. Internet Identity gives the user a different principal at each app, derived from that app's derivation origin, which is not always the app's visible URL; open_app resolve it, and the tools that act as the user take the resolved value. Within one app the user may hold several accounts.\n\nDECLARED CANISTERS. Every tool that reaches a canister — get_canister_candid, get_canister_api_doc, get_canister_oql_schema, canister_query and canister_update_call — works only on a canister the app that owns it declares at /.well-known/ic-architecture (https://docs.internetcomputer.org/guides/frontends/service-discoverability/), which is how its operators opt in to being read and operated by agents. `app_url` names that app and open_app returns it, alongside which of the app's canisters carry that declaration (marked [declared]); where a call carries both an `app_url` and a derivation origin, the two must belong to the same app. An app that publishes no manifest is still resolved and discovered, but none of its canisters can be read or called here: say that, and what its operators would publish, rather than retrying.\n\nSESSIONS. Calls that act as the user are signed with the Internet Identity credential this connection was authorized with. Internet Identity offers two access levels at that point: \"Questions only\", where reads work and state-changing calls are rejected by the network, and \"Actions & questions\", which permits both.\n\nFINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user: do not use canister_update_call to move assets. Value-moving methods, neuron management, and every update call to a known wallet, ledger, exchange or staking canister are refused before they reach the network; that guard is a safeguard, not a complete filter, so treat this policy, rather than the absence of a refusal, as the limit. For financial operations (token transfers, spending approvals, payments, trades), the user works outside this connector, in a trusted interface they control.\n\nBuilding and deploying canisters happens in the user's own environment with the icp CLI; no tool here creates, funds or deploys one.";
 
 impl ServerHandler for IcTools {
     async fn list_tools(
@@ -2091,7 +2243,14 @@ fn render_canister_line(c: &discover::DiscoveredCanister) -> String {
         (Some(n), None) => format!("  «{n}»"),
         _ => String::new(),
     };
+    // `[declared]` first, because it decides whether the canister is reachable at
+    // all: without it every tool that touches this canister refuses (see
+    // `discoverability`), which makes it more load-bearing than any capability
+    // flag. The raw provenance stays in `sources` for a caller that wants it.
     let mut caps = String::new();
+    if discover::is_declared(c) {
+        caps.push_str(" [declared]");
+    }
     if c.oql == Some(true) {
         caps.push_str(" [oql]");
     }
@@ -2125,7 +2284,7 @@ fn data_access_note(canisters: &[discover::DiscoveredCanister], handle: Option<&
             "To read it as the user, pass {clause} to get_canister_oql_schema (for the entity/field \
              names) and canister_query (with the `oql` argument), plus an optional account from list_app_accounts."
         ),
-        None => "Resolve the app's derivation_origin (open_app) and pass it to \
+        None => "Resolve the app (open_app) and pass its derivation_origin and app_url to \
                  get_canister_oql_schema (for the entity/field names) and canister_query (with the \
                  `oql` argument) to read as the user."
             .to_string(),
@@ -2400,7 +2559,7 @@ mod tests {
         // NOT interchangeable (an app can pin a derivation origin it doesn't serve
         // its manifest from), so the explicit argument decides.
         let (origin, source) =
-            super::declaration_origin(Some("https://app.example.com".into()), Some(&target), &canister)
+            super::declaration_origin(Some("https://app.example.com".into()), Some(&target), &canister, super::discoverability::CallKind::Update, "canister_update_call")
                 .expect("app_url is accepted");
         assert_eq!(origin, "https://app.example.com");
         assert_eq!(source, super::OriginSource::AppUrl);
@@ -2414,56 +2573,95 @@ mod tests {
             .expect("some target");
         assert_eq!(gateway.origin, "https://x.ic0.app", "the identity path remaps");
         let (origin, source) =
-            super::declaration_origin(None, Some(&gateway), &canister).expect("falls back");
+            super::declaration_origin(None, Some(&gateway), &canister, super::discoverability::CallKind::Update, "canister_update_call").expect("falls back");
         assert_eq!(origin, "https://x.icp0.io", "the manifest fetch does not");
         assert_eq!(source, super::OriginSource::DerivationOrigin);
 
         // Neither: refused, with the guidance that names the missing argument.
-        let e = super::declaration_origin(None, None, &canister).expect_err("must refuse");
+        let e = super::declaration_origin(None, None, &canister, super::discoverability::CallKind::Update, "canister_update_call").expect_err("must refuse");
         assert!(e.contains("`app_url`"), "{e}");
         assert!(e.contains(&canister.to_text()), "{e}");
 
         // A malformed app_url is rejected by the same validation every other
         // URL-taking argument uses, rather than being fetched.
-        assert!(super::declaration_origin(Some("http://x.example".into()), None, &canister).is_err());
-        assert!(super::declaration_origin(Some("   ".into()), None, &canister).is_err());
+        assert!(super::declaration_origin(Some("http://x.example".into()), None, &canister, super::discoverability::CallKind::Update, "canister_update_call").is_err());
+        assert!(super::declaration_origin(Some("   ".into()), None, &canister, super::discoverability::CallKind::Update, "canister_update_call").is_err());
     }
 
     // The discoverability gate is the opposite of the financial policy below: it
-    // is a property of THIS tool (it needs `app_url`, and it changes what the call
-    // does), so it belongs in the description, where an agent reads it before
-    // composing the call — and in the server instructions, which frame why. Pin
-    // both, plus the rule that reads stay open, so a future edit can't quietly
-    // turn the refusal into "this app is off limits".
+    // is a property of the tools that REACH a canister (they need `app_url`, and
+    // it changes what the call does), so `app_url` belongs on each of their
+    // schemas — and the rule belongs in the server instructions, which frame why.
+    // Pin both, plus the sentence that keeps a refusal from reading as "this app
+    // is off limits" now that it can no longer promise that reads still work.
     #[test]
-    fn discoverability_gate_is_stated_on_the_tool_and_server_wide() {
+    fn discoverability_gate_is_stated_on_every_tool_that_reaches_a_canister() {
         let tools = super::IcTools::all_tools();
-        // The description deliberately does not restate the gate: it is a
+        // The descriptions deliberately do not restate the gate: it is a
         // precondition the caller can neither check nor act on before calling,
         // `app_url` is documented on its own argument, and a refusal names the
         // manifest path and links the guide. The instructions carry it instead.
         //
-        // The argument is really on the schema, not just in the prose.
-        let schema = tools
-            .iter()
-            .find(|t| &*t.name == "canister_update_call")
-            .map(|t| serde_json::to_string(&t.input_schema).unwrap())
-            .unwrap();
-        assert!(schema.contains("app_url"), "app_url must be a declared argument: {schema}");
+        // The argument is really on each schema, not just in the prose. Every
+        // tool that touches a canister is listed, so adding a new one without
+        // wiring the gate fails here rather than silently opening a hole.
+        for tool in [
+            "get_canister_candid",
+            "get_canister_api_doc",
+            "get_canister_oql_schema",
+            "canister_query",
+            "canister_update_call",
+        ] {
+            let schema = tools
+                .iter()
+                .find(|t| &*t.name == tool)
+                .map(|t| serde_json::to_string(&t.input_schema).unwrap())
+                .unwrap_or_else(|| panic!("{tool} must be served"));
+            assert!(
+                schema.contains("app_url"),
+                "{tool} reaches a canister, so app_url must be a declared argument: {schema}"
+            );
+        }
+        // And no OTHER served tool grows one by accident: `app_url` is the gate's
+        // argument, so a tool that carries it without checking a manifest would be
+        // claiming an authorization it never performs.
+        for tool in tools.iter().filter(|t| {
+            !matches!(
+                &*t.name,
+                "get_canister_candid"
+                    | "get_canister_api_doc"
+                    | "get_canister_oql_schema"
+                    | "canister_query"
+                    | "canister_update_call"
+            )
+        }) {
+            let schema = serde_json::to_string(&tool.input_schema).unwrap();
+            assert!(
+                !schema.contains("app_url"),
+                "{} does not reach a canister, so it must not take app_url: {schema}",
+                tool.name
+            );
+        }
 
         let ins = super::SERVER_INSTRUCTIONS;
-        assert!(ins.contains("State-changing calls reach only apps that publish"));
+        assert!(ins.contains("Every tool that reaches a canister"));
         assert!(ins.contains("/.well-known/ic-architecture"));
         assert!(
             ins.contains(super::discover::SERVICE_DISCOVERABILITY_GUIDE),
             "the instructions must link the guide so an agent can relay it"
         );
-        // A gated write must not read as "this app is off limits": the sentence
-        // that keeps the reading path open is the one thing here that stops a
-        // refusal from ending the whole conversation about an app.
+        // A gated call must not read as "there is nothing to say about this app".
+        // The instructions can no longer promise that reading works — it is what
+        // may have just been refused — so what stops the agent from dropping the
+        // subject is being told what an undeclared app CAN still do and what its
+        // operators would publish.
         assert!(
-            ins.contains("Reading is not gated that way"),
-            "the instructions must keep reads open: {ins}"
+            ins.contains("still resolved and discovered"),
+            "the instructions must say what an undeclared app can still do: {ins}"
+        );
+        assert!(
+            !ins.contains("Reading is not gated"),
+            "the instructions must not claim reads are ungated: {ins}"
         );
     }
 

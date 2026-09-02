@@ -31,6 +31,18 @@ use serde::{Deserialize, Serialize};
 pub struct GetCandidArgs {
     /// Canister principal, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai" (the ICP ledger).
     pub canister_id: String,
+    /// The website URL of the app that owns `canister_id`, which open_app returns.
+    /// A read is made only from a canister that app declares in its
+    /// service-discoverability manifest at `/.well-known/ic-architecture`, read from
+    /// this origin. Omitted, `derivation_origin` is used as that origin instead.
+    #[serde(default)]
+    pub app_url: Option<String>,
+    /// The app's derivation origin, from open_app, used ONLY to locate the manifest
+    /// when no `app_url` is given — an app that pins a custom derivation origin
+    /// serves its manifest at its website instead, so prefer `app_url`. The
+    /// interface read itself is anonymous: this call acts as no identity.
+    #[serde(default, alias = "domain")]
+    pub derivation_origin: Option<String>,
 }
 
 /// Output of `get_canister_candid`.
@@ -47,6 +59,14 @@ pub struct GetCandidOutput {
     /// True when the canister declares the method get_canister_api_doc reads. It reports the
     /// declaration, so that call can still come back without a doc.
     pub api_doc_available: bool,
+    /// The app origin whose service-discoverability manifest DECLARES this
+    /// canister — the app whose published manifest authorized this read. Always
+    /// present on a successful call: without a declaration the read is refused.
+    pub declared_by: String,
+    /// The well-known path that declaration was read from. Always
+    /// `/.well-known/ic-architecture`, echoed so a reply says where the
+    /// authorization came from rather than leaving it implied.
+    pub declared_at: String,
 }
 
 /// Arguments for `get_canister_oql_schema`.
@@ -59,6 +79,12 @@ pub struct OqlSchemaArgs {
     /// user's account there, and this server does not read it anonymously.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
+    /// The website URL of the app that owns `canister_id`, which open_app returns.
+    /// A read is made only from a canister that app declares in its
+    /// service-discoverability manifest at `/.well-known/ic-architecture`, read from
+    /// this origin. Omitted, `derivation_origin` is used as that origin instead.
+    #[serde(default)]
+    pub app_url: Option<String>,
     /// Which of the user's accounts to act as, by name (see list_app_accounts). Omit for the
     /// app's default account.
     #[serde(default)]
@@ -89,6 +115,14 @@ pub struct OqlSchemaOutput {
     /// One ready-to-run canister_query call per entity, each preserving the identity this
     /// schema was read under. Empty when the schema exposes no entities.
     pub example_queries: Vec<String>,
+    /// The app origin whose service-discoverability manifest DECLARES this
+    /// canister — the app whose published manifest authorized this read. Always
+    /// present on a successful call: without a declaration the read is refused.
+    pub declared_by: String,
+    /// The well-known path that declaration was read from. Always
+    /// `/.well-known/ic-architecture`, echoed so a reply says where the
+    /// authorization came from rather than leaving it implied.
+    pub declared_at: String,
 }
 
 /// Output of `icp_oql_guide`.
@@ -111,6 +145,18 @@ pub struct CandidGuideOutput {
 pub struct ApiDocArgs {
     /// Canister principal to read the API documentation from.
     pub canister_id: String,
+    /// The website URL of the app that owns `canister_id`, which open_app returns.
+    /// A read is made only from a canister that app declares in its
+    /// service-discoverability manifest at `/.well-known/ic-architecture`, read from
+    /// this origin. Omitted, `derivation_origin` is used as that origin instead.
+    #[serde(default)]
+    pub app_url: Option<String>,
+    /// The app's derivation origin, from open_app, used ONLY to locate the manifest
+    /// when no `app_url` is given — an app that pins a custom derivation origin
+    /// serves its manifest at its website instead, so prefer `app_url`. The doc read
+    /// itself is anonymous: this call acts as no identity.
+    #[serde(default, alias = "domain")]
+    pub derivation_origin: Option<String>,
 }
 
 /// Output of `get_canister_api_doc`.
@@ -136,6 +182,14 @@ pub struct ApiDocOutput {
     /// What to do next. Null when a doc was returned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
+    /// The app origin whose service-discoverability manifest DECLARES this
+    /// canister — the app whose published manifest authorized this read. Always
+    /// present on a successful call: without a declaration the read is refused.
+    pub declared_by: String,
+    /// The well-known path that declaration was read from. Always
+    /// `/.well-known/ic-architecture`, echoed so a reply says where the
+    /// authorization came from rather than leaving it implied.
+    pub declared_at: String,
 }
 
 /// Arguments for `canister_update_call`.
@@ -243,6 +297,12 @@ pub struct CanisterQueryArgs {
     /// its own. Ignored for an OQL query.
     #[serde(default)]
     pub candid: Option<String>,
+    /// The website URL of the app that owns `canister_id`, which open_app returns.
+    /// A read is made only from a canister that app declares in its
+    /// service-discoverability manifest at `/.well-known/ic-architecture`, read from
+    /// this origin. Omitted, `derivation_origin` is used as that origin instead.
+    #[serde(default)]
+    pub app_url: Option<String>,
 }
 
 /// Output of `canister_query`. The populated fields depend on `mode`: a Candid
@@ -300,6 +360,14 @@ pub struct CanisterQueryOutput {
     /// "bookings"). Null unless an unknown-`start` diagnosis found a near match.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub did_you_mean: Option<String>,
+    /// The app origin whose service-discoverability manifest DECLARES this
+    /// canister — the app whose published manifest authorized this read. Always
+    /// present on a successful call: without a declaration the read is refused.
+    pub declared_by: String,
+    /// The well-known path that declaration was read from. Always
+    /// `/.well-known/ic-architecture`, echoed so a reply says where the
+    /// authorization came from rather than leaving it implied.
+    pub declared_at: String,
 }
 
 pub fn default_args() -> String {

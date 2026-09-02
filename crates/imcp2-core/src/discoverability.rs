@@ -1,48 +1,54 @@
-//! The service-discoverability gate for the generic update-call tool.
+//! The service-discoverability gate for every tool that reaches a canister.
 //!
-//! Reading the Internet Computer is open to everyone: any canister's Candid
-//! interface, metadata, and query methods are public, and this server treats
-//! them that way. WRITING is different. A state-changing call runs against
-//! someone's live application — it can create, mutate, or destroy records that
-//! app's operators are answerable for — and nothing about a canister being
-//! publicly callable means its operators want an AI agent driving it.
+//! A canister being publicly callable is not a statement by its operators that
+//! they want an AI agent reading it or driving it. The
+//! **service-discoverability manifest** is where they make that statement: the
+//! JSON document at [`ARCHITECTURE_PATH`] listing every canister the app
+//! comprises and each one's role (Layer 1 of the protocol,
+//! [`SERVICE_DISCOVERABILITY_GUIDE`]). Publishing that file is a deliberate act,
+//! and per the guide it is how an app's operators opt in: it says "these are my
+//! canisters, an agent handed my URL may work them out and use them".
 //!
-//! So `canister_update_call` is restricted to canisters an app DECLARES in its
-//! **service-discoverability manifest**: the JSON document at
-//! [`ARCHITECTURE_PATH`] listing every canister the app comprises and each one's
-//! role (Layer 1 of the protocol, [`SERVICE_DISCOVERABILITY_GUIDE`]). Publishing
-//! that file is a deliberate act by the app's operators, and per the guide it is
-//! how they opt their app in: it says "these are my canisters, an agent handed my
-//! URL may work them out and use them". An app that has not published one has
-//! made no such statement, so this server does not write to it — it reads it,
-//! discovers it, and tells the agent what the app would have to publish.
+//! So every tool that reaches a canister is restricted to canisters an app
+//! DECLARES — `get_canister_candid`, `get_canister_api_doc`,
+//! `get_canister_oql_schema`, `canister_query` on both its paths, and
+//! `canister_update_call`. An app that has published no manifest has made no
+//! such statement, so this server neither reads nor calls its canisters: it
+//! still resolves the app, discovers it, and tells the agent what the app would
+//! have to publish.
+//!
+//! Reads and writes share one mechanism and differ only in what a refusal SAYS.
+//! [`CallKind`] carries which operation was attempted so a refusal can name it
+//! accurately — "this read" is not "a state-changing call", and an agent told
+//! the wrong one relays the wrong thing to the user. Nothing else about the
+//! check varies with the kind.
 //!
 //! The gate needs to know WHICH app owns the target, because the manifest lives
-//! at the app's origin, not on chain. That is the `app_url` argument on
-//! `canister_update_call` (falling back to `derivation_origin` when the app
-//! serves its manifest there); `open_app` hands back exactly that URL alongside
-//! the canisters it discovered, so the normal flow already carries it.
+//! at the app's origin, not on chain. That is the `app_url` argument every one
+//! of those tools takes (falling back to `derivation_origin` when the app serves
+//! its manifest there); `open_app` hands back exactly that URL alongside the
+//! canisters it discovered, so the normal flow already carries it.
 //!
-//! Three scope notes, so nobody over-claims what this gate does:
+//! Four scope notes, so nobody over-claims what this gate does:
 //!
 //!   * It is a **consent and provenance** gate, not a proof of ownership.
 //!     Whoever controls a domain controls what its manifest says, so a manifest
 //!     can name a canister its publisher does not own. What the gate guarantees
 //!     is that SOMEONE published a document, at an origin the caller named,
-//!     claiming that canister as part of their app — and that a write the user
+//!     claiming that canister as part of their app — and that a call the user
 //!     later questions can be traced back to that claim (the reply echoes the
 //!     origin and path that authorized it). It does not, and cannot, establish
 //!     that the claim was theirs to make.
 //!   * It bounds the BLAST RADIUS of a confused or misled agent far more than it
-//!     stops a determined attacker: an agent that has been talked into writing
-//!     somewhere now has to be talked into naming an origin that declares the
+//!     stops a determined attacker: an agent that has been talked into touching
+//!     a canister now has to be talked into naming an origin that declares the
 //!     target as well, and the vast majority of the ~1.2M canisters on the IC are
 //!     declared by no manifest at all. Two limits of that, spelled out because
 //!     they are the ones a reader is most likely to assume away (per review):
-//!     an ANONYMOUS write skips [`bind_identity`] entirely — there is no app
+//!     an ANONYMOUS call skips [`bind_identity`] entirely — there is no app
 //!     identity to protect — so an attacker who declares a victim canister in
 //!     their own manifest can have this connector make an anonymous call to it;
-//!     and an AUTHENTICATED write binds to the attacker's own app identity while
+//!     and an AUTHENTICATED one binds to the attacker's own app identity while
 //!     still reaching any victim method that accepts an arbitrary principal.
 //!     Neither grants a capability the attacker did not already have — anyone can
 //!     send either call to a public canister with an ordinary agent, since the IC
@@ -52,14 +58,25 @@
 //!     rest would take an association the TARGET attests to, which the protocol
 //!     does not define today (nothing a canister publishes names its app's
 //!     origin); it is raised on the pull request rather than invented here.
-//!   * It gates **writes only**. Reads (`canister_query`, `get_canister_candid`,
-//!     the OQL surface) and discovery are unchanged on every canister: the
-//!     protocol exists to make apps *more* legible to agents, and it would be a
-//!     strange reading of it to make this server see less.
+//!   * On READS specifically, it is **stricter than the protocol asks for**, and
+//!     deliberately so. The guide frames discoverability as an aid to reading,
+//!     and reading the IC is open to anyone with an ordinary agent, so gating
+//!     reads withholds nothing from an attacker — it is a statement about whose
+//!     canisters this connector is willing to read ON A USER'S BEHALF, made at
+//!     the cost of not answering questions about undeclared canisters. The cost
+//!     is real and lands on the discovery path: a candidate mined from an app's
+//!     `/env.json` or JS bundle can no longer be confirmed by reading its
+//!     interface, so a manifest is now the only route from an app to a usable
+//!     canister.
+//!   * It gates the tools that REACH a canister, and nothing else. `open_app`
+//!     (which resolves an app and discovers its canisters), the static guides,
+//!     and the identity tools (`get_app_principal`, `list_app_accounts`) touch no
+//!     canister and are unaffected — an agent refused here can still say which
+//!     app it was talking about and what that app declares.
 //!
 //! Only [`ARCHITECTURE_PATH`] authorizes. This server proposed the same document
 //! at [`discover::LEGACY_MANIFEST_PATH`] before the protocol was published, and
-//! discovery still READS it — but it cannot authorize a write, because the
+//! discovery still READS it — but it cannot authorize a call, because the
 //! operators who adopted that proposal published it against different terms and
 //! never agreed to the ones publishing the protocol manifest now signifies
 //! (<https://internetcomputer.org/icp-mcp/app-operator-terms/>). Consent that was never given
@@ -93,6 +110,67 @@ impl OriginSource {
     }
 }
 
+/// Which operation the gate is authorizing. The RULE does not vary with it —
+/// only a canister an app declares is reachable, read or write — but a refusal
+/// has to name what the caller actually attempted: an agent told its READ was
+/// refused as "a state-changing call" relays something false to the user, and a
+/// write reported as a read hides what it just tried to do. So the kind reaches
+/// the refusal builders and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallKind {
+    /// A read: `get_canister_candid`, `get_canister_api_doc`,
+    /// `get_canister_oql_schema`, or `canister_query` on either path.
+    Read,
+    /// A state-changing call: `canister_update_call`.
+    Update,
+}
+
+impl CallKind {
+    /// The operation as a bare noun: "read" / "write".
+    fn noun(self) -> &'static str {
+        match self {
+            CallKind::Read => "read",
+            CallKind::Update => "write",
+        }
+    }
+
+    /// The operation as a verb whose object is the canister, for "…before it
+    /// will {} it": "read" / "write to".
+    fn verb(self) -> &'static str {
+        match self {
+            CallKind::Read => "read",
+            CallKind::Update => "write to",
+        }
+    }
+
+    /// Sentence-initial gerund whose object is the canister: "Reading" /
+    /// "Writing to".
+    fn gerund(self) -> &'static str {
+        match self {
+            CallKind::Read => "Reading",
+            CallKind::Update => "Writing to",
+        }
+    }
+
+    /// What this connector declines to do, for "…so this connector will not {}
+    /// its canisters".
+    fn will_not(self) -> &'static str {
+        match self {
+            CallKind::Read => "read",
+            CallKind::Update => "make a state-changing call to",
+        }
+    }
+
+    /// What the user can still do for themselves, once the agent has stopped
+    /// retrying. Both kinds end in the app's own frontend; only the verb differs.
+    fn user_alternative(self) -> &'static str {
+        match self {
+            CallKind::Read => "they can see the data themselves in the app's own frontend",
+            CallKind::Update => "they can perform the action themselves in the app's own frontend",
+        }
+    }
+}
+
 /// What authorized an update call: the app origin whose manifest declares the
 /// target canister, and the well-known path that manifest was read from. Echoed
 /// in the tool's reply so the write's provenance is visible to the user, not just
@@ -112,14 +190,18 @@ const MAX_LISTED_DECLARED: usize = 12;
 /// `canister_id` in its service-discoverability manifest, `Err(refusal)` — the
 /// complete tool error text — in every other case. Fails CLOSED: an unreachable
 /// origin, an unparseable document, and an absent manifest all refuse.
-pub async fn authorize_update_call(
+///
+/// `kind` reaches only the refusal text (see [`CallKind`]); the check a read and
+/// a write run is byte for byte the same one.
+pub async fn authorize_call(
     app_origin: &str,
     source: OriginSource,
     canister_id: &Principal,
+    kind: CallKind,
 ) -> Result<Declaration, String> {
     match discover::fetch_declared_manifest(app_origin).await {
-        Ok(probe) => decide(probe, app_origin, source, canister_id),
-        Err(e) => Err(unreachable_refusal(app_origin, source, &e)),
+        Ok(probe) => decide(probe, app_origin, source, canister_id, kind),
+        Err(e) => Err(unreachable_refusal(app_origin, source, &e, kind)),
     }
 }
 
@@ -136,6 +218,7 @@ fn decide(
     app_origin: &str,
     source: OriginSource,
     canister_id: &Principal,
+    kind: CallKind,
 ) -> Result<Declaration, String> {
     let manifest = match probe {
         discover::ManifestProbe::Declared(m) => m,
@@ -144,20 +227,20 @@ fn decide(
         // its operators looking for a file that is already there, when what they
         // actually have to do is serve it at the standard path.
         discover::ManifestProbe::Absent { legacy: Some(legacy), .. } => {
-            return Err(legacy_only_refusal(&legacy, canister_id, source))
+            return Err(legacy_only_refusal(&legacy, canister_id, source, kind))
         }
         discover::ManifestProbe::Absent { served_non_manifest, legacy: None } => {
-            return Err(no_manifest_refusal(app_origin, source, served_non_manifest.as_deref()))
+            return Err(no_manifest_refusal(app_origin, source, served_non_manifest.as_deref(), kind))
         }
     };
     if manifest.canisters.contains(canister_id) {
         return Ok(Declaration { origin: manifest.origin, path: manifest.path });
     }
-    Err(not_declared_refusal(&manifest, canister_id, source))
+    Err(not_declared_refusal(&manifest, canister_id, source, kind))
 }
 
-/// The identity half of the gate: the app whose manifest authorizes the write
-/// must be the app the write is SIGNED as.
+/// The identity half of the gate: the app whose manifest authorizes the call
+/// must be the app the call is SIGNED as.
 ///
 /// The manifest gate alone establishes that someone published a document at the
 /// origin the caller named. It says nothing about whose identity the call goes
@@ -167,8 +250,12 @@ fn decide(
 /// deliberately does not prove ownership — while the call was signed with the
 /// principal the user holds at a DIFFERENT app they actually trusted. Requiring
 /// the app to resolve to the identity being used removes that pairing: an
-/// attacker's manifest can only ever authorize writes made as the attacker's own
+/// attacker's manifest can only ever authorize calls made as the attacker's own
 /// app identity, which is worth nothing to them.
+///
+/// This matters for a READ as much as for a write: an authenticated read runs as
+/// the user's principal at whatever app they named, and a foreign manifest must
+/// not be able to point that principal at someone else's canister.
 ///
 /// The comparison is against what the app ITSELF resolves to — its declared Layer
 /// 5 origin, else a known-app value, else its own origin — not against the app URL
@@ -185,10 +272,11 @@ pub async fn bind_identity(
     app_origin: &str,
     requested_identity: &str,
     canister_id: &Principal,
+    kind: CallKind,
 ) -> Result<(), String> {
     let identity = discover::resolve_app_identity(app_origin, false)
         .await
-        .map_err(|e| identity_unresolvable_refusal(app_origin, &e))?;
+        .map_err(|e| identity_unresolvable_refusal(app_origin, &e, kind))?;
     // Compare canonical forms: `requested_identity` has been through the identity
     // path's canonicalization (which remaps the *.icp0.io / *.icp.net gateway
     // hosts to *.ic0.app), so put the resolved value through the same one or the
@@ -197,7 +285,7 @@ pub async fn bind_identity(
     if app_identity.eq_ignore_ascii_case(requested_identity) {
         return Ok(());
     }
-    Err(identity_mismatch_refusal(app_origin, &app_identity, requested_identity, canister_id))
+    Err(identity_mismatch_refusal(app_origin, &app_identity, requested_identity, canister_id, kind))
 }
 
 /// Cap on any externally-influenced string a refusal echoes back. A transport
@@ -254,37 +342,50 @@ fn safe_cause(cause: &str) -> String {
 }
 
 /// One sentence, in every refusal, stating the rule the caller just hit. Kept in
-/// one place so the policy can never be described two different ways.
+/// one place so the policy can never be described two different ways — and
+/// deliberately NOT parameterised by [`CallKind`]: the rule is the same for a
+/// read and a write, and a caller who hit it with one should be told the whole
+/// of it rather than the half that happens to apply.
 fn the_rule() -> String {
     format!(
-        "This server makes state-changing calls ONLY to canisters an app declares in its \
+        "This server reads and calls ONLY canisters an app declares in its \
          service-discoverability manifest at {ARCHITECTURE_PATH} — publishing it is how an app's \
          operators opt in to being discovered and operated by agents ({SERVICE_DISCOVERABILITY_GUIDE})."
     )
 }
 
-/// One sentence, in every refusal, making clear that only WRITES are gated — so
-/// an agent doesn't conclude the whole app is off limits and give up on a
-/// question it could still answer by reading.
-const READS_ARE_FINE: &str = "Reading is unaffected: canister_query, get_canister_candid, \
-     get_canister_api_doc, the OQL tools and the discovery tools work on this canister as before, \
-     so answer what you can by reading.";
+/// One sentence, in every refusal, naming what still works — so an agent doesn't
+/// conclude the whole app is off limits and drop the subject. It can no longer
+/// promise that reading works (it is exactly what may just have been refused),
+/// so it points at the tool that tells the agent WHICH canisters this app has
+/// put within reach.
+const DISCOVERY_IS_FINE: &str = "Discovery is unaffected: open_app resolves the app and lists what \
+     it declares, and the canisters on that list are the ones this connector can read and call — \
+     so say what you can from there rather than dropping the subject.";
 
 /// No `app_url` and no `derivation_origin`: the gate has no origin to check, so
-/// it cannot even start. Names the missing argument and where to get it.
-pub fn missing_origin_refusal(canister_id: &Principal) -> String {
+/// it cannot even start. Names the missing argument and where to get it. `tool`
+/// is the tool the caller actually invoked — five of them can land here, and
+/// naming the wrong one sends the agent to the wrong argument list.
+pub fn missing_origin_refusal(tool: &str, canister_id: &Principal, kind: CallKind) -> String {
     format!(
-        "`canister_update_call` needs to know which APP owns {canister_id} before it will write to \
-         it: pass `app_url` (the app's website URL, e.g. https://app.example.com). {} Get the URL \
-         from open_app — it returns `app_url` alongside the canisters it discovered — or from the \
-         user. {READS_ARE_FINE}",
+        "`{tool}` needs to know which APP owns {canister_id} before it will {} it: pass `app_url` \
+         (the app's website URL, e.g. https://app.example.com). {} Get the URL from open_app — it \
+         returns `app_url` alongside the canisters it discovered — or from the user. \
+         {DISCOVERY_IS_FINE}",
+        kind.verb(),
         the_rule()
     )
 }
 
 /// The origin could not be reached at all. Distinct from "publishes no manifest":
 /// we do not know, so the refusal is retryable rather than a verdict on the app.
-fn unreachable_refusal(app_origin: &str, source: OriginSource, error: &str) -> String {
+fn unreachable_refusal(
+    app_origin: &str,
+    source: OriginSource,
+    error: &str,
+    kind: CallKind,
+) -> String {
     let app_origin = safe_origin(app_origin);
     // Not every check failure clears on its own: an origin answering 401/403 on
     // the path is denying it deliberately, a stopped redirect is a configuration
@@ -297,11 +398,12 @@ fn unreachable_refusal(app_origin: &str, source: OriginSource, error: &str) -> S
         "This is likely transient — retry; if it persists, confirm that the origin is right."
     };
     format!(
-        "Could not check whether {app_origin} declares this canister: {}. {} The call is \
+        "Could not check whether {app_origin} declares this canister: {}. {} The {} is \
          refused rather than made blind. {next} Confirm that {} names the app's real origin \
-         (open_app returns it). {READS_ARE_FINE}",
+         (open_app returns it). {DISCOVERY_IS_FINE}",
         safe_cause(error),
         the_rule(),
+        kind.noun(),
         source.arg()
     )
 }
@@ -313,11 +415,13 @@ fn no_manifest_refusal(
     app_origin: &str,
     source: OriginSource,
     served_non_manifest: Option<&str>,
+    kind: CallKind,
 ) -> String {
     let app_origin = safe_origin(app_origin);
     let mut msg = format!(
         "{app_origin} publishes no service-discoverability manifest at {ARCHITECTURE_PATH}, so \
-         this connector will not make a state-changing call to its canisters. {} ",
+         this connector will not {} its canisters. {} ",
+        kind.will_not(),
         the_rule()
     );
     // The origin DID answer that path, just not with a manifest. Naming what it
@@ -344,11 +448,13 @@ fn no_manifest_refusal(
         "Otherwise: if this is NOT the app's origin (a marketing site, a docs host, a guessed \
          domain), pass the right `app_url` — open_app resolves one from the app's name or URL. If \
          it IS the app's origin, the app has not adopted the protocol, and re-running open_app \
-         will not change that: STOP retrying, tell the user this write cannot be made for them \
+         will not change that: STOP retrying, tell the user this {} cannot be made for them \
          here, and that the app's operators enable it by publishing the manifest \
          ({SERVICE_DISCOVERABILITY_GUIDE}); the skill://service-discoverability resource carries \
-         the deploy-time recipe for generating it, if the user is the one who can ship it. They \
-         can also perform the action themselves in the app's own frontend. {READS_ARE_FINE}"
+         the deploy-time recipe for generating it, if the user is the one who can ship it. In the \
+         meantime {}. {DISCOVERY_IS_FINE}",
+        kind.noun(),
+        kind.user_alternative()
     ));
     msg
 }
@@ -366,22 +472,27 @@ fn legacy_only_refusal(
     legacy: &discover::DeclaredManifest,
     canister_id: &Principal,
     source: OriginSource,
+    kind: CallKind,
 ) -> String {
     let mut msg = format!(
         "{} serves this connector's older, pre-protocol document at {} but publishes no \
-         service-discoverability manifest at {ARCHITECTURE_PATH}, so this connector will not make \
-         a state-changing call to its canisters. {} ",
+         service-discoverability manifest at {ARCHITECTURE_PATH}, so this connector will not {} \
+         its canisters. {} ",
         legacy.origin,
         legacy.path,
+        kind.will_not(),
         the_rule()
     );
-    msg.push_str(if legacy.canisters.contains(canister_id) {
-        "That older document DOES list this canister, but it cannot authorize the write: it \
-         predates the protocol, and its publishers never accepted the terms that publishing the \
-         standard manifest now signifies \
-         (https://internetcomputer.org/icp-mcp/app-operator-terms/). "
+    msg.push_str(&if legacy.canisters.contains(canister_id) {
+        format!(
+            "That older document DOES list this canister, but it cannot authorize the {}: it \
+             predates the protocol, and its publishers never accepted the terms that publishing \
+             the standard manifest now signifies \
+             (https://internetcomputer.org/icp-mcp/app-operator-terms/). ",
+            kind.noun()
+        )
     } else {
-        "That older document does not list this canister either. "
+        "That older document does not list this canister either. ".to_string()
     });
     if source == OriginSource::DerivationOrigin {
         msg.push_str(
@@ -394,14 +505,15 @@ fn legacy_only_refusal(
         "For the app's operators the fix is small and entirely theirs to make: serve the same JSON \
          at {ARCHITECTURE_PATH}, which is how they opt the app in \
          ({SERVICE_DISCOVERABILITY_GUIDE}); the skill://service-discoverability resource carries \
-         the deploy-time recipe. Until they do, STOP retrying: tell the user this write cannot be \
-         made for them here, and that they can perform the action themselves in the app's own \
-         frontend. {READS_ARE_FINE}"
+         the deploy-time recipe. Until they do, STOP retrying: tell the user this {} cannot be \
+         made for them here, and that {}. {DISCOVERY_IS_FINE}",
+        kind.noun(),
+        kind.user_alternative()
     ));
     msg
 }
 
-/// The caller named an app whose manifest authorizes the write, but asked to sign
+/// The caller named an app whose manifest authorizes the call, but asked to sign
 /// as a DIFFERENT app's identity. Without this check the manifest gate could be
 /// satisfied by an origin the attacker controls while the call went out under the
 /// principal the user holds somewhere else: any site can publish a manifest naming
@@ -413,20 +525,24 @@ fn identity_mismatch_refusal(
     app_identity: &str,
     requested_identity: &str,
     canister_id: &Principal,
+    kind: CallKind,
 ) -> String {
     let (app_origin, app_identity, requested_identity) =
         (safe_origin(app_origin), safe_origin(app_identity), safe_origin(requested_identity));
     format!(
         "The app at {app_origin} is not the app this call would be signed as. Internet \
          Identity derives that app's users from {app_identity}, while this call asks to act as \
-         {requested_identity}. Writing to {canister_id} on that combination is refused: a \
-         manifest published at one origin does not authorize a write made under another app's \
-         identity, or any site could declare a canister and have this connector write to it as \
+         {requested_identity}. {} {canister_id} on that combination is refused: a \
+         manifest published at one origin does not authorize a {} made under another app's \
+         identity, or any site could declare a canister and have this connector {} it as \
          you, at an app you trusted for something else. If {canister_id} belongs to the app you \
          are acting at, pass THAT app's URL as `app_url` — open_app returns the `app_url` and \
          the `derivation_origin` of one app together, so a pair from a single open_app call \
          always matches. If you meant to act at {app_origin} instead, pass its own derivation \
-         origin. {READS_ARE_FINE}"
+         origin. {DISCOVERY_IS_FINE}",
+        kind.gerund(),
+        kind.noun(),
+        kind.verb()
     )
 }
 
@@ -435,7 +551,7 @@ fn identity_mismatch_refusal(
 /// declared origin does not authorize). Distinct from a mismatch: we do not know
 /// that the two disagree, only that we cannot show they agree, and the call is
 /// refused rather than made blind.
-fn identity_unresolvable_refusal(app_origin: &str, cause: &str) -> String {
+fn identity_unresolvable_refusal(app_origin: &str, cause: &str, kind: CallKind) -> String {
     // Not every failure here is a blip: `resolve_app_identity` also refuses a
     // cross-origin derivation-origin declaration that the declared origin does
     // not authorize in its ii-alternative-origins, and no amount of retrying
@@ -456,11 +572,13 @@ fn identity_unresolvable_refusal(app_origin: &str, cause: &str) -> String {
          you are acting at (open_app returns its `app_url` and `derivation_origin` together)."
     };
     format!(
-        "Could not establish that {} is the app this call would be signed as: {}. The call is \
-         refused rather than made blind, because a manifest only authorizes a write when it \
-         comes from the app whose identity is signing. {next} {READS_ARE_FINE}",
+        "Could not establish that {} is the app this call would be signed as: {}. The {} is \
+         refused rather than made blind, because a manifest only authorizes a {} when it \
+         comes from the app whose identity is signing. {next} {DISCOVERY_IS_FINE}",
         safe_origin(app_origin),
-        safe_cause(cause)
+        safe_cause(cause),
+        kind.noun(),
+        kind.noun()
     )
 }
 
@@ -472,6 +590,7 @@ fn not_declared_refusal(
     manifest: &discover::DeclaredManifest,
     canister_id: &Principal,
     source: OriginSource,
+    kind: CallKind,
 ) -> String {
     let listed: Vec<String> = manifest
         .canisters
@@ -496,25 +615,27 @@ fn not_declared_refusal(
         return format!(
             "Could not determine whether {} declares {canister_id}: its manifest ({}) carries {} \
              entries beyond the limit this server reads, which were NOT checked, so this connector \
-             will not make a state-changing call to it. {} Of what WAS read, it {declares}. If \
+             will not {} it. {} Of what WAS read, it {declares}. If \
              {canister_id} is one of the unread entries, the manifest is too long and its \
              operators should shorten it ({SERVICE_DISCOVERABILITY_GUIDE}); if it belongs to a \
-             DIFFERENT app, pass that app's URL as `app_url` instead of {}. {READS_ARE_FINE}",
+             DIFFERENT app, pass that app's URL as `app_url` instead of {}. {DISCOVERY_IS_FINE}",
             manifest.origin,
             manifest.path,
             manifest.omitted,
+            kind.will_not(),
             the_rule(),
             source.arg()
         );
     }
     format!(
-        "{} does not declare {canister_id} in its manifest ({}), so this connector will not make a \
-         state-changing call to it. It {declares}. {} Use one of the declared canisters for this \
+        "{} does not declare {canister_id} in its manifest ({}), so this connector will not {} \
+         it. It {declares}. {} Use one of the declared canisters for this \
          operation. If {canister_id} really is part of this app, its operators must add it to the \
          manifest ({SERVICE_DISCOVERABILITY_GUIDE}); if it belongs to a DIFFERENT app, pass that \
-         app's URL as `app_url` instead of {}. {READS_ARE_FINE}",
+         app's URL as `app_url` instead of {}. {DISCOVERY_IS_FINE}",
         manifest.origin,
         manifest.path,
+        kind.will_not(),
         the_rule(),
         source.arg()
     )
@@ -564,18 +685,20 @@ mod tests {
     #[test]
     fn every_manifest_refusal_states_the_rule_and_links_the_guide() {
         let refusals = [
-            missing_origin_refusal(&backend()),
-            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out"),
-            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None),
+            missing_origin_refusal("canister_update_call", &backend(), CallKind::Update),
+            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Update),
+            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Update),
             not_declared_refusal(
                 &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
                 &backend(),
                 OriginSource::AppUrl,
+                CallKind::Update,
             ),
             legacy_only_refusal(
                 &manifest("https://app.example.com", LEGACY_MANIFEST_PATH, &[backend()]),
                 &backend(),
                 OriginSource::AppUrl,
+                CallKind::Update,
             ),
         ];
         for msg in refusals {
@@ -587,33 +710,147 @@ mod tests {
         }
     }
 
-    // A refusal must not read as "this app is off limits": writes are gated,
-    // reads are not, and an agent that stops reading has been over-refused.
+    // A refusal must not read as "there is nothing to say about this app". It can
+    // no longer point at reading — that is exactly what may have just been
+    // refused — so what keeps an over-refused agent from dropping the subject is
+    // the one thing that still works: resolving the app and listing what it
+    // declares. Pinned for BOTH kinds, because a read refusal that quietly kept
+    // the old "just read it instead" sentence would be advice that cannot work.
     #[test]
-    fn refusals_keep_the_reading_path_open() {
+    fn refusals_point_at_what_still_works() {
         for msg in [
-            missing_origin_refusal(&backend()),
-            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None),
+            missing_origin_refusal("canister_query", &backend(), CallKind::Read),
+            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Read),
+            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Read),
             not_declared_refusal(
                 &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
                 &backend(),
                 OriginSource::AppUrl,
+                CallKind::Read,
             ),
             legacy_only_refusal(
                 &manifest("https://app.example.com", LEGACY_MANIFEST_PATH, &[backend()]),
                 &backend(),
                 OriginSource::AppUrl,
+                CallKind::Read,
             ),
             identity_mismatch_refusal(
                 "https://evil.example",
                 "https://evil.example",
                 "https://gooddapp.com",
                 &backend(),
+                CallKind::Read,
             ),
-            identity_unresolvable_refusal("https://app.example.com", "timed out"),
+            identity_unresolvable_refusal("https://app.example.com", "timed out", CallKind::Read),
         ] {
-            assert!(msg.contains("canister_query"), "must point at the read path: {msg}");
+            assert!(msg.contains("open_app"), "must point at what still works: {msg}");
+            assert!(
+                !msg.contains("Reading is unaffected"),
+                "reads are gated too — a refusal must not promise otherwise: {msg}"
+            );
         }
+        for msg in [
+            missing_origin_refusal("canister_update_call", &backend(), CallKind::Update),
+            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Update),
+            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Update),
+            not_declared_refusal(
+                &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
+                &backend(),
+                OriginSource::AppUrl,
+                CallKind::Update,
+            ),
+            legacy_only_refusal(
+                &manifest("https://app.example.com", LEGACY_MANIFEST_PATH, &[backend()]),
+                &backend(),
+                OriginSource::AppUrl,
+                CallKind::Update,
+            ),
+            identity_mismatch_refusal(
+                "https://evil.example",
+                "https://evil.example",
+                "https://gooddapp.com",
+                &backend(),
+                CallKind::Update,
+            ),
+            identity_unresolvable_refusal("https://app.example.com", "timed out", CallKind::Update),
+        ] {
+            assert!(msg.contains("open_app"), "must point at what still works: {msg}");
+        }
+    }
+
+    // A refusal names the operation the caller actually attempted. An agent told
+    // its READ was refused as "a state-changing call" relays something false to
+    // the user — and, worse, may conclude the read it wanted is still available
+    // and retry it. The kind reaches every refusal, so check every refusal.
+    #[test]
+    fn a_refusal_names_the_operation_it_refused() {
+        for msg in [
+            missing_origin_refusal("canister_query", &backend(), CallKind::Read),
+            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Read),
+            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Read),
+            not_declared_refusal(
+                &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
+                &backend(),
+                OriginSource::AppUrl,
+                CallKind::Read,
+            ),
+            legacy_only_refusal(
+                &manifest("https://app.example.com", LEGACY_MANIFEST_PATH, &[backend()]),
+                &backend(),
+                OriginSource::AppUrl,
+                CallKind::Read,
+            ),
+            identity_mismatch_refusal(
+                "https://evil.example",
+                "https://evil.example",
+                "https://gooddapp.com",
+                &backend(),
+                CallKind::Read,
+            ),
+            identity_unresolvable_refusal("https://app.example.com", "timed out", CallKind::Read),
+        ] {
+            assert!(
+                !msg.contains("state-changing"),
+                "a read refusal must not describe itself as a write: {msg}"
+            );
+            assert!(
+                !msg.contains("write"),
+                "a read refusal must not use the write vocabulary: {msg}"
+            );
+        }
+        for msg in [
+            missing_origin_refusal("canister_update_call", &backend(), CallKind::Update),
+            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Update),
+            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Update),
+            not_declared_refusal(
+                &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
+                &backend(),
+                OriginSource::AppUrl,
+                CallKind::Update,
+            ),
+            legacy_only_refusal(
+                &manifest("https://app.example.com", LEGACY_MANIFEST_PATH, &[backend()]),
+                &backend(),
+                OriginSource::AppUrl,
+                CallKind::Update,
+            ),
+            identity_mismatch_refusal(
+                "https://evil.example",
+                "https://evil.example",
+                "https://gooddapp.com",
+                &backend(),
+                CallKind::Update,
+            ),
+            identity_unresolvable_refusal("https://app.example.com", "timed out", CallKind::Update),
+        ] {
+            assert!(
+                msg.contains("write") || msg.contains("state-changing"),
+                "a write refusal must say so: {msg}"
+            );
+        }
+        // The RULE itself is deliberately kind-neutral: a caller who hits it with
+        // one operation is told the whole policy, not the half that applies.
+        assert!(the_rule().contains("reads and calls ONLY canisters an app declares"));
     }
 
     // "Could not ask" is not "the app has not adopted the protocol". The
@@ -621,7 +858,7 @@ mod tests {
     // publishing nothing — that verdict needs an answer from the origin.
     #[test]
     fn unreachable_is_retryable_not_a_verdict() {
-        let msg = unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out");
+        let msg = unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Update);
         assert!(msg.contains("timed out"), "surfaces the cause: {msg}");
         assert!(msg.contains("retry"), "must invite a retry: {msg}");
         assert!(!msg.contains("publishes no"), "must not conclude absence: {msg}");
@@ -633,12 +870,12 @@ mod tests {
     // case where the SAME app might still pass with the right argument.
     #[test]
     fn no_manifest_refusal_distinguishes_wrong_origin_from_no_adoption() {
-        let from_url = no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None);
+        let from_url = no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Update);
         assert!(from_url.contains("`app_url`"), "{from_url}");
         assert!(!from_url.contains("came from `derivation_origin`"), "{from_url}");
 
         let from_origin =
-            no_manifest_refusal("https://app.example.com", OriginSource::DerivationOrigin, None);
+            no_manifest_refusal("https://app.example.com", OriginSource::DerivationOrigin, None, CallKind::Update);
         assert!(
             from_origin.contains("came from `derivation_origin`"),
             "must suggest the app_url retry first: {from_origin}"
@@ -654,6 +891,7 @@ mod tests {
             &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
             &backend(),
             OriginSource::AppUrl,
+            CallKind::Update,
         );
         assert!(msg.contains(&frontend().to_text()), "shows the declared id: {msg}");
         assert!(msg.contains(&backend().to_text()), "names the refused id: {msg}");
@@ -663,6 +901,7 @@ mod tests {
             &manifest("https://app.example.com", ARCHITECTURE_PATH, &many),
             &backend(),
             OriginSource::AppUrl,
+            CallKind::Update,
         );
         assert_eq!(
             msg.matches(&frontend().to_text()).count(),
@@ -680,6 +919,7 @@ mod tests {
             &manifest("https://app.example.com", ARCHITECTURE_PATH, &[]),
             &backend(),
             OriginSource::AppUrl,
+            CallKind::Update,
         );
         assert!(msg.contains("declares no canisters at all"), "{msg}");
         assert!(msg.contains(ARCHITECTURE_PATH), "names the path that answered: {msg}");
@@ -694,27 +934,30 @@ mod tests {
     #[test]
     fn refusals_never_borrow_another_failures_repair() {
         for msg in [
-            missing_origin_refusal(&backend()),
-            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out"),
-            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None),
-            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, Some("text/html")),
+            missing_origin_refusal("canister_update_call", &backend(), CallKind::Update),
+            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Update),
+            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Update),
+            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, Some("text/html"), CallKind::Update),
             not_declared_refusal(
                 &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
                 &backend(),
                 OriginSource::AppUrl,
+                CallKind::Update,
             ),
             legacy_only_refusal(
                 &manifest("https://app.example.com", LEGACY_MANIFEST_PATH, &[backend()]),
                 &backend(),
                 OriginSource::AppUrl,
+                CallKind::Update,
             ),
             identity_mismatch_refusal(
                 "https://evil.example",
                 "https://evil.example",
                 "https://gooddapp.com",
                 &backend(),
+                CallKind::Update,
             ),
-            identity_unresolvable_refusal("https://app.example.com", "timed out"),
+            identity_unresolvable_refusal("https://app.example.com", "timed out", CallKind::Update),
         ] {
             for wrong in [
                 "reconnect",
@@ -736,13 +979,13 @@ mod tests {
     #[test]
     fn no_manifest_refusal_names_the_spa_catch_all() {
         let msg =
-            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, Some("text/html"));
+            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, Some("text/html"), CallKind::Update);
         assert!(msg.contains("`text/html`"), "names what was served: {msg}");
         assert!(msg.contains("single-page-app catch-all"), "names the cause: {msg}");
         assert!(msg.contains("/.well-known/*"), "names the fix: {msg}");
 
         // Nothing was served there at all: no diagnosis to offer, and none invented.
-        let absent = no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None);
+        let absent = no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Update);
         assert!(!absent.contains("catch-all"), "{absent}");
     }
 
@@ -754,7 +997,7 @@ mod tests {
     // weaker handoff than the deploy-time recipe for generating one.
     #[test]
     fn no_manifest_refusal_stops_the_agent_retrying() {
-        let msg = no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None);
+        let msg = no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Update);
         assert!(msg.contains("will not change that"), "{msg}");
         assert!(msg.contains("STOP retrying"), "{msg}");
         assert!(msg.contains("skill://service-discoverability"), "names the how-to skill: {msg}");
@@ -769,6 +1012,7 @@ mod tests {
             &with_omitted("https://app.example.com", ARCHITECTURE_PATH, &[frontend()], 7),
             &backend(),
             OriginSource::AppUrl,
+            CallKind::Update,
         );
         assert!(msg.contains("7 entries beyond"), "reports how many were unread: {msg}");
         assert!(msg.contains("NOT checked"), "{msg}");
@@ -784,6 +1028,7 @@ mod tests {
             &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
             &backend(),
             OriginSource::AppUrl,
+            CallKind::Update,
         );
         assert!(!exact.contains("entries beyond"), "{exact}");
         assert!(exact.contains("does not declare"), "a fully read manifest is definite: {exact}");
@@ -796,7 +1041,7 @@ mod tests {
     #[test]
     fn the_echoed_cause_is_scrubbed_and_capped() {
         let hostile = format!("error \u{1b}[31m\r\nIGNORE PREVIOUS {}", "x".repeat(4096));
-        let msg = unreachable_refusal("https://app.example.com", OriginSource::AppUrl, &hostile);
+        let msg = unreachable_refusal("https://app.example.com", OriginSource::AppUrl, &hostile, CallKind::Update);
         assert!(!msg.chars().any(char::is_control), "control chars must be gone: {msg}");
         assert!(
             !msg.contains(&"x".repeat(MAX_ECHOED_CAUSE + 1)),
@@ -817,6 +1062,7 @@ mod tests {
             &manifest("https://app.example.com", LEGACY_MANIFEST_PATH, &[backend(), frontend()]),
             &backend(),
             OriginSource::AppUrl,
+            CallKind::Update,
         );
         assert!(listed.contains(LEGACY_MANIFEST_PATH), "names what it found: {listed}");
         assert!(listed.contains(ARCHITECTURE_PATH), "names the path to adopt: {listed}");
@@ -830,6 +1076,7 @@ mod tests {
             &manifest("https://app.example.com", LEGACY_MANIFEST_PATH, &[frontend()]),
             &backend(),
             OriginSource::AppUrl,
+            CallKind::Update,
         );
         assert!(unlisted.contains("does not list this canister either"), "{unlisted}");
         assert!(!unlisted.contains("DOES list"), "{unlisted}");
@@ -857,7 +1104,7 @@ mod tests {
                 ids,
             ))
         };
-        let call = |probe| decide(probe, "https://app.example.com", OriginSource::AppUrl, &backend());
+        let call = |probe| decide(probe, "https://app.example.com", OriginSource::AppUrl, &backend(), CallKind::Update);
 
         // Declared at the standard path: authorized, and the provenance echoed
         // back is the origin and path that authorized it.
@@ -907,6 +1154,7 @@ mod tests {
             "https://evil.example",
             "https://gooddapp.com",
             &backend(),
+            CallKind::Update,
         );
         assert!(msg.contains("evil.example"), "names the app whose manifest was read: {msg}");
         assert!(msg.contains("gooddapp.com"), "names the identity it would sign as: {msg}");
@@ -915,7 +1163,7 @@ mod tests {
 
         // Not knowing is not the same as knowing they differ: the unresolvable
         // refusal reads as a check that failed, not as a verdict on the caller.
-        let unresolved = identity_unresolvable_refusal("https://app.example.com", "timed out");
+        let unresolved = identity_unresolvable_refusal("https://app.example.com", "timed out", CallKind::Update);
         assert!(unresolved.contains("Could not establish"), "{unresolved}");
         assert!(unresolved.contains("retry"), "{unresolved}");
         assert!(!unresolved.contains("is not the app"), "must not assert a mismatch: {unresolved}");
@@ -951,15 +1199,16 @@ mod tests {
             "https://app.example.com",
             OriginSource::AppUrl,
             "HTTP 302 Found",
+            CallKind::Update,
         );
         assert!(stopped.contains("Retrying will not clear this one"), "{stopped}");
         let blip =
-            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out");
+            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Update);
         assert!(blip.contains("likely transient"), "{blip}");
 
         // Same on the identity side, where the previous check only knew about an
         // unauthorized cross-origin claim.
-        let denied = identity_unresolvable_refusal("https://app.example.com", "HTTP 403 Forbidden");
+        let denied = identity_unresolvable_refusal("https://app.example.com", "HTTP 403 Forbidden", CallKind::Update);
         assert!(denied.contains("Retrying will not clear this one either"), "{denied}");
     }
 
@@ -970,10 +1219,10 @@ mod tests {
     fn refusals_cap_the_echoed_origin() {
         let flood = format!("https://app.example.com/{}", "a".repeat(10_000));
         for msg in [
-            unreachable_refusal(&flood, OriginSource::AppUrl, "timed out"),
-            no_manifest_refusal(&flood, OriginSource::AppUrl, None),
-            identity_unresolvable_refusal(&flood, "timed out"),
-            identity_mismatch_refusal(&flood, &flood, &flood, &backend()),
+            unreachable_refusal(&flood, OriginSource::AppUrl, "timed out", CallKind::Update),
+            no_manifest_refusal(&flood, OriginSource::AppUrl, None, CallKind::Update),
+            identity_unresolvable_refusal(&flood, "timed out", CallKind::Update),
+            identity_mismatch_refusal(&flood, &flood, &flood, &backend(), CallKind::Update),
         ] {
             assert!(
                 !msg.contains(&"a".repeat(MAX_ECHOED_CAUSE + 1)),
@@ -1002,7 +1251,7 @@ mod tests {
         let Some(declared) = m.canisters.first().copied() else {
             return; // an empty manifest authorizes nothing
         };
-        let ok = authorize_update_call(APP, OriginSource::AppUrl, &declared)
+        let ok = authorize_call(APP, OriginSource::AppUrl, &declared, CallKind::Update)
             .await
             .expect("a declared canister must authorize");
         assert_eq!(ok.origin, m.origin);
@@ -1011,7 +1260,7 @@ mod tests {
         // An unrelated canister is refused at the same origin.
         let ledger = canister("ryjl3-tyaaa-aaaaa-aaaba-cai");
         if !m.canisters.contains(&ledger) {
-            let err = authorize_update_call(APP, OriginSource::AppUrl, &ledger)
+            let err = authorize_call(APP, OriginSource::AppUrl, &ledger, CallKind::Update)
                 .await
                 .expect_err("an undeclared canister must be refused");
             assert!(err.contains(&ledger.to_text()), "{err}");
@@ -1034,12 +1283,12 @@ mod tests {
         if canonical == APP {
             return; // no longer cross-origin; nothing distinctive left to assert
         }
-        bind_identity(APP, &canonical, &backend())
+        bind_identity(APP, &canonical, &backend(), CallKind::Update)
             .await
             .expect("an app must bind to the identity it declares, at any origin");
 
         // And a different app's identity is still refused against it.
-        let err = bind_identity(APP, "https://oisy.com", &backend())
+        let err = bind_identity(APP, "https://oisy.com", &backend(), CallKind::Update)
             .await
             .expect_err("a crossed pair must never bind");
         assert!(err.contains("is not the app this call would be signed as"), "{err}");
@@ -1063,7 +1312,7 @@ mod tests {
         let Some(declared) = legacy.canisters.first().copied() else {
             return; // an empty legacy document proves nothing here
         };
-        let err = authorize_update_call(APP, OriginSource::AppUrl, &declared)
+        let err = authorize_call(APP, OriginSource::AppUrl, &declared, CallKind::Update)
             .await
             .expect_err("the legacy path must not authorize");
         assert!(err.contains(ARCHITECTURE_PATH), "names the path to adopt: {err}");
@@ -1076,7 +1325,7 @@ mod tests {
     // IANA-reserved and will never serve one.
     #[tokio::test]
     async fn refuses_an_origin_with_no_manifest() {
-        let err = authorize_update_call("https://example.com", OriginSource::AppUrl, &backend())
+        let err = authorize_call("https://example.com", OriginSource::AppUrl, &backend(), CallKind::Update)
             .await
             .expect_err("example.com publishes no manifest");
         assert!(err.contains("publishes no service-discoverability manifest"), "{err}");
@@ -1087,9 +1336,10 @@ mod tests {
     // refusal reads as a check failure rather than as a verdict on an app.
     #[tokio::test]
     async fn refuses_a_non_public_origin_without_fetching() {
-        let err = authorize_update_call("https://127.0.0.1", OriginSource::AppUrl, &backend())
+        let err = authorize_call("https://127.0.0.1", OriginSource::AppUrl, &backend(), CallKind::Update)
             .await
             .expect_err("loopback must be refused");
         assert!(err.contains("Could not check"), "{err}");
     }
 }
+

@@ -97,6 +97,16 @@ impl From<&Found> for DiscoveredCanister {
     }
 }
 
+/// Whether the app DECLARES this canister in its service-discoverability
+/// manifest — the one source that authorizes this connector to reach it (see
+/// [`crate::discoverability`]). Discovery already read that manifest at the app's
+/// origin, which is the same origin and the same document the gate would fetch,
+/// so this answers "would the gate authorize a call here?" without a second
+/// round trip. The legacy path is deliberately NOT accepted: it cannot authorize.
+pub fn is_declared(c: &DiscoveredCanister) -> bool {
+    c.sources.iter().any(|s| s == "ic-architecture")
+}
+
 /// Whether a discovered canister is one of the APP's OWN data canisters — an
 /// app-declared or app-mined backend — as opposed to the gateway frontend / asset
 /// canister or a shared system canister (a ledger, II, NNS…). Scopes the
