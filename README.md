@@ -8,15 +8,17 @@ encoding/decoding and signing against the IC via
 [`ic-agent`](https://github.com/dfinity/agent-rs). The MCP layer is the
 [official Rust SDK](https://github.com/modelcontextprotocol/rust-sdk) (`rmcp`).
 
-**Writes go only to apps that opted in.** Reading the Internet Computer is open —
-every read tool here works on any canister. A *state-changing* call runs against
-someone's live application, so `canister_update_call` is made **only** to a
-canister the owning app declares in its
+**This server reaches only canisters an app opted in.** A canister being publicly
+callable is not a statement by its operators that they want an agent reading it
+or driving it, so every tool that touches one — `get_canister_candid`,
+`get_canister_api_doc`, `get_canister_oql_schema`, `canister_query` and
+`canister_update_call` — works **only** on a canister the owning app declares in
+its
 [service-discoverability](https://docs.internetcomputer.org/guides/frontends/service-discoverability/)
 manifest at `/.well-known/ic-architecture`. Publishing that manifest is how an
-app's operators opt in; an app that publishes none stays fully readable and
-discoverable, but cannot be written to through this server. See
-[Writes are gated on the discoverability manifest](#writes-are-gated-on-the-discoverability-manifest).
+app's operators opt in; an app that publishes none can still be resolved and
+discovered, but none of its canisters can be read or called through this server.
+See [Reaching a canister is gated on the discoverability manifest](#reaching-a-canister-is-gated-on-the-discoverability-manifest).
 
 **Not for financial operations.** IMCP2 is infrastructure tooling for reading,
 building, and operating canisters — it is not a wallet or trading tool, and
@@ -156,16 +158,26 @@ results).
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `open_app` | `app` (name **or** URL) | **One-call entry point** when a user names/links an app: resolves the Internet Identity `derivation_origin` *and* discovers the canisters behind it, together. A name or bare host is matched to the known-app registry first (so a wrong-TLD guess repairs to the canonical URL); an explicit `https://` URL is resolved as given. An unknown bare name is *refused*, and so is a URL that would need its own origin assumed as the derivation origin while showing no IC evidence (never guessed). Also probes the app's own canisters and reports per-canister `oql`/`api_doc_available` capability flags — for **up to eight** eligible canisters, with both fields *omitted* (not false) on any beyond that — plus a data-access note (which canister is read through the OQL path, and the origin that path requires). No auth |
-| `get_canister_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text), plus two capability flags: `oql` (`true` when it exposes an OQL query surface — a `schema` + `execute` pair — with a pointer to `icp_oql_guide`) and `api_doc_available` (`true` when it declares a `getApiDoc`/`get_api_doc` method, gating `get_canister_api_doc`) |
-| `get_canister_api_doc` | `canister_id` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), from its `getApiDoc`/`get_api_doc` method. Call **only** when `get_canister_candid`/`open_app` report `api_doc_available`. Returns a **structured** result for every documentation outcome — `available` + the doc on success, else `available:false` with `expected`/`retry`/`next`, so "no compatible method was detected" is distinct from "no answer was obtained". An unusable `canister_id` is rejected before any lookup and is a plain error, not that shape; and `expected:true` is not proof of absence, since an interface the parser cannot read also comes up empty |
-| `canister_query` | `canister_id`, `method?` **or** `oql?`, `args?` (textual Candid), `derivation_origin?`, `account?`, `candid?` | READ a canister — provide EITHER a Candid `query` `method` (with `args`) OR an `oql` query (a JSON object string, run against `execute`). A Candid `method` query may be anonymous or as your account and returns textual Candid; an `oql` query **requires** `derivation_origin` and returns `columns` + `rows` (a table) with `has_more`, validating `start` against the schema on an empty result. On an OQL canister a Candid `method` query is rejected — use `oql`. `candid` is a fallback: the `.did` interface text to encode/decode against when the canister exposes no `candid:service` metadata. Echoes `derived_for_origin` / `requested` so an origin mismatch is visible (never the principal — `get_app_principal` returns it on request) |
-| `canister_update_call` | `canister_id`, `method`, `args` (textual Candid), `app_url?`, `derivation_origin?`, `account?`, `candid?` | Make an UPDATE (state-changing) call; reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`). **The target must be declared by its app**: the call is made only when the app at `app_url` (from `open_app`; falling back to `derivation_origin` when no `app_url` is given) declares `canister_id` in its `/.well-known/ic-architecture` manifest — see [Writes are gated on the discoverability manifest](#writes-are-gated-on-the-discoverability-manifest). When `derivation_origin` is also given, the two must belong to the same app — the app at `app_url` is resolved to the derivation origin II derives its users from, and a mismatch is refused rather than signed. The reply echoes `declared_by` / `declared_at` (which origin authorized the write, and at which path). **Financial transactions are refused**: the ICRC-standard transfer/approval methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents) and the NNS/SNS governance method `manage_neuron` (neuron staking and disbursement) are disallowed on every canister, and the ICP and cycles ledgers' own value-moving methods (the legacy `transfer`, `withdraw`, the `create_canister` spends) and the cycles-minting canister's funding-completion methods (`notify_top_up`, `notify_create_canister`, `notify_mint_cycles`, `create_canister`) on those canisters; and **every** update call is refused on the financial-service canisters the guard carries — all to protect the user. The refusal directs the user to perform the operation outside the connector, in a trusted interface they control — or, for canister creation and funding, with the [icp CLI](https://github.com/dfinity/icp-cli) in their own terminal. The policy is stated in the server-level instructions, deliberately not in any tool description. `candid` is the same `.did` fallback as on `canister_query`, used when the interface isn't published on-chain. Echoes `derived_for_origin` / `requested` so an origin mismatch is visible (never the principal — `get_app_principal` returns it on request) |
+| `open_app` | `app` (name **or** URL) | **One-call entry point** when a user names/links an app: resolves the Internet Identity `derivation_origin` *and* discovers the canisters behind it, together. A name or bare host is matched to the known-app registry first (so a wrong-TLD guess repairs to the canonical URL); an explicit `https://` URL is resolved as given. An unknown bare name is *refused*, and so is a URL that would need its own origin assumed as the derivation origin while showing no IC evidence (never guessed). Also probes the app's own **declared** canisters and reports per-canister `oql`/`api_doc_available` capability flags — for **up to eight** eligible canisters, with both fields *omitted* (not false) on any beyond that, and on any candidate the app does not declare (which this connector cannot read, so it is not probed) — plus a data-access note (which canister is read through the OQL path, and the origin that path requires). No auth |
+| `get_canister_candid` | `canister_id`, `app_url?`, `derivation_origin?` | The canister's `candid:service` interface (`.did` text), plus two capability flags: `oql` (`true` when it exposes an OQL query surface — a `schema` + `execute` pair — with a pointer to `icp_oql_guide`) and `api_doc_available` (`true` when it declares a `getApiDoc`/`get_api_doc` method, gating `get_canister_api_doc`) |
+| `get_canister_api_doc` | `canister_id`, `app_url?`, `derivation_origin?` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), from its `getApiDoc`/`get_api_doc` method. Call **only** when `get_canister_candid`/`open_app` report `api_doc_available`. Returns a **structured** result for every documentation outcome — `available` + the doc on success, else `available:false` with `expected`/`retry`/`next`, so "no compatible method was detected" is distinct from "no answer was obtained". An unusable `canister_id` is rejected before any lookup and is a plain error, not that shape; and `expected:true` is not proof of absence, since an interface the parser cannot read also comes up empty |
+| `canister_query` | `canister_id`, `method?` **or** `oql?`, `args?` (textual Candid), `app_url?`, `derivation_origin?`, `account?`, `candid?` | READ a canister — provide EITHER a Candid `query` `method` (with `args`) OR an `oql` query (a JSON object string, run against `execute`). A Candid `method` query may be anonymous or as your account and returns textual Candid; an `oql` query **requires** `derivation_origin` and returns `columns` + `rows` (a table) with `has_more`, validating `start` against the schema on an empty result. On an OQL canister a Candid `method` query is rejected — use `oql`. `candid` is a fallback: the `.did` interface text to encode/decode against when the canister exposes no `candid:service` metadata. Echoes `derived_for_origin` / `requested` so an origin mismatch is visible (never the principal — `get_app_principal` returns it on request) |
+| `canister_update_call` | `canister_id`, `method`, `args` (textual Candid), `app_url?`, `derivation_origin?`, `account?`, `candid?` | Make an UPDATE (state-changing) call; reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`). **The target must be declared by its app**: the call is made only when the app at `app_url` (from `open_app`; falling back to `derivation_origin` when no `app_url` is given) declares `canister_id` in its `/.well-known/ic-architecture` manifest — see [Reaching a canister is gated on the discoverability manifest](#reaching-a-canister-is-gated-on-the-discoverability-manifest). When `derivation_origin` is also given, the two must belong to the same app — the app at `app_url` is resolved to the derivation origin II derives its users from, and a mismatch is refused rather than signed. The reply echoes `declared_by` / `declared_at` (which origin authorized the write, and at which path). **Financial transactions are refused**: the ICRC-standard transfer/approval methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents) and the NNS/SNS governance method `manage_neuron` (neuron staking and disbursement) are disallowed on every canister, and the ICP and cycles ledgers' own value-moving methods (the legacy `transfer`, `withdraw`, the `create_canister` spends) and the cycles-minting canister's funding-completion methods (`notify_top_up`, `notify_create_canister`, `notify_mint_cycles`, `create_canister`) on those canisters; and **every** update call is refused on the financial-service canisters the guard carries — all to protect the user. The refusal directs the user to perform the operation outside the connector, in a trusted interface they control — or, for canister creation and funding, with the [icp CLI](https://github.com/dfinity/icp-cli) in their own terminal. The policy is stated in the server-level instructions, deliberately not in any tool description. `candid` is the same `.did` fallback as on `canister_query`, used when the interface isn't published on-chain. Echoes `derived_for_origin` / `requested` so an origin mismatch is visible (never the principal — `get_app_principal` returns it on request) |
 | `get_app_principal` | `derivation_origin`, `account?` | The principal you act as at an app. Identify the app by its `derivation_origin` (from `open_app`). Echoes `derived_for_origin` / `requested` so an origin mismatch is visible |
 | `list_app_accounts` | `derivation_origin` | The user's Internet Identity accounts at an app — the default account plus any named ones — with name, number, and the derivation origin they were listed for (no principals and no last-used timestamps: the listing exists to pick an account). Identify the app by its `derivation_origin` (from `open_app`) |
 | `candid_syntax_guide` | — | The textual-Candid value syntax the `args` of `canister_query` / `canister_update_call` take and their replies come back in: the literal form for each Candid type, and when a value needs an explicit `: type` annotation. The full type system stays available as the `candid://reference` MCP resource |
 | `icp_oql_guide` | — | The OQL query-surface dialect guide (for canisters where `get_canister_candid` reports `oql: true`): the JSON query object, predicate grammar, edges, and paged result shape. The entity/field names come from `get_canister_oql_schema` and queries run through `canister_query` (the `oql` argument) |
-| `get_canister_oql_schema` | `canister_id`, `derivation_origin`, `account?` | The canister's OQL schema catalogue (entities, primary keys, fields, edges) as JSON — wraps its `schema` method — plus a ready-to-run `canister_query` example per entity. **`derivation_origin` is required**: this server rejects an anonymous read (for now) with guidance — its own rule, not an inference about the canister — rather than calling `schema` anonymously and returning an empty list |
+| `get_canister_oql_schema` | `canister_id`, `derivation_origin`, `app_url?`, `account?` | The canister's OQL schema catalogue (entities, primary keys, fields, edges) as JSON — wraps its `schema` method — plus a ready-to-run `canister_query` example per entity. **`derivation_origin` is required**: this server rejects an anonymous read (for now) with guidance — its own rule, not an inference about the canister — rather than calling `schema` anonymously and returning an empty list |
+
+Every row above that names a `canister_id` takes `app_url`, and for the same
+reason: the app at that URL must declare the canister in its
+`/.well-known/ic-architecture` manifest, or the call is refused before the
+canister is contacted. `open_app` returns the `app_url` alongside the canisters
+it discovered, and marks the declared ones `[declared]`. Omitted, `app_url` falls
+back to `derivation_origin`; given both, they must belong to the same app. Each
+successful reply echoes `declared_by` / `declared_at` — which origin authorized
+the call, and at which path. See
+[Reaching a canister is gated on the discoverability manifest](#reaching-a-canister-is-gated-on-the-discoverability-manifest).
 
 `open_app` (its `app` argument takes a name **or** a URL) is the one-call entry point
 when the user names or links an app: it resolves the Internet Identity
@@ -195,22 +207,27 @@ Acting **for the user** at an app:
    remember it).
 4. **`get_app_principal`** — only when you need the principal *value* itself;
    `canister_query` / `canister_update_call` act as the account without pre-fetching it.
-5. **`get_canister_candid`** to learn the interface — its `oql` flag says whether OQL
-   is available, its `api_doc_available` flag whether to call **`get_canister_api_doc`**
-   (call it only when that's true). For an OQL canister, get the entity/field names
-   from **`get_canister_oql_schema`** (pass the `derivation_origin`).
+5. **`get_canister_candid`** to learn the interface, passing the `app_url` from step
+   0–2 — its `oql` flag says whether OQL is available, its `api_doc_available` flag
+   whether to call **`get_canister_api_doc`** (call it only when that's true). For an
+   OQL canister, get the entity/field names from **`get_canister_oql_schema`** (pass
+   the `derivation_origin` too).
 6. **Read** with `canister_query`: use the `oql` argument when OQL is available,
    passing the `derivation_origin` — an OQL read **requires** it (an anonymous per-app
    read is rejected for now, and a Candid `method` query is rejected on an OQL
    canister). Otherwise pass a Candid `method`.
-7. **Act** with `canister_update_call`, passing the `app_url` from step 0–2 (it
-   gates the write on the app's declared manifest) plus `derivation_origin` +
-   `account` to act as the user.
+7. **Act** with `canister_update_call`, passing `derivation_origin` + `account` to
+   act as the user.
 
-Genuinely public reads via a `canister_query` Candid `method` query or the
-public-metadata tools (`get_canister_candid`, `open_app`) skip steps
-3/4 and need no origin; OQL reads always require one. The per-canister inspection (5) is
-independent of the identity steps (3/4), so they can run in parallel. Managing your
+Steps 5–7 all take the `app_url` from step 0–2: it is what authorizes reaching
+the canister at all, and only the canisters `open_app` marked `[declared]` are
+within reach. A canister id from anywhere else — a mined candidate, a dashboard
+lookup, the user's clipboard — needs the URL of the app that declares it before
+any of these tools will touch it. Identity is a separate question: a Candid
+`method` query can still run anonymously (no `derivation_origin`), while an OQL
+read always needs one, so steps 3/4 are skippable but step 0–2 is not. The
+per-canister inspection (5) is independent of the identity steps (3/4), so they
+can run in parallel. Managing your
 **own** canisters is not part of this connector: create and manage them with the
 [`icp` CLI](https://github.com/dfinity/icp-cli) in your own terminal.
 
@@ -238,17 +255,17 @@ serves:
 Each entry needs an `id` (a canister principal); `name`, `role`, and
 `description` are optional and become the finding's label (`role — description`,
 falling back to `name`). Unknown fields are ignored, so the format can grow.
-The write gate holds `id` to the protocol's own type rule — an entry must be a
+The gate holds `id` to the protocol's own type rule — an entry must be a
 **canister** principal (a 10-byte opaque id) to authorize anything, so a manifest
 cannot declare a user principal, the anonymous principal, or the management
-canister `aaaaa-aa` (all of which parse as principals) and have a write follow.
-This manifest is also the **only** thing that permits a write — see
-[Writes are gated on the discoverability manifest](#writes-are-gated-on-the-discoverability-manifest).
+canister `aaaaa-aa` (all of which parse as principals) and have a call follow.
+This manifest is also the **only** thing that permits reaching a canister — see
+[Reaching a canister is gated on the discoverability manifest](#reaching-a-canister-is-gated-on-the-discoverability-manifest).
 
 Before the protocol was published this server proposed the same document at
 `/.well-known/ic-app.json`, with an extra top-level `derivation_origin` field.
 That path is still read for discovery, at lower authority, so those apps stay
-legible — but it does not authorize a write (see below); new apps should publish
+legible — but it does not authorize a call (see below); new apps should publish
 `/.well-known/ic-architecture`
 and, if they pin a custom derivation origin, `/.well-known/ii-derivation-origin`
 (the protocol's Layer 5 — one canonical `https://host` on a single line, which
@@ -260,18 +277,23 @@ misconfiguration, an SPA catch-all serving `index.html` at these paths: the JSON
 parse fails, and the derivation-origin file's first line is not an origin. Every
 id is validated as a principal before it is kept.
 
-### Writes are gated on the discoverability manifest
+### Reaching a canister is gated on the discoverability manifest
 
-Reading is open; writing is not. A state-changing call runs against someone's
-live application, and a canister being publicly callable is not a statement by
-its operators that they want an agent driving it. So `canister_update_call` is
-restricted to canisters an app **declares** in its `/.well-known/ic-architecture`
-manifest. Publishing that manifest is a deliberate act, and per the protocol guide
-it is exactly how an app's operators say "these are my canisters; an agent handed
-my URL may work them out and use them".
+A canister being publicly callable is not a statement by its operators that they
+want an agent reading it or driving it. So every tool that reaches a canister —
+`get_canister_candid`, `get_canister_api_doc`, `get_canister_oql_schema`,
+`canister_query` (both paths) and `canister_update_call` — is restricted to
+canisters an app **declares** in its `/.well-known/ic-architecture` manifest.
+Publishing that manifest is a deliberate act, and per the protocol guide it is
+exactly how an app's operators say "these are my canisters; an agent handed my
+URL may work them out and use them".
+
+Reads and writes run the *same* check and differ only in what a refusal says: it
+names the operation that was actually attempted, so an agent never relays "a
+state-changing call was refused" about a read it tried to make.
 
 **Only the standard path authorizes.** The legacy `/.well-known/ic-app.json`
-document is still read during discovery, but it does not permit a write: the apps
+document is still read during discovery, but it does not authorize a call: the apps
 serving it adopted a proposal this server made before the protocol existed, under
 different terms, and never agreed to the ones publishing the standard manifest now
 signifies. Consent that was never given cannot be inherited from a path this server
@@ -281,7 +303,9 @@ send its operators hunting for a file that is already there — and saying that
 serving the same JSON at `/.well-known/ic-architecture` is the whole fix.
 
 **The manifest and the identity are bound.** `app_url` picks which manifest is
-read; `derivation_origin` picks whose principal signs. Left unbound those are
+read; `derivation_origin` picks whose principal signs — and for an authenticated
+read as much as for a write, since a read runs as the user's principal at
+whichever app they named. Left unbound those are
 separable, and separable is exploitable: publishing a manifest is free and the
 gate deliberately does not prove ownership, so an attacker's origin could declare
 someone else's canister while the call went out under the principal the user holds
@@ -293,7 +317,7 @@ origin — so the many apps whose derivation origin differs from their website (
 of 17 in the built-in registry) still pass, and Internet Identity's own
 `ii-alternative-origins` rule is enforced on the way, so an app cannot simply
 claim another's identity to satisfy the check. An attacker's manifest can then
-only authorize writes made as the attacker's own app identity, which is worth
+only authorize calls made as the attacker's own app identity, which is worth
 nothing to them. `open_app` returns a matching pair, so the normal flow never
 trips this.
 
@@ -302,22 +326,24 @@ which app owns the target: that is the `app_url` argument (`open_app` returns it
 falling back to `derivation_origin` when the app serves its manifest at that same
 origin. The gate then fetches the manifest — under the same SSRF hardening and
 size caps as the rest of discovery — and refuses unless the target is listed.
-Every refusal names the standard path, links the guide, distinguishes its cause
-(no origin given / origin unreachable / no manifest published / only the legacy
-document published / published but this canister is not in it — that last one lists
-what the app *does* declare), and says
-explicitly that reads are unaffected, so an agent answers what it can rather than
-concluding the whole app is off limits. A successful call echoes `declared_by` and
-`declared_at`, so a write's provenance is visible in the reply.
+Every refusal names the standard path, links the guide, and distinguishes its
+cause (no origin given / origin unreachable / no manifest published / only the
+legacy document published / published but this canister is not in it — that last
+one lists what the app *does* declare). What it can no longer say is "read it
+instead", so what stops an agent from concluding the whole app is off limits is
+the sentence naming what still works: `open_app` resolves the app and lists what
+it declares, and those canisters are the ones within reach. A successful call
+echoes `declared_by` and `declared_at`, so the call's provenance is visible in
+the reply.
 
-Three things this gate is not:
+Four things this gate is not:
 
 - **It is not proof of ownership.** Whoever controls a domain controls what its
   manifest says, so a manifest can name a canister its publisher does not own.
   What the gate establishes is that *someone* published a document, at an origin
   the caller named, claiming that canister as part of their app — and that a
-  write can be traced back to that claim. Two limits worth stating outright: an
-  anonymous write skips the identity binding (there is no app identity to
+  call can be traced back to that claim. Two limits worth stating outright: an
+  anonymous call skips the identity binding (there is no app identity to
   protect), and an authenticated one binds to the *caller's* app while still
   reaching any victim method that accepts an arbitrary principal. Neither grants
   a capability an attacker lacked — the IC accepts ingress from anywhere, so both
@@ -328,9 +354,19 @@ Three things this gate is not:
 - **It is not a substitute for the canister's own authorization.** The IC still
   decides what the calling principal may do; this only decides what this server
   is willing to send.
-- **It is not a read restriction.** `canister_query`, `get_canister_candid`,
-  `get_canister_api_doc`, the OQL surface and every discovery tool work on any
-  canister, exactly as before.
+- **On reads, it is stricter than the protocol asks for.** The guide frames
+  discoverability as an aid to *reading*, and reading the IC is open to anyone
+  with an ordinary agent, so gating reads withholds nothing from an attacker: it
+  is a statement about whose canisters this connector will read **on a user's
+  behalf**. The cost is real and lands on discovery — a candidate mined from an
+  app's `/env.json` or JS bundle can no longer be confirmed by reading its
+  interface, so a manifest is now the only route from an app to a usable
+  canister, and `open_app` leaves the capability flags of an undeclared candidate
+  blank rather than probing it.
+- **It is not a restriction on discovery.** `open_app` resolves an app and lists
+  its canisters exactly as before, the guides are static, and the identity tools
+  (`get_app_principal`, `list_app_accounts`) touch no canister. An agent refused
+  here can still say which app it meant and what that app declares.
 
 Discovery fetches are **SSRF-hardened** (CWE-918). Only `https` URLs with a real
 host are fetched, and every outbound fetch runs under a redirect guard (a 3xx may only
@@ -338,7 +374,7 @@ go to a **globally-routable** IP or the same host, never a different private
 target; capped at 10 hops) with per-body and aggregate size caps, so a hostile or
 accidental large body can't exhaust memory. The untrusted **user-supplied** site
 fetches (an app origin from `open_app`, or
-the `app_url` the write gate checks in `canister_update_call`)
+the `app_url` the gate checks on every canister-reaching tool)
 additionally resolve the target host up front and **pin** the connection to that
 validated globally-routable address, so a name resolving to a
 private/loopback/link-local address is refused and re-resolution can't rebind
@@ -346,9 +382,12 @@ mid-flight. Fixed public-host enrichment (the IC dashboard)
 uses the redirect guard but is not separately address-pinned. No JavaScript is
 executed, and every extracted id is validated as a principal.
 
-Note that the write gate makes `canister_update_call` an **outbound-fetching**
-tool: acting at an app now contacts that app's website (once per write) to read
-its manifest, where previously only the discovery/resolution tools did. A
+Note that the gate makes every canister-reaching tool an **outbound-fetching**
+one: touching a canister now contacts the owning app's website (once per call) to
+read its manifest, where previously only the discovery/resolution tools did.
+There is no manifest cache, so that fetch is paid per call — on the read path
+that is a per-query DNS resolve, TLS handshake and two HTTP GETs ahead of the
+boundary-node call. A
 manifest is only honoured when the origin the connector **probed** is the origin
 that **answered** — a redirect can't let one origin borrow another's declaration
 and have `declared_by` name the wrong app.
@@ -371,9 +410,10 @@ inline.)
 
 `canister_query` and `canister_update_call` run anonymously by default; pass a
 `derivation_origin` to call as
-your account at that app. (Anonymous still means anonymous *identity* — a write
-additionally needs an app origin, via `app_url` or `derivation_origin`, for the
-manifest check above; there is no origin-less write.) The server mints a **short-lived account delegation on
+your account at that app. (Anonymous still means anonymous *identity* — every
+call that reaches a canister additionally needs an app origin, via `app_url` or
+`derivation_origin`, for the manifest check above; there is no origin-less read
+or write.) The server mints a **short-lived account delegation on
 demand** using the connection's registered Internet Identity session key (see
 [Domain identities](#domain-identities-on-demand)) — there is no per-app sign-in
 step. `get_app_principal` returns that account's principal
@@ -418,7 +458,8 @@ token (see Auth).
 > **guessed** from an app name (a lookalike/squatted site), and the refusal names
 > the well-known app the host resembles when there is one. A genuinely non-IC-hosted
 > app that uses Internet Identity can still be targeted deliberately by passing its
-> origin as `derivation_origin` (which is trusted verbatim, ungated). Under the hood
+> origin as `derivation_origin` (which is trusted verbatim as an *identity*, ungated
+> — reaching that app's canisters still needs its declaration). Under the hood
 > the origin goes through the same canonicalizer the delegation path uses (bare
 > `https://<host>`, with the `*.icp0.io`/`*.icp.net` → `*.ic0.app` gateway remap
 > below). For backward compatibility the identity tools still accept the legacy

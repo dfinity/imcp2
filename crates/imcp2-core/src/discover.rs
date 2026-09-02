@@ -51,6 +51,10 @@ pub struct Found {
     /// IC dashboard classification (e.g. "ledger"), when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Whether the app's manifest DECLARES this id in the sense the gate means
+    /// (see [`is_declared`]). Set by [`Findings::mark_declared`] from the gate's
+    /// own parse of the same document, never inferred from `sources`.
+    pub declared: bool,
 }
 
 /// One canister discovered behind a web domain — the `open_app` MCP
@@ -80,6 +84,11 @@ pub struct DiscoveredCanister {
     /// Whether this canister declares the method get_canister_api_doc reads. Null when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_doc_available: Option<bool>,
+    /// Whether the app DECLARES this canister in its service-discoverability
+    /// manifest — which is what decides whether any tool here may reach it at
+    /// all (see [`is_declared`]). False for a canister found only in the gateway
+    /// header, `/env.json`, the JS bundle or the legacy document.
+    pub declared: bool,
 }
 
 impl From<&Found> for DiscoveredCanister {
@@ -90,11 +99,27 @@ impl From<&Found> for DiscoveredCanister {
             name: f.name.clone(),
             kind: f.kind.clone(),
             sources: f.sources.clone(),
+            declared: f.declared,
             // Capability flags are filled in post-discovery by enrich_capabilities.
             oql: None,
             api_doc_available: None,
         }
     }
+}
+
+/// Whether the app DECLARES this canister in its service-discoverability
+/// manifest — the one source that authorizes this connector to reach it (see
+/// [`crate::discoverability`]). Discovery read that manifest at the app's origin,
+/// which is the same origin and the same document the gate would fetch, so this
+/// answers "would the gate authorize a call here?" without a second round trip.
+///
+/// The marker is set by [`Findings::mark_declared`] from the gate's OWN parse of
+/// that document, so it cannot over-claim; reading it off the `ic-architecture`
+/// provenance instead would (see that function). Two caveats it does not close:
+/// the app may serve a different manifest by the time a call is made, and an
+/// entry past the gate's read cap is neither authorized nor marked here.
+pub fn is_declared(c: &DiscoveredCanister) -> bool {
+    c.declared
 }
 
 /// Whether a discovered canister is one of the APP's OWN data canisters — an
@@ -1817,11 +1842,36 @@ impl Findings {
         } else if self.map.len() < Self::MAX {
             self.map.insert(
                 id.to_string(),
-                Found { canister_id: id.to_string(), label, sources: vec![source], name: None, kind: None },
+                Found {
+                    canister_id: id.to_string(),
+                    label,
+                    sources: vec![source],
+                    name: None,
+                    kind: None,
+                    declared: false,
+                },
             );
         } else {
             // At capacity and this id is new — count it (saturating), don't allocate.
             self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    /// Mark the findings the GATE would authorize, from `authorized` — the ids
+    /// [`manifest_canister_ids`] read out of the very same manifest body.
+    ///
+    /// It has to come from the gate's parser, not from the presence of an
+    /// `ic-architecture` source, because the two parsers deliberately disagree
+    /// (per review): the listing parser keeps an id as spelled, drops blanks
+    /// before the 100-entry cap, and never checks what KIND of principal it is,
+    /// while the gate parses each id, applies the cap first, and keeps only
+    /// canister principals. Inferring the marker from `sources` would therefore
+    /// promise reachability for an entry the gate refuses — `aaaaa-aa`, a
+    /// non-principal, or a real id sitting past the cap behind blank entries.
+    fn mark_declared(&mut self, authorized: &[Principal]) {
+        for entry in self.map.values_mut() {
+            entry.declared = Principal::from_text(&entry.canister_id)
+                .is_ok_and(|p| authorized.contains(&p));
         }
     }
 }
@@ -1877,6 +1927,15 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
         for (id, label) in canisters_from_app_manifest(text) {
             found.add(&id, label, source.into());
         }
+    }
+    // Which of those the GATE would actually authorize, read back out of the
+    // standard document with the gate's own parser. This is the only honest way
+    // to produce the `declared` marker: the listing above is deliberately more
+    // permissive than the authorization set (see `mark_declared`), and a marker
+    // built from its provenance would promise reachability the gate withholds.
+    // The legacy document is not consulted — it authorizes nothing.
+    if let Some(authorized) = architecture.as_deref().and_then(manifest_canister_ids) {
+        found.mark_declared(&authorized.ids);
     }
 
     // 2. Frontend via the gateway header (and keep the HTML for bundle mining).
@@ -2641,6 +2700,7 @@ mod tests {
             sources: vec![source.to_string()],
             name: None,
             kind: None,
+            declared: false,
         };
         // Authority-ordered, as discover() produces: labelled tiers first, then
         // a long tail of bare bundle literals.
@@ -2879,6 +2939,45 @@ mod tests {
         let f = &found.map[id];
         assert_eq!(f.label.as_deref(), Some("backend — main canister"));
         assert_eq!(f.sources, vec!["ic-architecture", "header"], "both provenances kept");
+    }
+
+    // The `declared` marker must mean "the GATE would authorize this", not "an
+    // ic-architecture entry mentioned it" — the two parsers deliberately
+    // disagree, and a marker built from provenance promises reachability that
+    // every gated tool then refuses (per review). This runs the two steps
+    // discover() runs, on one body that exercises both divergences.
+    #[test]
+    fn the_declared_marker_follows_the_gate_not_the_listing() {
+        let backend = "hmxr2-pqaaa-aaabq-qaaaa-cai";
+        // 100 blank ids, then a real one: the listing parser drops blanks BEFORE
+        // its cap and keeps the id; the gate caps BEFORE parsing and never sees
+        // it. Same document, two answers — the marker must follow the gate's.
+        let blanks = vec![r#"{"id":"  "}"#; MAX_MANIFEST_CANISTERS].join(",");
+        let body = format!(
+            r#"{{"canisters":[{{"id":"{backend}","role":"backend"}},
+               {{"id":"aaaaa-aa","role":"the management canister"}},
+               {{"id":"2vxsx-fae","role":"the anonymous principal"}},
+               {blanks},
+               {{"id":"hcv4s-uaaaa-aaabq-qaaba-cai","role":"past the cap"}}]}}"#
+        );
+
+        let mut found = Findings::default();
+        for (id, label) in canisters_from_app_manifest(&body) {
+            found.add(&id, label, "ic-architecture".into());
+        }
+        found.mark_declared(&manifest_canister_ids(&body).expect("a manifest document").ids);
+
+        let declared = |id: &str| found.map.get(id).expect("listed").declared;
+        assert!(declared(backend), "a plain canister entry is authorized and marked");
+        // Listed by discovery — they ARE in the document — but not authorized,
+        // so not marked: the protocol requires an `id` to be a canister.
+        assert!(!declared("aaaaa-aa"), "the management canister authorizes nothing");
+        assert!(!declared("2vxsx-fae"), "nor does the anonymous principal");
+        // Present in the listing, past the gate's cap, so refused at call time.
+        assert!(
+            !declared("hcv4s-uaaaa-aaabq-qaaba-cai"),
+            "an entry the gate never read must not be advertised as reachable"
+        );
     }
 
     // The proposed /.well-known/ic-app.json manifest: entries yield (id, label)
@@ -3526,6 +3625,7 @@ mod tests {
             name: None,
             kind: kind.map(str::to_string),
             sources: sources.iter().map(|s| s.to_string()).collect(),
+            declared: false,
             oql: None,
             api_doc_available: None,
         };
