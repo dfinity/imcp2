@@ -360,6 +360,9 @@ struct Harness {
     opaque: Principal,
     /// The principal the seeded session signs as at [`Self::origin`].
     principal: Principal,
+    /// The session store, so a test that needs the user to hold an identity at
+    /// a SECOND app can seed one ([`Identities::seed_app_identity`]).
+    identities: Identities,
     /// The app origin whose manifest declares [`Self::app`] and [`Self::oql`].
     origin: String,
 }
@@ -459,7 +462,7 @@ impl Harness {
 
         let tools = IcTools::new(
             agent,
-            identities,
+            identities.clone(),
             // The authentication seam: every call in these tests arrives on the
             // one authenticated session, the way a single-user deployment
             // resolves it.
@@ -481,6 +484,7 @@ impl Harness {
             oql,
             opaque,
             principal,
+            identities,
             origin: origin.to_string(),
         })
     }
@@ -1076,29 +1080,116 @@ async fn the_gate_holds_for_every_canister_reaching_tool() {
          refusal must name it: {msg}"
     );
 
-    // The identity binding: a call may not use one app's manifest to authorize a
-    // canister while signing as the user's identity at ANOTHER app.
-    webfixture::serve(
-        "https://other.e2e.test",
-        webfixture::Site::declaring(&[h.app]).deriving_at("https://other.e2e.test"),
-    );
-    let msg = refusal(
-        &h.call(
+    // --- the derivation origin has to belong to the app named by `app_url` ---
+    // A second app that declares the same canister and pins ITS OWN origin as
+    // the identity to derive against. Naming it as `app_url` while signing as
+    // the user's identity at the first app is the case the binding exists for:
+    // one app's manifest must not authorize a canister for a principal the
+    // user holds somewhere else.
+    const OTHER_APP: &str = "https://other.e2e.test";
+    webfixture::serve(OTHER_APP, webfixture::Site::declaring(&[h.app, h.oql]).deriving_at(OTHER_APP));
+    // On the write path and on the reads that sign as someone — the binding
+    // runs wherever a call carries both an app and an identity, so a refusal
+    // that only held for writes would leave the reads open.
+    for (tool, args) in [
+        (
             "canister_update_call",
             serde_json::json!({
                 "canister_id": declared,
                 "method": "set_message",
                 "args": "(\"from the wrong app\")",
-                "app_url": "https://other.e2e.test",
+                "app_url": OTHER_APP,
                 "derivation_origin": h.origin,
             }),
+        ),
+        (
+            "canister_query",
+            serde_json::json!({
+                "canister_id": declared,
+                "method": "greet",
+                "args": "(\"from the wrong app\")",
+                "app_url": OTHER_APP,
+                "derivation_origin": h.origin,
+            }),
+        ),
+        (
+            "get_canister_oql_schema",
+            serde_json::json!({
+                "canister_id": h.oql.to_text(),
+                "app_url": OTHER_APP,
+                "derivation_origin": h.origin,
+            }),
+        ),
+    ] {
+        let msg = refusal(&h.call(tool, args).await);
+        assert!(
+            msg.contains("other.e2e.test") && msg.contains(&h.origin),
+            "{tool}'s mismatch refusal must name BOTH apps: {msg}"
+        );
+    }
+
+    // The other side of the same check: an app whose identity origin is NOT its
+    // own URL — the common shape, since an app that pins a custom derivation
+    // origin serves its manifest at the origin the user visits. Passing the
+    // origin that app really pins is accepted, and the reply shows the two
+    // apart: one app authorized the read, a different origin derived the
+    // identity that made it.
+    const PINNING_APP: &str = "https://pinning.e2e.test";
+    const PINNED_IDENTITY: &str = "https://identity.e2e.test";
+    webfixture::serve(
+        PINNING_APP,
+        webfixture::Site::declaring(&[h.app]).deriving_at(PINNED_IDENTITY),
+    );
+    h.identities
+        .seed_app_identity(SESSION, PINNED_IDENTITY)
+        .await
+        .expect("the user also holds an identity at the pinned origin");
+    let result = h
+        .call(
+            "canister_query",
+            serde_json::json!({
+                "canister_id": declared,
+                "method": "greet",
+                "args": "(\"from the app that pins an origin\")",
+                "app_url": PINNING_APP,
+                "derivation_origin": PINNED_IDENTITY,
+            }),
         )
-        .await,
+        .await;
+    assert_eq!(ok_text(&result), "(\"from the app that pins an origin\")");
+    let structured = ok_structured(&result);
+    assert_eq!(
+        structured["derived_for_origin"],
+        serde_json::json!(PINNED_IDENTITY),
+        "the identity came from the origin the app pins: {structured}"
     );
-    assert!(
-        msg.contains("other.e2e.test") && msg.contains(&h.origin),
-        "the mismatch refusal must name BOTH apps: {msg}"
+    assert_eq!(
+        structured["declared_by"],
+        serde_json::json!(PINNING_APP),
+        "while the manifest that authorized it is the app's own: {structured}"
     );
+
+    // A derivation origin that is not an origin at all is refused before any
+    // network work, naming the argument to fix.
+    for bad in ["", "not a url", "ftp://app.example", "https://"] {
+        let msg = refusal(
+            &h.call(
+                "canister_query",
+                serde_json::json!({
+                    "canister_id": declared,
+                    "method": "greet",
+                    "args": "(\"x\")",
+                    "app_url": h.origin,
+                    "derivation_origin": bad,
+                }),
+            )
+            .await,
+        );
+        assert!(
+            msg.contains("derivation_origin"),
+            "a `derivation_origin` of {bad:?} must be refused by name: {msg}"
+        );
+    }
 
     // The control: the same six shapes, unchanged, against the canister each
     // one's app DOES declare. Every one must SUCCEED — not merely avoid one
