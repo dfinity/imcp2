@@ -1126,6 +1126,13 @@ async fn resolve_declared_origin(
 /// whenever a declaration names a different origin — the flag only governs whether
 /// it is additionally returned for display.
 pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Result<AppIdentity, String> {
+    // The end-to-end tests' stand-in for an app's web server (see
+    // [`webfixture`]); compiled only into this crate's own test binary under
+    // the `e2e` feature, and a no-op for any origin no fixture registered.
+    #[cfg(all(test, feature = "e2e"))]
+    if let Some(fixture) = webfixture::app_identity(app_url) {
+        return fixture;
+    }
     let base = normalize(app_url);
     let (base_url, pinned) = resolve_public_url(&base).await?;
     // Lowercase the host: the known-app registry is keyed by lowercased host, and
@@ -1714,6 +1721,13 @@ pub(crate) enum ManifestProbe {
 /// adopted the protocol is never the slower path. The same SSRF-pinned client and
 /// capped reads as the rest of this module — `app_url` is caller-controlled.
 pub(crate) async fn fetch_declared_manifest(app_url: &str) -> Result<ManifestProbe, String> {
+    // The end-to-end tests' stand-in for an app's web server (see
+    // [`webfixture`]); compiled only into this crate's own test binary under
+    // the `e2e` feature, and a no-op for any origin no fixture registered.
+    #[cfg(all(test, feature = "e2e"))]
+    if let Some(fixture) = webfixture::manifest_probe(app_url) {
+        return fixture;
+    }
     let base = normalize(app_url);
     let (base_url, pinned) = resolve_public_url(&base).await?;
     let host = base_url.host_str().unwrap_or_default().to_ascii_lowercase();
@@ -1732,13 +1746,32 @@ pub(crate) async fn fetch_declared_manifest(app_url: &str) -> Result<ManifestPro
     // ask", and the first of those is a verdict on the app that tells the agent to
     // stop retrying. A legacy probe that failed costs nothing — it can only enrich
     // a refusal that is happening anyway.
-    if let Err(e) = &architecture {
-        return Err(format!("could not read {ARCHITECTURE_PATH} at {origin}: {e}"));
-    }
+    let architecture = match architecture {
+        Ok(doc) => doc,
+        Err(e) => return Err(format!("could not read {ARCHITECTURE_PATH} at {origin}: {e}")),
+    };
+    Ok(probe_from_documents(&origin, architecture, legacy.ok().flatten()))
+}
+
+/// Read the two well-known documents an origin answered with into a
+/// [`ManifestProbe`]: which path served a manifest, whether a redirect target
+/// answered instead of the probed origin, and what the protocol path claimed to
+/// be when it answered with something that is not a manifest.
+///
+/// Split out of [`fetch_declared_manifest`] so the decision is separable from
+/// the fetch that feeds it — the end-to-end tests run this exact assembly (and
+/// the real [`manifest_canister_ids`] parse under it) over fixture-served
+/// documents, since the SSRF guard refuses a loopback origin before a local
+/// fixture server could answer.
+fn probe_from_documents(
+    origin: &str,
+    architecture: Option<FetchedDocument>,
+    legacy: Option<FetchedDocument>,
+) -> ManifestProbe {
     let mut served_non_manifest = None;
     let (mut declared, mut legacy_declared) = (None, None);
     for (path, doc) in [(ARCHITECTURE_PATH, &architecture), (LEGACY_MANIFEST_PATH, &legacy)] {
-        let Ok(Some(doc)) = doc else { continue };
+        let Some(doc) = doc else { continue };
         if doc.served_from != origin {
             tracing::warn!(
                 probed = %origin,
@@ -1757,7 +1790,7 @@ pub(crate) async fn fetch_declared_manifest(app_url: &str) -> Result<ManifestPro
             continue;
         };
         let parsed = DeclaredManifest {
-            origin: origin.clone(),
+            origin: origin.to_string(),
             path,
             canisters: canisters.ids,
             omitted: canisters.omitted,
@@ -1769,7 +1802,7 @@ pub(crate) async fn fetch_declared_manifest(app_url: &str) -> Result<ManifestPro
         }
     }
     if let Some(m) = declared {
-        return Ok(ManifestProbe::Declared(m));
+        return ManifestProbe::Declared(m);
     }
     if legacy_declared.is_some() {
         // The population still on the pre-protocol path is what says whether
@@ -1780,7 +1813,165 @@ pub(crate) async fn fetch_declared_manifest(app_url: &str) -> Result<ManifestPro
             "origin publishes only the LEGACY manifest; it does not authorize writes"
         );
     }
-    Ok(ManifestProbe::Absent { served_non_manifest, legacy: legacy_declared })
+    ManifestProbe::Absent { served_non_manifest, legacy: legacy_declared }
+}
+
+// ---------------------------------------------------------------------------
+// Test-only web fixtures — compiled ONLY into this crate's own test binary,
+// and only under the `e2e` cargo feature, which no release build enables (see
+// `Cargo.toml`). A library build has neither this module nor the two call
+// sites that consult it.
+// ---------------------------------------------------------------------------
+
+/// An in-process stand-in for the app origins the discoverability gate reads,
+/// for the end-to-end tests in `crate::e2e_canister_tools`.
+///
+/// **Why a seam and not a local web server.** Every fetch in this module goes
+/// through the SSRF guard ([`resolve_public_url`]), which resolves and PINS
+/// public addresses before any request — so a fixture served on loopback is
+/// refused before it could answer, and relaxing the guard for tests is the
+/// exact thing that guard exists to prevent. The tests therefore register the
+/// DOCUMENTS an app would serve, and the two functions the gate calls answer
+/// from them.
+///
+/// **What stays real.** Only the HTTP exchange is stubbed. The manifest is
+/// parsed by [`manifest_canister_ids`] and assembled by
+/// [`probe_from_documents`], so `discoverability` decides on exactly the values
+/// a live fetch would hand it. The fetch itself keeps its own coverage: the
+/// live-network tests in [`crate::discoverability`] read a real adopter's
+/// manifest over the wire.
+#[cfg(all(test, feature = "e2e"))]
+pub(crate) mod webfixture {
+    use super::{
+        normalize, probe_from_documents, AppIdentity, DerivationSource, FetchedDocument,
+        ManifestProbe, ARCHITECTURE_PATH,
+    };
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    /// The documents one registered origin serves.
+    #[derive(Default)]
+    pub(crate) struct Site {
+        /// Body served at [`ARCHITECTURE_PATH`] — the only document that can
+        /// authorize a call. `None` means the origin answers "not here" there.
+        pub architecture: Option<String>,
+        /// The `Content-Type` the architecture path answers with. Read only when
+        /// the body is not a manifest (the refusal names it, which is how an
+        /// SPA catch-all is diagnosed).
+        pub architecture_content_type: String,
+        /// Body served at `/.well-known/ic-app.json`, the pre-protocol document
+        /// that does NOT authorize a call.
+        pub legacy: Option<String>,
+        /// The Internet Identity derivation origin this app pins, as its
+        /// `/.well-known/ii-derivation-origin` would. `None` means it pins none,
+        /// so an identity derives against the application origin itself.
+        pub derivation_origin: Option<String>,
+        /// When set, the origin cannot be reached and both entry points fail
+        /// with this cause — the gate's "could not find out" branch, which is
+        /// not a verdict on the app.
+        pub unreachable: Option<String>,
+    }
+
+    impl Site {
+        /// An origin whose protocol manifest declares exactly `canisters`.
+        pub(crate) fn declaring(canisters: &[candid::Principal]) -> Self {
+            let entries: Vec<serde_json::Value> = canisters
+                .iter()
+                .map(|c| serde_json::json!({ "id": c.to_text(), "role": "backend" }))
+                .collect();
+            Self {
+                architecture: Some(serde_json::json!({ "canisters": entries }).to_string()),
+                architecture_content_type: "application/json".to_string(),
+                ..Self::default()
+            }
+        }
+
+        /// An origin that answers the protocol path with something that is not a
+        /// manifest — the SPA catch-all every adoption guide warns about.
+        pub(crate) fn serving_a_catch_all() -> Self {
+            Self {
+                architecture: Some("<!doctype html><title>app</title>".to_string()),
+                architecture_content_type: "text/html".to_string(),
+                ..Self::default()
+            }
+        }
+
+        /// Pin an Internet Identity derivation origin for this app.
+        pub(crate) fn deriving_at(mut self, origin: &str) -> Self {
+            self.derivation_origin = Some(origin.to_string());
+            self
+        }
+    }
+
+    static SITES: OnceLock<Mutex<HashMap<String, Site>>> = OnceLock::new();
+
+    fn sites() -> &'static Mutex<HashMap<String, Site>> {
+        SITES.get_or_init(Default::default)
+    }
+
+    /// The registry key: the origin, derived the way the real fetch derives it,
+    /// so a fixture registered for `https://app.test` also answers a call that
+    /// named `https://app.test/some/path`.
+    fn key(app_url: &str) -> String {
+        url::Url::parse(&normalize(app_url))
+            .map(|u| u.origin().ascii_serialization())
+            .unwrap_or_else(|_| app_url.trim().to_string())
+    }
+
+    /// Register (replacing any earlier registration) what `origin` serves. This
+    /// registry is process-global, like the web it stands in for, so concurrent
+    /// tests must use origins distinct from each other's.
+    pub(crate) fn serve(origin: &str, site: Site) {
+        sites().lock().expect("fixture registry").insert(key(origin), site);
+    }
+
+    /// [`super::fetch_declared_manifest`] for a registered origin. `None` when
+    /// nothing is registered for it, which leaves the real fetch to run.
+    pub(crate) fn manifest_probe(app_url: &str) -> Option<Result<ManifestProbe, String>> {
+        let origin = key(app_url);
+        let registry = sites().lock().expect("fixture registry");
+        let site = registry.get(&origin)?;
+        if let Some(cause) = &site.unreachable {
+            return Some(Err(format!("could not read {ARCHITECTURE_PATH} at {origin}: {cause}")));
+        }
+        let served = |body: &Option<String>, content_type: &str| {
+            body.as_ref().map(|b| FetchedDocument {
+                served_from: origin.clone(),
+                content_type: content_type.to_string(),
+                body: b.clone(),
+            })
+        };
+        Some(Ok(probe_from_documents(
+            &origin,
+            served(&site.architecture, &site.architecture_content_type),
+            served(&site.legacy, "application/json"),
+        )))
+    }
+
+    /// [`super::resolve_app_identity`] for a registered origin. `None` when
+    /// nothing is registered for it.
+    pub(crate) fn app_identity(app_url: &str) -> Option<Result<AppIdentity, String>> {
+        let origin = key(app_url);
+        let registry = sites().lock().expect("fixture registry");
+        let site = registry.get(&origin)?;
+        if let Some(cause) = &site.unreachable {
+            return Some(Err(format!("could not reach {origin}: {cause}")));
+        }
+        let (derivation_origin, source) = match &site.derivation_origin {
+            Some(pinned) => (pinned.clone(), DerivationSource::Declared),
+            None => (origin.clone(), DerivationSource::AppUrlDefault),
+        };
+        Some(Ok(AppIdentity {
+            application_origin: origin,
+            derivation_origin,
+            derivation_origin_source: source,
+            alternative_origins: Vec::new(),
+            // Probed only when the origin had to be ASSUMED, exactly as the real
+            // resolution reports it; a registered origin stands in for a real
+            // IC-served app, so the evidence is there when it is looked for.
+            application_is_ic: matches!(source, DerivationSource::AppUrlDefault).then_some(true),
+        }))
+    }
 }
 
 /// Accumulator for discovered canister ids, with a hard ceiling on the number of

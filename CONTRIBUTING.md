@@ -58,6 +58,40 @@ Test the status dashboard:
 npm test --prefix monitoring/mcp-status
 ```
 
+### End-to-end tests
+
+Two suites run against a real replica in
+[PocketIC](https://github.com/dfinity/pocketic) rather than against mocks. Both
+are behind the `e2e` cargo feature, so the commands above compile neither them
+nor `pocket-ic`, and both skip cleanly when the artifacts they need — which
+cargo does not fetch — are absent.
+
+Fetch the PocketIC server once. Its version must satisfy the `pocket-ic` crate
+the workspace pins (v15 today), and the asset below is the Linux x86-64 build:
+
+```sh
+curl -fL -o pocket-ic.gz \
+  https://github.com/dfinity/pocketic/releases/download/15.0.0/pocket-ic-x86_64-linux.gz
+gunzip pocket-ic.gz && chmod +x pocket-ic
+```
+
+**The canister tools** — every tool that reaches a canister, driven over a real
+MCP session against canisters installed in PocketIC
+(`crates/imcp2-core/src/e2e_canister_tools.rs`). CI runs this one:
+
+```sh
+POCKET_IC_BIN=$PWD/pocket-ic cargo test -p imcp2-core --features e2e
+```
+
+**The Internet Identity handshake** — the connect ceremony against a live
+Internet Identity canister (`src/e2e_handshake.rs`). It additionally needs an
+Internet Identity release wasm, so CI does not run it:
+
+```sh
+II_WASM=/abs/internet_identity_backend.wasm.gz POCKET_IC_BIN=$PWD/pocket-ic \
+  cargo test --features e2e
+```
+
 See the [README](README.md) for the tool surface, the auth flow, and deploy
 instructions.
 
