@@ -1843,8 +1843,8 @@ fn probe_from_documents(
 #[cfg(all(test, feature = "e2e"))]
 pub(crate) mod webfixture {
     use super::{
-        normalize, probe_from_documents, AppIdentity, DerivationSource, FetchedDocument,
-        ManifestProbe, ARCHITECTURE_PATH,
+        decide_declared_origin, normalize, probe_from_documents, AppIdentity, DerivationSource,
+        FetchedDocument, ManifestProbe, ARCHITECTURE_PATH,
     };
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -1866,6 +1866,11 @@ pub(crate) mod webfixture {
         /// `/.well-known/ii-derivation-origin` would. `None` means it pins none,
         /// so an identity derives against the application origin itself.
         pub derivation_origin: Option<String>,
+        /// The application origins this origin authorizes to derive against it,
+        /// as its `/.well-known/ii-alternative-origins` would list them. Read
+        /// off the origin a cross-origin claim NAMES, never off the origin
+        /// making the claim: the authority is the origin being impersonated.
+        pub alternative_origins: Vec<String>,
         /// When set, the origin cannot be reached and both entry points fail
         /// with this cause — the gate's "could not find out" branch, which is
         /// not a verdict on the app.
@@ -1899,6 +1904,12 @@ pub(crate) mod webfixture {
         /// Pin an Internet Identity derivation origin for this app.
         pub(crate) fn deriving_at(mut self, origin: &str) -> Self {
             self.derivation_origin = Some(origin.to_string());
+            self
+        }
+
+        /// List the application origins this origin lets derive against it.
+        pub(crate) fn authorizing(mut self, origins: &[&str]) -> Self {
+            self.alternative_origins = origins.iter().map(|o| (*o).to_string()).collect();
             self
         }
     }
@@ -1950,6 +1961,13 @@ pub(crate) mod webfixture {
 
     /// [`super::resolve_app_identity`] for a registered origin. `None` when
     /// nothing is registered for it.
+    ///
+    /// A cross-origin claim runs the production decision
+    /// ([`decide_declared_origin`]) over the alt-origins list of the origin the
+    /// claim NAMES — not the claiming site's own. Deciding it here instead
+    /// would let a fixture accept a configuration production refuses, and this
+    /// is the branch that stops any site from claiming another app's identity
+    /// and having the user's agent act as their principal there.
     pub(crate) fn app_identity(app_url: &str) -> Option<Result<AppIdentity, String>> {
         let origin = key(app_url);
         let registry = sites().lock().expect("fixture registry");
@@ -1957,15 +1975,26 @@ pub(crate) mod webfixture {
         if let Some(cause) = &site.unreachable {
             return Some(Err(format!("could not reach {origin}: {cause}")));
         }
-        let (derivation_origin, source) = match &site.derivation_origin {
-            Some(pinned) => (pinned.clone(), DerivationSource::Declared),
-            None => (origin.clone(), DerivationSource::AppUrlDefault),
-        };
+        let declared = site.derivation_origin.clone();
+        // The authorization list is served BY the declared origin. An origin no
+        // fixture registered authorizes nobody, exactly as an unreachable or
+        // absent `ii-alternative-origins` does.
+        let alts = declared
+            .as_deref()
+            .filter(|d| key(d) != origin)
+            .and_then(|d| registry.get(&key(d)))
+            .map(|declared_site| declared_site.alternative_origins.clone())
+            .unwrap_or_default();
+        let (derivation_origin, source) =
+            match decide_declared_origin(&origin, declared.as_deref(), &alts) {
+                Ok(decision) => decision,
+                Err(refusal) => return Some(Err(refusal)),
+            };
         Some(Ok(AppIdentity {
             application_origin: origin,
             derivation_origin,
             derivation_origin_source: source,
-            alternative_origins: Vec::new(),
+            alternative_origins: alts,
             // Probed only when the origin had to be ASSUMED, exactly as the real
             // resolution reports it; a registered origin stands in for a real
             // IC-served app, so the evidence is there when it is looked for.

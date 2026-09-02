@@ -1134,11 +1134,18 @@ async fn the_gate_holds_for_every_canister_reaching_tool() {
     // origin that app really pins is accepted, and the reply shows the two
     // apart: one app authorized the read, a different origin derived the
     // identity that made it.
+    // The direction of trust is what makes this safe: the pinned origin is the
+    // one that publishes who may derive against it, so it is registered here
+    // listing the app back. Without that the claim is refused (the case below).
     const PINNING_APP: &str = "https://pinning.e2e.test";
     const PINNED_IDENTITY: &str = "https://identity.e2e.test";
     webfixture::serve(
         PINNING_APP,
         webfixture::Site::declaring(&[h.app]).deriving_at(PINNED_IDENTITY),
+    );
+    webfixture::serve(
+        PINNED_IDENTITY,
+        webfixture::Site::default().authorizing(&[PINNING_APP]),
     );
     h.identities
         .seed_app_identity(SESSION, PINNED_IDENTITY)
@@ -1167,6 +1174,50 @@ async fn the_gate_holds_for_every_canister_reaching_tool() {
         structured["declared_by"],
         serde_json::json!(PINNING_APP),
         "while the manifest that authorized it is the app's own: {structured}"
+    );
+
+    // And the claim the direction of trust exists to stop: an app pinning an
+    // origin that does NOT list it back. Nothing about the claiming site
+    // changes — only the answer from the origin it names — and the call is
+    // refused rather than deriving against an identity that app has no right
+    // to. (Unregistered here means an origin that authorizes nobody, which is
+    // what an absent or unreadable list amounts to.)
+    const SPOOFING_APP: &str = "https://spoofing.e2e.test";
+    const UNWILLING_IDENTITY: &str = "https://unwilling.e2e.test";
+    webfixture::serve(
+        SPOOFING_APP,
+        webfixture::Site::declaring(&[h.app]).deriving_at(UNWILLING_IDENTITY),
+    );
+    webfixture::serve(UNWILLING_IDENTITY, webfixture::Site::default().authorizing(&[]));
+    h.identities
+        .seed_app_identity(SESSION, UNWILLING_IDENTITY)
+        .await
+        .expect("the user holds an identity there too — the claim is still refused");
+    let msg = refusal(
+        &h.call(
+            "canister_query",
+            serde_json::json!({
+                "canister_id": declared,
+                "method": "greet",
+                "args": "(\"x\")",
+                "app_url": SPOOFING_APP,
+                "derivation_origin": UNWILLING_IDENTITY,
+            }),
+        )
+        .await,
+    );
+    assert!(
+        msg.contains(SPOOFING_APP) && msg.contains(UNWILLING_IDENTITY),
+        "the refusal must name the app and the origin it claimed: {msg}"
+    );
+    assert!(
+        msg.contains("does not authorize it back"),
+        "and say which way the authorization is missing — the claimed origin never listed \
+         this app, not the other way round: {msg}"
+    );
+    assert!(
+        msg.contains("Retrying will not change it"),
+        "a misconfiguration is not a transient failure, and an agent told otherwise loops: {msg}"
     );
 
     // A derivation origin that is not an origin at all is refused before any
