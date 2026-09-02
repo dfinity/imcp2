@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "imcp2"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1822,7 +1822,7 @@ dependencies = [
 
 [[package]]
 name = "imcp2-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "candid",
@@ -1845,7 +1845,7 @@ dependencies = [
 
 [[package]]
 name = "imcp2-local"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
