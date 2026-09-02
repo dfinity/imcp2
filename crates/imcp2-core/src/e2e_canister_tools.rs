@@ -974,23 +974,31 @@ async fn the_gate_holds_for_every_canister_reaching_tool() {
     let undeclared = h.opaque.to_text();
     let declared = h.app.to_text();
 
-    // Each canister-reaching tool, with the arguments it needs, aimed at a
-    // canister the app's manifest does not list.
-    let calls: Vec<(&'static str, serde_json::Value)> = vec![
-        ("get_canister_candid", serde_json::json!({ "canister_id": undeclared, "app_url": h.origin })),
-        ("get_canister_api_doc", serde_json::json!({ "canister_id": undeclared, "app_url": h.origin })),
+    // Every call shape that reaches a canister, each paired with the DECLARED
+    // canister it would work against — the app canister for the Candid and
+    // doc shapes, the OQL canister for the two OQL ones. Each shape is run
+    // three ways below: against an undeclared canister (must be refused),
+    // with no origin at all (must be refused), and against its own declared
+    // canister, where it must SUCCEED. That last one is the control that says
+    // the refusals above came from the gate rejecting the target rather than
+    // from a call that could never have worked.
+    let calls: Vec<(&'static str, &Principal, serde_json::Value)> = vec![
+        ("get_canister_candid", &h.app, serde_json::json!({ "app_url": h.origin })),
+        ("get_canister_api_doc", &h.app, serde_json::json!({ "app_url": h.origin })),
         (
             "get_canister_oql_schema",
-            serde_json::json!({ "canister_id": undeclared, "app_url": h.origin, "derivation_origin": h.origin }),
+            &h.oql,
+            serde_json::json!({ "app_url": h.origin, "derivation_origin": h.origin }),
         ),
         (
             "canister_query",
-            serde_json::json!({ "canister_id": undeclared, "method": "greet", "args": "(\"x\")", "app_url": h.origin }),
+            &h.app,
+            serde_json::json!({ "method": "greet", "args": "(\"x\")", "app_url": h.origin }),
         ),
         (
             "canister_query",
+            &h.oql,
             serde_json::json!({
-                "canister_id": undeclared,
                 "oql": "{\"start\":\"booking\"}",
                 "app_url": h.origin,
                 "derivation_origin": h.origin,
@@ -998,12 +1006,22 @@ async fn the_gate_holds_for_every_canister_reaching_tool() {
         ),
         (
             "canister_update_call",
-            serde_json::json!({ "canister_id": undeclared, "method": "greet", "args": "(\"x\")", "app_url": h.origin }),
+            &h.app,
+            serde_json::json!({ "method": "greet", "args": "(\"x\")", "app_url": h.origin }),
         ),
     ];
-    for (tool, args) in &calls {
+    /// The call's arguments aimed at `canister`.
+    fn at(args: &serde_json::Value, canister: &str) -> serde_json::Value {
+        let mut args = args.clone();
+        args.as_object_mut()
+            .expect("object")
+            .insert("canister_id".into(), serde_json::json!(canister));
+        args
+    }
+
+    for (tool, _, args) in &calls {
         let is_write = *tool == "canister_update_call";
-        let msg = refusal(&h.call(tool, args.clone()).await);
+        let msg = refusal(&h.call(tool, at(args, &undeclared)).await);
         assert!(
             msg.contains(&undeclared),
             "{tool}'s refusal must name the canister it would not reach: {msg}"
@@ -1028,14 +1046,14 @@ async fn the_gate_holds_for_every_canister_reaching_tool() {
     }
 
     // With NO origin at all there is no manifest to consult, so every one of
-    // them refuses rather than reaching the canister anonymously.
-    for (tool, args) in &calls {
-        let mut args = args.clone();
+    // them refuses — even aimed at a canister that IS declared, since without
+    // an app named there is nothing to read a declaration from.
+    for (tool, target, args) in &calls {
+        let mut args = at(args, &target.to_text());
         let map = args.as_object_mut().expect("object");
         map.remove("app_url");
         map.remove("derivation_origin");
-        let result = h.call(tool, args).await;
-        let msg = refusal(&result);
+        let msg = refusal(&h.call(tool, args).await);
         assert!(
             msg.contains("app_url") || msg.contains("derivation_origin"),
             "{tool} with no origin must say which argument is missing: {msg}"
@@ -1082,19 +1100,20 @@ async fn the_gate_holds_for_every_canister_reaching_tool() {
         "the mismatch refusal must name BOTH apps: {msg}"
     );
 
-    // And the same tools, unchanged, reach the canister the app DOES declare.
-    // Two of these calls still fail there — the app canister has no OQL surface
-    // — but for a reason of their own, never the gate's, which is what this
-    // asserts: nothing on the surface is refused by the gate for a declared id.
-    for (tool, args) in &calls {
-        let mut args = args.clone();
-        args.as_object_mut()
-            .expect("object")
-            .insert("canister_id".into(), serde_json::json!(declared));
-        let msg = all_text(&h.call(tool, args).await);
-        assert!(
-            !msg.contains("does not declare"),
-            "{tool} must not be turned away by the gate on a declared canister: {msg}"
+    // The control: the same six shapes, unchanged, against the canister each
+    // one's app DOES declare. Every one must SUCCEED — not merely avoid one
+    // wording of one refusal, which would still pass if the gate turned a
+    // declared canister away down some other branch (no manifest, an
+    // unreachable origin, an identity mismatch). A success is the only
+    // outcome that proves the gate admitted the call.
+    for (tool, target, args) in &calls {
+        let result = h.call(tool, at(args, &target.to_text())).await;
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "{tool} must succeed against the canister its app declares, or the refusals \
+             above prove nothing about the gate: {}",
+            all_text(&result)
         );
     }
 }
