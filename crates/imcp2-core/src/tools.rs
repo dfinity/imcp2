@@ -338,7 +338,14 @@ impl IcCanisterTools {
             Ok(b) => b,
             Err(e) => return Ok(err(format!("OQL schema call failed: {e}"))),
         };
-        let schema = calls::decode_schema_reply(&reply);
+        // `decode_schema_reply` bounds the schema's size and parses it ONCE (the
+        // entity names below come from that parse); the text itself is handed on
+        // verbatim, never re-rendered, and an over-large reply is refused here
+        // rather than copied through the result.
+        let schema = match calls::decode_schema_reply(&reply) {
+            Ok(s) => s,
+            Err(e) => return Ok(err(format!("OQL schema call failed: {e}"))),
+        };
         // An origin is required (rejected above if absent), so this is never anonymous.
         let is_anonymous = false;
         // #8: a COMPLETE canister_query per entity, carrying the SAME identity this
@@ -347,14 +354,14 @@ impl IcCanisterTools {
         // copied example must pass the same gate this schema read just passed.
         let example_queries = calls::oql_query_examples(
             &canister_id,
-            &schema,
+            schema.entity_names(),
             Some(declaration.origin.as_str()),
             Some(target.origin.as_str()),
             account.as_deref(),
         );
         // #1: an EMPTY schema (no visible entities) for this authenticated account is
         // "nothing visible here", not "the app has no data model".
-        let empty_note = if calls::oql_schema_is_empty(&schema) {
+        let empty_note = if schema.is_empty() {
             Some(
                 "This account sees no OQL entities on this canister — confirm the \
                  derivation_origin/account are the ones the user uses in their browser."
@@ -366,6 +373,7 @@ impl IcCanisterTools {
         // Keep the primary block as the raw schema JSON (paste-able); surface the
         // empty-note, the ready-to-run examples, and the identity note as SEPARATE
         // blocks so none of them break the JSON for a copy-paste consumer.
+        let schema = schema.text;
         let mut blocks = vec![schema.clone()];
         if let Some(note) = &empty_note {
             blocks.push(note.clone());
@@ -1658,10 +1666,11 @@ enum EmptyContext {
 ///    misdescribe it):
 ///     - Anonymous + empty → the #1 auth remediation (empty is almost certainly
 ///       "not authenticated as your account", not "no data").
-///     - Authenticated + the schema read SUCCEEDED and shows no entities → this
-///       account sees no entities here. (A schema read that FAILED is left
-///       undiagnosed — the caller falls back to a benign "0 rows" note — rather
-///       than mislabeled "no entities".)
+///     - Authenticated + the schema read SUCCEEDED and declares no entities → this
+///       account sees no entities here. (A schema read that FAILED, or that came
+///       back in a shape we don't recognize, is left undiagnosed — the caller
+///       falls back to a benign "0 rows" note — rather than mislabeled "no
+///       entities".)
 ///     - `start` valid but 0 rows → authenticated gets no note here (the caller
 ///       adds the benign "0 rows"); anonymous still gets the auth hint.
 async fn diagnose_empty_oql(
@@ -1675,12 +1684,18 @@ async fn diagnose_empty_oql(
     // never fill with a guessed origin (#1).
     const ADD_HINT: &str = "the app's `derivation_origin` (its canonical Internet Identity origin)";
     // Re-read the schema for THIS principal (same agent). `None` = the read FAILED
-    // (unknown, not "empty"); `Some(vec)` = it succeeded (possibly with no entities).
+    // or came back in an unrecognized shape (unknown, not "empty"); `Some(vec)` =
+    // it succeeded (possibly with no entities).
     // Keeping the two apart stops a transient schema failure from being mislabeled
     // "this account sees no entities".
     let entities: Option<Vec<String>> = match calls::encode_unit_arg() {
         Ok(arg) => match calls::raw_call(agent, principal, "schema", arg, true).await {
-            Ok(reply) => Some(calls::oql_entity_names(&calls::decode_schema_reply(&reply))),
+            // An over-large schema is refused by the decoder, and a schema in a shape
+            // we don't recognize yields no names — treat both like a failed read
+            // (unknown), never as "no entities".
+            Ok(reply) => calls::decode_schema_reply(&reply)
+                .ok()
+                .and_then(|s| s.recognized_entity_names().map(<[String]>::to_vec)),
             Err(_) => None,
         },
         Err(_) => None,
