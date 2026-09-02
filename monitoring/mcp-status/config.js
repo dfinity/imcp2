@@ -193,6 +193,122 @@ export const normaliseOrigin = (value) => {
 };
 
 /**
+ * @typedef {Object} Target
+ * @property {string} name       Short label shown on the dashboard ("staging").
+ * @property {string} mcpOrigin  The MCP server origin to probe.
+ * @property {string | undefined} iiOrigin  Pinned II origin, replacing the
+ *   list the server advertises at /version (see resolveConfig). Per target,
+ *   because the reason to pin is per deployment: production's edge currently
+ *   answers /version with a redirect, so its pairing cannot be read from it.
+ */
+
+/**
+ * Target names appear as column headings, in `?target=` queries and in log
+ * lines, so keep them to a short, unambiguous token.
+ */
+const TARGET_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/;
+
+/**
+ * Parse a whitespace-separated list of `name=origin` entries — the shape of
+ * `--target` (repeated) and of the `MCP_STATUS_TARGETS` variable, which has to
+ * be readable and quotable in a systemd unit file, where JSON is not.
+ *
+ * Only the shape is checked here; `resolveTargets` normalises and allowlists
+ * the origins. Throws on a malformed entry or a duplicate name, because a
+ * dashboard quietly monitoring fewer instances than configured is the failure
+ * mode a status page must not have.
+ *
+ * @param {string | string[] | undefined} spec
+ * @returns {{ name: string, origin: string }[]}
+ */
+export const parseTargetList = (spec) => {
+  const entries = (Array.isArray(spec) ? spec : [spec ?? ""])
+    .flatMap((s) => String(s).split(/\s+/))
+    .filter(Boolean);
+  const seen = new Set();
+  return entries.map((entry) => {
+    const eq = entry.indexOf("=");
+    const name = eq === -1 ? "" : entry.slice(0, eq);
+    const origin = eq === -1 ? "" : entry.slice(eq + 1);
+    if (!TARGET_NAME.test(name) || !origin) {
+      throw new Error(
+        `Invalid target "${entry}": expected name=origin, where the name is 1-32 letters, digits, "_", "." or "-"`,
+      );
+    }
+    if (seen.has(name)) throw new Error(`Duplicate target name "${name}"`);
+    seen.add(name);
+    return { name, origin };
+  });
+};
+
+/**
+ * Resolve the set of instances to monitor.
+ *
+ * A target list (`targets`, from `--target`/`MCP_STATUS_TARGETS`) defines the
+ * set; per-target II pins (`targetIi`, from `--target-ii`/`MCP_STATUS_TARGET_II`,
+ * same `name=origin` syntax) must name a target in it. Without a list, the
+ * single-target configuration `resolveConfig` has always understood
+ * (`mcpOrigin`/`iiOrigin`, then `MCP_ORIGIN`/`II_ORIGIN`, then the default)
+ * yields one target named after its host — so an existing deployment keeps
+ * working, and shows as a one-column dashboard.
+ *
+ * Every origin goes through `resolveConfig`, so the allowlist applies to each
+ * configured instance exactly as it did to the single one.
+ *
+ * @param {{ targets?: string | string[], targetIi?: string | string[], mcpOrigin?: string, iiOrigin?: string, timeoutMs?: number }} [opts]
+ * @returns {{ targets: Target[], timeoutMs: number }}
+ */
+export const resolveTargets = (opts = {}) => {
+  const listSpec = opts.targets ?? process.env.MCP_STATUS_TARGETS;
+  const hasList = listSpec !== undefined && String(listSpec).trim() !== "";
+  if (hasList && opts.mcpOrigin !== undefined) {
+    throw new Error(
+      "--mcp and --target are mutually exclusive: name every instance with --target",
+    );
+  }
+  if (!hasList) {
+    const cfg = resolveConfig({
+      mcpOrigin: opts.mcpOrigin,
+      iiOrigin: opts.iiOrigin,
+      timeoutMs: opts.timeoutMs,
+    });
+    return {
+      targets: [
+        {
+          name: new URL(cfg.mcpOrigin).hostname,
+          mcpOrigin: cfg.mcpOrigin,
+          iiOrigin: cfg.iiOverride,
+        },
+      ],
+      timeoutMs: cfg.timeoutMs,
+    };
+  }
+
+  const list = parseTargetList(listSpec);
+  const pins = new Map(
+    parseTargetList(opts.targetIi ?? process.env.MCP_STATUS_TARGET_II).map(
+      (p) => [p.name, p.origin],
+    ),
+  );
+  for (const name of pins.keys()) {
+    if (!list.some((t) => t.name === name)) {
+      throw new Error(`II pin for unknown target "${name}"`);
+    }
+  }
+  let timeoutMs = DEFAULT_TIMEOUT_MS;
+  const targets = list.map(({ name, origin }) => {
+    const cfg = resolveConfig({
+      mcpOrigin: origin,
+      iiOrigin: pins.get(name),
+      timeoutMs: opts.timeoutMs,
+    });
+    timeoutMs = cfg.timeoutMs;
+    return { name, mcpOrigin: cfg.mcpOrigin, iiOrigin: cfg.iiOverride };
+  });
+  return { targets, timeoutMs };
+};
+
+/**
  * Resolve the effective configuration from explicit overrides, falling back to
  * environment variables and finally the built-in defaults. All resolved origins
  * are validated against the host allowlist.

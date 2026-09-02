@@ -6,13 +6,20 @@
 // dashboard work at all: the MCP server's `/mcp` 401 challenge, its landing
 // page, and the II instance's CSP header are not CORS-readable from a browser.
 //
-// The probe targets are fixed by the operator when the server is started — via
-// the defaults, `--mcp`/`--ii` flags, or the MCP_ORIGIN/II_ORIGIN env vars —
-// and are deliberately NOT taken from the incoming request. A hosted status
-// page must never let a visitor steer server-side requests at arbitrary hosts.
+// The instances to probe are fixed by the operator when the server is started —
+// named targets via `--target name=origin` (repeatable) or MCP_STATUS_TARGETS,
+// with optional per-target II pins via `--target-ii name=origin` or
+// MCP_STATUS_TARGET_II; or the single-target `--mcp`/`--ii` flags and
+// MCP_ORIGIN/II_ORIGIN variables, which yield one instance named after its
+// host. They are deliberately NOT taken from the incoming request: a hosted
+// status page must never let a visitor steer server-side requests at arbitrary
+// hosts. `?target=<name>` selects among the configured instances only.
 //
 // Usage:
-//   node monitoring/mcp-status/server.js [--port 8080] [--host 127.0.0.1] [--mcp <origin>] [--ii <origin>]
+//   node monitoring/mcp-status/server.js [--port 8080] [--host 127.0.0.1] \
+//     --target staging=https://mcp.beta.id.ai \
+//     --target production=https://mcp.internetcomputer.org --target-ii production=https://id.ai
+//   node monitoring/mcp-status/server.js --mcp <origin> [--ii <origin>]
 //
 // Binds to 127.0.0.1 by default so the probe endpoint is not directly exposed;
 // front it with a TLS reverse proxy (e.g. Caddy) to publish it.
@@ -21,7 +28,8 @@ import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { runDashboard } from "./checks.js";
+import { resolveTargets } from "./config.js";
+import { createInstanceReporter, selectPusherTarget } from "./instances.js";
 import { sanitizeForLog } from "./log.js";
 import {
   resolveStatuspageConfig,
@@ -48,82 +56,43 @@ const argValue = (flag) => {
   const idx = process.argv.indexOf(flag);
   return idx !== -1 ? process.argv[idx + 1] : undefined;
 };
+/** Every value following a repeatable flag, in order. */
+const argValues = (flag) =>
+  process.argv.flatMap((a, i) => (a === flag ? [process.argv[i + 1]] : []));
 
-const defaults = {
-  mcpOrigin: argValue("--mcp"),
-  iiOrigin: argValue("--ii"),
-};
+// Resolve — and allowlist-check — every instance before listening, so a
+// misconfigured target is a clear startup failure rather than a 400 on every
+// request for the lifetime of the process.
+let targets;
+let timeoutMs;
+try {
+  const targetFlags = argValues("--target");
+  const pinFlags = argValues("--target-ii");
+  ({ targets, timeoutMs } = resolveTargets({
+    targets: targetFlags.length ? targetFlags : undefined,
+    targetIi: pinFlags.length ? pinFlags : undefined,
+    mcpOrigin: argValue("--mcp"),
+    iiOrigin: argValue("--ii"),
+  }));
+} catch (e) {
+  process.stderr.write(`mcp-status: ${e?.message ?? e}\n`);
+  process.exit(2);
+}
 
 // `/api/status` runs the full probe suite — which includes a dynamic OAuth
-// client registration against the monitored server — so re-running it on every
-// request (multiple open tabs, rapid refreshes, a publicly reachable URL) would
-// multiply load and mint a fresh client each time. Cache the most recent report
-// for a short TTL and coalesce concurrent requests into a single in-flight run.
+// client registration against each monitored server — so re-running it on
+// every request (multiple open tabs, rapid refreshes, a publicly reachable URL)
+// would multiply load and mint a fresh client each time. The reporter caches
+// each instance's most recent report for a short TTL and coalesces concurrent
+// requests into a single in-flight run per instance; an explicit refresh
+// (`?fresh=1`) bypasses the TTL but never re-probes past a short floor.
 const ttlEnv = Number(process.env.MCP_STATUS_CACHE_TTL_MS);
-const CACHE_TTL_MS = Number.isFinite(ttlEnv) && ttlEnv > 0 ? ttlEnv : 15_000;
-// An explicit refresh (`?fresh=1`) bypasses the TTL so the button feels live,
-// but never re-probes more often than this floor — so it can't be used to hammer
-// the monitored server (each run includes a dynamic client registration).
-const FORCE_MIN_AGE_MS = 2_000;
-/** @type {{ at: number, report: import("./checks.js").DashboardReport | null }} */
-let cache = { at: 0, report: null };
-/** @type {Promise<import("./checks.js").DashboardReport> | null} */
-let inFlight = null;
-
-/** @param {boolean} [force] bypass the normal TTL (still rate-floored + coalesced). */
-const getReport = (force = false) => {
-  const maxAge = force ? FORCE_MIN_AGE_MS : CACHE_TTL_MS;
-  if (cache.report && Date.now() - cache.at < maxAge) {
-    return Promise.resolve(cache.report);
-  }
-  if (!inFlight) {
-    inFlight = runDashboard(defaults)
-      .then((report) => {
-        cache = { at: Date.now(), report };
-        return report;
-      })
-      .finally(() => {
-        inFlight = null;
-      });
-  }
-  return inFlight;
-};
-
-// Report source for the periodic Statuspage pusher. Unlike visitor-triggered
-// probes, this runs unattended around the clock, and the full suite's Dynamic
-// Client Registration check mints and persists a client_id on the monitored
-// server per run — a 60 s loop would grind ~1,440 junk registrations a day
-// through the server's LRU-bounded client store. So: reuse a recent
-// visitor-triggered full report when one exists (it was already paid for), and
-// otherwise probe with `mutating: false`, which skips both registration probes
-// (the DCR check, and the allow-list check that would mutate if the guard it
-// tests regressed). The non-mutating report is deliberately NOT stored in the
-// visitor cache — it is missing those two checks, and /api/status promises the
-// full suite.
-/** @type {Promise<import("./checks.js").DashboardReport> | null} */
-let pusherInFlight = null;
-/** @param {number} maxAgeMs how recent a full report must be to be reused. */
-const getPusherReport = (maxAgeMs) => {
-  // Bound reuse by the dashboard cache TTL as well as the push interval:
-  // reusing a report /api/status already considers expired would let a tick
-  // publish stale state, delaying an outage by up to two intervals.
-  const maxAge = Math.min(maxAgeMs, CACHE_TTL_MS);
-  if (cache.report && Date.now() - cache.at < maxAge) {
-    return Promise.resolve(cache.report);
-  }
-  // A visitor-triggered full run that is already in flight satisfies the
-  // pusher too — join it rather than doubling the probe load with a second
-  // concurrent suite.
-  if (inFlight) return inFlight;
-  if (!pusherInFlight) {
-    pusherInFlight = runDashboard({ ...defaults, mutating: false }).finally(
-      () => {
-        pusherInFlight = null;
-      },
-    );
-  }
-  return pusherInFlight;
-};
+const reporter = createInstanceReporter({
+  targets,
+  timeoutMs,
+  cacheTtlMs: Number.isFinite(ttlEnv) && ttlEnv > 0 ? ttlEnv : 15_000,
+  forceMinAgeMs: 2_000,
+});
 
 const sendJson = (res, code, body) => {
   const payload = JSON.stringify(body);
@@ -150,11 +119,25 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === "/api/status") {
-      // `?fresh=1` only controls caching, never the probe target, so it does not
-      // widen the SSRF surface (the target stays fixed at startup).
+      // `?fresh=1` only controls caching and `?target=` only selects among the
+      // instances fixed at startup, so neither widens the SSRF surface.
       const force = url.searchParams.get("fresh") === "1";
-      const report = await getReport(force);
-      sendJson(res, report.overall === "fail" ? 503 : 200, report);
+      const target = url.searchParams.get("target");
+      if (target !== null) {
+        // One instance, in the single-report shape the dashboard has always
+        // served — for an uptime monitor that watches one deployment.
+        const report = await reporter.getInstanceReport(target, force);
+        if (!report) {
+          sendJson(res, 404, { error: "unknown target" });
+          return;
+        }
+        sendJson(res, report.overall === "fail" ? 503 : 200, report);
+        return;
+      }
+      const envelope = await reporter.getEnvelope(force);
+      // 503 when ANY instance fails: the page as a whole is then reporting an
+      // outage, and a monitor watching this URL should see it as one.
+      sendJson(res, envelope.overall === "fail" ? 503 : 200, envelope);
       return;
     }
 
@@ -180,25 +163,43 @@ const host = argValue("--host") ?? process.env.MCP_STATUS_HOST ?? "127.0.0.1";
 server.listen(port, host, () => {
   process.stdout.write(
     `IMCP status dashboard listening on http://${host}:${port}\n` +
-      `  monitoring: ${defaults.mcpOrigin ?? "https://mcp.beta.id.ai (default)"}\n`,
+      targets
+        .map(
+          (t) =>
+            `  monitoring ${t.name}: ${t.mcpOrigin}` +
+            (t.iiOrigin ? ` (II pinned to ${t.iiOrigin})` : ""),
+        )
+        .join("\n") +
+      "\n",
   );
 });
 
-// Optionally mirror the verdict to an Atlassian Statuspage component (e.g. on
-// status.internetcomputer.org). Off unless the STATUSPAGE_* variables are set —
-// see statuspage.js and the README. The pusher reuses a recent visitor-triggered
-// report when one exists and otherwise probes without the state-mutating DCR
-// check (see getPusherReport), so it never registers OAuth clients on its own.
+// Optionally mirror one instance's verdict to an Atlassian Statuspage component
+// (e.g. on status.internetcomputer.org). Off unless the STATUSPAGE_* variables
+// are set — see statuspage.js and the README. STATUSPAGE_TARGET names the
+// instance that drives the component (default: the first configured). The
+// pusher reuses a recent visitor-triggered report when one exists and otherwise
+// probes without the state-mutating registration checks (see instances.js), so
+// it never registers OAuth clients on its own.
 const { config: statuspageConfig, warning: statuspageWarning } =
   resolveStatuspageConfig();
 if (statuspageWarning) console.error(statuspageWarning);
 if (statuspageConfig) {
-  startStatuspagePusher({
-    getReport: () => getPusherReport(statuspageConfig.intervalMs),
-    config: statuspageConfig,
-  });
-  process.stdout.write(
-    `  statuspage: pushing to component ${statuspageConfig.componentId} ` +
-      `(page ${statuspageConfig.pageId}) every ${statuspageConfig.intervalMs} ms\n`,
-  );
+  const { name: pushTarget, warning: targetWarning } = selectPusherTarget(targets);
+  if (targetWarning) {
+    console.error(targetWarning);
+  } else {
+    startStatuspagePusher({
+      getReport: () =>
+        reporter.getPusherReport(
+          /** @type {string} */ (pushTarget),
+          statuspageConfig.intervalMs,
+        ),
+      config: statuspageConfig,
+    });
+    process.stdout.write(
+      `  statuspage: pushing ${pushTarget} to component ${statuspageConfig.componentId} ` +
+        `(page ${statuspageConfig.pageId}) every ${statuspageConfig.intervalMs} ms\n`,
+    );
+  }
 }
