@@ -60,11 +60,11 @@ npm test --prefix monitoring/mcp-status
 
 ### End-to-end tests
 
-Two suites run against a real replica in
-[PocketIC](https://github.com/dfinity/pocketic) rather than against mocks. Both
-are behind the `e2e` cargo feature, so the commands above compile neither them
-nor `pocket-ic`, and both skip cleanly when the artifacts they need — which
-cargo does not fetch — are absent.
+Three suites run against a real replica in
+[PocketIC](https://github.com/dfinity/pocketic) rather than against mocks. Each
+is behind its crate's `e2e` cargo feature, so the commands above compile
+neither them nor `pocket-ic`, and each skips cleanly when the artifacts it
+needs — which cargo does not fetch — are absent.
 
 Fetch the PocketIC server once. Its version must satisfy the `pocket-ic` crate
 the workspace pins (v15 today), and the asset below is the Linux x86-64 build:
@@ -83,13 +83,24 @@ MCP session against canisters installed in PocketIC
 POCKET_IC_BIN=$PWD/pocket-ic cargo test -p imcp2-core --features e2e
 ```
 
-**The Internet Identity handshake** — the connect ceremony against a live
-Internet Identity canister (`src/e2e_handshake.rs`). It additionally needs an
-Internet Identity release wasm, so CI does not run it:
+The other two drive the Internet Identity connect ceremony against a live
+Internet Identity canister, so they additionally need an Internet Identity
+release wasm — which is why CI runs neither.
+
+**The hosted server's handshake** (`src/e2e_handshake.rs`), which redeems a
+real registration delegation through the OAuth connect flow:
 
 ```sh
 II_WASM=/abs/internet_identity_backend.wasm.gz POCKET_IC_BIN=$PWD/pocket-ic \
   cargo test --features e2e
+```
+
+**The local binary's login** (`crates/imcp2-local/src/e2e_local_login.rs`),
+which does the same through `imcp2-local`'s browser login flow:
+
+```sh
+II_WASM=/abs/internet_identity_backend.wasm.gz POCKET_IC_BIN=$PWD/pocket-ic \
+  cargo test -p imcp2-local --features e2e
 ```
 
 See the [README](README.md) for the tool surface, the auth flow, and deploy

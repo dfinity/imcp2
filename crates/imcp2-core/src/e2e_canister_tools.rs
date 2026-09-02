@@ -89,6 +89,12 @@ enum Behavior {
     /// Reply with the CALLER's principal, as a Candid `(principal)` — which is
     /// how a test sees whose identity a call was actually signed with.
     Caller,
+    /// Reply with `reply`, but ONLY if the call's argument is exactly
+    /// `expected`; otherwise trap. For a method whose reply says nothing about
+    /// what it was asked: a query cannot record anything (the replica discards
+    /// a query's writes), so the canister refuses the call instead, and the
+    /// caller's success is the proof that the right bytes arrived.
+    ReplyIfArgIs { expected: Vec<u8>, reply: Vec<u8> },
 }
 
 /// One exported canister method: its Candid mode, its name, and what it does.
@@ -109,6 +115,10 @@ impl Method {
         Self { query: false, name, behavior }
     }
 }
+
+/// What a [`Behavior::ReplyIfArgIs`] method traps with when the argument it was
+/// sent is not the one it was built to accept.
+const ARG_MISMATCH: &str = "this canister was called with an argument it did not expect";
 
 /// Bytes of one buffer in the canister's memory: big enough for any argument
 /// or reply these tests send, small enough to keep the module tiny.
@@ -156,6 +166,35 @@ fn canister_wasm(did: Option<&str>, methods: &[Method]) -> Vec<u8> {
             }
             Behavior::Echo => copy_arg_and_reply(SCRATCH, false),
             Behavior::Store => copy_arg_and_reply(STORE, true),
+            Behavior::ReplyIfArgIs { expected, reply } => {
+                let mut place = |bytes: &Vec<u8>| {
+                    let at = next_const;
+                    next_const += bytes.len() as u32;
+                    data.push((at, bytes.clone()));
+                    (at, bytes.len())
+                };
+                let (want, want_len) = place(expected);
+                let (answer, answer_len) = place(reply);
+                let (why, why_len) = place(&ARG_MISMATCH.as_bytes().to_vec());
+                format!(
+                    "(local.set $n (call $arg_size))\n    \
+                     (if (i32.ne (local.get $n) (i32.const {want_len}))\n      \
+                       (then (call $trap (i32.const {why}) (i32.const {why_len}))))\n    \
+                     (call $arg_copy (i32.const {SCRATCH}) (i32.const 0) (local.get $n))\n    \
+                     (local.set $i (i32.const 0))\n    \
+                     (block $done\n      \
+                       (loop $next\n        \
+                         (br_if $done (i32.ge_u (local.get $i) (local.get $n)))\n        \
+                         (if (i32.ne\n              \
+                               (i32.load8_u (i32.add (i32.const {SCRATCH}) (local.get $i)))\n              \
+                               (i32.load8_u (i32.add (i32.const {want}) (local.get $i))))\n          \
+                           (then (call $trap (i32.const {why}) (i32.const {why_len}))))\n        \
+                         (local.set $i (i32.add (local.get $i) (i32.const 1)))\n        \
+                         (br $next)))\n    \
+                     (call $reply_append (i32.const {answer}) (i32.const {answer_len}))\n    \
+                     (call $reply)"
+                )
+            }
             Behavior::Load => format!(
                 "(call $reply_append (i32.const {STORE}) (i32.load (i32.const 0)))\n    \
                  (call $reply)"
@@ -173,7 +212,7 @@ fn canister_wasm(did: Option<&str>, methods: &[Method]) -> Vec<u8> {
                  (call $reply)"
             ),
         };
-        funcs.push_str(&format!("  (func $m{i} (local $n i32)\n    {body})\n"));
+        funcs.push_str(&format!("  (func $m{i} (local $n i32) (local $i i32)\n    {body})\n"));
         let mode = if m.query { "query" } else { "update" };
         exports.push_str(&format!(
             "  (export \"canister_{mode} {}\" (func $m{i}))\n",
@@ -289,6 +328,18 @@ const OQL_DID: &str = "service : {\n  \
 /// What the OQL canister's `schema` returns: the `{"entities":[…]}` document the
 /// schema tool reads entity names out of (and builds ready-to-run examples from).
 const OQL_SCHEMA: &str = r#"{"entities":[{"name":"booking","key":"id","fields":[{"name":"id","type":"text"},{"name":"seats","type":"int"}]}]}"#;
+
+/// The OQL query the suite runs, as a caller writes it.
+const OQL_QUERY: &str = r#"{"start":"booking","limit":10}"#;
+
+/// The Candid argument `execute` must be sent for [`OQL_QUERY`]: one `text`
+/// holding the query as normalized JSON (a parsed-and-reserialized object, so
+/// its keys are ordered, not as the caller happened to spell it). Written out
+/// rather than produced by the encoder under test, so it pins the contract
+/// instead of agreeing with whatever that encoder does.
+fn expected_execute_arg() -> Vec<u8> {
+    Encode!(&r#"{"limit":10,"start":"booking"}"#).expect("encode the expected query argument")
+}
 
 /// The `execute` reply every OQL query in these tests gets: two rows, two
 /// columns, no further page.
@@ -419,9 +470,17 @@ impl Harness {
                 Some(OQL_DID),
                 &[
                     Method::query("schema", Behavior::Const(text_reply(OQL_SCHEMA))),
+                    // `execute`'s reply says nothing about the query it ran, so
+                    // it answers ONLY the argument the OQL path is supposed to
+                    // send: a constant-answering fixture would take whatever
+                    // bytes that path encoded, including wrong ones, and still
+                    // look right.
                     Method::query(
                         "execute",
-                        Behavior::Const(encode_typed_reply(OQL_DID, "execute", OQL_ROWS)),
+                        Behavior::ReplyIfArgIs {
+                            expected: expected_execute_arg(),
+                            reply: encode_typed_reply(OQL_DID, "execute", OQL_ROWS),
+                        },
                     ),
                 ],
             ),
@@ -730,26 +789,69 @@ async fn reads_reach_a_declared_canister_end_to_end() {
     assert_eq!(structured["derived_for_origin"], serde_json::json!(h.origin));
 
     // --- get_canister_oql_schema: read as the app identity ---
+    // Read through an app whose identity origin is NOT its own URL, so the two
+    // origins in the reply and in the generated examples are DISTINCT values.
+    // Passing the same origin for both would make this blind to the wiring bug
+    // it exists to catch: an example that carried the identity origin where the
+    // authorizing `app_url` belongs would satisfy every assertion below.
+    const SCHEMA_APP: &str = "https://schema-app.e2e.test";
+    const SCHEMA_IDENTITY: &str = "https://schema-identity.e2e.test";
+    webfixture::serve(
+        SCHEMA_APP,
+        webfixture::Site::declaring(&[h.oql]).deriving_at(SCHEMA_IDENTITY),
+    );
+    webfixture::serve(
+        SCHEMA_IDENTITY,
+        webfixture::Site::default().authorizing(&[SCHEMA_APP]),
+    );
+    h.identities
+        .seed_app_identity(SESSION, SCHEMA_IDENTITY)
+        .await
+        .expect("an identity at the origin this app pins");
     let result = h
         .call(
             "get_canister_oql_schema",
-            serde_json::json!({ "canister_id": oql, "derivation_origin": h.origin, "app_url": h.origin }),
+            serde_json::json!({
+                "canister_id": oql,
+                "derivation_origin": SCHEMA_IDENTITY,
+                "app_url": SCHEMA_APP,
+            }),
         )
         .await;
     let schema = ok_text(&result);
     assert!(schema.contains("\"booking\""), "the canister's schema comes back: {schema}");
     let structured = ok_structured(&result);
     assert_eq!(structured["is_anonymous"], serde_json::json!(false), "read as the app identity");
+    assert_eq!(structured["derived_for_origin"], serde_json::json!(SCHEMA_IDENTITY));
+    assert_eq!(structured["declared_by"], serde_json::json!(SCHEMA_APP));
     let examples = structured["example_queries"]
         .as_array()
         .expect("a ready-to-run query per entity")
         .clone();
     assert_eq!(examples.len(), 1, "one entity, one example: {examples:?}");
     let example = examples[0].as_str().unwrap_or_default();
-    // The example has to carry the origin that authorized this read, or copying
-    // it would fail the very gate the schema read just passed.
-    assert!(example.contains("app_url"), "the example carries app_url: {example}");
-    assert!(example.contains("booking"), "and starts at the entity: {example}");
+    // Each example is a complete, copy-able call. Parse it and check both
+    // origins independently: it has to carry the app that AUTHORIZED the read
+    // as `app_url` — copying one that named the identity origin there would be
+    // refused by the very gate this schema read just passed — and the identity
+    // it was read as.
+    let args: serde_json::Value = serde_json::from_str(
+        example.strip_prefix("canister_query ").unwrap_or_else(|| {
+            panic!("an example must be a ready-to-run canister_query call: {example}")
+        }),
+    )
+    .expect("the example's arguments are JSON");
+    assert_eq!(args["app_url"], serde_json::json!(SCHEMA_APP), "example: {example}");
+    assert_eq!(
+        args["derivation_origin"],
+        serde_json::json!(SCHEMA_IDENTITY),
+        "example: {example}"
+    );
+    assert_eq!(args["canister_id"], serde_json::json!(oql), "example: {example}");
+    assert!(
+        args["oql"].as_str().is_some_and(|q| q.contains("booking")),
+        "and it starts at the entity: {example}"
+    );
 
     // --- canister_query, OQL path: the query runs and comes back as a table ---
     let result = h
@@ -757,7 +859,7 @@ async fn reads_reach_a_declared_canister_end_to_end() {
             "canister_query",
             serde_json::json!({
                 "canister_id": oql,
-                "oql": "{\"start\":\"booking\",\"limit\":10}",
+                "oql": OQL_QUERY,
                 "derivation_origin": h.origin,
                 "app_url": h.origin,
             }),
@@ -775,6 +877,29 @@ async fn reads_reach_a_declared_canister_end_to_end() {
     assert_eq!(structured["rows"].as_array().map(Vec::len), Some(2));
     assert_eq!(structured["has_more"], serde_json::json!(false));
     assert_eq!(structured["declared_by"], serde_json::json!(h.origin));
+
+    // That the table came back at all is the assertion about ENCODING: this
+    // canister's `execute` answers only the exact Candid argument the OQL path
+    // is supposed to send, and traps on anything else. A reply built from a
+    // constant would otherwise accept whatever bytes that path produced.
+    //
+    // The control for that claim, from outside the connector: the same method
+    // called with a different argument does trap, so the success above is the
+    // fixture agreeing with the encoder rather than ignoring it.
+    let wrong = h
+        .pic
+        .query_call(
+            h.oql,
+            Principal::anonymous(),
+            "execute",
+            Encode!(&r#"{"start":"something-else"}"#).expect("encode another query"),
+        )
+        .await;
+    let rejection = wrong.expect_err("a different argument must be refused by the fixture");
+    assert!(
+        format!("{rejection:?}").contains("did not expect"),
+        "and refused for that reason: {rejection:?}"
+    );
 
     // A Candid `method` query on an OQL canister is redirected to the OQL path
     // rather than run.
@@ -1003,7 +1128,7 @@ async fn the_gate_holds_for_every_canister_reaching_tool() {
             "canister_query",
             &h.oql,
             serde_json::json!({
-                "oql": "{\"start\":\"booking\"}",
+                "oql": OQL_QUERY,
                 "app_url": h.origin,
                 "derivation_origin": h.origin,
             }),
@@ -1340,7 +1465,7 @@ async fn a_read_that_cannot_run_says_what_to_fix() {
                 "canister_id": oql,
                 "method": "schema",
                 "args": "()",
-                "oql": "{\"start\":\"booking\"}",
+                "oql": OQL_QUERY,
                 "app_url": h.origin,
             }),
         )
@@ -1351,7 +1476,7 @@ async fn a_read_that_cannot_run_says_what_to_fix() {
     // --- the OQL reads refuse to run anonymously ---
     for args in [
         serde_json::json!({ "canister_id": oql, "app_url": h.origin }),
-        serde_json::json!({ "canister_id": oql, "app_url": h.origin, "oql": "{\"start\":\"booking\"}" }),
+        serde_json::json!({ "canister_id": oql, "app_url": h.origin, "oql": OQL_QUERY }),
     ] {
         let tool = if args.get("oql").is_some() { "canister_query" } else { "get_canister_oql_schema" };
         let msg = refusal(&h.call(tool, args).await);
