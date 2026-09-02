@@ -6,8 +6,10 @@
 //! Everything between the tool call and the canister:
 //!
 //!   * a genuine **MCP session**: [`IcTools`] is served over a JSON-RPC
-//!     connection, and each case is an ordinary `tools/call` from an `rmcp`
-//!     client — so tool names, the derived argument schemas, and the
+//!     connection; the suite reads the surface with `tools/list` the way a
+//!     client does before calling anything, and each case is an ordinary
+//!     `tools/call` — so tool names, the schemas advertised over the wire, the
+//!     JSON argument objects those schemas describe, and the
 //!     content/structured-content shape of every reply are exercised as a
 //!     client sees them, not as Rust function arguments;
 //!   * a genuine **replica**: PocketIC executes the calls, so argument
@@ -264,6 +266,7 @@ const APP_DID: &str = "service : {\n  \
     whoami : () -> (principal) query;\n  \
     get_message : () -> (text) query;\n  \
     set_message : (text) -> (text);\n  \
+    icrc1_transfer : (text) -> (text);\n  \
     get_api_doc : () -> (text) query;\n\
 }";
 
@@ -327,11 +330,23 @@ fn encode_typed_reply(did: &str, method: &str, textual: &str) -> Vec<u8> {
 /// deployment resolves one exactly like this.
 const SESSION: &str = "e2e-canister-tools";
 
+/// Every tool that reaches a canister — the surface these tests are about, and
+/// the one the discoverability gate decides for.
+const CANISTER_TOOLS: [&str; 5] = [
+    "get_canister_candid",
+    "get_canister_api_doc",
+    "get_canister_oql_schema",
+    "canister_query",
+    "canister_update_call",
+];
+
 /// A live replica, the canisters under test, and an MCP client connected to the
 /// real tool surface.
 struct Harness {
-    /// Kept alive for the lifetime of the test: dropping it stops the replica.
-    _pic: pocket_ic::nonblocking::PocketIc,
+    /// The replica. Held for the lifetime of the test (dropping it stops the
+    /// replica), and called directly where a test needs to reach a canister
+    /// from OUTSIDE the connector.
+    pic: pocket_ic::nonblocking::PocketIc,
     /// The served tool surface, on the other end of [`Self::client`]. Held so
     /// the connection outlives the calls made over it.
     _server: RunningService<RoleServer, IcTools>,
@@ -383,6 +398,13 @@ impl Harness {
                     Method::query("whoami", Behavior::Caller),
                     Method::query("get_message", Behavior::Load),
                     Method::update("set_message", Behavior::Store),
+                    // A value-moving method name, declared and exported, that
+                    // writes to the SAME store `get_message` reads. The
+                    // financial-transactions gate is the only thing standing
+                    // between a tool call and that write, so a test that gets
+                    // the refusal AND an unchanged store has shown the gate
+                    // ran — an undeclared method would give both for free.
+                    Method::update("icrc1_transfer", Behavior::Store),
                     Method::query("get_api_doc", Behavior::Const(text_reply(API_DOC))),
                 ],
             ),
@@ -452,7 +474,7 @@ impl Harness {
         let client = client.expect("connect an MCP client");
 
         Some(Self {
-            _pic: pic,
+            pic,
             _server: server,
             client,
             app,
@@ -557,6 +579,34 @@ async fn reads_reach_a_declared_canister_end_to_end() {
     let Some(h) = Harness::start("https://reads.e2e.test").await else { return };
     let app = h.app.to_text();
     let oql = h.oql.to_text();
+
+    // --- what a client sees before it calls anything ---
+    // The calls below are written against these advertised schemas, so read
+    // them over the connection first: a tool whose schema never reached the
+    // client is one no client could call, however well it answers in-process.
+    let listed = h.client.list_all_tools().await.expect("tools/list");
+    for tool in CANISTER_TOOLS {
+        let advertised = listed
+            .iter()
+            .find(|t| &*t.name == tool)
+            .unwrap_or_else(|| panic!("{tool} is not on the advertised surface"));
+        let input = serde_json::to_value(&advertised.input_schema).expect("input schema");
+        for arg in ["canister_id", "app_url"] {
+            assert!(
+                input["properties"][arg].is_object(),
+                "{tool} must advertise `{arg}`, which every call below passes: {input}"
+            );
+        }
+        let output = advertised
+            .output_schema
+            .as_ref()
+            .unwrap_or_else(|| panic!("{tool} must advertise an output schema"));
+        assert_eq!(
+            serde_json::to_value(output).expect("output schema")["type"],
+            "object",
+            "{tool}'s output schema must be object-rooted, as its structured content is"
+        );
+    }
 
     // --- get_canister_candid: the canister's own published interface ---
     let result = h
@@ -830,26 +880,69 @@ async fn an_update_call_writes_state_a_query_reads_back() {
     assert_eq!(ok_text(&result), "(\"as an update\")");
 
     // --- the financial-transactions gate: refused before the network ---
-    // A value-moving method name is refused on EVERY canister, so this one is
-    // refused even though it declares no such method and the app declares it.
+    // A value-moving method name is refused on EVERY canister. This canister
+    // really declares and exports `icrc1_transfer`, and it writes to the same
+    // store `get_message` reads — so the assertions below distinguish "the
+    // gate stopped this" from "the canister would have rejected it anyway".
+    let transfer = serde_json::json!({
+        "canister_id": app,
+        "method": "icrc1_transfer",
+        "args": "(\"moved through the connector\")",
+        "app_url": h.origin,
+        "derivation_origin": h.origin,
+    });
+    let msg = refusal(&h.call("canister_update_call", transfer).await);
+    assert!(
+        msg.contains("icrc1_transfer"),
+        "the refusal names the method it refused: {msg}"
+    );
+    // Wording only this gate produces: a replica rejection could never say it.
+    assert!(
+        msg.contains("not supported by this server, to protect the user"),
+        "the refusal must be the connector's policy, not the replica's: {msg}"
+    );
+    assert_eq!(read_back().await, "(\"booked seat 14\")", "and the canister was never called");
+
+    // The positive control for that last assertion: the method is live and
+    // does mutate. Called from OUTSIDE the connector it writes, which is what
+    // makes "unchanged" above a statement about the gate rather than about a
+    // canister that could not have done anything anyway.
+    h.pic
+        .update_call(
+            h.app,
+            Principal::anonymous(),
+            "icrc1_transfer",
+            Encode!(&"moved on the replica").expect("encode the transfer argument"),
+        )
+        .await
+        .expect("the fixture's icrc1_transfer is callable on the replica");
+    assert_eq!(
+        read_back().await,
+        "(\"moved on the replica\")",
+        "the method the gate refused really does change state when it is reached"
+    );
+
+    // --- the update path signs as the app identity too ---
+    // `is_anonymous` above says only that an origin was passed. This is the
+    // canister's own view of who called, on the WRITE path: a signer
+    // regression there would not show up in the query-path check.
     let result = h
         .call(
             "canister_update_call",
             serde_json::json!({
                 "canister_id": app,
-                "method": "icrc1_transfer",
-                "args": "(\"anything\")",
+                "method": "whoami",
+                "args": "()",
                 "app_url": h.origin,
                 "derivation_origin": h.origin,
             }),
         )
         .await;
-    let msg = refusal(&result);
-    assert!(
-        msg.to_lowercase().contains("icrc1_transfer"),
-        "the refusal names the method it refused: {msg}"
+    assert_eq!(
+        ok_text(&result),
+        format!("(principal \"{}\")", h.principal),
+        "an update call reaches the canister as the user's principal at this app"
     );
-    assert_eq!(read_back().await, "(\"booked seat 14\")", "and the canister was never called");
 
     // --- an argument that does not match the interface ---
     let result = h
@@ -864,7 +957,11 @@ async fn an_update_call_writes_state_a_query_reads_back() {
         )
         .await;
     refusal(&result);
-    assert_eq!(read_back().await, "(\"booked seat 14\")", "a rejected argument writes nothing");
+    assert_eq!(
+        read_back().await,
+        "(\"moved on the replica\")",
+        "a rejected argument writes nothing — the store still holds the last write"
+    );
 }
 
 /// The discoverability gate, over the whole canister-reaching surface: a
