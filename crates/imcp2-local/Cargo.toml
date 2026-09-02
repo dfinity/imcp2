@@ -1,6 +1,6 @@
 [package]
 name = "imcp2-local"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Local MCP server for the Internet Computer: the imcp2 tool surface over stdio, with a built-in Internet Identity browser login."
 license = "Apache-2.0"
