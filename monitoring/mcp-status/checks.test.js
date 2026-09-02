@@ -457,6 +457,37 @@ test("checkMcpEndpoints reports the hop that served /version", async () => {
   }
 });
 
+// A 3xx may carry a body, and may still be streaming it. Abandoning it unread
+// leaves that request active — and its connection checked out — after the probe
+// has returned its verdict, so a followed hop's body has to be released.
+test("checkMcpEndpoints releases the body of a followed redirect", async () => {
+  const origin = "https://mcp.beta.test";
+  let cancelled = 0;
+  const restore = stubFetch({
+    ...healthyRoutes(origin),
+    [`GET ${origin}/`]: {
+      status: 308,
+      headers: new Headers({ location: "/landing/" }),
+      body: {
+        cancel: async () => {
+          cancelled += 1;
+        },
+      },
+      text: async () => "",
+    },
+    [`GET ${origin}/landing/`]: resp(200, {
+      headers: { "content-type": "text/html" },
+    }),
+  });
+  try {
+    const { section } = await checkMcpEndpoints(origin, 2000);
+    assert.equal(byId(section, "root").status, "pass");
+    assert.equal(cancelled, 1, "the followed hop's body must be cancelled");
+  } finally {
+    restore();
+  }
+});
+
 // The protocol documents are a different contract: MCP clients read the status
 // code itself, so a 3xx where the spec says 200 stays a finding.
 test("checkMcpEndpoints does not follow redirects on the protocol documents", async () => {

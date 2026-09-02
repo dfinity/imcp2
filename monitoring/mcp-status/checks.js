@@ -161,6 +161,12 @@ const probe = async (url, init = {}) => {
           ? location
           : null;
       if (next) {
+        // Release the hop before opening the next one. A 3xx may carry a body —
+        // and may still be streaming it — so abandoning it unread leaves that
+        // request active (and its connection checked out) long after this probe
+        // has returned its verdict. Cancelling is best-effort: a body that has
+        // already errored is one we no longer need either way.
+        await res.body?.cancel().catch(() => {});
         redirects.push({ status: res.status, location: next });
         seen.add(next);
         current = next;
