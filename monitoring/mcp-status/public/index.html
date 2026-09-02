@@ -331,7 +331,9 @@
       // hunting through the tabs.
       let lastData = null;
       /** @type {Record<string, string>} instance name -> active tab id */
-      const activeTabs = {};
+      // Null prototype: instance names are operator-chosen, and a plain object
+      // would treat "__proto__" or "constructor" as inherited properties.
+      const activeTabs = Object.create(null);
 
       function fmtTime(epochSec) {
         if (typeof epochSec !== "number" || !isFinite(epochSec)) return "";

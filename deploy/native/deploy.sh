@@ -85,19 +85,29 @@ caddyfile="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__ACME_EMAIL__#$ACME_EMAIL#g"
 caddy_unit="$(cat "$here/caddy.service")"
 # The dashboard shows the monitored instances side by side. Every host renders
 # the same set by default -- staging and production -- so the page reads the same
-# wherever it is served; STATUS_TARGETS / STATUS_TARGET_II override it
-# (whitespace-separated name=origin entries, see monitoring/mcp-status/README.md).
-# Production's II is pinned because that origin's edge answers /version with a
-# redirect, so its pairing cannot be read from the server; drop the pin once the
-# edge forwards /version.
-status_targets="${STATUS_TARGETS:-staging=https://mcp.beta.id.ai production=https://mcp.internetcomputer.org}"
-status_target_ii="${STATUS_TARGET_II:-production=https://id.ai}"
-# The dashboard's SSRF allowlist: this host plus each target's host, exactly and
-# nothing wider. It used to be the PARENT domain (${DOMAIN#*.}) because the
-# dashboard guessed the II origin by stripping the `mcp.` label -- on
-# mcp.internetcomputer.org that silently allowlisted all of internetcomputer.org.
-# The II origins now come from each server's /version (or a pin) and are covered
-# by the dashboard's built-in id.ai suffixes, so only the MCP hosts need adding.
+# wherever it is served. STATUS_TARGETS replaces the set (whitespace-separated
+# name=origin entries, see monitoring/mcp-status/README.md), and STATUS_TARGET_II
+# the II pins. The default pin belongs to the default set: production's II is
+# pinned because that origin's edge answers /version with a redirect, so its
+# pairing cannot be read from the server (drop the pin once the edge forwards
+# /version) -- but a custom set gets no pin it did not ask for, since a pin for a
+# target that is not in the list makes the dashboard refuse to start. `-` rather
+# than `:-`, so an explicit empty STATUS_TARGET_II clears the default pin.
+if [ "${STATUS_TARGETS+set}" = set ]; then
+  status_targets="$STATUS_TARGETS"
+  status_target_ii="${STATUS_TARGET_II-}"
+else
+  status_targets="staging=https://mcp.beta.id.ai production=https://mcp.internetcomputer.org"
+  status_target_ii="${STATUS_TARGET_II-production=https://id.ai}"
+fi
+# The dashboard's SSRF allowlist: this host plus each target's host. Entries are
+# matched as suffixes (like the built-in id.ai), so a listed host also admits its
+# own subdomains -- the rule this deployment's own host has always been under.
+# It used to be the PARENT domain (${DOMAIN#*.}) because the dashboard guessed
+# the II origin by stripping the `mcp.` label -- on mcp.internetcomputer.org that
+# silently allowlisted all of internetcomputer.org. The II origins now come from
+# each server's /version (or a pin) and are covered by the built-in id.ai
+# suffixes, so only the MCP hosts need adding.
 status_allowed="$DOMAIN"
 for entry in $status_targets; do
   h="${entry#*=}"; h="${h#*://}"; h="${h%%[/:]*}"

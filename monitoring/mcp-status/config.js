@@ -193,6 +193,24 @@ export const normaliseOrigin = (value) => {
 };
 
 /**
+ * Coerce the configured per-probe timeout to a positive, finite number of
+ * milliseconds: the explicit override, else MCP_STATUS_TIMEOUT_MS, else the
+ * default. An unset/garbage value (e.g. "abc") would otherwise yield NaN and
+ * later make AbortSignal.timeout() throw at probe time, so it falls back too.
+ *
+ * @param {number | undefined} override
+ * @returns {number}
+ */
+const resolveTimeout = (override) => {
+  const raw =
+    override ??
+    (process.env.MCP_STATUS_TIMEOUT_MS
+      ? Number(process.env.MCP_STATUS_TIMEOUT_MS)
+      : DEFAULT_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TIMEOUT_MS;
+};
+
+/**
  * @typedef {Object} Target
  * @property {string} name       Short label shown on the dashboard ("staging").
  * @property {string} mcpOrigin  The MCP server origin to probe.
@@ -259,14 +277,23 @@ export const parseTargetList = (spec) => {
  * @returns {{ targets: Target[], timeoutMs: number }}
  */
 export const resolveTargets = (opts = {}) => {
+  const present = (v) =>
+    v !== undefined &&
+    (Array.isArray(v) ? v.length > 0 : String(v).trim() !== "");
   const listSpec = opts.targets ?? process.env.MCP_STATUS_TARGETS;
-  const hasList = listSpec !== undefined && String(listSpec).trim() !== "";
-  if (hasList && opts.mcpOrigin !== undefined) {
-    throw new Error(
-      "--mcp and --target are mutually exclusive: name every instance with --target",
-    );
-  }
+  const pinSpec = opts.targetIi ?? process.env.MCP_STATUS_TARGET_II;
+  const hasList = present(listSpec);
+
   if (!hasList) {
+    // A pin with nothing to pin into is a misspelled or half-typed multi-target
+    // invocation, not a request for the single-target fallback: honouring the
+    // fallback would monitor a different pairing than the operator wrote down,
+    // and look healthy doing it.
+    if (present(pinSpec)) {
+      throw new Error(
+        "--target-ii / MCP_STATUS_TARGET_II pins an instance in a target list, but no --target / MCP_STATUS_TARGETS is set",
+      );
+    }
     const cfg = resolveConfig({
       mcpOrigin: opts.mcpOrigin,
       iiOrigin: opts.iiOrigin,
@@ -284,28 +311,40 @@ export const resolveTargets = (opts = {}) => {
     };
   }
 
+  // With a list active, every single-target setting is a contradiction rather
+  // than a fallback: --mcp / MCP_ORIGIN would name an instance outside the list,
+  // and --ii / II_ORIGIN would pin every target that has no pin of its own to one
+  // II — silently changing pairings the list spelled out. Refuse all of them, so
+  // the list is the whole configuration or the process does not start.
+  const legacy = [
+    ["--mcp", opts.mcpOrigin],
+    ["--ii", opts.iiOrigin],
+    ["MCP_ORIGIN", process.env.MCP_ORIGIN],
+    ["II_ORIGIN", process.env.II_ORIGIN],
+  ].filter(([, v]) => present(v));
+  if (legacy.length > 0) {
+    throw new Error(
+      `${legacy.map(([k]) => k).join(", ")} cannot be combined with --target / MCP_STATUS_TARGETS: name every instance (and its II pin) in the target list`,
+    );
+  }
+
   const list = parseTargetList(listSpec);
-  const pins = new Map(
-    parseTargetList(opts.targetIi ?? process.env.MCP_STATUS_TARGET_II).map(
-      (p) => [p.name, p.origin],
-    ),
-  );
+  const pins = new Map(parseTargetList(pinSpec).map((p) => [p.name, p.origin]));
   for (const name of pins.keys()) {
     if (!list.some((t) => t.name === name)) {
       throw new Error(`II pin for unknown target "${name}"`);
     }
   }
-  let timeoutMs = DEFAULT_TIMEOUT_MS;
-  const targets = list.map(({ name, origin }) => {
-    const cfg = resolveConfig({
-      mcpOrigin: origin,
-      iiOrigin: pins.get(name),
-      timeoutMs: opts.timeoutMs,
-    });
-    timeoutMs = cfg.timeoutMs;
-    return { name, mcpOrigin: cfg.mcpOrigin, iiOrigin: cfg.iiOverride };
-  });
-  return { targets, timeoutMs };
+  // Resolved directly rather than through resolveConfig, whose env fallbacks are
+  // exactly what the check above rules out; the allowlist applies just the same.
+  const targets = list.map(({ name, origin }) => ({
+    name,
+    mcpOrigin: assertAllowedOrigin(normaliseOrigin(origin)),
+    iiOrigin: pins.has(name)
+      ? assertAllowedOrigin(normaliseOrigin(/** @type {string} */ (pins.get(name))))
+      : undefined,
+  }));
+  return { targets, timeoutMs: resolveTimeout(opts.timeoutMs) };
 };
 
 /**
@@ -334,18 +373,5 @@ export const resolveConfig = (overrides = {}) => {
     ? assertAllowedOrigin(normaliseOrigin(explicitIi))
     : undefined;
 
-  // Coerce the configured timeout to a positive, finite number of milliseconds.
-  // An unset/garbage env var (e.g. "abc") would otherwise yield NaN and later
-  // make AbortSignal.timeout() throw at probe time, so fall back to the default.
-  const rawTimeout =
-    overrides.timeoutMs ??
-    (process.env.MCP_STATUS_TIMEOUT_MS
-      ? Number(process.env.MCP_STATUS_TIMEOUT_MS)
-      : DEFAULT_TIMEOUT_MS);
-  const timeoutMs =
-    Number.isFinite(rawTimeout) && rawTimeout > 0
-      ? rawTimeout
-      : DEFAULT_TIMEOUT_MS;
-
-  return { mcpOrigin, iiOverride, timeoutMs };
+  return { mcpOrigin, iiOverride, timeoutMs: resolveTimeout(overrides.timeoutMs) };
 };
