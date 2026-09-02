@@ -10,6 +10,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   worstStatus,
+  isRedirect,
   parseCspDirective,
   checkMcpEndpoints,
   checkLinkage,
@@ -78,6 +79,45 @@ const registerRoute = (init) => {
     ? resp(201, { body: JSON.stringify({ client_id: "client-123" }) })
     : resp(400, { body: JSON.stringify({ error: "invalid_redirect_uri" }) });
 };
+
+/**
+ * The route table of a well-behaved server, for tests that vary one endpoint.
+ * Spread `...healthyRoutes(origin)` and override the key under test.
+ */
+const healthyRoutes = (origin) => ({
+  [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
+  [`GET ${origin}/version`]: resp(200, {
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ version: "0.1.0", commit: "abc123def4567890" }),
+  }),
+  [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      authorization_servers: [`${origin}/mcp`],
+      resource: `${origin}/mcp`,
+    }),
+  }),
+  [`GET ${origin}/.well-known/oauth-authorization-server`]: resp(200, {
+    body: JSON.stringify({
+      issuer: `${origin}/mcp`,
+      authorization_endpoint: `${origin}/mcp/oauth/authorize`,
+      token_endpoint: `${origin}/mcp/oauth/token`,
+      registration_endpoint: `${origin}/mcp/oauth/register`,
+      code_challenge_methods_supported: ["S256"],
+    }),
+  }),
+  [`POST ${origin}/mcp`]: resp(401, {
+    headers: {
+      "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
+    },
+    body: JSON.stringify({ error: "invalid_token" }),
+  }),
+  [`POST ${origin}/mcp/oauth/register`]: registerRoute,
+  [`GET ${origin}/mcp/oauth/authorize`]: resp(400, { body: "missing client_id" }),
+  [`POST ${origin}/mcp/oauth/token`]: resp(400, {
+    body: JSON.stringify({ error: "invalid_grant" }),
+  }),
+});
 
 test("worstStatus picks the most severe status", () => {
   assert.equal(worstStatus(["pass", "pass"]), "pass");
@@ -232,7 +272,8 @@ test("resolveConfig rejects a disallowed origin", () => {
 test("checkMcpEndpoints passes for a well-behaved server", async () => {
   const origin = "https://mcp.beta.test";
   const restore = stubFetch({
-    [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
+    ...healthyRoutes(origin),
+    // Carries the build and start times this test asserts on.
     [`GET ${origin}/version`]: resp(200, {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -241,33 +282,6 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
         built_at: 1_700_000_000,
         started_at: 1_700_000_500,
       }),
-    }),
-    [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        authorization_servers: [`${origin}/mcp`],
-        resource: `${origin}/mcp`,
-      }),
-    }),
-    [`GET ${origin}/.well-known/oauth-authorization-server`]: resp(200, {
-      body: JSON.stringify({
-        issuer: `${origin}/mcp`,
-        authorization_endpoint: `${origin}/mcp/oauth/authorize`,
-        token_endpoint: `${origin}/mcp/oauth/token`,
-        registration_endpoint: `${origin}/mcp/oauth/register`,
-        code_challenge_methods_supported: ["S256"],
-      }),
-    }),
-    [`POST ${origin}/mcp`]: resp(401, {
-      headers: {
-        "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
-      },
-      body: JSON.stringify({ error: "invalid_token" }),
-    }),
-    [`POST ${origin}/mcp/oauth/register`]: registerRoute,
-    [`GET ${origin}/mcp/oauth/authorize`]: resp(400, { body: "missing client_id" }),
-    [`POST ${origin}/mcp/oauth/token`]: resp(400, {
-      body: JSON.stringify({ error: "invalid_grant" }),
     }),
   });
   try {
@@ -303,50 +317,132 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
   }
 });
 
+// The landing page and its subpages moved off this origin — they are
+// maintained in dfinity/internetcomputer-org and served at
+// internetcomputer.org/icp-mcp/ — and the server answers their old paths with
+// permanent redirects so published links keep working. That is the deployed
+// shape, so it has to read as healthy: asserting "200 text/html" reported a
+// correctly working deployment as a failing one (and pushed a partial outage to
+// the public status page).
+test("checkMcpEndpoints tolerates a landing page that redirects off-origin", async () => {
+  const origin = "https://mcp.beta.test";
+  const restore = stubFetch({
+    ...healthyRoutes(origin),
+    // The stub throws on any unexpected fetch, so this also asserts the
+    // off-origin destination is reported, never requested.
+    [`GET ${origin}/`]: resp(308, {
+      headers: { location: "https://internetcomputer.org/icp-mcp/" },
+    }),
+  });
+  try {
+    const { section, facts } = await checkMcpEndpoints(origin, 2000);
+    const root = byId(section, "root");
+    assert.equal(root.status, "pass");
+    assert.equal(root.httpStatus, 308);
+    assert.match(root.detail, /308 → https:\/\/internetcomputer\.org\/icp-mcp\//);
+    assert.equal(facts.landing.movedTo, "https://internetcomputer.org/icp-mcp/");
+    assert.equal(facts.landing.servedHere, false);
+    // One failing check used to sink the whole section, and with it the
+    // dashboard's overall verdict. (The section still warns here: the TLS check
+    // cannot reach the unresolvable test hostname.)
+    assert.notEqual(section.status, "fail");
+  } finally {
+    restore();
+  }
+});
+
+// A redirect that stays on the origin is followed to the page, so the check
+// still reports what was actually served rather than the hop.
+test("checkMcpEndpoints follows a same-origin landing-page redirect", async () => {
+  const origin = "https://mcp.beta.test";
+  const restore = stubFetch({
+    ...healthyRoutes(origin),
+    [`GET ${origin}/`]: resp(301, { headers: { location: "/landing/" } }),
+    [`GET ${origin}/landing/`]: resp(200, {
+      headers: { "content-type": "text/html; charset=utf-8" },
+    }),
+  });
+  try {
+    const { section, facts } = await checkMcpEndpoints(origin, 2000);
+    const root = byId(section, "root");
+    assert.equal(root.status, "pass");
+    assert.equal(root.httpStatus, 200);
+    assert.match(root.detail, /after 1 redirect/);
+    assert.equal(facts.landing.servedHere, true);
+  } finally {
+    restore();
+  }
+});
+
+// Tolerating redirects must not tolerate broken ones: a 3xx is healthy because
+// it names where the page went, so one that names nothing — or names itself —
+// is still a failure.
+test("checkMcpEndpoints fails a landing-page redirect that goes nowhere", async () => {
+  const origin = "https://mcp.beta.test";
+  for (const [label, root] of [
+    ["no Location header", resp(308)],
+    ["a non-http Location", resp(302, { headers: { location: "mailto:a@b.c" } })],
+    ["a redirect to itself", resp(308, { headers: { location: "/" } })],
+    ["a 404", resp(404, { headers: { "content-type": "text/plain" } })],
+  ]) {
+    let rootRequests = 0;
+    const restore = stubFetch({
+      ...healthyRoutes(origin),
+      [`GET ${origin}/`]: () => {
+        rootRequests += 1;
+        return root;
+      },
+    });
+    try {
+      const { section } = await checkMcpEndpoints(origin, 2000);
+      assert.equal(byId(section, "root").status, "fail", label);
+      assert.equal(section.status, "fail", label);
+      // The self-redirect must not be chased: a URL already fetched in this
+      // probe is never re-fetched, so a loop ends at the first hop.
+      assert.equal(rootRequests, 1, label);
+    } finally {
+      restore();
+    }
+  }
+});
+
+// The protocol documents are a different contract: MCP clients read the status
+// code itself, so a 3xx where the spec says 200 stays a finding.
+test("checkMcpEndpoints does not follow redirects on the protocol documents", async () => {
+  const origin = "https://mcp.beta.test";
+  const restore = stubFetch({
+    ...healthyRoutes(origin),
+    [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(302, {
+      headers: { location: "/.well-known/oauth-protected-resource/mcp" },
+    }),
+  });
+  try {
+    const { section } = await checkMcpEndpoints(origin, 2000);
+    assert.equal(byId(section, "protected-resource").status, "fail");
+    assert.equal(byId(section, "protected-resource").httpStatus, 302);
+  } finally {
+    restore();
+  }
+});
+
+test("isRedirect recognises the redirect status codes", () => {
+  for (const s of [301, 302, 303, 307, 308]) assert.equal(isRedirect(s), true, `${s}`);
+  for (const s of [200, 304, 400, 401, 404, 500]) assert.equal(isRedirect(s), false, `${s}`);
+});
+
 test("checkMcpEndpoints in non-mutating mode never registers a client", async () => {
   const origin = "https://mcp.beta.test";
   /** @type {string[]} */
   const registerRedirects = [];
   const restore = stubFetch({
-    [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
-    [`GET ${origin}/version`]: resp(200, {
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ version: "0.1.0", commit: "abc123def4567890" }),
-    }),
-    [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        authorization_servers: [`${origin}/mcp`],
-        resource: `${origin}/mcp`,
-      }),
-    }),
-    [`GET ${origin}/.well-known/oauth-authorization-server`]: resp(200, {
-      body: JSON.stringify({
-        issuer: `${origin}/mcp`,
-        authorization_endpoint: `${origin}/mcp/oauth/authorize`,
-        token_endpoint: `${origin}/mcp/oauth/token`,
-        registration_endpoint: `${origin}/mcp/oauth/register`,
-        code_challenge_methods_supported: ["S256"],
-      }),
-    }),
-    [`POST ${origin}/mcp`]: resp(401, {
-      headers: {
-        "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
-      },
-      body: JSON.stringify({ error: "invalid_token" }),
-    }),
+    ...healthyRoutes(origin),
+    // Records every registration attempt, so the test can assert none was made.
     [`POST ${origin}/mcp/oauth/register`]: (init) => {
       registerRedirects.push(
         (JSON.parse(init.body ?? "{}").redirect_uris ?? [])[0] ?? "",
       );
       return registerRoute(init);
     },
-    [`GET ${origin}/mcp/oauth/authorize`]: resp(400, {
-      body: "missing client_id",
-    }),
-    [`POST ${origin}/mcp/oauth/token`]: resp(400, {
-      body: JSON.stringify({ error: "invalid_grant" }),
-    }),
   });
   try {
     const { section } = await checkMcpEndpoints(origin, 2000, {
@@ -372,26 +468,9 @@ test("checkMcpEndpoints in non-mutating mode never registers a client", async ()
 test("checkMcpEndpoints flags a missing OAuth challenge", async () => {
   const origin = "https://mcp.beta.test";
   const restore = stubFetch({
-    [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
-    [`GET ${origin}/version`]: resp(404),
-    [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
-      body: JSON.stringify({ authorization_servers: [`${origin}/mcp`], resource: `${origin}/mcp` }),
-    }),
-    [`GET ${origin}/.well-known/oauth-authorization-server`]: resp(200, {
-      body: JSON.stringify({
-        issuer: `${origin}/mcp`,
-        authorization_endpoint: `${origin}/mcp/oauth/authorize`,
-        token_endpoint: `${origin}/mcp/oauth/token`,
-        registration_endpoint: `${origin}/mcp/oauth/register`,
-      }),
-    }),
+    ...healthyRoutes(origin),
     // 200 instead of a 401 challenge → wrong contract.
     [`POST ${origin}/mcp`]: resp(200, { body: "{}" }),
-    [`POST ${origin}/mcp/oauth/register`]: registerRoute,
-    [`GET ${origin}/mcp/oauth/authorize`]: resp(400),
-    [`POST ${origin}/mcp/oauth/token`]: resp(400, {
-      body: JSON.stringify({ error: "invalid_grant" }),
-    }),
   });
   try {
     const { section } = await checkMcpEndpoints(origin, 2000);
@@ -404,32 +483,10 @@ test("checkMcpEndpoints flags a missing OAuth challenge", async () => {
 test("checkMcpEndpoints flags a missing hosted-redirect allow-list", async () => {
   const origin = "https://mcp.beta.test";
   const restore = stubFetch({
-    [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
-    [`GET ${origin}/version`]: resp(404),
-    [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
-      body: JSON.stringify({ authorization_servers: [`${origin}/mcp`], resource: `${origin}/mcp` }),
-    }),
-    [`GET ${origin}/.well-known/oauth-authorization-server`]: resp(200, {
-      body: JSON.stringify({
-        issuer: `${origin}/mcp`,
-        authorization_endpoint: `${origin}/mcp/oauth/authorize`,
-        token_endpoint: `${origin}/mcp/oauth/token`,
-        registration_endpoint: `${origin}/mcp/oauth/register`,
-      }),
-    }),
-    [`POST ${origin}/mcp`]: resp(401, {
-      headers: {
-        "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
-      },
-      body: JSON.stringify({ error: "invalid_token" }),
-    }),
+    ...healthyRoutes(origin),
     // Guard MISSING: the server accepts ANY redirect (even a hosted one) with 201.
     [`POST ${origin}/mcp/oauth/register`]: resp(201, {
       body: JSON.stringify({ client_id: "leaked" }),
-    }),
-    [`GET ${origin}/mcp/oauth/authorize`]: resp(400),
-    [`POST ${origin}/mcp/oauth/token`]: resp(400, {
-      body: JSON.stringify({ error: "invalid_grant" }),
     }),
   });
   try {
@@ -519,6 +576,42 @@ test("checkIiHealth verifies the /mcp delegation flow and config", async () => {
     assert.equal(facts.canisterId, "gjxif-ryaaa-aaaad-ae4ka-cai");
     assert.deepEqual(facts.relatedOrigins, [ii, "https://beta.identity.ic0.app"]);
     assert.equal(facts.config.status, 200);
+    assert.equal(facts.config.backendCanisterId, "fgte5-ciaaa-aaaad-aaatq-cai");
+  } finally {
+    restore();
+  }
+});
+
+// A frontend that canonicalises /mcp to /mcp/ is serving the connect page; the
+// check reads the page it lands on, not the hop.
+test("checkIiHealth follows a redirect to the served /mcp connect page", async () => {
+  const ii = "https://beta.test";
+  const mcp = "https://mcp.beta.test";
+  const restore = stubFetch({
+    [`GET ${ii}/`]: resp(308, { headers: { location: "/index.html" } }),
+    [`GET ${ii}/index.html`]: resp(200, {
+      headers: {
+        "x-ic-canister-id": "gjxif-ryaaa-aaaad-ae4ka-cai",
+        "ic-certificate": "certificate=:abc:",
+      },
+    }),
+    [`GET ${ii}/mcp`]: resp(308, { headers: { location: `${ii}/mcp/` } }),
+    [`GET ${ii}/mcp/`]: resp(200),
+    [`GET ${ii}/.config`]: resp(307, { headers: { location: "/.config/" } }),
+    [`GET ${ii}/.config/`]: resp(200, {
+      headers: { "content-type": "text/plain" },
+      body: `record { backend_canister_id = principal "fgte5-ciaaa-aaaad-aaatq-cai"; }`,
+    }),
+  });
+  try {
+    const { section, facts } = await checkIiHealth(ii, mcp, 2000);
+    assert.equal(byId(section, "ii-reachable").status, "pass");
+    assert.match(byId(section, "ii-reachable").detail, /after 1 redirect/);
+    // Headers come from the response that actually served the page.
+    assert.equal(byId(section, "ii-certified").status, "pass");
+    assert.equal(facts.canisterId, "gjxif-ryaaa-aaaad-ae4ka-cai");
+    assert.equal(byId(section, "ii-mcp-flow").status, "pass");
+    assert.equal(byId(section, "ii-config").status, "pass");
     assert.equal(facts.config.backendCanisterId, "fgte5-ciaaa-aaaad-aaatq-cai");
   } finally {
     restore();

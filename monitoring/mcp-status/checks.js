@@ -65,41 +65,143 @@ export const worstStatus = (statuses) =>
     /** @type {Status} */ ("pass"),
   );
 
+/** Redirect status codes that carry a `Location` a client is meant to follow. */
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/** Whether a status code is a redirect. */
+export const isRedirect = (status) => REDIRECT_STATUSES.has(status);
+
+/**
+ * Resolve a response's `Location` against the URL it answered, yielding an
+ * absolute http(s) URL — or null when there is nothing usable to follow (no
+ * header, an unparseable value, or a non-http scheme). A 3xx without a usable
+ * target is a broken redirect, and callers treat it as such.
+ *
+ * @param {Headers} headers
+ * @param {string} from the URL the response answered
+ * @returns {string | null}
+ */
+const redirectTarget = (headers, from) => {
+  const raw = headers.get("location");
+  if (!raw) return null;
+  let target;
+  try {
+    target = new URL(raw, from);
+  } catch {
+    return null;
+  }
+  return target.protocol === "https:" || target.protocol === "http:"
+    ? target.toString()
+    : null;
+};
+
 /**
  * Perform an HTTP request with a timeout, capturing status, headers, body and
  * latency without ever throwing (network errors are returned as `error`).
  *
+ * Redirects are never followed implicitly (`redirect: "manual"`): a probe that
+ * silently followed one could not tell an endpoint serving a document from an
+ * endpoint pointing elsewhere. Pass `follow: n` to follow up to `n` hops,
+ * subject to three guards:
+ *
+ *   - only `GET` (a 301/302/303 hop rewrites the method, and re-sending a POST
+ *     body on a 307/308 could repeat a state-changing call);
+ *   - only within the origin the probe started on, so a monitored server can
+ *     never steer the dashboard's requests anywhere the operator did not fix as
+ *     a target — the SSRF guard in config.js pins the origins at startup, and a
+ *     followed `Location` would otherwise reach past it (including at loopback
+ *     services on the monitoring host, whose responses are quoted back in a
+ *     publicly served report);
+ *   - never to a URL already fetched in this probe, so a redirect loop ends.
+ *
+ * A hop that fails a guard is not an error: the 3xx response is returned as-is,
+ * with `location` naming where it pointed, and the caller decides whether that
+ * is healthy — for the landing page, an off-origin redirect IS the healthy
+ * answer. `timeoutMs` bounds the whole probe, hops included, not each hop.
+ *
  * @param {string} url
- * @param {RequestInit & { timeoutMs?: number }} [init]
+ * @param {RequestInit & { timeoutMs?: number, follow?: number }} [init]
  */
 const probe = async (url, init = {}) => {
-  const { timeoutMs = 10_000, ...rest } = init;
+  const { timeoutMs = 10_000, follow = 0, ...rest } = init;
   const start = Date.now();
+  const deadline = start + timeoutMs;
+  const followable = !rest.method || rest.method.toUpperCase() === "GET";
+  const startOrigin = (() => {
+    try {
+      return new URL(url).origin;
+    } catch {
+      return null;
+    }
+  })();
+  /** Hops actually followed, oldest first. */
+  const redirects = /** @type {{ status: number, location: string }[]} */ ([]);
+  const seen = new Set([url]);
+  let current = url;
   try {
-    const res = await fetch(url, {
-      redirect: "manual",
-      ...rest,
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    const bodyText = await res.text().catch(() => "");
-    return {
-      ok: true,
-      status: res.status,
-      headers: res.headers,
-      bodyText,
-      latencyMs: Date.now() - start,
-      error: /** @type {Error | null} */ (null),
-    };
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error("timed out following redirects");
+      const res = await fetch(current, {
+        redirect: "manual",
+        ...rest,
+        signal: AbortSignal.timeout(remaining),
+      });
+      const location = isRedirect(res.status)
+        ? redirectTarget(res.headers, current)
+        : null;
+      const next =
+        location &&
+        followable &&
+        redirects.length < follow &&
+        !seen.has(location) &&
+        new URL(location).origin === startOrigin
+          ? location
+          : null;
+      if (next) {
+        redirects.push({ status: res.status, location: next });
+        seen.add(next);
+        current = next;
+        continue;
+      }
+      const bodyText = await res.text().catch(() => "");
+      return {
+        ok: true,
+        status: res.status,
+        headers: res.headers,
+        bodyText,
+        /** The URL this response answered — the last hop, when any were followed. */
+        url: current,
+        /** Where this response points, when it is itself an unfollowed redirect. */
+        location,
+        redirects,
+        latencyMs: Date.now() - start,
+        error: /** @type {Error | null} */ (null),
+      };
+    }
   } catch (err) {
     return {
       ok: false,
       status: /** @type {number | null} */ (null),
       headers: new Headers(),
       bodyText: "",
+      url: current,
+      location: /** @type {string | null} */ (null),
+      redirects,
       latencyMs: Date.now() - start,
       error: /** @type {Error} */ (err),
     };
   }
+};
+
+/**
+ * `" (after 2 redirects)"` for a probe that followed hops, `""` otherwise — so
+ * a detail line says when the reported status came from somewhere else.
+ * @param {{ redirects: { status: number, location: string }[] }} r
+ */
+const hopSuffix = (r) => {
+  const n = r.redirects.length;
+  return n === 0 ? "" : ` (after ${n} redirect${n > 1 ? "s" : ""})`;
 };
 
 /** Safely JSON-parse a string, returning undefined on failure. */
@@ -197,33 +299,62 @@ export const checkMcpEndpoints = async (
   /** @type {Record<string, unknown>} */
   const facts = { origin: mcpOrigin };
 
-  // 1. Landing page.
+  // 1. Landing page. The signal is that the root URL *answers for* the landing
+  //    page, which no longer means holding a copy of it: the human-facing pages
+  //    (the landing page and its /privacy-policy, /support and /terms subpages)
+  //    are maintained in dfinity/internetcomputer-org and served under
+  //    internetcomputer.org/icp-mcp/, and this origin answers their old paths
+  //    with permanent redirects so published links keep working while the
+  //    content exists exactly once. So a 3xx naming a destination is as healthy
+  //    as a 200 with the page — what is not healthy is a 4xx/5xx, an
+  //    unreachable server, or a 3xx that names nowhere to go.
+  //
+  //    An off-origin destination is reported rather than followed — probe()
+  //    only follows within the origin it started on, so a monitored server
+  //    cannot steer these requests (see probe) — while a deployment that
+  //    redirects to a page on its own origin is followed to it.
   {
-    const r = await probe(`${mcpOrigin}/`, { timeoutMs });
+    const r = await probe(`${mcpOrigin}/`, { timeoutMs, follow: 3 });
     const ct = r.headers.get("content-type") ?? "";
-    const pass = r.ok && r.status === 200 && /text\/html/i.test(ct);
+    const servedHere = r.ok && r.status === 200 && /text\/html/i.test(ct);
+    // A redirect back to the URL we just asked for is a loop, not a landing
+    // page — probe() leaves it unfollowed, and it must not read as healthy.
+    const movedTo =
+      r.ok && isRedirect(r.status) && r.location && r.location !== r.url
+        ? r.location
+        : null;
+    const pass = servedHere || !!movedTo;
+    facts.landing = { status: r.status, servedHere, movedTo };
     checks.push({
       id: "root",
       label: "Landing page",
       description:
-        "Confirms the server is up and serving its human-facing landing page (HTTP 200, HTML) at the root URL.",
+        "Confirms the root URL answers for the server's human-facing landing page — either serving it (HTTP 200, HTML) or redirecting to where it is published. The landing pages are maintained and served at internetcomputer.org/icp-mcp/, and this origin redirects their old paths there, so a permanent redirect is the expected healthy answer; a 4xx/5xx, an unreachable server, or a redirect pointing nowhere is not.",
       target: `GET ${mcpOrigin}/`,
-      expected: "200 text/html",
+      expected:
+        "200 text/html, or a redirect to where the landing page is served",
       status: pass ? "pass" : "fail",
       httpStatus: r.status,
       latencyMs: r.latencyMs,
       detail: r.error
         ? `request failed: ${r.error.message}`
-        : `${r.status}, content-type: ${ct || "(none)"}`,
+        : movedTo
+          ? `${r.status} → ${movedTo}${hopSuffix(r)}`
+          : `${r.status}, content-type: ${ct || "(none)"}${hopSuffix(r)}`,
     });
   }
 
   // 1b. Build/version: which commit is actually running. Surfaced prominently
   //     in the report (with a GitHub link) so operators can confirm the live
   //     deployment; older builds without /version are treated as informational.
+  //     What matters is the JSON, not which hop served it, so a same-origin
+  //     redirect on the way to it is followed. The protocol documents below
+  //     deliberately do not follow: for those the status code IS the contract
+  //     an MCP client depends on, and a 3xx where a 200 is specified is a
+  //     finding, not a detour.
   {
     const url = `${mcpOrigin}/version`;
-    const r = await probe(url, { timeoutMs });
+    const r = await probe(url, { timeoutMs, follow: 3 });
     const json = tryJson(r.bodyText);
     const commit =
       json && typeof json.commit === "string" ? json.commit : undefined;
@@ -743,7 +874,11 @@ export const checkIiHealth = async (
   }
 
   facts.origin = iiOrigin;
-  const r = await probe(`${iiOrigin}/`, { timeoutMs });
+  // The II is a canister-served frontend behind a boundary node; whether it
+  // canonicalises the root through a redirect is not a health signal, so
+  // same-origin hops are followed and the checks below read the response that
+  // actually served the page.
+  const r = await probe(`${iiOrigin}/`, { timeoutMs, follow: 3 });
   const csp = r.headers.get("content-security-policy");
   const canisterId = r.headers.get("x-ic-canister-id");
   const icCertificate = r.headers.get("ic-certificate");
@@ -756,13 +891,13 @@ export const checkIiHealth = async (
     description:
       "Confirms the linked Internet Identity frontend is reachable and returns HTTP 200.",
     target: `GET ${iiOrigin}/`,
-    expected: "200",
+    expected: "200 (redirects followed)",
     status: r.ok && r.status === 200 ? "pass" : "fail",
     httpStatus: r.status,
     latencyMs: r.latencyMs,
     detail: r.error
       ? `request failed: ${r.error.message}`
-      : `${r.status}${canisterId ? `, canister ${canisterId}` : ""}`,
+      : `${r.status}${canisterId ? `, canister ${canisterId}` : ""}${hopSuffix(r)}`,
   });
 
   // 2. Served & certified by the Internet Computer (canister is live).
@@ -800,7 +935,7 @@ export const checkIiHealth = async (
   //    signal left is that the /mcp connect page is served.
   {
     const url = `${iiOrigin}/mcp`;
-    const mr = await probe(url, { timeoutMs });
+    const mr = await probe(url, { timeoutMs, follow: 3 });
     const served = mr.ok && mr.status === 200;
     checks.push({
       id: `ii-mcp-flow${sfx}`,
@@ -808,15 +943,15 @@ export const checkIiHealth = async (
       description:
         "Confirms the II serves its /mcp connect page. The connect flow runs on a top-level navigation back to the server's pinned callback page and a fetch() from that page to the server (governed by CSP connect-src, which allows the https MCP origin) — neither is gated by form-action — so serving the page is the health signal. Since #4052 trust is per-user (each identity adds its trusted server in II Settings, synced on-chain), which servers a given identity trusts is not globally inspectable; this checks the instance-wide flow is enabled.",
       target: `GET ${url}`,
-      expected: "200 (connect page served)",
+      expected: "200 (connect page served, redirects followed)",
       status: served ? "pass" : "fail",
       httpStatus: mr.status,
       latencyMs: mr.latencyMs,
       detail: mr.error
         ? `request failed: ${mr.error.message}`
         : served
-          ? `${mr.status}, /mcp connect page served`
-          : `${mr.status}, /mcp connect page not served`,
+          ? `${mr.status}, /mcp connect page served${hopSuffix(mr)}`
+          : `${mr.status}, /mcp connect page not served${hopSuffix(mr)}`,
     });
   }
 
@@ -827,7 +962,7 @@ export const checkIiHealth = async (
   //     surface the backend canister id.
   {
     const url = `${iiOrigin}/.config`;
-    const cr = await probe(url, { timeoutMs });
+    const cr = await probe(url, { timeoutMs, follow: 3 });
     // The config is text/plain Candid, so bodyText is the real content; prefer
     // the server-reported content-length for the byte count when present. (Guard
     // against a missing header: Number(null) is 0, which would wrongly win here.)

@@ -11,7 +11,21 @@ It answers three questions and adds a few suggestions:
    (`/version`), the two OAuth discovery documents, the `/mcp` endpoint's
    unauthenticated `401` challenge, dynamic client registration, and the
    `/mcp/oauth/authorize` + `/mcp/oauth/token` endpoints, plus TLS certificate
-   freshness.
+   freshness. The landing-page check asks whether the root **answers for** the
+   landing page, which no longer means holding a copy of it: the human-facing
+   pages live in
+   [dfinity/internetcomputer-org](https://github.com/dfinity/internetcomputer-org)
+   (`public/icp-mcp/`), are served at <https://internetcomputer.org/icp-mcp/>,
+   and this origin answers their old paths with permanent redirects so published
+   links keep working. A `3xx` naming a destination is therefore as healthy as a
+   `200` with the page — demanding `200 text/html` reported the live deployment
+   as failing while it served everything correctly. Still a failure: a
+   `4xx`/`5xx`, an unreachable server, or a redirect naming nowhere to go (no
+   `Location`, a non-http one, or one pointing back at the URL just requested).
+   The protocol documents keep their exact status codes: for the discovery
+   documents, the `/mcp` challenge and the OAuth endpoints the status code *is*
+   the contract MCP clients depend on, so a redirect there is a finding, not a
+   detour.
 2. **Which Internet Identity instance(s) is it linked to?** — read from the
    `instances` array the server advertises at `GET /version`, one entry per
    served mount (`{name, mcp_path, ii_origin, ii_canister}`). The server is the
@@ -92,6 +106,15 @@ against a host allowlist: only `https` origins on `id.ai` (and its sub-domains),
 plus loopback hosts for local development, may be probed. To monitor a
 deployment on another domain, extend the allowlist via the
 `MCP_STATUS_ALLOWED_HOSTS` environment variable (comma-separated host suffixes).
+
+Redirects are followed only **within the origin the probe started on**, and
+only for `GET`, at most a few hops, never re-fetching a URL already fetched in
+that probe. A same-origin hop (a frontend canonicalising `/mcp` to `/mcp/`, say)
+is followed so the check reports the page that was actually served; a
+cross-origin `Location` is reported but never requested, so a monitored server
+cannot steer these probes past the allowlist above — not even at a loopback
+service on the monitoring host, whose response would be quoted back in a
+publicly served report.
 
 `server.js` binds to `127.0.0.1` by default; override with `--host` /
 `MCP_STATUS_HOST` only when you really mean to expose the port directly.
@@ -190,10 +213,12 @@ actually matters.
 
 ## Current beta findings (snapshot)
 
-Against `https://mcp.beta.id.ai` the server passes all endpoint checks; the
-linked II is `https://beta.id.ai` (frontend canister `gjxif-ryaaa-aaaad-ae4ka-cai`,
-backend `fgte5-ciaaa-aaaad-aaatq-cai`), whose `/mcp` connect page is served (the
-connect flow is `fetch()`/navigation-based, so its CSP is not asserted). Whether
-a given identity trusts this MCP server is now per-user (set in II Settings,
-synced on-chain) and so is not asserted here. With the linked II healthy, the
-dashboard reports all green.
+Against `https://mcp.beta.id.ai` the server passes all endpoint checks — its
+root answers `308 → https://internetcomputer.org/icp-mcp/`, where the landing
+page is served. The linked IIs are `https://id.ai` and `https://beta.id.ai`
+(frontend canister `gjxif-ryaaa-aaaad-ae4ka-cai`, backend
+`fgte5-ciaaa-aaaad-aaatq-cai` for beta), whose `/mcp` connect pages are served
+(the connect flow is `fetch()`/navigation-based, so its CSP is not asserted).
+Whether a given identity trusts this MCP server is now per-user (set in II
+Settings, synced on-chain) and so is not asserted here. With the linked IIs
+healthy, the dashboard reports all green.
