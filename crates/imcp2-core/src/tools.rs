@@ -338,10 +338,10 @@ impl IcCanisterTools {
             Ok(b) => b,
             Err(e) => return Ok(err(format!("OQL schema call failed: {e}"))),
         };
-        // `decode_schema_reply` bounds the schema's size, parses it ONCE (the entity
-        // names below come from that parse) and only pretty-prints a small, shallow
-        // document — an over-large reply is refused here rather than expanded and
-        // copied through the result.
+        // `decode_schema_reply` bounds the schema's size and parses it ONCE (the
+        // entity names below come from that parse); the text itself is handed on
+        // verbatim, never re-rendered, and an over-large reply is refused here
+        // rather than copied through the result.
         let schema = match calls::decode_schema_reply(&reply) {
             Ok(s) => s,
             Err(e) => return Ok(err(format!("OQL schema call failed: {e}"))),

@@ -96,8 +96,8 @@ pub struct OqlSchemaArgs {
 pub struct OqlSchemaOutput {
     /// The canister whose schema was read.
     pub canister_id: String,
-    /// The entity/field/edge catalogue returned by `schema` (JSON text,
-    /// pretty-printed when it is small and shallow, otherwise verbatim).
+    /// The entity/field/edge catalogue returned by `schema` (JSON text, exactly
+    /// as the canister returned it).
     pub schema: String,
     /// The effective Internet Identity derivation origin used.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1274,24 +1274,15 @@ fn try_decode_text_reply(reply: &[u8]) -> Result<String, String> {
 /// the operative bound on the schema's size.
 pub(crate) const MAX_OQL_SCHEMA_BYTES: usize = 256 * 1024;
 
-/// Pretty-printing is offered only to a schema no larger than this AND no deeper
-/// than [`MAX_PRETTY_SCHEMA_DEPTH`]. Indentation makes the rendered size grow with
-/// `depth × lines`: a nest of `d` arrays renders to `2·d²` bytes from `2·d`, so a
-/// 2 MiB reply of 126-deep nests would pretty-print to ~255 MiB (a ~127×
-/// expansion). Within these two bounds the expansion is at most ~2·depth+1, so
-/// the rendered text stays under ~2 MiB; anything else is handed on verbatim.
-const MAX_PRETTY_SCHEMA_BYTES: usize = 64 * 1024;
-/// Deepest JSON nesting [`decode_schema_reply`] will pretty-print. A real
-/// catalogue is `{"entities":[{"fields":[{…}]}]}`-shaped — depth 5 or 6.
-const MAX_PRETTY_SCHEMA_DEPTH: usize = 16;
-
 /// A canister's decoded OQL `schema` reply: the text to hand onward plus the
 /// entity names extracted from the one JSON parse [`decode_schema_reply`] does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedSchema {
-    /// The schema text: pretty-printed when it is valid JSON that is small and
-    /// shallow (see [`MAX_PRETTY_SCHEMA_BYTES`]); otherwise the reply verbatim,
-    /// whether or not it parsed as JSON.
+    /// The reply text, verbatim, whether or not it parsed as JSON. Never
+    /// re-rendered: the consumer is a model, compact JSON is fewer tokens, and
+    /// indented output grows with depth × lines (a nest of `d` arrays renders to
+    /// `2·d²` bytes from `2·d`), so passing the bytes through is both the cheapest
+    /// and the only size-linear rendering.
     pub text: String,
     /// `Some` when the JSON carries an `entities` array (possibly empty); `None`
     /// when it doesn't parse or lacks the key (an unrecognized shape).
@@ -1373,30 +1364,13 @@ pub(crate) fn schema_from_text(text: String) -> Result<DecodedSchema, String> {
             text.len()
         ));
     }
-    // One parse, shared by the entity extraction and the (optional) re-rendering;
-    // the tree is bounded by the byte cap above and by serde_json's recursion limit.
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Ok(DecodedSchema { text, entities: None });
-    };
-    let entities = schema_entities(&v);
-    let text = if text.len() <= MAX_PRETTY_SCHEMA_BYTES && json_depth_within(&v, MAX_PRETTY_SCHEMA_DEPTH) {
-        serde_json::to_string_pretty(&v).unwrap_or(text)
-    } else {
-        text
-    };
+    // One parse, for the entity extraction only — the text itself is handed on
+    // untouched. The tree is bounded by the byte cap above and by serde_json's
+    // recursion limit.
+    let entities = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| schema_entities(&v));
     Ok(DecodedSchema { text, entities })
-}
-
-/// Whether `v` nests no deeper than `limit` containers (a scalar is depth 0, `[]`
-/// depth 1). Stops descending as soon as the limit is exceeded. Recursion here is
-/// safe: serde_json's own recursion limit (128) already bounds the tree's depth.
-fn json_depth_within(v: &serde_json::Value, limit: usize) -> bool {
-    use serde_json::Value;
-    match v {
-        Value::Array(items) => limit > 0 && items.iter().all(|i| json_depth_within(i, limit - 1)),
-        Value::Object(fields) => limit > 0 && fields.values().all(|i| json_depth_within(i, limit - 1)),
-        _ => true,
-    }
 }
 
 /// The canister's API-documentation method name, if it declares one — `getApiDoc`
@@ -2386,16 +2360,15 @@ mod tests {
         assert!(normalize_oql_query(&huge).is_err(), "oversized query is rejected");
     }
 
-    // schema decoding: the single `text` reply is returned, pretty-printed when
-    // it parses as JSON.
+    // schema decoding: the single `text` reply is returned exactly as sent (never
+    // re-rendered), and its entities come from the same parse.
     #[test]
-    fn decode_schema_reply_pretty_prints_json() {
+    fn decode_schema_reply_passes_json_through_verbatim() {
         use super::decode_schema_reply;
         let did = "service : { schema : () -> (text) query; }";
         let reply = encode_reply(did, "schema", "(\"{\\\"entities\\\":[]}\")");
         let out = decode_schema_reply(&reply).expect("small schema is accepted");
-        assert!(out.text.contains("\"entities\""), "schema JSON should be surfaced: {}", out.text);
-        assert!(out.text.contains('\n'), "valid JSON should be pretty-printed: {}", out.text);
+        assert_eq!(out.text, r#"{"entities":[]}"#, "schema JSON is surfaced byte-for-byte");
         assert!(out.is_empty(), "an empty entities list is detected from the single parse");
         assert!(out.entity_names().is_empty());
     }
@@ -2446,34 +2419,33 @@ mod tests {
         assert_eq!(not_json.recognized_entity_names(), None);
     }
 
-    // A `schema` reply of deeply nested arrays must NOT be pretty-printed —
-    // indentation would expand it ~2·depth× (a 2 MiB reply of 126-deep nests
-    // renders to ~255 MiB). Deep or large JSON is handed on verbatim (linear in
-    // the input), and a text over MAX_OQL_SCHEMA_BYTES is refused outright. All
-    // of it end-to-end through the reply decoder: the schema is decoded against
-    // its `(text)` type, so a reply up to the cap gets through the candid quota
-    // (the untyped decode would call anything over ~60 KB undecodable).
+    // A `schema` reply of deeply nested arrays is handed on byte-for-byte —
+    // re-rendering it with indentation would expand it ~2·depth× (a 2 MiB reply
+    // of 126-deep nests would render to ~255 MiB) — and a text over
+    // MAX_OQL_SCHEMA_BYTES is refused outright. All of it end-to-end through the
+    // reply decoder: the schema is decoded against its `(text)` type, so a reply
+    // up to the cap gets through the candid quota (the untyped decode would call
+    // anything over ~60 KB undecodable).
     #[test]
     fn decode_schema_reply_bounds_expansion_and_size() {
         use super::{decode_schema_reply, MAX_OQL_SCHEMA_BYTES};
-        // 126-deep nests inside one outer array: the maximal-expansion shape, just
-        // under the byte cap. Pretty-printed this would be ~32 MB; it must come
-        // back byte-for-byte.
+        // 126-deep nests inside one outer array: the shape indentation would
+        // expand the most, just under the byte cap.
         let nest = format!("{}{}", "[".repeat(126), "]".repeat(126));
         let nests: Vec<&str> = std::iter::repeat_n(nest.as_str(), 1000).collect();
         let deep = format!("[{}]", nests.join(","));
         assert!(deep.len() < MAX_OQL_SCHEMA_BYTES, "input must fit the byte cap: {}", deep.len());
         let out = decode_schema_reply(&encode_text_reply(&deep)).expect("within the byte cap → accepted");
-        assert_eq!(out.text, deep, "deep JSON is passed through verbatim, never indented");
+        assert_eq!(out.text, deep, "deep JSON is passed through verbatim, never re-rendered");
         assert!(out.entity_names().is_empty());
 
-        // Shallow but larger than the pretty-print budget (and larger than the
-        // untyped decode would admit): accepted, and passed through verbatim.
+        // Shallow and wide, larger than the untyped decode would admit: accepted,
+        // entities extracted, and passed through verbatim.
         let wide = format!(
             "{{\"entities\":[{}]}}",
             (0..3000).map(|i| format!("{{\"name\":\"entity_{i:04}\"}}")).collect::<Vec<_>>().join(",")
         );
-        assert!(wide.len() > super::MAX_PRETTY_SCHEMA_BYTES && wide.len() < MAX_OQL_SCHEMA_BYTES);
+        assert!(wide.len() > 60_000 && wide.len() < MAX_OQL_SCHEMA_BYTES, "{}", wide.len());
         let out = decode_schema_reply(&encode_text_reply(&wide)).expect("accepted");
         assert_eq!(out.text, wide, "large JSON is passed through verbatim");
         assert_eq!(out.entity_names().len(), super::MAX_OQL_ENTITIES, "entity list is capped");
@@ -2489,22 +2461,6 @@ mod tests {
         let out = decode_schema_reply(b"not candid").expect("undecodable → explanatory text");
         assert!(out.text.starts_with("(undecodable reply:"), "{}", out.text);
         assert!(out.entity_names().is_empty() && !out.is_empty());
-    }
-
-    // The pretty-print gate is on depth as well as size: a small document that
-    // nests past MAX_PRETTY_SCHEMA_DEPTH stays compact, one within it is indented.
-    #[test]
-    fn decode_schema_reply_pretty_prints_only_shallow_json() {
-        use super::{decode_schema_reply, MAX_PRETTY_SCHEMA_DEPTH};
-        let d = MAX_PRETTY_SCHEMA_DEPTH + 1;
-        let too_deep = format!("{}{}", "[".repeat(d), "]".repeat(d));
-        let out = decode_schema_reply(&encode_text_reply(&too_deep)).expect("accepted");
-        assert_eq!(out.text, too_deep, "past the depth budget → verbatim");
-
-        let d = MAX_PRETTY_SCHEMA_DEPTH;
-        let shallow = format!("{}{}", "[".repeat(d), "]".repeat(d));
-        let out = decode_schema_reply(&encode_text_reply(&shallow)).expect("accepted");
-        assert!(out.text.contains('\n'), "within the depth budget → pretty-printed: {}", out.text);
     }
 
     // api_doc_method finds either naming (getApiDoc / get_api_doc), prefers
@@ -2525,7 +2481,7 @@ mod tests {
     }
 
     // decode_text_reply returns the single `text` value verbatim (markdown doc),
-    // without the JSON pretty-printing that decode_schema_reply layers on.
+    // just as decode_schema_reply does for the schema text.
     #[test]
     fn decode_text_reply_returns_text_verbatim() {
         use super::decode_text_reply;
