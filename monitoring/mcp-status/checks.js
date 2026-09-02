@@ -117,7 +117,9 @@ const redirectTarget = (headers, from) => {
  * A hop that fails a guard is not an error: the 3xx response is returned as-is,
  * with `location` naming where it pointed, and the caller decides whether that
  * is healthy — for the landing page, an off-origin redirect IS the healthy
- * answer. `timeoutMs` bounds the whole probe, hops included, not each hop.
+ * answer. `cycle` marks the one shape no caller should read as healthy: a
+ * destination this probe already fetched, so the chain leads nowhere new.
+ * `timeoutMs` bounds the whole probe, hops included, not each hop.
  *
  * @param {string} url
  * @param {RequestInit & { timeoutMs?: number, follow?: number }} [init]
@@ -174,6 +176,12 @@ const probe = async (url, init = {}) => {
         url: current,
         /** Where this response points, when it is itself an unfollowed redirect. */
         location,
+        /**
+         * That `location` is a URL this probe already fetched — the chain loops.
+         * Reported rather than inferred from `url`, because a loop can close on
+         * any earlier hop (`/` → `/landing` → `/`), not just the last one.
+         */
+        cycle: !!location && seen.has(location),
         redirects,
         latencyMs: Date.now() - start,
         error: /** @type {Error | null} */ (null),
@@ -187,6 +195,7 @@ const probe = async (url, init = {}) => {
       bodyText: "",
       url: current,
       location: /** @type {string | null} */ (null),
+      cycle: false,
       redirects,
       latencyMs: Date.now() - start,
       error: /** @type {Error} */ (err),
@@ -317,12 +326,11 @@ export const checkMcpEndpoints = async (
     const r = await probe(`${mcpOrigin}/`, { timeoutMs, follow: 3 });
     const ct = r.headers.get("content-type") ?? "";
     const servedHere = r.ok && r.status === 200 && /text\/html/i.test(ct);
-    // A redirect back to the URL we just asked for is a loop, not a landing
-    // page — probe() leaves it unfollowed, and it must not read as healthy.
+    // A redirect closing a loop is not a landing page, however many hops it
+    // takes to close (`/` → `/` or `/` → `/landing` → `/`): probe() leaves it
+    // unfollowed and flags the cycle, and it must not read as healthy.
     const movedTo =
-      r.ok && isRedirect(r.status) && r.location && r.location !== r.url
-        ? r.location
-        : null;
+      r.ok && isRedirect(r.status) && r.location && !r.cycle ? r.location : null;
     const pass = servedHere || !!movedTo;
     facts.landing = { status: r.status, servedHere, movedTo };
     checks.push({
@@ -390,8 +398,8 @@ export const checkMcpEndpoints = async (
       detail: r.error
         ? `request failed: ${r.error.message}`
         : exposed
-          ? `version ${version ?? "?"}, commit ${commit}`
-          : `${r.status}, no version info exposed`,
+          ? `version ${version ?? "?"}, commit ${commit}${hopSuffix(r)}`
+          : `${r.status}, no version info exposed${hopSuffix(r)}`,
     });
   }
 
@@ -912,8 +920,8 @@ export const checkIiHealth = async (
     httpStatus: r.status,
     latencyMs: r.latencyMs,
     detail: icCertificate
-      ? `ic-certificate present${canisterId ? ` for canister ${canisterId}` : ""}`
-      : "no ic-certificate header (response not certified by the IC?)",
+      ? `ic-certificate present${canisterId ? ` for canister ${canisterId}` : ""}${hopSuffix(r)}`
+      : `no ic-certificate header (response not certified by the IC?)${hopSuffix(r)}`,
   });
 
   // 3. /mcp connect page. Since dfinity/internet-identity#4052 the II no longer
@@ -997,8 +1005,8 @@ export const checkIiHealth = async (
       detail: cr.error
         ? `request failed: ${cr.error.message}`
         : present
-          ? `${cr.status}, ${bytes} bytes${backendCanisterId ? `, backend ${backendCanisterId}` : ""}`
-          : `${cr.status}, ${cr.bodyText.slice(0, 80) || "(empty)"}`,
+          ? `${cr.status}, ${bytes} bytes${backendCanisterId ? `, backend ${backendCanisterId}` : ""}${hopSuffix(cr)}`
+          : `${cr.status}, ${cr.bodyText.slice(0, 80) || "(empty)"}${hopSuffix(cr)}`,
     });
   }
 
