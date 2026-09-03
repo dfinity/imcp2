@@ -1377,15 +1377,47 @@ fn ipv6_is_global(ip: &Ipv6Addr) -> bool {
         || (seg[0] == 0x2001 && seg[1] == 0x0000)) // 2001::/32 Teredo
 }
 
+/// Why [`resolve_public_url`] returned no addresses: the URL itself is refused —
+/// it does not parse, is not https, names no host, or resolves to a non-public
+/// address (the SSRF guard) — or its host could not be resolved RIGHT NOW, which
+/// says nothing about the URL. A caller that remembers refusals (the OAuth
+/// server's client-metadata cache) must not remember a resolver outage as one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ResolveError {
+    Refused(String),
+    Unresolved(String),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(why) | Self::Unresolved(why) => f.write_str(why),
+        }
+    }
+}
+
+/// The discovery crawl reports every failure as a message, and tells these apart
+/// no further; `?` keeps working there.
+impl From<ResolveError> for String {
+    fn from(err: ResolveError) -> Self {
+        match err {
+            ResolveError::Refused(why) | ResolveError::Unresolved(why) => why,
+        }
+    }
+}
+
 /// Validate a user-supplied discovery URL against SSRF and return the parsed URL
 /// plus the socket addresses to PIN the client to. https only; every resolved
 /// address must be global. Async DNS (no blocking of the executor).
-pub(crate) async fn resolve_public_url(raw: &str) -> Result<(url::Url, Vec<SocketAddr>), String> {
-    let url = url::Url::parse(raw).map_err(|e| format!("invalid discovery URL {raw}: {e}"))?;
+pub(crate) async fn resolve_public_url(
+    raw: &str,
+) -> Result<(url::Url, Vec<SocketAddr>), ResolveError> {
+    let url = url::Url::parse(raw)
+        .map_err(|e| ResolveError::Refused(format!("invalid discovery URL {raw}: {e}")))?;
     if url.scheme() != "https" {
-        return Err(format!(
+        return Err(ResolveError::Refused(format!(
             "refusing to fetch {raw}: only https:// discovery targets are allowed (SSRF guard)"
-        ));
+        )));
     }
     let port = url.port_or_known_default().unwrap_or(443);
     let addrs: Vec<SocketAddr> = match url.host() {
@@ -1393,19 +1425,19 @@ pub(crate) async fn resolve_public_url(raw: &str) -> Result<(url::Url, Vec<Socke
         Some(url::Host::Ipv6(v6)) => vec![SocketAddr::new(IpAddr::V6(v6), port)],
         Some(url::Host::Domain(host)) => tokio::net::lookup_host((host, port))
             .await
-            .map_err(|e| format!("could not resolve {host}: {e}"))?
+            .map_err(|e| ResolveError::Unresolved(format!("could not resolve {host}: {e}")))?
             .collect(),
-        None => return Err(format!("refusing to fetch {raw}: no host")),
+        None => return Err(ResolveError::Refused(format!("refusing to fetch {raw}: no host"))),
     };
     if addrs.is_empty() {
-        return Err(format!("refusing to fetch {raw}: host did not resolve"));
+        return Err(ResolveError::Unresolved(format!("could not resolve {raw}: no addresses")));
     }
     if let Some(bad) = addrs.iter().find(|a| !ip_is_global(&a.ip())) {
-        return Err(format!(
+        return Err(ResolveError::Refused(format!(
             "refusing to fetch {raw}: it resolves to a non-public address ({}) — discovery is \
              restricted to public hosts (SSRF guard)",
             bad.ip()
-        ));
+        )));
     }
     Ok((url, addrs))
 }

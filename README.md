@@ -710,7 +710,9 @@ its AS issuer is `<PUBLIC_URL>/mcp` and everything OAuth lives under it:
   10 min when it sends none, not at all on `no-store`), so a directory client
   connecting thousands of times mints no registrations. Concurrent requests for
   one document share a single fetch, and at most eight fetches are in flight at
-  once, two per host, so one slow host cannot hold up the rest. Claude and ChatGPT both select CIMD over DCR when it is
+  once per process (however many instances the binary mounts), two per host, so
+  one slow host cannot hold up the rest. The fetch connects directly, never
+  through a proxy from the environment, so the address pin always binds. Claude and ChatGPT both select CIMD over DCR when it is
   advertised — which it is only where `OAUTH_CIMD_ENABLED=1` is set (the deploy
   template takes it from the GitHub Environment's variable of that name, so a
   deploy never enables it by itself; unsetting it is the rollback, no rebuild:

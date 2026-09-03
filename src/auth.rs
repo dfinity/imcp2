@@ -800,10 +800,11 @@ const CIMD_MAX_BYTES: usize = 8 * 1024;
 /// Fetch timeout. Claude waits at most 10 s for OUR authorize endpoint, so the
 /// fetch it triggers must finish well inside that.
 const CIMD_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
-/// Fetches allowed in flight at once, across all documents. An excess request
-/// is refused (told to retry), never queued, so a flood of distinct `client_id`
-/// URLs at the unauthenticated endpoint holds at most this many outbound
-/// requests open. Concurrent requests for ONE document never compete for these:
+/// Fetches allowed in flight at once, across all documents and every mounted
+/// instance — the bounds live in the process-wide [`CimdState`]. An excess
+/// request is refused (told to retry), never queued, so a flood of distinct
+/// `client_id` URLs at the unauthenticated endpoint holds at most this many
+/// outbound requests open. Concurrent requests for ONE document never compete for these:
 /// they wait for the single fetch in flight for it and read the cache after
 /// ([`AuthStore::client_metadata_for`]).
 const CIMD_MAX_INFLIGHT: usize = 8;
@@ -954,8 +955,9 @@ fn allow_listed_domain(host: &str) -> bool {
 /// Parse and validate the document fetched from `client_id` (RFC 7591 client
 /// metadata, per the CIMD draft). Accepted only if it is a JSON object whose
 /// `client_id` equals the URL exactly; whose `redirect_uris` is a non-empty
-/// array of strings no longer than a DCR registration may send
-/// ([`MAX_REDIRECT_URIS`]); that carries no client secret; and that can authenticate
+/// array of strings within what a DCR registration may send ([`MAX_REDIRECT_URIS`]
+/// of at most [`MAX_REDIRECT_URI_LEN`] bytes each); that carries no client secret;
+/// and that can authenticate
 /// as a PUBLIC client — its `token_endpoint_auth_method` is `none` (or absent:
 /// a document may not use a secret-based method, so absence cannot mean
 /// RFC 7591's `client_secret_basic` default) OR its
@@ -994,6 +996,11 @@ fn parse_client_metadata(client_id: &str, body: &str) -> Result<ClientMetadata, 
         Some(list) if list.len() > MAX_REDIRECT_URIS => {
             return Err(format!("too many redirect_uris ({}, max {MAX_REDIRECT_URIS})", list.len()))
         }
+        Some(list)
+            if list.iter().any(|u| u.as_str().is_some_and(|u| u.len() > MAX_REDIRECT_URI_LEN)) =>
+        {
+            return Err(format!("a redirect_uri is too long (max {MAX_REDIRECT_URI_LEN} bytes)"))
+        }
         Some(list) if !list.is_empty() && list.iter().all(Value::is_string) => {
             list.iter().filter_map(Value::as_str).collect()
         }
@@ -1026,29 +1033,69 @@ fn is_json_media_type(content_type: Option<&str>) -> bool {
         .is_some_and(|essence| essence.eq_ignore_ascii_case("application/json"))
 }
 
+/// What this process knows about the web of metadata documents, and how much of
+/// it is being asked at once: the cache, the single-flight map, and the in-flight
+/// bounds. ONE per process, shared by every [`AuthStore`] — the bundled binary
+/// mounts a store per II instance (`/mcp`, `/mcp-beta`) — so the bounds hold per
+/// process, as their docs say, rather than multiplying with the mounts, and a
+/// document fetched for one mount serves the other.
+struct CimdState {
+    /// Documents fetched and validated — or found invalid — keyed by the
+    /// `client_id` URL, each with the instant it goes stale. Bounded at
+    /// [`CIMD_CACHE_MAX`]; see [`AuthStore::remember_client_metadata`].
+    cache: RwLock<HashMap<String, CachedClientMetadata>>,
+    /// Bounds concurrent metadata-document fetches at [`CIMD_MAX_INFLIGHT`]: each
+    /// is an outbound request an UNAUTHENTICATED `/oauth/authorize` can trigger.
+    inflight: Semaphore,
+    /// Single-flight: the fetch in flight for one `client_id`, whose outcome —
+    /// document, invalid, or unavailable — every request that missed while it
+    /// ran shares, instead of each fetching and each spending a permit. An entry
+    /// lives only while a fetch is in flight ([`Flight`]).
+    fetching: std::sync::Mutex<HashMap<String, Flight>>,
+    /// Fetches in flight per `client_id` host ([`HostSlot`]).
+    hosts: std::sync::Mutex<HashMap<String, usize>>,
+}
+
+impl CimdState {
+    fn new() -> Self {
+        Self {
+            cache: RwLock::default(),
+            inflight: Semaphore::new(CIMD_MAX_INFLIGHT),
+            fetching: std::sync::Mutex::default(),
+            hosts: std::sync::Mutex::default(),
+        }
+    }
+
+    /// The one instance every store in the process shares.
+    fn shared() -> Arc<Self> {
+        static SHARED: std::sync::OnceLock<Arc<CimdState>> = std::sync::OnceLock::new();
+        Arc::clone(SHARED.get_or_init(|| Arc::new(Self::new())))
+    }
+}
+
 /// Fetches in flight per `client_id` host, held as a guard so a slot is given
 /// back however the fetch ends ([`CIMD_MAX_INFLIGHT_PER_HOST`]).
 struct HostSlot {
-    hosts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    state: Arc<CimdState>,
     host: String,
 }
 
 impl HostSlot {
     /// Take a slot for `host`, or `None` when it already holds the maximum.
-    fn take(hosts: &Arc<std::sync::Mutex<HashMap<String, usize>>>, host: &str) -> Option<Self> {
-        let mut map = hosts.lock().expect("cimd host slots");
+    fn take(state: &Arc<CimdState>, host: &str) -> Option<Self> {
+        let mut map = state.hosts.lock().expect("cimd host slots");
         let held = map.get(host).copied().unwrap_or(0);
         if held >= CIMD_MAX_INFLIGHT_PER_HOST {
             return None;
         }
         map.insert(host.to_owned(), held + 1);
-        Some(Self { hosts: Arc::clone(hosts), host: host.to_owned() })
+        Some(Self { state: Arc::clone(state), host: host.to_owned() })
     }
 }
 
 impl Drop for HostSlot {
     fn drop(&mut self) {
-        let mut map = self.hosts.lock().expect("cimd host slots");
+        let mut map = self.state.hosts.lock().expect("cimd host slots");
         match map.get_mut(&self.host) {
             Some(held) if *held > 1 => *held -= 1,
             _ => {
@@ -1230,20 +1277,10 @@ pub struct AuthStore {
     /// [`crate::McpConfig::require_resource`]); when clear, a missing `resource`
     /// is tolerated.
     require_resource: bool,
-    /// Client ID Metadata Documents already fetched and validated, keyed by the
-    /// `client_id` URL, each with the instant it goes stale. Bounded at
-    /// [`CIMD_CACHE_MAX`]; see [`AuthStore::client_metadata_for`].
-    cimd_cache: Arc<RwLock<HashMap<String, CachedClientMetadata>>>,
-    /// Bounds concurrent metadata-document fetches at [`CIMD_MAX_INFLIGHT`]: each
-    /// is an outbound request an UNAUTHENTICATED `/oauth/authorize` can trigger.
-    cimd_inflight: Arc<Semaphore>,
-    /// Single-flight: the fetch in flight for one `client_id`, whose outcome —
-    /// document, invalid, or unavailable — every request that missed while it
-    /// ran shares, instead of each fetching and each spending a permit. An entry
-    /// lives only while a fetch is in flight ([`Flight`]).
-    cimd_fetching: Arc<std::sync::Mutex<HashMap<String, Flight>>>,
-    /// Fetches in flight per `client_id` host ([`HostSlot`]).
-    cimd_hosts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    /// Client ID Metadata Documents: the cache, single-flight map and in-flight
+    /// bounds — the PROCESS's ([`CimdState::shared`]), so every mounted instance
+    /// draws on the same bounds; a test may give a store its own.
+    cimd: Arc<CimdState>,
     /// Whether URL `client_id`s are accepted and CIMD advertised: the process's
     /// `OAUTH_CIMD_ENABLED` ([`cimd_enabled_by_env`]), or what a test set.
     cimd_enabled: bool,
@@ -1365,18 +1402,17 @@ impl AuthStore {
             public_url,
             mcp_path,
             require_resource,
-            cimd_cache: Arc::default(),
-            cimd_inflight: Arc::new(Semaphore::new(CIMD_MAX_INFLIGHT)),
-            cimd_fetching: Arc::default(),
-            cimd_hosts: Arc::default(),
+            cimd: CimdState::shared(),
             cimd_enabled: cimd_enabled_by_env(),
         }
     }
 
-    /// This store with CIMD switched on or off, whatever the environment says.
+    /// This store with CIMD switched on or off, whatever the environment says,
+    /// and with CIMD state of its own, so tests do not see each other's flights.
     #[cfg(test)]
     fn with_cimd(mut self, enabled: bool) -> Self {
         self.cimd_enabled = enabled;
+        self.cimd = Arc::new(CimdState::new());
         self
     }
 
@@ -1479,7 +1515,7 @@ impl AuthStore {
         // would have every concurrent authorize fetch the same bytes and spend a
         // permit each.
         let flight: Flight = Arc::clone(
-            self.cimd_fetching.lock().expect("cimd fetch locks").entry(key.to_owned()).or_default(),
+            self.cimd.fetching.lock().expect("cimd fetch locks").entry(key.to_owned()).or_default(),
         );
         let mut slot = flight.lock().await;
         if let Some(outcome) = slot.as_ref() {
@@ -1496,7 +1532,7 @@ impl AuthStore {
         // Retire THIS flight only: waiters keep their own handle to it and read
         // the outcome from there, and a flight a later miss may have started is
         // left alone.
-        let mut fetching = self.cimd_fetching.lock().expect("cimd fetch locks");
+        let mut fetching = self.cimd.fetching.lock().expect("cimd fetch locks");
         if fetching.get(key).is_some_and(|current| Arc::ptr_eq(current, &flight)) {
             fetching.remove(key);
         }
@@ -1509,7 +1545,7 @@ impl AuthStore {
         &self,
         key: &str,
     ) -> Option<Result<Arc<ClientMetadata>, CimdError>> {
-        let cache = self.cimd_cache.read().await;
+        let cache = self.cimd.cache.read().await;
         let hit = cache.get(key).filter(|hit| hit.expires > Instant::now())?;
         Some(hit.outcome.clone().map_err(CimdError::Invalid))
     }
@@ -1526,12 +1562,12 @@ impl AuthStore {
     ) -> Result<Arc<ClientMetadata>, CimdError> {
         let key = client_id.as_str();
         let host = client_id.host_str().unwrap_or_default().to_ascii_lowercase();
-        let Some(_slot) = HostSlot::take(&self.cimd_hosts, &host) else {
+        let Some(_slot) = HostSlot::take(&self.cimd, &host) else {
             return Err(CimdError::Unavailable(format!(
                 "too many client metadata fetches in flight for {host}; retry shortly"
             )));
         };
-        let Ok(_permit) = self.cimd_inflight.try_acquire() else {
+        let Ok(_permit) = self.cimd.inflight.try_acquire() else {
             return Err(CimdError::Unavailable(
                 "too many client metadata fetches in flight; retry shortly".into(),
             ));
@@ -1557,7 +1593,7 @@ impl AuthStore {
         expires: Instant,
     ) {
         let now = Instant::now();
-        let mut cache = self.cimd_cache.write().await;
+        let mut cache = self.cimd.cache.write().await;
         if cache.len() >= CIMD_CACHE_MAX && !cache.contains_key(key) {
             // Make room: drop what has expired; if that frees nothing, the entry
             // closest to expiry (an LRU stand-in that needs no write per hit).
@@ -3224,6 +3260,11 @@ mod tests {
         let too_many = json!({ "client_id": OTHER, "redirect_uris": many }).to_string();
         let err = parse_client_metadata(OTHER, &too_many).unwrap_err();
         assert!(err.contains("too many redirect_uris"), "{err}");
+        // …nor a longer one: a same-origin redirect DCR would refuse is refused here.
+        let long = format!("https://cimd-other.test/{}", "x".repeat(super::MAX_REDIRECT_URI_LEN));
+        let too_long = json!({ "client_id": OTHER, "redirect_uris": [long] }).to_string();
+        let err = parse_client_metadata(OTHER, &too_long).unwrap_err();
+        assert!(err.contains("too long"), "{err}");
     }
 
     /// The deploy-time opt-in's reading of its variable: off unless it says on.
@@ -3368,8 +3409,8 @@ mod tests {
             other => panic!("the third fetch for one host must be refused, got {other:?}"),
         }
         // Slots and single-flight entries are released, not leaked.
-        assert!(store.cimd_hosts.lock().unwrap().is_empty());
-        assert!(store.cimd_fetching.lock().unwrap().is_empty());
+        assert!(store.cimd.hosts.lock().unwrap().is_empty());
+        assert!(store.cimd.fetching.lock().unwrap().is_empty());
         // The refused one succeeds on retry (its document was never fetched).
         assert_eq!(check(THREE, REDIRECT).await, ClientCheck::Allowed);
     }
@@ -3723,6 +3764,14 @@ mod tests {
     }
 
     fn test_store_cfg(require_resource: bool) -> super::AuthStore {
+        // As deployed with `OAUTH_CIMD_ENABLED=1`, and with CIMD state of its own so
+        // tests do not see each other's flights; the off case sets this itself.
+        new_store(require_resource).with_cimd(true)
+    }
+
+    /// A store exactly as [`super::AuthStore::new`] builds it: CIMD per the
+    /// environment (off under `cargo test`), CIMD state shared process-wide.
+    fn new_store(require_resource: bool) -> super::AuthStore {
         use candid::Principal;
         use imcp2_core::identities::{Identities, IiInstance};
         let agent =
@@ -3746,8 +3795,19 @@ mod tests {
             "/mcp".into(),
             require_resource,
         )
-        // As deployed with `OAUTH_CIMD_ENABLED=1`; the off case sets this itself.
-        .with_cimd(true)
+    }
+
+    /// Every store in the process shares one CIMD state: the bundled binary
+    /// mounts a store per II instance, and the in-flight bounds must hold across
+    /// them — two mounts must not mean twice the fetches — as must the cache.
+    #[test]
+    fn cimd_state_is_shared_by_every_store() {
+        use std::sync::Arc;
+        let (a, b) = (new_store(false), new_store(false));
+        assert!(Arc::ptr_eq(&a.cimd, &b.cimd), "stores must share the process's CIMD state");
+        // The test stores keep their own, so tests do not see each other's flights.
+        let (c, d) = (test_store(), test_store());
+        assert!(!Arc::ptr_eq(&c.cimd, &d.cimd) && !Arc::ptr_eq(&c.cimd, &a.cimd));
     }
 
     /// A request header map that accepts HTML — i.e. a browser hitting the

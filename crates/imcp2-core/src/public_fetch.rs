@@ -9,9 +9,11 @@
 //! up front and refused if ANY address is loopback / private / link-local /
 //! CGNAT / otherwise reserved; the validated addresses pinned into the client so
 //! a re-resolution cannot rebind the connection (DNS rebinding); and the body
-//! read under a hard byte cap (CWE-770). On top of that, this fetch is STRICT
-//! where the crawl is opportunistic — the document is the URL's own statement
-//! about itself, so:
+//! read under a hard byte cap (CWE-770). The connection is DIRECT: no proxy is
+//! taken from the environment, since a proxy would resolve the host itself and
+//! the pin would bind nothing. On top of that, this fetch is STRICT where the
+//! crawl is opportunistic — the document is the URL's own statement about
+//! itself, so:
 //!
 //!   * redirects are not followed at all: a 3xx is a non-success answer, so no
 //!     other URL's bytes — on another host, another port, or another path of the
@@ -25,8 +27,9 @@
 //!
 //! Failures are typed ([`FetchError`]) so a caller can tell what is about the URL
 //! (the guard refuses it; the origin answers 404 or a redirect; the body is too
-//! large or not UTF-8) from what is about the moment (a deadline, a connection
-//! that failed, a 5xx) — the first kind may be remembered, the second may not.
+//! large or not UTF-8) from what is about the moment (a resolver that did not
+//! answer, a deadline, a connection that failed, a 5xx) — the first kind may be
+//! remembered, the second may not.
 //!
 //! The origin's caching instruction is reported as the REMAINING freshness
 //! lifetime, per HTTP: every `Cache-Control` field line is read (a `no-store` on
@@ -36,7 +39,7 @@ use std::{fmt, time::Duration};
 
 use reqwest::header::{HeaderMap, AGE, CACHE_CONTROL, CONTENT_TYPE};
 
-use crate::discover::{read_capped_bytes, resolve_public_url};
+use crate::discover::{read_capped_bytes, resolve_public_url, ResolveError};
 
 /// A small public document fetched under the SSRF guard.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,8 +61,9 @@ pub enum FetchError {
     /// The URL itself: it does not parse, is not https, names no host, or names
     /// one with a non-public address. No request was made.
     Refused(String),
-    /// The moment: the deadline passed, or the request could not be sent or its
-    /// body not read. The same URL may work next time.
+    /// The moment: the host could not be resolved, the deadline passed, or the
+    /// request could not be sent or its body not read. The same URL may work
+    /// next time.
     Unreachable(String),
     /// The origin answered, but not 2xx — a redirect (never followed) included.
     /// `status` lets the caller tell a 404 (no document there) from a 503.
@@ -105,7 +109,10 @@ pub async fn fetch_public_document(
 }
 
 async fn fetch(url: &str, max_bytes: usize) -> Result<PublicDocument, FetchError> {
-    let (parsed, pinned) = resolve_public_url(url).await.map_err(FetchError::Refused)?;
+    let (parsed, pinned) = resolve_public_url(url).await.map_err(|e| match e {
+        ResolveError::Refused(why) => FetchError::Refused(why),
+        ResolveError::Unresolved(why) => FetchError::Unreachable(why),
+    })?;
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
     let client = reqwest::Client::builder()
         .user_agent(concat!("imcp2-core/", env!("CARGO_PKG_VERSION")))
@@ -115,6 +122,12 @@ async fn fetch(url: &str, max_bytes: usize) -> Result<PublicDocument, FetchError
         // afterwards) also closes the same-origin case, where a redirect to another
         // path would have put a different document behind this URL.
         .redirect(reqwest::redirect::Policy::none())
+        // Direct, whatever the environment says: the pin below binds only a
+        // connection this client opens itself, and a proxy (reqwest takes one from
+        // `HTTPS_PROXY` by default) would resolve the host on its own — past the
+        // guard. A deployment that must egress through a proxy has that proxy do
+        // the guard's job, as a deliberate choice, not one this fetch takes silently.
+        .no_proxy()
         .resolve_to_addrs(&host, &pinned)
         .build()
         .map_err(|e| FetchError::Unreachable(format!("http client: {e}")))?;
@@ -192,6 +205,9 @@ fn freshness(headers: &HeaderMap) -> Option<Duration> {
 
 /// The caching lifetime a `Cache-Control` value asks for: its `max-age`, or zero
 /// when it forbids reuse (`no-store` / `no-cache`); `None` when it says neither.
+/// A `max-age` given more than once is honoured at its MOST RESTRICTIVE value
+/// (RFC 9111 §4.2.1: conflicting freshness information must not extend
+/// freshness), so `max-age=300, max-age=0` is zero, not five minutes.
 fn cache_max_age(cache_control: &str) -> Option<Duration> {
     let directives: Vec<&str> = cache_control.split(',').map(str::trim).collect();
     if directives
@@ -200,13 +216,16 @@ fn cache_max_age(cache_control: &str) -> Option<Duration> {
     {
         return Some(Duration::ZERO);
     }
-    directives.iter().find_map(|d| {
-        let (name, value) = d.split_once('=')?;
-        name.trim()
-            .eq_ignore_ascii_case("max-age")
-            .then(|| value.trim().trim_matches('"').parse::<u64>().ok())?
-            .map(Duration::from_secs)
-    })
+    directives
+        .iter()
+        .filter_map(|d| {
+            let (name, value) = d.split_once('=')?;
+            name.trim()
+                .eq_ignore_ascii_case("max-age")
+                .then(|| value.trim().trim_matches('"').parse::<u64>().ok())?
+        })
+        .min()
+        .map(Duration::from_secs)
 }
 
 #[cfg(test)]
@@ -361,5 +380,25 @@ mod tests {
         assert_eq!(cache_max_age("max-age=300, no-cache"), Some(Duration::ZERO));
         assert_eq!(cache_max_age("public"), None);
         assert_eq!(cache_max_age("max-age=soon"), None);
+        // A duplicated max-age is honoured at its most restrictive value, never
+        // the one that happens to come first.
+        assert_eq!(cache_max_age("max-age=300, max-age=0"), Some(Duration::ZERO));
+        assert_eq!(cache_max_age("max-age=0, max-age=300"), Some(Duration::ZERO));
+        assert_eq!(cache_max_age("max-age=300, public, max-age=60"), Some(Duration::from_secs(60)));
+    }
+
+    /// A host that cannot be resolved is a failure of the MOMENT, not of the URL:
+    /// `Unreachable`, never `Refused`, or a caller that remembers refusals would
+    /// remember a resolver outage as "no document there".
+    #[tokio::test]
+    async fn unresolvable_host_is_unreachable_not_refused() {
+        let err = fetch_public_document(
+            "https://does-not-exist.invalid/client.json",
+            1024,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, FetchError::Unreachable(_)), "{err:?}");
     }
 }
