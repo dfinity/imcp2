@@ -1368,6 +1368,7 @@ fn ipv6_is_global(ip: &Ipv6Addr) -> bool {
         || (seg[0] & 0xfe00) == 0xfc00       // fc00::/7 unique-local
         || (seg[0] & 0xffc0) == 0xfe80       // fe80::/10 link-local unicast
         || (seg[0] & 0xffc0) == 0xfec0       // fec0::/10 site-local (deprecated, RFC 3879)
+        || (seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0) // 100::/64 discard-only (RFC 6666)
         || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
         // Transition mechanisms embed an IPv4 address deeper in the v6 space than
         // `to_ipv4` decodes, so a NAT64/6to4/Teredo host would otherwise translate
@@ -2864,6 +2865,7 @@ mod tests {
             "fd12::1",
             "fe80::1",
             "fec0::1", // site-local: deprecated, still routable on legacy networks
+            "100::1",  // discard-only
             "2001:db8::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1", // IPv4-mapped private/loopback

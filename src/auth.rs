@@ -820,6 +820,20 @@ const CIMD_MAX_INFLIGHT: usize = 8;
 /// serving many distinct URLs cannot occupy every permit above: it gets this
 /// many, and every other host keeps the rest.
 const CIMD_MAX_INFLIGHT_PER_HOST: usize = 2;
+/// Fetches allowed per minute, process-wide, however fast they complete. The
+/// in-flight bounds cap how many run at once, not how many run in a minute: an
+/// origin answering 404 at once gives its permit straight back, and distinct
+/// paths on a vetted host defeat the negative cache, so this is what bounds the
+/// outbound request rate an unauthenticated caller can drive at a vendor (the
+/// rate cap PR #143 §5 requires alongside the concurrency cap). A token bucket:
+/// this many tokens to start, and this many a minute of refill. Legitimate
+/// traffic is a handful of documents, each cached for minutes to a day.
+const CIMD_RATE_PER_MINUTE: u32 = 60;
+/// Fetches allowed per minute for one vetted domain — the allow-list entry the
+/// `client_id` host is on or under — so a flood at one vendor leaves the others
+/// their share. Keyed by the DOMAIN, a finite vetted set, not the host: a
+/// vendor's subdomains are not finite.
+const CIMD_RATE_PER_DOMAIN_PER_MINUTE: u32 = 30;
 /// Distinct `client_id` URLs cached. A handful of directory clients is the
 /// expected population; the bound is against abuse, not for capacity.
 const CIMD_CACHE_MAX: usize = 512;
@@ -956,9 +970,16 @@ fn cimd_origin_trusted(client_id: &url::Url) -> bool {
 /// Whether `host` equals, or is a dot-boundary subdomain of, an allow-listed
 /// registrable domain — the host rule of [`redirect_uri_permitted`], on its own.
 fn allow_listed_domain(host: &str) -> bool {
+    vetted_domain(host).is_some()
+}
+
+/// The allow-listed registrable domain `host` equals or is a dot-boundary
+/// subdomain of, if any: the trust policy's match, and the key of the per-vendor
+/// fetch rate ([`CIMD_RATE_PER_DOMAIN_PER_MINUTE`]).
+fn vetted_domain(host: &str) -> Option<&'static str> {
     let host = host_key(host);
-    allowed_redirects().iter().any(|(domain, _, _)| {
-        host == *domain || host.strip_suffix(domain.as_str()).is_some_and(|p| p.ends_with('.'))
+    allowed_redirects().iter().map(|(domain, _, _)| domain.as_str()).find(|domain| {
+        host == *domain || host.strip_suffix(*domain).is_some_and(|p| p.ends_with('.'))
     })
 }
 
@@ -987,9 +1008,13 @@ fn host_key(host: &str) -> String {
 /// types lose `authorization_code` ([`granted_grant_types`]).
 ///
 /// Of the `redirect_uris`, only those this server could ever honour are kept:
-/// loopback ones (native clients bind a port at runtime), and hosted ones on the
-/// SAME ORIGIN as the document URL — a self-asserted document may not point the
-/// code at another party. A document left with none is refused.
+/// each must be one a DCR registration could have registered
+/// ([`redirect_uri_permitted`]: loopback, or https on an allow-listed host and
+/// pinned path, and in either case without query or fragment — a fragment would
+/// otherwise be ignored by the loopback match and admit a redirect DCR refuses),
+/// and a hosted one must be on the SAME ORIGIN as the document URL — a
+/// self-asserted document may not point the code at another party. A document
+/// left with none is refused.
 fn parse_client_metadata(client_id: &str, body: &str) -> Result<ClientMetadata, String> {
     let doc: Value = serde_json::from_str(body).map_err(|e| format!("not valid JSON: {e}"))?;
     let Some(obj) = doc.as_object() else {
@@ -1053,12 +1078,17 @@ fn parse_client_metadata(client_id: &str, body: &str) -> Result<ClientMetadata, 
     let redirect_uris: Vec<String> = listed
         .into_iter()
         .filter(|u| {
-            is_loopback_redirect(u) || url::Url::parse(u).is_ok_and(|r| r.origin() == own_origin)
+            redirect_uri_permitted(u)
+                && (is_loopback_redirect(u)
+                    || url::Url::parse(u).is_ok_and(|r| r.origin() == own_origin))
         })
         .map(str::to_owned)
         .collect();
     if redirect_uris.is_empty() {
-        return Err("lists no redirect_uri on its own origin (nor a loopback one)".into());
+        return Err("lists no redirect_uri this server could honour: one on its own origin that \
+                    the hosted-redirect allow-list admits, or a loopback one, neither with a \
+                    query or fragment"
+            .into());
     }
     let client_name = obj.get("client_name").and_then(Value::as_str).map(str::to_owned);
     Ok(ClientMetadata { client_id: client_id.to_owned(), client_name, redirect_uris })
@@ -1097,6 +1127,8 @@ struct CimdState {
     fetching: std::sync::Mutex<HashMap<String, Flight>>,
     /// Fetches in flight per `client_id` host ([`HostSlot`]).
     hosts: std::sync::Mutex<HashMap<String, usize>>,
+    /// Fetches per minute: the process's bucket, and one per vetted domain.
+    rates: std::sync::Mutex<Rates>,
 }
 
 impl CimdState {
@@ -1106,6 +1138,10 @@ impl CimdState {
             inflight: Semaphore::new(CIMD_MAX_INFLIGHT),
             fetching: std::sync::Mutex::default(),
             hosts: std::sync::Mutex::default(),
+            rates: std::sync::Mutex::new(Rates {
+                all: TokenBucket::per_minute(CIMD_RATE_PER_MINUTE),
+                per_domain: HashMap::new(),
+            }),
         }
     }
 
@@ -1113,6 +1149,44 @@ impl CimdState {
     fn shared() -> Arc<Self> {
         static SHARED: std::sync::OnceLock<Arc<CimdState>> = std::sync::OnceLock::new();
         Arc::clone(SHARED.get_or_init(|| Arc::new(Self::new())))
+    }
+}
+
+/// The fetch-rate buckets ([`CIMD_RATE_PER_MINUTE`], [`CIMD_RATE_PER_DOMAIN_PER_MINUTE`]).
+struct Rates {
+    all: TokenBucket,
+    per_domain: HashMap<&'static str, TokenBucket>,
+}
+
+/// A token bucket: `capacity` tokens to start, refilled continuously at
+/// `capacity` a minute, one taken per fetch.
+struct TokenBucket {
+    capacity: f64,
+    tokens: f64,
+    refilled_at: Instant,
+}
+
+impl TokenBucket {
+    fn per_minute(capacity: u32) -> Self {
+        Self {
+            capacity: f64::from(capacity),
+            tokens: f64::from(capacity),
+            refilled_at: Instant::now(),
+        }
+    }
+
+    /// Refill for the time passed, then say whether a token is there to take.
+    fn has_token(&mut self) -> bool {
+        let now = Instant::now();
+        let refill = now.duration_since(self.refilled_at).as_secs_f64() * self.capacity / 60.0;
+        self.tokens = (self.tokens + refill).min(self.capacity);
+        self.refilled_at = now;
+        self.tokens >= 1.0
+    }
+
+    /// Take the token [`Self::has_token`] just said was there.
+    fn take(&mut self) {
+        self.tokens -= 1.0;
     }
 }
 
@@ -1148,25 +1222,35 @@ impl Drop for HostSlot {
     }
 }
 
-/// Retires a flight's entry in the single-flight map when the request fetching
-/// for it is done — OR IS DROPPED. An authorize future can be dropped at any
-/// await (the client resets the stream), and a fetch dropped mid-way would
-/// otherwise leave its entry in the process-wide map for good; with unique URLs
-/// on a vetted host, that is unbounded growth. Only this flight's own entry is
-/// removed, never a newer one. Waiters keep their handle to the flight and,
-/// finding no outcome in it once the lock is theirs, one of them fetches.
-struct RetireFlight<'a> {
+/// A request's hold on a flight, from joining it to being done — OR DROPPED,
+/// since an authorize future can be dropped at any await (the client resets the
+/// stream). The LAST holder to go retires the flight's entry from the map: with
+/// an outcome published the flight has done its job (later requests find the
+/// cache); without one, every request in it was cancelled, and an entry left
+/// behind would be unbounded growth on a vetted host with unique URLs. While
+/// anyone else holds the flight it stays where newcomers find it, so a fetcher
+/// cancelled mid-way hands over to a waiter — which, finding no outcome once
+/// the lock is its, fetches — instead of leaving the waiters on one flight and
+/// newcomers on a second, fetching the same document twice. Only this flight's
+/// own entry is ever removed, never a newer one.
+struct FlightGuard<'a> {
     state: &'a CimdState,
     key: &'a str,
     flight: &'a Flight,
 }
 
-impl Drop for RetireFlight<'_> {
+impl Drop for FlightGuard<'_> {
     fn drop(&mut self) {
         let mut fetching = self.state.fetching.lock().expect("cimd fetch locks");
-        if fetching.get(self.key).is_some_and(|current| Arc::ptr_eq(current, self.flight)) {
-            fetching.remove(self.key);
+        let Some(current) = fetching.get(self.key) else { return };
+        // Two handles are the map's and this request's; more means other requests
+        // still hold the flight, and the last of them retires it. The count is
+        // read under the map lock, where a newcomer would take its handle, so the
+        // two cannot cross.
+        if !Arc::ptr_eq(current, self.flight) || Arc::strong_count(self.flight) > 2 {
+            return;
         }
+        fetching.remove(self.key);
     }
 }
 
@@ -1183,11 +1267,16 @@ async fn fetch_client_metadata_document(
     url: &str,
 ) -> Result<imcp2_core::public_fetch::PublicDocument, imcp2_core::public_fetch::FetchError> {
     #[cfg(test)]
-    if let Some(fixture) = cimd_fixture::get(url) {
-        // A real fetch suspends here; so does the stand-in, so tests see what
-        // concurrent requests do while one is in flight.
-        tokio::task::yield_now().await;
-        return fixture;
+    if let Some(served) = cimd_fixture::get(url) {
+        return match served {
+            cimd_fixture::Served::Now(answer) => {
+                // A real fetch suspends here; so does the stand-in, so tests see
+                // what concurrent requests do while one is in flight.
+                tokio::task::yield_now().await;
+                answer
+            }
+            cimd_fixture::Served::Never => std::future::pending().await,
+        };
     }
     imcp2_core::public_fetch::fetch_public_document(url, CIMD_MAX_BYTES, CIMD_FETCH_TIMEOUT).await
 }
@@ -1242,7 +1331,17 @@ mod cimd_fixture {
 
     use imcp2_core::public_fetch::{FetchError, PublicDocument};
 
-    type Registry = Mutex<HashMap<String, Result<PublicDocument, FetchError>>>;
+    /// What the fixture does for a fetch of a URL.
+    #[derive(Clone)]
+    pub(super) enum Served {
+        /// Answer this, after the one suspension a real fetch would take.
+        Now(Result<PublicDocument, FetchError>),
+        /// Never answer: an origin that hangs. The request's only way out is to
+        /// be dropped, as a client resetting the stream would drop it.
+        Never,
+    }
+
+    type Registry = Mutex<HashMap<String, Served>>;
     static DOCS: OnceLock<Registry> = OnceLock::new();
     static HITS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
 
@@ -1262,7 +1361,12 @@ mod cimd_fixture {
             content_type: Some(content_type.into()),
             cache_max_age: None,
         };
-        docs().lock().expect("fixture registry").insert(url.into(), Ok(doc));
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Ok(doc)));
+    }
+
+    /// Make a fetch of `url` hang until the request is dropped.
+    pub(super) fn hang(url: &str) {
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Never);
     }
 
     /// How many times `url` has been fetched.
@@ -1282,23 +1386,23 @@ mod cimd_fixture {
             content_type: Some("application/json".into()),
             cache_max_age: Some(std::time::Duration::ZERO),
         };
-        docs().lock().expect("fixture registry").insert(url.into(), Ok(doc));
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Ok(doc)));
     }
 
     /// Make fetching `url` fail TRANSIENTLY — an origin that cannot be reached —
     /// with `why`.
     pub(super) fn fail(url: &str, why: &str) {
         let err = FetchError::Unreachable(why.into());
-        docs().lock().expect("fixture registry").insert(url.into(), Err(err));
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Err(err)));
     }
 
     /// Make `url` answer 404: no document there, a failure about the URL itself.
     pub(super) fn not_found(url: &str) {
         let err = FetchError::Answered { status: 404, detail: format!("{url} answered 404") };
-        docs().lock().expect("fixture registry").insert(url.into(), Err(err));
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Err(err)));
     }
 
-    pub(super) fn get(url: &str) -> Option<Result<PublicDocument, FetchError>> {
+    pub(super) fn get(url: &str) -> Option<Served> {
         let served = docs().lock().expect("fixture registry").get(url).cloned();
         if served.is_some() {
             *HITS
@@ -1584,17 +1688,16 @@ impl AuthStore {
         let flight: Flight = Arc::clone(
             self.cimd.fetching.lock().expect("cimd fetch locks").entry(key.to_owned()).or_default(),
         );
+        // Held for as long as this request is in the flight, however it leaves;
+        // the last holder out retires the flight ([`FlightGuard`]).
+        let _hold = FlightGuard { state: &self.cimd, key, flight: &flight };
         let mut slot = flight.lock().await;
         if let Some(outcome) = slot.as_ref() {
             return outcome.clone();
         }
         // First through the lock: this request fetches — unless a flight that
         // finished between the miss above and here has filled the cache meanwhile
-        // — and publishes. Its entry is retired when it is done or dropped
-        // ([`RetireFlight`]; declared after `slot`, so it runs before the lock is
-        // released), so a request cancelled mid-fetch leaves nothing behind, and
-        // waiters read the outcome from the handle they already hold.
-        let _retire = RetireFlight { state: &self.cimd, key, flight: &flight };
+        // — and publishes, for the waiters to read from the handle they hold.
         let outcome = match self.cached_client_metadata(key).await {
             Some(cached) => cached,
             None => self.fetch_and_cache_client_metadata(client_id).await,
@@ -1614,9 +1717,10 @@ impl AuthStore {
         Some(hit.outcome.clone().map_err(CimdError::Invalid))
     }
 
-    /// Fetch, validate and cache the document at `client_id`. Bounded twice
-    /// before any request goes out: per host, so one slow host cannot take every
-    /// permit, and overall. Neither queues — an excess request is told to retry.
+    /// Fetch, validate and cache the document at `client_id`. Bounded before any
+    /// request goes out: in rate, per vendor and overall, and in flight, per host
+    /// (so one slow host cannot take every permit) and overall. None of these
+    /// queues — an excess request is told to retry.
     /// A document is cached for as long as [`cimd_ttl`] says, which is not at all
     /// when its origin forbids reuse; a failure about the URL itself is cached
     /// negatively for [`CIMD_NEGATIVE_TTL`]; a transient failure is not cached.
@@ -1626,6 +1730,30 @@ impl AuthStore {
     ) -> Result<Arc<ClientMetadata>, CimdError> {
         let key = client_id.as_str();
         let host = host_key(client_id.host_str().unwrap_or_default());
+        // The RATE first, before anything is held: the in-flight bounds below cap
+        // how many fetches run at once, not how many run in a minute. The vendor's
+        // share, then the process's — both must have a token before either is taken.
+        {
+            let mut rates = self.cimd.rates.lock().expect("cimd rates");
+            let rates = &mut *rates;
+            let domain = vetted_domain(&host).unwrap_or_default();
+            let vendor = rates
+                .per_domain
+                .entry(domain)
+                .or_insert_with(|| TokenBucket::per_minute(CIMD_RATE_PER_DOMAIN_PER_MINUTE));
+            if !vendor.has_token() {
+                return Err(CimdError::Unavailable(format!(
+                    "client metadata fetch rate for {domain} exceeded; retry shortly"
+                )));
+            }
+            if !rates.all.has_token() {
+                return Err(CimdError::Unavailable(
+                    "client metadata fetch rate exceeded; retry shortly".into(),
+                ));
+            }
+            vendor.take();
+            rates.all.take();
+        }
         let Some(_slot) = HostSlot::take(&self.cimd, &host) else {
             return Err(CimdError::Unavailable(format!(
                 "too many client metadata fetches in flight for {host}; retry shortly"
@@ -3342,22 +3470,31 @@ mod tests {
         assert!(err.contains("array of strings"), "{err}");
         assert!(refused_for(with("response_types", json!([1]))).contains("array of strings"));
         // Hosted redirects must be same-origin with the document; loopback is exempt.
-        const OTHER: &str = "https://cimd-other.test/client.json";
+        const OTHER: &str = "https://cimd-other.claude.ai/client.json";
+        const OWN: &str = "https://cimd-other.claude.ai/api/mcp/auth_callback";
         let borrowed = json!({ "client_id": OTHER, "redirect_uris": [CHATGPT_REDIRECT] });
         let err = parse_client_metadata(OTHER, &borrowed.to_string()).unwrap_err();
         assert!(err.contains("own origin"), "{err}");
         let mixed = json!({
             "client_id": OTHER,
             "redirect_uris": [
-                CHATGPT_REDIRECT, "https://cimd-other.test/cb", "http://127.0.0.1/cb"
+                CHATGPT_REDIRECT, OWN, "http://127.0.0.1/cb"
             ],
         });
         let kept = parse_client_metadata(OTHER, &mixed.to_string()).expect("own + loopback kept");
-        assert_eq!(kept.redirect_uris, ["https://cimd-other.test/cb", "http://127.0.0.1/cb"]);
+        assert_eq!(kept.redirect_uris, [OWN, "http://127.0.0.1/cb"]);
         // Same host, different port or scheme, is a different origin.
-        let off_origin =
-            json!({ "client_id": OTHER, "redirect_uris": ["https://cimd-other.test:8443/cb"] });
+        let off_origin = json!({ "client_id": OTHER, "redirect_uris": [format!("{OWN}:8443")] });
         assert!(parse_client_metadata(OTHER, &off_origin.to_string()).is_err());
+        // Only what a DCR registration could have registered is kept: a loopback
+        // redirect with a fragment (which the port-agnostic match would ignore,
+        // admitting a redirect DCR refuses), or an own-origin path the allow-list
+        // does not pin, leaves the document with nothing.
+        let fragment = json!({ "client_id": OTHER, "redirect_uris": ["http://127.0.0.1/cb#x"] });
+        assert!(parse_client_metadata(OTHER, &fragment.to_string()).is_err());
+        let unpinned =
+            json!({ "client_id": OTHER, "redirect_uris": ["https://cimd-other.claude.ai/cb"] });
+        assert!(parse_client_metadata(OTHER, &unpinned.to_string()).is_err());
         // No more redirect_uris than a DCR registration may send.
         let many: Vec<String> = (0..=super::MAX_REDIRECT_URIS)
             .map(|i| format!("https://cimd-other.test/cb/{i}"))
@@ -3542,6 +3679,112 @@ mod tests {
         assert!(store.cimd.fetching.lock().unwrap().is_empty());
         // The refused one succeeds on retry (its document was never fetched).
         assert_eq!(check(THREE, REDIRECT).await, ClientCheck::Allowed);
+    }
+
+    /// A token bucket starts full, gives one token per take, and refills only
+    /// with time.
+    #[test]
+    fn cimd_rate_bucket() {
+        use super::TokenBucket;
+        let mut bucket = TokenBucket::per_minute(2);
+        assert!(bucket.has_token());
+        bucket.take();
+        assert!(bucket.has_token());
+        bucket.take();
+        assert!(!bucket.has_token(), "two tokens a minute means two, not three, at once");
+    }
+
+    /// The fetch RATE is bounded, not only how many are in flight: an origin that
+    /// answers at once gives its permit straight back, so without this a caller
+    /// could drive one request after another at a vendor with distinct paths.
+    /// A vendor's share runs out first, leaving the others theirs; then the
+    /// process's budget does, for everyone.
+    #[tokio::test]
+    async fn cimd_fetch_rate_is_bounded() {
+        use super::{
+            cimd_fixture, ClientCheck, CIMD_RATE_PER_DOMAIN_PER_MINUTE, CIMD_RATE_PER_MINUTE,
+        };
+        let store = test_store();
+        const REDIRECT: &str = "http://127.0.0.1:1/cb";
+        fn rate_limited(verdict: &ClientCheck) -> bool {
+            matches!(verdict, ClientCheck::MetadataUnavailable(why) if why.contains("rate"))
+        }
+        // Distinct, never-seen paths on one vendor, each answered 404 at once (so
+        // nothing legitimate is cached): each is a fetch, until that vendor's
+        // share for the minute is spent.
+        for i in 0..CIMD_RATE_PER_DOMAIN_PER_MINUTE {
+            let id = format!("https://cimd-rate.claude.ai/{i}.json");
+            cimd_fixture::not_found(&id);
+            assert_eq!(store.validate_client(&id, REDIRECT).await, ClientCheck::Refused, "{id}");
+        }
+        const OVER: &str = "https://cimd-rate.claude.ai/over.json";
+        cimd_fixture::not_found(OVER);
+        let verdict = store.validate_client(OVER, REDIRECT).await;
+        assert!(rate_limited(&verdict), "{verdict:?}");
+        assert_eq!(cimd_fixture::hits(OVER), 0, "refused before any fetch");
+        // Another vendor still has its share…
+        assert_eq!(
+            CIMD_RATE_PER_MINUTE,
+            2 * CIMD_RATE_PER_DOMAIN_PER_MINUTE,
+            "this test spends exactly the process's budget over two vendors"
+        );
+        for i in 0..CIMD_RATE_PER_DOMAIN_PER_MINUTE {
+            let id = format!("https://cimd-rate.chatgpt.com/{i}.json");
+            cimd_fixture::not_found(&id);
+            assert_eq!(store.validate_client(&id, REDIRECT).await, ClientCheck::Refused, "{id}");
+        }
+        // …until the process's budget is spent, which refuses a third vendor too.
+        const THIRD: &str = "https://cimd-rate.cursor.com/one.json";
+        cimd_fixture::not_found(THIRD);
+        let verdict = store.validate_client(THIRD, REDIRECT).await;
+        assert!(rate_limited(&verdict), "{verdict:?}");
+        assert_eq!(cimd_fixture::hits(THIRD), 0);
+        // A refusal holds nothing: no slot, no permit, no flight.
+        assert!(store.cimd.hosts.lock().unwrap().is_empty());
+        assert!(store.cimd.fetching.lock().unwrap().is_empty());
+    }
+
+    /// A fetcher dropped mid-fetch while a waiter is in the flight hands over:
+    /// the flight stays where the waiter and any newcomer find it, the waiter
+    /// takes over the one fetch, and nobody fetches the document twice at once.
+    #[tokio::test]
+    async fn cimd_cancelled_fetcher_hands_over_to_a_waiter() {
+        use super::{cimd_fixture, ClientCheck};
+        use serde_json::json;
+        let store = test_store();
+        const HANDOVER: &str = "https://cimd-handover.claude.ai/client.json";
+        let request = |store: super::AuthStore| async move {
+            store.validate_client(HANDOVER, "http://127.0.0.1:1/cb").await
+        };
+        // The fetcher's fetch hangs (an origin that has not answered)…
+        cimd_fixture::hang(HANDOVER);
+        let fetcher = tokio::spawn(request(store.clone()));
+        tokio::task::yield_now().await;
+        // …a waiter joins the flight and waits for that fetch…
+        let waiter = tokio::spawn(request(store.clone()));
+        tokio::task::yield_now().await;
+        assert_eq!(cimd_fixture::hits(HANDOVER), 1, "the waiter must not fetch for itself");
+        // …and the fetcher is dropped. The flight survives for its waiter, which
+        // takes over the fetch (the origin answers now); a newcomer arriving then
+        // finds the one flight, or the document it cached, and fetches nothing.
+        let doc = json!({ "client_id": HANDOVER, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve(HANDOVER, &doc.to_string());
+        fetcher.abort();
+        assert!(fetcher.await.unwrap_err().is_cancelled());
+        assert!(store.cimd.fetching.lock().unwrap().contains_key(HANDOVER), "flight must survive");
+        let newcomer = tokio::spawn(request(store.clone()));
+        assert_eq!(waiter.await.unwrap(), ClientCheck::Allowed);
+        assert_eq!(newcomer.await.unwrap(), ClientCheck::Allowed);
+        assert_eq!(
+            cimd_fixture::hits(HANDOVER),
+            2,
+            "one attempt each by fetcher and waiter, none more"
+        );
+        assert!(
+            store.cimd.fetching.lock().unwrap().is_empty(),
+            "the last one out retires the flight"
+        );
+        assert!(store.cimd.hosts.lock().unwrap().is_empty());
     }
 
     /// A request dropped mid-fetch — the client reset the stream, so the
