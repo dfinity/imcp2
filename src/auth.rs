@@ -958,12 +958,14 @@ fn cimd_client_id(client_id: &str) -> Option<url::Url> {
         return None;
     }
     // The WHATWG parser silently strips ASCII tab/newline/CR from anywhere in its
-    // input, trims leading and trailing C0 controls and spaces, and erases an
-    // EMPTY userinfo (`https://@host` parses as `https://host`), so all three are
-    // refused on the RAW string — as `resource_matches_issuer` does — or the
+    // input, trims leading and trailing C0 controls and spaces, reads a backslash
+    // as a slash (`https:\\host\path` parses as `https://host/path`, and one in
+    // the authority would end it before an `@` a raw scan expects there), and
+    // erases an EMPTY userinfo (`https://@host` parses as `https://host`). All of
+    // it is refused on the RAW string — as `resource_matches_issuer` does — or the
     // identifier taken as given would not be the URL that was parsed and fetched.
     let trimmed_by_parser = |c: char| c <= ' ';
-    if client_id.contains(['\t', '\n', '\r'])
+    if client_id.contains(['\t', '\n', '\r', '\\'])
         || client_id.starts_with(trimmed_by_parser)
         || client_id.ends_with(trimmed_by_parser)
         || raw_authority_has_userinfo(client_id)
@@ -3443,6 +3445,10 @@ mod tests {
         assert!(cimd_client_id("https://chat\tgpt.com/oauth/client.json").is_none());
         assert!(cimd_client_id("https://chatgpt.com/oauth/client.json\n").is_none());
         assert!(cimd_client_id("https:\r//chatgpt.com/oauth/client.json").is_none());
+        // …the backslashes it reads as slashes, wherever they are…
+        assert!(cimd_client_id("https:\\\\chatgpt.com\\oauth\\client.json").is_none());
+        assert!(cimd_client_id("https://chatgpt.com\\@evil.example/oauth/client.json").is_none());
+        assert!(cimd_client_id("https://chatgpt.com/oauth\\client.json").is_none());
         // …and the leading/trailing C0 controls and spaces it trims.
         assert!(cimd_client_id(" https://chatgpt.com/oauth/client.json").is_none());
         assert!(cimd_client_id("https://chatgpt.com/oauth/client.json ").is_none());
