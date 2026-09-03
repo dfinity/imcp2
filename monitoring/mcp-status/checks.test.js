@@ -420,7 +420,6 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
   try {
     const { section, facts } = await checkMcpEndpoints(origin, 2000);
     assert.equal(byId(section, "root").status, "pass");
-    assert.equal(byId(section, "version").status, "pass");
     assert.equal(byId(section, "protected-resource").status, "pass");
     assert.equal(byId(section, "as-metadata").status, "pass");
     assert.equal(byId(section, "metadata-consistency").status, "pass");
@@ -438,6 +437,12 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
     );
     assert.equal(facts.deployment.builtAt, 1_700_000_000);
     assert.equal(facts.deployment.startedAt, 1_700_000_500);
+    // ...but /version itself is not graded: it is an operator convenience, not
+    // part of the MCP contract, and production's edge no longer serves it.
+    assert.equal(
+      section.checks.find((c) => c.id === "version"),
+      undefined,
+    );
     // Every check carries a human-readable description.
     for (const c of section.checks) {
       assert.ok(
@@ -479,6 +484,60 @@ test("checkMcpEndpoints tolerates a landing page that redirects off-origin", asy
     // dashboard's overall verdict. (The section still warns here: the TLS check
     // cannot reach the unresolvable test hostname.)
     assert.notEqual(section.status, "fail");
+  } finally {
+    restore();
+  }
+});
+
+// /version is read for the deployment banner and the II discovery, but it is
+// not a health check: it is an operator convenience rather than part of the MCP
+// contract, and production's fronting edge answers it with a redirect to the
+// landing site instead of serving it. Grading it warned that column on every
+// run forever while the MCP surface was serving everything correctly — so a
+// deployment that does not expose /version must read exactly as healthy as one
+// that does.
+test("checkMcpEndpoints does not grade /version", async () => {
+  const origin = "https://mcp.beta.test";
+  const served = await (async () => {
+    const restore = stubFetch(healthyRoutes(origin));
+    try {
+      return await checkMcpEndpoints(origin, 2000);
+    } finally {
+      restore();
+    }
+  })();
+
+  const restore = stubFetch({
+    ...healthyRoutes(origin),
+    // Production's shape: the edge redirects /version to the landing site.
+    [`GET ${origin}/version`]: resp(308, {
+      headers: { location: "https://internetcomputer.org/icp-mcp/" },
+    }),
+  });
+  try {
+    const { section, facts } = await checkMcpEndpoints(origin, 2000);
+    // No check is emitted for it, whether it is served or not, so the section
+    // reads the same either way.
+    assert.equal(
+      section.checks.find((c) => c.id === "version"),
+      undefined,
+    );
+    assert.deepEqual(
+      section.checks.map((c) => c.id),
+      served.section.checks.map((c) => c.id),
+    );
+    assert.equal(section.status, served.section.status);
+    // The facts it would have carried are simply absent: the report's
+    // deployment banner is omitted, and with no advertised instances the II
+    // has to be pinned (--target-ii, as the deployed dashboard does).
+    assert.deepEqual(facts.deployment, {
+      version: undefined,
+      commit: undefined,
+      commitUrl: undefined,
+      builtAt: undefined,
+      startedAt: undefined,
+    });
+    assert.deepEqual(facts.advertised, { instances: [], rejected: [] });
   } finally {
     restore();
   }

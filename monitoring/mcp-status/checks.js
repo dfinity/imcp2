@@ -316,13 +316,22 @@ export const checkMcpEndpoints = async (
     });
   }
 
-  // 1b. Build/version: which commit is actually running. Surfaced prominently
-  //     in the report (with a GitHub link) so operators can confirm the live
-  //     deployment; older builds without /version are treated as informational.
-  //     A redirect here, as on every probe below, is reported with where it
-  //     points rather than followed — for the protocol documents the status
-  //     code IS the contract an MCP client depends on, and for the rest a
-  //     detour is worth knowing about, not hiding.
+  // 1b. Build/version: read, but not graded. `GET /version` is the server's own
+  //     account of which build is running and which II instances it serves, so
+  //     it still feeds the report's deployment banner and the II discovery in
+  //     checkLinkage below. It is deliberately not a check: the endpoint is an
+  //     operator convenience rather than part of the MCP contract, production's
+  //     fronting edge answers it with a redirect to the landing site instead of
+  //     serving it, and a build stamp nobody exposes says nothing about whether
+  //     the MCP surface is up — grading it warned that column on every run,
+  //     forever, while everything an MCP client depends on was served
+  //     correctly. When it is missing, the banner and the advertised II list
+  //     are simply absent (pin the II with --ii / II_ORIGIN to probe it).
+  //
+  //     On the probes below that DO check something, a redirect is reported
+  //     with where it points rather than followed — for the protocol documents
+  //     the status code IS the contract an MCP client depends on, and for the
+  //     rest a detour is worth knowing about, not hiding.
   {
     const url = `${mcpOrigin}/version`;
     const r = await probe(url, { timeoutMs });
@@ -346,24 +355,6 @@ export const checkMcpEndpoints = async (
     // guessed from the hostname: see parseAdvertisedInstances in config.js for
     // why the hostname cannot answer this.
     facts.advertised = parseAdvertisedInstances(json);
-    const exposed = r.ok && r.status === 200 && !!commit;
-    const known = exposed && commit !== "unknown";
-    checks.push({
-      id: "version",
-      label: "Deployment version",
-      description:
-        "Reports the running build's version and commit via GET /version, so you can confirm exactly which deployment is live and trace it back to source.",
-      target: `GET ${url}`,
-      expected: "200 JSON with version + commit",
-      status: known ? "pass" : "warn",
-      httpStatus: r.status,
-      latencyMs: r.latencyMs,
-      detail: r.error
-        ? `request failed: ${r.error.message}`
-        : exposed
-          ? `version ${version ?? "?"}, commit ${commit}`
-          : `${r.status}${redirectNote(r)}, no version info exposed`,
-    });
   }
 
   // 2. OAuth Protected Resource Metadata (RFC 9728).

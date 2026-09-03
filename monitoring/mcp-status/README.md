@@ -9,13 +9,13 @@ paired with.
 It answers three questions and adds a few suggestions:
 
 1. **Is the server running and responding on all advertised endpoints with the
-   correct status codes?** — probes the landing page, the build/version endpoint
-   (`/version`), the two OAuth discovery documents, the `/mcp` endpoint's
-   unauthenticated `401` challenge, dynamic client registration, and the
-   `/mcp/oauth/authorize` + `/mcp/oauth/token` endpoints, plus TLS certificate
-   freshness. The landing-page check asks whether the root **answers for** the
-   landing page, which no longer means holding a copy of it: the human-facing
-   pages live in
+   correct status codes?** — probes the landing page, the two OAuth discovery
+   documents, the `/mcp` endpoint's unauthenticated `401` challenge, dynamic
+   client registration, and the `/mcp/oauth/authorize` + `/mcp/oauth/token`
+   endpoints, plus TLS certificate freshness. `GET /version` is read too, but
+   **not graded** (see below). The landing-page check asks whether the root
+   **answers for** the landing page, which no longer means holding a copy of
+   it: the human-facing pages live in
    [dfinity/internetcomputer-org](https://github.com/dfinity/internetcomputer-org)
    (`public/icp-mcp/`), are served at <https://internetcomputer.org/icp-mcp/>,
    and this origin answers their old paths with permanent redirects so published
@@ -68,6 +68,15 @@ Every check carries a plain-language description, and the report shows which
 `GET /version`, linked to the commit on GitHub), **when it was last redeployed**
 (the server process's start time), and its build time. The web dashboard groups
 the sections into **tabs** for easier navigation.
+
+`GET /version` is the one endpoint the dashboard reads without checking: it
+feeds that banner and the II discovery in question 2, and when it is missing
+both simply go unreported. It is an operator convenience, not part of the MCP
+contract, and production's fronting edge answers it with a redirect to the
+landing site rather than serving it — so grading it warned that column on every
+run, forever, while the MCP surface served everything correctly. A build stamp
+nobody exposes says nothing about whether the server is up; the checks that do
+answer that are the ones above.
 
 ## Usage
 
@@ -211,10 +220,10 @@ dashboard):
 "Service-availability checks" are the endpoint probes that report `fail` on a
 failed request (landing page, discovery documents, the `/mcp` challenge, and
 the OAuth endpoints). Auxiliary checks are excluded from the major-outage
-test on purpose: `version` and `metadata-consistency` only degrade to `warn`
-when the server is unreachable, and the TLS check can stay green while the
-application behind the proxy is down — counting them would make a total
-outage report as merely partial.
+test on purpose: `metadata-consistency` only degrades to `warn` when the server
+is unreachable, and the TLS check can stay green while the application behind
+the proxy is down — counting them would make a total outage report as merely
+partial.
 
 The pusher re-evaluates every `STATUSPAGE_PUSH_INTERVAL_MS` (default 60 s,
 floor 15 s) and PATCHes the component **only when the mapped status changes**
@@ -262,11 +271,12 @@ actually matters.
 ## Current findings (snapshot)
 
 **Production** (`https://mcp.internetcomputer.org`): the MCP surface is healthy
-— `/mcp` answers its `401` challenge and both discovery documents are served —
-but the fronting edge answers `/version` (and `/status/`) with a redirect to
-the landing site, so the version check warns and the linked II cannot be read
-from the server; the deployed dashboard pins it to `https://id.ai`. That edge
-rule is the one thing standing between production and an all-green column.
+— `/mcp` answers its `401` challenge and both discovery documents are served.
+The fronting edge answers `/version` (and `/status/`) with a redirect to the
+landing site rather than serving it, so the deployment banner is blank and the
+linked II cannot be read from the server; the deployed dashboard pins it to
+`https://id.ai`. Neither is graded any more — that redirect used to warn the
+column on every run while nothing was actually wrong with the MCP surface.
 
 **Staging** (`https://mcp.beta.id.ai`): the server passes all endpoint checks — its
 root answers `308 → https://internetcomputer.org/icp-mcp/`, where the landing
