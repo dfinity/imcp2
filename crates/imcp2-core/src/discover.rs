@@ -1350,6 +1350,9 @@ fn ipv4_is_global(ip: &Ipv4Addr) -> bool {
         || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT (shared)
         || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IETF protocol
         || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18.0.0/15 benchmarking
+        // 192.88.99.0/24, the deprecated 6to4 relay anycast block (RFC 7526), is not
+        // globally reachable — bar 192.88.99.2, the 6a44 relay anycast (RFC 6751).
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99 && o[3] != 2)
         || o[0] >= 240) // 240.0.0.0/4 reserved
 }
 
@@ -2866,6 +2869,7 @@ mod tests {
         // Publicly-routable addresses.
         assert!(g("8.8.8.8"));
         assert!(g("1.1.1.1"));
+        assert!(g("192.88.99.2"), "the 6a44 relay anycast is the reachable exception in its /24");
         assert!(g("2606:4700:4700::1111"));
         // Loopback / private / link-local / CGNAT / reserved / doc / bench, plus
         // IPv4 embedded in IPv6 as MAPPED (::ffff:…) and COMPATIBLE (::…) forms.
@@ -2880,6 +2884,7 @@ mod tests {
             "255.255.255.255",
             "192.0.2.1",
             "198.18.0.1",
+            "192.88.99.1", // 6to4 relay anycast, deprecated
             "240.0.0.1",
             "::1",
             "::",

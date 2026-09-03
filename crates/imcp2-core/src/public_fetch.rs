@@ -42,7 +42,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use reqwest::header::{HeaderMap, AGE, CACHE_CONTROL, CONTENT_TYPE, DATE, EXPIRES};
+use reqwest::header::{HeaderMap, AGE, CACHE_CONTROL, CONTENT_TYPE, DATE, EXPIRES, VARY};
 
 use crate::discover::{read_capped_bytes, resolve_public_url, ResolveError};
 
@@ -197,9 +197,20 @@ async fn accept(
 /// From it the response's CURRENT AGE is subtracted — the larger of its `Age`
 /// and its apparent age, `now` less its `Date`, so an answer some cache held for
 /// an hour without saying so in `Age` is not given a new lifetime here. A `Date`
-/// in the future (clock skew) is an apparent age of zero. `None` when neither a
-/// freshness directive nor `Expires` was sent.
+/// in the future (clock skew) is an apparent age of zero. A response that varies
+/// on everything (`Vary: *`) has no freshness at all for a shared cache, whatever
+/// else it says (§4.1: it can never match a later request). `None` when neither
+/// a freshness directive nor `Expires` was sent.
 fn freshness(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    let varies_on_everything = headers
+        .get_all(VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|field| field.trim() == "*");
+    if varies_on_everything {
+        return Some(Duration::ZERO);
+    }
     let header = |name| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
     let date = header(DATE).and_then(|v| httpdate::parse_http_date(v).ok());
     let cache_control: Vec<&str> =
@@ -347,6 +358,7 @@ mod tests {
             "https://127.0.0.1/client.json",
             "https://10.0.0.1/client.json",
             "https://192.168.1.1/client.json",
+            "https://192.88.99.1/client.json",
             "https://169.254.169.254/latest/meta-data/",
             "https://[::1]/client.json",
             "https://[::ffff:127.0.0.1]/client.json",
@@ -504,6 +516,14 @@ mod tests {
         assert_eq!(freshness(&headers(&both), now), Some(Duration::from_secs(60)));
         let forbidden = [("cache-control", "no-store"), ("expires", &ahead(86400))];
         assert_eq!(freshness(&headers(&forbidden), now), Some(Duration::ZERO));
+        // `Vary: *` can never match a later request: no freshness for a shared
+        // cache, whatever the lifetime says — on its own or among other fields.
+        let varies = [("cache-control", "max-age=86400"), ("vary", "*")];
+        assert_eq!(freshness(&headers(&varies), now), Some(Duration::ZERO));
+        let among = [("cache-control", "max-age=60"), ("vary", "Accept-Encoding, *")];
+        assert_eq!(freshness(&headers(&among), now), Some(Duration::ZERO));
+        let ordinary = [("cache-control", "max-age=60"), ("vary", "accept-encoding")];
+        assert_eq!(freshness(&headers(&ordinary), now), Some(Duration::from_secs(60)));
     }
 
     #[test]
