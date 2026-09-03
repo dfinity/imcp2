@@ -1362,6 +1362,14 @@ fn ipv6_is_global(ip: &Ipv6Addr) -> bool {
         return ipv4_is_global(&v4);
     }
     let seg = ip.segments();
+    // 2001::/23 is IETF protocol assignments (RFC 2928): NOT globally reachable
+    // by default — Teredo (2001::/32), benchmarking (2001:2::/48), ORCHID and
+    // ORCHIDv2 (2001:10::/28, 2001:20::/28), and everything unassigned — with
+    // the IANA registry's globally reachable exceptions admitted by name, so a
+    // new assignment is refused until audited rather than accepted until noticed.
+    if seg[0] == 0x2001 && (seg[1] & 0xfe00) == 0 {
+        return ietf_protocol_assignment_is_global(&seg);
+    }
     !(ip.is_unspecified()                    // ::
         || ip.is_loopback()                  // ::1
         || ip.is_multicast()                 // ff00::/8
@@ -1369,19 +1377,28 @@ fn ipv6_is_global(ip: &Ipv6Addr) -> bool {
         || (seg[0] & 0xffc0) == 0xfe80       // fe80::/10 link-local unicast
         || (seg[0] & 0xffc0) == 0xfec0       // fec0::/10 site-local (deprecated, RFC 3879)
         || (seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0) // 100::/64 discard-only (RFC 6666)
-        || (seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0) // 2001:2::/48 benchmarking (RFC 5180)
-        || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0010)     // 2001:10::/28 ORCHID (deprecated, RFC 4843)
-        || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0020)     // 2001:20::/28 ORCHIDv2, not routable (RFC 7343)
         || (seg[0] == 0x3fff && (seg[1] & 0xf000) == 0)          // 3fff::/20 documentation (RFC 9637)
         || seg[0] == 0x5f00                                      // 5f00::/16 SRv6 SIDs, not globally reachable (RFC 9602)
         || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
         // Transition mechanisms embed an IPv4 address deeper in the v6 space than
-        // `to_ipv4` decodes, so a NAT64/6to4/Teredo host would otherwise translate
-        // one of these to loopback/link-local/RFC1918/metadata (ICPBB-377). imcp2
-        // never needs to reach them, so refuse the prefixes outright.
+        // `to_ipv4` decodes, so a NAT64/6to4 host would otherwise translate one
+        // of these to loopback/link-local/RFC1918/metadata (ICPBB-377); Teredo is
+        // refused with the rest of 2001::/23 above. imcp2 never needs to reach
+        // them, so refuse the prefixes outright.
         || (seg[0] == 0x0064 && seg[1] == 0xff9b)  // 64:ff9b::/32 NAT64 (RFC 6052 WKP + RFC 8215 local-use)
-        || seg[0] == 0x2002                        // 2002::/16 6to4
-        || (seg[0] == 0x2001 && seg[1] == 0x0000)) // 2001::/32 Teredo
+        || seg[0] == 0x2002) // 2002::/16 6to4
+}
+
+/// The globally reachable exceptions inside `2001::/23` (IETF protocol
+/// assignments), per the IANA IPv6 Special-Purpose Address Registry. Everything
+/// else in the block — assigned to a non-routable use or not assigned at all —
+/// is refused.
+fn ietf_protocol_assignment_is_global(seg: &[u16; 8]) -> bool {
+    let anycast = seg[1] == 0x0001 && seg[2..7] == [0; 5] && matches!(seg[7], 1 | 2);
+    anycast                                       // 2001:1::1 PCP (RFC 7723), 2001:1::2 TURN (RFC 8155)
+        || seg[1] == 0x0003                       // 2001:3::/32 AMT (RFC 7450)
+        || (seg[1] == 0x0004 && seg[2] == 0x0112) // 2001:4:112::/48 AS112-v6 (RFC 7535)
+        || (seg[1] & 0xfff0) == 0x0030 // 2001:30::/28 Drone Remote ID (RFC 9374)
 }
 
 /// Why [`resolve_public_url`] returned no addresses: the URL itself is refused —
@@ -2869,13 +2886,16 @@ mod tests {
             "fc00::1",
             "fd12::1",
             "fe80::1",
-            "fec0::1",    // site-local: deprecated, still routable on legacy networks
-            "100::1",     // discard-only
-            "2001:2::1",  // benchmarking
-            "2001:10::1", // ORCHID (deprecated)
-            "2001:20::1", // ORCHIDv2 (not routable)
-            "3fff::1",    // documentation (RFC 9637)
-            "5f00::1",    // SRv6 SIDs (RFC 9602)
+            "fec0::1",     // site-local: deprecated, still routable on legacy networks
+            "100::1",      // discard-only
+            "2001:2::1",   // benchmarking
+            "2001:10::1",  // ORCHID (deprecated)
+            "2001:20::1",  // ORCHIDv2 (not routable)
+            "2001:1::3",   // unassigned inside 2001::/23 (IETF protocol assignments)
+            "2001:5::1",   // likewise
+            "2001:1ff::1", // the block's last /32, likewise
+            "3fff::1",     // documentation (RFC 9637)
+            "5f00::1",     // SRv6 SIDs (RFC 9602)
             "2001:db8::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1", // IPv4-mapped private/loopback
@@ -2895,6 +2915,11 @@ mod tests {
         }
         // A real public v6 that merely starts with 0x2001 (not db8/Teredo) stays global.
         assert!(g("2001:4860:4860::8888"));
+        assert!(g("2001:200::1"), "just past 2001::/23");
+        // The globally reachable exceptions inside 2001::/23 stay global.
+        for good in ["2001:1::1", "2001:1::2", "2001:3::1", "2001:4:112::1", "2001:30::1"] {
+            assert!(g(good), "{good} is globally reachable per the IANA registry");
+        }
     }
 
     // The exact vectors from the finding, plus https-to-internal, are refused

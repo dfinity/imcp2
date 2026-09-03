@@ -1715,14 +1715,15 @@ impl AuthStore {
             Some(cached) => cached,
             None => self.fetch_and_cache_client_metadata(client_id).await,
         };
-        *slot = Some(outcome.clone());
-        // Published — so retire the flight NOW, not when its last holder leaves:
-        // a request arriving from here on goes to the cache, or, for an outcome
-        // the cache does not hold (a `no-store` document, a transient failure),
-        // fetches afresh — never joins this flight to reuse an outcome the origin
-        // said not to reuse, or a failure that may be over. The waiters read it
-        // from the handle they already hold.
+        // Retire the flight BEFORE publishing, still under its lock, so no request
+        // can join it once the outcome is there: a request arriving from here on
+        // goes to the cache, or, for an outcome the cache does not hold (a
+        // `no-store` document, a transient failure), fetches afresh — never joins
+        // this flight to reuse an outcome the origin said not to reuse, or a
+        // failure that may be over. Everyone who joined before this reads the
+        // outcome from the handle they already hold.
         self.cimd.retire_flight(key, &flight);
+        *slot = Some(outcome.clone());
         outcome
     }
 

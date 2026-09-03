@@ -220,10 +220,11 @@ fn freshness(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
 /// caller's process-wide cache is: `s-maxage` if present, else `max-age`; zero
 /// when the origin forbids shared reuse (`no-store`, `no-cache`, `private`);
 /// `None` when it says none of these. Directives are recognised by NAME, so
-/// `no-cache="set-cookie"` still counts, and one given more than once is
-/// honoured at its MOST RESTRICTIVE value (RFC 9111 §4.2.1: conflicting
-/// freshness information must not extend freshness), so `max-age=300,
-/// max-age=0` is zero, not five minutes.
+/// `no-cache="set-cookie"` still counts. One given more than once is honoured at
+/// its MOST RESTRICTIVE value, and one given without a valid number is ZERO —
+/// stale, never a default lifetime (RFC 9111 §4.2.1: invalid or conflicting
+/// freshness information must not extend freshness) — so `max-age=300,
+/// max-age=0` is zero, not five minutes, and so is `max-age=soon`.
 fn cache_max_age(cache_control: &str) -> Option<Duration> {
     // Each directive as (name, argument): `max-age=300` → ("max-age", Some("300")).
     let directives: Vec<(&str, Option<&str>)> = cache_control
@@ -237,14 +238,18 @@ fn cache_max_age(cache_control: &str) -> Option<Duration> {
     if has("no-store") || has("no-cache") || has("private") {
         return Some(Duration::ZERO);
     }
-    let seconds = |wanted: &str| {
+    // A directive's lifetime: `None` when absent; else the most restrictive of
+    // its values, an unparseable one counting as zero.
+    let lifetime = |wanted: &str| {
         directives
             .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case(wanted))
-            .filter_map(|(_, arg)| arg.and_then(|a| a.parse::<u64>().ok()))
+            .map(|(_, arg)| {
+                arg.and_then(|a| a.parse::<u64>().ok()).map_or(Duration::ZERO, Duration::from_secs)
+            })
             .min()
     };
-    seconds("s-maxage").or_else(|| seconds("max-age")).map(Duration::from_secs)
+    lifetime("s-maxage").or_else(|| lifetime("max-age"))
 }
 
 #[cfg(test)]
@@ -288,6 +293,7 @@ mod tests {
             "https://[100::1]/client.json",
             "https://[3fff::1]/client.json",
             "https://[5f00::1]/client.json",
+            "https://[2001:1::3]/client.json",
         ] {
             let Err(FetchError::Refused(why)) = fetch(internal).await else {
                 panic!("{internal} must be refused by the guard");
@@ -427,7 +433,11 @@ mod tests {
         assert_eq!(cache_max_age("no-store"), Some(Duration::ZERO));
         assert_eq!(cache_max_age("max-age=300, no-cache"), Some(Duration::ZERO));
         assert_eq!(cache_max_age("public"), None);
-        assert_eq!(cache_max_age("max-age=soon"), None);
+        // Given but not a number: stale, never the default lifetime.
+        assert_eq!(cache_max_age("max-age=soon"), Some(Duration::ZERO));
+        assert_eq!(cache_max_age("max-age"), Some(Duration::ZERO));
+        assert_eq!(cache_max_age("max-age=300, max-age=soon"), Some(Duration::ZERO));
+        assert_eq!(cache_max_age("s-maxage=soon, max-age=300"), Some(Duration::ZERO));
         // A duplicated max-age is honoured at its most restrictive value, never
         // the one that happens to come first.
         assert_eq!(cache_max_age("max-age=300, max-age=0"), Some(Duration::ZERO));
