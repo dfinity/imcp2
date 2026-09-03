@@ -64,7 +64,9 @@ use std::{
 use base64::Engine;
 use candid::{CandidType, Decode, Encode, Principal};
 use ic_agent::{
-    identity::{BasicIdentity, DelegatedIdentity, Delegation, DelegationPermissions, SignedDelegation},
+    identity::{
+        BasicIdentity, DelegatedIdentity, Delegation, DelegationPermissions, SignedDelegation,
+    },
     Agent, Identity,
 };
 // rmcp re-exports schemars 1.x; the `#[tool]` output-schema machinery requires
@@ -112,7 +114,8 @@ const MAX_APP_DELEGATIONS: usize = 64;
 
 /// Shown when a connect can't be started because the session map is at
 /// [`MAX_SESSIONS`]. Actionable: the caller should retry, not re-register.
-const AT_CAPACITY_MSG: &str = "This server is at capacity for Internet Identity sessions right now. \
+const AT_CAPACITY_MSG: &str =
+    "This server is at capacity for Internet Identity sessions right now. \
      Wait a few minutes and start the sign-in again.";
 
 /// Internet Identity instance, single source of truth. Default: **`beta.id.ai`**.
@@ -193,10 +196,7 @@ impl IiInstance {
 
 /// An origin from the environment (no trailing slash), with a default.
 fn env_origin(var: &str, default: &str) -> String {
-    std::env::var(var)
-        .unwrap_or_else(|_| default.to_string())
-        .trim_end_matches('/')
-        .to_string()
+    std::env::var(var).unwrap_or_else(|_| default.to_string()).trim_end_matches('/').to_string()
 }
 
 /// A principal from the environment, with a default.
@@ -251,10 +251,7 @@ pub struct SessionGauges {
 /// derivation — a dapp declaring a custom derivation origin via
 /// `/.well-known/ii-alternative-origins` is NOT handled here (a known limitation).
 pub(crate) fn target_origin(domain: &str) -> String {
-    let host = domain
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
+    let host = domain.trim().trim_start_matches("https://").trim_start_matches("http://");
     let host = host.split(['/', '?', '#']).next().unwrap_or(host);
     let host = host.strip_suffix(":443").unwrap_or(host);
     for gateway in [".icp0.io", ".icp.net"] {
@@ -346,27 +343,18 @@ pub struct AccountInfo {
     pub account_number: Option<u64>,
     /// User-given account name — `None` for the default account.
     pub name: Option<String>,
-    /// When the account was last used (ns since the Unix epoch), if known.
-    pub last_used: Option<u64>,
 }
 
-/// Arguments for `get_app_principal`. Identify the app by its canonical derivation
-/// origin (`derivation_origin`), obtained from `open_app` / `resolve_app`.
+/// Arguments for `get_app_principal`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetPrincipalArgs {
-    /// The exact canonical origin Internet Identity uses to derive this app's
-    /// principal — NOT necessarily the website's visible URL. For an app that
-    /// pins a custom derivation origin (via `derivationOrigin` +
-    /// `/.well-known/ii-alternative-origins`), pass that canonical origin here
-    /// (e.g. "https://<frontend-canister>.icp0.io"). Do NOT infer it from an
-    /// alternativeOrigins list, and do NOT pass a raw website URL — get the
-    /// derivation origin from open_app / resolve_app (which resolve an app name or
-    /// URL to it under the guessed-domain gate) and reuse it. Accepts the legacy
-    /// name `domain`. Required — this tool always acts as an app account.
+    /// The app's derivation origin, from open_app. This is the origin Internet
+    /// Identity derives the principal from, which is not always the app's website URL, and
+    /// never an alternative-origins entry.
     #[serde(alias = "domain")]
     pub derivation_origin: String,
-    /// Which of your accounts to resolve, by account name (see list_app_accounts).
-    /// Omit to use that app's default account.
+    /// Which of the user's accounts to resolve, by name (see list_app_accounts). Omit for the
+    /// app's default account.
     #[serde(default)]
     pub account: Option<String>,
 }
@@ -375,58 +363,46 @@ pub struct GetPrincipalArgs {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct PrincipalOutput {
     /// The effective Internet Identity derivation origin the principal was
-    /// derived for (after canonicalization). Compare against `requested` to spot
-    /// an origin mismatch.
+    /// derived for. Compare against `requested` to spot an origin mismatch.
     pub derived_for_origin: String,
-    /// Exactly what you supplied as `derivation_origin`, echoed so a mismatch with
-    /// `derived_for_origin` (from canonicalization) is immediately visible.
+    /// Exactly what you supplied as `derivation_origin`.
     pub requested: String,
-    /// How `derived_for_origin` was determined — always "explicit" here, since this
-    /// tool takes the canonical derivation origin directly. (The "declared" /
-    /// "known" / "app_url_default" sources are reported by the resolver tools
-    /// open_app / resolve_app, which turn a URL into a derivation origin.)
+    /// How `derived_for_origin` was determined.
     pub derivation_origin_source: String,
     /// The account name resolved, or null for the app's default account.
     pub account: Option<String>,
     /// The principal you act as at that app.
     pub principal: String,
-    /// True if this Internet Identity session is query-only (canister management
-    /// is unavailable until reconnected under "Actions & questions").
+    /// True if this session is query-only, so state-changing calls are rejected by the
+    /// network. False also covers a session whose access level is not known.
     pub read_only: bool,
 }
 
-/// Arguments for `list_app_accounts`. Identify the app by its canonical derivation
-/// origin (`derivation_origin`), obtained from `open_app` / `resolve_app`.
+/// Arguments for `list_app_accounts`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListAccountsArgs {
-    /// The exact canonical Internet Identity derivation origin (NOT necessarily the
-    /// visible URL). Do NOT pass a raw website URL — get the derivation origin from
-    /// open_app / resolve_app (which resolve an app name or URL to it under the
-    /// guessed-domain gate) and reuse it. Accepts the legacy name `domain`. Required
-    /// to identify the app.
+    /// The app's derivation origin, from open_app. This is the origin Internet
+    /// Identity derives the principal from, which is not always the app's website URL, and
+    /// never an alternative-origins entry.
     #[serde(alias = "domain")]
     pub derivation_origin: String,
 }
 
-/// One account in the `list_app_accounts` MCP output (a serialization mirror of
-/// [`AccountInfo`]).
+/// One account in the `list_app_accounts` MCP output. Deliberately carries no
+/// last-used timestamp and no principal: the name (and number) is all a caller
+/// needs to select an account, and the routine listing should not disclose
+/// more than that (get_app_principal returns the principal on request).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct AccountEntry {
     /// The user-given account name, or null for the default account.
     pub name: Option<String>,
     /// The II account number, or null for the default account.
     pub account_number: Option<u64>,
-    /// When the account was last used (ns since the Unix epoch), if known.
-    pub last_used: Option<u64>,
 }
 
 impl From<&AccountInfo> for AccountEntry {
     fn from(a: &AccountInfo) -> Self {
-        Self {
-            name: a.name.clone(),
-            account_number: a.account_number,
-            last_used: a.last_used,
-        }
+        Self { name: a.name.clone(), account_number: a.account_number }
     }
 }
 
@@ -435,60 +411,12 @@ impl From<&AccountInfo> for AccountEntry {
 pub struct AccountsOutput {
     /// The effective Internet Identity derivation origin the accounts belong to.
     pub derived_for_origin: String,
-    /// Exactly what you supplied as `derivation_origin`, echoed so a mismatch with
-    /// `derived_for_origin` (from canonicalization) is immediately visible.
+    /// Exactly what you supplied as `derivation_origin`.
     pub requested: String,
-    /// How `derived_for_origin` was determined — always "explicit" here, since this
-    /// tool takes the canonical derivation origin directly. (The "declared" /
-    /// "known" / "app_url_default" sources are reported by open_app / resolve_app.)
+    /// How `derived_for_origin` was determined.
     pub derivation_origin_source: String,
     /// The user's accounts at that origin (empty if none).
     pub accounts: Vec<AccountEntry>,
-}
-
-/// Arguments for `resolve_app`.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ResolveAppArgs {
-    /// The application's URL, e.g. "https://oisy.com". Must be a URL you actually
-    /// have — given by the user, shown by `open_app` for a well-known app name, or
-    /// found by a web search of the app's official site. NEVER a domain guessed
-    /// from an app's name (guessed lookalike domains are unrelated or squatted
-    /// sites and are refused).
-    pub app_url: String,
-}
-
-/// Structured output of `resolve_app`.
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct ResolveAppOutput {
-    /// The normalized application origin of `app_url`.
-    pub application_origin: String,
-    /// The Internet Identity derivation origin to use for this app — pass this
-    /// as `derivation_origin` to the identity tools.
-    pub derivation_origin: String,
-    /// How `derivation_origin` was determined: "declared" (the app declared it
-    /// in /.well-known/ic-app.json — authoritative), "known" (from the connector's
-    /// built-in registry of well-known custom-derivation-origin apps, used only
-    /// when the app declares none), or "app_url_default" (assumed to equal the
-    /// application origin — correct only if the app has no custom derivation
-    /// origin, which this connector cannot verify).
-    pub derivation_origin_source: String,
-    /// Origins the application origin's `/.well-known/ii-alternative-origins`
-    /// permits to derive from it. Informational only — this is the INVERSE of
-    /// "which derivation origin the app uses", so do not infer the derivation
-    /// origin from it.
-    pub alternative_origins: Vec<String>,
-    /// Whether the application origin showed evidence of being served from the
-    /// Internet Computer (the gateway's `x-ic-canister-id` header). Only probed
-    /// when `derivation_origin_source` is "app_url_default" (and then always
-    /// true here — an origin with NO IC evidence is refused instead of resolved);
-    /// null when the probe wasn't needed (declared/known origins).
-    pub application_is_ic: Option<bool>,
-    /// A human note, e.g. flagging that the derivation origin was assumed.
-    /// This tool deliberately does NOT return a principal: it resolves the
-    /// derivation origin only, since the caller hasn't chosen an account. Get the
-    /// principal with `get_app_principal` (or `list_app_accounts`) for a specific
-    /// account, passing this `derivation_origin`.
-    pub note: Option<String>,
 }
 
 #[derive(Clone)]
@@ -509,12 +437,7 @@ pub struct Identities {
 
 impl Identities {
     pub fn new(instance: IiInstance, public_url: String, agent: Agent) -> Self {
-        Self {
-            instance,
-            public_url,
-            agent,
-            sessions: Arc::default(),
-        }
+        Self { instance, public_url, agent, sessions: Arc::default() }
     }
 
     /// The injected base agent with `identity` swapped in: a clone shares the
@@ -882,7 +805,8 @@ impl Identities {
         // mcp_get_accounts(target_origin) -> variant { Ok: vec AccountInfo; Err }
         // A signed query: II recovers the anchor from the caller (the session key)
         // and returns that anchor's accounts at `target_origin`.
-        let arg = Encode!(&origin).map_err(|e| format!("could not encode mcp_get_accounts args: {e}"))?;
+        let arg =
+            Encode!(&origin).map_err(|e| format!("could not encode mcp_get_accounts args: {e}"))?;
         let reply = agent
             .query(&canister, "mcp_get_accounts")
             .with_arg(arg)
@@ -895,11 +819,7 @@ impl Identities {
 
         Ok(accounts
             .into_iter()
-            .map(|a| AccountInfo {
-                account_number: a.account_number,
-                name: a.name,
-                last_used: a.last_used,
-            })
+            .map(|a| AccountInfo { account_number: a.account_number, name: a.name })
             .collect())
     }
 
@@ -945,9 +865,8 @@ impl Identities {
         let (reg_seed, reg_der, session_der) = {
             let sessions = self.sessions.read().await;
             let s = sessions.get(session_id).ok_or("no such session")?;
-            let reg_seed = s
-                .reg_key_seed
-                .ok_or("no registration key was minted for this connect")?;
+            let reg_seed =
+                s.reg_key_seed.ok_or("no registration key was minted for this connect")?;
             let reg_der = s
                 .reg_pubkey_der
                 .clone()
@@ -963,8 +882,13 @@ impl Identities {
         // hard-coded mainnet key — so a host pointed at a non-mainnet IC verifies
         // and signs against the same trust anchor. In production the agent is
         // mainnet, so this is the mainnet root.
-        let identity =
-            registration_identity(reg_user_key, reg_seed, &reg_der, chain, &self.agent.read_root_key())?;
+        let identity = registration_identity(
+            reg_user_key,
+            reg_seed,
+            &reg_der,
+            chain,
+            &self.agent.read_root_key(),
+        )?;
         let agent = self.agent_as(identity);
 
         // mcp_register_v2(session_key) -> variant { Ok : McpRegisterV2Ok; Err : text }
@@ -990,10 +914,7 @@ impl Identities {
         let permissions = outcome.permissions.as_text();
         self.set_grant_expiration(session_id, outcome.expiration).await;
         self.set_permissions(session_id, permissions).await;
-        Ok(RegistrationOutcome {
-            expiration_ns: outcome.expiration,
-            permissions,
-        })
+        Ok(RegistrationOutcome { expiration_ns: outcome.expiration, permissions })
     }
 
     /// Resolve an optional account `name` at `domain` to its account number
@@ -1067,10 +988,8 @@ impl Identities {
         account_number: Option<u64>,
     ) -> Option<AppDelegation> {
         let sessions = self.sessions.read().await;
-        let app = sessions
-            .get(session_id)?
-            .app_delegations
-            .get(&(domain.to_string(), account_number))?;
+        let app =
+            sessions.get(session_id)?.app_delegations.get(&(domain.to_string(), account_number))?;
         if !app.fresh() {
             return None;
         }
@@ -1082,7 +1001,13 @@ impl Identities {
         })
     }
 
-    async fn store(&self, session_id: &str, domain: &str, account_number: Option<u64>, app: AppDelegation) {
+    async fn store(
+        &self,
+        session_id: &str,
+        domain: &str,
+        account_number: Option<u64>,
+        app: AppDelegation,
+    ) {
         let mut sessions = self.sessions.write().await;
         if let Some(s) = sessions.get_mut(session_id) {
             let key = (domain.to_string(), account_number);
@@ -1144,8 +1069,9 @@ impl Identities {
         //   -> variant { Ok: SignedDelegation; Err: AccountDelegationError } query
         // Thread the account + expiration `prepare` returned VERBATIM, or II
         // returns NoSuchDelegation (the default account is mutable between calls).
-        let get_arg = Encode!(&origin, &prepared.account_number, &app_key_der, &prepared.expiration)
-            .map_err(|e| format!("could not encode get args: {e}"))?;
+        let get_arg =
+            Encode!(&origin, &prepared.account_number, &app_key_der, &prepared.expiration)
+                .map_err(|e| format!("could not encode get args: {e}"))?;
         let got = agent
             .query(&canister, "mcp_get_delegation")
             .with_arg(get_arg)
@@ -1163,6 +1089,63 @@ impl Identities {
             expiration_ns: prepared.expiration,
             app_key_seed,
         })
+    }
+
+    /// Test-only (the `e2e` cargo feature, which no release build enables):
+    /// establish a session holding a per-app delegation for `domain`, so an
+    /// end-to-end test can act as an app identity without an Internet Identity
+    /// canister to mint one.
+    ///
+    /// The delegation is GENUINE, not a stub: an Ed25519 anchor key signs a real
+    /// [`Delegation`] to a fresh per-app key, and the pair is stored in the same
+    /// cache a live `mcp_prepare_delegation` fills, so every layer above —
+    /// [`Self::delegated_identity_for`], [`build_identity`], the agent's request
+    /// signing, and the replica's own chain verification at ingress — runs
+    /// exactly as it does in production. The one thing it is not is
+    /// II-certified: the chain roots in a plain self-authenticating principal
+    /// rather than a canister signature, which the replica accepts on the same
+    /// terms.
+    ///
+    /// Returns the principal the session now signs as at `domain`.
+    #[cfg(all(test, feature = "e2e"))]
+    pub(crate) async fn seed_app_identity(
+        &self,
+        session_id: &str,
+        domain: &str,
+    ) -> Result<Principal, String> {
+        let (anchor_seed, anchor_der) = fresh_ed25519();
+        let (app_seed, app_der) = fresh_ed25519();
+        // Well past the re-derive margin, so the cached entry is `fresh()` for
+        // the whole test and nothing tries to re-derive it against an II that
+        // isn't there.
+        let expiration = now_ns() + 3_600_000_000_000;
+        let delegation = Delegation {
+            pubkey: app_der,
+            expiration,
+            targets: None,
+            // Unrestricted: `queries` is the read-only scope, and these tests
+            // exercise update calls too.
+            permissions: None,
+        };
+        let signature = BasicIdentity::from_raw_key(&anchor_seed)
+            .sign_delegation(&delegation)
+            .map_err(|e| format!("could not sign the test delegation: {e}"))?
+            .signature
+            .ok_or("the test delegation carried no signature")?;
+        let app = AppDelegation {
+            user_key: anchor_der,
+            chain: vec![SignedDelegation { delegation, signature }],
+            expiration_ns: expiration,
+            app_key_seed: app_seed,
+        };
+        let principal = build_identity(&app)?
+            .sender()
+            .map_err(|e| format!("the test delegation has no sender: {e}"))?;
+        self.ensure_session(session_id).await?;
+        self.set_grant_expiration(session_id, expiration).await;
+        // Keyed the way every reader keys it: the canonical origin.
+        self.store(session_id, &target_origin(domain), None, app).await;
+        Ok(principal)
     }
 }
 
@@ -1237,10 +1220,8 @@ fn bound_app_delegations(cache: &mut HashMap<(String, Option<u64>), AppDelegatio
     }
     cache.retain(|_, a| a.fresh());
     while cache.len() >= MAX_APP_DELEGATIONS {
-        let Some(victim) = cache
-            .iter()
-            .min_by_key(|(_, a)| a.expiration_ns)
-            .map(|(k, _)| k.clone())
+        let Some(victim) =
+            cache.iter().min_by_key(|(_, a)| a.expiration_ns).map(|(k, _)| k.clone())
         else {
             break;
         };
@@ -1252,9 +1233,7 @@ fn bound_app_delegations(cache: &mut HashMap<(String, Option<u64>), AppDelegatio
 fn fresh_ed25519() -> ([u8; 32], Vec<u8>) {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).expect("getrandom");
-    let pubkey_der = BasicIdentity::from_raw_key(&seed)
-        .public_key()
-        .expect("ed25519 public key");
+    let pubkey_der = BasicIdentity::from_raw_key(&seed).public_key().expect("ed25519 public key");
     (seed, pubkey_der)
 }
 
@@ -1411,12 +1390,13 @@ struct McpRegisterV2Ok {
 type McpRegisterV2Reply = std::result::Result<McpRegisterV2Ok, String>;
 
 /// One of an anchor's accounts at an origin (II `AccountInfo`). Decoded by name,
-/// so field order is irrelevant and the wire record's `origin` field is skipped
-/// (we already know the origin we queried).
+/// so field order is irrelevant and the wire record's `origin` and `last_used`
+/// fields are skipped — the origin because we already know the one we queried,
+/// the last-used timestamp so it is dropped at the decode boundary and never
+/// carried into a tool reply (data minimization: the listing doesn't need it).
 #[derive(CandidType, Deserialize)]
 struct IiAccountInfo {
     account_number: Option<u64>,
-    last_used: Option<u64>,
     name: Option<String>,
 }
 
@@ -1452,7 +1432,9 @@ struct IiDelegation {
 ///   resurface the same opaque "sig not found in the signature tree" replica
 ///   error. Failing fast surfaces the real cause and forces a server update
 ///   instead of silently regressing.
-pub(crate) fn permissions_from_text(permissions: Option<&str>) -> Result<Option<DelegationPermissions>, String> {
+pub(crate) fn permissions_from_text(
+    permissions: Option<&str>,
+) -> Result<Option<DelegationPermissions>, String> {
     match permissions {
         None => Ok(None),
         Some("queries") => Ok(Some(DelegationPermissions::Queries)),
@@ -1574,10 +1556,7 @@ mod tests {
 
     // An Identities store over a dummy II instance (tests never hit the network).
     fn test_ids() -> Identities {
-        let agent = Agent::builder()
-            .with_url("https://ii.test")
-            .build()
-            .expect("test agent");
+        let agent = Agent::builder().with_url("https://ii.test").build().expect("test agent");
         Identities::new(
             IiInstance {
                 name: "test",
@@ -1598,7 +1577,13 @@ mod tests {
     }
 
     // Insert a cached app delegation for (domain, account_number) directly.
-    async fn seed_app(ids: &Identities, session_id: &str, domain: &str, account: Option<u64>, exp: u64) {
+    async fn seed_app(
+        ids: &Identities,
+        session_id: &str,
+        domain: &str,
+        account: Option<u64>,
+        exp: u64,
+    ) {
         let mut sessions = ids.sessions.write().await;
         let s = sessions.get_mut(session_id).expect("session");
         s.app_delegations.insert(
@@ -1818,8 +1803,13 @@ mod tests {
         let base = now_ns() + REDERIVE_MARGIN_NS + 60 * 1_000_000_000;
         for i in 0..MAX_APP_DELEGATIONS as u64 {
             // Later `i` expires later, so `app0` is always the nearest expiry.
-            ids.store("sess", &format!("app{i}.example"), None, app_delegation(base + i * 1_000_000_000))
-                .await;
+            ids.store(
+                "sess",
+                &format!("app{i}.example"),
+                None,
+                app_delegation(base + i * 1_000_000_000),
+            )
+            .await;
         }
         assert_eq!(
             ids.sessions.read().await.get("sess").expect("session").app_delegations.len(),
@@ -1925,8 +1915,10 @@ mod tests {
     }
 
     // Lock in the mcp_get_accounts Candid contract: a `vec AccountInfo` (with the
-    // full record incl. `origin`) decodes into our subset `IiAccountInfo` (origin
-    // skipped), and the Ok/Err variant maps to a Rust Result over the error type.
+    // full record incl. `origin` and `last_used`) decodes into our subset
+    // `IiAccountInfo` (origin and last_used skipped — the timestamp is dropped at
+    // the decode boundary by design), and the Ok/Err variant maps to a Rust
+    // Result over the error type.
     #[test]
     fn mcp_get_accounts_reply_decodes_account_records() {
         #[derive(CandidType)]
@@ -1937,7 +1929,12 @@ mod tests {
             name: Option<String>,
         }
         let wire: std::result::Result<Vec<WireAccount>, AccountDelegationError> = Ok(vec![
-            WireAccount { account_number: None, origin: "https://oisy.com".into(), last_used: None, name: None },
+            WireAccount {
+                account_number: None,
+                origin: "https://oisy.com".into(),
+                last_used: None,
+                name: None,
+            },
             WireAccount {
                 account_number: Some(7),
                 origin: "https://oisy.com".into(),
@@ -1951,10 +1948,11 @@ mod tests {
         // Default account (the anchor's current default): no number, no name.
         assert_eq!(decoded[0].account_number, None);
         assert_eq!(decoded[0].name, None);
-        // Named account: number, name, and last_used recovered (origin ignored).
+        // Named account: number and name recovered (origin and last_used ignored —
+        // `IiAccountInfo` deliberately declares neither, so the wire's timestamp
+        // never leaves the decoder).
         assert_eq!(decoded[1].account_number, Some(7));
         assert_eq!(decoded[1].name.as_deref(), Some("savings"));
-        assert_eq!(decoded[1].last_used, Some(123));
     }
 
     // II's `SignedDelegation` / `Delegation` Candid contract, mirrored so tests can
@@ -2238,10 +2236,7 @@ mod tests {
         // an unrestricted delegation changes the signed bytes, so the anchor's
         // signature no longer verifies and the identity refuses to build. A client
         // cannot silently promote a read-only delegation to full access.
-        let unrestricted = Delegation {
-            permissions: None,
-            ..delegation.clone()
-        };
+        let unrestricted = Delegation { permissions: None, ..delegation.clone() };
         assert_ne!(
             delegation.signable(),
             unrestricted.signable(),
@@ -2327,7 +2322,11 @@ mod tests {
             let b = Encode!(&p).expect("encode perm");
             IDLArgs::from_bytes(&b).expect("typeless-decode perm").args[0].to_string()
         };
-        assert_eq!(wire(IiPermissions::Queries), literal("queries"), "on-wire label must be `queries`");
+        assert_eq!(
+            wire(IiPermissions::Queries),
+            literal("queries"),
+            "on-wire label must be `queries`"
+        );
         assert_eq!(wire(IiPermissions::All), literal("all"), "on-wire label must be `all`");
         // Sanity: the two labels hash differently, so the checks above genuinely
         // pin each one and aren't matching everything.

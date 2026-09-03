@@ -156,18 +156,11 @@ fn run_in(env: &Env, mode: Mode) -> (String, usize) {
         Mode::Remove => "Removing",
         Mode::Print => "Setup steps for",
     };
-    lines.push(format!(
-        "{verb} the imcp2 local MCP server (binary: {}).\n",
-        env.exe.display()
-    ));
+    lines.push(format!("{verb} the imcp2 local MCP server (binary: {}).\n", env.exe.display()));
 
     for client in clients(env) {
         let line = match mode {
-            Mode::Print => format!(
-                "• {}\n  {}",
-                client.name,
-                client.manual.replace('\n', "\n  ")
-            ),
+            Mode::Print => format!("• {}\n  {}", client.name, client.manual.replace('\n', "\n  ")),
             Mode::Apply | Mode::Remove => match &client.target {
                 Target::NotDetected(reason) => {
                     format!("• {}: not detected ({reason}) — skipped.", client.name)
@@ -291,10 +284,7 @@ enum Target {
     Json(PathBuf),
     /// Codex: its CLI when recent enough (`codex mcp`), else its
     /// `config.toml` (`[mcp_servers.<name>]`).
-    Codex {
-        config: PathBuf,
-        cli: Option<PathBuf>,
-    },
+    Codex { config: PathBuf, cli: Option<PathBuf> },
     /// Claude Code: registered through its own CLI.
     ClaudeCli(PathBuf),
     /// Detected, but only registrable through the app's UI (Perplexity).
@@ -528,10 +518,7 @@ fn upsert_json_server(path: &Path, exe: &Path) -> anyhow::Result<String> {
             serde_json::json!({})
         } else {
             serde_json::from_str(&text).with_context(|| {
-                format!(
-                    "{} is not valid JSON — fix or remove it, then rerun",
-                    path.display()
-                )
+                format!("{} is not valid JSON — fix or remove it, then rerun", path.display())
             })?
         }
     } else {
@@ -678,11 +665,7 @@ fn remove_codex_server(path: &Path) -> anyhow::Result<String> {
         return Ok("nothing to remove".to_string());
     }
     // Drop a now-empty `[mcp_servers]` table rather than leaving a bare header.
-    if doc
-        .get("mcp_servers")
-        .and_then(|s| s.as_table())
-        .is_some_and(|t| t.is_empty())
-    {
+    if doc.get("mcp_servers").and_then(|s| s.as_table()).is_some_and(|t| t.is_empty()) {
         doc.remove("mcp_servers");
     }
     // Same one-time backup contract as the JSON removal above.
@@ -773,10 +756,7 @@ mod tests {
         assert!(report.contains("Antigravity: registered"), "{report}");
         assert!(report.contains("Codex: registered; backup at"), "{report}");
         assert!(report.contains("Claude Code: not detected"), "{report}");
-        assert!(
-            report.contains("Perplexity (macOS): not detected"),
-            "{report}"
-        );
+        assert!(report.contains("Perplexity (macOS): not detected"), "{report}");
 
         // Claude Desktop / Antigravity: files created with the exact snippet.
         for file in [
@@ -785,40 +765,28 @@ mod tests {
         ] {
             let v: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-            assert_eq!(
-                v["mcpServers"]["imcp2"]["command"], "/opt/imcp2/imcp2-local",
-                "{file:?}"
-            );
+            assert_eq!(v["mcpServers"]["imcp2"]["command"], "/opt/imcp2/imcp2-local", "{file:?}");
         }
         // Cursor: our entry added, the other server and unrelated keys intact.
         let cursor: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(root.path.join(".cursor/mcp.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            cursor["mcpServers"]["imcp2"]["command"],
-            "/opt/imcp2/imcp2-local"
-        );
+        assert_eq!(cursor["mcpServers"]["imcp2"]["command"], "/opt/imcp2/imcp2-local");
         assert_eq!(
             cursor["mcpServers"]["imcp2"]["env"]["IMCP2_IC_URL"], "http://127.0.0.1:4943",
             "user-added keys survive re-registration"
         );
         assert_eq!(cursor["mcpServers"]["other"]["command"], "/bin/other");
         assert_eq!(cursor["theme"], "dark");
-        assert!(
-            root.path.join(".cursor/mcp.json.imcp2-bak").exists(),
-            "backup kept"
-        );
+        assert!(root.path.join(".cursor/mcp.json.imcp2-bak").exists(), "backup kept");
         // Codex: comments and existing entries survive toml_edit.
         let codex = std::fs::read_to_string(root.path.join(".codex/config.toml")).unwrap();
         assert!(codex.contains("# my codex config"), "{codex}");
         assert!(codex.contains("model = \"o5\""), "{codex}");
         assert!(codex.contains("[mcp_servers.other]"), "{codex}");
         let doc: toml_edit::DocumentMut = codex.parse().unwrap();
-        assert_eq!(
-            doc["mcp_servers"]["imcp2"]["command"].as_str(),
-            Some("/opt/imcp2/imcp2-local")
-        );
+        assert_eq!(doc["mcp_servers"]["imcp2"]["command"].as_str(), Some("/opt/imcp2/imcp2-local"));
         assert_eq!(
             doc["mcp_servers"]["imcp2"]["env"]["FOO"].as_str(),
             Some("bar"),
@@ -851,13 +819,7 @@ mod tests {
     fn undetected_clients_are_skipped_not_invented() {
         let (root, env) = scratch(&[]);
         let (report, _) = run_in(&env, Mode::Apply);
-        for client in [
-            "Claude Desktop",
-            "Claude Code",
-            "Codex",
-            "Cursor",
-            "Antigravity",
-        ] {
+        for client in ["Claude Desktop", "Claude Code", "Codex", "Cursor", "Antigravity"] {
             assert!(
                 report.contains(&format!("{client}: not detected")),
                 "{client} should be skipped:\n{report}"
@@ -873,20 +835,11 @@ mod tests {
     fn print_mode_only_prints() {
         let (root, env) = scratch(&[".cursor"]);
         let (report, _) = run_in(&env, Mode::Print);
-        assert!(
-            report.contains("claude mcp add --scope user --transport stdio imcp2"),
-            "{report}"
-        );
+        assert!(report.contains("claude mcp add --scope user --transport stdio imcp2"), "{report}");
         assert!(report.contains("[mcp_servers.imcp2]"), "{report}");
-        assert!(
-            report.contains("Settings → Connectors → Add Connector"),
-            "{report}"
-        );
+        assert!(report.contains("Settings → Connectors → Add Connector"), "{report}");
         assert!(report.contains("mcpServers"), "{report}");
-        assert!(
-            !root.path.join(".cursor/mcp.json").exists(),
-            "--print must not write"
-        );
+        assert!(!root.path.join(".cursor/mcp.json").exists(), "--print must not write");
     }
 
     // A corrupt config is refused with a clear error naming the file — setup
@@ -900,11 +853,7 @@ mod tests {
         assert_eq!(failed, 1, "the refusal must reach the exit code: {report}");
         assert!(report.contains("Cursor: FAILED"), "{report}");
         assert!(report.contains("not valid JSON"), "{report}");
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            "{ not json",
-            "file untouched"
-        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{ not json", "file untouched");
     }
 
     // The vendor CLI is preferred when it's recent enough: a `codex` that
@@ -917,11 +866,8 @@ mod tests {
         let (root, mut env) = scratch(&[".codex"]);
         let log = root.path.join("codex-calls.log");
         let script = root.path.join("codex");
-        std::fs::write(
-            &script,
-            format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", log.display()),
-        )
-        .unwrap();
+        std::fs::write(&script, format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", log.display()))
+            .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         env.codex_cli = Some(script);
 
@@ -934,10 +880,7 @@ mod tests {
         );
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(calls.contains("mcp --help"), "{calls}");
-        assert!(
-            calls.contains("mcp add imcp2 -- /opt/imcp2/imcp2-local"),
-            "{calls}"
-        );
+        assert!(calls.contains("mcp add imcp2 -- /opt/imcp2/imcp2-local"), "{calls}");
 
         let (report, failed) = run_in(&env, Mode::Remove);
         assert_eq!(failed, 0, "{report}");
@@ -972,13 +915,8 @@ mod tests {
     fn manual_snippets_escape_awkward_paths() {
         let (_root, mut env) = scratch(&[]);
         env.exe = PathBuf::from(r"C:\Program Files\imcp2\imcp2-local.exe");
-        let by_name = |name: &str| {
-            clients(&env)
-                .into_iter()
-                .find(|c| c.name == name)
-                .unwrap()
-                .manual
-        };
+        let by_name =
+            |name: &str| clients(&env).into_iter().find(|c| c.name == name).unwrap().manual;
 
         let cursor = by_name("Cursor");
         let snippet = cursor.split_once(":\n").unwrap().1;
@@ -1015,10 +953,6 @@ mod tests {
         let first = std::fs::read_to_string(&bak).unwrap();
         assert!(!first.contains("imcp2"), "backup is the pre-imcp2 state");
         run_in(&env, Mode::Apply);
-        assert_eq!(
-            std::fs::read_to_string(&bak).unwrap(),
-            first,
-            "backup not rotated"
-        );
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), first, "backup not rotated");
     }
 }

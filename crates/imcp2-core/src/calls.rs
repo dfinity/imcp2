@@ -31,6 +31,18 @@ use serde::{Deserialize, Serialize};
 pub struct GetCandidArgs {
     /// Canister principal, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai" (the ICP ledger).
     pub canister_id: String,
+    /// The website URL of the app that owns `canister_id`, which open_app returns.
+    /// A read is made only from a canister that app declares in its
+    /// service-discoverability manifest at `/.well-known/ic-architecture`, read from
+    /// this origin. Omitted, `derivation_origin` is used as that origin instead.
+    #[serde(default)]
+    pub app_url: Option<String>,
+    /// The app's derivation origin, from open_app, used ONLY to locate the manifest
+    /// when no `app_url` is given — an app that pins a custom derivation origin
+    /// serves its manifest at its website instead, so prefer `app_url`. The
+    /// interface read itself is anonymous: this call acts as no identity.
+    #[serde(default, alias = "domain")]
+    pub derivation_origin: Option<String>,
 }
 
 /// Output of `get_canister_candid`.
@@ -40,18 +52,21 @@ pub struct GetCandidOutput {
     pub canister_id: String,
     /// The Candid (`.did`) interface text.
     pub candid: String,
-    /// True when the interface exposes the standard OQL query surface (both a
-    /// `schema` and an `execute` method). When set, load `icp_oql_guide` (or the
-    /// `oql://usage` resource) to learn the JSON query dialect, then call
-    /// `get_canister_oql_schema` for the entity/field names and `canister_query`
-    /// (its `oql` argument) to run the query.
+    /// True when the canister declares an OQL query surface. Reads then go through
+    /// get_canister_oql_schema and canister_query's `oql` argument, and this server refuses
+    /// a Candid `method` query on the canister. Update calls are unaffected.
     pub oql: bool,
-    /// True when the canister declares an API-documentation method
-    /// (`getApiDoc`/`get_api_doc`) — computed with the SAME predicate
-    /// get_canister_api_doc uses, so it tells you up front whether that call will
-    /// return anything. Only call get_canister_api_doc when this is true; when it's
-    /// false the canister has no prose doc and the Candid types here are the interface.
+    /// True when the canister declares the method get_canister_api_doc reads. It reports the
+    /// declaration, so that call can still come back without a doc.
     pub api_doc_available: bool,
+    /// The app origin whose service-discoverability manifest DECLARES this
+    /// canister — the app whose published manifest authorized this read. Always
+    /// present on a successful call: without a declaration the read is refused.
+    pub declared_by: String,
+    /// The well-known path that declaration was read from. Always
+    /// `/.well-known/ic-architecture`, echoed so a reply says where the
+    /// authorization came from rather than leaving it implied.
+    pub declared_at: String,
 }
 
 /// Arguments for `get_canister_oql_schema`.
@@ -60,13 +75,18 @@ pub struct OqlSchemaArgs {
     /// Canister principal that exposes the OQL surface (get_canister_candid reports
     /// `oql: true`).
     pub canister_id: String,
-    /// Read AS the user's account at an app, given its canonical Internet
-    /// Identity derivation origin (not necessarily the visible URL). Accepts the
-    /// legacy name `domain`. Omit to read anonymously.
+    /// The app's derivation origin, from open_app. The schema is read as the
+    /// user's account there, and this server does not read it anonymously.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
-    /// Which of your accounts to act as (see list_app_accounts). Ignored when reading
-    /// anonymously.
+    /// The website URL of the app that owns `canister_id`, which open_app returns.
+    /// A read is made only from a canister that app declares in its
+    /// service-discoverability manifest at `/.well-known/ic-architecture`, read from
+    /// this origin. Omitted, `derivation_origin` is used as that origin instead.
+    #[serde(default)]
+    pub app_url: Option<String>,
+    /// Which of the user's accounts to act as, by name (see list_app_accounts). Omit for the
+    /// app's default account.
     #[serde(default)]
     pub account: Option<String>,
 }
@@ -76,44 +96,47 @@ pub struct OqlSchemaArgs {
 pub struct OqlSchemaOutput {
     /// The canister whose schema was read.
     pub canister_id: String,
-    /// The entity/field/edge catalogue returned by `schema` (JSON text,
-    /// pretty-printed when it parses).
+    /// The entity/field/edge catalogue returned by `schema` (JSON text, exactly
+    /// as the canister returned it).
     pub schema: String,
-    /// The principal the read was signed as — null for an anonymous read.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub acted_as_principal: Option<String>,
-    /// When reading as an app account: the effective Internet Identity derivation
-    /// origin used (after canonicalization). Null for anonymous reads.
+    /// The effective Internet Identity derivation origin used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_for_origin: Option<String>,
-    /// When reading as an app account: exactly what you supplied as
-    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` (from
-    /// canonicalization) is visible. Null for anonymous reads.
+    /// Exactly what you supplied as `derivation_origin`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
-    /// True when the schema was read as the ANONYMOUS principal (no
-    /// `derivation_origin`). Always present: the schema is itself caller-gated, so
-    /// an anonymous read commonly returns NO entities — which means "not
-    /// authenticated as your account", not "the app has no data model".
+    /// Whether the schema was read as the anonymous principal. False here: a read with no derivation origin is rejected rather than made
+    /// anonymously.
     pub is_anonymous: bool,
-    /// A note when the schema came back with NO entities: the anonymous-read auth
-    /// remediation (#1) when anonymous, else a note that this principal can see no
-    /// entities here. Null when entities were returned.
+    /// Set when the schema came back with no entities: this account sees none here. Null when
+    /// entities were returned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// One ready-to-run `canister_query` invocation per entity — a COMPLETE call
-    /// (canister_id + a minimal `{start, limit}` OQL query in the `oql` argument) that
-    /// PRESERVES the identity this schema was read under (same
-    /// `derivation_origin`/`account`), so copying an example doesn't silently drop
-    /// back to anonymous. Read-only. Empty when the schema exposes no entities.
+    /// One ready-to-run canister_query call per entity, each preserving the identity this
+    /// schema was read under. Empty when the schema exposes no entities.
     pub example_queries: Vec<String>,
+    /// The app origin whose service-discoverability manifest DECLARES this
+    /// canister — the app whose published manifest authorized this read. Always
+    /// present on a successful call: without a declaration the read is refused.
+    pub declared_by: String,
+    /// The well-known path that declaration was read from. Always
+    /// `/.well-known/ic-architecture`, echoed so a reply says where the
+    /// authorization came from rather than leaving it implied.
+    pub declared_at: String,
 }
 
 /// Output of `icp_oql_guide`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct OqlGuideOutput {
-    /// The OQL usage guide (markdown): the `schema`/`execute` methods, the JSON
-    /// query object, the predicate grammar, edges, and the result shape.
+    /// The OQL usage guide (markdown): the JSON query object, the predicate grammar, edges, and the result shape.
+    pub content: String,
+}
+
+/// Output of `candid_syntax_guide`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CandidGuideOutput {
+    /// The textual-Candid guide (markdown): the literal form for each Candid type,
+    /// and when a value needs an explicit `: type` annotation.
     pub content: String,
 }
 
@@ -122,19 +145,28 @@ pub struct OqlGuideOutput {
 pub struct ApiDocArgs {
     /// Canister principal to read the API documentation from.
     pub canister_id: String,
+    /// The website URL of the app that owns `canister_id`, which open_app returns.
+    /// A read is made only from a canister that app declares in its
+    /// service-discoverability manifest at `/.well-known/ic-architecture`, read from
+    /// this origin. Omitted, `derivation_origin` is used as that origin instead.
+    #[serde(default)]
+    pub app_url: Option<String>,
+    /// The app's derivation origin, from open_app, used ONLY to locate the manifest
+    /// when no `app_url` is given — an app that pins a custom derivation origin
+    /// serves its manifest at its website instead, so prefer `app_url`. The doc read
+    /// itself is anonymous: this call acts as no identity.
+    #[serde(default, alias = "domain")]
+    pub derivation_origin: Option<String>,
 }
 
-/// Output of `get_canister_api_doc` — a STRUCTURED result in every case (not an
-/// error when the doc simply isn't there), so the agent can distinguish "this app
-/// has no prose doc" (expected, don't retry) from "couldn't reach it" (retry).
+/// Output of `get_canister_api_doc`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ApiDocOutput {
     /// The canister the doc was requested from.
     pub canister_id: String,
     /// True when an API-doc method was found and returned a doc (`doc` is set).
     pub available: bool,
-    /// The method the doc was read from (`getApiDoc`/`get_api_doc`) — null when
-    /// unavailable.
+    /// The method the doc was read from; null when unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
     /// The API documentation (markdown): how the app behaves — units, auth,
@@ -142,19 +174,22 @@ pub struct ApiDocOutput {
     /// Null when unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    /// When `available` is false: whether absence is EXPECTED — the interface read
-    /// fine and the canister simply declares no api-doc method (most canisters
-    /// don't). True on the normal "no such method" path; false when we couldn't tell
-    /// (interface unreadable / the call failed). Meaningless when `available`.
+    /// When `available` is false: true if the interface was read and declared no doc method,
+    /// which is the normal case and will not change on a retry.
     pub expected: bool,
-    /// When `available` is false: whether retrying might help. False when the method
-    /// genuinely isn't declared (retrying won't conjure one); true for a transient
-    /// failure (interface/method call unreachable). Meaningless when `available`.
+    /// When `available` is false: true if no answer was obtained at all, so a retry may help.
     pub retry: bool,
-    /// What to do next — e.g. "use get_canister_candid for the interface" when there
-    /// is no doc, or "retry" on a transient failure. Null when `available`.
+    /// What to do next. Null when a doc was returned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
+    /// The app origin whose service-discoverability manifest DECLARES this
+    /// canister — the app whose published manifest authorized this read. Always
+    /// present on a successful call: without a declaration the read is refused.
+    pub declared_by: String,
+    /// The well-known path that declaration was read from. Always
+    /// `/.well-known/ic-architecture`, echoed so a reply says where the
+    /// authorization came from rather than leaving it implied.
+    pub declared_at: String,
 }
 
 /// Arguments for `canister_update_call`.
@@ -164,27 +199,30 @@ pub struct CanisterUpdateCallArgs {
     pub canister_id: String,
     /// Update method name to invoke.
     pub method: String,
-    /// Arguments in textual Candid syntax, e.g. `()` or `(record { owner = principal "..." })`.
+    /// Arguments in textual Candid, e.g. `()` or `(record { owner = principal "..." })`; the
+    /// `candid://textual-syntax` resource documents that syntax and `candid://reference` its
+    /// type system. Encoded against the method's declared types when the interface is available,
+    /// published or supplied in `candid`, so plain literals need no `: type` annotation.
+    /// Without an interface they are encoded as written and need their own annotations.
     #[serde(default = "default_args")]
     pub args: String,
-    /// Call AS the user's account at an app, identified by its exact canonical
-    /// Internet Identity derivation origin — NOT necessarily the visible URL (do
-    /// not infer it from an alternativeOrigins list). Get it from open_app /
-    /// resolve_app, which resolve an app NAME or URL to the derivation origin under
-    /// the guessed-domain gate; then reuse it here. This does NOT accept a raw
-    /// website URL — a derivation origin is a stable per-app value, resolved once
-    /// and reused. Accepts the legacy name `domain`. Omit to call anonymously. The
-    /// account delegation is derived on demand for this connection.
+    /// The website URL of the app that owns `canister_id`, which open_app returns.
+    /// A write is made only to a canister that app declares in its
+    /// service-discoverability manifest at `/.well-known/ic-architecture`, read from
+    /// this origin. Omitted, `derivation_origin` is used as that origin instead.
+    /// Given both, they must name the same app; a mismatch is refused.
+    #[serde(default)]
+    pub app_url: Option<String>,
+    /// The app's derivation origin, from open_app, to call as the user's
+    /// account there. Not necessarily the app's website URL. Omit to call anonymously.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
-    /// Which of your accounts to act as, by account name (see list_app_accounts).
-    /// Omit to use that app's default account. Ignored for anonymous calls.
+    /// Which of the user's accounts to act as, by name (see list_app_accounts). Omit for the
+    /// app's default account. Ignored for anonymous calls.
     #[serde(default)]
     pub account: Option<String>,
-    /// Optional Candid service definition (`.did` text) for the canister. Used to
-    /// encode the args to the method's declared types and decode the reply, for
-    /// when the canister's own `candid:service` metadata can't be read (e.g.
-    /// access-restricted) — get it from get_canister_candid, or ask the user for it.
+    /// The canister's Candid interface as `.did` text, for when the canister does not publish
+    /// its own. Supplying it keeps arguments and the reply typed.
     #[serde(default)]
     pub candid: Option<String>,
 }
@@ -198,29 +236,29 @@ pub struct CanisterUpdateCallOutput {
     pub method: String,
     /// The decoded reply in textual Candid.
     pub reply: String,
-    /// The principal the call was signed as — null for an anonymous call.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub acted_as_principal: Option<String>,
     /// When called as an app account: the effective Internet Identity derivation
-    /// origin used (after canonicalization). Null for anonymous calls.
+    /// origin used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_for_origin: Option<String>,
     /// When called as an app account: exactly what you supplied as
-    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` (from
-    /// canonicalization) is visible. Null for anonymous calls.
+    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` is visible.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
-    /// When called as an app account: how `derived_for_origin` was determined —
-    /// always "explicit" here, since this tool takes the canonical derivation origin
-    /// directly. (The "declared"/"known"/"app_url_default" sources are reported by
-    /// the resolver tools open_app / resolve_app, which turn a URL into an origin.)
-    /// Null for anonymous calls.
+    /// How `derived_for_origin` was determined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derivation_origin_source: Option<String>,
-    /// True when the call ran as the ANONYMOUS principal (no `derivation_origin`).
-    /// Always present so a text-only client can tell an anonymous call from an
-    /// authenticated one.
+    /// True when the call ran as the anonymous principal.
     pub is_anonymous: bool,
+    /// The app origin whose service-discoverability manifest DECLARES this
+    /// canister — the app whose published manifest authorized this write. Always
+    /// present on a successful call: without a declaration the call is refused.
+    pub declared_by: String,
+    /// The well-known path that declaration was read from. Always
+    /// `/.well-known/ic-architecture`: it is the only document that authorizes a
+    /// write, so no other value can appear on a successful call. Echoed anyway, so
+    /// a reply says where the authorization came from rather than leaving it
+    /// implied.
+    pub declared_at: String,
 }
 
 /// Arguments for `canister_query` — a READ that runs EITHER a Candid `query` method
@@ -230,47 +268,48 @@ pub struct CanisterUpdateCallOutput {
 pub struct CanisterQueryArgs {
     /// Target canister principal.
     pub canister_id: String,
-    /// A `query` METHOD name from the canister's Candid interface, invoked as a
-    /// read-only query call. Provide EITHER `method` (a Candid query) OR `oql` (an
-    /// OQL query) — not both. On a canister that exposes an OQL query surface
-    /// (get_canister_candid reports `oql: true`), data reads are rejected on this
-    /// path — use `oql` instead.
+    /// A `query` method from the canister's Candid interface. Pass either this or `oql`,
+    /// never both. A Candid `method` query to an OQL canister is refused here.
     #[serde(default)]
     pub method: Option<String>,
-    /// Arguments for `method` in textual Candid syntax, e.g. `()` or
-    /// `(record { owner = principal "..." })`. Ignored for an OQL query.
+    /// Arguments for `method` in textual Candid, e.g. `()` or `(record { owner = principal
+    /// "..." })`; the `candid://textual-syntax` resource documents that syntax. Plain literals
+    /// need no `: type` annotation when the interface is available.
+    /// Ignored for an OQL query.
     #[serde(default = "default_args")]
     pub args: String,
-    /// An OQL query as a JSON object string — passed straight to the canister's
-    /// `execute` method, so NO Candid escaping is needed (write plain JSON). E.g.
-    /// `{"start":"employee","where":{"icontains":{"field":"lastName","value":"smith"}},"select":["firstName","lastName"],"limit":10}`.
-    /// Provide EITHER `oql` OR `method` — not both. See icp_oql_guide for the dialect
-    /// and get_canister_oql_schema for the entity/field names.
-    /// The OQL path REQUIRES `derivation_origin` (anonymous per-app reads are disabled).
+    /// An OQL query as a JSON object string, e.g.
+    /// `{"start":"employee","select":["firstName"],"limit":10}`. Pass either this or
+    /// `method`, never both. icp_oql_guide documents the dialect and get_canister_oql_schema
+    /// returns the entity and field names. Requires `derivation_origin`.
     #[serde(default)]
     pub oql: Option<String>,
-    /// Read AS the user's account at an app, given its exact canonical Internet
-    /// Identity derivation origin — NOT necessarily the visible URL. Get it from
-    /// open_app / resolve_app; this does NOT accept a raw website URL. Accepts the
-    /// legacy name `domain`. REQUIRED for an `oql` query; optional for a Candid
-    /// `method` query (omit to query anonymously).
+    /// The app's derivation origin, from open_app, to read as the user's
+    /// account there. Not necessarily the app's website URL. Required for an OQL query; omit on a Candid
+    /// query to read anonymously.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
-    /// Which of your accounts to act as, by account name (see list_app_accounts).
-    /// Omit to use that app's default account. Ignored for anonymous calls.
+    /// Which of the user's accounts to act as, by name (see list_app_accounts). Omit for the
+    /// app's default account. Ignored for anonymous reads.
     #[serde(default)]
     pub account: Option<String>,
-    /// Optional Candid service definition (`.did` text) for the canister. Used to
-    /// encode the args to a Candid `method`'s declared types and decode the reply,
-    /// for when the canister's own `candid:service` metadata can't be read — get it
-    /// from get_canister_candid, or ask the user for it. Ignored for an OQL query.
+    /// The canister's Candid interface as `.did` text, for when the canister does not publish
+    /// its own. Ignored for an OQL query.
     #[serde(default)]
     pub candid: Option<String>,
+    /// The website URL of the app that owns `canister_id`, which open_app returns.
+    /// A read is made only from a canister that app declares in its
+    /// service-discoverability manifest at `/.well-known/ic-architecture`, read from
+    /// this origin. Omitted, `derivation_origin` is used as that origin instead.
+    #[serde(default)]
+    pub app_url: Option<String>,
 }
 
 /// Output of `canister_query`. The populated fields depend on `mode`: a Candid
 /// `method` query sets `method` + `reply`; an `oql` query sets `columns` + `rows`
-/// (+ `has_more` and, on an empty result, `valid_entities` / `did_you_mean`).
+/// (+ `has_more`). `valid_entities` and `did_you_mean` are optional even on an
+/// empty result: they appear only when the query's `start` is not one of the
+/// entities visible to this caller.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CanisterQueryOutput {
     /// The canister that was queried.
@@ -294,31 +333,22 @@ pub struct CanisterQueryOutput {
     /// (oql mode) true when more rows remain — re-query with a higher `offset` to page.
     #[serde(default)]
     pub has_more: bool,
-    /// The principal the query was signed as — null for an anonymous query.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub acted_as_principal: Option<String>,
     /// When querying as an app account: the effective Internet Identity derivation
-    /// origin used (after canonicalization). Null for anonymous queries.
+    /// origin used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_for_origin: Option<String>,
     /// When querying as an app account: exactly what you supplied as
-    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` (from
-    /// canonicalization) is visible. Null for anonymous queries.
+    /// `derivation_origin`, echoed so a mismatch with `derived_for_origin` is visible.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
-    /// When querying as an app account: how `derived_for_origin` was determined —
-    /// always "explicit" here (this tool takes the canonical derivation origin
-    /// directly). Null for anonymous queries.
+    /// How `derived_for_origin` was determined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derivation_origin_source: Option<String>,
-    /// True when the query ran as the ANONYMOUS principal (no `derivation_origin`).
-    /// Always present so a text-only client can tell an anonymous read from an
-    /// authenticated one even on an empty result — per-app data is caller-gated, so
-    /// an anonymous empty result usually means "not authenticated", not "no data".
+    /// Whether the read ran as the anonymous principal. On an empty result this separates
+    /// "not authenticated" from "no data" where an app gates its data by caller.
     pub is_anonymous: bool,
-    /// A diagnostic note for an EMPTY result: the anonymous-read auth remediation
-    /// (#1), an unknown-`start` repair (#7, oql mode), or a note that the query
-    /// matched nothing for the authenticated principal. Null when data was returned.
+    /// A diagnosis for an empty result, or a warning that an OQL reply could not be
+    /// parsed as a table.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// (oql mode) when an empty result was diagnosed as an unknown `start` entity:
@@ -330,6 +360,14 @@ pub struct CanisterQueryOutput {
     /// "bookings"). Null unless an unknown-`start` diagnosis found a near match.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub did_you_mean: Option<String>,
+    /// The app origin whose service-discoverability manifest DECLARES this
+    /// canister — the app whose published manifest authorized this read. Always
+    /// present on a successful call: without a declaration the read is refused.
+    pub declared_by: String,
+    /// The well-known path that declaration was read from. Always
+    /// `/.well-known/ic-architecture`, echoed so a reply says where the
+    /// authorization came from rather than leaving it implied.
+    pub declared_at: String,
 }
 
 pub fn default_args() -> String {
@@ -342,7 +380,11 @@ pub fn default_args() -> String {
 
 /// The interface to encode/decode against: the canister's own `candid:service`
 /// if exposed, else the caller-supplied `provided` definition.
-pub async fn resolve_did(agent: &Agent, canister: Principal, provided: Option<&str>) -> Option<String> {
+pub async fn resolve_did(
+    agent: &Agent,
+    canister: Principal,
+    provided: Option<&str>,
+) -> Option<String> {
     if let Some(did) = candid_service(agent, canister).await {
         return Some(did);
     }
@@ -351,10 +393,7 @@ pub async fn resolve_did(agent: &Agent, canister: Principal, provided: Option<&s
 
 /// The canister's `candid:service` interface (`.did` text), if exposed.
 pub async fn candid_service(agent: &Agent, canister: Principal) -> Option<String> {
-    let raw = agent
-        .read_state_canister_metadata(canister, "candid:service")
-        .await
-        .ok()?;
+    let raw = agent.read_state_canister_metadata(canister, "candid:service").await.ok()?;
     String::from_utf8(raw).ok()
 }
 
@@ -685,9 +724,7 @@ pub fn encode_args(did: Option<&str>, method: &str, args_text: &str) -> Result<V
                 }
             }
         }
-        parsed
-            .to_bytes()
-            .map_err(|e| format!("could not encode args `{args_text}`: {e}"))
+        parsed.to_bytes().map_err(|e| format!("could not encode args `{args_text}`: {e}"))
     })
     .unwrap_or_else(|| Err("could not spawn a thread to parse the `args` value".into()))
 }
@@ -715,8 +752,7 @@ const REPLY_DECODING_QUOTA: usize = 3_000_000;
 /// decoding and skipping counters, applied to every decode of untrusted reply bytes.
 fn reply_decoder_config() -> candid::DecoderConfig {
     let mut cfg = candid::DecoderConfig::new();
-    cfg.set_decoding_quota(REPLY_DECODING_QUOTA)
-        .set_skipping_quota(REPLY_DECODING_QUOTA);
+    cfg.set_decoding_quota(REPLY_DECODING_QUOTA).set_skipping_quota(REPLY_DECODING_QUOTA);
     cfg
 }
 
@@ -759,7 +795,13 @@ pub fn decode_bytes_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<St
         let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
         let actor = actor?;
         let func = env.get_method(&actor, method).ok()?;
-        let decoded = IDLArgs::from_bytes_with_types_with_config(bytes, &env, &func.rets, &reply_decoder_config()).ok()?;
+        let decoded = IDLArgs::from_bytes_with_types_with_config(
+            bytes,
+            &env,
+            &func.rets,
+            &reply_decoder_config(),
+        )
+        .ok()?;
         Some(decoded.to_string())
     })
     .flatten()
@@ -833,7 +875,7 @@ pub fn oql_query_redirect(did: Option<&str>) -> Option<String> {
              for the JSON dialect (once), (2) `get_canister_oql_schema` for the entity and field \
              names, (3) call `canister_query` again with the `oql` argument (a JSON query object) \
              instead of `method`. This canister gates data by the caller's principal, so pass the \
-             app's `derivation_origin` (from open_app / resolve_app) — an anonymous read is rejected. \
+             app's `derivation_origin` (from open_app) — an anonymous read is rejected. \
              UPDATE calls (state changes) go through `canister_update_call`."
                 .to_string(),
         )
@@ -879,49 +921,41 @@ pub fn anonymous_empty_note(what: &str, add_hint: &str) -> String {
         "Read anonymously (as principal 2vxsx-fae) and {what} came back empty. This canister \
          gates data by the CALLER's principal, so empty here most likely means \"not authenticated \
          as your account\", NOT \"no data\". Re-run this exact call adding {add_hint} to read as \
-         your account — if you don't have it yet, open_app / resolve_app resolves it from the app's \
+         your account — if you don't have it yet, open_app resolves it from the app's \
          URL or name."
     )
 }
 
-/// Whether a decoded OQL `schema` JSON exposes NO entities — the caller-gated
-/// "empty schema" an anonymous read yields when the app shows a principal only the
-/// entities it may see. Conservative: a schema that doesn't parse as the expected
-/// `{"entities":[...]}` shape is NOT treated as empty (so we never raise a false
-/// auth hint on an unrecognized shape).
-pub fn oql_schema_is_empty(schema_json: &str) -> bool {
-    match serde_json::from_str::<serde_json::Value>(schema_json) {
-        Ok(v) => v
-            .get("entities")
-            .and_then(|e| e.as_array())
-            .is_some_and(|a| a.is_empty()),
-        Err(_) => false,
-    }
+/// The `entities` array of a parsed OQL `schema` JSON: how many elements it
+/// declares, and the string `name`s extracted from them (in order, de-duplicated,
+/// capped at [`MAX_OQL_ENTITIES`]). The count is kept apart from the names so
+/// "declares no entities" (`declared == 0`) is never confused with "declares
+/// entities in a shape we can't read" (`declared > 0`, no names).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaEntities {
+    declared: usize,
+    names: Vec<String>,
 }
 
-/// The entity names declared in a decoded OQL `schema` JSON (the `name` of each
-/// `entities[]` element, in order, de-duplicated, capped at [`MAX_OQL_ENTITIES`]).
-/// Empty when the schema is absent/unparseable or lists none — used to validate a
-/// query's `start` (#7) and to build per-entity examples (#8).
-pub fn oql_entity_names(schema_json: &str) -> Vec<String> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(schema_json) else {
-        return Vec::new();
-    };
-    let Some(arr) = v.get("entities").and_then(|e| e.as_array()) else {
-        return Vec::new();
-    };
-    let mut out: Vec<String> = Vec::new();
+/// The `entities` of a parsed OQL `schema` JSON, or `None` when the document has
+/// no `entities` array at all (an unrecognized shape, kept apart from "an empty
+/// list" so callers never raise the auth hint on it). Feeds `start` validation
+/// (#7) and the per-entity examples (#8) through [`DecodedSchema`]; the one place
+/// the schema tree is walked, so a schema is parsed exactly once.
+fn schema_entities(v: &serde_json::Value) -> Option<SchemaEntities> {
+    let arr = v.get("entities").and_then(|e| e.as_array())?;
+    let mut names: Vec<String> = Vec::new();
     for e in arr {
         if let Some(name) = e.get("name").and_then(|n| n.as_str()) {
-            if !out.iter().any(|n| n == name) {
-                out.push(name.to_string());
-                if out.len() >= MAX_OQL_ENTITIES {
+            if !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+                if names.len() >= MAX_OQL_ENTITIES {
                     break;
                 }
             }
         }
     }
-    out
+    Some(SchemaEntities { declared: arr.len(), names })
 }
 
 /// The `start` entity of a normalized OQL query JSON, if present. Used to
@@ -1015,18 +1049,24 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 /// One ready-to-run `canister_query` invocation per entity (#8) — a COMPLETE call
 /// (canister_id + a minimal `{"start":<entity>,"limit":10}` OQL query in the `oql`
-/// argument) that PRESERVES the identity the schema was read under (the same
-/// `derivation_origin` / `account`), so copying an example doesn't silently drop
-/// back to anonymous. Read-only. Empty when the schema exposes no entities. Each
-/// line is `canister_query <compact-json-args>`.
+/// argument) that PRESERVES both halves of the call the schema was read under:
+/// the identity (the same `derivation_origin` / `account`), so copying an example
+/// doesn't silently drop back to anonymous, and the AUTHORIZATION (`app_url` —
+/// the origin whose manifest declared this canister), so it doesn't fall back to
+/// checking the manifest at the derivation origin. Those two differ for most apps
+/// (13 of 17 in the built-in registry), and an example missing `app_url` is one
+/// that gets refused for the very apps the fallback was meant to cover (per
+/// review). Read-only. Empty when the schema exposes no entities. Each line is
+/// `canister_query <compact-json-args>`.
 pub fn oql_query_examples(
     canister_id: &str,
-    schema_json: &str,
+    entities: &[String],
+    app_url: Option<&str>,
     derivation_origin: Option<&str>,
     account: Option<&str>,
 ) -> Vec<String> {
-    oql_entity_names(schema_json)
-        .into_iter()
+    entities
+        .iter()
         .map(|entity| {
             let mut args = serde_json::Map::new();
             args.insert("canister_id".into(), serde_json::Value::String(canister_id.to_string()));
@@ -1036,6 +1076,9 @@ pub fn oql_query_examples(
             // escaped and the example stays valid JSON.
             let query = serde_json::json!({ "start": entity, "limit": 10 }).to_string();
             args.insert("oql".into(), serde_json::Value::String(query));
+            if let Some(u) = app_url {
+                args.insert("app_url".into(), serde_json::Value::String(u.to_string()));
+            }
             if let Some(o) = derivation_origin {
                 args.insert("derivation_origin".into(), serde_json::Value::String(o.to_string()));
             }
@@ -1061,11 +1104,7 @@ pub fn candid_reply_is_empty(reply: &str) -> bool {
         return true;
     }
     // Strip one layer of the outer `( … )` tuple wrapper if present.
-    let inner = t
-        .strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
-        .map(str::trim)
-        .unwrap_or(t);
+    let inner = t.strip_prefix('(').and_then(|s| s.strip_suffix(')')).map(str::trim).unwrap_or(t);
     match inner {
         "" | "null" | "none" => true,
         _ => {
@@ -1100,7 +1139,7 @@ pub fn normalize_oql_query(query: &str) -> Result<String, String> {
         serde_json::from_str(query).map_err(|e| format!("`query` must be valid JSON: {e}"))?;
     if !value.is_object() {
         return Err(
-            "`query` must be a JSON object, e.g. {\"start\":\"employee\",\"limit\":10}".to_string(),
+            "`query` must be a JSON object, e.g. {\"start\":\"employee\",\"limit\":10}".to_string()
         );
     }
     Ok(value.to_string())
@@ -1116,19 +1155,13 @@ pub fn encode_text_arg(text: &str) -> Result<Vec<u8>, String> {
 
 /// Encode the empty argument tuple `()` for `schema`.
 pub fn encode_unit_arg() -> Result<Vec<u8>, String> {
-    IDLArgs::new(&[])
-        .to_bytes()
-        .map_err(|e| format!("could not encode arguments: {e}"))
+    IDLArgs::new(&[]).to_bytes().map_err(|e| format!("could not encode arguments: {e}"))
 }
 
 /// The parsed outcome of an OQL `execute` reply.
 pub enum OqlResult {
     /// A decoded table: column names, string-rendered rows, and the paging flag.
-    Table {
-        columns: Vec<String>,
-        rows: Vec<Vec<String>>,
-        has_more: bool,
-    },
+    Table { columns: Vec<String>, rows: Vec<Vec<String>>, has_more: bool },
     /// The canister returned its error arm (e.g. `variant { err = "…" }`).
     QueryError(String),
     /// The reply's first row declared MORE than [`MAX_OQL_COLUMNS`] columns, so we
@@ -1149,11 +1182,7 @@ pub enum OqlResult {
 enum TableOutcome {
     /// A densified table (at most [`MAX_OQL_ROWS`] rows). `rows_truncated` is true
     /// when rows past the cap were dropped — recoverable via a higher `offset`.
-    Table {
-        columns: Vec<String>,
-        rows: Vec<Vec<String>>,
-        rows_truncated: bool,
-    },
+    Table { columns: Vec<String>, rows: Vec<Vec<String>>, rows_truncated: bool },
     /// The first row declared `column_count` (> [`MAX_OQL_COLUMNS`]) columns.
     TooWide { column_count: usize },
 }
@@ -1183,11 +1212,15 @@ pub fn parse_execute_reply(did: Option<&str>, reply: &[u8]) -> OqlResult {
             },
         };
         match decoded.args.into_iter().next() {
-            Some(val) => extract_oql(&val).unwrap_or_else(|| OqlResult::Unrecognized(val.to_string())),
+            Some(val) => {
+                extract_oql(&val).unwrap_or_else(|| OqlResult::Unrecognized(val.to_string()))
+            }
             None => OqlResult::Unrecognized("(empty reply)".to_string()),
         }
     })
-    .unwrap_or_else(|| OqlResult::Unrecognized("(could not spawn a thread to decode the reply)".to_string()))
+    .unwrap_or_else(|| {
+        OqlResult::Unrecognized("(could not spawn a thread to decode the reply)".to_string())
+    })
 }
 
 /// Decode a reply that is a single `text` value (e.g. `schema` or the API-doc
@@ -1196,6 +1229,13 @@ pub fn parse_execute_reply(did: Option<&str>, reply: &[u8]) -> OqlResult {
 /// (so nothing is silently dropped, even though these methods return one value by
 /// contract); an undecodable reply yields an explanatory string.
 pub fn decode_text_reply(reply: &[u8]) -> String {
+    try_decode_text_reply(reply).unwrap_or_else(|explanation| explanation)
+}
+
+/// [`decode_text_reply`] with the two outcomes kept apart: `Ok` is the rendered
+/// reply (the bare text, or the rendering of a non-text value / tuple), `Err` the
+/// explanatory string for a reply that could not be decoded at all.
+fn try_decode_text_reply(reply: &[u8]) -> Result<String, String> {
     // Decode, match, render, and drop the attacker-controlled reply on the deep
     // stack (CWE-674). candid's `from_bytes` decode recurses per nesting level but
     // is depth-bounded by candid's own `stacker::remaining_stack()` guard (an
@@ -1206,26 +1246,125 @@ pub fn decode_text_reply(reply: &[u8]) -> String {
     on_deep_stack(|| {
         let args = match IDLArgs::from_bytes_with_config(reply, &reply_decoder_config()) {
             Ok(a) => a,
-            Err(e) => return format!("(undecodable reply: {e})"),
+            Err(e) => return Err(format!("(undecodable reply: {e})")),
         };
-        match args.args.as_slice() {
+        Ok(match args.args.as_slice() {
             [] => "(empty reply)".to_string(),
             [IDLValue::Text(s)] => s.clone(),
             [single] => single.to_string(),
             _ => args.to_string(),
-        }
+        })
     })
-    .unwrap_or_else(|| "(could not spawn a thread to decode the reply)".to_string())
+    .unwrap_or_else(|| Err("(could not spawn a thread to decode the reply)".to_string()))
 }
 
-/// Decode a `schema` reply — a single `text` (the JSON catalogue). Pretty-print
-/// it when it parses as JSON; otherwise return it as-is.
-pub fn decode_schema_reply(reply: &[u8]) -> String {
-    let text = decode_text_reply(reply);
-    match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(text),
-        Err(_) => text,
+/// Largest `schema` reply text this server hands onward. A real OQL catalogue
+/// (at most [`MAX_OQL_ENTITIES`] entities are ever enumerated, each with a handful
+/// of fields and edges) is a few KB; the IC lets a reply carry ~2 MiB. Everything
+/// downstream of [`decode_schema_reply`] — the JSON parse, the text block, the
+/// structured content, the response body — is a small multiple of this bound.
+/// The reply is decoded against its declared `(text)` type first (see
+/// [`try_decode_schema_text`]) so that this cap, not candid's decoding quota, is
+/// the operative bound on the schema's size.
+pub(crate) const MAX_OQL_SCHEMA_BYTES: usize = 256 * 1024;
+
+/// A canister's decoded OQL `schema` reply: the text to hand onward plus the
+/// entity names extracted from the one JSON parse [`decode_schema_reply`] does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedSchema {
+    /// The reply text, verbatim, whether or not it parsed as JSON. Never
+    /// re-rendered: the consumer is a model, compact JSON is fewer tokens, and
+    /// indented output grows with depth × lines (a nest of `d` arrays renders to
+    /// `2·d²` bytes from `2·d`), so passing the bytes through is both the cheapest
+    /// and the only size-linear rendering.
+    pub text: String,
+    /// `Some` when the JSON carries an `entities` array (possibly empty); `None`
+    /// when it doesn't parse or lacks the key (an unrecognized shape).
+    entities: Option<SchemaEntities>,
+}
+
+impl DecodedSchema {
+    /// The declared entity names (see [`schema_entities`]) — empty for an
+    /// unparseable/unrecognized schema as well as for one that lists none.
+    pub fn entity_names(&self) -> &[String] {
+        self.entities.as_ref().map(|e| e.names.as_slice()).unwrap_or(&[])
     }
+
+    /// The entity names, or `None` when the schema was NOT recognized: no
+    /// `entities` array (unparseable text, or a document without the key), or an
+    /// array whose elements carry no string `name` at all. `Some(&[])` therefore
+    /// means exactly "declares zero entities" — the one case a caller may report as
+    /// "this account sees no entities" rather than leave undiagnosed.
+    pub fn recognized_entity_names(&self) -> Option<&[String]> {
+        match &self.entities {
+            Some(e) if e.declared == 0 || !e.names.is_empty() => Some(e.names.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Whether the schema declares NO entities (an `entities` array with zero
+    /// elements) — the caller-gated "empty schema" an anonymous read yields when
+    /// the app shows a principal only the entities it may see. Conservative: a
+    /// schema that doesn't parse as the expected `{"entities":[...]}` shape, or
+    /// whose elements we can't read names from, is NOT empty (so we never raise a
+    /// false auth hint on an unrecognized shape).
+    pub fn is_empty(&self) -> bool {
+        self.entities.as_ref().is_some_and(|e| e.declared == 0)
+    }
+}
+
+/// Decode a `schema` reply — a single `text` (the JSON catalogue) — into a
+/// [`DecodedSchema`]. `Err` when the text exceeds [`MAX_OQL_SCHEMA_BYTES`]: an
+/// over-large schema is refused up front rather than parsed, copied and
+/// serialized several times over. Text that isn't JSON is passed through verbatim (with no entities) — as is the explanatory
+/// string for a reply that doesn't decode at all (linear in the reply, and what
+/// every text-reply tool surfaces for one).
+pub fn decode_schema_reply(reply: &[u8]) -> Result<DecodedSchema, String> {
+    match try_decode_schema_text(reply) {
+        Ok(text) => schema_from_text(text),
+        Err(explanation) => Ok(DecodedSchema { text: explanation, entities: None }),
+    }
+}
+
+/// The text of a `schema` reply, decoded as its declared `(text)` return type
+/// straight into a `String`. Decoding into a concrete Rust type charges
+/// [`REPLY_DECODING_QUOTA`] once per byte, whereas decoding into a dynamic
+/// `IDLValue` (what [`decode_text_reply`] does — candid costs that as "untyped"
+/// even when a type is supplied) charges 50× and so calls any text over ~60 KB
+/// "undecodable", which would make [`MAX_OQL_SCHEMA_BYTES`] unreachable and hand a
+/// merely large schema on as an error dump. A reply that isn't exactly one `text`
+/// falls back to the rendering every text-reply tool gives (so a
+/// contract-violating reply still surfaces as before).
+fn try_decode_schema_text(reply: &[u8]) -> Result<String, String> {
+    let typed = on_deep_stack(|| {
+        let mut de =
+            candid::de::IDLDeserialize::new_with_config(reply, &reply_decoder_config()).ok()?;
+        let text: String = de.get_value().ok()?;
+        de.done().ok()?;
+        Some(text)
+    })
+    .flatten();
+    match typed {
+        Some(text) => Ok(text),
+        // Sequential, not nested: the typed decode's deep-stack call has returned.
+        None => try_decode_text_reply(reply),
+    }
+}
+
+/// The bounded, parse-once half of [`decode_schema_reply`], over the decoded text.
+pub(crate) fn schema_from_text(text: String) -> Result<DecodedSchema, String> {
+    if text.len() > MAX_OQL_SCHEMA_BYTES {
+        return Err(format!(
+            "the OQL schema reply is too large to process ({} bytes; limit {MAX_OQL_SCHEMA_BYTES})",
+            text.len()
+        ));
+    }
+    // One parse, for the entity extraction only — the text itself is handed on
+    // untouched. The tree is bounded by the byte cap above and by serde_json's
+    // recursion limit.
+    let entities =
+        serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| schema_entities(&v));
+    Ok(DecodedSchema { text, entities })
 }
 
 /// The canister's API-documentation method name, if it declares one — `getApiDoc`
@@ -1240,9 +1379,7 @@ pub fn api_doc_method(did: &str) -> Option<&'static str> {
         let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() else {
             return None;
         };
-        ["getApiDoc", "get_api_doc"]
-            .into_iter()
-            .find(|m| env.get_method(&actor, m).is_ok())
+        ["getApiDoc", "get_api_doc"].into_iter().find(|m| env.get_method(&actor, m).is_ok())
     })
     .flatten()
 }
@@ -1261,7 +1398,8 @@ fn decode_args_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<IDLArgs
     let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
     let actor = actor?;
     let func = env.get_method(&actor, method).ok()?;
-    IDLArgs::from_bytes_with_types_with_config(bytes, &env, &func.rets, &reply_decoder_config()).ok()
+    IDLArgs::from_bytes_with_types_with_config(bytes, &env, &func.rets, &reply_decoder_config())
+        .ok()
 }
 
 /// Recognize an OQL result value: a `record { hasMore; rows }`, optionally
@@ -1442,10 +1580,7 @@ fn cell_scalar(v: &IDLValue) -> String {
 /// OQL fields we ask for ("rows", "hasMore", "name", "value"); a hashed
 /// (`Label::Id`) label never equals a non-numeric key anyway.
 fn field_by_name<'a>(fields: &'a [IDLField], name: &str) -> Option<&'a IDLValue> {
-    fields
-        .iter()
-        .find(|f| matches!(&f.id, Label::Named(n) if n == name))
-        .map(|f| &f.val)
+    fields.iter().find(|f| matches!(&f.id, Label::Named(n) if n == name)).map(|f| &f.val)
 }
 
 fn label_name(l: &Label) -> String {
@@ -1475,9 +1610,8 @@ pub fn render_table(columns: &[String], rows: &[Vec<String>], has_more: bool) ->
     }
     out.push('\n');
     for row in rows {
-        let cells: Vec<String> = (0..columns.len())
-            .map(|i| esc(row.get(i).map(String::as_str).unwrap_or("")))
-            .collect();
+        let cells: Vec<String> =
+            (0..columns.len()).map(|i| esc(row.get(i).map(String::as_str).unwrap_or(""))).collect();
         out.push_str("| ");
         out.push_str(&cells.join(" | "));
         out.push_str(" |\n");
@@ -1485,11 +1619,7 @@ pub fn render_table(columns: &[String], rows: &[Vec<String>], has_more: bool) ->
     out.push_str(&format!(
         "\n{} row(s){}.",
         rows.len(),
-        if has_more {
-            " — more available; re-query with a higher `offset` to page"
-        } else {
-            ""
-        }
+        if has_more { " — more available; re-query with a higher `offset` to page" } else { "" }
     ));
     out
 }
@@ -1586,11 +1716,7 @@ mod tests {
         // Mixed prefix+group nesting must count BOTH levels per step (each
         // `opt record {` is depth 2), so the `opt` prefix isn't lost to the
         // following `record` keyword. 100 levels ⇒ ~200 frames ⇒ refused.
-        let deep_mixed = format!(
-            "{}1{}",
-            "opt record { a = ".repeat(100),
-            " }".repeat(100),
-        );
+        let deep_mixed = format!("{}1{}", "opt record { a = ".repeat(100), " }".repeat(100),);
         assert!(
             guard_candid_text("v", &deep_mixed).is_err(),
             "deep opt-record nesting must be refused (no prefix under-count)"
@@ -1605,7 +1731,8 @@ mod tests {
         // No false positives: brackets inside a STRING don't count, and many
         // SIBLING (non-nested) opts stay shallow.
         assert!(guard_candid_text("v", &format!("\"{}\"", "(".repeat(10_000))).is_ok());
-        assert!(guard_candid_text("v", &format!("(record {{ {} }})", "a = opt 1; ".repeat(1000))).is_ok());
+        assert!(guard_candid_text("v", &format!("(record {{ {} }})", "a = opt 1; ".repeat(1000)))
+            .is_ok());
     }
 
     // CWE-674, comment-hidden quote: `candid_parser`'s lexer drops `//` and
@@ -1649,11 +1776,8 @@ mod tests {
         }
         // A comment may also sit BETWEEN a prefix and the group it wraps: the
         // `opt` must survive the comment and still outlive `record`'s braces.
-        let deep_commented = format!(
-            "{}1{}",
-            "opt /* c */ record // c\n { a = ".repeat(100),
-            " }".repeat(100),
-        );
+        let deep_commented =
+            format!("{}1{}", "opt /* c */ record // c\n { a = ".repeat(100), " }".repeat(100),);
         assert!(
             guard_candid_text("v", &deep_commented).is_err(),
             "a comment between `opt` and `record {{` must not drop the prefix"
@@ -1738,9 +1862,7 @@ mod tests {
         // A realistic interface is nowhere near the cap.
         let realistic = format!(
             "{}service:{{ get:(t0)->(t0) query; set:(t0)->() }}",
-            (0..180)
-                .map(|i| format!("type t{i}=record{{a:nat;b:opt text}};"))
-                .collect::<String>()
+            (0..180).map(|i| format!("type t{i}=record{{a:nat;b:opt text}};")).collect::<String>()
         );
         assert!(guard_candid_text("d", &realistic).is_ok(), "real interfaces must pass");
     }
@@ -1788,13 +1910,10 @@ mod tests {
     #[test]
     fn deep_stack_parses_are_capped_but_all_complete() {
         use super::on_deep_stack;
-        let callers: Vec<_> = (0..64u32)
-            .map(|i| std::thread::spawn(move || on_deep_stack(|| i * 2)))
-            .collect();
-        let got: Vec<_> = callers
-            .into_iter()
-            .map(|c| c.join().expect("caller must not panic or hang"))
-            .collect();
+        let callers: Vec<_> =
+            (0..64u32).map(|i| std::thread::spawn(move || on_deep_stack(|| i * 2))).collect();
+        let got: Vec<_> =
+            callers.into_iter().map(|c| c.join().expect("caller must not panic or hang")).collect();
         assert_eq!(got, (0..64u32).map(|i| Some(i * 2)).collect::<Vec<_>>());
         // Permits are returned, so a later call still runs rather than blocking.
         assert_eq!(on_deep_stack(|| "after"), Some("after"));
@@ -1857,8 +1976,12 @@ mod tests {
         // Positive control: the SAME two-method interface without the deep
         // nesting IS detected, so the false above is provably the guard (depth),
         // not the interface shape.
-        let shallow_twin = "service : { schema : () -> (nat) query; execute : (text) -> (text) query; }";
-        assert!(has_oql(shallow_twin), "shallow twin should be detected — isolates the guard as the cause");
+        let shallow_twin =
+            "service : { schema : () -> (nat) query; execute : (text) -> (text) query; }";
+        assert!(
+            has_oql(shallow_twin),
+            "shallow twin should be detected — isolates the guard as the cause"
+        );
     }
 
     // is_query_method classifies a method by its Candid mode so canister_query can
@@ -1877,10 +2000,18 @@ mod tests {
         assert_eq!(is_query_method(did, "stats"), Some(true), "composite_query → Some(true)");
         assert_eq!(is_query_method(did, "transfer"), Some(false), "update method → Some(false)");
         assert_eq!(is_query_method(did, "missing"), None, "undeclared method → None (fail open)");
-        assert_eq!(is_query_method("not a candid interface", "x"), None, "unparseable → None (fail open)");
+        assert_eq!(
+            is_query_method("not a candid interface", "x"),
+            None,
+            "unparseable → None (fail open)"
+        );
         // Fail-open on an over-limit interface (CWE-674 guard), like has_oql.
         let over_deep = format!("service : {{ f : () -> ({}nat) query; }}", "vec ".repeat(5000));
-        assert_eq!(is_query_method(&over_deep, "f"), None, "over-limit interface → None (fail open)");
+        assert_eq!(
+            is_query_method(&over_deep, "f"),
+            None,
+            "over-limit interface → None (fail open)"
+        );
     }
 
     // "Prefer OQL": canister_query must reject a Candid `method` query on an OQL
@@ -1897,10 +2028,19 @@ mod tests {
         // names the full guide→schema→query path (#5) plus the auth hint.
         let msg = oql_query_redirect(Some(oql)).expect("query on OQL canister must be redirected");
         assert!(msg.contains("icp_oql_guide"), "message must point to the OQL guide: {msg}");
-        assert!(msg.contains("get_canister_oql_schema"), "message must point to the OQL schema tool: {msg}");
-        assert!(msg.contains("canister_query"), "message must point to canister_query's oql path: {msg}");
+        assert!(
+            msg.contains("get_canister_oql_schema"),
+            "message must point to the OQL schema tool: {msg}"
+        );
+        assert!(
+            msg.contains("canister_query"),
+            "message must point to canister_query's oql path: {msg}"
+        );
         assert!(msg.contains("`oql`"), "message must name the oql argument: {msg}");
-        assert!(msg.contains("derivation_origin"), "message must carry the auth hint (pass the origin): {msg}");
+        assert!(
+            msg.contains("derivation_origin"),
+            "message must carry the auth hint (pass the origin): {msg}"
+        );
 
         // Query on a non-OQL canister proceeds.
         assert!(oql_query_redirect(Some(plain)).is_none(), "non-OQL query must pass through");
@@ -1913,9 +2053,7 @@ mod tests {
     // can be exercised end-to-end against a realistic `execute` return type.
     #[cfg(test)]
     fn encode_reply(did: &str, method: &str, textual: &str) -> Vec<u8> {
-        let (env, actor) = candid_parser::utils::CandidSource::Text(did)
-            .load()
-            .expect("parse did");
+        let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().expect("parse did");
         let actor = actor.expect("service");
         let func = env.get_method(&actor, method).expect("method");
         candid_parser::parse_idl_args(textual)
@@ -1959,10 +2097,13 @@ mod tests {
         match parse_execute_reply(Some(did), &ok_reply) {
             OqlResult::Table { columns, rows, has_more } => {
                 assert_eq!(columns, vec!["firstName", "lastName"]);
-                assert_eq!(rows, vec![
-                    vec!["Ada".to_string(), "Lovelace".to_string()],
-                    vec!["Alan".to_string(), "Turing".to_string()],
-                ]);
+                assert_eq!(
+                    rows,
+                    vec![
+                        vec!["Ada".to_string(), "Lovelace".to_string()],
+                        vec!["Alan".to_string(), "Turing".to_string()],
+                    ]
+                );
                 assert!(has_more, "hasMore = true must be read");
             }
             _ => panic!("expected a Table"),
@@ -1977,10 +2118,7 @@ mod tests {
 
         // Without the interface, field names are hashed on the wire, so the shape
         // isn't recognized — degrade to Unrecognized rather than guess/panic.
-        assert!(matches!(
-            parse_execute_reply(None, &ok_reply),
-            OqlResult::Unrecognized(_)
-        ));
+        assert!(matches!(parse_execute_reply(None, &ok_reply), OqlResult::Unrecognized(_)));
 
         // A query that matched nothing (`rows = vec {}`) is a legitimate empty
         // table, NOT an error or Unrecognized.
@@ -1991,7 +2129,10 @@ mod tests {
         );
         match parse_execute_reply(Some(did), &empty) {
             OqlResult::Table { columns, rows, has_more } => {
-                assert!(columns.is_empty() && rows.is_empty() && !has_more, "empty result is a 0-row table");
+                assert!(
+                    columns.is_empty() && rows.is_empty() && !has_more,
+                    "empty result is a 0-row table"
+                );
             }
             _ => panic!("empty rows should be a Table, not an error/Unrecognized"),
         }
@@ -2025,11 +2166,12 @@ mod tests {
     // would loop the agent forever (ICPBB-384/385 + PR #136 review).
     #[test]
     fn rows_to_table_refuses_a_too_wide_first_row() {
-        use super::{extract_oql, rows_to_table, OqlResult, TableOutcome, IDLValue, MAX_OQL_COLUMNS};
+        use super::{
+            extract_oql, rows_to_table, IDLValue, OqlResult, TableOutcome, MAX_OQL_COLUMNS,
+        };
 
-        let wide: Vec<IDLValue> = (0..MAX_OQL_COLUMNS + 44)
-            .map(|c| oql_cell(&format!("c{c}"), "x"))
-            .collect();
+        let wide: Vec<IDLValue> =
+            (0..MAX_OQL_COLUMNS + 44).map(|c| oql_cell(&format!("c{c}"), "x")).collect();
         let width = wide.len();
         // Extra rows after the wide first row must NOT flip this into a row-paged
         // table: width is decided at the first row, before any row is materialized.
@@ -2038,13 +2180,17 @@ mod tests {
 
         match rows_to_table(&IDLValue::Vec(rows.clone())).expect("recognizable") {
             TableOutcome::TooWide { column_count } => assert_eq!(column_count, width),
-            TableOutcome::Table { .. } => panic!("an over-wide first row must be refused, not capped"),
+            TableOutcome::Table { .. } => {
+                panic!("an over-wide first row must be refused, not capped")
+            }
         }
 
         // Through the public mapping: TooManyColumns, and never a has_more table.
         match extract_oql(&oql_record(rows, false)).expect("recognizable") {
             OqlResult::TooManyColumns { column_count } => assert_eq!(column_count, width),
-            other => panic!("expected TooManyColumns, got a different arm: {}", oql_variant_name(&other)),
+            other => {
+                panic!("expected TooManyColumns, got a different arm: {}", oql_variant_name(&other))
+            }
         }
     }
 
@@ -2053,16 +2199,13 @@ mod tests {
     // even when the canister itself said hasMore = false.
     #[test]
     fn rows_to_table_caps_tall_replies_as_pageable() {
-        use super::{extract_oql, rows_to_table, OqlResult, TableOutcome, IDLValue, MAX_OQL_ROWS};
+        use super::{extract_oql, rows_to_table, IDLValue, OqlResult, TableOutcome, MAX_OQL_ROWS};
 
         // Two columns (well within the width cap), MAX_OQL_ROWS + 100 rows.
         let make_rows = || {
             (0..MAX_OQL_ROWS + 100)
                 .map(|r| {
-                    IDLValue::Vec(vec![
-                        oql_cell("id", &format!("{r}")),
-                        oql_cell("name", "x"),
-                    ])
+                    IDLValue::Vec(vec![oql_cell("id", &format!("{r}")), oql_cell("name", "x")])
                 })
                 .collect::<Vec<_>>()
         };
@@ -2093,11 +2236,10 @@ mod tests {
     // boundary against an off-by-one.)
     #[test]
     fn rows_to_table_column_cap_is_exclusive() {
-        use super::{rows_to_table, TableOutcome, IDLValue, MAX_OQL_COLUMNS};
+        use super::{rows_to_table, IDLValue, TableOutcome, MAX_OQL_COLUMNS};
 
-        let row_of = |n: usize| {
-            IDLValue::Vec((0..n).map(|c| oql_cell(&format!("c{c}"), "x")).collect())
-        };
+        let row_of =
+            |n: usize| IDLValue::Vec((0..n).map(|c| oql_cell(&format!("c{c}"), "x")).collect());
 
         // Exactly at the cap → a normal table with all columns.
         match rows_to_table(&IDLValue::Vec(vec![row_of(MAX_OQL_COLUMNS)])).expect("recognizable") {
@@ -2105,7 +2247,9 @@ mod tests {
             TableOutcome::TooWide { .. } => panic!("exactly MAX_OQL_COLUMNS must be accepted"),
         }
         // One over the cap → refused.
-        match rows_to_table(&IDLValue::Vec(vec![row_of(MAX_OQL_COLUMNS + 1)])).expect("recognizable") {
+        match rows_to_table(&IDLValue::Vec(vec![row_of(MAX_OQL_COLUMNS + 1)]))
+            .expect("recognizable")
+        {
             TableOutcome::TooWide { column_count } => assert_eq!(column_count, MAX_OQL_COLUMNS + 1),
             TableOutcome::Table { .. } => panic!("MAX_OQL_COLUMNS + 1 must be refused"),
         }
@@ -2115,7 +2259,7 @@ mod tests {
     // flagged; one more row is dropped and flags rows_truncated.
     #[test]
     fn rows_to_table_row_cap_is_exclusive() {
-        use super::{rows_to_table, TableOutcome, IDLValue, MAX_OQL_ROWS};
+        use super::{rows_to_table, IDLValue, TableOutcome, MAX_OQL_ROWS};
 
         let rows_of = |n: usize| {
             IDLValue::Vec((0..n).map(|_| IDLValue::Vec(vec![oql_cell("id", "x")])).collect())
@@ -2143,7 +2287,7 @@ mod tests {
     // set and its unknown cells are skipped (PR #136 review, r3803651957).
     #[test]
     fn rows_to_table_bounds_a_wide_later_row() {
-        use super::{rows_to_table, TableOutcome, IDLValue};
+        use super::{rows_to_table, IDLValue, TableOutcome};
 
         // Row 0 establishes a single column "id"; row 1 carries "id" plus 5_000
         // junk cells with names that are NOT columns.
@@ -2215,16 +2359,125 @@ mod tests {
         assert!(normalize_oql_query(&huge).is_err(), "oversized query is rejected");
     }
 
-    // schema decoding: the single `text` reply is returned, pretty-printed when
-    // it parses as JSON.
+    // schema decoding: the single `text` reply is returned exactly as sent (never
+    // re-rendered), and its entities come from the same parse.
     #[test]
-    fn decode_schema_reply_pretty_prints_json() {
+    fn decode_schema_reply_passes_json_through_verbatim() {
         use super::decode_schema_reply;
         let did = "service : { schema : () -> (text) query; }";
         let reply = encode_reply(did, "schema", "(\"{\\\"entities\\\":[]}\")");
-        let out = decode_schema_reply(&reply);
-        assert!(out.contains("\"entities\""), "schema JSON should be surfaced: {out}");
-        assert!(out.contains('\n'), "valid JSON should be pretty-printed: {out}");
+        let out = decode_schema_reply(&reply).expect("small schema is accepted");
+        assert_eq!(out.text, r#"{"entities":[]}"#, "schema JSON is surfaced byte-for-byte");
+        assert!(out.is_empty(), "an empty entities list is detected from the single parse");
+        assert!(out.entity_names().is_empty());
+    }
+
+    /// Encode a `schema`-shaped reply carrying `text` directly (no textual-Candid
+    /// round trip, so a multi-hundred-KB payload encodes instantly).
+    fn encode_text_reply(text: &str) -> Vec<u8> {
+        super::IDLArgs::new(&[super::IDLValue::Text(text.to_string())])
+            .to_bytes()
+            .expect("encode text reply")
+    }
+
+    // The entity names come out of the SAME parse as the text (no re-parse), with
+    // the same de-duplication/cap semantics as `schema_entities`; a shape without
+    // `entities` is "unrecognized", not empty.
+    #[test]
+    fn decode_schema_reply_extracts_entities_once() {
+        use super::decode_schema_reply;
+        let out = decode_schema_reply(&encode_text_reply(
+            r#"{"entities":[{"name":"bookings"},{"name":"users"},{"name":"bookings"}]}"#,
+        ))
+        .expect("accepted");
+        assert_eq!(out.entity_names(), ["bookings".to_string(), "users".to_string()]);
+        assert!(!out.is_empty());
+
+        assert_eq!(
+            out.recognized_entity_names(),
+            Some(&["bookings".to_string(), "users".to_string()][..])
+        );
+
+        let unrecognized = decode_schema_reply(&encode_text_reply("{}")).expect("accepted");
+        assert!(unrecognized.entity_names().is_empty());
+        assert!(!unrecognized.is_empty(), "no entities key → not treated as empty");
+        assert_eq!(unrecognized.recognized_entity_names(), None, "no entities key → unrecognized");
+
+        // An `entities` array whose elements carry no string `name` declares
+        // entities we can't read: NOT empty (no false auth hint), and unrecognized
+        // for the diagnosis — only a zero-element array is "declares no entities".
+        let nameless =
+            decode_schema_reply(&encode_text_reply(r#"{"entities":[{}]}"#)).expect("accepted");
+        assert!(nameless.entity_names().is_empty());
+        assert!(!nameless.is_empty(), "elements without names → not treated as empty");
+        assert_eq!(
+            nameless.recognized_entity_names(),
+            None,
+            "elements without names → unrecognized"
+        );
+        let empty =
+            decode_schema_reply(&encode_text_reply(r#"{"entities":[]}"#)).expect("accepted");
+        assert!(empty.is_empty());
+        assert_eq!(
+            empty.recognized_entity_names(),
+            Some(&[][..]),
+            "zero elements → recognized as empty"
+        );
+
+        let not_json = decode_schema_reply(&encode_text_reply("not json")).expect("accepted");
+        assert_eq!(not_json.text, "not json", "non-JSON text passes through verbatim");
+        assert!(not_json.entity_names().is_empty());
+        assert!(!not_json.is_empty());
+        assert_eq!(not_json.recognized_entity_names(), None);
+    }
+
+    // A `schema` reply of deeply nested arrays is handed on byte-for-byte —
+    // re-rendering it with indentation would expand it ~2·depth× (a 2 MiB reply
+    // of 126-deep nests would render to ~255 MiB) — and a text over
+    // MAX_OQL_SCHEMA_BYTES is refused outright. All of it end-to-end through the
+    // reply decoder: the schema is decoded against its `(text)` type, so a reply
+    // up to the cap gets through the candid quota (the untyped decode would call
+    // anything over ~60 KB undecodable).
+    #[test]
+    fn decode_schema_reply_bounds_expansion_and_size() {
+        use super::{decode_schema_reply, MAX_OQL_SCHEMA_BYTES};
+        // 126-deep nests inside one outer array: the shape indentation would
+        // expand the most, just under the byte cap.
+        let nest = format!("{}{}", "[".repeat(126), "]".repeat(126));
+        let nests: Vec<&str> = std::iter::repeat_n(nest.as_str(), 1000).collect();
+        let deep = format!("[{}]", nests.join(","));
+        assert!(deep.len() < MAX_OQL_SCHEMA_BYTES, "input must fit the byte cap: {}", deep.len());
+        let out =
+            decode_schema_reply(&encode_text_reply(&deep)).expect("within the byte cap → accepted");
+        assert_eq!(out.text, deep, "deep JSON is passed through verbatim, never re-rendered");
+        assert!(out.entity_names().is_empty());
+
+        // Shallow and wide, larger than the untyped decode would admit: accepted,
+        // entities extracted, and passed through verbatim.
+        let wide = format!(
+            "{{\"entities\":[{}]}}",
+            (0..3000)
+                .map(|i| format!("{{\"name\":\"entity_{i:04}\"}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(wide.len() > 60_000 && wide.len() < MAX_OQL_SCHEMA_BYTES, "{}", wide.len());
+        let out = decode_schema_reply(&encode_text_reply(&wide)).expect("accepted");
+        assert_eq!(out.text, wide, "large JSON is passed through verbatim");
+        assert_eq!(out.entity_names().len(), super::MAX_OQL_ENTITIES, "entity list is capped");
+
+        // Over the byte cap: refused before any parse, as an error (not handed on
+        // as an explanatory "schema").
+        let huge = format!("[{}]", "0,".repeat(MAX_OQL_SCHEMA_BYTES / 2));
+        let err =
+            decode_schema_reply(&encode_text_reply(&huge)).expect_err("over the cap → refused");
+        assert!(err.contains("too large"), "{err}");
+
+        // A reply that doesn't decode at all is surfaced as before (its explanation,
+        // no entities), not refused as "too large".
+        let out = decode_schema_reply(b"not candid").expect("undecodable → explanatory text");
+        assert!(out.text.starts_with("(undecodable reply:"), "{}", out.text);
+        assert!(out.entity_names().is_empty() && !out.is_empty());
     }
 
     // api_doc_method finds either naming (getApiDoc / get_api_doc), prefers
@@ -2233,10 +2486,18 @@ mod tests {
     #[test]
     fn api_doc_method_detection() {
         use super::api_doc_method;
-        assert_eq!(api_doc_method("service : { getApiDoc : () -> (text) query; }"), Some("getApiDoc"));
-        assert_eq!(api_doc_method("service : { get_api_doc : () -> (text) query; }"), Some("get_api_doc"));
         assert_eq!(
-            api_doc_method("service : { getApiDoc : () -> (text) query; get_api_doc : () -> (text) query; }"),
+            api_doc_method("service : { getApiDoc : () -> (text) query; }"),
+            Some("getApiDoc")
+        );
+        assert_eq!(
+            api_doc_method("service : { get_api_doc : () -> (text) query; }"),
+            Some("get_api_doc")
+        );
+        assert_eq!(
+            api_doc_method(
+                "service : { getApiDoc : () -> (text) query; get_api_doc : () -> (text) query; }"
+            ),
             Some("getApiDoc"),
             "prefers getApiDoc when both are declared"
         );
@@ -2245,7 +2506,7 @@ mod tests {
     }
 
     // decode_text_reply returns the single `text` value verbatim (markdown doc),
-    // without the JSON pretty-printing that decode_schema_reply layers on.
+    // just as decode_schema_reply does for the schema text.
     #[test]
     fn decode_text_reply_returns_text_verbatim() {
         use super::decode_text_reply;
@@ -2258,7 +2519,10 @@ mod tests {
         let multi_did = "service : { foo : () -> (text, nat) query; }";
         let multi = encode_reply(multi_did, "foo", "(\"a\", 5 : nat)");
         let out = decode_text_reply(&multi);
-        assert!(out.contains("a") && out.contains('5'), "multi-value reply keeps all values: {out}");
+        assert!(
+            out.contains("a") && out.contains('5'),
+            "multi-value reply keeps all values: {out}"
+        );
     }
 
     // Every type-less reply-decode path runs on the guarded deep stack (CWE-674). The
@@ -2272,7 +2536,9 @@ mod tests {
     // to trigger an abort, which is uncatchable and cannot be asserted on anyway.
     #[test]
     fn typeless_reply_paths_bound_deep_nesting() {
-        use super::{decode_reply, decode_text_reply, on_deep_stack, parse_execute_reply, OqlResult};
+        use super::{
+            decode_reply, decode_text_reply, on_deep_stack, parse_execute_reply, OqlResult,
+        };
         use candid::{IDLArgs, IDLValue};
         // ~DEPTH-deep `opt opt … opt null`. Build, encode, AND drop the input tree on
         // the deep stack too, so the test harness thread (also ~2 MiB) can't overflow
@@ -2304,7 +2570,10 @@ mod tests {
         use super::anonymous_empty_note;
         let note = anonymous_empty_note("this query", "the app's `derivation_origin`");
         assert!(note.contains("anonymous"), "must name the anonymous read: {note}");
-        assert!(note.to_lowercase().contains("not authenticated"), "must name the likely cause: {note}");
+        assert!(
+            note.to_lowercase().contains("not authenticated"),
+            "must name the likely cause: {note}"
+        );
         assert!(note.contains("this query"), "must echo `what`: {note}");
         assert!(note.contains("the app's `derivation_origin`"), "must echo `add_hint`: {note}");
         // Never a fabricated origin — only the placeholder hint.
@@ -2316,34 +2585,46 @@ mod tests {
     // never raise a false auth hint).
     #[test]
     fn oql_schema_is_empty_detects_only_empty_entities() {
-        use super::oql_schema_is_empty;
-        assert!(oql_schema_is_empty(r#"{"entities":[]}"#), "empty entities → empty");
+        assert!(schema_is_empty(r#"{"entities":[]}"#), "empty entities → empty");
         assert!(
-            oql_schema_is_empty("{\n  \"entities\": []\n}"),
+            schema_is_empty("{\n  \"entities\": []\n}"),
             "pretty-printed empty entities → empty"
         );
-        assert!(!oql_schema_is_empty(r#"{"entities":[{"name":"bookings"}]}"#), "populated → not empty");
-        assert!(!oql_schema_is_empty("not json"), "unparseable → not treated as empty");
-        assert!(!oql_schema_is_empty("{}"), "no entities key → not treated as empty");
+        assert!(!schema_is_empty(r#"{"entities":[{"name":"bookings"}]}"#), "populated → not empty");
+        assert!(!schema_is_empty("not json"), "unparseable → not treated as empty");
+        assert!(!schema_is_empty("{}"), "no entities key → not treated as empty");
+    }
+
+    /// The entity names `schema_from_text` extracts from a schema text.
+    fn entity_names(schema_json: &str) -> Vec<String> {
+        super::schema_from_text(schema_json.to_string())
+            .expect("small schema")
+            .entity_names()
+            .to_vec()
+    }
+
+    /// Whether `schema_from_text` reads a schema text as "no entities".
+    fn schema_is_empty(schema_json: &str) -> bool {
+        super::schema_from_text(schema_json.to_string()).expect("small schema").is_empty()
     }
 
     // #7/#8: entity names are extracted in order, de-duplicated, and capped; a
     // missing/garbage schema yields none.
     #[test]
     fn oql_entity_names_extracts_dedups_and_caps() {
-        use super::{oql_entity_names, MAX_OQL_ENTITIES};
-        let names = oql_entity_names(
+        use super::MAX_OQL_ENTITIES;
+        let names = entity_names(
             r#"{"entities":[{"name":"bookings"},{"name":"users"},{"name":"bookings"}]}"#,
         );
         assert_eq!(names, vec!["bookings", "users"], "in order, de-duplicated");
-        assert!(oql_entity_names("garbage").is_empty(), "garbage → none");
-        assert!(oql_entity_names("{}").is_empty(), "no entities → none");
+        assert!(entity_names("garbage").is_empty(), "garbage → none");
+        assert!(entity_names("{}").is_empty(), "no entities → none");
         // Cap: a schema with more entities than the cap is trimmed.
         let many: String = (0..(MAX_OQL_ENTITIES + 10))
             .map(|i| format!("{{\"name\":\"e{i}\"}}"))
             .collect::<Vec<_>>()
             .join(",");
-        let capped = oql_entity_names(&format!("{{\"entities\":[{many}]}}"));
+        let capped = entity_names(&format!("{{\"entities\":[{many}]}}"));
         assert_eq!(capped.len(), MAX_OQL_ENTITIES, "entity list is capped");
     }
 
@@ -2351,7 +2632,10 @@ mod tests {
     #[test]
     fn oql_query_start_extracts_start() {
         use super::oql_query_start;
-        assert_eq!(oql_query_start(r#"{"start":"bookings","limit":10}"#).as_deref(), Some("bookings"));
+        assert_eq!(
+            oql_query_start(r#"{"start":"bookings","limit":10}"#).as_deref(),
+            Some("bookings")
+        );
         assert_eq!(oql_query_start(r#"{"limit":10}"#), None, "no start → None");
         assert_eq!(oql_query_start("not json"), None, "garbage → None");
     }
@@ -2361,7 +2645,8 @@ mod tests {
     #[test]
     fn closest_entity_repairs_near_misses_only() {
         use super::closest_entity;
-        let entities = vec!["bookings".to_string(), "users".to_string(), "appointments".to_string()];
+        let entities =
+            vec!["bookings".to_string(), "users".to_string(), "appointments".to_string()];
         // The motivating case: singular guess → plural entity.
         assert_eq!(closest_entity("booking", &entities).as_deref(), Some("bookings"));
         // Case-insensitive exact.
@@ -2405,7 +2690,10 @@ mod tests {
         let long_entity = "a".repeat(MAX_FUZZY_NAME_LEN * 4);
         let big = vec![long_entity.clone()];
         assert_eq!(closest_entity(&long_entity, &big).as_deref(), Some(long_entity.as_str()));
-        assert_eq!(closest_entity(&format!("{long_entity}s"), &big).as_deref(), Some(long_entity.as_str()));
+        assert_eq!(
+            closest_entity(&format!("{long_entity}s"), &big).as_deref(),
+            Some(long_entity.as_str())
+        );
 
         // Unicode: the length-difference pruning counts chars, not bytes, so a
         // multi-byte near-miss (1 edit) is NOT wrongly pruned by a larger byte diff.
@@ -2417,38 +2705,68 @@ mod tests {
         );
     }
 
-    // #8: one COMPLETE canister_query per entity, each preserving the identity the
-    // schema was read under (derivation_origin + account), so copying an example
-    // doesn't silently drop back to anonymous.
+    // #8: one COMPLETE canister_query per entity, each preserving BOTH halves of
+    // the call the schema was read under — the identity (derivation_origin +
+    // account), so copying an example doesn't drop back to anonymous, and the
+    // authorizing `app_url`, so it doesn't get refused by the discoverability
+    // gate. The two are different origins for most apps, so an example carrying
+    // only the identity would fail exactly where the fallback was supposed to help.
     #[test]
-    fn oql_query_examples_are_complete_and_preserve_identity() {
+    fn oql_query_examples_are_complete_and_preserve_identity_and_authorization() {
         use super::oql_query_examples;
-        let schema = r#"{"entities":[{"name":"bookings"},{"name":"users"}]}"#;
-        let ex = oql_query_examples("aaaaa-aa", schema, Some("https://app.example.com"), Some("work"));
+        let schema = entity_names(r#"{"entities":[{"name":"bookings"},{"name":"users"}]}"#);
+        let ex = oql_query_examples(
+            "aaaaa-aa",
+            &schema,
+            Some("https://nns.internetcomputer.org"),
+            Some("https://nns.ic0.app"),
+            Some("work"),
+        );
         assert_eq!(ex.len(), 2, "one example per entity");
         assert!(ex[0].starts_with("canister_query "), "names the tool: {}", ex[0]);
         assert!(ex[0].contains("aaaaa-aa"), "carries the canister id: {}", ex[0]);
         assert!(ex[0].contains("bookings"), "uses the entity as start: {}", ex[0]);
-        assert!(ex[0].contains("https://app.example.com"), "preserves derivation_origin: {}", ex[0]);
+        assert!(ex[0].contains("https://nns.ic0.app"), "preserves derivation_origin: {}", ex[0]);
         assert!(ex[0].contains("work"), "preserves account: {}", ex[0]);
+        // The authorizing origin travels too, and as its OWN argument — the whole
+        // point is that it is not the derivation origin.
+        let args_json = ex[0].strip_prefix("canister_query ").expect("tool prefix");
+        let args: serde_json::Value = serde_json::from_str(args_json).expect("valid JSON args");
+        assert_eq!(
+            args.get("app_url").and_then(|u| u.as_str()),
+            Some("https://nns.internetcomputer.org"),
+            "the example must carry the origin that authorized the schema read: {}",
+            ex[0]
+        );
         // Anonymous schema read → examples carry no identity args (stay anonymous).
-        let anon = oql_query_examples("aaaaa-aa", schema, None, None);
-        assert!(!anon[0].contains("derivation_origin"), "no origin when read anonymously: {}", anon[0]);
+        let anon = oql_query_examples("aaaaa-aa", &schema, None, None, None);
+        assert!(
+            !anon[0].contains("derivation_origin"),
+            "no origin when read anonymously: {}",
+            anon[0]
+        );
+        assert!(!anon[0].contains("app_url"), "and no app_url when none was used: {}", anon[0]);
         // No entities → no examples.
-        assert!(oql_query_examples("aaaaa-aa", "{}", None, None).is_empty());
+        assert!(oql_query_examples("aaaaa-aa", &entity_names("{}"), None, None, None).is_empty());
 
         // Escaping: an entity name with a quote/backslash (the schema is
         // canister-supplied, hence untrusted) must still yield a VALID-JSON example.
         // The example line is `canister_query <json-args>`; the `oql` arg is itself a
         // JSON-object string — both must parse.
-        let weird = r#"{"entities":[{"name":"we\"ird"}]}"#;
-        let wex = oql_query_examples("aaaaa-aa", weird, None, None);
+        let weird = entity_names(r#"{"entities":[{"name":"we\"ird"}]}"#);
+        let wex = oql_query_examples("aaaaa-aa", &weird, None, None, None);
         assert_eq!(wex.len(), 1);
         let args_json = wex[0].strip_prefix("canister_query ").expect("tool prefix");
-        let args: serde_json::Value = serde_json::from_str(args_json).expect("args must be valid JSON");
+        let args: serde_json::Value =
+            serde_json::from_str(args_json).expect("args must be valid JSON");
         let query = args.get("oql").and_then(|q| q.as_str()).expect("oql string");
-        let parsed: serde_json::Value = serde_json::from_str(query).expect("oql must be valid JSON");
-        assert_eq!(parsed.get("start").and_then(|s| s.as_str()), Some("we\"ird"), "entity name round-trips");
+        let parsed: serde_json::Value =
+            serde_json::from_str(query).expect("oql must be valid JSON");
+        assert_eq!(
+            parsed.get("start").and_then(|s| s.as_str()),
+            Some("we\"ird"),
+            "entity name round-trips"
+        );
     }
 
     // #1: the conservative empty-reply detector recognizes the unambiguous empties

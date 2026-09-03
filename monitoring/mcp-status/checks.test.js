@@ -10,6 +10,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   worstStatus,
+  isRedirect,
   parseCspDirective,
   checkMcpEndpoints,
   checkLinkage,
@@ -21,7 +22,9 @@ import {
   isAllowedOrigin,
   normaliseOrigin,
   parseAdvertisedInstances,
+  parseTargetList,
   resolveConfig,
+  resolveTargets,
 } from "./config.js";
 
 const byId = (section, id) => section.checks.find((c) => c.id === id);
@@ -37,12 +40,16 @@ const resp = (status, { headers = {}, body = "" } = {}) => ({
  * Install a fetch stub that dispatches on "METHOD url". A route value is either a
  * `resp(...)` object or a function `(init) => resp(...)` that answers by request
  * (used to mirror the /oauth/register allow-list, which branches on the body).
+ *
+ * The fragment is stripped along with the query, because `fetch` never sends
+ * one: a probe asking for `/#landing` reaches the server as `/`, and a stub that
+ * routed them separately would hide exactly that.
  * @param {Record<string, ReturnType<typeof resp> | ((init: RequestInit) => ReturnType<typeof resp>)>} routes
  */
 const stubFetch = (routes) => {
   const original = globalThis.fetch;
   globalThis.fetch = async (url, init = {}) => {
-    const key = `${init.method ?? "GET"} ${url.split("?")[0]}`;
+    const key = `${init.method ?? "GET"} ${url.split(/[?#]/)[0]}`;
     const route = routes[key];
     if (route) return typeof route === "function" ? route(init) : route;
     throw new Error(`unexpected fetch: ${key}`);
@@ -78,6 +85,45 @@ const registerRoute = (init) => {
     ? resp(201, { body: JSON.stringify({ client_id: "client-123" }) })
     : resp(400, { body: JSON.stringify({ error: "invalid_redirect_uri" }) });
 };
+
+/**
+ * The route table of a well-behaved server, for tests that vary one endpoint.
+ * Spread `...healthyRoutes(origin)` and override the key under test.
+ */
+const healthyRoutes = (origin) => ({
+  [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
+  [`GET ${origin}/version`]: resp(200, {
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ version: "0.1.0", commit: "abc123def4567890" }),
+  }),
+  [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      authorization_servers: [`${origin}/mcp`],
+      resource: `${origin}/mcp`,
+    }),
+  }),
+  [`GET ${origin}/.well-known/oauth-authorization-server`]: resp(200, {
+    body: JSON.stringify({
+      issuer: `${origin}/mcp`,
+      authorization_endpoint: `${origin}/mcp/oauth/authorize`,
+      token_endpoint: `${origin}/mcp/oauth/token`,
+      registration_endpoint: `${origin}/mcp/oauth/register`,
+      code_challenge_methods_supported: ["S256"],
+    }),
+  }),
+  [`POST ${origin}/mcp`]: resp(401, {
+    headers: {
+      "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
+    },
+    body: JSON.stringify({ error: "invalid_token" }),
+  }),
+  [`POST ${origin}/mcp/oauth/register`]: registerRoute,
+  [`GET ${origin}/mcp/oauth/authorize`]: resp(400, { body: "missing client_id" }),
+  [`POST ${origin}/mcp/oauth/token`]: resp(400, {
+    body: JSON.stringify({ error: "invalid_grant" }),
+  }),
+});
 
 test("worstStatus picks the most severe status", () => {
   assert.equal(worstStatus(["pass", "pass"]), "pass");
@@ -229,10 +275,138 @@ test("resolveConfig rejects a disallowed origin", () => {
   );
 });
 
+/** Run `fn` with the given variables set (undefined = unset), restoring afterwards. */
+const withEnv = (vars, fn) => {
+  const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  for (const [k, v] of Object.entries(vars)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  try {
+    fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+};
+
+test("parseTargetList reads name=origin entries from a string or repeated flags", () => {
+  assert.deepEqual(
+    parseTargetList("staging=https://mcp.beta.id.ai  production=https://mcp.internetcomputer.org"),
+    [
+      { name: "staging", origin: "https://mcp.beta.id.ai" },
+      { name: "production", origin: "https://mcp.internetcomputer.org" },
+    ],
+  );
+  // Repeated --target flags arrive as an array; an unset variable as nothing.
+  assert.deepEqual(parseTargetList(["a=https://a.id.ai", "b=https://b.id.ai"]).length, 2);
+  assert.deepEqual(parseTargetList(undefined), []);
+  assert.deepEqual(parseTargetList("   "), []);
+  // Malformed entries and duplicate names are errors, not silently dropped: a
+  // dashboard monitoring fewer instances than configured must not look whole.
+  assert.throws(() => parseTargetList("https://mcp.beta.id.ai"), /name=origin/);
+  assert.throws(() => parseTargetList("bad name=https://x.id.ai"), /name=origin/);
+  assert.throws(() => parseTargetList("a/b=https://x.id.ai"), /name=origin/);
+  assert.throws(() => parseTargetList("x="), /name=origin/);
+  assert.throws(() => parseTargetList("a=https://x.id.ai a=https://y.id.ai"), /Duplicate/);
+});
+
+test("resolveTargets builds the instance set, pins per target, and allowlists each", () => {
+  const { targets } = resolveTargets({
+    targets: "staging=https://mcp.beta.id.ai production=https://mcp.id.ai",
+    targetIi: "production=https://id.ai",
+  });
+  assert.deepEqual(targets, [
+    { name: "staging", mcpOrigin: "https://mcp.beta.id.ai", iiOrigin: undefined },
+    { name: "production", mcpOrigin: "https://mcp.id.ai", iiOrigin: "https://id.ai" },
+  ]);
+  // A pin has to name a configured target.
+  assert.throws(
+    () => resolveTargets({ targets: "a=https://mcp.beta.id.ai", targetIi: "b=https://id.ai" }),
+    /unknown target "b"/,
+  );
+  // The SSRF allowlist applies to every configured instance, not just the first.
+  assert.throws(
+    () => resolveTargets({ targets: "a=https://mcp.beta.id.ai b=https://evil.example" }),
+    (e) => e.code === "DISALLOWED_ORIGIN",
+  );
+  assert.throws(
+    () => resolveTargets({ targets: "a=https://mcp.beta.id.ai", targetIi: "a=https://evil.example" }),
+    (e) => e.code === "DISALLOWED_ORIGIN",
+  );
+  // Naming instances two ways at once is a configuration error, not a merge —
+  // for the MCP origin AND for the II pin: a global --ii / II_ORIGIN alongside a
+  // list would silently pin every unpinned target to the same II.
+  assert.throws(
+    () => resolveTargets({ targets: "a=https://mcp.beta.id.ai", mcpOrigin: "https://mcp.id.ai" }),
+    /--mcp cannot be combined/,
+  );
+  assert.throws(
+    () => resolveTargets({ targets: "a=https://mcp.beta.id.ai", iiOrigin: "https://id.ai" }),
+    /--ii cannot be combined/,
+  );
+  withEnv({ II_ORIGIN: "https://id.ai" }, () => {
+    assert.throws(
+      () => resolveTargets({ targets: "a=https://mcp.beta.id.ai b=https://mcp.id.ai" }),
+      /II_ORIGIN cannot be combined/,
+    );
+  });
+  withEnv({ MCP_ORIGIN: "https://mcp.id.ai" }, () => {
+    assert.throws(
+      () => resolveTargets({ targets: "a=https://mcp.beta.id.ai" }),
+      /MCP_ORIGIN cannot be combined/,
+    );
+  });
+  // An unpinned target stays unpinned: nothing falls through to the environment.
+  withEnv({ II_ORIGIN: undefined }, () => {
+    const { targets: t } = resolveTargets({
+      targets: "a=https://mcp.beta.id.ai b=https://mcp.id.ai",
+      targetIi: "b=https://id.ai",
+    });
+    assert.deepEqual(t.map((x) => x.iiOrigin), [undefined, "https://id.ai"]);
+  });
+});
+
+test("resolveTargets refuses a pin that has no target list to pin into", () => {
+  // A half-typed multi-target invocation must not quietly become the
+  // single-target fallback monitoring a different pairing.
+  assert.throws(
+    () => resolveTargets({ targetIi: "production=https://id.ai" }),
+    /no --target \/ MCP_STATUS_TARGETS is set/,
+  );
+  withEnv({ MCP_STATUS_TARGET_II: "production=https://id.ai" }, () => {
+    assert.throws(() => resolveTargets(), /no --target \/ MCP_STATUS_TARGETS is set/);
+  });
+  // Empty pin settings are not pins.
+  withEnv({ MCP_STATUS_TARGET_II: "  " }, () => {
+    assert.equal(resolveTargets({ mcpOrigin: "https://mcp.beta.id.ai" }).targets.length, 1);
+  });
+});
+
+test("resolveTargets falls back to the single-target configuration, named by host", () => {
+  const { targets } = resolveTargets({
+    mcpOrigin: "https://mcp.beta.id.ai",
+    iiOrigin: "https://beta.id.ai",
+  });
+  assert.deepEqual(targets, [
+    { name: "mcp.beta.id.ai", mcpOrigin: "https://mcp.beta.id.ai", iiOrigin: "https://beta.id.ai" },
+  ]);
+  // MCP_STATUS_TARGETS in the environment defines the set the same way a flag does.
+  withEnv({ MCP_STATUS_TARGETS: "one=https://mcp.beta.id.ai two=https://mcp.id.ai" }, () => {
+    assert.deepEqual(
+      resolveTargets().targets.map((t) => t.name),
+      ["one", "two"],
+    );
+  });
+});
+
 test("checkMcpEndpoints passes for a well-behaved server", async () => {
   const origin = "https://mcp.beta.test";
   const restore = stubFetch({
-    [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
+    ...healthyRoutes(origin),
+    // Carries the build and start times this test asserts on.
     [`GET ${origin}/version`]: resp(200, {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -242,38 +416,10 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
         started_at: 1_700_000_500,
       }),
     }),
-    [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        authorization_servers: [`${origin}/mcp`],
-        resource: `${origin}/mcp`,
-      }),
-    }),
-    [`GET ${origin}/.well-known/oauth-authorization-server`]: resp(200, {
-      body: JSON.stringify({
-        issuer: `${origin}/mcp`,
-        authorization_endpoint: `${origin}/mcp/oauth/authorize`,
-        token_endpoint: `${origin}/mcp/oauth/token`,
-        registration_endpoint: `${origin}/mcp/oauth/register`,
-        code_challenge_methods_supported: ["S256"],
-      }),
-    }),
-    [`POST ${origin}/mcp`]: resp(401, {
-      headers: {
-        "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
-      },
-      body: JSON.stringify({ error: "invalid_token" }),
-    }),
-    [`POST ${origin}/mcp/oauth/register`]: registerRoute,
-    [`GET ${origin}/mcp/oauth/authorize`]: resp(400, { body: "missing client_id" }),
-    [`POST ${origin}/mcp/oauth/token`]: resp(400, {
-      body: JSON.stringify({ error: "invalid_grant" }),
-    }),
   });
   try {
     const { section, facts } = await checkMcpEndpoints(origin, 2000);
     assert.equal(byId(section, "root").status, "pass");
-    assert.equal(byId(section, "version").status, "pass");
     assert.equal(byId(section, "protected-resource").status, "pass");
     assert.equal(byId(section, "as-metadata").status, "pass");
     assert.equal(byId(section, "metadata-consistency").status, "pass");
@@ -291,6 +437,12 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
     );
     assert.equal(facts.deployment.builtAt, 1_700_000_000);
     assert.equal(facts.deployment.startedAt, 1_700_000_500);
+    // ...but /version itself is not graded: it is an operator convenience, not
+    // part of the MCP contract, and production's edge no longer serves it.
+    assert.equal(
+      section.checks.find((c) => c.id === "version"),
+      undefined,
+    );
     // Every check carries a human-readable description.
     for (const c of section.checks) {
       assert.ok(
@@ -303,50 +455,207 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
   }
 });
 
+// The landing page and its subpages moved off this origin — they are
+// maintained in dfinity/internetcomputer-org and served at
+// internetcomputer.org/icp-mcp/ — and the server answers their old paths with
+// permanent redirects so published links keep working. That is the deployed
+// shape, so it has to read as healthy: asserting "200 text/html" reported a
+// correctly working deployment as a failing one (and pushed a partial outage to
+// the public status page).
+test("checkMcpEndpoints tolerates a landing page that redirects off-origin", async () => {
+  const origin = "https://mcp.beta.test";
+  const restore = stubFetch({
+    ...healthyRoutes(origin),
+    // The stub throws on any unexpected fetch, so this also asserts the
+    // off-origin destination is reported, never requested.
+    [`GET ${origin}/`]: resp(308, {
+      headers: { location: "https://internetcomputer.org/icp-mcp/" },
+    }),
+  });
+  try {
+    const { section, facts } = await checkMcpEndpoints(origin, 2000);
+    const root = byId(section, "root");
+    assert.equal(root.status, "pass");
+    assert.equal(root.httpStatus, 308);
+    assert.match(root.detail, /308 → https:\/\/internetcomputer\.org\/icp-mcp\//);
+    assert.equal(facts.landing.movedTo, "https://internetcomputer.org/icp-mcp/");
+    assert.equal(facts.landing.servedHere, false);
+    // One failing check used to sink the whole section, and with it the
+    // dashboard's overall verdict. (The section still warns here: the TLS check
+    // cannot reach the unresolvable test hostname.)
+    assert.notEqual(section.status, "fail");
+  } finally {
+    restore();
+  }
+});
+
+// /version is read for the deployment banner and the II discovery, but it is
+// not a health check: it is an operator convenience rather than part of the MCP
+// contract, and production's fronting edge answers it with a redirect to the
+// landing site instead of serving it. Grading it warned that column on every
+// run forever while the MCP surface was serving everything correctly — so a
+// deployment that does not expose /version must read exactly as healthy as one
+// that does.
+test("checkMcpEndpoints does not grade /version", async () => {
+  const origin = "https://mcp.beta.test";
+  const served = await (async () => {
+    const restore = stubFetch(healthyRoutes(origin));
+    try {
+      return await checkMcpEndpoints(origin, 2000);
+    } finally {
+      restore();
+    }
+  })();
+
+  const restore = stubFetch({
+    ...healthyRoutes(origin),
+    // Production's shape: the edge redirects /version to the landing site.
+    [`GET ${origin}/version`]: resp(308, {
+      headers: { location: "https://internetcomputer.org/icp-mcp/" },
+    }),
+  });
+  try {
+    const { section, facts } = await checkMcpEndpoints(origin, 2000);
+    // No check is emitted for it, whether it is served or not, so the section
+    // reads the same either way.
+    assert.equal(
+      section.checks.find((c) => c.id === "version"),
+      undefined,
+    );
+    assert.deepEqual(
+      section.checks.map((c) => c.id),
+      served.section.checks.map((c) => c.id),
+    );
+    assert.equal(section.status, served.section.status);
+    // The facts it would have carried are simply absent: the report's
+    // deployment banner is omitted, and with no advertised instances the II
+    // has to be pinned (--target-ii, as the deployed dashboard does).
+    assert.deepEqual(facts.deployment, {
+      version: undefined,
+      commit: undefined,
+      commitUrl: undefined,
+      builtAt: undefined,
+      startedAt: undefined,
+    });
+    assert.deepEqual(facts.advertised, { instances: [], rejected: [] });
+  } finally {
+    restore();
+  }
+});
+
+// A redirect that stays on the origin is taken at its word too — reported with
+// its destination, not followed. The stub throws on any route it does not know,
+// so leaving `/landing/` undefined asserts it is never requested.
+test("checkMcpEndpoints reports a same-origin landing-page redirect without following it", async () => {
+  const origin = "https://mcp.beta.test";
+  const restore = stubFetch({
+    ...healthyRoutes(origin),
+    [`GET ${origin}/`]: resp(301, { headers: { location: "/landing/" } }),
+  });
+  try {
+    const { section, facts } = await checkMcpEndpoints(origin, 2000);
+    const root = byId(section, "root");
+    assert.equal(root.status, "pass");
+    assert.equal(root.httpStatus, 301);
+    assert.equal(root.detail, `301 → ${origin}/landing/`);
+    assert.equal(facts.landing.movedTo, `${origin}/landing/`);
+  } finally {
+    restore();
+  }
+});
+
+// Tolerating redirects must not tolerate broken ones: a 3xx is healthy because
+// it names where the page went, so one that names nothing — or names itself —
+// is still a failure.
+test("checkMcpEndpoints fails a landing-page redirect that goes nowhere", async () => {
+  const origin = "https://mcp.beta.test";
+  for (const [label, root] of [
+    ["no Location header", resp(308)],
+    ["a non-http Location", resp(302, { headers: { location: "mailto:a@b.c" } })],
+    ["a redirect to itself", resp(308, { headers: { location: "/" } })],
+    ["a 404", resp(404, { headers: { "content-type": "text/plain" } })],
+  ]) {
+    let rootRequests = 0;
+    const restore = stubFetch({
+      ...healthyRoutes(origin),
+      [`GET ${origin}/`]: () => {
+        rootRequests += 1;
+        return root;
+      },
+    });
+    try {
+      const { section } = await checkMcpEndpoints(origin, 2000);
+      assert.equal(byId(section, "root").status, "fail", label);
+      assert.equal(section.status, "fail", label);
+      // Nothing is followed, so the self-redirect is never chased.
+      assert.equal(rootRequests, 1, label);
+    } finally {
+      restore();
+    }
+  }
+});
+
+// A fragment is not part of a request — `fetch` never sends one — so a
+// `Location` differing only there names the resource just requested, not a new
+// destination, however different the two strings look.
+test("checkMcpEndpoints fails a fragment-only landing-page redirect", async () => {
+  const origin = "https://mcp.beta.test";
+  const restore = stubFetch({
+    ...healthyRoutes(origin),
+    [`GET ${origin}/`]: resp(308, { headers: { location: "#landing" } }),
+  });
+  try {
+    const { section, facts } = await checkMcpEndpoints(origin, 2000);
+    assert.equal(byId(section, "root").status, "fail");
+    assert.equal(facts.landing.movedTo, null);
+  } finally {
+    restore();
+  }
+});
+
+// Everywhere else a redirect is a finding, reported with where it went: for the
+// protocol documents MCP clients read the status code itself, so a 3xx where
+// the spec says 200 is the contract broken, not a detour to take.
+test("checkMcpEndpoints reports a redirected protocol document as a failure", async () => {
+  const origin = "https://mcp.beta.test";
+  const restore = stubFetch({
+    ...healthyRoutes(origin),
+    [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(302, {
+      headers: { location: "/.well-known/oauth-protected-resource/mcp" },
+    }),
+  });
+  try {
+    const { section } = await checkMcpEndpoints(origin, 2000);
+    const doc = byId(section, "protected-resource");
+    assert.equal(doc.status, "fail");
+    assert.equal(doc.httpStatus, 302);
+    assert.equal(
+      doc.detail,
+      `302 → ${origin}/.well-known/oauth-protected-resource/mcp, missing required fields`,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("isRedirect recognises the redirect status codes", () => {
+  for (const s of [301, 302, 303, 307, 308]) assert.equal(isRedirect(s), true, `${s}`);
+  for (const s of [200, 304, 400, 401, 404, 500]) assert.equal(isRedirect(s), false, `${s}`);
+});
+
 test("checkMcpEndpoints in non-mutating mode never registers a client", async () => {
   const origin = "https://mcp.beta.test";
   /** @type {string[]} */
   const registerRedirects = [];
   const restore = stubFetch({
-    [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
-    [`GET ${origin}/version`]: resp(200, {
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ version: "0.1.0", commit: "abc123def4567890" }),
-    }),
-    [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        authorization_servers: [`${origin}/mcp`],
-        resource: `${origin}/mcp`,
-      }),
-    }),
-    [`GET ${origin}/.well-known/oauth-authorization-server`]: resp(200, {
-      body: JSON.stringify({
-        issuer: `${origin}/mcp`,
-        authorization_endpoint: `${origin}/mcp/oauth/authorize`,
-        token_endpoint: `${origin}/mcp/oauth/token`,
-        registration_endpoint: `${origin}/mcp/oauth/register`,
-        code_challenge_methods_supported: ["S256"],
-      }),
-    }),
-    [`POST ${origin}/mcp`]: resp(401, {
-      headers: {
-        "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
-      },
-      body: JSON.stringify({ error: "invalid_token" }),
-    }),
+    ...healthyRoutes(origin),
+    // Records every registration attempt, so the test can assert none was made.
     [`POST ${origin}/mcp/oauth/register`]: (init) => {
       registerRedirects.push(
         (JSON.parse(init.body ?? "{}").redirect_uris ?? [])[0] ?? "",
       );
       return registerRoute(init);
     },
-    [`GET ${origin}/mcp/oauth/authorize`]: resp(400, {
-      body: "missing client_id",
-    }),
-    [`POST ${origin}/mcp/oauth/token`]: resp(400, {
-      body: JSON.stringify({ error: "invalid_grant" }),
-    }),
   });
   try {
     const { section } = await checkMcpEndpoints(origin, 2000, {
@@ -372,26 +681,9 @@ test("checkMcpEndpoints in non-mutating mode never registers a client", async ()
 test("checkMcpEndpoints flags a missing OAuth challenge", async () => {
   const origin = "https://mcp.beta.test";
   const restore = stubFetch({
-    [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
-    [`GET ${origin}/version`]: resp(404),
-    [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
-      body: JSON.stringify({ authorization_servers: [`${origin}/mcp`], resource: `${origin}/mcp` }),
-    }),
-    [`GET ${origin}/.well-known/oauth-authorization-server`]: resp(200, {
-      body: JSON.stringify({
-        issuer: `${origin}/mcp`,
-        authorization_endpoint: `${origin}/mcp/oauth/authorize`,
-        token_endpoint: `${origin}/mcp/oauth/token`,
-        registration_endpoint: `${origin}/mcp/oauth/register`,
-      }),
-    }),
+    ...healthyRoutes(origin),
     // 200 instead of a 401 challenge → wrong contract.
     [`POST ${origin}/mcp`]: resp(200, { body: "{}" }),
-    [`POST ${origin}/mcp/oauth/register`]: registerRoute,
-    [`GET ${origin}/mcp/oauth/authorize`]: resp(400),
-    [`POST ${origin}/mcp/oauth/token`]: resp(400, {
-      body: JSON.stringify({ error: "invalid_grant" }),
-    }),
   });
   try {
     const { section } = await checkMcpEndpoints(origin, 2000);
@@ -404,32 +696,10 @@ test("checkMcpEndpoints flags a missing OAuth challenge", async () => {
 test("checkMcpEndpoints flags a missing hosted-redirect allow-list", async () => {
   const origin = "https://mcp.beta.test";
   const restore = stubFetch({
-    [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
-    [`GET ${origin}/version`]: resp(404),
-    [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
-      body: JSON.stringify({ authorization_servers: [`${origin}/mcp`], resource: `${origin}/mcp` }),
-    }),
-    [`GET ${origin}/.well-known/oauth-authorization-server`]: resp(200, {
-      body: JSON.stringify({
-        issuer: `${origin}/mcp`,
-        authorization_endpoint: `${origin}/mcp/oauth/authorize`,
-        token_endpoint: `${origin}/mcp/oauth/token`,
-        registration_endpoint: `${origin}/mcp/oauth/register`,
-      }),
-    }),
-    [`POST ${origin}/mcp`]: resp(401, {
-      headers: {
-        "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
-      },
-      body: JSON.stringify({ error: "invalid_token" }),
-    }),
+    ...healthyRoutes(origin),
     // Guard MISSING: the server accepts ANY redirect (even a hosted one) with 201.
     [`POST ${origin}/mcp/oauth/register`]: resp(201, {
       body: JSON.stringify({ client_id: "leaked" }),
-    }),
-    [`GET ${origin}/mcp/oauth/authorize`]: resp(400),
-    [`POST ${origin}/mcp/oauth/token`]: resp(400, {
-      body: JSON.stringify({ error: "invalid_grant" }),
     }),
   });
   try {
@@ -520,6 +790,31 @@ test("checkIiHealth verifies the /mcp delegation flow and config", async () => {
     assert.deepEqual(facts.relatedOrigins, [ii, "https://beta.identity.ic0.app"]);
     assert.equal(facts.config.status, 200);
     assert.equal(facts.config.backendCanisterId, "fgte5-ciaaa-aaaad-aaatq-cai");
+  } finally {
+    restore();
+  }
+});
+
+// The case that decides why redirects are never followed: an II that has
+// removed its /mcp connect page and, like most single-page apps, answers unknown
+// paths with a redirect to /. Following would land on a 200 and call the page
+// served; the check has to say the page is gone, and where the request went.
+test("checkIiHealth fails a redirected /mcp connect page and says where it went", async () => {
+  const ii = "https://beta.test";
+  const restore = stubFetch({
+    [`GET ${ii}/`]: resp(200, { headers: { "ic-certificate": "certificate=:a:" } }),
+    [`GET ${ii}/mcp`]: resp(302, { headers: { location: "/" } }),
+    [`GET ${ii}/.config`]: resp(200, {
+      headers: { "content-type": "text/plain" },
+      body: `record { backend_canister_id = principal "fgte5-ciaaa-aaaad-aaatq-cai"; }`,
+    }),
+  });
+  try {
+    const { section } = await checkIiHealth(ii, "https://mcp.beta.test", 2000);
+    const flow = byId(section, "ii-mcp-flow");
+    assert.equal(flow.status, "fail");
+    assert.equal(flow.httpStatus, 302);
+    assert.equal(flow.detail, `302 → ${ii}/, /mcp connect page not served`);
   } finally {
     restore();
   }

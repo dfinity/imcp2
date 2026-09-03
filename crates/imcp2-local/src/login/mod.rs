@@ -45,10 +45,7 @@ const GRANT_TTL_SECS: u64 = 3600;
 const CONTACT_EMAIL: &str = "mcp@dfinity.org";
 
 fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
 }
 
 /// The login flow's shared handle: the `authenticate`/`auth_status` tools call
@@ -192,10 +189,7 @@ impl LoginDriver {
 
         if let Some(p) = &state.pending {
             if !p.expired() {
-                return Ok(BeginOutcome::Pending {
-                    url: p.url.clone(),
-                    fresh: false,
-                });
+                return Ok(BeginOutcome::Pending { url: p.url.clone(), fresh: false });
             }
             // Expired while nobody was looking: tear it down, then start fresh.
             if let Some(p) = state.pending.take() {
@@ -213,11 +207,7 @@ impl LoginDriver {
         // A FRESH session id per flow: fresh id ⇒ fresh session + registration
         // keys in `Identities`, per the II fresh-session-key contract.
         let session_id = uuid::Uuid::new_v4().to_string();
-        let reg_pubkey = self
-            .inner
-            .identities
-            .registration_pubkey_b64(&session_id)
-            .await?;
+        let reg_pubkey = self.inner.identities.registration_pubkey_b64(&session_id).await?;
 
         // Port 0: the OS picks a free port. II trusts a local server by
         // loopback host rather than by exact origin, so a fresh port per
@@ -304,10 +294,7 @@ impl LoginDriver {
     #[cfg(test)]
     pub(crate) async fn pending_handshake(&self) -> Option<(String, String)> {
         let state = self.inner.state.lock().await;
-        state
-            .pending
-            .as_ref()
-            .map(|p| (p.session_id.clone(), p.callback_url.clone()))
+        state.pending.as_ref().map(|p| (p.session_id.clone(), p.callback_url.clone()))
     }
 
     pub async fn status(&self) -> LoginStatus {

@@ -34,27 +34,83 @@ const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 /// refresh procedure); updates ship like any other code change, through
 /// review and a release.
 pub const BUNDLED_SKILLS: &[(&str, &str, &str)] = &[
-    ("agent-web-identity", "Agent Web Identity Sign-In", include_str!("../static/skills/agent-web-identity.md")),
-    ("caffeine-app", "Caffeine App (build from scratch)", include_str!("../static/skills/caffeine-app.md")),
-    ("canister-security", "Canister Security", include_str!("../static/skills/canister-security.md")),
-    ("certified-variables", "Certified Variables", include_str!("../static/skills/certified-variables.md")),
-    ("cloud-engine-canisters", "Cloud Engine Canisters", include_str!("../static/skills/cloud-engine-canisters.md")),
+    (
+        "agent-web-identity",
+        "Agent Web Identity Sign-In",
+        include_str!("../static/skills/agent-web-identity.md"),
+    ),
+    (
+        "caffeine-app",
+        "Caffeine App (build from scratch)",
+        include_str!("../static/skills/caffeine-app.md"),
+    ),
+    (
+        "canister-security",
+        "Canister Security",
+        include_str!("../static/skills/canister-security.md"),
+    ),
+    (
+        "certified-variables",
+        "Certified Variables",
+        include_str!("../static/skills/certified-variables.md"),
+    ),
+    (
+        "cloud-engine-canisters",
+        "Cloud Engine Canisters",
+        include_str!("../static/skills/cloud-engine-canisters.md"),
+    ),
     ("custom-domains", "Custom Domains", include_str!("../static/skills/custom-domains.md")),
-    ("cycles-management", "Cycles Management", include_str!("../static/skills/cycles-management.md")),
-    ("deploy-to-cloud-engine", "Deploy to Cloud Engine", include_str!("../static/skills/deploy-to-cloud-engine.md")),
+    (
+        "cycles-management",
+        "Cycles Management",
+        include_str!("../static/skills/cycles-management.md"),
+    ),
+    (
+        "deploy-to-cloud-engine",
+        "Deploy to Cloud Engine",
+        include_str!("../static/skills/deploy-to-cloud-engine.md"),
+    ),
     ("encrypted-maps", "Encrypted Maps", include_str!("../static/skills/encrypted-maps.md")),
     ("evm-rpc", "EVM RPC", include_str!("../static/skills/evm-rpc.md")),
     ("https-outcalls", "HTTPS Outcalls", include_str!("../static/skills/https-outcalls.md")),
     ("ic-dashboard", "IC Dashboard APIs", include_str!("../static/skills/ic-dashboard.md")),
     ("icp-cli", "ICP CLI", include_str!("../static/skills/icp-cli.md")),
-    ("internet-identity", "Internet Identity", include_str!("../static/skills/internet-identity.md")),
-    ("migrating-motoko-actors", "Motoko Actor Migrations", include_str!("../static/skills/migrating-motoko-actors.md")),
+    (
+        "internet-identity",
+        "Internet Identity",
+        include_str!("../static/skills/internet-identity.md"),
+    ),
+    (
+        "migrating-motoko-actors",
+        "Motoko Actor Migrations",
+        include_str!("../static/skills/migrating-motoko-actors.md"),
+    ),
     ("mops-cli", "Mops CLI", include_str!("../static/skills/mops-cli.md")),
-    ("multi-canister", "Multi-Canister Architecture", include_str!("../static/skills/multi-canister.md")),
-    ("service-discoverability", "Service Discoverability", include_str!("../static/skills/service-discoverability.md")),
-    ("stable-memory", "Stable Memory & Upgrades", include_str!("../static/skills/stable-memory.md")),
-    ("static-site", "Static Site (Certified Assets)", include_str!("../static/skills/static-site.md")),
-    ("troubleshooting-motoko-migrations", "Troubleshooting Motoko Migrations", include_str!("../static/skills/troubleshooting-motoko-migrations.md")),
+    (
+        "multi-canister",
+        "Multi-Canister Architecture",
+        include_str!("../static/skills/multi-canister.md"),
+    ),
+    (
+        "service-discoverability",
+        "Service Discoverability",
+        include_str!("../static/skills/service-discoverability.md"),
+    ),
+    (
+        "stable-memory",
+        "Stable Memory & Upgrades",
+        include_str!("../static/skills/stable-memory.md"),
+    ),
+    (
+        "static-site",
+        "Static Site (Certified Assets)",
+        include_str!("../static/skills/static-site.md"),
+    ),
+    (
+        "troubleshooting-motoko-migrations",
+        "Troubleshooting Motoko Migrations",
+        include_str!("../static/skills/troubleshooting-motoko-migrations.md"),
+    ),
     ("vetkeys", "vetKeys", include_str!("../static/skills/vetkeys.md")),
     ("writing-motoko", "Writing Motoko", include_str!("../static/skills/writing-motoko.md")),
 ];
@@ -67,34 +123,95 @@ pub const BUNDLED_SKILLS: &[(&str, &str, &str)] = &[
 /// bundle whose links led back to the registry would put the retrieval it
 /// removes back in the agent's path.
 pub const BUNDLED_SKILL_REFERENCES: &[(&str, &str, &str)] = &[
-    ("caffeine-app", "frontend-template.md", include_str!("../static/skills/references/caffeine-app/frontend-template.md")),
-    ("encrypted-maps", "metadata.md", include_str!("../static/skills/references/encrypted-maps/metadata.md")),
-    ("icp-cli", "binding-generation.md", include_str!("../static/skills/references/icp-cli/binding-generation.md")),
-    ("icp-cli", "canister-env-vars.md", include_str!("../static/skills/references/icp-cli/canister-env-vars.md")),
+    (
+        "caffeine-app",
+        "frontend-template.md",
+        include_str!("../static/skills/references/caffeine-app/frontend-template.md"),
+    ),
+    (
+        "encrypted-maps",
+        "metadata.md",
+        include_str!("../static/skills/references/encrypted-maps/metadata.md"),
+    ),
+    (
+        "icp-cli",
+        "binding-generation.md",
+        include_str!("../static/skills/references/icp-cli/binding-generation.md"),
+    ),
+    (
+        "icp-cli",
+        "canister-env-vars.md",
+        include_str!("../static/skills/references/icp-cli/canister-env-vars.md"),
+    ),
     ("icp-cli", "dev-server.md", include_str!("../static/skills/references/icp-cli/dev-server.md")),
-    ("icp-cli", "dfx-migration.md", include_str!("../static/skills/references/icp-cli/dfx-migration.md")),
-    ("migrating-motoko-actors", "examples.md", include_str!("../static/skills/references/migrating-motoko-actors/examples.md")),
-    ("static-site", "legacy-asset-canister.md", include_str!("../static/skills/references/static-site/legacy-asset-canister.md")),
-    ("static-site", "migrating-from-asset-canister.md", include_str!("../static/skills/references/static-site/migrating-from-asset-canister.md")),
-    ("vetkeys", "bls-signing.md", include_str!("../static/skills/references/vetkeys/bls-signing.md")),
+    (
+        "icp-cli",
+        "dfx-migration.md",
+        include_str!("../static/skills/references/icp-cli/dfx-migration.md"),
+    ),
+    (
+        "migrating-motoko-actors",
+        "examples.md",
+        include_str!("../static/skills/references/migrating-motoko-actors/examples.md"),
+    ),
+    (
+        "static-site",
+        "legacy-asset-canister.md",
+        include_str!("../static/skills/references/static-site/legacy-asset-canister.md"),
+    ),
+    (
+        "static-site",
+        "migrating-from-asset-canister.md",
+        include_str!("../static/skills/references/static-site/migrating-from-asset-canister.md"),
+    ),
+    (
+        "vetkeys",
+        "bls-signing.md",
+        include_str!("../static/skills/references/vetkeys/bls-signing.md"),
+    ),
     ("vetkeys", "ibe.md", include_str!("../static/skills/references/vetkeys/ibe.md")),
-    ("writing-motoko", "api-reference.md", include_str!("../static/skills/references/writing-motoko/api-reference.md")),
-    ("writing-motoko", "control-flow.md", include_str!("../static/skills/references/writing-motoko/control-flow.md")),
-    ("writing-motoko", "equality.md", include_str!("../static/skills/references/writing-motoko/equality.md")),
-    ("writing-motoko", "examples.md", include_str!("../static/skills/references/writing-motoko/examples.md")),
-    ("writing-motoko", "project-setup.md", include_str!("../static/skills/references/writing-motoko/project-setup.md")),
-    ("writing-motoko", "reserved-keywords.md", include_str!("../static/skills/references/writing-motoko/reserved-keywords.md")),
-    ("writing-motoko", "type-conversions.md", include_str!("../static/skills/references/writing-motoko/type-conversions.md")),
+    (
+        "writing-motoko",
+        "api-reference.md",
+        include_str!("../static/skills/references/writing-motoko/api-reference.md"),
+    ),
+    (
+        "writing-motoko",
+        "control-flow.md",
+        include_str!("../static/skills/references/writing-motoko/control-flow.md"),
+    ),
+    (
+        "writing-motoko",
+        "equality.md",
+        include_str!("../static/skills/references/writing-motoko/equality.md"),
+    ),
+    (
+        "writing-motoko",
+        "examples.md",
+        include_str!("../static/skills/references/writing-motoko/examples.md"),
+    ),
+    (
+        "writing-motoko",
+        "project-setup.md",
+        include_str!("../static/skills/references/writing-motoko/project-setup.md"),
+    ),
+    (
+        "writing-motoko",
+        "reserved-keywords.md",
+        include_str!("../static/skills/references/writing-motoko/reserved-keywords.md"),
+    ),
+    (
+        "writing-motoko",
+        "type-conversions.md",
+        include_str!("../static/skills/references/writing-motoko/type-conversions.md"),
+    ),
 ];
 
 /// The bundled `SKILL.md` for `name` (trimmed, ASCII case-insensitive), if
 /// any — the lookup behind `skill://<name>` reads.
 pub fn bundled_skill(name: &str) -> Option<&'static str> {
     let name = name.trim();
-    BUNDLED_SKILLS
-        .iter()
-        .find(|(n, _, _)| n.eq_ignore_ascii_case(name))
-        .map(|(_, _, md)| *md)
+    BUNDLED_SKILLS.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(name)).map(|(_, _, md)| *md)
 }
 
 /// The bundled document a `skill://` URI addresses, given the part after the
@@ -225,9 +342,7 @@ pub struct SkillsOutput {
 
 impl From<Vec<SkillEntry>> for SkillsOutput {
     fn from(entries: Vec<SkillEntry>) -> Self {
-        Self {
-            skills: entries.iter().map(SkillSummary::from).collect(),
-        }
+        Self { skills: entries.iter().map(SkillSummary::from).collect() }
     }
 }
 
@@ -277,22 +392,14 @@ impl SkillsCatalog {
             .await
             .map_err(|e| format!("could not reach the skills registry: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!(
-                "skills registry returned HTTP {}",
-                resp.status().as_u16()
-            ));
+            return Err(format!("skills registry returned HTTP {}", resp.status().as_u16()));
         }
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| format!("reading skills registry: {e}"))?;
-        let manifest: Manifest =
-            serde_json::from_str(&text).map_err(|e| format!("could not parse skills manifest: {e}"))?;
+        let text = resp.text().await.map_err(|e| format!("reading skills registry: {e}"))?;
+        let manifest: Manifest = serde_json::from_str(&text)
+            .map_err(|e| format!("could not parse skills manifest: {e}"))?;
         let skills = manifest.skills;
-        *self.cache.write().await = Some(Cached {
-            skills: skills.clone(),
-            fetched_at: Instant::now(),
-        });
+        *self.cache.write().await =
+            Some(Cached { skills: skills.clone(), fetched_at: Instant::now() });
         Ok(skills)
     }
 
@@ -321,9 +428,7 @@ impl SkillsCatalog {
                 resp.status().as_u16()
             ));
         }
-        resp.text()
-            .await
-            .map_err(|e| format!("reading skill `{name}`: {e}"))
+        resp.text().await.map_err(|e| format!("reading skill `{name}`: {e}"))
     }
 
     /// Render the catalogue grouped by category for the `icp_list_skills` tool.
@@ -331,11 +436,7 @@ impl SkillsCatalog {
         use std::collections::BTreeMap;
         let mut by_cat: BTreeMap<&str, Vec<&SkillEntry>> = BTreeMap::new();
         for s in skills {
-            let cat = if s.category.trim().is_empty() {
-                "Other"
-            } else {
-                s.category.as_str()
-            };
+            let cat = if s.category.trim().is_empty() { "Other" } else { s.category.as_str() };
             by_cat.entry(cat).or_default().push(s);
         }
         let mut out = String::from(
@@ -373,7 +474,10 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), total, "bundled skill names must be unique");
         for referenced in ["icp-cli", "cycles-management"] {
-            assert!(bundled_skill(referenced).is_some(), "{referenced} is referenced by the financial refusal");
+            assert!(
+                bundled_skill(referenced).is_some(),
+                "{referenced} is referenced by the financial refusal"
+            );
         }
         assert!(bundled_skill("no-such-skill").is_none());
         assert_eq!(bundled_skill(" ICP-CLI "), bundled_skill("icp-cli"));
@@ -387,8 +491,15 @@ mod tests {
     #[test]
     fn bundled_documents_link_only_within_the_bundle() {
         for (skill, file, md) in BUNDLED_SKILL_REFERENCES {
-            assert!(!skill.is_empty() && !file.is_empty() && !md.trim().is_empty(), "{skill}/{file}");
-            assert_eq!(bundled_skill_reference(skill, file), Some(*md), "{skill}/{file} must be readable");
+            assert!(
+                !skill.is_empty() && !file.is_empty() && !md.trim().is_empty(),
+                "{skill}/{file}"
+            );
+            assert_eq!(
+                bundled_skill_reference(skill, file),
+                Some(*md),
+                "{skill}/{file} must be readable"
+            );
             assert!(
                 bundled_skill(skill).is_some(),
                 "{skill}/{file} belongs to a skill that is not bundled"
@@ -423,7 +534,8 @@ mod tests {
             for link in md.match_indices("skill://").map(|(i, _)| {
                 md[i + "skill://".len()..]
                     .split(|c: char| {
-                        c.is_whitespace() || matches!(c, ')' | '(' | ']' | '[' | '`' | '>' | ',' | '"')
+                        c.is_whitespace()
+                            || matches!(c, ')' | '(' | ']' | '[' | '`' | '>' | ',' | '"')
                     })
                     .next()
                     .unwrap_or_default()
@@ -496,10 +608,7 @@ mod tests {
         assert_eq!(resolve_skills_base(None), default);
         assert_eq!(resolve_skills_base(Some(String::new())), default);
         assert_eq!(resolve_skills_base(Some("   ".into())), default);
-        assert_eq!(
-            resolve_skills_base(Some("https://x.example/".into())),
-            "https://x.example"
-        );
+        assert_eq!(resolve_skills_base(Some("https://x.example/".into())), "https://x.example");
     }
 
     // markdown_url_for_base honours same-origin https URLs and falls back
@@ -545,10 +654,11 @@ mod tests {
         // at least one CORE skill is present — resilient to any single rename.
         assert!(!skills.is_empty(), "the registry returned no skills");
         let core = ["internet-identity", "icp-cli", "cycles-management"];
-        let present = skills.iter().find(|s| core.contains(&s.name.as_str())).unwrap_or_else(|| {
-            let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
-            panic!("none of the core skills {core:?} are in the registry; got {names:?}")
-        });
+        let present =
+            skills.iter().find(|s| core.contains(&s.name.as_str())).unwrap_or_else(|| {
+                let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+                panic!("none of the core skills {core:?} are in the registry; got {names:?}")
+            });
 
         // Every entry carries a markdown URL we can fetch; the SKILL.md is non-empty.
         let md = catalog.get(&present.name).await.expect("get a core skill's markdown");

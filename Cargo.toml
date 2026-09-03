@@ -1,6 +1,6 @@
 [package]
 name = "imcp2"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2021"
 description = "Minimal MCP server that bridges an LLM to the Internet Computer, speaking textual Candid."
 license = "Apache-2.0"
@@ -44,7 +44,7 @@ dist = false
 # codec, and candid lines can never drift between imcp2-core, imcp2, and
 # imcp2-local.
 [workspace.dependencies]
-imcp2-core = { path = "crates/imcp2-core", version = "0.2.0" }
+imcp2-core = { path = "crates/imcp2-core", version = "0.4.0" }
 rmcp = "1.7"
 axum = "0.8"
 anyhow = "1"

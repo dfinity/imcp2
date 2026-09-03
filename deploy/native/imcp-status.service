@@ -15,12 +15,18 @@ Type=simple
 # service's UID would hand the secret to whoever can modify it.
 User=imcp-status
 WorkingDirectory=/opt/imcp-status
-# Probe the public deployment end-to-end (through Caddy/TLS). Which Internet
-# Identity instances to probe is read from this server's own /version, so no II
-# origin is configured here. The allowlist is pinned to the deployment's own host
-# (the dashboard always permits the built-in id.ai suffixes on top), so the probes
-# can never be steered elsewhere -- including by the server's own /version.
-# Binds to 127.0.0.1; Caddy publishes it under https://<domain>/status/.
+# Probe every instance end-to-end (through its Caddy/TLS), one dashboard column
+# each: deploy.sh renders the set (by default staging and production, so every
+# host shows the same two columns). Which Internet Identity instances to probe
+# is read from each server's own /version; a target whose /version cannot be
+# read -- production's edge currently answers it with a redirect -- gets its II
+# pinned via MCP_STATUS_TARGET_II. The allowlist is pinned to this host plus each
+# target's host (the dashboard always permits the built-in id.ai suffixes on
+# top), so the probes can never be steered elsewhere -- including by a server's
+# own /version. Binds to 127.0.0.1; Caddy publishes it under
+# https://<domain>/status/.
+Environment="MCP_STATUS_TARGETS=__TARGETS__"
+Environment="MCP_STATUS_TARGET_II=__TARGET_II__"
 Environment=MCP_STATUS_ALLOWED_HOSTS=__ALLOWED_HOSTS__
 # Optional: mirror the verdict to an Atlassian Statuspage component (e.g. on
 # status.internetcomputer.org). The file holds STATUSPAGE_PAGE_ID,
@@ -29,7 +35,7 @@ Environment=MCP_STATUS_ALLOWED_HOSTS=__ALLOWED_HOSTS__
 # the API key stays out of this repository and of the rendered unit file. The
 # leading "-" makes it optional: without the file the pusher never starts.
 EnvironmentFile=-/etc/imcp-status/statuspage.env
-ExecStart=/usr/bin/node /opt/imcp-status/server.js --port 8137 --host 127.0.0.1 --mcp https://__DOMAIN__
+ExecStart=/usr/bin/node /opt/imcp-status/server.js --port 8137 --host 127.0.0.1
 Restart=always
 RestartSec=5
 LimitNOFILE=65536

@@ -2,8 +2,10 @@
 # and every push to main, so regressions are caught before merge. This is where
 # the read-only-delegation e2e test
 # (`identities::tests::read_only_delegation_scopes_signed_requests_end_to_end`)
-# and the rest of the `cargo test` suite run in CI — the deploy workflow only
-# runs the status-dashboard's npm tests.
+# and the rest of the `cargo test` suite run in CI, alongside the canister
+# tools' PocketIC end-to-end suite in its own job below, the rustfmt check,
+# and the internal-identifier scan — the deploy workflow only runs the
+# status-dashboard's npm tests.
 name: CI
 
 on:
@@ -40,6 +42,78 @@ jobs:
 
       - name: Test
         run: cargo test --locked --workspace --all-targets
+
+  # Formatting, enforced rather than merely requested: CONTRIBUTING.md asks for
+  # `cargo fmt --all` and the coding guidelines ask for a rustfmt-clean tree,
+  # and this is what keeps that true. Without it the tree drifts out of shape
+  # silently, and the next contributor to run the documented step gets a
+  # whole-repo reformat in their diff — which is exactly how `rustfmt.toml` came
+  # to be missing for this long.
+  #
+  # Its own job, not a step in `test`: a formatting nit should not hide the test
+  # results, nor a compile error the formatting. It compiles nothing, so it
+  # finishes in seconds and adds no wall-clock to the run.
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # As in the other jobs: the runner's rustup, no third-party action. Note
+      # that this tracks rolling `stable`, so a release that changes rustfmt's
+      # output can turn this red with no code change; the fix is then to re-run
+      # `cargo fmt --all` and commit, not to pin.
+      - name: Install stable Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup component add rustfmt
+          cargo fmt --version
+
+      # `--check` reports the drift and fails; it never rewrites the tree.
+      # Reproduce locally with `cargo fmt --all`, which CONTRIBUTING.md asks for.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # The canister tools' end-to-end suite: real canisters on a real replica in
+  # PocketIC, driven over a real MCP session. Its own job because it needs the
+  # PocketIC server binary — which cargo does not fetch, and without which the
+  # suite skips itself — and because compiling `pocket-ic` would otherwise slow
+  # the main build down for every change. The Internet Identity handshake suite
+  # (`src/e2e_handshake.rs`) is NOT run here: it additionally needs an II
+  # release wasm, which this workflow has no supported way to pin.
+  e2e:
+    name: End-to-end (PocketIC)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustc --version && cargo --version
+
+      # Pinned to a server version the `pocket-ic` crate accepts (>= 15, < 16)
+      # AND to that download's digest: a test suite is only worth as much as the
+      # replica it runs against, so the binary is verified rather than trusted.
+      - name: Fetch the PocketIC server
+        run: |
+          curl -fsSL -o pocket-ic.gz \
+            https://github.com/dfinity/pocketic/releases/download/15.0.0/pocket-ic-x86_64-linux.gz
+          echo "972d592975bdd0f046b05b5414ed6f9a044c676ef912b8ac81d359dd4982b038  pocket-ic.gz" \
+            | sha256sum --check --strict
+          gunzip pocket-ic.gz
+          chmod +x pocket-ic
+
+      # POCKET_IC_BIN is what stops the suite from skipping itself, so a failure
+      # to provide it fails this job loudly rather than passing empty.
+      - name: Test
+        run: |
+          POCKET_IC_BIN="$PWD/pocket-ic" \
+            cargo test --locked -p imcp2-core --features e2e e2e_canister_tools -- --nocapture
 
   # Block new internal network identifiers from entering the repository. Secret
   # scanning and push protection already cover credentials; this covers the

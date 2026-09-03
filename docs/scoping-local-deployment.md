@@ -106,9 +106,9 @@ minimal.
     `list_accounts` `:873`).
   - `calls.rs` (Candid textual↔binary codec, `raw_call`), `discover.rs` (discovery + SSRF
     guard), `management.rs`, `skills.rs`.
-  - `tools.rs` — the **entire** MCP tool surface. The 26 `#[tool]` definitions live on
+  - `tools.rs` — the **entire** MCP tool surface. The 24 `#[tool]` definitions live on
     two `#[tool_router]` impls — `IcCanisterTools` (11 served) and `IcProtocolTools`
-    (15 deferred) — behind a hand-written `impl ServerHandler for IcTools` that serves
+    (13 deferred) — behind a hand-written `impl ServerHandler for IcTools` that serves
     the canister router; all of it **must stay co-located**; both binaries construct `IcTools`, differing
     in transport + session source (the local binary additionally wraps it in its login
     handler, component 6). The injected `SessionResolver` seam (component 7) lives here —
@@ -467,7 +467,7 @@ middleware; a stdio pipe has no per-request middleware at all), so the middlewar
 with their transports and core only receives their outcome.
 
 Tools that are already session-free work unchanged locally: `get_canister_candid`,
-`get_canister_api_doc`, `open_app`, `resolve_app`, `discover_app_canisters`, `icp_oql_guide`,
+`get_canister_api_doc`, `open_app`, `candid_syntax_guide`, `icp_oql_guide`,
 and the anonymous path of `canister_query`. (The skill documents are served as `skill://`
 resources.)
 

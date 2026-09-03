@@ -38,10 +38,8 @@ pub struct AuthenticateArgs {
     pub refresh: bool,
 }
 
-/// Structured output of `authenticate` and `auth_status` — one shape for the
-/// whole sign-in lifecycle, so both tools honour the same all-tools
-/// `outputSchema` contract as the core surface (every core tool declares an
-/// object-rooted schema and attaches matching `structuredContent`).
+/// Structured output of `authenticate` and `auth_status`: one shape for the
+/// whole sign-in lifecycle.
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 pub struct AuthOutput {
     /// The sign-in state: `signed_in`, `pending` (a browser handshake is
@@ -131,10 +129,7 @@ fn ok_structured<T: serde::Serialize>(text: String, value: &T) -> CallToolResult
 fn schema_for_output<T: schemars::JsonSchema + std::any::Any>(
 ) -> std::sync::Arc<rmcp::model::JsonObject> {
     rmcp::handler::server::tool::schema_for_output::<T>().unwrap_or_else(|e| {
-        panic!(
-            "output schema for `{}` must be object-rooted: {e}",
-            std::any::type_name::<T>()
-        )
+        panic!("output schema for `{}` must be object-rooted: {e}", std::any::type_name::<T>())
     })
 }
 
@@ -165,15 +160,11 @@ fn human_minutes(mins: u64) -> String {
 #[tool_router]
 impl LocalServer {
     pub fn new(tools: IcTools, login: LoginDriver, auto_open: bool) -> Self {
-        Self {
-            tools,
-            login,
-            auto_open,
-        }
+        Self { tools, login, auto_open }
     }
 
     #[tool(
-        description = "Sign in with Internet Identity. Returns an id.ai sign-in link for the USER to open in their browser (the server also tries to open it for them), and returns immediately — it never waits for the browser. After the user finishes, auth_status (or simply retrying the tool that needed a session) confirms the session. Call this when a tool answers that it needs an authenticated session. Repeat calls while a sign-in is pending return the same link.",
+        description = "Return an id.ai sign-in link for the user to open, so tool calls can act as their Internet Identity, or report the session already active. Use this when a tool answers that it needs an authenticated session. It returns at once without waiting for the browser; auth_status, or retrying the original tool, confirms the result. Repeat calls during a pending sign-in return the same link.",
         annotations(
             title = "Sign in with Internet Identity",
             read_only_hint = false,
@@ -224,7 +215,7 @@ impl LocalServer {
     }
 
     #[tool(
-        description = "Report the Internet Identity sign-in state of this local server: signed in (with the session principal, access level, and time to expiry), sign-in pending (with the link to finish it), expired, or signed out.",
+        description = "Report this server's Internet Identity sign-in state: signed in, with the session principal, access level and time to expiry; pending, with the link to finish it; expired; or signed out.",
         annotations(
             title = "Check sign-in status",
             read_only_hint = true,
@@ -272,12 +263,10 @@ impl ServerHandler for LocalServer {
         let core = info.instructions.take().unwrap_or_default();
         info.instructions = Some(format!(
             "{core}\n\n\
-             SIGNING IN (this local server). Tool calls act as the USER's Internet Identity. \
-             When a tool answers that it needs an authenticated session, call `authenticate`: \
-             it returns an id.ai sign-in link (and best-effort opens the browser) and never \
-             blocks — after the user finishes in the browser, `auth_status` or simply retrying \
-             the original tool confirms. Sessions are in-memory: the user signs in again after \
-             a restart, when the grant expires, or if they revoke it at id.ai."
+             SIGNING IN. On this local server the user signs in through `authenticate`, which \
+             returns an id.ai link for them to open. Sessions are held in memory, so the user \
+             signs in again after a restart, when the grant expires, or if they revoke it at \
+             id.ai."
         ));
         info
     }
@@ -306,10 +295,7 @@ impl ServerHandler for LocalServer {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        Self::tool_router()
-            .get(name)
-            .cloned()
-            .or_else(|| self.tools.get_tool(name))
+        Self::tool_router().get(name).cloned().or_else(|| self.tools.get_tool(name))
     }
 
     async fn list_resources(
@@ -337,10 +323,8 @@ mod tests {
     use rmcp::ServiceExt;
 
     fn test_server() -> LocalServer {
-        let agent = imcp2_core::Agent::builder()
-            .with_url(imcp2_core::IC_URL)
-            .build()
-            .expect("agent");
+        let agent =
+            imcp2_core::Agent::builder().with_url(imcp2_core::IC_URL).build().expect("agent");
         let identities = Identities::new(
             IiInstance::prod().expect("prod II"),
             "https://mcp.internetcomputer.org".into(),
@@ -423,31 +407,13 @@ mod tests {
         let info = client.peer_info().expect("initialized");
         assert_eq!(info.server_info.name, "imcp2-local");
         let instructions = info.instructions.as_deref().unwrap_or_default();
-        assert!(
-            instructions.contains("SIGNING IN"),
-            "login guidance must be taught"
-        );
-        assert!(
-            instructions.contains("textual Candid"),
-            "core guidance must survive the merge"
-        );
+        assert!(instructions.contains("SIGNING IN"), "login guidance must be taught");
+        assert!(instructions.contains("textual Candid"), "core guidance must survive the merge");
 
         let tools = client.list_all_tools().await.expect("tools/list");
-        assert_eq!(
-            tools.len(),
-            13,
-            "11 served core tools + authenticate + auth_status"
-        );
-        for expected in [
-            "get_canister_candid",
-            "canister_query",
-            "authenticate",
-            "auth_status",
-        ] {
-            assert!(
-                tools.iter().any(|t| &*t.name == expected),
-                "missing {expected}"
-            );
+        assert_eq!(tools.len(), 12, "10 served core tools + authenticate + auth_status");
+        for expected in ["get_canister_candid", "canister_query", "authenticate", "auth_status"] {
+            assert!(tools.iter().any(|t| &*t.name == expected), "missing {expected}");
         }
 
         let call = |name: &'static str, args: Option<serde_json::Value>| {
@@ -472,10 +438,7 @@ mod tests {
         let (is_error, text, structured) = call("auth_status", None).await;
         assert!(!is_error, "{text}");
         assert!(text.contains("Not signed in"), "{text}");
-        assert_eq!(
-            structured.expect("structuredContent")["status"],
-            "signed_out"
-        );
+        assert_eq!(structured.expect("structuredContent")["status"], "signed_out");
 
         let (is_error, text, structured) = call("authenticate", Some(serde_json::json!({}))).await;
         assert!(!is_error, "{text}");
@@ -483,9 +446,7 @@ mod tests {
         let structured = structured.expect("structuredContent");
         assert_eq!(structured["status"], "pending");
         assert!(
-            structured["url"]
-                .as_str()
-                .is_some_and(|u| u.starts_with("https://id.ai/mcp#")),
+            structured["url"].as_str().is_some_and(|u| u.starts_with("https://id.ai/mcp#")),
             "{structured}"
         );
 
@@ -510,9 +471,7 @@ mod tests {
         // running — and rather than dying some other way: a disconnect or a
         // different error must not pass this regression.
         let mut params = rmcp::model::CallToolRequestParams::new("icp_get_skill");
-        params.arguments = serde_json::json!({ "name": "writing-motoko" })
-            .as_object()
-            .cloned();
+        params.arguments = serde_json::json!({ "name": "writing-motoko" }).as_object().cloned();
         let err = client
             .call_tool(params)
             .await
@@ -544,11 +503,8 @@ mod tests {
         let (server, client) = (server.expect("server up"), client.expect("client up"));
 
         let resources = client.list_all_resources().await.expect("resources/list");
-        let skills: Vec<String> = resources
-            .iter()
-            .map(|r| r.uri.clone())
-            .filter(|u| u.starts_with("skill://"))
-            .collect();
+        let skills: Vec<String> =
+            resources.iter().map(|r| r.uri.clone()).filter(|u| u.starts_with("skill://")).collect();
         assert_eq!(
             skills.len(),
             imcp2_core::skills::BUNDLED_SKILLS.len()
@@ -586,13 +542,18 @@ mod tests {
                     .await
                     .unwrap_or_else(|e| panic!("{uri}: {e}"));
                 match &read.contents[0] {
-                    rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.clone(),
+                    rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+                        text.clone()
+                    }
                     other => panic!("{uri} served non-text contents: {other:?}"),
                 }
             }
         };
         let motoko = one("skill://writing-motoko").await;
-        assert!(motoko.contains("skill://writing-motoko/references/api-reference.md"), "{motoko:.400}");
+        assert!(
+            motoko.contains("skill://writing-motoko/references/api-reference.md"),
+            "{motoko:.400}"
+        );
         let api_reference = one("skill://writing-motoko/references/api-reference.md").await;
         assert!(!api_reference.trim().is_empty());
 

@@ -9,6 +9,16 @@ deployment; paste and adapt them in the portal.
 Verified against the official docs on **2026-07-31**. The portal UI may add
 details (e.g. exact icon dimensions) not published in the docs.
 
+> **Server-state claims re-verified 2026-09-01.** Tool-surface numbers below
+> were regenerated from a live scan of a deployed instance of the current
+> build plus the code at `main` (the count is unit-pinned in
+> [`crates/imcp2-core/src/tools.rs`](../crates/imcp2-core/src/tools.rs),
+> `the_default_composition_defers_the_protocol_tools`). Production probes the
+> same day found `mcp.internetcomputer.org` now fronted by Internet Computer
+> HTTP-gateway infrastructure: `/mcp` and the OAuth discovery documents pass
+> through, but `/version` and `/status/` answer with a redirect at that edge —
+> the rows and steps below that relied on them say so inline.
+
 ## Where and how submission happens
 
 - **Portal:** <https://claude.ai/admin-settings/directory/submissions/new>
@@ -38,10 +48,11 @@ details (e.g. exact icon dimensions) not published in the docs.
 ## Readiness: requirements already met
 
 Transport and auth rows were verified against the live production
-deployment (2026-07-31). The tool-surface rows (annotations, counts, names,
-schemas) describe `main` — the build the next release deploys and the one
-under submission; the live pre-release build still serves the old surface
-(see blocker 4), so re-verify them against production after that release:
+deployment (2026-07-31, re-probed 2026-09-01). The tool-surface rows
+(annotations, counts, names, schemas) describe `main` — the build under
+submission — and match a live scan of a deployed instance of that build
+(2026-09-01); production's exact commit can no longer be read externally
+(see blocker 4), so have the operators confirm it before submitting:
 
 | Requirement | Status |
 |---|---|
@@ -51,16 +62,16 @@ under submission; the live pre-release build still serves the old surface
 | Claude's hosted callback `https://claude.ai/api/mcp/auth_callback` accepted | ✅ seeded in the redirect allow-list ([`src/auth.rs`](../src/auth.rs), `DEFAULT_ALLOWED_REDIRECTS`) |
 | Claude Code loopback redirects (RFC 8252) | ✅ loopback redirects are exempt from the hosted allow-list |
 | Discovery documents (RFC 8414 + RFC 9728, path-scoped + root fallback) | ✅ all four live, `WWW-Authenticate` on the 401 points at the resource metadata |
-| Every tool: `title` + `readOnlyHint`/`destructiveHint` (+ `idempotentHint`, `openWorldHint`) | ✅ on all 11 tools, enforced by a unit test ([`crates/imcp2-core/src/tools.rs`](../crates/imcp2-core/src/tools.rs)) |
-| No catch-all read/write tool; reads and writes are separate tools | ✅ 10 of the 11 tools are read-only; the one write is `canister_update_call`. |
-| Tool names ≤ 64 chars | ✅ longest on `main` (the build to submit) is 23 (`get_canister_oql_schema`); the live pre-release build's longest is 30 — both within the limit |
+| Every tool: `title` + `readOnlyHint`/`destructiveHint` (+ `idempotentHint`, `openWorldHint`) | ✅ on all 10 tools, enforced by a unit test ([`crates/imcp2-core/src/tools.rs`](../crates/imcp2-core/src/tools.rs)) |
+| No catch-all read/write tool; reads and writes are separate tools | ✅ 9 of the 10 tools are read-only; the one write is `canister_update_call`. |
+| Tool names ≤ 64 chars | ✅ longest is 23 (`get_canister_oql_schema`) |
 | `outputSchema` + structured content on every tool | ✅ enforced by a unit test |
 | Certificates from a recognized authority | ✅ Let's Encrypt via Caddy |
 | OAuth endpoint latency ≤ 10 s (discovery/registration/token) | ✅ all sub-second in probes |
 | Support channel | ✅ <mcp@dfinity.org> (shown on every error screen) |
 | Security-vulnerability reporting mechanism (a Software Directory Terms obligation) | ✅ [`SECURITY.md`](../SECURITY.md) → Hackenproof bug bounty |
-| Public documentation by publish date | ✅ this repo's README + the landing page at <https://mcp.internetcomputer.org> |
-| Status/health visibility | ✅ <https://mcp.internetcomputer.org/status/> |
+| Public documentation by publish date | ✅ this repo's README + the landing page at <https://internetcomputer.org/icp-mcp/> (its one home, maintained in dfinity/internetcomputer-org; `https://mcp.internetcomputer.org` permanently redirects there from the release that ships #165) |
+| Status/health visibility | ⚠️ <https://mcp.internetcomputer.org/status/> is currently cut off: since the origin moved behind the gateway front it answers with a redirect to the landing page instead of the dashboard (observed 2026-09-01). Have the fronting layer forward `/status/` (and `/version`, which the dashboard and the health workflow read), or point the listing at a reachable status page, before submitting |
 
 Notes on auth mode: pure M2M `client_credentials` is unsupported by Claude
 (every connection needs a user in the loop) — IMCP2's user-consent flow via
@@ -128,46 +139,63 @@ server actually does, it should cover at least:
   explicitly, or disclose them if added).
 - **Controller and contact:** DFINITY Stiftung; <mcp@dfinity.org>.
 
-Publication venue: `https://mcp.internetcomputer.org/privacy-policy`, served
-by the MCP server itself. The page and its route shipped in
-[#112](https://github.com/dfinity/imcp2/pull/112) (effective date August 3,
-2026), the landing page's footer links it, and the page is live on
-production (verified 2026-08-27: HTTP 200). What remains: enter that URL in
-the portal, and cut the next `release-*` first — the live text is behind
-`main` (the current draft's identifier-linkability wording and the updated
-third-party list land with that release). The reviewed source
+Publication venue: `https://internetcomputer.org/icp-mcp/privacy-policy/` —
+the page's one home, maintained in dfinity/internetcomputer-org
+(`public/icp-mcp/privacy-policy/`) and live there
+(dfinity/internetcomputer-org#77 refreshes its text to the current draft:
+the identifier-linkability wording and the updated third-party list).
+The MCP server no longer serves a copy: from the release that ships
+[#165](https://github.com/dfinity/imcp2/pull/165),
+`https://mcp.internetcomputer.org/privacy-policy` answers with a permanent
+redirect to that home (until that release it still serves the previous
+revision itself). Either URL works in the portal; prefer the canonical one.
+The reviewed source
 text is [`icp-mcp-privacy-policy-draft.md`](icp-mcp-privacy-policy-draft.md).
 
-### 2. Financial-transactions policy (resolved in code)
+### 2. Financial-transactions policy
 
 The Directory Policy **prohibits connectors that transfer money,
 cryptocurrency, or other financial assets, or execute financial
 transactions**, and the portal's compliance step requires acknowledging this.
 
-**Mitigations shipped across
-[#153](https://github.com/dfinity/imcp2/pull/153) /
-[#154](https://github.com/dfinity/imcp2/pull/154) — the stated and enforced
-posture is that the server is not a financial tool (this section assumes
-both are merged):**
+**The server is not a financial tool, and does not support financial
+transactions:**
 
-- **The connector has no funding or management tools.** The execution paths
-  that once moved funds are removed from the binary
-  ([#153](https://github.com/dfinity/imcp2/pull/153) /
-  [#154](https://github.com/dfinity/imcp2/pull/154)). Creating, funding, and
-  managing canisters is done by the user with the icp CLI in their own
-  terminal.
-- `canister_update_call` **refuses the standardized ledger methods** that
-  move value or grant spending rights — the ICRC-standard names
-  (ICRC-1/ICRC-2 plus ICRC-4/-7/-37) on every canister, and the ICP and
+- **The connector serves no funding, creation, or canister-management
+  tools.** Creating, funding, and deploying canisters is work the user does
+  with the icp CLI in their own terminal. The generic `canister_update_call`
+  is not a way around that either: management-canister lifecycle calls must
+  carry the TARGET canister as the request's effective canister id, which the
+  update-call path does not set (it defaults to the callee, `aaaaa-aa`), so
+  the boundary node rejects them. No dedicated management tooling is served,
+  and
+  none of this moves funds.
+- `canister_update_call` **refuses the standardized value-moving methods** —
+  the ICRC-standard transfer/approval names
+  (ICRC-1/ICRC-2 plus ICRC-4/-7/-37) and the NNS/SNS governance method
+  `manage_neuron` (neuron staking and disbursement, on every SNS DAO's
+  governance as well as the NNS's) on every canister, and the ICP and
   cycles ledgers' own `transfer`/`send_dfx`/`withdraw`/`create_canister`
-  methods on those ledgers; the refusal recommends the user act themselves
-  in a wallet they control (oisy.com; a refused canister-creation spend
-  points at the user-run icp CLI), and the policy is stated in the
-  server-level instructions — deliberately not in the tool description,
-  which stays free of financial language per maintainer review
-  ([#154](https://github.com/dfinity/imcp2/pull/154)).
-- The README, the landing page, and the server instructions all state
-  explicitly that financial transactions are not supported.
+  methods on those ledgers, the cycles-minting canister's funding-completion
+  methods (`notify_top_up`, `notify_create_canister`, `notify_mint_cycles`,
+  `create_canister`), and refuses **every** update call on the
+  financial-service canisters it carries; the refusal tells the user to
+  perform the operation
+  outside the connector, in a trusted interface they control, and names no
+  venue (a refused canister-creation or funding-completion call points at the
+  user-run icp CLI). The policy is stated in the server-level instructions —
+  the field the directories scan — where it covers the whole surface at once,
+  and a unit test holds it there. What those instructions state is the policy
+  itself, not its implementation: the method families and canister scopes are
+  in the guard and in the refusal an attempted call receives, so the
+  instructions carry no copy of that list to keep in sync.
+- The README and the server instructions both state explicitly that
+  financial transactions are not supported. The landing page is no longer one
+  of them: #165 moved it to <https://internetcomputer.org/icp-mcp/>,
+  maintained in dfinity/internetcomputer-org, and the page committed there
+  carries no policy text. Stating otherwise here would be a claim about
+  content this repository cannot keep true, so adding the posture to that
+  page belongs in that repository.
 
 **Posture, stated plainly — the black-and-white answer the compliance step
 needs:** no tool initiates or executes a transfer of the user's funds.
@@ -176,12 +204,35 @@ served at all — users run those operations themselves with the icp CLI. The
 financial-transactions acknowledgment is made on that basis, without
 qualifications.
 
-**Status: resolved in code.** An email to <mcp-review@anthropic.com>
-(2026-07-31) had asked whether cycles funding and the general-purpose
-`canister_update_call` pass review; the changes above made both questions
-moot — funding no longer executes at all, and the update tool refuses
-financial ledger methods. No open compliance question remains on this topic;
-if a reply arrives, answer with the shipped posture.
+**mcp-review thread:** an email to <mcp-review@anthropic.com> (2026-07-31)
+asked ahead about this acknowledgment. No reply is needed to submit; if one
+arrives, answer with the posture above.
+
+Related point for the same step: the **model-readable metadata describes the
+surface and the constraints on using it, without attempting to manipulate
+Claude**. The server instructions, all 10 tool descriptions, and every
+argument and reply schema each say what their tool does, returns, rejects, and
+requires — the guidance a caller needs to use it correctly and safely, which
+both directories expect a description to carry, including `open_app`'s "do not
+construct a domain from the name". What none of them carries is the set of
+manipulations the directories prohibit: unrelated behavioral instructions,
+overly broad triggering, preference over or interference with other tools,
+calls to unrelated external software, and hidden or obfuscated instructions. A
+unit test (`model_readable_metadata_respects_marketplace_policy`) guards that
+across every one of those surfaces, and what it guarantees is worth stating
+exactly: it rejects an enumerated set of phrasings — the ones that appeared here
+before, plus the ones review named — and, completely, any character outside a
+small allowlist, so nothing invisible can ride along in a field doc. Judging a
+novel phrasing of a prohibited intent stays human review's job.
+`the_policy_gate_catches_what_it_lists` keeps the gate live from both sides, and
+`open_app_metadata_forbids_a_constructed_domain` pins the safeguard itself.
+Each description also matches the tool's behavior, so no side effect is
+implicit — with one deliberate exception: the financial-transactions policy is
+stated in the server-level instructions and in no tool description (a policy
+paragraph inside `canister_update_call`'s description would read as a hint that
+the tool is usable for financial transactions), and a test
+(`financial_policy_is_a_server_instruction_not_a_description`) keeps it that
+way. The refusal itself is the tool's error text at call time.
 
 Related honesty point for the same step: there is **no per-call confirmation**
 for sensitive methods server-side today —
@@ -210,14 +261,21 @@ If that comes back, the fallback is a dedicated identity with a recovery
 phrase in the team vault and an account at a demo app. (No controlled canister or
 cycles balance is needed: the connector has no canister-management tools.)
 
-### 4. Production is behind `main`
+### 4. Production build can no longer be verified from outside
 
-The live server reports commit `bbf0844` (v0.1.1, tag
-`release-2026-08-18-0.1.1`), which predates the entire compliance chain
-(#153, #154, #155, #157, #158): it still serves the old 26-tool surface,
-including the funding and management tools this document says do not exist.
-Cut a `release-*` tag from current `main` and deploy it BEFORE submitting —
-every attestation here describes `main`, not what is currently live.
+Production has been redeployed since this document first flagged it as
+behind `main` (it then reported `bbf0844`, v0.1.1, the old 26-tool surface):
+as of 2026-09-01 the live `/mcp` endpoint, the OAuth discovery documents,
+and the II callbacks document all match the current codebase's shape, and a
+deployed instance of the current build serves the 10-tool surface this
+document describes. What can NO longer be confirmed externally is the exact
+commit: `mcp.internetcomputer.org` now sits behind Internet Computer
+HTTP-gateway infrastructure that forwards only the MCP and OAuth paths, so
+`/version` answers with a redirect at that edge instead of the build report.
+Before submitting, have the operators confirm production runs a `release-*`
+tag cut from current `main` (on-host `curl localhost:8000/version`, or the
+deploy workflow's record) — or have the fronting layer forward `/version`
+again so the check works from anywhere.
 
 ### 5. Icon asset — ready
 
@@ -274,10 +332,13 @@ Paste-and-adapt; portal limits in parentheses.
   > lookalike domains are refused rather than resolved.
 - **Categories** (1–5): Developer tools; plus whatever the portal offers
   closest to data/productivity/web3.
-- **Documentation URL:** `https://mcp.internetcomputer.org` (landing page;
-  README as backup: `https://github.com/dfinity/imcp2#readme`)
-- **Privacy policy URL:** `https://mcp.internetcomputer.org/privacy-policy`
-  — enter it only once the page is live (blocker 1); a missing or incomplete
+- **Documentation URL:** `https://internetcomputer.org/icp-mcp/` (the landing
+  page's home; `https://mcp.internetcomputer.org` permanently redirects there
+  from the release that ships #165. README as backup:
+  `https://github.com/dfinity/imcp2#readme`)
+- **Privacy policy URL:** `https://internetcomputer.org/icp-mcp/privacy-policy/`
+  (live; the old `https://mcp.internetcomputer.org/privacy-policy` permanently
+  redirects there from the release that ships #165). A missing or incomplete
   policy is documented as immediate rejection. Do not substitute the
   foundation-wide `dfinity.org/privacy`.
 - **Support contact:** `mcp@dfinity.org`
@@ -318,23 +379,35 @@ Paste-and-adapt; portal limits in parentheses.
 >    Every read-only tool works with any identity, because it reads public
 >    network state.
 > 2. On the consent screen pick a session duration and an access level:
->    "Questions only" exercises the 10 read-only-annotated tools; "Actions &
+>    "Questions only" exercises the 9 read-only-annotated tools; "Actions &
 >    questions" additionally allows state-changing calls
 >    (`canister_update_call`).
 > 3. Try the example prompts above. On a Questions-only session a
->    state-changing call (`canister_update_call`) is rejected by the
->    network and the tool reports the failed call; the server
->    instructions prime the assistant to explain the access level and
->    recommend reconnecting under "Actions & questions" — that behavior
->    is intended. Access is revocable at any time at
->    https://id.ai/manage/settings.
-> 4. Canister-management tools are not part of this connector, so there is
->    nothing to provision: creating and managing canisters happens outside
->    the connector, with the icp CLI.
+>    state-changing call made AS YOUR APP ACCOUNT (`canister_update_call`
+>    with a `derivation_origin`, so it is signed with that session's
+>    delegation) is rejected by the network, and the tool reports the
+>    failed call — that behavior is intended, and reconnecting under
+>    "Actions & questions" is what permits such calls. A call with no
+>    `derivation_origin` is not signed with the delegation at all: it runs
+>    as the anonymous principal, so the access level does not decide it.
+>    The connector's own checks still do — the financial-transactions guard
+>    runs before any identity resolution or network I/O, so a call it refuses
+>    is refused with or without an origin — and past that the canister
+>    decides. The server instructions describe both, so the assistant can
+>    explain which case a call is in. Access is revocable at
+>    any time at https://id.ai/manage/settings.
+> 4. No canister creation, funding, or dedicated management tool is served,
+>    so there is nothing to provision: that work happens outside the
+>    connector, with the icp CLI. (`canister_update_call` is not a substitute:
+>    management-canister lifecycle calls need the target as the effective
+>    canister id, which that path does not set, so the boundary node rejects
+>    them.)
 > 5. Financial ledger operations are refused by design: asking the assistant
->    to move tokens returns a policy message directing the user to a wallet
->    they control — that behavior is intended (financial transactions are
->    not supported).
+>    to move tokens returns a policy message saying financial transactions
+>    are not supported and recommending the operation be performed outside
+>    this connector, in a trusted interface you control — that behavior is
+>    intended. The message names no specific venue, and a test enforces
+>    that, so do not expect it to name a wallet.
 
 ### The seven compliance acknowledgments
 
@@ -358,10 +431,10 @@ conversation beyond tool arguments and generates no media.
 
 ## Submission-day checklist
 
-- [ ] Privacy policy entered in the portal — the page is already live at `https://mcp.internetcomputer.org/privacy-policy` (verified 2026-08-27); the next `release-*` refreshes its text to the current draft (blocker 1)
-- [x] Financial-transactions question resolved in code (blocker 2) — no mcp-review reply is needed; if one arrives, answer with the shipped posture. The first-party-API/data-handling question was NOT in the 2026-07-31 email: raise it with mcp-review only if the portal's data-handling options don't fit
+- [ ] Privacy policy entered in the portal — enter `https://internetcomputer.org/icp-mcp/privacy-policy/`, the page's one home (live; dfinity/internetcomputer-org#77 refreshes its text to the current draft, and the old mcp.internetcomputer.org URL redirects there from the release that ships #165) (blocker 1)
+- [x] Financial-transactions acknowledgment is a clean yes (blocker 2): the server does not support financial transactions. No mcp-review reply is needed; if one arrives, answer with the stated posture. The first-party-API/data-handling question was NOT in the 2026-07-31 email: raise it with mcp-review only if the portal's data-handling options don't fit
 - [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — if a reviewer asks for a populated account, provision a demo-app account (no funding needed: there are no funding or canister-management tools)
-- [ ] `release-*` tag cut; `/version` on production shows the intended commit (blocker 4)
+- [ ] `release-*` tag cut; production confirmed to run the intended commit by the operators — externally `/version` is cut off by the gateway front, so the check is on-host or via the deploy workflow's record (blocker 4)
 - [x] Square PNG icon exported — `docs/assets/icp-logo-{1024,512}.png` (blocker 5)
 - [ ] Every tool exercised once by the submitter (portal asks you to confirm this; MCP Inspector or a custom connector in Claude both count)
 - [ ] Submitter has Owner / Directory-management access in DFINITY's Claude Team/Enterprise org

@@ -24,7 +24,13 @@ use serde::Deserialize;
 /// the fragment; the callback page rendered by [`pinned_callback_page`] is the
 /// sole fragment reader. No `priv(X)` is ever put in the link — only its
 /// public half.
-pub fn ii_mcp_url(ii_url: &str, callback_url: &str, state: &str, ttl_secs: u64, reg_pubkey_b64: &str) -> String {
+pub fn ii_mcp_url(
+    ii_url: &str,
+    callback_url: &str,
+    state: &str,
+    ttl_secs: u64,
+    reg_pubkey_b64: &str,
+) -> String {
     format!(
         "{ii_url}/mcp#callback={cb}&state={st}&ttl={ttl_secs}&registration_key={rk}",
         cb = urlencoding::encode(callback_url),
@@ -304,7 +310,9 @@ fn hex_decode(field: &str, s: &str) -> Result<Vec<u8>, String> {
 /// `prepare_mcp_registration_delegation`, and it never touches the server. So a
 /// `permissions` field appearing here would be unexpected, and
 /// [`JsonDelegationChain`] fails fast if one ever does.
-pub fn parse_registration_delegation(delegation_json: &str) -> Result<(Vec<u8>, Vec<SignedDelegation>), String> {
+pub fn parse_registration_delegation(
+    delegation_json: &str,
+) -> Result<(Vec<u8>, Vec<SignedDelegation>), String> {
     // Bound the size BEFORE parsing (see MAX_REG_DELEGATION_JSON): reject
     // oversized input without allocating for it. This also inherently bounds
     // every field inside the JSON (pubkeys, signatures, targets).
@@ -430,7 +438,8 @@ mod tests {
             "publicKey": "010203",
         })
         .to_string();
-        let err = super::parse_registration_delegation(&bad_exp).expect_err("bad expiration must fail");
+        let err =
+            super::parse_registration_delegation(&bad_exp).expect_err("bad expiration must fail");
         assert!(err.contains("expiration"), "got: {err}");
 
         // A field this parser does not carry (e.g. a future `permissions`)
@@ -454,13 +463,15 @@ mod tests {
     #[test]
     fn parse_registration_delegation_bounds_input_size() {
         let huge = "A".repeat(super::MAX_REG_DELEGATION_JSON + 1);
-        let err = super::parse_registration_delegation(&huge).expect_err("oversized delegation rejected");
+        let err =
+            super::parse_registration_delegation(&huge).expect_err("oversized delegation rejected");
         assert!(err.contains("exceeds"), "got: {err}");
 
         // At-cap input proceeds past the size check (and fails on content,
         // not on size) — the bound doesn't clip legitimate-shaped requests.
         let at_cap = "A".repeat(super::MAX_REG_DELEGATION_JSON);
-        let err = super::parse_registration_delegation(&at_cap).expect_err("fails on content, not size");
+        let err =
+            super::parse_registration_delegation(&at_cap).expect_err("fails on content, not size");
         assert!(!err.contains("exceeds"), "at-cap input must pass the size check: {err}");
     }
 

@@ -65,9 +65,69 @@ export const worstStatus = (statuses) =>
     /** @type {Status} */ ("pass"),
   );
 
+/** Redirect status codes that carry a `Location` a client is meant to follow. */
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/** Whether a status code is a redirect. */
+export const isRedirect = (status) => REDIRECT_STATUSES.has(status);
+
+/**
+ * Resolve a response's `Location` against the URL it answered, yielding an
+ * absolute http(s) URL — or null when there is nothing usable to follow (no
+ * header, an unparseable value, or a non-http scheme). A 3xx without a usable
+ * target is a broken redirect, and callers treat it as such.
+ *
+ * @param {Headers} headers
+ * @param {string} from the URL the response answered
+ * @returns {string | null}
+ */
+const redirectTarget = (headers, from) => {
+  const raw = headers.get("location");
+  if (!raw) return null;
+  let target;
+  try {
+    target = new URL(raw, from);
+  } catch {
+    return null;
+  }
+  return target.protocol === "https:" || target.protocol === "http:"
+    ? target.toString()
+    : null;
+};
+
+/**
+ * A URL's request identity: the part a request is actually made of. `fetch`
+ * never sends the fragment, so two URLs differing only there address the same
+ * resource — a `Location: #elsewhere` names the resource just requested, not
+ * a new destination, however different the two strings look.
+ *
+ * @param {string} url
+ * @returns {string}
+ */
+const requestKey = (url) => {
+  try {
+    const u = new URL(url);
+    u.hash = "";
+    return u.toString();
+  } catch {
+    return url;
+  }
+};
+
 /**
  * Perform an HTTP request with a timeout, capturing status, headers, body and
  * latency without ever throwing (network errors are returned as `error`).
+ *
+ * Redirects are reported, never followed (`redirect: "manual"`). A probe that
+ * followed one could not tell an endpoint serving a page from an endpoint
+ * pointing at some other page that happens to be served — for the II's `/mcp`
+ * connect page that is exactly the difference between healthy and gone — and a
+ * followed `Location` is a request the monitored server chose, not the
+ * operator, which the SSRF guard in config.js exists to prevent. So a 3xx comes
+ * back as itself, with `location` naming where it points (resolved, http(s)
+ * only; null when the header is missing or unusable), and each check decides
+ * what that means: for the landing page a destination is the healthy answer,
+ * for everything else it is a finding that says where the endpoint went.
  *
  * @param {string} url
  * @param {RequestInit & { timeoutMs?: number }} [init]
@@ -87,6 +147,10 @@ const probe = async (url, init = {}) => {
       status: res.status,
       headers: res.headers,
       bodyText,
+      /** Where a 3xx points, when it names somewhere usable; null otherwise. */
+      location: isRedirect(res.status)
+        ? redirectTarget(res.headers, url)
+        : null,
       latencyMs: Date.now() - start,
       error: /** @type {Error | null} */ (null),
     };
@@ -96,11 +160,19 @@ const probe = async (url, init = {}) => {
       status: /** @type {number | null} */ (null),
       headers: new Headers(),
       bodyText: "",
+      location: /** @type {string | null} */ (null),
       latencyMs: Date.now() - start,
       error: /** @type {Error} */ (err),
     };
   }
 };
+
+/**
+ * `" → <where>"` for a response that is a redirect with a usable target, `""`
+ * otherwise — so a detail line that prints a 3xx also says where it went.
+ * @param {{ location: string | null }} r
+ */
+const redirectNote = (r) => (r.location ? ` → ${r.location}` : "");
 
 /** Safely JSON-parse a string, returning undefined on failure. */
 const tryJson = (text) => {
@@ -197,30 +269,72 @@ export const checkMcpEndpoints = async (
   /** @type {Record<string, unknown>} */
   const facts = { origin: mcpOrigin };
 
-  // 1. Landing page.
+  // 1. Landing page. The signal is that the root URL *answers for* the landing
+  //    page, which no longer means holding a copy of it: the human-facing pages
+  //    (the landing page and its /privacy-policy, /support and /terms subpages)
+  //    are maintained in dfinity/internetcomputer-org and served under
+  //    internetcomputer.org/icp-mcp/, and this origin answers their old paths
+  //    with permanent redirects so published links keep working while the
+  //    content exists exactly once. So a 3xx naming a destination is as healthy
+  //    as a 200 with the page — what is not healthy is a 4xx/5xx, an
+  //    unreachable server, or a 3xx that names nowhere to go.
+  //
+  //    The destination is reported, not followed (see probe): the check takes
+  //    the redirect's word for where the page went, and says so.
   {
-    const r = await probe(`${mcpOrigin}/`, { timeoutMs });
+    const target = `${mcpOrigin}/`;
+    const r = await probe(target, { timeoutMs });
     const ct = r.headers.get("content-type") ?? "";
-    const pass = r.ok && r.status === 200 && /text\/html/i.test(ct);
+    const servedHere = r.ok && r.status === 200 && /text\/html/i.test(ct);
+    // A redirect back at the resource just requested is a loop, not a landing
+    // page. Compared by request identity: `/` → `/#landing` re-fetches `/`.
+    const movedTo =
+      r.ok &&
+      isRedirect(r.status) &&
+      r.location &&
+      requestKey(r.location) !== requestKey(target)
+        ? r.location
+        : null;
+    const pass = servedHere || !!movedTo;
+    facts.landing = { status: r.status, servedHere, movedTo };
     checks.push({
       id: "root",
       label: "Landing page",
       description:
-        "Confirms the server is up and serving its human-facing landing page (HTTP 200, HTML) at the root URL.",
+        "Confirms the root URL answers for the server's human-facing landing page — either serving it (HTTP 200, HTML) or redirecting to where it is published. The landing pages are maintained and served at internetcomputer.org/icp-mcp/, and this origin redirects their old paths there, so a permanent redirect is the expected healthy answer; a 4xx/5xx, an unreachable server, or a redirect pointing nowhere is not.",
       target: `GET ${mcpOrigin}/`,
-      expected: "200 text/html",
+      expected:
+        "200 text/html, or a redirect to where the landing page is served",
       status: pass ? "pass" : "fail",
       httpStatus: r.status,
       latencyMs: r.latencyMs,
       detail: r.error
         ? `request failed: ${r.error.message}`
-        : `${r.status}, content-type: ${ct || "(none)"}`,
+        : movedTo
+          ? `${r.status} → ${movedTo}`
+          : `${r.status}${redirectNote(r)}, content-type: ${ct || "(none)"}`,
     });
   }
 
-  // 1b. Build/version: which commit is actually running. Surfaced prominently
-  //     in the report (with a GitHub link) so operators can confirm the live
-  //     deployment; older builds without /version are treated as informational.
+  // 1b. Build/version: read, but not graded. `GET /version` is the server's own
+  //     account of which build is running and which II instances it serves, so
+  //     it still feeds the report's deployment banner and the II discovery in
+  //     checkLinkage below. It is deliberately not a check: the endpoint is an
+  //     operator convenience rather than part of the MCP contract, production's
+  //     fronting edge answers it with a redirect to the landing site instead of
+  //     serving it, and a build stamp nobody exposes says nothing about whether
+  //     the MCP surface is up — grading it warned that column on every run,
+  //     forever, while everything an MCP client depends on was served
+  //     correctly. Only the banner is purely informational, though: when
+  //     /version is missing it is simply omitted, but the advertised II list
+  //     goes with it, and checkLinkage/checkIiHealth then fail on an II they
+  //     cannot resolve. Pin one with --ii / II_ORIGIN (as the deployed
+  //     production target does) and both run as normal.
+  //
+  //     On the probes below that DO check something, a redirect is reported
+  //     with where it points rather than followed — for the protocol documents
+  //     the status code IS the contract an MCP client depends on, and for the
+  //     rest a detour is worth knowing about, not hiding.
   {
     const url = `${mcpOrigin}/version`;
     const r = await probe(url, { timeoutMs });
@@ -244,24 +358,6 @@ export const checkMcpEndpoints = async (
     // guessed from the hostname: see parseAdvertisedInstances in config.js for
     // why the hostname cannot answer this.
     facts.advertised = parseAdvertisedInstances(json);
-    const exposed = r.ok && r.status === 200 && !!commit;
-    const known = exposed && commit !== "unknown";
-    checks.push({
-      id: "version",
-      label: "Deployment version",
-      description:
-        "Reports the running build's version and commit via GET /version, so you can confirm exactly which deployment is live and trace it back to source.",
-      target: `GET ${url}`,
-      expected: "200 JSON with version + commit",
-      status: known ? "pass" : "warn",
-      httpStatus: r.status,
-      latencyMs: r.latencyMs,
-      detail: r.error
-        ? `request failed: ${r.error.message}`
-        : exposed
-          ? `version ${version ?? "?"}, commit ${commit}`
-          : `${r.status}, no version info exposed`,
-    });
   }
 
   // 2. OAuth Protected Resource Metadata (RFC 9728).
@@ -291,7 +387,7 @@ export const checkMcpEndpoints = async (
       detail: !pass
         ? r.error
           ? `request failed: ${r.error.message}`
-          : `${r.status}, missing required fields`
+          : `${r.status}${redirectNote(r)}, missing required fields`
         : resourceOk
           ? `resource=${protectedResource.resource}, AS=${protectedResource.authorization_servers.join(", ")}`
           : `resource=${protectedResource.resource} (expected ${mcpOrigin}/mcp)`,
@@ -328,7 +424,7 @@ export const checkMcpEndpoints = async (
       detail: !pass
         ? r.error
           ? `request failed: ${r.error.message}`
-          : `${r.status}, missing fields: ${missing.join(", ") || "n/a"}`
+          : `${r.status}${redirectNote(r)}, missing fields: ${missing.join(", ") || "n/a"}`
         : `issuer=${asMeta.issuer}, PKCE=${(asMeta.code_challenge_methods_supported || []).join(",") || "none"}`,
     });
   }
@@ -402,7 +498,7 @@ export const checkMcpEndpoints = async (
       latencyMs: r.latencyMs,
       detail: r.error
         ? `request failed: ${r.error.message}`
-        : `${r.status}, www-authenticate: ${wwwAuth || "(missing)"}`,
+        : `${r.status}${redirectNote(r)}, www-authenticate: ${wwwAuth || "(missing)"}`,
     });
   }
 
@@ -446,7 +542,7 @@ export const checkMcpEndpoints = async (
         ? `request failed: ${r.error.message}`
         : pass
           ? `registered client_id=${json.client_id}`
-          : `${r.status}, body: ${r.bodyText.slice(0, 120)}`,
+          : `${r.status}${redirectNote(r)}, body: ${r.bodyText.slice(0, 120)}`,
     });
   }
 
@@ -491,7 +587,7 @@ export const checkMcpEndpoints = async (
         ? `request failed: ${r.error.message}`
         : pass
           ? "rejected non-allow-listed hosted redirect_uri"
-          : `expected 400 invalid_redirect_uri, got ${r.status}: ${r.bodyText.slice(0, 120)}`,
+          : `expected 400 invalid_redirect_uri, got ${r.status}${redirectNote(r)}: ${r.bodyText.slice(0, 120)}`,
     });
   }
 
@@ -514,7 +610,7 @@ export const checkMcpEndpoints = async (
       latencyMs: r.latencyMs,
       detail: r.error
         ? `request failed: ${r.error.message}`
-        : `${r.status}, ${r.bodyText.slice(0, 100)}`,
+        : `${r.status}${redirectNote(r)}, ${r.bodyText.slice(0, 100)}`,
     });
   }
 
@@ -541,7 +637,7 @@ export const checkMcpEndpoints = async (
       latencyMs: r.latencyMs,
       detail: r.error
         ? `request failed: ${r.error.message}`
-        : `${r.status}, error: ${json?.error ?? r.bodyText.slice(0, 80)}`,
+        : `${r.status}${redirectNote(r)}, error: ${json?.error ?? r.bodyText.slice(0, 80)}`,
     });
   }
 
@@ -762,7 +858,7 @@ export const checkIiHealth = async (
     latencyMs: r.latencyMs,
     detail: r.error
       ? `request failed: ${r.error.message}`
-      : `${r.status}${canisterId ? `, canister ${canisterId}` : ""}`,
+      : `${r.status}${redirectNote(r)}${canisterId ? `, canister ${canisterId}` : ""}`,
   });
 
   // 2. Served & certified by the Internet Computer (canister is live).
@@ -816,7 +912,7 @@ export const checkIiHealth = async (
         ? `request failed: ${mr.error.message}`
         : served
           ? `${mr.status}, /mcp connect page served`
-          : `${mr.status}, /mcp connect page not served`,
+          : `${mr.status}${redirectNote(mr)}, /mcp connect page not served`,
     });
   }
 
@@ -863,7 +959,7 @@ export const checkIiHealth = async (
         ? `request failed: ${cr.error.message}`
         : present
           ? `${cr.status}, ${bytes} bytes${backendCanisterId ? `, backend ${backendCanisterId}` : ""}`
-          : `${cr.status}, ${cr.bodyText.slice(0, 80) || "(empty)"}`,
+          : `${cr.status}${redirectNote(cr)}, ${cr.bodyText.slice(0, 80) || "(empty)"}`,
     });
   }
 

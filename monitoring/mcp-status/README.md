@@ -1,17 +1,33 @@
 # IMCP (IC MCP) status dashboard
 
-A small, dependency-free monitoring tool for the **IC MCP** server
-([https://mcp.beta.id.ai](https://mcp.beta.id.ai) by default) and the **Internet
-Identity** instance it is paired with.
+A small, dependency-free monitoring tool for the **IC MCP** server instances
+(staging at [mcp.beta.id.ai](https://mcp.beta.id.ai) and production at
+[mcp.internetcomputer.org](https://mcp.internetcomputer.org), shown side by
+side on the deployed dashboard) and the **Internet Identity** instances each is
+paired with.
 
 It answers three questions and adds a few suggestions:
 
 1. **Is the server running and responding on all advertised endpoints with the
-   correct status codes?** — probes the landing page, the build/version endpoint
-   (`/version`), the two OAuth discovery documents, the `/mcp` endpoint's
-   unauthenticated `401` challenge, dynamic client registration, and the
-   `/mcp/oauth/authorize` + `/mcp/oauth/token` endpoints, plus TLS certificate
-   freshness.
+   correct status codes?** — probes the landing page, the two OAuth discovery
+   documents, the `/mcp` endpoint's unauthenticated `401` challenge, dynamic
+   client registration, and the `/mcp/oauth/authorize` + `/mcp/oauth/token`
+   endpoints, plus TLS certificate freshness. `GET /version` is read too, but
+   **not graded** (see below). The landing-page check asks whether the root
+   **answers for** the landing page, which no longer means holding a copy of
+   it: the human-facing pages live in
+   [dfinity/internetcomputer-org](https://github.com/dfinity/internetcomputer-org)
+   (`public/icp-mcp/`), are served at <https://internetcomputer.org/icp-mcp/>,
+   and this origin answers their old paths with permanent redirects so published
+   links keep working. A `3xx` naming a destination is therefore as healthy as a
+   `200` with the page — demanding `200 text/html` reported the live deployment
+   as failing while it served everything correctly. Still a failure: a
+   `4xx`/`5xx`, an unreachable server, or a redirect naming nowhere to go (no
+   `Location`, a non-http one, or one pointing back at the URL just requested).
+   The protocol documents keep their exact status codes: for the discovery
+   documents, the `/mcp` challenge and the OAuth endpoints the status code *is*
+   the contract MCP clients depend on, so a redirect there is a finding, not a
+   detour.
 2. **Which Internet Identity instance(s) is it linked to?** — read from the
    `instances` array the server advertises at `GET /version`, one entry per
    served mount (`{name, mcp_path, ii_origin, ii_canister}`). The server is the
@@ -53,6 +69,22 @@ Every check carries a plain-language description, and the report shows which
 (the server process's start time), and its build time. The web dashboard groups
 the sections into **tabs** for easier navigation.
 
+`GET /version` is the one endpoint the dashboard reads without checking: it
+feeds that banner and the II discovery in question 2. It is an operator
+convenience, not part of the MCP contract, and production's fronting edge
+answers it with a redirect to the landing site rather than serving it — so
+grading it warned that column on every run, forever, while the MCP surface
+served everything correctly. A build stamp nobody exposes says nothing about
+whether the server is up; the checks that do answer that are the ones above.
+
+Only the banner is purely informational, though. With no `/version` it is
+simply omitted, but the advertised II list goes with it, and an II the
+dashboard cannot discover is one it cannot monitor: `ii-target` and
+`ii-unresolved` fail, exactly as they did before this change. Pin the II
+(`--ii` / `II_ORIGIN`, or `--target-ii <name>=<origin>` for one instance of a
+set) and questions 2 and 3 run as normal — which is how the deployed dashboard
+configures production.
+
 ## Usage
 
 No build step and no dependencies — just Node ≥ 20 (uses the global `fetch`).
@@ -70,12 +102,17 @@ node monitoring/mcp-status/cli.js --mcp https://mcp.id.ai
 # Machine-readable output for alerting / CI
 node monitoring/mcp-status/cli.js --json
 
-# Live web dashboard at http://localhost:8080 (auto-refreshing)
-# (target is fixed at startup; pass --mcp/--ii to monitor another deployment)
+# Live web dashboard at http://localhost:8080 (auto-refreshing), one instance
+# (targets are fixed at startup; pass --mcp/--ii to monitor another deployment)
 node monitoring/mcp-status/server.js --port 8080 --mcp https://mcp.id.ai   # or: npm run serve
 
+# Staging and production side by side, production's II pinned (see below)
+node monitoring/mcp-status/server.js --port 8080 \
+  --target staging=https://mcp.beta.id.ai \
+  --target production=https://mcp.internetcomputer.org --target-ii production=https://id.ai
+
 # Unit tests
-node --test monitoring/mcp-status/checks.test.js                  # or: npm test
+node --test monitoring/mcp-status/                                # or: npm test
 ```
 
 CLI options: `--mcp <origin>`, `--ii <origin>`, `--timeout <ms>`, `--json`,
@@ -83,29 +120,76 @@ CLI options: `--mcp <origin>`, `--ii <origin>`, `--timeout <ms>`, `--json`,
 code is `0` when healthy and `1` on failures, so it slots straight into cron, a
 CI job, or an uptime check.
 
+### Several instances side by side
+
+`server.js` monitors a **set of named instances** and renders one column per
+instance. Name them with `--target <name>=<origin>` (repeatable) or the
+`MCP_STATUS_TARGETS` variable (whitespace-separated `name=origin` entries — a
+shape that stays readable and quotable in a systemd unit, where JSON does not).
+A name is a short token (letters, digits, `_`, `.`, `-`); it is the column
+heading, the `?target=` key and the label in log lines. Where an instance's
+pairing cannot be read from its own `/version`, pin its II with
+`--target-ii <name>=<origin>` / `MCP_STATUS_TARGET_II`, same syntax — as
+production's needs today, because that origin's edge answers `/version` with a
+redirect. A pin replaces the advertised list for that target only.
+
+Without a target list the single-target flags and variables (`--mcp`/`--ii`,
+`MCP_ORIGIN`/`II_ORIGIN`, then the default) yield one instance named after its
+host, so an existing deployment keeps working as a one-column dashboard. Naming
+instances both ways at once is a startup error, not a merge.
+
+`GET /api/status` serves an **envelope**:
+
+```json
+{ "generatedAt": "…", "overall": "warn",
+  "instances": [ { "name": "staging", …DashboardReport }, { "name": "production", … } ] }
+```
+
+`overall` is the worst verdict across instances and decides the HTTP status
+(`503` when any instance fails — a monitor watching this URL should see the page
+reporting an outage as one). `generatedAt` is the oldest column's, so everything
+shown is at least that fresh. `GET /api/status?target=<name>` serves that one
+instance in the single-report shape the dashboard has always had, for an uptime
+monitor that watches one deployment; an unknown name is a `404`, never a probe.
+
 ### Allowed targets (SSRF guard)
 
-The web server probes only the target fixed at startup — it never takes the
-target from an incoming request, so a visitor cannot steer server-side requests
-at arbitrary hosts. As defence in depth, every resolved origin is also validated
+The web server probes only the instances fixed at startup — it never takes a
+target from an incoming request (`?target=` only selects among the configured
+names), so a visitor cannot steer server-side requests at arbitrary hosts. As defence in depth, every resolved origin is also validated
 against a host allowlist: only `https` origins on `id.ai` (and its sub-domains),
 plus loopback hosts for local development, may be probed. To monitor a
 deployment on another domain, extend the allowlist via the
 `MCP_STATUS_ALLOWED_HOSTS` environment variable (comma-separated host suffixes).
 
+Redirects are **reported, never followed**. A `3xx` comes back as itself with
+its destination in the detail line (`302 → https://…`), and each check decides
+what that means: for the landing page a destination is the healthy answer; for
+everything else it is a finding that says where the endpoint went. Two reasons.
+A followed `Location` is a request the monitored server chose rather than the
+operator, which is precisely what the allowlist above exists to prevent — and
+following would blur the one distinction some checks exist to draw: an II that
+has removed its `/mcp` connect page and redirects unknown paths to `/` would
+land on a `200` and read as "connect page served".
+
 `server.js` binds to `127.0.0.1` by default; override with `--host` /
 `MCP_STATUS_HOST` only when you really mean to expose the port directly.
-`/api/status` is cached for a short TTL (`MCP_STATUS_CACHE_TTL_MS`, default
-15 s) and concurrent requests are coalesced into one probe run, so multiple
-tabs / refreshes don't multiply load on the monitored server.
+Each instance's report is cached for a short TTL (`MCP_STATUS_CACHE_TTL_MS`,
+default 15 s) and concurrent requests are coalesced into one probe run per
+instance, so multiple tabs / refreshes don't multiply load on the monitored
+servers.
 
 ### Deployment
 
 The standard deploy ([`deploy/native`](../../deploy/native)) ships this tool to
 the host and runs it as the `imcp-status.service` systemd unit (bound to
-`127.0.0.1:8137`, monitoring the deployment's own public origin). Caddy
-publishes it at `https://<domain>/status/`, and the CI workflow runs the unit
-tests below before rolling out. See the deploy README for details.
+`127.0.0.1:8137`). By default the unit is rendered to monitor **both** instances
+— `staging=https://mcp.beta.id.ai` and `production=https://mcp.internetcomputer.org`,
+production's II pinned to `https://id.ai` — so every host's dashboard shows the
+same two columns; `STATUS_TARGETS` / `STATUS_TARGET_II` in `deploy.sh`'s
+environment override the set, and the allowlist is widened to each target's
+host automatically. Caddy publishes it at `https://<domain>/status/`, and the CI
+workflow runs the unit tests below before rolling out. See the deploy README.
 
 ### Publishing to an Atlassian Statuspage (status.internetcomputer.org)
 
@@ -122,6 +206,7 @@ are set:
 | `STATUSPAGE_PAGE_ID` | The page id (visible in the Statuspage admin, or as `page.id` in `https://<page>/api/v2/status.json`). |
 | `STATUSPAGE_API_KEY` | An API key minted in the Statuspage admin (read from the environment, never argv; never logged). |
 | `STATUSPAGE_COMPONENT_ID` | The id of the component to drive. |
+| `STATUSPAGE_TARGET` | Optional: which configured instance drives the component (its target name, e.g. `production`). Defaults to the first configured instance; a name that matches nothing disables the pusher with a warning rather than feeding the public page from the wrong instance. |
 
 One-time setup in the Statuspage admin: create the component (e.g. **"ICP MCP
 server"**, optionally inside an existing group), mint an API key, and note the
@@ -142,10 +227,10 @@ dashboard):
 "Service-availability checks" are the endpoint probes that report `fail` on a
 failed request (landing page, discovery documents, the `/mcp` challenge, and
 the OAuth endpoints). Auxiliary checks are excluded from the major-outage
-test on purpose: `version` and `metadata-consistency` only degrade to `warn`
-when the server is unreachable, and the TLS check can stay green while the
-application behind the proxy is down — counting them would make a total
-outage report as merely partial.
+test on purpose: `metadata-consistency` only degrades to `warn` when the server
+is unreachable, and the TLS check can stay green while the application behind
+the proxy is down — counting them would make a total outage report as merely
+partial.
 
 The pusher re-evaluates every `STATUSPAGE_PUSH_INTERVAL_MS` (default 60 s,
 floor 15 s) and PATCHes the component **only when the mapped status changes**
@@ -183,17 +268,30 @@ actually matters.
 | `checks.js`        | All probing logic; exports `runDashboard()`.                   |
 | `report.js`        | ANSI/plain-text rendering for the CLI.                         |
 | `cli.js`           | Command-line entry point.                                      |
+| `instances.js`     | The monitored instances: per-instance report cache, envelope, pusher source. |
 | `server.js`        | HTTP server: serves the dashboard and runs probes server-side. |
-| `public/index.html`| Self-contained auto-refreshing web dashboard.                  |
+| `public/index.html`| Self-contained auto-refreshing web dashboard, one column per instance. |
 | `checks.test.js`   | `node:test` unit tests (stubbed `fetch`, no network).          |
+| `instances.test.js`| Reporter tests (stubbed `runDashboard`, injected clock).        |
 | `package.json`     | Marks the tool as ESM (`type: module`) and defines npm scripts.|
 
-## Current beta findings (snapshot)
+## Current findings (snapshot)
 
-Against `https://mcp.beta.id.ai` the server passes all endpoint checks; the
-linked II is `https://beta.id.ai` (frontend canister `gjxif-ryaaa-aaaad-ae4ka-cai`,
-backend `fgte5-ciaaa-aaaad-aaatq-cai`), whose `/mcp` connect page is served (the
-connect flow is `fetch()`/navigation-based, so its CSP is not asserted). Whether
-a given identity trusts this MCP server is now per-user (set in II Settings,
-synced on-chain) and so is not asserted here. With the linked II healthy, the
-dashboard reports all green.
+**Production** (`https://mcp.internetcomputer.org`): the MCP surface is healthy
+— `/mcp` answers its `401` challenge and both discovery documents are served.
+The fronting edge answers `/version` (and `/status/`) with a redirect to the
+landing site rather than serving it, so the deployment banner is blank and the
+linked II cannot be read from the server. `/version` is no longer graded — that
+redirect used to warn the column on every run while nothing was actually wrong
+with the MCP surface. The unreadable II still would be, which is why the
+deployed dashboard pins it: `--target-ii production=https://id.ai`.
+
+**Staging** (`https://mcp.beta.id.ai`): the server passes all endpoint checks — its
+root answers `308 → https://internetcomputer.org/icp-mcp/`, where the landing
+page is served. The linked IIs are `https://id.ai` and `https://beta.id.ai`
+(frontend canister `gjxif-ryaaa-aaaad-ae4ka-cai`, backend
+`fgte5-ciaaa-aaaad-aaatq-cai` for beta), whose `/mcp` connect pages are served
+(the connect flow is `fetch()`/navigation-based, so its CSP is not asserted).
+Whether a given identity trusts this MCP server is now per-user (set in II
+Settings, synced on-chain) and so is not asserted here. With the linked IIs
+healthy, the dashboard reports all green.

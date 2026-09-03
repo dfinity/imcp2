@@ -229,19 +229,11 @@ fn device_data_1() -> DeviceData {
 /// Register a fresh anchor (captcha disabled ⇒ the accepted solution is "a").
 async fn register_anchor(pic: &pocket_ic::nonblocking::PocketIc, ii: Principal) -> u64 {
     let bytes = pic
-        .update_call(
-            ii,
-            Principal::anonymous(),
-            "create_challenge",
-            Encode!().unwrap(),
-        )
+        .update_call(ii, Principal::anonymous(), "create_challenge", Encode!().unwrap())
         .await
         .expect("create_challenge");
     let challenge = Decode!(&bytes, Challenge).unwrap();
-    let attempt = ChallengeResult {
-        key: challenge.challenge_key,
-        chars: "a".to_string(),
-    };
+    let attempt = ChallengeResult { key: challenge.challenge_key, chars: "a".to_string() };
     let bytes = pic
         .update_call(
             ii,
@@ -261,10 +253,7 @@ async fn register_anchor(pic: &pocket_ic::nonblocking::PocketIc, ii: Principal) 
 /// Pull `key=value` out of a `&`-separated fragment (values are base64url or
 /// plain text here — none contain `&`).
 fn field<'a>(blob: &'a str, key: &str) -> Option<&'a str> {
-    blob.split('&')
-        .filter_map(|kv| kv.split_once('='))
-        .find(|(k, _)| *k == key)
-        .map(|(_, v)| v)
+    blob.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == key).map(|(_, v)| v)
 }
 
 #[tokio::test]
@@ -299,21 +288,15 @@ async fn local_login_end_to_end() {
             captcha_trigger: CaptchaTrigger::Static(StaticCaptchaTrigger::CaptchaDisabled),
         }),
     };
-    pic.install_canister(ii, ii_wasm, Encode!(&Some(init)).unwrap(), None)
-        .await;
+    pic.install_canister(ii, ii_wasm, Encode!(&Some(init)).unwrap(), None).await;
 
     // --- The local binary's composition, exactly as `serve()` wires it, but
     //     pointed at PocketIC's gateway (the component-3 test configuration:
     //     endpoint override + fetch_root_key against a loopback replica). ---
     let gateway = pic.make_live(None).await;
-    let agent = imcp2_core::Agent::builder()
-        .with_url(gateway.as_str())
-        .build()
-        .expect("build agent");
-    agent
-        .fetch_root_key()
-        .await
-        .expect("fetch PocketIC root key");
+    let agent =
+        imcp2_core::Agent::builder().with_url(gateway.as_str()).build().expect("build agent");
+    agent.fetch_root_key().await.expect("fetch PocketIC root key");
     let identities = Identities::new(
         IiInstance {
             name: "e2e",
@@ -347,10 +330,7 @@ async fn local_login_end_to_end() {
         callback_url,
         "the fragment's callback must be the listener's callback"
     );
-    let origin = callback_url
-        .strip_suffix("/callback")
-        .expect("callback path")
-        .to_string();
+    let origin = callback_url.strip_suffix("/callback").expect("callback path").to_string();
     let http = reqwest::Client::new();
 
     // --- 2. The browser lands on the pinned page ---
@@ -373,20 +353,12 @@ async fn local_login_end_to_end() {
             ii,
             principal_1(),
             "mcp_set_config",
-            Encode!(
-                &anchor,
-                &McpConfig {
-                    enabled: true,
-                    url: Some("http://127.0.0.1".into()),
-                }
-            )
-            .unwrap(),
+            Encode!(&anchor, &McpConfig { enabled: true, url: Some("http://127.0.0.1".into()) })
+                .unwrap(),
         )
         .await
         .expect("mcp_set_config call");
-    Decode!(&set_cfg, Result<(), String>)
-        .unwrap()
-        .expect("mcp_set_config Ok");
+    Decode!(&set_cfg, Result<(), String>).unwrap().expect("mcp_set_config Ok");
 
     // prepare: consent (full access, 24h grant) is recorded server-side,
     // keyed by the P_reg the canister returns as `user_key`.
@@ -396,13 +368,7 @@ async fn local_login_end_to_end() {
             ii,
             principal_1(),
             "prepare_mcp_registration_delegation",
-            Encode!(
-                &anchor,
-                &reg_key_x,
-                &Some(Permissions::All),
-                &Some(GRANT_TTL_NS)
-            )
-            .unwrap(),
+            Encode!(&anchor, &reg_key_x, &Some(Permissions::All), &Some(GRANT_TTL_NS)).unwrap(),
         )
         .await
         .expect("prepare call");
@@ -416,23 +382,12 @@ async fn local_login_end_to_end() {
             ii,
             principal_1(),
             "get_mcp_registration_delegation",
-            Encode!(
-                &anchor,
-                &reg_key_x,
-                &prepared.user_key,
-                &prepared.expiration
-            )
-            .unwrap(),
+            Encode!(&anchor, &reg_key_x, &prepared.user_key, &prepared.expiration).unwrap(),
         )
         .await
         .expect("get call");
-    let signed = Decode!(&get_bytes, Result<SignedDelegation, String>)
-        .unwrap()
-        .expect("get Ok");
-    assert_eq!(
-        signed.delegation.pubkey, reg_key_x,
-        "delegation targets our X"
-    );
+    let signed = Decode!(&get_bytes, Result<SignedDelegation, String>).unwrap().expect("get Ok");
+    assert_eq!(signed.delegation.pubkey, reg_key_x, "delegation targets our X");
 
     // Serialize into the agent-js DelegationChain JSON the redeem parses: hex
     // byte fields, HEX-string expiration, publicKey = der(P_reg).
@@ -465,18 +420,11 @@ async fn local_login_end_to_end() {
     );
 
     // --- 5. Signed in: the slot holds this session; status + principal agree ---
-    assert_eq!(
-        slot.get(),
-        Some(state.clone()),
-        "the session slot is filled"
-    );
+    assert_eq!(slot.get(), Some(state.clone()), "the session slot is filled");
     match driver.status().await {
         LoginStatus::SignedIn(g) => {
             assert_eq!(g.session_id, state);
-            assert_eq!(
-                g.permissions, "all",
-                "the consent-time access level was recorded"
-            );
+            assert_eq!(g.permissions, "all", "the consent-time access level was recorded");
             assert!(g.minutes_left() > 0, "the 24h grant is live");
             assert_eq!(
                 g.principal,
@@ -503,8 +451,5 @@ async fn local_login_end_to_end() {
             Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
         }
     }
-    assert!(
-        listener_down,
-        "the login listener must shut down once the grant landed"
-    );
+    assert!(listener_down, "the login listener must shut down once the grant landed");
 }

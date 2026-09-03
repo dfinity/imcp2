@@ -38,14 +38,22 @@ pub mod tools;
 mod calls;
 mod compliance;
 mod discover;
+mod discoverability;
 mod management;
 
-pub use identities::{IiInstance, SessionGauges};
-pub use tools::{IcCanisterTools, IcProtocolTools, IcTools, SessionResolver};
+// End-to-end tests for the canister tools, against real canisters in PocketIC.
+// In-crate (not tests/) so they can use the feature-gated optional `pocket-ic`
+// dependency and the crate internals; gated so the default build compiles
+// neither them nor `pocket-ic`. See the module docs to run them.
+#[cfg(all(test, feature = "e2e"))]
+mod e2e_canister_tools;
+
 /// The IC [`Agent`] type the components are built around, re-exported so
 /// callers construct the injected agent from the exact `ic-agent` version this
 /// crate links.
 pub use ic_agent::{self, Agent};
+pub use identities::{IiInstance, SessionGauges};
+pub use tools::{IcCanisterTools, IcProtocolTools, IcTools, SessionResolver};
 
 /// A sensible default IC API boundary node (the public mainnet endpoint) for
 /// callers that just want `Agent::builder().with_url(IC_URL).build()`. A host

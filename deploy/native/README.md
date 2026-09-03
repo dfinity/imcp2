@@ -337,9 +337,14 @@ sudo journalctl -u caddy -f        # TLS / cert logs
 sudo journalctl -u imcp-status -f  # status dashboard logs
 ```
 
-The dashboard is at `https://<domain>/status/`. To probe a different target or
-extend its SSRF allowlist, edit `Environment=`/`ExecStart=` in
+The dashboard is at `https://<domain>/status/` and shows staging and production
+side by side (the same two columns on every host). To change the monitored set,
+its II pins or the SSRF allowlist, set `STATUS_TARGETS` / `STATUS_TARGET_II` for
+`deploy.sh` or edit the `Environment=` lines in
 `/etc/systemd/system/imcp-status.service` and `systemctl restart imcp-status`.
+The optional Statuspage pusher (`/etc/imcp-status/statuspage.env`) drives its
+component from the first configured instance unless `STATUSPAGE_TARGET` names
+another — set it to `production` there, so the public page reflects production.
 
 ## Files
 
@@ -348,6 +353,6 @@ extend its SSRF allowlist, edit `Environment=`/`ExecStart=` in
 | `build.sh` | Cross-build `build-out/imcp2` (linux/arm64, bullseye glibc) |
 | `deploy.sh` | Ship binary + `monitoring/`, render & install units/Caddyfile, (re)start services |
 | `imcp2.service` | systemd unit for the app (`__PUBLIC_URL__` substituted at deploy) |
-| `imcp-status.service` | systemd unit for the status dashboard (`__DOMAIN__`, `__ALLOWED_HOSTS__` substituted at deploy) |
+| `imcp-status.service` | systemd unit for the status dashboard (`__TARGETS__`, `__TARGET_II__`, `__ALLOWED_HOSTS__` substituted at deploy) |
 | `caddy.service` | systemd unit for Caddy |
 | `Caddyfile` | Caddy config (`__DOMAIN__`, `__ACME_EMAIL__` substituted at deploy) |
