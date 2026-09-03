@@ -210,12 +210,13 @@ stdin/stdout, in place of `StreamableHttpService`), `axum` (the transient login 
 `open` (browser launch), and `tracing-subscriber` (stderr logging); dev-dependency:
 `pocket-ic` (the local-flow integration tests, component 3).
 
-The local binary's one HTTP surface is the transient login callback (component 5) — three
+The local binary's one HTTP surface is the transient login callback (component 5) — two
 loopback routes served with **axum**, the same shape as the ICP CLI's web-identity flow
 (`icp identity link web`: an axum `Router` on a `TcpListener` at `127.0.0.1:0`, graceful
 shutdown on completion — `crates/icp-cli/src/commands/identity/link/web.rs`). `tower-http`
-is still not needed: the only CORS requirement is one `Access-Control-Allow-Origin` header
-on the `#4091` well-known, set directly on that response.
+is still not needed: nothing here is fetched cross-origin, so there is no CORS requirement
+at all (the `#4091` well-known that would have needed one is not served — II exempts a
+loopback callback from that check).
 
 Net minimal local deps: `imcp2-core` + `rmcp{server,macros,transport-io}` + `tokio` +
 `axum` (the transient login listener) + `open` (browser launch) + `anyhow` + `serde_json` +
@@ -269,8 +270,10 @@ test build at any other local replica, such as one spawned by the ICP CLI.
   answers `{"done": true}` and the page renders its completion state in place ("Signed in —
   you can close this tab", the state component 9 promises), while the hosted redeem keeps
   answering `redirect`.
-- the **`#4091` allow-list** `/.well-known/ii-auth-callbacks` (`auth.rs:1304,1319`) — still
-  mandatory: II fail-closed-fetches it before honoring the callback.
+- the **`#4091` allow-list** `/.well-known/ii-auth-callbacks` (`auth.rs:1304,1319`) — **not**
+  carried over. Browsers block II's https document from fetching a loopback URL, so II
+  exempts a local server from the check and takes the callback as given. The hosted server
+  still serves it; the local listener does not.
 
 **Dropped (the entire OAuth 2.1 AS):** `/authorize` (`auth.rs:1053`), `/token` + PKCE + tokens
 (`auth.rs:1969-2137`), `/register` + DCR + the persisted client store (`auth.rs:2139-2221`;
@@ -304,8 +307,9 @@ callback↔connect correlator.
    refused only when the session map hits its CWE-770 capacity bound, which a single-user
    binary never does.)
 3. Bind a transient listener on `127.0.0.1:0`; the callback origin is
-   `http://127.0.0.1:<port>`. Both the II link's `callback` and the well-known entry derive
-   from this one value, so they cannot drift (II matches by exact string equality).
+   `http://127.0.0.1:<port>`. A fresh port per handshake is fine: II trusts a local server
+   by loopback **host**, against the port-less `http://127.0.0.1` the user stored in
+   Settings, rather than by exact origin.
 4. Build the II link (`iiconnect::ii_mcp_url`) against `https://id.ai` and surface it to the
    user **in-band** — as the text result of an `authenticate` MCP tool (component 6) — plus a
    best-effort server-side browser auto-open via `open::that` (the `open` crate, as in the
@@ -313,21 +317,19 @@ callback↔connect correlator.
    **stderr** for the URL: every
    client routes a stdio server's stderr to a log file/panel, never the chat (component 6).
    stdout is the JSON-RPC channel, so all logging stays on stderr.
-5. Serve exactly three loopback routes: `GET /callback` (the pinned fragment-reading page),
-   `POST /redeem` (slim redeem → `redeem_registration_delegation`), and
-   `GET /.well-known/ii-auth-callbacks` (the `#4091` allow-list, one `Access-Control-Allow-Origin: *`
-   header since II fetches it cross-origin).
+5. Serve exactly two loopback routes: `GET /callback` (the pinned fragment-reading page) and
+   `POST /redeem` (slim redeem → `redeem_registration_delegation`). No `#4091` allow-list —
+   II exempts a local server from it, because it cannot fetch one from a loopback origin.
 6. On redeem success, answer `{"done": true}` — the callback page renders "Signed in — you
    can close this tab" (component 4) — record the grant in memory, and shut the listener
    down. `IcTools` now serves tools over stdio, minting per-app delegations on demand
    against mainnet.
 
 The loopback listener is the unavoidable minimum, not a design slip: II delivers the
-delegation by *navigating the browser* to the callback (a URL fragment only a served page can
-read and POST back), and the `#4091` check *fetches* `/.well-known/ii-auth-callbacks` from
-the callback's **origin** before honoring it — both require a real HTTP origin. A custom URI
-scheme has no origin for that fetch (and component 6's client research found custom schemes
-unreliably opened), and II's MCP contract offers no device-grant-style manual alternative
+delegation by *navigating the browser* to the callback, in a URL fragment only a served page
+can read and POST back — which requires a real HTTP origin. A custom URI scheme has none
+(and component 6's client research found custom schemes unreliably opened), and II's MCP
+contract offers no device-grant-style manual alternative
 (the RFC 8628 device grant was dropped from this server early on). This is the standard
 native-app loopback redirect (RFC 8252 §7.3) — the same shape as `gh auth login` /
 `gcloud auth login`. The listener is transient (up for the handshake, torn down on redeem or
@@ -477,7 +479,7 @@ resources.)
 rides stdio: it has no listening socket — it is reachable only by the parent process holding
 its stdin/stdout, i.e. the client that launched it. The one socket the binary ever opens is
 the transient login listener (component 5), and reaching it confers nothing: the callback
-page and the `#4091` well-known are static, and `/redeem` only advances the connect this
+page is static, and `/redeem` only advances the connect this
 process started (`state` must match) with a chain targeting the in-process `X` — it can
 neither invoke tools nor read the session. But the client then wields the user's
 **real production II accounts** on mainnet (any update call under a per-app delegation, for
@@ -615,24 +617,27 @@ register → authorize → the II registration-delegation ceremony → redeem �
 complete redemption after `fetch_root_key`, which is what makes a PocketIC-based test of the
 *local* flow possible.)
 
-What remains open is specific to the **local binary's `http://127.0.0.1` callback**, which
-the hosted https deployment never exercises:
-1. **Mixed content:** II's https document must `fetch()`
-   `http://127.0.0.1:<port>/.well-known/…`. Loopback is "potentially trustworthy" (W3C Secure
-   Contexts), so Chrome/Firefox allow https→http-loopback — prefer the `127.0.0.1` literal
-   over the `localhost` name; Safari and enterprise policies are the unknowns.
-2. **CORS:** the well-known response needs `Access-Control-Allow-Origin` (II fetches it
-   cross-origin; `*` is fine with `credentials: omit`).
+What was open here — whether II's https document could `fetch()`
+`http://127.0.0.1:<port>/.well-known/…` — is settled, and the answer was no: browsers block
+it. Since the `#4091` check is fail-closed, every local sign-in would have failed. II
+therefore exempts a local server from the check, and this binary serves no well-known;
+neither the mixed-content nor the CORS question applies any more.
+
+II now trusts a local server by loopback **host** rather than by exact origin, stored
+port-less as `http://127.0.0.1`, which is what lets the listener keep binding port 0. The
+user opts a local connector in from II Settings, and II shows a notice before the first local
+sign-in for an identity on a machine. What remains specific to the local callback is only
+that the browser must be able to reach `127.0.0.1` on the machine the binary runs on — the
+same constraint the ICP CLI's `icp identity link web` carries.
 
 Verification plan: integration tests run `imcp2-local` in its **local-replica test
 configuration** (component 3) against **PocketIC carrying a deployed II canister** — the
 `pocket-ic` dev dependency, extending the existing e2e harness to drive the local
 browser-handshake flow (loopback listener + slim redeem) with no live network. That harness
-exercises the protocol, not browser policy, so it cannot answer the two questions above —
-Stage 2's login exit criterion therefore also includes a **real-browser compatibility
-gate**: an automated Chromium/Firefox run of the full login against the loopback listener
-(Playwright-style), plus a manual Safari and enterprise-policy pass, before the flow is
-declared working on supported clients. The `II_URL_PROD`/`II_CANISTER_ID_PROD` overrides
+exercises the protocol, not browser policy, so Stage 2's login exit criterion also includes a
+**real-browser compatibility gate**: an automated Chromium/Firefox run of the full login
+against the loopback listener (Playwright-style), plus a manual Safari and enterprise-policy
+pass, before the flow is declared working on supported clients. The `II_URL_PROD`/`II_CANISTER_ID_PROD` overrides
 additionally allow pointing a binary at beta II.
 
 ## Appendix: evidence index
@@ -649,7 +654,7 @@ additionally allow pointing a binary at beta II.
   `IMCP2_STATE_DIR`/`OAUTH_REQUIRE_RESOURCE` in `main.rs`).
 - OAuth AS vs II-connect split: `auth.rs:24-60` (module docs), handlers
   `auth.rs:1053/1987/2139`, connect subset `auth.rs:1284/1342-1515/1673-1782/1839`,
-  `#4091` `auth.rs:1304/1319`.
+  `#4091` `auth.rs:1304/1319` (hosted only).
 - Session seam: `auth.rs:2264/2292`, `tools.rs:1493`, 13 call-sites listed in component 7.
 - II login primitives: `identities.rs:595/936`, `ii_mcp_url` `auth.rs:1284`.
 - Production II served at `/mcp` (#92, `main.rs:376-385`); PocketIC e2e handshake test

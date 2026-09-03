@@ -3,7 +3,6 @@
 //! attacker) over real HTTP.
 
 use super::*;
-use imcp2_core::iiconnect::AUTH_CALLBACKS_WELL_KNOWN;
 use imcp2_core::IiInstance;
 
 /// A driver against the real mainnet/prod-II config — nothing here touches
@@ -66,12 +65,12 @@ async fn begin_mints_one_flow_and_repeats_it_while_pending() {
     assert!(matches!(driver.status().await, LoginStatus::Pending { .. }));
 }
 
-// The transient listener's whole surface, driven like the browser: the
-// pinned page (strict CSP + the hosted server's hardening headers, script
-// pointed at /redeem), and the #4091 allow-list (this callback verbatim,
-// CORS-readable, never cached).
+// The transient listener's whole surface, driven like the browser: the pinned
+// page (strict CSP + the hosted server's hardening headers, script pointed at
+// /redeem), and nothing else — II exempts a local server from the #4091
+// allow-list, so this listener serves no well-known.
 #[tokio::test]
-async fn the_listener_serves_the_pinned_page_and_the_allow_list() {
+async fn the_listener_serves_the_pinned_page_and_nothing_else() {
     let (driver, _slot) = test_driver();
     driver.begin(false).await.expect("begin");
     let (_, callback_url) = driver.pending_handshake().await.expect("pending");
@@ -99,28 +98,12 @@ async fn the_listener_serves_the_pinned_page_and_the_allow_list() {
     assert!(html.contains("/redeem"), "the script must POST to this listener's redeem");
     assert!(html.contains("data.done"), "the local success arm must be in the shipped page");
 
-    let wk = http
-        .get(format!("{origin}{AUTH_CALLBACKS_WELL_KNOWN}"))
-        .send()
-        .await
-        .expect("GET allow-list");
-    assert_eq!(wk.status(), 200);
-    assert_eq!(
-        wk.headers().get("access-control-allow-origin").and_then(|v| v.to_str().ok()),
-        Some("*"),
-        "II fetches the allow-list cross-origin"
-    );
-    assert_eq!(
-        wk.headers().get("cache-control").and_then(|v| v.to_str().ok()),
-        Some("no-store"),
-        "fail-closed infrastructure must never be served stale"
-    );
-    let doc: serde_json::Value = wk.json().await.unwrap();
-    assert_eq!(
-        doc,
-        serde_json::json!({ "callbacks": [callback_url] }),
-        "the declared callback must equal the link's callback VERBATIM (exact-match)"
-    );
+    // The handshake's whole surface is the two routes above. Anything else,
+    // the retired allow-list included, is not served.
+    for path in ["/.well-known/ii-auth-callbacks", "/", "/anything"] {
+        let resp = http.get(format!("{origin}{path}")).send().await.expect("GET");
+        assert_eq!(resp.status(), 404, "the login listener must serve nothing at {path}");
+    }
 }
 
 // The redeem's refusal paths, in order: an unknown `state` (or one from a

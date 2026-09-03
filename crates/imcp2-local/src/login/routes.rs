@@ -1,26 +1,31 @@
-//! The transient loopback listener's HTTP surface — the three login-handshake
-//! routes (pinned callback page, slim redeem, the #4091 allow-list) plus the
-//! Host-validation middleware. Up only for the duration of one handshake; the
-//! MCP tool surface never rides HTTP.
+//! The transient loopback listener's HTTP surface — the two login-handshake
+//! routes (pinned callback page, slim redeem) plus the Host-validation
+//! middleware. Up only for the duration of one handshake; the MCP tool surface
+//! never rides HTTP.
+//!
+//! No `#4091` allow-list here, unlike the hosted server: II can't fetch one
+//! from a loopback origin (browsers block the request from its https document),
+//! so it exempts a local server and takes the callback as given. What stands in
+//! its place is the user's deliberate opt-in to a local connector in II
+//! Settings, II's notice before the first local sign-in on a machine, and its
+//! consent screen on every connect.
 
 use axum::extract::State;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use imcp2_core::iiconnect::{self, RedeemBody, AUTH_CALLBACKS_WELL_KNOWN};
+use imcp2_core::iiconnect::{self, RedeemBody};
 use serde_json::json;
 
 use super::{Grant, LoginDriver, CONTACT_EMAIL};
 
-/// The three transient loopback routes — the login handshake's whole HTTP
-/// surface. `callback_url` is this listener's own callback, echoed verbatim in
-/// the allow-list document; `authority` is its `127.0.0.1:<port>` host, the
-/// only `Host` header the listener accepts.
-pub(super) fn login_router(driver: LoginDriver, callback_url: String, authority: String) -> Router {
+/// The two transient loopback routes — the login handshake's whole HTTP
+/// surface. `authority` is this listener's `127.0.0.1:<port>` host, the only
+/// `Host` header it accepts.
+pub(super) fn login_router(driver: LoginDriver, authority: String) -> Router {
     Router::new()
         .route("/callback", get(callback_page))
         .route("/redeem", post(redeem))
-        .route(AUTH_CALLBACKS_WELL_KNOWN, get(auth_callbacks))
         // Anti-DNS-rebinding, per the design's loopback hardening (the local
         // analogue of the hosted server's Host allow-list): a page on an
         // attacker's hostname that rebinds to 127.0.0.1 reaches this port
@@ -30,11 +35,11 @@ pub(super) fn login_router(driver: LoginDriver, callback_url: String, authority:
         // rebinder — `/redeem` requires the connect `state` and a chain
         // targeting the in-process `X` — this closes the door outright.)
         .layer(axum::middleware::from_fn_with_state(authority, require_own_host))
-        .with_state(RouteCtx { driver, callback_url })
+        .with_state(RouteCtx { driver })
 }
 
 /// Reject any request whose `Host` header is not this listener's own
-/// `127.0.0.1:<port>` authority (exact string match, like II's allow-list).
+/// `127.0.0.1:<port>` authority (exact string match).
 async fn require_own_host(
     State(expected): State<String>,
     req: axum::extract::Request,
@@ -55,7 +60,6 @@ async fn require_own_host(
 #[derive(Clone)]
 struct RouteCtx {
     driver: LoginDriver,
-    callback_url: String,
 }
 
 /// GET /callback — the pinned fragment-reading page (shared with the hosted
@@ -78,21 +82,6 @@ async fn callback_page() -> Response {
         axum::http::HeaderValue::from_static("nosniff"),
     );
     h.insert(axum::http::header::X_FRAME_OPTIONS, axum::http::HeaderValue::from_static("DENY"));
-    resp
-}
-
-/// GET /.well-known/ii-auth-callbacks — the #4091 allow-list: exactly this
-/// listener's callback. II fetches it cross-origin (hence the one CORS
-/// header) and fail-closed before honoring the callback; `no-store` keeps an
-/// intermediary from serving a stale document for a past listener's port.
-async fn auth_callbacks(State(ctx): State<RouteCtx>) -> Response {
-    let mut resp = Json(json!({ "callbacks": [ctx.callback_url] })).into_response();
-    let h = resp.headers_mut();
-    h.insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
-    h.insert(
-        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        axum::http::HeaderValue::from_static("*"),
-    );
     resp
 }
 
