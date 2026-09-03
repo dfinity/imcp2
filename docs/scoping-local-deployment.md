@@ -210,12 +210,13 @@ stdin/stdout, in place of `StreamableHttpService`), `axum` (the transient login 
 `open` (browser launch), and `tracing-subscriber` (stderr logging); dev-dependency:
 `pocket-ic` (the local-flow integration tests, component 3).
 
-The local binary's one HTTP surface is the transient login callback (component 5) — three
+The local binary's one HTTP surface is the transient login callback (component 5) — two
 loopback routes served with **axum**, the same shape as the ICP CLI's web-identity flow
 (`icp identity link web`: an axum `Router` on a `TcpListener` at `127.0.0.1:0`, graceful
 shutdown on completion — `crates/icp-cli/src/commands/identity/link/web.rs`). `tower-http`
-is still not needed: the only CORS requirement is one `Access-Control-Allow-Origin` header
-on the `#4091` well-known, set directly on that response.
+is still not needed: nothing here is fetched cross-origin, so there is no CORS requirement
+at all (the `#4091` well-known that would have needed one is not served — II exempts a
+loopback callback from that check).
 
 Net minimal local deps: `imcp2-core` + `rmcp{server,macros,transport-io}` + `tokio` +
 `axum` (the transient login listener) + `open` (browser launch) + `anyhow` + `serde_json` +
@@ -306,8 +307,9 @@ callback↔connect correlator.
    refused only when the session map hits its CWE-770 capacity bound, which a single-user
    binary never does.)
 3. Bind a transient listener on `127.0.0.1:0`; the callback origin is
-   `http://127.0.0.1:<port>`. Both the II link's `callback` and the well-known entry derive
-   from this one value, so they cannot drift (II matches by exact string equality).
+   `http://127.0.0.1:<port>`. A fresh port per handshake is fine: II trusts a local server
+   by loopback **host**, against the port-less `http://127.0.0.1` the user stored in
+   Settings, rather than by exact origin.
 4. Build the II link (`iiconnect::ii_mcp_url`) against `https://id.ai` and surface it to the
    user **in-band** — as the text result of an `authenticate` MCP tool (component 6) — plus a
    best-effort server-side browser auto-open via `open::that` (the `open` crate, as in the

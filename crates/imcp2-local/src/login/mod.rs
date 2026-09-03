@@ -90,13 +90,19 @@ struct Pending {
     /// Doubles as the connect `state` in the II link — II echoes it to the
     /// callback, and the redeem accepts only this value.
     ///
-    /// Unguessable on purpose (a v4 UUID), and load-bearing in a way a hosted
-    /// server's `state` is not: a hosted callback sits on a domain a random
-    /// page can't reach, while this listener is reachable by any page in the
-    /// browser and any process on the machine. `state` is what stops a forged
-    /// POST to `/redeem` from injecting an identity the user never chose. II
-    /// treats it as opaque and only echoes it, so keeping it unpredictable is
-    /// entirely this side's job.
+    /// Unguessable on purpose (a v4 UUID). Both redeems are reachable by any
+    /// page — the hosted one over the internet, this one from any page in the
+    /// browser or any process on the machine — but they prove the requester
+    /// differently. The hosted flow has a public `/oauth/authorize` to be
+    /// confused through, so it carries a separate *initiator* proof, the `sid`
+    /// cookie it set there (`CONNECT_COOKIE`, `src/auth.rs`). This flow has no
+    /// such endpoint (the binary mints `X` itself) and so no cookie, which
+    /// leaves two things to stand for the initiator: `state`, matched against
+    /// the one pending flow, and the delegation's final hop, which must target
+    /// the `X` minted in this process — an attacker can't produce a chain
+    /// toward an `X` they never saw. `state` alone is not the gate, but it is
+    /// the half II round-trips, and II treats it as opaque and only echoes it,
+    /// so keeping it unpredictable is entirely this side's job.
     session_id: String,
     url: String,
     /// This flow's loopback callback (`http://127.0.0.1:<port>/callback`) —

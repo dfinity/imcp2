@@ -6,6 +6,13 @@
 //! strings) and returns plain values — the embedding server wraps them in its
 //! own HTTP handlers and supplies its own state (an OAuth authorization server
 //! in the hosted `imcp2` binary; a transient loopback listener in a local one).
+//!
+//! Not all of it applies to both. The `#4091` allow-list is a **remote
+//! callback's** obligation only: II can't fetch it from a loopback origin
+//! (browsers block the request from II's https document), so it exempts a
+//! local server and takes the callback as given. `AUTH_CALLBACKS_WELL_KNOWN`
+//! is therefore used by the hosted binary alone, while `imcp2-local` calls
+//! [`ii_mcp_url`] and [`pinned_callback_page`] without serving one.
 
 use base64::Engine;
 use candid::Principal;
@@ -19,8 +26,9 @@ use serde::Deserialize;
 /// registration public key `pub(X)` (DER, base64url), toward which II builds
 /// the registration chain `P_reg -> Y -> X` (param name per
 /// dfinity/internet-identity#4093; its presence selects the connect flow). II
-/// navigates the tab back to `callback` — validated against the origin's
-/// [`AUTH_CALLBACKS_WELL_KNOWN`] allow-list (#4091) — with the delegation in
+/// navigates the tab back to `callback` — validated, when it is a remote
+/// origin, against that origin's [`AUTH_CALLBACKS_WELL_KNOWN`] allow-list
+/// (#4091); a loopback callback is exempt — with the delegation in
 /// the fragment; the callback page rendered by [`pinned_callback_page`] is the
 /// sole fragment reader. No `priv(X)` is ever put in the link — only its
 /// public half.
@@ -48,7 +56,12 @@ pub fn ii_mcp_url(
 /// `no-store`, 8 KB cap, `application/json` required — and rejects the connect
 /// unless the callback URL is EXACTLY (string-equal) one of the declared
 /// entries. **Fail-closed**: a missing/unfetchable file fails every connect for
-/// this origin, so serving this document is mandatory once #4091 ships.
+/// this origin, so serving this document is mandatory once #4091 ships — for a
+/// server on a **remote** origin. A loopback callback is exempt, because the
+/// browser blocks II's https document from fetching `http://127.0.0.1` and the
+/// check could then only ever fail: `imcp2-local` serves no such document, and
+/// what stands in its place is the user's opt-in to a local connector in II
+/// Settings plus II's consent screen on every connect.
 pub const AUTH_CALLBACKS_WELL_KNOWN: &str = "/.well-known/ii-auth-callbacks";
 
 /// A fresh CSP nonce: 128 bits from the OS CSPRNG, **standard** base64. CSP3's
