@@ -478,6 +478,11 @@ where
 const DEFAULT_ALLOWED_REDIRECTS: &[(&str, &str)] = &[
     ("antigravity.google", "/oauth-callback"), // Google Antigravity
     ("chatgpt.com", "/connector/oauth/"),      // OpenAI ChatGPT connectors
+    // OpenAI ChatGPT connectors, issuer-identification form. ChatGPT sends this
+    // stable path — not the `{callback_id}` one above — to an authorization server
+    // whose metadata advertises `authorization_response_iss_parameter_supported`,
+    // which ours does, so this is the path a ChatGPT connection actually registers.
+    ("chatgpt.com", "/connector_platform_oauth_redirect"),
     ("claude.ai", "/api/mcp/auth_callback"),   // Anthropic Claude
     ("cursor.com", "/agents/mcp/oauth/callback"), // Cursor (registered as www.cursor.com)
     ("grok.com", "/connector/oauth/"),         // xAI Grok
@@ -2170,6 +2175,10 @@ mod tests {
         // Allow-listed vendor domains/subdomains UNDER their pinned callback path.
         assert!(redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback"));
         assert!(redirect_uri_permitted("https://chatgpt.com/connector/oauth/abc"));
+        // ChatGPT's issuer-identification callback: one stable path, no `{callback_id}`
+        // segment. This is the form it sends us, since our AS metadata advertises
+        // `authorization_response_iss_parameter_supported`.
+        assert!(redirect_uri_permitted("https://chatgpt.com/connector_platform_oauth_redirect"));
         assert!(redirect_uri_permitted("https://grok.com/mcp/callback"));
         assert!(redirect_uri_permitted("https://grok.com/connectors-oauth-exchange-code/x"));
         assert!(redirect_uri_permitted("https://www.perplexity.ai/rest/connections/oauth_callback"));
@@ -2189,6 +2198,9 @@ mod tests {
         // Right domain, wrong path, plus a non-segment-boundary near-miss of the pin.
         assert!(!redirect_uri_permitted("https://claude.ai/foo"));
         assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callbackEVIL"));
+        assert!(!redirect_uri_permitted(
+            "https://chatgpt.com/connector_platform_oauth_redirectEVIL"
+        ));
         // Dot-segment traversal (raw and percent-encoded): url::Url normalizes these
         // to `/g/evil` on parse (WHATWG), which then fails the pinned-prefix check.
         assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/../../g/evil"));
