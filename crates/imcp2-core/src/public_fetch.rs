@@ -269,6 +269,9 @@ mod tests {
             "https://169.254.169.254/latest/meta-data/",
             "https://[::1]/client.json",
             "https://[::ffff:127.0.0.1]/client.json",
+            "https://[fec0::1]/client.json",
+            "https://[fe80::1]/client.json",
+            "https://[fd00::1]/client.json",
         ] {
             let Err(FetchError::Refused(why)) = fetch(internal).await else {
                 panic!("{internal} must be refused by the guard");
