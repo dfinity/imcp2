@@ -8,20 +8,22 @@
 //! The guard is the discovery module's (CWE-918): https only; the host resolved
 //! up front and refused if ANY address is loopback / private / link-local /
 //! CGNAT / otherwise reserved; the validated addresses pinned into the client so
-//! a re-resolution cannot rebind the connection (DNS rebinding); every redirect
-//! hop re-checked; and the body read under a hard byte cap (CWE-770). On top of
-//! that, this fetch is STRICT where the crawl is opportunistic — the document is
-//! the URL's own statement about itself, so:
+//! a re-resolution cannot rebind the connection (DNS rebinding); and the body
+//! read under a hard byte cap (CWE-770). On top of that, this fetch is STRICT
+//! where the crawl is opportunistic — the document is the URL's own statement
+//! about itself, so:
 //!
-//!   * a response served by a redirect target is refused (the shared redirect
-//!     policy permits same-host different-port hops and hops to global IP
-//!     literals, either of which would put another origin's bytes behind the URL);
+//!   * redirects are not followed at all: a 3xx is a non-success answer, so no
+//!     other URL's bytes — on another host, another port, or another path of the
+//!     same origin — can ever stand in for the document at this one;
 //!   * a body over the cap, or one whose transfer failed part-way, is an error,
-//!     never a shorter document.
+//!     never a shorter document;
+//!   * the caller's timeout bounds the WHOLE operation, DNS resolution included,
+//!     so a slow resolver cannot hold the caller past its deadline.
 
 use std::time::Duration;
 
-use crate::discover::{read_capped_inner, resolve_public_url, ssrf_redirect_policy};
+use crate::discover::{read_capped_inner, resolve_public_url};
 
 /// A small public document fetched under the SSRF guard.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,19 +40,34 @@ pub struct PublicDocument {
 
 /// GET `url` and return its body, or the reason it was not fetched: the URL is
 /// refused by the SSRF guard (not https, no host, or a host with a non-public
-/// address), unreachable within `timeout`, answered by another origin, answered
-/// with a non-success status, larger than `max_bytes`, or cut off mid-body.
+/// address); resolving, connecting, answering and delivering the body did not
+/// all complete within `timeout`; the answer was anything but 2xx (a redirect
+/// included); the body is larger than `max_bytes`; or the transfer was cut off.
 pub async fn fetch_public_document(
     url: &str,
     max_bytes: usize,
     timeout: Duration,
 ) -> Result<PublicDocument, String> {
+    // One deadline over everything, resolution included: `resolve_public_url`
+    // does the DNS lookup, and a resolver that never answers must not hold the
+    // caller (and whatever it is holding, such as an in-flight permit) forever.
+    tokio::time::timeout(timeout, fetch(url, max_bytes, timeout))
+        .await
+        .map_err(|_| format!("fetching {url} did not complete within {timeout:?}"))?
+}
+
+async fn fetch(url: &str, max_bytes: usize, timeout: Duration) -> Result<PublicDocument, String> {
     let (parsed, pinned) = resolve_public_url(url).await?;
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
     let client = reqwest::Client::builder()
         .user_agent(concat!("imcp2-core/", env!("CARGO_PKG_VERSION")))
         .timeout(timeout)
-        .redirect(ssrf_redirect_policy())
+        // Never follow a redirect: the document is this URL's statement about
+        // itself, and a 3xx is that URL declining to make it. Refusing here (rather
+        // than following under the crawl's redirect guard and comparing origins
+        // afterwards) also closes the same-origin case, where a redirect to another
+        // path would have put a different document behind this URL.
+        .redirect(reqwest::redirect::Policy::none())
         .resolve_to_addrs(&host, &pinned)
         .build()
         .map_err(|e| format!("http client: {e}"))?;
@@ -60,13 +77,6 @@ pub async fn fetch_public_document(
         .send()
         .await
         .map_err(|e| format!("could not fetch {url}: {e}"))?;
-    // The document is this URL's statement about itself, so only its own origin
-    // may answer; a redirect target's answer is not that statement.
-    let expected_origin = parsed.origin().ascii_serialization();
-    let served_from = resp.url().origin().ascii_serialization();
-    if served_from != expected_origin {
-        return Err(format!("{url} was answered by {served_from}, not by its own origin"));
-    }
     let status = resp.status();
     if !status.is_success() {
         return Err(format!("{url} answered {status}"));
@@ -77,8 +87,9 @@ pub async fn fetch_public_document(
     let content_type = header(reqwest::header::CONTENT_TYPE);
     let cache_max_age = header(reqwest::header::CACHE_CONTROL).and_then(|v| cache_max_age(&v));
     // Read ONE byte past the cap so overflow is detectable: a truncated body is
-    // not a shorter document.
-    let body = match read_capped_inner(resp, max_bytes + 1).await {
+    // not a shorter document. Saturating, so a caller passing `usize::MAX` (no
+    // cap) reads everything rather than wrapping to a zero-byte read.
+    let body = match read_capped_inner(resp, max_bytes.saturating_add(1)).await {
         Ok(body) if body.len() > max_bytes => {
             return Err(format!("{url} is larger than the {max_bytes}-byte cap"))
         }
@@ -132,6 +143,19 @@ mod tests {
             assert!(err.contains("non-public address"), "{internal}: {err}");
         }
         assert!(fetch("not a url").await.is_err());
+        // An uncapped read is a valid request, not an overflow.
+        let uncapped = fetch_public_document("https://[::1]/x", usize::MAX, Duration::from_secs(1));
+        assert!(uncapped.await.unwrap_err().contains("non-public address"));
+    }
+
+    /// The deadline covers resolution too: a zero timeout expires before the DNS
+    /// lookup of a public name can answer, and names the deadline, not the guard.
+    #[tokio::test]
+    async fn deadline_covers_resolution() {
+        let err = fetch_public_document("https://example.com/client.json", 1024, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(err.contains("did not complete within"), "{err}");
     }
 
     #[test]

@@ -1434,7 +1434,7 @@ fn redirect_hop_ok(next: &url::Url, prev_host: Option<&str>) -> bool {
 /// Redirect policy shared by every discovery/dashboard client: follow only safe
 /// public https hops (bounded), and stop — rather than follow — an unsafe hop, so
 /// no request is ever issued to an internal host.
-pub(crate) fn ssrf_redirect_policy() -> reqwest::redirect::Policy {
+fn ssrf_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         let prev_host = attempt.previous().last().and_then(|u| u.host_str()).map(str::to_string);
         if attempt.previous().len() >= 10 {

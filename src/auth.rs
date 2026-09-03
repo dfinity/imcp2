@@ -790,11 +790,13 @@ const CIMD_MAX_INFLIGHT: usize = 8;
 const CIMD_CACHE_MAX: usize = 512;
 /// How long a document is reused when its origin sends no `max-age`.
 const CIMD_CACHE_DEFAULT_TTL: Duration = Duration::from_secs(10 * 60);
-/// Floor and ceiling on the origin's `max-age`. The floor keeps a `no-store` or
-/// tiny `max-age` from turning every authorize into a fetch (a client's identity
-/// document changing within the minute is not a case worth serving); the ceiling
-/// bounds how long a since-changed document is still honoured.
-const CIMD_CACHE_MIN_TTL: Duration = Duration::from_secs(60);
+/// Ceiling on the origin's `max-age`: bounds how long a since-changed document is
+/// still honoured. There is deliberately no floor — an origin's `no-store`,
+/// `no-cache` or `max-age=0` means the document is not reused at all, so a
+/// redirect the client withdraws is gone with the next request. That costs this
+/// server nothing it was not already paying: an invalid document is never
+/// cached either, so a stranger could always force a fetch per request, and the
+/// in-flight bound is what contains that.
 const CIMD_CACHE_MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Whether CIMD is switched on: it is unless `OAUTH_CIMD_DISABLED` is set to
@@ -941,9 +943,11 @@ fn parse_client_metadata(client_id: &str, body: &str) -> Result<ClientMetadata, 
     Ok(ClientMetadata { client_id: client_id.to_owned(), client_name, redirect_uris })
 }
 
-/// The origin's cache hint (or the default), bounded to `[MIN, MAX]`.
+/// How long to reuse a document: the origin's `max-age` capped at
+/// [`CIMD_CACHE_MAX_TTL`], the default when it sent none, and ZERO — do not
+/// cache — when it said `no-store`, `no-cache` or `max-age=0`.
 fn cimd_ttl(max_age: Option<Duration>) -> Duration {
-    max_age.unwrap_or(CIMD_CACHE_DEFAULT_TTL).clamp(CIMD_CACHE_MIN_TTL, CIMD_CACHE_MAX_TTL)
+    max_age.unwrap_or(CIMD_CACHE_DEFAULT_TTL).min(CIMD_CACHE_MAX_TTL)
 }
 
 /// GET a metadata document: the process-global test fixture when one is
@@ -982,6 +986,16 @@ mod cimd_fixture {
             body: body.into(),
             content_type: Some("application/json".into()),
             cache_max_age: None,
+        };
+        docs().lock().expect("fixture registry").insert(url.into(), Ok(doc));
+    }
+
+    /// Serve `body` at `url` with `Cache-Control: no-store` (a zero max-age).
+    pub(super) fn serve_uncacheable(url: &str, body: &str) {
+        let doc = PublicDocument {
+            body: body.into(),
+            content_type: Some("application/json".into()),
+            cache_max_age: Some(std::time::Duration::ZERO),
         };
         docs().lock().expect("fixture registry").insert(url.into(), Ok(doc));
     }
@@ -1230,8 +1244,9 @@ impl AuthStore {
     }
 
     /// The validated metadata document behind a CIMD `client_id`, from the cache
-    /// while fresh, else fetched (under the in-flight bound) and cached for the
-    /// origin's `max-age`, bounded by [`cimd_ttl`]. Failures are never cached.
+    /// while fresh, else fetched (under the in-flight bound) and cached for as
+    /// long as [`cimd_ttl`] says — which is not at all when the origin forbids
+    /// reuse. Failures are never cached.
     async fn client_metadata_for(
         &self,
         client_id: &url::Url,
@@ -1254,7 +1269,13 @@ impl AuthStore {
         let meta = parse_client_metadata(key, &doc.body)
             .map(Arc::new)
             .map_err(|why| CimdError::Invalid(format!("{key}: {why}")))?;
-        let expires = now + cimd_ttl(doc.cache_max_age);
+        let ttl = cimd_ttl(doc.cache_max_age);
+        if ttl.is_zero() {
+            // `no-store` / `no-cache` / `max-age=0`: the origin's instruction not to
+            // reuse this is honoured to the letter.
+            return Ok(meta);
+        }
+        let expires = now + ttl;
         let mut cache = self.cimd_cache.write().await;
         if cache.len() >= CIMD_CACHE_MAX && !cache.contains_key(key) {
             // Make room: drop what has expired; if that frees nothing, the entry
@@ -2914,12 +2935,14 @@ mod tests {
 
     #[test]
     fn cimd_cache_ttl_is_bounded() {
-        use super::{cimd_ttl, CIMD_CACHE_DEFAULT_TTL, CIMD_CACHE_MAX_TTL, CIMD_CACHE_MIN_TTL};
+        use super::{cimd_ttl, CIMD_CACHE_DEFAULT_TTL, CIMD_CACHE_MAX_TTL};
         assert_eq!(cimd_ttl(None), CIMD_CACHE_DEFAULT_TTL);
-        // `no-store` / a tiny max-age: floored, so it cannot force a fetch per authorize.
-        assert_eq!(cimd_ttl(Some(Duration::ZERO)), CIMD_CACHE_MIN_TTL);
+        // The origin's value is honoured as given, however small, up to the ceiling.
         assert_eq!(cimd_ttl(Some(Duration::from_secs(300))), Duration::from_secs(300));
+        assert_eq!(cimd_ttl(Some(Duration::from_secs(5))), Duration::from_secs(5));
         assert_eq!(cimd_ttl(Some(Duration::from_secs(10 * 24 * 3600))), CIMD_CACHE_MAX_TTL);
+        // `no-store` / `no-cache` / `max-age=0` is zero: not cached at all.
+        assert_eq!(cimd_ttl(Some(Duration::ZERO)), Duration::ZERO);
     }
 
     /// `/oauth/authorize` with a CIMD client: the document's redirects get the
@@ -2991,6 +3014,21 @@ mod tests {
         let liar_doc = json!({ "client_id": HOSTED, "redirect_uris": [CHATGPT_REDIRECT] });
         cimd_fixture::serve(LIAR, &liar_doc.to_string());
         assert_eq!(check(LIAR, CHATGPT_REDIRECT).await, ClientCheck::Refused);
+
+        // A document served `no-store` is honoured, then NOT reused: once its URL
+        // fails, so does the next authorize (contrast HOSTED above, which was cached).
+        const VOLATILE: &str = "https://claude.ai/oauth/claude-code-client-metadata";
+        let volatile_doc = json!({
+            "client_id": VOLATILE,
+            "client_name": "Claude Code",
+            "redirect_uris": ["http://localhost/callback", "http://127.0.0.1/callback"],
+            "token_endpoint_auth_method": "none",
+        });
+        cimd_fixture::serve_uncacheable(VOLATILE, &volatile_doc.to_string());
+        assert_eq!(check(VOLATILE, "http://localhost:3118/callback").await, ClientCheck::Allowed);
+        cimd_fixture::fail(VOLATILE, "origin down");
+        let verdict = check(VOLATILE, "http://localhost:3118/callback").await;
+        assert!(matches!(verdict, ClientCheck::MetadataUnavailable(_)), "{verdict:?}");
 
         // DCR clients are untouched: an unregistered ordinary id is refused.
         assert_eq!(check("client-unknown", "http://127.0.0.1:1/cb").await, ClientCheck::Refused);
