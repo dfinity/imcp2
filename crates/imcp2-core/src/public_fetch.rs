@@ -34,14 +34,15 @@
 //! The origin's caching instruction is reported as the REMAINING freshness
 //! lifetime, per HTTP: every `Cache-Control` field line is read (a `no-store` on
 //! a second line counts), and the response's current age — the larger of its
-//! `Age` and the time since its `Date` — is subtracted from `max-age`.
+//! `Age` and the time since its `Date` — is subtracted from `max-age`; where
+//! `Cache-Control` grants no freshness, `Expires` relative to `Date` decides.
 
 use std::{
     fmt,
     time::{Duration, SystemTime},
 };
 
-use reqwest::header::{HeaderMap, AGE, CACHE_CONTROL, CONTENT_TYPE, DATE};
+use reqwest::header::{HeaderMap, AGE, CACHE_CONTROL, CONTENT_TYPE, DATE, EXPIRES};
 
 use crate::discover::{read_capped_bytes, resolve_public_url, ResolveError};
 
@@ -188,32 +189,40 @@ async fn accept(
 }
 
 /// The remaining freshness lifetime the response's headers grant, per HTTP
-/// caching (RFC 9111 §4.2): `max-age` from the COMBINED `Cache-Control` fields
-/// (a header may be sent as several lines, and a `no-store` on any of them wins),
-/// less the response's CURRENT AGE — the larger of its `Age` and its apparent
-/// age, `now` less its `Date`, so an answer some cache held for an hour without
-/// saying so in `Age` is not given a new lifetime here. A `Date` in the future
-/// (clock skew) is an apparent age of zero. `None` when no `max-age` was sent.
+/// caching (RFC 9111 §4.2). The lifetime is `max-age` (or `s-maxage`) from the
+/// COMBINED `Cache-Control` fields (a header may be sent as several lines, and a
+/// `no-store` on any of them wins); where those grant no freshness, it is
+/// `Expires` less `Date` (less `now`, when there is no `Date`), an `Expires`
+/// that is invalid — `0` is the classic — or already past meaning stale (§5.3).
+/// From it the response's CURRENT AGE is subtracted — the larger of its `Age`
+/// and its apparent age, `now` less its `Date`, so an answer some cache held for
+/// an hour without saying so in `Age` is not given a new lifetime here. A `Date`
+/// in the future (clock skew) is an apparent age of zero. `None` when neither a
+/// freshness directive nor `Expires` was sent.
 fn freshness(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    let header = |name| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
+    let date = header(DATE).and_then(|v| httpdate::parse_http_date(v).ok());
     let cache_control: Vec<&str> =
         headers.get_all(CACHE_CONTROL).iter().filter_map(|v| v.to_str().ok()).collect();
-    if cache_control.is_empty() {
-        return None;
-    }
-    let max_age = cache_max_age(&cache_control.join(", "))?;
-    let age = headers
-        .get(AGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    let from_cache_control =
+        (!cache_control.is_empty()).then(|| cache_max_age(&cache_control.join(", "))).flatten();
+    let lifetime = match from_cache_control {
+        Some(lifetime) => lifetime,
+        None => {
+            let expires = header(EXPIRES)?;
+            httpdate::parse_http_date(expires)
+                .ok()
+                .and_then(|expires| expires.duration_since(date.unwrap_or(now)).ok())
+                .unwrap_or(Duration::ZERO)
+        }
+    };
+    let age = header(AGE)
+        .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::ZERO);
-    let apparent_age = headers
-        .get(DATE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| httpdate::parse_http_date(v.trim()).ok())
-        .and_then(|date| now.duration_since(date).ok())
-        .unwrap_or(Duration::ZERO);
-    Some(max_age.saturating_sub(age.max(apparent_age)))
+    let apparent_age =
+        date.and_then(|date| now.duration_since(date).ok()).unwrap_or(Duration::ZERO);
+    Some(lifetime.saturating_sub(age.max(apparent_age)))
 }
 
 /// The caching lifetime a `Cache-Control` value grants a SHARED cache — which the
@@ -474,6 +483,27 @@ mod tests {
         let future = httpdate::fmt_http_date(now + Duration::from_secs(3600));
         let skewed = [("cache-control", "max-age=300"), ("date", &future)];
         assert_eq!(freshness(&headers(&skewed), now), Some(Duration::from_secs(300)));
+        // Where Cache-Control grants no freshness, Expires decides — relative to
+        // Date, or to now without one — so it comes to "Expires less now"; an
+        // Expires already past, or invalid ("0" is the classic), is stale, never
+        // the default lifetime.
+        let ahead = |secs: u64| httpdate::fmt_http_date(now + Duration::from_secs(secs));
+        assert_eq!(
+            freshness(&headers(&[("expires", &ahead(120))]), now),
+            Some(Duration::from_secs(120))
+        );
+        let (date, expires) = (dated(100), ahead(200));
+        let with_date = [("date", date.as_str()), ("expires", expires.as_str())];
+        assert_eq!(freshness(&headers(&with_date), now), Some(Duration::from_secs(200)));
+        assert_eq!(freshness(&headers(&[("expires", &dated(3600))]), now), Some(Duration::ZERO));
+        assert_eq!(freshness(&headers(&[("expires", "0")]), now), Some(Duration::ZERO));
+        let public = [("cache-control", "public"), ("expires", &ahead(90))];
+        assert_eq!(freshness(&headers(&public), now), Some(Duration::from_secs(90)));
+        // A Cache-Control that does speak to freshness wins over Expires, either way.
+        let both = [("cache-control", "max-age=60"), ("expires", &ahead(86400))];
+        assert_eq!(freshness(&headers(&both), now), Some(Duration::from_secs(60)));
+        let forbidden = [("cache-control", "no-store"), ("expires", &ahead(86400))];
+        assert_eq!(freshness(&headers(&forbidden), now), Some(Duration::ZERO));
     }
 
     #[test]

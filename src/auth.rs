@@ -945,9 +945,11 @@ type Flight = Arc<tokio::sync::Mutex<Option<Result<Arc<ClientMetadata>, CimdErro
 /// ([`host_key`]), so no spelling of a vetted host is a stranger or a second
 /// quota.
 fn cimd_client_id(client_id: &str) -> Option<url::Url> {
-    if client_id.len() > CIMD_MAX_CLIENT_ID_LEN || !client_id.starts_with("https://") {
+    if client_id.len() > CIMD_MAX_CLIENT_ID_LEN {
         return None;
     }
+    // Parsed, not prefix-matched: a scheme is case-insensitive (`HTTPS://` is
+    // https), and a DCR id (`client-…`) is no URL at all, so it parses to nothing.
     let url = url::Url::parse(client_id).ok()?;
     let well_formed = url.scheme() == "https"
         && url.host_str().is_some_and(|h| !h.is_empty())
@@ -3357,9 +3359,11 @@ mod tests {
         }
     }
 
-    /// A Client ID Metadata Document `client_id` is an https URL with a path and
-    /// nothing else, in canonical form (its document must repeat it byte for
-    /// byte). Anything else is an ordinary (DCR) identifier.
+    /// A Client ID Metadata Document `client_id` is an https URL naming a host
+    /// and a path beyond `/`, with no fragment or userinfo, within the length cap
+    /// — taken as given, in whatever spelling its document repeats (a query is
+    /// tolerated, as the draft only discourages one). Anything else is an
+    /// ordinary (DCR) identifier.
     #[test]
     fn cimd_client_id_shape() {
         use super::cimd_client_id;
@@ -3382,6 +3386,7 @@ mod tests {
         // identity and the cache key), and only the host is normalised, for the
         // trust policy and the per-host quota (`host_key`).
         for spelling in [
+            "HTTPS://chatgpt.com/oauth/client.json",
             "https://ChatGPT.com/oauth/client.json",
             "https://chatgpt.com:443/oauth/client.json",
             "https://chatgpt.com./oauth/client.json",
