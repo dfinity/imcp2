@@ -1148,6 +1148,28 @@ impl Drop for HostSlot {
     }
 }
 
+/// Retires a flight's entry in the single-flight map when the request fetching
+/// for it is done — OR IS DROPPED. An authorize future can be dropped at any
+/// await (the client resets the stream), and a fetch dropped mid-way would
+/// otherwise leave its entry in the process-wide map for good; with unique URLs
+/// on a vetted host, that is unbounded growth. Only this flight's own entry is
+/// removed, never a newer one. Waiters keep their handle to the flight and,
+/// finding no outcome in it once the lock is theirs, one of them fetches.
+struct RetireFlight<'a> {
+    state: &'a CimdState,
+    key: &'a str,
+    flight: &'a Flight,
+}
+
+impl Drop for RetireFlight<'_> {
+    fn drop(&mut self) {
+        let mut fetching = self.state.fetching.lock().expect("cimd fetch locks");
+        if fetching.get(self.key).is_some_and(|current| Arc::ptr_eq(current, self.flight)) {
+            fetching.remove(self.key);
+        }
+    }
+}
+
 /// How long to reuse a document: the origin's `max-age` capped at
 /// [`CIMD_CACHE_MAX_TTL`], the default when it sent none, and ZERO — do not
 /// cache — when it said `no-store`, `no-cache` or `max-age=0`.
@@ -1566,21 +1588,18 @@ impl AuthStore {
         if let Some(outcome) = slot.as_ref() {
             return outcome.clone();
         }
-        // First through the lock: fetch — unless a flight that finished between
-        // the miss above and here has filled the cache meanwhile — and publish.
+        // First through the lock: this request fetches — unless a flight that
+        // finished between the miss above and here has filled the cache meanwhile
+        // — and publishes. Its entry is retired when it is done or dropped
+        // ([`RetireFlight`]; declared after `slot`, so it runs before the lock is
+        // released), so a request cancelled mid-fetch leaves nothing behind, and
+        // waiters read the outcome from the handle they already hold.
+        let _retire = RetireFlight { state: &self.cimd, key, flight: &flight };
         let outcome = match self.cached_client_metadata(key).await {
             Some(cached) => cached,
             None => self.fetch_and_cache_client_metadata(client_id).await,
         };
         *slot = Some(outcome.clone());
-        drop(slot);
-        // Retire THIS flight only: waiters keep their own handle to it and read
-        // the outcome from there, and a flight a later miss may have started is
-        // left alone.
-        let mut fetching = self.cimd.fetching.lock().expect("cimd fetch locks");
-        if fetching.get(key).is_some_and(|current| Arc::ptr_eq(current, &flight)) {
-            fetching.remove(key);
-        }
         outcome
     }
 
@@ -3523,6 +3542,45 @@ mod tests {
         assert!(store.cimd.fetching.lock().unwrap().is_empty());
         // The refused one succeeds on retry (its document was never fetched).
         assert_eq!(check(THREE, REDIRECT).await, ClientCheck::Allowed);
+    }
+
+    /// A request dropped mid-fetch — the client reset the stream, so the
+    /// authorize future was dropped — leaves nothing behind: not its single-flight
+    /// entry, not its host slot, not its permit. The next request for the same
+    /// document starts afresh and succeeds.
+    #[tokio::test]
+    async fn cimd_cancelled_fetch_leaves_nothing_behind() {
+        use super::{cimd_fixture, ClientCheck, CIMD_MAX_INFLIGHT};
+        use serde_json::json;
+        let store = test_store();
+        const GONE: &str = "https://cimd-gone.claude.ai/client.json";
+        let doc = json!({ "client_id": GONE, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve(GONE, &doc.to_string());
+        // The leader runs until its fetch suspends (the fixture yields there, as a
+        // real fetch would), then is aborted — as a dropped connection drops the
+        // authorize future.
+        let leader = tokio::spawn({
+            let store = store.clone();
+            async move { store.validate_client(GONE, "http://127.0.0.1:1/cb").await }
+        });
+        tokio::task::yield_now().await;
+        assert!(store.cimd.fetching.lock().unwrap().contains_key(GONE), "leader must be mid-fetch");
+        assert_eq!(cimd_fixture::hits(GONE), 1);
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+        assert!(
+            store.cimd.fetching.lock().unwrap().is_empty(),
+            "a dropped fetch retires its flight"
+        );
+        assert!(store.cimd.hosts.lock().unwrap().is_empty(), "…and gives its host slot back");
+        assert_eq!(store.cimd.inflight.available_permits(), CIMD_MAX_INFLIGHT, "…and its permit");
+        // Nothing was cached (the fetch never completed), so the next request
+        // fetches afresh — and succeeds.
+        assert_eq!(
+            store.validate_client(GONE, "http://127.0.0.1:1/cb").await,
+            ClientCheck::Allowed
+        );
+        assert_eq!(cimd_fixture::hits(GONE), 2);
     }
 
     /// `/oauth/authorize` with a CIMD client: the document's redirects get the
