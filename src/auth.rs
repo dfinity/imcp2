@@ -905,8 +905,8 @@ struct CachedClientMetadata {
 enum CimdError {
     /// A failure of the MOMENT ([`classify_fetch_error`]): the host did not
     /// resolve, the deadline passed, the connection failed, the origin answered
-    /// 5xx / 408 / 429, or this server's own fetch budget or in-flight bounds
-    /// were spent. The same request may succeed next time, so the user is told
+    /// 5xx or one of the 4xx the client may retry (408, 421, 425, 429), or this
+    /// server's own fetch budget or in-flight bounds were spent. The same request may succeed next time, so the user is told
     /// to retry and nothing is remembered.
     Unavailable(String),
     /// A failure of the URL or its document: the SSRF guard refuses the URL, the
@@ -1348,14 +1348,17 @@ async fn fetch_and_validate_client_metadata(
 /// guard refuses it, the origin has no document there or answers with a redirect
 /// or another 4xx, the body is over the cap or not UTF-8 — is `Invalid`, which is
 /// remembered for [`CIMD_NEGATIVE_TTL`]. The moment — a resolver that did not
-/// answer, the deadline, a connection that failed, a 5xx, or the two 4xx that
-/// are about the moment too (408 Request Timeout, 429 Too Many Requests) — is
-/// `Unavailable`, which is never remembered.
+/// answer, the deadline, a connection that failed, a 5xx, or one of the 4xx
+/// that are about the moment too, which their definitions say the client may
+/// retry (408 Request Timeout, 421 Misdirected Request, 425 Too Early, 429 Too
+/// Many Requests) — is `Unavailable`, which is never remembered.
 fn classify_fetch_error(err: imcp2_core::public_fetch::FetchError) -> CimdError {
     use imcp2_core::public_fetch::FetchError;
     match err {
         FetchError::Unreachable(why) => CimdError::Unavailable(why),
-        FetchError::Answered { status, detail } if status >= 500 || matches!(status, 408 | 429) => {
+        FetchError::Answered { status, detail }
+            if status >= 500 || matches!(status, 408 | 421 | 425 | 429) =>
+        {
             CimdError::Unavailable(detail)
         }
         FetchError::Answered { detail, .. } => CimdError::Invalid(detail),
@@ -1457,7 +1460,12 @@ mod cimd_fixture {
 
     /// Make `url` answer 404: no document there, a failure about the URL itself.
     pub(super) fn not_found(url: &str) {
-        let err = FetchError::Answered { status: 404, detail: format!("{url} answered 404") };
+        answer(url, 404);
+    }
+
+    /// Make `url` answer with `status` (anything but the `200 OK` a document is).
+    pub(super) fn answer(url: &str, status: u16) {
+        let err = FetchError::Answered { status, detail: format!("{url} answered {status}") };
         docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Err(err)));
     }
 
@@ -3634,7 +3642,7 @@ mod tests {
             |e: FetchError| matches!(classify_fetch_error(e), CimdError::Unavailable(_));
         let invalid = |e: FetchError| matches!(classify_fetch_error(e), CimdError::Invalid(_));
         assert!(unavailable(FetchError::Unreachable("dns".into())));
-        for status in [500u16, 502, 503, 504, 408, 429] {
+        for status in [500u16, 502, 503, 504, 408, 421, 425, 429] {
             assert!(unavailable(answered(status)), "{status} is about the moment");
         }
         for status in [301u16, 302, 400, 401, 403, 404, 410, 451] {
@@ -4212,6 +4220,60 @@ mod tests {
         assert!(content_type.contains("json"), "{content_type}");
         assert!(json.contains("invalid_client") && json.contains(super::CONTACT), "{json}");
         assert_eq!(super::cimd_fixture::hits(STRANGER), 0, "nothing is fetched off-policy");
+    }
+
+    /// The transient verdict at the endpoint. A vetted CIMD client whose document
+    /// could not be fetched RIGHT NOW — the origin unreachable, or answering with
+    /// a status the client may retry (425 Too Early here) — is told to retry:
+    /// `503 temporarily_unavailable` to a programmatic caller, the sign-in error
+    /// page to a browser. Not `invalid_client`, which would have the user re-add
+    /// the connector. Neither body reflects the `client_id` URL or the cause, and
+    /// nothing is remembered: the next request fetches again.
+    #[tokio::test]
+    async fn authorize_tells_a_cimd_client_to_retry_when_its_document_is_unavailable() {
+        use axum::extract::{Query, State};
+        let store = test_store();
+        const DOWN: &str = "https://cimd-authorize-down.claude.ai/client.json";
+        const EARLY: &str = "https://cimd-authorize-early.claude.ai/client.json";
+        super::cimd_fixture::fail(DOWN, "connection reset by peer");
+        super::cimd_fixture::answer(EARLY, 425);
+        let query = |client_id: &str| super::AuthorizeQuery {
+            response_type: Some("code".into()),
+            client_id: client_id.into(),
+            redirect_uri: "http://127.0.0.1:1/cb".into(),
+            state: Some("xyz".into()),
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            scope: None,
+            resource: None,
+        };
+        let body_of = |resp: axum::response::Response| async {
+            let content_type =
+                resp.headers()[axum::http::header::CONTENT_TYPE].to_str().unwrap().to_owned();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            (content_type, String::from_utf8(bytes.to_vec()).unwrap())
+        };
+        for (id, cause) in [(DOWN, "reset"), (EARLY, "425")] {
+            let resp =
+                super::authorize(State(store.clone()), json_headers(), Query(query(id))).await;
+            assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE, "{id}");
+            let (content_type, json) = body_of(resp).await;
+            assert!(content_type.contains("json"), "{content_type}");
+            assert!(json.contains("temporarily_unavailable"), "{json}");
+            assert!(!json.contains("invalid_client"), "a retry, not a client to re-add: {json}");
+            assert!(
+                !json.contains(id) && !json.contains(cause),
+                "the body reflects nothing: {json}"
+            );
+            let resp =
+                super::authorize(State(store.clone()), html_headers(), Query(query(id))).await;
+            assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE, "{id}");
+            let (content_type, html) = body_of(resp).await;
+            assert!(content_type.starts_with("text/html"), "{content_type}");
+            assert!(html.contains("Try again in a moment"), "{html}");
+            assert!(!html.contains(id) && !html.contains(cause), "the page reflects nothing");
+            assert_eq!(super::cimd_fixture::hits(id), 2, "{id}: not remembered, so fetched again");
+        }
     }
 
     /// `OAUTH_ALLOWED_REDIRECT_PREFIXES` entries parse to `(host, path)` only for a
