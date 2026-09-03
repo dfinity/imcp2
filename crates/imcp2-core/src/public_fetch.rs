@@ -64,6 +64,13 @@ pub struct PublicDocument {
     /// information at all. A hint for the caller's own cache, for the caller to
     /// bound — never binding.
     pub cache_max_age: Option<Duration>,
+    /// How old the response already was on receipt, per HTTP (RFC 9111 §4.2.3):
+    /// the larger of its `Age` (every line, the greatest; an unparseable one the
+    /// greatest of all) and the time since its `Date`. Already subtracted from
+    /// `cache_max_age`; for a caller applying a lifetime of ITS OWN where the
+    /// origin sent none, the amount to subtract from that too, so an answer some
+    /// cache held for a day is not given a fresh default.
+    pub current_age: Duration,
 }
 
 /// Why a document was not returned, split by what the failure is ABOUT.
@@ -177,7 +184,9 @@ async fn accept(
     }
     let content_type =
         resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_owned);
-    let cache_max_age = freshness(resp.headers(), SystemTime::now());
+    let now = SystemTime::now();
+    let cache_max_age = freshness(resp.headers(), now);
+    let current_age = current_age(resp.headers(), now);
     // Read ONE byte past the cap so overflow is detectable: a truncated body is
     // not a shorter document. Saturating, so a caller passing `usize::MAX` (no
     // cap) reads everything rather than wrapping to a zero-byte read.
@@ -196,7 +205,7 @@ async fn accept(
     // so the document parsed is exactly the one served.
     let body = String::from_utf8(bytes)
         .map_err(|e| FetchError::NotUtf8(format!("{url} is not valid UTF-8: {e}")))?;
-    Ok(PublicDocument { body, content_type, cache_max_age })
+    Ok(PublicDocument { body, content_type, cache_max_age, current_age })
 }
 
 /// The remaining freshness lifetime the response's headers grant, per HTTP
@@ -243,10 +252,17 @@ fn freshness(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
                 .unwrap_or(Duration::ZERO)
         }
     };
-    // Every `Age` line counts and the greatest wins; one that is sent but does not
-    // parse — overflowing, not a number, not even ASCII — is taken as the largest
-    // age, not as none (RFC 9111 §1.2.2 has oversized delta-seconds treated as the
-    // greatest value): a response of unknowable age is not given a whole lifetime.
+    Some(lifetime.saturating_sub(current_age(headers, now)))
+}
+
+/// How old the response already is (RFC 9111 §4.2.3): the larger of its `Age`
+/// and its apparent age, `now` less its `Date` (a `Date` in the future — clock
+/// skew — is an apparent age of zero). Every `Age` line counts and the greatest
+/// wins; one that is sent but does not parse — overflowing, not a number, not
+/// even ASCII — is taken as the largest age, not as none (RFC 9111 §1.2.2 has
+/// oversized delta-seconds treated as the greatest value): a response of
+/// unknowable age is not given a whole lifetime.
+fn current_age(headers: &HeaderMap, now: SystemTime) -> Duration {
     let age = headers
         .get_all(AGE)
         .iter()
@@ -258,9 +274,13 @@ fn freshness(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
         })
         .max()
         .unwrap_or(Duration::ZERO);
-    let apparent_age =
-        date.and_then(|date| now.duration_since(date).ok()).unwrap_or(Duration::ZERO);
-    Some(lifetime.saturating_sub(age.max(apparent_age)))
+    let apparent_age = headers
+        .get(DATE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| httpdate::parse_http_date(v.trim()).ok())
+        .and_then(|date| now.duration_since(date).ok())
+        .unwrap_or(Duration::ZERO);
+    age.max(apparent_age)
 }
 
 /// The caching lifetime a `Cache-Control` value grants a SHARED cache — which the
@@ -357,7 +377,7 @@ fn cache_directives(value: &str) -> Option<Vec<(String, Option<String>)>> {
 mod tests {
     use std::time::Duration;
 
-    use super::{accept, cache_max_age, fetch_public_document, freshness, FetchError};
+    use super::{accept, cache_max_age, current_age, fetch_public_document, freshness, FetchError};
 
     /// A response as the origin might send it, for pinning the acceptance rules
     /// without a network: `status`, `headers` (repeatable), `body`.
@@ -526,6 +546,15 @@ mod tests {
             reqwest::header::HeaderValue::from_bytes(b"foo=\"\xff\", max-age=0").unwrap(),
         );
         assert_eq!(freshness(&undecodable, now), Some(Duration::ZERO));
+        // The current age is reported on its own too, for a caller applying a
+        // lifetime of its own where the origin sent none: a day-old answer must
+        // not get a fresh default there either.
+        assert_eq!(current_age(&headers(&[]), now), Duration::ZERO);
+        assert_eq!(current_age(&headers(&[("age", "86400")]), now), Duration::from_secs(86400));
+        let dated_100 = httpdate::fmt_http_date(now - Duration::from_secs(100));
+        let held_long = [("date", dated_100.as_str()), ("age", "50")];
+        assert_eq!(current_age(&headers(&held_long), now), Duration::from_secs(100));
+        assert_eq!(current_age(&headers(&[("age", "soon")]), now), Duration::MAX);
         let mut odd_vary = headers(&[("cache-control", "max-age=86400")]);
         odd_vary.append(
             reqwest::header::VARY,

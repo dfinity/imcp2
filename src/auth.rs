@@ -1292,11 +1292,16 @@ impl Drop for FlightGuard<'_> {
     }
 }
 
-/// How long to reuse a document: the origin's `max-age` capped at
-/// [`CIMD_CACHE_MAX_TTL`], the default when it sent none, and ZERO — do not
-/// cache — when it said `no-store`, `no-cache` or `max-age=0`.
-fn cimd_ttl(max_age: Option<Duration>) -> Duration {
-    max_age.unwrap_or(CIMD_CACHE_DEFAULT_TTL).min(CIMD_CACHE_MAX_TTL)
+/// How long to reuse a document: the remaining freshness the origin granted
+/// (already less the response's age) capped at [`CIMD_CACHE_MAX_TTL`]; ZERO — do
+/// not cache — when it forbade reuse or that freshness is spent; and, when it
+/// sent no freshness information at all, the default LESS the age the response
+/// already has, so an answer some cache along the way held for a day is not
+/// given ten fresh minutes here.
+fn cimd_ttl(remaining: Option<Duration>, current_age: Duration) -> Duration {
+    remaining
+        .unwrap_or_else(|| CIMD_CACHE_DEFAULT_TTL.saturating_sub(current_age))
+        .min(CIMD_CACHE_MAX_TTL)
 }
 
 /// GET a metadata document: the process-global test fixture when one is
@@ -1334,7 +1339,7 @@ async fn fetch_and_validate_client_metadata(
     let meta = parse_client_metadata(key, &doc.body)
         .map(Arc::new)
         .map_err(|why| CimdError::Invalid(format!("{key}: {why}")))?;
-    Ok((meta, cimd_ttl(doc.cache_max_age)))
+    Ok((meta, cimd_ttl(doc.cache_max_age, doc.current_age)))
 }
 
 /// Sort a fetch failure by what it is ABOUT (PR #143 §3.4). The URL itself — the
@@ -1398,6 +1403,19 @@ mod cimd_fixture {
             body: body.into(),
             content_type: Some(content_type.into()),
             cache_max_age: None,
+            current_age: std::time::Duration::ZERO,
+        };
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Ok(doc)));
+    }
+
+    /// Serve `body` (JSON) at `url` with no cache hint, as an answer some cache
+    /// along the way has already held for `age`.
+    pub(super) fn serve_aged(url: &str, body: &str, age: std::time::Duration) {
+        let doc = PublicDocument {
+            body: body.into(),
+            content_type: Some("application/json".into()),
+            cache_max_age: None,
+            current_age: age,
         };
         docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Ok(doc)));
     }
@@ -1423,6 +1441,7 @@ mod cimd_fixture {
             body: body.into(),
             content_type: Some("application/json".into()),
             cache_max_age: Some(std::time::Duration::ZERO),
+            current_age: std::time::Duration::ZERO,
         };
         docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Ok(doc)));
     }
@@ -3687,13 +3706,23 @@ mod tests {
     #[test]
     fn cimd_cache_ttl_is_bounded() {
         use super::{cimd_ttl, CIMD_CACHE_DEFAULT_TTL, CIMD_CACHE_MAX_TTL};
-        assert_eq!(cimd_ttl(None), CIMD_CACHE_DEFAULT_TTL);
+        let fresh = Duration::ZERO;
+        assert_eq!(cimd_ttl(None, fresh), CIMD_CACHE_DEFAULT_TTL);
         // The origin's value is honoured as given, however small, up to the ceiling.
-        assert_eq!(cimd_ttl(Some(Duration::from_secs(300))), Duration::from_secs(300));
-        assert_eq!(cimd_ttl(Some(Duration::from_secs(5))), Duration::from_secs(5));
-        assert_eq!(cimd_ttl(Some(Duration::from_secs(10 * 24 * 3600))), CIMD_CACHE_MAX_TTL);
+        assert_eq!(cimd_ttl(Some(Duration::from_secs(300)), fresh), Duration::from_secs(300));
+        assert_eq!(cimd_ttl(Some(Duration::from_secs(5)), fresh), Duration::from_secs(5));
+        assert_eq!(cimd_ttl(Some(Duration::from_secs(10 * 24 * 3600)), fresh), CIMD_CACHE_MAX_TTL);
         // `no-store` / `no-cache` / `max-age=0` is zero: not cached at all.
-        assert_eq!(cimd_ttl(Some(Duration::ZERO)), Duration::ZERO);
+        assert_eq!(cimd_ttl(Some(Duration::ZERO), fresh), Duration::ZERO);
+        // No freshness information: the default LESS the age the answer already
+        // has — an origin's own value is already net of it.
+        let aged = Duration::from_secs(4 * 60);
+        assert_eq!(cimd_ttl(None, aged), CIMD_CACHE_DEFAULT_TTL - aged);
+        assert_eq!(cimd_ttl(None, Duration::from_secs(86400)), Duration::ZERO);
+        assert_eq!(
+            cimd_ttl(Some(Duration::from_secs(300)), Duration::from_secs(86400)),
+            Duration::from_secs(300)
+        );
     }
 
     /// The media type a document must be served as, by essence: parameters and
@@ -4079,6 +4108,16 @@ mod tests {
         cimd_fixture::serve(MISSING, &late_doc.to_string());
         assert_eq!(check(MISSING, "http://127.0.0.1:7/cb").await, ClientCheck::Refused);
         assert_eq!(cimd_fixture::hits(MISSING), 1, "a missing document is remembered");
+
+        // A document with no cache hint that some cache along the way held for a
+        // day is not given ten fresh minutes here: the default lifetime is spent,
+        // so the next request fetches again.
+        const AGED: &str = "https://cimd-aged.claude.ai/client.json";
+        let aged_doc = json!({ "client_id": AGED, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve_aged(AGED, &aged_doc.to_string(), Duration::from_secs(86400));
+        assert_eq!(check(AGED, "http://127.0.0.1:3/cb").await, ClientCheck::Allowed);
+        assert_eq!(check(AGED, "http://127.0.0.1:3/cb").await, ClientCheck::Allowed);
+        assert_eq!(cimd_fixture::hits(AGED), 2, "a spent default lifetime is not cached");
 
         // Whereas a PER-REQUEST failure never poisons a real client: HOSTED was
         // probed above with a redirect its document does not list, and its
