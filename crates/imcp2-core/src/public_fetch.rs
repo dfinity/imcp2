@@ -122,7 +122,7 @@ mod tests {
         assert!(fetch("http://example.com/client.json").await.unwrap_err().contains("only https"));
         for internal in [
             "https://127.0.0.1/client.json",
-            "https://10.0.0.7/client.json",
+            "https://10.0.0.1/client.json",
             "https://192.168.1.1/client.json",
             "https://169.254.169.254/latest/meta-data/",
             "https://[::1]/client.json",
