@@ -203,29 +203,35 @@ fn freshness(headers: &HeaderMap) -> Option<Duration> {
     Some(max_age.saturating_sub(age))
 }
 
-/// The caching lifetime a `Cache-Control` value asks for: its `max-age`, or zero
-/// when it forbids reuse (`no-store` / `no-cache`); `None` when it says neither.
-/// A `max-age` given more than once is honoured at its MOST RESTRICTIVE value
-/// (RFC 9111 §4.2.1: conflicting freshness information must not extend
-/// freshness), so `max-age=300, max-age=0` is zero, not five minutes.
+/// The caching lifetime a `Cache-Control` value grants a SHARED cache — which the
+/// caller's process-wide cache is: `s-maxage` if present, else `max-age`; zero
+/// when the origin forbids shared reuse (`no-store`, `no-cache`, `private`);
+/// `None` when it says none of these. Directives are recognised by NAME, so
+/// `no-cache="set-cookie"` still counts, and one given more than once is
+/// honoured at its MOST RESTRICTIVE value (RFC 9111 §4.2.1: conflicting
+/// freshness information must not extend freshness), so `max-age=300,
+/// max-age=0` is zero, not five minutes.
 fn cache_max_age(cache_control: &str) -> Option<Duration> {
-    let directives: Vec<&str> = cache_control.split(',').map(str::trim).collect();
-    if directives
-        .iter()
-        .any(|d| d.eq_ignore_ascii_case("no-store") || d.eq_ignore_ascii_case("no-cache"))
-    {
+    // Each directive as (name, argument): `max-age=300` → ("max-age", Some("300")).
+    let directives: Vec<(&str, Option<&str>)> = cache_control
+        .split(',')
+        .map(|d| match d.trim().split_once('=') {
+            Some((name, arg)) => (name.trim(), Some(arg.trim().trim_matches('"'))),
+            None => (d.trim(), None),
+        })
+        .collect();
+    let has = |wanted: &str| directives.iter().any(|(name, _)| name.eq_ignore_ascii_case(wanted));
+    if has("no-store") || has("no-cache") || has("private") {
         return Some(Duration::ZERO);
     }
-    directives
-        .iter()
-        .filter_map(|d| {
-            let (name, value) = d.split_once('=')?;
-            name.trim()
-                .eq_ignore_ascii_case("max-age")
-                .then(|| value.trim().trim_matches('"').parse::<u64>().ok())?
-        })
-        .min()
-        .map(Duration::from_secs)
+    let seconds = |wanted: &str| {
+        directives
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(wanted))
+            .filter_map(|(_, arg)| arg.and_then(|a| a.parse::<u64>().ok()))
+            .min()
+    };
+    seconds("s-maxage").or_else(|| seconds("max-age")).map(Duration::from_secs)
 }
 
 #[cfg(test)]
@@ -385,6 +391,15 @@ mod tests {
         assert_eq!(cache_max_age("max-age=300, max-age=0"), Some(Duration::ZERO));
         assert_eq!(cache_max_age("max-age=0, max-age=300"), Some(Duration::ZERO));
         assert_eq!(cache_max_age("max-age=300, public, max-age=60"), Some(Duration::from_secs(60)));
+        // The caller is a SHARED cache: `private` forbids it reuse, and `s-maxage`
+        // is its lifetime whenever present, over `max-age`.
+        assert_eq!(cache_max_age("private, max-age=86400"), Some(Duration::ZERO));
+        assert_eq!(cache_max_age("s-maxage=0, max-age=86400"), Some(Duration::ZERO));
+        assert_eq!(cache_max_age("max-age=600, s-maxage=60"), Some(Duration::from_secs(60)));
+        assert_eq!(cache_max_age("s-maxage=600, max-age=60"), Some(Duration::from_secs(600)));
+        // Directives are matched by name, however they are argued.
+        assert_eq!(cache_max_age("max-age=300, no-cache=\"set-cookie\""), Some(Duration::ZERO));
+        assert_eq!(cache_max_age("No-Store"), Some(Duration::ZERO));
     }
 
     /// A host that cannot be resolved is a failure of the MOMENT, not of the URL:

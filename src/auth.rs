@@ -982,7 +982,15 @@ fn parse_client_metadata(client_id: &str, body: &str) -> Result<ClientMetadata, 
     if obj.contains_key("client_secret") || obj.contains_key("client_secret_expires_at") {
         return Err("carries a client secret, which a metadata document must not".into());
     }
-    let method = obj.get("token_endpoint_auth_method").and_then(Value::as_str).unwrap_or("none");
+    // Absent means `none` (see above); present, it must be a string — a wrong type
+    // is a malformed document, not an omission to read charitably.
+    let method = match obj.get("token_endpoint_auth_method") {
+        None => "none",
+        Some(Value::String(method)) => method.as_str(),
+        Some(other) => {
+            return Err(format!("token_endpoint_auth_method must be a string, not {other}"))
+        }
+    };
     let lists_none = obj
         .get("token_endpoint_auth_methods_supported")
         .and_then(Value::as_array)
@@ -1148,13 +1156,15 @@ async fn fetch_and_validate_client_metadata(
 /// Sort a fetch failure by what it is ABOUT (PR #143 §3.4). The URL itself — the
 /// guard refuses it, the origin has no document there or answers with a redirect
 /// or another 4xx, the body is over the cap or not UTF-8 — is `Invalid`, which is
-/// remembered for [`CIMD_NEGATIVE_TTL`]. The moment — the deadline, a connection
-/// that failed, a 5xx or a 429 — is `Unavailable`, which is never remembered.
+/// remembered for [`CIMD_NEGATIVE_TTL`]. The moment — a resolver that did not
+/// answer, the deadline, a connection that failed, a 5xx, or the two 4xx that
+/// are about the moment too (408 Request Timeout, 429 Too Many Requests) — is
+/// `Unavailable`, which is never remembered.
 fn classify_fetch_error(err: imcp2_core::public_fetch::FetchError) -> CimdError {
     use imcp2_core::public_fetch::FetchError;
     match err {
         FetchError::Unreachable(why) => CimdError::Unavailable(why),
-        FetchError::Answered { status, detail } if status >= 500 || status == 429 => {
+        FetchError::Answered { status, detail } if status >= 500 || matches!(status, 408 | 429) => {
             CimdError::Unavailable(detail)
         }
         FetchError::Answered { detail, .. } => CimdError::Invalid(detail),
@@ -3236,6 +3246,13 @@ mod tests {
         // An absent method is `none`: a document may not use a secret-based one.
         let no_method = json!({ "client_id": CHATGPT, "redirect_uris": [CHATGPT_REDIRECT] });
         assert!(parse_client_metadata(CHATGPT, &no_method.to_string()).is_ok());
+        // A PRESENT method of the wrong type is malformed, not absent.
+        let odd_method = json!({
+            "client_id": CHATGPT,
+            "redirect_uris": [CHATGPT_REDIRECT],
+            "token_endpoint_auth_method": 1,
+        });
+        assert!(refused_for(odd_method).contains("must be a string"));
         // Hosted redirects must be same-origin with the document; loopback is exempt.
         const OTHER: &str = "https://cimd-other.test/client.json";
         let borrowed = json!({ "client_id": OTHER, "redirect_uris": [CHATGPT_REDIRECT] });
@@ -3265,6 +3282,30 @@ mod tests {
         let too_long = json!({ "client_id": OTHER, "redirect_uris": [long] }).to_string();
         let err = parse_client_metadata(OTHER, &too_long).unwrap_err();
         assert!(err.contains("too long"), "{err}");
+    }
+
+    /// What a fetch failure is ABOUT decides whether it is remembered: the URL
+    /// (refused, nothing there, a redirect, another 4xx, too large, not UTF-8) is
+    /// invalid and cached; the moment (unreachable, 5xx, 408, 429) is unavailable
+    /// and retried.
+    #[test]
+    fn cimd_fetch_error_classification() {
+        use super::{classify_fetch_error, CimdError};
+        use imcp2_core::public_fetch::FetchError;
+        let answered = |status: u16| FetchError::Answered { status, detail: format!("{status}") };
+        let unavailable =
+            |e: FetchError| matches!(classify_fetch_error(e), CimdError::Unavailable(_));
+        let invalid = |e: FetchError| matches!(classify_fetch_error(e), CimdError::Invalid(_));
+        assert!(unavailable(FetchError::Unreachable("dns".into())));
+        for status in [500u16, 502, 503, 504, 408, 429] {
+            assert!(unavailable(answered(status)), "{status} is about the moment");
+        }
+        for status in [301u16, 302, 400, 401, 403, 404, 410, 451] {
+            assert!(invalid(answered(status)), "{status} is about the URL");
+        }
+        assert!(invalid(FetchError::Refused("private address".into())));
+        assert!(invalid(FetchError::TooLarge("cap".into())));
+        assert!(invalid(FetchError::NotUtf8("bytes".into())));
     }
 
     /// The deploy-time opt-in's reading of its variable: off unless it says on.
