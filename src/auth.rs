@@ -958,11 +958,16 @@ fn cimd_client_id(client_id: &str) -> Option<url::Url> {
         return None;
     }
     // The WHATWG parser silently strips ASCII tab/newline/CR from anywhere in its
-    // input and erases an EMPTY userinfo (`https://@host` parses as
-    // `https://host`), so both are refused on the RAW string — as
-    // `resource_matches_issuer` does — or the identifier taken as given would not
-    // be the URL that was parsed and fetched.
-    if client_id.contains(['\t', '\n', '\r']) || raw_authority_has_userinfo(client_id) {
+    // input, trims leading and trailing C0 controls and spaces, and erases an
+    // EMPTY userinfo (`https://@host` parses as `https://host`), so all three are
+    // refused on the RAW string — as `resource_matches_issuer` does — or the
+    // identifier taken as given would not be the URL that was parsed and fetched.
+    let trimmed_by_parser = |c: char| c <= ' ';
+    if client_id.contains(['\t', '\n', '\r'])
+        || client_id.starts_with(trimmed_by_parser)
+        || client_id.ends_with(trimmed_by_parser)
+        || raw_authority_has_userinfo(client_id)
+    {
         return None;
     }
     // Parsed, not prefix-matched: a scheme is case-insensitive (`HTTPS://` is
@@ -3419,6 +3424,10 @@ mod tests {
         assert!(cimd_client_id("https://chat\tgpt.com/oauth/client.json").is_none());
         assert!(cimd_client_id("https://chatgpt.com/oauth/client.json\n").is_none());
         assert!(cimd_client_id("https:\r//chatgpt.com/oauth/client.json").is_none());
+        // …and the leading/trailing C0 controls and spaces it trims.
+        assert!(cimd_client_id(" https://chatgpt.com/oauth/client.json").is_none());
+        assert!(cimd_client_id("https://chatgpt.com/oauth/client.json ").is_none());
+        assert!(cimd_client_id("\u{1}https://chatgpt.com/oauth/client.json").is_none());
         // The draft asks for an https URL the document repeats byte for byte, not
         // for one spelling of it: these are accepted as given (they are the
         // identity and the cache key), and only the host is normalised, for the

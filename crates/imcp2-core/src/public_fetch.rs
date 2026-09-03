@@ -232,12 +232,20 @@ fn freshness(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
                 .unwrap_or(Duration::ZERO)
         }
     };
-    // An `Age` that is sent but does not parse — overflowing, or not a number at
-    // all — is taken as the largest age, not as none (RFC 9111 §1.2.2 has
-    // oversized delta-seconds treated as the greatest value): a response of
-    // unknowable age is not given a whole lifetime.
-    let age = header(AGE)
-        .map(|v| v.parse::<u64>().map_or(Duration::MAX, Duration::from_secs))
+    // Every `Age` line counts and the greatest wins; one that is sent but does not
+    // parse — overflowing, not a number, not even ASCII — is taken as the largest
+    // age, not as none (RFC 9111 §1.2.2 has oversized delta-seconds treated as the
+    // greatest value): a response of unknowable age is not given a whole lifetime.
+    let age = headers
+        .get_all(AGE)
+        .iter()
+        .map(|v| {
+            v.to_str()
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map_or(Duration::MAX, Duration::from_secs)
+        })
+        .max()
         .unwrap_or(Duration::ZERO);
     let apparent_age =
         date.and_then(|date| now.duration_since(date).ok()).unwrap_or(Duration::ZERO);
@@ -485,6 +493,16 @@ mod tests {
         assert_eq!(freshness(&headers(&overflowing), now), Some(Duration::ZERO));
         let nonsense = [("cache-control", "max-age=86400"), ("age", "soon")];
         assert_eq!(freshness(&headers(&nonsense), now), Some(Duration::ZERO));
+        // Every Age line counts, the greatest winning; one that is not even ASCII
+        // is the greatest age too.
+        let two_lines = [("cache-control", "max-age=300"), ("age", "10"), ("age", "400")];
+        assert_eq!(freshness(&headers(&two_lines), now), Some(Duration::ZERO));
+        let mut opaque = headers(&[("cache-control", "max-age=86400")]);
+        opaque.append(
+            reqwest::header::AGE,
+            reqwest::header::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert_eq!(freshness(&opaque, now), Some(Duration::ZERO));
         // Two Cache-Control lines: the no-store on the second is not missed.
         assert_eq!(
             freshness(
