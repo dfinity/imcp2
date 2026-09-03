@@ -18,8 +18,10 @@
 //!     same origin — can ever stand in for the document at this one;
 //!   * a body over the cap, or one whose transfer failed part-way, is an error,
 //!     never a shorter document;
-//!   * the caller's timeout bounds the WHOLE operation, DNS resolution included,
-//!     so a slow resolver cannot hold the caller past its deadline.
+//!   * the caller's timeout is ONE deadline over the whole operation, DNS
+//!     resolution included, so a slow resolver cannot hold the caller past it —
+//!     and it is the only deadline, so however far the fetch got when it ran out
+//!     of time, the caller sees the same "did not complete" error.
 
 use std::time::Duration;
 
@@ -51,17 +53,19 @@ pub async fn fetch_public_document(
     // One deadline over everything, resolution included: `resolve_public_url`
     // does the DNS lookup, and a resolver that never answers must not hold the
     // caller (and whatever it is holding, such as an in-flight permit) forever.
-    tokio::time::timeout(timeout, fetch(url, max_bytes, timeout))
+    // Deliberately the ONLY deadline — the client below sets none of its own —
+    // so the error is the same wherever the time ran out, and dropping the
+    // future on expiry is what aborts the connection.
+    tokio::time::timeout(timeout, fetch(url, max_bytes))
         .await
         .map_err(|_| format!("fetching {url} did not complete within {timeout:?}"))?
 }
 
-async fn fetch(url: &str, max_bytes: usize, timeout: Duration) -> Result<PublicDocument, String> {
+async fn fetch(url: &str, max_bytes: usize) -> Result<PublicDocument, String> {
     let (parsed, pinned) = resolve_public_url(url).await?;
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
     let client = reqwest::Client::builder()
         .user_agent(concat!("imcp2-core/", env!("CARGO_PKG_VERSION")))
-        .timeout(timeout)
         // Never follow a redirect: the document is this URL's statement about
         // itself, and a 3xx is that URL declining to make it. Refusing here (rather
         // than following under the crawl's redirect guard and comparing origins
@@ -148,10 +152,12 @@ mod tests {
         assert!(uncapped.await.unwrap_err().contains("non-public address"));
     }
 
-    /// The deadline covers resolution too: a zero timeout expires before the DNS
-    /// lookup of a public name can answer, and names the deadline, not the guard.
+    /// One deadline over the whole fetch: with no time at all, the operation fails
+    /// with the deadline's error whether it ran out during DNS resolution or after
+    /// (on a fast resolver, during the connect) — never with a request error of its
+    /// own, since the client sets no separate timeout.
     #[tokio::test]
-    async fn deadline_covers_resolution() {
+    async fn one_deadline_covers_the_whole_fetch() {
         let err = fetch_public_document("https://example.com/client.json", 1024, Duration::ZERO)
             .await
             .unwrap_err();
