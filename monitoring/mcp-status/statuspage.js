@@ -69,8 +69,8 @@ export const PUSH_TIMEOUT_MS = 10_000;
  * Check ids in the "endpoints" section that directly measure whether the MCP
  * service is reachable and serving: each of these probes an endpoint and
  * reports "fail" on a failed request. The section's other checks are
- * deliberately excluded because they do NOT fail in a total outage — `version`
- * and `metadata-consistency` degrade to "warn" when the server is unreachable,
+ * deliberately excluded because they do NOT fail in a total outage —
+ * `metadata-consistency` degrades to "warn" when the server is unreachable,
  * and `mcp-tls` inspects the TLS layer, which can stay "pass" (a healthy
  * reverse proxy in front of a dead application) or degrade to "warn". Testing
  * "every check failed" over the whole section would therefore be unsatisfiable

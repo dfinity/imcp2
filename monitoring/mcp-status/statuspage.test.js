@@ -50,8 +50,8 @@ const report = (overall, endpointStatuses = []) => ({
 /**
  * What the endpoints section actually looks like when the server is entirely
  * unreachable: every availability probe fails, but the auxiliary checks do NOT
- * — `version` and `metadata-consistency` degrade to "warn", and `mcp-tls` can
- * stay "pass" (a healthy reverse proxy fronting a dead application).
+ * — `metadata-consistency` degrades to "warn", and `mcp-tls` can stay "pass"
+ * (a healthy reverse proxy fronting a dead application).
  */
 const totalOutageReport = () => ({
   overall: "fail",
@@ -62,7 +62,6 @@ const totalOutageReport = () => ({
       status: "fail",
       checks: [
         ...AVAILABILITY_IDS.map((id) => ({ id, status: "fail" })),
-        { id: "version", status: "warn" },
         { id: "metadata-consistency", status: "warn" },
         { id: "mcp-tls", status: "pass" },
       ],
@@ -103,8 +102,8 @@ test("componentStatusFor: every availability check down is a major outage", () =
 });
 
 test("componentStatusFor: a realistic total outage is a major outage", () => {
-  // Auxiliary checks (version, metadata-consistency, mcp-tls) do not fail when
-  // the server is unreachable; they must not veto the major-outage verdict.
+  // Auxiliary checks (metadata-consistency, mcp-tls) do not fail when the
+  // server is unreachable; they must not veto the major-outage verdict.
   assert.equal(componentStatusFor(totalOutageReport()), "major_outage");
 });
 
