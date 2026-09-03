@@ -33,11 +33,15 @@
 //!
 //! The origin's caching instruction is reported as the REMAINING freshness
 //! lifetime, per HTTP: every `Cache-Control` field line is read (a `no-store` on
-//! a second line counts), and the response's `Age` is subtracted from `max-age`.
+//! a second line counts), and the response's current age — the larger of its
+//! `Age` and the time since its `Date` — is subtracted from `max-age`.
 
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    time::{Duration, SystemTime},
+};
 
-use reqwest::header::{HeaderMap, AGE, CACHE_CONTROL, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, AGE, CACHE_CONTROL, CONTENT_TYPE, DATE};
 
 use crate::discover::{read_capped_bytes, resolve_public_url, ResolveError};
 
@@ -161,7 +165,7 @@ async fn accept(
     }
     let content_type =
         resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_owned);
-    let cache_max_age = freshness(resp.headers());
+    let cache_max_age = freshness(resp.headers(), SystemTime::now());
     // Read ONE byte past the cap so overflow is detectable: a truncated body is
     // not a shorter document. Saturating, so a caller passing `usize::MAX` (no
     // cap) reads everything rather than wrapping to a zero-byte read.
@@ -184,10 +188,13 @@ async fn accept(
 }
 
 /// The remaining freshness lifetime the response's headers grant, per HTTP
-/// caching: `max-age` from the COMBINED `Cache-Control` fields (a header may be
-/// sent as several lines, and a `no-store` on any of them wins), less the
-/// response's `Age`. `None` when no `max-age` was sent.
-fn freshness(headers: &HeaderMap) -> Option<Duration> {
+/// caching (RFC 9111 §4.2): `max-age` from the COMBINED `Cache-Control` fields
+/// (a header may be sent as several lines, and a `no-store` on any of them wins),
+/// less the response's CURRENT AGE — the larger of its `Age` and its apparent
+/// age, `now` less its `Date`, so an answer some cache held for an hour without
+/// saying so in `Age` is not given a new lifetime here. A `Date` in the future
+/// (clock skew) is an apparent age of zero. `None` when no `max-age` was sent.
+fn freshness(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
     let cache_control: Vec<&str> =
         headers.get_all(CACHE_CONTROL).iter().filter_map(|v| v.to_str().ok()).collect();
     if cache_control.is_empty() {
@@ -200,7 +207,13 @@ fn freshness(headers: &HeaderMap) -> Option<Duration> {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::ZERO);
-    Some(max_age.saturating_sub(age))
+    let apparent_age = headers
+        .get(DATE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| httpdate::parse_http_date(v.trim()).ok())
+        .and_then(|date| now.duration_since(date).ok())
+        .unwrap_or(Duration::ZERO);
+    Some(max_age.saturating_sub(age.max(apparent_age)))
 }
 
 /// The caching lifetime a `Cache-Control` value grants a SHARED cache — which the
@@ -342,10 +355,15 @@ mod tests {
         assert!(matches!(err, FetchError::NotUtf8(_)), "{err:?}");
     }
 
-    /// Freshness follows HTTP: every `Cache-Control` line counts, and `Age` is
-    /// subtracted, so a CDN answer near the end of its life is not given a new one.
+    /// Freshness follows HTTP: every `Cache-Control` line counts, and the current
+    /// age — `Age`, or the time since `Date`, whichever is larger — is subtracted,
+    /// so a CDN answer near the end of its life is not given a new one.
     #[test]
     fn freshness_honours_age_and_every_cache_control_line() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        // A whole-second "now", since an HTTP date has no finer resolution.
+        let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = UNIX_EPOCH + Duration::from_secs(since_epoch);
         let headers = |pairs: &[(&str, &str)]| {
             let mut h = reqwest::header::HeaderMap::new();
             for (name, value) in pairs {
@@ -356,26 +374,44 @@ mod tests {
             }
             h
         };
-        assert_eq!(freshness(&headers(&[])), None);
-        assert_eq!(freshness(&headers(&[("age", "10")])), None);
+        assert_eq!(freshness(&headers(&[]), now), None);
+        assert_eq!(freshness(&headers(&[("age", "10")]), now), None);
         assert_eq!(
-            freshness(&headers(&[("cache-control", "public, max-age=86400")])),
+            freshness(&headers(&[("cache-control", "public, max-age=86400")]), now),
             Some(Duration::from_secs(86400))
         );
         assert_eq!(
-            freshness(&headers(&[("cache-control", "max-age=86400"), ("age", "86399")])),
+            freshness(&headers(&[("cache-control", "max-age=86400"), ("age", "86399")]), now),
             Some(Duration::from_secs(1))
         );
         // Freshness already spent: zero, not negative and not a fresh lifetime.
         assert_eq!(
-            freshness(&headers(&[("cache-control", "max-age=300"), ("age", "301")])),
+            freshness(&headers(&[("cache-control", "max-age=300"), ("age", "301")]), now),
             Some(Duration::ZERO)
         );
         // Two Cache-Control lines: the no-store on the second is not missed.
         assert_eq!(
-            freshness(&headers(&[("cache-control", "max-age=300"), ("cache-control", "no-store")])),
+            freshness(
+                &headers(&[("cache-control", "max-age=300"), ("cache-control", "no-store")]),
+                now
+            ),
             Some(Duration::ZERO)
         );
+        // The apparent age counts too: a Date an hour old with no Age means the
+        // answer has been held for an hour, and five fresh minutes are long gone.
+        let dated = |secs_ago: u64| httpdate::fmt_http_date(now - Duration::from_secs(secs_ago));
+        let stale = [("cache-control", "max-age=300"), ("date", &dated(3600))];
+        assert_eq!(freshness(&headers(&stale), now), Some(Duration::ZERO));
+        // The current age is the LARGER of Age and apparent age, either way round.
+        let aged = [("cache-control", "max-age=300"), ("date", &dated(50)), ("age", "100")];
+        assert_eq!(freshness(&headers(&aged), now), Some(Duration::from_secs(200)));
+        let held = [("cache-control", "max-age=300"), ("date", &dated(100)), ("age", "50")];
+        assert_eq!(freshness(&headers(&held), now), Some(Duration::from_secs(200)));
+        // A Date in the future (clock skew) is an apparent age of zero, not a
+        // negative one.
+        let future = httpdate::fmt_http_date(now + Duration::from_secs(3600));
+        let skewed = [("cache-control", "max-age=300"), ("date", &future)];
+        assert_eq!(freshness(&headers(&skewed), now), Some(Duration::from_secs(300)));
     }
 
     #[test]

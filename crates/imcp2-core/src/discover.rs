@@ -1369,6 +1369,9 @@ fn ipv6_is_global(ip: &Ipv6Addr) -> bool {
         || (seg[0] & 0xffc0) == 0xfe80       // fe80::/10 link-local unicast
         || (seg[0] & 0xffc0) == 0xfec0       // fec0::/10 site-local (deprecated, RFC 3879)
         || (seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0) // 100::/64 discard-only (RFC 6666)
+        || (seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0) // 2001:2::/48 benchmarking (RFC 5180)
+        || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0010)     // 2001:10::/28 ORCHID (deprecated, RFC 4843)
+        || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0020)     // 2001:20::/28 ORCHIDv2, not routable (RFC 7343)
         || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
         // Transition mechanisms embed an IPv4 address deeper in the v6 space than
         // `to_ipv4` decodes, so a NAT64/6to4/Teredo host would otherwise translate
@@ -2864,8 +2867,11 @@ mod tests {
             "fc00::1",
             "fd12::1",
             "fe80::1",
-            "fec0::1", // site-local: deprecated, still routable on legacy networks
-            "100::1",  // discard-only
+            "fec0::1",    // site-local: deprecated, still routable on legacy networks
+            "100::1",     // discard-only
+            "2001:2::1",  // benchmarking
+            "2001:10::1", // ORCHID (deprecated)
+            "2001:20::1", // ORCHIDv2 (not routable)
             "2001:db8::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1", // IPv4-mapped private/loopback

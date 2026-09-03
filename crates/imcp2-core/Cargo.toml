@@ -31,6 +31,7 @@ reqwest = { workspace = true }
 getrandom = { workspace = true }
 urlencoding = { workspace = true }
 url = { workspace = true }
+httpdate = { workspace = true }
 # Only for the end-to-end canister-tool tests (src/e2e_canister_tools.rs),
 # behind the `e2e` feature so the default build compiles neither. `pocket-ic`
 # runs a real replica locally (needs the POCKET_IC_BIN server binary at

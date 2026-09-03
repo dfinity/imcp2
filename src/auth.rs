@@ -1730,9 +1730,23 @@ impl AuthStore {
     ) -> Result<Arc<ClientMetadata>, CimdError> {
         let key = client_id.as_str();
         let host = host_key(client_id.host_str().unwrap_or_default());
-        // The RATE first, before anything is held: the in-flight bounds below cap
-        // how many fetches run at once, not how many run in a minute. The vendor's
-        // share, then the process's — both must have a token before either is taken.
+        let Some(_slot) = HostSlot::take(&self.cimd, &host) else {
+            return Err(CimdError::Unavailable(format!(
+                "too many client metadata fetches in flight for {host}; retry shortly"
+            )));
+        };
+        let Ok(_permit) = self.cimd.inflight.try_acquire() else {
+            return Err(CimdError::Unavailable(
+                "too many client metadata fetches in flight; retry shortly".into(),
+            ));
+        };
+        // The RATE last, once a slot and a permit are held, so a token is spent
+        // only on a fetch that goes out: a request refused for congestion drains
+        // no budget, or a burst during congestion could spend the minute's budget
+        // without a single fetch and lock the real clients out once it clears.
+        // The in-flight bounds cap how many fetches run at once, not how many run
+        // in a minute; this does. The vendor's share, then the process's — both
+        // must have a token before either is taken.
         {
             let mut rates = self.cimd.rates.lock().expect("cimd rates");
             let rates = &mut *rates;
@@ -1754,16 +1768,6 @@ impl AuthStore {
             vendor.take();
             rates.all.take();
         }
-        let Some(_slot) = HostSlot::take(&self.cimd, &host) else {
-            return Err(CimdError::Unavailable(format!(
-                "too many client metadata fetches in flight for {host}; retry shortly"
-            )));
-        };
-        let Ok(_permit) = self.cimd.inflight.try_acquire() else {
-            return Err(CimdError::Unavailable(
-                "too many client metadata fetches in flight; retry shortly".into(),
-            ));
-        };
         let fetched = Instant::now();
         let (outcome, ttl) = match fetch_and_validate_client_metadata(key).await {
             Ok((meta, ttl)) => (Ok(meta), ttl),
@@ -3674,6 +3678,10 @@ mod tests {
             }
             other => panic!("the third fetch for one host must be refused, got {other:?}"),
         }
+        // The refusal spent no rate budget: a token goes only with a fetch that
+        // goes out — herd, herd-down, one and two so far, four in all.
+        let tokens_left = store.cimd.rates.lock().unwrap().all.tokens.floor() as u32;
+        assert_eq!(tokens_left, super::CIMD_RATE_PER_MINUTE - 4, "a refused slot drains no budget");
         // Slots and single-flight entries are released, not leaked.
         assert!(store.cimd.hosts.lock().unwrap().is_empty());
         assert!(store.cimd.fetching.lock().unwrap().is_empty());
