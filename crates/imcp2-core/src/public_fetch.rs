@@ -15,7 +15,8 @@
 //! crawl is opportunistic — the document is the URL's own statement about
 //! itself, so:
 //!
-//!   * redirects are not followed at all: a 3xx is a non-success answer, so no
+//!   * redirects are not followed at all: a 3xx is not `200 OK` (nor is a 206
+//!     fragment or any other 2xx), so no
 //!     other URL's bytes — on another host, another port, or another path of the
 //!     same origin — can ever stand in for the document at this one;
 //!   * a body over the cap, one whose transfer failed part-way, or one that is
@@ -75,7 +76,8 @@ pub enum FetchError {
     /// request could not be sent or its body not read. The same URL may work
     /// next time.
     Unreachable(String),
-    /// The origin answered, but not 2xx — a redirect (never followed) included.
+    /// The origin answered, but not `200 OK` — a redirect (never followed) or any
+    /// other 2xx (a 206 fragment, a 203 transformed by a proxy, a 204) included.
     /// `status` lets the caller tell a 404 (no document there) from a 503.
     Answered { status: u16, detail: String },
     /// The body is larger than the caller's cap.
@@ -99,9 +101,9 @@ impl std::error::Error for FetchError {}
 
 /// GET `url` and return its body, or why not ([`FetchError`]): the URL is refused
 /// by the SSRF guard; resolving, connecting, answering and delivering the body
-/// did not all complete within `timeout`; the answer was anything but 2xx (a
-/// redirect included); the body is larger than `max_bytes`, was cut off, or is
-/// not UTF-8.
+/// did not all complete within `timeout`; the answer was anything but `200 OK`
+/// (a redirect or a 206 fragment included); the body is larger than `max_bytes`,
+/// was cut off, or is not UTF-8.
 pub async fn fetch_public_document(
     url: &str,
     max_bytes: usize,
@@ -151,7 +153,7 @@ async fn fetch(url: &str, max_bytes: usize) -> Result<PublicDocument, FetchError
 }
 
 /// Turn the origin's answer into a [`PublicDocument`], or refuse it: anything
-/// but 2xx (a redirect is named as such, since it is not followed), a body over
+/// but `200 OK` (a redirect is named as such, since it is not followed), a body over
 /// `max_bytes` or cut off mid-transfer, or one that is not valid UTF-8. Kept apart
 /// from the sending so the acceptance rules are pinned by tests on synthetic
 /// responses, with no network.
@@ -160,8 +162,12 @@ async fn accept(
     resp: reqwest::Response,
     max_bytes: usize,
 ) -> Result<PublicDocument, FetchError> {
+    // Exactly 200: the document is the URL's complete statement about itself,
+    // and only `200 OK` says the body is that. A `206 Partial Content` is a
+    // fragment (one that may well parse as JSON), a `203` has been through a
+    // transforming proxy, a `204` has no body — none of them is the document.
     let status = resp.status();
-    if !status.is_success() {
+    if status != reqwest::StatusCode::OK {
         let redirect =
             if status.is_redirection() { ", a redirect, which is not followed" } else { "" };
         return Err(FetchError::Answered {
@@ -207,19 +213,24 @@ async fn accept(
 /// else it says (§4.1: it can never match a later request). `None` when neither
 /// a freshness directive nor `Expires` was sent.
 fn freshness(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
-    let varies_on_everything = headers
-        .get_all(VARY)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .any(|field| field.trim() == "*");
-    if varies_on_everything {
+    // A `Vary` or `Cache-Control` line this cannot decode (a quoted argument may
+    // carry obs-text) is read as forbidding reuse — it might have said so — rather
+    // than skipped, or a `foo="…", max-age=0` in obs-text would be dropped and
+    // the decodable `max-age=86400` beside it honoured.
+    let decode_all = |name| -> Option<Vec<&str>> {
+        headers.get_all(name).iter().map(|v| v.to_str().ok()).collect()
+    };
+    let Some(vary) = decode_all(VARY) else {
+        return Some(Duration::ZERO);
+    };
+    if vary.iter().flat_map(|v| v.split(',')).any(|field| field.trim() == "*") {
         return Some(Duration::ZERO);
     }
     let header = |name| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
     let date = header(DATE).and_then(|v| httpdate::parse_http_date(v).ok());
-    let cache_control: Vec<&str> =
-        headers.get_all(CACHE_CONTROL).iter().filter_map(|v| v.to_str().ok()).collect();
+    let Some(cache_control) = decode_all(CACHE_CONTROL) else {
+        return Some(Duration::ZERO);
+    };
     let from_cache_control =
         (!cache_control.is_empty()).then(|| cache_max_age(&cache_control.join(", "))).flatten();
     let lifetime = match from_cache_control {
@@ -423,8 +434,11 @@ mod tests {
             assert_eq!(*got, status);
             assert!(detail.contains("not followed"), "{detail}");
         }
-        for status in [404u16, 500, 503] {
-            let err = accept(URL, synthetic(status, &[], b"nope"), 1024).await.unwrap_err();
+        // Any other 2xx too: a 206 is a fragment (here a valid-looking one), a 203
+        // has been transformed, a 204 has no body. Only 200 is the document.
+        for status in [404u16, 500, 503, 206, 203, 204] {
+            let body = br#"{"client_id":"x"}"#;
+            let err = accept(URL, synthetic(status, &[], body), 1024).await.unwrap_err();
             assert!(
                 matches!(err, FetchError::Answered { status: got, .. } if got == status),
                 "{err:?}"
@@ -504,6 +518,20 @@ mod tests {
             reqwest::header::HeaderValue::from_bytes(b"\xff").unwrap(),
         );
         assert_eq!(freshness(&opaque, now), Some(Duration::ZERO));
+        // A Cache-Control (or Vary) line that cannot be decoded is read as
+        // forbidding reuse, never skipped: it may be the restrictive one.
+        let mut undecodable = headers(&[("cache-control", "max-age=86400")]);
+        undecodable.append(
+            reqwest::header::CACHE_CONTROL,
+            reqwest::header::HeaderValue::from_bytes(b"foo=\"\xff\", max-age=0").unwrap(),
+        );
+        assert_eq!(freshness(&undecodable, now), Some(Duration::ZERO));
+        let mut odd_vary = headers(&[("cache-control", "max-age=86400")]);
+        odd_vary.append(
+            reqwest::header::VARY,
+            reqwest::header::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert_eq!(freshness(&odd_vary, now), Some(Duration::ZERO));
         // Two Cache-Control lines: the no-store on the second is not missed.
         assert_eq!(
             freshness(
