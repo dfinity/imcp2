@@ -70,13 +70,20 @@ Every check carries a plain-language description, and the report shows which
 the sections into **tabs** for easier navigation.
 
 `GET /version` is the one endpoint the dashboard reads without checking: it
-feeds that banner and the II discovery in question 2, and when it is missing
-both simply go unreported. It is an operator convenience, not part of the MCP
-contract, and production's fronting edge answers it with a redirect to the
-landing site rather than serving it — so grading it warned that column on every
-run, forever, while the MCP surface served everything correctly. A build stamp
-nobody exposes says nothing about whether the server is up; the checks that do
-answer that are the ones above.
+feeds that banner and the II discovery in question 2. It is an operator
+convenience, not part of the MCP contract, and production's fronting edge
+answers it with a redirect to the landing site rather than serving it — so
+grading it warned that column on every run, forever, while the MCP surface
+served everything correctly. A build stamp nobody exposes says nothing about
+whether the server is up; the checks that do answer that are the ones above.
+
+Only the banner is purely informational, though. With no `/version` it is
+simply omitted, but the advertised II list goes with it, and an II the
+dashboard cannot discover is one it cannot monitor: `ii-target` and
+`ii-unresolved` fail, exactly as they did before this change. Pin the II
+(`--ii` / `II_ORIGIN`, or `--target-ii <name>=<origin>` for one instance of a
+set) and questions 2 and 3 run as normal — which is how the deployed dashboard
+configures production.
 
 ## Usage
 

@@ -325,8 +325,11 @@ export const checkMcpEndpoints = async (
   //     serving it, and a build stamp nobody exposes says nothing about whether
   //     the MCP surface is up — grading it warned that column on every run,
   //     forever, while everything an MCP client depends on was served
-  //     correctly. When it is missing, the banner and the advertised II list
-  //     are simply absent (pin the II with --ii / II_ORIGIN to probe it).
+  //     correctly. Only the banner is purely informational, though: when
+  //     /version is missing it is simply omitted, but the advertised II list
+  //     goes with it, and checkLinkage/checkIiHealth then fail on an II they
+  //     cannot resolve. Pin one with --ii / II_ORIGIN (as the deployed
+  //     production target does) and both run as normal.
   //
   //     On the probes below that DO check something, a redirect is reported
   //     with where it points rather than followed — for the protocol documents
