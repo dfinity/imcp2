@@ -720,7 +720,8 @@ its AS issuer is `<PUBLIC_URL>/mcp` and everything OAuth lives under it:
   through a proxy from the environment, so the address pin always binds. Claude and ChatGPT both select CIMD over DCR when it is
   advertised — which it is only where `OAUTH_CIMD_ENABLED=1` is set (the deploy
   template takes it from the GitHub Environment's variable of that name, so a
-  deploy never enables it by itself; unsetting it is the rollback, no rebuild:
+  deploy never enables it by itself; to roll back, unset it and redeploy — the
+  value is read once at start-up, so the variable alone changes nothing — and
   clients re-read the metadata within minutes and fall back to DCR). Only a
   document on a vetted vendor origin is fetched at all — a host on or under an
   allow-listed domain, default port (the trust policy of PR #143); any other URL

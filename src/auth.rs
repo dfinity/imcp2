@@ -790,9 +790,12 @@ fn loopback_match(registered: &str, requested: &str) -> bool {
 // `client_id` is an unknown client. Claude and ChatGPT both switch to CIMD the
 // moment an AS advertises it, so a routine deploy must never switch them over
 // by itself (the deploy template takes the variable from the GitHub
-// Environment), and unsetting it is the rollback — they re-read the metadata
-// within minutes and fall back to DCR — should a vendor's document turn out to
-// be shaped in a way this implementation refuses.
+// Environment). The rollback, should a vendor's document turn out to be shaped
+// in a way this implementation refuses, is to unset the variable AND redeploy:
+// it is rendered into the unit at deploy time and read here once at start-up
+// ([`cimd_enabled_by_env`]), so changing it alone changes nothing on the host.
+// Once the process restarts without it, the clients re-read the metadata within
+// minutes and fall back to DCR.
 
 /// Byte cap on a `client_id` URL before it is treated as CIMD at all: the URL
 /// becomes a key of the process-wide cache and single-flight map (and part of a
@@ -3006,7 +3009,8 @@ pub async fn authorization_server_metadata(State(store): State<AuthStore>) -> Re
         // instead of registering (see `cimd_client_id`). Claude and ChatGPT both
         // select CIMD over DCR when this is advertised alongside `none` above —
         // which is why it is advertised only where the deployment opts in with
-        // `OAUTH_CIMD_ENABLED`, and unsetting that withdraws it without a rebuild.
+        // `OAUTH_CIMD_ENABLED`, and a redeploy without that withdraws it (no
+        // rebuild; the value is read once at start-up).
         "client_id_metadata_document_supported": store.cimd_enabled,
         // RFC 9207: we emit `iss` on every authorization response, so we MUST
         // advertise it here (a client that sees this flag rejects any response

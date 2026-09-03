@@ -36,7 +36,9 @@ Environment=OPENAI_APPS_CHALLENGE_TOKEN=__OPENAI_APPS_CHALLENGE_TOKEN__
 # __OAUTH_CIMD_ENABLED__ from the OAUTH_CIMD_ENABLED variable of the GitHub
 # Environment being deployed (empty when unset), so a routine deploy never
 # switches the directory clients over by itself: enable it on staging first,
-# then production, each deliberately; unset it to roll back without a rebuild.
+# then production, each deliberately. Rendered at deploy time and read once at
+# start-up, so to roll back, unset the variable AND redeploy (the same ref will
+# do — no rebuild); changing the variable alone changes nothing on the host.
 Environment=OAUTH_CIMD_ENABLED=__OAUTH_CIMD_ENABLED__
 # imcp2 creates its operational files (today: the dynamic-client-registration
 # store, so OAuth clients that cached their client_id keep working across

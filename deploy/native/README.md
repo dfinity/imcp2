@@ -306,7 +306,7 @@ the unit like the secrets above:
 
 | Variable | Value |
 |---|---|
-| `OAUTH_CIMD_ENABLED` | `1` to advertise Client ID Metadata Documents — the registration mode Claude and ChatGPT prefer over DCR — on that environment; unset or empty is off. Off by default so a routine deploy never switches the directory clients over by itself: enable it on staging first, then production, and unset it to roll back without a rebuild |
+| `OAUTH_CIMD_ENABLED` | `1` to advertise Client ID Metadata Documents — the registration mode Claude and ChatGPT prefer over DCR — on that environment; unset or empty is off. Off by default so a routine deploy never switches the directory clients over by itself: enable it on staging first, then production. The value is rendered into the unit at deploy time and read once at start-up, so to roll back, unset (or clear) the variable **and redeploy** — `workflow_dispatch` with the same ref is enough, no rebuild; changing the variable alone changes nothing on the host |
 
 > **Set these as repository-level secrets** (**Settings → Secrets and variables →
 > Actions**). The callers pass them into the reusable workflow, and a job that calls
