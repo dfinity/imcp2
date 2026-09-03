@@ -380,7 +380,11 @@ pub fn default_args() -> String {
 
 /// The interface to encode/decode against: the canister's own `candid:service`
 /// if exposed, else the caller-supplied `provided` definition.
-pub async fn resolve_did(agent: &Agent, canister: Principal, provided: Option<&str>) -> Option<String> {
+pub async fn resolve_did(
+    agent: &Agent,
+    canister: Principal,
+    provided: Option<&str>,
+) -> Option<String> {
     if let Some(did) = candid_service(agent, canister).await {
         return Some(did);
     }
@@ -389,10 +393,7 @@ pub async fn resolve_did(agent: &Agent, canister: Principal, provided: Option<&s
 
 /// The canister's `candid:service` interface (`.did` text), if exposed.
 pub async fn candid_service(agent: &Agent, canister: Principal) -> Option<String> {
-    let raw = agent
-        .read_state_canister_metadata(canister, "candid:service")
-        .await
-        .ok()?;
+    let raw = agent.read_state_canister_metadata(canister, "candid:service").await.ok()?;
     String::from_utf8(raw).ok()
 }
 
@@ -723,9 +724,7 @@ pub fn encode_args(did: Option<&str>, method: &str, args_text: &str) -> Result<V
                 }
             }
         }
-        parsed
-            .to_bytes()
-            .map_err(|e| format!("could not encode args `{args_text}`: {e}"))
+        parsed.to_bytes().map_err(|e| format!("could not encode args `{args_text}`: {e}"))
     })
     .unwrap_or_else(|| Err("could not spawn a thread to parse the `args` value".into()))
 }
@@ -753,8 +752,7 @@ const REPLY_DECODING_QUOTA: usize = 3_000_000;
 /// decoding and skipping counters, applied to every decode of untrusted reply bytes.
 fn reply_decoder_config() -> candid::DecoderConfig {
     let mut cfg = candid::DecoderConfig::new();
-    cfg.set_decoding_quota(REPLY_DECODING_QUOTA)
-        .set_skipping_quota(REPLY_DECODING_QUOTA);
+    cfg.set_decoding_quota(REPLY_DECODING_QUOTA).set_skipping_quota(REPLY_DECODING_QUOTA);
     cfg
 }
 
@@ -797,7 +795,13 @@ pub fn decode_bytes_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<St
         let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
         let actor = actor?;
         let func = env.get_method(&actor, method).ok()?;
-        let decoded = IDLArgs::from_bytes_with_types_with_config(bytes, &env, &func.rets, &reply_decoder_config()).ok()?;
+        let decoded = IDLArgs::from_bytes_with_types_with_config(
+            bytes,
+            &env,
+            &func.rets,
+            &reply_decoder_config(),
+        )
+        .ok()?;
         Some(decoded.to_string())
     })
     .flatten()
@@ -1100,11 +1104,7 @@ pub fn candid_reply_is_empty(reply: &str) -> bool {
         return true;
     }
     // Strip one layer of the outer `( … )` tuple wrapper if present.
-    let inner = t
-        .strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
-        .map(str::trim)
-        .unwrap_or(t);
+    let inner = t.strip_prefix('(').and_then(|s| s.strip_suffix(')')).map(str::trim).unwrap_or(t);
     match inner {
         "" | "null" | "none" => true,
         _ => {
@@ -1139,7 +1139,7 @@ pub fn normalize_oql_query(query: &str) -> Result<String, String> {
         serde_json::from_str(query).map_err(|e| format!("`query` must be valid JSON: {e}"))?;
     if !value.is_object() {
         return Err(
-            "`query` must be a JSON object, e.g. {\"start\":\"employee\",\"limit\":10}".to_string(),
+            "`query` must be a JSON object, e.g. {\"start\":\"employee\",\"limit\":10}".to_string()
         );
     }
     Ok(value.to_string())
@@ -1155,19 +1155,13 @@ pub fn encode_text_arg(text: &str) -> Result<Vec<u8>, String> {
 
 /// Encode the empty argument tuple `()` for `schema`.
 pub fn encode_unit_arg() -> Result<Vec<u8>, String> {
-    IDLArgs::new(&[])
-        .to_bytes()
-        .map_err(|e| format!("could not encode arguments: {e}"))
+    IDLArgs::new(&[]).to_bytes().map_err(|e| format!("could not encode arguments: {e}"))
 }
 
 /// The parsed outcome of an OQL `execute` reply.
 pub enum OqlResult {
     /// A decoded table: column names, string-rendered rows, and the paging flag.
-    Table {
-        columns: Vec<String>,
-        rows: Vec<Vec<String>>,
-        has_more: bool,
-    },
+    Table { columns: Vec<String>, rows: Vec<Vec<String>>, has_more: bool },
     /// The canister returned its error arm (e.g. `variant { err = "…" }`).
     QueryError(String),
     /// The reply's first row declared MORE than [`MAX_OQL_COLUMNS`] columns, so we
@@ -1188,11 +1182,7 @@ pub enum OqlResult {
 enum TableOutcome {
     /// A densified table (at most [`MAX_OQL_ROWS`] rows). `rows_truncated` is true
     /// when rows past the cap were dropped — recoverable via a higher `offset`.
-    Table {
-        columns: Vec<String>,
-        rows: Vec<Vec<String>>,
-        rows_truncated: bool,
-    },
+    Table { columns: Vec<String>, rows: Vec<Vec<String>>, rows_truncated: bool },
     /// The first row declared `column_count` (> [`MAX_OQL_COLUMNS`]) columns.
     TooWide { column_count: usize },
 }
@@ -1222,11 +1212,15 @@ pub fn parse_execute_reply(did: Option<&str>, reply: &[u8]) -> OqlResult {
             },
         };
         match decoded.args.into_iter().next() {
-            Some(val) => extract_oql(&val).unwrap_or_else(|| OqlResult::Unrecognized(val.to_string())),
+            Some(val) => {
+                extract_oql(&val).unwrap_or_else(|| OqlResult::Unrecognized(val.to_string()))
+            }
             None => OqlResult::Unrecognized("(empty reply)".to_string()),
         }
     })
-    .unwrap_or_else(|| OqlResult::Unrecognized("(could not spawn a thread to decode the reply)".to_string()))
+    .unwrap_or_else(|| {
+        OqlResult::Unrecognized("(could not spawn a thread to decode the reply)".to_string())
+    })
 }
 
 /// Decode a reply that is a single `text` value (e.g. `schema` or the API-doc
@@ -1343,7 +1337,8 @@ pub fn decode_schema_reply(reply: &[u8]) -> Result<DecodedSchema, String> {
 /// contract-violating reply still surfaces as before).
 fn try_decode_schema_text(reply: &[u8]) -> Result<String, String> {
     let typed = on_deep_stack(|| {
-        let mut de = candid::de::IDLDeserialize::new_with_config(reply, &reply_decoder_config()).ok()?;
+        let mut de =
+            candid::de::IDLDeserialize::new_with_config(reply, &reply_decoder_config()).ok()?;
         let text: String = de.get_value().ok()?;
         de.done().ok()?;
         Some(text)
@@ -1367,9 +1362,8 @@ pub(crate) fn schema_from_text(text: String) -> Result<DecodedSchema, String> {
     // One parse, for the entity extraction only — the text itself is handed on
     // untouched. The tree is bounded by the byte cap above and by serde_json's
     // recursion limit.
-    let entities = serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|v| schema_entities(&v));
+    let entities =
+        serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| schema_entities(&v));
     Ok(DecodedSchema { text, entities })
 }
 
@@ -1385,9 +1379,7 @@ pub fn api_doc_method(did: &str) -> Option<&'static str> {
         let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() else {
             return None;
         };
-        ["getApiDoc", "get_api_doc"]
-            .into_iter()
-            .find(|m| env.get_method(&actor, m).is_ok())
+        ["getApiDoc", "get_api_doc"].into_iter().find(|m| env.get_method(&actor, m).is_ok())
     })
     .flatten()
 }
@@ -1406,7 +1398,8 @@ fn decode_args_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<IDLArgs
     let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
     let actor = actor?;
     let func = env.get_method(&actor, method).ok()?;
-    IDLArgs::from_bytes_with_types_with_config(bytes, &env, &func.rets, &reply_decoder_config()).ok()
+    IDLArgs::from_bytes_with_types_with_config(bytes, &env, &func.rets, &reply_decoder_config())
+        .ok()
 }
 
 /// Recognize an OQL result value: a `record { hasMore; rows }`, optionally
@@ -1587,10 +1580,7 @@ fn cell_scalar(v: &IDLValue) -> String {
 /// OQL fields we ask for ("rows", "hasMore", "name", "value"); a hashed
 /// (`Label::Id`) label never equals a non-numeric key anyway.
 fn field_by_name<'a>(fields: &'a [IDLField], name: &str) -> Option<&'a IDLValue> {
-    fields
-        .iter()
-        .find(|f| matches!(&f.id, Label::Named(n) if n == name))
-        .map(|f| &f.val)
+    fields.iter().find(|f| matches!(&f.id, Label::Named(n) if n == name)).map(|f| &f.val)
 }
 
 fn label_name(l: &Label) -> String {
@@ -1620,9 +1610,8 @@ pub fn render_table(columns: &[String], rows: &[Vec<String>], has_more: bool) ->
     }
     out.push('\n');
     for row in rows {
-        let cells: Vec<String> = (0..columns.len())
-            .map(|i| esc(row.get(i).map(String::as_str).unwrap_or("")))
-            .collect();
+        let cells: Vec<String> =
+            (0..columns.len()).map(|i| esc(row.get(i).map(String::as_str).unwrap_or(""))).collect();
         out.push_str("| ");
         out.push_str(&cells.join(" | "));
         out.push_str(" |\n");
@@ -1630,11 +1619,7 @@ pub fn render_table(columns: &[String], rows: &[Vec<String>], has_more: bool) ->
     out.push_str(&format!(
         "\n{} row(s){}.",
         rows.len(),
-        if has_more {
-            " — more available; re-query with a higher `offset` to page"
-        } else {
-            ""
-        }
+        if has_more { " — more available; re-query with a higher `offset` to page" } else { "" }
     ));
     out
 }
@@ -1731,11 +1716,7 @@ mod tests {
         // Mixed prefix+group nesting must count BOTH levels per step (each
         // `opt record {` is depth 2), so the `opt` prefix isn't lost to the
         // following `record` keyword. 100 levels ⇒ ~200 frames ⇒ refused.
-        let deep_mixed = format!(
-            "{}1{}",
-            "opt record { a = ".repeat(100),
-            " }".repeat(100),
-        );
+        let deep_mixed = format!("{}1{}", "opt record { a = ".repeat(100), " }".repeat(100),);
         assert!(
             guard_candid_text("v", &deep_mixed).is_err(),
             "deep opt-record nesting must be refused (no prefix under-count)"
@@ -1750,7 +1731,8 @@ mod tests {
         // No false positives: brackets inside a STRING don't count, and many
         // SIBLING (non-nested) opts stay shallow.
         assert!(guard_candid_text("v", &format!("\"{}\"", "(".repeat(10_000))).is_ok());
-        assert!(guard_candid_text("v", &format!("(record {{ {} }})", "a = opt 1; ".repeat(1000))).is_ok());
+        assert!(guard_candid_text("v", &format!("(record {{ {} }})", "a = opt 1; ".repeat(1000)))
+            .is_ok());
     }
 
     // CWE-674, comment-hidden quote: `candid_parser`'s lexer drops `//` and
@@ -1794,11 +1776,8 @@ mod tests {
         }
         // A comment may also sit BETWEEN a prefix and the group it wraps: the
         // `opt` must survive the comment and still outlive `record`'s braces.
-        let deep_commented = format!(
-            "{}1{}",
-            "opt /* c */ record // c\n { a = ".repeat(100),
-            " }".repeat(100),
-        );
+        let deep_commented =
+            format!("{}1{}", "opt /* c */ record // c\n { a = ".repeat(100), " }".repeat(100),);
         assert!(
             guard_candid_text("v", &deep_commented).is_err(),
             "a comment between `opt` and `record {{` must not drop the prefix"
@@ -1883,9 +1862,7 @@ mod tests {
         // A realistic interface is nowhere near the cap.
         let realistic = format!(
             "{}service:{{ get:(t0)->(t0) query; set:(t0)->() }}",
-            (0..180)
-                .map(|i| format!("type t{i}=record{{a:nat;b:opt text}};"))
-                .collect::<String>()
+            (0..180).map(|i| format!("type t{i}=record{{a:nat;b:opt text}};")).collect::<String>()
         );
         assert!(guard_candid_text("d", &realistic).is_ok(), "real interfaces must pass");
     }
@@ -1933,13 +1910,10 @@ mod tests {
     #[test]
     fn deep_stack_parses_are_capped_but_all_complete() {
         use super::on_deep_stack;
-        let callers: Vec<_> = (0..64u32)
-            .map(|i| std::thread::spawn(move || on_deep_stack(|| i * 2)))
-            .collect();
-        let got: Vec<_> = callers
-            .into_iter()
-            .map(|c| c.join().expect("caller must not panic or hang"))
-            .collect();
+        let callers: Vec<_> =
+            (0..64u32).map(|i| std::thread::spawn(move || on_deep_stack(|| i * 2))).collect();
+        let got: Vec<_> =
+            callers.into_iter().map(|c| c.join().expect("caller must not panic or hang")).collect();
         assert_eq!(got, (0..64u32).map(|i| Some(i * 2)).collect::<Vec<_>>());
         // Permits are returned, so a later call still runs rather than blocking.
         assert_eq!(on_deep_stack(|| "after"), Some("after"));
@@ -2002,8 +1976,12 @@ mod tests {
         // Positive control: the SAME two-method interface without the deep
         // nesting IS detected, so the false above is provably the guard (depth),
         // not the interface shape.
-        let shallow_twin = "service : { schema : () -> (nat) query; execute : (text) -> (text) query; }";
-        assert!(has_oql(shallow_twin), "shallow twin should be detected — isolates the guard as the cause");
+        let shallow_twin =
+            "service : { schema : () -> (nat) query; execute : (text) -> (text) query; }";
+        assert!(
+            has_oql(shallow_twin),
+            "shallow twin should be detected — isolates the guard as the cause"
+        );
     }
 
     // is_query_method classifies a method by its Candid mode so canister_query can
@@ -2022,10 +2000,18 @@ mod tests {
         assert_eq!(is_query_method(did, "stats"), Some(true), "composite_query → Some(true)");
         assert_eq!(is_query_method(did, "transfer"), Some(false), "update method → Some(false)");
         assert_eq!(is_query_method(did, "missing"), None, "undeclared method → None (fail open)");
-        assert_eq!(is_query_method("not a candid interface", "x"), None, "unparseable → None (fail open)");
+        assert_eq!(
+            is_query_method("not a candid interface", "x"),
+            None,
+            "unparseable → None (fail open)"
+        );
         // Fail-open on an over-limit interface (CWE-674 guard), like has_oql.
         let over_deep = format!("service : {{ f : () -> ({}nat) query; }}", "vec ".repeat(5000));
-        assert_eq!(is_query_method(&over_deep, "f"), None, "over-limit interface → None (fail open)");
+        assert_eq!(
+            is_query_method(&over_deep, "f"),
+            None,
+            "over-limit interface → None (fail open)"
+        );
     }
 
     // "Prefer OQL": canister_query must reject a Candid `method` query on an OQL
@@ -2042,10 +2028,19 @@ mod tests {
         // names the full guide→schema→query path (#5) plus the auth hint.
         let msg = oql_query_redirect(Some(oql)).expect("query on OQL canister must be redirected");
         assert!(msg.contains("icp_oql_guide"), "message must point to the OQL guide: {msg}");
-        assert!(msg.contains("get_canister_oql_schema"), "message must point to the OQL schema tool: {msg}");
-        assert!(msg.contains("canister_query"), "message must point to canister_query's oql path: {msg}");
+        assert!(
+            msg.contains("get_canister_oql_schema"),
+            "message must point to the OQL schema tool: {msg}"
+        );
+        assert!(
+            msg.contains("canister_query"),
+            "message must point to canister_query's oql path: {msg}"
+        );
         assert!(msg.contains("`oql`"), "message must name the oql argument: {msg}");
-        assert!(msg.contains("derivation_origin"), "message must carry the auth hint (pass the origin): {msg}");
+        assert!(
+            msg.contains("derivation_origin"),
+            "message must carry the auth hint (pass the origin): {msg}"
+        );
 
         // Query on a non-OQL canister proceeds.
         assert!(oql_query_redirect(Some(plain)).is_none(), "non-OQL query must pass through");
@@ -2058,9 +2053,7 @@ mod tests {
     // can be exercised end-to-end against a realistic `execute` return type.
     #[cfg(test)]
     fn encode_reply(did: &str, method: &str, textual: &str) -> Vec<u8> {
-        let (env, actor) = candid_parser::utils::CandidSource::Text(did)
-            .load()
-            .expect("parse did");
+        let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().expect("parse did");
         let actor = actor.expect("service");
         let func = env.get_method(&actor, method).expect("method");
         candid_parser::parse_idl_args(textual)
@@ -2104,10 +2097,13 @@ mod tests {
         match parse_execute_reply(Some(did), &ok_reply) {
             OqlResult::Table { columns, rows, has_more } => {
                 assert_eq!(columns, vec!["firstName", "lastName"]);
-                assert_eq!(rows, vec![
-                    vec!["Ada".to_string(), "Lovelace".to_string()],
-                    vec!["Alan".to_string(), "Turing".to_string()],
-                ]);
+                assert_eq!(
+                    rows,
+                    vec![
+                        vec!["Ada".to_string(), "Lovelace".to_string()],
+                        vec!["Alan".to_string(), "Turing".to_string()],
+                    ]
+                );
                 assert!(has_more, "hasMore = true must be read");
             }
             _ => panic!("expected a Table"),
@@ -2122,10 +2118,7 @@ mod tests {
 
         // Without the interface, field names are hashed on the wire, so the shape
         // isn't recognized — degrade to Unrecognized rather than guess/panic.
-        assert!(matches!(
-            parse_execute_reply(None, &ok_reply),
-            OqlResult::Unrecognized(_)
-        ));
+        assert!(matches!(parse_execute_reply(None, &ok_reply), OqlResult::Unrecognized(_)));
 
         // A query that matched nothing (`rows = vec {}`) is a legitimate empty
         // table, NOT an error or Unrecognized.
@@ -2136,7 +2129,10 @@ mod tests {
         );
         match parse_execute_reply(Some(did), &empty) {
             OqlResult::Table { columns, rows, has_more } => {
-                assert!(columns.is_empty() && rows.is_empty() && !has_more, "empty result is a 0-row table");
+                assert!(
+                    columns.is_empty() && rows.is_empty() && !has_more,
+                    "empty result is a 0-row table"
+                );
             }
             _ => panic!("empty rows should be a Table, not an error/Unrecognized"),
         }
@@ -2170,11 +2166,12 @@ mod tests {
     // would loop the agent forever (ICPBB-384/385 + PR #136 review).
     #[test]
     fn rows_to_table_refuses_a_too_wide_first_row() {
-        use super::{extract_oql, rows_to_table, OqlResult, TableOutcome, IDLValue, MAX_OQL_COLUMNS};
+        use super::{
+            extract_oql, rows_to_table, IDLValue, OqlResult, TableOutcome, MAX_OQL_COLUMNS,
+        };
 
-        let wide: Vec<IDLValue> = (0..MAX_OQL_COLUMNS + 44)
-            .map(|c| oql_cell(&format!("c{c}"), "x"))
-            .collect();
+        let wide: Vec<IDLValue> =
+            (0..MAX_OQL_COLUMNS + 44).map(|c| oql_cell(&format!("c{c}"), "x")).collect();
         let width = wide.len();
         // Extra rows after the wide first row must NOT flip this into a row-paged
         // table: width is decided at the first row, before any row is materialized.
@@ -2183,13 +2180,17 @@ mod tests {
 
         match rows_to_table(&IDLValue::Vec(rows.clone())).expect("recognizable") {
             TableOutcome::TooWide { column_count } => assert_eq!(column_count, width),
-            TableOutcome::Table { .. } => panic!("an over-wide first row must be refused, not capped"),
+            TableOutcome::Table { .. } => {
+                panic!("an over-wide first row must be refused, not capped")
+            }
         }
 
         // Through the public mapping: TooManyColumns, and never a has_more table.
         match extract_oql(&oql_record(rows, false)).expect("recognizable") {
             OqlResult::TooManyColumns { column_count } => assert_eq!(column_count, width),
-            other => panic!("expected TooManyColumns, got a different arm: {}", oql_variant_name(&other)),
+            other => {
+                panic!("expected TooManyColumns, got a different arm: {}", oql_variant_name(&other))
+            }
         }
     }
 
@@ -2198,16 +2199,13 @@ mod tests {
     // even when the canister itself said hasMore = false.
     #[test]
     fn rows_to_table_caps_tall_replies_as_pageable() {
-        use super::{extract_oql, rows_to_table, OqlResult, TableOutcome, IDLValue, MAX_OQL_ROWS};
+        use super::{extract_oql, rows_to_table, IDLValue, OqlResult, TableOutcome, MAX_OQL_ROWS};
 
         // Two columns (well within the width cap), MAX_OQL_ROWS + 100 rows.
         let make_rows = || {
             (0..MAX_OQL_ROWS + 100)
                 .map(|r| {
-                    IDLValue::Vec(vec![
-                        oql_cell("id", &format!("{r}")),
-                        oql_cell("name", "x"),
-                    ])
+                    IDLValue::Vec(vec![oql_cell("id", &format!("{r}")), oql_cell("name", "x")])
                 })
                 .collect::<Vec<_>>()
         };
@@ -2238,11 +2236,10 @@ mod tests {
     // boundary against an off-by-one.)
     #[test]
     fn rows_to_table_column_cap_is_exclusive() {
-        use super::{rows_to_table, TableOutcome, IDLValue, MAX_OQL_COLUMNS};
+        use super::{rows_to_table, IDLValue, TableOutcome, MAX_OQL_COLUMNS};
 
-        let row_of = |n: usize| {
-            IDLValue::Vec((0..n).map(|c| oql_cell(&format!("c{c}"), "x")).collect())
-        };
+        let row_of =
+            |n: usize| IDLValue::Vec((0..n).map(|c| oql_cell(&format!("c{c}"), "x")).collect());
 
         // Exactly at the cap → a normal table with all columns.
         match rows_to_table(&IDLValue::Vec(vec![row_of(MAX_OQL_COLUMNS)])).expect("recognizable") {
@@ -2250,7 +2247,9 @@ mod tests {
             TableOutcome::TooWide { .. } => panic!("exactly MAX_OQL_COLUMNS must be accepted"),
         }
         // One over the cap → refused.
-        match rows_to_table(&IDLValue::Vec(vec![row_of(MAX_OQL_COLUMNS + 1)])).expect("recognizable") {
+        match rows_to_table(&IDLValue::Vec(vec![row_of(MAX_OQL_COLUMNS + 1)]))
+            .expect("recognizable")
+        {
             TableOutcome::TooWide { column_count } => assert_eq!(column_count, MAX_OQL_COLUMNS + 1),
             TableOutcome::Table { .. } => panic!("MAX_OQL_COLUMNS + 1 must be refused"),
         }
@@ -2260,7 +2259,7 @@ mod tests {
     // flagged; one more row is dropped and flags rows_truncated.
     #[test]
     fn rows_to_table_row_cap_is_exclusive() {
-        use super::{rows_to_table, TableOutcome, IDLValue, MAX_OQL_ROWS};
+        use super::{rows_to_table, IDLValue, TableOutcome, MAX_OQL_ROWS};
 
         let rows_of = |n: usize| {
             IDLValue::Vec((0..n).map(|_| IDLValue::Vec(vec![oql_cell("id", "x")])).collect())
@@ -2288,7 +2287,7 @@ mod tests {
     // set and its unknown cells are skipped (PR #136 review, r3803651957).
     #[test]
     fn rows_to_table_bounds_a_wide_later_row() {
-        use super::{rows_to_table, TableOutcome, IDLValue};
+        use super::{rows_to_table, IDLValue, TableOutcome};
 
         // Row 0 establishes a single column "id"; row 1 carries "id" plus 5_000
         // junk cells with names that are NOT columns.
@@ -2394,7 +2393,10 @@ mod tests {
         assert_eq!(out.entity_names(), ["bookings".to_string(), "users".to_string()]);
         assert!(!out.is_empty());
 
-        assert_eq!(out.recognized_entity_names(), Some(&["bookings".to_string(), "users".to_string()][..]));
+        assert_eq!(
+            out.recognized_entity_names(),
+            Some(&["bookings".to_string(), "users".to_string()][..])
+        );
 
         let unrecognized = decode_schema_reply(&encode_text_reply("{}")).expect("accepted");
         assert!(unrecognized.entity_names().is_empty());
@@ -2404,13 +2406,23 @@ mod tests {
         // An `entities` array whose elements carry no string `name` declares
         // entities we can't read: NOT empty (no false auth hint), and unrecognized
         // for the diagnosis — only a zero-element array is "declares no entities".
-        let nameless = decode_schema_reply(&encode_text_reply(r#"{"entities":[{}]}"#)).expect("accepted");
+        let nameless =
+            decode_schema_reply(&encode_text_reply(r#"{"entities":[{}]}"#)).expect("accepted");
         assert!(nameless.entity_names().is_empty());
         assert!(!nameless.is_empty(), "elements without names → not treated as empty");
-        assert_eq!(nameless.recognized_entity_names(), None, "elements without names → unrecognized");
-        let empty = decode_schema_reply(&encode_text_reply(r#"{"entities":[]}"#)).expect("accepted");
+        assert_eq!(
+            nameless.recognized_entity_names(),
+            None,
+            "elements without names → unrecognized"
+        );
+        let empty =
+            decode_schema_reply(&encode_text_reply(r#"{"entities":[]}"#)).expect("accepted");
         assert!(empty.is_empty());
-        assert_eq!(empty.recognized_entity_names(), Some(&[][..]), "zero elements → recognized as empty");
+        assert_eq!(
+            empty.recognized_entity_names(),
+            Some(&[][..]),
+            "zero elements → recognized as empty"
+        );
 
         let not_json = decode_schema_reply(&encode_text_reply("not json")).expect("accepted");
         assert_eq!(not_json.text, "not json", "non-JSON text passes through verbatim");
@@ -2435,7 +2447,8 @@ mod tests {
         let nests: Vec<&str> = std::iter::repeat_n(nest.as_str(), 1000).collect();
         let deep = format!("[{}]", nests.join(","));
         assert!(deep.len() < MAX_OQL_SCHEMA_BYTES, "input must fit the byte cap: {}", deep.len());
-        let out = decode_schema_reply(&encode_text_reply(&deep)).expect("within the byte cap → accepted");
+        let out =
+            decode_schema_reply(&encode_text_reply(&deep)).expect("within the byte cap → accepted");
         assert_eq!(out.text, deep, "deep JSON is passed through verbatim, never re-rendered");
         assert!(out.entity_names().is_empty());
 
@@ -2443,7 +2456,10 @@ mod tests {
         // entities extracted, and passed through verbatim.
         let wide = format!(
             "{{\"entities\":[{}]}}",
-            (0..3000).map(|i| format!("{{\"name\":\"entity_{i:04}\"}}")).collect::<Vec<_>>().join(",")
+            (0..3000)
+                .map(|i| format!("{{\"name\":\"entity_{i:04}\"}}"))
+                .collect::<Vec<_>>()
+                .join(",")
         );
         assert!(wide.len() > 60_000 && wide.len() < MAX_OQL_SCHEMA_BYTES, "{}", wide.len());
         let out = decode_schema_reply(&encode_text_reply(&wide)).expect("accepted");
@@ -2453,7 +2469,8 @@ mod tests {
         // Over the byte cap: refused before any parse, as an error (not handed on
         // as an explanatory "schema").
         let huge = format!("[{}]", "0,".repeat(MAX_OQL_SCHEMA_BYTES / 2));
-        let err = decode_schema_reply(&encode_text_reply(&huge)).expect_err("over the cap → refused");
+        let err =
+            decode_schema_reply(&encode_text_reply(&huge)).expect_err("over the cap → refused");
         assert!(err.contains("too large"), "{err}");
 
         // A reply that doesn't decode at all is surfaced as before (its explanation,
@@ -2469,10 +2486,18 @@ mod tests {
     #[test]
     fn api_doc_method_detection() {
         use super::api_doc_method;
-        assert_eq!(api_doc_method("service : { getApiDoc : () -> (text) query; }"), Some("getApiDoc"));
-        assert_eq!(api_doc_method("service : { get_api_doc : () -> (text) query; }"), Some("get_api_doc"));
         assert_eq!(
-            api_doc_method("service : { getApiDoc : () -> (text) query; get_api_doc : () -> (text) query; }"),
+            api_doc_method("service : { getApiDoc : () -> (text) query; }"),
+            Some("getApiDoc")
+        );
+        assert_eq!(
+            api_doc_method("service : { get_api_doc : () -> (text) query; }"),
+            Some("get_api_doc")
+        );
+        assert_eq!(
+            api_doc_method(
+                "service : { getApiDoc : () -> (text) query; get_api_doc : () -> (text) query; }"
+            ),
             Some("getApiDoc"),
             "prefers getApiDoc when both are declared"
         );
@@ -2494,7 +2519,10 @@ mod tests {
         let multi_did = "service : { foo : () -> (text, nat) query; }";
         let multi = encode_reply(multi_did, "foo", "(\"a\", 5 : nat)");
         let out = decode_text_reply(&multi);
-        assert!(out.contains("a") && out.contains('5'), "multi-value reply keeps all values: {out}");
+        assert!(
+            out.contains("a") && out.contains('5'),
+            "multi-value reply keeps all values: {out}"
+        );
     }
 
     // Every type-less reply-decode path runs on the guarded deep stack (CWE-674). The
@@ -2508,7 +2536,9 @@ mod tests {
     // to trigger an abort, which is uncatchable and cannot be asserted on anyway.
     #[test]
     fn typeless_reply_paths_bound_deep_nesting() {
-        use super::{decode_reply, decode_text_reply, on_deep_stack, parse_execute_reply, OqlResult};
+        use super::{
+            decode_reply, decode_text_reply, on_deep_stack, parse_execute_reply, OqlResult,
+        };
         use candid::{IDLArgs, IDLValue};
         // ~DEPTH-deep `opt opt … opt null`. Build, encode, AND drop the input tree on
         // the deep stack too, so the test harness thread (also ~2 MiB) can't overflow
@@ -2540,7 +2570,10 @@ mod tests {
         use super::anonymous_empty_note;
         let note = anonymous_empty_note("this query", "the app's `derivation_origin`");
         assert!(note.contains("anonymous"), "must name the anonymous read: {note}");
-        assert!(note.to_lowercase().contains("not authenticated"), "must name the likely cause: {note}");
+        assert!(
+            note.to_lowercase().contains("not authenticated"),
+            "must name the likely cause: {note}"
+        );
         assert!(note.contains("this query"), "must echo `what`: {note}");
         assert!(note.contains("the app's `derivation_origin`"), "must echo `add_hint`: {note}");
         // Never a fabricated origin — only the placeholder hint.
@@ -2564,7 +2597,10 @@ mod tests {
 
     /// The entity names `schema_from_text` extracts from a schema text.
     fn entity_names(schema_json: &str) -> Vec<String> {
-        super::schema_from_text(schema_json.to_string()).expect("small schema").entity_names().to_vec()
+        super::schema_from_text(schema_json.to_string())
+            .expect("small schema")
+            .entity_names()
+            .to_vec()
     }
 
     /// Whether `schema_from_text` reads a schema text as "no entities".
@@ -2596,7 +2632,10 @@ mod tests {
     #[test]
     fn oql_query_start_extracts_start() {
         use super::oql_query_start;
-        assert_eq!(oql_query_start(r#"{"start":"bookings","limit":10}"#).as_deref(), Some("bookings"));
+        assert_eq!(
+            oql_query_start(r#"{"start":"bookings","limit":10}"#).as_deref(),
+            Some("bookings")
+        );
         assert_eq!(oql_query_start(r#"{"limit":10}"#), None, "no start → None");
         assert_eq!(oql_query_start("not json"), None, "garbage → None");
     }
@@ -2606,7 +2645,8 @@ mod tests {
     #[test]
     fn closest_entity_repairs_near_misses_only() {
         use super::closest_entity;
-        let entities = vec!["bookings".to_string(), "users".to_string(), "appointments".to_string()];
+        let entities =
+            vec!["bookings".to_string(), "users".to_string(), "appointments".to_string()];
         // The motivating case: singular guess → plural entity.
         assert_eq!(closest_entity("booking", &entities).as_deref(), Some("bookings"));
         // Case-insensitive exact.
@@ -2650,7 +2690,10 @@ mod tests {
         let long_entity = "a".repeat(MAX_FUZZY_NAME_LEN * 4);
         let big = vec![long_entity.clone()];
         assert_eq!(closest_entity(&long_entity, &big).as_deref(), Some(long_entity.as_str()));
-        assert_eq!(closest_entity(&format!("{long_entity}s"), &big).as_deref(), Some(long_entity.as_str()));
+        assert_eq!(
+            closest_entity(&format!("{long_entity}s"), &big).as_deref(),
+            Some(long_entity.as_str())
+        );
 
         // Unicode: the length-difference pruning counts chars, not bytes, so a
         // multi-byte near-miss (1 edit) is NOT wrongly pruned by a larger byte diff.
@@ -2697,7 +2740,11 @@ mod tests {
         );
         // Anonymous schema read → examples carry no identity args (stay anonymous).
         let anon = oql_query_examples("aaaaa-aa", &schema, None, None, None);
-        assert!(!anon[0].contains("derivation_origin"), "no origin when read anonymously: {}", anon[0]);
+        assert!(
+            !anon[0].contains("derivation_origin"),
+            "no origin when read anonymously: {}",
+            anon[0]
+        );
         assert!(!anon[0].contains("app_url"), "and no app_url when none was used: {}", anon[0]);
         // No entities → no examples.
         assert!(oql_query_examples("aaaaa-aa", &entity_names("{}"), None, None, None).is_empty());
@@ -2710,10 +2757,16 @@ mod tests {
         let wex = oql_query_examples("aaaaa-aa", &weird, None, None, None);
         assert_eq!(wex.len(), 1);
         let args_json = wex[0].strip_prefix("canister_query ").expect("tool prefix");
-        let args: serde_json::Value = serde_json::from_str(args_json).expect("args must be valid JSON");
+        let args: serde_json::Value =
+            serde_json::from_str(args_json).expect("args must be valid JSON");
         let query = args.get("oql").and_then(|q| q.as_str()).expect("oql string");
-        let parsed: serde_json::Value = serde_json::from_str(query).expect("oql must be valid JSON");
-        assert_eq!(parsed.get("start").and_then(|s| s.as_str()), Some("we\"ird"), "entity name round-trips");
+        let parsed: serde_json::Value =
+            serde_json::from_str(query).expect("oql must be valid JSON");
+        assert_eq!(
+            parsed.get("start").and_then(|s| s.as_str()),
+            Some("we\"ird"),
+            "entity name round-trips"
+        );
     }
 
     // #1: the conservative empty-reply detector recognizes the unambiguous empties

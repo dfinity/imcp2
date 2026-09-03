@@ -155,12 +155,12 @@ const DISALLOWED_CANISTER_METHODS: &[(&str, &str, &str)] = &[
     // The cycles-minting canister's user-callable update surface. Each call
     // completes a funding operation against ICP the user already sent; the
     // remaining methods on this canister are queries or NNS-only admin calls.
-    (CYCLES_MINTING_CANISTER, "notify_top_up", "a cycles top-up completion (minting cycles for a canister)"),
     (
         CYCLES_MINTING_CANISTER,
-        "notify_create_canister",
-        "a canister-creation payment completion",
+        "notify_top_up",
+        "a cycles top-up completion (minting cycles for a canister)",
     ),
+    (CYCLES_MINTING_CANISTER, "notify_create_canister", "a canister-creation payment completion"),
     (CYCLES_MINTING_CANISTER, "notify_mint_cycles", "a cycles mint to a cycles-ledger account"),
     (CYCLES_MINTING_CANISTER, "create_canister", "a canister creation paid with attached cycles"),
 ];
@@ -494,9 +494,7 @@ pub fn disallowed_update_method(canister_id: &Principal, method: &str) -> Option
              {instead}"
         ));
     }
-    let (_, service, why) = DISALLOWED_FINANCE_CANISTERS
-        .iter()
-        .find(|(c, _, _)| *c == canister)?;
+    let (_, service, why) = DISALLOWED_FINANCE_CANISTERS.iter().find(|(c, _, _)| *c == canister)?;
     // The blanket: what is disallowed here is the destination, not this call,
     // so the message says that and claims nothing about the method (per
     // review — `store` on a wallet backend is not a transfer).
@@ -728,8 +726,8 @@ mod tests {
     // route to another. Pin those pieces so the message can't degrade.
     #[test]
     fn refusal_names_method_and_policy_without_naming_a_venue() {
-        let msg = disallowed_update_method(&any_canister(), "icrc1_transfer")
-            .expect("must be refused");
+        let msg =
+            disallowed_update_method(&any_canister(), "icrc1_transfer").expect("must be refused");
         assert!(msg.contains("`icrc1_transfer`"), "{msg}");
         assert!(msg.contains("an ICRC-1 token transfer"), "{msg}");
         assert!(msg.contains("the call itself carries out that operation"), "{msg}");
@@ -752,14 +750,15 @@ mod tests {
     // review), instead of calling every invocation a transfer.
     #[test]
     fn manage_neuron_refusal_explains_the_whole_surface() {
-        let msg = disallowed_update_method(&any_canister(), "manage_neuron")
-            .expect("must be refused");
+        let msg =
+            disallowed_update_method(&any_canister(), "manage_neuron").expect("must be refused");
         assert!(msg.contains("voting, following, and dissolve delay"), "{msg}");
         assert!(msg.contains("disbursing, splitting, and spawning staked tokens"), "{msg}");
         assert!(msg.contains("disabled as a whole rather than per command"), "{msg}");
         assert!(msg.contains("does not mean this particular call moves assets"), "{msg}");
         assert!(
-            !msg.contains("is a financial transaction") && !msg.contains("— a financial transaction"),
+            !msg.contains("is a financial transaction")
+                && !msg.contains("— a financial transaction"),
             "the caller's command is not classified as a transfer: {msg}"
         );
     }

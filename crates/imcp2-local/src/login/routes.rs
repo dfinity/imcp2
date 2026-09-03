@@ -29,14 +29,8 @@ pub(super) fn login_router(driver: LoginDriver, callback_url: String, authority:
         // routing. (Even without this the routes are largely inert to a
         // rebinder — `/redeem` requires the connect `state` and a chain
         // targeting the in-process `X` — this closes the door outright.)
-        .layer(axum::middleware::from_fn_with_state(
-            authority,
-            require_own_host,
-        ))
-        .with_state(RouteCtx {
-            driver,
-            callback_url,
-        })
+        .layer(axum::middleware::from_fn_with_state(authority, require_own_host))
+        .with_state(RouteCtx { driver, callback_url })
 }
 
 /// Reject any request whose `Host` header is not this listener's own
@@ -52,10 +46,7 @@ async fn require_own_host(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|host| host == expected);
     if !ok {
-        return (
-            axum::http::StatusCode::FORBIDDEN,
-            "wrong Host for this login listener",
-        )
+        return (axum::http::StatusCode::FORBIDDEN, "wrong Host for this login listener")
             .into_response();
     }
     next.run(req).await
@@ -86,10 +77,7 @@ async fn callback_page() -> Response {
         axum::http::header::X_CONTENT_TYPE_OPTIONS,
         axum::http::HeaderValue::from_static("nosniff"),
     );
-    h.insert(
-        axum::http::header::X_FRAME_OPTIONS,
-        axum::http::HeaderValue::from_static("DENY"),
-    );
+    h.insert(axum::http::header::X_FRAME_OPTIONS, axum::http::HeaderValue::from_static("DENY"));
     resp
 }
 
@@ -100,10 +88,7 @@ async fn callback_page() -> Response {
 async fn auth_callbacks(State(ctx): State<RouteCtx>) -> Response {
     let mut resp = Json(json!({ "callbacks": [ctx.callback_url] })).into_response();
     let h = resp.headers_mut();
-    h.insert(
-        axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-store"),
-    );
+    h.insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
     h.insert(
         axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
         axum::http::HeaderValue::from_static("*"),
@@ -112,11 +97,7 @@ async fn auth_callbacks(State(ctx): State<RouteCtx>) -> Response {
 }
 
 fn redeem_err(msg: &str) -> Response {
-    (
-        axum::http::StatusCode::BAD_REQUEST,
-        Json(json!({ "error": msg })),
-    )
-        .into_response()
+    (axum::http::StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
 }
 
 /// The local success answer: no OAuth continuation to redirect into, so the
@@ -140,11 +121,7 @@ async fn redeem(State(ctx): State<RouteCtx>, Json(body): Json<RedeemBody>) -> Re
     // so an unknown/expired `state` gets its accurate refusal without parsing.
     {
         let state = driver.inner.state.lock().await;
-        if state
-            .grant
-            .as_ref()
-            .is_some_and(|g| g.session_id == body.state)
-        {
+        if state.grant.as_ref().is_some_and(|g| g.session_id == body.state) {
             // A retry of an already-successful redeem (II's delegation redeems
             // repeatedly within its lifetime): idempotent success.
             return done();
@@ -179,11 +156,7 @@ async fn redeem(State(ctx): State<RouteCtx>, Json(body): Json<RedeemBody>) -> Re
     // Claim atomically (re-checking: the flow may have moved while parsing).
     {
         let mut state = driver.inner.state.lock().await;
-        if state
-            .grant
-            .as_ref()
-            .is_some_and(|g| g.session_id == body.state)
-        {
+        if state.grant.as_ref().is_some_and(|g| g.session_id == body.state) {
             return done();
         }
         match state.pending.as_mut() {
@@ -222,11 +195,7 @@ async fn redeem(State(ctx): State<RouteCtx>, Json(body): Json<RedeemBody>) -> Re
     // claim above stays: it stops a page double-submit; this lock orders
     // DISTINCT flows.
     let _registration = driver.inner.registration.lock().await;
-    match driver
-        .inner
-        .identities
-        .redeem_registration_delegation(&body.state, user_key, chain)
-        .await
+    match driver.inner.identities.redeem_registration_delegation(&body.state, user_key, chain).await
     {
         Err(e) => {
             let mut state = driver.inner.state.lock().await;
@@ -240,10 +209,7 @@ async fn redeem(State(ctx): State<RouteCtx>, Json(body): Json<RedeemBody>) -> Re
         Ok(outcome) => {
             let principal = driver.inner.identities.session_principal(&body.state).await;
             let mut state = driver.inner.state.lock().await;
-            driver
-                .inner
-                .slot
-                .set(body.state.clone(), outcome.expiration_ns);
+            driver.inner.slot.set(body.state.clone(), outcome.expiration_ns);
             state.grant = Some(Grant {
                 session_id: body.state.clone(),
                 principal,

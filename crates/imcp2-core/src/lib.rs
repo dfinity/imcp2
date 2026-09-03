@@ -48,12 +48,12 @@ mod management;
 #[cfg(all(test, feature = "e2e"))]
 mod e2e_canister_tools;
 
-pub use identities::{IiInstance, SessionGauges};
-pub use tools::{IcCanisterTools, IcProtocolTools, IcTools, SessionResolver};
 /// The IC [`Agent`] type the components are built around, re-exported so
 /// callers construct the injected agent from the exact `ic-agent` version this
 /// crate links.
 pub use ic_agent::{self, Agent};
+pub use identities::{IiInstance, SessionGauges};
+pub use tools::{IcCanisterTools, IcProtocolTools, IcTools, SessionResolver};
 
 /// A sensible default IC API boundary node (the public mainnet endpoint) for
 /// callers that just want `Agent::builder().with_url(IC_URL).build()`. A host

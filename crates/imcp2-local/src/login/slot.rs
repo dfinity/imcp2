@@ -53,10 +53,7 @@ impl SessionSlot {
     /// Replace the session after a successful login (a fresh id per the II
     /// fresh-session-key contract), with the grant expiration II returned.
     pub fn set(&self, session_id: String, expiration_ns: u64) {
-        *self.0.write().expect("session slot poisoned") = Some(Entry {
-            session_id,
-            expiration_ns,
-        });
+        *self.0.write().expect("session slot poisoned") = Some(Entry { session_id, expiration_ns });
     }
 
     /// This slot as the [`imcp2_core::SessionResolver`] the local binary

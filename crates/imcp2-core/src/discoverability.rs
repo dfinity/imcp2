@@ -230,7 +230,12 @@ fn decide(
             return Err(legacy_only_refusal(&legacy, canister_id, source, kind))
         }
         discover::ManifestProbe::Absent { served_non_manifest, legacy: None } => {
-            return Err(no_manifest_refusal(app_origin, source, served_non_manifest.as_deref(), kind))
+            return Err(no_manifest_refusal(
+                app_origin,
+                source,
+                served_non_manifest.as_deref(),
+                kind,
+            ))
         }
     };
     if manifest.canisters.contains(canister_id) {
@@ -359,7 +364,8 @@ fn the_rule() -> String {
 /// promise that reading works (it is exactly what may just have been refused),
 /// so it points at the tool that tells the agent WHICH canisters this app has
 /// put within reach.
-const DISCOVERY_IS_FINE: &str = "Discovery is unaffected: open_app resolves the app and lists what \
+const DISCOVERY_IS_FINE: &str =
+    "Discovery is unaffected: open_app resolves the app and lists what \
      it declares, and the canisters on that list are the ones this connector can read and call — \
      so say what you can from there rather than dropping the subject.";
 
@@ -592,12 +598,8 @@ fn not_declared_refusal(
     source: OriginSource,
     kind: CallKind,
 ) -> String {
-    let listed: Vec<String> = manifest
-        .canisters
-        .iter()
-        .take(MAX_LISTED_DECLARED)
-        .map(Principal::to_text)
-        .collect();
+    let listed: Vec<String> =
+        manifest.canisters.iter().take(MAX_LISTED_DECLARED).map(Principal::to_text).collect();
     let declares = if listed.is_empty() {
         "declares no canisters at all".to_string()
     } else {
@@ -686,8 +688,18 @@ mod tests {
     fn every_manifest_refusal_states_the_rule_and_links_the_guide() {
         let refusals = [
             missing_origin_refusal("canister_update_call", &backend(), CallKind::Update),
-            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Update),
-            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Update),
+            unreachable_refusal(
+                "https://app.example.com",
+                OriginSource::AppUrl,
+                "timed out",
+                CallKind::Update,
+            ),
+            no_manifest_refusal(
+                "https://app.example.com",
+                OriginSource::AppUrl,
+                None,
+                CallKind::Update,
+            ),
             not_declared_refusal(
                 &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
                 &backend(),
@@ -720,8 +732,18 @@ mod tests {
     fn refusals_point_at_what_still_works() {
         for msg in [
             missing_origin_refusal("canister_query", &backend(), CallKind::Read),
-            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Read),
-            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Read),
+            unreachable_refusal(
+                "https://app.example.com",
+                OriginSource::AppUrl,
+                "timed out",
+                CallKind::Read,
+            ),
+            no_manifest_refusal(
+                "https://app.example.com",
+                OriginSource::AppUrl,
+                None,
+                CallKind::Read,
+            ),
             not_declared_refusal(
                 &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
                 &backend(),
@@ -751,8 +773,18 @@ mod tests {
         }
         for msg in [
             missing_origin_refusal("canister_update_call", &backend(), CallKind::Update),
-            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Update),
-            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Update),
+            unreachable_refusal(
+                "https://app.example.com",
+                OriginSource::AppUrl,
+                "timed out",
+                CallKind::Update,
+            ),
+            no_manifest_refusal(
+                "https://app.example.com",
+                OriginSource::AppUrl,
+                None,
+                CallKind::Update,
+            ),
             not_declared_refusal(
                 &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
                 &backend(),
@@ -786,8 +818,18 @@ mod tests {
     fn a_refusal_names_the_operation_it_refused() {
         for msg in [
             missing_origin_refusal("canister_query", &backend(), CallKind::Read),
-            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Read),
-            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Read),
+            unreachable_refusal(
+                "https://app.example.com",
+                OriginSource::AppUrl,
+                "timed out",
+                CallKind::Read,
+            ),
+            no_manifest_refusal(
+                "https://app.example.com",
+                OriginSource::AppUrl,
+                None,
+                CallKind::Read,
+            ),
             not_declared_refusal(
                 &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
                 &backend(),
@@ -820,8 +862,18 @@ mod tests {
         }
         for msg in [
             missing_origin_refusal("canister_update_call", &backend(), CallKind::Update),
-            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Update),
-            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Update),
+            unreachable_refusal(
+                "https://app.example.com",
+                OriginSource::AppUrl,
+                "timed out",
+                CallKind::Update,
+            ),
+            no_manifest_refusal(
+                "https://app.example.com",
+                OriginSource::AppUrl,
+                None,
+                CallKind::Update,
+            ),
             not_declared_refusal(
                 &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
                 &backend(),
@@ -858,7 +910,12 @@ mod tests {
     // publishing nothing — that verdict needs an answer from the origin.
     #[test]
     fn unreachable_is_retryable_not_a_verdict() {
-        let msg = unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Update);
+        let msg = unreachable_refusal(
+            "https://app.example.com",
+            OriginSource::AppUrl,
+            "timed out",
+            CallKind::Update,
+        );
         assert!(msg.contains("timed out"), "surfaces the cause: {msg}");
         assert!(msg.contains("retry"), "must invite a retry: {msg}");
         assert!(!msg.contains("publishes no"), "must not conclude absence: {msg}");
@@ -870,12 +927,21 @@ mod tests {
     // case where the SAME app might still pass with the right argument.
     #[test]
     fn no_manifest_refusal_distinguishes_wrong_origin_from_no_adoption() {
-        let from_url = no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Update);
+        let from_url = no_manifest_refusal(
+            "https://app.example.com",
+            OriginSource::AppUrl,
+            None,
+            CallKind::Update,
+        );
         assert!(from_url.contains("`app_url`"), "{from_url}");
         assert!(!from_url.contains("came from `derivation_origin`"), "{from_url}");
 
-        let from_origin =
-            no_manifest_refusal("https://app.example.com", OriginSource::DerivationOrigin, None, CallKind::Update);
+        let from_origin = no_manifest_refusal(
+            "https://app.example.com",
+            OriginSource::DerivationOrigin,
+            None,
+            CallKind::Update,
+        );
         assert!(
             from_origin.contains("came from `derivation_origin`"),
             "must suggest the app_url retry first: {from_origin}"
@@ -935,9 +1001,24 @@ mod tests {
     fn refusals_never_borrow_another_failures_repair() {
         for msg in [
             missing_origin_refusal("canister_update_call", &backend(), CallKind::Update),
-            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Update),
-            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Update),
-            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, Some("text/html"), CallKind::Update),
+            unreachable_refusal(
+                "https://app.example.com",
+                OriginSource::AppUrl,
+                "timed out",
+                CallKind::Update,
+            ),
+            no_manifest_refusal(
+                "https://app.example.com",
+                OriginSource::AppUrl,
+                None,
+                CallKind::Update,
+            ),
+            no_manifest_refusal(
+                "https://app.example.com",
+                OriginSource::AppUrl,
+                Some("text/html"),
+                CallKind::Update,
+            ),
             not_declared_refusal(
                 &manifest("https://app.example.com", ARCHITECTURE_PATH, &[frontend()]),
                 &backend(),
@@ -959,13 +1040,9 @@ mod tests {
             ),
             identity_unresolvable_refusal("https://app.example.com", "timed out", CallKind::Update),
         ] {
-            for wrong in [
-                "reconnect",
-                "Actions & questions",
-                "Questions only",
-                "financial",
-                "oisy.com",
-            ] {
+            for wrong in
+                ["reconnect", "Actions & questions", "Questions only", "financial", "oisy.com"]
+            {
                 assert!(!msg.contains(wrong), "must not say {wrong:?}: {msg}");
             }
         }
@@ -978,14 +1055,23 @@ mod tests {
     // told only "absent" would go looking for a file that is already there.
     #[test]
     fn no_manifest_refusal_names_the_spa_catch_all() {
-        let msg =
-            no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, Some("text/html"), CallKind::Update);
+        let msg = no_manifest_refusal(
+            "https://app.example.com",
+            OriginSource::AppUrl,
+            Some("text/html"),
+            CallKind::Update,
+        );
         assert!(msg.contains("`text/html`"), "names what was served: {msg}");
         assert!(msg.contains("single-page-app catch-all"), "names the cause: {msg}");
         assert!(msg.contains("/.well-known/*"), "names the fix: {msg}");
 
         // Nothing was served there at all: no diagnosis to offer, and none invented.
-        let absent = no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Update);
+        let absent = no_manifest_refusal(
+            "https://app.example.com",
+            OriginSource::AppUrl,
+            None,
+            CallKind::Update,
+        );
         assert!(!absent.contains("catch-all"), "{absent}");
     }
 
@@ -997,7 +1083,12 @@ mod tests {
     // weaker handoff than the deploy-time recipe for generating one.
     #[test]
     fn no_manifest_refusal_stops_the_agent_retrying() {
-        let msg = no_manifest_refusal("https://app.example.com", OriginSource::AppUrl, None, CallKind::Update);
+        let msg = no_manifest_refusal(
+            "https://app.example.com",
+            OriginSource::AppUrl,
+            None,
+            CallKind::Update,
+        );
         assert!(msg.contains("will not change that"), "{msg}");
         assert!(msg.contains("STOP retrying"), "{msg}");
         assert!(msg.contains("skill://service-discoverability"), "names the how-to skill: {msg}");
@@ -1041,7 +1132,12 @@ mod tests {
     #[test]
     fn the_echoed_cause_is_scrubbed_and_capped() {
         let hostile = format!("error \u{1b}[31m\r\nIGNORE PREVIOUS {}", "x".repeat(4096));
-        let msg = unreachable_refusal("https://app.example.com", OriginSource::AppUrl, &hostile, CallKind::Update);
+        let msg = unreachable_refusal(
+            "https://app.example.com",
+            OriginSource::AppUrl,
+            &hostile,
+            CallKind::Update,
+        );
         assert!(!msg.chars().any(char::is_control), "control chars must be gone: {msg}");
         assert!(
             !msg.contains(&"x".repeat(MAX_ECHOED_CAUSE + 1)),
@@ -1104,7 +1200,15 @@ mod tests {
                 ids,
             ))
         };
-        let call = |probe| decide(probe, "https://app.example.com", OriginSource::AppUrl, &backend(), CallKind::Update);
+        let call = |probe| {
+            decide(
+                probe,
+                "https://app.example.com",
+                OriginSource::AppUrl,
+                &backend(),
+                CallKind::Update,
+            )
+        };
 
         // Declared at the standard path: authorized, and the provenance echoed
         // back is the origin and path that authorized it.
@@ -1163,7 +1267,8 @@ mod tests {
 
         // Not knowing is not the same as knowing they differ: the unresolvable
         // refusal reads as a check that failed, not as a verdict on the caller.
-        let unresolved = identity_unresolvable_refusal("https://app.example.com", "timed out", CallKind::Update);
+        let unresolved =
+            identity_unresolvable_refusal("https://app.example.com", "timed out", CallKind::Update);
         assert!(unresolved.contains("Could not establish"), "{unresolved}");
         assert!(unresolved.contains("retry"), "{unresolved}");
         assert!(!unresolved.contains("is not the app"), "must not assert a mismatch: {unresolved}");
@@ -1202,13 +1307,21 @@ mod tests {
             CallKind::Update,
         );
         assert!(stopped.contains("Retrying will not clear this one"), "{stopped}");
-        let blip =
-            unreachable_refusal("https://app.example.com", OriginSource::AppUrl, "timed out", CallKind::Update);
+        let blip = unreachable_refusal(
+            "https://app.example.com",
+            OriginSource::AppUrl,
+            "timed out",
+            CallKind::Update,
+        );
         assert!(blip.contains("likely transient"), "{blip}");
 
         // Same on the identity side, where the previous check only knew about an
         // unauthorized cross-origin claim.
-        let denied = identity_unresolvable_refusal("https://app.example.com", "HTTP 403 Forbidden", CallKind::Update);
+        let denied = identity_unresolvable_refusal(
+            "https://app.example.com",
+            "HTTP 403 Forbidden",
+            CallKind::Update,
+        );
         assert!(denied.contains("Retrying will not clear this one either"), "{denied}");
     }
 
@@ -1325,9 +1438,14 @@ mod tests {
     // IANA-reserved and will never serve one.
     #[tokio::test]
     async fn refuses_an_origin_with_no_manifest() {
-        let err = authorize_call("https://example.com", OriginSource::AppUrl, &backend(), CallKind::Update)
-            .await
-            .expect_err("example.com publishes no manifest");
+        let err = authorize_call(
+            "https://example.com",
+            OriginSource::AppUrl,
+            &backend(),
+            CallKind::Update,
+        )
+        .await
+        .expect_err("example.com publishes no manifest");
         assert!(err.contains("publishes no service-discoverability manifest"), "{err}");
     }
 
@@ -1336,10 +1454,10 @@ mod tests {
     // refusal reads as a check failure rather than as a verdict on an app.
     #[tokio::test]
     async fn refuses_a_non_public_origin_without_fetching() {
-        let err = authorize_call("https://127.0.0.1", OriginSource::AppUrl, &backend(), CallKind::Update)
-            .await
-            .expect_err("loopback must be refused");
+        let err =
+            authorize_call("https://127.0.0.1", OriginSource::AppUrl, &backend(), CallKind::Update)
+                .await
+                .expect_err("loopback must be refused");
         assert!(err.contains("Could not check"), "{err}");
     }
 }
-

@@ -153,10 +153,7 @@ fn default_init_arg() -> String {
 pub async fn cycles_balance(ids: &Identities, session_id: &str) -> Result<CyclesBalance, String> {
     let (agent, principal) = management_agent(ids, session_id).await?;
     let ledger = parse_principal(CYCLES_LEDGER)?;
-    let account = Account {
-        owner: principal,
-        subaccount: None,
-    };
+    let account = Account { owner: principal, subaccount: None };
     let arg = Encode!(&account).map_err(|e| format!("encode account: {e}"))?;
     let reply = agent
         .query(&ledger, "icrc1_balance_of")
@@ -165,10 +162,7 @@ pub async fn cycles_balance(ids: &Identities, session_id: &str) -> Result<Cycles
         .await
         .map_err(|e| format!("icrc1_balance_of failed: {e}"))?;
     let balance = Decode!(&reply, Nat).map_err(|e| format!("decode balance: {e}"))?;
-    Ok(CyclesBalance {
-        principal: principal.to_text(),
-        balance: balance.to_string(),
-    })
+    Ok(CyclesBalance { principal: principal.to_text(), balance: balance.to_string() })
 }
 
 /// Install (or reinstall/upgrade) a Wasm module on a canister you control.
@@ -197,11 +191,7 @@ pub async fn install_code(
         };
         let bytes = Encode!(&install).map_err(|e| format!("encode install_code: {e}"))?;
         mgmt_call(&agent, target, "install_code", bytes).await?;
-        Ok(format!(
-            "Installed {}-byte module on {target} (mode {}).",
-            wasm.len(),
-            args.mode
-        ))
+        Ok(format!("Installed {}-byte module on {target} (mode {}).", wasm.len(), args.mode))
     } else {
         let chunks = wasm.len().div_ceil(CHUNK_SIZE);
         install_chunked(&agent, target, mode, &wasm, init_arg).await?;
@@ -224,10 +214,8 @@ pub async fn canister_status(
     ids.require_write(session_id).await?;
     let target = parse_principal(&args.canister_id)?;
     let (agent, _) = management_agent(ids, session_id).await?;
-    let arg = Encode!(&CanisterIdRecord {
-        canister_id: target
-    })
-    .map_err(|e| format!("encode: {e}"))?;
+    let arg =
+        Encode!(&CanisterIdRecord { canister_id: target }).map_err(|e| format!("encode: {e}"))?;
     // canister_status is an UPDATE call (controller-gated), not a query.
     let bytes = mgmt_call(&agent, target, "canister_status", arg).await?;
     Ok(format_status(target, &bytes))
@@ -243,11 +231,8 @@ pub async fn update_canister_settings(
     let target = parse_principal(&args.canister_id)?;
     let mut settings = CanisterSettings::default();
     if let Some(cs) = &args.controllers {
-        settings.controllers = Some(
-            cs.iter()
-                .map(|c| parse_principal(c))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
+        settings.controllers =
+            Some(cs.iter().map(|c| parse_principal(c)).collect::<Result<Vec<_>, _>>()?);
     }
     settings.compute_allocation = args.compute_allocation.map(Nat::from);
     settings.memory_allocation = args.memory_allocation.map(Nat::from);
@@ -270,29 +255,43 @@ pub async fn update_canister_settings(
 }
 
 /// Start a stopped canister.
-pub async fn start_canister(ids: &Identities, sid: &str, canister_id: &str) -> Result<String, String> {
+pub async fn start_canister(
+    ids: &Identities,
+    sid: &str,
+    canister_id: &str,
+) -> Result<String, String> {
     lifecycle(ids, sid, canister_id, "start_canister").await?;
     Ok(format!("Started {canister_id}."))
 }
 
 /// Stop a running canister (required before deletion).
-pub async fn stop_canister(ids: &Identities, sid: &str, canister_id: &str) -> Result<String, String> {
+pub async fn stop_canister(
+    ids: &Identities,
+    sid: &str,
+    canister_id: &str,
+) -> Result<String, String> {
     lifecycle(ids, sid, canister_id, "stop_canister").await?;
     Ok(format!("Stopped {canister_id}."))
 }
 
 /// Remove a canister's code and state, leaving it empty.
-pub async fn uninstall_code(ids: &Identities, sid: &str, canister_id: &str) -> Result<String, String> {
+pub async fn uninstall_code(
+    ids: &Identities,
+    sid: &str,
+    canister_id: &str,
+) -> Result<String, String> {
     lifecycle(ids, sid, canister_id, "uninstall_code").await?;
     Ok(format!("Uninstalled code from {canister_id}."))
 }
 
 /// Delete a stopped canister permanently (irreversible).
-pub async fn delete_canister(ids: &Identities, sid: &str, canister_id: &str) -> Result<String, String> {
+pub async fn delete_canister(
+    ids: &Identities,
+    sid: &str,
+    canister_id: &str,
+) -> Result<String, String> {
     lifecycle(ids, sid, canister_id, "delete_canister").await?;
-    Ok(format!(
-        "Deleted {canister_id}. (Its remaining cycles are burned; this is irreversible.)"
-    ))
+    Ok(format!("Deleted {canister_id}. (Its remaining cycles are burned; this is irreversible.)"))
 }
 
 // ===========================================================================
@@ -302,11 +301,13 @@ pub async fn delete_canister(ids: &Identities, sid: &str, canister_id: &str) -> 
 /// Build an ic-agent backed by the connection's stable management identity (the
 /// user's default account at this server's own origin), plus that identity's
 /// principal (the default controller/funder).
-async fn management_agent(ids: &Identities, session_id: &str) -> Result<(Agent, Principal), String> {
+async fn management_agent(
+    ids: &Identities,
+    session_id: &str,
+) -> Result<(Agent, Principal), String> {
     let identity = ids.management_identity(session_id).await?;
-    let principal = identity
-        .sender()
-        .map_err(|e| format!("could not derive your principal: {e}"))?;
+    let principal =
+        identity.sender().map_err(|e| format!("could not derive your principal: {e}"))?;
     // A clone of the injected base agent with the management identity swapped
     // in — same boundary-node routing as every other call.
     let agent = ids.agent_as(identity);
@@ -350,10 +351,8 @@ async fn lifecycle(
     ids.require_write(session_id).await?;
     let target = parse_principal(canister_id)?;
     let (agent, _) = management_agent(ids, session_id).await?;
-    let arg = Encode!(&CanisterIdRecord {
-        canister_id: target
-    })
-    .map_err(|e| format!("encode: {e}"))?;
+    let arg =
+        Encode!(&CanisterIdRecord { canister_id: target }).map_err(|e| format!("encode: {e}"))?;
     mgmt_call(&agent, target, method, arg).await?;
     Ok(())
 }
@@ -367,19 +366,14 @@ async fn install_chunked(
     arg: Vec<u8>,
 ) -> Result<(), String> {
     // Start from a clean store so a previous partial upload can't leak in.
-    let clear = Encode!(&CanisterIdRecord {
-        canister_id: target
-    })
-    .map_err(|e| format!("encode clear_chunk_store: {e}"))?;
+    let clear = Encode!(&CanisterIdRecord { canister_id: target })
+        .map_err(|e| format!("encode clear_chunk_store: {e}"))?;
     mgmt_call(agent, target, "clear_chunk_store", clear).await?;
 
     let mut hashes: Vec<ChunkHash> = Vec::new();
     for chunk in wasm.chunks(CHUNK_SIZE) {
-        let up = Encode!(&UploadChunkArg {
-            canister_id: target,
-            chunk: chunk.to_vec(),
-        })
-        .map_err(|e| format!("encode upload_chunk: {e}"))?;
+        let up = Encode!(&UploadChunkArg { canister_id: target, chunk: chunk.to_vec() })
+            .map_err(|e| format!("encode upload_chunk: {e}"))?;
         let reply = mgmt_call(agent, target, "upload_chunk", up).await?;
         let h = Decode!(&reply, ChunkHash).map_err(|e| format!("decode chunk hash: {e}"))?;
         hashes.push(h);
@@ -416,9 +410,7 @@ fn parse_mode(s: &str) -> Result<CanisterInstallMode, String> {
         "install" => Ok(CanisterInstallMode::Install),
         "reinstall" => Ok(CanisterInstallMode::Reinstall),
         "upgrade" => Ok(CanisterInstallMode::Upgrade(None)),
-        other => Err(format!(
-            "invalid install mode `{other}` (use install|reinstall|upgrade)"
-        )),
+        other => Err(format!("invalid install mode `{other}` (use install|reinstall|upgrade)")),
     }
 }
 
@@ -426,9 +418,7 @@ fn parse_log_visibility(s: &str) -> Result<LogVisibility, String> {
     match s.trim().to_lowercase().as_str() {
         "controllers" => Ok(LogVisibility::Controllers),
         "public" => Ok(LogVisibility::Public),
-        other => Err(format!(
-            "invalid log_visibility `{other}` (use controllers|public)"
-        )),
+        other => Err(format!("invalid log_visibility `{other}` (use controllers|public)")),
     }
 }
 
@@ -754,10 +744,7 @@ mod tests {
             reserved_cycles = 0 : nat; \
             query_stats = record { num_calls_total = 7 : nat } \
         })";
-        let bytes = candid_parser::parse_idl_args(textual)
-            .unwrap()
-            .to_bytes()
-            .unwrap();
+        let bytes = candid_parser::parse_idl_args(textual).unwrap().to_bytes().unwrap();
         let decoded = Decode!(&bytes, CanisterStatusResult).expect("subset decode");
         assert!(matches!(decoded.status, CanisterRunStatus::Running));
         assert_eq!(decoded.cycles, Nat::from(9_000_000_000_000u128));

@@ -236,10 +236,7 @@ async fn register_anchor(pic: &pocket_ic::nonblocking::PocketIc, ii: Principal) 
         .await
         .expect("create_challenge");
     let challenge = Decode!(&bytes, Challenge).unwrap();
-    let attempt = ChallengeResult {
-        key: challenge.challenge_key,
-        chars: "a".to_string(),
-    };
+    let attempt = ChallengeResult { key: challenge.challenge_key, chars: "a".to_string() };
     let bytes = pic
         .update_call(
             ii,
@@ -266,10 +263,7 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 /// Pull `key=value` out of a `&`-separated fragment/query (values are base64url
 /// or plain text here — none contain `&`).
 fn field<'a>(blob: &'a str, key: &str) -> Option<&'a str> {
-    blob.split('&')
-        .filter_map(|kv| kv.split_once('='))
-        .find(|(k, _)| *k == key)
-        .map(|(_, v)| v)
+    blob.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == key).map(|(_, v)| v)
 }
 
 /// Removes this test's throwaway operational directory on drop — even on a
@@ -289,8 +283,7 @@ impl Drop for StateDirGuard {
 #[tokio::test]
 async fn registration_delegation_end_to_end() {
     // Runtime guard: skip cleanly unless the un-fetchable artifacts are provided.
-    let (Ok(ii_wasm_path), Ok(_)) =
-        (std::env::var("II_WASM"), std::env::var("POCKET_IC_BIN"))
+    let (Ok(ii_wasm_path), Ok(_)) = (std::env::var("II_WASM"), std::env::var("POCKET_IC_BIN"))
     else {
         eprintln!(
             "skipping registration_delegation_end_to_end: set II_WASM (internet_identity \
@@ -304,14 +297,9 @@ async fn registration_delegation_end_to_end() {
     // runs never collide on a fixed name), removed on drop — even on a panic — by
     // the guard. The directory is injected via `McpConfig::state_dir`; no
     // process-global env is involved.
-    let nanos = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let state_dir = std::env::temp_dir().join(format!(
-        "imcp2-e2e-state-{}-{nanos}",
-        std::process::id()
-    ));
+    let nanos = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let state_dir =
+        std::env::temp_dir().join(format!("imcp2-e2e-state-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&state_dir).expect("create e2e state dir");
     let _state_guard = StateDirGuard { dir: state_dir.clone() };
 
@@ -334,26 +322,18 @@ async fn registration_delegation_end_to_end() {
             captcha_trigger: CaptchaTrigger::Static(StaticCaptchaTrigger::CaptchaDisabled),
         }),
     };
-    pic.install_canister(ii, ii_wasm, Encode!(&Some(init)).unwrap(), None)
-        .await;
+    pic.install_canister(ii, ii_wasm, Encode!(&Some(init)).unwrap(), None).await;
 
     // Expose the gateway and point the server's OWN injected agent at it.
     let gateway = pic.make_live(None).await;
-    let agent = crate::Agent::builder()
-        .with_url(gateway.as_str())
-        .build()
-        .expect("build agent");
+    let agent = crate::Agent::builder().with_url(gateway.as_str()).build().expect("build agent");
     agent.fetch_root_key().await.expect("fetch PocketIC root key");
 
     // --- The real MCP server, injected with the PocketIC-backed agent ---
     let public_url = "http://localhost:8000"; // http ⇒ the sid cookie is not `Secure`
     let server = crate::McpServer::new(crate::McpConfig {
         agent,
-        instance: crate::IiInstance {
-            name: "e2e",
-            ii_url: gateway.to_string(),
-            ii_canister: ii,
-        },
+        instance: crate::IiInstance { name: "e2e", ii_url: gateway.to_string(), ii_canister: ii },
         public_url: public_url.into(),
         mcp_path: "/mcp".into(),
         clients: crate::SharedClients::load(&state_dir),
@@ -403,11 +383,9 @@ async fn registration_delegation_end_to_end() {
     let state = field(fragment, "state").expect("state").to_string();
     let reg_key_b64 = field(fragment, "registration_key").expect("registration_key");
     // pub(X) as II expects it (DER). base64url no-pad, per registration_pubkey_b64.
-    let reg_key_x = base64::Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        reg_key_b64,
-    )
-    .expect("decode registration_key");
+    let reg_key_x =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, reg_key_b64)
+            .expect("decode registration_key");
     // The initiator cookie `mcp_connect=<value>` (not Secure over http).
     let cookie_val = set_cookie
         .split(';')
@@ -424,14 +402,8 @@ async fn registration_delegation_end_to_end() {
             ii,
             principal_1(),
             "mcp_set_config",
-            Encode!(
-                &anchor,
-                &McpConfig {
-                    enabled: true,
-                    url: Some(format!("{public_url}/mcp")),
-                }
-            )
-            .unwrap(),
+            Encode!(&anchor, &McpConfig { enabled: true, url: Some(format!("{public_url}/mcp")) })
+                .unwrap(),
         )
         .await
         .expect("mcp_set_config call");
@@ -445,13 +417,7 @@ async fn registration_delegation_end_to_end() {
             ii,
             principal_1(),
             "prepare_mcp_registration_delegation",
-            Encode!(
-                &anchor,
-                &reg_key_x,
-                &Some(Permissions::All),
-                &Some(GRANT_TTL_NS)
-            )
-            .unwrap(),
+            Encode!(&anchor, &reg_key_x, &Some(Permissions::All), &Some(GRANT_TTL_NS)).unwrap(),
         )
         .await
         .expect("prepare call");
@@ -469,9 +435,7 @@ async fn registration_delegation_end_to_end() {
         )
         .await
         .expect("get call");
-    let signed = Decode!(&get_bytes, Result<SignedDelegation, String>)
-        .unwrap()
-        .expect("get Ok");
+    let signed = Decode!(&get_bytes, Result<SignedDelegation, String>).unwrap().expect("get Ok");
     assert_eq!(signed.delegation.pubkey, reg_key_x, "delegation targets our X");
 
     // Serialize into the agent-js DelegationChain JSON the server parses: hex
@@ -530,7 +494,10 @@ async fn registration_delegation_end_to_end() {
     assert_eq!(tok["token_type"], "Bearer");
     // TTL tracks the II grant (never outlives it): positive, ~24h.
     let expires_in = tok["expires_in"].as_u64().expect("expires_in");
-    assert!(expires_in > 0 && expires_in <= GRANT_TTL_NS / 1_000_000_000, "TTL tracks grant: {expires_in}");
+    assert!(
+        expires_in > 0 && expires_in <= GRANT_TTL_NS / 1_000_000_000,
+        "TTL tracks grant: {expires_in}"
+    );
 
     // --- 6. The minted token authenticates and resolves to this connect ---
     let (principal, session_id) = server

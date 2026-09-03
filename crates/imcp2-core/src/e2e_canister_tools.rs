@@ -214,10 +214,7 @@ fn canister_wasm(did: Option<&str>, methods: &[Method]) -> Vec<u8> {
         };
         funcs.push_str(&format!("  (func $m{i} (local $n i32) (local $i i32)\n    {body})\n"));
         let mode = if m.query { "query" } else { "update" };
-        exports.push_str(&format!(
-            "  (export \"canister_{mode} {}\" (func $m{i}))\n",
-            m.name
-        ));
+        exports.push_str(&format!("  (export \"canister_{mode} {}\" (func $m{i}))\n", m.name));
     }
 
     let segments: String = data
@@ -362,9 +359,8 @@ const OQL_ROWS: &str = "(variant { ok = record { \
 /// other side matches on — the wire hashes them, and a reply encoded without
 /// its types would be unrecognizable as an OQL table.
 fn encode_typed_reply(did: &str, method: &str, textual: &str) -> Vec<u8> {
-    let (env, actor) = candid_parser::utils::CandidSource::Text(did)
-        .load()
-        .expect("parse the test interface");
+    let (env, actor) =
+        candid_parser::utils::CandidSource::Text(did).load().expect("parse the test interface");
     let actor = actor.expect("a service");
     let func = env.get_method(&actor, method).expect("the method is declared");
     candid_parser::parse_idl_args(textual)
@@ -433,10 +429,8 @@ impl Harness {
             );
             return None;
         }
-        let mut pic = pocket_ic::PocketIcBuilder::new()
-            .with_application_subnet()
-            .build_async()
-            .await;
+        let mut pic =
+            pocket_ic::PocketIcBuilder::new().with_application_subnet().build_async().await;
         // A fresh instance boots at a mock clock years in the past, which would
         // put every ingress expiry and every delegation this test signs out of
         // range. Align it with the wall clock the server signs against.
@@ -497,10 +491,7 @@ impl Harness {
 
         // The server's own agent, pointed at this replica's gateway.
         let gateway = pic.make_live(None).await;
-        let agent = Agent::builder()
-            .with_url(gateway.as_str())
-            .build()
-            .expect("build the agent");
+        let agent = Agent::builder().with_url(gateway.as_str()).build().expect("build the agent");
         agent.fetch_root_key().await.expect("fetch the replica's root key");
 
         let identities = Identities::new(
@@ -579,11 +570,7 @@ async fn install(pic: &pocket_ic::nonblocking::PocketIc, wasm: Vec<u8>) -> Princ
 
 /// The text content blocks of a result, in order.
 fn blocks(result: &CallToolResult) -> Vec<String> {
-    result
-        .content
-        .iter()
-        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-        .collect()
+    result.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect()
 }
 
 /// Every text block joined — for asserting that a reply says something
@@ -720,7 +707,10 @@ async fn reads_reach_a_declared_canister_end_to_end() {
 
     // --- get_canister_api_doc: the prose the canister publishes ---
     let result = h
-        .call("get_canister_api_doc", serde_json::json!({ "canister_id": app, "app_url": h.origin }))
+        .call(
+            "get_canister_api_doc",
+            serde_json::json!({ "canister_id": app, "app_url": h.origin }),
+        )
         .await;
     assert_eq!(ok_text(&result), API_DOC, "the doc comes back verbatim");
     let structured = ok_structured(&result);
@@ -731,7 +721,10 @@ async fn reads_reach_a_declared_canister_end_to_end() {
     // A declared canister that publishes no API-doc method reports an EXPECTED
     // absence — nothing to retry.
     let result = h
-        .call("get_canister_api_doc", serde_json::json!({ "canister_id": oql, "app_url": h.origin }))
+        .call(
+            "get_canister_api_doc",
+            serde_json::json!({ "canister_id": oql, "app_url": h.origin }),
+        )
         .await;
     let structured = ok_structured(&result);
     assert_eq!(structured["available"], serde_json::json!(false));
@@ -800,10 +793,7 @@ async fn reads_reach_a_declared_canister_end_to_end() {
         SCHEMA_APP,
         webfixture::Site::declaring(&[h.oql]).deriving_at(SCHEMA_IDENTITY),
     );
-    webfixture::serve(
-        SCHEMA_IDENTITY,
-        webfixture::Site::default().authorizing(&[SCHEMA_APP]),
-    );
+    webfixture::serve(SCHEMA_IDENTITY, webfixture::Site::default().authorizing(&[SCHEMA_APP]));
     h.identities
         .seed_app_identity(SESSION, SCHEMA_IDENTITY)
         .await
@@ -824,10 +814,8 @@ async fn reads_reach_a_declared_canister_end_to_end() {
     assert_eq!(structured["is_anonymous"], serde_json::json!(false), "read as the app identity");
     assert_eq!(structured["derived_for_origin"], serde_json::json!(SCHEMA_IDENTITY));
     assert_eq!(structured["declared_by"], serde_json::json!(SCHEMA_APP));
-    let examples = structured["example_queries"]
-        .as_array()
-        .expect("a ready-to-run query per entity")
-        .clone();
+    let examples =
+        structured["example_queries"].as_array().expect("a ready-to-run query per entity").clone();
     assert_eq!(examples.len(), 1, "one entity, one example: {examples:?}");
     let example = examples[0].as_str().unwrap_or_default();
     // Each example is a complete, copy-able call. Parse it and check both
@@ -835,18 +823,13 @@ async fn reads_reach_a_declared_canister_end_to_end() {
     // as `app_url` — copying one that named the identity origin there would be
     // refused by the very gate this schema read just passed — and the identity
     // it was read as.
-    let args: serde_json::Value = serde_json::from_str(
-        example.strip_prefix("canister_query ").unwrap_or_else(|| {
+    let args: serde_json::Value =
+        serde_json::from_str(example.strip_prefix("canister_query ").unwrap_or_else(|| {
             panic!("an example must be a ready-to-run canister_query call: {example}")
-        }),
-    )
-    .expect("the example's arguments are JSON");
+        }))
+        .expect("the example's arguments are JSON");
     assert_eq!(args["app_url"], serde_json::json!(SCHEMA_APP), "example: {example}");
-    assert_eq!(
-        args["derivation_origin"],
-        serde_json::json!(SCHEMA_IDENTITY),
-        "example: {example}"
-    );
+    assert_eq!(args["derivation_origin"], serde_json::json!(SCHEMA_IDENTITY), "example: {example}");
     assert_eq!(args["canister_id"], serde_json::json!(oql), "example: {example}");
     assert!(
         args["oql"].as_str().is_some_and(|q| q.contains("booking")),
@@ -967,7 +950,8 @@ async fn an_update_call_writes_state_a_query_reads_back() {
     // The write's provenance is a text block too, so a client that reads no
     // structured content still shows the user which app authorized it.
     assert!(
-        all_text(&result).contains(&format!("[declared by {} in /.well-known/ic-architecture]", h.origin)),
+        all_text(&result)
+            .contains(&format!("[declared by {} in /.well-known/ic-architecture]", h.origin)),
         "the reply carries the provenance block: {}",
         all_text(&result)
     );
@@ -1021,10 +1005,7 @@ async fn an_update_call_writes_state_a_query_reads_back() {
         "derivation_origin": h.origin,
     });
     let msg = refusal(&h.call("canister_update_call", transfer).await);
-    assert!(
-        msg.contains("icrc1_transfer"),
-        "the refusal names the method it refused: {msg}"
-    );
+    assert!(msg.contains("icrc1_transfer"), "the refusal names the method it refused: {msg}");
     // Wording only this gate produces: a replica rejection could never say it.
     assert!(
         msg.contains("not supported by this server, to protect the user"),
@@ -1212,7 +1193,10 @@ async fn the_gate_holds_for_every_canister_reaching_tool() {
     // one app's manifest must not authorize a canister for a principal the
     // user holds somewhere else.
     const OTHER_APP: &str = "https://other.e2e.test";
-    webfixture::serve(OTHER_APP, webfixture::Site::declaring(&[h.app, h.oql]).deriving_at(OTHER_APP));
+    webfixture::serve(
+        OTHER_APP,
+        webfixture::Site::declaring(&[h.app, h.oql]).deriving_at(OTHER_APP),
+    );
     // On the write path and on the reads that sign as someone — the binding
     // runs wherever a call carries both an app and an identity, so a refusal
     // that only held for writes would leave the reads open.
@@ -1268,10 +1252,7 @@ async fn the_gate_holds_for_every_canister_reaching_tool() {
         PINNING_APP,
         webfixture::Site::declaring(&[h.app]).deriving_at(PINNED_IDENTITY),
     );
-    webfixture::serve(
-        PINNED_IDENTITY,
-        webfixture::Site::default().authorizing(&[PINNING_APP]),
-    );
+    webfixture::serve(PINNED_IDENTITY, webfixture::Site::default().authorizing(&[PINNING_APP]));
     h.identities
         .seed_app_identity(SESSION, PINNED_IDENTITY)
         .await
@@ -1478,7 +1459,8 @@ async fn a_read_that_cannot_run_says_what_to_fix() {
         serde_json::json!({ "canister_id": oql, "app_url": h.origin }),
         serde_json::json!({ "canister_id": oql, "app_url": h.origin, "oql": OQL_QUERY }),
     ] {
-        let tool = if args.get("oql").is_some() { "canister_query" } else { "get_canister_oql_schema" };
+        let tool =
+            if args.get("oql").is_some() { "canister_query" } else { "get_canister_oql_schema" };
         let msg = refusal(&h.call(tool, args).await);
         assert!(
             msg.contains("derivation_origin") && msg.contains("open_app"),

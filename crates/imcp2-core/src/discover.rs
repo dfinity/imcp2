@@ -130,15 +130,11 @@ pub fn is_declared(c: &DiscoveredCanister) -> bool {
 pub fn is_app_data_candidate(c: &DiscoveredCanister) -> bool {
     // Declared or mined as the app's own backend (not merely the gateway header).
     let app_owned = c.sources.iter().any(|s| {
-        s == "ic-architecture"
-            || s == "ic-app.json"
-            || s == "env.json"
-            || s.starts_with("bundle")
+        s == "ic-architecture" || s == "ic-app.json" || s == "env.json" || s.starts_with("bundle")
     });
     // The frontend / asset canister: an explicit "frontend" label, or found ONLY
     // via the gateway `x-ic-canister-id` header.
-    let is_frontend =
-        c.label.as_deref() == Some("frontend") || c.sources == ["header"];
+    let is_frontend = c.label.as_deref() == Some("frontend") || c.sources == ["header"];
     // A dashboard-classified shared system canister (ledger, governance, …).
     let is_system = c.kind.as_deref().is_some_and(|k| {
         let k = k.to_ascii_lowercase();
@@ -278,12 +274,8 @@ fn canisters_from_app_manifest(text: &str) -> Vec<(String, Option<String>)> {
             // short handle ("backend"). Prefer the former, fall back to the
             // latter, so a spec manifest that labels only with `name` still
             // yields a label instead of a bare principal.
-            let role = e
-                .role
-                .as_deref()
-                .or(e.name.as_deref())
-                .map(clean_label)
-                .filter(|s| !s.is_empty());
+            let role =
+                e.role.as_deref().or(e.name.as_deref()).map(clean_label).filter(|s| !s.is_empty());
             let desc = e.description.as_deref().map(clean_label).filter(|s| !s.is_empty());
             let label = match (role, desc) {
                 (Some(r), Some(d)) => Some(format!("{r} — {d}")),
@@ -563,10 +555,7 @@ const KNOWN_DERIVATION_ORIGINS: &[(&str, &str)] = &[
 /// The built-in derivation origin for a well-known app host, if any (see
 /// [`KNOWN_DERIVATION_ORIGINS`]). `host` must be the lowercased host (no port).
 fn known_derivation_origin(host: &str) -> Option<&'static str> {
-    KNOWN_DERIVATION_ORIGINS
-        .iter()
-        .find(|(h, _)| *h == host)
-        .map(|(_, origin)| *origin)
+    KNOWN_DERIVATION_ORIGINS.iter().find(|(h, _)| *h == host).map(|(_, origin)| *origin)
 }
 
 /// The built-in derivation origin for a well-known app URL, if any — the
@@ -627,7 +616,11 @@ struct KnownApp {
 // to its canisters is refused by that guard regardless of how the URL was
 // reached.
 const KNOWN_APPS: &[KnownApp] = &[
-    KnownApp { name: "NNS", aliases: &["nns", "nnsdapp"], app_url: "https://nns.internetcomputer.org" },
+    KnownApp {
+        name: "NNS",
+        aliases: &["nns", "nnsdapp"],
+        app_url: "https://nns.internetcomputer.org",
+    },
     KnownApp { name: "Oisy", aliases: &["oisy", "oisywallet"], app_url: "https://oisy.com" },
     KnownApp { name: "MULTI/DEX", aliases: &["multidex"], app_url: "https://multidex.ai" },
     KnownApp { name: "ICPSwap", aliases: &["icpswap"], app_url: "https://app.icpswap.com" },
@@ -679,12 +672,8 @@ fn find_known_app(query: &str) -> Option<&'static KnownApp> {
     // "oisy" in "noisy"). Bounded: a window is abandoned once it grows past the
     // longest alias (it — and every longer window — can't match), and it's checked
     // in place rather than materializing every window.
-    let max_alias = KNOWN_APPS
-        .iter()
-        .flat_map(|app| app.aliases.iter())
-        .map(|a| a.len())
-        .max()
-        .unwrap_or(0);
+    let max_alias =
+        KNOWN_APPS.iter().flat_map(|app| app.aliases.iter()).map(|a| a.len()).max().unwrap_or(0);
     for start in 0..tokens.len() {
         let mut acc = String::new();
         for t in &tokens[start..] {
@@ -1092,20 +1081,23 @@ async fn resolve_declared_origin(
         Vec::new()
     };
 
-    let (derivation_origin, source) =
-        match decide_declared_origin(application_origin, declared.as_deref(), &alts) {
-            Ok(decision) => decision,
-            Err(e) => {
-                // Cross-origin claim we can't authorize (spoof, misconfig, or an
-                // unreachable list): refuse rather than derive a wrong identity.
-                tracing::warn!(
-                    application_origin = %application_origin,
-                    declared = declared.as_deref().unwrap_or_default(),
-                    "refusing a cross-origin derivation_origin declaration that could not be authorized"
-                );
-                return Err(e);
-            }
-        };
+    let (derivation_origin, source) = match decide_declared_origin(
+        application_origin,
+        declared.as_deref(),
+        &alts,
+    ) {
+        Ok(decision) => decision,
+        Err(e) => {
+            // Cross-origin claim we can't authorize (spoof, misconfig, or an
+            // unreachable list): refuse rather than derive a wrong identity.
+            tracing::warn!(
+                application_origin = %application_origin,
+                declared = declared.as_deref().unwrap_or_default(),
+                "refusing a cross-origin derivation_origin declaration that could not be authorized"
+            );
+            return Err(e);
+        }
+    };
 
     Ok(DeclaredResolution {
         derivation_origin,
@@ -1125,7 +1117,10 @@ async fn resolve_declared_origin(
 /// [`derivation_origin_authorized`]), so it is fetched regardless of this flag
 /// whenever a declaration names a different origin — the flag only governs whether
 /// it is additionally returned for display.
-pub async fn resolve_app_identity(app_url: &str, want_alt_origins: bool) -> Result<AppIdentity, String> {
+pub async fn resolve_app_identity(
+    app_url: &str,
+    want_alt_origins: bool,
+) -> Result<AppIdentity, String> {
     // The end-to-end tests' stand-in for an app's web server (see
     // [`webfixture`]); compiled only into this crate's own test binary under
     // the `e2e` feature, and a no-op for any origin no fixture registered.
@@ -1355,7 +1350,7 @@ fn ipv4_is_global(ip: &Ipv4Addr) -> bool {
         || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT (shared)
         || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IETF protocol
         || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18.0.0/15 benchmarking
-        || o[0] >= 240)                         // 240.0.0.0/4 reserved
+        || o[0] >= 240) // 240.0.0.0/4 reserved
 }
 
 fn ipv6_is_global(ip: &Ipv6Addr) -> bool {
@@ -1441,11 +1436,7 @@ fn redirect_hop_ok(next: &url::Url, prev_host: Option<&str>) -> bool {
 /// no request is ever issued to an internal host.
 fn ssrf_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
-        let prev_host = attempt
-            .previous()
-            .last()
-            .and_then(|u| u.host_str())
-            .map(str::to_string);
+        let prev_host = attempt.previous().last().and_then(|u| u.host_str()).map(str::to_string);
         if attempt.previous().len() >= 10 {
             attempt.error("too many redirects")
         } else if redirect_hop_ok(attempt.url(), prev_host.as_deref()) {
@@ -1563,9 +1554,7 @@ async fn read_capped_inner(
                 }
             }
             Ok(None) => break,
-            Err(e) => {
-                return Err((String::from_utf8_lossy(&buf).into_owned(), e.to_string()))
-            }
+            Err(e) => return Err((String::from_utf8_lossy(&buf).into_owned(), e.to_string())),
         }
     }
     Ok(String::from_utf8_lossy(&buf).into_owned())
@@ -1598,11 +1587,7 @@ async fn get_document(
     let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
     let status = resp.status();
     if !status.is_success() {
-        return if means_not_published(status) {
-            Ok(None)
-        } else {
-            Err(format!("HTTP {status}"))
-        };
+        return if means_not_published(status) { Ok(None) } else { Err(format!("HTTP {status}")) };
     }
     // Captured BEFORE the body is consumed: which origin actually answered (a
     // redirect may have moved it) and what it claimed to be.
@@ -2090,8 +2075,8 @@ impl Findings {
     /// non-principal, or a real id sitting past the cap behind blank entries.
     fn mark_declared(&mut self, authorized: &[Principal]) {
         for entry in self.map.values_mut() {
-            entry.declared = Principal::from_text(&entry.canister_id)
-                .is_ok_and(|p| authorized.contains(&p));
+            entry.declared =
+                Principal::from_text(&entry.canister_id).is_ok_and(|p| authorized.contains(&p));
         }
     }
 }
@@ -2131,18 +2116,13 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
     // discovery. Their findings are recorded in authority order afterwards, so
     // `add`'s first-label-wins rule still resolves ties deterministically rather
     // than by whichever response happened to land first.
-    let (architecture_url, legacy_url) = (
-        format!("{origin}{ARCHITECTURE_PATH}"),
-        format!("{origin}{LEGACY_MANIFEST_PATH}"),
-    );
+    let (architecture_url, legacy_url) =
+        (format!("{origin}{ARCHITECTURE_PATH}"), format!("{origin}{LEGACY_MANIFEST_PATH}"));
     let (architecture, legacy_manifest) = tokio::join!(
         fetch_success_body(&client, &architecture_url, MAX_META_BYTES),
         fetch_success_body(&client, &legacy_url, MAX_META_BYTES),
     );
-    for (source, body) in [
-        ("ic-architecture", &architecture),
-        ("ic-app.json", &legacy_manifest),
-    ] {
+    for (source, body) in [("ic-architecture", &architecture), ("ic-app.json", &legacy_manifest)] {
         let Some(text) = body.as_deref() else { continue };
         for (id, label) in canisters_from_app_manifest(text) {
             found.add(&id, label, source.into());
@@ -2161,16 +2141,9 @@ pub async fn discover(domain: &str) -> Result<Discovery, String> {
     // 2. Frontend via the gateway header (and keep the HTML for bundle mining).
     // This is also the reachability gate: the probes above are best-effort, but
     // an unreachable base is a hard error.
-    let resp = client
-        .get(&base)
-        .send()
-        .await
-        .map_err(|e| format!("could not reach {base}: {e}"))?;
-    if let Some(id) = resp
-        .headers()
-        .get("x-ic-canister-id")
-        .and_then(|v| v.to_str().ok())
-    {
+    let resp =
+        client.get(&base).send().await.map_err(|e| format!("could not reach {base}: {e}"))?;
+    if let Some(id) = resp.headers().get("x-ic-canister-id").and_then(|v| v.to_str().ok()) {
         found.add(id, Some("frontend".into()), "header".into());
     }
     let html = read_capped(resp, MAX_BODY_BYTES).await;
@@ -2496,29 +2469,17 @@ pub async fn lookup_canister(client: &reqwest::Client, id: &str) -> Result<Canis
         return Err(format!("invalid canister id: {id}"));
     }
     let url = format!("{}/api/v3/canisters/{id}", dashboard_api());
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("dashboard request failed: {e}"))?;
+    let resp =
+        client.get(&url).send().await.map_err(|e| format!("dashboard request failed: {e}"))?;
     // "No dashboard record" (404) is expected for many principals — return a
     // bare, unlabelled identity rather than an error so the tool still responds.
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(CanisterInfo {
-            canister_id: id.to_string(),
-            ..Default::default()
-        });
+        return Ok(CanisterInfo { canister_id: id.to_string(), ..Default::default() });
     }
     if !resp.status().is_success() {
-        return Err(format!(
-            "dashboard returned HTTP {} for {id}",
-            resp.status().as_u16()
-        ));
+        return Err(format!("dashboard returned HTTP {} for {id}", resp.status().as_u16()));
     }
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("could not read dashboard response: {e}"))?;
+    let body = resp.text().await.map_err(|e| format!("could not read dashboard response: {e}"))?;
     let raw: RawCanister = serde_json::from_str(&body)
         .map_err(|e| format!("could not parse dashboard response: {e}"))?;
     Ok(raw.into())
@@ -2580,10 +2541,7 @@ pub struct FindCanisterOutput {
 impl From<(String, Vec<Match>)> for FindCanisterOutput {
     /// `(query, matches)` → the structured `icp_find_canister_by_name` reply.
     fn from((query, matches): (String, Vec<Match>)) -> Self {
-        Self {
-            query,
-            matches: matches.iter().map(FoundCanister::from).collect(),
-        }
+        Self { query, matches: matches.iter().map(FoundCanister::from).collect() }
     }
 }
 
@@ -2751,31 +2709,18 @@ pub async fn search_by_name(query: &str) -> Result<Vec<Match>, String> {
     // independent registries concurrently to keep this interactive tool snappy.
     let ledgers_url = format!("{}/api/v1/ledgers?limit=100", icrc_api());
     let snses_url = format!("{}/api/v1/snses?limit=100&offset=0", sns_api());
-    let (ledgers, snses) = tokio::join!(
-        fetch_text(&client, &ledgers_url),
-        fetch_text(&client, &snses_url),
-    );
+    let (ledgers, snses) =
+        tokio::join!(fetch_text(&client, &ledgers_url), fetch_text(&client, &snses_url),);
 
     // Best-effort: tolerate one registry being down, but not both.
     if ledgers.is_err() && snses.is_err() {
-        return Err(ledgers
-            .err()
-            .or(snses.err())
-            .unwrap_or_else(|| "search failed".into()));
+        return Err(ledgers.err().or(snses.err()).unwrap_or_else(|| "search failed".into()));
     }
-    Ok(search_in(
-        ledgers.as_deref().unwrap_or("{}"),
-        snses.as_deref().unwrap_or("{}"),
-        query,
-    ))
+    Ok(search_in(ledgers.as_deref().unwrap_or("{}"), snses.as_deref().unwrap_or("{}"), query))
 }
 
 async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String, String> {
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("request to {url} failed: {e}"))?;
+    let resp = client.get(url).send().await.map_err(|e| format!("request to {url} failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("{url} returned HTTP {}", resp.status().as_u16()));
     }
@@ -2853,17 +2798,36 @@ mod tests {
         // Loopback / private / link-local / CGNAT / reserved / doc / bench, plus
         // IPv4 embedded in IPv6 as MAPPED (::ffff:…) and COMPATIBLE (::…) forms.
         for bad in [
-            "127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.1.1", "169.254.169.254",
-            "100.64.0.1", "0.0.0.0", "255.255.255.255", "192.0.2.1", "198.18.0.1", "240.0.0.1",
-            "::1", "::", "fc00::1", "fd12::1", "fe80::1", "2001:db8::1",
-            "::ffff:127.0.0.1", "::ffff:10.0.0.1", // IPv4-mapped private/loopback
-            "::127.0.0.1", "::192.168.1.1",        // IPv4-compatible private/loopback
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "192.0.2.1",
+            "198.18.0.1",
+            "240.0.0.1",
+            "::1",
+            "::",
+            "fc00::1",
+            "fd12::1",
+            "fe80::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1", // IPv4-mapped private/loopback
+            "::127.0.0.1",
+            "::192.168.1.1", // IPv4-compatible private/loopback
             // Transition-mechanism prefixes: a NAT64/6to4/Teredo host translates
             // these to internal/metadata IPv4 (ICPBB-377), so they must not pass.
-            "64:ff9b::a9fe:a9fe", "64:ff9b::7f00:1", "64:ff9b::a00:1", // NAT64 WKP → metadata/loopback/RFC1918
-            "64:ff9b:1::a9fe:a9fe",                                   // NAT64 RFC 8215 local-use
-            "2002:a9fe:a9fe::", "2002:7f00:1::",                      // 6to4 → metadata/loopback
-            "2001:0:0:0:0:0:a9fe:a9fe",                               // Teredo
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a00:1",       // NAT64 WKP → metadata/loopback/RFC1918
+            "64:ff9b:1::a9fe:a9fe", // NAT64 RFC 8215 local-use
+            "2002:a9fe:a9fe::",
+            "2002:7f00:1::",            // 6to4 → metadata/loopback
+            "2001:0:0:0:0:0:a9fe:a9fe", // Teredo
         ] {
             assert!(!g(bad), "{bad} must be classified non-global");
         }
@@ -2882,7 +2846,7 @@ mod tests {
             "https://10.0.0.1/",                        // private
             "https://169.254.169.254/",                 // link-local metadata
             "https://[::1]/",                           // loopback v6
-            "ftp://example.com/",                        // non-https scheme
+            "ftp://example.com/",                       // non-https scheme
         ] {
             assert!(resolve_public_url(bad).await.is_err(), "{bad} must be refused");
         }
@@ -3058,9 +3022,7 @@ mod tests {
         );
 
         let client = http_client().expect("client");
-        let info = lookup_canister(&client, "xevnm-gaaaa-aaaar-qafnq-cai")
-            .await
-            .expect("lookup");
+        let info = lookup_canister(&client, "xevnm-gaaaa-aaaar-qafnq-cai").await.expect("lookup");
         assert_eq!(info.canister_type.as_deref(), Some("ledger"));
         assert!(info.name.as_deref().unwrap_or_default().contains("ckUSDC"));
     }
@@ -3072,10 +3034,7 @@ mod tests {
         assert_eq!(resolve_base(None, default), default);
         assert_eq!(resolve_base(Some("".into()), default), default);
         assert_eq!(resolve_base(Some("   ".into()), default), default);
-        assert_eq!(
-            resolve_base(Some("https://x.example/".into()), default),
-            "https://x.example"
-        );
+        assert_eq!(resolve_base(Some("https://x.example/".into()), default), "https://x.example");
     }
 
     // A blank query short-circuits before any network call.
@@ -3219,7 +3178,10 @@ mod tests {
         }"#;
         let got = canisters_from_app_manifest(manifest);
         assert_eq!(got.len(), 4, "blank/missing ids are skipped: {got:?}");
-        assert_eq!(got[0], ("dmp3l-2yaaa-aaaae-aamva-cai".into(), Some("backend — orders API".into())));
+        assert_eq!(
+            got[0],
+            ("dmp3l-2yaaa-aaaae-aamva-cai".into(), Some("backend — orders API".into()))
+        );
         assert_eq!(got[1], ("ryjl3-tyaaa-aaaaa-aaaba-cai".into(), Some("ledger".into())));
         assert_eq!(got[2], ("qoctq-giaaa-aaaaa-aaaea-cai".into(), Some("governance".into())));
         assert_eq!(got[3], ("aaaaa-aa".into(), None), "unknown fields are ignored");
@@ -3232,10 +3194,7 @@ mod tests {
         // Bounded: a hostile manifest can't produce unbounded findings.
         let huge = format!(
             r#"{{"canisters":[{}]}}"#,
-            std::iter::repeat(r#"{"id":"aaaaa-aa"}"#)
-                .take(500)
-                .collect::<Vec<_>>()
-                .join(",")
+            std::iter::repeat(r#"{"id":"aaaaa-aa"}"#).take(500).collect::<Vec<_>>().join(",")
         );
         assert_eq!(canisters_from_app_manifest(&huge).len(), MAX_MANIFEST_CANISTERS);
 
@@ -3244,7 +3203,8 @@ mod tests {
         let got = canisters_from_app_manifest(sneaky);
         let label = got[0].1.as_deref().unwrap();
         assert!(!label.chars().any(char::is_control), "control chars must be gone: {label:?}");
-        let long = format!(r#"{{"canisters":[{{"id":"aaaaa-aa","role":"{}"}}]}}"#, "x".repeat(1000));
+        let long =
+            format!(r#"{{"canisters":[{{"id":"aaaaa-aa","role":"{}"}}]}}"#, "x".repeat(1000));
         assert!(canisters_from_app_manifest(&long)[0].1.as_deref().unwrap().len() <= 120);
     }
 
@@ -3332,15 +3292,12 @@ mod tests {
         // absence rather than an empty declaration.
         for body in [
             "<!DOCTYPE html>\n<html lang=\"en\"><head><title>App</title></head></html>", // the SPA catch-all
-            "{}",                          // a JSON object with no canisters key
-            r#"{"error":"not found"}"#,    // an API error envelope
-            "[1,2,3]",                     // JSON, wrong shape
-            "",                            // empty body
+            "{}",                       // a JSON object with no canisters key
+            r#"{"error":"not found"}"#, // an API error envelope
+            "[1,2,3]",                  // JSON, wrong shape
+            "",                         // empty body
         ] {
-            assert!(
-                manifest_canister_ids(body).is_none(),
-                "must not read {body:?} as a manifest"
-            );
+            assert!(manifest_canister_ids(body).is_none(), "must not read {body:?} as a manifest");
         }
     }
 
@@ -3379,7 +3336,8 @@ mod tests {
     fn derivation_origin_file_parses_one_line_and_fails_closed() {
         // The guide's example.
         assert_eq!(
-            parse_derivation_origin_file("https://hcv4s-uaaaa-aaabq-qaaba-cai.icp.net\n").as_deref(),
+            parse_derivation_origin_file("https://hcv4s-uaaaa-aaabq-qaaba-cai.icp.net\n")
+                .as_deref(),
             Some("https://hcv4s-uaaaa-aaabq-qaaba-cai.icp.net")
         );
         // Leading blank lines and surrounding whitespace are tolerated — they are
@@ -3395,12 +3353,12 @@ mod tests {
         // protocol's own default for an absent file) rather than as an
         // authoritative declaration of whatever we could salvage.
         for malformed in [
-            "app.example.com",                              // bare host, not an origin
-            "https://app.example.com/path",                 // a URL, not an origin
-            "https://app.example.com/?x=1",                 // query
-            "https://app.example.com#f",                    // fragment
+            "app.example.com",                                // bare host, not an origin
+            "https://app.example.com/path",                   // a URL, not an origin
+            "https://app.example.com/?x=1",                   // query
+            "https://app.example.com#f",                      // fragment
             "https://app.example.com\nhttps://other.example", // two claims, not one
-            "https://app.example.com\nignored",             // a trailing comment
+            "https://app.example.com\nignored",               // a trailing comment
         ] {
             assert_eq!(
                 parse_derivation_origin_file(malformed),
@@ -3433,14 +3391,18 @@ mod tests {
     // bare origin; absent / blank / non-http values yield None (fail-closed).
     #[test]
     fn declared_derivation_origin_parses_and_fails_closed() {
-        let declared = r#"{"derivation_origin":"https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io","canisters":[]}"#;
+        let declared =
+            r#"{"derivation_origin":"https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io","canisters":[]}"#;
         assert_eq!(
             declared_derivation_origin(declared).as_deref(),
             Some("https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io")
         );
         // Reduced to a bare origin (path/query/trailing slash dropped).
         let with_path = r#"{"derivation_origin":"https://app.example.com/x?y=1"}"#;
-        assert_eq!(declared_derivation_origin(with_path).as_deref(), Some("https://app.example.com"));
+        assert_eq!(
+            declared_derivation_origin(with_path).as_deref(),
+            Some("https://app.example.com")
+        );
         // A scheme-less bare host is accepted (https assumed), matching the
         // interactive `derivation_origin` param, so a good-faith bare-host
         // declaration resolves instead of being silently dropped.
@@ -3452,9 +3414,15 @@ mod tests {
         assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"ftp://x/"}"#), None);
         // Non-https is rejected (https-only; else target_origin would silently
         // upgrade an http:// declaration while still reporting source=declared).
-        assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"http://example.com"}"#), None);
+        assert_eq!(
+            declared_derivation_origin(r#"{"derivation_origin":"http://example.com"}"#),
+            None
+        );
         // User-info is rejected (url.origin() would silently drop it).
-        assert_eq!(declared_derivation_origin(r#"{"derivation_origin":"https://u:p@example.com"}"#), None);
+        assert_eq!(
+            declared_derivation_origin(r#"{"derivation_origin":"https://u:p@example.com"}"#),
+            None
+        );
         assert_eq!(declared_derivation_origin("<!doctype html>"), None);
     }
 
@@ -3508,7 +3476,11 @@ mod tests {
         assert!(!derivation_origin_authorized(
             "https://app.example",
             "https://oisy.com",
-            &["https://app.example:8443".into(), "http://app.example".into(), "https://app.example.evil".into()]
+            &[
+                "https://app.example:8443".into(),
+                "http://app.example".into(),
+                "https://app.example.evil".into()
+            ]
         ));
     }
 
@@ -3537,7 +3509,12 @@ mod tests {
             ("https://oisy.com".to_string(), DerivationSource::Declared)
         );
         // Unauthorized cross-origin (the spoof) → Err, NOT an app-origin fall-back.
-        assert!(decide_declared_origin(app, Some("https://oisy.com"), &["https://oisy.com".into()]).is_err());
+        assert!(decide_declared_origin(
+            app,
+            Some("https://oisy.com"),
+            &["https://oisy.com".into()]
+        )
+        .is_err());
         // Unverifiable — empty list (not listed, or the fetch failed) → Err.
         assert!(decide_declared_origin(app, Some("https://oisy.com"), &[]).is_err());
     }
@@ -3552,10 +3529,7 @@ mod tests {
         assert_eq!(normalize("HTTPS://example.com"), "HTTPS://example.com");
         // The uppercase-scheme result parses cleanly (url lowercases the scheme),
         // rather than becoming a double-prefixed `https://HTTPS://example.com`.
-        assert_eq!(
-            url::Url::parse(&normalize("HTTPS://example.com")).unwrap().scheme(),
-            "https"
-        );
+        assert_eq!(url::Url::parse(&normalize("HTTPS://example.com")).unwrap().scheme(), "https");
     }
 
     // The built-in registry maps each special-cased app host to its custom
@@ -3563,7 +3537,10 @@ mod tests {
     // registered value is already a canonical bare https origin.
     #[test]
     fn known_derivation_origin_maps_special_cased_apps() {
-        assert_eq!(known_derivation_origin("nns.internetcomputer.org"), Some("https://nns.ic0.app"));
+        assert_eq!(
+            known_derivation_origin("nns.internetcomputer.org"),
+            Some("https://nns.ic0.app")
+        );
         assert_eq!(known_derivation_origin("nns.ic0.app"), Some("https://nns.ic0.app"));
         assert_eq!(known_derivation_origin("oisy.com"), Some("https://oisy.com"));
         assert_eq!(
@@ -3592,8 +3569,14 @@ mod tests {
     fn known_registry_does_not_match_a_non_default_port() {
         let url = |u: &str| url::Url::parse(&normalize(u)).unwrap();
         // The bare origin and its explicit default port still resolve.
-        assert_eq!(known_derivation_origin_for_url(&url("https://oisy.com")), Some("https://oisy.com"));
-        assert_eq!(known_derivation_origin_for_url(&url("https://oisy.com:443")), Some("https://oisy.com"));
+        assert_eq!(
+            known_derivation_origin_for_url(&url("https://oisy.com")),
+            Some("https://oisy.com")
+        );
+        assert_eq!(
+            known_derivation_origin_for_url(&url("https://oisy.com:443")),
+            Some("https://oisy.com")
+        );
         // A non-default port does not, on any registered host.
         for u in ["https://oisy.com:8443", "https://nns.ic0.app:8443", "https://multidex.ai:8080"] {
             assert_eq!(
@@ -3632,7 +3615,9 @@ mod tests {
     fn find_app_by_name_resolves_known_apps_and_directs_others() {
         // MULTI/DEX matches regardless of punctuation/casing/spacing, including when
         // the name is split across tokens inside a longer phrase.
-        for q in ["MULTI/DEX", "multidex", "multi dex", "Use the MULTIDEX app", "Use the MULTI DEX app"] {
+        for q in
+            ["MULTI/DEX", "multidex", "multi dex", "Use the MULTIDEX app", "Use the MULTI DEX app"]
+        {
             let out = find_app_by_name(q);
             assert_eq!(out.matches.len(), 1, "{q:?} should match one app");
             assert_eq!(out.matches[0].app_url, "https://multidex.ai");
@@ -3651,7 +3636,8 @@ mod tests {
         // source of truth), so every app_url host must be a registry key — otherwise
         // known_app_derivation_origin would silently fall back to the app URL.
         for app in KNOWN_APPS {
-            let host = url::Url::parse(app.app_url).unwrap().host_str().unwrap().to_ascii_lowercase();
+            let host =
+                url::Url::parse(app.app_url).unwrap().host_str().unwrap().to_ascii_lowercase();
             assert!(
                 known_derivation_origin(&host).is_some(),
                 "{}'s app_url host {host} must be a key in KNOWN_DERIVATION_ORIGINS \
@@ -3719,10 +3705,15 @@ mod tests {
             assert_eq!(m.app_url, "https://multidex.ai");
             assert_eq!(m.derivation_origin, known_derivation_origin("multidex.ai").unwrap());
         }
-        assert_eq!(similar_known_app("icpswap.com").map(|m| m.app_url).as_deref(), Some("https://app.icpswap.com"));
+        assert_eq!(
+            similar_known_app("icpswap.com").map(|m| m.app_url).as_deref(),
+            Some("https://app.icpswap.com")
+        );
         assert_eq!(similar_known_app("oisy.org").map(|m| m.name).as_deref(), Some("Oisy"));
         // A REAL known-app host is not a lookalike — nothing to repair.
-        for real in ["multidex.ai", "https://oisy.com", "app.icpswap.com", "nns.internetcomputer.org"] {
+        for real in
+            ["multidex.ai", "https://oisy.com", "app.icpswap.com", "nns.internetcomputer.org"]
+        {
             assert!(similar_known_app(real).is_none(), "{real} is a real host, no suggestion");
         }
         // Token boundaries hold (no substring false positives), and unrelated or

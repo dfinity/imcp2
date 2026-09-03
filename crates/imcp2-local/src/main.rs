@@ -82,12 +82,7 @@ fn main() -> anyhow::Result<()> {
 
 fn truthy(var: &str) -> bool {
     std::env::var(var)
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
 }
 
@@ -175,9 +170,8 @@ async fn serve() -> anyhow::Result<()> {
     let auto_open = !truthy("IMCP2_NO_OPEN");
     let login = login::LoginDriver::new(identities, slot, auto_open);
 
-    let service = server::LocalServer::new(tools, login, auto_open)
-        .serve(rmcp::transport::stdio())
-        .await?;
+    let service =
+        server::LocalServer::new(tools, login, auto_open).serve(rmcp::transport::stdio()).await?;
     tracing::info!("imcp2-local serving MCP over stdio");
     // Runs until the client closes the pipe (or the service errors).
     service.waiting().await?;
@@ -209,10 +203,7 @@ mod tests {
             "http://replica.internal:4943",
             "not a url",
         ] {
-            assert!(
-                !super::is_loopback_url(bad),
-                "{bad} must not count as loopback"
-            );
+            assert!(!super::is_loopback_url(bad), "{bad} must not count as loopback");
         }
     }
 }
