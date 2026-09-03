@@ -845,10 +845,11 @@ const CIMD_CACHE_DEFAULT_TTL: Duration = Duration::from_secs(10 * 60);
 /// Ceiling on the origin's `max-age`: bounds how long a since-changed document is
 /// still honoured. There is deliberately no floor — an origin's `no-store`,
 /// `no-cache` or `max-age=0` means the document is not reused at all, so a
-/// redirect the client withdraws is gone with the next request. That costs this
-/// server nothing it was not already paying: an invalid document is never
-/// cached either, so a stranger could always force a fetch per request, and the
-/// in-flight bound is what contains that.
+/// redirect the client withdraws is gone with the next request. The cost is a
+/// fetch per request for a VALID document whose origin forbids reuse, which is
+/// the origin's own choice and is contained like every other fetch: by the
+/// in-flight and rate bounds. (An invalid document is a different case — it is
+/// remembered for [`CIMD_NEGATIVE_TTL`], so a repeat costs nothing.)
 const CIMD_CACHE_MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long a URL whose document failed a DOCUMENT-INTRINSIC check — nothing
 /// there (404), not JSON, about another URL, too large — is remembered as
@@ -902,11 +903,17 @@ struct CachedClientMetadata {
 /// Why a CIMD client's document did not yield a [`ClientMetadata`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CimdError {
-    /// It could not be fetched right now (guard, network, status, size): a
-    /// transient as far as this server can tell, so the user is told to retry.
+    /// A failure of the MOMENT ([`classify_fetch_error`]): the host did not
+    /// resolve, the deadline passed, the connection failed, the origin answered
+    /// 5xx / 408 / 429, or this server's own fetch budget or in-flight bounds
+    /// were spent. The same request may succeed next time, so the user is told
+    /// to retry and nothing is remembered.
     Unavailable(String),
-    /// It was fetched but is not a valid document for that URL: the client is
-    /// misconfigured or hostile, so it is an unknown client, not a retry.
+    /// A failure of the URL or its document: the SSRF guard refuses the URL, the
+    /// origin has no document there (404, a redirect, any other 4xx), the body
+    /// is over the cap or not UTF-8, or it was fetched but is not a valid
+    /// document for that URL. The client is misconfigured or hostile: an unknown
+    /// client, not a retry, and remembered for [`CIMD_NEGATIVE_TTL`].
     Invalid(String),
 }
 
