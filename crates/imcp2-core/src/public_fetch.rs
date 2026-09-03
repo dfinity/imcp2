@@ -53,10 +53,15 @@ pub struct PublicDocument {
     pub body: String,
     /// The `Content-Type` the origin sent, if any.
     pub content_type: Option<String>,
-    /// How much longer the origin considers this fresh: its `max-age` less the
-    /// response's `Age`, if it sent a `max-age`; `Some(0)` when it said
-    /// `no-store` or `no-cache`, or the freshness has already run out. A hint
-    /// for the caller's own cache, for the caller to bound — never binding.
+    /// How much longer a SHARED cache may reuse this, per HTTP caching (RFC
+    /// 9111), as [`freshness`] computes it: the lifetime — `s-maxage`, else
+    /// `max-age`, from every `Cache-Control` line combined, else `Expires` less
+    /// `Date` — minus the response's current age (the larger of `Age` and the
+    /// time since `Date`). `Some(0)` when the origin forbids reuse (`no-store`,
+    /// `no-cache`, `private`, `Vary: *`), gives an invalid or already-spent
+    /// lifetime, or the freshness has run out; `None` when it sent no freshness
+    /// information at all. A hint for the caller's own cache, for the caller to
+    /// bound — never binding.
     pub cache_max_age: Option<Duration>,
 }
 
