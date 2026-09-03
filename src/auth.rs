@@ -980,7 +980,11 @@ fn host_key(host: &str) -> String {
 /// RFC 7591's `client_secret_basic` default) OR its
 /// `token_endpoint_auth_methods_supported` lists `none`. ChatGPT's document is
 /// the case for the latter: it prefers `private_key_jwt` but lists `none`, which
-/// is what it uses against an AS that, like this one, offers only `none`.
+/// is what it uses against an AS that, like this one, offers only `none`. And it
+/// must be able to run the ONE flow this server offers: `grant_types`, if given,
+/// must list `authorization_code` and `response_types`, if given, `code` (RFC
+/// 7591's defaults when absent) — as DCR refuses a registration whose grant
+/// types lose `authorization_code` ([`granted_grant_types`]).
 ///
 /// Of the `redirect_uris`, only those this server could ever honour are kept:
 /// loopback ones (native clients bind a port at runtime), and hosted ones on the
@@ -1016,6 +1020,20 @@ fn parse_client_metadata(client_id: &str, body: &str) -> Result<ClientMetadata, 
         return Err(format!(
             "authenticates only as {method:?}; this server supports public clients (none) only"
         ));
+    }
+    // The flow: absent means RFC 7591's defaults (`authorization_code` / `code`);
+    // present, each must be a string array naming this server's one flow, or the
+    // client could never complete an authorization here (DCR refuses the same).
+    for (field, needed) in [("grant_types", "authorization_code"), ("response_types", "code")] {
+        match obj.get(field) {
+            None => {}
+            Some(Value::Array(list)) if list.iter().all(Value::is_string) => {
+                if !list.iter().any(|v| v.as_str() == Some(needed)) {
+                    return Err(format!("{field} does not include {needed:?}, the only flow here"));
+                }
+            }
+            Some(_) => return Err(format!("{field} must be an array of strings")),
+        }
     }
     let listed: Vec<&str> = match obj.get("redirect_uris").and_then(Value::as_array) {
         Some(list) if list.len() > MAX_REDIRECT_URIS => {
@@ -3290,6 +3308,20 @@ mod tests {
             "token_endpoint_auth_method": 1,
         });
         assert!(refused_for(odd_method).contains("must be a string"));
+        // The flow: absent is the RFC default (accepted above); present, it must
+        // include the one flow this server runs, and be a string array to say so.
+        let with = |field: &str, value: serde_json::Value| json!({ "client_id": CHATGPT, "redirect_uris": [CHATGPT_REDIRECT], field: value });
+        let ok = |doc: serde_json::Value| parse_client_metadata(CHATGPT, &doc.to_string()).is_ok();
+        assert!(ok(with("grant_types", json!(["authorization_code", "refresh_token"]))));
+        assert!(ok(with("response_types", json!(["code"]))));
+        let err = refused_for(with("grant_types", json!(["client_credentials"])));
+        assert!(err.contains("grant_types") && err.contains("authorization_code"), "{err}");
+        let err = refused_for(with("response_types", json!(["token"])));
+        assert!(err.contains("response_types") && err.contains("\"code\""), "{err}");
+        assert!(refused_for(with("grant_types", json!([]))).contains("authorization_code"));
+        let err = refused_for(with("grant_types", json!("authorization_code")));
+        assert!(err.contains("array of strings"), "{err}");
+        assert!(refused_for(with("response_types", json!([1]))).contains("array of strings"));
         // Hosted redirects must be same-origin with the document; loopback is exempt.
         const OTHER: &str = "https://cimd-other.test/client.json";
         let borrowed = json!({ "client_id": OTHER, "redirect_uris": [CHATGPT_REDIRECT] });
