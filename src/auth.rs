@@ -1659,7 +1659,10 @@ impl AuthStore {
         // vetted vendor origin or not at all, so an unauthenticated request naming
         // a stranger's URL costs this server nothing and admits nothing.
         if !cimd_origin_trusted(&cimd_url) {
-            tracing::info!(client_id, "refusing a client_id URL off the vendor trust policy");
+            // Debug, not info: this runs for every unauthenticated request, before
+            // any rate limit, and carries a caller-chosen URL — a flood of distinct
+            // strangers must not be a flood of log lines.
+            tracing::debug!(client_id, "refusing a client_id URL off the vendor trust policy");
             return ClientCheck::UntrustedClientOrigin;
         }
         // Allow-list BEFORE any fetch too: a redirect this server would refuse
@@ -1678,15 +1681,16 @@ impl AuthStore {
                     ClientCheck::Refused
                 }
             }
+            // Both outcomes are logged at warn WHERE THE FETCH HAPPENS (bounded by
+            // the fetch rate); here, per request — a negative-cache hit or a refused
+            // permit costs no fetch — only at debug, or a flood of requests for one
+            // bad URL would be a flood of log lines carrying its caller-chosen text.
             Err(CimdError::Invalid(why)) => {
-                tracing::warn!(
-                    client_id, %why,
-                    "refusing a client whose metadata document is invalid"
-                );
+                tracing::debug!(client_id, %why, "client metadata document is invalid");
                 ClientCheck::Refused
             }
             Err(CimdError::Unavailable(why)) => {
-                tracing::warn!(client_id, %why, "client metadata document unavailable");
+                tracing::debug!(client_id, %why, "client metadata document unavailable");
                 ClientCheck::MetadataUnavailable(why)
             }
         }
@@ -1806,10 +1810,21 @@ impl AuthStore {
             rates.all.take();
         }
         let fetched = Instant::now();
+        // The one place these are logged at warn: a fetch happened, and fetches
+        // are rate-limited, so the log is bounded however the requests flood.
         let (outcome, ttl) = match fetch_and_validate_client_metadata(key).await {
             Ok((meta, ttl)) => (Ok(meta), ttl),
-            Err(CimdError::Invalid(why)) => (Err(why), CIMD_NEGATIVE_TTL),
-            Err(unavailable @ CimdError::Unavailable(_)) => return Err(unavailable),
+            Err(CimdError::Invalid(why)) => {
+                tracing::warn!(
+                    client_id = key, %why,
+                    "client metadata document is invalid; refusing its client for a minute"
+                );
+                (Err(why), CIMD_NEGATIVE_TTL)
+            }
+            Err(CimdError::Unavailable(why)) => {
+                tracing::warn!(client_id = key, %why, "client metadata document unavailable");
+                return Err(CimdError::Unavailable(why));
+            }
         };
         if !ttl.is_zero() {
             self.remember_client_metadata(key, outcome.clone(), fetched + ttl).await;

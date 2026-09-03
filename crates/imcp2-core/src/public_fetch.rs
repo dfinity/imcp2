@@ -227,9 +227,12 @@ fn freshness(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
                 .unwrap_or(Duration::ZERO)
         }
     };
+    // An `Age` that is sent but does not parse — overflowing, or not a number at
+    // all — is taken as the largest age, not as none (RFC 9111 §1.2.2 has
+    // oversized delta-seconds treated as the greatest value): a response of
+    // unknowable age is not given a whole lifetime.
     let age = header(AGE)
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs)
+        .map(|v| v.parse::<u64>().map_or(Duration::MAX, Duration::from_secs))
         .unwrap_or(Duration::ZERO);
     let apparent_age =
         date.and_then(|date| now.duration_since(date).ok()).unwrap_or(Duration::ZERO);
@@ -472,6 +475,11 @@ mod tests {
             freshness(&headers(&[("cache-control", "max-age=300"), ("age", "301")]), now),
             Some(Duration::ZERO)
         );
+        // An Age that overflows, or is no number, is the greatest age, not none.
+        let overflowing = [("cache-control", "max-age=86400"), ("age", "99999999999999999999")];
+        assert_eq!(freshness(&headers(&overflowing), now), Some(Duration::ZERO));
+        let nonsense = [("cache-control", "max-age=86400"), ("age", "soon")];
+        assert_eq!(freshness(&headers(&nonsense), now), Some(Duration::ZERO));
         // Two Cache-Control lines: the no-store on the second is not missed.
         assert_eq!(
             freshness(
