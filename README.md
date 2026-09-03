@@ -711,9 +711,16 @@ its AS issuer is `<PUBLIC_URL>/mcp` and everything OAuth lives under it:
   connecting thousands of times mints no registrations. Concurrent requests for
   one document share a single fetch, and at most eight fetches are in flight at
   once, two per host, so one slow host cannot hold up the rest. Claude and ChatGPT both select CIMD over DCR when it is
-  advertised; `OAUTH_CIMD_DISABLED=1` withdraws the advertisement and the
-  mechanism without a rebuild (clients re-read the metadata within minutes and
-  fall back to DCR).
+  advertised — which it is only where `OAUTH_CIMD_ENABLED=1` is set (the deploy
+  template takes it from the GitHub Environment's variable of that name, so a
+  deploy never enables it by itself; unsetting it is the rollback, no rebuild:
+  clients re-read the metadata within minutes and fall back to DCR). Only a
+  document on a vetted vendor origin is fetched at all — a host on or under an
+  allow-listed domain, default port (the trust policy of PR #143); any other URL
+  `client_id` is refused before any request and pointed at the allow-listing
+  contact. A document-intrinsic failure (no document there, not JSON, about
+  another URL) is remembered for a minute so a repeat is cheap; a transient one
+  is not.
 
 - `GET  /mcp/oauth/authorize` — validates the client + redirect, requires PKCE, sets
   the binding cookie, then redirects to II's handshake (with `registration_key`)

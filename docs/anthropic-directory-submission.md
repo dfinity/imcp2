@@ -59,7 +59,7 @@ submission — and match a live scan of a deployed instance of that build
 | HTTPS remote server, Streamable HTTP transport | ✅ `rmcp` streamable-HTTP, stateless, JSON responses ([`src/lib.rs`](../src/lib.rs)) |
 | OAuth 2.0, authorization-code + PKCE **S256**, advertised in metadata | ✅ `code_challenge_methods_supported: ["S256"]` in the live RFC 8414 document |
 | Dynamic Client Registration (RFC 7591) — the out-of-the-box `oauth_dcr` mode | ✅ live probe: `POST /mcp/oauth/register` with the claude.ai callback → `201` |
-| Client ID Metadata Documents — the `oauth_cimd` mode Anthropic recommends over DCR for directory listings | ✅ `client_id_metadata_document_supported: true` alongside `"none"` in `token_endpoint_auth_methods_supported`, the two flags Claude requires to select CIMD. Claude Code's live document (`https://claude.ai/oauth/claude-code-client-metadata`) is a fixture of the parsing test ([`src/auth.rs`](../src/auth.rs), `cimd_client_id` / `parse_client_metadata`) |
+| Client ID Metadata Documents — the `oauth_cimd` mode Anthropic recommends over DCR for directory listings | ✅ implemented, trust-policy-gated per the scoping in PR #143; advertised as `client_id_metadata_document_supported: true` alongside `"none"` in `token_endpoint_auth_methods_supported` — the two flags Claude requires to select CIMD — only where the deployment sets `OAUTH_CIMD_ENABLED=1` (off by default; enable per environment). Claude Code's live document (`https://claude.ai/oauth/claude-code-client-metadata`) is a fixture of the parsing test ([`src/auth.rs`](../src/auth.rs), `cimd_client_id` / `parse_client_metadata`) |
 | Claude's hosted callback `https://claude.ai/api/mcp/auth_callback` accepted | ✅ seeded in the redirect allow-list ([`src/auth.rs`](../src/auth.rs), `DEFAULT_ALLOWED_REDIRECTS`) |
 | Claude Code loopback redirects (RFC 8252) | ✅ loopback redirects are exempt from the hosted allow-list |
 | Discovery documents (RFC 8414 + RFC 9728, path-scoped + root fallback) | ✅ all four live, `WWW-Authenticate` on the 401 points at the resource metadata |
@@ -80,8 +80,9 @@ Internet Identity is exactly the supported shape. Against a DCR-only server
 Claude registers a new client on each fresh connection (the registration store
 is a bounded LRU of 10,000, which tolerates that churn); Anthropic recommends
 **CIMD** (Client ID Metadata Documents) for high-traffic directory listings,
-and the server now advertises and implements it, so Claude selects CIMD and
-registers nothing.
+and the server implements it (PR #143's trust-policy-gated design) and
+advertises it where `OAUTH_CIMD_ENABLED=1` is set, so there Claude selects CIMD
+and registers nothing.
 
 ## Blockers to resolve before submitting
 

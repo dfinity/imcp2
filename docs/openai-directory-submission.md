@@ -60,7 +60,7 @@ add details not published in the docs.
 | Requirement | Status |
 |---|---|
 | OAuth 2.1 authorization-code + PKCE **S256**, per the MCP authorization spec | ✅ live; `code_challenge_methods_supported: ["S256"]` |
-| Client registration: CIMD preferred; DCR (`registration_endpoint`) and predefined clients also accepted | ✅ both. `client_id_metadata_document_supported: true` — ChatGPT's live document (`https://chatgpt.com/oauth/client.json`) is a fixture of the parsing test ([`src/auth.rs`](../src/auth.rs)); it prefers `private_key_jwt` but lists `none`, which is what it uses against this AS — and RFC 7591 DCR live and verified |
+| Client registration: CIMD preferred; DCR (`registration_endpoint`) and predefined clients also accepted | ✅ both. CIMD implemented (trust-policy-gated per PR #143), advertised as `client_id_metadata_document_supported: true` where the deployment sets `OAUTH_CIMD_ENABLED=1` (off by default) — ChatGPT's live document (`https://chatgpt.com/oauth/client.json`) is a fixture of the parsing test ([`src/auth.rs`](../src/auth.rs)); it prefers `private_key_jwt` but lists `none`, which is what it uses against this AS — and RFC 7591 DCR live and verified |
 | Discovery documents (RFC 8414 AS metadata + RFC 9728 protected-resource) | ✅ all live, path-scoped + root fallback |
 | Both of ChatGPT's callbacks accepted — `https://chatgpt.com/connector_platform_oauth_redirect` (the form it sends us) and `https://chatgpt.com/connector/oauth/{callback_id}` | ✅ the redirect allow-list pins both paths for `chatgpt.com` ([`src/auth.rs`](../src/auth.rs), `DEFAULT_ALLOWED_REDIRECTS`) |
 | No machine-to-machine grants (client credentials etc. unsupported by ChatGPT) | ✅ user-consent authorization-code flow only |

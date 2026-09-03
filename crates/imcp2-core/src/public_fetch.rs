@@ -23,11 +23,16 @@
 //!     and it is the only deadline, so however far the fetch got when it ran out
 //!     of time, the caller sees the same "did not complete" error.
 //!
+//! Failures are typed ([`FetchError`]) so a caller can tell what is about the URL
+//! (the guard refuses it; the origin answers 404 or a redirect; the body is too
+//! large or not UTF-8) from what is about the moment (a deadline, a connection
+//! that failed, a 5xx) — the first kind may be remembered, the second may not.
+//!
 //! The origin's caching instruction is reported as the REMAINING freshness
 //! lifetime, per HTTP: every `Cache-Control` field line is read (a `no-store` on
 //! a second line counts), and the response's `Age` is subtracted from `max-age`.
 
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use reqwest::header::{HeaderMap, AGE, CACHE_CONTROL, CONTENT_TYPE};
 
@@ -47,29 +52,60 @@ pub struct PublicDocument {
     pub cache_max_age: Option<Duration>,
 }
 
-/// GET `url` and return its body, or the reason it was not fetched: the URL is
-/// refused by the SSRF guard (not https, no host, or a host with a non-public
-/// address); resolving, connecting, answering and delivering the body did not
-/// all complete within `timeout`; the answer was anything but 2xx (a redirect
-/// included); the body is larger than `max_bytes`, was cut off, or is not UTF-8.
+/// Why a document was not returned, split by what the failure is ABOUT.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FetchError {
+    /// The URL itself: it does not parse, is not https, names no host, or names
+    /// one with a non-public address. No request was made.
+    Refused(String),
+    /// The moment: the deadline passed, or the request could not be sent or its
+    /// body not read. The same URL may work next time.
+    Unreachable(String),
+    /// The origin answered, but not 2xx — a redirect (never followed) included.
+    /// `status` lets the caller tell a 404 (no document there) from a 503.
+    Answered { status: u16, detail: String },
+    /// The body is larger than the caller's cap.
+    TooLarge(String),
+    /// The body is not valid UTF-8.
+    NotUtf8(String),
+}
+
+impl fmt::Display for FetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused(s) | Self::Unreachable(s) | Self::TooLarge(s) | Self::NotUtf8(s) => {
+                f.write_str(s)
+            }
+            Self::Answered { detail, .. } => f.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
+
+/// GET `url` and return its body, or why not ([`FetchError`]): the URL is refused
+/// by the SSRF guard; resolving, connecting, answering and delivering the body
+/// did not all complete within `timeout`; the answer was anything but 2xx (a
+/// redirect included); the body is larger than `max_bytes`, was cut off, or is
+/// not UTF-8.
 pub async fn fetch_public_document(
     url: &str,
     max_bytes: usize,
     timeout: Duration,
-) -> Result<PublicDocument, String> {
+) -> Result<PublicDocument, FetchError> {
     // One deadline over everything, resolution included: `resolve_public_url`
     // does the DNS lookup, and a resolver that never answers must not hold the
     // caller (and whatever it is holding, such as an in-flight permit) forever.
     // Deliberately the ONLY deadline — the client below sets none of its own —
     // so the error is the same wherever the time ran out, and dropping the
     // future on expiry is what aborts the connection.
-    tokio::time::timeout(timeout, fetch(url, max_bytes))
-        .await
-        .map_err(|_| format!("fetching {url} did not complete within {timeout:?}"))?
+    tokio::time::timeout(timeout, fetch(url, max_bytes)).await.map_err(|_| {
+        FetchError::Unreachable(format!("fetching {url} did not complete within {timeout:?}"))
+    })?
 }
 
-async fn fetch(url: &str, max_bytes: usize) -> Result<PublicDocument, String> {
-    let (parsed, pinned) = resolve_public_url(url).await?;
+async fn fetch(url: &str, max_bytes: usize) -> Result<PublicDocument, FetchError> {
+    let (parsed, pinned) = resolve_public_url(url).await.map_err(FetchError::Refused)?;
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
     let client = reqwest::Client::builder()
         .user_agent(concat!("imcp2-core/", env!("CARGO_PKG_VERSION")))
@@ -81,13 +117,13 @@ async fn fetch(url: &str, max_bytes: usize) -> Result<PublicDocument, String> {
         .redirect(reqwest::redirect::Policy::none())
         .resolve_to_addrs(&host, &pinned)
         .build()
-        .map_err(|e| format!("http client: {e}"))?;
+        .map_err(|e| FetchError::Unreachable(format!("http client: {e}")))?;
     let resp = client
         .get(parsed.as_str())
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|e| format!("could not fetch {url}: {e}"))?;
+        .map_err(|e| FetchError::Unreachable(format!("could not fetch {url}: {e}")))?;
     accept(url, resp, max_bytes).await
 }
 
@@ -100,13 +136,15 @@ async fn accept(
     url: &str,
     resp: reqwest::Response,
     max_bytes: usize,
-) -> Result<PublicDocument, String> {
+) -> Result<PublicDocument, FetchError> {
     let status = resp.status();
-    if status.is_redirection() {
-        return Err(format!("{url} answered {status}, a redirect, which is not followed"));
-    }
     if !status.is_success() {
-        return Err(format!("{url} answered {status}"));
+        let redirect =
+            if status.is_redirection() { ", a redirect, which is not followed" } else { "" };
+        return Err(FetchError::Answered {
+            status: status.as_u16(),
+            detail: format!("{url} answered {status}{redirect}"),
+        });
     }
     let content_type =
         resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_owned);
@@ -116,14 +154,19 @@ async fn accept(
     // cap) reads everything rather than wrapping to a zero-byte read.
     let bytes = match read_capped_bytes(resp, max_bytes.saturating_add(1)).await {
         Ok(bytes) if bytes.len() > max_bytes => {
-            return Err(format!("{url} is larger than the {max_bytes}-byte cap"))
+            return Err(FetchError::TooLarge(format!(
+                "{url} is larger than the {max_bytes}-byte cap"
+            )))
         }
         Ok(bytes) => bytes,
-        Err((_, e)) => return Err(format!("reading {url} failed part-way: {e}")),
+        Err((_, e)) => {
+            return Err(FetchError::Unreachable(format!("reading {url} failed part-way: {e}")))
+        }
     };
     // Strict, not lossy: a byte that is not UTF-8 is refused rather than replaced,
     // so the document parsed is exactly the one served.
-    let body = String::from_utf8(bytes).map_err(|e| format!("{url} is not valid UTF-8: {e}"))?;
+    let body = String::from_utf8(bytes)
+        .map_err(|e| FetchError::NotUtf8(format!("{url} is not valid UTF-8: {e}")))?;
     Ok(PublicDocument { body, content_type, cache_max_age })
 }
 
@@ -170,7 +213,7 @@ fn cache_max_age(cache_control: &str) -> Option<Duration> {
 mod tests {
     use std::time::Duration;
 
-    use super::{accept, cache_max_age, fetch_public_document, freshness};
+    use super::{accept, cache_max_age, fetch_public_document, freshness, FetchError};
 
     /// A response as the origin might send it, for pinning the acceptance rules
     /// without a network: `status`, `headers` (repeatable), `body`.
@@ -186,11 +229,14 @@ mod tests {
 
     /// The SSRF guard decides before any request: these never touch the network
     /// (IP-literal hosts need no DNS), and each is refused for the reason the
-    /// guard names.
+    /// guard names — as `Refused`, the failure that is about the URL.
     #[tokio::test]
     async fn guard_refuses_before_fetching() {
         let fetch = |url: &'static str| fetch_public_document(url, 1024, Duration::from_secs(1));
-        assert!(fetch("http://example.com/client.json").await.unwrap_err().contains("only https"));
+        let Err(FetchError::Refused(why)) = fetch("http://example.com/client.json").await else {
+            panic!("http must be refused by the guard");
+        };
+        assert!(why.contains("only https"), "{why}");
         for internal in [
             "https://127.0.0.1/client.json",
             "https://10.0.0.1/client.json",
@@ -199,13 +245,15 @@ mod tests {
             "https://[::1]/client.json",
             "https://[::ffff:127.0.0.1]/client.json",
         ] {
-            let err = fetch(internal).await.unwrap_err();
-            assert!(err.contains("non-public address"), "{internal}: {err}");
+            let Err(FetchError::Refused(why)) = fetch(internal).await else {
+                panic!("{internal} must be refused by the guard");
+            };
+            assert!(why.contains("non-public address"), "{internal}: {why}");
         }
-        assert!(fetch("not a url").await.is_err());
+        assert!(matches!(fetch("not a url").await, Err(FetchError::Refused(_))));
         // An uncapped read is a valid request, not an overflow.
         let uncapped = fetch_public_document("https://[::1]/x", usize::MAX, Duration::from_secs(1));
-        assert!(uncapped.await.unwrap_err().contains("non-public address"));
+        assert!(matches!(uncapped.await, Err(FetchError::Refused(_))));
     }
 
     /// One deadline over the whole fetch: with no time at all, the operation fails
@@ -217,22 +265,29 @@ mod tests {
         let err = fetch_public_document("https://example.com/client.json", 1024, Duration::ZERO)
             .await
             .unwrap_err();
-        assert!(err.contains("did not complete within"), "{err}");
+        let FetchError::Unreachable(why) = &err else { panic!("{err:?}") };
+        assert!(why.contains("did not complete within"), "{why}");
     }
 
     /// A redirect is refused as such — its target is never requested, since the
-    /// client follows none — and so is any other non-2xx answer.
+    /// client follows none — and so is any other non-2xx answer, each carrying its
+    /// status so the caller can tell "no document there" from "not right now".
     #[tokio::test]
     async fn accept_refuses_redirects_and_errors() {
         for status in [301u16, 302, 307, 308] {
             let resp = synthetic(status, &[("location", "https://client.example/other.json")], b"");
             let err = accept(URL, resp, 1024).await.unwrap_err();
-            assert!(err.contains(&status.to_string()) && err.contains("not followed"), "{err}");
+            let FetchError::Answered { status: got, detail } = &err else { panic!("{err:?}") };
+            assert_eq!(*got, status);
+            assert!(detail.contains("not followed"), "{detail}");
         }
-        let err = accept(URL, synthetic(404, &[], b"nope"), 1024).await.unwrap_err();
-        assert!(err.contains("404"), "{err}");
-        let err = accept(URL, synthetic(500, &[], b""), 1024).await.unwrap_err();
-        assert!(err.contains("500"), "{err}");
+        for status in [404u16, 500, 503] {
+            let err = accept(URL, synthetic(status, &[], b"nope"), 1024).await.unwrap_err();
+            assert!(
+                matches!(err, FetchError::Answered { status: got, .. } if got == status),
+                "{err:?}"
+            );
+        }
     }
 
     /// The body is taken only complete and only as valid UTF-8; the media type and
@@ -250,12 +305,12 @@ mod tests {
         let body = br#"{"client_id":"x"}"#;
         assert!(accept(URL, synthetic(200, &[], body), body.len()).await.is_ok());
         let err = accept(URL, synthetic(200, &[], body), body.len() - 1).await.unwrap_err();
-        assert!(err.contains("larger than"), "{err}");
+        assert!(matches!(err, FetchError::TooLarge(_)), "{err:?}");
         // A byte that is not UTF-8 is refused, not replaced.
         let err = accept(URL, synthetic(200, &[], b"{\"client_name\":\"\xff\"}"), 1024)
             .await
             .unwrap_err();
-        assert!(err.contains("UTF-8"), "{err}");
+        assert!(matches!(err, FetchError::NotUtf8(_)), "{err:?}");
     }
 
     /// Freshness follows HTTP: every `Cache-Control` line counts, and `Age` is

@@ -415,7 +415,7 @@ export const checkMcpEndpoints = async (
       id: "as-metadata",
       label: "OAuth Authorization Server Metadata",
       description:
-        "Verifies the RFC 8414 metadata advertising the authorize/token/registration endpoints and PKCE support that clients need to log in, and reports whether Client ID Metadata Documents are advertised (the registration mode Claude and ChatGPT prefer over DCR; off when the server runs with OAUTH_CIMD_DISABLED).",
+        "Verifies the RFC 8414 metadata advertising the authorize/token/registration endpoints and PKCE support that clients need to log in, and reports whether Client ID Metadata Documents are advertised (the registration mode Claude and ChatGPT prefer over DCR; on only where the server runs with OAUTH_CIMD_ENABLED=1).",
       target: `GET ${url}`,
       expected: "200 JSON with issuer + authorize/token/register endpoints",
       status: pass ? "pass" : "fail",
