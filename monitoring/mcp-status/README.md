@@ -281,9 +281,10 @@ actually matters.
 — `/mcp` answers its `401` challenge and both discovery documents are served.
 The fronting edge answers `/version` (and `/status/`) with a redirect to the
 landing site rather than serving it, so the deployment banner is blank and the
-linked II cannot be read from the server; the deployed dashboard pins it to
-`https://id.ai`. Neither is graded any more — that redirect used to warn the
-column on every run while nothing was actually wrong with the MCP surface.
+linked II cannot be read from the server. `/version` is no longer graded — that
+redirect used to warn the column on every run while nothing was actually wrong
+with the MCP surface. The unreadable II still would be, which is why the
+deployed dashboard pins it: `--target-ii production=https://id.ai`.
 
 **Staging** (`https://mcp.beta.id.ai`): the server passes all endpoint checks — its
 root answers `308 → https://internetcomputer.org/icp-mcp/`, where the landing
