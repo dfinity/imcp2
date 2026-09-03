@@ -692,6 +692,43 @@ its AS issuer is `<PUBLIC_URL>/mcp` and everything OAuth lives under it:
   honoured (intersected with `authorization_code`). A **hosted** `redirect_uri` is
   rejected unless its host is on the allow-list (see the Companion-control note
   below); loopback redirects are always accepted.
+- **Client ID Metadata Documents** — the MCP authorization spec's preferred
+  registration, advertised as `client_id_metadata_document_supported: true`. A
+  client may skip `/register` and use the https URL of its metadata document as
+  its `client_id`; `/mcp/oauth/authorize` fetches that document under the same
+  SSRF guard as app discovery (https only, public addresses only, pinned, no
+  redirects, 8 KiB cap, 5 s including DNS), requires its `client_id` to equal the URL, and checks the requested
+  redirect against the document's `redirect_uris` exactly as it would a DCR
+  registration's — hosted-redirect allow-list included, and checked before any
+  fetch, so a document can neither admit a redirect a DCR client couldn't
+  register nor make the server fetch a URL for a redirect it would refuse. A
+  hosted redirect must also be same-origin with the document URL (loopback
+  excepted), so a self-asserted document cannot point the code at another
+  party. Only clients that can authenticate as PUBLIC clients are accepted: a
+  `token_endpoint_auth_method` of `none` (or none given), or `none` among the
+  document's `token_endpoint_auth_methods_supported` — ChatGPT's case, since it
+  prefers `private_key_jwt` but lists `none`, which is what it uses here.
+  Documents must be served as `application/json`, and are cached (bounded; the
+  origin's remaining freshness — `max-age` less `Age` — honoured up to 24 h,
+  10 min when it sends none, not at all on `no-store`), so a directory client
+  connecting thousands of times mints no registrations. Concurrent requests for
+  one document share a single fetch, and at most eight fetches are in flight at
+  once per process (however many instances the binary mounts), two per host, so
+  one slow host cannot hold up the rest — and no more than sixty a minute per
+  process, thirty per vendor domain, so an origin that answers at once cannot be
+  made to answer without end. The fetch connects directly, never
+  through a proxy from the environment, so the address pin always binds. Claude and ChatGPT both select CIMD over DCR when it is
+  advertised — which it is only where `OAUTH_CIMD_ENABLED=1` is set (the deploy
+  template takes it from the GitHub Environment's variable of that name, so a
+  deploy never enables it by itself; to roll back, unset it and redeploy — the
+  value is read once at start-up, so the variable alone changes nothing — and
+  clients re-read the metadata within minutes and fall back to DCR). Only a
+  document on a vetted vendor origin is fetched at all — a host on or under an
+  allow-listed domain, default port (the trust policy of PR #143); any other URL
+  `client_id` is refused before any request and pointed at the allow-listing
+  contact. A document-intrinsic failure (no document there, not JSON, about
+  another URL) is remembered for a minute so a repeat is cheap; a transient one
+  is not.
 
 - `GET  /mcp/oauth/authorize` — validates the client + redirect, requires PKCE, sets
   the binding cookie, then redirects to II's handshake (with `registration_key`)

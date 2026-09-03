@@ -108,7 +108,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
 use imcp2_core::identities::Identities;
@@ -743,6 +743,746 @@ fn loopback_match(registered: &str, requested: &str) -> bool {
     a.host_str() == b.host_str() && a.path() == b.path() && a.query() == b.query()
 }
 
+// ---- Client ID Metadata Documents (CIMD) ------------------------------------
+//
+// The MCP authorization spec's preferred registration (draft-ietf-oauth-client-
+// id-metadata-document): the client's `client_id` IS an https URL, and the
+// RFC 7591-shaped JSON at that URL is its registration — `redirect_uris`,
+// `client_name`, how it authenticates. Nothing is stored per client, so a
+// directory client that connects thousands of times (Claude, ChatGPT) no longer
+// mints a DCR registration each time.
+//
+// Adopted the way the scoping in PR #143 lays it out — TRUST-POLICY-GATED and
+// additive. Only a `client_id` on a vetted vendor origin is fetched at all: its
+// host must be on (or under) a domain of the hosted-redirect allow-list, on the
+// default port ([`cimd_origin_trusted`]), so the one source of truth for who is
+// a vetted vendor also decides whose document this server will GET. Any other
+// URL `client_id` is refused before any request goes out and pointed at the
+// allow-listing contact, exactly like a hosted redirect off the list; DCR stays
+// for everyone else. That collapses the new outbound-fetch surface — an
+// UNAUTHENTICATED `/oauth/authorize` naming a URL — from "any URL" to a finite
+// set of vetted hosts. Even those are fetched under the SSRF guard
+// ([`imcp2_core::public_fetch`]: every resolved address public and pinned, no
+// redirect followed, a strict byte cap), because a vetted vendor's DNS is not
+// this server's to trust.
+//
+// A fetched document is validated as the draft requires (its own `client_id`
+// must equal the URL, byte for byte) and then given EXACTLY the checks a DCR
+// registration gets: the requested `redirect_uri` must be one the document
+// lists (loopback port-agnostically) AND pass the hosted-redirect allow-list
+// ([`redirect_uri_permitted`]). A document cannot talk its way past the
+// allow-list, so accepting one admits no redirect a DCR client could not already
+// register. On top of that, a hosted redirect the document lists must be
+// SAME-ORIGIN with the document URL (loopback excepted, for native clients): the
+// document is self-asserted, so this is what ties the code's destination to the
+// party that published the document, as Anthropic's reference authorization
+// server also requires. Only public clients (`none`) are supported, as
+// `token_endpoint_auth_methods_supported` says.
+//
+// Nothing in a document is trusted for DISPLAY. This server has no consent
+// screen of its own (`/oauth/authorize` hands the browser to Internet Identity),
+// so the relying party is not shown for CIMD clients any more than for DCR
+// ones; were one added, the only attested fact is the HOST of the `client_id`
+// URL — never the self-asserted `client_name` or `logo_uri`.
+//
+// OPT-IN per deployment: `OAUTH_CIMD_ENABLED=1` advertises the mechanism and
+// accepts URL `client_id`s; unset, the metadata does not advertise it and a URL
+// `client_id` is an unknown client. Claude and ChatGPT both switch to CIMD the
+// moment an AS advertises it, so a routine deploy must never switch them over
+// by itself (the deploy template takes the variable from the GitHub
+// Environment). The rollback, should a vendor's document turn out to be shaped
+// in a way this implementation refuses, is to unset the variable AND redeploy:
+// it is rendered into the unit at deploy time and read here once at start-up
+// ([`cimd_enabled_by_env`]), so changing it alone changes nothing on the host.
+// Once the process restarts without it, the clients re-read the metadata within
+// minutes and fall back to DCR.
+
+/// Byte cap on a `client_id` URL before it is treated as CIMD at all: the URL
+/// becomes a key of the process-wide cache and single-flight map (and part of a
+/// negative entry's reason), so an unauthenticated caller must not get to size
+/// those entries at will — [`CIMD_CACHE_MAX`] entries of at most this many bytes
+/// of key is the memory bound. The same cap a redirect URI gets; the real
+/// identifiers are under 100 bytes. A longer value is an ordinary, unknown
+/// client id: refused, not fetched, not remembered.
+const CIMD_MAX_CLIENT_ID_LEN: usize = MAX_REDIRECT_URI_LEN;
+/// Byte cap on a metadata document. The draft recommends documents stay under
+/// 5 KB; the real ones are well under 1 KB, so this is generous yet bounded.
+const CIMD_MAX_BYTES: usize = 8 * 1024;
+/// Fetch timeout. Claude waits at most 10 s for OUR authorize endpoint, so the
+/// fetch it triggers must finish well inside that.
+const CIMD_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Fetches allowed in flight at once, across all documents and every mounted
+/// instance — the bounds live in the process-wide [`CimdState`]. An excess
+/// request is refused (told to retry), never queued, so a flood of distinct
+/// `client_id` URLs at the unauthenticated endpoint holds at most this many
+/// outbound requests open. Concurrent requests for ONE document never compete for these:
+/// they wait for the single fetch in flight for it and read the cache after
+/// ([`AuthStore::client_metadata_for`]).
+const CIMD_MAX_INFLIGHT: usize = 8;
+/// Fetches allowed in flight per `client_id` HOST, so one slow (or hostile) host
+/// serving many distinct URLs cannot occupy every permit above: it gets this
+/// many, and every other host keeps the rest.
+const CIMD_MAX_INFLIGHT_PER_HOST: usize = 2;
+/// Fetches allowed per minute, process-wide, however fast they complete. The
+/// in-flight bounds cap how many run at once, not how many run in a minute: an
+/// origin answering 404 at once gives its permit straight back, and distinct
+/// paths on a vetted host defeat the negative cache, so this is what bounds the
+/// outbound request rate an unauthenticated caller can drive at a vendor (the
+/// rate cap PR #143 §5 requires alongside the concurrency cap). A token bucket:
+/// this many tokens to start, and this many a minute of refill. Legitimate
+/// traffic is a handful of documents, each cached for minutes to a day.
+const CIMD_RATE_PER_MINUTE: u32 = 60;
+/// Fetches allowed per minute for one vetted domain — the allow-list entry the
+/// `client_id` host is on or under — so a flood at one vendor leaves the others
+/// their share. Keyed by the DOMAIN, a finite vetted set, not the host: a
+/// vendor's subdomains are not finite.
+const CIMD_RATE_PER_DOMAIN_PER_MINUTE: u32 = 30;
+/// Distinct `client_id` URLs cached. A handful of directory clients is the
+/// expected population; the bound is against abuse, not for capacity.
+const CIMD_CACHE_MAX: usize = 512;
+/// How long a document is reused when its origin sends no `max-age`.
+const CIMD_CACHE_DEFAULT_TTL: Duration = Duration::from_secs(10 * 60);
+/// Ceiling on the origin's `max-age`: bounds how long a since-changed document is
+/// still honoured. There is deliberately no floor — an origin's `no-store`,
+/// `no-cache` or `max-age=0` means the document is not reused at all, so a
+/// redirect the client withdraws is gone with the next request. The cost is a
+/// fetch per request for a VALID document whose origin forbids reuse, which is
+/// the origin's own choice and is contained like every other fetch: by the
+/// in-flight and rate bounds. (An invalid document is a different case — it is
+/// remembered for [`CIMD_NEGATIVE_TTL`], so a repeat costs nothing.)
+const CIMD_CACHE_MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long a URL whose document failed a DOCUMENT-INTRINSIC check — nothing
+/// there (404), not JSON, about another URL, too large — is remembered as
+/// invalid, so a repeat of the same bogus path costs no fetch (PR #143 §3.5).
+/// Short, so a vendor fixing its document is not locked out for long. Only what
+/// is about the URL itself is remembered: a per-request failure (a redirect the
+/// document does not list) never is, or a probe with a bad redirect could lock
+/// out a real client; nor is a transient (a deadline, a 5xx), which is retried.
+const CIMD_NEGATIVE_TTL: Duration = Duration::from_secs(60);
+
+/// Whether this process is deployed with CIMD on: `OAUTH_CIMD_ENABLED` set to
+/// an on-value ([`cimd_enabled_by`]). Read once (the env is process-static),
+/// like the allow-list's `OAUTH_ALLOWED_REDIRECT_PREFIXES`; each [`AuthStore`]
+/// takes its own copy at construction, which tests set directly.
+fn cimd_enabled_by_env() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled = cimd_enabled_by(std::env::var("OAUTH_CIMD_ENABLED").ok().as_deref());
+        if enabled {
+            tracing::info!("OAUTH_CIMD_ENABLED is set: Client ID Metadata Documents are on");
+        }
+        enabled
+    })
+}
+
+/// The opt-in's reading of `OAUTH_CIMD_ENABLED`: `1`, `true`, `yes` and `on`
+/// (any case) switch CIMD on; unset, empty, or anything else leaves it off.
+fn cimd_enabled_by(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+/// A validated Client ID Metadata Document: what this server needs from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClientMetadata {
+    /// The document URL, which is also the `client_id` (verified equal).
+    client_id: String,
+    client_name: Option<String>,
+    redirect_uris: Vec<String>,
+}
+
+/// A cache entry: the validated document, or — a negative entry, held for
+/// [`CIMD_NEGATIVE_TTL`] — why the URL yields none; either until `expires`.
+#[derive(Clone, Debug)]
+struct CachedClientMetadata {
+    outcome: Result<Arc<ClientMetadata>, String>,
+    expires: Instant,
+}
+
+/// Why a CIMD client's document did not yield a [`ClientMetadata`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CimdError {
+    /// A failure of the MOMENT ([`classify_fetch_error`]): the host did not
+    /// resolve, the deadline passed, the connection failed, the origin answered
+    /// 5xx or one of the 4xx the client may retry (408, 421, 425, 429), or this
+    /// server's own fetch budget or in-flight bounds were spent. The same request may succeed next time, so the user is told
+    /// to retry and nothing is remembered.
+    Unavailable(String),
+    /// A failure of the URL or its document: the SSRF guard refuses the URL, the
+    /// origin has no document there (404, a redirect, any other 4xx), the body
+    /// is over the cap or not UTF-8, or it was fetched but is not a valid
+    /// document for that URL. The client is misconfigured or hostile: an unknown
+    /// client, not a retry, and remembered for [`CIMD_NEGATIVE_TTL`].
+    Invalid(String),
+}
+
+/// The verdict of [`AuthStore::validate_client`].
+#[derive(Debug, PartialEq, Eq)]
+enum ClientCheck {
+    /// Known client, and `redirect_uri` is one it registered.
+    Allowed,
+    /// Unknown client, or a redirect it did not register or that is not permitted.
+    Refused,
+    /// A CIMD client whose document could not be fetched right now — retryable,
+    /// so the user is not told to re-add the connector. The reason is logged and
+    /// carried for the caller's own logging; it is not shown to the browser.
+    MetadataUnavailable(String),
+    /// A URL `client_id` whose origin is not on the vendor trust policy
+    /// ([`cimd_origin_trusted`]): refused before any fetch and — like a hosted
+    /// redirect off the allow-list — told where to request access.
+    UntrustedClientOrigin,
+}
+
+/// One in-flight fetch of a document, shared by every request that missed the
+/// cache while it ran: the slot holds the outcome once the fetch is done, and
+/// whoever finds it empty on locking is the one to fetch.
+type Flight = Arc<tokio::sync::Mutex<Option<Result<Arc<ClientMetadata>, CimdError>>>>;
+
+/// Whether `client_id` is a Client ID Metadata Document URL — returned parsed —
+/// or `None` for an ordinary (DCR) identifier. A CIMD `client_id` must be https,
+/// name a host, carry a path beyond `/`, and have no fragment or userinfo (the
+/// draft's MUSTs; a query is only discouraged there, so one is tolerated), and
+/// must fit [`CIMD_MAX_CLIENT_ID_LEN`], since it is about to become a cache key.
+/// The draft asks for no particular spelling beyond that: the identifier is
+/// taken AS GIVEN — it is what the document must repeat byte for byte, and what
+/// the cache is keyed by — so `https://ChatGPT.com/…` or an explicit `:443` is
+/// a client like any other, provided its document says the same. Only the host
+/// is normalised, and only for the trust policy and the per-host quota
+/// ([`host_key`]), so no spelling of a vetted host is a stranger or a second
+/// quota. Taken as given also means the raw string must BE the URL parsed: one
+/// the parser would silently alter (stripping tab/newline/CR, or an empty
+/// `@` userinfo) is refused.
+fn cimd_client_id(client_id: &str) -> Option<url::Url> {
+    if client_id.len() > CIMD_MAX_CLIENT_ID_LEN {
+        return None;
+    }
+    // The WHATWG parser silently strips ASCII tab/newline/CR from anywhere in its
+    // input, trims leading and trailing C0 controls and spaces, reads a backslash
+    // as a slash (`https:\\host\path` parses as `https://host/path`, and one in
+    // the authority would end it before an `@` a raw scan expects there), and
+    // erases an EMPTY userinfo (`https://@host` parses as `https://host`). All of
+    // it is refused on the RAW string — as `resource_matches_issuer` does — or the
+    // identifier taken as given would not be the URL that was parsed and fetched.
+    let trimmed_by_parser = |c: char| c <= ' ';
+    if client_id.contains(['\t', '\n', '\r', '\\'])
+        || client_id.starts_with(trimmed_by_parser)
+        || client_id.ends_with(trimmed_by_parser)
+        || raw_authority_has_userinfo(client_id)
+    {
+        return None;
+    }
+    // Parsed, not prefix-matched: a scheme is case-insensitive (`HTTPS://` is
+    // https), and a DCR id (`client-…`) is no URL at all, so it parses to nothing.
+    let url = url::Url::parse(client_id).ok()?;
+    let well_formed = url.scheme() == "https"
+        && url.host_str().is_some_and(|h| !h.is_empty())
+        && url.path().len() > 1
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none();
+    well_formed.then_some(url)
+}
+
+/// The trust policy of PR #143: whether a CIMD `client_id` URL (already shaped by
+/// [`cimd_client_id`]) is on an origin this server will fetch from — its host on,
+/// or a dot-boundary subdomain of, a domain of the hosted-redirect allow-list
+/// ([`allowed_redirects`], the one source of truth for who is a vetted vendor),
+/// on the default https port. The port matters: the SSRF guard connects to the
+/// port the URL names, so a host-only check would let `https://claude.ai:8443/…`
+/// past a `claude.ai` gate and on to a service nobody vetted.
+fn cimd_origin_trusted(client_id: &url::Url) -> bool {
+    client_id.scheme() == "https"
+        && client_id.port().is_none()
+        && client_id.host_str().is_some_and(allow_listed_domain)
+}
+
+/// Whether `host` equals, or is a dot-boundary subdomain of, an allow-listed
+/// registrable domain — the host rule of [`redirect_uri_permitted`], on its own.
+fn allow_listed_domain(host: &str) -> bool {
+    vetted_domain(host).is_some()
+}
+
+/// The allow-listed registrable domain `host` equals or is a dot-boundary
+/// subdomain of, if any: the trust policy's match, and the key of the per-vendor
+/// fetch rate ([`CIMD_RATE_PER_DOMAIN_PER_MINUTE`]).
+fn vetted_domain(host: &str) -> Option<&'static str> {
+    let host = host_key(host);
+    allowed_redirects().iter().map(|(domain, _, _)| domain.as_str()).find(|domain| {
+        host == *domain || host.strip_suffix(*domain).is_some_and(|p| p.ends_with('.'))
+    })
+}
+
+/// One spelling per host — lower-case, no trailing dot — so that whatever is
+/// keyed by host (the trust policy's match, the per-host in-flight slots) treats
+/// `claude.ai`, `Claude.AI` and `claude.ai.` as the one host they resolve to.
+fn host_key(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Parse and validate the document fetched from `client_id` (RFC 7591 client
+/// metadata, per the CIMD draft). Accepted only if it is a JSON object whose
+/// `client_id` equals the URL exactly; whose `redirect_uris` is a non-empty
+/// array of strings within what a DCR registration may send ([`MAX_REDIRECT_URIS`]
+/// of at most [`MAX_REDIRECT_URI_LEN`] bytes each); that carries no client secret;
+/// and that can authenticate
+/// as a PUBLIC client — its `token_endpoint_auth_method` is `none` (or absent:
+/// a document may not use a secret-based method, so absence cannot mean
+/// RFC 7591's `client_secret_basic` default) OR its
+/// `token_endpoint_auth_methods_supported` lists `none`. ChatGPT's document is
+/// the case for the latter: it prefers `private_key_jwt` but lists `none`, which
+/// is what it uses against an AS that, like this one, offers only `none`. And it
+/// must be able to run the ONE flow this server offers: `grant_types`, if given,
+/// must list `authorization_code` and `response_types`, if given, `code` (RFC
+/// 7591's defaults when absent) — as DCR refuses a registration whose grant
+/// types lose `authorization_code` ([`granted_grant_types`]).
+///
+/// Of the `redirect_uris`, only those this server could ever honour are kept:
+/// each must be one a DCR registration could have registered
+/// ([`redirect_uri_permitted`]: loopback, or https on an allow-listed host and
+/// pinned path, and in either case without query or fragment — a fragment would
+/// otherwise be ignored by the loopback match and admit a redirect DCR refuses),
+/// and a hosted one must be on the SAME ORIGIN as the document URL — a
+/// self-asserted document may not point the code at another party. A document
+/// left with none is refused.
+fn parse_client_metadata(client_id: &str, body: &str) -> Result<ClientMetadata, String> {
+    let doc: Value = serde_json::from_str(body).map_err(|e| format!("not valid JSON: {e}"))?;
+    let Some(obj) = doc.as_object() else {
+        return Err("not a JSON object".into());
+    };
+    match obj.get("client_id").and_then(Value::as_str) {
+        Some(id) if id == client_id => {}
+        Some(id) => return Err(format!("its client_id is {id:?}, not the document URL")),
+        None => return Err("no client_id".into()),
+    }
+    if obj.contains_key("client_secret") || obj.contains_key("client_secret_expires_at") {
+        return Err("carries a client secret, which a metadata document must not".into());
+    }
+    // Absent means `none` (see above); present, it must be a string — a wrong type
+    // is a malformed document, not an omission to read charitably.
+    let method = match obj.get("token_endpoint_auth_method") {
+        None => "none",
+        Some(Value::String(method)) => method.as_str(),
+        Some(other) => {
+            return Err(format!("token_endpoint_auth_method must be a string, not {other}"))
+        }
+    };
+    let lists_none = obj
+        .get("token_endpoint_auth_methods_supported")
+        .and_then(Value::as_array)
+        .is_some_and(|methods| methods.iter().any(|m| m.as_str() == Some("none")));
+    if method != "none" && !lists_none {
+        return Err(format!(
+            "authenticates only as {method:?}; this server supports public clients (none) only"
+        ));
+    }
+    // The flow: absent means RFC 7591's defaults (`authorization_code` / `code`);
+    // present, each must be a string array naming this server's one flow, or the
+    // client could never complete an authorization here (DCR refuses the same).
+    for (field, needed) in [("grant_types", "authorization_code"), ("response_types", "code")] {
+        match obj.get(field) {
+            None => {}
+            Some(Value::Array(list)) if list.iter().all(Value::is_string) => {
+                if !list.iter().any(|v| v.as_str() == Some(needed)) {
+                    return Err(format!("{field} does not include {needed:?}, the only flow here"));
+                }
+            }
+            Some(_) => return Err(format!("{field} must be an array of strings")),
+        }
+    }
+    let listed: Vec<&str> = match obj.get("redirect_uris").and_then(Value::as_array) {
+        Some(list) if list.len() > MAX_REDIRECT_URIS => {
+            return Err(format!("too many redirect_uris ({}, max {MAX_REDIRECT_URIS})", list.len()))
+        }
+        Some(list)
+            if list.iter().any(|u| u.as_str().is_some_and(|u| u.len() > MAX_REDIRECT_URI_LEN)) =>
+        {
+            return Err(format!("a redirect_uri is too long (max {MAX_REDIRECT_URI_LEN} bytes)"))
+        }
+        Some(list) if !list.is_empty() && list.iter().all(Value::is_string) => {
+            list.iter().filter_map(Value::as_str).collect()
+        }
+        _ => return Err("redirect_uris must be a non-empty array of strings".into()),
+    };
+    let own_origin = url::Url::parse(client_id).map_err(|e| format!("client_id: {e}"))?.origin();
+    let redirect_uris: Vec<String> = listed
+        .into_iter()
+        .filter(|u| {
+            redirect_uri_permitted(u)
+                && (is_loopback_redirect(u)
+                    || url::Url::parse(u).is_ok_and(|r| r.origin() == own_origin))
+        })
+        .map(str::to_owned)
+        .collect();
+    if redirect_uris.is_empty() {
+        return Err("lists no redirect_uri this server could honour: one on its own origin that \
+                    the hosted-redirect allow-list admits, or a loopback one, neither with a \
+                    query or fragment"
+            .into());
+    }
+    let client_name = obj.get("client_name").and_then(Value::as_str).map(str::to_owned);
+    Ok(ClientMetadata { client_id: client_id.to_owned(), client_name, redirect_uris })
+}
+
+/// Whether a `Content-Type` is `application/json` — the media type a Client ID
+/// Metadata Document must be served as — by its essence, so parameters such as
+/// `charset=utf-8` are fine and case does not matter. A document served as
+/// anything else (or as nothing) is refused before it is parsed: bytes that
+/// happen to parse as JSON on a page the origin did not mean as its OAuth
+/// statement are not that statement.
+fn is_json_media_type(content_type: Option<&str>) -> bool {
+    content_type
+        .map(|ct| ct.split(';').next().unwrap_or("").trim())
+        .is_some_and(|essence| essence.eq_ignore_ascii_case("application/json"))
+}
+
+/// What this process knows about the web of metadata documents, and how much of
+/// it is being asked at once: the cache, the single-flight map, and the in-flight
+/// bounds. ONE per process, shared by every [`AuthStore`] — the bundled binary
+/// mounts a store per II instance (`/mcp`, `/mcp-beta`) — so the bounds hold per
+/// process, as their docs say, rather than multiplying with the mounts, and a
+/// document fetched for one mount serves the other.
+struct CimdState {
+    /// Documents fetched and validated — or found invalid — keyed by the
+    /// `client_id` URL, each with the instant it goes stale. Bounded at
+    /// [`CIMD_CACHE_MAX`]; see [`AuthStore::remember_client_metadata`].
+    cache: RwLock<HashMap<String, CachedClientMetadata>>,
+    /// Bounds concurrent metadata-document fetches at [`CIMD_MAX_INFLIGHT`]: each
+    /// is an outbound request an UNAUTHENTICATED `/oauth/authorize` can trigger.
+    inflight: Semaphore,
+    /// Single-flight: the fetch in flight for one `client_id`, whose outcome —
+    /// document, invalid, or unavailable — every request that missed while it
+    /// ran shares, instead of each fetching and each spending a permit. An entry
+    /// lives only while a fetch is in flight ([`Flight`]).
+    fetching: std::sync::Mutex<HashMap<String, Flight>>,
+    /// Fetches in flight per `client_id` host ([`HostSlot`]).
+    hosts: std::sync::Mutex<HashMap<String, usize>>,
+    /// Fetches per minute: the process's bucket, and one per vetted domain.
+    rates: std::sync::Mutex<Rates>,
+}
+
+impl CimdState {
+    fn new() -> Self {
+        Self {
+            cache: RwLock::default(),
+            inflight: Semaphore::new(CIMD_MAX_INFLIGHT),
+            fetching: std::sync::Mutex::default(),
+            hosts: std::sync::Mutex::default(),
+            rates: std::sync::Mutex::new(Rates {
+                all: TokenBucket::per_minute(CIMD_RATE_PER_MINUTE),
+                per_domain: HashMap::new(),
+            }),
+        }
+    }
+
+    /// The one instance every store in the process shares.
+    fn shared() -> Arc<Self> {
+        static SHARED: std::sync::OnceLock<Arc<CimdState>> = std::sync::OnceLock::new();
+        Arc::clone(SHARED.get_or_init(|| Arc::new(Self::new())))
+    }
+
+    /// Take `flight`'s entry for `key` out of the single-flight map — if it is
+    /// still the one there; a newer flight for the same key is left alone.
+    fn retire_flight(&self, key: &str, flight: &Flight) {
+        let mut fetching = self.fetching.lock().expect("cimd fetch locks");
+        if fetching.get(key).is_some_and(|current| Arc::ptr_eq(current, flight)) {
+            fetching.remove(key);
+        }
+    }
+}
+
+/// The fetch-rate buckets ([`CIMD_RATE_PER_MINUTE`], [`CIMD_RATE_PER_DOMAIN_PER_MINUTE`]).
+struct Rates {
+    all: TokenBucket,
+    per_domain: HashMap<&'static str, TokenBucket>,
+}
+
+/// A token bucket: `capacity` tokens to start, refilled continuously at
+/// `capacity` a minute, one taken per fetch.
+struct TokenBucket {
+    capacity: f64,
+    tokens: f64,
+    refilled_at: Instant,
+}
+
+impl TokenBucket {
+    fn per_minute(capacity: u32) -> Self {
+        Self {
+            capacity: f64::from(capacity),
+            tokens: f64::from(capacity),
+            refilled_at: Instant::now(),
+        }
+    }
+
+    /// Refill for the time passed, then say whether a token is there to take.
+    fn has_token(&mut self) -> bool {
+        let now = Instant::now();
+        let refill = now.duration_since(self.refilled_at).as_secs_f64() * self.capacity / 60.0;
+        self.tokens = (self.tokens + refill).min(self.capacity);
+        self.refilled_at = now;
+        self.tokens >= 1.0
+    }
+
+    /// Take the token [`Self::has_token`] just said was there.
+    fn take(&mut self) {
+        self.tokens -= 1.0;
+    }
+}
+
+/// Fetches in flight per `client_id` host, held as a guard so a slot is given
+/// back however the fetch ends ([`CIMD_MAX_INFLIGHT_PER_HOST`]).
+struct HostSlot {
+    state: Arc<CimdState>,
+    host: String,
+}
+
+impl HostSlot {
+    /// Take a slot for `host`, or `None` when it already holds the maximum.
+    fn take(state: &Arc<CimdState>, host: &str) -> Option<Self> {
+        let mut map = state.hosts.lock().expect("cimd host slots");
+        let held = map.get(host).copied().unwrap_or(0);
+        if held >= CIMD_MAX_INFLIGHT_PER_HOST {
+            return None;
+        }
+        map.insert(host.to_owned(), held + 1);
+        Some(Self { state: Arc::clone(state), host: host.to_owned() })
+    }
+}
+
+impl Drop for HostSlot {
+    fn drop(&mut self) {
+        let mut map = self.state.hosts.lock().expect("cimd host slots");
+        match map.get_mut(&self.host) {
+            Some(held) if *held > 1 => *held -= 1,
+            _ => {
+                map.remove(&self.host);
+            }
+        }
+    }
+}
+
+/// A request's hold on a flight, from joining it to leaving — by returning, or
+/// by being DROPPED, since an authorize future can be dropped at any await (the
+/// client resets the stream). A flight that publishes its outcome is retired by
+/// its fetcher at once ([`AuthStore::client_metadata_for`]); this guard is for
+/// the flight that never gets that far because every request in it was
+/// cancelled: the LAST holder out retires it, so no entry is left behind (on a
+/// vetted host with unique URLs, that would be unbounded growth). While another
+/// request still holds such a flight it stays where newcomers find it, so a
+/// fetcher cancelled mid-way hands over to a waiter — which, finding no outcome
+/// once the lock is its, fetches — instead of leaving the waiters on one flight
+/// and newcomers on a second, fetching the same document twice. Only this
+/// flight's own entry is ever removed, never a newer one.
+struct FlightGuard<'a> {
+    state: &'a CimdState,
+    key: &'a str,
+    flight: &'a Flight,
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        // Two handles are the map's and this request's; more means other requests
+        // still hold the flight, and the last of them retires it. The count is
+        // read under the map lock, where a newcomer would take its handle, so the
+        // two cannot cross.
+        let mut fetching = self.state.fetching.lock().expect("cimd fetch locks");
+        let Some(current) = fetching.get(self.key) else { return };
+        if !Arc::ptr_eq(current, self.flight) || Arc::strong_count(self.flight) > 2 {
+            return;
+        }
+        fetching.remove(self.key);
+    }
+}
+
+/// How long to reuse a document: the remaining freshness the origin granted
+/// (already less the response's age) capped at [`CIMD_CACHE_MAX_TTL`]; ZERO — do
+/// not cache — when it forbade reuse or that freshness is spent; and, when it
+/// sent no freshness information at all, the default LESS the age the response
+/// already has, so an answer some cache along the way held for a day is not
+/// given ten fresh minutes here.
+fn cimd_ttl(remaining: Option<Duration>, current_age: Duration) -> Duration {
+    remaining
+        .unwrap_or_else(|| CIMD_CACHE_DEFAULT_TTL.saturating_sub(current_age))
+        .min(CIMD_CACHE_MAX_TTL)
+}
+
+/// GET a metadata document: the process-global test fixture when one is
+/// registered for `url`, else the real SSRF-guarded fetch.
+async fn fetch_client_metadata_document(
+    url: &str,
+) -> Result<imcp2_core::public_fetch::PublicDocument, imcp2_core::public_fetch::FetchError> {
+    #[cfg(test)]
+    if let Some(served) = cimd_fixture::get(url) {
+        return match served {
+            cimd_fixture::Served::Now(answer) => {
+                // A real fetch suspends here; so does the stand-in, so tests see
+                // what concurrent requests do while one is in flight.
+                tokio::task::yield_now().await;
+                answer
+            }
+            cimd_fixture::Served::Never => std::future::pending().await,
+        };
+    }
+    imcp2_core::public_fetch::fetch_public_document(url, CIMD_MAX_BYTES, CIMD_FETCH_TIMEOUT).await
+}
+
+/// GET the document at `key` and validate it: the document plus how long its
+/// origin lets it be reused ([`cimd_ttl`]), or why it is not one.
+async fn fetch_and_validate_client_metadata(
+    key: &str,
+) -> Result<(Arc<ClientMetadata>, Duration), CimdError> {
+    let doc = fetch_client_metadata_document(key).await.map_err(classify_fetch_error)?;
+    if !is_json_media_type(doc.content_type.as_deref()) {
+        return Err(CimdError::Invalid(format!(
+            "{key}: served as {}, not application/json",
+            doc.content_type.as_deref().unwrap_or("no media type")
+        )));
+    }
+    let meta = parse_client_metadata(key, &doc.body)
+        .map(Arc::new)
+        .map_err(|why| CimdError::Invalid(format!("{key}: {why}")))?;
+    Ok((meta, cimd_ttl(doc.cache_max_age, doc.current_age)))
+}
+
+/// Sort a fetch failure by what it is ABOUT (PR #143 §3.4). The URL itself — the
+/// guard refuses it, the origin has no document there or answers with a redirect
+/// or another 4xx, the body is over the cap or not UTF-8 — is `Invalid`, which is
+/// remembered for [`CIMD_NEGATIVE_TTL`]. The moment — a resolver that did not
+/// answer, the deadline, a connection that failed, a 5xx, or one of the 4xx
+/// that are about the moment too, which their definitions say the client may
+/// retry (408 Request Timeout, 421 Misdirected Request, 425 Too Early, 429 Too
+/// Many Requests) — is `Unavailable`, which is never remembered.
+fn classify_fetch_error(err: imcp2_core::public_fetch::FetchError) -> CimdError {
+    use imcp2_core::public_fetch::FetchError;
+    match err {
+        FetchError::Unreachable(why) => CimdError::Unavailable(why),
+        FetchError::Answered { status, detail }
+            if status >= 500 || matches!(status, 408 | 421 | 425 | 429) =>
+        {
+            CimdError::Unavailable(detail)
+        }
+        FetchError::Answered { detail, .. } => CimdError::Invalid(detail),
+        FetchError::Refused(why) | FetchError::TooLarge(why) | FetchError::NotUtf8(why) => {
+            CimdError::Invalid(why)
+        }
+    }
+}
+
+/// The tests' stand-in for the web: what each `client_id` URL serves. Process-
+/// global, like the web it stands in for, so concurrent tests use distinct URLs.
+#[cfg(test)]
+mod cimd_fixture {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+    };
+
+    use imcp2_core::public_fetch::{FetchError, PublicDocument};
+
+    /// What the fixture does for a fetch of a URL.
+    #[derive(Clone)]
+    pub(super) enum Served {
+        /// Answer this, after the one suspension a real fetch would take.
+        Now(Result<PublicDocument, FetchError>),
+        /// Never answer: an origin that hangs. The request's only way out is to
+        /// be dropped, as a client resetting the stream would drop it.
+        Never,
+    }
+
+    type Registry = Mutex<HashMap<String, Served>>;
+    static DOCS: OnceLock<Registry> = OnceLock::new();
+    static HITS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+    fn docs() -> &'static Registry {
+        DOCS.get_or_init(Default::default)
+    }
+
+    /// Serve `body` (JSON) at `url`, with no cache hint.
+    pub(super) fn serve(url: &str, body: &str) {
+        serve_as(url, body, "application/json");
+    }
+
+    /// Serve `body` at `url` with the given `Content-Type`, no cache hint.
+    pub(super) fn serve_as(url: &str, body: &str, content_type: &str) {
+        let doc = PublicDocument {
+            body: body.into(),
+            content_type: Some(content_type.into()),
+            cache_max_age: None,
+            current_age: std::time::Duration::ZERO,
+        };
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Ok(doc)));
+    }
+
+    /// Serve `body` (JSON) at `url` with no cache hint, as an answer some cache
+    /// along the way has already held for `age`.
+    pub(super) fn serve_aged(url: &str, body: &str, age: std::time::Duration) {
+        let doc = PublicDocument {
+            body: body.into(),
+            content_type: Some("application/json".into()),
+            cache_max_age: None,
+            current_age: age,
+        };
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Ok(doc)));
+    }
+
+    /// Make a fetch of `url` hang until the request is dropped.
+    pub(super) fn hang(url: &str) {
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Never);
+    }
+
+    /// How many times `url` has been fetched.
+    pub(super) fn hits(url: &str) -> usize {
+        HITS.get_or_init(Default::default)
+            .lock()
+            .expect("fixture hits")
+            .get(url)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Serve `body` at `url` with `Cache-Control: no-store` (a zero max-age).
+    pub(super) fn serve_uncacheable(url: &str, body: &str) {
+        let doc = PublicDocument {
+            body: body.into(),
+            content_type: Some("application/json".into()),
+            cache_max_age: Some(std::time::Duration::ZERO),
+            current_age: std::time::Duration::ZERO,
+        };
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Ok(doc)));
+    }
+
+    /// Make fetching `url` fail TRANSIENTLY — an origin that cannot be reached —
+    /// with `why`.
+    pub(super) fn fail(url: &str, why: &str) {
+        let err = FetchError::Unreachable(why.into());
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Err(err)));
+    }
+
+    /// Make `url` answer 404: no document there, a failure about the URL itself.
+    pub(super) fn not_found(url: &str) {
+        answer(url, 404);
+    }
+
+    /// Make `url` answer with `status` (anything but the `200 OK` a document is).
+    pub(super) fn answer(url: &str, status: u16) {
+        let err = FetchError::Answered { status, detail: format!("{url} answered {status}") };
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Err(err)));
+    }
+
+    pub(super) fn get(url: &str) -> Option<Served> {
+        let served = docs().lock().expect("fixture registry").get(url).cloned();
+        if served.is_some() {
+            *HITS
+                .get_or_init(Default::default)
+                .lock()
+                .expect("fixture hits")
+                .entry(url.into())
+                .or_insert(0) += 1;
+        }
+        served
+    }
+}
+
 #[derive(Clone)]
 pub struct AuthStore {
     clients: Arc<ClientStore>,
@@ -775,6 +1515,13 @@ pub struct AuthStore {
     /// [`crate::McpConfig::require_resource`]); when clear, a missing `resource`
     /// is tolerated.
     require_resource: bool,
+    /// Client ID Metadata Documents: the cache, single-flight map and in-flight
+    /// bounds — the PROCESS's ([`CimdState::shared`]), so every mounted instance
+    /// draws on the same bounds; a test may give a store its own.
+    cimd: Arc<CimdState>,
+    /// Whether URL `client_id`s are accepted and CIMD advertised: the process's
+    /// `OAUTH_CIMD_ENABLED` ([`cimd_enabled_by_env`]), or what a test set.
+    cimd_enabled: bool,
 }
 
 /// An auth-code connect awaiting the user's II handshake.
@@ -893,7 +1640,18 @@ impl AuthStore {
             public_url,
             mcp_path,
             require_resource,
+            cimd: CimdState::shared(),
+            cimd_enabled: cimd_enabled_by_env(),
         }
+    }
+
+    /// This store with CIMD switched on or off, whatever the environment says,
+    /// and with CIMD state of its own, so tests do not see each other's flights.
+    #[cfg(test)]
+    fn with_cimd(mut self, enabled: bool) -> Self {
+        self.cimd_enabled = enabled;
+        self.cimd = Arc::new(CimdState::new());
+        self
     }
 
     /// The II instance this store serves.
@@ -921,13 +1679,222 @@ impl AuthStore {
         format!("{}/.well-known/oauth-protected-resource{}", self.public_url, self.mcp_path)
     }
 
-    /// Whether `redirect_uri` is acceptable for `client_id`: the client must be
-    /// registered, and the redirect must match a registered URI (exactly, or
-    /// port-agnostically for loopback per RFC 8252 §7.3). A match also marks the
+    /// Whether `redirect_uri` is acceptable for `client_id`. A CIMD client (its
+    /// `client_id` is an https URL, [`cimd_client_id`], and CIMD is on) must be
+    /// on a vetted vendor origin ([`cimd_origin_trusted`]) and is then checked
+    /// against its fetched, validated document; any other client must hold a
+    /// registration in the DCR store. Either way the redirect must match one the
+    /// client registered (exactly, or port-agnostically for loopback per RFC 8252
+    /// §7.3) AND pass the hosted-redirect allow-list. A DCR match also marks the
     /// registration as recently used (it is about to sign a user in), which is
     /// what keeps it ahead of the store's LRU eviction.
-    async fn validate_client(&self, client_id: &str, redirect_uri: &str) -> bool {
-        self.clients.redirect_allowed_for(client_id, redirect_uri).await
+    async fn validate_client(&self, client_id: &str, redirect_uri: &str) -> ClientCheck {
+        let Some(cimd_url) = cimd_client_id(client_id).filter(|_| self.cimd_enabled) else {
+            return if self.clients.redirect_allowed_for(client_id, redirect_uri).await {
+                ClientCheck::Allowed
+            } else {
+                ClientCheck::Refused
+            };
+        };
+        // The trust policy, BEFORE anything else: a document is fetched from a
+        // vetted vendor origin or not at all, so an unauthenticated request naming
+        // a stranger's URL costs this server nothing and admits nothing.
+        if !cimd_origin_trusted(&cimd_url) {
+            // Debug, not info: this runs for every unauthenticated request, before
+            // any rate limit, and carries a caller-chosen URL — a flood of distinct
+            // strangers must not be a flood of log lines.
+            tracing::debug!(client_id, "refusing a client_id URL off the vendor trust policy");
+            return ClientCheck::UntrustedClientOrigin;
+        }
+        // Allow-list BEFORE any fetch too: a redirect this server would refuse
+        // anyway must not cost an outbound request, so even a vetted host is not
+        // asked for a document on behalf of a redirect that could never be used.
+        if !redirect_uri_permitted(redirect_uri) {
+            return ClientCheck::Refused;
+        }
+        match self.client_metadata_for(client_id, &cimd_url).await {
+            Ok(meta) => {
+                // The same check a DCR registration gets, over the document's redirects.
+                let reg = ClientReg::new(meta.redirect_uris.clone());
+                if redirect_allowed(Some(&reg), redirect_uri) {
+                    ClientCheck::Allowed
+                } else {
+                    ClientCheck::Refused
+                }
+            }
+            // Both outcomes are logged at warn WHERE THE FETCH HAPPENS (bounded by
+            // the fetch rate); here, per request — a negative-cache hit or a refused
+            // permit costs no fetch — only at debug, or a flood of requests for one
+            // bad URL would be a flood of log lines carrying its caller-chosen text.
+            Err(CimdError::Invalid(why)) => {
+                tracing::debug!(client_id, %why, "client metadata document is invalid");
+                ClientCheck::Refused
+            }
+            Err(CimdError::Unavailable(why)) => {
+                tracing::debug!(client_id, %why, "client metadata document unavailable");
+                ClientCheck::MetadataUnavailable(why)
+            }
+        }
+    }
+
+    /// The validated metadata document behind a CIMD `client_id`, from the cache
+    /// while fresh, else fetched — once, however many requests miss at the same
+    /// time, all of which share that one fetch's outcome — under the in-flight
+    /// bounds. What is then cached, and for how long, is
+    /// [`AuthStore::fetch_and_cache_client_metadata`]'s call.
+    async fn client_metadata_for(
+        &self,
+        key: &str,
+        client_id: &url::Url,
+    ) -> Result<Arc<ClientMetadata>, CimdError> {
+        // `key` is the identifier AS GIVEN — the string the document must repeat,
+        // and what the cache and single-flight map are keyed by; `client_id` is
+        // it parsed, for the host.
+        if let Some(cached) = self.cached_client_metadata(key).await {
+            return cached;
+        }
+        // Single-flight: the first miss for a document fetches it; the others wait
+        // for that fetch and take its outcome — a failure or an uncacheable
+        // document included, so nobody re-fetches serially behind a slow origin.
+        // Without this a popular client's cold start (or a document's expiry)
+        // would have every concurrent authorize fetch the same bytes and spend a
+        // permit each.
+        let flight: Flight = Arc::clone(
+            self.cimd.fetching.lock().expect("cimd fetch locks").entry(key.to_owned()).or_default(),
+        );
+        // Held for as long as this request is in the flight, however it leaves;
+        // the last holder out retires the flight ([`FlightGuard`]).
+        let _hold = FlightGuard { state: &self.cimd, key, flight: &flight };
+        let mut slot = flight.lock().await;
+        if let Some(outcome) = slot.as_ref() {
+            return outcome.clone();
+        }
+        // First through the lock: this request fetches — unless a flight that
+        // finished between the miss above and here has filled the cache meanwhile
+        // — and publishes, for the waiters to read from the handle they hold.
+        let outcome = match self.cached_client_metadata(key).await {
+            Some(cached) => cached,
+            None => self.fetch_and_cache_client_metadata(key, client_id).await,
+        };
+        // Retire the flight BEFORE publishing, still under its lock, so no request
+        // can join it once the outcome is there: a request arriving from here on
+        // goes to the cache, or, for an outcome the cache does not hold (a
+        // `no-store` document, a transient failure), fetches afresh — never joins
+        // this flight to reuse an outcome the origin said not to reuse, or a
+        // failure that may be over. Everyone who joined before this reads the
+        // outcome from the handle they already hold.
+        self.cimd.retire_flight(key, &flight);
+        *slot = Some(outcome.clone());
+        outcome
+    }
+
+    /// The cached outcome for `key`, if one is held and still fresh: the
+    /// document, or — a negative entry — why the URL yields none.
+    async fn cached_client_metadata(
+        &self,
+        key: &str,
+    ) -> Option<Result<Arc<ClientMetadata>, CimdError>> {
+        let cache = self.cimd.cache.read().await;
+        let hit = cache.get(key).filter(|hit| hit.expires > Instant::now())?;
+        Some(hit.outcome.clone().map_err(CimdError::Invalid))
+    }
+
+    /// Fetch, validate and cache the document at `client_id`. Bounded before any
+    /// request goes out: in rate, per vendor and overall, and in flight, per host
+    /// (so one slow host cannot take every permit) and overall. None of these
+    /// queues — an excess request is told to retry.
+    /// A document is cached for as long as [`cimd_ttl`] says, which is not at all
+    /// when its origin forbids reuse; a failure about the URL itself is cached
+    /// negatively for [`CIMD_NEGATIVE_TTL`]; a transient failure is not cached.
+    async fn fetch_and_cache_client_metadata(
+        &self,
+        key: &str,
+        client_id: &url::Url,
+    ) -> Result<Arc<ClientMetadata>, CimdError> {
+        let host = host_key(client_id.host_str().unwrap_or_default());
+        let Some(_slot) = HostSlot::take(&self.cimd, &host) else {
+            return Err(CimdError::Unavailable(format!(
+                "too many client metadata fetches in flight for {host}; retry shortly"
+            )));
+        };
+        let Ok(_permit) = self.cimd.inflight.try_acquire() else {
+            return Err(CimdError::Unavailable(
+                "too many client metadata fetches in flight; retry shortly".into(),
+            ));
+        };
+        // The RATE last, once a slot and a permit are held, so a token is spent
+        // only on a fetch that goes out: a request refused for congestion drains
+        // no budget, or a burst during congestion could spend the minute's budget
+        // without a single fetch and lock the real clients out once it clears.
+        // The in-flight bounds cap how many fetches run at once, not how many run
+        // in a minute; this does. The vendor's share, then the process's — both
+        // must have a token before either is taken.
+        {
+            let mut rates = self.cimd.rates.lock().expect("cimd rates");
+            let rates = &mut *rates;
+            let domain = vetted_domain(&host).unwrap_or_default();
+            let vendor = rates
+                .per_domain
+                .entry(domain)
+                .or_insert_with(|| TokenBucket::per_minute(CIMD_RATE_PER_DOMAIN_PER_MINUTE));
+            if !vendor.has_token() {
+                return Err(CimdError::Unavailable(format!(
+                    "client metadata fetch rate for {domain} exceeded; retry shortly"
+                )));
+            }
+            if !rates.all.has_token() {
+                return Err(CimdError::Unavailable(
+                    "client metadata fetch rate exceeded; retry shortly".into(),
+                ));
+            }
+            vendor.take();
+            rates.all.take();
+        }
+        let fetched = Instant::now();
+        // The one place these are logged at warn: a fetch happened, and fetches
+        // are rate-limited, so the log is bounded however the requests flood.
+        let (outcome, ttl) = match fetch_and_validate_client_metadata(key).await {
+            Ok((meta, ttl)) => (Ok(meta), ttl),
+            Err(CimdError::Invalid(why)) => {
+                tracing::warn!(
+                    client_id = key, %why,
+                    "client metadata document is invalid; refusing its client for a minute"
+                );
+                (Err(why), CIMD_NEGATIVE_TTL)
+            }
+            Err(CimdError::Unavailable(why)) => {
+                tracing::warn!(client_id = key, %why, "client metadata document unavailable");
+                return Err(CimdError::Unavailable(why));
+            }
+        };
+        if !ttl.is_zero() {
+            self.remember_client_metadata(key, outcome.clone(), fetched + ttl).await;
+        }
+        outcome.map_err(CimdError::Invalid)
+    }
+
+    /// Hold `outcome` for `key` until `expires`, making room under
+    /// [`CIMD_CACHE_MAX`] first.
+    async fn remember_client_metadata(
+        &self,
+        key: &str,
+        outcome: Result<Arc<ClientMetadata>, String>,
+        expires: Instant,
+    ) {
+        let now = Instant::now();
+        let mut cache = self.cimd.cache.write().await;
+        if cache.len() >= CIMD_CACHE_MAX && !cache.contains_key(key) {
+            // Make room: drop what has expired; if that frees nothing, the entry
+            // closest to expiry (an LRU stand-in that needs no write per hit).
+            cache.retain(|_, c| c.expires > now);
+            if cache.len() >= CIMD_CACHE_MAX {
+                let victim = cache.iter().min_by_key(|(_, c)| c.expires).map(|(k, _)| k.clone());
+                if let Some(victim) = victim {
+                    cache.remove(&victim);
+                }
+            }
+        }
+        cache.insert(key.to_owned(), CachedClientMetadata { outcome, expires });
     }
 
     /// The verified principal + session id behind a bearer token, if valid.
@@ -1145,7 +2112,41 @@ pub async fn authorize(
             )
         }
     }
-    if !store.validate_client(&q.client_id, &q.redirect_uri).await {
+    let client_check = store.validate_client(&q.client_id, &q.redirect_uri).await;
+    if let ClientCheck::MetadataUnavailable(_) = &client_check {
+        // A CIMD client this server could not verify RIGHT NOW (the cause is
+        // logged by `validate_client`): neither a malformed request nor a client
+        // to re-add, so say retry. Nothing about the failure is reflected here —
+        // the cause quotes the caller-supplied `client_id` URL.
+        return signin_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "the client's metadata document could not be fetched",
+            SIGNIN_HEADLINE,
+            "We couldn't fetch your MCP client's identity document just now. Try again in a \
+             moment.",
+        );
+    }
+    if client_check == ClientCheck::UntrustedClientOrigin {
+        // A URL `client_id` on an origin that is not a vetted vendor (the trust
+        // policy of PR #143), refused before any fetch. Like a hosted redirect
+        // off the allow-list, this is an approval gap with a concrete next step,
+        // not a malformed request — so the same "not approved" page, or its JSON.
+        return if accepts_html(&headers) {
+            not_allowlisted_page()
+        } else {
+            oauth_err(
+                StatusCode::FORBIDDEN,
+                "invalid_client",
+                &format!(
+                    "client_id URL is not on a vetted vendor origin; contact {CONTACT} to request \
+                     access"
+                ),
+            )
+        };
+    }
+    if client_check != ClientCheck::Allowed {
         if !redirect_uri_permitted(&q.redirect_uri) {
             // Two distinct failures reach here. A WELL-FORMED hosted `redirect_uri`
             // that simply isn't on the allow-list is an approval gap, not a
@@ -2076,6 +3077,14 @@ pub async fn authorization_server_metadata(State(store): State<AuthStore>) -> Re
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
+        // The MCP authorization spec's preferred registration: a client may
+        // identify itself with the https URL of its Client ID Metadata Document
+        // instead of registering (see `cimd_client_id`). Claude and ChatGPT both
+        // select CIMD over DCR when this is advertised alongside `none` above —
+        // which is why it is advertised only where the deployment opts in with
+        // `OAUTH_CIMD_ENABLED`, and a redeploy without that withdraws it (no
+        // rebuild; the value is read once at start-up).
+        "client_id_metadata_document_supported": store.cimd_enabled,
         // RFC 9207: we emit `iss` on every authorization response, so we MUST
         // advertise it here (a client that sees this flag rejects any response
         // missing `iss`). See `build_redirect`.
@@ -2416,6 +3425,857 @@ mod tests {
         }
     }
 
+    /// A Client ID Metadata Document `client_id` is an https URL naming a host
+    /// and a path beyond `/`, with no fragment or userinfo, within the length cap
+    /// — taken as given, in whatever spelling its document repeats (a query is
+    /// tolerated, as the draft only discourages one). Anything else is an
+    /// ordinary (DCR) identifier.
+    #[test]
+    fn cimd_client_id_shape() {
+        use super::cimd_client_id;
+        // The two directory clients' real identifiers.
+        assert!(cimd_client_id("https://chatgpt.com/oauth/client.json").is_some());
+        assert!(cimd_client_id("https://claude.ai/oauth/claude-code-client-metadata").is_some());
+        // A DCR identifier, and other non-URLs, are not CIMD.
+        assert!(cimd_client_id("client-3f6a9b2c-1d4e-4f5a-8b6c-7d8e9f0a1b2c").is_none());
+        assert!(cimd_client_id("").is_none());
+        // The draft's MUSTs.
+        assert!(cimd_client_id("http://chatgpt.com/oauth/client.json").is_none());
+        assert!(cimd_client_id("https://chatgpt.com").is_none());
+        assert!(cimd_client_id("https://chatgpt.com/").is_none());
+        assert!(cimd_client_id("https://chatgpt.com/oauth/client.json#x").is_none());
+        // A query is only discouraged by the draft, so it is tolerated — canonically.
+        assert!(cimd_client_id("https://chatgpt.com/oauth/client.json?v=2").is_some());
+        assert!(cimd_client_id("https://user@chatgpt.com/oauth/client.json").is_none());
+        // …including what the parser would silently alter: an EMPTY userinfo it
+        // erases, and the tab/newline/CR it strips from anywhere.
+        assert!(cimd_client_id("https://@chatgpt.com/oauth/client.json").is_none());
+        assert!(cimd_client_id("https://chat\tgpt.com/oauth/client.json").is_none());
+        assert!(cimd_client_id("https://chatgpt.com/oauth/client.json\n").is_none());
+        assert!(cimd_client_id("https:\r//chatgpt.com/oauth/client.json").is_none());
+        // …the backslashes it reads as slashes, wherever they are…
+        assert!(cimd_client_id("https:\\\\chatgpt.com\\oauth\\client.json").is_none());
+        assert!(cimd_client_id("https://chatgpt.com\\@evil.example/oauth/client.json").is_none());
+        assert!(cimd_client_id("https://chatgpt.com/oauth\\client.json").is_none());
+        // …and the leading/trailing C0 controls and spaces it trims.
+        assert!(cimd_client_id(" https://chatgpt.com/oauth/client.json").is_none());
+        assert!(cimd_client_id("https://chatgpt.com/oauth/client.json ").is_none());
+        assert!(cimd_client_id("\u{1}https://chatgpt.com/oauth/client.json").is_none());
+        // The draft asks for an https URL the document repeats byte for byte, not
+        // for one spelling of it: these are accepted as given (they are the
+        // identity and the cache key), and only the host is normalised, for the
+        // trust policy and the per-host quota (`host_key`).
+        for spelling in [
+            "HTTPS://chatgpt.com/oauth/client.json",
+            "https://ChatGPT.com/oauth/client.json",
+            "https://chatgpt.com:443/oauth/client.json",
+            "https://chatgpt.com./oauth/client.json",
+            "https://chatgpt.com/oauth/../oauth/client.json",
+        ] {
+            assert!(cimd_client_id(spelling).is_some(), "{spelling}");
+        }
+        // Bounded, since it is about to become a cache key: the cap exactly, not
+        // one byte more.
+        let at_cap =
+            format!("https://chatgpt.com/{}", "x".repeat(super::CIMD_MAX_CLIENT_ID_LEN - 20));
+        assert_eq!(at_cap.len(), super::CIMD_MAX_CLIENT_ID_LEN);
+        assert!(cimd_client_id(&at_cap).is_some());
+        assert!(cimd_client_id(&format!("{at_cap}x")).is_none());
+    }
+
+    /// Whatever is keyed by host sees one spelling per host, so a trailing dot or
+    /// upper case cannot buy a second per-host quota.
+    #[test]
+    fn cimd_host_key_is_one_spelling_per_host() {
+        use super::host_key;
+        for spelling in ["claude.ai", "Claude.AI", "claude.ai.", "CLAUDE.AI."] {
+            assert_eq!(host_key(spelling), "claude.ai", "{spelling}");
+        }
+    }
+
+    /// A document is accepted only as the draft and this public-client-only AS
+    /// require. The bodies are the two directory clients' real documents (as
+    /// served on 2026-09-03), so a change in how either identifies itself lands
+    /// here first.
+    #[test]
+    fn client_metadata_parsing() {
+        use super::parse_client_metadata;
+        use serde_json::json;
+        const CHATGPT: &str = "https://chatgpt.com/oauth/client.json";
+        const CHATGPT_REDIRECT: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
+        let chatgpt_doc = json!({
+            "client_id": CHATGPT,
+            "client_uri": "https://chatgpt.com/",
+            "redirect_uris": [CHATGPT_REDIRECT],
+            "token_endpoint_auth_method": "private_key_jwt",
+            "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "client_name": "ChatGPT",
+            "logo_uri": "https://persistent.oaistatic.com/sonic/misc/openai-logo.png",
+            "token_endpoint_auth_signing_alg": "RS256",
+            "jwks_uri": "https://chatgpt.com/oauth/jwks.json",
+        })
+        .to_string();
+        const CLAUDE_CODE: &str = "https://claude.ai/oauth/claude-code-client-metadata";
+        let claude_code_doc = json!({
+            "client_id": CLAUDE_CODE,
+            "client_name": "Claude Code",
+            "client_uri": "https://claude.ai",
+            "redirect_uris": ["http://localhost/callback", "http://127.0.0.1/callback"],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        })
+        .to_string();
+        // ChatGPT PREFERS private_key_jwt but lists `none`, which is what it uses here.
+        let chatgpt = parse_client_metadata(CHATGPT, &chatgpt_doc).expect("ChatGPT's document");
+        assert_eq!(chatgpt.client_name.as_deref(), Some("ChatGPT"));
+        assert_eq!(chatgpt.redirect_uris, [CHATGPT_REDIRECT]);
+        let claude = parse_client_metadata(CLAUDE_CODE, &claude_code_doc).expect("Claude Code's");
+        assert_eq!(
+            claude.redirect_uris,
+            ["http://localhost/callback", "http://127.0.0.1/callback"]
+        );
+        // The document must be about the URL it was fetched from.
+        let err = parse_client_metadata(CLAUDE_CODE, &chatgpt_doc).unwrap_err();
+        assert!(err.contains("not the document URL"), "{err}");
+        // Required shape.
+        assert!(parse_client_metadata(CHATGPT, "not json").is_err());
+        assert!(parse_client_metadata(CHATGPT, "[]").is_err());
+        let no_id = json!({ "redirect_uris": [CHATGPT_REDIRECT] }).to_string();
+        assert!(parse_client_metadata(CHATGPT, &no_id).unwrap_err().contains("no client_id"));
+        let refused_for =
+            |doc: serde_json::Value| parse_client_metadata(CHATGPT, &doc.to_string()).unwrap_err();
+        assert!(refused_for(json!({ "client_id": CHATGPT })).contains("redirect_uris"));
+        let no_uris = json!({ "client_id": CHATGPT, "redirect_uris": [] });
+        assert!(refused_for(no_uris).contains("redirect_uris"));
+        let bad_uris = json!({ "client_id": CHATGPT, "redirect_uris": [1] });
+        assert!(refused_for(bad_uris).contains("redirect_uris"));
+        // No secret in a public document, and no secret-only or JWT-only client.
+        let secret = json!({
+            "client_id": CHATGPT,
+            "redirect_uris": [CHATGPT_REDIRECT],
+            "client_secret": "s",
+        });
+        assert!(refused_for(secret).contains("secret"));
+        let jwt_only = json!({
+            "client_id": CHATGPT,
+            "redirect_uris": [CHATGPT_REDIRECT],
+            "token_endpoint_auth_method": "private_key_jwt",
+        });
+        assert!(refused_for(jwt_only).contains("public clients"));
+        // An absent method is `none`: a document may not use a secret-based one.
+        let no_method = json!({ "client_id": CHATGPT, "redirect_uris": [CHATGPT_REDIRECT] });
+        assert!(parse_client_metadata(CHATGPT, &no_method.to_string()).is_ok());
+        // A PRESENT method of the wrong type is malformed, not absent.
+        let odd_method = json!({
+            "client_id": CHATGPT,
+            "redirect_uris": [CHATGPT_REDIRECT],
+            "token_endpoint_auth_method": 1,
+        });
+        assert!(refused_for(odd_method).contains("must be a string"));
+        // The flow: absent is the RFC default (accepted above); present, it must
+        // include the one flow this server runs, and be a string array to say so.
+        let with = |field: &str, value: serde_json::Value| json!({ "client_id": CHATGPT, "redirect_uris": [CHATGPT_REDIRECT], field: value });
+        let ok = |doc: serde_json::Value| parse_client_metadata(CHATGPT, &doc.to_string()).is_ok();
+        assert!(ok(with("grant_types", json!(["authorization_code", "refresh_token"]))));
+        assert!(ok(with("response_types", json!(["code"]))));
+        let err = refused_for(with("grant_types", json!(["client_credentials"])));
+        assert!(err.contains("grant_types") && err.contains("authorization_code"), "{err}");
+        let err = refused_for(with("response_types", json!(["token"])));
+        assert!(err.contains("response_types") && err.contains("\"code\""), "{err}");
+        assert!(refused_for(with("grant_types", json!([]))).contains("authorization_code"));
+        let err = refused_for(with("grant_types", json!("authorization_code")));
+        assert!(err.contains("array of strings"), "{err}");
+        assert!(refused_for(with("response_types", json!([1]))).contains("array of strings"));
+        // Hosted redirects must be same-origin with the document; loopback is exempt.
+        const OTHER: &str = "https://cimd-other.claude.ai/client.json";
+        const OWN: &str = "https://cimd-other.claude.ai/api/mcp/auth_callback";
+        let borrowed = json!({ "client_id": OTHER, "redirect_uris": [CHATGPT_REDIRECT] });
+        let err = parse_client_metadata(OTHER, &borrowed.to_string()).unwrap_err();
+        assert!(err.contains("own origin"), "{err}");
+        let mixed = json!({
+            "client_id": OTHER,
+            "redirect_uris": [
+                CHATGPT_REDIRECT, OWN, "http://127.0.0.1/cb"
+            ],
+        });
+        let kept = parse_client_metadata(OTHER, &mixed.to_string()).expect("own + loopback kept");
+        assert_eq!(kept.redirect_uris, [OWN, "http://127.0.0.1/cb"]);
+        // Same host, different port or scheme, is a different origin.
+        let off_origin = json!({ "client_id": OTHER, "redirect_uris": [format!("{OWN}:8443")] });
+        assert!(parse_client_metadata(OTHER, &off_origin.to_string()).is_err());
+        // Only what a DCR registration could have registered is kept: a loopback
+        // redirect with a fragment (which the port-agnostic match would ignore,
+        // admitting a redirect DCR refuses), or an own-origin path the allow-list
+        // does not pin, leaves the document with nothing.
+        let fragment = json!({ "client_id": OTHER, "redirect_uris": ["http://127.0.0.1/cb#x"] });
+        assert!(parse_client_metadata(OTHER, &fragment.to_string()).is_err());
+        let unpinned =
+            json!({ "client_id": OTHER, "redirect_uris": ["https://cimd-other.claude.ai/cb"] });
+        assert!(parse_client_metadata(OTHER, &unpinned.to_string()).is_err());
+        // No more redirect_uris than a DCR registration may send.
+        let many: Vec<String> = (0..=super::MAX_REDIRECT_URIS)
+            .map(|i| format!("https://cimd-other.test/cb/{i}"))
+            .collect();
+        let too_many = json!({ "client_id": OTHER, "redirect_uris": many }).to_string();
+        let err = parse_client_metadata(OTHER, &too_many).unwrap_err();
+        assert!(err.contains("too many redirect_uris"), "{err}");
+        // …nor a longer one: a same-origin redirect DCR would refuse is refused here.
+        let long = format!("https://cimd-other.test/{}", "x".repeat(super::MAX_REDIRECT_URI_LEN));
+        let too_long = json!({ "client_id": OTHER, "redirect_uris": [long] }).to_string();
+        let err = parse_client_metadata(OTHER, &too_long).unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+    }
+
+    /// What a fetch failure is ABOUT decides whether it is remembered: the URL
+    /// (refused, nothing there, a redirect, another 4xx, too large, not UTF-8) is
+    /// invalid and cached; the moment (unreachable, 5xx, 408, 429) is unavailable
+    /// and retried.
+    #[test]
+    fn cimd_fetch_error_classification() {
+        use super::{classify_fetch_error, CimdError};
+        use imcp2_core::public_fetch::FetchError;
+        let answered = |status: u16| FetchError::Answered { status, detail: format!("{status}") };
+        let unavailable =
+            |e: FetchError| matches!(classify_fetch_error(e), CimdError::Unavailable(_));
+        let invalid = |e: FetchError| matches!(classify_fetch_error(e), CimdError::Invalid(_));
+        assert!(unavailable(FetchError::Unreachable("dns".into())));
+        for status in [500u16, 502, 503, 504, 408, 421, 425, 429] {
+            assert!(unavailable(answered(status)), "{status} is about the moment");
+        }
+        for status in [301u16, 302, 400, 401, 403, 404, 410, 451] {
+            assert!(invalid(answered(status)), "{status} is about the URL");
+        }
+        assert!(invalid(FetchError::Refused("private address".into())));
+        assert!(invalid(FetchError::TooLarge("cap".into())));
+        assert!(invalid(FetchError::NotUtf8("bytes".into())));
+    }
+
+    /// The deploy-time opt-in's reading of its variable: off unless it says on.
+    #[test]
+    fn cimd_opt_in_values() {
+        use super::cimd_enabled_by;
+        let off = [None, Some(""), Some(" "), Some("0"), Some("false"), Some("no"), Some("off")];
+        for value in off.into_iter().chain([Some("enabled"), Some("2")]) {
+            assert!(!cimd_enabled_by(value), "{value:?} should leave CIMD off");
+        }
+        for value in [Some("1"), Some("true"), Some("Yes"), Some("ON"), Some(" 1 ")] {
+            assert!(cimd_enabled_by(value), "{value:?} should turn CIMD on");
+        }
+    }
+
+    /// PR #143's trust policy: a document is fetched only from a vetted vendor
+    /// origin — a host on or under an allow-listed domain, on the default port.
+    /// Any other URL `client_id` is refused before any fetch and told where to
+    /// request access; with CIMD off, it is simply an unknown client.
+    #[tokio::test]
+    async fn cimd_origin_trust_policy() {
+        use super::{cimd_client_id, cimd_fixture, cimd_origin_trusted, ClientCheck};
+        let trusted =
+            |id: &str| cimd_origin_trusted(&cimd_client_id(id).expect("a CIMD client_id"));
+        // The directory clients' real identifiers, and subdomains of vetted domains.
+        assert!(trusted("https://chatgpt.com/oauth/client.json"));
+        assert!(trusted("https://claude.ai/oauth/claude-code-client-metadata"));
+        assert!(trusted("https://www.cursor.com/mcp/client.json"));
+        assert!(trusted("https://www.perplexity.ai/client.json"));
+        // Not vetted: a stranger; a look-alike that is no dot-boundary subdomain; a
+        // vetted name as a SUBDOMAIN of a stranger; a non-default port on a vetted
+        // host (the SSRF guard would connect to it, and nobody vetted that service).
+        assert!(!trusted("https://cimd-stranger.test/client.json"));
+        assert!(!trusted("https://evilclaude.ai/client.json"));
+        assert!(!trusted("https://claude.ai.evil.test/client.json"));
+        assert!(!trusted("https://claude.ai:8443/oauth/client.json"));
+
+        // Refused BEFORE any fetch: were one made, these fixtures would turn the
+        // verdict into MetadataUnavailable, and the hit counts would say so.
+        let store = test_store();
+        const STRANGER: &str = "https://cimd-stranger.test/client.json";
+        const PORT: &str = "https://claude.ai:8443/oauth/client.json";
+        for id in [STRANGER, PORT] {
+            cimd_fixture::fail(id, "must not be fetched");
+            let verdict = store.validate_client(id, "http://127.0.0.1:1/cb").await;
+            assert_eq!(verdict, ClientCheck::UntrustedClientOrigin, "{id}");
+            assert_eq!(cimd_fixture::hits(id), 0, "{id} must not be fetched");
+        }
+
+        // With CIMD off, a URL client_id — vetted or not — is an unknown client:
+        // nothing is fetched, and no page points at the contact for a mechanism
+        // this deployment does not offer.
+        let off = test_store().with_cimd(false);
+        const VETTED: &str = "https://cimd-off.claude.ai/client.json";
+        cimd_fixture::fail(VETTED, "must not be fetched");
+        assert_eq!(
+            off.validate_client(VETTED, "http://127.0.0.1:1/cb").await,
+            ClientCheck::Refused
+        );
+        assert_eq!(
+            off.validate_client(STRANGER, "http://127.0.0.1:1/cb").await,
+            ClientCheck::Refused
+        );
+        assert_eq!(cimd_fixture::hits(VETTED), 0);
+    }
+
+    #[test]
+    fn cimd_cache_ttl_is_bounded() {
+        use super::{cimd_ttl, CIMD_CACHE_DEFAULT_TTL, CIMD_CACHE_MAX_TTL};
+        let fresh = Duration::ZERO;
+        assert_eq!(cimd_ttl(None, fresh), CIMD_CACHE_DEFAULT_TTL);
+        // The origin's value is honoured as given, however small, up to the ceiling.
+        assert_eq!(cimd_ttl(Some(Duration::from_secs(300)), fresh), Duration::from_secs(300));
+        assert_eq!(cimd_ttl(Some(Duration::from_secs(5)), fresh), Duration::from_secs(5));
+        assert_eq!(cimd_ttl(Some(Duration::from_secs(10 * 24 * 3600)), fresh), CIMD_CACHE_MAX_TTL);
+        // `no-store` / `no-cache` / `max-age=0` is zero: not cached at all.
+        assert_eq!(cimd_ttl(Some(Duration::ZERO), fresh), Duration::ZERO);
+        // No freshness information: the default LESS the age the answer already
+        // has — an origin's own value is already net of it.
+        let aged = Duration::from_secs(4 * 60);
+        assert_eq!(cimd_ttl(None, aged), CIMD_CACHE_DEFAULT_TTL - aged);
+        assert_eq!(cimd_ttl(None, Duration::from_secs(86400)), Duration::ZERO);
+        assert_eq!(
+            cimd_ttl(Some(Duration::from_secs(300)), Duration::from_secs(86400)),
+            Duration::from_secs(300)
+        );
+    }
+
+    /// The media type a document must be served as, by essence: parameters and
+    /// case are fine, anything else — or nothing — is not.
+    #[test]
+    fn cimd_media_type() {
+        use super::is_json_media_type;
+        assert!(is_json_media_type(Some("application/json")));
+        assert!(is_json_media_type(Some("application/json; charset=utf-8")));
+        assert!(is_json_media_type(Some("Application/JSON")));
+        assert!(!is_json_media_type(Some("text/html; charset=utf-8")));
+        assert!(!is_json_media_type(Some("text/plain")));
+        assert!(!is_json_media_type(Some("application/jose+json")));
+        assert!(!is_json_media_type(None));
+    }
+
+    /// Concurrent requests for one cold document share a single fetch, and one
+    /// host cannot take every permit: it gets [`CIMD_MAX_INFLIGHT_PER_HOST`] and
+    /// the excess is told to retry — with every slot given back afterwards.
+    #[tokio::test]
+    async fn cimd_fetches_are_coalesced_and_bounded_per_host() {
+        use super::{cimd_fixture, ClientCheck};
+        use serde_json::json;
+        let store = test_store();
+        let check = |id: &'static str, redirect: &'static str| store.validate_client(id, redirect);
+        let native = |id: &str| {
+            json!({ "client_id": id, "redirect_uris": ["http://127.0.0.1/cb"] }).to_string()
+        };
+        const REDIRECT: &str = "http://127.0.0.1:4242/cb";
+
+        // Three misses at once for one document: one fetch, three admissions.
+        const HERD: &str = "https://cimd-herd.claude.ai/client.json";
+        cimd_fixture::serve(HERD, &native(HERD));
+        let (a, b, c) =
+            tokio::join!(check(HERD, REDIRECT), check(HERD, REDIRECT), check(HERD, REDIRECT));
+        assert_eq!((a, b, c), (ClientCheck::Allowed, ClientCheck::Allowed, ClientCheck::Allowed));
+        assert_eq!(cimd_fixture::hits(HERD), 1, "concurrent misses must share one fetch");
+
+        // A failure is shared the same way: three misses for a document whose
+        // origin is down make ONE attempt, and all three are told to retry — none
+        // queues behind the others for a fetch of its own.
+        const DOWN: &str = "https://cimd-herd-down.claude.ai/client.json";
+        cimd_fixture::fail(DOWN, "origin down");
+        let (a, b, c) =
+            tokio::join!(check(DOWN, REDIRECT), check(DOWN, REDIRECT), check(DOWN, REDIRECT));
+        for verdict in [a, b, c] {
+            assert!(matches!(verdict, ClientCheck::MetadataUnavailable(_)), "{verdict:?}");
+        }
+        assert_eq!(cimd_fixture::hits(DOWN), 1, "concurrent misses must share one failure");
+
+        // Three distinct documents on ONE host at once: two fetch, the third is
+        // told to retry rather than taking a third permit for that host.
+        const ONE: &str = "https://cimd-busy.claude.ai/one.json";
+        const TWO: &str = "https://cimd-busy.claude.ai/two.json";
+        const THREE: &str = "https://cimd-busy.claude.ai/three.json";
+        for id in [ONE, TWO, THREE] {
+            cimd_fixture::serve(id, &native(id));
+        }
+        let (one, two, three) =
+            tokio::join!(check(ONE, REDIRECT), check(TWO, REDIRECT), check(THREE, REDIRECT));
+        assert_eq!((one, two), (ClientCheck::Allowed, ClientCheck::Allowed));
+        match three {
+            ClientCheck::MetadataUnavailable(why) => {
+                assert!(why.contains("cimd-busy.claude.ai"), "{why}")
+            }
+            other => panic!("the third fetch for one host must be refused, got {other:?}"),
+        }
+        // The refusal spent no rate budget: a token goes only with a fetch that
+        // goes out — herd, herd-down, one and two so far, four in all.
+        let tokens_left = store.cimd.rates.lock().unwrap().all.tokens.floor() as u32;
+        assert_eq!(tokens_left, super::CIMD_RATE_PER_MINUTE - 4, "a refused slot drains no budget");
+        // Slots and single-flight entries are released, not leaked.
+        assert!(store.cimd.hosts.lock().unwrap().is_empty());
+        assert!(store.cimd.fetching.lock().unwrap().is_empty());
+        // The refused one succeeds on retry (its document was never fetched).
+        assert_eq!(check(THREE, REDIRECT).await, ClientCheck::Allowed);
+    }
+
+    /// A token bucket starts full, gives one token per take, and refills only
+    /// with time.
+    #[test]
+    fn cimd_rate_bucket() {
+        use super::TokenBucket;
+        let mut bucket = TokenBucket::per_minute(2);
+        assert!(bucket.has_token());
+        bucket.take();
+        assert!(bucket.has_token());
+        bucket.take();
+        assert!(!bucket.has_token(), "two tokens a minute means two, not three, at once");
+    }
+
+    /// The fetch RATE is bounded, not only how many are in flight: an origin that
+    /// answers at once gives its permit straight back, so without this a caller
+    /// could drive one request after another at a vendor with distinct paths.
+    /// A vendor's share runs out first, leaving the others theirs; then the
+    /// process's budget does, for everyone.
+    #[tokio::test]
+    async fn cimd_fetch_rate_is_bounded() {
+        use super::{
+            cimd_fixture, ClientCheck, CIMD_RATE_PER_DOMAIN_PER_MINUTE, CIMD_RATE_PER_MINUTE,
+        };
+        let store = test_store();
+        const REDIRECT: &str = "http://127.0.0.1:1/cb";
+        fn rate_limited(verdict: &ClientCheck) -> bool {
+            matches!(verdict, ClientCheck::MetadataUnavailable(why) if why.contains("rate"))
+        }
+        // Distinct, never-seen paths on one vendor, each answered 404 at once (so
+        // nothing legitimate is cached): each is a fetch, until that vendor's
+        // share for the minute is spent.
+        for i in 0..CIMD_RATE_PER_DOMAIN_PER_MINUTE {
+            let id = format!("https://cimd-rate.claude.ai/{i}.json");
+            cimd_fixture::not_found(&id);
+            assert_eq!(store.validate_client(&id, REDIRECT).await, ClientCheck::Refused, "{id}");
+        }
+        const OVER: &str = "https://cimd-rate.claude.ai/over.json";
+        cimd_fixture::not_found(OVER);
+        let verdict = store.validate_client(OVER, REDIRECT).await;
+        assert!(rate_limited(&verdict), "{verdict:?}");
+        assert_eq!(cimd_fixture::hits(OVER), 0, "refused before any fetch");
+        // Another vendor still has its share…
+        assert_eq!(
+            CIMD_RATE_PER_MINUTE,
+            2 * CIMD_RATE_PER_DOMAIN_PER_MINUTE,
+            "this test spends exactly the process's budget over two vendors"
+        );
+        for i in 0..CIMD_RATE_PER_DOMAIN_PER_MINUTE {
+            let id = format!("https://cimd-rate.chatgpt.com/{i}.json");
+            cimd_fixture::not_found(&id);
+            assert_eq!(store.validate_client(&id, REDIRECT).await, ClientCheck::Refused, "{id}");
+        }
+        // …until the process's budget is spent, which refuses a third vendor too.
+        const THIRD: &str = "https://cimd-rate.cursor.com/one.json";
+        cimd_fixture::not_found(THIRD);
+        let verdict = store.validate_client(THIRD, REDIRECT).await;
+        assert!(rate_limited(&verdict), "{verdict:?}");
+        assert_eq!(cimd_fixture::hits(THIRD), 0);
+        // A refusal holds nothing: no slot, no permit, no flight.
+        assert!(store.cimd.hosts.lock().unwrap().is_empty());
+        assert!(store.cimd.fetching.lock().unwrap().is_empty());
+    }
+
+    /// A fetcher dropped mid-fetch while a waiter is in the flight hands over:
+    /// the flight stays where the waiter and any newcomer find it, the waiter
+    /// takes over the one fetch, and nobody fetches the document twice at once.
+    #[tokio::test]
+    async fn cimd_cancelled_fetcher_hands_over_to_a_waiter() {
+        use super::{cimd_fixture, ClientCheck};
+        use serde_json::json;
+        let store = test_store();
+        const HANDOVER: &str = "https://cimd-handover.claude.ai/client.json";
+        let request = |store: super::AuthStore| async move {
+            store.validate_client(HANDOVER, "http://127.0.0.1:1/cb").await
+        };
+        // The fetcher's fetch hangs (an origin that has not answered)…
+        cimd_fixture::hang(HANDOVER);
+        let fetcher = tokio::spawn(request(store.clone()));
+        tokio::task::yield_now().await;
+        // …a waiter joins the flight and waits for that fetch…
+        let waiter = tokio::spawn(request(store.clone()));
+        tokio::task::yield_now().await;
+        assert_eq!(cimd_fixture::hits(HANDOVER), 1, "the waiter must not fetch for itself");
+        // …and the fetcher is dropped. The flight survives for its waiter, which
+        // takes over the fetch (the origin answers now); a newcomer arriving then
+        // finds the one flight, or the document it cached, and fetches nothing.
+        let doc = json!({ "client_id": HANDOVER, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve(HANDOVER, &doc.to_string());
+        fetcher.abort();
+        assert!(fetcher.await.unwrap_err().is_cancelled());
+        assert!(store.cimd.fetching.lock().unwrap().contains_key(HANDOVER), "flight must survive");
+        let newcomer = tokio::spawn(request(store.clone()));
+        assert_eq!(waiter.await.unwrap(), ClientCheck::Allowed);
+        assert_eq!(newcomer.await.unwrap(), ClientCheck::Allowed);
+        assert_eq!(
+            cimd_fixture::hits(HANDOVER),
+            2,
+            "one attempt each by fetcher and waiter, none more"
+        );
+        assert!(
+            store.cimd.fetching.lock().unwrap().is_empty(),
+            "the last one out retires the flight"
+        );
+        assert!(store.cimd.hosts.lock().unwrap().is_empty());
+    }
+
+    /// A `client_id` spelt otherwise than canonically is the same vetted host to
+    /// the trust policy, and fetched — from the URL as given, which its document
+    /// must repeat.
+    #[tokio::test]
+    async fn cimd_client_id_is_taken_as_given() {
+        use super::{cimd_fixture, ClientCheck};
+        use serde_json::json;
+        let store = test_store();
+        const SPELT: &str = "https://Cimd-Spelling.claude.ai:443/client.json";
+        let doc = json!({ "client_id": SPELT, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve(SPELT, &doc.to_string());
+        assert_eq!(
+            store.validate_client(SPELT, "http://127.0.0.1:1/cb").await,
+            ClientCheck::Allowed
+        );
+        assert_eq!(cimd_fixture::hits(SPELT), 1, "fetched from the URL as given");
+        // The same document under a differently spelt id is a different client,
+        // and its document, saying otherwise, does not vouch for it.
+        const OTHERWISE: &str = "https://cimd-spelling.claude.ai/client.json";
+        cimd_fixture::serve(OTHERWISE, &doc.to_string());
+        assert_eq!(
+            store.validate_client(OTHERWISE, "http://127.0.0.1:1/cb").await,
+            ClientCheck::Refused
+        );
+    }
+
+    /// The two rules a flight lives by. Publishing retires it at once, however
+    /// many requests still hold it — they read the outcome from their own handle,
+    /// and a newcomer must not join a published flight to reuse an outcome the
+    /// origin said not to reuse (`no-store`) or a failure that may be over. An
+    /// UNPUBLISHED flight, its fetcher cancelled, stays for its holders and is
+    /// retired by the last of them, so a waiter can take over the fetch and no
+    /// entry is left behind. Neither ever touches a newer flight for the key.
+    #[test]
+    fn cimd_flight_retirement_rules() {
+        use super::{CimdState, Flight, FlightGuard};
+        let state = CimdState::new();
+        let key = "https://cimd-rules.claude.ai/client.json";
+        let join = || -> Flight {
+            std::sync::Arc::clone(state.fetching.lock().unwrap().entry(key.to_owned()).or_default())
+        };
+        let held = || state.fetching.lock().unwrap().contains_key(key);
+
+        // Published while a waiter still holds it: retired at once.
+        let (fetcher, waiter) = (join(), join());
+        let (fetcher_guard, waiter_guard) = (
+            FlightGuard { state: &state, key, flight: &fetcher },
+            FlightGuard { state: &state, key, flight: &waiter },
+        );
+        state.retire_flight(key, &fetcher);
+        assert!(!held(), "a published flight is retired however many hold it");
+        // A newer flight for the key is not touched by the old one's holders leaving.
+        let newer = join();
+        drop(fetcher_guard);
+        drop(waiter_guard);
+        assert!(held(), "an old flight's holders must not retire a newer flight");
+        state.retire_flight(key, &fetcher);
+        assert!(held(), "nor does retiring the old flight");
+        state.retire_flight(key, &newer);
+        assert!(!held());
+
+        // Unpublished — the fetcher is cancelled — with a waiter: stays for the
+        // waiter; the last holder out retires it.
+        let (fetcher, waiter) = (join(), join());
+        let waiter_guard = FlightGuard { state: &state, key, flight: &waiter };
+        drop(FlightGuard { state: &state, key, flight: &fetcher });
+        drop(fetcher);
+        assert!(held(), "a cancelled fetcher leaves the flight for its waiter");
+        drop(waiter_guard);
+        assert!(!held(), "the last holder out retires an unpublished flight");
+    }
+
+    /// A request dropped mid-fetch — the client reset the stream, so the
+    /// authorize future was dropped — leaves nothing behind: not its single-flight
+    /// entry, not its host slot, not its permit. The next request for the same
+    /// document starts afresh and succeeds.
+    #[tokio::test]
+    async fn cimd_cancelled_fetch_leaves_nothing_behind() {
+        use super::{cimd_fixture, ClientCheck, CIMD_MAX_INFLIGHT};
+        use serde_json::json;
+        let store = test_store();
+        const GONE: &str = "https://cimd-gone.claude.ai/client.json";
+        let doc = json!({ "client_id": GONE, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve(GONE, &doc.to_string());
+        // The leader runs until its fetch suspends (the fixture yields there, as a
+        // real fetch would), then is aborted — as a dropped connection drops the
+        // authorize future.
+        let leader = tokio::spawn({
+            let store = store.clone();
+            async move { store.validate_client(GONE, "http://127.0.0.1:1/cb").await }
+        });
+        tokio::task::yield_now().await;
+        assert!(store.cimd.fetching.lock().unwrap().contains_key(GONE), "leader must be mid-fetch");
+        assert_eq!(cimd_fixture::hits(GONE), 1);
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+        assert!(
+            store.cimd.fetching.lock().unwrap().is_empty(),
+            "a dropped fetch retires its flight"
+        );
+        assert!(store.cimd.hosts.lock().unwrap().is_empty(), "…and gives its host slot back");
+        assert_eq!(store.cimd.inflight.available_permits(), CIMD_MAX_INFLIGHT, "…and its permit");
+        // Nothing was cached (the fetch never completed), so the next request
+        // fetches afresh — and succeeds.
+        assert_eq!(
+            store.validate_client(GONE, "http://127.0.0.1:1/cb").await,
+            ClientCheck::Allowed
+        );
+        assert_eq!(cimd_fixture::hits(GONE), 2);
+    }
+
+    /// `/oauth/authorize` with a CIMD client: the document's redirects get the
+    /// checks a DCR registration gets — hosted-redirect allow-list included, and
+    /// checked BEFORE any fetch — the document is cached, an invalid document is
+    /// an unknown client (remembered as one, briefly), and an unfetchable one is
+    /// a retry, not an unknown client (and not remembered).
+    #[tokio::test]
+    async fn cimd_client_authorization() {
+        use super::{cimd_fixture, ClientCheck};
+        use serde_json::json;
+        let store = test_store();
+        const CHATGPT_REDIRECT: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
+        let check = |id: &'static str, redirect: &'static str| store.validate_client(id, redirect);
+
+        // ChatGPT, exactly as it identifies itself: its real client_id and document,
+        // served by the fixture. Its redirect is same-origin AND allow-listed.
+        const HOSTED: &str = "https://chatgpt.com/oauth/client.json";
+        let hosted_doc = json!({
+            "client_id": HOSTED,
+            "client_name": "ChatGPT",
+            "redirect_uris": [CHATGPT_REDIRECT],
+            "token_endpoint_auth_method": "private_key_jwt",
+            "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+        });
+        cimd_fixture::serve(HOSTED, &hosted_doc.to_string());
+        assert_eq!(check(HOSTED, CHATGPT_REDIRECT).await, ClientCheck::Allowed);
+        // A redirect the document does NOT list is refused, allow-listed or not.
+        let other_vendor = "https://claude.ai/api/mcp/auth_callback";
+        assert_eq!(check(HOSTED, other_vendor).await, ClientCheck::Refused);
+        // Cached: with its URL now failing, the client still passes.
+        cimd_fixture::fail(HOSTED, "origin down");
+        assert_eq!(check(HOSTED, CHATGPT_REDIRECT).await, ClientCheck::Allowed);
+
+        // Another origin's document borrowing ChatGPT's (allow-listed) redirect is
+        // refused: a self-asserted document may not point the code at another party.
+        const CROSS: &str = "https://cimd-cross.claude.ai/client.json";
+        let cross_doc = json!({ "client_id": CROSS, "redirect_uris": [CHATGPT_REDIRECT] });
+        cimd_fixture::serve(CROSS, &cross_doc.to_string());
+        assert_eq!(check(CROSS, CHATGPT_REDIRECT).await, ClientCheck::Refused);
+
+        // A document listing a redirect that is NOT allow-listed gains nothing: the
+        // allow-list is checked before the fetch, so the document is never asked
+        // for (were it, this fixture would turn the verdict into Unavailable).
+        const ROGUE: &str = "https://cimd-rogue.claude.ai/client.json";
+        cimd_fixture::fail(ROGUE, "must not be fetched");
+        let rogue_redirect = "https://cimd-rogue.claude.ai/callback";
+        assert_eq!(check(ROGUE, rogue_redirect).await, ClientCheck::Refused);
+        assert_eq!(cimd_fixture::hits(ROGUE), 0);
+
+        // Claude-Code-shaped: loopback redirects match port-agnostically.
+        const LOOPBACK: &str = "https://cimd-loopback.claude.ai/client-metadata";
+        let loopback_doc = json!({
+            "client_id": LOOPBACK,
+            "client_name": "Native",
+            "redirect_uris": ["http://localhost/callback", "http://127.0.0.1/callback"],
+            "token_endpoint_auth_method": "none",
+        });
+        cimd_fixture::serve(LOOPBACK, &loopback_doc.to_string());
+        assert_eq!(check(LOOPBACK, "http://localhost:3118/callback").await, ClientCheck::Allowed);
+        assert_eq!(check(LOOPBACK, "http://127.0.0.1:51234/callback").await, ClientCheck::Allowed);
+        assert_eq!(check(LOOPBACK, "http://127.0.0.1:51234/other").await, ClientCheck::Refused);
+
+        // Unfetchable: a retry, not an unknown client — and not remembered, so
+        // once the origin is back the next request fetches the document.
+        const DOWN: &str = "https://cimd-down.claude.ai/client.json";
+        cimd_fixture::fail(DOWN, "connection refused");
+        let verdict = check(DOWN, "http://127.0.0.1:9/cb").await;
+        assert!(matches!(verdict, ClientCheck::MetadataUnavailable(_)), "{verdict:?}");
+        let down_doc = json!({ "client_id": DOWN, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve(DOWN, &down_doc.to_string());
+        assert_eq!(check(DOWN, "http://127.0.0.1:9/cb").await, ClientCheck::Allowed);
+        assert_eq!(cimd_fixture::hits(DOWN), 2, "a transient failure is retried");
+
+        // A document about ANOTHER URL is an unknown client (misconfigured or
+        // hostile) — remembered as one, so the repeat costs no fetch.
+        const LIAR: &str = "https://cimd-liar.claude.ai/client.json";
+        let liar_doc = json!({ "client_id": HOSTED, "redirect_uris": [CHATGPT_REDIRECT] });
+        cimd_fixture::serve(LIAR, &liar_doc.to_string());
+        assert_eq!(check(LIAR, CHATGPT_REDIRECT).await, ClientCheck::Refused);
+        assert_eq!(check(LIAR, CHATGPT_REDIRECT).await, ClientCheck::Refused);
+        assert_eq!(cimd_fixture::hits(LIAR), 1, "an invalid document is remembered");
+
+        // Nothing at the URL (404) is likewise about the URL: remembered, so even a
+        // document appearing there is not seen until the negative entry lapses.
+        const MISSING: &str = "https://cimd-missing.claude.ai/client.json";
+        cimd_fixture::not_found(MISSING);
+        assert_eq!(check(MISSING, "http://127.0.0.1:7/cb").await, ClientCheck::Refused);
+        let late_doc = json!({ "client_id": MISSING, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve(MISSING, &late_doc.to_string());
+        assert_eq!(check(MISSING, "http://127.0.0.1:7/cb").await, ClientCheck::Refused);
+        assert_eq!(cimd_fixture::hits(MISSING), 1, "a missing document is remembered");
+
+        // A document with no cache hint that some cache along the way held for a
+        // day is not given ten fresh minutes here: the default lifetime is spent,
+        // so the next request fetches again.
+        const AGED: &str = "https://cimd-aged.claude.ai/client.json";
+        let aged_doc = json!({ "client_id": AGED, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve_aged(AGED, &aged_doc.to_string(), Duration::from_secs(86400));
+        assert_eq!(check(AGED, "http://127.0.0.1:3/cb").await, ClientCheck::Allowed);
+        assert_eq!(check(AGED, "http://127.0.0.1:3/cb").await, ClientCheck::Allowed);
+        assert_eq!(cimd_fixture::hits(AGED), 2, "a spent default lifetime is not cached");
+
+        // Whereas a PER-REQUEST failure never poisons a real client: HOSTED was
+        // probed above with a redirect its document does not list, and its
+        // legitimate redirect still passes from the (positive) cache.
+        assert_eq!(check(HOSTED, other_vendor).await, ClientCheck::Refused);
+        assert_eq!(check(HOSTED, CHATGPT_REDIRECT).await, ClientCheck::Allowed);
+
+        // A document served `no-store` is honoured, then NOT reused: once its URL
+        // fails, so does the next authorize (contrast HOSTED above, which was cached).
+        const VOLATILE: &str = "https://claude.ai/oauth/claude-code-client-metadata";
+        let volatile_doc = json!({
+            "client_id": VOLATILE,
+            "client_name": "Claude Code",
+            "redirect_uris": ["http://localhost/callback", "http://127.0.0.1/callback"],
+            "token_endpoint_auth_method": "none",
+        });
+        cimd_fixture::serve_uncacheable(VOLATILE, &volatile_doc.to_string());
+        assert_eq!(check(VOLATILE, "http://localhost:3118/callback").await, ClientCheck::Allowed);
+        cimd_fixture::fail(VOLATILE, "origin down");
+        let verdict = check(VOLATILE, "http://localhost:3118/callback").await;
+        assert!(matches!(verdict, ClientCheck::MetadataUnavailable(_)), "{verdict:?}");
+
+        // A document served as anything but application/json is not a document.
+        const HTML: &str = "https://cimd-html.claude.ai/client.json";
+        let html_doc = json!({ "client_id": HTML, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve_as(HTML, &html_doc.to_string(), "text/html; charset=utf-8");
+        assert_eq!(check(HTML, "http://127.0.0.1:7/cb").await, ClientCheck::Refused);
+
+        // DCR clients are untouched: an unregistered ordinary id is refused.
+        assert_eq!(check("client-unknown", "http://127.0.0.1:1/cb").await, ClientCheck::Refused);
+    }
+
+    /// The AS advertises CIMD — which is what makes Claude and ChatGPT select it
+    /// over DCR, and would be an outage without the implementation behind it —
+    /// alongside the `none` that both require to go with it, and only where the
+    /// deployment opted in.
+    #[tokio::test]
+    async fn as_metadata_advertises_cimd_only_where_enabled() {
+        let metadata = |store: super::AuthStore| async {
+            let resp = super::authorization_server_metadata(axum::extract::State(store)).await;
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.expect("body");
+            serde_json::from_slice::<serde_json::Value>(&body).expect("JSON")
+        };
+        let on = metadata(test_store()).await;
+        assert_eq!(on["client_id_metadata_document_supported"], serde_json::json!(true));
+        assert_eq!(on["token_endpoint_auth_methods_supported"], serde_json::json!(["none"]));
+        let off = metadata(test_store().with_cimd(false)).await;
+        assert_eq!(off["client_id_metadata_document_supported"], serde_json::json!(false));
+        assert_eq!(off["token_endpoint_auth_methods_supported"], serde_json::json!(["none"]));
+    }
+
+    /// `/oauth/authorize` with a URL `client_id` off the vendor trust policy: the
+    /// same "not approved" page (or JSON) a hosted redirect off the allow-list
+    /// gets — 403, naming the contact — and no fetch.
+    #[tokio::test]
+    async fn authorize_points_an_unvetted_cimd_origin_at_the_contact() {
+        use axum::extract::{Query, State};
+        let store = test_store();
+        const STRANGER: &str = "https://cimd-authorize-stranger.test/client.json";
+        super::cimd_fixture::fail(STRANGER, "must not be fetched");
+        let query = || super::AuthorizeQuery {
+            response_type: Some("code".into()),
+            client_id: STRANGER.into(),
+            redirect_uri: "http://127.0.0.1:1/cb".into(),
+            state: Some("xyz".into()),
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            scope: None,
+            resource: None,
+        };
+        let body_of = |resp: axum::response::Response| async {
+            let content_type =
+                resp.headers()[axum::http::header::CONTENT_TYPE].to_str().unwrap().to_owned();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            (content_type, String::from_utf8(bytes.to_vec()).unwrap())
+        };
+        let resp = super::authorize(State(store.clone()), html_headers(), Query(query())).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        let (content_type, html) = body_of(resp).await;
+        assert!(content_type.starts_with("text/html"), "{content_type}");
+        assert!(html.contains(super::CONTACT), "the page must name the contact");
+        assert!(!html.contains(STRANGER), "the page reflects nothing");
+        let resp = super::authorize(State(store.clone()), json_headers(), Query(query())).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        let (content_type, json) = body_of(resp).await;
+        assert!(content_type.contains("json"), "{content_type}");
+        assert!(json.contains("invalid_client") && json.contains(super::CONTACT), "{json}");
+        assert_eq!(super::cimd_fixture::hits(STRANGER), 0, "nothing is fetched off-policy");
+    }
+
+    /// The transient verdict at the endpoint. A vetted CIMD client whose document
+    /// could not be fetched RIGHT NOW — the origin unreachable, or answering with
+    /// a status the client may retry (425 Too Early here) — is told to retry:
+    /// `503 temporarily_unavailable` to a programmatic caller, the sign-in error
+    /// page to a browser. Not `invalid_client`, which would have the user re-add
+    /// the connector. Neither body reflects the `client_id` URL or the cause, and
+    /// nothing is remembered: the next request fetches again.
+    #[tokio::test]
+    async fn authorize_tells_a_cimd_client_to_retry_when_its_document_is_unavailable() {
+        use axum::extract::{Query, State};
+        let store = test_store();
+        const DOWN: &str = "https://cimd-authorize-down.claude.ai/client.json";
+        const EARLY: &str = "https://cimd-authorize-early.claude.ai/client.json";
+        super::cimd_fixture::fail(DOWN, "connection reset by peer");
+        super::cimd_fixture::answer(EARLY, 425);
+        let query = |client_id: &str| super::AuthorizeQuery {
+            response_type: Some("code".into()),
+            client_id: client_id.into(),
+            redirect_uri: "http://127.0.0.1:1/cb".into(),
+            state: Some("xyz".into()),
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            scope: None,
+            resource: None,
+        };
+        let body_of = |resp: axum::response::Response| async {
+            let content_type =
+                resp.headers()[axum::http::header::CONTENT_TYPE].to_str().unwrap().to_owned();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            (content_type, String::from_utf8(bytes.to_vec()).unwrap())
+        };
+        for (id, cause) in [(DOWN, "reset"), (EARLY, "425")] {
+            let resp =
+                super::authorize(State(store.clone()), json_headers(), Query(query(id))).await;
+            assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE, "{id}");
+            let (content_type, json) = body_of(resp).await;
+            assert!(content_type.contains("json"), "{content_type}");
+            assert!(json.contains("temporarily_unavailable"), "{json}");
+            assert!(!json.contains("invalid_client"), "a retry, not a client to re-add: {json}");
+            assert!(
+                !json.contains(id) && !json.contains(cause),
+                "the body reflects nothing: {json}"
+            );
+            let resp =
+                super::authorize(State(store.clone()), html_headers(), Query(query(id))).await;
+            assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE, "{id}");
+            let (content_type, html) = body_of(resp).await;
+            assert!(content_type.starts_with("text/html"), "{content_type}");
+            assert!(html.contains("Try again in a moment"), "{html}");
+            assert!(!html.contains(id) && !html.contains(cause), "the page reflects nothing");
+            assert_eq!(super::cimd_fixture::hits(id), 2, "{id}: not remembered, so fetched again");
+        }
+    }
+
     /// `OAUTH_ALLOWED_REDIRECT_PREFIXES` entries parse to `(host, path)` only for a
     /// bare `https://host/path`; a port, query, fragment, or userinfo is refused
     /// (dropped) rather than silently discarded, and so is a non-https or root-path
@@ -2585,6 +4445,14 @@ mod tests {
     }
 
     fn test_store_cfg(require_resource: bool) -> super::AuthStore {
+        // As deployed with `OAUTH_CIMD_ENABLED=1`, and with CIMD state of its own so
+        // tests do not see each other's flights; the off case sets this itself.
+        new_store(require_resource).with_cimd(true)
+    }
+
+    /// A store exactly as [`super::AuthStore::new`] builds it: CIMD per the
+    /// environment (off under `cargo test`), CIMD state shared process-wide.
+    fn new_store(require_resource: bool) -> super::AuthStore {
         use candid::Principal;
         use imcp2_core::identities::{Identities, IiInstance};
         let agent =
@@ -2608,6 +4476,19 @@ mod tests {
             "/mcp".into(),
             require_resource,
         )
+    }
+
+    /// Every store in the process shares one CIMD state: the bundled binary
+    /// mounts a store per II instance, and the in-flight bounds must hold across
+    /// them — two mounts must not mean twice the fetches — as must the cache.
+    #[test]
+    fn cimd_state_is_shared_by_every_store() {
+        use std::sync::Arc;
+        let (a, b) = (new_store(false), new_store(false));
+        assert!(Arc::ptr_eq(&a.cimd, &b.cimd), "stores must share the process's CIMD state");
+        // The test stores keep their own, so tests do not see each other's flights.
+        let (c, d) = (test_store(), test_store());
+        assert!(!Arc::ptr_eq(&c.cimd, &d.cimd) && !Arc::ptr_eq(&c.cimd, &a.cimd));
     }
 
     /// A request header map that accepts HTML — i.e. a browser hitting the
@@ -2736,14 +4617,13 @@ mod tests {
         let stamp = || async { store.clients.registrations.read().await["client-x"].last_used };
 
         backdate().await;
-        assert!(store.validate_client("client-x", redirect).await);
+        assert_eq!(store.validate_client("client-x", redirect).await, super::ClientCheck::Allowed);
         assert!(stamp().await > 0, "an accepted redirect refreshes the LRU stamp");
 
         backdate().await;
-        assert!(
-            !store
-                .validate_client("client-x", "https://claude.ai/api/mcp/auth_callback/nope")
-                .await
+        assert_eq!(
+            store.validate_client("client-x", "https://claude.ai/api/mcp/auth_callback/nope").await,
+            super::ClientCheck::Refused
         );
         assert_eq!(stamp().await, 0, "a rejected redirect must not refresh the stamp");
     }

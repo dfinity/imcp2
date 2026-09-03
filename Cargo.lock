@@ -1830,6 +1830,8 @@ dependencies = [
  "crc32fast",
  "getrandom 0.3.4",
  "hex",
+ "http",
+ "httpdate",
  "ic-agent",
  "pocket-ic",
  "regex",

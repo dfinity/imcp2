@@ -18,7 +18,7 @@ rmcp = { workspace = true, features = ["server", "macros"] }
 ic-agent = { workspace = true }
 candid = { workspace = true }
 candid_parser = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "net"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "net", "time"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -31,6 +31,7 @@ reqwest = { workspace = true }
 getrandom = { workspace = true }
 urlencoding = { workspace = true }
 url = { workspace = true }
+httpdate = { workspace = true }
 # Only for the end-to-end canister-tool tests (src/e2e_canister_tools.rs),
 # behind the `e2e` feature so the default build compiles neither. `pocket-ic`
 # runs a real replica locally (needs the POCKET_IC_BIN server binary at
@@ -48,3 +49,8 @@ wat = { version = "1", optional = true }
 # `Identities::seed_app_identity` — are gated on `cfg(test)` as well, so they
 # exist only in this crate's own test binary, never in a library build.
 e2e = ["dep:pocket-ic", "dep:wat", "rmcp/client"]
+
+[dev-dependencies]
+# Synthetic responses for pinning `public_fetch`'s acceptance rules without a
+# network (`reqwest::Response: From<http::Response<_>>`).
+http = { workspace = true }

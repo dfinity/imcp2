@@ -245,6 +245,11 @@ jobs:
           # Unset -> endpoint 404s. An optional secret that neither caller
           # passes arrives here as the empty string.
           OPENAI_APPS_CHALLENGE_TOKEN: ${{ secrets.OPENAI_APPS_CHALLENGE_TOKEN }}
+          # Client ID Metadata Documents: advertised only where this GitHub
+          # Environment defines the OAUTH_CIMD_ENABLED variable as `1` (this job
+          # runs in that environment, so its variables resolve here). Unset
+          # arrives as the empty string, which the server reads as off.
+          OAUTH_CIMD_ENABLED: ${{ vars.OAUTH_CIMD_ENABLED }}
         run: deploy/native/deploy.sh
 
       # Confirm the host is actually running the commit we just shipped, rather
