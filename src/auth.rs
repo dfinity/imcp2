@@ -935,25 +935,26 @@ type Flight = Arc<tokio::sync::Mutex<Option<Result<Arc<ClientMetadata>, CimdErro
 /// Whether `client_id` is a Client ID Metadata Document URL — returned parsed —
 /// or `None` for an ordinary (DCR) identifier. A CIMD `client_id` must be https,
 /// name a host, carry a path beyond `/`, and have no fragment or userinfo (the
-/// draft's MUSTs; a query is only discouraged there, so one is tolerated). It
-/// must also already be in canonical form: the document's own `client_id` is
-/// compared to it by plain string equality, so a non-canonical spelling
-/// (`HTTPS://`, an explicit `:443`, an upper-case host, a dot-segment, a host
-/// with a trailing dot) could never match its document and is refused up front
-/// rather than fetched. And it must fit [`CIMD_MAX_CLIENT_ID_LEN`], since it is
-/// about to become a cache key.
+/// draft's MUSTs; a query is only discouraged there, so one is tolerated), and
+/// must fit [`CIMD_MAX_CLIENT_ID_LEN`], since it is about to become a cache key.
+/// The draft asks for no particular spelling beyond that: the identifier is
+/// taken AS GIVEN — it is what the document must repeat byte for byte, and what
+/// the cache is keyed by — so `https://ChatGPT.com/…` or an explicit `:443` is
+/// a client like any other, provided its document says the same. Only the host
+/// is normalised, and only for the trust policy and the per-host quota
+/// ([`host_key`]), so no spelling of a vetted host is a stranger or a second
+/// quota.
 fn cimd_client_id(client_id: &str) -> Option<url::Url> {
     if client_id.len() > CIMD_MAX_CLIENT_ID_LEN || !client_id.starts_with("https://") {
         return None;
     }
     let url = url::Url::parse(client_id).ok()?;
     let well_formed = url.scheme() == "https"
-        && url.host_str().is_some_and(|h| !h.is_empty() && !h.ends_with('.'))
+        && url.host_str().is_some_and(|h| !h.is_empty())
         && url.path().len() > 1
         && url.fragment().is_none()
         && url.username().is_empty()
-        && url.password().is_none()
-        && url.as_str() == client_id;
+        && url.password().is_none();
     well_formed.then_some(url)
 }
 
@@ -1655,7 +1656,7 @@ impl AuthStore {
         if !redirect_uri_permitted(redirect_uri) {
             return ClientCheck::Refused;
         }
-        match self.client_metadata_for(&cimd_url).await {
+        match self.client_metadata_for(client_id, &cimd_url).await {
             Ok(meta) => {
                 // The same check a DCR registration gets, over the document's redirects.
                 let reg = ClientReg::new(meta.redirect_uris.clone());
@@ -1686,9 +1687,12 @@ impl AuthStore {
     /// [`AuthStore::fetch_and_cache_client_metadata`]'s call.
     async fn client_metadata_for(
         &self,
+        key: &str,
         client_id: &url::Url,
     ) -> Result<Arc<ClientMetadata>, CimdError> {
-        let key = client_id.as_str();
+        // `key` is the identifier AS GIVEN — the string the document must repeat,
+        // and what the cache and single-flight map are keyed by; `client_id` is
+        // it parsed, for the host.
         if let Some(cached) = self.cached_client_metadata(key).await {
             return cached;
         }
@@ -1713,7 +1717,7 @@ impl AuthStore {
         // — and publishes, for the waiters to read from the handle they hold.
         let outcome = match self.cached_client_metadata(key).await {
             Some(cached) => cached,
-            None => self.fetch_and_cache_client_metadata(client_id).await,
+            None => self.fetch_and_cache_client_metadata(key, client_id).await,
         };
         // Retire the flight BEFORE publishing, still under its lock, so no request
         // can join it once the outcome is there: a request arriving from here on
@@ -1747,9 +1751,9 @@ impl AuthStore {
     /// negatively for [`CIMD_NEGATIVE_TTL`]; a transient failure is not cached.
     async fn fetch_and_cache_client_metadata(
         &self,
+        key: &str,
         client_id: &url::Url,
     ) -> Result<Arc<ClientMetadata>, CimdError> {
-        let key = client_id.as_str();
         let host = host_key(client_id.host_str().unwrap_or_default());
         let Some(_slot) = HostSlot::take(&self.cimd, &host) else {
             return Err(CimdError::Unavailable(format!(
@@ -3373,13 +3377,18 @@ mod tests {
         // A query is only discouraged by the draft, so it is tolerated — canonically.
         assert!(cimd_client_id("https://chatgpt.com/oauth/client.json?v=2").is_some());
         assert!(cimd_client_id("https://user@chatgpt.com/oauth/client.json").is_none());
-        // Non-canonical spellings could never equal their document's client_id.
-        assert!(cimd_client_id("https://ChatGPT.com/oauth/client.json").is_none());
-        assert!(cimd_client_id("https://chatgpt.com:443/oauth/client.json").is_none());
-        assert!(cimd_client_id("https://chatgpt.com/oauth/../oauth/client.json").is_none());
-        // A trailing-dot host names the same host as without it, yet would be a
-        // distinct key everywhere: refused, so there is one spelling per host.
-        assert!(cimd_client_id("https://chatgpt.com./oauth/client.json").is_none());
+        // The draft asks for an https URL the document repeats byte for byte, not
+        // for one spelling of it: these are accepted as given (they are the
+        // identity and the cache key), and only the host is normalised, for the
+        // trust policy and the per-host quota (`host_key`).
+        for spelling in [
+            "https://ChatGPT.com/oauth/client.json",
+            "https://chatgpt.com:443/oauth/client.json",
+            "https://chatgpt.com./oauth/client.json",
+            "https://chatgpt.com/oauth/../oauth/client.json",
+        ] {
+            assert!(cimd_client_id(spelling).is_some(), "{spelling}");
+        }
         // Bounded, since it is about to become a cache key: the cap exactly, not
         // one byte more.
         let at_cap =
@@ -3815,6 +3824,32 @@ mod tests {
             "the last one out retires the flight"
         );
         assert!(store.cimd.hosts.lock().unwrap().is_empty());
+    }
+
+    /// A `client_id` spelt otherwise than canonically is the same vetted host to
+    /// the trust policy, and fetched — from the URL as given, which its document
+    /// must repeat.
+    #[tokio::test]
+    async fn cimd_client_id_is_taken_as_given() {
+        use super::{cimd_fixture, ClientCheck};
+        use serde_json::json;
+        let store = test_store();
+        const SPELT: &str = "https://Cimd-Spelling.claude.ai:443/client.json";
+        let doc = json!({ "client_id": SPELT, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve(SPELT, &doc.to_string());
+        assert_eq!(
+            store.validate_client(SPELT, "http://127.0.0.1:1/cb").await,
+            ClientCheck::Allowed
+        );
+        assert_eq!(cimd_fixture::hits(SPELT), 1, "fetched from the URL as given");
+        // The same document under a differently spelt id is a different client,
+        // and its document, saying otherwise, does not vouch for it.
+        const OTHERWISE: &str = "https://cimd-spelling.claude.ai/client.json";
+        cimd_fixture::serve(OTHERWISE, &doc.to_string());
+        assert_eq!(
+            store.validate_client(OTHERWISE, "http://127.0.0.1:1/cb").await,
+            ClientCheck::Refused
+        );
     }
 
     /// The two rules a flight lives by. Publishing retires it at once, however

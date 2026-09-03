@@ -1394,8 +1394,8 @@ fn ipv6_is_global(ip: &Ipv6Addr) -> bool {
 /// else in the block — assigned to a non-routable use or not assigned at all —
 /// is refused.
 fn ietf_protocol_assignment_is_global(seg: &[u16; 8]) -> bool {
-    let anycast = seg[1] == 0x0001 && seg[2..7] == [0; 5] && matches!(seg[7], 1 | 2);
-    anycast                                       // 2001:1::1 PCP (RFC 7723), 2001:1::2 TURN (RFC 8155)
+    let anycast = seg[1] == 0x0001 && seg[2..7] == [0; 5] && (1..=3).contains(&seg[7]);
+    anycast // 2001:1::1 PCP (RFC 7723), 2001:1::2 TURN (RFC 8155), 2001:1::3 DNS-SD SRP (RFC 9665)
         || seg[1] == 0x0003                       // 2001:3::/32 AMT (RFC 7450)
         || (seg[1] == 0x0004 && seg[2] == 0x0112) // 2001:4:112::/48 AS112-v6 (RFC 7535)
         || (seg[1] & 0xfff0) == 0x0030 // 2001:30::/28 Drone Remote ID (RFC 9374)
@@ -2891,7 +2891,7 @@ mod tests {
             "2001:2::1",   // benchmarking
             "2001:10::1",  // ORCHID (deprecated)
             "2001:20::1",  // ORCHIDv2 (not routable)
-            "2001:1::3",   // unassigned inside 2001::/23 (IETF protocol assignments)
+            "2001:1::4",   // unassigned inside 2001::/23 (IETF protocol assignments)
             "2001:5::1",   // likewise
             "2001:1ff::1", // the block's last /32, likewise
             "3fff::1",     // documentation (RFC 9637)
@@ -2917,7 +2917,9 @@ mod tests {
         assert!(g("2001:4860:4860::8888"));
         assert!(g("2001:200::1"), "just past 2001::/23");
         // The globally reachable exceptions inside 2001::/23 stay global.
-        for good in ["2001:1::1", "2001:1::2", "2001:3::1", "2001:4:112::1", "2001:30::1"] {
+        for good in
+            ["2001:1::1", "2001:1::2", "2001:1::3", "2001:3::1", "2001:4:112::1", "2001:30::1"]
+        {
             assert!(g(good), "{good} is globally reachable per the IANA registry");
         }
     }

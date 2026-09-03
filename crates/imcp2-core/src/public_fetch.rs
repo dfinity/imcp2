@@ -224,16 +224,12 @@ fn freshness(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
 /// its MOST RESTRICTIVE value, and one given without a valid number is ZERO —
 /// stale, never a default lifetime (RFC 9111 §4.2.1: invalid or conflicting
 /// freshness information must not extend freshness) — so `max-age=300,
-/// max-age=0` is zero, not five minutes, and so is `max-age=soon`.
+/// max-age=0` is zero, not five minutes, and so is `max-age=soon`. A value that
+/// cannot be parsed at all (an unterminated quoted-string) is zero too.
 fn cache_max_age(cache_control: &str) -> Option<Duration> {
-    // Each directive as (name, argument): `max-age=300` → ("max-age", Some("300")).
-    let directives: Vec<(&str, Option<&str>)> = cache_control
-        .split(',')
-        .map(|d| match d.trim().split_once('=') {
-            Some((name, arg)) => (name.trim(), Some(arg.trim().trim_matches('"'))),
-            None => (d.trim(), None),
-        })
-        .collect();
+    let Some(directives) = cache_directives(cache_control) else {
+        return Some(Duration::ZERO);
+    };
     let has = |wanted: &str| directives.iter().any(|(name, _)| name.eq_ignore_ascii_case(wanted));
     if has("no-store") || has("no-cache") || has("private") {
         return Some(Duration::ZERO);
@@ -245,11 +241,69 @@ fn cache_max_age(cache_control: &str) -> Option<Duration> {
             .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case(wanted))
             .map(|(_, arg)| {
-                arg.and_then(|a| a.parse::<u64>().ok()).map_or(Duration::ZERO, Duration::from_secs)
+                arg.as_deref()
+                    .and_then(|a| a.parse::<u64>().ok())
+                    .map_or(Duration::ZERO, Duration::from_secs)
             })
             .min()
     };
     lifetime("s-maxage").or_else(|| lifetime("max-age"))
+}
+
+/// The directives of a `Cache-Control` value, each as (name, argument), split at
+/// the commas that are NOT inside a quoted-string: an argument may be quoted and
+/// then contain commas and backslash-escaped characters (RFC 9110 §5.6.4), so
+/// `foo="x,s-maxage=86400", max-age=60` is `foo` and `max-age`, not an
+/// `s-maxage` of a day. Quotes and escapes are removed from the argument. `None`
+/// when the value cannot be parsed (a quoted-string never closes).
+fn cache_directives(value: &str) -> Option<Vec<(String, Option<String>)>> {
+    let mut raw: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let (mut in_quotes, mut escaped) = (false, false);
+    for c in value.chars() {
+        if escaped {
+            current.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_quotes => {
+                escaped = true;
+                current.push(c);
+            }
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(c);
+            }
+            ',' if !in_quotes => raw.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    if in_quotes || escaped {
+        return None;
+    }
+    raw.push(current);
+    let unquote = |arg: &str| -> String {
+        let Some(inner) = arg.strip_prefix('"').and_then(|a| a.strip_suffix('"')) else {
+            return arg.to_owned();
+        };
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            out.push(if c == '\\' { chars.next().unwrap_or(c) } else { c });
+        }
+        out
+    };
+    Some(
+        raw.iter()
+            .map(|d| d.trim())
+            .filter(|d| !d.is_empty())
+            .map(|d| match d.split_once('=') {
+                Some((name, arg)) => (name.trim().to_owned(), Some(unquote(arg.trim()))),
+                None => (d.to_owned(), None),
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -293,7 +347,7 @@ mod tests {
             "https://[100::1]/client.json",
             "https://[3fff::1]/client.json",
             "https://[5f00::1]/client.json",
-            "https://[2001:1::3]/client.json",
+            "https://[2001:1::4]/client.json",
         ] {
             let Err(FetchError::Refused(why)) = fetch(internal).await else {
                 panic!("{internal} must be refused by the guard");
@@ -452,6 +506,16 @@ mod tests {
         // Directives are matched by name, however they are argued.
         assert_eq!(cache_max_age("max-age=300, no-cache=\"set-cookie\""), Some(Duration::ZERO));
         assert_eq!(cache_max_age("No-Store"), Some(Duration::ZERO));
+        // A comma inside a quoted argument does not start a directive, so an
+        // extension's argument cannot smuggle in a day of freshness; escapes are
+        // honoured; a quoted-string that never closes is not reused at all.
+        assert_eq!(
+            cache_max_age("foo=\"x,s-maxage=86400\", max-age=60"),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(cache_max_age("ext=\"a\\\"b,c\", max-age=30"), Some(Duration::from_secs(30)));
+        assert_eq!(cache_max_age("foo=\"x, max-age=60"), Some(Duration::ZERO));
+        assert_eq!(cache_max_age("max-age=\"45\""), Some(Duration::from_secs(45)));
     }
 
     /// A host that cannot be resolved is a failure of the MOMENT, not of the URL:
