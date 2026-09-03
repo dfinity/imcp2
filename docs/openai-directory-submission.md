@@ -62,7 +62,7 @@ add details not published in the docs.
 | OAuth 2.1 authorization-code + PKCE **S256**, per the MCP authorization spec | ✅ live; `code_challenge_methods_supported: ["S256"]` |
 | Client registration: DCR (`registration_endpoint`) — CIMD and predefined clients also accepted | ✅ RFC 7591 DCR live and verified |
 | Discovery documents (RFC 8414 AS metadata + RFC 9728 protected-resource) | ✅ all live, path-scoped + root fallback |
-| ChatGPT's callback `https://chatgpt.com/connector/oauth/{callback_id}` accepted | ✅ the redirect allow-list pins `("chatgpt.com", "/connector/oauth/")` as a prefix ([`src/auth.rs`](../src/auth.rs), `DEFAULT_ALLOWED_REDIRECTS`) |
+| Both of ChatGPT's callbacks accepted — `https://chatgpt.com/connector_platform_oauth_redirect` (the form it sends us) and `https://chatgpt.com/connector/oauth/{callback_id}` | ✅ the redirect allow-list pins both paths for `chatgpt.com` ([`src/auth.rs`](../src/auth.rs), `DEFAULT_ALLOWED_REDIRECTS`) |
 | No machine-to-machine grants (client credentials etc. unsupported by ChatGPT) | ✅ user-consent authorization-code flow only |
 | Tools explicitly annotated `readOnlyHint` / `destructiveHint` / `openWorldHint` — "incorrect or missing action labels are a common cause of rejection" | ✅ set on all 10 tools (9 read-only; the one write is `canister_update_call`). The unit test enforces annotation presence and the `readOnlyHint`/`destructiveHint` values; `openWorldHint` is declared everywhere but not asserted by the test, so re-check it in the portal's Scan Tools step |
 | Tool names "human-readable, specific, and descriptive"; accurate descriptions; minimum-information requests | ✅ reviewed against the same bar for the Anthropic listing. Replies are minimized to match: the account listing carries names and numbers only (no last-used timestamps), and no routine reply echoes the user's per-app principal — `get_app_principal` returns it on request |
@@ -75,11 +75,17 @@ add details not published in the docs.
 | Terms of Service URL | ✅ `https://internetcomputer.org/icp-mcp/terms/` — the **ICP MCP User Terms**, the end-user agreement to enter in the portal (the old mcp.internetcomputer.org URL permanently redirects there). Swiss-law terms covering the credentials-never-held session model, the user's sole responsibility for authorized actions, irreversibility of network actions, and as-is/liability limits with the Art. 100 CO carve-out. Since 2026-09-01 the operator-side provisions live in a separate agreement, the [ICP MCP App Operator Terms](https://internetcomputer.org/icp-mcp/app-operator-terms/) (dfinity/internetcomputer-org#90), which governs how applications are made discoverable and is not the URL a directory listing wants. Both need the same legal pass as the privacy policy |
 | Logo | ✅ [`docs/assets/icp-logo-1024.png`](assets/icp-logo-1024.png) |
 
-Note the legacy redirect `chatgpt.com/connector_platform_oauth_redirect` is
-not in the allow-list; per OpenAI's docs the current `{callback_id}` form is
-what ChatGPT uses, and the legacy URI merely "continues to work" for old
-connections. Add it via `OAUTH_ALLOWED_REDIRECT_PREFIXES` at deploy time only
-if a reviewer reports a failure.
+Note `chatgpt.com/connector_platform_oauth_redirect` was previously recorded
+here as a legacy URI deliberately left out of the allow-list. That was wrong,
+and the submission failed on it: OpenAI's two callback forms are not old and
+new but conditional on the authorization server. ChatGPT sends
+`/connector/oauth/{callback_id}` only to a server *without* issuer
+identification, and the stable `/connector_platform_oauth_redirect` to one
+that advertises `authorization_response_iss_parameter_supported` — which our
+AS metadata does. So the stable path is the one a ChatGPT connection registers
+with us, and DCR was rejecting it with `invalid_redirect_uri`. Both paths are
+now pinned in `DEFAULT_ALLOWED_REDIRECTS`, so neither needs an
+`OAUTH_ALLOWED_REDIRECT_PREFIXES` entry at deploy time.
 
 ## Blockers and open items
 

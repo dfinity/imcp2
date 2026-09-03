@@ -453,8 +453,20 @@ where
     }
 }
 
-/// (registrable domain, redirect-path prefix) pairs whose hosts (and subdomains)
-/// may register a **hosted** (non-loopback) OAuth `redirect_uri`. Open dynamic
+/// How an allow-list entry's pinned path is matched against a `redirect_uri` path.
+/// A vendor whose callback path carries a per-connection id needs `Prefix`; one whose
+/// callback is a single fixed endpoint gets `Exact`, so no descendant of it is
+/// registrable either.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PathPin {
+    /// Only this exact path.
+    Exact,
+    /// This path, or a descendant of it at a segment boundary ([`path_within_prefix`]).
+    Prefix,
+}
+
+/// (registrable domain, redirect path, how to match that path) triples whose hosts
+/// (and subdomains) may register a **hosted** (non-loopback) OAuth `redirect_uri`. Open dynamic
 /// client registration means that without this an attacker could register a hosted
 /// redirect it controls and phish an authorization code to it (the same-browser
 /// variant Consent-Bound Completion does not close, CWE-601).
@@ -474,17 +486,33 @@ where
 /// deploy time with `OAUTH_ALLOWED_REDIRECT_PREFIXES` (comma/space-separated full
 /// `https://host/path` URL prefixes, each pinning a host + path prefix), additive, no
 /// rebuild; a bare-domain (root-path) entry is refused so ops can't reopen the
-/// domain-wide hole.
-const DEFAULT_ALLOWED_REDIRECTS: &[(&str, &str)] = &[
-    ("antigravity.google", "/oauth-callback"), // Google Antigravity
-    ("chatgpt.com", "/connector/oauth/"),      // OpenAI ChatGPT connectors
-    ("claude.ai", "/api/mcp/auth_callback"),   // Anthropic Claude
-    ("cursor.com", "/agents/mcp/oauth/callback"), // Cursor (registered as www.cursor.com)
-    ("grok.com", "/connector/oauth/"),         // xAI Grok
-    ("grok.com", "/connectors-oauth-exchange-code/"),
-    ("grok.com", "/mcp/callback"),
-    ("perplexity.ai", "/rest/connections/oauth_callback"), // Perplexity (any subdomain)
-    ("perplexity.com", "/rest/connections/oauth_callback"),
+/// domain-wide hole (env entries are prefixes, [`PathPin::Prefix`]).
+///
+/// Each entry says HOW its path is matched ([`PathPin`]). `Prefix` admits the path
+/// and any segment-boundary descendant, which a vendor whose callback carries an id
+/// (`/connector/oauth/{callback_id}`) needs; `Exact` admits only the path itself.
+/// The vendors seeded as `Prefix` are left that way deliberately: tightening one to
+/// `Exact` would reject an already-registered client of that vendor that appends a
+/// segment, so it wants checking vendor by vendor rather than in bulk here.
+const DEFAULT_ALLOWED_REDIRECTS: &[(&str, &str, PathPin)] = &[
+    ("antigravity.google", "/oauth-callback", PathPin::Prefix), // Google Antigravity
+    ("chatgpt.com", "/connector/oauth/", PathPin::Prefix), // OpenAI ChatGPT connectors
+    // OpenAI ChatGPT connectors, issuer-identification form. ChatGPT sends this
+    // stable path — not the `{callback_id}` one above — to an authorization server
+    // whose metadata advertises `authorization_response_iss_parameter_supported`,
+    // which ours does, so this is the path a ChatGPT connection actually registers.
+    // One fixed endpoint with nothing appended, so it is pinned as `Exact`: unlike a
+    // `Prefix` entry, no descendant of it is registrable either.
+    ("chatgpt.com", "/connector_platform_oauth_redirect", PathPin::Exact),
+    ("claude.ai", "/api/mcp/auth_callback", PathPin::Prefix), // Anthropic Claude
+    // Cursor (registered as www.cursor.com)
+    ("cursor.com", "/agents/mcp/oauth/callback", PathPin::Prefix),
+    ("grok.com", "/connector/oauth/", PathPin::Prefix), // xAI Grok
+    ("grok.com", "/connectors-oauth-exchange-code/", PathPin::Prefix),
+    ("grok.com", "/mcp/callback", PathPin::Prefix),
+    // Perplexity (any subdomain)
+    ("perplexity.ai", "/rest/connections/oauth_callback", PathPin::Prefix),
+    ("perplexity.com", "/rest/connections/oauth_callback", PathPin::Prefix),
 ];
 
 /// The effective hosted-redirect allow-list: the compiled-in defaults plus any
@@ -498,15 +526,18 @@ const DEFAULT_ALLOWED_REDIRECTS: &[(&str, &str)] = &[
 /// shipped binary is safe by default and ops can only widen the set. Computed ONCE
 /// (the env is process-static) via `OnceLock`, so `/oauth/register` and
 /// `/oauth/authorize` neither re-parse the env nor re-log its warnings per call.
-fn allowed_redirects() -> &'static [(String, String)] {
-    static CACHE: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+fn allowed_redirects() -> &'static [(String, String, PathPin)] {
+    static CACHE: std::sync::OnceLock<Vec<(String, String, PathPin)>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| {
-        let mut out: Vec<(String, String)> =
-            DEFAULT_ALLOWED_REDIRECTS.iter().map(|(d, p)| (d.to_string(), p.to_string())).collect();
+        let mut out: Vec<(String, String, PathPin)> = DEFAULT_ALLOWED_REDIRECTS
+            .iter()
+            .map(|(d, p, pin)| (d.to_string(), p.to_string(), *pin))
+            .collect();
         if let Ok(extra) = std::env::var("OAUTH_ALLOWED_REDIRECT_PREFIXES") {
             for raw in extra.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
                 match parse_redirect_prefix(raw) {
-                    Some(e) => out.push(e),
+                    // `…_PREFIXES`, so an ops entry matches as a prefix.
+                    Some((host, path)) => out.push((host, path, PathPin::Prefix)),
                     None => tracing::warn!(
                         "ignoring OAUTH_ALLOWED_REDIRECT_PREFIXES entry `{raw}`: must be a bare \
                          `https://host/path` with a non-root path prefix and no non-default port \
@@ -578,7 +609,8 @@ fn path_has_percent_encoding(path: &str) -> bool {
 /// userinfo, name no
 /// off-origin port (only the implicit/`:443` default is allowed), its host must
 /// equal (or be a subdomain of) an allow-listed registrable domain, AND its path
-/// must fall within that entry's pinned callback prefix (see
+/// must match that entry's pinned callback path — exactly or as a prefix, per the
+/// entry's [`PathPin`] (see
 /// [`DEFAULT_ALLOWED_REDIRECTS`]), so a user-content path on an allow-listed
 /// origin (`perplexity.ai/page/…`, `chatgpt.com/g/…`) is refused even though the
 /// host matches. The host is read from the PARSED URL, not the raw string, so
@@ -635,13 +667,17 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     if path_has_percent_encoding(path) {
         return false;
     }
-    // host == domain (or a dot-boundary subdomain) AND the path is within the
-    // vendor's pinned callback prefix. The path pin is what keeps a registration
-    // off third-party/user-content paths (e.g. `/page/…`, `/g/…`) on the same
-    // origin; without it, domain-only matching would let those capture the code.
-    allowed_redirects().iter().any(|(domain, prefix)| {
+    // host == domain (or a dot-boundary subdomain) AND the path matches the vendor's
+    // pinned callback path the way that entry says to ([`PathPin`]: its own path only,
+    // or descendants too). The path pin is what keeps a registration off
+    // third-party/user-content paths (e.g. `/page/…`, `/g/…`) on the same origin;
+    // without it, domain-only matching would let those capture the code.
+    allowed_redirects().iter().any(|(domain, prefix, pin)| {
         (host == *domain || host.strip_suffix(domain.as_str()).is_some_and(|p| p.ends_with('.')))
-            && path_within_prefix(path, prefix)
+            && match pin {
+                PathPin::Exact => path == prefix,
+                PathPin::Prefix => path_within_prefix(path, prefix),
+            }
     })
 }
 
@@ -2170,6 +2206,15 @@ mod tests {
         // Allow-listed vendor domains/subdomains UNDER their pinned callback path.
         assert!(redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback"));
         assert!(redirect_uri_permitted("https://chatgpt.com/connector/oauth/abc"));
+        // ChatGPT's issuer-identification callback: one stable path, no `{callback_id}`
+        // segment. This is the form it sends us, since our AS metadata advertises
+        // `authorization_response_iss_parameter_supported`.
+        assert!(redirect_uri_permitted("https://chatgpt.com/connector_platform_oauth_redirect"));
+        // …and being `PathPin::Exact`, ONLY that path: a descendant is refused, unlike
+        // under a `PathPin::Prefix` entry (the `{callback_id}` one above).
+        assert!(!redirect_uri_permitted(
+            "https://chatgpt.com/connector_platform_oauth_redirect/anything"
+        ));
         assert!(redirect_uri_permitted("https://grok.com/mcp/callback"));
         assert!(redirect_uri_permitted("https://grok.com/connectors-oauth-exchange-code/x"));
         assert!(redirect_uri_permitted("https://www.perplexity.ai/rest/connections/oauth_callback"));
@@ -2189,6 +2234,9 @@ mod tests {
         // Right domain, wrong path, plus a non-segment-boundary near-miss of the pin.
         assert!(!redirect_uri_permitted("https://claude.ai/foo"));
         assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callbackEVIL"));
+        assert!(!redirect_uri_permitted(
+            "https://chatgpt.com/connector_platform_oauth_redirectEVIL"
+        ));
         // Dot-segment traversal (raw and percent-encoded): url::Url normalizes these
         // to `/g/evil` on parse (WHATWG), which then fails the pinned-prefix check.
         assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/../../g/evil"));
@@ -2257,6 +2305,39 @@ mod tests {
         // now-removed domain) still can't receive a code at /oauth/authorize.
         let junk = ClientReg::new(vec!["https://example.com/cb".to_string()]);
         assert!(!redirect_allowed(Some(&junk), "https://example.com/cb"));
+    }
+
+    /// The two path-matching modes an allow-list entry can carry ([`PathPin`]): a
+    /// `Prefix` entry admits segment-boundary descendants (a vendor callback that
+    /// carries a per-connection id needs that), an `Exact` entry admits only its own
+    /// path. Pinned here as well as through [`redirect_uri_permitted`] so a change to
+    /// either mode fails loudly rather than quietly widening what DCR accepts.
+    #[test]
+    fn path_pin_modes() {
+        use super::{PathPin, path_within_prefix};
+        // `Prefix`: the path itself, and descendants at a segment boundary only.
+        assert!(path_within_prefix("/connector/oauth/", "/connector/oauth/"));
+        assert!(path_within_prefix("/connector/oauth/abc", "/connector/oauth/"));
+        assert!(path_within_prefix("/mcp/callback", "/mcp/callback"));
+        assert!(path_within_prefix("/mcp/callback/x", "/mcp/callback"));
+        assert!(!path_within_prefix("/mcp/callbackEVIL", "/mcp/callback"));
+        assert!(!path_within_prefix("/mcp", "/mcp/callback"));
+        // ChatGPT's stable callback is pinned `Exact`, which is what stops
+        // `/connector_platform_oauth_redirect/…` from being registrable.
+        assert!(super::DEFAULT_ALLOWED_REDIRECTS.contains(&(
+            "chatgpt.com",
+            "/connector_platform_oauth_redirect",
+            PathPin::Exact
+        )));
+        // A trailing slash means descendants are expected, so such an entry must be
+        // `Prefix` — `Exact` there could match only a path ending in `/`, which no
+        // vendor callback is, silently pinning nothing.
+        for (domain, path, pin) in super::DEFAULT_ALLOWED_REDIRECTS {
+            assert!(
+                !path.ends_with('/') || *pin == PathPin::Prefix,
+                "{domain}{path} ends in `/` but is not PathPin::Prefix"
+            );
+        }
     }
 
     /// `OAUTH_ALLOWED_REDIRECT_PREFIXES` entries parse to `(host, path)` only for a
