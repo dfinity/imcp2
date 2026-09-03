@@ -705,9 +705,12 @@ its AS issuer is `<PUBLIC_URL>/mcp` and everything OAuth lives under it:
   hosted redirect must also be same-origin with the document URL (loopback
   excepted), so a self-asserted document cannot point the code at another
   party. Only public clients (`token_endpoint_auth_method: none`) are accepted.
-  Documents are cached (bounded; the origin's `max-age` honoured up to 24 h,
+  Documents must be served as `application/json`, and are cached (bounded; the
+  origin's remaining freshness — `max-age` less `Age` — honoured up to 24 h,
   10 min when it sends none, not at all on `no-store`), so a directory client
-  connecting thousands of times mints no registrations. Claude and ChatGPT both select CIMD over DCR when it is
+  connecting thousands of times mints no registrations. Concurrent requests for
+  one document share a single fetch, and at most eight fetches are in flight at
+  once, two per host, so one slow host cannot hold up the rest. Claude and ChatGPT both select CIMD over DCR when it is
   advertised; `OAUTH_CIMD_DISABLED=1` withdraws the advertisement and the
   mechanism without a rebuild (clients re-read the metadata within minutes and
   fall back to DCR).

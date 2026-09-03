@@ -781,10 +781,17 @@ const CIMD_MAX_BYTES: usize = 8 * 1024;
 /// Fetch timeout. Claude waits at most 10 s for OUR authorize endpoint, so the
 /// fetch it triggers must finish well inside that.
 const CIMD_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
-/// Fetches allowed in flight at once. An excess request is refused (told to
-/// retry), never queued, so a flood of distinct `client_id` URLs at the
-/// unauthenticated endpoint holds at most this many outbound requests open.
+/// Fetches allowed in flight at once, across all documents. An excess request
+/// is refused (told to retry), never queued, so a flood of distinct `client_id`
+/// URLs at the unauthenticated endpoint holds at most this many outbound
+/// requests open. Concurrent requests for ONE document never compete for these:
+/// they wait for the single fetch in flight for it and read the cache after
+/// ([`AuthStore::client_metadata_for`]).
 const CIMD_MAX_INFLIGHT: usize = 8;
+/// Fetches allowed in flight per `client_id` HOST, so one slow (or hostile) host
+/// serving many distinct URLs cannot occupy every permit above: it gets this
+/// many, and every other host keeps the rest.
+const CIMD_MAX_INFLIGHT_PER_HOST: usize = 2;
 /// Distinct `client_id` URLs cached. A handful of directory clients is the
 /// expected population; the bound is against abuse, not for capacity.
 const CIMD_CACHE_MAX: usize = 512;
@@ -943,6 +950,50 @@ fn parse_client_metadata(client_id: &str, body: &str) -> Result<ClientMetadata, 
     Ok(ClientMetadata { client_id: client_id.to_owned(), client_name, redirect_uris })
 }
 
+/// Whether a `Content-Type` is `application/json` — the media type a Client ID
+/// Metadata Document must be served as — by its essence, so parameters such as
+/// `charset=utf-8` are fine and case does not matter. A document served as
+/// anything else (or as nothing) is refused before it is parsed: bytes that
+/// happen to parse as JSON on a page the origin did not mean as its OAuth
+/// statement are not that statement.
+fn is_json_media_type(content_type: Option<&str>) -> bool {
+    content_type
+        .map(|ct| ct.split(';').next().unwrap_or("").trim())
+        .is_some_and(|essence| essence.eq_ignore_ascii_case("application/json"))
+}
+
+/// Fetches in flight per `client_id` host, held as a guard so a slot is given
+/// back however the fetch ends ([`CIMD_MAX_INFLIGHT_PER_HOST`]).
+struct HostSlot {
+    hosts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    host: String,
+}
+
+impl HostSlot {
+    /// Take a slot for `host`, or `None` when it already holds the maximum.
+    fn take(hosts: &Arc<std::sync::Mutex<HashMap<String, usize>>>, host: &str) -> Option<Self> {
+        let mut map = hosts.lock().expect("cimd host slots");
+        let held = map.get(host).copied().unwrap_or(0);
+        if held >= CIMD_MAX_INFLIGHT_PER_HOST {
+            return None;
+        }
+        map.insert(host.to_owned(), held + 1);
+        Some(Self { hosts: Arc::clone(hosts), host: host.to_owned() })
+    }
+}
+
+impl Drop for HostSlot {
+    fn drop(&mut self) {
+        let mut map = self.hosts.lock().expect("cimd host slots");
+        match map.get_mut(&self.host) {
+            Some(held) if *held > 1 => *held -= 1,
+            _ => {
+                map.remove(&self.host);
+            }
+        }
+    }
+}
+
 /// How long to reuse a document: the origin's `max-age` capped at
 /// [`CIMD_CACHE_MAX_TTL`], the default when it sent none, and ZERO — do not
 /// cache — when it said `no-store`, `no-cache` or `max-age=0`.
@@ -957,6 +1008,9 @@ async fn fetch_client_metadata_document(
 ) -> Result<imcp2_core::public_fetch::PublicDocument, String> {
     #[cfg(test)]
     if let Some(fixture) = cimd_fixture::get(url) {
+        // A real fetch suspends here; so does the stand-in, so tests see what
+        // concurrent requests do while one is in flight.
+        tokio::task::yield_now().await;
         return fixture;
     }
     imcp2_core::public_fetch::fetch_public_document(url, CIMD_MAX_BYTES, CIMD_FETCH_TIMEOUT).await
@@ -975,6 +1029,7 @@ mod cimd_fixture {
 
     type Registry = Mutex<HashMap<String, Result<PublicDocument, String>>>;
     static DOCS: OnceLock<Registry> = OnceLock::new();
+    static HITS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
 
     fn docs() -> &'static Registry {
         DOCS.get_or_init(Default::default)
@@ -982,12 +1037,27 @@ mod cimd_fixture {
 
     /// Serve `body` (JSON) at `url`, with no cache hint.
     pub(super) fn serve(url: &str, body: &str) {
+        serve_as(url, body, "application/json");
+    }
+
+    /// Serve `body` at `url` with the given `Content-Type`, no cache hint.
+    pub(super) fn serve_as(url: &str, body: &str, content_type: &str) {
         let doc = PublicDocument {
             body: body.into(),
-            content_type: Some("application/json".into()),
+            content_type: Some(content_type.into()),
             cache_max_age: None,
         };
         docs().lock().expect("fixture registry").insert(url.into(), Ok(doc));
+    }
+
+    /// How many times `url` has been fetched.
+    pub(super) fn hits(url: &str) -> usize {
+        HITS.get_or_init(Default::default)
+            .lock()
+            .expect("fixture hits")
+            .get(url)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Serve `body` at `url` with `Cache-Control: no-store` (a zero max-age).
@@ -1006,7 +1076,16 @@ mod cimd_fixture {
     }
 
     pub(super) fn get(url: &str) -> Option<Result<PublicDocument, String>> {
-        docs().lock().expect("fixture registry").get(url).cloned()
+        let served = docs().lock().expect("fixture registry").get(url).cloned();
+        if served.is_some() {
+            *HITS
+                .get_or_init(Default::default)
+                .lock()
+                .expect("fixture hits")
+                .entry(url.into())
+                .or_insert(0) += 1;
+        }
+        served
     }
 }
 
@@ -1049,6 +1128,13 @@ pub struct AuthStore {
     /// Bounds concurrent metadata-document fetches at [`CIMD_MAX_INFLIGHT`]: each
     /// is an outbound request an UNAUTHENTICATED `/oauth/authorize` can trigger.
     cimd_inflight: Arc<Semaphore>,
+    /// Single-flight: the lock a cold fetch of one `client_id` holds, so
+    /// concurrent misses for that document wait for the one fetch and then read
+    /// the cache, instead of each fetching and each spending a permit. An entry
+    /// lives only while a fetch is in flight.
+    cimd_fetching: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Fetches in flight per `client_id` host ([`HostSlot`]).
+    cimd_hosts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
 }
 
 /// An auth-code connect awaiting the user's II handshake.
@@ -1169,6 +1255,8 @@ impl AuthStore {
             require_resource,
             cimd_cache: Arc::default(),
             cimd_inflight: Arc::new(Semaphore::new(CIMD_MAX_INFLIGHT)),
+            cimd_fetching: Arc::default(),
+            cimd_hosts: Arc::default(),
         }
     }
 
@@ -1244,28 +1332,70 @@ impl AuthStore {
     }
 
     /// The validated metadata document behind a CIMD `client_id`, from the cache
-    /// while fresh, else fetched (under the in-flight bound) and cached for as
-    /// long as [`cimd_ttl`] says — which is not at all when the origin forbids
-    /// reuse. Failures are never cached.
+    /// while fresh, else fetched — once, however many requests miss at the same
+    /// time — under the in-flight bounds, and cached for as long as [`cimd_ttl`]
+    /// says, which is not at all when the origin forbids reuse. Failures are
+    /// never cached.
     async fn client_metadata_for(
         &self,
         client_id: &url::Url,
     ) -> Result<Arc<ClientMetadata>, CimdError> {
         let key = client_id.as_str();
-        let now = Instant::now();
-        if let Some(hit) = self.cimd_cache.read().await.get(key) {
-            if hit.expires > now {
-                return Ok(Arc::clone(&hit.meta));
-            }
+        if let Some(meta) = self.cached_client_metadata(key).await {
+            return Ok(meta);
         }
-        // Not queued: under load an excess request is told to retry, so a flood
-        // of distinct URLs holds at most CIMD_MAX_INFLIGHT outbound requests open.
+        // Single-flight: the first miss for a document fetches it; the others wait
+        // here for that fetch, then find it in the cache below. Without this a
+        // popular client's cold start (or a document's expiry) would have every
+        // concurrent authorize fetch the same bytes and spend a permit each.
+        let flight = Arc::clone(
+            self.cimd_fetching.lock().expect("cimd fetch locks").entry(key.to_owned()).or_default(),
+        );
+        let held = flight.lock().await;
+        let result = match self.cached_client_metadata(key).await {
+            Some(meta) => Ok(meta),
+            None => self.fetch_and_cache_client_metadata(client_id).await,
+        };
+        drop(held);
+        // The entry has done its job; waiters keep their own handle to the lock.
+        self.cimd_fetching.lock().expect("cimd fetch locks").remove(key);
+        result
+    }
+
+    /// The cached document for `key`, if one is held and still fresh.
+    async fn cached_client_metadata(&self, key: &str) -> Option<Arc<ClientMetadata>> {
+        let cache = self.cimd_cache.read().await;
+        cache.get(key).filter(|hit| hit.expires > Instant::now()).map(|hit| Arc::clone(&hit.meta))
+    }
+
+    /// Fetch, validate and (per its freshness) cache the document at `client_id`.
+    /// Bounded twice before any request goes out: per host, so one slow host
+    /// cannot take every permit, and overall. Neither queues — an excess request
+    /// is told to retry.
+    async fn fetch_and_cache_client_metadata(
+        &self,
+        client_id: &url::Url,
+    ) -> Result<Arc<ClientMetadata>, CimdError> {
+        let key = client_id.as_str();
+        let host = client_id.host_str().unwrap_or_default().to_ascii_lowercase();
+        let Some(_slot) = HostSlot::take(&self.cimd_hosts, &host) else {
+            return Err(CimdError::Unavailable(format!(
+                "too many client metadata fetches in flight for {host}; retry shortly"
+            )));
+        };
         let Ok(_permit) = self.cimd_inflight.try_acquire() else {
             return Err(CimdError::Unavailable(
                 "too many client metadata fetches in flight; retry shortly".into(),
             ));
         };
+        let now = Instant::now();
         let doc = fetch_client_metadata_document(key).await.map_err(CimdError::Unavailable)?;
+        if !is_json_media_type(doc.content_type.as_deref()) {
+            return Err(CimdError::Invalid(format!(
+                "{key}: served as {}, not application/json",
+                doc.content_type.as_deref().unwrap_or("no media type")
+            )));
+        }
         let meta = parse_client_metadata(key, &doc.body)
             .map(Arc::new)
             .map_err(|why| CimdError::Invalid(format!("{key}: {why}")))?;
@@ -2945,6 +3075,66 @@ mod tests {
         assert_eq!(cimd_ttl(Some(Duration::ZERO)), Duration::ZERO);
     }
 
+    /// The media type a document must be served as, by essence: parameters and
+    /// case are fine, anything else — or nothing — is not.
+    #[test]
+    fn cimd_media_type() {
+        use super::is_json_media_type;
+        assert!(is_json_media_type(Some("application/json")));
+        assert!(is_json_media_type(Some("application/json; charset=utf-8")));
+        assert!(is_json_media_type(Some("Application/JSON")));
+        assert!(!is_json_media_type(Some("text/html; charset=utf-8")));
+        assert!(!is_json_media_type(Some("text/plain")));
+        assert!(!is_json_media_type(Some("application/jose+json")));
+        assert!(!is_json_media_type(None));
+    }
+
+    /// Concurrent requests for one cold document share a single fetch, and one
+    /// host cannot take every permit: it gets [`CIMD_MAX_INFLIGHT_PER_HOST`] and
+    /// the excess is told to retry — with every slot given back afterwards.
+    #[tokio::test]
+    async fn cimd_fetches_are_coalesced_and_bounded_per_host() {
+        use super::{cimd_fixture, ClientCheck};
+        use serde_json::json;
+        let store = test_store();
+        let check = |id: &'static str, redirect: &'static str| store.validate_client(id, redirect);
+        let native = |id: &str| {
+            json!({ "client_id": id, "redirect_uris": ["http://127.0.0.1/cb"] }).to_string()
+        };
+        const REDIRECT: &str = "http://127.0.0.1:4242/cb";
+
+        // Three misses at once for one document: one fetch, three admissions.
+        const HERD: &str = "https://cimd-herd.test/client.json";
+        cimd_fixture::serve(HERD, &native(HERD));
+        let (a, b, c) =
+            tokio::join!(check(HERD, REDIRECT), check(HERD, REDIRECT), check(HERD, REDIRECT));
+        assert_eq!((a, b, c), (ClientCheck::Allowed, ClientCheck::Allowed, ClientCheck::Allowed));
+        assert_eq!(cimd_fixture::hits(HERD), 1, "concurrent misses must share one fetch");
+
+        // Three distinct documents on ONE host at once: two fetch, the third is
+        // told to retry rather than taking a third permit for that host.
+        const ONE: &str = "https://cimd-busy.test/one.json";
+        const TWO: &str = "https://cimd-busy.test/two.json";
+        const THREE: &str = "https://cimd-busy.test/three.json";
+        for id in [ONE, TWO, THREE] {
+            cimd_fixture::serve(id, &native(id));
+        }
+        let (one, two, three) =
+            tokio::join!(check(ONE, REDIRECT), check(TWO, REDIRECT), check(THREE, REDIRECT));
+        assert_eq!((one, two), (ClientCheck::Allowed, ClientCheck::Allowed));
+        match three {
+            ClientCheck::MetadataUnavailable(why) => {
+                assert!(why.contains("cimd-busy.test"), "{why}")
+            }
+            other => panic!("the third fetch for one host must be refused, got {other:?}"),
+        }
+        // Slots and single-flight entries are released, not leaked.
+        assert!(store.cimd_hosts.lock().unwrap().is_empty());
+        assert!(store.cimd_fetching.lock().unwrap().is_empty());
+        // The refused one succeeds on retry (its document was never fetched).
+        assert_eq!(check(THREE, REDIRECT).await, ClientCheck::Allowed);
+    }
+
     /// `/oauth/authorize` with a CIMD client: the document's redirects get the
     /// checks a DCR registration gets — hosted-redirect allow-list included, and
     /// checked BEFORE any fetch — the document is cached, an invalid document is
@@ -3029,6 +3219,12 @@ mod tests {
         cimd_fixture::fail(VOLATILE, "origin down");
         let verdict = check(VOLATILE, "http://localhost:3118/callback").await;
         assert!(matches!(verdict, ClientCheck::MetadataUnavailable(_)), "{verdict:?}");
+
+        // A document served as anything but application/json is not a document.
+        const HTML: &str = "https://cimd-html.test/client.json";
+        let html_doc = json!({ "client_id": HTML, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve_as(HTML, &html_doc.to_string(), "text/html; charset=utf-8");
+        assert_eq!(check(HTML, "http://127.0.0.1:7/cb").await, ClientCheck::Refused);
 
         // DCR clients are untouched: an unregistered ordinary id is refused.
         assert_eq!(check("client-unknown", "http://127.0.0.1:1/cb").await, ClientCheck::Refused);

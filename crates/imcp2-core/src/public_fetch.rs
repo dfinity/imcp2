@@ -16,27 +16,34 @@
 //!   * redirects are not followed at all: a 3xx is a non-success answer, so no
 //!     other URL's bytes — on another host, another port, or another path of the
 //!     same origin — can ever stand in for the document at this one;
-//!   * a body over the cap, or one whose transfer failed part-way, is an error,
-//!     never a shorter document;
+//!   * a body over the cap, one whose transfer failed part-way, or one that is
+//!     not valid UTF-8 is an error, never a shorter or a normalised document;
 //!   * the caller's timeout is ONE deadline over the whole operation, DNS
 //!     resolution included, so a slow resolver cannot hold the caller past it —
 //!     and it is the only deadline, so however far the fetch got when it ran out
 //!     of time, the caller sees the same "did not complete" error.
+//!
+//! The origin's caching instruction is reported as the REMAINING freshness
+//! lifetime, per HTTP: every `Cache-Control` field line is read (a `no-store` on
+//! a second line counts), and the response's `Age` is subtracted from `max-age`.
 
 use std::time::Duration;
 
-use crate::discover::{read_capped_inner, resolve_public_url};
+use reqwest::header::{HeaderMap, AGE, CACHE_CONTROL, CONTENT_TYPE};
+
+use crate::discover::{read_capped_bytes, resolve_public_url};
 
 /// A small public document fetched under the SSRF guard.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicDocument {
-    /// The complete body (it fit under the caller's cap).
+    /// The complete body (it fit under the caller's cap), valid UTF-8.
     pub body: String,
     /// The `Content-Type` the origin sent, if any.
     pub content_type: Option<String>,
-    /// The `max-age` of the origin's `Cache-Control`, if it sent one; `Some(0)`
-    /// when it said `no-store` or `no-cache`. A hint for the caller's own cache,
-    /// for the caller to bound — never binding.
+    /// How much longer the origin considers this fresh: its `max-age` less the
+    /// response's `Age`, if it sent a `max-age`; `Some(0)` when it said
+    /// `no-store` or `no-cache`, or the freshness has already run out. A hint
+    /// for the caller's own cache, for the caller to bound — never binding.
     pub cache_max_age: Option<Duration>,
 }
 
@@ -44,7 +51,7 @@ pub struct PublicDocument {
 /// refused by the SSRF guard (not https, no host, or a host with a non-public
 /// address); resolving, connecting, answering and delivering the body did not
 /// all complete within `timeout`; the answer was anything but 2xx (a redirect
-/// included); the body is larger than `max_bytes`; or the transfer was cut off.
+/// included); the body is larger than `max_bytes`, was cut off, or is not UTF-8.
 pub async fn fetch_public_document(
     url: &str,
     max_bytes: usize,
@@ -81,26 +88,63 @@ async fn fetch(url: &str, max_bytes: usize) -> Result<PublicDocument, String> {
         .send()
         .await
         .map_err(|e| format!("could not fetch {url}: {e}"))?;
+    accept(url, resp, max_bytes).await
+}
+
+/// Turn the origin's answer into a [`PublicDocument`], or refuse it: anything
+/// but 2xx (a redirect is named as such, since it is not followed), a body over
+/// `max_bytes` or cut off mid-transfer, or one that is not valid UTF-8. Kept apart
+/// from the sending so the acceptance rules are pinned by tests on synthetic
+/// responses, with no network.
+async fn accept(
+    url: &str,
+    resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<PublicDocument, String> {
     let status = resp.status();
+    if status.is_redirection() {
+        return Err(format!("{url} answered {status}, a redirect, which is not followed"));
+    }
     if !status.is_success() {
         return Err(format!("{url} answered {status}"));
     }
-    let header = |name: reqwest::header::HeaderName| {
-        resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned)
-    };
-    let content_type = header(reqwest::header::CONTENT_TYPE);
-    let cache_max_age = header(reqwest::header::CACHE_CONTROL).and_then(|v| cache_max_age(&v));
+    let content_type =
+        resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let cache_max_age = freshness(resp.headers());
     // Read ONE byte past the cap so overflow is detectable: a truncated body is
     // not a shorter document. Saturating, so a caller passing `usize::MAX` (no
     // cap) reads everything rather than wrapping to a zero-byte read.
-    let body = match read_capped_inner(resp, max_bytes.saturating_add(1)).await {
-        Ok(body) if body.len() > max_bytes => {
+    let bytes = match read_capped_bytes(resp, max_bytes.saturating_add(1)).await {
+        Ok(bytes) if bytes.len() > max_bytes => {
             return Err(format!("{url} is larger than the {max_bytes}-byte cap"))
         }
-        Ok(body) => body,
+        Ok(bytes) => bytes,
         Err((_, e)) => return Err(format!("reading {url} failed part-way: {e}")),
     };
+    // Strict, not lossy: a byte that is not UTF-8 is refused rather than replaced,
+    // so the document parsed is exactly the one served.
+    let body = String::from_utf8(bytes).map_err(|e| format!("{url} is not valid UTF-8: {e}"))?;
     Ok(PublicDocument { body, content_type, cache_max_age })
+}
+
+/// The remaining freshness lifetime the response's headers grant, per HTTP
+/// caching: `max-age` from the COMBINED `Cache-Control` fields (a header may be
+/// sent as several lines, and a `no-store` on any of them wins), less the
+/// response's `Age`. `None` when no `max-age` was sent.
+fn freshness(headers: &HeaderMap) -> Option<Duration> {
+    let cache_control: Vec<&str> =
+        headers.get_all(CACHE_CONTROL).iter().filter_map(|v| v.to_str().ok()).collect();
+    if cache_control.is_empty() {
+        return None;
+    }
+    let max_age = cache_max_age(&cache_control.join(", "))?;
+    let age = headers
+        .get(AGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::ZERO);
+    Some(max_age.saturating_sub(age))
 }
 
 /// The caching lifetime a `Cache-Control` value asks for: its `max-age`, or zero
@@ -126,7 +170,19 @@ fn cache_max_age(cache_control: &str) -> Option<Duration> {
 mod tests {
     use std::time::Duration;
 
-    use super::{cache_max_age, fetch_public_document};
+    use super::{accept, cache_max_age, fetch_public_document, freshness};
+
+    /// A response as the origin might send it, for pinning the acceptance rules
+    /// without a network: `status`, `headers` (repeatable), `body`.
+    fn synthetic(status: u16, headers: &[(&str, &str)], body: &[u8]) -> reqwest::Response {
+        let mut b = http::Response::builder().status(status);
+        for (name, value) in headers {
+            b = b.header(*name, *value);
+        }
+        reqwest::Response::from(b.body(body.to_vec()).expect("synthetic response"))
+    }
+
+    const URL: &str = "https://client.example/client.json";
 
     /// The SSRF guard decides before any request: these never touch the network
     /// (IP-literal hosts need no DNS), and each is refused for the reason the
@@ -162,6 +218,80 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("did not complete within"), "{err}");
+    }
+
+    /// A redirect is refused as such — its target is never requested, since the
+    /// client follows none — and so is any other non-2xx answer.
+    #[tokio::test]
+    async fn accept_refuses_redirects_and_errors() {
+        for status in [301u16, 302, 307, 308] {
+            let resp = synthetic(status, &[("location", "https://client.example/other.json")], b"");
+            let err = accept(URL, resp, 1024).await.unwrap_err();
+            assert!(err.contains(&status.to_string()) && err.contains("not followed"), "{err}");
+        }
+        let err = accept(URL, synthetic(404, &[], b"nope"), 1024).await.unwrap_err();
+        assert!(err.contains("404"), "{err}");
+        let err = accept(URL, synthetic(500, &[], b""), 1024).await.unwrap_err();
+        assert!(err.contains("500"), "{err}");
+    }
+
+    /// The body is taken only complete and only as valid UTF-8; the media type and
+    /// the remaining freshness ride along.
+    #[tokio::test]
+    async fn accept_takes_only_a_complete_valid_body() {
+        let headers =
+            [("content-type", "application/json; charset=utf-8"), ("cache-control", "max-age=300")];
+        let doc =
+            accept(URL, synthetic(200, &headers, br#"{"client_id":"x"}"#), 1024).await.unwrap();
+        assert_eq!(doc.body, r#"{"client_id":"x"}"#);
+        assert_eq!(doc.content_type.as_deref(), Some("application/json; charset=utf-8"));
+        assert_eq!(doc.cache_max_age, Some(Duration::from_secs(300)));
+        // Over the cap: an error, not a truncated document. The cap is exact.
+        let body = br#"{"client_id":"x"}"#;
+        assert!(accept(URL, synthetic(200, &[], body), body.len()).await.is_ok());
+        let err = accept(URL, synthetic(200, &[], body), body.len() - 1).await.unwrap_err();
+        assert!(err.contains("larger than"), "{err}");
+        // A byte that is not UTF-8 is refused, not replaced.
+        let err = accept(URL, synthetic(200, &[], b"{\"client_name\":\"\xff\"}"), 1024)
+            .await
+            .unwrap_err();
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    /// Freshness follows HTTP: every `Cache-Control` line counts, and `Age` is
+    /// subtracted, so a CDN answer near the end of its life is not given a new one.
+    #[test]
+    fn freshness_honours_age_and_every_cache_control_line() {
+        let headers = |pairs: &[(&str, &str)]| {
+            let mut h = reqwest::header::HeaderMap::new();
+            for (name, value) in pairs {
+                h.append(
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    value.parse().unwrap(),
+                );
+            }
+            h
+        };
+        assert_eq!(freshness(&headers(&[])), None);
+        assert_eq!(freshness(&headers(&[("age", "10")])), None);
+        assert_eq!(
+            freshness(&headers(&[("cache-control", "public, max-age=86400")])),
+            Some(Duration::from_secs(86400))
+        );
+        assert_eq!(
+            freshness(&headers(&[("cache-control", "max-age=86400"), ("age", "86399")])),
+            Some(Duration::from_secs(1))
+        );
+        // Freshness already spent: zero, not negative and not a fresh lifetime.
+        assert_eq!(
+            freshness(&headers(&[("cache-control", "max-age=300"), ("age", "301")])),
+            Some(Duration::ZERO)
+        );
+        // Two Cache-Control lines: the no-store on the second is not missed.
+        assert_eq!(
+            freshness(&headers(&[("cache-control", "max-age=300"), ("cache-control", "no-store")])),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]

@@ -1537,9 +1537,25 @@ enum Overflow {
 /// transfer failed, so the fail-soft caller can keep it and the strict one can
 /// report the failure.
 pub(crate) async fn read_capped_inner(
-    mut resp: reqwest::Response,
+    resp: reqwest::Response,
     max: usize,
 ) -> Result<String, (String, String)> {
+    // Lossy by design for the crawl: a stray byte must not cost a whole bundle.
+    // A caller that treats the body as a statement (the CIMD fetch) reads the
+    // bytes and decodes strictly instead.
+    match read_capped_bytes(resp, max).await {
+        Ok(buf) => Ok(String::from_utf8_lossy(&buf).into_owned()),
+        Err((buf, e)) => Err((String::from_utf8_lossy(&buf).into_owned(), e)),
+    }
+}
+
+/// The shared read in bytes: up to `max` of the body, stopping — and so dropping
+/// the response and its connection — at the cap. `Err((partial, error))` carries
+/// what had arrived before the transfer failed.
+pub(crate) async fn read_capped_bytes(
+    mut resp: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, (Vec<u8>, String)> {
     let mut buf: Vec<u8> = Vec::new();
     loop {
         if buf.len() >= max {
@@ -1554,10 +1570,10 @@ pub(crate) async fn read_capped_inner(
                 }
             }
             Ok(None) => break,
-            Err(e) => return Err((String::from_utf8_lossy(&buf).into_owned(), e.to_string())),
+            Err(e) => return Err((buf, e.to_string())),
         }
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(buf)
 }
 
 /// GET `url` and return up to `max` bytes of its body, distinguishing "this app
