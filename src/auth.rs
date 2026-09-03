@@ -1150,6 +1150,15 @@ impl CimdState {
         static SHARED: std::sync::OnceLock<Arc<CimdState>> = std::sync::OnceLock::new();
         Arc::clone(SHARED.get_or_init(|| Arc::new(Self::new())))
     }
+
+    /// Take `flight`'s entry for `key` out of the single-flight map — if it is
+    /// still the one there; a newer flight for the same key is left alone.
+    fn retire_flight(&self, key: &str, flight: &Flight) {
+        let mut fetching = self.fetching.lock().expect("cimd fetch locks");
+        if fetching.get(key).is_some_and(|current| Arc::ptr_eq(current, flight)) {
+            fetching.remove(key);
+        }
+    }
 }
 
 /// The fetch-rate buckets ([`CIMD_RATE_PER_MINUTE`], [`CIMD_RATE_PER_DOMAIN_PER_MINUTE`]).
@@ -1222,17 +1231,18 @@ impl Drop for HostSlot {
     }
 }
 
-/// A request's hold on a flight, from joining it to being done — OR DROPPED,
-/// since an authorize future can be dropped at any await (the client resets the
-/// stream). The LAST holder to go retires the flight's entry from the map: with
-/// an outcome published the flight has done its job (later requests find the
-/// cache); without one, every request in it was cancelled, and an entry left
-/// behind would be unbounded growth on a vetted host with unique URLs. While
-/// anyone else holds the flight it stays where newcomers find it, so a fetcher
-/// cancelled mid-way hands over to a waiter — which, finding no outcome once
-/// the lock is its, fetches — instead of leaving the waiters on one flight and
-/// newcomers on a second, fetching the same document twice. Only this flight's
-/// own entry is ever removed, never a newer one.
+/// A request's hold on a flight, from joining it to leaving — by returning, or
+/// by being DROPPED, since an authorize future can be dropped at any await (the
+/// client resets the stream). A flight that publishes its outcome is retired by
+/// its fetcher at once ([`AuthStore::client_metadata_for`]); this guard is for
+/// the flight that never gets that far because every request in it was
+/// cancelled: the LAST holder out retires it, so no entry is left behind (on a
+/// vetted host with unique URLs, that would be unbounded growth). While another
+/// request still holds such a flight it stays where newcomers find it, so a
+/// fetcher cancelled mid-way hands over to a waiter — which, finding no outcome
+/// once the lock is its, fetches — instead of leaving the waiters on one flight
+/// and newcomers on a second, fetching the same document twice. Only this
+/// flight's own entry is ever removed, never a newer one.
 struct FlightGuard<'a> {
     state: &'a CimdState,
     key: &'a str,
@@ -1241,12 +1251,12 @@ struct FlightGuard<'a> {
 
 impl Drop for FlightGuard<'_> {
     fn drop(&mut self) {
-        let mut fetching = self.state.fetching.lock().expect("cimd fetch locks");
-        let Some(current) = fetching.get(self.key) else { return };
         // Two handles are the map's and this request's; more means other requests
         // still hold the flight, and the last of them retires it. The count is
         // read under the map lock, where a newcomer would take its handle, so the
         // two cannot cross.
+        let mut fetching = self.state.fetching.lock().expect("cimd fetch locks");
+        let Some(current) = fetching.get(self.key) else { return };
         if !Arc::ptr_eq(current, self.flight) || Arc::strong_count(self.flight) > 2 {
             return;
         }
@@ -1703,6 +1713,13 @@ impl AuthStore {
             None => self.fetch_and_cache_client_metadata(client_id).await,
         };
         *slot = Some(outcome.clone());
+        // Published — so retire the flight NOW, not when its last holder leaves:
+        // a request arriving from here on goes to the cache, or, for an outcome
+        // the cache does not hold (a `no-store` document, a transient failure),
+        // fetches afresh — never joins this flight to reuse an outcome the origin
+        // said not to reuse, or a failure that may be over. The waiters read it
+        // from the handle they already hold.
+        self.cimd.retire_flight(key, &flight);
         outcome
     }
 
@@ -3793,6 +3810,52 @@ mod tests {
             "the last one out retires the flight"
         );
         assert!(store.cimd.hosts.lock().unwrap().is_empty());
+    }
+
+    /// The two rules a flight lives by. Publishing retires it at once, however
+    /// many requests still hold it — they read the outcome from their own handle,
+    /// and a newcomer must not join a published flight to reuse an outcome the
+    /// origin said not to reuse (`no-store`) or a failure that may be over. An
+    /// UNPUBLISHED flight, its fetcher cancelled, stays for its holders and is
+    /// retired by the last of them, so a waiter can take over the fetch and no
+    /// entry is left behind. Neither ever touches a newer flight for the key.
+    #[test]
+    fn cimd_flight_retirement_rules() {
+        use super::{CimdState, Flight, FlightGuard};
+        let state = CimdState::new();
+        let key = "https://cimd-rules.claude.ai/client.json";
+        let join = || -> Flight {
+            std::sync::Arc::clone(state.fetching.lock().unwrap().entry(key.to_owned()).or_default())
+        };
+        let held = || state.fetching.lock().unwrap().contains_key(key);
+
+        // Published while a waiter still holds it: retired at once.
+        let (fetcher, waiter) = (join(), join());
+        let (fetcher_guard, waiter_guard) = (
+            FlightGuard { state: &state, key, flight: &fetcher },
+            FlightGuard { state: &state, key, flight: &waiter },
+        );
+        state.retire_flight(key, &fetcher);
+        assert!(!held(), "a published flight is retired however many hold it");
+        // A newer flight for the key is not touched by the old one's holders leaving.
+        let newer = join();
+        drop(fetcher_guard);
+        drop(waiter_guard);
+        assert!(held(), "an old flight's holders must not retire a newer flight");
+        state.retire_flight(key, &fetcher);
+        assert!(held(), "nor does retiring the old flight");
+        state.retire_flight(key, &newer);
+        assert!(!held());
+
+        // Unpublished — the fetcher is cancelled — with a waiter: stays for the
+        // waiter; the last holder out retires it.
+        let (fetcher, waiter) = (join(), join());
+        let waiter_guard = FlightGuard { state: &state, key, flight: &waiter };
+        drop(FlightGuard { state: &state, key, flight: &fetcher });
+        drop(fetcher);
+        assert!(held(), "a cancelled fetcher leaves the flight for its waiter");
+        drop(waiter_guard);
+        assert!(!held(), "the last holder out retires an unpublished flight");
     }
 
     /// A request dropped mid-fetch — the client reset the stream, so the

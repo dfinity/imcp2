@@ -1372,6 +1372,8 @@ fn ipv6_is_global(ip: &Ipv6Addr) -> bool {
         || (seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0) // 2001:2::/48 benchmarking (RFC 5180)
         || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0010)     // 2001:10::/28 ORCHID (deprecated, RFC 4843)
         || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0020)     // 2001:20::/28 ORCHIDv2, not routable (RFC 7343)
+        || (seg[0] == 0x3fff && (seg[1] & 0xf000) == 0)          // 3fff::/20 documentation (RFC 9637)
+        || seg[0] == 0x5f00                                      // 5f00::/16 SRv6 SIDs, not globally reachable (RFC 9602)
         || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
         // Transition mechanisms embed an IPv4 address deeper in the v6 space than
         // `to_ipv4` decodes, so a NAT64/6to4/Teredo host would otherwise translate
@@ -2872,6 +2874,8 @@ mod tests {
             "2001:2::1",  // benchmarking
             "2001:10::1", // ORCHID (deprecated)
             "2001:20::1", // ORCHIDv2 (not routable)
+            "3fff::1",    // documentation (RFC 9637)
+            "5f00::1",    // SRv6 SIDs (RFC 9602)
             "2001:db8::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1", // IPv4-mapped private/loopback
