@@ -692,6 +692,25 @@ its AS issuer is `<PUBLIC_URL>/mcp` and everything OAuth lives under it:
   honoured (intersected with `authorization_code`). A **hosted** `redirect_uri` is
   rejected unless its host is on the allow-list (see the Companion-control note
   below); loopback redirects are always accepted.
+- **Client ID Metadata Documents** — the MCP authorization spec's preferred
+  registration, advertised as `client_id_metadata_document_supported: true`. A
+  client may skip `/register` and use the https URL of its metadata document as
+  its `client_id`; `/mcp/oauth/authorize` fetches that document under the same
+  SSRF guard as app discovery (https only, public addresses only, pinned, 8 KiB
+  cap, 5 s), requires its `client_id` to equal the URL, and checks the requested
+  redirect against the document's `redirect_uris` exactly as it would a DCR
+  registration's — hosted-redirect allow-list included, and checked before any
+  fetch, so a document can neither admit a redirect a DCR client couldn't
+  register nor make the server fetch a URL for a redirect it would refuse. A
+  hosted redirect must also be same-origin with the document URL (loopback
+  excepted), so a self-asserted document cannot point the code at another
+  party. Only public clients (`token_endpoint_auth_method: none`) are accepted.
+  Documents are cached (bounded; the origin's `max-age` clamped to 1 min–24 h,
+  10 min by default), so a directory client connecting thousands of times mints
+  no registrations. Claude and ChatGPT both select CIMD over DCR when it is
+  advertised; `OAUTH_CIMD_DISABLED=1` withdraws the advertisement and the
+  mechanism without a rebuild (clients re-read the metadata within minutes and
+  fall back to DCR).
 
 - `GET  /mcp/oauth/authorize` — validates the client + redirect, requires PKCE, sets
   the binding cookie, then redirects to II's handshake (with `registration_key`)

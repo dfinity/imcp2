@@ -1380,7 +1380,7 @@ fn ipv6_is_global(ip: &Ipv6Addr) -> bool {
 /// Validate a user-supplied discovery URL against SSRF and return the parsed URL
 /// plus the socket addresses to PIN the client to. https only; every resolved
 /// address must be global. Async DNS (no blocking of the executor).
-async fn resolve_public_url(raw: &str) -> Result<(url::Url, Vec<SocketAddr>), String> {
+pub(crate) async fn resolve_public_url(raw: &str) -> Result<(url::Url, Vec<SocketAddr>), String> {
     let url = url::Url::parse(raw).map_err(|e| format!("invalid discovery URL {raw}: {e}"))?;
     if url.scheme() != "https" {
         return Err(format!(
@@ -1434,7 +1434,7 @@ fn redirect_hop_ok(next: &url::Url, prev_host: Option<&str>) -> bool {
 /// Redirect policy shared by every discovery/dashboard client: follow only safe
 /// public https hops (bounded), and stop — rather than follow — an unsafe hop, so
 /// no request is ever issued to an internal host.
-fn ssrf_redirect_policy() -> reqwest::redirect::Policy {
+pub(crate) fn ssrf_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         let prev_host = attempt.previous().last().and_then(|u| u.host_str()).map(str::to_string);
         if attempt.previous().len() >= 10 {
@@ -1536,7 +1536,7 @@ enum Overflow {
 /// The shared read. `Err((partial, error))` carries what had arrived before the
 /// transfer failed, so the fail-soft caller can keep it and the strict one can
 /// report the failure.
-async fn read_capped_inner(
+pub(crate) async fn read_capped_inner(
     mut resp: reqwest::Response,
     max: usize,
 ) -> Result<String, (String, String)> {
