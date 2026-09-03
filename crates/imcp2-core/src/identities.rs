@@ -64,7 +64,9 @@ use std::{
 use base64::Engine;
 use candid::{CandidType, Decode, Encode, Principal};
 use ic_agent::{
-    identity::{BasicIdentity, DelegatedIdentity, Delegation, DelegationPermissions, SignedDelegation},
+    identity::{
+        BasicIdentity, DelegatedIdentity, Delegation, DelegationPermissions, SignedDelegation,
+    },
     Agent, Identity,
 };
 // rmcp re-exports schemars 1.x; the `#[tool]` output-schema machinery requires
@@ -112,7 +114,8 @@ const MAX_APP_DELEGATIONS: usize = 64;
 
 /// Shown when a connect can't be started because the session map is at
 /// [`MAX_SESSIONS`]. Actionable: the caller should retry, not re-register.
-const AT_CAPACITY_MSG: &str = "This server is at capacity for Internet Identity sessions right now. \
+const AT_CAPACITY_MSG: &str =
+    "This server is at capacity for Internet Identity sessions right now. \
      Wait a few minutes and start the sign-in again.";
 
 /// Internet Identity instance, single source of truth. Default: **`beta.id.ai`**.
@@ -193,10 +196,7 @@ impl IiInstance {
 
 /// An origin from the environment (no trailing slash), with a default.
 fn env_origin(var: &str, default: &str) -> String {
-    std::env::var(var)
-        .unwrap_or_else(|_| default.to_string())
-        .trim_end_matches('/')
-        .to_string()
+    std::env::var(var).unwrap_or_else(|_| default.to_string()).trim_end_matches('/').to_string()
 }
 
 /// A principal from the environment, with a default.
@@ -251,10 +251,7 @@ pub struct SessionGauges {
 /// derivation — a dapp declaring a custom derivation origin via
 /// `/.well-known/ii-alternative-origins` is NOT handled here (a known limitation).
 pub(crate) fn target_origin(domain: &str) -> String {
-    let host = domain
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
+    let host = domain.trim().trim_start_matches("https://").trim_start_matches("http://");
     let host = host.split(['/', '?', '#']).next().unwrap_or(host);
     let host = host.strip_suffix(":443").unwrap_or(host);
     for gateway in [".icp0.io", ".icp.net"] {
@@ -440,12 +437,7 @@ pub struct Identities {
 
 impl Identities {
     pub fn new(instance: IiInstance, public_url: String, agent: Agent) -> Self {
-        Self {
-            instance,
-            public_url,
-            agent,
-            sessions: Arc::default(),
-        }
+        Self { instance, public_url, agent, sessions: Arc::default() }
     }
 
     /// The injected base agent with `identity` swapped in: a clone shares the
@@ -813,7 +805,8 @@ impl Identities {
         // mcp_get_accounts(target_origin) -> variant { Ok: vec AccountInfo; Err }
         // A signed query: II recovers the anchor from the caller (the session key)
         // and returns that anchor's accounts at `target_origin`.
-        let arg = Encode!(&origin).map_err(|e| format!("could not encode mcp_get_accounts args: {e}"))?;
+        let arg =
+            Encode!(&origin).map_err(|e| format!("could not encode mcp_get_accounts args: {e}"))?;
         let reply = agent
             .query(&canister, "mcp_get_accounts")
             .with_arg(arg)
@@ -872,9 +865,8 @@ impl Identities {
         let (reg_seed, reg_der, session_der) = {
             let sessions = self.sessions.read().await;
             let s = sessions.get(session_id).ok_or("no such session")?;
-            let reg_seed = s
-                .reg_key_seed
-                .ok_or("no registration key was minted for this connect")?;
+            let reg_seed =
+                s.reg_key_seed.ok_or("no registration key was minted for this connect")?;
             let reg_der = s
                 .reg_pubkey_der
                 .clone()
@@ -890,8 +882,13 @@ impl Identities {
         // hard-coded mainnet key — so a host pointed at a non-mainnet IC verifies
         // and signs against the same trust anchor. In production the agent is
         // mainnet, so this is the mainnet root.
-        let identity =
-            registration_identity(reg_user_key, reg_seed, &reg_der, chain, &self.agent.read_root_key())?;
+        let identity = registration_identity(
+            reg_user_key,
+            reg_seed,
+            &reg_der,
+            chain,
+            &self.agent.read_root_key(),
+        )?;
         let agent = self.agent_as(identity);
 
         // mcp_register_v2(session_key) -> variant { Ok : McpRegisterV2Ok; Err : text }
@@ -917,10 +914,7 @@ impl Identities {
         let permissions = outcome.permissions.as_text();
         self.set_grant_expiration(session_id, outcome.expiration).await;
         self.set_permissions(session_id, permissions).await;
-        Ok(RegistrationOutcome {
-            expiration_ns: outcome.expiration,
-            permissions,
-        })
+        Ok(RegistrationOutcome { expiration_ns: outcome.expiration, permissions })
     }
 
     /// Resolve an optional account `name` at `domain` to its account number
@@ -994,10 +988,8 @@ impl Identities {
         account_number: Option<u64>,
     ) -> Option<AppDelegation> {
         let sessions = self.sessions.read().await;
-        let app = sessions
-            .get(session_id)?
-            .app_delegations
-            .get(&(domain.to_string(), account_number))?;
+        let app =
+            sessions.get(session_id)?.app_delegations.get(&(domain.to_string(), account_number))?;
         if !app.fresh() {
             return None;
         }
@@ -1009,7 +1001,13 @@ impl Identities {
         })
     }
 
-    async fn store(&self, session_id: &str, domain: &str, account_number: Option<u64>, app: AppDelegation) {
+    async fn store(
+        &self,
+        session_id: &str,
+        domain: &str,
+        account_number: Option<u64>,
+        app: AppDelegation,
+    ) {
         let mut sessions = self.sessions.write().await;
         if let Some(s) = sessions.get_mut(session_id) {
             let key = (domain.to_string(), account_number);
@@ -1071,8 +1069,9 @@ impl Identities {
         //   -> variant { Ok: SignedDelegation; Err: AccountDelegationError } query
         // Thread the account + expiration `prepare` returned VERBATIM, or II
         // returns NoSuchDelegation (the default account is mutable between calls).
-        let get_arg = Encode!(&origin, &prepared.account_number, &app_key_der, &prepared.expiration)
-            .map_err(|e| format!("could not encode get args: {e}"))?;
+        let get_arg =
+            Encode!(&origin, &prepared.account_number, &app_key_der, &prepared.expiration)
+                .map_err(|e| format!("could not encode get args: {e}"))?;
         let got = agent
             .query(&canister, "mcp_get_delegation")
             .with_arg(get_arg)
@@ -1221,10 +1220,8 @@ fn bound_app_delegations(cache: &mut HashMap<(String, Option<u64>), AppDelegatio
     }
     cache.retain(|_, a| a.fresh());
     while cache.len() >= MAX_APP_DELEGATIONS {
-        let Some(victim) = cache
-            .iter()
-            .min_by_key(|(_, a)| a.expiration_ns)
-            .map(|(k, _)| k.clone())
+        let Some(victim) =
+            cache.iter().min_by_key(|(_, a)| a.expiration_ns).map(|(k, _)| k.clone())
         else {
             break;
         };
@@ -1236,9 +1233,7 @@ fn bound_app_delegations(cache: &mut HashMap<(String, Option<u64>), AppDelegatio
 fn fresh_ed25519() -> ([u8; 32], Vec<u8>) {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).expect("getrandom");
-    let pubkey_der = BasicIdentity::from_raw_key(&seed)
-        .public_key()
-        .expect("ed25519 public key");
+    let pubkey_der = BasicIdentity::from_raw_key(&seed).public_key().expect("ed25519 public key");
     (seed, pubkey_der)
 }
 
@@ -1437,7 +1432,9 @@ struct IiDelegation {
 ///   resurface the same opaque "sig not found in the signature tree" replica
 ///   error. Failing fast surfaces the real cause and forces a server update
 ///   instead of silently regressing.
-pub(crate) fn permissions_from_text(permissions: Option<&str>) -> Result<Option<DelegationPermissions>, String> {
+pub(crate) fn permissions_from_text(
+    permissions: Option<&str>,
+) -> Result<Option<DelegationPermissions>, String> {
     match permissions {
         None => Ok(None),
         Some("queries") => Ok(Some(DelegationPermissions::Queries)),
@@ -1559,10 +1556,7 @@ mod tests {
 
     // An Identities store over a dummy II instance (tests never hit the network).
     fn test_ids() -> Identities {
-        let agent = Agent::builder()
-            .with_url("https://ii.test")
-            .build()
-            .expect("test agent");
+        let agent = Agent::builder().with_url("https://ii.test").build().expect("test agent");
         Identities::new(
             IiInstance {
                 name: "test",
@@ -1583,7 +1577,13 @@ mod tests {
     }
 
     // Insert a cached app delegation for (domain, account_number) directly.
-    async fn seed_app(ids: &Identities, session_id: &str, domain: &str, account: Option<u64>, exp: u64) {
+    async fn seed_app(
+        ids: &Identities,
+        session_id: &str,
+        domain: &str,
+        account: Option<u64>,
+        exp: u64,
+    ) {
         let mut sessions = ids.sessions.write().await;
         let s = sessions.get_mut(session_id).expect("session");
         s.app_delegations.insert(
@@ -1803,8 +1803,13 @@ mod tests {
         let base = now_ns() + REDERIVE_MARGIN_NS + 60 * 1_000_000_000;
         for i in 0..MAX_APP_DELEGATIONS as u64 {
             // Later `i` expires later, so `app0` is always the nearest expiry.
-            ids.store("sess", &format!("app{i}.example"), None, app_delegation(base + i * 1_000_000_000))
-                .await;
+            ids.store(
+                "sess",
+                &format!("app{i}.example"),
+                None,
+                app_delegation(base + i * 1_000_000_000),
+            )
+            .await;
         }
         assert_eq!(
             ids.sessions.read().await.get("sess").expect("session").app_delegations.len(),
@@ -1924,7 +1929,12 @@ mod tests {
             name: Option<String>,
         }
         let wire: std::result::Result<Vec<WireAccount>, AccountDelegationError> = Ok(vec![
-            WireAccount { account_number: None, origin: "https://oisy.com".into(), last_used: None, name: None },
+            WireAccount {
+                account_number: None,
+                origin: "https://oisy.com".into(),
+                last_used: None,
+                name: None,
+            },
             WireAccount {
                 account_number: Some(7),
                 origin: "https://oisy.com".into(),
@@ -2226,10 +2236,7 @@ mod tests {
         // an unrestricted delegation changes the signed bytes, so the anchor's
         // signature no longer verifies and the identity refuses to build. A client
         // cannot silently promote a read-only delegation to full access.
-        let unrestricted = Delegation {
-            permissions: None,
-            ..delegation.clone()
-        };
+        let unrestricted = Delegation { permissions: None, ..delegation.clone() };
         assert_ne!(
             delegation.signable(),
             unrestricted.signable(),
@@ -2315,7 +2322,11 @@ mod tests {
             let b = Encode!(&p).expect("encode perm");
             IDLArgs::from_bytes(&b).expect("typeless-decode perm").args[0].to_string()
         };
-        assert_eq!(wire(IiPermissions::Queries), literal("queries"), "on-wire label must be `queries`");
+        assert_eq!(
+            wire(IiPermissions::Queries),
+            literal("queries"),
+            "on-wire label must be `queries`"
+        );
         assert_eq!(wire(IiPermissions::All), literal("all"), "on-wire label must be `all`");
         // Sanity: the two labels hash differently, so the checks above genuinely
         // pin each one and aren't matching everything.

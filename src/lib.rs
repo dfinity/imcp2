@@ -98,11 +98,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde_json::json;
 use rmcp::transport::{
     streamable_http_server::{session::local::LocalSessionManager, tower::StreamableHttpService},
     StreamableHttpServerConfig,
 };
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 pub use auth::SharedClients;
@@ -303,10 +303,7 @@ impl McpServer {
             ]);
         let gated_mcp = Router::new()
             .fallback_service(mcp_service)
-            .layer(middleware::from_fn_with_state(
-                self.store.clone(),
-                auth::require_token,
-            ))
+            .layer(middleware::from_fn_with_state(self.store.clone(), auth::require_token))
             .layer(mcp_cors);
 
         let oauth = Router::new()
@@ -382,10 +379,7 @@ impl McpServer {
                 "/.well-known/oauth-authorization-server",
                 get(auth::authorization_server_metadata),
             )
-            .route(
-                "/.well-known/oauth-protected-resource",
-                get(auth::protected_resource_metadata),
-            )
+            .route("/.well-known/oauth-protected-resource", get(auth::protected_resource_metadata))
             .with_state(self.store.clone())
             .layer(permissive_cors())
     }
@@ -589,11 +583,7 @@ fn normalize_mount_path(path: &str) -> String {
 fn normalize_public_url(raw: &str) -> String {
     let raw = raw.trim();
     // Give `Url::parse` a scheme to work with; a bare host isn't a valid URL.
-    let candidate = if raw.contains("://") {
-        raw.to_string()
-    } else {
-        format!("https://{raw}")
-    };
+    let candidate = if raw.contains("://") { raw.to_string() } else { format!("https://{raw}") };
     if let Ok(url) = url::Url::parse(&candidate) {
         // `scheme()` is lowercased by the parser; `host_str()` keeps IPv6
         // brackets; `port()` is `None` for an absent or default port (so the
@@ -612,8 +602,8 @@ fn normalize_public_url(raw: &str) -> String {
 #[cfg(test)]
 mod lib_tests {
     use super::{
-        allowed_hosts_for, normalize_mount_path, normalize_public_url, Agent, IiInstance, McpConfig,
-        McpServer, SharedClients, IC_URL,
+        allowed_hosts_for, normalize_mount_path, normalize_public_url, Agent, IiInstance,
+        McpConfig, McpServer, SharedClients, IC_URL,
     };
     use std::path::PathBuf;
 
@@ -674,7 +664,10 @@ mod lib_tests {
         assert_eq!(normalize_public_url("HTTPS://mcp.example.com"), "https://mcp.example.com");
         // Default port dropped; non-default kept; local http preserved.
         assert_eq!(normalize_public_url("https://mcp.example.com:443"), "https://mcp.example.com");
-        assert_eq!(normalize_public_url("https://mcp.example.com:8443"), "https://mcp.example.com:8443");
+        assert_eq!(
+            normalize_public_url("https://mcp.example.com:8443"),
+            "https://mcp.example.com:8443"
+        );
         assert_eq!(normalize_public_url("http://localhost:8000"), "http://localhost:8000");
         // IPv6 literal stays bracketed.
         assert_eq!(normalize_public_url("http://[::1]:8080"), "http://[::1]:8080");

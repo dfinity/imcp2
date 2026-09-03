@@ -10,20 +10,14 @@ use imcp2_core::IiInstance;
 /// the network (agent construction, key minting, and the loopback listener
 /// are all local), which is exactly what these tests rely on.
 fn test_driver() -> (LoginDriver, SessionSlot) {
-    let agent = imcp2_core::Agent::builder()
-        .with_url(imcp2_core::IC_URL)
-        .build()
-        .expect("agent");
+    let agent = imcp2_core::Agent::builder().with_url(imcp2_core::IC_URL).build().expect("agent");
     let identities = Identities::new(
         IiInstance::prod().expect("prod II instance"),
         "https://mcp.internetcomputer.org".into(),
         agent,
     );
     let slot = SessionSlot::new();
-    (
-        LoginDriver::new(identities, slot.clone(), /* auto_open */ false),
-        slot,
-    )
+    (LoginDriver::new(identities, slot.clone(), /* auto_open */ false), slot)
 }
 
 /// A shape-valid two-hop chain (the same wire shape as iiconnect's parser
@@ -58,10 +52,7 @@ async fn begin_mints_one_flow_and_repeats_it_while_pending() {
     };
     assert!(fresh);
     assert!(url.starts_with("https://id.ai/mcp#callback="), "{url}");
-    assert!(
-        url.contains("http%3A%2F%2F127.0.0.1%3A"),
-        "loopback callback in the fragment: {url}"
-    );
+    assert!(url.contains("http%3A%2F%2F127.0.0.1%3A"), "loopback callback in the fragment: {url}");
     assert!(url.contains("&ttl=3600&registration_key="), "{url}");
 
     let BeginOutcome::Pending { url: again, fresh } = driver.begin(false).await.expect("begin")
@@ -102,20 +93,11 @@ async fn the_listener_serves_the_pinned_page_and_the_allow_list() {
         ("x-content-type-options", "nosniff"),
         ("x-frame-options", "DENY"),
     ] {
-        assert_eq!(
-            page.headers().get(name).and_then(|v| v.to_str().ok()),
-            Some(want)
-        );
+        assert_eq!(page.headers().get(name).and_then(|v| v.to_str().ok()), Some(want));
     }
     let html = page.text().await.unwrap();
-    assert!(
-        html.contains("/redeem"),
-        "the script must POST to this listener's redeem"
-    );
-    assert!(
-        html.contains("data.done"),
-        "the local success arm must be in the shipped page"
-    );
+    assert!(html.contains("/redeem"), "the script must POST to this listener's redeem");
+    assert!(html.contains("data.done"), "the local success arm must be in the shipped page");
 
     let wk = http
         .get(format!("{origin}{AUTH_CALLBACKS_WELL_KNOWN}"))
@@ -124,16 +106,12 @@ async fn the_listener_serves_the_pinned_page_and_the_allow_list() {
         .expect("GET allow-list");
     assert_eq!(wk.status(), 200);
     assert_eq!(
-        wk.headers()
-            .get("access-control-allow-origin")
-            .and_then(|v| v.to_str().ok()),
+        wk.headers().get("access-control-allow-origin").and_then(|v| v.to_str().ok()),
         Some("*"),
         "II fetches the allow-list cross-origin"
     );
     assert_eq!(
-        wk.headers()
-            .get("cache-control")
-            .and_then(|v| v.to_str().ok()),
+        wk.headers().get("cache-control").and_then(|v| v.to_str().ok()),
         Some("no-store"),
         "fail-closed infrastructure must never be served stale"
     );
@@ -164,43 +142,21 @@ async fn redeem_refuses_bad_deliveries_and_keeps_the_flow_retryable() {
     let post = |body: serde_json::Value| {
         let http = http.clone();
         let redeem_url = redeem_url.clone();
-        async move {
-            http.post(&redeem_url)
-                .json(&body)
-                .send()
-                .await
-                .expect("POST /redeem")
-        }
+        async move { http.post(&redeem_url).json(&body).send().await.expect("POST /redeem") }
     };
 
     let r = post(serde_json::json!({ "state": "someone-else", "delegation": "" })).await;
     assert_eq!(r.status(), 400);
     let e: serde_json::Value = r.json().await.unwrap();
-    assert!(
-        e["error"]
-            .as_str()
-            .unwrap()
-            .contains("unknown or already used"),
-        "{e}"
-    );
+    assert!(e["error"].as_str().unwrap().contains("unknown or already used"), "{e}");
 
     let r = post(serde_json::json!({ "state": state, "delegation": "not json" })).await;
     assert_eq!(r.status(), 400);
     let e: serde_json::Value = r.json().await.unwrap();
-    assert!(
-        e["error"]
-            .as_str()
-            .unwrap()
-            .contains("couldn't read the sign-in response"),
-        "{e}"
-    );
+    assert!(e["error"].as_str().unwrap().contains("couldn't read the sign-in response"), "{e}");
 
     let r = post(serde_json::json!({ "state": state, "delegation": fake_chain_json() })).await;
-    assert_eq!(
-        r.status(),
-        400,
-        "garbage signatures must be rejected by the redeem"
-    );
+    assert_eq!(r.status(), 400, "garbage signatures must be rejected by the redeem");
     let e: serde_json::Value = r.json().await.unwrap();
     assert!(e["error"].is_string(), "{e}");
 
@@ -231,11 +187,7 @@ async fn status_reports_the_grant_lifecycle() {
     driver.inner.state.lock().await.grant = Some(grant(now_ns() + 30 * 60_000_000_000));
     match driver.status().await {
         LoginStatus::SignedIn(g) => {
-            assert!(
-                (25..=30).contains(&g.minutes_left()),
-                "{}",
-                g.minutes_left()
-            );
+            assert!((25..=30).contains(&g.minutes_left()), "{}", g.minutes_left());
         }
         _ => panic!("a live grant must report SignedIn"),
     }
@@ -291,9 +243,8 @@ async fn the_listener_rejects_foreign_host_headers() {
     let port: u16 = authority.split(':').nth(1).unwrap().parse().unwrap();
 
     let request = |host: String| async move {
-        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .expect("connect");
+        let mut stream =
+            tokio::net::TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
         stream
             .write_all(
                 format!("GET /callback HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
@@ -303,28 +254,16 @@ async fn the_listener_rejects_foreign_host_headers() {
             .expect("write");
         let mut response = String::new();
         stream.read_to_string(&mut response).await.expect("read");
-        response
-            .split_whitespace()
-            .nth(1)
-            .expect("status code")
-            .to_string()
+        response.split_whitespace().nth(1).expect("status code").to_string()
     };
 
-    assert_eq!(
-        request("attacker.example".into()).await,
-        "403",
-        "rebound hostname"
-    );
+    assert_eq!(request("attacker.example".into()).await, "403", "rebound hostname");
     assert_eq!(
         request(format!("localhost:{port}")).await,
         "403",
         "even localhost: only the one advertised authority is served"
     );
-    assert_eq!(
-        request(authority.to_string()).await,
-        "200",
-        "the true authority passes"
-    );
+    assert_eq!(request(authority.to_string()).await, "200", "the true authority passes");
 }
 
 // The session slot is shared and REPLACEABLE: it starts empty (signed
@@ -342,11 +281,7 @@ fn the_session_slot_is_shared_and_replaceable() {
     slot.set("sess-1".into(), hour_from_now);
     assert_eq!(reader.get(), Some("sess-1".into()), "clones share the slot");
     slot.set("sess-2".into(), hour_from_now);
-    assert_eq!(
-        reader.get(),
-        Some("sess-2".into()),
-        "a re-login replaces the id"
-    );
+    assert_eq!(reader.get(), Some("sess-2".into()), "a re-login replaces the id");
     // Expiry-aware: the moment the grant lapses, the slot reports NO session
     // — tools return sign-in guidance instead of acting on a dead session,
     // regardless of when the 60-second reaper gets to the server-side state.

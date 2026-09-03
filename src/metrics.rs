@@ -46,9 +46,8 @@ const UNMATCHED_ROUTE: &str = "other";
 const UNKNOWN_METHOD: &str = "other";
 
 /// Methods that may appear as a label; anything unlisted collapses to `other`.
-const KNOWN_METHODS: [&str; 9] = [
-    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT",
-];
+const KNOWN_METHODS: [&str; 9] =
+    ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"];
 
 /// Session-gauge label. NOT `instance`: Prometheus attaches its own `instance`
 /// target label to every sample and renames a colliding exposed one to
@@ -59,9 +58,8 @@ const SESSION_LABEL: &str = "ii_instance";
 /// Latency buckets in seconds. The static pages and `/version` answer in
 /// single-digit milliseconds; MCP tool calls do IC round trips and land in the
 /// hundreds. The crate defaults have no resolution below 5ms.
-const LATENCY_BUCKETS: &[f64] = &[
-    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
-];
+const LATENCY_BUCKETS: &[f64] =
+    &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
 /// Handle for recording this crate's metrics. Cheap to clone: collectors are
 /// `Arc`-backed, so clones share one set of series.
@@ -232,9 +230,7 @@ impl Metrics {
 /// collide with a host that already has one). A no-op off Linux.
 pub fn register_process_collector(registry: &Registry) -> prometheus::Result<()> {
     #[cfg(target_os = "linux")]
-    registry.register(Box::new(
-        prometheus::process_collector::ProcessCollector::for_self(),
-    ))?;
+    registry.register(Box::new(prometheus::process_collector::ProcessCollector::for_self()))?;
     #[cfg(not(target_os = "linux"))]
     let _ = registry;
     Ok(())
@@ -255,10 +251,7 @@ pub async fn write_request_metrics(
     next: Next,
 ) -> Response {
     // Read the matched template before `next.run` consumes the request.
-    let route = req
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|m| m.as_str().to_string());
+    let route = req.extensions().get::<MatchedPath>().map(|m| m.as_str().to_string());
     let method = req.method().clone();
     let started = std::time::Instant::now();
     let resp = next.run(req).await;
@@ -329,10 +322,7 @@ mod tests {
     /// A real production-instance server. Construction is pure — no network.
     fn server() -> crate::McpServer {
         crate::McpServer::new(crate::McpConfig {
-            agent: crate::Agent::builder()
-                .with_url(crate::IC_URL)
-                .build()
-                .expect("build agent"),
+            agent: crate::Agent::builder().with_url(crate::IC_URL).build().expect("build agent"),
             instance: crate::IiInstance::prod().expect("prod instance"),
             public_url: "https://mcp.example.com".into(),
             mcp_path: "/mcp".into(),

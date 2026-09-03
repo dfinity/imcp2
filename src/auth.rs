@@ -112,8 +112,8 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use imcp2_core::identities::Identities;
-use imcp2_core::iiconnect::{self, RedeemBody};
 pub use imcp2_core::iiconnect::AUTH_CALLBACKS_WELL_KNOWN;
+use imcp2_core::iiconnect::{self, RedeemBody};
 
 /// The verified session id of an authenticated MCP session: [`require_token`]
 /// validates the bearer token and stashes this on the request; the
@@ -402,7 +402,8 @@ impl ClientStore {
                 // A registration may have landed between that last check and
                 // releasing the writer slot: re-take it if so (unless another
                 // caller already did), else this writer is done.
-                if !store.dirty.load(Ordering::SeqCst) || store.writing.swap(true, Ordering::SeqCst) {
+                if !store.dirty.load(Ordering::SeqCst) || store.writing.swap(true, Ordering::SeqCst)
+                {
                     break;
                 }
             }
@@ -418,10 +419,8 @@ impl ClientStore {
 /// an evicted client re-registers automatically.
 fn make_room_for_client(clients: &mut HashMap<String, ClientReg>) {
     while clients.len() >= MAX_CLIENTS {
-        let Some(victim) = clients
-            .iter()
-            .min_by_key(|(_, c)| c.last_used)
-            .map(|(id, _)| id.clone())
+        let Some(victim) =
+            clients.iter().min_by_key(|(_, c)| c.last_used).map(|(id, _)| id.clone())
         else {
             break;
         };
@@ -446,7 +445,8 @@ where
     }
     map.retain(|_, v| !remaining(v).is_zero());
     while map.len() >= cap {
-        let Some(victim) = map.iter().min_by_key(|(_, v)| remaining(v)).map(|(k, _)| k.clone()) else {
+        let Some(victim) = map.iter().min_by_key(|(_, v)| remaining(v)).map(|(k, _)| k.clone())
+        else {
             break;
         };
         map.remove(&victim);
@@ -496,7 +496,7 @@ enum PathPin {
 /// segment, so it wants checking vendor by vendor rather than in bulk here.
 const DEFAULT_ALLOWED_REDIRECTS: &[(&str, &str, PathPin)] = &[
     ("antigravity.google", "/oauth-callback", PathPin::Prefix), // Google Antigravity
-    ("chatgpt.com", "/connector/oauth/", PathPin::Prefix), // OpenAI ChatGPT connectors
+    ("chatgpt.com", "/connector/oauth/", PathPin::Prefix),      // OpenAI ChatGPT connectors
     // OpenAI ChatGPT connectors, issuer-identification form. ChatGPT sends this
     // stable path — not the `{callback_id}` one above — to an authorization server
     // whose metadata advertises `authorization_response_iss_parameter_supported`,
@@ -534,7 +534,8 @@ fn allowed_redirects() -> &'static [(String, String, PathPin)] {
             .map(|(d, p, pin)| (d.to_string(), p.to_string(), *pin))
             .collect();
         if let Ok(extra) = std::env::var("OAUTH_ALLOWED_REDIRECT_PREFIXES") {
-            for raw in extra.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
+            for raw in extra.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty())
+            {
                 match parse_redirect_prefix(raw) {
                     // `…_PREFIXES`, so an ops entry matches as a prefix.
                     Some((host, path)) => out.push((host, path, PathPin::Prefix)),
@@ -725,9 +726,7 @@ fn redirect_allowed(reg: Option<&ClientReg>, redirect_uri: &str) -> bool {
     if !redirect_uri_permitted(redirect_uri) {
         return false;
     }
-    reg.redirect_uris
-        .iter()
-        .any(|u| u == redirect_uri || loopback_match(u, redirect_uri))
+    reg.redirect_uris.iter().any(|u| u == redirect_uri || loopback_match(u, redirect_uri))
 }
 
 /// Whether `requested` is a loopback redirect matching the registered loopback
@@ -919,10 +918,7 @@ impl AuthStore {
     /// advertised in the 401 challenge: the path-inserted form for the
     /// resource `{public_url}{mcp_path}`.
     fn resource_metadata_url(&self) -> String {
-        format!(
-            "{}/.well-known/oauth-protected-resource{}",
-            self.public_url, self.mcp_path
-        )
+        format!("{}/.well-known/oauth-protected-resource{}", self.public_url, self.mcp_path)
     }
 
     /// Whether `redirect_uri` is acceptable for `client_id`: the client must be
@@ -949,7 +945,11 @@ impl AuthStore {
     /// entries pair 1:1 with these.
     async fn insert_pending(&self, session_id: String, pending: AuthzPending) {
         let mut authz = self.authz.write().await;
-        make_room(&mut authz, imcp2_core::identities::MAX_PENDING_CONNECTS, AuthzPending::remaining);
+        make_room(
+            &mut authz,
+            imcp2_core::identities::MAX_PENDING_CONNECTS,
+            AuthzPending::remaining,
+        );
         authz.insert(session_id, pending);
     }
 
@@ -1125,12 +1125,24 @@ pub async fn authorize(
     match q.response_type.as_deref() {
         Some("code") => {}
         Some(_) => {
-            return signin_error(&headers, StatusCode::BAD_REQUEST, "unsupported_response_type",
-                "only response_type=code", SIGNIN_HEADLINE, MALFORMED_DIAGNOSTIC)
+            return signin_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                "unsupported_response_type",
+                "only response_type=code",
+                SIGNIN_HEADLINE,
+                MALFORMED_DIAGNOSTIC,
+            )
         }
         None => {
-            return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
-                "response_type=code required", SIGNIN_HEADLINE, MALFORMED_DIAGNOSTIC)
+            return signin_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "response_type=code required",
+                SIGNIN_HEADLINE,
+                MALFORMED_DIAGNOSTIC,
+            )
         }
     }
     if !store.validate_client(&q.client_id, &q.redirect_uri).await {
@@ -1156,18 +1168,28 @@ pub async fn authorize(
             // non-https, or userinfo-bearing). That's a client-side request error,
             // not an approval gap, so classify it `invalid_request` and show the
             // generic sign-in error rather than a misleading "request access" page.
-            return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
-                "redirect_uri must be a valid https or loopback URL", SIGNIN_HEADLINE,
-                MALFORMED_DIAGNOSTIC);
+            return signin_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "redirect_uri must be a valid https or loopback URL",
+                SIGNIN_HEADLINE,
+                MALFORMED_DIAGNOSTIC,
+            );
         }
         // `invalid_client` (not `invalid_request`): the request is well-formed,
         // it's the CLIENT identification that failed — the AS error code the
         // MCP server guide (and RFC 6749's taxonomy) expects here. No redirect:
         // an unvalidated redirect_uri must never receive an error response.
-        return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_client",
-            "unknown client_id / redirect_uri", SIGNIN_HEADLINE,
+        return signin_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "invalid_client",
+            "unknown client_id / redirect_uri",
+            SIGNIN_HEADLINE,
             "This server doesn't recognize your MCP client. Its registration may have expired. \
-             Remove the connector and add it again. Then sign in.");
+             Remove the connector and add it again. Then sign in.",
+        );
     }
     // OAuth 2.1: PKCE is required for public clients.
     let Some(code_challenge) = q.code_challenge.clone() else {
@@ -1181,11 +1203,16 @@ pub async fn authorize(
     // accepting the omission and then verifying as S256 would hand a
     // spec-strict `plain` client a code it can never exchange.
     if q.code_challenge_method.as_deref() != Some("S256") {
-        return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
-            "code_challenge_method=S256 is required", SIGNIN_HEADLINE,
+        return signin_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "code_challenge_method=S256 is required",
+            SIGNIN_HEADLINE,
             "Your MCP client's request used an unsupported PKCE method (only S256 is supported). \
              The client may be out of date. Try updating it. If that doesn't help, remove the \
-             connector and add it again.");
+             connector and add it again.",
+        );
     }
     // RFC 8707 Resource Indicators (MCP authorization): a token must only be
     // issued for THIS instance, so refuse a `resource` that names any other
@@ -1226,10 +1253,15 @@ pub async fn authorize(
         Ok(k) => k,
         Err(e) => {
             tracing::warn!("refusing a connect: {e}");
-            return signin_error(&headers, StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable",
-                "the server is at capacity for sessions; retry shortly", SIGNIN_HEADLINE,
+            return signin_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "the server is at capacity for sessions; retry shortly",
+                SIGNIN_HEADLINE,
                 "This server is busy right now, so it couldn't start a new sign-in. Wait a moment \
-                 and try again.");
+                 and try again.",
+            );
         }
     };
     // Bind this browser to the flow (the `sid` cookie, set now and required at
@@ -1307,9 +1339,12 @@ fn connect_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
 /// `location.hash`. Sets `Referrer-Policy: no-referrer` (tidiness — the authorize
 /// query carries only non-secret OAuth params).
 fn redirect_302(url: &str) -> Response {
-    let mut resp = (StatusCode::FOUND, [(axum::http::header::LOCATION, url.to_string())]).into_response();
-    resp.headers_mut()
-        .insert(axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer"));
+    let mut resp =
+        (StatusCode::FOUND, [(axum::http::header::LOCATION, url.to_string())]).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
     resp
 }
 
@@ -1410,10 +1445,7 @@ fn pinned_callback_page(prefix: &str) -> Response {
         axum::http::header::X_CONTENT_TYPE_OPTIONS,
         axum::http::HeaderValue::from_static("nosniff"),
     );
-    h.insert(
-        axum::http::header::X_FRAME_OPTIONS,
-        axum::http::HeaderValue::from_static("DENY"),
-    );
+    h.insert(axum::http::header::X_FRAME_OPTIONS, axum::http::HeaderValue::from_static("DENY"));
     resp
 }
 
@@ -1465,10 +1497,10 @@ fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
         // Acceptable unless an explicit `q=0` (any spelling: `0`, `0.0`, `0.000`).
         // A malformed or absent q-value leaves the range acceptable.
         !parts.any(|param| {
-            param
-                .split_once('=')
-                .is_some_and(|(k, v)| k.trim().eq_ignore_ascii_case("q")
-                    && v.trim().parse::<f32>().is_ok_and(|q| q <= 0.0))
+            param.split_once('=').is_some_and(|(k, v)| {
+                k.trim().eq_ignore_ascii_case("q")
+                    && v.trim().parse::<f32>().is_ok_and(|q| q <= 0.0)
+            })
         })
     })
 }
@@ -1490,7 +1522,13 @@ fn contact_report_hint() -> String {
 /// script on the page, so no `script-src`; the only inline is the nonce'd
 /// `<style>`, everything else is denied (`default-src 'none'`), and framing is
 /// refused so the page can't be embedded for UI redress.
-fn error_screen(status: StatusCode, title: &str, headline: &str, detail: &str, hint: &str) -> Response {
+fn error_screen(
+    status: StatusCode,
+    title: &str,
+    headline: &str,
+    detail: &str,
+    hint: &str,
+) -> Response {
     let nonce = iiconnect::csp_nonce();
     let html = CONNECT_ERROR_HTML
         .replace("__NONCE__", &nonce)
@@ -1514,10 +1552,7 @@ fn error_screen(status: StatusCode, title: &str, headline: &str, detail: &str, h
         axum::http::header::X_CONTENT_TYPE_OPTIONS,
         axum::http::HeaderValue::from_static("nosniff"),
     );
-    h.insert(
-        axum::http::header::X_FRAME_OPTIONS,
-        axum::http::HeaderValue::from_static("DENY"),
-    );
+    h.insert(axum::http::header::X_FRAME_OPTIONS, axum::http::HeaderValue::from_static("DENY"));
     resp
 }
 
@@ -1639,8 +1674,19 @@ pub async fn connect_redeem(
             )
         })
     };
-    let Some((expired, cookie, client_id, redirect_uri, client_state, code_challenge, existing_code)) = snap else {
-        return redeem_err("This connect request is unknown or already used. Restart from your client.");
+    let Some((
+        expired,
+        cookie,
+        client_id,
+        redirect_uri,
+        client_state,
+        code_challenge,
+        existing_code,
+    )) = snap
+    else {
+        return redeem_err(
+            "This connect request is unknown or already used. Restart from your client.",
+        );
     };
     if expired {
         return redeem_err("This connect request has expired. Restart from your client.");
@@ -1659,7 +1705,10 @@ pub async fn connect_redeem(
     let iss = store.issuer();
     // Idempotent: if a code was already minted for this connect, return it again.
     if let Some(code) = existing_code {
-        return Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) })).into_response();
+        return Json(
+            json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) }),
+        )
+        .into_response();
     }
     // Decode the fragment delegation (agent-js DelegationChain JSON, II #4093)
     // before claiming, so a malformed delivery never occupies the single-flight
@@ -1667,7 +1716,11 @@ pub async fn connect_redeem(
     // captured them at prepare and recovers them from caller() == P_reg).
     let (user_key, chain) = match iiconnect::parse_registration_delegation(&body.delegation) {
         Ok(v) => v,
-        Err(e) => return redeem_err(&format!("We couldn't read the sign-in response. Restart from your client. ({e})")),
+        Err(e) => {
+            return redeem_err(&format!(
+                "We couldn't read the sign-in response. Restart from your client. ({e})"
+            ))
+        }
     };
     // Single-flight: atomically claim this connect's redemption so a double-submit
     // can't fire two concurrent mcp_register_v2 calls (and a request racing a
@@ -1675,8 +1728,10 @@ pub async fn connect_redeem(
     match claim_redemption(&store, &body.state).await {
         RedeemClaim::Claimed => {}
         RedeemClaim::Existing(code) => {
-            return Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) }))
-                .into_response()
+            return Json(
+                json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) }),
+            )
+            .into_response()
         }
         RedeemClaim::InProgress => {
             return redeem_err(
@@ -1684,15 +1739,15 @@ pub async fn connect_redeem(
                  If nothing happens, restart from your client.",
             )
         }
-        RedeemClaim::Vanished => return redeem_err("This connect request is no longer available. Restart from your client."),
+        RedeemClaim::Vanished => {
+            return redeem_err(
+                "This connect request is no longer available. Restart from your client.",
+            )
+        }
     }
     // Redeem: build a DelegatedIdentity from priv(X) + the chain and make one
     // authenticated mcp_register_v2 call. Success proves consent AND registration.
-    match store
-        .identities
-        .redeem_registration_delegation(&body.state, user_key, chain)
-        .await
-    {
+    match store.identities.redeem_registration_delegation(&body.state, user_key, chain).await {
         Ok(outcome) => {
             tracing::info!(
                 state = %body.state,
@@ -1714,7 +1769,9 @@ pub async fn connect_redeem(
     let (code, newly_minted) = {
         let mut authz = store.authz.write().await;
         let Some(a) = authz.get_mut(&body.state) else {
-            return redeem_err("This connect request is no longer available. Restart from your client.");
+            return redeem_err(
+                "This connect request is no longer available. Restart from your client.",
+            );
         };
         a.redeeming = false;
         match &a.code {
@@ -1739,7 +1796,8 @@ pub async fn connect_redeem(
         );
     }
     tracing::info!(session_id = %body.state, "grant confirmed via registration delegation; issued authorization code");
-    Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) })).into_response()
+    Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) }))
+        .into_response()
 }
 
 // ---- Token: exchange an authorization code ------------------------------
@@ -1765,7 +1823,11 @@ pub struct TokenForm {
 pub async fn token(State(store): State<AuthStore>, Form(req): Form<TokenForm>) -> Response {
     match req.grant_type.as_str() {
         "authorization_code" => token_authorization_code(store, req).await,
-        _ => oauth_err(StatusCode::BAD_REQUEST, "unsupported_grant_type", "only authorization_code is supported"),
+        _ => oauth_err(
+            StatusCode::BAD_REQUEST,
+            "unsupported_grant_type",
+            "only authorization_code is supported",
+        ),
     }
 }
 
@@ -1778,13 +1840,19 @@ async fn token_authorization_code(store: AuthStore, req: TokenForm) -> Response 
     match req.resource.as_deref() {
         Some(resource) if resource_matches_issuer(resource, &store.issuer()) => {}
         Some(_) => {
-            return oauth_err(StatusCode::BAD_REQUEST, "invalid_target",
-                "the `resource` does not identify this MCP server (RFC 8707)");
+            return oauth_err(
+                StatusCode::BAD_REQUEST,
+                "invalid_target",
+                "the `resource` does not identify this MCP server (RFC 8707)",
+            );
         }
         None if store.require_resource => {
             tracing::warn!("refusing a token request with no RFC 8707 `resource` (strict mode)");
-            return oauth_err(StatusCode::BAD_REQUEST, "invalid_request",
-                "the `resource` parameter is required (RFC 8707)");
+            return oauth_err(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "the `resource` parameter is required (RFC 8707)",
+            );
         }
         None => {}
     }
@@ -1800,7 +1868,13 @@ async fn token_authorization_code(store: AuthStore, req: TokenForm) -> Response 
     if let Some(challenge) = &grant.code_challenge {
         let verifier = match &req.code_verifier {
             Some(v) => v,
-            None => return oauth_err(StatusCode::BAD_REQUEST, "invalid_grant", "code_verifier required"),
+            None => {
+                return oauth_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "code_verifier required",
+                )
+            }
         };
         if &pkce_s256(verifier) != challenge {
             return oauth_err(StatusCode::BAD_REQUEST, "invalid_grant", "PKCE verification failed");
@@ -1835,15 +1909,8 @@ async fn issue_token(store: &AuthStore, session_id: &str) -> Response {
         .session_principal(session_id)
         .await
         .unwrap_or_else(|| "unknown".to_string());
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let ttl = token_ttl(
-        TOKEN_TTL,
-        store.identities.grant_expiration_ns(session_id).await,
-        now_ns,
-    );
+    let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let ttl = token_ttl(TOKEN_TTL, store.identities.grant_expiration_ns(session_id).await, now_ns);
 
     let access_token = format!("mcp-token-{}", Uuid::new_v4());
     {
@@ -1898,11 +1965,8 @@ fn granted_grant_types(requested: &[String]) -> Option<Vec<String>> {
     let granted: Vec<String> = if requested.is_empty() {
         SUPPORTED.iter().map(|s| s.to_string()).collect()
     } else {
-        let mut g: Vec<String> = requested
-            .iter()
-            .filter(|g| SUPPORTED.contains(&g.as_str()))
-            .cloned()
-            .collect();
+        let mut g: Vec<String> =
+            requested.iter().filter(|g| SUPPORTED.contains(&g.as_str())).cloned().collect();
         g.dedup();
         g
     };
@@ -1914,7 +1978,10 @@ fn granted_grant_types(requested: &[String]) -> Option<Vec<String>> {
 /// with the supported set ([`granted_grant_types`]); a request whose
 /// intersection loses `authorization_code` is refused with
 /// `invalid_client_metadata` BEFORE anything is stored.
-pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRequest>) -> Response {
+pub async fn register(
+    State(store): State<AuthStore>,
+    Json(req): Json<RegisterRequest>,
+) -> Response {
     // Bound the redirect_uris array (count + per-URI length) FIRST — before grant
     // validation and before anything is stored. Open DCR is unauthenticated, so a
     // single request must not be able to pin unbounded memory or bloat the
@@ -2031,14 +2098,15 @@ pub async fn protected_resource_metadata(State(store): State<AuthStore>) -> Resp
 
 // ---- Bearer-token gate for /mcp -----------------------------------------
 
-pub async fn require_token(State(store): State<AuthStore>, mut request: Request<Body>, next: Next) -> Response {
+pub async fn require_token(
+    State(store): State<AuthStore>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
     // The `Bearer` auth-scheme is case-insensitive (RFC 7235 §2.1), so match it
     // that way — an `Authorization: bearer <token>` must be recognized too.
-    let token = request
-        .headers()
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| {
+    let token =
+        request.headers().get("Authorization").and_then(|h| h.to_str().ok()).and_then(|h| {
             let (scheme, rest) = h.split_once(' ')?;
             scheme.eq_ignore_ascii_case("Bearer").then(|| rest.trim().to_owned())
         });
@@ -2217,9 +2285,13 @@ mod tests {
         ));
         assert!(redirect_uri_permitted("https://grok.com/mcp/callback"));
         assert!(redirect_uri_permitted("https://grok.com/connectors-oauth-exchange-code/x"));
-        assert!(redirect_uri_permitted("https://www.perplexity.ai/rest/connections/oauth_callback"));
+        assert!(redirect_uri_permitted(
+            "https://www.perplexity.ai/rest/connections/oauth_callback"
+        ));
         // Subdomain + the pinned path (Perplexity uses www/staging/enterprise/n).
-        assert!(redirect_uri_permitted("https://staging.perplexity.com/rest/connections/oauth_callback"));
+        assert!(redirect_uri_permitted(
+            "https://staging.perplexity.com/rest/connections/oauth_callback"
+        ));
         assert!(redirect_uri_permitted("https://antigravity.google/oauth-callback"));
         // Loopback is always allowed (any port), no allow-list entry needed.
         assert!(redirect_uri_permitted("http://127.0.0.1:6112/cb"));
@@ -2240,8 +2312,12 @@ mod tests {
         // Dot-segment traversal (raw and percent-encoded): url::Url normalizes these
         // to `/g/evil` on parse (WHATWG), which then fails the pinned-prefix check.
         assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/../../g/evil"));
-        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%2e%2e/%2e%2e/g/evil"));
-        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%2E%2E/%2E%2E/g/evil"));
+        assert!(!redirect_uri_permitted(
+            "https://chatgpt.com/connector/oauth/%2e%2e/%2e%2e/g/evil"
+        ));
+        assert!(!redirect_uri_permitted(
+            "https://chatgpt.com/connector/oauth/%2E%2E/%2E%2E/g/evil"
+        ));
         // A dot-segment that normalizes to WITHIN the vendor's pinned prefix is fine
         // (it lands in the vendor's own callback space, not an escape).
         assert!(redirect_uri_permitted("https://chatgpt.com/connector/oauth/x/../y"));
@@ -2272,8 +2348,8 @@ mod tests {
         // www.cursor.com), refused on any other path.
         assert!(redirect_uri_permitted("https://www.cursor.com/agents/mcp/oauth/callback"));
         assert!(!redirect_uri_permitted("https://cursor.com/oauth/callback")); // wrong path
-        // vscode.dev is deliberately NOT allow-listed: its only registered path is
-        // `/redirect`, a web-to-desktop forwarding endpoint (see the PR discussion).
+                                                                               // vscode.dev is deliberately NOT allow-listed: its only registered path is
+                                                                               // `/redirect`, a web-to-desktop forwarding endpoint (see the PR discussion).
         assert!(!redirect_uri_permitted("https://vscode.dev/redirect"));
         assert!(!redirect_uri_permitted("https://insiders.vscode.dev/redirect"));
         // Attacker-controlled hosted redirects: refused (the finding's payloads).
@@ -2314,7 +2390,7 @@ mod tests {
     /// either mode fails loudly rather than quietly widening what DCR accepts.
     #[test]
     fn path_pin_modes() {
-        use super::{PathPin, path_within_prefix};
+        use super::{path_within_prefix, PathPin};
         // `Prefix`: the path itself, and descendants at a segment boundary only.
         assert!(path_within_prefix("/connector/oauth/", "/connector/oauth/"));
         assert!(path_within_prefix("/connector/oauth/abc", "/connector/oauth/"));
@@ -2415,7 +2491,10 @@ mod tests {
 
         let no_token = super::bearer_challenge(false, meta);
         assert!(no_token.starts_with("Bearer "));
-        assert!(!no_token.contains("error="), "a bare challenge must omit the error code: {no_token}");
+        assert!(
+            !no_token.contains("error="),
+            "a bare challenge must omit the error code: {no_token}"
+        );
         assert!(no_token.contains(&format!("resource_metadata=\"{meta}\"")));
     }
 
@@ -2427,10 +2506,7 @@ mod tests {
         use axum::http::{header::COOKIE, HeaderMap, HeaderValue};
         let mut h = HeaderMap::new();
         assert_eq!(super::connect_cookie(&h), None);
-        h.insert(
-            COOKIE,
-            HeaderValue::from_static("other=1; mcp_connect=bind-xyz; last=2"),
-        );
+        h.insert(COOKIE, HeaderValue::from_static("other=1; mcp_connect=bind-xyz; last=2"));
         assert_eq!(super::connect_cookie(&h).as_deref(), Some("bind-xyz"));
         // A different cookie name present but not ours -> None.
         let mut h2 = HeaderMap::new();
@@ -2454,21 +2530,12 @@ mod tests {
         // Grant known and longer than the default → the FULL remaining grant
         // (the old fixed 1h cap is gone: a 1-day grant mints a 1-day token).
         let far = now_ns + 86_400 * 1_000_000_000;
-        assert_eq!(
-            super::token_ttl(default, Some(far), now_ns),
-            Duration::from_secs(86_400)
-        );
+        assert_eq!(super::token_ttl(default, Some(far), now_ns), Duration::from_secs(86_400));
         // Grant known and shorter than the default (user picked 10 min) → that.
         let soon = now_ns + 600 * 1_000_000_000;
-        assert_eq!(
-            super::token_ttl(default, Some(soon), now_ns),
-            Duration::from_secs(600)
-        );
+        assert_eq!(super::token_ttl(default, Some(soon), now_ns), Duration::from_secs(600));
         // Grant already expired → zero (never a negative-wrap).
-        assert_eq!(
-            super::token_ttl(default, Some(now_ns - 1), now_ns),
-            Duration::ZERO
-        );
+        assert_eq!(super::token_ttl(default, Some(now_ns - 1), now_ns), Duration::ZERO);
     }
 
     /// RFC 7591 / guide: requested grant types are INTERSECTED with the
@@ -2518,12 +2585,10 @@ mod tests {
     }
 
     fn test_store_cfg(require_resource: bool) -> super::AuthStore {
-        use imcp2_core::identities::{Identities, IiInstance};
         use candid::Principal;
-        let agent = crate::Agent::builder()
-            .with_url("https://ii.test")
-            .build()
-            .expect("test agent");
+        use imcp2_core::identities::{Identities, IiInstance};
+        let agent =
+            crate::Agent::builder().with_url("https://ii.test").build().expect("test agent");
         let ids = Identities::new(
             IiInstance {
                 name: "test",
@@ -2569,20 +2634,21 @@ mod tests {
     async fn seed_pending(store: &super::AuthStore, id: &str, cookie: &str) {
         // Record a pending authorization the way `authorize` does — through the
         // bounded insert — just without the browser redirect around it.
-        store.insert_pending(
-            id.to_string(),
-            super::AuthzPending {
-                client_id: "c".into(),
-                redirect_uri: "https://app.test/cb".into(),
-                client_state: String::new(),
-                code_challenge: Some("cc".into()),
-                cookie: cookie.into(),
-                created: std::time::Instant::now(),
-                code: None,
-                redeeming: false,
-            },
-        )
-        .await;
+        store
+            .insert_pending(
+                id.to_string(),
+                super::AuthzPending {
+                    client_id: "c".into(),
+                    redirect_uri: "https://app.test/cb".into(),
+                    client_state: String::new(),
+                    code_challenge: Some("cc".into()),
+                    cookie: cookie.into(),
+                    created: std::time::Instant::now(),
+                    code: None,
+                    redeeming: false,
+                },
+            )
+            .await;
     }
 
     // ---- Bounded state (CWE-770) --------------------------------------------
@@ -2658,7 +2724,14 @@ mod tests {
         let redirect = "https://claude.ai/api/mcp/auth_callback";
         store.clients.seed("client-x", vec![redirect]).await;
         let backdate = || async {
-            store.clients.registrations.write().await.get_mut("client-x").expect("client").last_used = 0;
+            store
+                .clients
+                .registrations
+                .write()
+                .await
+                .get_mut("client-x")
+                .expect("client")
+                .last_used = 0;
         };
         let stamp = || async { store.clients.registrations.read().await["client-x"].last_used };
 
@@ -2667,7 +2740,11 @@ mod tests {
         assert!(stamp().await > 0, "an accepted redirect refreshes the LRU stamp");
 
         backdate().await;
-        assert!(!store.validate_client("client-x", "https://claude.ai/api/mcp/auth_callback/nope").await);
+        assert!(
+            !store
+                .validate_client("client-x", "https://claude.ai/api/mcp/auth_callback/nope")
+                .await
+        );
         assert_eq!(stamp().await, 0, "a rejected redirect must not refresh the stamp");
     }
 
@@ -2713,7 +2790,8 @@ mod tests {
         assert!(url.contains("state=sess-1"));
         assert!(url.contains("registration_key=PUBX"));
         // The callback lives under the instance's mount ({public_url}{mcp_path}).
-        let encoded = urlencoding::encode("https://mcp.test/mcp/oauth/connect/callback").into_owned();
+        let encoded =
+            urlencoding::encode("https://mcp.test/mcp/oauth/connect/callback").into_owned();
         assert!(url.contains(&format!("callback={encoded}")), "callback under the mount: {url}");
     }
 
@@ -2725,13 +2803,11 @@ mod tests {
     #[tokio::test]
     async fn auth_callbacks_declares_link_callbacks_verbatim() {
         use axum::extract::State;
-        use imcp2_core::identities::{Identities, IiInstance};
         use candid::Principal;
+        use imcp2_core::identities::{Identities, IiInstance};
         let make = |mcp_path: &'static str| {
-            let agent = crate::Agent::builder()
-                .with_url("https://ii.test")
-                .build()
-                .expect("test agent");
+            let agent =
+                crate::Agent::builder().with_url("https://ii.test").build().expect("test agent");
             super::AuthStore::new(
                 Identities::new(
                     IiInstance {
@@ -2827,11 +2903,18 @@ mod tests {
         )
         .await;
 
-        assert_eq!(resp.status(), axum::http::StatusCode::FOUND, "authorize must 302, not render a page");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FOUND,
+            "authorize must 302, not render a page"
+        );
         let h = resp.headers();
         let location = h.get(axum::http::header::LOCATION).unwrap().to_str().unwrap();
         // The II link, with the connect params carried in the URL FRAGMENT.
-        assert!(location.starts_with("https://ii.test/mcp#"), "redirects to the II /mcp link: {location}");
+        assert!(
+            location.starts_with("https://ii.test/mcp#"),
+            "redirects to the II /mcp link: {location}"
+        );
         for needle in ["callback=", "state=", "registration_key="] {
             assert!(location.contains(needle), "fragment must carry `{needle}`: {location}");
         }
@@ -2853,9 +2936,9 @@ mod tests {
         // Canonical, plus security-irrelevant variance that must still match.
         for ok in [
             "https://mcp.test/mcp",
-            "https://mcp.test/mcp/",   // one trailing slash
-            "https://MCP.test/mcp",    // host case
-            "HTTPS://mcp.test/mcp",    // scheme case
+            "https://mcp.test/mcp/",    // one trailing slash
+            "https://MCP.test/mcp",     // host case
+            "HTTPS://mcp.test/mcp",     // scheme case
             "https://mcp.test:443/mcp", // explicit default port
         ] {
             assert!(super::resource_matches_issuer(ok, issuer), "must accept {ok}");
@@ -2869,14 +2952,14 @@ mod tests {
             "https://mcp.test/mcp-beta",
             "https://mcp.test:8443/mcp",
             "https://mcp.test/mcp#x",
-            "https://user@mcp.test/mcp",         // userinfo is not part of the identifier
-            "https://@mcp.test/mcp",             // empty userinfo (url erases it) — still refused
-            "https://:@mcp.test/mcp",            // empty user:pass userinfo — still refused
-            "https:\t//user@mcp.test/mcp",       // tab hides `://`; url strips it, parsing userinfo
-            "https://mcp.test\n/mcp",            // stripped newline must not smuggle content past the scan
+            "https://user@mcp.test/mcp", // userinfo is not part of the identifier
+            "https://@mcp.test/mcp",     // empty userinfo (url erases it) — still refused
+            "https://:@mcp.test/mcp",    // empty user:pass userinfo — still refused
+            "https:\t//user@mcp.test/mcp", // tab hides `://`; url strips it, parsing userinfo
+            "https://mcp.test\n/mcp",    // stripped newline must not smuggle content past the scan
             "https://mcp.test/mcp?tenant=other", // a query differs from the issuer's (none)
-            "https://mcp.test/mcp//",            // doubled trailing slash is a distinct path
-            "http://mcp.test/mcp",               // scheme downgrade
+            "https://mcp.test/mcp//",    // doubled trailing slash is a distinct path
+            "http://mcp.test/mcp",       // scheme downgrade
             "not-a-url",
         ] {
             assert!(!super::resource_matches_issuer(bad, issuer), "must refuse {bad}");
@@ -2903,24 +2986,60 @@ mod tests {
         };
 
         // A foreign resource is refused with `invalid_target` and never reaches II.
-        let foreign = super::authorize(State(store.clone()), json_headers(), Query(mk(Some("https://other.example/mcp")))).await;
-        assert_eq!(foreign.status(), axum::http::StatusCode::BAD_REQUEST, "a foreign resource must be refused");
+        let foreign = super::authorize(
+            State(store.clone()),
+            json_headers(),
+            Query(mk(Some("https://other.example/mcp"))),
+        )
+        .await;
+        assert_eq!(
+            foreign.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "a foreign resource must be refused"
+        );
         let body = axum::body::to_bytes(foreign.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "invalid_target");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+            "invalid_target"
+        );
 
         // A sibling instance's resource (same host, other path) is also foreign.
-        let sibling = super::authorize(State(store.clone()), json_headers(), Query(mk(Some("https://mcp.test/mcp-beta")))).await;
-        assert_eq!(sibling.status(), axum::http::StatusCode::BAD_REQUEST, "a sibling instance's resource must be refused");
+        let sibling = super::authorize(
+            State(store.clone()),
+            json_headers(),
+            Query(mk(Some("https://mcp.test/mcp-beta"))),
+        )
+        .await;
+        assert_eq!(
+            sibling.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "a sibling instance's resource must be refused"
+        );
 
         // This instance's own resource (and a trailing-slash variant) → 302 to II.
         for ok in ["https://mcp.test/mcp", "https://mcp.test/mcp/"] {
-            let resp = super::authorize(State(store.clone()), axum::http::HeaderMap::new(), Query(mk(Some(ok)))).await;
-            assert_eq!(resp.status(), axum::http::StatusCode::FOUND, "the canonical resource must be accepted: {ok}");
+            let resp = super::authorize(
+                State(store.clone()),
+                axum::http::HeaderMap::new(),
+                Query(mk(Some(ok))),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::FOUND,
+                "the canonical resource must be accepted: {ok}"
+            );
         }
 
         // A missing resource stays accepted (pre-RFC-8707 clients).
-        let none = super::authorize(State(store.clone()), axum::http::HeaderMap::new(), Query(mk(None))).await;
-        assert_eq!(none.status(), axum::http::StatusCode::FOUND, "a missing resource must remain accepted");
+        let none =
+            super::authorize(State(store.clone()), axum::http::HeaderMap::new(), Query(mk(None)))
+                .await;
+        assert_eq!(
+            none.status(),
+            axum::http::StatusCode::FOUND,
+            "a missing resource must remain accepted"
+        );
     }
 
     // RFC 8707 end-to-end: a token request carrying a FOREIGN `resource` is
@@ -2929,7 +3048,13 @@ mod tests {
     // protected /mcp accepts.
     #[tokio::test]
     async fn token_endpoint_enforces_resource_indicator() {
-        use axum::{body::Body, http::{header, Request, StatusCode}, middleware, routing::post, Router};
+        use axum::{
+            body::Body,
+            http::{header, Request, StatusCode},
+            middleware,
+            routing::post,
+            Router,
+        };
         use tower::ServiceExt;
 
         let store = test_store();
@@ -2969,10 +3094,20 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "a foreign resource must be refused at /oauth/token");
+        assert_eq!(
+            refused.status(),
+            StatusCode::BAD_REQUEST,
+            "a foreign resource must be refused at /oauth/token"
+        );
         let body = axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "invalid_target");
-        assert!(store.codes.read().await.contains_key("proof-code"), "a refused request must not consume the code");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+            "invalid_target"
+        );
+        assert!(
+            store.codes.read().await.contains_key("proof-code"),
+            "a refused request must not consume the code"
+        );
 
         // 2) Canonical resource → token minted and accepted by the protected /mcp.
         let exchange = make_app(store.clone())
@@ -2986,12 +3121,24 @@ mod tests {
             .unwrap();
         assert_eq!(exchange.status(), StatusCode::OK, "the canonical resource must be accepted");
         let body = axum::body::to_bytes(exchange.into_body(), usize::MAX).await.unwrap();
-        let token = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["access_token"].as_str().unwrap().to_owned();
+        let token = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["access_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let authed = make_app(store.clone())
-            .oneshot(Request::post("/mcp").header(header::AUTHORIZATION, format!("Bearer {token}")).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::post("/mcp")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(authed.status(), StatusCode::OK, "a token for this resource must be accepted at /mcp");
+        assert_eq!(
+            authed.status(),
+            StatusCode::OK,
+            "a token for this resource must be accepted at /mcp"
+        );
 
         // 3) Missing resource → still accepted (pre-RFC-8707 clients).
         store.codes.write().await.insert("proof-code-2".into(), seed_code());
@@ -3028,19 +3175,43 @@ mod tests {
 
         // Missing resource → refused with `invalid_request` (the strict delta).
         let missing = super::authorize(State(store.clone()), json_headers(), Query(mk(None))).await;
-        assert_eq!(missing.status(), axum::http::StatusCode::BAD_REQUEST, "strict mode must refuse a missing resource");
+        assert_eq!(
+            missing.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "strict mode must refuse a missing resource"
+        );
         let body = axum::body::to_bytes(missing.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "invalid_request");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+            "invalid_request"
+        );
 
         // Foreign resource → still `invalid_target`.
-        let foreign = super::authorize(State(store.clone()), json_headers(), Query(mk(Some("https://other.example/mcp")))).await;
+        let foreign = super::authorize(
+            State(store.clone()),
+            json_headers(),
+            Query(mk(Some("https://other.example/mcp"))),
+        )
+        .await;
         assert_eq!(foreign.status(), axum::http::StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(foreign.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "invalid_target");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+            "invalid_target"
+        );
 
         // Canonical resource → still reaches II.
-        let ok = super::authorize(State(store.clone()), axum::http::HeaderMap::new(), Query(mk(Some("https://mcp.test/mcp")))).await;
-        assert_eq!(ok.status(), axum::http::StatusCode::FOUND, "the canonical resource must still be accepted in strict mode");
+        let ok = super::authorize(
+            State(store.clone()),
+            axum::http::HeaderMap::new(),
+            Query(mk(Some("https://mcp.test/mcp"))),
+        )
+        .await;
+        assert_eq!(
+            ok.status(),
+            axum::http::StatusCode::FOUND,
+            "the canonical resource must still be accepted in strict mode"
+        );
     }
 
     // Strict RFC 8707 at `/oauth/token`: a missing `resource` is refused with
@@ -3048,11 +3219,17 @@ mod tests {
     // still mints a token.
     #[tokio::test]
     async fn token_strict_requires_resource() {
-        use axum::{body::Body, http::{header, Request, StatusCode}, routing::post, Router};
+        use axum::{
+            body::Body,
+            http::{header, Request, StatusCode},
+            routing::post,
+            Router,
+        };
         use tower::ServiceExt;
 
         let store = test_store_cfg(true);
-        let app = || Router::new().route("/oauth/token", post(super::token)).with_state(store.clone());
+        let app =
+            || Router::new().route("/oauth/token", post(super::token)).with_state(store.clone());
         let seed = || super::CodeGrant {
             client_id: "mcp-client".into(),
             code_challenge: Some(super::pkce_s256("verifier")),
@@ -3078,10 +3255,20 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "strict mode must refuse a missing resource at /oauth/token");
+        assert_eq!(
+            refused.status(),
+            StatusCode::BAD_REQUEST,
+            "strict mode must refuse a missing resource at /oauth/token"
+        );
         let body = axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "invalid_request");
-        assert!(store.codes.read().await.contains_key("proof-code"), "a refused request must not consume the code");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+            "invalid_request"
+        );
+        assert!(
+            store.codes.read().await.contains_key("proof-code"),
+            "a refused request must not consume the code"
+        );
 
         // Canonical resource → token minted.
         let ok = app()
@@ -3093,7 +3280,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(ok.status(), StatusCode::OK, "the canonical resource must mint a token in strict mode");
+        assert_eq!(
+            ok.status(),
+            StatusCode::OK,
+            "the canonical resource must mint a token in strict mode"
+        );
     }
 
     // A client turned away by the allow-list gets the on-brand HTML page, not a
@@ -3160,7 +3351,12 @@ mod tests {
             resource: None,
         };
         let content_type = |resp: &axum::response::Response| {
-            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string()
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
         };
 
         // -- Browser (Accept: text/html): friendly on-brand HTML in both cases. --
@@ -3172,7 +3368,10 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
-        assert!(content_type(&resp).starts_with("text/html"), "an allow-list rejection renders HTML for a browser");
+        assert!(
+            content_type(&resp).starts_with("text/html"),
+            "an allow-list rejection renders HTML for a browser"
+        );
         let html = String::from_utf8(
             axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
         )
@@ -3188,7 +3387,10 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
-        assert!(content_type(&resp).starts_with("text/html"), "an unknown client renders HTML for a browser");
+        assert!(
+            content_type(&resp).starts_with("text/html"),
+            "an unknown client renders HTML for a browser"
+        );
         let html = String::from_utf8(
             axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
         )
@@ -3199,7 +3401,11 @@ mod tests {
         // -- Machine (Accept: application/json): RFC-style JSON in both cases. --
         for (client_id, redirect_uri, want_status) in [
             ("client-legacy", "https://example.com/cb", axum::http::StatusCode::FORBIDDEN),
-            ("client-nope", "https://claude.ai/api/mcp/auth_callback", axum::http::StatusCode::BAD_REQUEST),
+            (
+                "client-nope",
+                "https://claude.ai/api/mcp/auth_callback",
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
         ] {
             let resp = super::authorize(
                 State(store.clone()),
@@ -3208,7 +3414,10 @@ mod tests {
             )
             .await;
             assert_eq!(resp.status(), want_status);
-            assert!(content_type(&resp).contains("json"), "a machine caller keeps JSON for {client_id}");
+            assert!(
+                content_type(&resp).contains("json"),
+                "a machine caller keeps JSON for {client_id}"
+            );
         }
     }
 
@@ -3285,21 +3494,32 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        assert!(csp.contains("default-src 'none'") && csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(
+            csp.contains("default-src 'none'") && csp.contains("frame-ancestors 'none'"),
+            "{csp}"
+        );
         assert!(!csp.contains("script-src"), "the error screen needs no script-src: {csp}");
         let html = String::from_utf8(
             axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
         )
         .unwrap();
         assert!(html.contains("PKCE"), "the diagnostic should name the missing security parameter");
-        assert!(html.contains(&format!("mailto:{}", super::CONTACT)), "the screen names the contact");
+        assert!(
+            html.contains(&format!("mailto:{}", super::CONTACT)),
+            "the screen names the contact"
+        );
         assert!(!html.contains("__"), "every placeholder must be substituted: {html}");
 
         // Machine: the RFC-style JSON error is preserved.
         let resp = super::authorize(State(store.clone()), json_headers(), Query(mk())).await;
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
-        let ctype =
-            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+        let ctype = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(ctype.contains("json"), "a machine caller keeps JSON: {ctype}");
     }
 
@@ -3376,7 +3596,10 @@ mod tests {
         );
         assert!(html.contains("rel=icon href=/favicon.svg"), "{html}");
         assert!(html.contains("location.hash"), "the page reads the fragment client-side");
-        assert!(html.contains("/mcp-beta/oauth/connect/redeem"), "posts to the instance's redeem path");
+        assert!(
+            html.contains("/mcp-beta/oauth/connect/redeem"),
+            "posts to the instance's redeem path"
+        );
         assert!(!html.contains("__REDEEM_URL__"), "the redeem-URL placeholder must be substituted");
         // Every handshake/redeem failure lands on this page, so it carries the
         // "contact us to report it" line (hidden until the script adds `.error`),
@@ -3414,7 +3637,10 @@ mod tests {
         seed_pending(&store, "sess-r", "bind-r").await;
 
         // First claim wins; a concurrent second claim is refused.
-        assert!(matches!(super::claim_redemption(&store, "sess-r").await, super::RedeemClaim::Claimed));
+        assert!(matches!(
+            super::claim_redemption(&store, "sess-r").await,
+            super::RedeemClaim::Claimed
+        ));
         assert!(matches!(
             super::claim_redemption(&store, "sess-r").await,
             super::RedeemClaim::InProgress
@@ -3422,7 +3648,10 @@ mod tests {
 
         // A failed attempt releases the claim, so a genuine retry proceeds.
         super::release_redemption(&store, "sess-r").await;
-        assert!(matches!(super::claim_redemption(&store, "sess-r").await, super::RedeemClaim::Claimed));
+        assert!(matches!(
+            super::claim_redemption(&store, "sess-r").await,
+            super::RedeemClaim::Claimed
+        ));
 
         // Once the code is minted, later claims return it rather than redeeming.
         store.authz.write().await.get_mut("sess-r").unwrap().code = Some("mcp-code-x".into());
@@ -3452,10 +3681,7 @@ mod tests {
         let redeem = super::connect_redeem(
             State(store),
             axum::http::HeaderMap::new(),
-            axum::Json(super::RedeemBody {
-                state: "sess-x".into(),
-                delegation: String::new(),
-            }),
+            axum::Json(super::RedeemBody { state: "sess-x".into(), delegation: String::new() }),
         )
         .await;
         assert_eq!(redeem.status(), axum::http::StatusCode::BAD_REQUEST);

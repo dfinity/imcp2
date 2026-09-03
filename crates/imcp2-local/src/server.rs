@@ -129,10 +129,7 @@ fn ok_structured<T: serde::Serialize>(text: String, value: &T) -> CallToolResult
 fn schema_for_output<T: schemars::JsonSchema + std::any::Any>(
 ) -> std::sync::Arc<rmcp::model::JsonObject> {
     rmcp::handler::server::tool::schema_for_output::<T>().unwrap_or_else(|e| {
-        panic!(
-            "output schema for `{}` must be object-rooted: {e}",
-            std::any::type_name::<T>()
-        )
+        panic!("output schema for `{}` must be object-rooted: {e}", std::any::type_name::<T>())
     })
 }
 
@@ -163,11 +160,7 @@ fn human_minutes(mins: u64) -> String {
 #[tool_router]
 impl LocalServer {
     pub fn new(tools: IcTools, login: LoginDriver, auto_open: bool) -> Self {
-        Self {
-            tools,
-            login,
-            auto_open,
-        }
+        Self { tools, login, auto_open }
     }
 
     #[tool(
@@ -302,10 +295,7 @@ impl ServerHandler for LocalServer {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        Self::tool_router()
-            .get(name)
-            .cloned()
-            .or_else(|| self.tools.get_tool(name))
+        Self::tool_router().get(name).cloned().or_else(|| self.tools.get_tool(name))
     }
 
     async fn list_resources(
@@ -333,10 +323,8 @@ mod tests {
     use rmcp::ServiceExt;
 
     fn test_server() -> LocalServer {
-        let agent = imcp2_core::Agent::builder()
-            .with_url(imcp2_core::IC_URL)
-            .build()
-            .expect("agent");
+        let agent =
+            imcp2_core::Agent::builder().with_url(imcp2_core::IC_URL).build().expect("agent");
         let identities = Identities::new(
             IiInstance::prod().expect("prod II"),
             "https://mcp.internetcomputer.org".into(),
@@ -419,31 +407,13 @@ mod tests {
         let info = client.peer_info().expect("initialized");
         assert_eq!(info.server_info.name, "imcp2-local");
         let instructions = info.instructions.as_deref().unwrap_or_default();
-        assert!(
-            instructions.contains("SIGNING IN"),
-            "login guidance must be taught"
-        );
-        assert!(
-            instructions.contains("textual Candid"),
-            "core guidance must survive the merge"
-        );
+        assert!(instructions.contains("SIGNING IN"), "login guidance must be taught");
+        assert!(instructions.contains("textual Candid"), "core guidance must survive the merge");
 
         let tools = client.list_all_tools().await.expect("tools/list");
-        assert_eq!(
-            tools.len(),
-            12,
-            "10 served core tools + authenticate + auth_status"
-        );
-        for expected in [
-            "get_canister_candid",
-            "canister_query",
-            "authenticate",
-            "auth_status",
-        ] {
-            assert!(
-                tools.iter().any(|t| &*t.name == expected),
-                "missing {expected}"
-            );
+        assert_eq!(tools.len(), 12, "10 served core tools + authenticate + auth_status");
+        for expected in ["get_canister_candid", "canister_query", "authenticate", "auth_status"] {
+            assert!(tools.iter().any(|t| &*t.name == expected), "missing {expected}");
         }
 
         let call = |name: &'static str, args: Option<serde_json::Value>| {
@@ -468,10 +438,7 @@ mod tests {
         let (is_error, text, structured) = call("auth_status", None).await;
         assert!(!is_error, "{text}");
         assert!(text.contains("Not signed in"), "{text}");
-        assert_eq!(
-            structured.expect("structuredContent")["status"],
-            "signed_out"
-        );
+        assert_eq!(structured.expect("structuredContent")["status"], "signed_out");
 
         let (is_error, text, structured) = call("authenticate", Some(serde_json::json!({}))).await;
         assert!(!is_error, "{text}");
@@ -479,9 +446,7 @@ mod tests {
         let structured = structured.expect("structuredContent");
         assert_eq!(structured["status"], "pending");
         assert!(
-            structured["url"]
-                .as_str()
-                .is_some_and(|u| u.starts_with("https://id.ai/mcp#")),
+            structured["url"].as_str().is_some_and(|u| u.starts_with("https://id.ai/mcp#")),
             "{structured}"
         );
 
@@ -506,9 +471,7 @@ mod tests {
         // running — and rather than dying some other way: a disconnect or a
         // different error must not pass this regression.
         let mut params = rmcp::model::CallToolRequestParams::new("icp_get_skill");
-        params.arguments = serde_json::json!({ "name": "writing-motoko" })
-            .as_object()
-            .cloned();
+        params.arguments = serde_json::json!({ "name": "writing-motoko" }).as_object().cloned();
         let err = client
             .call_tool(params)
             .await
@@ -540,11 +503,8 @@ mod tests {
         let (server, client) = (server.expect("server up"), client.expect("client up"));
 
         let resources = client.list_all_resources().await.expect("resources/list");
-        let skills: Vec<String> = resources
-            .iter()
-            .map(|r| r.uri.clone())
-            .filter(|u| u.starts_with("skill://"))
-            .collect();
+        let skills: Vec<String> =
+            resources.iter().map(|r| r.uri.clone()).filter(|u| u.starts_with("skill://")).collect();
         assert_eq!(
             skills.len(),
             imcp2_core::skills::BUNDLED_SKILLS.len()
@@ -582,13 +542,18 @@ mod tests {
                     .await
                     .unwrap_or_else(|e| panic!("{uri}: {e}"));
                 match &read.contents[0] {
-                    rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.clone(),
+                    rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+                        text.clone()
+                    }
                     other => panic!("{uri} served non-text contents: {other:?}"),
                 }
             }
         };
         let motoko = one("skill://writing-motoko").await;
-        assert!(motoko.contains("skill://writing-motoko/references/api-reference.md"), "{motoko:.400}");
+        assert!(
+            motoko.contains("skill://writing-motoko/references/api-reference.md"),
+            "{motoko:.400}"
+        );
         let api_reference = one("skill://writing-motoko/references/api-reference.md").await;
         assert!(!api_reference.trim().is_empty());
 

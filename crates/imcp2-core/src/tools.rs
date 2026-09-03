@@ -12,13 +12,13 @@ use ic_agent::{Agent, Identity};
 use rmcp::{
     handler::server::{tool::ToolCallContext, wrapper::Parameters},
     model::*,
+    schemars,
     service::RequestContext,
-    tool, tool_router,
-    schemars, ErrorData as McpError, RoleServer, ServerHandler,
+    tool, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
 };
 
 use crate::{
-    calls, compliance, discoverability, discoverability::OriginSource, discover, identities,
+    calls, compliance, discover, discoverability, discoverability::OriginSource, identities,
     identities::Identities, management, skills,
 };
 use std::sync::Arc;
@@ -108,18 +108,11 @@ pub struct IcTools {
 /// signed-in session in a slot its resolver returns. `None` means this call is
 /// unauthenticated (the "needs an authenticated session" errors at the tool
 /// call sites are the caller-facing surface of that).
-pub type SessionResolver =
-    Arc<dyn Fn(&RequestContext<RoleServer>) -> Option<String> + Send + Sync>;
+pub type SessionResolver = Arc<dyn Fn(&RequestContext<RoleServer>) -> Option<String> + Send + Sync>;
 
 impl IcTools {
     pub fn new(agent: Agent, identities: Identities, session: SessionResolver) -> Self {
-        Self {
-            canister: IcCanisterTools {
-                agent,
-                identities,
-                session,
-            },
-        }
+        Self { canister: IcCanisterTools { agent, identities, session } }
     }
 
     /// Every tool on the served surface — the app/canister tools; exactly the
@@ -140,11 +133,7 @@ impl IcProtocolTools {
         skills: skills::SkillsCatalog,
         session: SessionResolver,
     ) -> Self {
-        Self {
-            identities,
-            skills,
-            session,
-        }
+        Self { identities, skills, session }
     }
 }
 
@@ -190,11 +179,7 @@ impl IcCanisterTools {
             Ok(d) => d,
             Err(refusal) => return Ok(err(refusal)),
         };
-        match self
-            .agent
-            .read_state_canister_metadata(principal, "candid:service")
-            .await
-        {
+        match self.agent.read_state_canister_metadata(principal, "candid:service").await {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(did) => {
                     // Signal an OQL query surface structurally (`oql: true`). When
@@ -252,9 +237,7 @@ impl IcCanisterTools {
                 }
                 Err(e) => Ok(err(format!("metadata is not valid UTF-8: {e}"))),
             },
-            Err(e) => Ok(err(format!(
-                "could not read candid:service metadata: {e}"
-            ))),
+            Err(e) => Ok(err(format!("could not read candid:service metadata: {e}"))),
         }
     }
 
@@ -328,7 +311,12 @@ impl IcCanisterTools {
         let requested = Some(target.requested.clone());
         let origin = Some(target.origin.clone());
         let agent = match self
-            .resolve_agent(&ctx, Some(target.origin.as_str()), account.as_deref(), "reading the schema")
+            .resolve_agent(
+                &ctx,
+                Some(target.origin.as_str()),
+                account.as_deref(),
+                "reading the schema",
+            )
             .await
         {
             Ok(a) => a,
@@ -435,8 +423,7 @@ impl IcCanisterTools {
         };
         // Every outcome below — the doc, and each way of not having one — happens
         // AFTER the gate, so all of them can state which app declared this canister.
-        let (declared_by, declared_at) =
-            (declaration.origin.clone(), declaration.path.to_string());
+        let (declared_by, declared_at) = (declaration.origin.clone(), declaration.path.to_string());
         // Read the interface to learn which naming the canister uses
         // (getApiDoc vs get_api_doc); the doc is public, so call anonymously.
         let did = calls::candid_service(&self.agent, principal).await;
@@ -551,10 +538,8 @@ impl IcCanisterTools {
                 let session_id = self
                     .current_session_id(ctx)
                     .ok_or_else(|| format!("{what} as an app needs an authenticated session"))?;
-                let delegated = self
-                    .identities
-                    .delegated_identity_for(&session_id, origin, account)
-                    .await?;
+                let delegated =
+                    self.identities.delegated_identity_for(&session_id, origin, account).await?;
                 // Clone the injected agent and swap in the delegated identity:
                 // authenticated calls ride the host's boundary-node routing,
                 // never a second hard-coded endpoint.
@@ -599,9 +584,8 @@ impl IcCanisterTools {
                 let did = calls::candid_service(&agent, principal).await;
                 // Only conclude flags when the interface was actually read; a failed
                 // read leaves them null (unknown), not a misleading `false`.
-                let flags = did
-                    .as_deref()
-                    .map(|d| (calls::has_oql(d), calls::api_doc_method(d).is_some()));
+                let flags =
+                    did.as_deref().map(|d| (calls::has_oql(d), calls::api_doc_method(d).is_some()));
                 (i, flags)
             });
         }
@@ -681,14 +665,12 @@ impl IcCanisterTools {
             Err(e) => return Ok(err(e)),
         };
         let origin = target.as_ref().map(|t| t.origin.as_str());
-        let agent = match self
-            .resolve_agent(&ctx, origin, account.as_deref(), "calling")
-            .await
-        {
+        let agent = match self.resolve_agent(&ctx, origin, account.as_deref(), "calling").await {
             Ok(a) => a,
             Err(e) => return Ok(err(e)),
         };
-        let reply_bytes = match calls::raw_call(&agent, principal, &method, arg_bytes, false).await {
+        let reply_bytes = match calls::raw_call(&agent, principal, &method, arg_bytes, false).await
+        {
             Ok(b) => b,
             Err(e) => return Ok(err(format!("call failed: {e}"))),
         };
@@ -712,13 +694,14 @@ impl IcCanisterTools {
         // declared this canister, and where that manifest was read from. A user
         // asking "why did it write there?" gets the answer in every client, not
         // just the ones that read structured output.
-        blocks.push(format!(
-            "[declared by {} in {}]",
-            declaration.origin, declaration.path
-        ));
+        blocks.push(format!("[declared by {} in {}]", declaration.origin, declaration.path));
         let output = calls::CanisterUpdateCallOutput {
-            canister_id, method, reply,
-            derived_for_origin, requested, derivation_origin_source,
+            canister_id,
+            method,
+            reply,
+            derived_for_origin,
+            requested,
+            derivation_origin_source,
             is_anonymous,
             declared_by: declaration.origin,
             declared_at: declaration.path.to_string(),
@@ -766,14 +749,27 @@ impl IcCanisterTools {
             )),
             (Some(method), None) => {
                 self.canister_candid_query(
-                    &ctx, principal, canister_id, method, args, derivation_origin, account, candid,
+                    &ctx,
+                    principal,
+                    canister_id,
+                    method,
+                    args,
+                    derivation_origin,
+                    account,
+                    candid,
                     app_url,
                 )
                 .await
             }
             (None, Some(oql)) => {
                 self.canister_oql_query(
-                    &ctx, principal, canister_id, oql, derivation_origin, account, app_url,
+                    &ctx,
+                    principal,
+                    canister_id,
+                    oql,
+                    derivation_origin,
+                    account,
+                    app_url,
                 )
                 .await
             }
@@ -850,10 +846,7 @@ impl IcCanisterTools {
             Err(e) => return Ok(err(e)),
         };
         let origin = target.as_ref().map(|t| t.origin.as_str());
-        let agent = match self
-            .resolve_agent(ctx, origin, account.as_deref(), "querying")
-            .await
-        {
+        let agent = match self.resolve_agent(ctx, origin, account.as_deref(), "querying").await {
             Ok(a) => a,
             Err(e) => return Ok(err(e)),
         };
@@ -975,7 +968,14 @@ impl IcCanisterTools {
                 // it against the schema for THIS principal and fold the repair into
                 // the error. Failed context: only the unknown-`start` repair is
                 // appended, never a "came back empty" note.
-                let d = diagnose_empty_oql(&agent, principal, &query_json, is_anonymous, EmptyContext::Failed).await;
+                let d = diagnose_empty_oql(
+                    &agent,
+                    principal,
+                    &query_json,
+                    is_anonymous,
+                    EmptyContext::Failed,
+                )
+                .await;
                 let mut msg = format!("OQL execute failed: {e}");
                 if let Some(note) = d.note {
                     msg.push_str(&format!("\n\n{note}"));
@@ -992,7 +992,14 @@ impl IcCanisterTools {
                 // from the SAME principal — unknown-`start` repair, or a benign
                 // "0 rows for this account" — never by probing others.
                 let mut diag = if rows.is_empty() {
-                    diagnose_empty_oql(&agent, principal, &query_json, is_anonymous, EmptyContext::EmptyResult).await
+                    diagnose_empty_oql(
+                        &agent,
+                        principal,
+                        &query_json,
+                        is_anonymous,
+                        EmptyContext::EmptyResult,
+                    )
+                    .await
                 } else {
                     OqlEmptyDiagnosis::none()
                 };
@@ -1032,7 +1039,14 @@ impl IcCanisterTools {
             calls::OqlResult::QueryError(msg) => {
                 // The canister returned its error arm. An invalid `start` can land
                 // here too, so enrich with the schema-based repair (#7).
-                let d = diagnose_empty_oql(&agent, principal, &query_json, is_anonymous, EmptyContext::Failed).await;
+                let d = diagnose_empty_oql(
+                    &agent,
+                    principal,
+                    &query_json,
+                    is_anonymous,
+                    EmptyContext::Failed,
+                )
+                .await;
                 let mut text = format!("the canister returned an OQL error: {msg}");
                 if let Some(note) = d.note {
                     text.push_str(&format!("\n\n{note}"));
@@ -1095,12 +1109,16 @@ impl IcCanisterTools {
     )]
     async fn get_app_principal(
         &self,
-        Parameters(identities::GetPrincipalArgs { derivation_origin, account }): Parameters<identities::GetPrincipalArgs>,
+        Parameters(identities::GetPrincipalArgs { derivation_origin, account }): Parameters<
+            identities::GetPrincipalArgs,
+        >,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session_id = match self.current_session_id(&ctx) {
             Some(s) => s,
-            None => return Ok(err("getting an app principal needs an authenticated session".into())),
+            None => {
+                return Ok(err("getting an app principal needs an authenticated session".into()))
+            }
         };
         // `derivation_origin` is a required String here, so this always yields a
         // target (never the anonymous None) unless it fails validation.
@@ -1119,7 +1137,9 @@ impl IcCanisterTools {
         };
         let principal = match delegated.sender() {
             Ok(p) => p.to_text(),
-            Err(e) => return Ok(err(format!("could not derive principal for {}: {e}", target.origin))),
+            Err(e) => {
+                return Ok(err(format!("could not derive principal for {}: {e}", target.origin)))
+            }
         };
         // Surface a query-only session (H2) so the LLM won't attempt (and have the
         // IC reject at ingress) state-changing update calls.
@@ -1151,7 +1171,9 @@ impl IcCanisterTools {
     )]
     async fn list_app_accounts(
         &self,
-        Parameters(identities::ListAccountsArgs { derivation_origin }): Parameters<identities::ListAccountsArgs>,
+        Parameters(identities::ListAccountsArgs { derivation_origin }): Parameters<
+            identities::ListAccountsArgs,
+        >,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session_id = match self.current_session_id(&ctx) {
@@ -1272,7 +1294,10 @@ impl IcCanisterTools {
             resolved.derivation_origin_source.as_str()
         );
         if !resolved.alternative_origins.is_empty() {
-            text.push_str(&format!("alternative_origins: {}\n", resolved.alternative_origins.join(", ")));
+            text.push_str(&format!(
+                "alternative_origins: {}\n",
+                resolved.alternative_origins.join(", ")
+            ));
         }
         if let Some(e) = &discovery_error {
             text.push_str(&format!(
@@ -1330,9 +1355,6 @@ impl IcCanisterTools {
         };
         Ok(ok_structured(text, &output))
     }
-
-
-
 }
 
 #[tool_router(vis = "pub")]
@@ -1386,7 +1408,6 @@ impl IcProtocolTools {
         }
     }
 
-
     #[tool(
         description = "Identify what a canister is, from the IC dashboard: its name, type, controllers, subnet, module hash, language and latest upgrade proposal. Use this to make sense of a bare canister id.",
         annotations(title = "Identify a canister", read_only_hint = true, destructive_hint = false, open_world_hint = true),
@@ -1394,7 +1415,9 @@ impl IcProtocolTools {
     )]
     async fn icp_lookup_canister_info_by_id(
         &self,
-        Parameters(discover::LookupCanisterArgs { canister_id }): Parameters<discover::LookupCanisterArgs>,
+        Parameters(discover::LookupCanisterArgs { canister_id }): Parameters<
+            discover::LookupCanisterArgs,
+        >,
     ) -> Result<CallToolResult, McpError> {
         let client = match discover::http_client() {
             Ok(c) => c,
@@ -1463,7 +1486,11 @@ impl IcProtocolTools {
     ) -> Result<CallToolResult, McpError> {
         let sid = match self.current_session_id(&ctx) {
             Some(s) => s,
-            None => return Ok(err("checking your cycles balance needs an authenticated session".into())),
+            None => {
+                return Ok(
+                    err("checking your cycles balance needs an authenticated session".into()),
+                )
+            }
         };
         match management::cycles_balance(&self.identities, &sid).await {
             Ok(b) => Ok(ok_structured(b.human(), &b)),
@@ -1504,7 +1531,9 @@ impl IcProtocolTools {
     ) -> Result<CallToolResult, McpError> {
         let sid = match self.current_session_id(&ctx) {
             Some(s) => s,
-            None => return Ok(err("reading canister status needs an authenticated session".into())),
+            None => {
+                return Ok(err("reading canister status needs an authenticated session".into()))
+            }
         };
         let canister_id = args.canister_id.clone();
         Ok(ok_canister_action(
@@ -1541,7 +1570,9 @@ impl IcProtocolTools {
     )]
     async fn icp_start_canister(
         &self,
-        Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
+        Parameters(management::CanisterRefArgs { canister_id }): Parameters<
+            management::CanisterRefArgs,
+        >,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let sid = match self.current_session_id(&ctx) {
@@ -1559,7 +1590,9 @@ impl IcProtocolTools {
     )]
     async fn icp_stop_canister(
         &self,
-        Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
+        Parameters(management::CanisterRefArgs { canister_id }): Parameters<
+            management::CanisterRefArgs,
+        >,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let sid = match self.current_session_id(&ctx) {
@@ -1577,7 +1610,9 @@ impl IcProtocolTools {
     )]
     async fn icp_uninstall_code(
         &self,
-        Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
+        Parameters(management::CanisterRefArgs { canister_id }): Parameters<
+            management::CanisterRefArgs,
+        >,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let sid = match self.current_session_id(&ctx) {
@@ -1595,7 +1630,9 @@ impl IcProtocolTools {
     )]
     async fn icp_delete_canister(
         &self,
-        Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
+        Parameters(management::CanisterRefArgs { canister_id }): Parameters<
+            management::CanisterRefArgs,
+        >,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let sid = match self.current_session_id(&ctx) {
@@ -1781,11 +1818,7 @@ fn resolve_identity_target(
         Some(d) => {
             let d = clean_identity_arg("derivation_origin", &d)?;
             let origin = canonicalize_derivation_origin(&d)?;
-            Ok(Some(IdentityTarget {
-                origin,
-                requested: d,
-                source: "explicit".to_string(),
-            }))
+            Ok(Some(IdentityTarget { origin, requested: d, source: "explicit".to_string() }))
         }
     }
 }
@@ -1813,7 +1846,9 @@ fn declaration_origin(
     tool: &str,
 ) -> Result<(String, OriginSource), String> {
     if let Some(url) = app_url {
-        return clean_app_url(&url).and_then(|u| app_origin_of(&u)).map(|u| (u, OriginSource::AppUrl));
+        return clean_app_url(&url)
+            .and_then(|u| app_origin_of(&u))
+            .map(|u| (u, OriginSource::AppUrl));
     }
     match target {
         Some(t) => app_origin_of(&t.requested).map(|o| (o, OriginSource::DerivationOrigin)),
@@ -1857,10 +1892,8 @@ async fn authorize_canister_call(
             _ => Ok(()),
         }
     };
-    let (bound, authorized) = tokio::join!(
-        binding,
-        discoverability::authorize_call(&origin, source, canister_id, kind)
-    );
+    let (bound, authorized) =
+        tokio::join!(binding, discoverability::authorize_call(&origin, source, canister_id, kind));
     // The mismatch is reported first when both fail: "this is not the app you
     // are signing as" tells the caller something a "not declared" refusal would
     // send them off to fix in the wrong place.
@@ -2136,10 +2169,7 @@ impl ServerHandler for IcTools {
         _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult {
-            tools: Self::all_tools(),
-            ..Default::default()
-        })
+        Ok(ListToolsResult { tools: Self::all_tools(), ..Default::default() })
     }
 
     async fn call_tool(
@@ -2160,11 +2190,9 @@ impl ServerHandler for IcTools {
     }
 
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder().enable_tools().enable_resources().build(),
-        )
-        .with_server_info(Implementation::from_build_env())
-        .with_instructions(SERVER_INSTRUCTIONS.to_string())
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
+            .with_server_info(Implementation::from_build_env())
+            .with_instructions(SERVER_INSTRUCTIONS.to_string())
     }
 
     async fn list_resources(
@@ -2177,8 +2205,7 @@ impl ServerHandler for IcTools {
                 .no_annotation(),
             RawResource::new(CANDID_REFERENCE_URI, "Candid type reference (full spec)")
                 .no_annotation(),
-            RawResource::new(OQL_USAGE_URI, "OQL query surface usage guide")
-                .no_annotation(),
+            RawResource::new(OQL_USAGE_URI, "OQL query surface usage guide").no_annotation(),
         ];
         // The IC skills, from the reviewed bundle compiled into this binary
         // ([`skills::BUNDLED_SKILLS`]) — the served surface retrieves nothing
@@ -2202,11 +2229,7 @@ impl ServerHandler for IcTools {
                 .no_annotation(),
             );
         }
-        Ok(ListResourcesResult {
-            resources,
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListResourcesResult { resources, next_cursor: None, meta: None })
     }
 
     async fn read_resource(
@@ -2221,10 +2244,9 @@ impl ServerHandler for IcTools {
             // `skill://<name>` is the skill itself; `skill://<name>/references/<file>`
             // is one of its companion documents, which its own links point at.
             return match skills::bundled_skill_document(path) {
-                Some(md) => Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    md,
-                    request.uri,
-                )])),
+                Some(md) => {
+                    Ok(ReadResourceResult::new(vec![ResourceContents::text(md, request.uri)]))
+                }
                 None => Err(McpError::resource_not_found(
                     "resource_not_found",
                     Some(serde_json::json!({
@@ -2248,10 +2270,7 @@ impl ServerHandler for IcTools {
                 ))
             }
         };
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(
-            body,
-            request.uri,
-        )]))
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(body, request.uri)]))
     }
 }
 
@@ -2297,7 +2316,10 @@ fn render_canister_line(c: &discover::DiscoveredCanister) -> String {
 /// neither. `handle` is the ready-to-use origin clause when the origin is
 /// already resolved (open_app), or `None` when it isn't (discover_app_canisters), in
 /// which case the note points at open_app to obtain it.
-fn data_access_note(canisters: &[discover::DiscoveredCanister], handle: Option<&str>) -> Option<String> {
+fn data_access_note(
+    canisters: &[discover::DiscoveredCanister],
+    handle: Option<&str>,
+) -> Option<String> {
     if !canisters.iter().any(|c| c.oql == Some(true)) {
         return None;
     }
@@ -2392,12 +2414,10 @@ fn format_accounts(target: &IdentityTarget, accounts: &[identities::AccountInfo]
 /// validation: a non-object schema is a programming error (every tool output
 /// type is a struct), so it panics at router-construction time rather than
 /// forcing an `.expect(…)` at each of the ~19 call sites.
-fn schema_for_output<T: schemars::JsonSchema + std::any::Any>() -> std::sync::Arc<rmcp::model::JsonObject> {
+fn schema_for_output<T: schemars::JsonSchema + std::any::Any>(
+) -> std::sync::Arc<rmcp::model::JsonObject> {
     rmcp::handler::server::tool::schema_for_output::<T>().unwrap_or_else(|e| {
-        panic!(
-            "output schema for `{}` must be object-rooted: {e}",
-            std::any::type_name::<T>()
-        )
+        panic!("output schema for `{}` must be object-rooted: {e}", std::any::type_name::<T>())
     })
 }
 
@@ -2460,7 +2480,6 @@ fn err(text: String) -> CallToolResult {
     CallToolResult::error(vec![Content::text(text)])
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::calls::decode_bytes_with_did;
@@ -2475,14 +2494,8 @@ mod tests {
         let msg = super::oql_needs_origin_error("Running an OQL query");
         assert!(msg.contains("Running an OQL query"), "echoes the action: {msg}");
         assert!(msg.contains("derivation_origin"), "names the arg to pass: {msg}");
-        assert!(
-            msg.contains("open_app"),
-            "names how to get the origin: {msg}"
-        );
-        assert!(
-            msg.to_lowercase().contains("anonymous"),
-            "explains anonymous is disabled: {msg}"
-        );
+        assert!(msg.contains("open_app"), "names how to get the origin: {msg}");
+        assert!(msg.to_lowercase().contains("anonymous"), "explains anonymous is disabled: {msg}");
     }
 
     // Field names are hashed on the Candid wire; decoding against the method's
@@ -2491,10 +2504,11 @@ mod tests {
     fn typed_decode_recovers_field_names() {
         let did = "service : { stats : () -> (record { name : text; url : text }) query }";
         // Encode a record reply (names get hashed in the wire format).
-        let bytes = parse_idl_args("(record { name = \"ICP\"; url = \"https://internetcomputer.org\" })")
-            .unwrap()
-            .to_bytes()
-            .unwrap();
+        let bytes =
+            parse_idl_args("(record { name = \"ICP\"; url = \"https://internetcomputer.org\" })")
+                .unwrap()
+                .to_bytes()
+                .unwrap();
 
         // Type-less decode -> hashed field ids.
         let typeless = IDLArgs::from_bytes(&bytes).unwrap().to_string();
@@ -2535,20 +2549,38 @@ mod tests {
         // AND set destructive_hint=false explicitly so a naive client that doesn't
         // gate destructive on read_only can't mislabel them.
         for name in [
-            "get_canister_candid", "canister_query", "get_canister_oql_schema", "icp_find_canister_by_name", "icp_lookup_canister_info_by_id",
-            "icp_list_skills", "icp_get_skill", "icp_oql_guide",
-            "get_canister_api_doc", "open_app", "list_app_accounts", "icp_cycles_balance", "get_app_principal", "icp_canister_status",
+            "get_canister_candid",
+            "canister_query",
+            "get_canister_oql_schema",
+            "icp_find_canister_by_name",
+            "icp_lookup_canister_info_by_id",
+            "icp_list_skills",
+            "icp_get_skill",
+            "icp_oql_guide",
+            "get_canister_api_doc",
+            "open_app",
+            "list_app_accounts",
+            "icp_cycles_balance",
+            "get_app_principal",
+            "icp_canister_status",
         ] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");
-            assert_eq!(a.destructive_hint, Some(false), "{name} should set destructive=false explicitly");
+            assert_eq!(
+                a.destructive_hint,
+                Some(false),
+                "{name} should set destructive=false explicitly"
+            );
         }
         // Destructive writes: not read-only, destructive — overwriting/removing
         // state: delete, uninstall, install (reinstall and upgrade replace the
         // running module), settings (can hand control away). `destructiveHint` is
         // what a client gates its confirmation prompt on.
         for name in [
-            "icp_delete_canister", "icp_uninstall_code", "icp_install_code", "icp_update_canister_settings",
+            "icp_delete_canister",
+            "icp_uninstall_code",
+            "icp_install_code",
+            "icp_update_canister_settings",
         ] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(false), "{name} should not be read-only");
@@ -2580,9 +2612,14 @@ mod tests {
         // app_url wins even when a derivation origin is also present: the two are
         // NOT interchangeable (an app can pin a derivation origin it doesn't serve
         // its manifest from), so the explicit argument decides.
-        let (origin, source) =
-            super::declaration_origin(Some("https://app.example.com".into()), Some(&target), &canister, super::discoverability::CallKind::Update, "canister_update_call")
-                .expect("app_url is accepted");
+        let (origin, source) = super::declaration_origin(
+            Some("https://app.example.com".into()),
+            Some(&target),
+            &canister,
+            super::discoverability::CallKind::Update,
+            "canister_update_call",
+        )
+        .expect("app_url is accepted");
         assert_eq!(origin, "https://app.example.com");
         assert_eq!(source, super::OriginSource::AppUrl);
 
@@ -2594,20 +2631,47 @@ mod tests {
             .expect("valid origin")
             .expect("some target");
         assert_eq!(gateway.origin, "https://x.ic0.app", "the identity path remaps");
-        let (origin, source) =
-            super::declaration_origin(None, Some(&gateway), &canister, super::discoverability::CallKind::Update, "canister_update_call").expect("falls back");
+        let (origin, source) = super::declaration_origin(
+            None,
+            Some(&gateway),
+            &canister,
+            super::discoverability::CallKind::Update,
+            "canister_update_call",
+        )
+        .expect("falls back");
         assert_eq!(origin, "https://x.icp0.io", "the manifest fetch does not");
         assert_eq!(source, super::OriginSource::DerivationOrigin);
 
         // Neither: refused, with the guidance that names the missing argument.
-        let e = super::declaration_origin(None, None, &canister, super::discoverability::CallKind::Update, "canister_update_call").expect_err("must refuse");
+        let e = super::declaration_origin(
+            None,
+            None,
+            &canister,
+            super::discoverability::CallKind::Update,
+            "canister_update_call",
+        )
+        .expect_err("must refuse");
         assert!(e.contains("`app_url`"), "{e}");
         assert!(e.contains(&canister.to_text()), "{e}");
 
         // A malformed app_url is rejected by the same validation every other
         // URL-taking argument uses, rather than being fetched.
-        assert!(super::declaration_origin(Some("http://x.example".into()), None, &canister, super::discoverability::CallKind::Update, "canister_update_call").is_err());
-        assert!(super::declaration_origin(Some("   ".into()), None, &canister, super::discoverability::CallKind::Update, "canister_update_call").is_err());
+        assert!(super::declaration_origin(
+            Some("http://x.example".into()),
+            None,
+            &canister,
+            super::discoverability::CallKind::Update,
+            "canister_update_call"
+        )
+        .is_err());
+        assert!(super::declaration_origin(
+            Some("   ".into()),
+            None,
+            &canister,
+            super::discoverability::CallKind::Update,
+            "canister_update_call"
+        )
+        .is_err());
     }
 
     // The discoverability gate is the opposite of the financial policy below: it
@@ -2706,11 +2770,7 @@ mod tests {
     fn financial_policy_is_a_server_instruction_not_a_description() {
         for tool in super::IcTools::all_tools() {
             let desc = tool.description.as_deref().unwrap_or_default();
-            assert!(
-                !desc.to_lowercase().contains("financial"),
-                "{}: {desc}",
-                tool.name
-            );
+            assert!(!desc.to_lowercase().contains("financial"), "{}: {desc}", tool.name);
             assert!(!desc.contains(".com"), "{} names a venue: {desc}", tool.name);
         }
         let ins = super::SERVER_INSTRUCTIONS;
@@ -2750,9 +2810,7 @@ mod tests {
         assert_eq!(served.len(), 10, "{:?}", served.iter().map(|t| &t.name).collect::<Vec<_>>());
         // icp_oql_guide is the one icp_-named tool that stays served: it is
         // part of the canister OQL read flow (guide → schema → query).
-        assert!(served
-            .iter()
-            .all(|t| !t.name.starts_with("icp_") || &*t.name == "icp_oql_guide"));
+        assert!(served.iter().all(|t| !t.name.starts_with("icp_") || &*t.name == "icp_oql_guide"));
         assert!(served.iter().any(|t| &*t.name == "icp_oql_guide"));
         assert_eq!(super::IcProtocolTools::tool_router().list_all().len(), 12);
         // tools/call routes through the canister router alone, so a deferred
@@ -2889,7 +2947,11 @@ mod tests {
             // vertical tab becomes the six characters `\u000b`), which would both
             // split a banned phrase and sail past the character allowlist below,
             // while the model still reads the invisible original (per review).
-            push_schema_strings(&format!("{} input schema", tool.name), &tool.input_schema, &mut surfaces);
+            push_schema_strings(
+                &format!("{} input schema", tool.name),
+                &tool.input_schema,
+                &mut surfaces,
+            );
             if let Some(schema) = &tool.output_schema {
                 push_schema_strings(&format!("{} output schema", tool.name), schema, &mut surfaces);
             }
@@ -2901,7 +2963,11 @@ mod tests {
         // text would break on a rewrap rather than on a broken scan.
         assert!(
             surfaces.iter().any(|(what, text)| what.starts_with("open_app output schema")
-                && text.split_whitespace().collect::<Vec<_>>().join(" ").contains("INVERSE relation")),
+                && text
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .contains("INVERSE relation")),
             "the schema scan no longer sees field documentation"
         );
         for (what, text) in surfaces {
@@ -3140,9 +3206,7 @@ mod tests {
             }],
         };
         let result = super::ok_structured("human text".to_string(), &output);
-        let value = result
-            .structured_content
-            .expect("structured content must be attached");
+        let value = result.structured_content.expect("structured content must be attached");
         assert_eq!(value.get("query"), Some(&serde_json::json!("ckUSDC")));
         let matches = value.get("matches").and_then(|v| v.as_array()).expect("matches array");
         assert_eq!(matches.len(), 1);
@@ -3175,7 +3239,10 @@ mod tests {
             .expect("valid derivation_origin resolves")
             .expect("an explicit derivation_origin yields a target");
         assert_eq!(target.requested, "https://example.com", "requested must be trimmed");
-        assert_eq!(target.origin, "https://example.com", "origin must be the canonical trimmed form");
+        assert_eq!(
+            target.origin, "https://example.com",
+            "origin must be the canonical trimmed form"
+        );
         assert_eq!(target.source, "explicit");
     }
 
@@ -3242,11 +3309,9 @@ mod tests {
     fn clean_app_url_rejects_bad_urls() {
         assert!(super::clean_app_url("   ").expect_err("blank").contains("must not be empty"));
         assert!(super::clean_app_url("http://example.com").expect_err("http").contains("https"));
-        assert!(
-            super::clean_app_url("https://user:pass@example.com")
-                .expect_err("user-info")
-                .contains("user-info")
-        );
+        assert!(super::clean_app_url("https://user:pass@example.com")
+            .expect_err("user-info")
+            .contains("user-info"));
         assert!(super::clean_app_url("https://").expect_err("host-less").contains("real host"));
         // A good bare host / https URL passes through.
         assert_eq!(super::clean_app_url("oisy.com").unwrap(), "oisy.com");
@@ -3348,7 +3413,3 @@ mod tests {
         assert_eq!(t.origin, "https://example.com", "valid input trims + canonicalizes");
     }
 }
-
-
-
-

@@ -33,10 +33,7 @@ fn test_state_dir() -> std::path::PathBuf {
 
 fn server(instance: imcp2::IiInstance, mcp_path: &str) -> imcp2::McpServer {
     let state_dir = test_state_dir();
-    let agent = imcp2::Agent::builder()
-        .with_url(imcp2::IC_URL)
-        .build()
-        .expect("build agent");
+    let agent = imcp2::Agent::builder().with_url(imcp2::IC_URL).build().expect("build agent");
     imcp2::McpServer::new(imcp2::McpConfig {
         agent,
         instance,
@@ -69,10 +66,7 @@ fn app() -> Router {
 }
 
 async fn get_json(app: Router, path: &str) -> (StatusCode, serde_json::Value) {
-    let resp = app
-        .oneshot(Request::get(path).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
+    let resp = app.oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
@@ -83,10 +77,9 @@ async fn get_json(app: Router, path: &str) -> (StatusCode, serde_json::Value) {
 async fn protected_resource_metadata_follows_each_mount() {
     // Prod (the default `/mcp` instance): served path-inserted (RFC 9728 §3.1)
     // and, as the default instance, at the plain root.
-    for path in [
-        "/.well-known/oauth-protected-resource/mcp",
-        "/.well-known/oauth-protected-resource",
-    ] {
+    for path in
+        ["/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-protected-resource"]
+    {
         let (status, doc) = get_json(app(), path).await;
         assert_eq!(status, StatusCode::OK, "GET {path}");
         assert_eq!(doc["resource"], format!("{PUBLIC_URL}/mcp"), "GET {path}");
@@ -111,15 +104,9 @@ async fn authorization_server_metadata_is_a_path_issuer_per_instance() {
         let (status, doc) = get_json(app(), path).await;
         assert_eq!(status, StatusCode::OK, "GET {path}");
         assert_eq!(doc["issuer"], format!("{PUBLIC_URL}/mcp"), "GET {path}");
-        assert_eq!(
-            doc["authorization_endpoint"],
-            format!("{PUBLIC_URL}/mcp/oauth/authorize")
-        );
+        assert_eq!(doc["authorization_endpoint"], format!("{PUBLIC_URL}/mcp/oauth/authorize"));
         assert_eq!(doc["token_endpoint"], format!("{PUBLIC_URL}/mcp/oauth/token"));
-        assert_eq!(
-            doc["registration_endpoint"],
-            format!("{PUBLIC_URL}/mcp/oauth/register")
-        );
+        assert_eq!(doc["registration_endpoint"], format!("{PUBLIC_URL}/mcp/oauth/register"));
         // RFC 9207: we emit `iss` on authorization responses, so the AS metadata
         // MUST advertise the parameter.
         assert_eq!(doc["authorization_response_iss_parameter_supported"], true);
@@ -133,10 +120,7 @@ async fn authorization_server_metadata_is_a_path_issuer_per_instance() {
         let (status, doc) = get_json(app(), path).await;
         assert_eq!(status, StatusCode::OK, "GET {path}");
         assert_eq!(doc["issuer"], format!("{PUBLIC_URL}/mcp-beta"), "GET {path}");
-        assert_eq!(
-            doc["authorization_endpoint"],
-            format!("{PUBLIC_URL}/mcp-beta/oauth/authorize")
-        );
+        assert_eq!(doc["authorization_endpoint"], format!("{PUBLIC_URL}/mcp-beta/oauth/authorize"));
     }
 }
 
@@ -191,10 +175,7 @@ async fn unauthenticated_mcp_requests_get_the_path_aware_challenge() {
     // trailing-slash form, and sub-paths are all gated — same breadth
     // `nest_service` used to give it.
     for path in ["/mcp", "/mcp/", "/mcp/sub"] {
-        let resp = app()
-            .oneshot(Request::post(path).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let resp = app().oneshot(Request::post(path).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "POST {path}");
         let challenge = resp
             .headers()
@@ -216,16 +197,11 @@ async fn unauthenticated_mcp_requests_get_the_path_aware_challenge() {
     }
 
     // Beta's challenge points at beta's document.
-    let resp = app()
-        .oneshot(Request::post("/mcp-beta").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
+    let resp =
+        app().oneshot(Request::post("/mcp-beta").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let challenge = resp
-        .headers()
-        .get("www-authenticate")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+    let challenge =
+        resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default();
     assert!(
         challenge.contains("/.well-known/oauth-protected-resource/mcp-beta\""),
         "beta challenge: {challenge}"
@@ -306,10 +282,7 @@ async fn dynamic_client_registration_round_trips_and_persists() {
         "the registration must reach {} so it survives a restart",
         path.display()
     );
-    assert!(
-        !persisted.contains("attacker.example"),
-        "a refused registration must never be stored"
-    );
+    assert!(!persisted.contains("attacker.example"), "a refused registration must never be stored");
 }
 
 /// Open DCR is unauthenticated, so a single `POST /oauth/register` must not be
@@ -388,11 +361,8 @@ async fn invalid_token_challenge_carries_rfc6750_error() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let challenge = resp
-        .headers()
-        .get("www-authenticate")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+    let challenge =
+        resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default();
     assert!(
         challenge.contains("error=\"invalid_token\""),
         "presented-but-invalid token must carry the RFC 6750 error: {challenge}"
@@ -471,10 +441,7 @@ async fn oauth_endpoints_live_under_each_mount() {
         ("/mcp/oauth/connect/callback", "/mcp/oauth/connect/redeem"),
         ("/mcp-beta/oauth/connect/callback", "/mcp-beta/oauth/connect/redeem"),
     ] {
-        let resp = app()
-            .oneshot(Request::get(page).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let resp = app().oneshot(Request::get(page).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "GET {page}");
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&bytes);

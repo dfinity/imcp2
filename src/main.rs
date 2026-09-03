@@ -432,9 +432,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(prod.root_well_known_router())
         // OpenAI Apps domain verification: inert (404) until
         // $OPENAI_APPS_CHALLENGE_TOKEN is set for a directory submission.
-        .merge(openai_apps_challenge_router(
-            std::env::var("OPENAI_APPS_CHALLENGE_TOKEN").ok(),
-        ))
+        .merge(openai_apps_challenge_router(std::env::var("OPENAI_APPS_CHALLENGE_TOKEN").ok()))
         // /robots.txt + /favicon.svg (the icon the connect screens link).
         .merge(site_metadata_router());
 
@@ -453,9 +451,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Staging additionally serves the beta II instance at `/mcp-beta`.
     if let Some(beta) = &beta {
-        app = app
-            .nest_service(beta.mcp_path(), beta.mcp_router())
-            .merge(beta.well_known_router());
+        app = app.nest_service(beta.mcp_path(), beta.mcp_router()).merge(beta.well_known_router());
     }
 
     // The II auth-callback allow-list is origin-global: one document declares
@@ -471,9 +467,7 @@ async fn main() -> anyhow::Result<()> {
             metrics.clone(),
             imcp2::metrics::write_request_metrics,
         ))
-        .layer(axum::middleware::from_fn(
-            imcp2::metrics::write_request_logs,
-        ));
+        .layer(axum::middleware::from_fn(imcp2::metrics::write_request_logs));
 
     let bind = bind_address();
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -497,9 +491,7 @@ async fn main() -> anyhow::Result<()> {
     // serve error (accept failure, etc.) still cancels the tokens before the
     // error propagates. (Stateless, no long-lived SSE, so there's nothing for
     // the tokens to cut post-drain.)
-    let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
+    let serve_result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await;
     prod.shutdown();
     if let Some(beta) = &beta {
         beta.shutdown();
@@ -695,10 +687,8 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .map(|v| v.to_str().unwrap().to_string());
+        let content_type =
+            resp.headers().get("content-type").map(|v| v.to_str().unwrap().to_string());
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8(body.to_vec()).unwrap(), content_type)
     }
