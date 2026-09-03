@@ -1365,30 +1365,32 @@ fn ipv6_is_global(ip: &Ipv6Addr) -> bool {
         return ipv4_is_global(&v4);
     }
     let seg = ip.segments();
-    // 2001::/23 is IETF protocol assignments (RFC 2928): NOT globally reachable
-    // by default — Teredo (2001::/32), benchmarking (2001:2::/48), ORCHID and
-    // ORCHIDv2 (2001:10::/28, 2001:20::/28), and everything unassigned — with
-    // the IANA registry's globally reachable exceptions admitted by name, so a
-    // new assignment is refused until audited rather than accepted until noticed.
+    // DEFAULT-DENY: IANA allocates global unicast only from 2000::/3 (RFC 4291
+    // §2.5.4; RFC 3513 §2.5.6), so a native address outside it — `::`, `::1`,
+    // the discard-only 100::/64, the NAT64 well-known 64:ff9b::/32, the SRv6
+    // 5f00::/16, unique-local fc00::/7, link-local fe80::/10, the deprecated
+    // site-local fec0::/10, multicast ff00::/8, and everything unallocated in
+    // between (4000::1 is nobody's) — is refused without being named, and so is
+    // whatever IANA allocates next, until it is audited here.
+    if (seg[0] & 0xe000) != 0x2000 {
+        return false;
+    }
+    // Within 2000::/3, 2001::/23 is IETF protocol assignments (RFC 2928): NOT
+    // globally reachable by default — Teredo (2001::/32), benchmarking
+    // (2001:2::/48), ORCHID and ORCHIDv2 (2001:10::/28, 2001:20::/28), and
+    // everything unassigned — with the IANA registry's globally reachable
+    // exceptions admitted by name, so a new assignment is refused until audited
+    // rather than accepted until noticed.
     if seg[0] == 0x2001 && (seg[1] & 0xfe00) == 0 {
         return ietf_protocol_assignment_is_global(&seg);
     }
-    !(ip.is_unspecified()                    // ::
-        || ip.is_loopback()                  // ::1
-        || ip.is_multicast()                 // ff00::/8
-        || (seg[0] & 0xfe00) == 0xfc00       // fc00::/7 unique-local
-        || (seg[0] & 0xffc0) == 0xfe80       // fe80::/10 link-local unicast
-        || (seg[0] & 0xffc0) == 0xfec0       // fec0::/10 site-local (deprecated, RFC 3879)
-        || (seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0) // 100::/64 discard-only (RFC 6666)
-        || (seg[0] == 0x3fff && (seg[1] & 0xf000) == 0)          // 3fff::/20 documentation (RFC 9637)
-        || seg[0] == 0x5f00                                      // 5f00::/16 SRv6 SIDs, not globally reachable (RFC 9602)
-        || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
-        // Transition mechanisms embed an IPv4 address deeper in the v6 space than
-        // `to_ipv4` decodes, so a NAT64/6to4 host would otherwise translate one
-        // of these to loopback/link-local/RFC1918/metadata (ICPBB-377); Teredo is
-        // refused with the rest of 2001::/23 above. imcp2 never needs to reach
-        // them, so refuse the prefixes outright.
-        || (seg[0] == 0x0064 && seg[1] == 0xff9b)  // 64:ff9b::/32 NAT64 (RFC 6052 WKP + RFC 8215 local-use)
+    // The rest of 2000::/3 is global unicast, less its special-purpose carve-outs.
+    !((seg[0] == 0x2001 && seg[1] == 0x0db8)        // 2001:db8::/32 documentation
+        || (seg[0] == 0x3fff && (seg[1] & 0xf000) == 0) // 3fff::/20 documentation (RFC 9637)
+        // 6to4 embeds an IPv4 address deeper in the v6 space than `to_ipv4`
+        // decodes, so a 6to4 host would otherwise translate one of these to
+        // loopback/link-local/RFC1918/metadata (ICPBB-377); NAT64 and Teredo are
+        // refused above. imcp2 never needs to reach them, so refuse the prefix.
         || seg[0] == 0x2002) // 2002::/16 6to4
 }
 
@@ -2901,6 +2903,9 @@ mod tests {
             "2001:1ff::1", // the block's last /32, likewise
             "3fff::1",     // documentation (RFC 9637)
             "5f00::1",     // SRv6 SIDs (RFC 9602)
+            "4000::1",     // outside 2000::/3: not allocated for global unicast
+            "8000::1",     // likewise
+            "e000::1",     // likewise
             "2001:db8::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1", // IPv4-mapped private/loopback

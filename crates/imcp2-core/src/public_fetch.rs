@@ -384,6 +384,7 @@ mod tests {
             "https://[100::1]/client.json",
             "https://[3fff::1]/client.json",
             "https://[5f00::1]/client.json",
+            "https://[4000::1]/client.json",
             "https://[2001:1::4]/client.json",
         ] {
             let Err(FetchError::Refused(why)) = fetch(internal).await else {
