@@ -44,7 +44,7 @@ jobs:
         run: cargo test --locked --workspace --all-targets
 
   # Formatting, enforced rather than merely requested: CONTRIBUTING.md asks for
-  # `cargo fmt --all` and the coding guidelines ask for an rustfmt-clean tree,
+  # `cargo fmt --all` and the coding guidelines ask for a rustfmt-clean tree,
   # and this is what keeps that true. Without it the tree drifts out of shape
   # silently, and the next contributor to run the documented step gets a
   # whole-repo reformat in their diff — which is exactly how `rustfmt.toml` came
