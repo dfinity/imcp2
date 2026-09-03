@@ -704,7 +704,10 @@ its AS issuer is `<PUBLIC_URL>/mcp` and everything OAuth lives under it:
   register nor make the server fetch a URL for a redirect it would refuse. A
   hosted redirect must also be same-origin with the document URL (loopback
   excepted), so a self-asserted document cannot point the code at another
-  party. Only public clients (`token_endpoint_auth_method: none`) are accepted.
+  party. Only clients that can authenticate as PUBLIC clients are accepted: a
+  `token_endpoint_auth_method` of `none` (or none given), or `none` among the
+  document's `token_endpoint_auth_methods_supported` — ChatGPT's case, since it
+  prefers `private_key_jwt` but lists `none`, which is what it uses here.
   Documents must be served as `application/json`, and are cached (bounded; the
   origin's remaining freshness — `max-age` less `Age` — honoured up to 24 h,
   10 min when it sends none, not at all on `no-store`), so a directory client

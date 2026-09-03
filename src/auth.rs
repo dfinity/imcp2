@@ -794,6 +794,14 @@ fn loopback_match(registered: &str, requested: &str) -> bool {
 // within minutes and fall back to DCR — should a vendor's document turn out to
 // be shaped in a way this implementation refuses.
 
+/// Byte cap on a `client_id` URL before it is treated as CIMD at all: the URL
+/// becomes a key of the process-wide cache and single-flight map (and part of a
+/// negative entry's reason), so an unauthenticated caller must not get to size
+/// those entries at will — [`CIMD_CACHE_MAX`] entries of at most this many bytes
+/// of key is the memory bound. The same cap a redirect URI gets; the real
+/// identifiers are under 100 bytes. A longer value is an ordinary, unknown
+/// client id: refused, not fetched, not remembered.
+const CIMD_MAX_CLIENT_ID_LEN: usize = MAX_REDIRECT_URI_LEN;
 /// Byte cap on a metadata document. The draft recommends documents stay under
 /// 5 KB; the real ones are well under 1 KB, so this is generous yet bounded.
 const CIMD_MAX_BYTES: usize = 8 * 1024;
@@ -913,15 +921,17 @@ type Flight = Arc<tokio::sync::Mutex<Option<Result<Arc<ClientMetadata>, CimdErro
 /// draft's MUSTs; a query is only discouraged there, so one is tolerated). It
 /// must also already be in canonical form: the document's own `client_id` is
 /// compared to it by plain string equality, so a non-canonical spelling
-/// (`HTTPS://`, an explicit `:443`, an upper-case host, a dot-segment) could
-/// never match its document and is refused up front rather than fetched.
+/// (`HTTPS://`, an explicit `:443`, an upper-case host, a dot-segment, a host
+/// with a trailing dot) could never match its document and is refused up front
+/// rather than fetched. And it must fit [`CIMD_MAX_CLIENT_ID_LEN`], since it is
+/// about to become a cache key.
 fn cimd_client_id(client_id: &str) -> Option<url::Url> {
-    if !client_id.starts_with("https://") {
+    if client_id.len() > CIMD_MAX_CLIENT_ID_LEN || !client_id.starts_with("https://") {
         return None;
     }
     let url = url::Url::parse(client_id).ok()?;
     let well_formed = url.scheme() == "https"
-        && url.host_str().is_some_and(|h| !h.is_empty())
+        && url.host_str().is_some_and(|h| !h.is_empty() && !h.ends_with('.'))
         && url.path().len() > 1
         && url.fragment().is_none()
         && url.username().is_empty()
@@ -946,10 +956,17 @@ fn cimd_origin_trusted(client_id: &url::Url) -> bool {
 /// Whether `host` equals, or is a dot-boundary subdomain of, an allow-listed
 /// registrable domain — the host rule of [`redirect_uri_permitted`], on its own.
 fn allow_listed_domain(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let host = host_key(host);
     allowed_redirects().iter().any(|(domain, _, _)| {
         host == *domain || host.strip_suffix(domain.as_str()).is_some_and(|p| p.ends_with('.'))
     })
+}
+
+/// One spelling per host — lower-case, no trailing dot — so that whatever is
+/// keyed by host (the trust policy's match, the per-host in-flight slots) treats
+/// `claude.ai`, `Claude.AI` and `claude.ai.` as the one host they resolve to.
+fn host_key(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// Parse and validate the document fetched from `client_id` (RFC 7591 client
@@ -1571,7 +1588,7 @@ impl AuthStore {
         client_id: &url::Url,
     ) -> Result<Arc<ClientMetadata>, CimdError> {
         let key = client_id.as_str();
-        let host = client_id.host_str().unwrap_or_default().to_ascii_lowercase();
+        let host = host_key(client_id.host_str().unwrap_or_default());
         let Some(_slot) = HostSlot::take(&self.cimd, &host) else {
             return Err(CimdError::Unavailable(format!(
                 "too many client metadata fetches in flight for {host}; retry shortly"
@@ -3169,6 +3186,26 @@ mod tests {
         assert!(cimd_client_id("https://ChatGPT.com/oauth/client.json").is_none());
         assert!(cimd_client_id("https://chatgpt.com:443/oauth/client.json").is_none());
         assert!(cimd_client_id("https://chatgpt.com/oauth/../oauth/client.json").is_none());
+        // A trailing-dot host names the same host as without it, yet would be a
+        // distinct key everywhere: refused, so there is one spelling per host.
+        assert!(cimd_client_id("https://chatgpt.com./oauth/client.json").is_none());
+        // Bounded, since it is about to become a cache key: the cap exactly, not
+        // one byte more.
+        let at_cap =
+            format!("https://chatgpt.com/{}", "x".repeat(super::CIMD_MAX_CLIENT_ID_LEN - 20));
+        assert_eq!(at_cap.len(), super::CIMD_MAX_CLIENT_ID_LEN);
+        assert!(cimd_client_id(&at_cap).is_some());
+        assert!(cimd_client_id(&format!("{at_cap}x")).is_none());
+    }
+
+    /// Whatever is keyed by host sees one spelling per host, so a trailing dot or
+    /// upper case cannot buy a second per-host quota.
+    #[test]
+    fn cimd_host_key_is_one_spelling_per_host() {
+        use super::host_key;
+        for spelling in ["claude.ai", "Claude.AI", "claude.ai.", "CLAUDE.AI."] {
+            assert_eq!(host_key(spelling), "claude.ai", "{spelling}");
+        }
     }
 
     /// A document is accepted only as the draft and this public-client-only AS
