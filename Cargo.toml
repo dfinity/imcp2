@@ -45,7 +45,7 @@ dist = false
 # imcp2-local.
 [workspace.dependencies]
 imcp2-core = { path = "crates/imcp2-core", version = "0.4.0" }
-rmcp = "1.7"
+rmcp = "2.0"
 axum = "0.8"
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
