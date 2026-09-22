@@ -50,7 +50,30 @@ ARG GIT_SHA=unknown
 ARG BUILD_TIME
 ENV GIT_SHA=${GIT_SHA}
 ENV BUILD_TIME=${BUILD_TIME}
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# bullseye left LTS on 2026-08-31 and deb.debian.org has since pruned its
+# -security pool: the suite's index still lists versions whose .deb files answer
+# 404, so any apt-get that consults the live bullseye-security fails. Resolving
+# from main alone does not work either: this image's preinstalled base packages
+# are at the FINAL security versions (perl-base 5.32.1-4+deb11u5, libc6
+# 2.31-13+deb11u14, ...), and main's perl / libc6-dev depend on exactly the
+# older main versions of perl-base / libc6, which apt will not downgrade to.
+# So install from snapshot.debian.org at the last moment both suites were
+# complete (2026-08-30; the image was built 2026-08-25). Both suites are frozen,
+# so that snapshot is the permanent final state of bullseye and the versions
+# match what the image already has: nothing is downgraded and apt's inputs are
+# fixed. (Only package resolution is reproducible: the rust:1-slim-bullseye tag
+# is mutable and BUILD_TIME is stamped per build.) The snapshot's Release files
+# have passed their Valid-Until,
+# hence check-valid-until=no. With that check off, apt's only defence against a
+# replayed older (still validly signed) index is the transport, so both lines
+# use https; the rust image preinstalls ca-certificates, so that works before
+# anything is installed. Acquire::Retries absorbs snapshot's occasional
+# throttling. (The durable fix is a base image whose archive is alive and whose
+# glibc still fits the host -- amazonlinux:2023 -- tracked separately.)
+RUN printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260830T000000Z bullseye main\ndeb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20260830T000000Z bullseye-security main\n' > /etc/apt/sources.list \
+    && rm -rf /etc/apt/sources.list.d/* \
+    && apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     build-essential cmake clang libclang-dev perl pkg-config ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./

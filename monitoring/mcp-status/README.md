@@ -188,8 +188,12 @@ the host and runs it as the `imcp-status.service` systemd unit (bound to
 production's II pinned to `https://id.ai` — so every host's dashboard shows the
 same two columns; `STATUS_TARGETS` / `STATUS_TARGET_II` in `deploy.sh`'s
 environment override the set, and the allowlist is widened to each target's
-host automatically. Caddy publishes it at `https://<domain>/status/`, and the CI
-workflow runs the unit tests below before rolling out. See the deploy README.
+host automatically. Caddy publishes it at `https://<domain>/status/` on **staging
+only** (`SERVE_STATUS`, set by `deploy-native.yml` for that environment); the
+production host runs the unit as well — its Statuspage pusher below feeds the public
+[status.internetcomputer.org](https://status.internetcomputer.org/) — but does not
+publish the dashboard at its origin. The CI workflow runs the unit tests below before
+rolling out. See the deploy README.
 
 ### Publishing to an Atlassian Statuspage (status.internetcomputer.org)
 
