@@ -950,31 +950,30 @@ type Flight = Arc<tokio::sync::Mutex<Option<Result<Arc<ClientMetadata>, CimdErro
 /// a client like any other, provided its document says the same. Only the host
 /// is normalised, and only for the trust policy and the per-host quota
 /// ([`host_key`]), so no spelling of a vetted host is a stranger or a second
-/// quota. Taken as given also means the raw string must BE the URL parsed: one
-/// the parser would silently alter (stripping tab/newline/CR, or an empty
-/// `@` userinfo) is refused.
+/// quota. Taken as given also means the raw string must BE the URL parsed and
+/// fetched: serialising the parsed URL must give the identifier back
+/// ([`parsed_as_given`]), so one the parser would silently rewrite is refused.
 fn cimd_client_id(client_id: &str) -> Option<url::Url> {
     if client_id.len() > CIMD_MAX_CLIENT_ID_LEN {
-        return None;
-    }
-    // The WHATWG parser silently strips ASCII tab/newline/CR from anywhere in its
-    // input, trims leading and trailing C0 controls and spaces, reads a backslash
-    // as a slash (`https:\\host\path` parses as `https://host/path`, and one in
-    // the authority would end it before an `@` a raw scan expects there), and
-    // erases an EMPTY userinfo (`https://@host` parses as `https://host`). All of
-    // it is refused on the RAW string — as `resource_matches_issuer` does — or the
-    // identifier taken as given would not be the URL that was parsed and fetched.
-    let trimmed_by_parser = |c: char| c <= ' ';
-    if client_id.contains(['\t', '\n', '\r', '\\'])
-        || client_id.starts_with(trimmed_by_parser)
-        || client_id.ends_with(trimmed_by_parser)
-        || raw_authority_has_userinfo(client_id)
-    {
         return None;
     }
     // Parsed, not prefix-matched: a scheme is case-insensitive (`HTTPS://` is
     // https), and a DCR id (`client-…`) is no URL at all, so it parses to nothing.
     let url = url::Url::parse(client_id).ok()?;
+    // The WHATWG parser silently rewrites a great deal: it strips ASCII
+    // tab/newline/CR from anywhere in its input, trims leading and trailing C0
+    // controls and spaces, reads a backslash as a slash, erases an EMPTY userinfo
+    // (`https://@host` parses as `https://host`), percent-encodes a space, a
+    // control, a `"`, `<`, `>`, `{`, `}`, a backtick or a non-ASCII character in
+    // the path (and a `'` in the query), percent-DEcodes and IDNA-encodes the
+    // host, and resolves `.` and `..` segments. Each would have the identifier
+    // taken as given — the cache key, and what the document must repeat — differ
+    // from the URL that is fetched, and the one rule that refuses all of them,
+    // and whatever else a parser upgrade adds, is that the parsed URL must
+    // serialise back to the raw string.
+    if !parsed_as_given(client_id, &url) {
+        return None;
+    }
     let well_formed = url.scheme() == "https"
         && url.host_str().is_some_and(|h| !h.is_empty())
         && url.path().len() > 1
@@ -982,6 +981,24 @@ fn cimd_client_id(client_id: &str) -> Option<url::Url> {
         && url.username().is_empty()
         && url.password().is_none();
     well_formed.then_some(url)
+}
+
+/// Whether `url`, serialised, is `raw` again — the parser having changed nothing
+/// but what a URL that IS what it says may be spelt either way: the scheme's and
+/// the host's ASCII case, and an explicit default port, which the parser lower-
+/// cases and drops. Those are folded on `raw` before comparing; everything else
+/// must match byte for byte. The authority is the slice of `raw` between `://`
+/// and the first `/`, `?` or `#` (as [`raw_authority_has_userinfo`] reads it), so
+/// a `raw` whose `://` the parser had to repair (`https:\t//…`) has none and
+/// fails, as it should.
+fn parsed_as_given(raw: &str, url: &url::Url) -> bool {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return false;
+    };
+    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let authority = authority.to_ascii_lowercase();
+    let authority = authority.strip_suffix(":443").unwrap_or(&authority);
+    format!("{}://{authority}{tail}", scheme.to_ascii_lowercase()) == url.as_str()
 }
 
 /// The trust policy of PR #143: whether a CIMD `client_id` URL (already shaped by
@@ -3428,8 +3445,9 @@ mod tests {
     /// A Client ID Metadata Document `client_id` is an https URL naming a host
     /// and a path beyond `/`, with no fragment or userinfo, within the length cap
     /// — taken as given, in whatever spelling its document repeats (a query is
-    /// tolerated, as the draft only discourages one). Anything else is an
-    /// ordinary (DCR) identifier.
+    /// tolerated, as the draft only discourages one), provided the parser sends
+    /// it as given: anything the parser would rewrite on the way is refused.
+    /// Anything else is an ordinary (DCR) identifier.
     #[test]
     fn cimd_client_id_shape() {
         use super::cimd_client_id;
@@ -3457,20 +3475,48 @@ mod tests {
         assert!(cimd_client_id("https:\\\\chatgpt.com\\oauth\\client.json").is_none());
         assert!(cimd_client_id("https://chatgpt.com\\@evil.example/oauth/client.json").is_none());
         assert!(cimd_client_id("https://chatgpt.com/oauth\\client.json").is_none());
-        // …and the leading/trailing C0 controls and spaces it trims.
+        // …the leading/trailing C0 controls and spaces it trims…
         assert!(cimd_client_id(" https://chatgpt.com/oauth/client.json").is_none());
         assert!(cimd_client_id("https://chatgpt.com/oauth/client.json ").is_none());
         assert!(cimd_client_id("\u{1}https://chatgpt.com/oauth/client.json").is_none());
+        // …everything it percent-encodes on the way: an INTERNAL space or control,
+        // DEL, a quote, an angle bracket, a brace, a backtick or a non-ASCII
+        // character in the path, a `'` in the query…
+        for rewritten in [
+            "https://chatgpt.com/oauth/cl ient.json",
+            "https://chatgpt.com/oauth/cl\u{1}ient.json",
+            "https://chatgpt.com/oauth/cl\u{7f}ient.json",
+            "https://chatgpt.com/oauth/cl\"ient.json",
+            "https://chatgpt.com/oauth/<client>.json",
+            "https://chatgpt.com/oauth/{client}.json",
+            "https://chatgpt.com/oauth/`client`.json",
+            "https://chatgpt.com/oauth/clïent.json",
+            "https://chatgpt.com/oauth/client.json?v='2'",
+            // …the host it percent-decodes, IDNA-encodes or renumbers, the
+            // default port it drops however spelt, and the dot segments it
+            // resolves: in each the URL fetched is not the identifier given.
+            "https://%63hatgpt.com/oauth/client.json",
+            "https://chatgpt.c\u{43e}m/oauth/client.json",
+            "https://[0:0:0:0:0:0:0:1]/oauth/client.json",
+            "https://chatgpt.com:0443/oauth/client.json",
+            "https://chatgpt.com/oauth/./client.json",
+            "https://chatgpt.com/oauth/../oauth/client.json",
+        ] {
+            assert!(cimd_client_id(rewritten).is_none(), "{rewritten:?}");
+        }
         // The draft asks for an https URL the document repeats byte for byte, not
         // for one spelling of it: these are accepted as given (they are the
-        // identity and the cache key), and only the host is normalised, for the
-        // trust policy and the per-host quota (`host_key`).
+        // identity and the cache key), the parser sending each as given bar the
+        // scheme's and host's case and the default port, and only the host is
+        // normalised, for the trust policy and the per-host quota (`host_key`).
         for spelling in [
             "HTTPS://chatgpt.com/oauth/client.json",
             "https://ChatGPT.com/oauth/client.json",
             "https://chatgpt.com:443/oauth/client.json",
             "https://chatgpt.com./oauth/client.json",
-            "https://chatgpt.com/oauth/../oauth/client.json",
+            "https://chatgpt.com/oauth/client%2Ejson",
+            "https://chatgpt.com/oauth/cl%C3%AFent.json",
+            "https://chatgpt.com//oauth/client.json",
         ] {
             assert!(cimd_client_id(spelling).is_some(), "{spelling}");
         }
