@@ -27,9 +27,12 @@ mismatch — otherwise the unit installs fine and then crash-loops on
 your domain and reverse-proxies to it, obtaining a Let's Encrypt cert automatically.
 
 The **status dashboard** (`monitoring/mcp-status`) is also shipped and run as a
-Node systemd service (`imcp-status.service`) bound to `127.0.0.1:8137`. Caddy
-publishes it at **`https://$DOMAIN/status/`**, where it probes the deployment's
-own public endpoints and the linked Internet Identity instance. Node ≥ 20 is
+Node systemd service (`imcp-status.service`) bound to `127.0.0.1:8137`. On
+**staging only**, Caddy publishes it at **`https://$DOMAIN/status/`**, where it
+probes the deployment's own public endpoints and the linked Internet Identity
+instance; production runs the same service (its Statuspage pusher feeds the
+public [status.internetcomputer.org](https://status.internetcomputer.org/)) but
+does not expose it at its origin (see `SERVE_STATUS` below). Node ≥ 20 is
 installed automatically on first deploy if absent; the dashboard has no build
 step and no third-party dependencies.
 
@@ -179,6 +182,13 @@ The staging deploy additionally sets `MCP_SERVE_BETA=1` (via `deploy-native.yml`
 substituted into the unit by `deploy.sh`), so staging serves the beta Internet
 Identity instance at `/mcp-beta` alongside the production `/mcp`. Production leaves
 it unset, so it serves `/mcp` (production II) alone.
+
+Staging alone also sets `SERVE_STATUS=1`. `deploy.sh` then keeps the Caddyfile's
+`/status/` block (between its `__STATUS_BEGIN__`/`__STATUS_END__` markers), so the
+status dashboard is published at `https://<staging domain>/status/`; for production
+the block is deleted and the dashboard is not published at the origin. The public
+status surface for ICP MCP is [status.internetcomputer.org](https://status.internetcomputer.org/),
+driven by the dashboard's Statuspage pusher, which keeps running on every host.
 
 Both hosts set `MCP_SERVE_METRICS=1` (hardcoded in the unit), so the app serves
 the Prometheus exposition at `/metrics` on its own port for a scraper to reach on
@@ -337,8 +347,9 @@ sudo journalctl -u caddy -f        # TLS / cert logs
 sudo journalctl -u imcp-status -f  # status dashboard logs
 ```
 
-The dashboard is at `https://<domain>/status/` and shows staging and production
-side by side (the same two columns on every host). To change the monitored set,
+The dashboard is published at `https://<staging domain>/status/` only (see
+`SERVE_STATUS` above; the public status page is status.internetcomputer.org) and
+shows staging and production side by side. To change the monitored set,
 its II pins or the SSRF allowlist, set `STATUS_TARGETS` / `STATUS_TARGET_II` for
 `deploy.sh` or edit the `Environment=` lines in
 `/etc/systemd/system/imcp-status.service` and `systemctl restart imcp-status`.

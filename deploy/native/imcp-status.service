@@ -23,8 +23,10 @@ WorkingDirectory=/opt/imcp-status
 # pinned via MCP_STATUS_TARGET_II. The allowlist is pinned to this host plus each
 # target's host (the dashboard always permits the built-in id.ai suffixes on
 # top), so the probes can never be steered elsewhere -- including by a server's
-# own /version. Binds to 127.0.0.1; Caddy publishes it under
-# https://<domain>/status/.
+# own /version. Binds to 127.0.0.1. Caddy publishes it under
+# https://<domain>/status/ on staging only (SERVE_STATUS in deploy.sh); the
+# production host runs this unit too -- its Statuspage pusher feeds the public
+# status.internetcomputer.org -- but does not publish the dashboard at its origin.
 Environment="MCP_STATUS_TARGETS=__TARGETS__"
 Environment="MCP_STATUS_TARGET_II=__TARGET_II__"
 Environment=MCP_STATUS_ALLOWED_HOSTS=__ALLOWED_HOSTS__

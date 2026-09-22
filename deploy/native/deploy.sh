@@ -81,7 +81,19 @@ echo ">> rendering + installing units and Caddyfile, then (re)starting services"
 # MCP_SERVE_BETA is set (to "1") only for the staging deployment, so /mcp-beta
 # is exposed there and not in production; it defaults to empty (off) otherwise.
 unit_mcp="$(sed -e "s#__PUBLIC_URL__#https://$DOMAIN#g" -e "s#__MCP_SERVE_BETA__#${MCP_SERVE_BETA:-}#g" -e "s#__OPENAI_APPS_CHALLENGE_TOKEN__#${OPENAI_APPS_CHALLENGE_TOKEN:-}#g" "$here/imcp2.service")"
-caddyfile="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__ACME_EMAIL__#$ACME_EMAIL#g" "$here/Caddyfile")"
+# SERVE_STATUS likewise is set (to "1") only for the staging deployment. Staging
+# keeps the Caddyfile's marked /status/ block (minus the marker lines) so the
+# dashboard is published at https://$DOMAIN/status/; production deletes the whole
+# block, so its origin does not publish the dashboard -- the public status surface
+# is status.internetcomputer.org. The imcp-status service is still installed and
+# started on every host below: the Statuspage pusher that feeds that page runs
+# inside it, and only the dashboard's exposure at /status/ is staging-only.
+if [ -n "${SERVE_STATUS:-}" ]; then
+  status_block=(-e '/__STATUS_BEGIN__/d' -e '/__STATUS_END__/d')
+else
+  status_block=(-e '/__STATUS_BEGIN__/,/__STATUS_END__/d')
+fi
+caddyfile="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__ACME_EMAIL__#$ACME_EMAIL#g" "${status_block[@]}" "$here/Caddyfile")"
 caddy_unit="$(cat "$here/caddy.service")"
 # The dashboard shows the monitored instances side by side. Every host renders
 # the same set by default -- staging and production -- so the page reads the same
