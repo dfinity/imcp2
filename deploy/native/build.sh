@@ -64,10 +64,13 @@ ENV BUILD_TIME=${BUILD_TIME}
 # fixed. (Only package resolution is reproducible: the rust:1-slim-bullseye tag
 # is mutable and BUILD_TIME is stamped per build.) The snapshot's Release files
 # have passed their Valid-Until,
-# hence check-valid-until=no; Acquire::Retries absorbs snapshot's occasional
+# hence check-valid-until=no. With that check off, apt's only defence against a
+# replayed older (still validly signed) index is the transport, so both lines
+# use https; the rust image preinstalls ca-certificates, so that works before
+# anything is installed. Acquire::Retries absorbs snapshot's occasional
 # throttling. (The durable fix is a base image whose archive is alive and whose
 # glibc still fits the host -- amazonlinux:2023 -- tracked separately.)
-RUN printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260830T000000Z bullseye main\ndeb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/20260830T000000Z bullseye-security main\n' > /etc/apt/sources.list \
+RUN printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260830T000000Z bullseye main\ndeb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20260830T000000Z bullseye-security main\n' > /etc/apt/sources.list \
     && rm -rf /etc/apt/sources.list.d/* \
     && apt-get -o Acquire::Retries=3 update \
     && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
