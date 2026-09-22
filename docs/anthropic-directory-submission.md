@@ -70,7 +70,7 @@ submission — and match a live scan of a deployed instance of that build
 | OAuth endpoint latency ≤ 10 s (discovery/registration/token) | ✅ all sub-second in probes |
 | Support channel | ✅ <mcp@dfinity.org> (shown on every error screen) |
 | Security-vulnerability reporting mechanism (a Software Directory Terms obligation) | ✅ [`SECURITY.md`](../SECURITY.md) → Hackenproof bug bounty |
-| Public documentation by publish date | ✅ this repo's README + the landing page at <https://internetcomputer.org/icp-mcp/> (its one home, maintained in dfinity/internetcomputer-org; `https://mcp.internetcomputer.org` permanently redirects there from the release that ships #165) |
+| Public documentation by publish date | ✅ this repo's README + the landing page at <https://internetcomputer.org/icp-mcp/> (its one home, maintained in dfinity/internetcomputer-org; `https://mcp.internetcomputer.org` permanently redirects there) |
 | Status/health visibility | ✅ <https://status.internetcomputer.org/> — the **ICP MCP** component on the ICP Statuspage, driven by the deployment's status dashboard (`monitoring/mcp-status`) through its Statuspage pusher. This is the only public status surface: the dashboard itself is published on staging alone (`SERVE_STATUS`, see `deploy/native/README.md`), not on `mcp.internetcomputer.org` (whose origin answers `/status/` with a redirect at the gateway) nor under `internetcomputer.org/icp-mcp/` |
 
 Notes on auth mode: pure M2M `client_credentials` is unsupported by Claude
@@ -142,13 +142,12 @@ server actually does, it should cover at least:
 Publication venue: `https://internetcomputer.org/icp-mcp/privacy-policy/` —
 the page's one home, maintained in dfinity/internetcomputer-org
 (`public/icp-mcp/privacy-policy/`) and live there
-(dfinity/internetcomputer-org#77 refreshes its text to the current draft:
-the identifier-linkability wording and the updated third-party list).
-The MCP server no longer serves a copy: from the release that ships
-[#165](https://github.com/dfinity/imcp2/pull/165),
+(dfinity/internetcomputer-org#77, merged 2026-08-28, brought its text to the
+current draft: the identifier-linkability wording and the updated third-party
+list). The MCP server no longer serves a copy:
 `https://mcp.internetcomputer.org/privacy-policy` answers with a permanent
-redirect to that home (until that release it still serves the previous
-revision itself). Either URL works in the portal; prefer the canonical one.
+redirect to that home ([#165](https://github.com/dfinity/imcp2/pull/165); the
+gateway front redirects it as well). Enter the canonical URL in the portal.
 The reviewed source
 text is [`icp-mcp-privacy-policy-draft.md`](icp-mcp-privacy-policy-draft.md).
 
@@ -246,7 +245,7 @@ destructive call).
 
 **Decided:** reviewers create their own Internet Identity rather than being
 handed a shared test account, and the test-credentials field points them at
-the setup instructions on <https://mcp.internetcomputer.org>. This is the
+the setup instructions on <https://internetcomputer.org/icp-mcp/>. This is the
 right call for this connector: Internet Identity is passkey-based and
 device-bound, so a "shared account" would mean circulating a recovery phrase,
 and every read-only tool works against public network state, so a
@@ -333,12 +332,11 @@ Paste-and-adapt; portal limits in parentheses.
 - **Categories** (1–5): Developer tools; plus whatever the portal offers
   closest to data/productivity/web3.
 - **Documentation URL:** `https://internetcomputer.org/icp-mcp/` (the landing
-  page's home; `https://mcp.internetcomputer.org` permanently redirects there
-  from the release that ships #165. README as backup:
-  `https://github.com/dfinity/imcp2#readme`)
+  page's home; `https://mcp.internetcomputer.org` permanently redirects there.
+  README as backup: `https://github.com/dfinity/imcp2#readme`)
 - **Privacy policy URL:** `https://internetcomputer.org/icp-mcp/privacy-policy/`
   (live; the old `https://mcp.internetcomputer.org/privacy-policy` permanently
-  redirects there from the release that ships #165). A missing or incomplete
+  redirects there). A missing or incomplete
   policy is documented as immediate rejection. Do not substitute the
   foundation-wide `dfinity.org/privacy`.
 - **Support contact:** `mcp@dfinity.org`
@@ -375,7 +373,7 @@ Paste-and-adapt; portal limits in parentheses.
 > 1. No shared test account is needed, and none would work well: Internet
 >    Identity is passkey-based and device-bound. Create your own at
 >    https://id.ai — it takes under a minute — then add the connector by
->    following the setup instructions at https://mcp.internetcomputer.org.
+>    following the setup instructions at https://internetcomputer.org/icp-mcp/.
 >    Every read-only tool works with any identity, because it reads public
 >    network state.
 > 2. On the consent screen pick a session duration and an access level:
@@ -431,7 +429,7 @@ conversation beyond tool arguments and generates no media.
 
 ## Submission-day checklist
 
-- [ ] Privacy policy entered in the portal — enter `https://internetcomputer.org/icp-mcp/privacy-policy/`, the page's one home (live; dfinity/internetcomputer-org#77 refreshes its text to the current draft, and the old mcp.internetcomputer.org URL redirects there from the release that ships #165) (blocker 1)
+- [ ] Privacy policy entered in the portal — enter `https://internetcomputer.org/icp-mcp/privacy-policy/`, the page's one home (live; the old mcp.internetcomputer.org URL permanently redirects there) (blocker 1)
 - [x] Financial-transactions acknowledgment is a clean yes (blocker 2): the server does not support financial transactions. No mcp-review reply is needed; if one arrives, answer with the stated posture. The first-party-API/data-handling question was NOT in the 2026-07-31 email: raise it with mcp-review only if the portal's data-handling options don't fit
 - [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — if a reviewer asks for a populated account, provision a demo-app account (no funding needed: there are no funding or canister-management tools)
 - [ ] `release-*` tag cut; production confirmed to run the intended commit by the operators — externally `/version` is cut off by the gateway front, so the check is on-host or via the deploy workflow's record (blocker 4)

@@ -16,9 +16,13 @@ add details not published in the docs.
 > [`crates/imcp2-core/src/tools.rs`](../crates/imcp2-core/src/tools.rs)).
 > Production probes the same day found `mcp.internetcomputer.org` fronted by
 > Internet Computer HTTP-gateway infrastructure that forwards only the MCP
-> and OAuth paths — `/version`, `/status/` and, critically for this
-> submission, `/.well-known/openai-apps-challenge` answer with a redirect at
-> that edge. The rows and steps below that rely on them say so inline.
+> and OAuth paths — `/version`, `/status/` and
+> `/.well-known/openai-apps-challenge` answer with a redirect at that edge.
+> Domain verification is unaffected: OpenAI accepts the challenge on a
+> **parent host name**, and the token is served from
+> `https://internetcomputer.org/.well-known/openai-apps-challenge`
+> (re-verified 2026-09-22; see blocker 1). The rows and steps below that rely
+> on `/version` say so inline.
 
 ## Where and how submission happens
 
@@ -70,8 +74,8 @@ add details not published in the docs.
 | Descriptions explain when a tool applies, and must not attempt to manipulate the model: no unrelated behavioral instructions, no overly broad triggering, no preference over or interference with other plugins, no calls to unrelated external software, no hidden or obfuscated instructions | ✅ each description states what its tool does, returns, rejects, and requires — including the constraints a caller needs, such as `open_app`'s "do not construct a domain from the name" — while none of the five prohibited manipulations appears. A unit test (`model_readable_metadata_respects_marketplace_policy`) guards this across the server instructions, all 10 descriptions, and the argument and reply schemas — precisely: it rejects an enumerated set of phrasings (those that appeared here before, plus what review named) and, completely, any character outside a small allowlist, so no invisible character can ride along; judging a novel phrasing of a prohibited intent is human review's job, not the test's. `the_policy_gate_catches_what_it_lists` keeps it live from both sides, and `open_app_metadata_forbids_a_constructed_domain` pins the safeguard itself |
 | Required identifiers must not depend on the model guessing them | ✅ `open_app` refuses an unknown bare name, and refuse a URL that would need its own origin assumed as the derivation origin when that origin shows no Internet Computer evidence, rather than resolving a guess (an app that declares its derivation origin is taken at its declaration, so that path is not gated by the evidence probe — but a CROSS-origin declaration is accepted only when the declared origin authorizes this app in its `/.well-known/ii-alternative-origins`, and an unauthorized one is refused outright rather than falling back, so a declaration is not a way around the identity checks); the description and the `app` schema both say to pass the user's name unchanged and to pass only a user-supplied or officially sourced URL. The IC-evidence check is stated for what it is — evidence that a domain is served from the Internet Computer, not that it is the intended app |
 | Public HTTPS production endpoint, stable and complete ("trial or demo plugins will not be accepted") | ✅ production deployment |
-| Privacy policy disclosing "categories of personal data collected, purposes of use, categories of recipients, data retention timelines" | ✅ the rewritten policy matches these four required disclosures exactly; its one home is `https://internetcomputer.org/icp-mcp/privacy-policy/` (dfinity/internetcomputer-org#77 refreshes its text to the current draft, and the old mcp.internetcomputer.org URL permanently redirects there from the release that ships #165) |
-| Customer support contact (OpenAI asks for a URL) | ✅ `https://internetcomputer.org/icp-mcp/support/` — the page's one home (the old mcp.internetcomputer.org URL permanently redirects there from the release that ships #165); routes users to <mcp@dfinity.org>, the status dashboard, id.ai access management, GitHub issues, and the security policy |
+| Privacy policy disclosing "categories of personal data collected, purposes of use, categories of recipients, data retention timelines" | ✅ the rewritten policy matches these four required disclosures exactly; its one home is `https://internetcomputer.org/icp-mcp/privacy-policy/` (the old mcp.internetcomputer.org URL permanently redirects there) |
+| Customer support contact (OpenAI asks for a URL) | ✅ `https://internetcomputer.org/icp-mcp/support/` — the page's one home (the old mcp.internetcomputer.org URL permanently redirects there); routes users to <mcp@dfinity.org>, the public status page (status.internetcomputer.org), id.ai access management, GitHub issues, and the security policy |
 | Terms of Service URL | ✅ `https://internetcomputer.org/icp-mcp/terms/` — the **ICP MCP User Terms**, the end-user agreement to enter in the portal (the old mcp.internetcomputer.org URL permanently redirects there). Swiss-law terms covering the credentials-never-held session model, the user's sole responsibility for authorized actions, irreversibility of network actions, and as-is/liability limits with the Art. 100 CO carve-out. Since 2026-09-01 the operator-side provisions live in a separate agreement, the [ICP MCP App Operator Terms](https://internetcomputer.org/icp-mcp/app-operator-terms/) (dfinity/internetcomputer-org#90), which governs how applications are made discoverable and is not the URL a directory listing wants. Both need the same legal pass as the privacy policy |
 | Logo | ✅ [`docs/assets/icp-logo-1024.png`](assets/icp-logo-1024.png) |
 
@@ -89,7 +93,7 @@ now pinned in `DEFAULT_ALLOWED_REDIRECTS`, so neither needs an
 
 ## Blockers and open items
 
-### 1. Domain-verification endpoint — implemented, but currently cut off by the gateway front
+### 1. Domain verification — resolved on the parent origin
 
 The portal requires proving control of the host: an endpoint at
 `https://<host>/.well-known/openai-apps-challenge` must return **only** the
@@ -99,19 +103,25 @@ serves `$OPENAI_APPS_CHALLENGE_TOKEN` verbatim as `text/plain` (trimmed, so
 unit-file whitespace can't break OpenAI's exact-match check) and 404s while
 the variable is unset, so it is inert until a submission is in flight.
 
-**New blocker in front of it (2026-09-01):** the gateway front now serving
-`mcp.internetcomputer.org` forwards only the MCP and OAuth paths, and answers
-`/.well-known/openai-apps-challenge` with a redirect to the landing page —
-the app's route never sees the request, so the portal's exact-match check
-cannot pass today. Before submission-day: have the fronting layer forward
-this path to the application (it already forwards
-`/.well-known/oauth-*` and `/.well-known/ii-auth-callbacks`, so it is an
-allowlist entry, not a new mechanism).
+**Resolved (2026-09-22) without touching the gateway.** OpenAI's submission
+docs state that the challenge base "must be the MCP host name **or a parent
+host name**; paths are ignored" — for a server at `https://api.example.com/mcp`,
+`https://example.com` is an acceptable challenge base. The parent of
+`mcp.internetcomputer.org` is `internetcomputer.org`, whose site repository
+commits the token at `public/.well-known/openai-apps-challenge`
+(dfinity/internetcomputer-org#99, 2026-09-03); it is live and returns exactly
+the token as `text/plain`. The gateway front serving `mcp.internetcomputer.org`
+forwards only the MCP and OAuth paths and answers `/.well-known/openai-apps-challenge`
+with a redirect, but that no longer matters: when the portal asks where to
+check the token, choose `internetcomputer.org` as the challenge base.
 
-When the path is forwarded and the portal reveals the token: set the
-**repository secret** `OPENAI_APPS_CHALLENGE_TOKEN` (Settings → Secrets and
-variables → Actions → Secrets, repository level — both deploy callers pass
-the same one) and deploy. Then have the portal run its check.
+The app's own route stays as a fallback for the day the portal insists on the
+server host itself. That would need the fronting layer to forward
+`/.well-known/openai-apps-challenge` to the application (an allowlist entry,
+like `/.well-known/oauth-*` and `/.well-known/ii-auth-callbacks`) and the
+**repository secret** `OPENAI_APPS_CHALLENGE_TOKEN` set to the portal's token
+(Settings → Secrets and variables → Actions → Secrets, repository level — both
+deploy callers pass the same one) and deployed.
 
 ### 2. Demo account (same tension as Anthropic, stricter wording)
 
@@ -237,9 +247,9 @@ Negative:
 - [ ] OpenAI Platform organization verified (business verification)
 - [ ] Submitter holds the Apps Management write permission
 - [ ] Production runs a release cut from current `main`, containing #153–#158 — confirmed by the operators immediately before submitting (externally `/version` is cut off by the gateway front; on-host `curl localhost:8000/version`, or the deploy workflow's record). The check still matters: the deploy workflow also accepts older tags/SHAs (rollbacks), so a deployed challenge token alone does not prove the compliant build is live
-- [ ] Gateway front forwards `/.well-known/openai-apps-challenge` to the application (blocker 1 — today that path answers with a redirect at the edge, so the portal's check cannot reach the route)
-- [ ] Repository secret `OPENAI_APPS_CHALLENGE_TOKEN` set to the portal's token and deployed; `curl https://mcp.internetcomputer.org/.well-known/openai-apps-challenge` returns exactly the token (blocker 1 — the route is merged and deployed; it 404s until the variable is set, by design)
-- [x] Privacy policy live at `https://internetcomputer.org/icp-mcp/privacy-policy/`, its one home (dfinity/internetcomputer-org#77 refreshes its text to the current draft; the old mcp.internetcomputer.org URL redirects there from the release that ships #165)
+- [x] Domain verification token served on the parent origin, `https://internetcomputer.org/.well-known/openai-apps-challenge` (dfinity/internetcomputer-org#99; returns exactly the token as `text/plain`, re-verified 2026-09-22). In the portal, choose `internetcomputer.org` as the challenge base; no gateway change is needed (blocker 1, resolved)
+- [ ] Only if the portal insists on the server host itself: have the gateway front forward `/.well-known/openai-apps-challenge` to the application and set the repository secret `OPENAI_APPS_CHALLENGE_TOKEN` (the app's route serves it verbatim as `text/plain`; it 404s until the variable is set). Not needed while the parent-origin token is accepted
+- [x] Privacy policy live at `https://internetcomputer.org/icp-mcp/privacy-policy/`, its one home (the old mcp.internetcomputer.org URL permanently redirects there)
 - [ ] Tools re-scanned in the portal after any server change; annotations verified in the scan
 - [ ] 5+ positive and 3+ negative test cases entered, verified on web and mobile
 - [ ] Starter prompts entered; country availability chosen
