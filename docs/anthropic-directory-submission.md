@@ -71,7 +71,7 @@ submission — and match a live scan of a deployed instance of that build
 | Support channel | ✅ <mcp@dfinity.org> (shown on every error screen) |
 | Security-vulnerability reporting mechanism (a Software Directory Terms obligation) | ✅ [`SECURITY.md`](../SECURITY.md) → Hackenproof bug bounty |
 | Public documentation by publish date | ✅ this repo's README + the landing page at <https://internetcomputer.org/icp-mcp/> (its one home, maintained in dfinity/internetcomputer-org; `https://mcp.internetcomputer.org` permanently redirects there from the release that ships #165) |
-| Status/health visibility | ⚠️ <https://mcp.internetcomputer.org/status/> is currently cut off: since the origin moved behind the gateway front it answers with a redirect to the landing page instead of the dashboard (observed 2026-09-01). Have the fronting layer forward `/status/` (and `/version`, which the dashboard and the health workflow read), or point the listing at a reachable status page, before submitting |
+| Status/health visibility | ✅ <https://status.internetcomputer.org/> — the **ICP MCP** component on the ICP Statuspage, driven by the deployment's status dashboard (`monitoring/mcp-status`) through its Statuspage pusher. This is the only public status surface: the dashboard itself is published on staging alone (`SERVE_STATUS`, see `deploy/native/README.md`), not on `mcp.internetcomputer.org` (whose origin answers `/status/` with a redirect at the gateway) nor under `internetcomputer.org/icp-mcp/` |
 
 Notes on auth mode: pure M2M `client_credentials` is unsupported by Claude
 (every connection needs a user in the loop) — IMCP2's user-consent flow via

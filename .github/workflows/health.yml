@@ -174,7 +174,7 @@ jobs:
               ":rotating_light: *ICP MCP production health check failed*\n"
               f"Failing: {os.environ.get('FAILED', 'unknown')}\n"
               f"<{sys.argv[1]}|Run log>  ·  "
-              "<https://mcp.internetcomputer.org/status/|Status page>"
+              "<https://status.internetcomputer.org/|Status page>"
           )
           json.dump({"text": text}, sys.stdout)
           PY
