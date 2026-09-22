@@ -101,8 +101,10 @@ fn serve_metrics() -> bool {
 /// This origin answers their old paths with permanent redirects instead of
 /// copies, so every published link keeps working — the directory listings'
 /// policy URLs, old bookmarks, search results — while the content exists
-/// exactly once. `/status/` is unaffected: the live dashboard is this
-/// deployment's own monitoring surface, published by the fronting proxy.
+/// exactly once. `/status/` is not among them and is not redirected here: the
+/// status dashboard is published by the fronting proxy on staging only (see
+/// `SERVE_STATUS` in deploy/native); production's origin does not publish it,
+/// and the public status surface is status.internetcomputer.org.
 const LANDING_SITE: &str = "https://internetcomputer.org/icp-mcp";
 
 /// The page paths this origin used to serve, each answered with a permanent
