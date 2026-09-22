@@ -269,7 +269,7 @@ fn current_age(headers: &HeaderMap, now: SystemTime) -> Duration {
         .map(|v| {
             v.to_str()
                 .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
+                .and_then(|v| delta_seconds(v.trim()))
                 .map_or(Duration::MAX, Duration::from_secs)
         })
         .max()
@@ -308,13 +308,22 @@ fn cache_max_age(cache_control: &str) -> Option<Duration> {
             .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case(wanted))
             .map(|(_, arg)| {
-                arg.as_deref()
-                    .and_then(|a| a.parse::<u64>().ok())
-                    .map_or(Duration::ZERO, Duration::from_secs)
+                arg.as_deref().and_then(delta_seconds).map_or(Duration::ZERO, Duration::from_secs)
             })
             .min()
     };
     lifetime("s-maxage").or_else(|| lifetime("max-age"))
+}
+
+/// A `delta-seconds` (RFC 9110 §10.2.2, RFC 9111 §1.2.2): one or more ASCII
+/// digits and nothing else. Rust's integer parser also takes a leading `+`, so
+/// `+1` is refused here before parsing, as is any other shape the grammar does
+/// not allow; a value too large for a `u64` is `None` as well, and the callers
+/// take that as the greatest age or no lifetime, whichever is the stale reading.
+fn delta_seconds(value: &str) -> Option<u64> {
+    (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| value.parse::<u64>().ok())
+        .flatten()
 }
 
 /// The directives of a `Cache-Control` value, each as (name, argument), split at
@@ -377,7 +386,10 @@ fn cache_directives(value: &str) -> Option<Vec<(String, Option<String>)>> {
 mod tests {
     use std::time::Duration;
 
-    use super::{accept, cache_max_age, current_age, fetch_public_document, freshness, FetchError};
+    use super::{
+        accept, cache_max_age, current_age, delta_seconds, fetch_public_document, freshness,
+        FetchError,
+    };
 
     /// A response as the origin might send it, for pinning the acceptance rules
     /// without a network: `status`, `headers` (repeatable), `body`.
@@ -528,6 +540,10 @@ mod tests {
         assert_eq!(freshness(&headers(&overflowing), now), Some(Duration::ZERO));
         let nonsense = [("cache-control", "max-age=86400"), ("age", "soon")];
         assert_eq!(freshness(&headers(&nonsense), now), Some(Duration::ZERO));
+        // So is one with a sign: delta-seconds is digits only, whatever the
+        // integer parser would accept.
+        let signed = [("cache-control", "max-age=86400"), ("age", "+1")];
+        assert_eq!(freshness(&headers(&signed), now), Some(Duration::ZERO));
         // Every Age line counts, the greatest winning; one that is not even ASCII
         // is the greatest age too.
         let two_lines = [("cache-control", "max-age=300"), ("age", "10"), ("age", "400")];
@@ -555,6 +571,7 @@ mod tests {
         let held_long = [("date", dated_100.as_str()), ("age", "50")];
         assert_eq!(current_age(&headers(&held_long), now), Duration::from_secs(100));
         assert_eq!(current_age(&headers(&[("age", "soon")]), now), Duration::MAX);
+        assert_eq!(current_age(&headers(&[("age", "+1")]), now), Duration::MAX);
         let mut odd_vary = headers(&[("cache-control", "max-age=86400")]);
         odd_vary.append(
             reqwest::header::VARY,
@@ -615,6 +632,21 @@ mod tests {
         assert_eq!(freshness(&headers(&ordinary), now), Some(Duration::from_secs(60)));
     }
 
+    /// `delta-seconds` is `1*DIGIT`: nothing the integer parser is lenient about
+    /// (a sign, surrounding space) and nothing beyond ASCII digits gets through.
+    #[test]
+    fn delta_seconds_is_ascii_digits_only() {
+        assert_eq!(delta_seconds("0"), Some(0));
+        assert_eq!(delta_seconds("86400"), Some(86400));
+        assert_eq!(delta_seconds("+1"), None);
+        assert_eq!(delta_seconds("-1"), None);
+        assert_eq!(delta_seconds(""), None);
+        assert_eq!(delta_seconds(" 1"), None);
+        assert_eq!(delta_seconds("1s"), None);
+        assert_eq!(delta_seconds("１"), None);
+        assert_eq!(delta_seconds("99999999999999999999"), None);
+    }
+
     #[test]
     fn cache_control_lifetime() {
         assert_eq!(cache_max_age("max-age=300"), Some(Duration::from_secs(300)));
@@ -631,6 +663,9 @@ mod tests {
         assert_eq!(cache_max_age("max-age"), Some(Duration::ZERO));
         assert_eq!(cache_max_age("max-age=300, max-age=soon"), Some(Duration::ZERO));
         assert_eq!(cache_max_age("s-maxage=soon, max-age=300"), Some(Duration::ZERO));
+        // A signed number is not a delta-seconds either, though `u64` would parse it.
+        assert_eq!(cache_max_age("max-age=+300"), Some(Duration::ZERO));
+        assert_eq!(cache_max_age("s-maxage=+60, max-age=300"), Some(Duration::ZERO));
         // A duplicated max-age is honoured at its most restrictive value, never
         // the one that happens to come first.
         assert_eq!(cache_max_age("max-age=300, max-age=0"), Some(Duration::ZERO));
