@@ -712,11 +712,15 @@ its AS issuer is `<PUBLIC_URL>/mcp` and everything OAuth lives under it:
   origin's remaining freshness — `max-age` less `Age` — honoured up to 24 h,
   10 min when it sends none, not at all on `no-store`), so a directory client
   connecting thousands of times mints no registrations. Concurrent requests for
-  one document share a single fetch, and at most eight fetches are in flight at
-  once per process (however many instances the binary mounts), two per host, so
-  one slow host cannot hold up the rest — and no more than sixty a minute per
-  process, thirty per vendor domain, so an origin that answers at once cannot be
-  made to answer without end. The fetch connects directly, never
+  one document share a single fetch, and at most sixteen fetches are in flight at
+  once per process (however many instances the binary mounts), four per host, so
+  one slow host cannot hold up the rest — and no more than 240 a minute per
+  process, 120 per vendor domain, so an origin that answers at once cannot be
+  made to answer without end. Half of each of those bounds is all that fetches
+  for documents this process has never validated may use; the other half is a
+  reserve for refreshing the documents it has, which only a vetted origin can put
+  in its cache — so a flood of made-up URLs on a vetted host is held to the first
+  half and cannot lock the vendors' real clients out. The fetch connects directly, never
   through a proxy from the environment, so the address pin always binds. Claude and ChatGPT both select CIMD over DCR when it is
   advertised — which it is only where `OAUTH_CIMD_ENABLED=1` is set (the deploy
   template takes it from the GitHub Environment's variable of that name, so a

@@ -815,28 +815,58 @@ const CIMD_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// instance — the bounds live in the process-wide [`CimdState`]. An excess
 /// request is refused (told to retry), never queued, so a flood of distinct
 /// `client_id` URLs at the unauthenticated endpoint holds at most this many
-/// outbound requests open. Concurrent requests for ONE document never compete for these:
-/// they wait for the single fetch in flight for it and read the cache after
-/// ([`AuthStore::client_metadata_for`]).
-const CIMD_MAX_INFLIGHT: usize = 8;
+/// outbound requests open. Concurrent requests for ONE document never compete
+/// for these: they wait for the single fetch in flight for it and read the cache
+/// after ([`AuthStore::client_metadata_for`]).
+///
+/// Every bound here — this, the per-host one, and the two rates — is split in
+/// two. A fetch for a document this process has NOT validated before (a URL
+/// never seen, or remembered only as invalid) may use at most HALF of it, the
+/// `_UNKNOWN` share; a fetch REFRESHING a document it has (a positive cache
+/// entry, fresh or stale — [`AuthStore::knows_client_metadata`]) may use all of
+/// it. Only a vetted origin can put a document in the positive cache, so the
+/// half above the unknown share is out of an unauthenticated caller's reach: a
+/// flood of made-up URLs on a vetted host is held to the unknown share and
+/// cannot starve the vendors' real documents, which, once fetched, refresh from
+/// the reserve for as long as the process runs. Without the split the bounds
+/// were themselves a denial-of-service lever: a caller keeping a vendor's share
+/// spent with made-up paths had every client of that vendor told to retry the
+/// moment its document expired. The unknown share is what bounds the outbound
+/// traffic such a flood can drive at a vendor (PR #143 §5); the whole is the
+/// most a vendor sees from this process, refreshes included. At 4 a second in
+/// all and 2 a second for one vendor — a made-up-URL flood driving at most half
+/// of each — the whole is nothing a vendor's edge would notice, while legitimate
+/// traffic is a handful of documents, each fetched once per lifetime (minutes to
+/// a day), for which both are headroom, not capacity.
+const CIMD_MAX_INFLIGHT: usize = 16;
+/// The share of [`CIMD_MAX_INFLIGHT`] for documents not validated before.
+const CIMD_MAX_INFLIGHT_UNKNOWN: usize = CIMD_MAX_INFLIGHT / 2;
 /// Fetches allowed in flight per `client_id` HOST, so one slow (or hostile) host
 /// serving many distinct URLs cannot occupy every permit above: it gets this
 /// many, and every other host keeps the rest.
-const CIMD_MAX_INFLIGHT_PER_HOST: usize = 2;
+const CIMD_MAX_INFLIGHT_PER_HOST: usize = 4;
+/// The share of [`CIMD_MAX_INFLIGHT_PER_HOST`] for documents not validated before.
+const CIMD_MAX_INFLIGHT_PER_HOST_UNKNOWN: usize = CIMD_MAX_INFLIGHT_PER_HOST / 2;
 /// Fetches allowed per minute, process-wide, however fast they complete. The
 /// in-flight bounds cap how many run at once, not how many run in a minute: an
 /// origin answering 404 at once gives its permit straight back, and distinct
 /// paths on a vetted host defeat the negative cache, so this is what bounds the
 /// outbound request rate an unauthenticated caller can drive at a vendor (the
 /// rate cap PR #143 §5 requires alongside the concurrency cap). A token bucket:
-/// this many tokens to start, and this many a minute of refill. Legitimate
-/// traffic is a handful of documents, each cached for minutes to a day.
-const CIMD_RATE_PER_MINUTE: u32 = 60;
+/// this many tokens to start, and this many a minute of refill.
+const CIMD_RATE_PER_MINUTE: u32 = 240;
+/// The share of [`CIMD_RATE_PER_MINUTE`] for documents not validated before: a
+/// second bucket of this capacity such a fetch must ALSO take from ([`Budget`]),
+/// so this is their sustained rate, and the rest of the whole is the refreshes'
+/// at all times.
+const CIMD_RATE_UNKNOWN_PER_MINUTE: u32 = CIMD_RATE_PER_MINUTE / 2;
 /// Fetches allowed per minute for one vetted domain — the allow-list entry the
 /// `client_id` host is on or under — so a flood at one vendor leaves the others
 /// their share. Keyed by the DOMAIN, a finite vetted set, not the host: a
 /// vendor's subdomains are not finite.
-const CIMD_RATE_PER_DOMAIN_PER_MINUTE: u32 = 30;
+const CIMD_RATE_PER_DOMAIN_PER_MINUTE: u32 = 120;
+/// The share of [`CIMD_RATE_PER_DOMAIN_PER_MINUTE`] for documents not validated before.
+const CIMD_RATE_PER_DOMAIN_UNKNOWN_PER_MINUTE: u32 = CIMD_RATE_PER_DOMAIN_PER_MINUTE / 2;
 /// Distinct `client_id` URLs cached. A handful of directory clients is the
 /// expected population; the bound is against abuse, not for capacity.
 const CIMD_CACHE_MAX: usize = 512;
@@ -1167,13 +1197,16 @@ struct CimdState {
     /// Bounds concurrent metadata-document fetches at [`CIMD_MAX_INFLIGHT`]: each
     /// is an outbound request an UNAUTHENTICATED `/oauth/authorize` can trigger.
     inflight: Semaphore,
+    /// Bounds those of them for documents not validated before at
+    /// [`CIMD_MAX_INFLIGHT_UNKNOWN`]; such a fetch holds a permit of each.
+    inflight_unknown: Semaphore,
     /// Single-flight: the fetch in flight for one `client_id`, whose outcome —
     /// document, invalid, or unavailable — every request that missed while it
     /// ran shares, instead of each fetching and each spending a permit. An entry
     /// lives only while a fetch is in flight ([`Flight`]).
     fetching: std::sync::Mutex<HashMap<String, Flight>>,
     /// Fetches in flight per `client_id` host ([`HostSlot`]).
-    hosts: std::sync::Mutex<HashMap<String, usize>>,
+    hosts: std::sync::Mutex<HashMap<String, HostLoad>>,
     /// Fetches per minute: the process's bucket, and one per vetted domain.
     rates: std::sync::Mutex<Rates>,
 }
@@ -1183,10 +1216,11 @@ impl CimdState {
         Self {
             cache: RwLock::default(),
             inflight: Semaphore::new(CIMD_MAX_INFLIGHT),
+            inflight_unknown: Semaphore::new(CIMD_MAX_INFLIGHT_UNKNOWN),
             fetching: std::sync::Mutex::default(),
             hosts: std::sync::Mutex::default(),
             rates: std::sync::Mutex::new(Rates {
-                all: TokenBucket::per_minute(CIMD_RATE_PER_MINUTE),
+                all: Budget::per_minute(CIMD_RATE_PER_MINUTE, CIMD_RATE_UNKNOWN_PER_MINUTE),
                 per_domain: HashMap::new(),
             }),
         }
@@ -1208,10 +1242,40 @@ impl CimdState {
     }
 }
 
-/// The fetch-rate buckets ([`CIMD_RATE_PER_MINUTE`], [`CIMD_RATE_PER_DOMAIN_PER_MINUTE`]).
+/// The fetch-rate budgets: the process's ([`CIMD_RATE_PER_MINUTE`]) and one per
+/// vetted domain ([`CIMD_RATE_PER_DOMAIN_PER_MINUTE`]).
 struct Rates {
+    all: Budget,
+    per_domain: HashMap<&'static str, Budget>,
+}
+
+/// A rate bound and the share of it for documents not validated before, as two
+/// buckets: a fetch for such a document takes a token from BOTH, a refresh of a
+/// known one from the whole only. So the unknown share is the former's sustained
+/// rate, the whole is everyone's, and the difference is the refreshes' whatever
+/// the unknown traffic does.
+struct Budget {
     all: TokenBucket,
-    per_domain: HashMap<&'static str, TokenBucket>,
+    unknown: TokenBucket,
+}
+
+impl Budget {
+    fn per_minute(all: u32, unknown: u32) -> Self {
+        Self { all: TokenBucket::per_minute(all), unknown: TokenBucket::per_minute(unknown) }
+    }
+
+    /// Whether a fetch — of a `known` document, or not — has its token(s) to take.
+    fn has_tokens(&mut self, known: bool) -> bool {
+        self.all.has_token() && (known || self.unknown.has_token())
+    }
+
+    /// Take the token(s) [`Self::has_tokens`] just said were there.
+    fn take(&mut self, known: bool) {
+        self.all.take();
+        if !known {
+            self.unknown.take();
+        }
+    }
 }
 
 /// A token bucket: `capacity` tokens to start, refilled continuously at
@@ -1246,23 +1310,38 @@ impl TokenBucket {
     }
 }
 
+/// One host's fetches in flight: all of them, and those for documents not
+/// validated before, which are held to [`CIMD_MAX_INFLIGHT_PER_HOST_UNKNOWN`] of
+/// the host's [`CIMD_MAX_INFLIGHT_PER_HOST`].
+#[derive(Clone, Copy, Default)]
+struct HostLoad {
+    all: usize,
+    unknown: usize,
+}
+
 /// Fetches in flight per `client_id` host, held as a guard so a slot is given
 /// back however the fetch ends ([`CIMD_MAX_INFLIGHT_PER_HOST`]).
 struct HostSlot {
     state: Arc<CimdState>,
     host: String,
+    known: bool,
 }
 
 impl HostSlot {
-    /// Take a slot for `host`, or `None` when it already holds the maximum.
-    fn take(state: &Arc<CimdState>, host: &str) -> Option<Self> {
+    /// Take a slot for `host` — for the refresh of a `known` document, or for one
+    /// not validated before — or `None` when the host already holds the maximum
+    /// for that standing.
+    fn take(state: &Arc<CimdState>, host: &str, known: bool) -> Option<Self> {
         let mut map = state.hosts.lock().expect("cimd host slots");
-        let held = map.get(host).copied().unwrap_or(0);
-        if held >= CIMD_MAX_INFLIGHT_PER_HOST {
+        let held = map.get(host).copied().unwrap_or_default();
+        if held.all >= CIMD_MAX_INFLIGHT_PER_HOST
+            || (!known && held.unknown >= CIMD_MAX_INFLIGHT_PER_HOST_UNKNOWN)
+        {
             return None;
         }
-        map.insert(host.to_owned(), held + 1);
-        Some(Self { state: Arc::clone(state), host: host.to_owned() })
+        let load = HostLoad { all: held.all + 1, unknown: held.unknown + usize::from(!known) };
+        map.insert(host.to_owned(), load);
+        Some(Self { state: Arc::clone(state), host: host.to_owned(), known })
     }
 }
 
@@ -1270,7 +1349,10 @@ impl Drop for HostSlot {
     fn drop(&mut self) {
         let mut map = self.state.hosts.lock().expect("cimd host slots");
         match map.get_mut(&self.host) {
-            Some(held) if *held > 1 => *held -= 1,
+            Some(held) if held.all > 1 => {
+                held.all -= 1;
+                held.unknown -= usize::from(!self.known);
+            }
             _ => {
                 map.remove(&self.host);
             }
@@ -1816,10 +1898,22 @@ impl AuthStore {
         Some(hit.outcome.clone().map_err(CimdError::Invalid))
     }
 
+    /// Whether this process has validated `key`'s document and still holds it,
+    /// fresh or stale: the standing that lets its refresh use the whole of each
+    /// fetch bound rather than the unknown share ([`CIMD_MAX_INFLIGHT`]). A
+    /// negative entry is no standing — anyone can make one, with a 404 on a
+    /// vetted host — and neither is a document evicted since, which is fetched as
+    /// unknown once more.
+    async fn knows_client_metadata(&self, key: &str) -> bool {
+        self.cimd.cache.read().await.get(key).is_some_and(|hit| hit.outcome.is_ok())
+    }
+
     /// Fetch, validate and cache the document at `client_id`. Bounded before any
     /// request goes out: in rate, per vendor and overall, and in flight, per host
-    /// (so one slow host cannot take every permit) and overall. None of these
-    /// queues — an excess request is told to retry.
+    /// (so one slow host cannot take every permit) and overall — each bound in
+    /// full for the refresh of a document this process knows, and at its unknown
+    /// share for one it does not ([`CIMD_MAX_INFLIGHT`]). None of these queues —
+    /// an excess request is told to retry.
     /// A document is cached for as long as [`cimd_ttl`] says, which is not at all
     /// when its origin forbids reuse; a failure about the URL itself is cached
     /// negatively for [`CIMD_NEGATIVE_TTL`]; a transient failure is not cached.
@@ -1828,8 +1922,9 @@ impl AuthStore {
         key: &str,
         client_id: &url::Url,
     ) -> Result<Arc<ClientMetadata>, CimdError> {
+        let known = self.knows_client_metadata(key).await;
         let host = host_key(client_id.host_str().unwrap_or_default());
-        let Some(_slot) = HostSlot::take(&self.cimd, &host) else {
+        let Some(_slot) = HostSlot::take(&self.cimd, &host, known) else {
             return Err(CimdError::Unavailable(format!(
                 "too many client metadata fetches in flight for {host}; retry shortly"
             )));
@@ -1838,6 +1933,16 @@ impl AuthStore {
             return Err(CimdError::Unavailable(
                 "too many client metadata fetches in flight; retry shortly".into(),
             ));
+        };
+        let _unknown_permit = if known {
+            None
+        } else {
+            let Ok(permit) = self.cimd.inflight_unknown.try_acquire() else {
+                return Err(CimdError::Unavailable(
+                    "too many client metadata fetches in flight; retry shortly".into(),
+                ));
+            };
+            Some(permit)
         };
         // The RATE last, once a slot and a permit are held, so a token is spent
         // only on a fetch that goes out: a request refused for congestion drains
@@ -1850,22 +1955,24 @@ impl AuthStore {
             let mut rates = self.cimd.rates.lock().expect("cimd rates");
             let rates = &mut *rates;
             let domain = vetted_domain(&host).unwrap_or_default();
-            let vendor = rates
-                .per_domain
-                .entry(domain)
-                .or_insert_with(|| TokenBucket::per_minute(CIMD_RATE_PER_DOMAIN_PER_MINUTE));
-            if !vendor.has_token() {
+            let vendor = rates.per_domain.entry(domain).or_insert_with(|| {
+                Budget::per_minute(
+                    CIMD_RATE_PER_DOMAIN_PER_MINUTE,
+                    CIMD_RATE_PER_DOMAIN_UNKNOWN_PER_MINUTE,
+                )
+            });
+            if !vendor.has_tokens(known) {
                 return Err(CimdError::Unavailable(format!(
                     "client metadata fetch rate for {domain} exceeded; retry shortly"
                 )));
             }
-            if !rates.all.has_token() {
+            if !rates.all.has_tokens(known) {
                 return Err(CimdError::Unavailable(
                     "client metadata fetch rate exceeded; retry shortly".into(),
                 ));
             }
-            vendor.take();
-            rates.all.take();
+            vendor.take(known);
+            rates.all.take(known);
         }
         let fetched = Instant::now();
         // The one place these are logged at warn: a fetch happened, and fetches
@@ -1901,9 +2008,19 @@ impl AuthStore {
         let now = Instant::now();
         let mut cache = self.cimd.cache.write().await;
         if cache.len() >= CIMD_CACHE_MAX && !cache.contains_key(key) {
-            // Make room: drop what has expired; if that frees nothing, the entry
-            // closest to expiry (an LRU stand-in that needs no write per hit).
-            cache.retain(|_, c| c.expires > now);
+            // Make room: first the expired NEGATIVE entries — a stale positive entry
+            // is what marks a document as known ([`Self::knows_client_metadata`]),
+            // and a flood of made-up URLs, which leaves only negative entries, must
+            // not strip the real documents of that standing; then, if still full,
+            // whatever has expired; then the entry closest to expiry (an LRU
+            // stand-in that needs no write per hit). Under the fetch rate the
+            // negatives alone never fill the cache ([`CIMD_RATE_UNKNOWN_PER_MINUTE`]
+            // a minute, each kept [`CIMD_NEGATIVE_TTL`]), so a flood does not reach
+            // the second step.
+            cache.retain(|_, c| c.expires > now || c.outcome.is_ok());
+            if cache.len() >= CIMD_CACHE_MAX {
+                cache.retain(|_, c| c.expires > now);
+            }
             if cache.len() >= CIMD_CACHE_MAX {
                 let victim = cache.iter().min_by_key(|(_, c)| c.expires).map(|(k, _)| k.clone());
                 if let Some(victim) = victim {
@@ -3833,8 +3950,9 @@ mod tests {
         }
         assert_eq!(cimd_fixture::hits(DOWN), 1, "concurrent misses must share one failure");
 
-        // Three distinct documents on ONE host at once: two fetch, the third is
-        // told to retry rather than taking a third permit for that host.
+        // Three distinct never-seen documents on ONE host at once: two fetch (the
+        // host's unknown share), the third is told to retry rather than taking a
+        // third slot for that host.
         const ONE: &str = "https://cimd-busy.claude.ai/one.json";
         const TWO: &str = "https://cimd-busy.claude.ai/two.json";
         const THREE: &str = "https://cimd-busy.claude.ai/three.json";
@@ -3852,7 +3970,7 @@ mod tests {
         }
         // The refusal spent no rate budget: a token goes only with a fetch that
         // goes out — herd, herd-down, one and two so far, four in all.
-        let tokens_left = store.cimd.rates.lock().unwrap().all.tokens.floor() as u32;
+        let tokens_left = store.cimd.rates.lock().unwrap().all.all.tokens.floor() as u32;
         assert_eq!(tokens_left, super::CIMD_RATE_PER_MINUTE - 4, "a refused slot drains no budget");
         // Slots and single-flight entries are released, not leaked.
         assert!(store.cimd.hosts.lock().unwrap().is_empty());
@@ -3877,22 +3995,35 @@ mod tests {
     /// The fetch RATE is bounded, not only how many are in flight: an origin that
     /// answers at once gives its permit straight back, so without this a caller
     /// could drive one request after another at a vendor with distinct paths.
-    /// A vendor's share runs out first, leaving the others theirs; then the
-    /// process's budget does, for everyone.
+    /// A vendor's share for never-seen documents runs out first, leaving the
+    /// others theirs; then the process's does, for every never-seen document —
+    /// while a document this process has validated before still refreshes, from
+    /// the half of each budget such a flood cannot reach.
     #[tokio::test]
     async fn cimd_fetch_rate_is_bounded() {
         use super::{
-            cimd_fixture, ClientCheck, CIMD_RATE_PER_DOMAIN_PER_MINUTE, CIMD_RATE_PER_MINUTE,
+            cimd_fixture, ClientCheck, CIMD_RATE_PER_DOMAIN_UNKNOWN_PER_MINUTE,
+            CIMD_RATE_UNKNOWN_PER_MINUTE,
         };
+        use serde_json::json;
         let store = test_store();
         const REDIRECT: &str = "http://127.0.0.1:1/cb";
         fn rate_limited(verdict: &ClientCheck) -> bool {
             matches!(verdict, ClientCheck::MetadataUnavailable(why) if why.contains("rate"))
         }
+        // A document seen before the flood — fetched (one token of its vendor's
+        // unknown share, its first sight), cached, and made stale, so its next
+        // request is a REFRESH.
+        const KNOWN: &str = "https://cimd-rate-known.claude.ai/client.json";
+        let doc = json!({ "client_id": KNOWN, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve(KNOWN, &doc.to_string());
+        assert_eq!(store.validate_client(KNOWN, REDIRECT).await, ClientCheck::Allowed);
+        store.cimd.cache.write().await.get_mut(KNOWN).unwrap().expires =
+            std::time::Instant::now() - std::time::Duration::from_secs(1);
         // Distinct, never-seen paths on one vendor, each answered 404 at once (so
         // nothing legitimate is cached): each is a fetch, until that vendor's
-        // share for the minute is spent.
-        for i in 0..CIMD_RATE_PER_DOMAIN_PER_MINUTE {
+        // share for never-seen documents is spent for the minute.
+        for i in 1..CIMD_RATE_PER_DOMAIN_UNKNOWN_PER_MINUTE {
             let id = format!("https://cimd-rate.claude.ai/{i}.json");
             cimd_fixture::not_found(&id);
             assert_eq!(store.validate_client(&id, REDIRECT).await, ClientCheck::Refused, "{id}");
@@ -3904,16 +4035,16 @@ mod tests {
         assert_eq!(cimd_fixture::hits(OVER), 0, "refused before any fetch");
         // Another vendor still has its share…
         assert_eq!(
-            CIMD_RATE_PER_MINUTE,
-            2 * CIMD_RATE_PER_DOMAIN_PER_MINUTE,
-            "this test spends exactly the process's budget over two vendors"
+            CIMD_RATE_UNKNOWN_PER_MINUTE,
+            2 * CIMD_RATE_PER_DOMAIN_UNKNOWN_PER_MINUTE,
+            "this test spends exactly the process's unknown share over two vendors"
         );
-        for i in 0..CIMD_RATE_PER_DOMAIN_PER_MINUTE {
+        for i in 0..CIMD_RATE_PER_DOMAIN_UNKNOWN_PER_MINUTE {
             let id = format!("https://cimd-rate.chatgpt.com/{i}.json");
             cimd_fixture::not_found(&id);
             assert_eq!(store.validate_client(&id, REDIRECT).await, ClientCheck::Refused, "{id}");
         }
-        // …until the process's budget is spent, which refuses a third vendor too.
+        // …until the process's share is spent, which refuses a third vendor too.
         const THIRD: &str = "https://cimd-rate.cursor.com/one.json";
         cimd_fixture::not_found(THIRD);
         let verdict = store.validate_client(THIRD, REDIRECT).await;
@@ -3922,6 +4053,141 @@ mod tests {
         // A refusal holds nothing: no slot, no permit, no flight.
         assert!(store.cimd.hosts.lock().unwrap().is_empty());
         assert!(store.cimd.fetching.lock().unwrap().is_empty());
+        // The reserve: with the vendor's and the process's unknown shares spent,
+        // the known document's refresh still fetches — charged to the whole only,
+        // so the unknown buckets stay empty and the flood stays refused.
+        assert_eq!(store.validate_client(KNOWN, REDIRECT).await, ClientCheck::Allowed);
+        assert_eq!(cimd_fixture::hits(KNOWN), 2, "the refresh went out");
+        {
+            let mut rates = store.cimd.rates.lock().unwrap();
+            assert!(!rates.all.unknown.has_token() && rates.all.all.has_token());
+            let vendor = rates.per_domain.get_mut("claude.ai").unwrap();
+            assert!(!vendor.unknown.has_token() && vendor.all.has_token());
+        }
+        let verdict = store.validate_client(OVER, REDIRECT).await;
+        assert!(rate_limited(&verdict), "{verdict:?}");
+    }
+
+    /// The in-flight bounds keep the same reserve: with a host's unknown share
+    /// of slots — or the process's unknown share of permits — held by fetches for
+    /// never-seen documents, a further such fetch is refused while a document this
+    /// process knows still refreshes; and the whole is still the whole, so the
+    /// refreshes are bounded too. Every slot and permit comes back afterwards.
+    #[tokio::test]
+    async fn cimd_known_documents_keep_a_reserve_in_flight() {
+        use super::{
+            cimd_fixture, ClientCheck, CIMD_MAX_INFLIGHT, CIMD_MAX_INFLIGHT_PER_HOST,
+            CIMD_MAX_INFLIGHT_PER_HOST_UNKNOWN, CIMD_MAX_INFLIGHT_UNKNOWN,
+        };
+        use serde_json::json;
+        let store = test_store();
+        const REDIRECT: &str = "http://127.0.0.1:1/cb";
+        let native = |id: &str| {
+            json!({ "client_id": id, "redirect_uris": ["http://127.0.0.1/cb"] }).to_string()
+        };
+        // A document this process knows: fetched once, then made stale.
+        async fn known(store: &super::AuthStore, id: &str, body: &str) {
+            cimd_fixture::serve(id, body);
+            assert_eq!(store.validate_client(id, REDIRECT).await, ClientCheck::Allowed, "{id}");
+            store.cimd.cache.write().await.get_mut(id).unwrap().expires =
+                std::time::Instant::now() - std::time::Duration::from_secs(1);
+        }
+        // A fetch that never returns, started and left in flight.
+        let hang = |id: &'static str| {
+            cimd_fixture::hang(id);
+            let store = store.clone();
+            tokio::spawn(async move { store.validate_client(id, REDIRECT).await })
+        };
+        // Let every spawned fetch reach its (hanging) request.
+        async fn settle() {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let load = |host: &str| {
+            store.cimd.hosts.lock().unwrap().get(host).map(|l| (l.all, l.unknown)).unwrap_or((0, 0))
+        };
+
+        // One host, its unknown share of slots held by never-seen documents.
+        const HOST: &str = "cimd-reserve.claude.ai";
+        const KNOWN_A: &str = "https://cimd-reserve.claude.ai/known-a.json";
+        const KNOWN_C: &str = "https://cimd-reserve.claude.ai/known-c.json";
+        const KNOWN_D: &str = "https://cimd-reserve.claude.ai/known-d.json";
+        const KNOWN_E: &str = "https://cimd-reserve.claude.ai/known-e.json";
+        // Known before the flood: a document's first sight is itself an unknown
+        // fetch, which the host's share below would refuse.
+        for id in [KNOWN_A, KNOWN_C, KNOWN_D, KNOWN_E] {
+            known(&store, id, &native(id)).await;
+        }
+        let mut hanging = vec![
+            hang("https://cimd-reserve.claude.ai/never-1.json"),
+            hang("https://cimd-reserve.claude.ai/never-2.json"),
+        ];
+        settle().await;
+        assert_eq!(load(HOST), (2, 2));
+        assert_eq!(CIMD_MAX_INFLIGHT_PER_HOST_UNKNOWN, 2, "the two above are the host's share");
+        // A third never-seen document on it is refused…
+        const NEVER_3: &str = "https://cimd-reserve.claude.ai/never-3.json";
+        cimd_fixture::serve(NEVER_3, &native(NEVER_3));
+        match store.validate_client(NEVER_3, REDIRECT).await {
+            ClientCheck::MetadataUnavailable(why) => assert!(why.contains(HOST), "{why}"),
+            other => panic!("the host's unknown share is spent, got {other:?}"),
+        }
+        assert_eq!(cimd_fixture::hits(NEVER_3), 0);
+        // …while the known one refreshes from the host's reserve.
+        assert_eq!(store.validate_client(KNOWN_A, REDIRECT).await, ClientCheck::Allowed);
+        assert_eq!(cimd_fixture::hits(KNOWN_A), 2, "the refresh went out");
+        assert_eq!(load(HOST), (2, 2), "and gave its slot back");
+
+        // The process's unknown share of permits, held across hosts.
+        const KNOWN_B: &str = "https://cimd-reserve-b.claude.ai/known-b.json";
+        known(&store, KNOWN_B, &native(KNOWN_B)).await;
+        hanging.extend([
+            hang("https://cimd-reserve-2.claude.ai/never-1.json"),
+            hang("https://cimd-reserve-2.claude.ai/never-2.json"),
+            hang("https://cimd-reserve-3.claude.ai/never-1.json"),
+            hang("https://cimd-reserve-3.claude.ai/never-2.json"),
+            hang("https://cimd-reserve-4.claude.ai/never-1.json"),
+            hang("https://cimd-reserve-4.claude.ai/never-2.json"),
+        ]);
+        settle().await;
+        assert_eq!(hanging.len(), CIMD_MAX_INFLIGHT_UNKNOWN, "the process's unknown share");
+        assert_eq!(store.cimd.inflight_unknown.available_permits(), 0);
+        assert_eq!(store.cimd.inflight.available_permits(), CIMD_MAX_INFLIGHT - hanging.len());
+        // A never-seen document on a FRESH host is refused by the process's share…
+        const NEVER_ELSEWHERE: &str = "https://cimd-reserve-5.claude.ai/never.json";
+        cimd_fixture::serve(NEVER_ELSEWHERE, &native(NEVER_ELSEWHERE));
+        match store.validate_client(NEVER_ELSEWHERE, REDIRECT).await {
+            ClientCheck::MetadataUnavailable(why) => {
+                assert!(why.contains("in flight") && !why.contains("for "), "{why}")
+            }
+            other => panic!("the process's unknown share is spent, got {other:?}"),
+        }
+        assert_eq!(cimd_fixture::hits(NEVER_ELSEWHERE), 0);
+        // …while the known one refreshes from the process's reserve.
+        assert_eq!(store.validate_client(KNOWN_B, REDIRECT).await, ClientCheck::Allowed);
+        assert_eq!(cimd_fixture::hits(KNOWN_B), 2);
+
+        // The whole is still the whole: known documents' refreshes fill HOST's
+        // remaining slots, and one more refresh there is refused like any other.
+        hanging.extend([hang(KNOWN_C), hang(KNOWN_D)]);
+        settle().await;
+        assert_eq!(load(HOST), (CIMD_MAX_INFLIGHT_PER_HOST, CIMD_MAX_INFLIGHT_PER_HOST_UNKNOWN));
+        match store.validate_client(KNOWN_E, REDIRECT).await {
+            ClientCheck::MetadataUnavailable(why) => assert!(why.contains(HOST), "{why}"),
+            other => panic!("the host's whole is spent, got {other:?}"),
+        }
+        assert_eq!(cimd_fixture::hits(KNOWN_E), 1, "no refresh went out");
+
+        // Everything held comes back.
+        for task in hanging {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        assert!(store.cimd.hosts.lock().unwrap().is_empty());
+        assert!(store.cimd.fetching.lock().unwrap().is_empty());
+        assert_eq!(store.cimd.inflight.available_permits(), CIMD_MAX_INFLIGHT);
+        assert_eq!(store.cimd.inflight_unknown.available_permits(), CIMD_MAX_INFLIGHT_UNKNOWN);
     }
 
     /// A fetcher dropped mid-fetch while a waiter is in the flight hands over:
@@ -4069,6 +4335,11 @@ mod tests {
         );
         assert!(store.cimd.hosts.lock().unwrap().is_empty(), "…and gives its host slot back");
         assert_eq!(store.cimd.inflight.available_permits(), CIMD_MAX_INFLIGHT, "…and its permit");
+        assert_eq!(
+            store.cimd.inflight_unknown.available_permits(),
+            super::CIMD_MAX_INFLIGHT_UNKNOWN,
+            "…both of them"
+        );
         // Nothing was cached (the fetch never completed), so the next request
         // fetches afresh — and succeeds.
         assert_eq!(
