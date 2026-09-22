@@ -3544,8 +3544,11 @@ mod tests {
         });
         let kept = parse_client_metadata(OTHER, &mixed.to_string()).expect("own + loopback kept");
         assert_eq!(kept.redirect_uris, [OWN, "http://127.0.0.1/cb"]);
-        // Same host, different port or scheme, is a different origin.
-        let off_origin = json!({ "client_id": OTHER, "redirect_uris": [format!("{OWN}:8443")] });
+        // Same host on another port is another origin.
+        let off_origin = json!({
+            "client_id": OTHER,
+            "redirect_uris": ["https://cimd-other.claude.ai:8443/api/mcp/auth_callback"],
+        });
         assert!(parse_client_metadata(OTHER, &off_origin.to_string()).is_err());
         // Only what a DCR registration could have registered is kept: a loopback
         // redirect with a fragment (which the port-agnostic match would ignore,
