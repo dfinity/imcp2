@@ -50,7 +50,15 @@ ARG GIT_SHA=unknown
 ARG BUILD_TIME
 ENV GIT_SHA=${GIT_SHA}
 ENV BUILD_TIME=${BUILD_TIME}
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# bullseye left LTS on 2026-08-31 and its -security pool has since been pruned:
+# the suite's index still lists package versions whose .deb files answer 404, so
+# any apt-get that consults bullseye-security fails. The main suite is intact
+# and carries everything this stage needs, so resolve from it alone. (When
+# deb.debian.org drops bullseye entirely, point this at archive.debian.org,
+# which already mirrors the main suite.)
+RUN printf 'deb http://deb.debian.org/debian bullseye main\n' > /etc/apt/sources.list \
+    && rm -rf /etc/apt/sources.list.d/* \
+    && apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake clang libclang-dev perl pkg-config ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
