@@ -1003,19 +1003,36 @@ fn host_key(host: &str) -> String {
 }
 
 /// The RFC 7591 client metadata this server reads from a Client ID Metadata
-/// Document; any other member is ignored. A member of the wrong type fails to
-/// deserialise, which makes the document invalid.
+/// Document; any other member is ignored. A member of the wrong type — an
+/// explicit `null` included ([`present`]) — fails to deserialise, which makes
+/// the document invalid; only an absent member is an omission.
 #[derive(Deserialize)]
 struct ClientMetadataDocument {
     client_id: String,
+    #[serde(default, deserialize_with = "present")]
     client_name: Option<String>,
     redirect_uris: Vec<String>,
+    #[serde(default, deserialize_with = "present")]
     client_secret: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
     client_secret_expires_at: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
     token_endpoint_auth_method: Option<String>,
+    #[serde(default, deserialize_with = "present")]
     token_endpoint_auth_methods_supported: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
     grant_types: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
     response_types: Option<Vec<String>>,
+}
+
+/// Deserialise a member that is present as `T` itself, so `null` is the type
+/// error it is rather than `None`; `#[serde(default)]` supplies the `None` for
+/// an absent member.
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
 }
 
 /// Parse and validate the document fetched from `client_id` (RFC 7591 client
@@ -3503,6 +3520,16 @@ mod tests {
         assert!(refused_for(with("grant_types", json!([]))).contains("authorization_code"));
         refused_for(with("grant_types", json!("authorization_code")));
         refused_for(with("response_types", json!([1])));
+        // An explicit null is not an omission: it is a member of the wrong type.
+        for field in [
+            "token_endpoint_auth_method",
+            "token_endpoint_auth_methods_supported",
+            "grant_types",
+            "response_types",
+            "client_secret",
+        ] {
+            refused_for(with(field, json!(null)));
+        }
         // Hosted redirects must be same-origin with the document; loopback is exempt.
         const OTHER: &str = "https://cimd-other.claude.ai/client.json";
         const OWN: &str = "https://cimd-other.claude.ai/api/mcp/auth_callback";
