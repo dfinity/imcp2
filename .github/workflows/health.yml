@@ -54,6 +54,14 @@ jobs:
       # dashboard. Without this the run fails with a usage error rather than a
       # health verdict, which is a confusing way to learn the service is fine.
       MCP_STATUS_ALLOWED_HOSTS: mcp.internetcomputer.org
+      # Which Internet Identity to probe. Left unpinned, the CLI reads the II
+      # list the server advertises at /version — but production's fronting edge
+      # forwards only the MCP and OAuth paths and answers /version with a
+      # redirect to the landing site, so the probe sees no II at all and the
+      # "Linked Internet Identity instance" and "Internet Identity health"
+      # checks fail on every tick while the service itself is healthy. Pin it,
+      # exactly as deploy.sh pins the hosted production dashboard.
+      II_ORIGIN: https://id.ai
       # A boolean, not the secret. The webhook itself is scoped to the one step
       # that posts it (below); putting it in the job environment would hand it to
       # every step and to the checked-out probe code, none of which needs it, and
@@ -85,7 +93,7 @@ jobs:
         id: probe
         run: |
           set +e
-          node monitoring/mcp-status/cli.js --mcp "$MCP_ORIGIN" --json > report.json 2> probe.err
+          node monitoring/mcp-status/cli.js --mcp "$MCP_ORIGIN" --ii "$II_ORIGIN" --json > report.json 2> probe.err
           code=$?
           set -e
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
