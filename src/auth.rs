@@ -1136,6 +1136,8 @@ struct CimdState {
     fetching: std::sync::Mutex<HashMap<String, Flight>>,
     /// Fetches in flight per `client_id` host ([`HostSlot`]).
     hosts: std::sync::Mutex<HashMap<String, usize>>,
+    /// When each vetted domain was last warned about ([`Self::warn_permitted`]).
+    warned: std::sync::Mutex<HashMap<&'static str, Instant>>,
 }
 
 impl CimdState {
@@ -1145,6 +1147,26 @@ impl CimdState {
             inflight: Semaphore::new(CIMD_MAX_INFLIGHT),
             fetching: std::sync::Mutex::default(),
             hosts: std::sync::Mutex::default(),
+            warned: std::sync::Mutex::default(),
+        }
+    }
+
+    /// Whether a fetch failure at `domain` is logged at warn: once a minute per
+    /// vetted domain, the rest at debug, so a caller rotating made-up paths on a
+    /// vetted host cannot flood the log. The domain set is finite.
+    fn warn_permitted(&self, domain: &'static str) -> bool {
+        let mut warned = self.warned.lock().expect("cimd warn sampling");
+        let now = Instant::now();
+        match warned.get_mut(domain) {
+            Some(last) if now.duration_since(*last) < Duration::from_secs(60) => false,
+            Some(last) => {
+                *last = now;
+                true
+            }
+            None => {
+                warned.insert(domain, now);
+                true
+            }
         }
     }
 
@@ -1656,9 +1678,9 @@ impl AuthStore {
                     ClientCheck::Refused
                 }
             }
-            // Both are logged at warn where the fetch happens (bounded by the
-            // in-flight limits); here, per request, only at debug, or a flood of
-            // requests for one bad URL would be a flood of log lines.
+            // Both are logged where the fetch happens (at warn once a minute per
+            // vendor); here, per request, only at debug, or a flood of requests
+            // for one bad URL would be a flood of log lines.
             Err(CimdError::Invalid(why)) => {
                 tracing::debug!(client_id, %why, "client metadata document is invalid");
                 ClientCheck::Refused
@@ -1754,19 +1776,28 @@ impl AuthStore {
             ));
         };
         let fetched = Instant::now();
-        // The one place these are logged at warn: a fetch happened, and fetches
-        // are bounded, so the log is too.
+        // The one place these are logged at warn — once a minute per vendor, at
+        // debug otherwise: with no rate cap, only sampling bounds the log.
+        let domain = vetted_domain(&host).unwrap_or_default();
         let (outcome, ttl) = match fetch_and_validate_client_metadata(key).await {
             Ok((meta, ttl)) => (Ok(meta), ttl),
             Err(CimdError::Invalid(why)) => {
-                tracing::warn!(
-                    client_id = key, %why,
-                    "client metadata document is invalid; refusing its client for a minute"
-                );
+                const MSG: &str =
+                    "client metadata document is invalid; refusing its client for a minute";
+                if self.cimd.warn_permitted(domain) {
+                    tracing::warn!(client_id = key, %why, "{MSG}");
+                } else {
+                    tracing::debug!(client_id = key, %why, "{MSG}");
+                }
                 (Err(why), CIMD_NEGATIVE_TTL)
             }
             Err(CimdError::Unavailable(why)) => {
-                tracing::warn!(client_id = key, %why, "client metadata document unavailable");
+                const MSG: &str = "client metadata document unavailable";
+                if self.cimd.warn_permitted(domain) {
+                    tracing::warn!(client_id = key, %why, "{MSG}");
+                } else {
+                    tracing::debug!(client_id = key, %why, "{MSG}");
+                }
                 return Err(CimdError::Unavailable(why));
             }
         };
@@ -4365,6 +4396,20 @@ mod tests {
             "/mcp".into(),
             require_resource,
         )
+    }
+
+    /// A vendor's fetch failures are warned about at most once a minute — a caller
+    /// rotating paths on a vetted host cannot flood the log — and each vendor
+    /// has its own minute.
+    #[test]
+    fn cimd_warnings_are_sampled_per_vendor() {
+        let state = super::CimdState::new();
+        assert!(state.warn_permitted("claude.ai"));
+        assert!(!state.warn_permitted("claude.ai"));
+        assert!(state.warn_permitted("chatgpt.com"));
+        *state.warned.lock().unwrap().get_mut("claude.ai").unwrap() -=
+            std::time::Duration::from_secs(61);
+        assert!(state.warn_permitted("claude.ai"));
     }
 
     /// Every store in the process shares one CIMD state: the bundled binary
