@@ -1002,99 +1002,80 @@ fn host_key(host: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// The RFC 7591 client metadata this server reads from a Client ID Metadata
+/// Document; any other member is ignored. A member of the wrong type fails to
+/// deserialise, which makes the document invalid.
+#[derive(Deserialize)]
+struct ClientMetadataDocument {
+    client_id: String,
+    client_name: Option<String>,
+    redirect_uris: Vec<String>,
+    client_secret: Option<Value>,
+    client_secret_expires_at: Option<Value>,
+    token_endpoint_auth_method: Option<String>,
+    token_endpoint_auth_methods_supported: Option<Vec<String>>,
+    grant_types: Option<Vec<String>>,
+    response_types: Option<Vec<String>>,
+}
+
 /// Parse and validate the document fetched from `client_id` (RFC 7591 client
-/// metadata, per the CIMD draft). Accepted only if it is a JSON object whose
-/// `client_id` equals the URL exactly; whose `redirect_uris` is a non-empty
-/// array of strings within what a DCR registration may send ([`MAX_REDIRECT_URIS`]
-/// of at most [`MAX_REDIRECT_URI_LEN`] bytes each); that carries no client secret;
-/// and that can authenticate
-/// as a PUBLIC client — its `token_endpoint_auth_method` is `none` (or absent:
-/// a document may not use a secret-based method, so absence cannot mean
-/// RFC 7591's `client_secret_basic` default) OR its
-/// `token_endpoint_auth_methods_supported` lists `none`. ChatGPT's document is
-/// the case for the latter: it prefers `private_key_jwt` but lists `none`, which
-/// is what it uses against an AS that, like this one, offers only `none`. And it
-/// must be able to run the ONE flow this server offers: `grant_types`, if given,
-/// must list `authorization_code` and `response_types`, if given, `code` (RFC
-/// 7591's defaults when absent) — as DCR refuses a registration whose grant
-/// types lose `authorization_code` ([`granted_grant_types`]).
-///
-/// Of the `redirect_uris`, only those this server could ever honour are kept:
-/// each must be one a DCR registration could have registered
-/// ([`redirect_uri_permitted`]: loopback, or https on an allow-listed host and
-/// pinned path, and in either case without query or fragment — a fragment would
-/// otherwise be ignored by the loopback match and admit a redirect DCR refuses),
-/// and a hosted one must be on the SAME ORIGIN as the document URL — a
-/// self-asserted document may not point the code at another party. A document
-/// left with none is refused.
+/// metadata, per the CIMD draft): its `client_id` must be the URL; it must carry
+/// no client secret; it must be able to authenticate as a PUBLIC client — a
+/// `token_endpoint_auth_method` of `none` (absent means `none`: a document may
+/// not use a secret-based method, so RFC 7591's default cannot apply) or `none`
+/// among its `token_endpoint_auth_methods_supported`, ChatGPT's case — and to
+/// run this server's one flow (`grant_types` / `response_types`, if given, must
+/// include `authorization_code` / `code`). Of its `redirect_uris` — at most
+/// [`MAX_REDIRECT_URIS`] of [`MAX_REDIRECT_URI_LEN`] bytes, as DCR allows — only
+/// those a DCR registration could have registered ([`redirect_uri_permitted`])
+/// that are loopback or on the document's own origin are kept; none left is a
+/// refusal.
 fn parse_client_metadata(client_id: &str, body: &str) -> Result<ClientMetadata, String> {
-    let doc: Value = serde_json::from_str(body).map_err(|e| format!("not valid JSON: {e}"))?;
-    let Some(obj) = doc.as_object() else {
-        return Err("not a JSON object".into());
-    };
-    match obj.get("client_id").and_then(Value::as_str) {
-        Some(id) if id == client_id => {}
-        Some(id) => return Err(format!("its client_id is {id:?}, not the document URL")),
-        None => return Err("no client_id".into()),
+    let doc: ClientMetadataDocument =
+        serde_json::from_str(body).map_err(|e| format!("not a client metadata document: {e}"))?;
+    if doc.client_id != client_id {
+        return Err(format!("its client_id is {:?}, not the document URL", doc.client_id));
     }
-    if obj.contains_key("client_secret") || obj.contains_key("client_secret_expires_at") {
+    if doc.client_secret.is_some() || doc.client_secret_expires_at.is_some() {
         return Err("carries a client secret, which a metadata document must not".into());
     }
-    // Absent means `none` (see above); present, it must be a string — a wrong type
-    // is a malformed document, not an omission to read charitably.
-    let method = match obj.get("token_endpoint_auth_method") {
-        None => "none",
-        Some(Value::String(method)) => method.as_str(),
-        Some(other) => {
-            return Err(format!("token_endpoint_auth_method must be a string, not {other}"))
-        }
-    };
-    let lists_none = obj
-        .get("token_endpoint_auth_methods_supported")
-        .and_then(Value::as_array)
-        .is_some_and(|methods| methods.iter().any(|m| m.as_str() == Some("none")));
+    let method = doc.token_endpoint_auth_method.as_deref().unwrap_or("none");
+    let lists_none = doc
+        .token_endpoint_auth_methods_supported
+        .as_deref()
+        .is_some_and(|methods| methods.iter().any(|m| m == "none"));
     if method != "none" && !lists_none {
         return Err(format!(
             "authenticates only as {method:?}; this server supports public clients (none) only"
         ));
     }
-    // The flow: absent means RFC 7591's defaults (`authorization_code` / `code`);
-    // present, each must be a string array naming this server's one flow, or the
-    // client could never complete an authorization here (DCR refuses the same).
-    for (field, needed) in [("grant_types", "authorization_code"), ("response_types", "code")] {
-        match obj.get(field) {
-            None => {}
-            Some(Value::Array(list)) if list.iter().all(Value::is_string) => {
-                if !list.iter().any(|v| v.as_str() == Some(needed)) {
-                    return Err(format!("{field} does not include {needed:?}, the only flow here"));
-                }
-            }
-            Some(_) => return Err(format!("{field} must be an array of strings")),
+    for (field, given, needed) in [
+        ("grant_types", &doc.grant_types, "authorization_code"),
+        ("response_types", &doc.response_types, "code"),
+    ] {
+        if given.as_deref().is_some_and(|list| !list.iter().any(|v| v == needed)) {
+            return Err(format!("{field} does not include {needed:?}, the only flow here"));
         }
     }
-    let listed: Vec<&str> = match obj.get("redirect_uris").and_then(Value::as_array) {
-        Some(list) if list.len() > MAX_REDIRECT_URIS => {
-            return Err(format!("too many redirect_uris ({}, max {MAX_REDIRECT_URIS})", list.len()))
-        }
-        Some(list)
-            if list.iter().any(|u| u.as_str().is_some_and(|u| u.len() > MAX_REDIRECT_URI_LEN)) =>
-        {
-            return Err(format!("a redirect_uri is too long (max {MAX_REDIRECT_URI_LEN} bytes)"))
-        }
-        Some(list) if !list.is_empty() && list.iter().all(Value::is_string) => {
-            list.iter().filter_map(Value::as_str).collect()
-        }
-        _ => return Err("redirect_uris must be a non-empty array of strings".into()),
-    };
+    if doc.redirect_uris.is_empty() {
+        return Err("redirect_uris is empty".into());
+    }
+    if doc.redirect_uris.len() > MAX_REDIRECT_URIS {
+        let n = doc.redirect_uris.len();
+        return Err(format!("too many redirect_uris ({n}, max {MAX_REDIRECT_URIS})"));
+    }
+    if doc.redirect_uris.iter().any(|u| u.len() > MAX_REDIRECT_URI_LEN) {
+        return Err(format!("a redirect_uri is too long (max {MAX_REDIRECT_URI_LEN} bytes)"));
+    }
     let own_origin = url::Url::parse(client_id).map_err(|e| format!("client_id: {e}"))?.origin();
-    let redirect_uris: Vec<String> = listed
+    let redirect_uris: Vec<String> = doc
+        .redirect_uris
         .into_iter()
         .filter(|u| {
             redirect_uri_permitted(u)
                 && (is_loopback_redirect(u)
                     || url::Url::parse(u).is_ok_and(|r| r.origin() == own_origin))
         })
-        .map(str::to_owned)
         .collect();
     if redirect_uris.is_empty() {
         return Err("lists no redirect_uri this server could honour: one on its own origin that \
@@ -1102,8 +1083,7 @@ fn parse_client_metadata(client_id: &str, body: &str) -> Result<ClientMetadata, 
                     query or fragment"
             .into());
     }
-    let client_name = obj.get("client_name").and_then(Value::as_str).map(str::to_owned);
-    Ok(ClientMetadata { client_id: client_id.to_owned(), client_name, redirect_uris })
+    Ok(ClientMetadata { client_id: doc.client_id, client_name: doc.client_name, redirect_uris })
 }
 
 /// Whether a `Content-Type` is `application/json` — the media type a Client ID
@@ -3479,14 +3459,14 @@ mod tests {
         assert!(parse_client_metadata(CHATGPT, "not json").is_err());
         assert!(parse_client_metadata(CHATGPT, "[]").is_err());
         let no_id = json!({ "redirect_uris": [CHATGPT_REDIRECT] }).to_string();
-        assert!(parse_client_metadata(CHATGPT, &no_id).unwrap_err().contains("no client_id"));
+        assert!(parse_client_metadata(CHATGPT, &no_id).unwrap_err().contains("client_id"));
         let refused_for =
             |doc: serde_json::Value| parse_client_metadata(CHATGPT, &doc.to_string()).unwrap_err();
         assert!(refused_for(json!({ "client_id": CHATGPT })).contains("redirect_uris"));
         let no_uris = json!({ "client_id": CHATGPT, "redirect_uris": [] });
         assert!(refused_for(no_uris).contains("redirect_uris"));
-        let bad_uris = json!({ "client_id": CHATGPT, "redirect_uris": [1] });
-        assert!(refused_for(bad_uris).contains("redirect_uris"));
+        // A member of the wrong type is a malformed document (serde names the type).
+        refused_for(json!({ "client_id": CHATGPT, "redirect_uris": [1] }));
         // No secret in a public document, and no secret-only or JWT-only client.
         let secret = json!({
             "client_id": CHATGPT,
@@ -3509,7 +3489,7 @@ mod tests {
             "redirect_uris": [CHATGPT_REDIRECT],
             "token_endpoint_auth_method": 1,
         });
-        assert!(refused_for(odd_method).contains("must be a string"));
+        assert!(refused_for(odd_method).contains("string"));
         // The flow: absent is the RFC default (accepted above); present, it must
         // include the one flow this server runs, and be a string array to say so.
         let with = |field: &str, value: serde_json::Value| json!({ "client_id": CHATGPT, "redirect_uris": [CHATGPT_REDIRECT], field: value });
@@ -3521,9 +3501,8 @@ mod tests {
         let err = refused_for(with("response_types", json!(["token"])));
         assert!(err.contains("response_types") && err.contains("\"code\""), "{err}");
         assert!(refused_for(with("grant_types", json!([]))).contains("authorization_code"));
-        let err = refused_for(with("grant_types", json!("authorization_code")));
-        assert!(err.contains("array of strings"), "{err}");
-        assert!(refused_for(with("response_types", json!([1]))).contains("array of strings"));
+        refused_for(with("grant_types", json!("authorization_code")));
+        refused_for(with("response_types", json!([1])));
         // Hosted redirects must be same-origin with the document; loopback is exempt.
         const OTHER: &str = "https://cimd-other.claude.ai/client.json";
         const OWN: &str = "https://cimd-other.claude.ai/api/mcp/auth_callback";
