@@ -315,11 +315,9 @@ fn cache_max_age(cache_control: &str) -> Option<Duration> {
     lifetime("s-maxage").or_else(|| lifetime("max-age"))
 }
 
-/// A `delta-seconds` (RFC 9110 §10.2.2, RFC 9111 §1.2.2): one or more ASCII
-/// digits and nothing else. Rust's integer parser also takes a leading `+`, so
-/// `+1` is refused here before parsing, as is any other shape the grammar does
-/// not allow; a value too large for a `u64` is `None` as well, and the callers
-/// take that as the greatest age or no lifetime, whichever is the stale reading.
+/// A `delta-seconds` (RFC 9110 §10.2.2): one or more ASCII digits and nothing
+/// else — Rust's integer parser would also take a leading `+`. `None` when it
+/// is not one, or does not fit a `u64`.
 fn delta_seconds(value: &str) -> Option<u64> {
     (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
         .then(|| value.parse::<u64>().ok())
