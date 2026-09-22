@@ -60,8 +60,10 @@ ENV BUILD_TIME=${BUILD_TIME}
 # So install from snapshot.debian.org at the last moment both suites were
 # complete (2026-08-30; the image was built 2026-08-25). Both suites are frozen,
 # so that snapshot is the permanent final state of bullseye and the versions
-# match what the image already has: nothing is downgraded and the build is
-# reproducible. The snapshot's Release files have passed their Valid-Until,
+# match what the image already has: nothing is downgraded and apt's inputs are
+# fixed. (Only package resolution is reproducible: the rust:1-slim-bullseye tag
+# is mutable and BUILD_TIME is stamped per build.) The snapshot's Release files
+# have passed their Valid-Until,
 # hence check-valid-until=no; Acquire::Retries absorbs snapshot's occasional
 # throttling. (The durable fix is a base image whose archive is alive and whose
 # glibc still fits the host -- amazonlinux:2023 -- tracked separately.)
