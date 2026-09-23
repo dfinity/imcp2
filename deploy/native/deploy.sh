@@ -274,27 +274,36 @@ echo ">> external check:"
 curl -sS --max-time 20 -o /dev/null -w "https://$DOMAIN/ -> HTTP %{http_code} (TLS verify %{ssl_verify_result})\n" "https://$DOMAIN/" || true
 curl -sS --max-time 20 -o /dev/null -w "https://$DOMAIN/status/ -> HTTP %{http_code}\n" "https://$DOMAIN/status/" || true
 
-# ...and /metrics must NOT be reachable on the public origin. Caddy answers it
-# with a 404; losing that one block would publish the exposition, so assert it on
-# every deploy. The assertion is "exactly the configured 404": any other code —
-# a proxied 500, a `000` from an unreachable or stalled origin — has not disproved
-# exposure, so it retries (Caddy may be reloading) and then fails hard.
+# /metrics must NOT be reachable on the public origin: the Caddyfile answers it
+# with a 404, and losing that one block would publish the exposition. Ask Caddy
+# itself, from the host, with $DOMAIN pinned to loopback so its site block
+# answers: production's public name now resolves to a fronting edge that
+# redirects every non-MCP path, so the public answer says nothing about this
+# host. -k because the question is the route, not the certificate.
 hidden=""
 for attempt in 1 2 3 4 5; do
-  code="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "https://$DOMAIN/metrics" || echo 000)"
-  if [ "$code" = 200 ]; then
-    echo "FATAL: https://$DOMAIN/metrics answered 200 — the Prometheus exposition is public" >&2
-    exit 1
-  fi
+  code="$($SSH "curl -ksS --max-time 10 -o /dev/null -w '%{http_code}' --resolve '$DOMAIN:443:127.0.0.1' 'https://$DOMAIN/metrics'" || echo 000)"
   if [ "$code" = 404 ]; then
     hidden=1
-    echo "https://$DOMAIN/metrics -> HTTP 404 (not published, as intended)"
+    echo "caddy on the host: https://$DOMAIN/metrics -> HTTP 404 (not published, as intended)"
     break
   fi
-  echo "https://$DOMAIN/metrics -> HTTP $code, expected 404 (attempt $attempt)" >&2
+  echo "caddy on the host: https://$DOMAIN/metrics -> HTTP $code, expected 404 (attempt $attempt)" >&2
   sleep 3
 done
 if [ -z "$hidden" ]; then
-  echo "FATAL: https://$DOMAIN/metrics never answered the configured 404, so its exposure is unproven" >&2
+  echo "FATAL: Caddy never answered the configured 404 for /metrics, so its exposure is unproven" >&2
   exit 1
 fi
+
+# Through the public name too, redirects followed: the exposition's own marker
+# in the body is what proves it public, whatever sits in front. A status alone
+# proves nothing either way (an edge's 200 page, a redirect elsewhere).
+public="$(mktemp)"
+summary="$(curl -sSL --max-redirs 5 --max-time 20 -o "$public" -w '%{http_code} at %{url_effective}' "https://$DOMAIN/metrics")" || summary="${summary:-000} (request failed)"
+if grep -q imcp2_build_info "$public"; then
+  echo "FATAL: https://$DOMAIN/metrics serves the Prometheus exposition publicly ($summary)" >&2
+  exit 1
+fi
+rm -f "$public"
+echo "https://$DOMAIN/metrics -> $summary; no exposition in the body"
