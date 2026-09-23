@@ -296,12 +296,14 @@ if [ -z "$hidden" ]; then
   exit 1
 fi
 
-# Through the public name too: a 200 means the exposition IS public, whatever
-# sits in front, and fails the deploy; anything else (Caddy's 404, an edge's
-# redirect) is reported, not judged.
-code="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "https://$DOMAIN/metrics" || echo 000)"
-if [ "$code" = 200 ]; then
-  echo "FATAL: https://$DOMAIN/metrics answered 200 — the Prometheus exposition is public" >&2
+# Through the public name too, redirects followed: the exposition's own marker
+# in the body is what proves it public, whatever sits in front. A status alone
+# proves nothing either way (an edge's 200 page, a redirect elsewhere).
+public="$(mktemp)"
+summary="$(curl -sSL --max-redirs 5 --max-time 20 -o "$public" -w '%{http_code} at %{url_effective}' "https://$DOMAIN/metrics")" || summary="${summary:-000} (request failed)"
+if grep -q imcp2_build_info "$public"; then
+  echo "FATAL: https://$DOMAIN/metrics serves the Prometheus exposition publicly ($summary)" >&2
   exit 1
 fi
-echo "https://$DOMAIN/metrics -> HTTP $code"
+rm -f "$public"
+echo "https://$DOMAIN/metrics -> $summary; no exposition in the body"

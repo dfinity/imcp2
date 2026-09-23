@@ -195,8 +195,8 @@ the Prometheus exposition at `/metrics` on its own port for a scraper to reach o
 the host's private address. Caddy answers `/metrics` with a 404, which is what keeps
 it off the internet. `deploy.sh` asserts that 404 against Caddy on the host itself,
 since a public name behind a fronting edge (production's is) answers with the edge's
-response rather than Caddy's; it separately fails the deploy if the public name ever
-returns 200 for it.
+response rather than Caddy's; it separately fails the deploy if the exposition itself
+ever shows up through the public name, redirects followed.
 
 The mechanics live in [`deploy-native.yml`](../../.github/workflows/deploy-native.yml),
 a reusable workflow both call. It first runs the status dashboard's unit tests (a
