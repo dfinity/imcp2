@@ -1350,6 +1350,9 @@ fn ipv4_is_global(ip: &Ipv4Addr) -> bool {
         || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT (shared)
         || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IETF protocol
         || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18.0.0/15 benchmarking
+        // 192.88.99.0/24, the deprecated 6to4 relay anycast block (RFC 7526), is not
+        // globally reachable — bar 192.88.99.2, the 6a44 relay anycast (RFC 6751).
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99 && o[3] != 2)
         || o[0] >= 240) // 240.0.0.0/4 reserved
 }
 
@@ -1362,30 +1365,88 @@ fn ipv6_is_global(ip: &Ipv6Addr) -> bool {
         return ipv4_is_global(&v4);
     }
     let seg = ip.segments();
-    !(ip.is_unspecified()                    // ::
-        || ip.is_loopback()                  // ::1
-        || ip.is_multicast()                 // ff00::/8
-        || (seg[0] & 0xfe00) == 0xfc00       // fc00::/7 unique-local
-        || (seg[0] & 0xffc0) == 0xfe80       // fe80::/10 link-local unicast
-        || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
-        // Transition mechanisms embed an IPv4 address deeper in the v6 space than
-        // `to_ipv4` decodes, so a NAT64/6to4/Teredo host would otherwise translate
-        // one of these to loopback/link-local/RFC1918/metadata (ICPBB-377). imcp2
-        // never needs to reach them, so refuse the prefixes outright.
-        || (seg[0] == 0x0064 && seg[1] == 0xff9b)  // 64:ff9b::/32 NAT64 (RFC 6052 WKP + RFC 8215 local-use)
-        || seg[0] == 0x2002                        // 2002::/16 6to4
-        || (seg[0] == 0x2001 && seg[1] == 0x0000)) // 2001::/32 Teredo
+    // DEFAULT-DENY: IANA allocates global unicast only from 2000::/3 (RFC 4291
+    // §2.5.4; RFC 3513 §2.5.6), so a native address outside it — `::`, `::1`,
+    // the discard-only 100::/64, the NAT64 well-known 64:ff9b::/32, the SRv6
+    // 5f00::/16, unique-local fc00::/7, link-local fe80::/10, the deprecated
+    // site-local fec0::/10, multicast ff00::/8, and everything unallocated in
+    // between (4000::1 is nobody's) — is refused without being named, and so is
+    // whatever IANA allocates next, until it is audited here.
+    if (seg[0] & 0xe000) != 0x2000 {
+        return false;
+    }
+    // Within 2000::/3, 2001::/23 is IETF protocol assignments (RFC 2928): NOT
+    // globally reachable by default — Teredo (2001::/32), benchmarking
+    // (2001:2::/48), ORCHID and ORCHIDv2 (2001:10::/28, 2001:20::/28), and
+    // everything unassigned — with the IANA registry's globally reachable
+    // exceptions admitted by name, so a new assignment is refused until audited
+    // rather than accepted until noticed.
+    if seg[0] == 0x2001 && (seg[1] & 0xfe00) == 0 {
+        return ietf_protocol_assignment_is_global(&seg);
+    }
+    // The rest of 2000::/3 is global unicast, less its special-purpose carve-outs.
+    !((seg[0] == 0x2001 && seg[1] == 0x0db8)        // 2001:db8::/32 documentation
+        || (seg[0] == 0x3fff && (seg[1] & 0xf000) == 0) // 3fff::/20 documentation (RFC 9637)
+        // 6to4 embeds an IPv4 address deeper in the v6 space than `to_ipv4`
+        // decodes, so a 6to4 host would otherwise translate one of these to
+        // loopback/link-local/RFC1918/metadata (ICPBB-377); NAT64 and Teredo are
+        // refused above. imcp2 never needs to reach them, so refuse the prefix.
+        || seg[0] == 0x2002) // 2002::/16 6to4
+}
+
+/// The globally reachable exceptions inside `2001::/23` (IETF protocol
+/// assignments), per the IANA IPv6 Special-Purpose Address Registry. Everything
+/// else in the block — assigned to a non-routable use or not assigned at all —
+/// is refused.
+fn ietf_protocol_assignment_is_global(seg: &[u16; 8]) -> bool {
+    let anycast = seg[1] == 0x0001 && seg[2..7] == [0; 5] && (1..=3).contains(&seg[7]);
+    anycast // 2001:1::1 PCP (RFC 7723), 2001:1::2 TURN (RFC 8155), 2001:1::3 DNS-SD SRP (RFC 9665)
+        || seg[1] == 0x0003                       // 2001:3::/32 AMT (RFC 7450)
+        || (seg[1] == 0x0004 && seg[2] == 0x0112) // 2001:4:112::/48 AS112-v6 (RFC 7535)
+        || (seg[1] & 0xfff0) == 0x0030 // 2001:30::/28 Drone Remote ID (RFC 9374)
+}
+
+/// Why [`resolve_public_url`] returned no addresses: the URL itself is refused —
+/// it does not parse, is not https, names no host, or resolves to a non-public
+/// address (the SSRF guard) — or its host could not be resolved RIGHT NOW, which
+/// says nothing about the URL. A caller that remembers refusals (the OAuth
+/// server's client-metadata cache) must not remember a resolver outage as one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ResolveError {
+    Refused(String),
+    Unresolved(String),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(why) | Self::Unresolved(why) => f.write_str(why),
+        }
+    }
+}
+
+/// The discovery crawl reports every failure as a message, and tells these apart
+/// no further; `?` keeps working there.
+impl From<ResolveError> for String {
+    fn from(err: ResolveError) -> Self {
+        match err {
+            ResolveError::Refused(why) | ResolveError::Unresolved(why) => why,
+        }
+    }
 }
 
 /// Validate a user-supplied discovery URL against SSRF and return the parsed URL
 /// plus the socket addresses to PIN the client to. https only; every resolved
 /// address must be global. Async DNS (no blocking of the executor).
-async fn resolve_public_url(raw: &str) -> Result<(url::Url, Vec<SocketAddr>), String> {
-    let url = url::Url::parse(raw).map_err(|e| format!("invalid discovery URL {raw}: {e}"))?;
+pub(crate) async fn resolve_public_url(
+    raw: &str,
+) -> Result<(url::Url, Vec<SocketAddr>), ResolveError> {
+    let url = url::Url::parse(raw)
+        .map_err(|e| ResolveError::Refused(format!("invalid discovery URL {raw}: {e}")))?;
     if url.scheme() != "https" {
-        return Err(format!(
+        return Err(ResolveError::Refused(format!(
             "refusing to fetch {raw}: only https:// discovery targets are allowed (SSRF guard)"
-        ));
+        )));
     }
     let port = url.port_or_known_default().unwrap_or(443);
     let addrs: Vec<SocketAddr> = match url.host() {
@@ -1393,19 +1454,19 @@ async fn resolve_public_url(raw: &str) -> Result<(url::Url, Vec<SocketAddr>), St
         Some(url::Host::Ipv6(v6)) => vec![SocketAddr::new(IpAddr::V6(v6), port)],
         Some(url::Host::Domain(host)) => tokio::net::lookup_host((host, port))
             .await
-            .map_err(|e| format!("could not resolve {host}: {e}"))?
+            .map_err(|e| ResolveError::Unresolved(format!("could not resolve {host}: {e}")))?
             .collect(),
-        None => return Err(format!("refusing to fetch {raw}: no host")),
+        None => return Err(ResolveError::Refused(format!("refusing to fetch {raw}: no host"))),
     };
     if addrs.is_empty() {
-        return Err(format!("refusing to fetch {raw}: host did not resolve"));
+        return Err(ResolveError::Unresolved(format!("could not resolve {raw}: no addresses")));
     }
     if let Some(bad) = addrs.iter().find(|a| !ip_is_global(&a.ip())) {
-        return Err(format!(
+        return Err(ResolveError::Refused(format!(
             "refusing to fetch {raw}: it resolves to a non-public address ({}) — discovery is \
              restricted to public hosts (SSRF guard)",
             bad.ip()
-        ));
+        )));
     }
     Ok((url, addrs))
 }
@@ -1536,10 +1597,26 @@ enum Overflow {
 /// The shared read. `Err((partial, error))` carries what had arrived before the
 /// transfer failed, so the fail-soft caller can keep it and the strict one can
 /// report the failure.
-async fn read_capped_inner(
-    mut resp: reqwest::Response,
+pub(crate) async fn read_capped_inner(
+    resp: reqwest::Response,
     max: usize,
 ) -> Result<String, (String, String)> {
+    // Lossy by design for the crawl: a stray byte must not cost a whole bundle.
+    // A caller that treats the body as a statement (the CIMD fetch) reads the
+    // bytes and decodes strictly instead.
+    match read_capped_bytes(resp, max).await {
+        Ok(buf) => Ok(String::from_utf8_lossy(&buf).into_owned()),
+        Err((buf, e)) => Err((String::from_utf8_lossy(&buf).into_owned(), e)),
+    }
+}
+
+/// The shared read in bytes: up to `max` of the body, stopping — and so dropping
+/// the response and its connection — at the cap. `Err((partial, error))` carries
+/// what had arrived before the transfer failed.
+pub(crate) async fn read_capped_bytes(
+    mut resp: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, (Vec<u8>, String)> {
     let mut buf: Vec<u8> = Vec::new();
     loop {
         if buf.len() >= max {
@@ -1554,10 +1631,10 @@ async fn read_capped_inner(
                 }
             }
             Ok(None) => break,
-            Err(e) => return Err((String::from_utf8_lossy(&buf).into_owned(), e.to_string())),
+            Err(e) => return Err((buf, e.to_string())),
         }
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(buf)
 }
 
 /// GET `url` and return up to `max` bytes of its body, distinguishing "this app
@@ -2794,6 +2871,7 @@ mod tests {
         // Publicly-routable addresses.
         assert!(g("8.8.8.8"));
         assert!(g("1.1.1.1"));
+        assert!(g("192.88.99.2"), "the 6a44 relay anycast is the reachable exception in its /24");
         assert!(g("2606:4700:4700::1111"));
         // Loopback / private / link-local / CGNAT / reserved / doc / bench, plus
         // IPv4 embedded in IPv6 as MAPPED (::ffff:…) and COMPATIBLE (::…) forms.
@@ -2808,12 +2886,26 @@ mod tests {
             "255.255.255.255",
             "192.0.2.1",
             "198.18.0.1",
+            "192.88.99.1", // 6to4 relay anycast, deprecated
             "240.0.0.1",
             "::1",
             "::",
             "fc00::1",
             "fd12::1",
             "fe80::1",
+            "fec0::1",     // site-local: deprecated, still routable on legacy networks
+            "100::1",      // discard-only
+            "2001:2::1",   // benchmarking
+            "2001:10::1",  // ORCHID (deprecated)
+            "2001:20::1",  // ORCHIDv2 (not routable)
+            "2001:1::4",   // unassigned inside 2001::/23 (IETF protocol assignments)
+            "2001:5::1",   // likewise
+            "2001:1ff::1", // the block's last /32, likewise
+            "3fff::1",     // documentation (RFC 9637)
+            "5f00::1",     // SRv6 SIDs (RFC 9602)
+            "4000::1",     // outside 2000::/3: not allocated for global unicast
+            "8000::1",     // likewise
+            "e000::1",     // likewise
             "2001:db8::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1", // IPv4-mapped private/loopback
@@ -2833,6 +2925,13 @@ mod tests {
         }
         // A real public v6 that merely starts with 0x2001 (not db8/Teredo) stays global.
         assert!(g("2001:4860:4860::8888"));
+        assert!(g("2001:200::1"), "just past 2001::/23");
+        // The globally reachable exceptions inside 2001::/23 stay global.
+        for good in
+            ["2001:1::1", "2001:1::2", "2001:1::3", "2001:3::1", "2001:4:112::1", "2001:30::1"]
+        {
+            assert!(g(good), "{good} is globally reachable per the IANA registry");
+        }
     }
 
     // The exact vectors from the finding, plus https-to-internal, are refused

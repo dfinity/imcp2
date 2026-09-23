@@ -415,7 +415,7 @@ export const checkMcpEndpoints = async (
       id: "as-metadata",
       label: "OAuth Authorization Server Metadata",
       description:
-        "Verifies the RFC 8414 metadata advertising the authorize/token/registration endpoints and PKCE support that clients need to log in.",
+        "Verifies the RFC 8414 metadata advertising the authorize/token/registration endpoints and PKCE support that clients need to log in, and reports whether Client ID Metadata Documents are advertised (the registration mode Claude and ChatGPT prefer over DCR; on only where the server runs with OAUTH_CIMD_ENABLED=1).",
       target: `GET ${url}`,
       expected: "200 JSON with issuer + authorize/token/register endpoints",
       status: pass ? "pass" : "fail",
@@ -425,7 +425,7 @@ export const checkMcpEndpoints = async (
         ? r.error
           ? `request failed: ${r.error.message}`
           : `${r.status}${redirectNote(r)}, missing fields: ${missing.join(", ") || "n/a"}`
-        : `issuer=${asMeta.issuer}, PKCE=${(asMeta.code_challenge_methods_supported || []).join(",") || "none"}`,
+        : `issuer=${asMeta.issuer}, PKCE=${(asMeta.code_challenge_methods_supported || []).join(",") || "none"}, CIMD=${asMeta.client_id_metadata_document_supported === true ? "on" : "off"}`,
     });
   }
 

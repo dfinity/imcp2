@@ -44,6 +44,7 @@ dist = false
 # codec, and candid lines can never drift between imcp2-core, imcp2, and
 # imcp2-local.
 [workspace.dependencies]
+httpdate = "1.0.3"
 imcp2-core = { path = "crates/imcp2-core", version = "0.4.0" }
 rmcp = "1.7"
 axum = "0.8"

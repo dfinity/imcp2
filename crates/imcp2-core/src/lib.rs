@@ -32,6 +32,7 @@
 
 pub mod identities;
 pub mod iiconnect;
+pub mod public_fetch;
 pub mod skills;
 pub mod tools;
 

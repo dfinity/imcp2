@@ -110,6 +110,7 @@ const healthyRoutes = (origin) => ({
       token_endpoint: `${origin}/mcp/oauth/token`,
       registration_endpoint: `${origin}/mcp/oauth/register`,
       code_challenge_methods_supported: ["S256"],
+      client_id_metadata_document_supported: true,
     }),
   }),
   [`POST ${origin}/mcp`]: resp(401, {
@@ -422,6 +423,9 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
     assert.equal(byId(section, "root").status, "pass");
     assert.equal(byId(section, "protected-resource").status, "pass");
     assert.equal(byId(section, "as-metadata").status, "pass");
+    // The detail line reports whether CIMD is advertised, so the kill switch's
+    // effect (or a regression that drops the flag) is visible on the dashboard.
+    assert.match(byId(section, "as-metadata").detail, /, CIMD=on$/);
     assert.equal(byId(section, "metadata-consistency").status, "pass");
     assert.equal(byId(section, "mcp-challenge").status, "pass");
     assert.equal(byId(section, "oauth-register").status, "pass");
