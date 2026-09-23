@@ -73,6 +73,7 @@
 //! and `II_URL_PROD` / `II_CANISTER_ID_PROD` (the Internet Identity instances).
 
 mod auth;
+mod branding;
 // Docs live in the module itself (`//!` in src/metrics.rs): an outer doc
 // comment here would resolve its intra-doc links in *this* scope rather than
 // the module's, silently breaking the links to `Registry` and `MatchedPath`.
@@ -330,9 +331,20 @@ impl McpServer {
             .with_state(self.store.clone())
             .layer(permissive_cors());
 
+        // Verified-connector branding (see [`branding`]), rooted at the issuer
+        // (`{public_url}{mcp_path}/branding/{slug}`) so II reaches it same-origin
+        // with the #4091-validated callback. CORS-open, like the other endpoints
+        // II fetches cross-origin.
+        let branding = Router::new()
+            .route("/branding/{slug}", get(branding::branding_metadata))
+            .route("/branding/{slug}/logo", get(branding::branding_logo))
+            .with_state(self.store.clone())
+            .layer(permissive_cors());
+
         Router::new()
             .nest("/oauth", oauth)
             .merge(oidc_alternate)
+            .merge(branding)
             // Everything else is the MCP endpoint: the bare mount path, its
             // trailing-slash form, and any sub-path (the streamable service
             // dispatches on method, not path) — same breadth `nest_service`

@@ -1624,8 +1624,9 @@ impl AuthStore {
 
     /// This instance's AS issuer: `{public_url}{mcp_path}` (an RFC 8414 *path
     /// issuer* whenever the router is nested below the root). Every OAuth
-    /// endpoint lives under it, at `{issuer}/oauth/*`.
-    fn issuer(&self) -> String {
+    /// endpoint lives under it, at `{issuer}/oauth/*`; the branding endpoints at
+    /// `{issuer}/branding/*` ([`crate::branding`]) also root here.
+    pub(crate) fn issuer(&self) -> String {
         format!("{}{}", self.public_url, self.mcp_path)
     }
 
@@ -2240,7 +2241,13 @@ pub async fn authorize(
         store.mcp_path,
         CONNECT_TTL.as_secs(),
     );
-    let ii_url = ii_mcp_url(&store, &session_id, &reg_pubkey);
+    // Verified-connector branding (see [`crate::branding`]): the request's
+    // redirect_uri is validated by this point, so its vendor is a curated signal
+    // of product identity. Resolve the connector slug for a vetted web vendor
+    // (`None` for loopback / unlisted → status-quo anonymous consent) and let it
+    // ride the connect link as `&connector=<slug>` for II to brand the screen.
+    let connector = crate::branding::connector_for_redirect(&q.redirect_uri).map(|c| c.slug);
+    let ii_url = ii_mcp_url(&store, &session_id, &reg_pubkey, connector);
     // Redirect the consenting browser to the II connect link with a real HTTP
     // 302 (`Location`). The link's params ride in the URL fragment
     // (`#callback=…&state=…&registration_key=…`); modern browsers preserve a
@@ -2309,13 +2316,19 @@ fn build_redirect(redirect_uri: &str, code: &str, client_state: &str, iss: &str)
 /// delegation in the fragment; that callback page is our sole fragment reader
 /// ([`connect_callback_page`]). No `priv(X)` is ever put in the link — only its
 /// public half.
-fn ii_mcp_url(store: &AuthStore, session_id: &str, reg_pubkey_b64: &str) -> String {
+fn ii_mcp_url(
+    store: &AuthStore,
+    session_id: &str,
+    reg_pubkey_b64: &str,
+    connector: Option<&str>,
+) -> String {
     iiconnect::ii_mcp_url(
         &store.instance().ii_url,
         &connect_callback_url(store),
         session_id,
         GRANT_TTL_SECS,
         reg_pubkey_b64,
+        connector,
     )
 }
 // ---- Callback allow-list (II #4091) ---------------------------------------
@@ -4599,7 +4612,7 @@ mod tests {
     #[test]
     fn v2_link_carries_registration_key() {
         let store = test_store();
-        let url = super::ii_mcp_url(&store, "sess-1", "PUBX");
+        let url = super::ii_mcp_url(&store, "sess-1", "PUBX", None);
         assert!(url.starts_with("https://ii.test/mcp#"), "everything rides the fragment: {url}");
         assert!(url.contains("state=sess-1"));
         assert!(url.contains("registration_key=PUBX"));
@@ -4674,8 +4687,8 @@ mod tests {
         // Each declared entry must equal the callback embedded in that
         // instance's II link, byte for byte.
         for (store, link) in [
-            (&prod, super::ii_mcp_url(&prod, "s", "K")),
-            (&beta, super::ii_mcp_url(&beta, "s", "K")),
+            (&prod, super::ii_mcp_url(&prod, "s", "K", None)),
+            (&beta, super::ii_mcp_url(&beta, "s", "K", None)),
         ] {
             let expected = super::connect_callback_url(store);
             assert!(declared.contains(&expected), "{expected} must be declared: {declared:?}");

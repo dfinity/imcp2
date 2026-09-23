@@ -234,6 +234,10 @@ impl LoginDriver {
             &session_id,
             GRANT_TTL_SECS,
             &reg_pubkey,
+            // No connector branding: a local app authenticates over a loopback
+            // callback, which carries no vetted-vendor identity (verified-connector
+            // branding is web-vendor only).
+            None,
         );
 
         let shutdown = Arc::new(Notify::new());

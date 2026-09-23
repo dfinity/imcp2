@@ -451,3 +451,45 @@ async fn oauth_endpoints_live_under_each_mount() {
         );
     }
 }
+
+/// Verified-connector branding endpoints (II fetches these from the issuer origin
+/// to brand the consent screen): a curated slug yields name + logo + verified; a
+/// slug outside the curated set 404s so the path can't be used to probe.
+#[tokio::test]
+async fn branding_endpoints_serve_vetted_connectors_and_404_others() {
+    // Metadata for a vetted connector: the curated name, the absolute logo URL
+    // under the instance issuer, `verified`, and `no-store`.
+    let resp =
+        app().oneshot(Request::get("/mcp/branding/claude").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(doc["name"], "Claude");
+    assert_eq!(doc["verified"], true);
+    assert_eq!(doc["logo"], format!("{PUBLIC_URL}/mcp/branding/claude/logo"));
+
+    // The logo is an SVG with nosniff (II renders it via <img>, never inlined).
+    let resp = app()
+        .oneshot(Request::get("/mcp/branding/claude/logo").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+        Some("image/svg+xml")
+    );
+    assert_eq!(
+        resp.headers().get("x-content-type-options").and_then(|v| v.to_str().ok()),
+        Some("nosniff")
+    );
+
+    // A slug outside the curated set 404s on both endpoints.
+    for path in ["/mcp/branding/not-a-connector", "/mcp/branding/not-a-connector/logo"] {
+        let resp = app().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "GET {path}");
+    }
+}
