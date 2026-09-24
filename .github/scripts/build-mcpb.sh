@@ -24,9 +24,13 @@
 # release's own binary answering `tools/list`, so the install dialog can
 # never advertise a surface the shipped server doesn't have.
 #
+# The MCPB CLI that validates and packs the bundle comes from
+# .github/scripts/mcpb-cli/package-lock.json, which pins its whole dependency
+# tree with integrity hashes; it is installed with `npm ci --ignore-scripts`,
+# so a release never resolves a dependency afresh or runs an install script.
+#
 # Env:
 #   LIPO                   lipo implementation (default `lipo`; `llvm-lipo` works off macOS)
-#   MCPB_VERSION           @anthropic-ai/mcpb CLI version (pinned below)
 #   MCPB_ALLOW_UNATTESTED  `1` builds without verifying provenance; refused in CI
 set -euo pipefail
 
@@ -40,7 +44,6 @@ version="${tag#imcp2-local-v}"
 base="https://github.com/dfinity/imcp2/releases/download/$tag"
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 lipo="${LIPO:-lipo}"
-mcpb="@anthropic-ai/mcpb@${MCPB_VERSION:-2.1.2}"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -147,6 +150,15 @@ case "$(uname -s)-$(uname -m)" in
   *) echo "cannot introspect the tool list on $(uname -s)-$(uname -m)" >&2; exit 1 ;;
 esac
 
+# That was the last fetch, and nothing below needs a credential. What runs
+# below does include code this repository didn't write (the mcpb CLI and its
+# npm dependencies), so drop credentials from the environment first. This
+# only narrows the exposure: a child can still read its parent's original
+# environment. The boundary is the workflow's: the job running this holds no
+# write or signing rights (see .github/workflows/imcp2-local-mcpb.yml). It also
+# keeps a developer's own token out of a local build's subprocesses.
+unset GH_TOKEN GITHUB_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
+
 tools="$(python3 - "$host_bin" <<'PY'
 import json, os, re, subprocess, sys
 
@@ -185,7 +197,17 @@ jq --arg version "$version" --argjson tools "$tools" \
   '.version = $version | .tools = $tools' \
   "$repo_root/crates/imcp2-local/mcpb/manifest.base.json" > "$bundle/manifest.json"
 
-npx -y "$mcpb" validate "$bundle/manifest.json"
+# The locked CLI, installed into the scratch directory so the checkout stays
+# clean. `npm ci` refuses a lockfile that disagrees with package.json and
+# checks every tarball against its recorded integrity hash.
+cli="$work/mcpb-cli"
+mkdir -p "$cli"
+cp "$repo_root/.github/scripts/mcpb-cli/package.json" \
+   "$repo_root/.github/scripts/mcpb-cli/package-lock.json" "$cli/"
+(cd "$cli" && npm ci --ignore-scripts --no-audit --no-fund --loglevel=error)
+mcpb="$cli/node_modules/.bin/mcpb"
+
+"$mcpb" validate "$bundle/manifest.json"
 mkdir -p "$out"
-npx -y "$mcpb" pack "$bundle" "$out/imcp2-local.mcpb"
+"$mcpb" pack "$bundle" "$out/imcp2-local.mcpb"
 echo "built $out/imcp2-local.mcpb for $tag ($(echo "$tools" | jq length) tools; macOS slices: $archs)"

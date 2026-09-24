@@ -585,8 +585,10 @@ One archive per platform, plus a single `.mcpb` for Claude Desktop. MCPB's
 macOS binary (the arm64 and x86_64 builds joined by `lipo`, each slice byte-identical to its
 attested archive) beside the Windows one, and Claude Desktop appends `.exe` itself. The
 bundle is assembled from the release's own published archives after they exist, and gets
-its own provenance attestation; building and signing these artifacts is a Stage 3
-deliverable.
+its own provenance attestation. Assembly runs third-party code (the MCPB CLI, installed
+from a checked-in lockfile with install scripts disabled), so it runs in a job holding
+only read access; a separate job with no such code attests and uploads the result.
+Building and signing these artifacts is a Stage 3 deliverable.
 
 ## Implementation Stages
 

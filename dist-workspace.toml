@@ -28,8 +28,10 @@ github-attestations = true
 # release notes. dist writes the body itself and has no setting for extra
 # prose, so this rides its custom-job seam; see the workflow for the text.
 post-announce-jobs = ["./imcp2-local-install-note", "./imcp2-local-mcpb"]
-# The bundle job attests what it builds, which needs an OIDC token and write
-# access to attestations beyond this workflow's default `contents: write`.
+# The bundle workflow attests what it builds, which needs an OIDC token and
+# write access to attestations beyond this workflow's default
+# `contents: write`. This grants the union; inside, the job that builds gets
+# only read access and the job that attests and uploads gets the rest.
 github-custom-job-permissions = { "imcp2-local-mcpb" = { contents = "write", id-token = "write", attestations = "write" } }
 
 # Pin GitHub Actions to exact commit SHAs in the generated release.yml
