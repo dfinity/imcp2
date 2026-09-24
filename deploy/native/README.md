@@ -224,9 +224,11 @@ git tag v0.6.0 rc-0.6.0-1^{}   # the candidate's commit, exactly
 git push origin v0.6.0
 ```
 
-Nothing is deployed by this. `publish-crate.yml` publishes the crates (refusing a
-commit that no `rc-0.6.0-N` tag points at) and `v-release.yml` ships the local MCP
-binaries; production picks the new crate up with a dependency bump of its own.
+Nothing is deployed by this. `publish-crate.yml` publishes the crates, refusing a
+commit unless an `rc-0.6.0-N` tag on it has its prerelease with the deployed binary,
+which exists only if that candidate's staging deploy succeeded; `v-release.yml` ships
+the local MCP binaries. Production picks the new crate up with a dependency bump of
+its own.
 
 **Rolling back staging:** run `deploy-candidate.yml` from the Actions tab with an
 earlier `rc-*` tag (or a full commit SHA) as the `ref` input. That rebuilds and ships

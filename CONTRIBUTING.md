@@ -141,8 +141,10 @@ A release takes two human actions, both tag pushes, and all three crates
    it, and nothing is deployed by either:
    - `.github/workflows/publish-crate.yml` publishes `imcp2-core` and `imcp2` to
      crates.io. It checks the tag against every `Cargo.toml`, that the commit is
-     on `main` and carries an `rc-X.Y.Z-N` tag, runs the suite and a dry-run
-     package, and only then publishes from a second job that compiles nothing.
+     on `main`, and that an `rc-X.Y.Z-N` tag on it has its prerelease with the
+     deployed binary (which exists only if the staging deploy succeeded), runs
+     the suite and a dry-run package, and only then publishes from a second job
+     that compiles nothing.
      It authenticates with crates.io
      [trusted publishing](https://crates.io/docs/trusted-publishing) (short-lived
      OIDC credentials), so there is no crates.io token in this repository's

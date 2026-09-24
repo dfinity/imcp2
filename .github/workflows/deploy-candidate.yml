@@ -193,7 +193,9 @@ jobs:
   # the candidate. Without this the only copy is a workflow artifact, which expires
   # after 7 days, so the revision under test would stop being retrievable while it
   # is still being tested. A prerelease, so GitHub's `latest` release stays a
-  # promoted vX.Y.Z (the release dist creates), never a candidate.
+  # promoted vX.Y.Z (the release dist creates), never a candidate. It is also the
+  # marker publish-crate.yml checks before promoting: the asset exists only if the
+  # deploy succeeded, so keep its name (imcp2-linux-arm64) in step with that check.
   #
   # Runs only after deploy succeeds, because an asset here asserts "this is what
   # staging is running". And only on the tag-push path: a dispatch redeploys an

@@ -13,8 +13,8 @@
 #   git push origin v0.6.0
 #
 # The tag must match every Cargo.toml `version` exactly and must point at a commit
-# on `main` that carries an `rc-X.Y.Z-N` tag — the guards below fail the run rather
-# than publishing. There is no
+# on `main` that an `rc-X.Y.Z-N` candidate was deployed from, successfully — the
+# guards below fail the run rather than publishing. There is no
 # rollback: crates.io releases are permanent and a bad one can only be yanked
 # (`cargo yank --version X.Y.Z`), which hides it from new dependency resolution but
 # leaves it downloadable for anyone whose lockfile already pins it. The fix for a
@@ -142,18 +142,36 @@ jobs:
             exit 1
           fi
 
-      # A release is a promoted candidate: the commit must carry an rc-X.Y.Z-N tag
-      # for this very version, which is what says it was deployed to staging and
-      # tested there (deploy-candidate.yml). The candidate tags are fetched
-      # explicitly rather than relying on the checkout having brought them along.
-      - name: Check the tag promotes a candidate
+      # A release is a promoted candidate: an rc-X.Y.Z-N tag for this very version
+      # must point at the commit, AND that candidate's prerelease must carry the
+      # deployed binary. deploy-candidate.yml uploads it only after the staging
+      # deploy succeeded, so it is the marker that the commit was deployed and could
+      # be tested; the tag alone proves only that a tag was pushed. A v tag pushed
+      # before the candidate's deploy finished fails here and is re-run afterwards.
+      # The candidate tags are fetched explicitly rather than relying on the
+      # checkout having brought them along.
+      - name: Check the tag promotes a deployed candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
           git fetch --no-tags origin "+refs/tags/rc-*:refs/tags/rc-*"
-          if ! git tag --points-at "${GITHUB_SHA}" | grep -Eqx "rc-${tag//./\\.}-[0-9]+"; then
-            echo "::error::${GITHUB_REF_NAME} points at a commit no rc-${tag}-N candidate was deployed from; cut a candidate first (deploy-candidate.yml)" >&2
+          deployed=""
+          for rc in $(git tag --points-at "${GITHUB_SHA}" | grep -Ex "rc-${tag//./\\.}-[0-9]+" || true); do
+            if gh release view "$rc" --json isPrerelease,assets \
+                 --jq 'select(.isPrerelease) | .assets[].name' 2>/dev/null | grep -qx imcp2-linux-arm64; then
+              deployed="$rc"
+              break
+            fi
+            echo "$rc points at this commit but has no prerelease carrying the deployed binary"
+          done
+          if [ -z "$deployed" ]; then
+            echo "::error::${GITHUB_REF_NAME} does not promote a deployed candidate: no rc-${tag}-N tag on this commit has a prerelease with the staging binary. Cut a candidate (deploy-candidate.yml), let its deploy finish, then re-run this workflow." >&2
             exit 1
           fi
+          echo "promotes ${deployed}, whose staging deploy succeeded"
 
       # ci.yml runs on pull requests and on pushes to main; a tag can point at any
       # commit, so re-run the suite against the exact revision about to become an

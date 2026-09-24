@@ -47,6 +47,12 @@ curl -fLO "https://github.com/dfinity/imcp2/releases/download/$TAG/imcp2-local-$
 two commands create it and copy the binary there, nothing edits your shell
 configuration.
 
+Releases before 0.6.0 predate this scheme: they are tagged `imcp2-local-vX.Y.Z`
+(the newest is `imcp2-local-v0.5.0`), are not what `latest` resolves to, and
+their archives were attested by `imcp2-local-release.yml`, the workflow's name
+at the time. To install one of those, set `TAG` to its tag and pass that
+filename to `--signer-workflow`; everything else above is the same.
+
 (Windows ships `imcp2-local-x86_64-pc-windows-msvc.zip`; verify it the same way.)
 
 **Installer script.** Shorter, and what the release notes lead with. It
