@@ -45,13 +45,18 @@ mcpb="@anthropic-ai/mcpb@${MCPB_VERSION:-2.1.2}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-# Verifying the inputs' provenance needs `gh`. It is not optional in CI; a
-# local build may opt out explicitly, and says so loudly.
-if command -v gh >/dev/null 2>&1; then
-  attested=1
-elif [ "${MCPB_ALLOW_UNATTESTED:-}" = "1" ] && [ -z "${CI:-}" ]; then
+# Verifying the inputs' provenance needs `gh`. A local build may opt out
+# explicitly, whether or not `gh` is installed, and says so loudly; CI never
+# may, and fails rather than quietly verifying anyway.
+if [ "${MCPB_ALLOW_UNATTESTED:-}" = "1" ]; then
+  if [ -n "${CI:-}" ]; then
+    echo "MCPB_ALLOW_UNATTESTED is refused in CI: a released bundle's inputs are always verified" >&2
+    exit 1
+  fi
   attested=0
   echo "WARNING: building from inputs whose provenance is NOT verified (MCPB_ALLOW_UNATTESTED=1)" >&2
+elif command -v gh >/dev/null 2>&1; then
+  attested=1
 else
   echo "gh is required to verify the input archives' attestations" \
        "(outside CI, MCPB_ALLOW_UNATTESTED=1 builds without)" >&2

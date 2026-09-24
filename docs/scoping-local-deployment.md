@@ -561,10 +561,13 @@ Two distinct layers, for two different verifiers:
     `.mcpb` and direct release downloads.
 - **Supply-chain provenance**, uniform across every artifact (all three platforms' binaries
   and the `.mcpb`): **GitHub artifact attestations** — Sigstore-based and keyless (OIDC), so
-  there are no long-lived signing secrets — verifiable with
-  `gh attestation verify imcp2-local -R dfinity/imcp2`. This layer proves an artifact came
-  from this repository's release workflow; it is for humans and auditors, and does not
-  satisfy the OS gates above (Gatekeeper recognizes only Apple-issued signatures).
+  there are no long-lived signing secrets — verifiable with `gh attestation verify`, pinned
+  to the signing workflow (`--signer-workflow`) and to the release's tag (`--source-ref`:
+  artifact names repeat across releases, so without it an older release's genuinely
+  attested file passes for a newer one's). This layer proves an artifact came from this
+  repository's release workflow for that release, and the bundle job applies the same check
+  to every archive it assembles from; it is for humans and auditors, and does not satisfy
+  the OS gates above (Gatekeeper recognizes only Apple-issued signatures).
 - **The `.mcpb` specifically.** Gatekeeper checks the **binary inside** the bundle
   (extraction inherits quarantine), so the per-OS signing above is the substance. The MCPB
   format does not currently specify bundle-level signing or install-time verification, so
