@@ -2201,33 +2201,28 @@ impl ServerHandler for IcTools {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
         let mut resources = vec![
-            RawResource::new(CANDID_TEXTUAL_URI, "Candid textual syntax (used by these tools)")
-                .no_annotation(),
-            RawResource::new(CANDID_REFERENCE_URI, "Candid type reference (full spec)")
-                .no_annotation(),
-            RawResource::new(OQL_USAGE_URI, "OQL query surface usage guide").no_annotation(),
+            Resource::new(CANDID_TEXTUAL_URI, "Candid textual syntax (used by these tools)"),
+            Resource::new(CANDID_REFERENCE_URI, "Candid type reference (full spec)"),
+            Resource::new(OQL_USAGE_URI, "OQL query surface usage guide"),
         ];
         // The IC skills, from the reviewed bundle compiled into this binary
         // ([`skills::BUNDLED_SKILLS`]) — the served surface retrieves nothing
         // dynamically. Each `skill://<name>` is read from the same bundle in
         // read_resource.
         for (name, title, _) in skills::BUNDLED_SKILLS {
-            resources.push(
-                RawResource::new(format!("{SKILL_URI_PREFIX}{name}"), format!("IC skill: {title}"))
-                    .no_annotation(),
-            );
+            resources.push(Resource::new(
+                format!("{SKILL_URI_PREFIX}{name}"),
+                format!("IC skill: {title}"),
+            ));
         }
         // The companion documents those skills link to, listed so a client can
         // see the whole bundle: every link inside a served skill resolves to
         // another served resource, never to a fetch.
         for (name, file, _) in skills::BUNDLED_SKILL_REFERENCES {
-            resources.push(
-                RawResource::new(
-                    format!("{SKILL_URI_PREFIX}{name}/references/{file}"),
-                    format!("IC skill reference: {name} / {file}"),
-                )
-                .no_annotation(),
-            );
+            resources.push(Resource::new(
+                format!("{SKILL_URI_PREFIX}{name}/references/{file}"),
+                format!("IC skill reference: {name} / {file}"),
+            ));
         }
         Ok(ListResourcesResult { resources, next_cursor: None, meta: None })
     }
@@ -2444,7 +2439,7 @@ fn ok_structured<T: serde::Serialize>(text: String, value: &T) -> CallToolResult
 /// text. The structured `value` is attached under the same object-rooted rule as
 /// [`ok_structured`].
 fn ok_structured_blocks<T: serde::Serialize>(texts: Vec<String>, value: &T) -> CallToolResult {
-    let mut result = CallToolResult::success(texts.into_iter().map(Content::text).collect());
+    let mut result = CallToolResult::success(texts.into_iter().map(ContentBlock::text).collect());
     result.structured_content = match serde_json::to_value(value) {
         Ok(v @ serde_json::Value::Object(_)) => Some(v),
         _ => None,
@@ -2477,7 +2472,7 @@ fn ok_canister_action(canister_id: String, r: Result<String, String>) -> CallToo
 }
 
 fn err(text: String) -> CallToolResult {
-    CallToolResult::error(vec![Content::text(text)])
+    CallToolResult::error(vec![ContentBlock::text(text)])
 }
 
 #[cfg(test)]
