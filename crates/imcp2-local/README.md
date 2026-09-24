@@ -25,20 +25,27 @@ its provenance against the workflow that built it, then install it into a
 directory on your `PATH`:
 
 ```sh
-# Resolve the newest binary release. Plain `releases/latest` is NOT usable
-# here: production deploys publish `release-*` releases in this same
-# repository, so the repository's latest release is often not this crate's.
-TAG=$(gh release list -R dfinity/imcp2 --json tagName \
-        -q '[.[].tagName | select(startswith("imcp2-local-v"))][0]')
+# Resolve the newest binary release. `releases/latest` is NOT this crate's:
+# production deploys publish `release-*` releases in this same repository, so
+# the repository's latest release is usually one of those. Paginate rather
+# than take a first page, for the same reason — this crate's tag is a small
+# minority of the releases here.
+TAG=$(gh api --paginate repos/dfinity/imcp2/releases --jq '.[].tag_name' \
+        | grep -m1 '^imcp2-local-v')
 TARGET=aarch64-apple-darwin   # or x86_64-apple-darwin, {x86_64,aarch64}-unknown-linux-gnu
 
-curl -LO "https://github.com/dfinity/imcp2/releases/download/$TAG/imcp2-local-$TARGET.tar.xz"
-gh attestation verify "imcp2-local-$TARGET.tar.xz" -R dfinity/imcp2 \
-  --signer-workflow dfinity/imcp2/.github/workflows/imcp2-local-release.yml
-tar xf "imcp2-local-$TARGET.tar.xz"
-mkdir -p ~/.local/bin   # or any directory already on your PATH
-install "imcp2-local-$TARGET/imcp2-local" ~/.local/bin/
+# Chained: a failed download or a failed attestation stops the install.
+curl -fLO "https://github.com/dfinity/imcp2/releases/download/$TAG/imcp2-local-$TARGET.tar.xz" &&
+  gh attestation verify "imcp2-local-$TARGET.tar.xz" -R dfinity/imcp2 \
+    --signer-workflow dfinity/imcp2/.github/workflows/imcp2-local-release.yml &&
+  tar xf "imcp2-local-$TARGET.tar.xz" &&
+  mkdir -p ~/.local/bin &&
+  install "imcp2-local-$TARGET/imcp2-local" ~/.local/bin/
 ```
+
+`~/.local/bin` stands in for any directory already on your `PATH`; the last
+two commands create it and copy the binary there, nothing edits your shell
+configuration.
 
 (Windows ships `imcp2-local-x86_64-pc-windows-msvc.zip`; verify it the same way.)
 
