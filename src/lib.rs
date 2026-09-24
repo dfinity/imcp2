@@ -237,9 +237,14 @@ impl McpServer {
     ///   * `/.well-known/oauth-authorization-server` — the OIDC-style
     ///     alternate location of the AS metadata (some clients derive
     ///     `<issuer>/.well-known/…` instead of RFC 8414 path insertion);
-    ///   * everything else — the MCP streamable-HTTP endpoint (the router
+    ///   * `/branding?state=…` and `/branding/{slug}/logo` — verified-connector
+    ///     branding for Internet Identity's consent screen, CORS-open: the
+    ///     first answers for one pending connect (from its validated
+    ///     `redirect_uri`, `no-store`, `404` otherwise), the second serves a
+    ///     curated connector's static logo;
+    ///   * every other path — the MCP streamable-HTTP endpoint (the router
     ///     fallback, so the bare mount path, its trailing-slash form, and
-    ///     sub-paths all reach it), bearer-token gated, with the CORS
+    ///     unmatched sub-paths all reach it), bearer-token gated, with the CORS
     ///     preflight answered before authentication and `WWW-Authenticate`
     ///     exposed cross-origin.
     ///
