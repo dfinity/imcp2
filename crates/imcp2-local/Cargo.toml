@@ -13,7 +13,7 @@ repository = "https://github.com/dfinity/imcp2"
 publish = false
 
 # The one dist-released app in this workspace: release binaries + installers
-# are built by dist (see dist-workspace.toml) on `imcp2-local-v*` tags.
+# are built by dist (see dist-workspace.toml) on the `vX.Y.Z` release tags.
 [package.metadata.dist]
 dist = true
 

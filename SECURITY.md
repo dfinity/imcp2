@@ -36,7 +36,8 @@ We are committed to fixing security vulnerabilities in a timely manner. Once a s
 
 This project is under active development and has not yet reached a stable `1.0`
 release. Security fixes are applied to the latest revision on the `main` branch
-and reach the deployment on the next `release-*` tag.
+and ship in the next release: a `vX.Y.Z` tag promoted from a staging candidate,
+which publishes the crates production embeds and the local MCP binaries.
 
 ## Preferred Language
 

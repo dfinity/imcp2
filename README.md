@@ -607,9 +607,10 @@ when hosting:
 
 A `Dockerfile` is included (works on Render / Fly / Cloud Run / Koyeb). The
 reference deployment (`deploy/native/`, see its README) instead runs the binary
-and Caddy as native systemd units: pushes to `main` auto-deploy staging, and
-`release-*` tags deploy production, attaching the deployed binary to the GitHub
-release. For a
+and Caddy as native systemd units: an `rc-X.Y.Z-N` tag deploys that candidate to
+staging (attaching the deployed binary to a GitHub prerelease), and the matching
+`vX.Y.Z` tag publishes the crates and the local MCP binaries; production embeds
+the published crate. For a
 zero-signup public URL during testing, expose the local server with a tunnel:
 
 ```bash

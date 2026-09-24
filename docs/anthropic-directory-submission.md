@@ -274,8 +274,8 @@ document describes. What can NO longer be confirmed externally is the exact
 commit: `mcp.internetcomputer.org` now sits behind Internet Computer
 HTTP-gateway infrastructure that forwards only the MCP and OAuth paths, so
 `/version` answers with a redirect at that edge instead of the build report.
-Before submitting, have the operators confirm production runs a `release-*`
-tag cut from current `main` (on-host `curl localhost:8000/version`, or the
+Before submitting, have the operators confirm production runs a `vX.Y.Z`
+release cut from current `main` (on-host `curl localhost:8000/version`, or the
 deploy workflow's record) — or have the fronting layer forward `/version`
 again so the check works from anywhere.
 
@@ -435,7 +435,7 @@ conversation beyond tool arguments and generates no media.
 - [ ] Privacy policy entered in the portal — enter `https://internetcomputer.org/icp-mcp/privacy-policy/`, the page's one home (live; the old mcp.internetcomputer.org URL permanently redirects there) (blocker 1)
 - [x] Financial-transactions acknowledgment is a clean yes (blocker 2): the server does not support financial transactions. No mcp-review reply is needed; if one arrives, answer with the stated posture. The first-party-API/data-handling question was NOT in the 2026-07-31 email: raise it with mcp-review only if the portal's data-handling options don't fit
 - [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — if a reviewer asks for a populated account, provision a demo-app account (no funding needed: there are no funding or canister-management tools)
-- [ ] `release-*` tag cut; production confirmed to run the intended commit by the operators — externally `/version` is cut off by the gateway front, so the check is on-host or via the deploy workflow's record (blocker 4)
+- [ ] `vX.Y.Z` release cut (promoted from a staging candidate) and picked up by the gateway; production confirmed to run the intended commit by the operators — externally `/version` is cut off by the gateway front, so the check is on-host or via the deploy workflow's record (blocker 4)
 - [x] Square PNG icon exported — `docs/assets/icp-logo-{1024,512}.png` (blocker 5)
 - [ ] Every tool exercised once by the submitter (portal asks you to confirm this; MCP Inspector or a custom connector in Claude both count)
 - [ ] Submitter has Owner / Directory-management access in DFINITY's Claude Team/Enterprise org

@@ -2,7 +2,7 @@
 # Build the Claude Desktop bundle (.mcpb) for one imcp2-local release.
 #
 #   .github/scripts/build-mcpb.sh <tag> <out-dir>
-#   e.g. .github/scripts/build-mcpb.sh imcp2-local-v0.5.0 dist-mcpb
+#   e.g. .github/scripts/build-mcpb.sh v0.6.0 dist-mcpb
 #
 # The bundle is assembled from the release's own published archives, so it
 # carries exactly the binaries that release attests, each checked against the
@@ -37,10 +37,10 @@ set -euo pipefail
 tag="${1:?usage: build-mcpb.sh <tag> <out-dir>}"
 out="${2:?usage: build-mcpb.sh <tag> <out-dir>}"
 case "$tag" in
-  imcp2-local-v*) ;;
-  *) echo "not an imcp2-local release tag: $tag" >&2; exit 2 ;;
+  v[0-9]*) ;;
+  *) echo "not a vX.Y.Z release tag: $tag" >&2; exit 2 ;;
 esac
-version="${tag#imcp2-local-v}"
+version="${tag#v}"
 base="https://github.com/dfinity/imcp2/releases/download/$tag"
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 lipo="${LIPO:-lipo}"
@@ -74,7 +74,7 @@ fi
 # refuses even a genuinely attested archive from an older release.
 verify_provenance() {
   gh attestation verify "$1" --repo dfinity/imcp2 \
-    --signer-workflow dfinity/imcp2/.github/workflows/imcp2-local-release.yml \
+    --signer-workflow dfinity/imcp2/.github/workflows/v-release.yml \
     --source-ref "refs/tags/$tag" --deny-self-hosted-runners >/dev/null
 }
 
