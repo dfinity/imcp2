@@ -329,6 +329,7 @@ mod tests {
             clients: crate::SharedClients::load(std::env::temp_dir()),
             state_dir: std::env::temp_dir(),
             require_resource: true,
+            cimd_enabled: false,
         })
     }
 

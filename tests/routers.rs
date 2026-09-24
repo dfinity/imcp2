@@ -44,6 +44,7 @@ fn server(instance: imcp2::IiInstance, mcp_path: &str) -> imcp2::McpServer {
         // Lenient: these router contract tests drive flows that don't carry a
         // `resource`; strict RFC 8707 is covered by the auth unit tests.
         require_resource: false,
+        cimd_enabled: false,
     })
 }
 

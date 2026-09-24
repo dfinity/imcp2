@@ -80,9 +80,9 @@ tar -C "$repo_root" -cf - monitoring | $SSH "tar -C $REMOTE_DIR -xf -"
 echo ">> rendering + installing units and Caddyfile, then (re)starting services"
 # MCP_SERVE_BETA is set (to "1") only for the staging deployment, so /mcp-beta
 # is exposed there and not in production; it defaults to empty (off) otherwise.
-# OAUTH_CIMD_ENABLED ("1" to advertise Client ID Metadata Documents) comes from
-# the GitHub Environment's variable of that name and defaults to empty (off),
-# so enabling CIMD is a per-environment decision, never a side effect of a deploy.
+# OAUTH_CIMD_ENABLED comes from the GitHub Environment's variable of that name:
+# Client ID Metadata Documents are on unless it is a falsey value (0/false/no/off);
+# empty (unset) is on. A roll-out kill switch only, to be removed.
 unit_mcp="$(sed -e "s#__PUBLIC_URL__#https://$DOMAIN#g" -e "s#__MCP_SERVE_BETA__#${MCP_SERVE_BETA:-}#g" -e "s#__OPENAI_APPS_CHALLENGE_TOKEN__#${OPENAI_APPS_CHALLENGE_TOKEN:-}#g" -e "s#__OAUTH_CIMD_ENABLED__#${OAUTH_CIMD_ENABLED:-}#g" "$here/imcp2.service")"
 # SERVE_STATUS likewise is set (to "1") only for the staging deployment. Staging
 # keeps the Caddyfile's marked /status/ block (minus the marker lines) so the
