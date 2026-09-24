@@ -17,9 +17,78 @@ cannot spawn local processes; they keep using the hosted server.
 ## Install
 
 Release binaries (macOS arm64/x64, Linux x64/arm64, Windows x64) ship from
-this repository's GitHub releases with shell/PowerShell installers, built by
-`dist` from `imcp2-local-v*` tags. Until the first release is cut, build from
-source:
+this repository's GitHub releases, built by `dist` from `imcp2-local-v*` tags.
+
+**Verified install.** This binary acts as your Internet Identity, so prefer the
+path that establishes where the artifact came from. Download the archive, check
+that this repository's release workflow built it for that very release, then
+install it into a directory on your `PATH`:
+
+```sh
+# Resolve the newest binary release. `releases/latest` is NOT this crate's:
+# production deploys publish `release-*` releases in this same repository, so
+# the repository's latest release is usually one of those. Paginate rather
+# than take a first page, for the same reason — this crate's tag is a small
+# minority of the releases here.
+TAG=$(gh api --paginate repos/dfinity/imcp2/releases --jq '.[].tag_name' \
+        | awk '/^imcp2-local-v/ && !seen++')
+TARGET=aarch64-apple-darwin   # or x86_64-apple-darwin, {x86_64,aarch64}-unknown-linux-gnu
+
+# Chained: a failed download or a failed attestation stops the install.
+# --source-ref pins the attestation to $TAG itself: archive names repeat
+# across releases, so without it an older release's archive would pass.
+curl -fLO "https://github.com/dfinity/imcp2/releases/download/$TAG/imcp2-local-$TARGET.tar.xz" &&
+  gh attestation verify "imcp2-local-$TARGET.tar.xz" -R dfinity/imcp2 \
+    --signer-workflow dfinity/imcp2/.github/workflows/imcp2-local-release.yml \
+    --source-ref "refs/tags/$TAG" --deny-self-hosted-runners &&
+  tar xf "imcp2-local-$TARGET.tar.xz" &&
+  mkdir -p ~/.local/bin &&
+  install "imcp2-local-$TARGET/imcp2-local" ~/.local/bin/
+```
+
+`~/.local/bin` stands in for any directory already on your `PATH`; the last
+two commands create it and copy the binary there, nothing edits your shell
+configuration.
+
+(Windows ships `imcp2-local-x86_64-pc-windows-msvc.zip`; verify it the same way.)
+
+**Installer script.** Shorter, and what the release notes lead with. It
+downloads the binary for your platform, installs it plus an auto-updater into
+`~/.cargo/bin`, and adds that directory to your PATH by appending a line to
+every shell profile it can find — `IMCP2_LOCAL_NO_MODIFY_PATH=1` and
+`IMCP2_LOCAL_DISABLE_UPDATE=1` opt out of those two. The shell script also
+compares a checksum baked into itself, but where `sha256sum` is missing (older
+macOS releases, for one) it prints a one-line "skipping" notice and installs
+anyway; the PowerShell installer checks none at all. Even where the shell
+checksum runs, it ships inside the very script being piped to a shell, so it
+catches a corrupted download rather than a bad release. On both platforms the
+attestation above is what establishes provenance.
+
+```sh
+# Substitute the newest imcp2-local-v* tag; each release's notes carry the
+# current command, and `releases/latest` is not this crate's release (above).
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dfinity/imcp2/releases/download/imcp2-local-v0.5.0/imcp2-local-installer.sh | sh
+```
+
+**Claude Desktop bundle.** Each release also carries `imcp2-local.mcpb`.
+Download it and double-click it: Claude Desktop installs and manages the
+server itself — nothing lands on your `PATH`, and no `setup` is needed. It
+holds a universal macOS binary (Apple Silicon and Intel) and the Windows one.
+It is not yet code-signed, so expect Claude Desktop's unverified-developer
+warning; on macOS, Gatekeeper may also refuse the server's first launch until
+you allow it under System Settings → Privacy & Security. Organizations that
+limit Claude Desktop to directory-listed extensions block it outright. The
+bundle is attested like the archives, but by its own workflow, and pinned to
+its release the same way:
+
+```sh
+# TAG: the release you downloaded the bundle from (resolved as above).
+gh attestation verify imcp2-local.mcpb -R dfinity/imcp2 \
+  --signer-workflow dfinity/imcp2/.github/workflows/imcp2-local-mcpb.yml \
+  --source-ref "refs/tags/$TAG" --deny-self-hosted-runners
+```
+
+**From source.**
 
 ```sh
 cargo build --release -p imcp2-local
@@ -106,12 +175,16 @@ screen. Concretely:
 ## Verifying a download
 
 Every platform archive carries a keyless provenance attestation proving it
-was built by this repository's release workflow:
+was built by this repository's release workflow from that release's tag (the
+Claude Desktop bundle is attested the same way by `imcp2-local-mcpb.yml`,
+which assembles it — see Install). Check both: archive names repeat across
+releases, so the tag is what tells this release's archive from an older one's:
 
 ```sh
-# (Windows archives are .zip — substitute the extension.)
+# <tag>: the release the archive came from. (Windows archives are .zip.)
 gh attestation verify imcp2-local-<target>.tar.xz -R dfinity/imcp2 \
-  --signer-workflow dfinity/imcp2/.github/workflows/imcp2-local-release.yml
+  --signer-workflow dfinity/imcp2/.github/workflows/imcp2-local-release.yml \
+  --source-ref refs/tags/<tag> --deny-self-hosted-runners
 ```
 
 plus a SHA256 checksum alongside each archive. The convenience installers

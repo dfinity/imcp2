@@ -1,0 +1,66 @@
+# Prepends a plain-language summary of what the install scripts do to the
+# release notes `dist` writes for an `imcp2-local-v*` release.
+#
+# Why a job rather than a setting: dist builds the release body itself (the
+# install one-liners, the download table, the attestation section) and has no
+# config for extra prose — a custom job is the only documented seam. This one
+# hangs off `post-announce-jobs` in dist-workspace.toml, so `dist generate`
+# keeps wiring it in and the release workflow stays reproducible from config.
+#
+# The prose lives in .github/release-notes/imcp2-local-install-note.md so it
+# is reviewed as rendered markdown rather than as a string inside YAML. Keep
+# it in step with the installers and with the crate README's Install section.
+#
+# Runs after the release is published and edits the notes in place; the
+# marker in that file makes a re-run a no-op.
+name: imcp2-local install note
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  install-note:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      PLAN: ${{ inputs.plan }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      NOTE_FILE: .github/release-notes/imcp2-local-install-note.md
+    steps:
+      # Pinned to a commit SHA, as every other action in this pipeline is.
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Prepend the install-script summary to the release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="$(printf '%s' "$PLAN" | jq -er '.announcement_tag')"
+          marker="$(head -n 1 "$NOTE_FILE")"
+
+          body="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json body -q .body)"
+          # A substring match in the shell, not `printf | grep -q`: under
+          # pipefail, grep exiting on the first match can SIGPIPE printf on a
+          # large body, fail the test, and prepend the note a second time.
+          case "$body" in
+            *"$marker"*)
+              echo "summary already present on $tag — nothing to do"
+              exit 0
+              ;;
+          esac
+
+          {
+            cat "$NOTE_FILE"
+            printf '\n%s\n' "$body"
+          } > "$RUNNER_TEMP/notes.md"
+
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/notes.md"
+          echo "install-script summary added to $tag"
