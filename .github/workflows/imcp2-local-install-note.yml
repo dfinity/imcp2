@@ -1,5 +1,5 @@
 # Prepends a plain-language summary of what the install scripts do to the
-# release notes `dist` writes for an `imcp2-local-v*` release.
+# release notes `dist` writes for a `vX.Y.Z` release.
 #
 # Why a job rather than a setting: dist builds the release body itself (the
 # install one-liners, the download table, the attestation section) and has no

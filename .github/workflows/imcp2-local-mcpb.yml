@@ -1,5 +1,5 @@
-# Builds the Claude Desktop bundle (`imcp2-local.mcpb`) for an
-# `imcp2-local-v*` release, attests it, and attaches it to that release.
+# Builds the Claude Desktop bundle (`imcp2-local.mcpb`) for a `vX.Y.Z`
+# release, attests it, and attaches it to that release.
 #
 # Hung off `post-announce-jobs` in dist-workspace.toml: dist has no notion of
 # an MCPB artifact, and the bundle needs the finished per-platform archives

@@ -1,8 +1,8 @@
 # Release configuration for the `imcp2-local` binary (the design's end-user
 # distribution channel), built with dist (cargo-dist) following the ICP CLI's
 # setup. Only `imcp2-local` is distributed (see `[package.metadata.dist]` in
-# the crate manifests); the `imcp2`/`imcp2-core` crates release to crates.io
-# through .github/workflows/publish-crate.yml instead.
+# the crate manifests); the same `vX.Y.Z` tag publishes the `imcp2`/`imcp2-core`
+# crates to crates.io through .github/workflows/publish-crate.yml.
 [workspace]
 members = ["cargo:."]
 
@@ -20,8 +20,12 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = true
-# A prefix git tags must include for dist to care about them
-tag-namespace = "imcp2-local"
+# A prefix git tags must include for dist to care about them: the promotion
+# tags (`vX.Y.Z`). Candidates are `rc-X.Y.Z-N` and must stay outside this
+# trigger, because dist matches a tag's version against Cargo.toml exactly and
+# a candidate tag would fail its plan. The namespace also names the generated
+# workflow, .github/workflows/v-release.yml.
+tag-namespace = "v"
 # Whether to enable GitHub Attestations
 github-attestations = true
 # Prepend a plain-language summary of what the install scripts do to the
