@@ -122,13 +122,20 @@ mkdir -p "$bundle/server"
   "$work/imcp2-local-aarch64-apple-darwin/imcp2-local" \
   "$work/imcp2-local-x86_64-apple-darwin/imcp2-local"
 chmod 0755 "$bundle/server/imcp2-local"
-archs="$("$lipo" -archs "$bundle/server/imcp2-local")"
-for a in arm64 x86_64; do
-  case " $archs " in
-    *" $a "*) ;;
-    *) echo "universal binary is missing the $a slice (has: $archs)" >&2; exit 1 ;;
-  esac
+# Each slice must come out of lipo exactly as it went in: that is what keeps
+# the arm64 slice's signature valid, and what the archives' attestations
+# vouch for. Checking for the architecture names alone would miss a lipo that
+# rewrote one; `-thin` also fails outright if a slice is missing.
+for pair in arm64:aarch64-apple-darwin x86_64:x86_64-apple-darwin; do
+  a="${pair%%:*}"
+  t="${pair#*:}"
+  "$lipo" -thin "$a" -output "$work/slice-$a" "$bundle/server/imcp2-local"
+  if ! cmp -s "$work/slice-$a" "$work/imcp2-local-$t/imcp2-local"; then
+    echo "the universal binary's $a slice differs from the attested $t binary" >&2
+    exit 1
+  fi
 done
+archs="$("$lipo" -archs "$bundle/server/imcp2-local")"
 
 exe="$(find "$work/win" -type f -name 'imcp2-local.exe' | awk 'NR == 1')"
 if [ -z "$exe" ]; then
