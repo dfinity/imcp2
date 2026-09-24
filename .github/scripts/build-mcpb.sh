@@ -75,8 +75,9 @@ verify_provenance() {
     --source-ref "refs/tags/$tag" --deny-self-hosted-runners >/dev/null
 }
 
-# macOS ships `shasum`, not `sha256sum` — the very gap the release notes warn
-# about in the installer, so this does not repeat it.
+# Not every macOS has `sha256sum` (older releases have only `shasum`) — the
+# very gap the release notes warn about in the installer, which then skips its
+# check. This falls back instead of repeating that.
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'

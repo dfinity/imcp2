@@ -57,11 +57,12 @@ downloads the binary for your platform, installs it plus an auto-updater into
 `~/.cargo/bin`, and adds that directory to your PATH by appending a line to
 every shell profile it can find — `IMCP2_LOCAL_NO_MODIFY_PATH=1` and
 `IMCP2_LOCAL_DISABLE_UPDATE=1` opt out of those two. The shell script also
-compares a checksum baked into itself, but skips that silently on stock macOS,
-which has no `sha256sum`; the PowerShell installer checks none at all. Even
-where the shell checksum runs, it ships inside the very script being piped to
-a shell, so it catches a corrupted download rather than a bad release. On both
-platforms the attestation above is what establishes provenance.
+compares a checksum baked into itself, but where `sha256sum` is missing (older
+macOS releases, for one) it prints a one-line "skipping" notice and installs
+anyway; the PowerShell installer checks none at all. Even where the shell
+checksum runs, it ships inside the very script being piped to a shell, so it
+catches a corrupted download rather than a bad release. On both platforms the
+attestation above is what establishes provenance.
 
 ```sh
 # Substitute the newest imcp2-local-v* tag; each release's notes carry the
