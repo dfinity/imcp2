@@ -566,22 +566,22 @@ mod tests {
         landing_redirects_router, metrics_router, openai_apps_challenge_router, serve_metrics,
         site_metadata_router,
     };
+}
+use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
+use tower::ServiceExt;
 
-    /// `OAUTH_CIMD_ENABLED`'s reading: off unless it says on.
-    #[test]
-    fn cimd_opt_in_values() {
-        use super::cimd_enabled_by;
-        let off = [None, Some(""), Some(" "), Some("0"), Some("false"), Some("no"), Some("off")];
-        for value in off.into_iter().chain([Some("enabled"), Some("2")]) {
-            assert!(!cimd_enabled_by(value), "{value:?} should leave CIMD off");
-        }
-        for value in [Some("1"), Some("true"), Some("Yes"), Some("ON"), Some(" 1 ")] {
-            assert!(cimd_enabled_by(value), "{value:?} should turn CIMD on");
-        }
+/// `OAUTH_CIMD_ENABLED`'s reading: off unless it says on.
+#[test]
+fn cimd_opt_in_values() {
+    use super::cimd_enabled_by;
+    let off = [None, Some(""), Some(" "), Some("0"), Some("false"), Some("no"), Some("off")];
+    for value in off.into_iter().chain([Some("enabled"), Some("2")]) {
+        assert!(!cimd_enabled_by(value), "{value:?} should leave CIMD off");
     }
-    use axum::http::{Request, StatusCode};
-    use http_body_util::BodyExt;
-    use tower::ServiceExt;
+    for value in [Some("1"), Some("true"), Some("Yes"), Some("ON"), Some(" 1 ")] {
+        assert!(cimd_enabled_by(value), "{value:?} should turn CIMD on");
+    }
 
     /// The exposition must be **off** unless asked for, and the ask must be
     /// explicit. This is the security-relevant half of the gate: the native host
