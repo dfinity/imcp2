@@ -81,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
         clients: SharedClients::load(&state_dir),
         state_dir,
         require_resource: true, // strict RFC 8707 (reject a missing `resource`)
-        cimd_enabled: false, // advertise Client ID Metadata Documents (URL client_ids)
+        cimd_enabled: false, // Client ID Metadata Documents (URL client_ids) off; true opts in
     });
     server.spawn_session_reaper();
     let app = axum::Router::new()
