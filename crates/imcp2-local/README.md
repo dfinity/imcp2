@@ -21,14 +21,22 @@ this repository's GitHub releases, built by `dist` from `imcp2-local-v*` tags.
 
 **Verified install.** This binary acts as your Internet Identity, so prefer the
 path that establishes where the artifact came from. Download the archive, check
-its provenance against the workflow that built it, then put it on your PATH:
+its provenance against the workflow that built it, then install it into a
+directory on your `PATH`:
 
 ```sh
+# Resolve the newest binary release. Plain `releases/latest` is NOT usable
+# here: production deploys publish `release-*` releases in this same
+# repository, so the repository's latest release is often not this crate's.
+TAG=$(gh release list -R dfinity/imcp2 --json tagName \
+        -q '[.[].tagName | select(startswith("imcp2-local-v"))][0]')
 TARGET=aarch64-apple-darwin   # or x86_64-apple-darwin, {x86_64,aarch64}-unknown-linux-gnu
-curl -LO "https://github.com/dfinity/imcp2/releases/latest/download/imcp2-local-$TARGET.tar.xz"
+
+curl -LO "https://github.com/dfinity/imcp2/releases/download/$TAG/imcp2-local-$TARGET.tar.xz"
 gh attestation verify "imcp2-local-$TARGET.tar.xz" -R dfinity/imcp2 \
   --signer-workflow dfinity/imcp2/.github/workflows/imcp2-local-release.yml
 tar xf "imcp2-local-$TARGET.tar.xz"
+mkdir -p ~/.local/bin   # or any directory already on your PATH
 install "imcp2-local-$TARGET/imcp2-local" ~/.local/bin/
 ```
 
@@ -38,15 +46,17 @@ install "imcp2-local-$TARGET/imcp2-local" ~/.local/bin/
 downloads the binary for your platform, installs it plus an auto-updater into
 `~/.cargo/bin`, and adds that directory to your PATH by appending a line to
 every shell profile it can find — `IMCP2_LOCAL_NO_MODIFY_PATH=1` and
-`IMCP2_LOCAL_DISABLE_UPDATE=1` opt out of those two. It also compares a
-checksum baked into itself, but skips that silently on stock macOS, which has
-no `sha256sum`, and the PowerShell installer checks none at all. Either hash
-travels in the same script you are piping to a shell, so it guards against a
-corrupted download rather than a bad release — which is what the attestation
-above is for.
+`IMCP2_LOCAL_DISABLE_UPDATE=1` opt out of those two. The shell script also
+compares a checksum baked into itself, but skips that silently on stock macOS,
+which has no `sha256sum`; the PowerShell installer checks none at all. Even
+where the shell checksum runs, it ships inside the very script being piped to
+a shell, so it catches a corrupted download rather than a bad release. On both
+platforms the attestation above is what establishes provenance.
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dfinity/imcp2/releases/latest/download/imcp2-local-installer.sh | sh
+# Substitute the newest imcp2-local-v* tag; each release's notes carry the
+# current command, and `releases/latest` is not this crate's release (above).
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dfinity/imcp2/releases/download/imcp2-local-v0.5.0/imcp2-local-installer.sh | sh
 ```
 
 **From source.**
