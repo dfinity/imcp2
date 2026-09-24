@@ -23,11 +23,13 @@
 //! the connect is that vendor, and the redirect vendor is a sound,
 //! server-curated proxy for product identity. (That holds for a conforming
 //! browser; a user agent the attacker controls, such as an embedded webview, is
-//! out of scope for branding as it is for the rest of the flow.) Host matching
+//! out of scope for branding as it is for the rest of the flow.) Only a redirect
+//! admitted by a **compiled-in** allow-list entry resolves
+//! ([`crate::auth::redirect_uri_on_default_allow_list`]), so a vendor's name is
+//! never shown for a path an operator added on the vendor's domain. Host matching
 //! reuses validation's own rule ([`crate::auth::host_key`],
-//! [`crate::auth::host_is_or_under`]), and a redirect that validation would
-//! refuse never resolves to a connector, so branding and validation cannot
-//! disagree about a vendor.
+//! [`crate::auth::host_is_or_under`]), so branding and validation cannot disagree
+//! about a vendor.
 //!
 //! Endpoints, both issuer-rooted (same origin as the #4091-validated callback):
 //! `GET /branding?state=…` (session-bound metadata: name, logo URL, `verified`)
@@ -46,7 +48,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::auth::{host_is_or_under, host_key, redirect_uri_permitted, AuthStore};
+use crate::auth::{host_is_or_under, host_key, redirect_uri_on_default_allow_list, AuthStore};
 
 /// A vetted connector's server-curated branding.
 pub(crate) struct Connector {
@@ -69,14 +71,16 @@ pub(crate) struct Connector {
 /// logo, which would be a trademark/licensing matter this repo should not decide.
 /// It is the placeholder for every connector until each vendor's own licensed
 /// mark is dropped into its [`Connector::logo`]. II renders it via a fixed-size
-/// `<img src>` (an `<img>`-loaded SVG cannot execute script), so it needs no
-/// server-side sanitising.
+/// `<img src>` (an `<img>`-loaded SVG cannot execute script), but the logo URL can
+/// also be opened top-level on the issuer origin, so every bundled logo must be
+/// static and script-free (a test checks) and is served under a sandboxing CSP.
 pub(crate) const PLACEHOLDER_LOGO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-label="Verified connector"><rect width="96" height="96" rx="20" fill="#ece7db"/><circle cx="48" cy="48" r="22" fill="none" stroke="#8a8574" stroke-width="6"/><path d="M38 48l7 8 14-16" fill="none" stroke="#8a8574" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 
 /// The vetted connectors and their curated branding. The domains are exactly the
 /// vendor domains of the compiled-in `DEFAULT_ALLOWED_REDIRECTS` (a test holds
-/// the two sets equal); a host ops adds via `OAUTH_ALLOWED_REDIRECT_PREFIXES` is
-/// accepted for redirects but stays anonymous until it is curated here. v1
+/// the two sets equal). An `OAUTH_ALLOWED_REDIRECT_PREFIXES` entry is accepted for
+/// redirects but never branded, even on a vendor's domain, because resolution
+/// requires a compiled-in entry ([`connector_for_redirect`]). v1
 /// covers self-authenticating WEB connectors only; native/loopback apps stay
 /// anonymous (their only identity signal is a spoofable `client_name`). Logos
 /// are placeholders — see [`PLACEHOLDER_LOGO_SVG`].
@@ -114,20 +118,19 @@ pub(crate) const CONNECTORS: &[Connector] = &[
     },
 ];
 
-/// The vetted connector a `redirect_uri` belongs to, if any. The redirect must
-/// pass validation itself ([`redirect_uri_permitted`]: allow-listed path, no
-/// port, userinfo, query, or percent-encoding) and be `https`, so this never
-/// depends on its caller having validated; the host then matches exactly as
-/// validation does — trailing root dots trimmed, lowercased, dot-boundary
-/// subdomains. `None` for loopback or an unlisted host, which read as anonymous.
+/// The vetted connector a `redirect_uri` belongs to, if any. The redirect must be
+/// admitted by a compiled-in allow-list entry under validation's own rules
+/// ([`redirect_uri_on_default_allow_list`]: canonical `https`, pinned path, no
+/// port, userinfo, query, fragment, or percent-encoding), so this never depends
+/// on its caller having validated, and an operator-added entry never brands. The
+/// host then matches exactly as validation does — trailing root dots trimmed,
+/// lowercased, dot-boundary subdomains. `None` for loopback, an unlisted host, or
+/// an operator entry, which read as anonymous.
 pub(crate) fn connector_for_redirect(redirect_uri: &str) -> Option<&'static Connector> {
-    if !redirect_uri_permitted(redirect_uri) {
+    if !redirect_uri_on_default_allow_list(redirect_uri) {
         return None;
     }
     let url = url::Url::parse(redirect_uri).ok()?;
-    if url.scheme() != "https" {
-        return None;
-    }
     let host = host_key(url.host_str()?);
     CONNECTORS.iter().find(|c| c.domains.iter().any(|domain| host_is_or_under(&host, domain)))
 }
@@ -151,7 +154,8 @@ pub(crate) struct BrandingQuery {
 /// unknown, or expired `state` and for a session whose redirect is not a vetted
 /// connector (loopback / unlisted), so the response is no oracle for which
 /// sessions exist; a malformed query (e.g. a repeated `state`) gets that same
-/// 404 rather than axum's 400. `no-store`: the answer is per-session.
+/// 404 rather than axum's 400. Every response is `no-store`: the answer is
+/// per-session.
 pub(crate) async fn branding_metadata(
     State(store): State<AuthStore>,
     query: Result<Query<BrandingQuery>, QueryRejection>,
@@ -177,7 +181,9 @@ pub(crate) async fn branding_metadata(
 /// per-connector asset: it makes no claim about any session (that is
 /// [`branding_metadata`]'s job, whose `logo` URL points here). II MUST render it
 /// via a fixed-size `<img src>`, never inline the SVG into the consent DOM: an
-/// `<img>`-loaded SVG cannot execute script, an inlined one can.
+/// `<img>`-loaded SVG cannot execute script, an inlined one can. Opened top-level
+/// it would render as a document on the issuer origin, so it also carries a
+/// sandboxing CSP ([`LOGO_CSP`]); an `<img>` ignores that header.
 pub(crate) async fn branding_logo(Path(slug): Path<String>) -> Response {
     let Some(connector) = connector_by_slug(&slug) else {
         return branding_not_found();
@@ -187,12 +193,21 @@ pub(crate) async fn branding_logo(Path(slug): Path<String>) -> Response {
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/svg+xml"));
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=3600"));
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(LOGO_CSP));
     resp
 }
 
-/// No branding for this request: 404, the same for every reason.
+/// The logo's `Content-Security-Policy`: no script, no subresources, a sandboxed
+/// document — inert even when the SVG is opened top-level on the issuer origin.
+/// Inline styles stay allowed, since SVG presentation may use them.
+const LOGO_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
+
+/// No branding for this request: 404, the same for every reason, and `no-store`
+/// like the answer it stands in for.
 fn branding_not_found() -> Response {
-    (StatusCode::NOT_FOUND, "no connector branding").into_response()
+    let mut resp = (StatusCode::NOT_FOUND, "no connector branding").into_response();
+    resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
 }
 
 #[cfg(test)]
@@ -268,6 +283,48 @@ mod tests {
         let curated: BTreeSet<&str> =
             CONNECTORS.iter().flat_map(|c| c.domains.iter().copied()).collect();
         assert_eq!(curated, crate::auth::default_redirect_domains());
+    }
+
+    #[test]
+    fn bundled_logos_are_static_svg() {
+        // A logo URL can be opened top-level on the issuer origin, where an SVG is a
+        // document: every bundled mark must be inert on its own.
+        // Internal references (`href="#id"`, `url(#gradient)`) are fine; script,
+        // event handlers, embedded HTML, and anything external are not.
+        for c in CONNECTORS {
+            // Namespace declarations are names, not references: drop the standard ones.
+            let svg = c
+                .logo
+                .to_ascii_lowercase()
+                .replace(char::is_whitespace, " ")
+                .replace(r#"xmlns="http://www.w3.org/2000/svg""#, "")
+                .replace(r#"xmlns:xlink="http://www.w3.org/1999/xlink""#, "");
+            assert!(svg.starts_with("<svg"), "{}: not an SVG", c.slug);
+            for banned in [
+                "<script",
+                "javascript:",
+                "<foreignobject",
+                "@import",
+                "=\"http",
+                "='http",
+                "=\"//",
+                "='//",
+                "=\"data:",
+                "='data:",
+                "url(http",
+                "url(//",
+                "url(data:",
+            ] {
+                assert!(!svg.contains(banned), "{}: bundled logo contains {banned:?}", c.slug);
+            }
+            // No `on…=` event-handler attribute.
+            let handler = svg.match_indices(" on").any(|(i, _)| {
+                let rest = &svg[i + 3..];
+                let name = rest.chars().take_while(char::is_ascii_alphabetic).count();
+                name > 0 && rest[name..].trim_start().starts_with('=')
+            });
+            assert!(!handler, "{}: bundled logo has an event-handler attribute", c.slug);
+        }
     }
 
     #[test]

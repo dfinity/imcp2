@@ -537,6 +537,11 @@ async fn branding_endpoints_are_session_bound_and_serve_logos() {
             resp.headers().contains_key("access-control-allow-origin"),
             "GET {path}: II fetches this cross-origin, so it must be CORS-open"
         );
+        assert_eq!(
+            resp.headers().get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "GET {path}: the 404 is per-session too"
+        );
     }
 
     // The old UNBOUND per-slug metadata endpoint (it returned `verified: true` for
@@ -561,6 +566,9 @@ async fn branding_endpoints_are_session_bound_and_serve_logos() {
         resp.headers().get("x-content-type-options").and_then(|v| v.to_str().ok()),
         Some("nosniff")
     );
+    // Opened top-level, the SVG is a document on the issuer origin: keep it inert.
+    let csp = resp.headers().get("content-security-policy").and_then(|v| v.to_str().ok());
+    assert!(csp.is_some_and(|v| v.contains("sandbox") && v.contains("default-src 'none'")));
 
     // A slug outside the curated set 404s, so the path can't probe.
     let resp = app()

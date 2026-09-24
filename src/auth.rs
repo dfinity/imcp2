@@ -652,6 +652,40 @@ pub(crate) fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     if is_loopback_url(&url) {
         return true;
     }
+    hosted_redirect_admitted(
+        &url,
+        allowed_redirects()
+            .iter()
+            .map(|(domain, path, pin)| (domain.as_str(), path.as_str(), *pin)),
+    )
+}
+
+/// Whether `redirect_uri` is a hosted redirect admitted by a **compiled-in**
+/// [`DEFAULT_ALLOWED_REDIRECTS`] entry, under the same rules as
+/// [`redirect_uri_permitted`] (no query or fragment, canonical `https` shape, no
+/// percent-encoding, pinned path). Operator entries from
+/// `OAUTH_ALLOWED_REDIRECT_PREFIXES` do not count, and neither does loopback.
+/// Connector branding ([`crate::branding`]) rests on this, so a vendor's name is
+/// only ever shown for the reviewed callback paths in this repo, never for a path
+/// a deployment added on the vendor's domain.
+pub(crate) fn redirect_uri_on_default_allow_list(redirect_uri: &str) -> bool {
+    let Ok(url) = url::Url::parse(redirect_uri) else {
+        return false;
+    };
+    if url.query().is_some() || url.fragment().is_some() {
+        return false;
+    }
+    hosted_redirect_admitted(&url, DEFAULT_ALLOWED_REDIRECTS.iter().copied())
+}
+
+/// The hosted half of [`redirect_uri_permitted`], over an explicit set of
+/// `(domain, path, pin)` entries: `url` (already free of query and fragment) must
+/// have the canonical `https://<host><path>` shape, a path with no
+/// percent-encoding, and a host and path that some entry admits.
+fn hosted_redirect_admitted<'a>(
+    url: &url::Url,
+    entries: impl IntoIterator<Item = (&'a str, &'a str, PathPin)>,
+) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
@@ -665,7 +699,7 @@ pub(crate) fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     let Ok(canonical) = url::Url::parse(&format!("https://{host}{}", url.path())) else {
         return false;
     };
-    if url != canonical {
+    if url != &canonical {
         return false;
     }
     let host = host_key(host);
@@ -687,7 +721,7 @@ pub(crate) fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     // or descendants too). The path pin is what keeps a registration off
     // third-party/user-content paths (e.g. `/page/…`, `/g/…`) on the same origin;
     // without it, domain-only matching would let those capture the code.
-    allowed_redirects().iter().any(|(domain, prefix, pin)| {
+    entries.into_iter().any(|(domain, prefix, pin)| {
         host_is_or_under(&host, domain)
             && match pin {
                 PathPin::Exact => path == prefix,
@@ -3243,6 +3277,33 @@ mod tests {
     /// pinned callback path; loopback always passes; everything else (a
     /// user-content path on an allow-listed origin, a wrong path, an unlisted
     /// domain, or an authority-trick look-alike) is refused.
+    // Branding's vetting ignores operator entries: a path a deployment adds on a
+    // vendor's domain is a valid redirect but never earns that vendor's name.
+    #[test]
+    fn default_allow_list_vetting_ignores_operator_entries() {
+        use super::{
+            hosted_redirect_admitted, redirect_uri_on_default_allow_list, PathPin,
+            DEFAULT_ALLOWED_REDIRECTS,
+        };
+        let ops_added = "https://claude.ai/ops/added/cb";
+        let with_operator_entry = DEFAULT_ALLOWED_REDIRECTS.iter().copied().chain([(
+            "claude.ai",
+            "/ops/added",
+            PathPin::Prefix,
+        )]);
+        let url = url::Url::parse(ops_added).unwrap();
+        assert!(
+            hosted_redirect_admitted(&url, with_operator_entry),
+            "the operator entry admits it"
+        );
+        assert!(!redirect_uri_on_default_allow_list(ops_added), "but it is not a vetted callback");
+        // The compiled-in callbacks are vetted, with validation's own rules.
+        assert!(redirect_uri_on_default_allow_list("https://claude.ai/api/mcp/auth_callback"));
+        assert!(redirect_uri_on_default_allow_list("https://claude.ai./api/mcp/auth_callback"));
+        assert!(!redirect_uri_on_default_allow_list("https://claude.ai/api/mcp/auth_callback?x=1"));
+        assert!(!redirect_uri_on_default_allow_list("http://127.0.0.1:5173/cb"));
+    }
+
     #[test]
     fn hosted_redirect_allow_list() {
         // Allow-listed vendor domains/subdomains UNDER their pinned callback path.
