@@ -79,6 +79,21 @@ fn serve_beta() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether to advertise and accept Client ID Metadata Documents, the
+/// registration mode Claude and ChatGPT prefer over DCR. Off unless
+/// `$OAUTH_CIMD_ENABLED` is truthy (`1`/`true`/`yes`/`on`): both switch to CIMD
+/// the moment it is advertised, so a deploy must never turn it on by itself.
+/// Read once and handed to every instance; to roll back, unset it and redeploy.
+fn cimd_enabled() -> bool {
+    cimd_enabled_by(std::env::var("OAUTH_CIMD_ENABLED").ok().as_deref())
+}
+
+fn cimd_enabled_by(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
 /// Whether to serve the Prometheus exposition at `/metrics`. Off unless
 /// `$MCP_SERVE_METRICS` is truthy (`1`/`true`/`yes`/`on`).
 ///
@@ -291,6 +306,12 @@ async fn main() -> anyhow::Result<()> {
     // the operational directory.
     let clients = SharedClients::load(&state_dir);
 
+    // Client ID Metadata Documents: one deploy-time switch for every instance.
+    let cimd_on = cimd_enabled();
+    if cimd_on {
+        tracing::info!("OAUTH_CIMD_ENABLED is set: Client ID Metadata Documents are on");
+    }
+
     // Production Internet Identity at `/mcp`: always served, and the origin's
     // default instance (it answers the plain-root discovery probes). A
     // self-contained McpServer whose sessions/tokens never cross instances.
@@ -302,6 +323,7 @@ async fn main() -> anyhow::Result<()> {
         clients: clients.clone(),
         state_dir: state_dir.clone(),
         require_resource: require_resource(),
+        cimd_enabled: cimd_on,
     });
     prod.spawn_session_reaper();
 
@@ -316,6 +338,7 @@ async fn main() -> anyhow::Result<()> {
             clients,
             state_dir,
             require_resource: require_resource(),
+            cimd_enabled: cimd_on,
         });
         beta.spawn_session_reaper();
         Some(beta)
@@ -543,6 +566,19 @@ mod tests {
         landing_redirects_router, metrics_router, openai_apps_challenge_router, serve_metrics,
         site_metadata_router,
     };
+
+    /// `OAUTH_CIMD_ENABLED`'s reading: off unless it says on.
+    #[test]
+    fn cimd_opt_in_values() {
+        use super::cimd_enabled_by;
+        let off = [None, Some(""), Some(" "), Some("0"), Some("false"), Some("no"), Some("off")];
+        for value in off.into_iter().chain([Some("enabled"), Some("2")]) {
+            assert!(!cimd_enabled_by(value), "{value:?} should leave CIMD off");
+        }
+        for value in [Some("1"), Some("true"), Some("Yes"), Some("ON"), Some(" 1 ")] {
+            assert!(cimd_enabled_by(value), "{value:?} should turn CIMD on");
+        }
+    }
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;

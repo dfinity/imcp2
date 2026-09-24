@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         clients: SharedClients::load(&state_dir),
         state_dir,
         require_resource: true, // strict RFC 8707 (reject a missing `resource`)
+        cimd_enabled: false, // advertise Client ID Metadata Documents (URL client_ids)
     });
     server.spawn_session_reaper();
     let app = axum::Router::new()
@@ -716,7 +717,8 @@ its AS issuer is `<PUBLIC_URL>/mcp` and everything OAuth lives under it:
   once per process (however many instances the binary mounts), four per host, so
   one slow host cannot hold up the rest. The fetch connects directly, never
   through a proxy from the environment, so the address pin always binds. Claude and ChatGPT both select CIMD over DCR when it is
-  advertised — which it is only where `OAUTH_CIMD_ENABLED=1` is set (the deploy
+  advertised — which it is only where the deployment opts in: `McpConfig::cimd_enabled`
+  for an embedding host, `OAUTH_CIMD_ENABLED=1` for the `imcp2` binary (the deploy
   template takes it from the GitHub Environment's variable of that name, so a
   deploy never enables it by itself; to roll back, unset it and redeploy — the
   value is read once at start-up, so the variable alone changes nothing — and

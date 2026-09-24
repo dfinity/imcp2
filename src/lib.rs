@@ -42,6 +42,7 @@
 //!         clients: SharedClients::load(&state_dir),
 //!         state_dir,
 //!         require_resource: true, // strict RFC 8707 (reject a missing `resource`)
+//!         cimd_enabled: false, // advertise Client ID Metadata Documents (URL client_ids)
 //!     });
 //!     server.spawn_session_reaper();
 //!     let app = axum::Router::new()
@@ -149,6 +150,14 @@ pub struct McpConfig {
     /// of turning away any client predating RFC 8707. When `false`, a missing
     /// `resource` is tolerated (a present one must still match).
     pub require_resource: bool,
+    /// Client ID Metadata Documents: when `true`, the AS metadata advertises
+    /// `client_id_metadata_document_supported` and a URL `client_id` on a vetted
+    /// vendor origin is accepted by fetching its document; when `false`, a URL
+    /// `client_id` is an unknown client. Claude and ChatGPT switch to CIMD the
+    /// moment it is advertised, so it is off unless the deployment opts in. Set
+    /// by the embedding application; the `imcp2` binary sets it from
+    /// `$OAUTH_CIMD_ENABLED`.
+    pub cimd_enabled: bool,
 }
 
 /// One MCP server instance: the shared state behind [`Self::mcp_router`] and
@@ -187,6 +196,7 @@ impl McpServer {
             public_url.clone(),
             mcp_path.clone(),
             config.require_resource,
+            config.cimd_enabled,
         );
         Self {
             agent: config.agent,
@@ -618,6 +628,7 @@ mod lib_tests {
             clients: SharedClients::load(&dir),
             state_dir: dir,
             require_resource: true,
+            cimd_enabled: false,
         })
     }
 
@@ -644,6 +655,7 @@ mod lib_tests {
             clients: SharedClients::load(std::env::temp_dir().join("dir-a")),
             state_dir: std::env::temp_dir().join("dir-b"),
             require_resource: true,
+            cimd_enabled: false,
         });
     }
 

@@ -785,17 +785,15 @@ fn loopback_match(registered: &str, requested: &str) -> bool {
 // ones; were one added, the only attested fact is the HOST of the `client_id`
 // URL — never the self-asserted `client_name` or `logo_uri`.
 //
-// OPT-IN per deployment: `OAUTH_CIMD_ENABLED=1` advertises the mechanism and
-// accepts URL `client_id`s; unset, the metadata does not advertise it and a URL
+// OPT-IN per deployment ([`crate::McpConfig::cimd_enabled`]): on, the metadata
+// advertises the mechanism and URL `client_id`s are accepted; off, a URL
 // `client_id` is an unknown client. Claude and ChatGPT both switch to CIMD the
 // moment an AS advertises it, so a routine deploy must never switch them over
-// by itself (the deploy template takes the variable from the GitHub
-// Environment). The rollback, should a vendor's document turn out to be shaped
-// in a way this implementation refuses, is to unset the variable AND redeploy:
-// it is rendered into the unit at deploy time and read here once at start-up
-// ([`cimd_enabled_by_env`]), so changing it alone changes nothing on the host.
-// Once the process restarts without it, the clients re-read the metadata within
-// minutes and fall back to DCR.
+// by itself: an embedding host sets the field, and the `imcp2` binary takes it
+// from `OAUTH_CIMD_ENABLED`, which the deploy template renders from the GitHub
+// Environment's variable. The rollback, should a vendor's document turn out to
+// be shaped in a way this implementation refuses, is to switch it off and
+// restart; the clients re-read the metadata within minutes and fall back to DCR.
 
 /// Byte cap on a `client_id` URL before it is treated as CIMD at all: the URL
 /// becomes a key of the process-wide cache and single-flight map (and part of a
@@ -843,29 +841,6 @@ const CIMD_CACHE_MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// document does not list) never is, or a probe with a bad redirect could lock
 /// out a real client; nor is a transient (a deadline, a 5xx), which is retried.
 const CIMD_NEGATIVE_TTL: Duration = Duration::from_secs(60);
-
-/// Whether this process is deployed with CIMD on: `OAUTH_CIMD_ENABLED` set to
-/// an on-value ([`cimd_enabled_by`]). Read once (the env is process-static),
-/// like the allow-list's `OAUTH_ALLOWED_REDIRECT_PREFIXES`; each [`AuthStore`]
-/// takes its own copy at construction, which tests set directly.
-fn cimd_enabled_by_env() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let enabled = cimd_enabled_by(std::env::var("OAUTH_CIMD_ENABLED").ok().as_deref());
-        if enabled {
-            tracing::info!("OAUTH_CIMD_ENABLED is set: Client ID Metadata Documents are on");
-        }
-        enabled
-    })
-}
-
-/// The opt-in's reading of `OAUTH_CIMD_ENABLED`: `1`, `true`, `yes` and `on`
-/// (any case) switch CIMD on; unset, empty, or anything else leaves it off.
-fn cimd_enabled_by(value: Option<&str>) -> bool {
-    value.is_some_and(|v| {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    })
-}
 
 /// A validated Client ID Metadata Document: what this server needs from it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1476,8 +1451,8 @@ pub struct AuthStore {
     /// bounds — the PROCESS's ([`CimdState::shared`]), so every mounted instance
     /// draws on the same bounds; a test may give a store its own.
     cimd: Arc<CimdState>,
-    /// Whether URL `client_id`s are accepted and CIMD advertised: the process's
-    /// `OAUTH_CIMD_ENABLED` ([`cimd_enabled_by_env`]), or what a test set.
+    /// Whether URL `client_id`s are accepted and CIMD advertised
+    /// ([`crate::McpConfig::cimd_enabled`]).
     cimd_enabled: bool,
 }
 
@@ -1587,6 +1562,7 @@ impl AuthStore {
         public_url: String,
         mcp_path: String,
         require_resource: bool,
+        cimd_enabled: bool,
     ) -> Self {
         Self {
             clients: clients.0,
@@ -1598,12 +1574,12 @@ impl AuthStore {
             mcp_path,
             require_resource,
             cimd: CimdState::shared(),
-            cimd_enabled: cimd_enabled_by_env(),
+            cimd_enabled,
         }
     }
 
-    /// This store with CIMD switched on or off, whatever the environment says,
-    /// and with CIMD state of its own, so tests do not see each other's flights.
+    /// This store with CIMD switched on or off, and with CIMD state of its own,
+    /// so tests do not see each other's flights.
     #[cfg(test)]
     fn with_cimd(mut self, enabled: bool) -> Self {
         self.cimd_enabled = enabled;
@@ -3015,9 +2991,8 @@ pub async fn authorization_server_metadata(State(store): State<AuthStore>) -> Re
         // identify itself with the https URL of its Client ID Metadata Document
         // instead of registering (see `cimd_client_id`). Claude and ChatGPT both
         // select CIMD over DCR when this is advertised alongside `none` above —
-        // which is why it is advertised only where the deployment opts in with
-        // `OAUTH_CIMD_ENABLED`, and a redeploy without that withdraws it (no
-        // rebuild; the value is read once at start-up).
+        // which is why it is advertised only where the deployment opts in
+        // (`McpConfig::cimd_enabled`), and switching that off withdraws it.
         "client_id_metadata_document_supported": store.cimd_enabled,
         // RFC 9207: we emit `iss` on every authorization response, so we MUST
         // advertise it here (a client that sees this flag rejects any response
@@ -3626,19 +3601,6 @@ mod tests {
         assert!(invalid(FetchError::Refused("private address".into())));
         assert!(invalid(FetchError::TooLarge("cap".into())));
         assert!(invalid(FetchError::NotUtf8("bytes".into())));
-    }
-
-    /// The deploy-time opt-in's reading of its variable: off unless it says on.
-    #[test]
-    fn cimd_opt_in_values() {
-        use super::cimd_enabled_by;
-        let off = [None, Some(""), Some(" "), Some("0"), Some("false"), Some("no"), Some("off")];
-        for value in off.into_iter().chain([Some("enabled"), Some("2")]) {
-            assert!(!cimd_enabled_by(value), "{value:?} should leave CIMD off");
-        }
-        for value in [Some("1"), Some("true"), Some("Yes"), Some("ON"), Some(" 1 ")] {
-            assert!(cimd_enabled_by(value), "{value:?} should turn CIMD on");
-        }
     }
 
     /// PR #143's trust policy: a document is fetched only from a vetted vendor
@@ -4365,13 +4327,13 @@ mod tests {
     }
 
     fn test_store_cfg(require_resource: bool) -> super::AuthStore {
-        // As deployed with `OAUTH_CIMD_ENABLED=1`, and with CIMD state of its own so
-        // tests do not see each other's flights; the off case sets this itself.
+        // As a deployment with CIMD on, and with CIMD state of its own so tests do
+        // not see each other's flights; the off case sets this itself.
         new_store(require_resource).with_cimd(true)
     }
 
-    /// A store exactly as [`super::AuthStore::new`] builds it: CIMD per the
-    /// environment (off under `cargo test`), CIMD state shared process-wide.
+    /// A store exactly as [`super::AuthStore::new`] builds it with CIMD off, CIMD
+    /// state shared process-wide.
     fn new_store(require_resource: bool) -> super::AuthStore {
         use candid::Principal;
         use imcp2_core::identities::{Identities, IiInstance};
@@ -4395,6 +4357,7 @@ mod tests {
             "https://mcp.test".into(),
             "/mcp".into(),
             require_resource,
+            false,
         )
     }
 
@@ -4638,6 +4601,7 @@ mod tests {
                 )),
                 "https://mcp.test".into(),
                 mcp_path.into(),
+                false,
                 false,
             )
         };

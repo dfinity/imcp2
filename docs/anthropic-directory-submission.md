@@ -81,7 +81,8 @@ Claude registers a new client on each fresh connection (the registration store
 is a bounded LRU of 10,000, which tolerates that churn); Anthropic recommends
 **CIMD** (Client ID Metadata Documents) for high-traffic directory listings,
 and the server implements it (PR #143's trust-policy-gated design) and
-advertises it where `OAUTH_CIMD_ENABLED=1` is set, so there Claude selects CIMD
+advertises it where the deployment opts in (`McpConfig::cimd_enabled`;
+`OAUTH_CIMD_ENABLED=1` for the `imcp2` binary), so there Claude selects CIMD
 and registers nothing.
 
 ## Blockers to resolve before submitting
