@@ -342,7 +342,7 @@ fn clients(env: &Env) -> Vec<Client> {
                 "its config directory is",
             ),
             manual: format!(
-                "Merge into claude_desktop_config.json (Settings → Developer → Edit Config):\n{json_snippet}\n(Or install the imcp2 .mcpb bundle by double-clicking it, once released.)"
+                "Merge into claude_desktop_config.json (Settings → Developer → Edit Config):\n{json_snippet}\n(Or skip this: double-click imcp2-local.mcpb from the GitHub release.)"
             ),
         },
         Client {

@@ -1,0 +1,62 @@
+# Builds the Claude Desktop bundle (`imcp2-local.mcpb`) for an
+# `imcp2-local-v*` release, attests it, and attaches it to that release.
+#
+# Hung off `post-announce-jobs` in dist-workspace.toml: dist has no notion of
+# an MCPB artifact, and the bundle needs the finished per-platform archives
+# anyway, so it is assembled after the release exists — from that release's
+# own published archives, each checked against its .sha256 (see
+# .github/scripts/build-mcpb.sh for why the macOS binary is universal).
+#
+# The bundle is a new artifact with its own digest, so it gets its own
+# provenance attestation rather than leaning on the archives'; the job needs
+# `id-token`/`attestations` for that, granted to its caller through
+# `github-custom-job-permissions`.
+#
+# Runs on macOS for the native `lipo` and to execute the universal binary it
+# just built, which is how the manifest's tool list is read off the server.
+name: imcp2-local Claude Desktop bundle
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  mcpb:
+    runs-on: macos-14
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      PLAN: ${{ inputs.plan }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      # Pinned to a commit SHA, as every other action in this pipeline is.
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Build the bundle from this release's archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(printf '%s' "$PLAN" | jq -er '.announcement_tag')"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          .github/scripts/build-mcpb.sh "$tag" mcpb-out
+
+      - name: Attest
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f
+        with:
+          subject-path: mcpb-out/imcp2-local.mcpb
+
+      - name: Attach to the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --clobber so a re-run replaces the asset rather than failing on it.
+          gh release upload "$TAG" mcpb-out/imcp2-local.mcpb \
+            --repo "$GITHUB_REPOSITORY" --clobber

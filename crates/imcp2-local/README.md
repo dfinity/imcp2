@@ -66,6 +66,21 @@ platforms the attestation above is what establishes provenance.
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dfinity/imcp2/releases/download/imcp2-local-v0.5.0/imcp2-local-installer.sh | sh
 ```
 
+**Claude Desktop bundle.** Each release also carries `imcp2-local.mcpb`.
+Download it and double-click it: Claude Desktop installs and manages the
+server itself — nothing lands on your `PATH`, and no `setup` is needed. It
+holds a universal macOS binary (Apple Silicon and Intel) and the Windows one.
+It is not yet code-signed, so expect Claude Desktop's unverified-developer
+warning; on macOS, Gatekeeper may also refuse the server's first launch until
+you allow it under System Settings → Privacy & Security. Organizations that
+limit Claude Desktop to directory-listed extensions block it outright. The
+bundle is attested like the archives, but by its own workflow:
+
+```sh
+gh attestation verify imcp2-local.mcpb -R dfinity/imcp2 \
+  --signer-workflow dfinity/imcp2/.github/workflows/imcp2-local-mcpb.yml
+```
+
 **From source.**
 
 ```sh
@@ -153,7 +168,9 @@ screen. Concretely:
 ## Verifying a download
 
 Every platform archive carries a keyless provenance attestation proving it
-was built by this repository's release workflow:
+was built by this repository's release workflow (the Claude Desktop bundle is
+attested the same way by `imcp2-local-mcpb.yml`, which assembles it — see
+Install):
 
 ```sh
 # (Windows archives are .zip — substitute the extension.)

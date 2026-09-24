@@ -503,7 +503,7 @@ the client provides one, and a `setup` subcommand in the binary for the rest.
 
 | Client | What the user does |
 |---|---|
-| Claude Desktop | **Double-click the `imcp2.mcpb` bundle** → Claude Desktop shows its install dialog → Enable. (MCPB is Claude Desktop's plugin format; the bundle carries the per-platform binary and installs it in one step.) |
+| Claude Desktop | **Double-click the `imcp2-local.mcpb` bundle** → Claude Desktop shows its install dialog → Enable. (MCPB is Claude Desktop's plugin format; the bundle carries a universal macOS binary and the Windows binary and installs the right one in one step.) |
 | Claude Code | Paste one command: `claude mcp add --transport stdio imcp2 -- <installed path>` |
 | Codex (CLI / IDE / desktop) | Paste one command: `codex mcp add imcp2 -- <installed path>` |
 | Cursor | Click the **"Add to Cursor"** install link on the docs page → Cursor opens its install prompt → Install. |
@@ -577,8 +577,13 @@ Two distinct layers, for two different verifiers:
   Application certificate + an App Store Connect API key; an Azure Trusted Signing account
   (or an EV certificate); artifact attestations are free to enable.
 
-One artifact per platform, with the `.mcpb` manifest pointing at the right per-OS binary;
-building and signing these artifacts is a Stage 3 deliverable.
+One archive per platform, plus a single `.mcpb` for Claude Desktop. MCPB's
+`platform_overrides` key on the OS alone, not the CPU, so the bundle carries a universal
+macOS binary (the arm64 and x86_64 builds joined by `lipo`, each slice byte-identical to its
+attested archive) beside the Windows one, and Claude Desktop appends `.exe` itself. The
+bundle is assembled from the release's own published archives after they exist, and gets
+its own provenance attestation; building and signing these artifacts is a Stage 3
+deliverable.
 
 ## Implementation Stages
 

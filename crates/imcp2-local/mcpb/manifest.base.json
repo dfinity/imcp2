@@ -1,0 +1,38 @@
+{
+  "manifest_version": "0.3",
+  "name": "icp-mcp-local",
+  "display_name": "ICP MCP",
+  "version": "0.0.0",
+  "description": "Questions and actions across ICP apps by chatting through AI, from a server running on your own machine.",
+  "long_description": "Runs the Internet Computer MCP server locally. It reads Internet Computer apps and canisters, and — once you sign in with Internet Identity in your browser — acts as your identity at the apps you choose. Treat it like a wallet: whatever drives it acts as you, within the access level and lifetime you grant on Internet Identity's consent screen.",
+  "author": {
+    "name": "DFINITY",
+    "email": "mcp@dfinity.org",
+    "url": "https://internetcomputer.org/icp-mcp"
+  },
+  "homepage": "https://internetcomputer.org/icp-mcp",
+  "documentation": "https://github.com/dfinity/imcp2/blob/main/crates/imcp2-local/README.md",
+  "support": "https://internetcomputer.org/icp-mcp/support/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dfinity/imcp2"
+  },
+  "icon": "icon.png",
+  "server": {
+    "type": "binary",
+    "entry_point": "server/imcp2-local",
+    "mcp_config": {
+      "command": "${__dirname}/server/imcp2-local",
+      "args": [],
+      "env": {}
+    }
+  },
+  "tools": [],
+  "tools_generated": false,
+  "keywords": ["icp", "internet computer", "internet identity", "icp-mcp", "caffeine", "cloud engines", "opencloud.org"],
+  "license": "Apache-2.0",
+  "privacy_policies": ["https://internetcomputer.org/icp-mcp/privacy-policy/"],
+  "compatibility": {
+    "platforms": ["darwin", "win32"]
+  }
+}
