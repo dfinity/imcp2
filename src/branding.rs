@@ -25,8 +25,9 @@
 //! browser; a user agent the attacker controls, such as an embedded webview, is
 //! out of scope for branding as it is for the rest of the flow.) Host matching
 //! reuses validation's own rule ([`crate::auth::host_key`],
-//! [`crate::auth::host_is_or_under`]), and a redirect validation would refuse
-//! never resolves, so branding and validation cannot disagree about a vendor.
+//! [`crate::auth::host_is_or_under`]), and a redirect that validation would
+//! refuse never resolves to a connector, so branding and validation cannot
+//! disagree about a vendor.
 //!
 //! Endpoints, both issuer-rooted (same origin as the #4091-validated callback):
 //! `GET /branding?state=…` (session-bound metadata: name, logo URL, `verified`)
@@ -245,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn a_redirect_validation_refuses_never_resolves() {
+    fn a_redirect_that_validation_refuses_never_resolves() {
         // A vetted host, but a path off its pin, a port, userinfo, a query, or
         // percent-encoding: validation refuses each, so branding must too.
         for redirect in [
