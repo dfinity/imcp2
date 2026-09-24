@@ -80,17 +80,20 @@ fn serve_beta() -> bool {
 }
 
 /// Whether to advertise and accept Client ID Metadata Documents, the
-/// registration mode Claude and ChatGPT prefer over DCR. Off unless
-/// `$OAUTH_CIMD_ENABLED` is truthy (`1`/`true`/`yes`/`on`): both switch to CIMD
-/// the moment it is advertised, so a deploy must never turn it on by itself.
-/// Read once and handed to every instance; to roll back, unset it and redeploy.
+/// registration mode Claude and ChatGPT prefer over DCR. **On by default**; a
+/// falsey `$OAUTH_CIMD_ENABLED` (`0`/`false`/`no`/`off`) switches it off. Read
+/// once and handed to every instance, so switching means setting it and
+/// redeploying.
+///
+/// TODO: remove the variable (pass `true` to every instance) once CIMD has run
+/// in production for a while; it exists only as a kill switch for the roll-out.
 fn cimd_enabled() -> bool {
     cimd_enabled_by(std::env::var("OAUTH_CIMD_ENABLED").ok().as_deref())
 }
 
 fn cimd_enabled_by(value: Option<&str>) -> bool {
-    value.is_some_and(|v| {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    !value.is_some_and(|v| {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
     })
 }
 
@@ -306,10 +309,10 @@ async fn main() -> anyhow::Result<()> {
     // the operational directory.
     let clients = SharedClients::load(&state_dir);
 
-    // Client ID Metadata Documents: one deploy-time switch for every instance.
+    // Client ID Metadata Documents: on for every instance unless the deploy says no.
     let cimd_on = cimd_enabled();
-    if cimd_on {
-        tracing::info!("OAUTH_CIMD_ENABLED is set: Client ID Metadata Documents are on");
+    if !cimd_on {
+        tracing::warn!("OAUTH_CIMD_ENABLED is off: Client ID Metadata Documents are disabled");
     }
 
     // Production Internet Identity at `/mcp`: always served, and the origin's
@@ -571,16 +574,16 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    /// `OAUTH_CIMD_ENABLED`'s reading: off unless it says on.
+    /// `OAUTH_CIMD_ENABLED`'s reading: on unless it says off.
     #[test]
-    fn cimd_opt_in_values() {
+    fn cimd_opt_out_values() {
         use super::cimd_enabled_by;
-        let off = [None, Some(""), Some(" "), Some("0"), Some("false"), Some("no"), Some("off")];
-        for value in off.into_iter().chain([Some("enabled"), Some("2")]) {
-            assert!(!cimd_enabled_by(value), "{value:?} should leave CIMD off");
+        let on = [None, Some(""), Some(" "), Some("1"), Some("true"), Some("yes"), Some("on")];
+        for value in on.into_iter().chain([Some("disabled"), Some("2")]) {
+            assert!(cimd_enabled_by(value), "{value:?} should leave CIMD on");
         }
-        for value in [Some("1"), Some("true"), Some("Yes"), Some("ON"), Some(" 1 ")] {
-            assert!(cimd_enabled_by(value), "{value:?} should turn CIMD on");
+        for value in [Some("0"), Some("false"), Some("No"), Some("OFF"), Some(" 0 ")] {
+            assert!(!cimd_enabled_by(value), "{value:?} should switch CIMD off");
         }
     }
 

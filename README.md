@@ -81,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
         clients: SharedClients::load(&state_dir),
         state_dir,
         require_resource: true, // strict RFC 8707 (reject a missing `resource`)
-        cimd_enabled: false, // Client ID Metadata Documents (URL client_ids) off; true opts in
+        cimd_enabled: true, // Client ID Metadata Documents (URL client_ids); false turns them off
     });
     server.spawn_session_reaper();
     let app = axum::Router::new()
@@ -600,6 +600,10 @@ when hosting:
   falsey value (`0`/`false`/`no`/`off`) only if you must serve a client too old to
   send `resource`; that reopens the confused-deputy path for such clients, so
   prefer updating the client.
+- **`OAUTH_CIMD_ENABLED`** — Client ID Metadata Documents, **on by default**. A
+  falsey value (`0`/`false`/`no`/`off`) switches them off, in which case Claude
+  and ChatGPT register through DCR instead. A kill switch for the roll-out only,
+  to be removed once CIMD has run in production for a while.
 
 A `Dockerfile` is included (works on Render / Fly / Cloud Run / Koyeb). The
 reference deployment (`deploy/native/`, see its README) instead runs the binary
@@ -717,12 +721,12 @@ its AS issuer is `<PUBLIC_URL>/mcp` and everything OAuth lives under it:
   once per process (however many instances the binary mounts), four per host, so
   one slow host cannot hold up the rest. The fetch connects directly, never
   through a proxy from the environment, so the address pin always binds. Claude and ChatGPT both select CIMD over DCR when it is
-  advertised — which it is only where the deployment opts in: `McpConfig::cimd_enabled`
-  for an embedding host, `OAUTH_CIMD_ENABLED=1` for the `imcp2` binary (the deploy
-  template takes it from the GitHub Environment's variable of that name, so a
-  deploy never enables it by itself; to roll back, unset it and redeploy — the
-  value is read once at start-up, so the variable alone changes nothing — and
-  clients re-read the metadata within minutes and fall back to DCR). Only a
+  advertised — which it is by default: `McpConfig::cimd_enabled` for an embedding
+  host, and the `imcp2` binary has it on unless `OAUTH_CIMD_ENABLED` is falsey
+  (a roll-out kill switch, to be removed; the deploy template takes it from the
+  GitHub Environment's variable of that name and the value is read once at
+  start-up, so switching means setting it and redeploying — clients then re-read
+  the metadata within minutes and fall back to DCR). Only a
   document on a vetted vendor origin is fetched at all — a host on or under an
   allow-listed domain, default port (the trust policy of PR #143); any other URL
   `client_id` is refused before any request and pointed at the allow-listing

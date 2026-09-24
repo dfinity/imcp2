@@ -313,13 +313,13 @@ addresses, since the ship job runs inside the VPN.
 | `DEPLOY_KNOWN_HOSTS` | `PROD_DEPLOY_KNOWN_HOSTS` | *(optional)* output of `ssh-keyscan <host>`; pin it to avoid trust-on-first-use |
 | `OPENAI_APPS_CHALLENGE_TOKEN` | *(same name)* | *(optional)* OpenAI Apps domain-verification token, served at `/.well-known/openai-apps-challenge` (404 while unset). Submission-specific rather than host-specific, so one repository-level secret feeds both environments |
 
-One setting is a GitHub Environment **variable** rather than a secret (**Settings →
-Environments → *staging* / *production* → Variables**); `deploy.sh` renders it into
-the unit like the secrets above:
+One optional setting is a GitHub Environment **variable** rather than a secret
+(**Settings → Environments → *staging* / *production* → Variables**); `deploy.sh`
+renders it into the unit like the secrets above:
 
 | Variable | Value |
 |---|---|
-| `OAUTH_CIMD_ENABLED` | `1` to advertise Client ID Metadata Documents — the registration mode Claude and ChatGPT prefer over DCR — on that environment; unset or empty is off. Off by default so a routine deploy never switches the directory clients over by itself: enable it on staging first, then production. The value is rendered into the unit at deploy time and read once at start-up, so to roll back, unset (or clear) the variable **and redeploy** — `workflow_dispatch` with the same ref is enough, no rebuild; changing the variable alone changes nothing on the host |
+| `OAUTH_CIMD_ENABLED` | Client ID Metadata Documents — the registration mode Claude and ChatGPT prefer over DCR — are **on** unless this is a falsey value (`0`/`false`/`no`/`off`); unset or empty is on. A roll-out kill switch, to be removed once CIMD has run in production for a while. The value is rendered into the unit at deploy time and read once at start-up, so to switch CIMD off, set the variable to `0` **and redeploy** — `workflow_dispatch` with the same ref is enough, no rebuild; changing the variable alone changes nothing on the host |
 
 > **Set these as repository-level secrets** (**Settings → Secrets and variables →
 > Actions**). The callers pass them into the reusable workflow, and a job that calls

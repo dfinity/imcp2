@@ -32,13 +32,13 @@ Environment=MCP_SERVE_METRICS=1
 # deploy inputs).
 Environment=OPENAI_APPS_CHALLENGE_TOKEN=__OPENAI_APPS_CHALLENGE_TOKEN__
 # Client ID Metadata Documents (CIMD), the registration mode Claude and ChatGPT
-# prefer over DCR: OFF unless this is `1`. deploy.sh substitutes
-# __OAUTH_CIMD_ENABLED__ from the OAUTH_CIMD_ENABLED variable of the GitHub
-# Environment being deployed (empty when unset), so a routine deploy never
-# switches the directory clients over by itself: enable it on staging first,
-# then production, each deliberately. Rendered at deploy time and read once at
-# start-up, so to roll back, unset the variable AND redeploy (the same ref will
-# do — no rebuild); changing the variable alone changes nothing on the host.
+# prefer over DCR: ON unless this is a falsey value (0/false/no/off). deploy.sh
+# substitutes __OAUTH_CIMD_ENABLED__ from the OAUTH_CIMD_ENABLED variable of the
+# GitHub Environment being deployed (empty when unset, which is on). A roll-out
+# kill switch only, to be removed once CIMD has run in production for a while.
+# Rendered at deploy time and read once at start-up, so to switch CIMD off, set
+# the variable to 0 AND redeploy (the same ref will do — no rebuild); changing
+# the variable alone changes nothing on the host.
 Environment=OAUTH_CIMD_ENABLED=__OAUTH_CIMD_ENABLED__
 # imcp2 creates its operational files (today: the dynamic-client-registration
 # store, so OAuth clients that cached their client_id keep working across

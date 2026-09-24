@@ -42,7 +42,7 @@
 //!         clients: SharedClients::load(&state_dir),
 //!         state_dir,
 //!         require_resource: true, // strict RFC 8707 (reject a missing `resource`)
-//!         cimd_enabled: false, // Client ID Metadata Documents (URL client_ids) off; true opts in
+//!         cimd_enabled: true, // Client ID Metadata Documents (URL client_ids); false turns them off
 //!     });
 //!     server.spawn_session_reaper();
 //!     let app = axum::Router::new()
@@ -153,10 +153,10 @@ pub struct McpConfig {
     /// Client ID Metadata Documents: when `true`, the AS metadata advertises
     /// `client_id_metadata_document_supported` and a URL `client_id` on a vetted
     /// vendor origin is accepted by fetching its document; when `false`, a URL
-    /// `client_id` is an unknown client. Claude and ChatGPT switch to CIMD the
-    /// moment it is advertised, so it is off unless the deployment opts in. Set
-    /// by the embedding application; the `imcp2` binary sets it from
-    /// `$OAUTH_CIMD_ENABLED`.
+    /// `client_id` is an unknown client. Claude and ChatGPT select CIMD the
+    /// moment it is advertised, so a deployment normally sets `true`. Set by the
+    /// embedding application; the `imcp2` binary has it on unless
+    /// `$OAUTH_CIMD_ENABLED` switches it off.
     pub cimd_enabled: bool,
 }
 

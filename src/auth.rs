@@ -785,15 +785,15 @@ fn loopback_match(registered: &str, requested: &str) -> bool {
 // ones; were one added, the only attested fact is the HOST of the `client_id`
 // URL — never the self-asserted `client_name` or `logo_uri`.
 //
-// OPT-IN per deployment ([`crate::McpConfig::cimd_enabled`]): on, the metadata
+// Per deployment ([`crate::McpConfig::cimd_enabled`]): on, the metadata
 // advertises the mechanism and URL `client_id`s are accepted; off, a URL
-// `client_id` is an unknown client. Claude and ChatGPT both switch to CIMD the
-// moment an AS advertises it, so a routine deploy must never switch them over
-// by itself: an embedding host sets the field, and the `imcp2` binary takes it
-// from `OAUTH_CIMD_ENABLED`, which the deploy template renders from the GitHub
-// Environment's variable. The rollback, should a vendor's document turn out to
-// be shaped in a way this implementation refuses, is to switch it off and
-// restart; the clients re-read the metadata within minutes and fall back to DCR.
+// `client_id` is an unknown client. Claude and ChatGPT both select CIMD the
+// moment an AS advertises it, so it is normally on: an embedding host sets the
+// field, and the `imcp2` binary has it on unless `OAUTH_CIMD_ENABLED`, a
+// roll-out kill switch slated for removal, says off. The rollback, should a
+// vendor's document turn out to be shaped in a way this implementation refuses,
+// is to switch it off and restart; the clients re-read the metadata within
+// minutes and fall back to DCR.
 
 /// Byte cap on a `client_id` URL before it is treated as CIMD at all: the URL
 /// becomes a key of the process-wide cache and single-flight map (and part of a
