@@ -31,7 +31,7 @@ directory on your `PATH`:
 # than take a first page, for the same reason — this crate's tag is a small
 # minority of the releases here.
 TAG=$(gh api --paginate repos/dfinity/imcp2/releases --jq '.[].tag_name' \
-        | grep -m1 '^imcp2-local-v')
+        | awk '/^imcp2-local-v/ && !seen++')
 TARGET=aarch64-apple-darwin   # or x86_64-apple-darwin, {x86_64,aarch64}-unknown-linux-gnu
 
 # Chained: a failed download or a failed attestation stops the install.

@@ -17,13 +17,17 @@
 # no override: for binary servers Claude Desktop appends `.exe` to the
 # command itself, so the manifest names the file without it.
 #
+# Every input archive must carry this repository's release-workflow
+# attestation for this very tag before it is used (see verify_provenance).
+#
 # The manifest's version and tool list are filled in here, the tools from the
 # release's own binary answering `tools/list`, so the install dialog can
 # never advertise a surface the shipped server doesn't have.
 #
 # Env:
-#   LIPO          lipo implementation (default `lipo`; `llvm-lipo` works off macOS)
-#   MCPB_VERSION  @anthropic-ai/mcpb CLI version (pinned below)
+#   LIPO                   lipo implementation (default `lipo`; `llvm-lipo` works off macOS)
+#   MCPB_VERSION           @anthropic-ai/mcpb CLI version (pinned below)
+#   MCPB_ALLOW_UNATTESTED  `1` builds without verifying provenance; refused in CI
 set -euo pipefail
 
 tag="${1:?usage: build-mcpb.sh <tag> <out-dir>}"
@@ -40,6 +44,31 @@ mcpb="@anthropic-ai/mcpb@${MCPB_VERSION:-2.1.2}"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
+
+# Verifying the inputs' provenance needs `gh`. It is not optional in CI; a
+# local build may opt out explicitly, and says so loudly.
+if command -v gh >/dev/null 2>&1; then
+  attested=1
+elif [ "${MCPB_ALLOW_UNATTESTED:-}" = "1" ] && [ -z "${CI:-}" ]; then
+  attested=0
+  echo "WARNING: building from inputs whose provenance is NOT verified (MCPB_ALLOW_UNATTESTED=1)" >&2
+else
+  echo "gh is required to verify the input archives' attestations" \
+       "(outside CI, MCPB_ALLOW_UNATTESTED=1 builds without)" >&2
+  exit 1
+fi
+
+# The .sha256 files come from the same mutable release as the archives, so
+# they catch a corrupted download but cannot catch a replaced one — and this
+# job goes on to attest what it builds, which would lend that attestation to
+# whatever sat in the release. So each input must also carry an attestation
+# from this repository's release workflow for this very tag; `--source-ref`
+# refuses even a genuinely attested archive from an older release.
+verify_provenance() {
+  gh attestation verify "$1" --repo dfinity/imcp2 \
+    --signer-workflow dfinity/imcp2/.github/workflows/imcp2-local-release.yml \
+    --source-ref "refs/tags/$tag" --deny-self-hosted-runners >/dev/null
+}
 
 # macOS ships `shasum`, not `sha256sum` — the very gap the release notes warn
 # about in the installer, so this does not repeat it.
@@ -61,6 +90,10 @@ fetch() {
   got="$(sha256 "$work/$asset")"
   if [ "$want" != "$got" ]; then
     echo "checksum mismatch for $asset: want $want, got $got" >&2
+    exit 1
+  fi
+  if [ "$attested" = 1 ] && ! verify_provenance "$work/$asset"; then
+    echo "$asset has no release-workflow attestation for $tag; refusing it" >&2
     exit 1
   fi
 }
@@ -88,7 +121,7 @@ for a in arm64 x86_64; do
   esac
 done
 
-exe="$(find "$work/win" -type f -name 'imcp2-local.exe' | head -n 1)"
+exe="$(find "$work/win" -type f -name 'imcp2-local.exe' | awk 'NR == 1')"
 if [ -z "$exe" ]; then
   echo "no imcp2-local.exe in the Windows archive" >&2
   exit 1

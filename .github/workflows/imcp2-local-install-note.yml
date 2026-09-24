@@ -47,10 +47,15 @@ jobs:
           marker="$(head -n 1 "$NOTE_FILE")"
 
           body="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json body -q .body)"
-          if printf '%s' "$body" | grep -qF "$marker"; then
-            echo "summary already present on $tag — nothing to do"
-            exit 0
-          fi
+          # A substring match in the shell, not `printf | grep -q`: under
+          # pipefail, grep exiting on the first match can SIGPIPE printf on a
+          # large body, fail the test, and prepend the note a second time.
+          case "$body" in
+            *"$marker"*)
+              echo "summary already present on $tag — nothing to do"
+              exit 0
+              ;;
+          esac
 
           {
             cat "$NOTE_FILE"
