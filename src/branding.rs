@@ -1,7 +1,9 @@
 //! Verified-connector branding: surface a vetted MCP client's product name and
 //! logo to Internet Identity's consent screen, so the user sees WHICH vetted
-//! product is requesting the connect rather than granting their II accounts to an
-//! anonymous "some bridge".
+//! product will receive the access a connect grants, rather than granting their
+//! II accounts on behalf of an unnamed client. It names where the authorization
+//! code is delivered — not who started the connect, nor which account at that
+//! product ends up holding the grant.
 //!
 //! **The server is the only source of branding, and it answers per session.** II
 //! asks `GET {issuer}/branding?state={state}` — the `state` it already holds from
@@ -285,45 +287,81 @@ mod tests {
         assert_eq!(curated, crate::auth::default_redirect_domains());
     }
 
+    /// What makes `svg` unfit to bundle as a logo, if anything. A logo URL can be
+    /// opened top-level on the issuer origin, where an SVG is a document, so every
+    /// bundled mark must be inert on its own: no script, event handlers, embedded
+    /// HTML, animation, or DTD, and no reference that leaves the document — every
+    /// `href`, `src`, and `url()` must be an internal `#…` reference. A guard for
+    /// hand-reviewed assets, not a general SVG sanitizer.
+    fn logo_problems(svg: &str) -> Vec<String> {
+        let lower = svg.to_ascii_lowercase();
+        let mut problems = Vec::new();
+        if !lower.trim_start().starts_with("<svg") {
+            problems.push("not an SVG".to_string());
+        }
+        // With all whitespace gone, spaced forms (`href = "…"`, `url( '…' )`)
+        // collapse into the forms checked below.
+        let squeezed: String = lower.chars().filter(|ch| !ch.is_whitespace()).collect();
+        for banned in [
+            "script",
+            "xhtml",
+            "foreignobject",
+            "@import",
+            "<!entity",
+            "<!doctype",
+            "<animate",
+            "<set",
+        ] {
+            if squeezed.contains(banned) {
+                problems.push(format!("contains {banned:?}"));
+            }
+        }
+        for marker in ["href=", "src=", "url("] {
+            for (i, _) in squeezed.match_indices(marker) {
+                let target = squeezed[i + marker.len()..].trim_start_matches(['"', '\'']);
+                if !target.starts_with('#') {
+                    problems.push(format!("external reference after {marker:?}"));
+                }
+            }
+        }
+        // Attributes are whitespace-separated, so an `on…=` handler follows a space.
+        let spaced = lower.replace(char::is_whitespace, " ");
+        let handler = spaced.match_indices(" on").any(|(i, _)| {
+            let rest = &spaced[i + 3..];
+            let name = rest.chars().take_while(char::is_ascii_alphabetic).count();
+            name > 0 && rest[name..].trim_start().starts_with('=')
+        });
+        if handler {
+            problems.push("event-handler attribute".to_string());
+        }
+        problems
+    }
+
     #[test]
     fn bundled_logos_are_static_svg() {
-        // A logo URL can be opened top-level on the issuer origin, where an SVG is a
-        // document: every bundled mark must be inert on its own.
-        // Internal references (`href="#id"`, `url(#gradient)`) are fine; script,
-        // event handlers, embedded HTML, and anything external are not.
         for c in CONNECTORS {
-            // Namespace declarations are names, not references: drop the standard ones.
-            let svg = c
-                .logo
-                .to_ascii_lowercase()
-                .replace(char::is_whitespace, " ")
-                .replace(r#"xmlns="http://www.w3.org/2000/svg""#, "")
-                .replace(r#"xmlns:xlink="http://www.w3.org/1999/xlink""#, "");
-            assert!(svg.starts_with("<svg"), "{}: not an SVG", c.slug);
-            for banned in [
-                "<script",
-                "javascript:",
-                "<foreignobject",
-                "@import",
-                "=\"http",
-                "='http",
-                "=\"//",
-                "='//",
-                "=\"data:",
-                "='data:",
-                "url(http",
-                "url(//",
-                "url(data:",
-            ] {
-                assert!(!svg.contains(banned), "{}: bundled logo contains {banned:?}", c.slug);
-            }
-            // No `on…=` event-handler attribute.
-            let handler = svg.match_indices(" on").any(|(i, _)| {
-                let rest = &svg[i + 3..];
-                let name = rest.chars().take_while(char::is_ascii_alphabetic).count();
-                name > 0 && rest[name..].trim_start().starts_with('=')
-            });
-            assert!(!handler, "{}: bundled logo has an event-handler attribute", c.slug);
+            assert_eq!(logo_problems(c.logo), Vec::<String>::new(), "{}: bundled logo", c.slug);
+        }
+        // Internal references are fine.
+        let internal = r##"<svg><defs><linearGradient id="g"/></defs><rect fill="url(#g)"/><use href="#g"/></svg>"##;
+        assert!(logo_problems(internal).is_empty());
+        // The guard catches each unsafe form, including spaced and quoted spellings.
+        for bad in [
+            r#"<svg><script>alert(1)</script></svg>"#,
+            r#"<svg onload="alert(1)"></svg>"#,
+            r#"<svg><rect ONCLICK = "x"/></svg>"#,
+            r#"<svg><image href = "https://x/y.png"/></svg>"#,
+            r#"<svg><image xlink:href='//x/y.png'/></svg>"#,
+            r#"<svg><rect style="fill:url('https://x/y')"/></svg>"#,
+            r#"<svg><rect fill="url( data:image/png;base64,AAAA )"/></svg>"#,
+            r#"<svg><style>@import "https://x/y.css";</style></svg>"#,
+            r#"<svg><foreignObject><div/></foreignObject></svg>"#,
+            r#"<svg xmlns:h="http://www.w3.org/1999/xhtml"><h:img src="x"/></svg>"#,
+            r#"<svg><a href="javascript:alert(1)"><rect/></a></svg>"#,
+            r#"<svg><set attributeName="href" to="https://x"/></svg>"#,
+            r#"<!DOCTYPE svg [<!ENTITY e SYSTEM "https://x">]><svg>&e;</svg>"#,
+        ] {
+            assert!(!logo_problems(bad).is_empty(), "the guard missed: {bad}");
         }
     }
 
