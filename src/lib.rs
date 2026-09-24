@@ -331,12 +331,13 @@ impl McpServer {
             .with_state(self.store.clone())
             .layer(permissive_cors());
 
-        // Verified-connector branding (see [`branding`]), rooted at the issuer
-        // (`{public_url}{mcp_path}/branding/{slug}`) so II reaches it same-origin
-        // with the #4091-validated callback. CORS-open, like the other endpoints
-        // II fetches cross-origin.
+        // Verified-connector branding (see [`branding`]), rooted at the issuer so
+        // II reaches it same-origin with the #4091-validated callback: the
+        // session-bound metadata (`/branding?state=…`, answered from that pending
+        // connect's validated redirect) and the static per-connector logo.
+        // CORS-open, like the other endpoints II fetches cross-origin.
         let branding = Router::new()
-            .route("/branding/{slug}", get(branding::branding_metadata))
+            .route("/branding", get(branding::branding_metadata))
             .route("/branding/{slug}/logo", get(branding::branding_logo))
             .with_state(self.store.clone())
             .layer(permissive_cors());

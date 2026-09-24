@@ -215,6 +215,11 @@ async fn unauthenticated_mcp_requests_get_the_path_aware_challenge() {
 /// registration lands in the state directory's `oauth-clients.json` so it
 /// survives a restart, and a redirect off the hosted allow-list is refused
 /// before anything is stored.
+///
+/// It also drives verified-connector branding end to end over HTTP (authorize →
+/// the `state` in II's link → `GET /branding?state=`), because this is the one
+/// test that registers a client: a second accepting registration elsewhere would
+/// race the persistence poll below on the shared store file.
 #[tokio::test]
 async fn dynamic_client_registration_round_trips_and_persists() {
     // One app, cloned per request, so both calls share the same client store.
@@ -237,28 +242,86 @@ async fn dynamic_client_registration_round_trips_and_persists() {
         }
     };
 
-    let (status, doc) = register(r#"{"redirect_uris":["http://127.0.0.1:4321/cb"]}"#).await;
+    // Loopback first (asserted below); the two claude.ai spellings — plain and
+    // with a trailing root dot, which validation accepts — are for branding.
+    let (status, doc) = register(
+        r#"{"redirect_uris":["http://127.0.0.1:4321/cb",
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://claude.ai./api/mcp/auth_callback"]}"#,
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
     let client_id = doc["client_id"].as_str().expect("a client_id").to_string();
     assert_eq!(doc["redirect_uris"][0], "http://127.0.0.1:4321/cb");
 
     // The fresh registration is usable: authorize accepts it and hands the
-    // browser to Internet Identity (302 + the binding cookie).
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::get(format!(
-                "/mcp/oauth/authorize?response_type=code&client_id={client_id}\
-                 &redirect_uri=http://127.0.0.1:4321/cb&code_challenge=abc\
-                 &code_challenge_method=S256"
-            ))
-            .body(Body::empty())
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::FOUND, "a registered client can start a sign-in");
-    assert!(resp.headers().contains_key("set-cookie"), "the binding cookie must be set");
+    // browser to Internet Identity (302 + the binding cookie). Returns the
+    // connect `state` (the pending session id) from the II link's fragment —
+    // what II passes back to `/branding`.
+    let authorize = |redirect: &'static str| {
+        let app = app.clone();
+        let client_id = client_id.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::get(format!(
+                        "/mcp/oauth/authorize?response_type=code&client_id={client_id}\
+                         &redirect_uri={redirect}&code_challenge=abc\
+                         &code_challenge_method=S256"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FOUND, "a registered client can start a sign-in");
+            assert!(resp.headers().contains_key("set-cookie"), "the binding cookie must be set");
+            let location = resp.headers()["location"].to_str().unwrap().to_string();
+            let (_, fragment) = location.split_once('#').expect("the II link carries a fragment");
+            url::form_urlencoded::parse(fragment.as_bytes())
+                .find(|(key, _)| key == "state")
+                .map(|(_, state)| state.into_owned())
+                .expect("the II link carries the connect state")
+        }
+    };
+    let branding = |state: String| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::get(format!("/mcp/branding?state={state}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let cache = resp
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let doc = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, cache, doc)
+        }
+    };
+
+    // Branding is answered per session, from that session's validated redirect:
+    // a loopback (native-app) session stays anonymous ...
+    let (status, _, _) = branding(authorize("http://127.0.0.1:4321/cb").await).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a loopback session gets no branding");
+    // ... and both claude.ai spellings brand as Claude, uncached.
+    for redirect in
+        ["https://claude.ai/api/mcp/auth_callback", "https://claude.ai./api/mcp/auth_callback"]
+    {
+        let (status, cache, doc) = branding(authorize(redirect).await).await;
+        assert_eq!(status, StatusCode::OK, "branding for {redirect}");
+        assert_eq!(doc["name"], "Claude", "branding for {redirect}");
+        assert_eq!(doc["verified"], true, "branding for {redirect}");
+        assert_eq!(doc["logo"], format!("{PUBLIC_URL}/mcp/branding/claude/logo"));
+        assert_eq!(cache.as_deref(), Some("no-store"), "a per-session answer must not be cached");
+    }
 
     // A hosted redirect that isn't allow-listed is refused (nothing stored).
     let (status, doc) = register(r#"{"redirect_uris":["https://attacker.example/cb"]}"#).await;
@@ -452,25 +515,37 @@ async fn oauth_endpoints_live_under_each_mount() {
     }
 }
 
-/// Verified-connector branding endpoints (II fetches these from the issuer origin
-/// to brand the consent screen): a curated slug yields name + logo + verified; a
-/// slug outside the curated set 404s so the path can't be used to probe.
+/// Verified-connector branding routing (II fetches these from the issuer origin to
+/// brand the consent screen). The metadata is SESSION-BOUND — answered only for a
+/// pending connect's validated redirect (the 200 path over HTTP is driven by
+/// `dynamic_client_registration_round_trips_and_persists`, and expiry by
+/// `branding_is_bound_to_the_session` in `src/auth.rs`); here: no session → 404,
+/// CORS-open for II's cross-origin fetch, the unbound per-slug metadata path is
+/// gone, and the static logo serves.
 #[tokio::test]
-async fn branding_endpoints_serve_vetted_connectors_and_404_others() {
-    // Metadata for a vetted connector: the curated name, the absolute logo URL
-    // under the instance issuer, `verified`, and `no-store`.
-    let resp =
-        app().oneshot(Request::get("/mcp/branding/claude").body(Body::empty()).unwrap()).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get("cache-control").and_then(|v| v.to_str().ok()),
-        Some("no-store")
-    );
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(doc["name"], "Claude");
-    assert_eq!(doc["verified"], true);
-    assert_eq!(doc["logo"], format!("{PUBLIC_URL}/mcp/branding/claude/logo"));
+async fn branding_endpoints_are_session_bound_and_serve_logos() {
+    // No such session, and no `state` at all: the same 404.
+    for path in ["/mcp/branding?state=sess-does-not-exist", "/mcp/branding"] {
+        let resp = app()
+            .oneshot(
+                Request::get(path).header("origin", "https://id.ai").body(Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "GET {path}");
+        assert!(
+            resp.headers().contains_key("access-control-allow-origin"),
+            "GET {path}: II fetches this cross-origin, so it must be CORS-open"
+        );
+    }
+
+    // The old UNBOUND per-slug metadata endpoint (it returned `verified: true` for
+    // any catalog slug) no longer exists: it must not answer with branding.
+    let resp = app()
+        .oneshot(Request::get("/mcp/branding/claude").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), StatusCode::OK, "no slug-keyed branding metadata");
 
     // The logo is an SVG with nosniff (II renders it via <img>, never inlined).
     let resp = app()
@@ -487,9 +562,10 @@ async fn branding_endpoints_serve_vetted_connectors_and_404_others() {
         Some("nosniff")
     );
 
-    // A slug outside the curated set 404s on both endpoints.
-    for path in ["/mcp/branding/not-a-connector", "/mcp/branding/not-a-connector/logo"] {
-        let resp = app().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "GET {path}");
-    }
+    // A slug outside the curated set 404s, so the path can't probe.
+    let resp = app()
+        .oneshot(Request::get("/mcp/branding/not-a-connector/logo").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

@@ -32,33 +32,19 @@ use serde::Deserialize;
 /// the fragment; the callback page rendered by [`pinned_callback_page`] is the
 /// sole fragment reader. No `priv(X)` is ever put in the link — only its
 /// public half.
-///
-/// `connector`, when present, is the server-curated verified-connector slug for
-/// the vetted vendor this connect is for (see the embedding server's branding
-/// module): II fetches the product's name and logo by it to brand the consent
-/// screen. It rides the fragment like the other params and is **additive** — an
-/// II that does not know the parameter ignores it — so emitting it is safe
-/// before II's side ships. Omitted for an unvetted/loopback connect, which keeps
-/// today's anonymous consent screen.
 pub fn ii_mcp_url(
     ii_url: &str,
     callback_url: &str,
     state: &str,
     ttl_secs: u64,
     reg_pubkey_b64: &str,
-    connector: Option<&str>,
 ) -> String {
-    let mut url = format!(
+    format!(
         "{ii_url}/mcp#callback={cb}&state={st}&ttl={ttl_secs}&registration_key={rk}",
         cb = urlencoding::encode(callback_url),
         st = urlencoding::encode(state),
         rk = urlencoding::encode(reg_pubkey_b64),
-    );
-    if let Some(slug) = connector {
-        url.push_str("&connector=");
-        url.push_str(&urlencoding::encode(slug));
-    }
-    url
+    )
 }
 
 // ---- Callback allow-list (II #4091) ---------------------------------------
@@ -528,29 +514,10 @@ mod tests {
             "sess-1",
             3600,
             "AQID",
-            None,
         );
         assert!(url.starts_with("https://id.ai/mcp#callback="));
         assert!(url.contains("callback=http%3A%2F%2F127.0.0.1%3A4361%2Fcallback"), "{url}");
         assert!(url.contains("&state=sess-1&ttl=3600&registration_key=AQID"), "{url}");
-        // No connector slug → the parameter is absent (unvetted/loopback connect).
-        assert!(!url.contains("connector="), "{url}");
-    }
-
-    // A vetted connect appends `&connector=<slug>` (percent-encoded) after the
-    // #4093 params — the additive branding hint II reads to brand the consent
-    // screen.
-    #[test]
-    fn ii_mcp_url_appends_the_connector_slug() {
-        let url = super::ii_mcp_url(
-            "https://id.ai",
-            "https://mcp.example.com/mcp/oauth/connect/callback",
-            "sess-1",
-            3600,
-            "AQID",
-            Some("chatgpt"),
-        );
-        assert!(url.ends_with("&connector=chatgpt"), "{url}");
     }
 
     // The page's script resolves the redeem answer three ways: `redirect`
