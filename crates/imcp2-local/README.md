@@ -17,9 +17,39 @@ cannot spawn local processes; they keep using the hosted server.
 ## Install
 
 Release binaries (macOS arm64/x64, Linux x64/arm64, Windows x64) ship from
-this repository's GitHub releases with shell/PowerShell installers, built by
-`dist` from `imcp2-local-v*` tags. Until the first release is cut, build from
-source:
+this repository's GitHub releases, built by `dist` from `imcp2-local-v*` tags.
+
+**Verified install.** This binary acts as your Internet Identity, so prefer the
+path that establishes where the artifact came from. Download the archive, check
+its provenance against the workflow that built it, then put it on your PATH:
+
+```sh
+TARGET=aarch64-apple-darwin   # or x86_64-apple-darwin, {x86_64,aarch64}-unknown-linux-gnu
+curl -LO "https://github.com/dfinity/imcp2/releases/latest/download/imcp2-local-$TARGET.tar.xz"
+gh attestation verify "imcp2-local-$TARGET.tar.xz" -R dfinity/imcp2 \
+  --signer-workflow dfinity/imcp2/.github/workflows/imcp2-local-release.yml
+tar xf "imcp2-local-$TARGET.tar.xz"
+install "imcp2-local-$TARGET/imcp2-local" ~/.local/bin/
+```
+
+(Windows ships `imcp2-local-x86_64-pc-windows-msvc.zip`; verify it the same way.)
+
+**Installer script.** Shorter, and what the release notes lead with. It
+downloads the binary for your platform, installs it plus an auto-updater into
+`~/.cargo/bin`, and adds that directory to your PATH by appending a line to
+every shell profile it can find — `IMCP2_LOCAL_NO_MODIFY_PATH=1` and
+`IMCP2_LOCAL_DISABLE_UPDATE=1` opt out of those two. It also compares a
+checksum baked into itself, but skips that silently on stock macOS, which has
+no `sha256sum`, and the PowerShell installer checks none at all. Either hash
+travels in the same script you are piping to a shell, so it guards against a
+corrupted download rather than a bad release — which is what the attestation
+above is for.
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dfinity/imcp2/releases/latest/download/imcp2-local-installer.sh | sh
+```
+
+**From source.**
 
 ```sh
 cargo build --release -p imcp2-local

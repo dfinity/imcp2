@@ -302,3 +302,12 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+
+  custom-imcp2-local-install-note:
+    needs:
+      - plan
+      - announce
+    uses: ./.github/workflows/imcp2-local-install-note.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit

@@ -24,6 +24,10 @@ install-updater = true
 tag-namespace = "imcp2-local"
 # Whether to enable GitHub Attestations
 github-attestations = true
+# Prepend a plain-language summary of what the install scripts do to the
+# release notes. dist writes the body itself and has no setting for extra
+# prose, so this rides its custom-job seam; see the workflow for the text.
+post-announce-jobs = ["./imcp2-local-install-note"]
 
 # Pin GitHub Actions to exact commit SHAs in the generated release.yml
 [dist.github-action-commits]
