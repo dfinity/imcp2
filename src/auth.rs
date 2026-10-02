@@ -515,6 +515,12 @@ const DEFAULT_ALLOWED_REDIRECTS: &[(&str, &str, PathPin)] = &[
     ("perplexity.com", "/rest/connections/oauth_callback", PathPin::Prefix),
 ];
 
+/// The compiled-in allow-list's vendor domains, for the branding parity test.
+#[cfg(test)]
+pub(crate) fn default_redirect_domains() -> std::collections::BTreeSet<&'static str> {
+    DEFAULT_ALLOWED_REDIRECTS.iter().map(|(domain, _, _)| *domain).collect()
+}
+
 /// The effective hosted-redirect allow-list: the compiled-in defaults plus any
 /// entries in `OAUTH_ALLOWED_REDIRECT_PREFIXES`. Each env entry is a bare
 /// `https://host/path` value pinning a host + path prefix; an entry that is not
@@ -568,7 +574,7 @@ fn parse_redirect_prefix(raw: &str) -> Option<(String, String)> {
     {
         return None;
     }
-    let host = u.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    let host = host_key(u.host_str()?);
     let path = u.path().to_string();
     (!host.is_empty() && path != "/" && !path.is_empty()).then_some((host, path))
 }
@@ -601,6 +607,14 @@ fn path_has_percent_encoding(path: &str) -> bool {
     path.contains('%')
 }
 
+/// Whether `host` (already [`host_key`]-normalized) is `domain` or a
+/// dot-boundary subdomain of it, so a look-alike apex (`evilchatgpt.com`) never
+/// matches `chatgpt.com`. The one host rule for redirect validation, the CIMD
+/// trust policy, and [`crate::branding`], so none can disagree about a vendor.
+pub(crate) fn host_is_or_under(host: &str, domain: &str) -> bool {
+    host == domain || host.strip_suffix(domain).is_some_and(|p| p.ends_with('.'))
+}
+
 /// Whether a `redirect_uri` may be registered or receive an authorization code.
 /// No redirect (loopback or hosted) may carry a query or fragment component: the
 /// authorization endpoint appends `?code=…&state=…`, so a pre-existing query would
@@ -619,7 +633,7 @@ fn path_has_percent_encoding(path: &str) -> bool {
 /// `https://claude.ai.evil.com` resolve to their real host and are refused; a bare
 /// `https://user@claude.ai` is refused too (userinfo serves no purpose in a
 /// redirect target, only muddies which host is addressed, and loopback rejects it).
-fn redirect_uri_permitted(redirect_uri: &str) -> bool {
+pub(crate) fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     let Ok(url) = url::Url::parse(redirect_uri) else {
         return false;
     };
@@ -638,6 +652,40 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     if is_loopback_url(&url) {
         return true;
     }
+    hosted_redirect_admitted(
+        &url,
+        allowed_redirects()
+            .iter()
+            .map(|(domain, path, pin)| (domain.as_str(), path.as_str(), *pin)),
+    )
+}
+
+/// Whether `redirect_uri` is a hosted redirect admitted by a **compiled-in**
+/// [`DEFAULT_ALLOWED_REDIRECTS`] entry, under the same rules as
+/// [`redirect_uri_permitted`] (no query or fragment, canonical `https` shape, no
+/// percent-encoding, pinned path). Operator entries from
+/// `OAUTH_ALLOWED_REDIRECT_PREFIXES` do not count, and neither does loopback.
+/// Connector branding ([`crate::branding`]) rests on this, so a vendor's name is
+/// only ever shown for the reviewed callback paths in this repo, never for a path
+/// a deployment added on the vendor's domain.
+pub(crate) fn redirect_uri_on_default_allow_list(redirect_uri: &str) -> bool {
+    let Ok(url) = url::Url::parse(redirect_uri) else {
+        return false;
+    };
+    if url.query().is_some() || url.fragment().is_some() {
+        return false;
+    }
+    hosted_redirect_admitted(&url, DEFAULT_ALLOWED_REDIRECTS.iter().copied())
+}
+
+/// The hosted half of [`redirect_uri_permitted`], over an explicit set of
+/// `(domain, path, pin)` entries: `url` (already free of query and fragment) must
+/// have the canonical `https://<host><path>` shape, a path with no
+/// percent-encoding, and a host and path that some entry admits.
+fn hosted_redirect_admitted<'a>(
+    url: &url::Url,
+    entries: impl IntoIterator<Item = (&'a str, &'a str, PathPin)>,
+) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
@@ -651,10 +699,10 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     let Ok(canonical) = url::Url::parse(&format!("https://{host}{}", url.path())) else {
         return false;
     };
-    if url != canonical {
+    if url != &canonical {
         return false;
     }
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let host = host_key(host);
     let path = url.path();
     // url::Url collapses only LITERAL `.`/`..` segments (raw or `%2e`-encoded whole
     // segments), so a real-slash traversal `/connector/oauth/../../g/evil` arrives
@@ -673,8 +721,8 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     // or descendants too). The path pin is what keeps a registration off
     // third-party/user-content paths (e.g. `/page/…`, `/g/…`) on the same origin;
     // without it, domain-only matching would let those capture the code.
-    allowed_redirects().iter().any(|(domain, prefix, pin)| {
-        (host == *domain || host.strip_suffix(domain.as_str()).is_some_and(|p| p.ends_with('.')))
+    entries.into_iter().any(|(domain, prefix, pin)| {
+        host_is_or_under(&host, domain)
             && match pin {
                 PathPin::Exact => path == prefix,
                 PathPin::Prefix => path_within_prefix(path, prefix),
@@ -965,15 +1013,17 @@ fn allow_listed_domain(host: &str) -> bool {
 /// subdomain of, if any: the trust policy's match.
 fn vetted_domain(host: &str) -> Option<&'static str> {
     let host = host_key(host);
-    allowed_redirects().iter().map(|(domain, _, _)| domain.as_str()).find(|domain| {
-        host == *domain || host.strip_suffix(*domain).is_some_and(|p| p.ends_with('.'))
-    })
+    allowed_redirects()
+        .iter()
+        .map(|(domain, _, _)| domain.as_str())
+        .find(|domain| host_is_or_under(&host, domain))
 }
 
 /// One spelling per host — lower-case, no trailing dot — so that whatever is
-/// keyed by host (the trust policy's match, the per-host in-flight slots) treats
-/// `claude.ai`, `Claude.AI` and `claude.ai.` as the one host they resolve to.
-fn host_key(host: &str) -> String {
+/// keyed or matched by host (redirect validation, the trust policy's match, the
+/// per-host in-flight slots, [`crate::branding`]) treats `claude.ai`,
+/// `Claude.AI` and `claude.ai.` as the one host they resolve to.
+pub(crate) fn host_key(host: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
@@ -1600,8 +1650,9 @@ impl AuthStore {
 
     /// This instance's AS issuer: `{public_url}{mcp_path}` (an RFC 8414 *path
     /// issuer* whenever the router is nested below the root). Every OAuth
-    /// endpoint lives under it, at `{issuer}/oauth/*`.
-    fn issuer(&self) -> String {
+    /// endpoint lives under it, at `{issuer}/oauth/*`; the branding endpoints at
+    /// `{issuer}/branding*` ([`crate::branding`]) root here too.
+    pub(crate) fn issuer(&self) -> String {
         format!("{}{}", self.public_url, self.mcp_path)
     }
 
@@ -1828,6 +1879,20 @@ impl AuthStore {
             AuthzPending::remaining,
         );
         authz.insert(session_id, pending);
+    }
+
+    /// The validated `redirect_uri` of the pending, unexpired connect
+    /// `session_id`, if there is one. Read-only — it neither consumes nor touches
+    /// the entry — so a lookup cannot interfere with the handshake. Branding
+    /// ([`crate::branding`]) derives the connector from THIS, the server's record
+    /// of what `authorize` validated, and never from anything the (craftable)
+    /// connect-link fragment asserts.
+    pub(crate) async fn pending_redirect_uri(&self, session_id: &str) -> Option<String> {
+        let authz = self.authz.read().await;
+        authz
+            .get(session_id)
+            .filter(|pending| !pending.remaining().is_zero())
+            .map(|pending| pending.redirect_uri.clone())
     }
 
     /// Drop every expired entry from the short-lived OAuth maps, returning how
@@ -3187,6 +3252,33 @@ mod tests {
     /// pinned callback path; loopback always passes; everything else (a
     /// user-content path on an allow-listed origin, a wrong path, an unlisted
     /// domain, or an authority-trick look-alike) is refused.
+    // Branding's vetting ignores operator entries: a path a deployment adds on a
+    // vendor's domain is a valid redirect but never earns that vendor's name.
+    #[test]
+    fn default_allow_list_vetting_ignores_operator_entries() {
+        use super::{
+            hosted_redirect_admitted, redirect_uri_on_default_allow_list, PathPin,
+            DEFAULT_ALLOWED_REDIRECTS,
+        };
+        let ops_added = "https://claude.ai/ops/added/cb";
+        let with_operator_entry = DEFAULT_ALLOWED_REDIRECTS.iter().copied().chain([(
+            "claude.ai",
+            "/ops/added",
+            PathPin::Prefix,
+        )]);
+        let url = url::Url::parse(ops_added).unwrap();
+        assert!(
+            hosted_redirect_admitted(&url, with_operator_entry),
+            "the operator entry admits it"
+        );
+        assert!(!redirect_uri_on_default_allow_list(ops_added), "but it is not a vetted callback");
+        // The compiled-in callbacks are vetted, with validation's own rules.
+        assert!(redirect_uri_on_default_allow_list("https://claude.ai/api/mcp/auth_callback"));
+        assert!(redirect_uri_on_default_allow_list("https://claude.ai./api/mcp/auth_callback"));
+        assert!(!redirect_uri_on_default_allow_list("https://claude.ai/api/mcp/auth_callback?x=1"));
+        assert!(!redirect_uri_on_default_allow_list("http://127.0.0.1:5173/cb"));
+    }
+
     #[test]
     fn hosted_redirect_allow_list() {
         // Allow-listed vendor domains/subdomains UNDER their pinned callback path.
@@ -4566,10 +4658,121 @@ mod tests {
         assert!(url.starts_with("https://ii.test/mcp#"), "everything rides the fragment: {url}");
         assert!(url.contains("state=sess-1"));
         assert!(url.contains("registration_key=PUBX"));
+        // The fragment is attacker-craftable, so it must never ASSERT branding:
+        // II asks the server (`/branding?state=…`), which answers from the
+        // session's validated redirect (see `branding_is_bound_to_the_session`).
+        assert!(!url.contains("connector"), "no branding hint in the fragment: {url}");
         // The callback lives under the instance's mount ({public_url}{mcp_path}).
         let encoded =
             urlencoding::encode("https://mcp.test/mcp/oauth/connect/callback").into_owned();
         assert!(url.contains(&format!("callback={encoded}")), "callback under the mount: {url}");
+    }
+
+    /// Record a pending connect for `redirect` the way `authorize` does (through
+    /// the bounded insert), created at `created`.
+    async fn seed_pending_redirect(
+        store: &super::AuthStore,
+        id: &str,
+        redirect: &str,
+        created: std::time::Instant,
+    ) {
+        store
+            .insert_pending(
+                id.to_string(),
+                super::AuthzPending {
+                    client_id: "c".into(),
+                    redirect_uri: redirect.into(),
+                    client_state: String::new(),
+                    code_challenge: Some("cc".into()),
+                    cookie: "k".into(),
+                    created,
+                    code: None,
+                    redeeming: false,
+                },
+            )
+            .await;
+    }
+
+    /// GET `/branding?state=` for `state`: the status and (on 200) the JSON body.
+    async fn branding_for(
+        store: &super::AuthStore,
+        state: Option<&str>,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        use axum::extract::{Query, State};
+        let resp = crate::branding::branding_metadata(
+            State(store.clone()),
+            Ok(Query(crate::branding::BrandingQuery { state: state.map(str::to_string) })),
+        )
+        .await;
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    // Branding is BOUND to the authorization session: II asks by `state`, and the
+    // server answers from that pending connect's VALIDATED redirect — never from
+    // anything the craftable fragment asserts. So a loopback/native client that
+    // drives navigation cannot make its own (valid) session read as a vetted
+    // connector: there is no slug to add or swap, and its session's redirect is
+    // loopback. Unknown, missing, and expired states all get the same 404.
+    #[tokio::test]
+    async fn branding_is_bound_to_the_session() {
+        use axum::http::StatusCode;
+        let store = test_store();
+        let now = std::time::Instant::now();
+        seed_pending_redirect(
+            &store,
+            "sess-claude",
+            "https://claude.ai/api/mcp/auth_callback",
+            now,
+        )
+        .await;
+        seed_pending_redirect(&store, "sess-native", "http://127.0.0.1:5173/cb", now).await;
+        // Validation trims a trailing root dot, so branding must too.
+        seed_pending_redirect(&store, "sess-dot", "https://claude.ai./api/mcp/auth_callback", now)
+            .await;
+
+        // A vetted session reads as its connector, with the logo under the issuer.
+        let (status, doc) = branding_for(&store, Some("sess-claude")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(doc["name"], "Claude");
+        assert_eq!(doc["verified"], true);
+        assert_eq!(doc["logo"], "https://mcp.test/mcp/branding/claude/logo");
+
+        // The core of the finding: a valid NATIVE session gets no branding.
+        assert_eq!(branding_for(&store, Some("sess-native")).await.0, StatusCode::NOT_FOUND);
+
+        // The trailing-dot form of a vetted redirect keeps its branding.
+        let (status, doc) = branding_for(&store, Some("sess-dot")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(doc["name"], "Claude");
+
+        // Unknown and missing states are indistinguishable from "no branding".
+        assert_eq!(branding_for(&store, Some("sess-unknown")).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(branding_for(&store, None).await.0, StatusCode::NOT_FOUND);
+
+        // An EXPIRED pending connect is gone for branding too (same definition of
+        // expired as the handshake: `AuthzPending::remaining`). Skipped only on a
+        // host whose monotonic clock started less than CONNECT_TTL ago.
+        if let Some(past) = now.checked_sub(super::CONNECT_TTL + std::time::Duration::from_secs(1))
+        {
+            seed_pending_redirect(
+                &store,
+                "sess-old",
+                "https://claude.ai/api/mcp/auth_callback",
+                past,
+            )
+            .await;
+            assert_eq!(branding_for(&store, Some("sess-old")).await.0, StatusCode::NOT_FOUND);
+        }
+
+        // Read-only: the lookups neither consumed nor advanced the pending
+        // connect, so the handshake proceeds exactly as if II never asked.
+        let authz = store.authz.read().await;
+        let pending = authz.get("sess-claude").expect("still pending");
+        assert_eq!(pending.redirect_uri, "https://claude.ai/api/mcp/auth_callback");
+        assert_eq!(pending.created, now);
+        assert!(pending.code.is_none() && !pending.redeeming);
     }
 
     // The allow-list invariant (II #4091 matches by EXACT string equality): the
