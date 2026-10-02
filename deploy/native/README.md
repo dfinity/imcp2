@@ -7,8 +7,11 @@ managed VPC) and you just want to put the app on it. The repo's
 
 ```
    build.sh  ─────►  build-out/imcp2        (cross-built linux/arm64 or amd64 binary)
-   deploy.sh ─────►  /opt/imcp2/{imcp2,static}   + systemd: imcp2.service
-                     /opt/imcp2/monitoring         + systemd: imcp-status.service (dashboard)
+   deploy.sh ─────►  /opt/imcp2/imcp2            + systemd: imcp2.service
+                     /opt/imcp2/monitoring         (staging copy of the dashboard source)
+                     /opt/imcp-status              + systemd: imcp-status.service (dashboard;
+                                                     root-owned executable copy, run as the
+                                                     dedicated imcp-status user)
                      /usr/local/bin/caddy          + systemd: caddy.service (TLS)
 ```
 
@@ -24,9 +27,13 @@ mismatch — otherwise the unit installs fine and then crash-loops on
 your domain and reverse-proxies to it, obtaining a Let's Encrypt cert automatically.
 
 The **status dashboard** (`monitoring/mcp-status`) is also shipped and run as a
-Node systemd service (`imcp-status.service`) bound to `127.0.0.1:8137`. Caddy
-publishes it at **`https://$DOMAIN/status/`**, where it probes the deployment's
-own public endpoints and the linked Internet Identity instance. Node ≥ 20 is
+Node systemd service (`imcp-status.service`) bound to `127.0.0.1:8137`. On
+**staging only**, Caddy publishes it at **`https://$DOMAIN/status/`**, where it
+probes the deployment's own public endpoints and the linked Internet Identity
+instance; a host deployed without `SERVE_STATUS` (see below) runs the same service
+(its Statuspage pusher feeds the public
+[status.internetcomputer.org](https://status.internetcomputer.org/)) but does not
+expose it at its origin. Node ≥ 20 is
 installed automatically on first deploy if absent; the dashboard has no build
 step and no third-party dependencies.
 
@@ -159,45 +166,73 @@ being able to `ssh` in does not mean 80/443 are reachable from the internet.
 that there's no public IPv4 inbound, and that AWS creds are granted — ask it to make
 the box publicly reachable and report the address to set DNS *before* the deploy.
 
-## Automated deploys: staging on `main`, production on `release-*`
-
-Two hosts, two triggers, one shared mechanism:
+## Automated deploys: one staging host, moved by candidates
 
 | Workflow | Trigger | Target | Environment |
 |---|---|---|---|
-| [`deploy.yml`](../../.github/workflows/deploy.yml) | push to `main` | staging | `staging` |
-| [`deploy-release.yml`](../../.github/workflows/deploy-release.yml) | push tag `release-*` | production | `production` |
+| [`deploy-candidate.yml`](../../.github/workflows/deploy-candidate.yml) | push tag `rc-X.Y.Z-N`; or a manual run naming an earlier `rc-*` tag or a commit SHA | staging | `staging` |
 
-Staging tracks `main` continuously so changes get exercised on a real host; production
-only ever moves when someone cuts a tag, so the live revision is always a named,
-reproducible point in history.
+Staging is the only host this repository deploys, and it moves only when someone cuts
+a candidate, so the revision under test is a named, reproducible point in history that
+no merge to `main` changes underneath the tester. Production is not deployed from here:
+it embeds the `imcp2` crate, which the matching `vX.Y.Z` tag publishes once the
+candidate has been tested (see [CONTRIBUTING.md](../../CONTRIBUTING.md), "Releasing").
 
-The staging deploy additionally sets `MCP_SERVE_BETA=1` (via `deploy-native.yml`,
-substituted into the unit by `deploy.sh`), so staging serves the beta Internet
-Identity instance at `/mcp-beta` alongside the production `/mcp`. Production leaves
-it unset, so it serves `/mcp` (production II) alone.
+The deploy sets `MCP_SERVE_BETA=1` for the `staging` environment (via
+`deploy-native.yml`, substituted into the unit by `deploy.sh`), so staging serves the
+beta Internet Identity instance at `/mcp-beta` alongside the production `/mcp`; a
+binary run without it serves `/mcp` (production II) alone.
 
-Both hosts set `MCP_SERVE_METRICS=1` (hardcoded in the unit), so the app serves
+The `staging` environment also sets `SERVE_STATUS=1`. `deploy.sh` then keeps the
+Caddyfile's `/status/` block (between its `__STATUS_BEGIN__`/`__STATUS_END__` markers),
+so the status dashboard is published at `https://<staging domain>/status/`; without it
+the block is deleted and the dashboard is not published at the origin. The public
+status surface for ICP MCP is [status.internetcomputer.org](https://status.internetcomputer.org/),
+driven by the dashboard's Statuspage pusher, which keeps running on every host.
+
+The unit hardcodes `MCP_SERVE_METRICS=1`, so the app serves
 the Prometheus exposition at `/metrics` on its own port for a scraper to reach on
-the host's private address. Caddy answers `/metrics` on the public origin with a
-404, which is what keeps it off the internet.
+the host's private address. Caddy answers `/metrics` with a 404, which is what keeps
+it off the internet. `deploy.sh` asserts that 404 against Caddy on the host itself,
+since a public name behind a fronting edge (production's is) answers with the edge's
+response rather than Caddy's; it separately fails the deploy if the exposition itself
+ever shows up through the public name, redirects followed.
 
 The mechanics live in [`deploy-native.yml`](../../.github/workflows/deploy-native.yml),
-a reusable workflow both call. It first runs the status dashboard's unit tests (a
+a reusable workflow. It first runs the status dashboard's unit tests (a
 regression there stops the rollout), cross-builds the binary with `build.sh`, then runs
 `deploy.sh` over SSH — which ships and (re)starts the app and the dashboard service. A
-`concurrency` group per environment serializes deploys so two never overlap.
+`concurrency` group serializes deploys so two never overlap.
 
-### Cutting a release
+### Cutting a candidate
 
 ```sh
-git tag release-2026-07-27 <commit>   # any suffix; the `release-` prefix is the trigger
-git push origin release-2026-07-27
+# the version bump (all three Cargo.toml files) has landed on main; then:
+git tag rc-0.6.0-1 <commit on main>
+git push origin rc-0.6.0-1
 ```
 
-**Rolling back:** re-run `deploy-release.yml` from the Actions tab with an earlier tag
-as the `ref` input. That rebuilds and ships that exact commit — no revert commit, no
-new tag.
+The workflow refuses a tag whose version does not match the manifests or whose commit
+is not on `main`, deploys, and publishes a GitHub prerelease `rc-0.6.0-1` carrying the
+deployed binary. A failed candidate is followed by a fix on `main` and `rc-0.6.0-2`;
+nothing is bumped after a candidate, so the commit that is promoted is the one tested.
+
+### Promoting a candidate
+
+```sh
+git tag v0.6.0 rc-0.6.0-1^{}   # the candidate's commit, exactly
+git push origin v0.6.0
+```
+
+Nothing is deployed by this. `publish-crate.yml` publishes the crates, refusing a
+commit unless an `rc-0.6.0-N` tag on it has its prerelease with the deployed binary,
+which exists only if that candidate's staging deploy succeeded; `v-release.yml` ships
+the local MCP binaries. Production picks the new crate up with a dependency bump of
+its own.
+
+**Rolling back staging:** run `deploy-candidate.yml` from the Actions tab with an
+earlier `rc-*` tag (or a full commit SHA) as the `ref` input. That rebuilds and ships
+that exact commit — no revert commit, no new tag.
 
 ### The build/ship split
 
@@ -206,8 +241,8 @@ new tag.
 **ship** runs wherever the target host is reachable and needs only `ssh` + `tar`, no
 Docker and no Rust.
 
-That split is what lets the ship job run on a **self-hosted runner**, which is how both
-environments deploy: the host is reached on its private address over the VPN rather than
+That split is what lets the ship job run on a **self-hosted runner**, which is how
+staging deploys: the host is reached on its private address over the VPN rather than
 over the public internet. The heavy build stays on hosted infrastructure and only the
 binary crosses into the private network. The ship runner's own architecture is
 irrelevant; it never executes the binary.
@@ -271,7 +306,7 @@ nothing but internet-sourced attempts. The rule permitting `22` from the private
 no IPv6 entry either, so nothing on the v6 side was relying on it.
 
 `ship_runs_on` takes a JSON string, so a bare name is `'"dind-small"'` and a label set
-is `'["self-hosted","linux"]'`. Both deploys use the bare-name form, because the org's
+is `'["self-hosted","linux"]'`. The deploy uses the bare-name form, because the org's
 self-hosted capacity is **ARC runner scale sets** — a scale set is selected by its name
 alone and carries none of the `self-hosted` / `linux` / `x64` labels that classic
 runners get automatically. A label list therefore matches no scale set however the pool
@@ -284,18 +319,26 @@ kept the old binary fails the run instead of passing quietly.
 
 ### Secrets
 
-Staging and production take separate secrets so a production rollout can never be
-pointed at the wrong box by a stale value. Both hosts are reached on their **private**
-addresses, since the ship job runs inside the VPN.
+The host is reached on its **private** address, since the ship job runs inside the
+VPN. (The `PROD_*` secrets and the `production` environment that an earlier
+production deploy used are no longer read by any workflow and can be deleted.)
 
-| Staging | Production | Value |
-|---|---|---|
-| `DEPLOY_SSH_KEY` | `PROD_DEPLOY_SSH_KEY` | Private SSH key for the sudo-capable host user |
-| `DEPLOY_HOST` | `PROD_DEPLOY_HOST` | `user@host`, the host's private address |
-| `DEPLOY_DOMAIN` | `PROD_DEPLOY_DOMAIN` | Public FQDN served over HTTPS |
-| `DEPLOY_ACME_EMAIL` | `PROD_DEPLOY_ACME_EMAIL` | Email for Let's Encrypt / ACME |
-| `DEPLOY_KNOWN_HOSTS` | `PROD_DEPLOY_KNOWN_HOSTS` | *(optional)* output of `ssh-keyscan <host>`; pin it to avoid trust-on-first-use |
-| `OPENAI_APPS_CHALLENGE_TOKEN` | *(same name)* | *(optional)* OpenAI Apps domain-verification token, served at `/.well-known/openai-apps-challenge` (404 while unset). Submission-specific rather than host-specific, so one repository-level secret feeds both environments |
+| Secret | Value |
+|---|---|
+| `DEPLOY_SSH_KEY` | Private SSH key for the sudo-capable host user |
+| `DEPLOY_HOST` | `user@host`, the host's private address |
+| `DEPLOY_DOMAIN` | Public FQDN served over HTTPS |
+| `DEPLOY_ACME_EMAIL` | Email for Let's Encrypt / ACME |
+| `DEPLOY_KNOWN_HOSTS` | *(optional)* output of `ssh-keyscan <host>`; pin it to avoid trust-on-first-use |
+| `OPENAI_APPS_CHALLENGE_TOKEN` | *(optional)* OpenAI Apps domain-verification token, served at `/.well-known/openai-apps-challenge` (404 while unset) |
+
+One optional setting is a GitHub Environment **variable** rather than a secret
+(**Settings → Environments → *staging* → Variables**); `deploy.sh`
+renders it into the unit like the secrets above:
+
+| Variable | Value |
+|---|---|
+| `OAUTH_CIMD_ENABLED` | Client ID Metadata Documents — the registration mode Claude and ChatGPT prefer over DCR — are **on** unless this is a falsey value (`0`/`false`/`no`/`off`); unset or empty is on. A roll-out kill switch, to be removed once CIMD has run in production for a while. The value is rendered into the unit at deploy time and read once at start-up, so to switch CIMD off, set the variable to `0` **and redeploy** — `workflow_dispatch` with the same ref is enough, no rebuild; changing the variable alone changes nothing on the host |
 
 > **Set these as repository-level secrets** (**Settings → Secrets and variables →
 > Actions**). The callers pass them into the reusable workflow, and a job that calls
@@ -319,10 +362,12 @@ workflow only automates the build-and-ship step, not provisioning the box.
 
 ### Approval gate
 
-Each deploy job runs in its named GitHub Environment. To require manual approval
-before production rollouts, go to **Settings → Environments → production** and add
-yourself (or a team) as a **Required reviewer**. Until a reviewer is configured the
-environment imposes no gate, so a `release-*` tag deploys straight through.
+The ship job runs in the `staging` GitHub Environment, which imposes no gate: a
+candidate tag deploys straight through, and the tag push itself is the human decision
+(the tag ruleset decides who can make it). Should you want a second pair of eyes, go
+to **Settings → Environments → staging** and add a **Required reviewer**. The approval
+that matters for a release is the one on the `release` environment, which gates the
+crates.io publish (see `publish-crate.yml`'s header).
 
 ## Operating
 
@@ -334,17 +379,23 @@ sudo journalctl -u caddy -f        # TLS / cert logs
 sudo journalctl -u imcp-status -f  # status dashboard logs
 ```
 
-The dashboard is at `https://<domain>/status/`. To probe a different target or
-extend its SSRF allowlist, edit `Environment=`/`ExecStart=` in
+The dashboard is published at `https://<staging domain>/status/` only (see
+`SERVE_STATUS` above; the public status page is status.internetcomputer.org) and
+shows staging and production side by side. To change the monitored set,
+its II pins or the SSRF allowlist, set `STATUS_TARGETS` / `STATUS_TARGET_II` for
+`deploy.sh` or edit the `Environment=` lines in
 `/etc/systemd/system/imcp-status.service` and `systemctl restart imcp-status`.
+The optional Statuspage pusher (`/etc/imcp-status/statuspage.env`) drives its
+component from the first configured instance unless `STATUSPAGE_TARGET` names
+another — set it to `production` there, so the public page reflects production.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `build.sh` | Cross-build `build-out/imcp2` (linux/arm64, bullseye glibc) |
-| `deploy.sh` | Ship binary + `static/` + `monitoring/`, render & install units/Caddyfile, (re)start services |
+| `deploy.sh` | Ship binary + `monitoring/`, render & install units/Caddyfile, (re)start services |
 | `imcp2.service` | systemd unit for the app (`__PUBLIC_URL__` substituted at deploy) |
-| `imcp-status.service` | systemd unit for the status dashboard (`__DOMAIN__`, `__ALLOWED_HOSTS__` substituted at deploy) |
+| `imcp-status.service` | systemd unit for the status dashboard (`__TARGETS__`, `__TARGET_II__`, `__ALLOWED_HOSTS__` substituted at deploy) |
 | `caddy.service` | systemd unit for Caddy |
 | `Caddyfile` | Caddy config (`__DOMAIN__`, `__ACME_EMAIL__` substituted at deploy) |

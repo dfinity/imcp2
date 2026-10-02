@@ -88,6 +88,7 @@
 
 use std::{
     collections::HashMap,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -104,15 +105,37 @@ use axum::{
     Form,
 };
 use base64::Engine;
-use candid::Principal;
-use ic_agent::identity::{Delegation, SignedDelegation};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
-use crate::identities::Identities;
+use imcp2_core::identities::Identities;
+pub use imcp2_core::iiconnect::AUTH_CALLBACKS_WELL_KNOWN;
+use imcp2_core::iiconnect::{self, RedeemBody};
+
+/// The verified session id of an authenticated MCP session: [`require_token`]
+/// validates the bearer token and stashes this on the request; the
+/// [`bearer_session_resolver`] hands it to the tool layer. The whole
+/// authentication step lives HERE, in the hosted binary — `imcp2-core` only
+/// asks its injected [`imcp2_core::SessionResolver`] for the outcome.
+#[derive(Clone, Debug)]
+pub struct AuthedSession {
+    pub session_id: String,
+}
+
+/// The hosted binary's [`imcp2_core::SessionResolver`]: read back the
+/// [`AuthedSession`] that [`require_token`] injected into the request
+/// extensions (rmcp surfaces the HTTP request's `Parts` in the tool context).
+pub fn bearer_session_resolver() -> imcp2_core::SessionResolver {
+    std::sync::Arc::new(|ctx| {
+        ctx.extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<AuthedSession>())
+            .map(|session| session.session_id.clone())
+    })
+}
 
 /// How long an authorization request and its pending II handshake stay valid
 /// before the user must restart.
@@ -200,48 +223,49 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
-/// File the dynamic client registrations are persisted to. RFC 7591 clients are
+/// Basename of the dynamic-client-registration store within the operational
+/// directory ([`McpConfig::state_dir`](crate::McpConfig)). RFC 7591 clients are
 /// long-lived (they cache their `client_id`), so registrations must survive a
 /// restart — unlike codes/tokens/connects, which are short-lived and stay in
-/// memory. Override with `OAUTH_CLIENTS_FILE`.
-fn clients_file() -> String {
-    std::env::var("OAUTH_CLIENTS_FILE").unwrap_or_else(|_| "oauth-clients.json".to_string())
+/// memory. The directory is injected via config, not read from the environment,
+/// so the embedding application owns where operational files live.
+const CLIENTS_FILENAME: &str = "oauth-clients.json";
+
+/// The temp path a client-store write stages to before the atomic rename: the
+/// target with a `.tmp` suffix, in the same directory (so the rename stays on one
+/// filesystem). Built on `OsString` so a non-UTF-8 path is preserved.
+fn clients_tmp_path(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    PathBuf::from(tmp)
 }
 
-fn load_clients() -> HashMap<String, ClientReg> {
-    load_clients_from(&clients_file())
-}
-
-fn load_clients_from(path: &str) -> HashMap<String, ClientReg> {
+fn load_clients_from(path: &Path) -> HashMap<String, ClientReg> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            tracing::warn!("could not parse {path}: {e}; starting with no clients");
+            tracing::warn!("could not parse {}: {e}; starting with no clients", path.display());
             HashMap::new()
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
         Err(e) => {
-            tracing::warn!("could not read {path}: {e}; starting with no clients");
+            tracing::warn!("could not read {}: {e}; starting with no clients", path.display());
             HashMap::new()
         }
     }
 }
 
-/// Best-effort write-through of the registration store. A failure (e.g. a
-/// read-only filesystem) only means registrations don't survive a restart — the
-/// client re-registers — so log and carry on.
+/// Best-effort write-through of the registration store to `path`. A failure (e.g.
+/// a read-only filesystem) only means registrations don't survive a restart —
+/// the client re-registers — so log and carry on.
 ///
 /// Atomic replace: `std::fs::write` truncates the target in place, so a crash or
-/// a concurrent [`load_clients`] mid-write could observe a half-written,
+/// a concurrent [`load_clients_from`] mid-write could observe a half-written,
 /// unparseable file and drop EVERY registration on the next load. Instead
 /// serialize to a sibling temp file and `rename` it over the target — atomic on
 /// POSIX, so a reader always sees either the old file or the complete new one.
-/// Only one writer runs at a time ([`ClientStore::persist_soon`]), so a fixed
+/// Only one writer runs at a time ([`ClientStore::persist_soon`]), so the fixed
 /// `.tmp` name cannot be raced.
-fn persist_clients(clients: &HashMap<String, ClientReg>) {
-    persist_clients_to(&clients_file(), clients);
-}
-
-fn persist_clients_to(path: &str, clients: &HashMap<String, ClientReg>) {
+fn persist_clients_to(path: &Path, clients: &HashMap<String, ClientReg>) {
     let bytes = match serde_json::to_vec_pretty(clients) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -249,13 +273,13 @@ fn persist_clients_to(path: &str, clients: &HashMap<String, ClientReg>) {
             return;
         }
     };
-    let tmp = format!("{path}.tmp");
+    let tmp = clients_tmp_path(path);
     if let Err(e) = std::fs::write(&tmp, &bytes) {
-        tracing::warn!("could not write {tmp}: {e}");
+        tracing::warn!("could not write {}: {e}", tmp.display());
         return;
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
-        tracing::warn!("could not replace {path}: {e}");
+        tracing::warn!("could not replace {}: {e}", path.display());
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -271,6 +295,13 @@ fn persist_clients_to(path: &str, clients: &HashMap<String, ClientReg>) {
 ///     re-serializes the whole store.
 struct ClientStore {
     registrations: RwLock<HashMap<String, ClientReg>>,
+    /// The operational directory this store lives in — the SINGLE source of truth
+    /// for where registrations persist (its file is `state_dir/{CLIENTS_FILENAME}`,
+    /// derived in [`Self::file`]). Owned by the store so the coalesced writer
+    /// ([`Self::persist_soon`]) needs no global/env lookup, and surfaced upward via
+    /// [`SharedClients::state_dir`] so `McpServer` reports the true location rather
+    /// than a possibly-diverging second copy.
+    state_dir: PathBuf,
     /// Set when the store holds registrations not yet written to disk. Cleared
     /// by the persist task before it snapshots, so a registration landing
     /// mid-write sets it again and gets its own pass (no lost updates).
@@ -281,19 +312,29 @@ struct ClientStore {
 }
 
 impl ClientStore {
-    /// Load the persisted registrations (see [`load_clients`]).
-    fn load() -> Arc<Self> {
-        Self::with(load_clients())
+    /// Load the persisted registrations from `state_dir/{CLIENTS_FILENAME}`,
+    /// binding the store to `state_dir` for later write-throughs.
+    fn load(state_dir: PathBuf) -> Arc<Self> {
+        let registrations = load_clients_from(&state_dir.join(CLIENTS_FILENAME));
+        Self::with(registrations, state_dir)
     }
 
-    /// A store over `registrations` as given (the seam tests use to start from a
-    /// known, empty set without reading the deployment's file).
-    fn with(registrations: HashMap<String, ClientReg>) -> Arc<Self> {
+    /// A store over `registrations` as given, bound to `state_dir` for
+    /// write-throughs (the seam tests use to start from a known set without
+    /// reading the deployment's file — pass a throwaway dir when persistence is
+    /// irrelevant).
+    fn with(registrations: HashMap<String, ClientReg>, state_dir: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             registrations: RwLock::new(registrations),
+            state_dir,
             dirty: AtomicBool::new(false),
             writing: AtomicBool::new(false),
         })
+    }
+
+    /// The file registrations persist to: `state_dir/{CLIENTS_FILENAME}`.
+    fn file(&self) -> PathBuf {
+        self.state_dir.join(CLIENTS_FILENAME)
     }
 
     /// Whether `redirect_uri` is acceptable for `client_id` ([`redirect_allowed`]),
@@ -351,14 +392,18 @@ impl ClientStore {
                 // during the write is guaranteed another pass.
                 while store.dirty.swap(false, Ordering::SeqCst) {
                     let snapshot = store.registrations.read().await.clone();
-                    tokio::task::spawn_blocking(move || persist_clients(&snapshot)).await.ok();
+                    let file = store.file();
+                    tokio::task::spawn_blocking(move || persist_clients_to(&file, &snapshot))
+                        .await
+                        .ok();
                     tokio::time::sleep(PERSIST_MIN_INTERVAL).await;
                 }
                 store.writing.store(false, Ordering::SeqCst);
                 // A registration may have landed between that last check and
                 // releasing the writer slot: re-take it if so (unless another
                 // caller already did), else this writer is done.
-                if !store.dirty.load(Ordering::SeqCst) || store.writing.swap(true, Ordering::SeqCst) {
+                if !store.dirty.load(Ordering::SeqCst) || store.writing.swap(true, Ordering::SeqCst)
+                {
                     break;
                 }
             }
@@ -374,10 +419,8 @@ impl ClientStore {
 /// an evicted client re-registers automatically.
 fn make_room_for_client(clients: &mut HashMap<String, ClientReg>) {
     while clients.len() >= MAX_CLIENTS {
-        let Some(victim) = clients
-            .iter()
-            .min_by_key(|(_, c)| c.last_used)
-            .map(|(id, _)| id.clone())
+        let Some(victim) =
+            clients.iter().min_by_key(|(_, c)| c.last_used).map(|(id, _)| id.clone())
         else {
             break;
         };
@@ -402,15 +445,28 @@ where
     }
     map.retain(|_, v| !remaining(v).is_zero());
     while map.len() >= cap {
-        let Some(victim) = map.iter().min_by_key(|(_, v)| remaining(v)).map(|(k, _)| k.clone()) else {
+        let Some(victim) = map.iter().min_by_key(|(_, v)| remaining(v)).map(|(k, _)| k.clone())
+        else {
             break;
         };
         map.remove(&victim);
     }
 }
 
-/// (registrable domain, redirect-path prefix) pairs whose hosts (and subdomains)
-/// may register a **hosted** (non-loopback) OAuth `redirect_uri`. Open dynamic
+/// How an allow-list entry's pinned path is matched against a `redirect_uri` path.
+/// A vendor whose callback path carries a per-connection id needs `Prefix`; one whose
+/// callback is a single fixed endpoint gets `Exact`, so no descendant of it is
+/// registrable either.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PathPin {
+    /// Only this exact path.
+    Exact,
+    /// This path, or a descendant of it at a segment boundary ([`path_within_prefix`]).
+    Prefix,
+}
+
+/// (registrable domain, redirect path, how to match that path) triples whose hosts
+/// (and subdomains) may register a **hosted** (non-loopback) OAuth `redirect_uri`. Open dynamic
 /// client registration means that without this an attacker could register a hosted
 /// redirect it controls and phish an authorization code to it (the same-browser
 /// variant Consent-Bound Completion does not close, CWE-601).
@@ -430,17 +486,33 @@ where
 /// deploy time with `OAUTH_ALLOWED_REDIRECT_PREFIXES` (comma/space-separated full
 /// `https://host/path` URL prefixes, each pinning a host + path prefix), additive, no
 /// rebuild; a bare-domain (root-path) entry is refused so ops can't reopen the
-/// domain-wide hole.
-const DEFAULT_ALLOWED_REDIRECTS: &[(&str, &str)] = &[
-    ("antigravity.google", "/oauth-callback"), // Google Antigravity
-    ("chatgpt.com", "/connector/oauth/"),      // OpenAI ChatGPT connectors
-    ("claude.ai", "/api/mcp/auth_callback"),   // Anthropic Claude
-    ("cursor.com", "/agents/mcp/oauth/callback"), // Cursor (registered as www.cursor.com)
-    ("grok.com", "/connector/oauth/"),         // xAI Grok
-    ("grok.com", "/connectors-oauth-exchange-code/"),
-    ("grok.com", "/mcp/callback"),
-    ("perplexity.ai", "/rest/connections/oauth_callback"), // Perplexity (any subdomain)
-    ("perplexity.com", "/rest/connections/oauth_callback"),
+/// domain-wide hole (env entries are prefixes, [`PathPin::Prefix`]).
+///
+/// Each entry says HOW its path is matched ([`PathPin`]). `Prefix` admits the path
+/// and any segment-boundary descendant, which a vendor whose callback carries an id
+/// (`/connector/oauth/{callback_id}`) needs; `Exact` admits only the path itself.
+/// The vendors seeded as `Prefix` are left that way deliberately: tightening one to
+/// `Exact` would reject an already-registered client of that vendor that appends a
+/// segment, so it wants checking vendor by vendor rather than in bulk here.
+const DEFAULT_ALLOWED_REDIRECTS: &[(&str, &str, PathPin)] = &[
+    ("antigravity.google", "/oauth-callback", PathPin::Prefix), // Google Antigravity
+    ("chatgpt.com", "/connector/oauth/", PathPin::Prefix),      // OpenAI ChatGPT connectors
+    // OpenAI ChatGPT connectors, issuer-identification form. ChatGPT sends this
+    // stable path — not the `{callback_id}` one above — to an authorization server
+    // whose metadata advertises `authorization_response_iss_parameter_supported`,
+    // which ours does, so this is the path a ChatGPT connection actually registers.
+    // One fixed endpoint with nothing appended, so it is pinned as `Exact`: unlike a
+    // `Prefix` entry, no descendant of it is registrable either.
+    ("chatgpt.com", "/connector_platform_oauth_redirect", PathPin::Exact),
+    ("claude.ai", "/api/mcp/auth_callback", PathPin::Prefix), // Anthropic Claude
+    // Cursor (registered as www.cursor.com)
+    ("cursor.com", "/agents/mcp/oauth/callback", PathPin::Prefix),
+    ("grok.com", "/connector/oauth/", PathPin::Prefix), // xAI Grok
+    ("grok.com", "/connectors-oauth-exchange-code/", PathPin::Prefix),
+    ("grok.com", "/mcp/callback", PathPin::Prefix),
+    // Perplexity (any subdomain)
+    ("perplexity.ai", "/rest/connections/oauth_callback", PathPin::Prefix),
+    ("perplexity.com", "/rest/connections/oauth_callback", PathPin::Prefix),
 ];
 
 /// The effective hosted-redirect allow-list: the compiled-in defaults plus any
@@ -454,15 +526,19 @@ const DEFAULT_ALLOWED_REDIRECTS: &[(&str, &str)] = &[
 /// shipped binary is safe by default and ops can only widen the set. Computed ONCE
 /// (the env is process-static) via `OnceLock`, so `/oauth/register` and
 /// `/oauth/authorize` neither re-parse the env nor re-log its warnings per call.
-fn allowed_redirects() -> &'static [(String, String)] {
-    static CACHE: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+fn allowed_redirects() -> &'static [(String, String, PathPin)] {
+    static CACHE: std::sync::OnceLock<Vec<(String, String, PathPin)>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| {
-        let mut out: Vec<(String, String)> =
-            DEFAULT_ALLOWED_REDIRECTS.iter().map(|(d, p)| (d.to_string(), p.to_string())).collect();
+        let mut out: Vec<(String, String, PathPin)> = DEFAULT_ALLOWED_REDIRECTS
+            .iter()
+            .map(|(d, p, pin)| (d.to_string(), p.to_string(), *pin))
+            .collect();
         if let Ok(extra) = std::env::var("OAUTH_ALLOWED_REDIRECT_PREFIXES") {
-            for raw in extra.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
+            for raw in extra.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty())
+            {
                 match parse_redirect_prefix(raw) {
-                    Some(e) => out.push(e),
+                    // `…_PREFIXES`, so an ops entry matches as a prefix.
+                    Some((host, path)) => out.push((host, path, PathPin::Prefix)),
                     None => tracing::warn!(
                         "ignoring OAUTH_ALLOWED_REDIRECT_PREFIXES entry `{raw}`: must be a bare \
                          `https://host/path` with a non-root path prefix and no non-default port \
@@ -534,7 +610,8 @@ fn path_has_percent_encoding(path: &str) -> bool {
 /// userinfo, name no
 /// off-origin port (only the implicit/`:443` default is allowed), its host must
 /// equal (or be a subdomain of) an allow-listed registrable domain, AND its path
-/// must fall within that entry's pinned callback prefix (see
+/// must match that entry's pinned callback path — exactly or as a prefix, per the
+/// entry's [`PathPin`] (see
 /// [`DEFAULT_ALLOWED_REDIRECTS`]), so a user-content path on an allow-listed
 /// origin (`perplexity.ai/page/…`, `chatgpt.com/g/…`) is refused even though the
 /// host matches. The host is read from the PARSED URL, not the raw string, so
@@ -591,13 +668,17 @@ fn redirect_uri_permitted(redirect_uri: &str) -> bool {
     if path_has_percent_encoding(path) {
         return false;
     }
-    // host == domain (or a dot-boundary subdomain) AND the path is within the
-    // vendor's pinned callback prefix. The path pin is what keeps a registration
-    // off third-party/user-content paths (e.g. `/page/…`, `/g/…`) on the same
-    // origin; without it, domain-only matching would let those capture the code.
-    allowed_redirects().iter().any(|(domain, prefix)| {
+    // host == domain (or a dot-boundary subdomain) AND the path matches the vendor's
+    // pinned callback path the way that entry says to ([`PathPin`]: its own path only,
+    // or descendants too). The path pin is what keeps a registration off
+    // third-party/user-content paths (e.g. `/page/…`, `/g/…`) on the same origin;
+    // without it, domain-only matching would let those capture the code.
+    allowed_redirects().iter().any(|(domain, prefix, pin)| {
         (host == *domain || host.strip_suffix(domain.as_str()).is_some_and(|p| p.ends_with('.')))
-            && path_within_prefix(path, prefix)
+            && match pin {
+                PathPin::Exact => path == prefix,
+                PathPin::Prefix => path_within_prefix(path, prefix),
+            }
     })
 }
 
@@ -645,9 +726,7 @@ fn redirect_allowed(reg: Option<&ClientReg>, redirect_uri: &str) -> bool {
     if !redirect_uri_permitted(redirect_uri) {
         return false;
     }
-    reg.redirect_uris
-        .iter()
-        .any(|u| u == redirect_uri || loopback_match(u, redirect_uri))
+    reg.redirect_uris.iter().any(|u| u == redirect_uri || loopback_match(u, redirect_uri))
 }
 
 /// Whether `requested` is a loopback redirect matching the registered loopback
@@ -664,12 +743,684 @@ fn loopback_match(registered: &str, requested: &str) -> bool {
     a.host_str() == b.host_str() && a.path() == b.path() && a.query() == b.query()
 }
 
+// ---- Client ID Metadata Documents (CIMD) ------------------------------------
+//
+// The MCP authorization spec's preferred registration (draft-ietf-oauth-client-
+// id-metadata-document): the client's `client_id` IS an https URL, and the
+// RFC 7591-shaped JSON at that URL is its registration — `redirect_uris`,
+// `client_name`, how it authenticates. Nothing is stored per client, so a
+// directory client that connects thousands of times (Claude, ChatGPT) no longer
+// mints a DCR registration each time.
+//
+// Adopted the way the scoping in PR #143 lays it out — TRUST-POLICY-GATED and
+// additive. Only a `client_id` on a vetted vendor origin is fetched at all: its
+// host must be on (or under) a domain of the hosted-redirect allow-list, on the
+// default port ([`cimd_origin_trusted`]), so the one source of truth for who is
+// a vetted vendor also decides whose document this server will GET. Any other
+// URL `client_id` is refused before any request goes out and pointed at the
+// allow-listing contact, exactly like a hosted redirect off the list; DCR stays
+// for everyone else. That collapses the new outbound-fetch surface — an
+// UNAUTHENTICATED `/oauth/authorize` naming a URL — from "any URL" to a finite
+// set of vetted hosts. Even those are fetched under the SSRF guard
+// ([`imcp2_core::public_fetch`]: every resolved address public and pinned, no
+// redirect followed, a strict byte cap), because a vetted vendor's DNS is not
+// this server's to trust.
+//
+// A fetched document is validated as the draft requires (its own `client_id`
+// must equal the URL, byte for byte) and then given EXACTLY the checks a DCR
+// registration gets: the requested `redirect_uri` must be one the document
+// lists (loopback port-agnostically) AND pass the hosted-redirect allow-list
+// ([`redirect_uri_permitted`]). A document cannot talk its way past the
+// allow-list, so accepting one admits no redirect a DCR client could not already
+// register. On top of that, a hosted redirect the document lists must be
+// SAME-ORIGIN with the document URL (loopback excepted, for native clients): the
+// document is self-asserted, so this is what ties the code's destination to the
+// party that published the document, as Anthropic's reference authorization
+// server also requires. Only public clients (`none`) are supported, as
+// `token_endpoint_auth_methods_supported` says.
+//
+// Nothing in a document is trusted for DISPLAY. This server has no consent
+// screen of its own (`/oauth/authorize` hands the browser to Internet Identity),
+// so the relying party is not shown for CIMD clients any more than for DCR
+// ones; were one added, the only attested fact is the HOST of the `client_id`
+// URL — never the self-asserted `client_name` or `logo_uri`.
+//
+// Per deployment ([`crate::McpConfig::cimd_enabled`]): on, the metadata
+// advertises the mechanism and URL `client_id`s are accepted; off, a URL
+// `client_id` is an unknown client. Claude and ChatGPT both select CIMD the
+// moment an AS advertises it, so it is normally on: an embedding host sets the
+// field, and the `imcp2` binary has it on unless `OAUTH_CIMD_ENABLED`, a
+// roll-out kill switch slated for removal, says off. The rollback, should a
+// vendor's document turn out to be shaped in a way this implementation refuses,
+// is to switch it off and restart; the clients re-read the metadata within
+// minutes and fall back to DCR.
+
+/// Byte cap on a `client_id` URL before it is treated as CIMD at all: the URL
+/// becomes a key of the process-wide cache and single-flight map (and part of a
+/// negative entry's reason), so an unauthenticated caller must not get to size
+/// those entries at will — [`CIMD_CACHE_MAX`] entries of at most this many bytes
+/// of key is the memory bound. The same cap a redirect URI gets; the real
+/// identifiers are under 100 bytes. A longer value is an ordinary, unknown
+/// client id: refused, not fetched, not remembered.
+const CIMD_MAX_CLIENT_ID_LEN: usize = MAX_REDIRECT_URI_LEN;
+/// Byte cap on a metadata document. The draft recommends documents stay under
+/// 5 KB; the real ones are well under 1 KB, so this is generous yet bounded.
+const CIMD_MAX_BYTES: usize = 8 * 1024;
+/// Fetch timeout. Claude waits at most 10 s for OUR authorize endpoint, so the
+/// fetch it triggers must finish well inside that.
+const CIMD_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Fetches allowed in flight at once, process-wide (every mounted instance shares
+/// [`CimdState`]). An excess request is told to retry, never queued; concurrent
+/// requests for ONE document share a single fetch and never compete for these.
+/// Deliberately no rate cap: a slot frees within the fetch deadline, so this is
+/// not a budget a flood of made-up URLs can spend to lock real clients out
+/// (rate limiting, if wanted, goes in front of the server — see the README).
+const CIMD_MAX_INFLIGHT: usize = 16;
+/// Fetches allowed in flight per `client_id` HOST, so one slow host cannot take
+/// every permit above.
+const CIMD_MAX_INFLIGHT_PER_HOST: usize = 4;
+/// Distinct `client_id` URLs cached. A handful of directory clients is the
+/// expected population; the bound is against abuse, not for capacity.
+const CIMD_CACHE_MAX: usize = 512;
+/// How long a document is reused when its origin sends no `max-age`.
+const CIMD_CACHE_DEFAULT_TTL: Duration = Duration::from_secs(10 * 60);
+/// Ceiling on the origin's `max-age`: bounds how long a since-changed document is
+/// still honoured. There is deliberately no floor — an origin's `no-store`,
+/// `no-cache` or `max-age=0` means the document is not reused at all, so a
+/// redirect the client withdraws is gone with the next request. The cost is a
+/// fetch per request for a VALID document whose origin forbids reuse, which is
+/// the origin's own choice and is contained like every other fetch: by the
+/// in-flight bounds. (An invalid document is a different case — it is
+/// remembered for [`CIMD_NEGATIVE_TTL`], so a repeat costs nothing.)
+const CIMD_CACHE_MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long a URL whose document failed a DOCUMENT-INTRINSIC check — nothing
+/// there (404), not JSON, about another URL, too large — is remembered as
+/// invalid, so a repeat of the same bogus path costs no fetch (PR #143 §3.5).
+/// Short, so a vendor fixing its document is not locked out for long. Only what
+/// is about the URL itself is remembered: a per-request failure (a redirect the
+/// document does not list) never is, or a probe with a bad redirect could lock
+/// out a real client; nor is a transient (a deadline, a 5xx), which is retried.
+const CIMD_NEGATIVE_TTL: Duration = Duration::from_secs(60);
+
+/// A validated Client ID Metadata Document: what this server needs from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClientMetadata {
+    /// The document URL, which is also the `client_id` (verified equal).
+    client_id: String,
+    client_name: Option<String>,
+    redirect_uris: Vec<String>,
+}
+
+/// A cache entry: the validated document, or — a negative entry, held for
+/// [`CIMD_NEGATIVE_TTL`] — why the URL yields none; either until `expires`.
+#[derive(Clone, Debug)]
+struct CachedClientMetadata {
+    outcome: Result<Arc<ClientMetadata>, String>,
+    expires: Instant,
+}
+
+/// Why a CIMD client's document did not yield a [`ClientMetadata`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CimdError {
+    /// A failure of the MOMENT ([`classify_fetch_error`]): the host did not
+    /// resolve, the deadline passed, the connection failed, the origin answered
+    /// 5xx or one of the 4xx the client may retry (408, 421, 425, 429), or this
+    /// server's own in-flight bounds were full. The same request may succeed next
+    /// time, so the user is told to retry and nothing is remembered.
+    Unavailable(String),
+    /// A failure of the URL or its document: the SSRF guard refuses the URL, the
+    /// origin has no document there (404, a redirect, any other 4xx), the body
+    /// is over the cap or not UTF-8, or it was fetched but is not a valid
+    /// document for that URL. The client is misconfigured or hostile: an unknown
+    /// client, not a retry, and remembered for [`CIMD_NEGATIVE_TTL`].
+    Invalid(String),
+}
+
+/// The verdict of [`AuthStore::validate_client`].
+#[derive(Debug, PartialEq, Eq)]
+enum ClientCheck {
+    /// Known client, and `redirect_uri` is one it registered.
+    Allowed,
+    /// Unknown client, or a redirect it did not register or that is not permitted.
+    Refused,
+    /// A CIMD client whose document could not be fetched right now — retryable,
+    /// so the user is not told to re-add the connector. The reason is logged and
+    /// carried for the caller's own logging; it is not shown to the browser.
+    MetadataUnavailable(String),
+    /// A URL `client_id` whose origin is not on the vendor trust policy
+    /// ([`cimd_origin_trusted`]): refused before any fetch and — like a hosted
+    /// redirect off the allow-list — told where to request access.
+    UntrustedClientOrigin,
+}
+
+/// One in-flight fetch of a document, shared by every request that missed the
+/// cache while it ran: the slot holds the outcome once the fetch is done, and
+/// whoever finds it empty on locking is the one to fetch.
+type Flight = Arc<tokio::sync::Mutex<Option<Result<Arc<ClientMetadata>, CimdError>>>>;
+
+/// Whether `client_id` is a Client ID Metadata Document URL — returned parsed —
+/// or `None` for an ordinary (DCR) identifier: https, a host, a path beyond `/`,
+/// no fragment or userinfo (the draft's MUSTs; a query is tolerated), within
+/// [`CIMD_MAX_CLIENT_ID_LEN`]. Taken AS GIVEN — it is the cache key and what the
+/// document must repeat byte for byte — so the parsed URL must serialise back to
+/// it ([`parsed_as_given`]); the host is normalised only for the trust policy
+/// and the per-host bound ([`host_key`]).
+fn cimd_client_id(client_id: &str) -> Option<url::Url> {
+    if client_id.len() > CIMD_MAX_CLIENT_ID_LEN {
+        return None;
+    }
+    // Parsed, not prefix-matched: a scheme is case-insensitive, and a DCR id is
+    // no URL at all.
+    let url = url::Url::parse(client_id).ok()?;
+    // The WHATWG parser silently rewrites a great deal — strips tab/newline/CR,
+    // trims edge controls, reads `\` as `/`, erases an empty userinfo,
+    // percent-encodes spaces, controls and more, decodes the host, resolves dot
+    // segments — and one rule refuses all of it: the URL must serialise back to
+    // the identifier given.
+    if !parsed_as_given(client_id, &url) {
+        return None;
+    }
+    let well_formed = url.scheme() == "https"
+        && url.host_str().is_some_and(|h| !h.is_empty())
+        && url.path().len() > 1
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none();
+    well_formed.then_some(url)
+}
+
+/// Whether `url` serialises back to `raw`, allowing only what a URL may spell
+/// either way: the scheme's and host's ASCII case, and an explicit `:443`. The
+/// authority is the slice between `://` and the first `/`, `?` or `#`.
+fn parsed_as_given(raw: &str, url: &url::Url) -> bool {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return false;
+    };
+    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let authority = authority.to_ascii_lowercase();
+    let authority = authority.strip_suffix(":443").unwrap_or(&authority);
+    format!("{}://{authority}{tail}", scheme.to_ascii_lowercase()) == url.as_str()
+}
+
+/// The trust policy of PR #143: whether a CIMD `client_id` URL (already shaped by
+/// [`cimd_client_id`]) is on an origin this server will fetch from — its host on,
+/// or a dot-boundary subdomain of, a domain of the hosted-redirect allow-list
+/// ([`allowed_redirects`], the one source of truth for who is a vetted vendor),
+/// on the default https port. The port matters: the SSRF guard connects to the
+/// port the URL names, so a host-only check would let `https://claude.ai:8443/…`
+/// past a `claude.ai` gate and on to a service nobody vetted.
+fn cimd_origin_trusted(client_id: &url::Url) -> bool {
+    client_id.scheme() == "https"
+        && client_id.port().is_none()
+        && client_id.host_str().is_some_and(allow_listed_domain)
+}
+
+/// Whether `host` equals, or is a dot-boundary subdomain of, an allow-listed
+/// registrable domain — the host rule of [`redirect_uri_permitted`], on its own.
+fn allow_listed_domain(host: &str) -> bool {
+    vetted_domain(host).is_some()
+}
+
+/// The allow-listed registrable domain `host` equals or is a dot-boundary
+/// subdomain of, if any: the trust policy's match.
+fn vetted_domain(host: &str) -> Option<&'static str> {
+    let host = host_key(host);
+    allowed_redirects().iter().map(|(domain, _, _)| domain.as_str()).find(|domain| {
+        host == *domain || host.strip_suffix(*domain).is_some_and(|p| p.ends_with('.'))
+    })
+}
+
+/// One spelling per host — lower-case, no trailing dot — so that whatever is
+/// keyed by host (the trust policy's match, the per-host in-flight slots) treats
+/// `claude.ai`, `Claude.AI` and `claude.ai.` as the one host they resolve to.
+fn host_key(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The RFC 7591 client metadata this server reads from a Client ID Metadata
+/// Document; any other member is ignored. A member of the wrong type — an
+/// explicit `null` included ([`present`]) — fails to deserialise, which makes
+/// the document invalid; only an absent member is an omission.
+#[derive(Deserialize)]
+struct ClientMetadataDocument {
+    client_id: String,
+    #[serde(default, deserialize_with = "present")]
+    client_name: Option<String>,
+    redirect_uris: Vec<String>,
+    #[serde(default, deserialize_with = "present")]
+    client_secret: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    client_secret_expires_at: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    token_endpoint_auth_method: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    token_endpoint_auth_methods_supported: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
+    grant_types: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
+    response_types: Option<Vec<String>>,
+}
+
+/// Deserialise a member that is present as `T` itself, so `null` is the type
+/// error it is rather than `None`; `#[serde(default)]` supplies the `None` for
+/// an absent member.
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
+
+/// Parse and validate the document fetched from `client_id` (RFC 7591 client
+/// metadata, per the CIMD draft): its `client_id` must be the URL; it must carry
+/// no client secret; it must be able to authenticate as a PUBLIC client — a
+/// `token_endpoint_auth_method` of `none` (absent means `none`: a document may
+/// not use a secret-based method, so RFC 7591's default cannot apply) or `none`
+/// among its `token_endpoint_auth_methods_supported`, ChatGPT's case — and to
+/// run this server's one flow (`grant_types` / `response_types`, if given, must
+/// include `authorization_code` / `code`). Of its `redirect_uris` — at most
+/// [`MAX_REDIRECT_URIS`] of [`MAX_REDIRECT_URI_LEN`] bytes, as DCR allows — only
+/// those a DCR registration could have registered ([`redirect_uri_permitted`])
+/// that are loopback or on the document's own origin are kept; none left is a
+/// refusal.
+fn parse_client_metadata(client_id: &str, body: &str) -> Result<ClientMetadata, String> {
+    let doc: ClientMetadataDocument =
+        serde_json::from_str(body).map_err(|e| format!("not a client metadata document: {e}"))?;
+    if doc.client_id != client_id {
+        return Err(format!("its client_id is {:?}, not the document URL", doc.client_id));
+    }
+    if doc.client_secret.is_some() || doc.client_secret_expires_at.is_some() {
+        return Err("carries a client secret, which a metadata document must not".into());
+    }
+    let method = doc.token_endpoint_auth_method.as_deref().unwrap_or("none");
+    let lists_none = doc
+        .token_endpoint_auth_methods_supported
+        .as_deref()
+        .is_some_and(|methods| methods.iter().any(|m| m == "none"));
+    if method != "none" && !lists_none {
+        return Err(format!(
+            "authenticates only as {method:?}; this server supports public clients (none) only"
+        ));
+    }
+    for (field, given, needed) in [
+        ("grant_types", &doc.grant_types, "authorization_code"),
+        ("response_types", &doc.response_types, "code"),
+    ] {
+        if given.as_deref().is_some_and(|list| !list.iter().any(|v| v == needed)) {
+            return Err(format!("{field} does not include {needed:?}, the only flow here"));
+        }
+    }
+    if doc.redirect_uris.is_empty() {
+        return Err("redirect_uris is empty".into());
+    }
+    if doc.redirect_uris.len() > MAX_REDIRECT_URIS {
+        let n = doc.redirect_uris.len();
+        return Err(format!("too many redirect_uris ({n}, max {MAX_REDIRECT_URIS})"));
+    }
+    if doc.redirect_uris.iter().any(|u| u.len() > MAX_REDIRECT_URI_LEN) {
+        return Err(format!("a redirect_uri is too long (max {MAX_REDIRECT_URI_LEN} bytes)"));
+    }
+    let own_origin = url::Url::parse(client_id).map_err(|e| format!("client_id: {e}"))?.origin();
+    let redirect_uris: Vec<String> = doc
+        .redirect_uris
+        .into_iter()
+        .filter(|u| {
+            redirect_uri_permitted(u)
+                && (is_loopback_redirect(u)
+                    || url::Url::parse(u).is_ok_and(|r| r.origin() == own_origin))
+        })
+        .collect();
+    if redirect_uris.is_empty() {
+        return Err("lists no redirect_uri this server could honour: one on its own origin that \
+                    the hosted-redirect allow-list admits, or a loopback one, neither with a \
+                    query or fragment"
+            .into());
+    }
+    Ok(ClientMetadata { client_id: doc.client_id, client_name: doc.client_name, redirect_uris })
+}
+
+/// Whether a `Content-Type` is `application/json` — the media type a Client ID
+/// Metadata Document must be served as — by its essence, so parameters such as
+/// `charset=utf-8` are fine and case does not matter. A document served as
+/// anything else (or as nothing) is refused before it is parsed: bytes that
+/// happen to parse as JSON on a page the origin did not mean as its OAuth
+/// statement are not that statement.
+fn is_json_media_type(content_type: Option<&str>) -> bool {
+    content_type
+        .map(|ct| ct.split(';').next().unwrap_or("").trim())
+        .is_some_and(|essence| essence.eq_ignore_ascii_case("application/json"))
+}
+
+/// What this process knows about the web of metadata documents, and how much of
+/// it is being asked at once: the cache, the single-flight map, and the in-flight
+/// bounds. ONE per process, shared by every [`AuthStore`] — the bundled binary
+/// mounts a store per II instance (`/mcp`, `/mcp-beta`) — so the bounds hold per
+/// process, as their docs say, rather than multiplying with the mounts, and a
+/// document fetched for one mount serves the other.
+struct CimdState {
+    /// Documents fetched and validated — or found invalid — keyed by the
+    /// `client_id` URL, each with the instant it goes stale. Bounded at
+    /// [`CIMD_CACHE_MAX`]; see [`AuthStore::remember_client_metadata`].
+    cache: RwLock<HashMap<String, CachedClientMetadata>>,
+    /// Bounds concurrent metadata-document fetches at [`CIMD_MAX_INFLIGHT`]: each
+    /// is an outbound request an UNAUTHENTICATED `/oauth/authorize` can trigger.
+    inflight: Semaphore,
+    /// Single-flight: the fetch in flight for one `client_id`, whose outcome —
+    /// document, invalid, or unavailable — every request that missed while it
+    /// ran shares, instead of each fetching and each spending a permit. An entry
+    /// lives only while a fetch is in flight ([`Flight`]).
+    fetching: std::sync::Mutex<HashMap<String, Flight>>,
+    /// Fetches in flight per `client_id` host ([`HostSlot`]).
+    hosts: std::sync::Mutex<HashMap<String, usize>>,
+    /// When each vetted domain was last warned about ([`Self::warn_permitted`]).
+    warned: std::sync::Mutex<HashMap<&'static str, Instant>>,
+}
+
+impl CimdState {
+    fn new() -> Self {
+        Self {
+            cache: RwLock::default(),
+            inflight: Semaphore::new(CIMD_MAX_INFLIGHT),
+            fetching: std::sync::Mutex::default(),
+            hosts: std::sync::Mutex::default(),
+            warned: std::sync::Mutex::default(),
+        }
+    }
+
+    /// Whether a fetch failure at `domain` is logged at warn: once a minute per
+    /// vetted domain, the rest at debug, so a caller rotating made-up paths on a
+    /// vetted host cannot flood the log. The domain set is finite.
+    fn warn_permitted(&self, domain: &'static str) -> bool {
+        let mut warned = self.warned.lock().expect("cimd warn sampling");
+        let now = Instant::now();
+        match warned.get_mut(domain) {
+            Some(last) if now.duration_since(*last) < Duration::from_secs(60) => false,
+            Some(last) => {
+                *last = now;
+                true
+            }
+            None => {
+                warned.insert(domain, now);
+                true
+            }
+        }
+    }
+
+    /// The one instance every store in the process shares.
+    fn shared() -> Arc<Self> {
+        static SHARED: std::sync::OnceLock<Arc<CimdState>> = std::sync::OnceLock::new();
+        Arc::clone(SHARED.get_or_init(|| Arc::new(Self::new())))
+    }
+
+    /// Take `flight`'s entry for `key` out of the single-flight map — if it is
+    /// still the one there; a newer flight for the same key is left alone.
+    fn retire_flight(&self, key: &str, flight: &Flight) {
+        let mut fetching = self.fetching.lock().expect("cimd fetch locks");
+        if fetching.get(key).is_some_and(|current| Arc::ptr_eq(current, flight)) {
+            fetching.remove(key);
+        }
+    }
+}
+
+/// Fetches in flight per `client_id` host, held as a guard so a slot is given
+/// back however the fetch ends ([`CIMD_MAX_INFLIGHT_PER_HOST`]).
+struct HostSlot {
+    state: Arc<CimdState>,
+    host: String,
+}
+
+impl HostSlot {
+    /// Take a slot for `host`, or `None` when it already holds the maximum.
+    fn take(state: &Arc<CimdState>, host: &str) -> Option<Self> {
+        let mut map = state.hosts.lock().expect("cimd host slots");
+        let held = map.get(host).copied().unwrap_or(0);
+        if held >= CIMD_MAX_INFLIGHT_PER_HOST {
+            return None;
+        }
+        map.insert(host.to_owned(), held + 1);
+        Some(Self { state: Arc::clone(state), host: host.to_owned() })
+    }
+}
+
+impl Drop for HostSlot {
+    fn drop(&mut self) {
+        let mut map = self.state.hosts.lock().expect("cimd host slots");
+        match map.get_mut(&self.host) {
+            Some(held) if *held > 1 => *held -= 1,
+            _ => {
+                map.remove(&self.host);
+            }
+        }
+    }
+}
+
+/// A request's hold on a flight, from joining it to leaving — by returning, or
+/// by being DROPPED, since an authorize future can be dropped at any await (the
+/// client resets the stream). A flight that publishes its outcome is retired by
+/// its fetcher at once ([`AuthStore::client_metadata_for`]); this guard is for
+/// the flight that never gets that far because every request in it was
+/// cancelled: the LAST holder out retires it, so no entry is left behind (on a
+/// vetted host with unique URLs, that would be unbounded growth). While another
+/// request still holds such a flight it stays where newcomers find it, so a
+/// fetcher cancelled mid-way hands over to a waiter — which, finding no outcome
+/// once the lock is its, fetches — instead of leaving the waiters on one flight
+/// and newcomers on a second, fetching the same document twice. Only this
+/// flight's own entry is ever removed, never a newer one.
+struct FlightGuard<'a> {
+    state: &'a CimdState,
+    key: &'a str,
+    flight: &'a Flight,
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        // Two handles are the map's and this request's; more means other requests
+        // still hold the flight, and the last of them retires it. The count is
+        // read under the map lock, where a newcomer would take its handle, so the
+        // two cannot cross.
+        let mut fetching = self.state.fetching.lock().expect("cimd fetch locks");
+        let Some(current) = fetching.get(self.key) else { return };
+        if !Arc::ptr_eq(current, self.flight) || Arc::strong_count(self.flight) > 2 {
+            return;
+        }
+        fetching.remove(self.key);
+    }
+}
+
+/// How long to reuse a document: the remaining freshness the origin granted
+/// (already less the response's age) capped at [`CIMD_CACHE_MAX_TTL`]; ZERO — do
+/// not cache — when it forbade reuse or that freshness is spent; and, when it
+/// sent no freshness information at all, the default LESS the age the response
+/// already has, so an answer some cache along the way held for a day is not
+/// given ten fresh minutes here.
+fn cimd_ttl(remaining: Option<Duration>, current_age: Duration) -> Duration {
+    remaining
+        .unwrap_or_else(|| CIMD_CACHE_DEFAULT_TTL.saturating_sub(current_age))
+        .min(CIMD_CACHE_MAX_TTL)
+}
+
+/// GET a metadata document: the process-global test fixture when one is
+/// registered for `url`, else the real SSRF-guarded fetch.
+async fn fetch_client_metadata_document(
+    url: &str,
+) -> Result<imcp2_core::public_fetch::PublicDocument, imcp2_core::public_fetch::FetchError> {
+    #[cfg(test)]
+    if let Some(served) = cimd_fixture::get(url) {
+        return match served {
+            cimd_fixture::Served::Now(answer) => {
+                // A real fetch suspends here; so does the stand-in, so tests see
+                // what concurrent requests do while one is in flight.
+                tokio::task::yield_now().await;
+                answer
+            }
+            cimd_fixture::Served::Never => std::future::pending().await,
+        };
+    }
+    imcp2_core::public_fetch::fetch_public_document(url, CIMD_MAX_BYTES, CIMD_FETCH_TIMEOUT).await
+}
+
+/// GET the document at `key` and validate it: the document plus how long its
+/// origin lets it be reused ([`cimd_ttl`]), or why it is not one.
+async fn fetch_and_validate_client_metadata(
+    key: &str,
+) -> Result<(Arc<ClientMetadata>, Duration), CimdError> {
+    let doc = fetch_client_metadata_document(key).await.map_err(classify_fetch_error)?;
+    if !is_json_media_type(doc.content_type.as_deref()) {
+        return Err(CimdError::Invalid(format!(
+            "{key}: served as {}, not application/json",
+            doc.content_type.as_deref().unwrap_or("no media type")
+        )));
+    }
+    let meta = parse_client_metadata(key, &doc.body)
+        .map(Arc::new)
+        .map_err(|why| CimdError::Invalid(format!("{key}: {why}")))?;
+    Ok((meta, cimd_ttl(doc.cache_max_age, doc.current_age)))
+}
+
+/// Sort a fetch failure by what it is ABOUT (PR #143 §3.4). The URL itself — the
+/// guard refuses it, the origin has no document there or answers with a redirect
+/// or another 4xx, the body is over the cap or not UTF-8 — is `Invalid`, which is
+/// remembered for [`CIMD_NEGATIVE_TTL`]. The moment — a resolver that did not
+/// answer, the deadline, a connection that failed, a 5xx, or one of the 4xx
+/// that are about the moment too, which their definitions say the client may
+/// retry (408 Request Timeout, 421 Misdirected Request, 425 Too Early, 429 Too
+/// Many Requests) — is `Unavailable`, which is never remembered.
+fn classify_fetch_error(err: imcp2_core::public_fetch::FetchError) -> CimdError {
+    use imcp2_core::public_fetch::FetchError;
+    match err {
+        FetchError::Unreachable(why) => CimdError::Unavailable(why),
+        FetchError::Answered { status, detail }
+            if status >= 500 || matches!(status, 408 | 421 | 425 | 429) =>
+        {
+            CimdError::Unavailable(detail)
+        }
+        FetchError::Answered { detail, .. } => CimdError::Invalid(detail),
+        FetchError::Refused(why) | FetchError::TooLarge(why) | FetchError::NotUtf8(why) => {
+            CimdError::Invalid(why)
+        }
+    }
+}
+
+/// The tests' stand-in for the web: what each `client_id` URL serves. Process-
+/// global, like the web it stands in for, so concurrent tests use distinct URLs.
+#[cfg(test)]
+mod cimd_fixture {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+    };
+
+    use imcp2_core::public_fetch::{FetchError, PublicDocument};
+
+    /// What the fixture does for a fetch of a URL.
+    #[derive(Clone)]
+    pub(super) enum Served {
+        /// Answer this, after the one suspension a real fetch would take.
+        Now(Result<PublicDocument, FetchError>),
+        /// Never answer: an origin that hangs. The request's only way out is to
+        /// be dropped, as a client resetting the stream would drop it.
+        Never,
+    }
+
+    type Registry = Mutex<HashMap<String, Served>>;
+    static DOCS: OnceLock<Registry> = OnceLock::new();
+    static HITS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+    fn docs() -> &'static Registry {
+        DOCS.get_or_init(Default::default)
+    }
+
+    /// Serve `body` (JSON) at `url`, with no cache hint.
+    pub(super) fn serve(url: &str, body: &str) {
+        serve_as(url, body, "application/json");
+    }
+
+    /// Serve `body` at `url` with the given `Content-Type`, no cache hint.
+    pub(super) fn serve_as(url: &str, body: &str, content_type: &str) {
+        let doc = PublicDocument {
+            body: body.into(),
+            content_type: Some(content_type.into()),
+            cache_max_age: None,
+            current_age: std::time::Duration::ZERO,
+        };
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Ok(doc)));
+    }
+
+    /// Serve `body` (JSON) at `url` with no cache hint, as an answer some cache
+    /// along the way has already held for `age`.
+    pub(super) fn serve_aged(url: &str, body: &str, age: std::time::Duration) {
+        let doc = PublicDocument {
+            body: body.into(),
+            content_type: Some("application/json".into()),
+            cache_max_age: None,
+            current_age: age,
+        };
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Ok(doc)));
+    }
+
+    /// Make a fetch of `url` hang until the request is dropped.
+    pub(super) fn hang(url: &str) {
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Never);
+    }
+
+    /// How many times `url` has been fetched.
+    pub(super) fn hits(url: &str) -> usize {
+        HITS.get_or_init(Default::default)
+            .lock()
+            .expect("fixture hits")
+            .get(url)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Serve `body` at `url` with `Cache-Control: no-store` (a zero max-age).
+    pub(super) fn serve_uncacheable(url: &str, body: &str) {
+        let doc = PublicDocument {
+            body: body.into(),
+            content_type: Some("application/json".into()),
+            cache_max_age: Some(std::time::Duration::ZERO),
+            current_age: std::time::Duration::ZERO,
+        };
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Ok(doc)));
+    }
+
+    /// Make fetching `url` fail TRANSIENTLY — an origin that cannot be reached —
+    /// with `why`.
+    pub(super) fn fail(url: &str, why: &str) {
+        let err = FetchError::Unreachable(why.into());
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Err(err)));
+    }
+
+    /// Make `url` answer 404: no document there, a failure about the URL itself.
+    pub(super) fn not_found(url: &str) {
+        answer(url, 404);
+    }
+
+    /// Make `url` answer with `status` (anything but the `200 OK` a document is).
+    pub(super) fn answer(url: &str, status: u16) {
+        let err = FetchError::Answered { status, detail: format!("{url} answered {status}") };
+        docs().lock().expect("fixture registry").insert(url.into(), Served::Now(Err(err)));
+    }
+
+    pub(super) fn get(url: &str) -> Option<Served> {
+        let served = docs().lock().expect("fixture registry").get(url).cloned();
+        if served.is_some() {
+            *HITS
+                .get_or_init(Default::default)
+                .lock()
+                .expect("fixture hits")
+                .entry(url.into())
+                .or_insert(0) += 1;
+        }
+        served
+    }
+}
+
 #[derive(Clone)]
 pub struct AuthStore {
     clients: Arc<ClientStore>,
     tokens: Arc<RwLock<HashMap<String, TokenInfo>>>,
     /// Auth-code connects in flight, keyed by `session_id` (= the II connect
-    /// `state`). Bounded at [`crate::identities::MAX_PENDING_CONNECTS`] (one
+    /// `state`). Bounded at [`imcp2_core::identities::MAX_PENDING_CONNECTS`] (one
     /// entry per pending connect, same as the session map) and swept of expired
     /// entries by [`AuthStore::reap_expired`].
     authz: Arc<RwLock<HashMap<String, AuthzPending>>>,
@@ -696,6 +1447,13 @@ pub struct AuthStore {
     /// [`crate::McpConfig::require_resource`]); when clear, a missing `resource`
     /// is tolerated.
     require_resource: bool,
+    /// Client ID Metadata Documents: the cache, single-flight map and in-flight
+    /// bounds — the PROCESS's ([`CimdState::shared`]), so every mounted instance
+    /// draws on the same bounds; a test may give a store its own.
+    cimd: Arc<CimdState>,
+    /// Whether URL `client_id`s are accepted and CIMD advertised
+    /// ([`crate::McpConfig::cimd_enabled`]).
+    cimd_enabled: bool,
 }
 
 /// An auth-code connect awaiting the user's II handshake.
@@ -777,10 +1535,23 @@ impl TokenInfo {
 pub struct SharedClients(Arc<ClientStore>);
 
 impl SharedClients {
-    /// Load the persisted client registrations once, to be shared by all stores
-    /// (file from `OAUTH_CLIENTS_FILE`, default `oauth-clients.json`).
-    pub fn load() -> Self {
-        Self(ClientStore::load())
+    /// Load the persisted client registrations from `state_dir` once, to be shared
+    /// by every instance on the origin (the store lives at
+    /// `{state_dir}/oauth-clients.json`). `state_dir` is the operational-files
+    /// directory the embedder configures as [`McpConfig::state_dir`](crate::McpConfig);
+    /// build ONE `SharedClients` from it and hand a clone to each instance so a
+    /// registration made against either instance's AS is known to both and the
+    /// persisted snapshot never loses the other's entries.
+    pub fn load(state_dir: impl AsRef<Path>) -> Self {
+        Self(ClientStore::load(state_dir.as_ref().to_path_buf()))
+    }
+
+    /// The operational directory this store loads from and persists to — the
+    /// authoritative location, so [`McpServer::state_dir`](crate::McpServer::state_dir)
+    /// reports where files actually go rather than a separately-stored copy that
+    /// could drift from the one passed to [`Self::load`].
+    pub fn state_dir(&self) -> &Path {
+        &self.0.state_dir
     }
 }
 
@@ -791,6 +1562,7 @@ impl AuthStore {
         public_url: String,
         mcp_path: String,
         require_resource: bool,
+        cimd_enabled: bool,
     ) -> Self {
         Self {
             clients: clients.0,
@@ -801,12 +1573,29 @@ impl AuthStore {
             public_url,
             mcp_path,
             require_resource,
+            cimd: CimdState::shared(),
+            cimd_enabled,
         }
     }
 
+    /// This store with CIMD switched on or off, and with CIMD state of its own,
+    /// so tests do not see each other's flights.
+    #[cfg(test)]
+    fn with_cimd(mut self, enabled: bool) -> Self {
+        self.cimd_enabled = enabled;
+        self.cimd = Arc::new(CimdState::new());
+        self
+    }
+
     /// The II instance this store serves.
-    fn instance(&self) -> &crate::identities::IiInstance {
+    fn instance(&self) -> &imcp2_core::identities::IiInstance {
         self.identities.instance()
+    }
+
+    /// The operational directory the client store persists to — the location
+    /// `McpServer::state_dir` reports (single source of truth).
+    pub(crate) fn state_dir(&self) -> &Path {
+        &self.clients.state_dir
     }
 
     /// This instance's AS issuer: `{public_url}{mcp_path}` (an RFC 8414 *path
@@ -820,19 +1609,202 @@ impl AuthStore {
     /// advertised in the 401 challenge: the path-inserted form for the
     /// resource `{public_url}{mcp_path}`.
     fn resource_metadata_url(&self) -> String {
-        format!(
-            "{}/.well-known/oauth-protected-resource{}",
-            self.public_url, self.mcp_path
-        )
+        format!("{}/.well-known/oauth-protected-resource{}", self.public_url, self.mcp_path)
     }
 
-    /// Whether `redirect_uri` is acceptable for `client_id`: the client must be
-    /// registered, and the redirect must match a registered URI (exactly, or
-    /// port-agnostically for loopback per RFC 8252 §7.3). A match also marks the
+    /// Whether `redirect_uri` is acceptable for `client_id`. A CIMD client (its
+    /// `client_id` is an https URL, [`cimd_client_id`], and CIMD is on) must be
+    /// on a vetted vendor origin ([`cimd_origin_trusted`]) and is then checked
+    /// against its fetched, validated document; any other client must hold a
+    /// registration in the DCR store. Either way the redirect must match one the
+    /// client registered (exactly, or port-agnostically for loopback per RFC 8252
+    /// §7.3) AND pass the hosted-redirect allow-list. A DCR match also marks the
     /// registration as recently used (it is about to sign a user in), which is
     /// what keeps it ahead of the store's LRU eviction.
-    async fn validate_client(&self, client_id: &str, redirect_uri: &str) -> bool {
-        self.clients.redirect_allowed_for(client_id, redirect_uri).await
+    async fn validate_client(&self, client_id: &str, redirect_uri: &str) -> ClientCheck {
+        let Some(cimd_url) = cimd_client_id(client_id).filter(|_| self.cimd_enabled) else {
+            return if self.clients.redirect_allowed_for(client_id, redirect_uri).await {
+                ClientCheck::Allowed
+            } else {
+                ClientCheck::Refused
+            };
+        };
+        // The trust policy, BEFORE anything else: a document is fetched from a
+        // vetted vendor origin or not at all, so an unauthenticated request naming
+        // a stranger's URL costs this server nothing and admits nothing.
+        if !cimd_origin_trusted(&cimd_url) {
+            // Debug, not info: this runs for every unauthenticated request and
+            // carries a caller-chosen URL, so a flood must not be a flood of log lines.
+            tracing::debug!(client_id, "refusing a client_id URL off the vendor trust policy");
+            return ClientCheck::UntrustedClientOrigin;
+        }
+        // Allow-list BEFORE any fetch too: a redirect this server would refuse
+        // anyway must not cost an outbound request, so even a vetted host is not
+        // asked for a document on behalf of a redirect that could never be used.
+        if !redirect_uri_permitted(redirect_uri) {
+            return ClientCheck::Refused;
+        }
+        match self.client_metadata_for(client_id, &cimd_url).await {
+            Ok(meta) => {
+                // The same check a DCR registration gets, over the document's redirects.
+                let reg = ClientReg::new(meta.redirect_uris.clone());
+                if redirect_allowed(Some(&reg), redirect_uri) {
+                    ClientCheck::Allowed
+                } else {
+                    ClientCheck::Refused
+                }
+            }
+            // Both are logged where the fetch happens (at warn once a minute per
+            // vendor); here, per request, only at debug, or a flood of requests
+            // for one bad URL would be a flood of log lines.
+            Err(CimdError::Invalid(why)) => {
+                tracing::debug!(client_id, %why, "client metadata document is invalid");
+                ClientCheck::Refused
+            }
+            Err(CimdError::Unavailable(why)) => {
+                tracing::debug!(client_id, %why, "client metadata document unavailable");
+                ClientCheck::MetadataUnavailable(why)
+            }
+        }
+    }
+
+    /// The validated metadata document behind a CIMD `client_id`, from the cache
+    /// while fresh, else fetched — once, however many requests miss at the same
+    /// time, all of which share that one fetch's outcome — under the in-flight
+    /// bounds. What is then cached, and for how long, is
+    /// [`AuthStore::fetch_and_cache_client_metadata`]'s call.
+    async fn client_metadata_for(
+        &self,
+        key: &str,
+        client_id: &url::Url,
+    ) -> Result<Arc<ClientMetadata>, CimdError> {
+        // `key` is the identifier AS GIVEN — the string the document must repeat,
+        // and what the cache and single-flight map are keyed by; `client_id` is
+        // it parsed, for the host.
+        if let Some(cached) = self.cached_client_metadata(key).await {
+            return cached;
+        }
+        // Single-flight: the first miss for a document fetches it; the others wait
+        // for that fetch and take its outcome — a failure or an uncacheable
+        // document included, so nobody re-fetches serially behind a slow origin.
+        // Without this a popular client's cold start (or a document's expiry)
+        // would have every concurrent authorize fetch the same bytes and spend a
+        // permit each.
+        let flight: Flight = Arc::clone(
+            self.cimd.fetching.lock().expect("cimd fetch locks").entry(key.to_owned()).or_default(),
+        );
+        // Held for as long as this request is in the flight, however it leaves;
+        // the last holder out retires the flight ([`FlightGuard`]).
+        let _hold = FlightGuard { state: &self.cimd, key, flight: &flight };
+        let mut slot = flight.lock().await;
+        if let Some(outcome) = slot.as_ref() {
+            return outcome.clone();
+        }
+        // First through the lock: this request fetches — unless a flight that
+        // finished between the miss above and here has filled the cache meanwhile
+        // — and publishes, for the waiters to read from the handle they hold.
+        let outcome = match self.cached_client_metadata(key).await {
+            Some(cached) => cached,
+            None => self.fetch_and_cache_client_metadata(key, client_id).await,
+        };
+        // Retire the flight BEFORE publishing, still under its lock, so no request
+        // can join it once the outcome is there: a request arriving from here on
+        // goes to the cache, or, for an outcome the cache does not hold (a
+        // `no-store` document, a transient failure), fetches afresh — never joins
+        // this flight to reuse an outcome the origin said not to reuse, or a
+        // failure that may be over. Everyone who joined before this reads the
+        // outcome from the handle they already hold.
+        self.cimd.retire_flight(key, &flight);
+        *slot = Some(outcome.clone());
+        outcome
+    }
+
+    /// The cached outcome for `key`, if one is held and still fresh: the
+    /// document, or — a negative entry — why the URL yields none.
+    async fn cached_client_metadata(
+        &self,
+        key: &str,
+    ) -> Option<Result<Arc<ClientMetadata>, CimdError>> {
+        let cache = self.cimd.cache.read().await;
+        let hit = cache.get(key).filter(|hit| hit.expires > Instant::now())?;
+        Some(hit.outcome.clone().map_err(CimdError::Invalid))
+    }
+
+    /// Fetch, validate and cache the document at `client_id`, under the in-flight
+    /// bounds (per host, then overall; an excess request is told to retry, never
+    /// queued). A document is cached for as long as [`cimd_ttl`] says — not at all
+    /// when its origin forbids reuse; a failure about the URL itself is cached
+    /// negatively for [`CIMD_NEGATIVE_TTL`]; a transient failure is not cached.
+    async fn fetch_and_cache_client_metadata(
+        &self,
+        key: &str,
+        client_id: &url::Url,
+    ) -> Result<Arc<ClientMetadata>, CimdError> {
+        let host = host_key(client_id.host_str().unwrap_or_default());
+        let Some(_slot) = HostSlot::take(&self.cimd, &host) else {
+            return Err(CimdError::Unavailable(format!(
+                "too many client metadata fetches in flight for {host}; retry shortly"
+            )));
+        };
+        let Ok(_permit) = self.cimd.inflight.try_acquire() else {
+            return Err(CimdError::Unavailable(
+                "too many client metadata fetches in flight; retry shortly".into(),
+            ));
+        };
+        let fetched = Instant::now();
+        // The one place these are logged at warn — once a minute per vendor, at
+        // debug otherwise: with no rate cap, only sampling bounds the log.
+        let domain = vetted_domain(&host).unwrap_or_default();
+        let (outcome, ttl) = match fetch_and_validate_client_metadata(key).await {
+            Ok((meta, ttl)) => (Ok(meta), ttl),
+            Err(CimdError::Invalid(why)) => {
+                const MSG: &str =
+                    "client metadata document is invalid; refusing its client for a minute";
+                if self.cimd.warn_permitted(domain) {
+                    tracing::warn!(client_id = key, %why, "{MSG}");
+                } else {
+                    tracing::debug!(client_id = key, %why, "{MSG}");
+                }
+                (Err(why), CIMD_NEGATIVE_TTL)
+            }
+            Err(CimdError::Unavailable(why)) => {
+                const MSG: &str = "client metadata document unavailable";
+                if self.cimd.warn_permitted(domain) {
+                    tracing::warn!(client_id = key, %why, "{MSG}");
+                } else {
+                    tracing::debug!(client_id = key, %why, "{MSG}");
+                }
+                return Err(CimdError::Unavailable(why));
+            }
+        };
+        if !ttl.is_zero() {
+            self.remember_client_metadata(key, outcome.clone(), fetched + ttl).await;
+        }
+        outcome.map_err(CimdError::Invalid)
+    }
+
+    /// Hold `outcome` for `key` until `expires`, making room under
+    /// [`CIMD_CACHE_MAX`] first.
+    async fn remember_client_metadata(
+        &self,
+        key: &str,
+        outcome: Result<Arc<ClientMetadata>, String>,
+        expires: Instant,
+    ) {
+        let now = Instant::now();
+        let mut cache = self.cimd.cache.write().await;
+        if cache.len() >= CIMD_CACHE_MAX && !cache.contains_key(key) {
+            // Make room: drop what has expired; if that frees nothing, the entry
+            // closest to expiry (an LRU stand-in that needs no write per hit).
+            cache.retain(|_, c| c.expires > now);
+            if cache.len() >= CIMD_CACHE_MAX {
+                let victim = cache.iter().min_by_key(|(_, c)| c.expires).map(|(k, _)| k.clone());
+                if let Some(victim) = victim {
+                    cache.remove(&victim);
+                }
+            }
+        }
+        cache.insert(key.to_owned(), CachedClientMetadata { outcome, expires });
     }
 
     /// The verified principal + session id behind a bearer token, if valid.
@@ -850,7 +1822,11 @@ impl AuthStore {
     /// entries pair 1:1 with these.
     async fn insert_pending(&self, session_id: String, pending: AuthzPending) {
         let mut authz = self.authz.write().await;
-        make_room(&mut authz, crate::identities::MAX_PENDING_CONNECTS, AuthzPending::remaining);
+        make_room(
+            &mut authz,
+            imcp2_core::identities::MAX_PENDING_CONNECTS,
+            AuthzPending::remaining,
+        );
         authz.insert(session_id, pending);
     }
 
@@ -1026,15 +2002,61 @@ pub async fn authorize(
     match q.response_type.as_deref() {
         Some("code") => {}
         Some(_) => {
-            return signin_error(&headers, StatusCode::BAD_REQUEST, "unsupported_response_type",
-                "only response_type=code", SIGNIN_HEADLINE, MALFORMED_DIAGNOSTIC)
+            return signin_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                "unsupported_response_type",
+                "only response_type=code",
+                SIGNIN_HEADLINE,
+                MALFORMED_DIAGNOSTIC,
+            )
         }
         None => {
-            return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
-                "response_type=code required", SIGNIN_HEADLINE, MALFORMED_DIAGNOSTIC)
+            return signin_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "response_type=code required",
+                SIGNIN_HEADLINE,
+                MALFORMED_DIAGNOSTIC,
+            )
         }
     }
-    if !store.validate_client(&q.client_id, &q.redirect_uri).await {
+    let client_check = store.validate_client(&q.client_id, &q.redirect_uri).await;
+    if let ClientCheck::MetadataUnavailable(_) = &client_check {
+        // A CIMD client this server could not verify RIGHT NOW (the cause is
+        // logged by `validate_client`): neither a malformed request nor a client
+        // to re-add, so say retry. Nothing about the failure is reflected here —
+        // the cause quotes the caller-supplied `client_id` URL.
+        return signin_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "the client's metadata document could not be fetched",
+            SIGNIN_HEADLINE,
+            "We couldn't fetch your MCP client's identity document just now. Try again in a \
+             moment.",
+        );
+    }
+    if client_check == ClientCheck::UntrustedClientOrigin {
+        // A URL `client_id` on an origin that is not a vetted vendor (the trust
+        // policy of PR #143), refused before any fetch. Like a hosted redirect
+        // off the allow-list, this is an approval gap with a concrete next step,
+        // not a malformed request — so the same "not approved" page, or its JSON.
+        return if accepts_html(&headers) {
+            not_allowlisted_page()
+        } else {
+            oauth_err(
+                StatusCode::FORBIDDEN,
+                "invalid_client",
+                &format!(
+                    "client_id URL is not on a vetted vendor origin; contact {CONTACT} to request \
+                     access"
+                ),
+            )
+        };
+    }
+    if client_check != ClientCheck::Allowed {
         if !redirect_uri_permitted(&q.redirect_uri) {
             // Two distinct failures reach here. A WELL-FORMED hosted `redirect_uri`
             // that simply isn't on the allow-list is an approval gap, not a
@@ -1057,18 +2079,28 @@ pub async fn authorize(
             // non-https, or userinfo-bearing). That's a client-side request error,
             // not an approval gap, so classify it `invalid_request` and show the
             // generic sign-in error rather than a misleading "request access" page.
-            return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
-                "redirect_uri must be a valid https or loopback URL", SIGNIN_HEADLINE,
-                MALFORMED_DIAGNOSTIC);
+            return signin_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "redirect_uri must be a valid https or loopback URL",
+                SIGNIN_HEADLINE,
+                MALFORMED_DIAGNOSTIC,
+            );
         }
         // `invalid_client` (not `invalid_request`): the request is well-formed,
         // it's the CLIENT identification that failed — the AS error code the
         // MCP server guide (and RFC 6749's taxonomy) expects here. No redirect:
         // an unvalidated redirect_uri must never receive an error response.
-        return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_client",
-            "unknown client_id / redirect_uri", SIGNIN_HEADLINE,
+        return signin_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "invalid_client",
+            "unknown client_id / redirect_uri",
+            SIGNIN_HEADLINE,
             "This server doesn't recognize your MCP client. Its registration may have expired. \
-             Remove the connector and add it again. Then sign in.");
+             Remove the connector and add it again. Then sign in.",
+        );
     }
     // OAuth 2.1: PKCE is required for public clients.
     let Some(code_challenge) = q.code_challenge.clone() else {
@@ -1082,11 +2114,16 @@ pub async fn authorize(
     // accepting the omission and then verifying as S256 would hand a
     // spec-strict `plain` client a code it can never exchange.
     if q.code_challenge_method.as_deref() != Some("S256") {
-        return signin_error(&headers, StatusCode::BAD_REQUEST, "invalid_request",
-            "code_challenge_method=S256 is required", SIGNIN_HEADLINE,
+        return signin_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "code_challenge_method=S256 is required",
+            SIGNIN_HEADLINE,
             "Your MCP client's request used an unsupported PKCE method (only S256 is supported). \
              The client may be out of date. Try updating it. If that doesn't help, remove the \
-             connector and add it again.");
+             connector and add it again.",
+        );
     }
     // RFC 8707 Resource Indicators (MCP authorization): a token must only be
     // issued for THIS instance, so refuse a `resource` that names any other
@@ -1127,10 +2164,15 @@ pub async fn authorize(
         Ok(k) => k,
         Err(e) => {
             tracing::warn!("refusing a connect: {e}");
-            return signin_error(&headers, StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable",
-                "the server is at capacity for sessions; retry shortly", SIGNIN_HEADLINE,
+            return signin_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "the server is at capacity for sessions; retry shortly",
+                SIGNIN_HEADLINE,
                 "This server is busy right now, so it couldn't start a new sign-in. Wait a moment \
-                 and try again.");
+                 and try again.",
+            );
         }
     };
     // Bind this browser to the flow (the `sid` cookie, set now and required at
@@ -1208,9 +2250,12 @@ fn connect_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
 /// `location.hash`. Sets `Referrer-Policy: no-referrer` (tidiness — the authorize
 /// query carries only non-secret OAuth params).
 fn redirect_302(url: &str) -> Response {
-    let mut resp = (StatusCode::FOUND, [(axum::http::header::LOCATION, url.to_string())]).into_response();
-    resp.headers_mut()
-        .insert(axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer"));
+    let mut resp =
+        (StatusCode::FOUND, [(axum::http::header::LOCATION, url.to_string())]).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
     resp
 }
 
@@ -1241,26 +2286,15 @@ fn build_redirect(redirect_uri: &str, code: &str, client_state: &str, iss: &str)
 /// ([`connect_callback_page`]). No `priv(X)` is ever put in the link — only its
 /// public half.
 fn ii_mcp_url(store: &AuthStore, session_id: &str, reg_pubkey_b64: &str) -> String {
-    format!(
-        "{ii}/mcp#callback={cb}&state={st}&ttl={ttl}&registration_key={rk}",
-        ii = store.instance().ii_url,
-        cb = urlencoding::encode(&connect_callback_url(store)),
-        st = urlencoding::encode(session_id),
-        ttl = GRANT_TTL_SECS,
-        rk = urlencoding::encode(reg_pubkey_b64),
+    iiconnect::ii_mcp_url(
+        &store.instance().ii_url,
+        &connect_callback_url(store),
+        session_id,
+        GRANT_TTL_SECS,
+        reg_pubkey_b64,
     )
 }
 // ---- Callback allow-list (II #4091) ---------------------------------------
-
-/// The well-known path Internet Identity fetches a server's **auth-callback
-/// allow-list** from (dfinity/internet-identity#4091): before contacting the
-/// connect callback named in the (attacker-craftable) link fragment, II fetches
-/// `<callback origin>` + this path — `redirect: "error"`, no credentials,
-/// `no-store`, 8 KB cap, `application/json` required — and rejects the connect
-/// unless the callback URL is EXACTLY (string-equal) one of the declared
-/// entries. **Fail-closed**: a missing/unfetchable file fails every connect for
-/// this origin, so serving this document is mandatory once #4091 ships.
-pub const AUTH_CALLBACKS_WELL_KNOWN: &str = "/.well-known/ii-auth-callbacks";
 
 /// An instance's connect-callback URL — the single source of truth used BOTH in
 /// the II link fragment and in the [`auth_callbacks`] allow-list, so the two
@@ -1302,158 +2336,17 @@ pub async fn connect_callback_page(State(store): State<AuthStore>) -> Response {
     pinned_callback_page(&store.mcp_path)
 }
 
-/// A fresh CSP nonce: 128 bits from the OS CSPRNG, **standard** base64. CSP3's
-/// `base64-value` grammar also admits base64url, but CSP2's does not (`-`/`_`
-/// absent), so use the standard alphabet for maximum parser compatibility — a
-/// strict-CSP2 parser that rejected the nonce source would block the inline
-/// script and break the callback page. `+`/`/`/`=` are all safe where the nonce
-/// rides (a quoted HTML attribute and a header value).
-fn csp_nonce() -> String {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("getrandom");
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-/// Styling for the pinned callback page, following the DFINITY brand guidelines
-/// (Parchment/Ink/Rust palette, an editorial serif display over a UI sans, a
-/// grid-paper surface, and the official gradient-infinity logo). A full-bleed
-/// screen: the status stage (a spinner on a soft elevated tile plus an accessible
-/// serif headline) fills and centres the viewport, with a foot-of-page "Hosted
-/// by" mark; the spinner is CSS-only (disabled under `prefers-reduced-motion`).
-/// Light/dark theming via `prefers-color-scheme` with a `data-theme` override,
-/// using the brand's Bark/Bone/Ember dark palette. Fully self-contained (no
-/// external fonts, images, or stylesheets; the logo is inlined into the served
-/// HTML), so it renders identically under the pinned page's strict
-/// `default-src 'none'` CSP. The stylesheet lives in `assets/connect.css` and is
-/// compiled into the binary via `include_str!` (no runtime file I/O), so it is
-/// authored as a real `.css` file rather than a Rust string literal. The pinned
-/// page serves it in a `<style nonce>` block (with `style-src 'nonce-...'` added
-/// to its CSP so the block is allowed WITHOUT `'unsafe-inline'`). The `.error`
-/// modifier (added to `.screen` client-side) hides the spinner tile once a
-/// terminal message is shown.
-const CONNECT_PAGE_CSS: &str = include_str!("assets/connect.css");
-
-/// The official DFINITY logo (gradient-infinity mark + wordmark), taken from
-/// dfinity.org. It lives in `assets/dfinity-logo.svg` and is compiled into the
-/// binary via `include_str!`, then inlined into the served HTML so it needs no
-/// external fetch under the pinned page's strict CSP. The infinity keeps the
-/// brand gradients; the wordmark is set to `currentColor` so it follows the
-/// page's Ink/Bone text color across light and dark themes.
-const CONNECT_LOGO_SVG: &str = include_str!("assets/dfinity-logo.svg");
-
-/// HTML template for the pinned callback page, kept as a real `.html` asset file
-/// (compiled in via `include_str!`, no runtime file I/O) rather than an inline
-/// Rust string literal, so the markup reads and diffs as HTML. It is a self-
-/// contained document with `__TOKEN__` placeholders spliced in at render time
-/// (the stylesheet `__CSS__`, the logo `__LOGO__`, and the per-response
-/// `__NONCE__`/`__SCRIPT__`). No user-influenced value is ever interpolated.
-const PINNED_PAGE_HTML: &str = include_str!("assets/connect-callback.html");
-
-/// The strict-CSP, non-reflecting pinned callback page. `nonce` is a fresh
-/// per-response value bound into the CSP header and BOTH the inline `<script>`
-/// and `<style>`, so no `'unsafe-inline'` is needed; `connect-src 'self'` limits
-/// the page's only network reach to the same-origin redeem endpoint, and
-/// `default-src 'none'` forbids loading anything else (all styling is inline and
-/// self-contained; see [`CONNECT_PAGE_CSS`]). No attacker-supplied value
-/// (fragment, query) is ever interpolated into the HTML; the fragment is read
-/// client-side and sent via `fetch`, never written to the DOM.
-///
-/// The fragment shape matches II's frontend (merged contract): the delegation
-/// chain plus the connect state only:
-/// `#delegation=<JSON.stringify(DelegationChain.toJSON())>&state=<state>`,
-/// percent-encoded by `URLSearchParams`. The script reads both fields and
-/// forwards them to the redeem endpoint (the chain's JSON text and the state
-/// echo). There is no `anchor`, and no `permissions`/`ttl`, in the fragment:
-/// the consent was captured earlier at `prepare_mcp_registration_delegation`
-/// (keyed by `P_reg`), and II recovers it (and the user's identity number)
-/// from `caller() == P_reg`, so the server sees none of them.
-///
-/// The pinned page's inline script and stylesheet are kept as PLAIN strings,
-/// not `format!` templates, so they read naturally (no doubled braces, room for
-/// comments). The one dynamic value in the script, the redeem URL, is spliced in
-/// by replacing `__REDEEM_URL__`, which sits inside a quoted JS string literal
-/// below.
-const PINNED_PAGE_JS: &str = r#"(function () {
-  function show(t, err) {
-    document.getElementById('m').textContent = t;
-    if (err) {
-      var c = document.querySelector('.screen');
-      if (c) { c.classList.add('error'); }
-    }
-  }
-  // II delivers #delegation=<chain JSON>&state=<state>: the two-hop chain plus
-  // the connect state, percent-encoded by URLSearchParams and decoded again by
-  // it here. Consent (permissions, max_ttl) is NOT in the fragment: the user
-  // chose it earlier at II's prepare step, which stored it keyed by P_reg, and
-  // mcp_register_v2 recovers it server-side. So the page forwards only the chain
-  // and the state; the backend redeems with mcp_register_v2(session_key).
-  var params = new URLSearchParams(location.hash.slice(1));
-  var body = JSON.stringify({
-    state: params.get('state') || '',
-    delegation: params.get('delegation') || ''
-  });
-  // Scrub the delegation from the address bar, keeping the path and any query
-  // string the declared callback carries. Best-effort: the POST below works
-  // even if a browser refuses the history call.
-  try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
-  fetch("__REDEEM_URL__", {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    credentials: 'same-origin',
-    body: body
-  })
-    .then(function (r) { return r.json().catch(function () { return {}; }); })
-    .then(function (d) {
-      if (d && d.redirect) {
-        location.replace(d.redirect);
-      } else {
-        show((d && d.error) || "We couldn't finish the connection. Restart from your client.", true);
-      }
-    })
-    .catch(function () {
-      show("We couldn't reach the server. Restart from your client.", true);
-    });
-})();"#;
-
+/// The strict-CSP pinned callback page (rendered by
+/// [`iiconnect::pinned_callback_page`], which binds a fresh nonce into the CSP
+/// and both inline blocks), wrapped into a Response with this deployment's
+/// redeem URL and the non-CSP hardening headers.
 fn pinned_callback_page(prefix: &str) -> Response {
-    let nonce = csp_nonce();
-    let redeem = js_escape(&format!("{prefix}/oauth/connect/redeem"));
-    let script = PINNED_PAGE_JS.replace("__REDEEM_URL__", &redeem);
-    // The markup lives in `assets/connect-callback.html` (include_str!). The
-    // status line is a `role=status` / `aria-live=polite` region so screen
-    // readers announce both "Connecting agent to Internet Identity…" and any
-    // terminal error the script swaps in. Below it sits a `.contact-hint` line
-    // (hidden during a normal connect; revealed by the stylesheet once the
-    // script adds `.error` to `.screen`) so every handshake/redeem failure the
-    // user lands on carries the "contact us to report it" line. The DFINITY logo
-    // carries its own `aria-label`; the spinner is decorative (`aria-hidden`).
-    // `__NONCE__` (both the `<style>` and `<script>` tags), the self-contained
-    // stylesheet, logo, the contact address, and redeem script are spliced in;
-    // none of those values contains a placeholder token, so the order is immaterial.
-    let html = PINNED_PAGE_HTML
-        .replace("__NONCE__", &nonce)
-        .replace("__CSS__", CONNECT_PAGE_CSS)
-        .replace("__LOGO__", CONNECT_LOGO_SVG)
-        .replace("__CONTACT__", CONTACT)
-        .replace("__SCRIPT__", &script);
-    // `style-src 'nonce-{nonce}'` admits ONLY the nonce'd `<style>` block above
-    // (no `'unsafe-inline'`, so an injected `style=` attribute or stray `<style>`
-    // still can't apply). Without it the block falls back to `default-src
-    // 'none'` and the page renders unstyled.
-    // `frame-ancestors 'none'`: II reaches this page only by top-level
-    // navigation, so framing is never legitimate: deny it outright so the
-    // delegation-bearing page can't be embedded for UI redress. X-Frame-Options
-    // covers legacy browsers that predate CSP2 (modern ones ignore it when
-    // frame-ancestors is present).
-    let csp = format!(
-        "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; \
-         connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
-    );
-    let mut resp = Html(html).into_response();
+    let page = iiconnect::pinned_callback_page(&format!("{prefix}/oauth/connect/redeem"), CONTACT);
+    let mut resp = Html(page.html).into_response();
     let h = resp.headers_mut();
     h.insert(
         axum::http::header::CONTENT_SECURITY_POLICY,
-        axum::http::HeaderValue::from_str(&csp).expect("valid CSP"),
+        axum::http::HeaderValue::from_str(&page.csp).expect("valid CSP"),
     );
     h.insert(
         axum::http::header::REFERRER_POLICY,
@@ -1463,10 +2356,7 @@ fn pinned_callback_page(prefix: &str) -> Response {
         axum::http::header::X_CONTENT_TYPE_OPTIONS,
         axum::http::HeaderValue::from_static("nosniff"),
     );
-    h.insert(
-        axum::http::header::X_FRAME_OPTIONS,
-        axum::http::HeaderValue::from_static("DENY"),
-    );
+    h.insert(axum::http::header::X_FRAME_OPTIONS, axum::http::HeaderValue::from_static("DENY"));
     resp
 }
 
@@ -1518,10 +2408,10 @@ fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
         // Acceptable unless an explicit `q=0` (any spelling: `0`, `0.0`, `0.000`).
         // A malformed or absent q-value leaves the range acceptable.
         !parts.any(|param| {
-            param
-                .split_once('=')
-                .is_some_and(|(k, v)| k.trim().eq_ignore_ascii_case("q")
-                    && v.trim().parse::<f32>().is_ok_and(|q| q <= 0.0))
+            param.split_once('=').is_some_and(|(k, v)| {
+                k.trim().eq_ignore_ascii_case("q")
+                    && v.trim().parse::<f32>().is_ok_and(|q| q <= 0.0)
+            })
         })
     })
 }
@@ -1543,18 +2433,24 @@ fn contact_report_hint() -> String {
 /// script on the page, so no `script-src`; the only inline is the nonce'd
 /// `<style>`, everything else is denied (`default-src 'none'`), and framing is
 /// refused so the page can't be embedded for UI redress.
-fn error_screen(status: StatusCode, title: &str, headline: &str, detail: &str, hint: &str) -> Response {
-    let nonce = csp_nonce();
+fn error_screen(
+    status: StatusCode,
+    title: &str,
+    headline: &str,
+    detail: &str,
+    hint: &str,
+) -> Response {
+    let nonce = iiconnect::csp_nonce();
     let html = CONNECT_ERROR_HTML
         .replace("__NONCE__", &nonce)
-        .replace("__CSS__", CONNECT_PAGE_CSS)
-        .replace("__LOGO__", CONNECT_LOGO_SVG)
+        .replace("__CSS__", iiconnect::CONNECT_PAGE_CSS)
+        .replace("__LOGO__", iiconnect::CONNECT_LOGO_SVG)
         .replace("__TITLE__", title)
         .replace("__HEADLINE__", headline)
         .replace("__DETAIL__", detail)
         .replace("__HINT__", hint);
     let csp = format!(
-        "default-src 'none'; style-src 'nonce-{nonce}'; base-uri 'none'; \
+        "default-src 'none'; style-src 'nonce-{nonce}'; img-src 'self'; base-uri 'none'; \
          form-action 'none'; frame-ancestors 'none'"
     );
     let mut resp = (status, Html(html)).into_response();
@@ -1567,10 +2463,7 @@ fn error_screen(status: StatusCode, title: &str, headline: &str, detail: &str, h
         axum::http::header::X_CONTENT_TYPE_OPTIONS,
         axum::http::HeaderValue::from_static("nosniff"),
     );
-    h.insert(
-        axum::http::header::X_FRAME_OPTIONS,
-        axum::http::HeaderValue::from_static("DENY"),
-    );
+    h.insert(axum::http::header::X_FRAME_OPTIONS, axum::http::HeaderValue::from_static("DENY"));
     resp
 }
 
@@ -1615,126 +2508,6 @@ fn not_allowlisted_page() -> Response {
              of your MCP client or AI chatbot."
         ),
     )
-}
-
-/// POST /oauth/connect/redeem body — what [`pinned_callback_page`] sends after
-/// parsing the fragment: the `state` echo and the delegation chain's JSON text
-/// exactly as II's frontend put it in the fragment
-/// (`JSON.stringify(DelegationChain.toJSON())`, dfinity/internet-identity#4093).
-/// **No consent values and no anchor are carried**: the user's chosen
-/// permissions/TTL were captured earlier at `prepare_mcp_registration_delegation`
-/// (keyed by `P_reg`), and II recovers them, and the user's identity number,
-/// from `caller() == P_reg`, so the server never sees any of them.
-#[derive(Deserialize)]
-pub struct RedeemBody {
-    /// The single-use connect state (= session id), echoed by II.
-    state: String,
-    /// The two-hop `P_reg -> Y -> X` chain as agent-js `DelegationChain` JSON
-    /// ([`JsonDelegationChain`]); `der(P_reg)` rides inside as `publicKey`.
-    #[serde(default)]
-    delegation: String,
-}
-
-/// Size cap for the redeem body's `delegation` JSON text, checked BEFORE
-/// parsing so oversized attacker-controlled input is rejected without large
-/// allocations (same posture as the discovery-buffering bound, CWE-770). A
-/// legitimate chain — one delegation plus a canister signature with its
-/// certificate — is a few KB of hex/JSON, so this is generous while staying
-/// far under axum's 2 MB body default. Defense-in-depth: the cookie gate
-/// already means only the connect's own initiator can reach the parse at all.
-const MAX_REG_DELEGATION_JSON: usize = 64 * 1024;
-
-/// agent-js `DelegationChain.toJSON()`, the wire shape II's frontend delivers
-/// in the callback fragment (dfinity/internet-identity#4093): byte fields are
-/// HEX strings, `expiration` is a HEX string of ns since the epoch
-/// (`BigInt.toString(16)`), `targets` are principal texts, and `publicKey` is
-/// the chain root `der(P_reg)`. `delegations` carries TWO hops — the
-/// canister-signed `P_reg -> Y` toward II's ephemeral browser-held `Y`, and
-/// the `Y`-signed `Y -> X` toward our registration key (the split keeps the
-/// canister-signed piece, which transits the IC, inert on its own).
-///
-/// `deny_unknown_fields` on purpose: every field of a delegation is covered by
-/// its canister signature, so a field this parser does not carry (e.g. a future
-/// `permissions`) could never re-hash to what II signed — dropping it silently
-/// would resurface the opaque "sig not found in the signature tree" replica
-/// error (the #40 read-only outage). Failing fast names the real problem.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JsonDelegationChain {
-    delegations: Vec<JsonSignedDelegation>,
-    #[serde(rename = "publicKey")]
-    public_key: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JsonSignedDelegation {
-    delegation: JsonDelegation,
-    signature: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JsonDelegation {
-    pubkey: String,
-    /// Hex string of ns since the Unix epoch (agent-js `BigInt.toString(16)`).
-    expiration: String,
-    #[serde(default)]
-    targets: Option<Vec<String>>,
-}
-
-/// Decode a hex string field of the chain JSON.
-fn hex_decode(field: &str, s: &str) -> Result<Vec<u8>, String> {
-    hex::decode(s.trim()).map_err(|e| format!("{field} is not valid hex: {e}"))
-}
-
-/// Parse the fragment's `DelegationChain` JSON into `(der(P_reg), chain)` as
-/// `ic-agent` types — hop count is preserved verbatim (two hops per rev3 of the
-/// guide; the redeem path only requires that the FINAL hop targets our `X`, and
-/// the replica verifies every hop authoritatively). The chain carries no
-/// `permissions` field: the access level isn't stored in the delegation at all.
-/// The user chose it at consent, II stored it under `P_reg` at
-/// `prepare_mcp_registration_delegation`, and it never touches the server. So a
-/// `permissions` field appearing here would be unexpected, and
-/// [`JsonDelegationChain`] fails fast if one ever does.
-fn parse_registration_delegation(delegation_json: &str) -> Result<(Vec<u8>, Vec<SignedDelegation>), String> {
-    // Bound the size BEFORE parsing (see MAX_REG_DELEGATION_JSON): reject
-    // oversized input without allocating for it. This also inherently bounds
-    // every field inside the JSON (pubkeys, signatures, targets).
-    if delegation_json.len() > MAX_REG_DELEGATION_JSON {
-        return Err(format!("delegation exceeds {MAX_REG_DELEGATION_JSON} bytes"));
-    }
-    let chain: JsonDelegationChain =
-        serde_json::from_str(delegation_json).map_err(|e| format!("delegation JSON: {e}"))?;
-    let user_key = hex_decode("publicKey", &chain.public_key)?;
-    let delegations = chain
-        .delegations
-        .iter()
-        .map(|d| {
-            let targets = match &d.delegation.targets {
-                None => None,
-                Some(ts) => Some(
-                    ts.iter()
-                        .map(|t| {
-                            Principal::from_text(t.trim())
-                                .map_err(|e| format!("delegation target principal: {e}"))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                ),
-            };
-            Ok(SignedDelegation {
-                delegation: Delegation {
-                    pubkey: hex_decode("delegation pubkey", &d.delegation.pubkey)?,
-                    expiration: u64::from_str_radix(d.delegation.expiration.trim(), 16)
-                        .map_err(|_| "delegation expiration is not a hex u64".to_string())?,
-                    targets,
-                    permissions: None,
-                },
-                signature: hex_decode("delegation signature", &d.signature)?,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok((user_key, delegations))
 }
 
 /// A JSON error the pinned page reads and displays.
@@ -1812,8 +2585,19 @@ pub async fn connect_redeem(
             )
         })
     };
-    let Some((expired, cookie, client_id, redirect_uri, client_state, code_challenge, existing_code)) = snap else {
-        return redeem_err("This connect request is unknown or already used. Restart from your client.");
+    let Some((
+        expired,
+        cookie,
+        client_id,
+        redirect_uri,
+        client_state,
+        code_challenge,
+        existing_code,
+    )) = snap
+    else {
+        return redeem_err(
+            "This connect request is unknown or already used. Restart from your client.",
+        );
     };
     if expired {
         return redeem_err("This connect request has expired. Restart from your client.");
@@ -1832,15 +2616,22 @@ pub async fn connect_redeem(
     let iss = store.issuer();
     // Idempotent: if a code was already minted for this connect, return it again.
     if let Some(code) = existing_code {
-        return Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) })).into_response();
+        return Json(
+            json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) }),
+        )
+        .into_response();
     }
     // Decode the fragment delegation (agent-js DelegationChain JSON, II #4093)
     // before claiming, so a malformed delivery never occupies the single-flight
     // slot. No consent values are parsed: they're not in the fragment (II
     // captured them at prepare and recovers them from caller() == P_reg).
-    let (user_key, chain) = match parse_registration_delegation(&body.delegation) {
+    let (user_key, chain) = match iiconnect::parse_registration_delegation(&body.delegation) {
         Ok(v) => v,
-        Err(e) => return redeem_err(&format!("We couldn't read the sign-in response. Restart from your client. ({e})")),
+        Err(e) => {
+            return redeem_err(&format!(
+                "We couldn't read the sign-in response. Restart from your client. ({e})"
+            ))
+        }
     };
     // Single-flight: atomically claim this connect's redemption so a double-submit
     // can't fire two concurrent mcp_register_v2 calls (and a request racing a
@@ -1848,8 +2639,10 @@ pub async fn connect_redeem(
     match claim_redemption(&store, &body.state).await {
         RedeemClaim::Claimed => {}
         RedeemClaim::Existing(code) => {
-            return Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) }))
-                .into_response()
+            return Json(
+                json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) }),
+            )
+            .into_response()
         }
         RedeemClaim::InProgress => {
             return redeem_err(
@@ -1857,15 +2650,15 @@ pub async fn connect_redeem(
                  If nothing happens, restart from your client.",
             )
         }
-        RedeemClaim::Vanished => return redeem_err("This connect request is no longer available. Restart from your client."),
+        RedeemClaim::Vanished => {
+            return redeem_err(
+                "This connect request is no longer available. Restart from your client.",
+            )
+        }
     }
     // Redeem: build a DelegatedIdentity from priv(X) + the chain and make one
     // authenticated mcp_register_v2 call. Success proves consent AND registration.
-    match store
-        .identities
-        .redeem_registration_delegation(&body.state, user_key, chain)
-        .await
-    {
+    match store.identities.redeem_registration_delegation(&body.state, user_key, chain).await {
         Ok(outcome) => {
             tracing::info!(
                 state = %body.state,
@@ -1887,7 +2680,9 @@ pub async fn connect_redeem(
     let (code, newly_minted) = {
         let mut authz = store.authz.write().await;
         let Some(a) = authz.get_mut(&body.state) else {
-            return redeem_err("This connect request is no longer available. Restart from your client.");
+            return redeem_err(
+                "This connect request is no longer available. Restart from your client.",
+            );
         };
         a.redeeming = false;
         match &a.code {
@@ -1912,12 +2707,8 @@ pub async fn connect_redeem(
         );
     }
     tracing::info!(session_id = %body.state, "grant confirmed via registration delegation; issued authorization code");
-    Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) })).into_response()
-}
-
-/// Escape a string for embedding inside a double-quoted JS string literal.
-fn js_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('<', "\\x3c")
+    Json(json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) }))
+        .into_response()
 }
 
 // ---- Token: exchange an authorization code ------------------------------
@@ -1943,7 +2734,11 @@ pub struct TokenForm {
 pub async fn token(State(store): State<AuthStore>, Form(req): Form<TokenForm>) -> Response {
     match req.grant_type.as_str() {
         "authorization_code" => token_authorization_code(store, req).await,
-        _ => oauth_err(StatusCode::BAD_REQUEST, "unsupported_grant_type", "only authorization_code is supported"),
+        _ => oauth_err(
+            StatusCode::BAD_REQUEST,
+            "unsupported_grant_type",
+            "only authorization_code is supported",
+        ),
     }
 }
 
@@ -1956,13 +2751,19 @@ async fn token_authorization_code(store: AuthStore, req: TokenForm) -> Response 
     match req.resource.as_deref() {
         Some(resource) if resource_matches_issuer(resource, &store.issuer()) => {}
         Some(_) => {
-            return oauth_err(StatusCode::BAD_REQUEST, "invalid_target",
-                "the `resource` does not identify this MCP server (RFC 8707)");
+            return oauth_err(
+                StatusCode::BAD_REQUEST,
+                "invalid_target",
+                "the `resource` does not identify this MCP server (RFC 8707)",
+            );
         }
         None if store.require_resource => {
             tracing::warn!("refusing a token request with no RFC 8707 `resource` (strict mode)");
-            return oauth_err(StatusCode::BAD_REQUEST, "invalid_request",
-                "the `resource` parameter is required (RFC 8707)");
+            return oauth_err(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "the `resource` parameter is required (RFC 8707)",
+            );
         }
         None => {}
     }
@@ -1978,7 +2779,13 @@ async fn token_authorization_code(store: AuthStore, req: TokenForm) -> Response 
     if let Some(challenge) = &grant.code_challenge {
         let verifier = match &req.code_verifier {
             Some(v) => v,
-            None => return oauth_err(StatusCode::BAD_REQUEST, "invalid_grant", "code_verifier required"),
+            None => {
+                return oauth_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "code_verifier required",
+                )
+            }
         };
         if &pkce_s256(verifier) != challenge {
             return oauth_err(StatusCode::BAD_REQUEST, "invalid_grant", "PKCE verification failed");
@@ -2013,15 +2820,8 @@ async fn issue_token(store: &AuthStore, session_id: &str) -> Response {
         .session_principal(session_id)
         .await
         .unwrap_or_else(|| "unknown".to_string());
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let ttl = token_ttl(
-        TOKEN_TTL,
-        store.identities.grant_expiration_ns(session_id).await,
-        now_ns,
-    );
+    let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let ttl = token_ttl(TOKEN_TTL, store.identities.grant_expiration_ns(session_id).await, now_ns);
 
     let access_token = format!("mcp-token-{}", Uuid::new_v4());
     {
@@ -2076,11 +2876,8 @@ fn granted_grant_types(requested: &[String]) -> Option<Vec<String>> {
     let granted: Vec<String> = if requested.is_empty() {
         SUPPORTED.iter().map(|s| s.to_string()).collect()
     } else {
-        let mut g: Vec<String> = requested
-            .iter()
-            .filter(|g| SUPPORTED.contains(&g.as_str()))
-            .cloned()
-            .collect();
+        let mut g: Vec<String> =
+            requested.iter().filter(|g| SUPPORTED.contains(&g.as_str())).cloned().collect();
         g.dedup();
         g
     };
@@ -2092,7 +2889,10 @@ fn granted_grant_types(requested: &[String]) -> Option<Vec<String>> {
 /// with the supported set ([`granted_grant_types`]); a request whose
 /// intersection loses `authorization_code` is refused with
 /// `invalid_client_metadata` BEFORE anything is stored.
-pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRequest>) -> Response {
+pub async fn register(
+    State(store): State<AuthStore>,
+    Json(req): Json<RegisterRequest>,
+) -> Response {
     // Bound the redirect_uris array (count + per-URI length) FIRST — before grant
     // validation and before anything is stored. Open DCR is unauthenticated, so a
     // single request must not be able to pin unbounded memory or bloat the
@@ -2187,6 +2987,13 @@ pub async fn authorization_server_metadata(State(store): State<AuthStore>) -> Re
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
+        // The MCP authorization spec's preferred registration: a client may
+        // identify itself with the https URL of its Client ID Metadata Document
+        // instead of registering (see `cimd_client_id`). Claude and ChatGPT both
+        // select CIMD over DCR when this is advertised alongside `none` above —
+        // which is why it is advertised only where the deployment opts in
+        // (`McpConfig::cimd_enabled`), and switching that off withdraws it.
+        "client_id_metadata_document_supported": store.cimd_enabled,
         // RFC 9207: we emit `iss` on every authorization response, so we MUST
         // advertise it here (a client that sees this flag rejects any response
         // missing `iss`). See `build_redirect`.
@@ -2209,22 +3016,15 @@ pub async fn protected_resource_metadata(State(store): State<AuthStore>) -> Resp
 
 // ---- Bearer-token gate for /mcp -----------------------------------------
 
-/// The verified principal + session id of the authenticated MCP session,
-/// injected into request extensions so tools can attribute actions and bind
-/// per-session delegated identities.
-#[derive(Clone, Debug)]
-pub struct AuthedSession {
-    pub session_id: String,
-}
-
-pub async fn require_token(State(store): State<AuthStore>, mut request: Request<Body>, next: Next) -> Response {
+pub async fn require_token(
+    State(store): State<AuthStore>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
     // The `Bearer` auth-scheme is case-insensitive (RFC 7235 §2.1), so match it
     // that way — an `Authorization: bearer <token>` must be recognized too.
-    let token = request
-        .headers()
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| {
+    let token =
+        request.headers().get("Authorization").and_then(|h| h.to_str().ok()).and_then(|h| {
             let (scheme, rest) = h.split_once(' ')?;
             scheme.eq_ignore_ascii_case("Bearer").then(|| rest.trim().to_owned())
         });
@@ -2325,13 +3125,10 @@ mod tests {
     /// the target is always a complete json document, and no `.tmp` is left).
     #[test]
     fn client_store_persists_atomically() {
-        use super::{load_clients_from, persist_clients_to};
+        use super::{clients_tmp_path, load_clients_from, persist_clients_to};
 
-        let path = std::env::temp_dir()
-            .join(format!("imcp2-clients-{}.json", std::process::id()))
-            .to_string_lossy()
-            .into_owned();
-        let tmp = format!("{path}.tmp");
+        let path = std::env::temp_dir().join(format!("imcp2-clients-{}.json", std::process::id()));
+        let tmp = clients_tmp_path(&path);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&tmp);
 
@@ -2343,7 +3140,7 @@ mod tests {
             ClientReg::new(vec!["http://127.0.0.1:1111/old".to_string()]),
         );
         persist_clients_to(&path, &old);
-        assert!(std::path::Path::new(&path).exists(), "old snapshot must exist first");
+        assert!(path.exists(), "old snapshot must exist first");
 
         // Persist a DIFFERENT set over the existing file.
         let mut clients = HashMap::new();
@@ -2364,7 +3161,7 @@ mod tests {
             loaded["client-abc"].redirect_uris,
             vec!["http://127.0.0.1:4321/cb".to_string()]
         );
-        assert!(!std::path::Path::new(&tmp).exists(), "no leftover .tmp file");
+        assert!(!tmp.exists(), "no leftover .tmp file");
 
         // The persisted target is always a COMPLETE json document.
         let raw = std::fs::read(&path).unwrap();
@@ -2395,11 +3192,24 @@ mod tests {
         // Allow-listed vendor domains/subdomains UNDER their pinned callback path.
         assert!(redirect_uri_permitted("https://claude.ai/api/mcp/auth_callback"));
         assert!(redirect_uri_permitted("https://chatgpt.com/connector/oauth/abc"));
+        // ChatGPT's issuer-identification callback: one stable path, no `{callback_id}`
+        // segment. This is the form it sends us, since our AS metadata advertises
+        // `authorization_response_iss_parameter_supported`.
+        assert!(redirect_uri_permitted("https://chatgpt.com/connector_platform_oauth_redirect"));
+        // …and being `PathPin::Exact`, ONLY that path: a descendant is refused, unlike
+        // under a `PathPin::Prefix` entry (the `{callback_id}` one above).
+        assert!(!redirect_uri_permitted(
+            "https://chatgpt.com/connector_platform_oauth_redirect/anything"
+        ));
         assert!(redirect_uri_permitted("https://grok.com/mcp/callback"));
         assert!(redirect_uri_permitted("https://grok.com/connectors-oauth-exchange-code/x"));
-        assert!(redirect_uri_permitted("https://www.perplexity.ai/rest/connections/oauth_callback"));
+        assert!(redirect_uri_permitted(
+            "https://www.perplexity.ai/rest/connections/oauth_callback"
+        ));
         // Subdomain + the pinned path (Perplexity uses www/staging/enterprise/n).
-        assert!(redirect_uri_permitted("https://staging.perplexity.com/rest/connections/oauth_callback"));
+        assert!(redirect_uri_permitted(
+            "https://staging.perplexity.com/rest/connections/oauth_callback"
+        ));
         assert!(redirect_uri_permitted("https://antigravity.google/oauth-callback"));
         // Loopback is always allowed (any port), no allow-list entry needed.
         assert!(redirect_uri_permitted("http://127.0.0.1:6112/cb"));
@@ -2414,11 +3224,18 @@ mod tests {
         // Right domain, wrong path, plus a non-segment-boundary near-miss of the pin.
         assert!(!redirect_uri_permitted("https://claude.ai/foo"));
         assert!(!redirect_uri_permitted("https://claude.ai/api/mcp/auth_callbackEVIL"));
+        assert!(!redirect_uri_permitted(
+            "https://chatgpt.com/connector_platform_oauth_redirectEVIL"
+        ));
         // Dot-segment traversal (raw and percent-encoded): url::Url normalizes these
         // to `/g/evil` on parse (WHATWG), which then fails the pinned-prefix check.
         assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/../../g/evil"));
-        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%2e%2e/%2e%2e/g/evil"));
-        assert!(!redirect_uri_permitted("https://chatgpt.com/connector/oauth/%2E%2E/%2E%2E/g/evil"));
+        assert!(!redirect_uri_permitted(
+            "https://chatgpt.com/connector/oauth/%2e%2e/%2e%2e/g/evil"
+        ));
+        assert!(!redirect_uri_permitted(
+            "https://chatgpt.com/connector/oauth/%2E%2E/%2E%2E/g/evil"
+        ));
         // A dot-segment that normalizes to WITHIN the vendor's pinned prefix is fine
         // (it lands in the vendor's own callback space, not an escape).
         assert!(redirect_uri_permitted("https://chatgpt.com/connector/oauth/x/../y"));
@@ -2449,8 +3266,8 @@ mod tests {
         // www.cursor.com), refused on any other path.
         assert!(redirect_uri_permitted("https://www.cursor.com/agents/mcp/oauth/callback"));
         assert!(!redirect_uri_permitted("https://cursor.com/oauth/callback")); // wrong path
-        // vscode.dev is deliberately NOT allow-listed: its only registered path is
-        // `/redirect`, a web-to-desktop forwarding endpoint (see the PR discussion).
+                                                                               // vscode.dev is deliberately NOT allow-listed: its only registered path is
+                                                                               // `/redirect`, a web-to-desktop forwarding endpoint (see the PR discussion).
         assert!(!redirect_uri_permitted("https://vscode.dev/redirect"));
         assert!(!redirect_uri_permitted("https://insiders.vscode.dev/redirect"));
         // Attacker-controlled hosted redirects: refused (the finding's payloads).
@@ -2482,6 +3299,863 @@ mod tests {
         // now-removed domain) still can't receive a code at /oauth/authorize.
         let junk = ClientReg::new(vec!["https://example.com/cb".to_string()]);
         assert!(!redirect_allowed(Some(&junk), "https://example.com/cb"));
+    }
+
+    /// The two path-matching modes an allow-list entry can carry ([`PathPin`]): a
+    /// `Prefix` entry admits segment-boundary descendants (a vendor callback that
+    /// carries a per-connection id needs that), an `Exact` entry admits only its own
+    /// path. Pinned here as well as through [`redirect_uri_permitted`] so a change to
+    /// either mode fails loudly rather than quietly widening what DCR accepts.
+    #[test]
+    fn path_pin_modes() {
+        use super::{path_within_prefix, PathPin};
+        // `Prefix`: the path itself, and descendants at a segment boundary only.
+        assert!(path_within_prefix("/connector/oauth/", "/connector/oauth/"));
+        assert!(path_within_prefix("/connector/oauth/abc", "/connector/oauth/"));
+        assert!(path_within_prefix("/mcp/callback", "/mcp/callback"));
+        assert!(path_within_prefix("/mcp/callback/x", "/mcp/callback"));
+        assert!(!path_within_prefix("/mcp/callbackEVIL", "/mcp/callback"));
+        assert!(!path_within_prefix("/mcp", "/mcp/callback"));
+        // ChatGPT's stable callback is pinned `Exact`, which is what stops
+        // `/connector_platform_oauth_redirect/…` from being registrable.
+        assert!(super::DEFAULT_ALLOWED_REDIRECTS.contains(&(
+            "chatgpt.com",
+            "/connector_platform_oauth_redirect",
+            PathPin::Exact
+        )));
+        // A trailing slash means descendants are expected, so such an entry must be
+        // `Prefix` — `Exact` there could match only a path ending in `/`, which no
+        // vendor callback is, silently pinning nothing.
+        for (domain, path, pin) in super::DEFAULT_ALLOWED_REDIRECTS {
+            assert!(
+                !path.ends_with('/') || *pin == PathPin::Prefix,
+                "{domain}{path} ends in `/` but is not PathPin::Prefix"
+            );
+        }
+    }
+
+    /// A Client ID Metadata Document `client_id` is an https URL naming a host
+    /// and a path beyond `/`, with no fragment or userinfo, within the length cap
+    /// — taken as given, in whatever spelling its document repeats (a query is
+    /// tolerated, as the draft only discourages one), provided the parser sends
+    /// it as given: anything the parser would rewrite on the way is refused.
+    /// Anything else is an ordinary (DCR) identifier.
+    #[test]
+    fn cimd_client_id_shape() {
+        use super::cimd_client_id;
+        // The two directory clients' real identifiers.
+        assert!(cimd_client_id("https://chatgpt.com/oauth/client.json").is_some());
+        assert!(cimd_client_id("https://claude.ai/oauth/claude-code-client-metadata").is_some());
+        // A DCR identifier, and other non-URLs, are not CIMD.
+        assert!(cimd_client_id("client-3f6a9b2c-1d4e-4f5a-8b6c-7d8e9f0a1b2c").is_none());
+        assert!(cimd_client_id("").is_none());
+        // The draft's MUSTs.
+        assert!(cimd_client_id("http://chatgpt.com/oauth/client.json").is_none());
+        assert!(cimd_client_id("https://chatgpt.com").is_none());
+        assert!(cimd_client_id("https://chatgpt.com/").is_none());
+        assert!(cimd_client_id("https://chatgpt.com/oauth/client.json#x").is_none());
+        // A query is only discouraged by the draft, so it is tolerated — canonically.
+        assert!(cimd_client_id("https://chatgpt.com/oauth/client.json?v=2").is_some());
+        assert!(cimd_client_id("https://user@chatgpt.com/oauth/client.json").is_none());
+        // …including what the parser would silently alter: an EMPTY userinfo it
+        // erases, and the tab/newline/CR it strips from anywhere.
+        assert!(cimd_client_id("https://@chatgpt.com/oauth/client.json").is_none());
+        assert!(cimd_client_id("https://chat\tgpt.com/oauth/client.json").is_none());
+        assert!(cimd_client_id("https://chatgpt.com/oauth/client.json\n").is_none());
+        assert!(cimd_client_id("https:\r//chatgpt.com/oauth/client.json").is_none());
+        // …the backslashes it reads as slashes, wherever they are…
+        assert!(cimd_client_id("https:\\\\chatgpt.com\\oauth\\client.json").is_none());
+        assert!(cimd_client_id("https://chatgpt.com\\@evil.example/oauth/client.json").is_none());
+        assert!(cimd_client_id("https://chatgpt.com/oauth\\client.json").is_none());
+        // …the leading/trailing C0 controls and spaces it trims…
+        assert!(cimd_client_id(" https://chatgpt.com/oauth/client.json").is_none());
+        assert!(cimd_client_id("https://chatgpt.com/oauth/client.json ").is_none());
+        assert!(cimd_client_id("\u{1}https://chatgpt.com/oauth/client.json").is_none());
+        // …everything it percent-encodes on the way: an INTERNAL space or control,
+        // DEL, a quote, an angle bracket, a brace, a backtick or a non-ASCII
+        // character in the path, a `'` in the query…
+        for rewritten in [
+            "https://chatgpt.com/oauth/cl ient.json",
+            "https://chatgpt.com/oauth/cl\u{1}ient.json",
+            "https://chatgpt.com/oauth/cl\u{7f}ient.json",
+            "https://chatgpt.com/oauth/cl\"ient.json",
+            "https://chatgpt.com/oauth/<client>.json",
+            "https://chatgpt.com/oauth/{client}.json",
+            "https://chatgpt.com/oauth/`client`.json",
+            "https://chatgpt.com/oauth/clïent.json",
+            "https://chatgpt.com/oauth/client.json?v='2'",
+            // …the host it percent-decodes, IDNA-encodes or renumbers, the
+            // default port it drops however spelt, and the dot segments it
+            // resolves: in each the URL fetched is not the identifier given.
+            "https://%63hatgpt.com/oauth/client.json",
+            "https://chatgpt.c\u{43e}m/oauth/client.json",
+            "https://[0:0:0:0:0:0:0:1]/oauth/client.json",
+            "https://chatgpt.com:0443/oauth/client.json",
+            "https://chatgpt.com/oauth/./client.json",
+            "https://chatgpt.com/oauth/../oauth/client.json",
+        ] {
+            assert!(cimd_client_id(rewritten).is_none(), "{rewritten:?}");
+        }
+        // The draft asks for an https URL the document repeats byte for byte, not
+        // for one spelling of it: these are accepted as given (they are the
+        // identity and the cache key), the parser sending each as given bar the
+        // scheme's and host's case and the default port, and only the host is
+        // normalised, for the trust policy and the per-host quota (`host_key`).
+        for spelling in [
+            "HTTPS://chatgpt.com/oauth/client.json",
+            "https://ChatGPT.com/oauth/client.json",
+            "https://chatgpt.com:443/oauth/client.json",
+            "https://chatgpt.com./oauth/client.json",
+            "https://chatgpt.com/oauth/client%2Ejson",
+            "https://chatgpt.com/oauth/cl%C3%AFent.json",
+            "https://chatgpt.com//oauth/client.json",
+        ] {
+            assert!(cimd_client_id(spelling).is_some(), "{spelling}");
+        }
+        // Bounded, since it is about to become a cache key: the cap exactly, not
+        // one byte more.
+        let at_cap =
+            format!("https://chatgpt.com/{}", "x".repeat(super::CIMD_MAX_CLIENT_ID_LEN - 20));
+        assert_eq!(at_cap.len(), super::CIMD_MAX_CLIENT_ID_LEN);
+        assert!(cimd_client_id(&at_cap).is_some());
+        assert!(cimd_client_id(&format!("{at_cap}x")).is_none());
+    }
+
+    /// Whatever is keyed by host sees one spelling per host, so a trailing dot or
+    /// upper case cannot buy a second per-host quota.
+    #[test]
+    fn cimd_host_key_is_one_spelling_per_host() {
+        use super::host_key;
+        for spelling in ["claude.ai", "Claude.AI", "claude.ai.", "CLAUDE.AI."] {
+            assert_eq!(host_key(spelling), "claude.ai", "{spelling}");
+        }
+    }
+
+    /// A document is accepted only as the draft and this public-client-only AS
+    /// require. The bodies are the two directory clients' real documents (as
+    /// served on 2026-09-03), so a change in how either identifies itself lands
+    /// here first.
+    #[test]
+    fn client_metadata_parsing() {
+        use super::parse_client_metadata;
+        use serde_json::json;
+        const CHATGPT: &str = "https://chatgpt.com/oauth/client.json";
+        const CHATGPT_REDIRECT: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
+        let chatgpt_doc = json!({
+            "client_id": CHATGPT,
+            "client_uri": "https://chatgpt.com/",
+            "redirect_uris": [CHATGPT_REDIRECT],
+            "token_endpoint_auth_method": "private_key_jwt",
+            "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "client_name": "ChatGPT",
+            "logo_uri": "https://persistent.oaistatic.com/sonic/misc/openai-logo.png",
+            "token_endpoint_auth_signing_alg": "RS256",
+            "jwks_uri": "https://chatgpt.com/oauth/jwks.json",
+        })
+        .to_string();
+        const CLAUDE_CODE: &str = "https://claude.ai/oauth/claude-code-client-metadata";
+        let claude_code_doc = json!({
+            "client_id": CLAUDE_CODE,
+            "client_name": "Claude Code",
+            "client_uri": "https://claude.ai",
+            "redirect_uris": ["http://localhost/callback", "http://127.0.0.1/callback"],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        })
+        .to_string();
+        // ChatGPT PREFERS private_key_jwt but lists `none`, which is what it uses here.
+        let chatgpt = parse_client_metadata(CHATGPT, &chatgpt_doc).expect("ChatGPT's document");
+        assert_eq!(chatgpt.client_name.as_deref(), Some("ChatGPT"));
+        assert_eq!(chatgpt.redirect_uris, [CHATGPT_REDIRECT]);
+        let claude = parse_client_metadata(CLAUDE_CODE, &claude_code_doc).expect("Claude Code's");
+        assert_eq!(
+            claude.redirect_uris,
+            ["http://localhost/callback", "http://127.0.0.1/callback"]
+        );
+        // The document must be about the URL it was fetched from.
+        let err = parse_client_metadata(CLAUDE_CODE, &chatgpt_doc).unwrap_err();
+        assert!(err.contains("not the document URL"), "{err}");
+        // Required shape.
+        assert!(parse_client_metadata(CHATGPT, "not json").is_err());
+        assert!(parse_client_metadata(CHATGPT, "[]").is_err());
+        let no_id = json!({ "redirect_uris": [CHATGPT_REDIRECT] }).to_string();
+        assert!(parse_client_metadata(CHATGPT, &no_id).unwrap_err().contains("client_id"));
+        let refused_for =
+            |doc: serde_json::Value| parse_client_metadata(CHATGPT, &doc.to_string()).unwrap_err();
+        assert!(refused_for(json!({ "client_id": CHATGPT })).contains("redirect_uris"));
+        let no_uris = json!({ "client_id": CHATGPT, "redirect_uris": [] });
+        assert!(refused_for(no_uris).contains("redirect_uris"));
+        // A member of the wrong type is a malformed document (serde names the type).
+        refused_for(json!({ "client_id": CHATGPT, "redirect_uris": [1] }));
+        // No secret in a public document, and no secret-only or JWT-only client.
+        let secret = json!({
+            "client_id": CHATGPT,
+            "redirect_uris": [CHATGPT_REDIRECT],
+            "client_secret": "s",
+        });
+        assert!(refused_for(secret).contains("secret"));
+        let jwt_only = json!({
+            "client_id": CHATGPT,
+            "redirect_uris": [CHATGPT_REDIRECT],
+            "token_endpoint_auth_method": "private_key_jwt",
+        });
+        assert!(refused_for(jwt_only).contains("public clients"));
+        // An absent method is `none`: a document may not use a secret-based one.
+        let no_method = json!({ "client_id": CHATGPT, "redirect_uris": [CHATGPT_REDIRECT] });
+        assert!(parse_client_metadata(CHATGPT, &no_method.to_string()).is_ok());
+        // A PRESENT method of the wrong type is malformed, not absent.
+        let odd_method = json!({
+            "client_id": CHATGPT,
+            "redirect_uris": [CHATGPT_REDIRECT],
+            "token_endpoint_auth_method": 1,
+        });
+        assert!(refused_for(odd_method).contains("string"));
+        // The flow: absent is the RFC default (accepted above); present, it must
+        // include the one flow this server runs, and be a string array to say so.
+        let with = |field: &str, value: serde_json::Value| json!({ "client_id": CHATGPT, "redirect_uris": [CHATGPT_REDIRECT], field: value });
+        let ok = |doc: serde_json::Value| parse_client_metadata(CHATGPT, &doc.to_string()).is_ok();
+        assert!(ok(with("grant_types", json!(["authorization_code", "refresh_token"]))));
+        assert!(ok(with("response_types", json!(["code"]))));
+        let err = refused_for(with("grant_types", json!(["client_credentials"])));
+        assert!(err.contains("grant_types") && err.contains("authorization_code"), "{err}");
+        let err = refused_for(with("response_types", json!(["token"])));
+        assert!(err.contains("response_types") && err.contains("\"code\""), "{err}");
+        assert!(refused_for(with("grant_types", json!([]))).contains("authorization_code"));
+        refused_for(with("grant_types", json!("authorization_code")));
+        refused_for(with("response_types", json!([1])));
+        // An explicit null is not an omission: it is a member of the wrong type.
+        for field in [
+            "token_endpoint_auth_method",
+            "token_endpoint_auth_methods_supported",
+            "grant_types",
+            "response_types",
+            "client_secret",
+        ] {
+            refused_for(with(field, json!(null)));
+        }
+        // Hosted redirects must be same-origin with the document; loopback is exempt.
+        const OTHER: &str = "https://cimd-other.claude.ai/client.json";
+        const OWN: &str = "https://cimd-other.claude.ai/api/mcp/auth_callback";
+        let borrowed = json!({ "client_id": OTHER, "redirect_uris": [CHATGPT_REDIRECT] });
+        let err = parse_client_metadata(OTHER, &borrowed.to_string()).unwrap_err();
+        assert!(err.contains("own origin"), "{err}");
+        let mixed = json!({
+            "client_id": OTHER,
+            "redirect_uris": [
+                CHATGPT_REDIRECT, OWN, "http://127.0.0.1/cb"
+            ],
+        });
+        let kept = parse_client_metadata(OTHER, &mixed.to_string()).expect("own + loopback kept");
+        assert_eq!(kept.redirect_uris, [OWN, "http://127.0.0.1/cb"]);
+        // Same host on another port is another origin.
+        let off_origin = json!({
+            "client_id": OTHER,
+            "redirect_uris": ["https://cimd-other.claude.ai:8443/api/mcp/auth_callback"],
+        });
+        assert!(parse_client_metadata(OTHER, &off_origin.to_string()).is_err());
+        // Only what a DCR registration could have registered is kept: a loopback
+        // redirect with a fragment (which the port-agnostic match would ignore,
+        // admitting a redirect DCR refuses), or an own-origin path the allow-list
+        // does not pin, leaves the document with nothing.
+        let fragment = json!({ "client_id": OTHER, "redirect_uris": ["http://127.0.0.1/cb#x"] });
+        assert!(parse_client_metadata(OTHER, &fragment.to_string()).is_err());
+        let unpinned =
+            json!({ "client_id": OTHER, "redirect_uris": ["https://cimd-other.claude.ai/cb"] });
+        assert!(parse_client_metadata(OTHER, &unpinned.to_string()).is_err());
+        // No more redirect_uris than a DCR registration may send.
+        let many: Vec<String> = (0..=super::MAX_REDIRECT_URIS)
+            .map(|i| format!("https://cimd-other.test/cb/{i}"))
+            .collect();
+        let too_many = json!({ "client_id": OTHER, "redirect_uris": many }).to_string();
+        let err = parse_client_metadata(OTHER, &too_many).unwrap_err();
+        assert!(err.contains("too many redirect_uris"), "{err}");
+        // …nor a longer one: a same-origin redirect DCR would refuse is refused here.
+        let long = format!("https://cimd-other.test/{}", "x".repeat(super::MAX_REDIRECT_URI_LEN));
+        let too_long = json!({ "client_id": OTHER, "redirect_uris": [long] }).to_string();
+        let err = parse_client_metadata(OTHER, &too_long).unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+    }
+
+    /// What a fetch failure is ABOUT decides whether it is remembered: the URL
+    /// (refused, nothing there, a redirect, another 4xx, too large, not UTF-8) is
+    /// invalid and cached; the moment (unreachable, 5xx, 408, 429) is unavailable
+    /// and retried.
+    #[test]
+    fn cimd_fetch_error_classification() {
+        use super::{classify_fetch_error, CimdError};
+        use imcp2_core::public_fetch::FetchError;
+        let answered = |status: u16| FetchError::Answered { status, detail: format!("{status}") };
+        let unavailable =
+            |e: FetchError| matches!(classify_fetch_error(e), CimdError::Unavailable(_));
+        let invalid = |e: FetchError| matches!(classify_fetch_error(e), CimdError::Invalid(_));
+        assert!(unavailable(FetchError::Unreachable("dns".into())));
+        for status in [500u16, 502, 503, 504, 408, 421, 425, 429] {
+            assert!(unavailable(answered(status)), "{status} is about the moment");
+        }
+        for status in [301u16, 302, 400, 401, 403, 404, 410, 451] {
+            assert!(invalid(answered(status)), "{status} is about the URL");
+        }
+        assert!(invalid(FetchError::Refused("private address".into())));
+        assert!(invalid(FetchError::TooLarge("cap".into())));
+        assert!(invalid(FetchError::NotUtf8("bytes".into())));
+    }
+
+    /// PR #143's trust policy: a document is fetched only from a vetted vendor
+    /// origin — a host on or under an allow-listed domain, on the default port.
+    /// Any other URL `client_id` is refused before any fetch and told where to
+    /// request access; with CIMD off, it is simply an unknown client.
+    #[tokio::test]
+    async fn cimd_origin_trust_policy() {
+        use super::{cimd_client_id, cimd_fixture, cimd_origin_trusted, ClientCheck};
+        let trusted =
+            |id: &str| cimd_origin_trusted(&cimd_client_id(id).expect("a CIMD client_id"));
+        // The directory clients' real identifiers, and subdomains of vetted domains.
+        assert!(trusted("https://chatgpt.com/oauth/client.json"));
+        assert!(trusted("https://claude.ai/oauth/claude-code-client-metadata"));
+        assert!(trusted("https://www.cursor.com/mcp/client.json"));
+        assert!(trusted("https://www.perplexity.ai/client.json"));
+        // Not vetted: a stranger; a look-alike that is no dot-boundary subdomain; a
+        // vetted name as a SUBDOMAIN of a stranger; a non-default port on a vetted
+        // host (the SSRF guard would connect to it, and nobody vetted that service).
+        assert!(!trusted("https://cimd-stranger.test/client.json"));
+        assert!(!trusted("https://evilclaude.ai/client.json"));
+        assert!(!trusted("https://claude.ai.evil.test/client.json"));
+        assert!(!trusted("https://claude.ai:8443/oauth/client.json"));
+
+        // Refused BEFORE any fetch: were one made, these fixtures would turn the
+        // verdict into MetadataUnavailable, and the hit counts would say so.
+        let store = test_store();
+        const STRANGER: &str = "https://cimd-stranger.test/client.json";
+        const PORT: &str = "https://claude.ai:8443/oauth/client.json";
+        for id in [STRANGER, PORT] {
+            cimd_fixture::fail(id, "must not be fetched");
+            let verdict = store.validate_client(id, "http://127.0.0.1:1/cb").await;
+            assert_eq!(verdict, ClientCheck::UntrustedClientOrigin, "{id}");
+            assert_eq!(cimd_fixture::hits(id), 0, "{id} must not be fetched");
+        }
+
+        // With CIMD off, a URL client_id — vetted or not — is an unknown client:
+        // nothing is fetched, and no page points at the contact for a mechanism
+        // this deployment does not offer.
+        let off = test_store().with_cimd(false);
+        const VETTED: &str = "https://cimd-off.claude.ai/client.json";
+        cimd_fixture::fail(VETTED, "must not be fetched");
+        assert_eq!(
+            off.validate_client(VETTED, "http://127.0.0.1:1/cb").await,
+            ClientCheck::Refused
+        );
+        assert_eq!(
+            off.validate_client(STRANGER, "http://127.0.0.1:1/cb").await,
+            ClientCheck::Refused
+        );
+        assert_eq!(cimd_fixture::hits(VETTED), 0);
+    }
+
+    #[test]
+    fn cimd_cache_ttl_is_bounded() {
+        use super::{cimd_ttl, CIMD_CACHE_DEFAULT_TTL, CIMD_CACHE_MAX_TTL};
+        let fresh = Duration::ZERO;
+        assert_eq!(cimd_ttl(None, fresh), CIMD_CACHE_DEFAULT_TTL);
+        // The origin's value is honoured as given, however small, up to the ceiling.
+        assert_eq!(cimd_ttl(Some(Duration::from_secs(300)), fresh), Duration::from_secs(300));
+        assert_eq!(cimd_ttl(Some(Duration::from_secs(5)), fresh), Duration::from_secs(5));
+        assert_eq!(cimd_ttl(Some(Duration::from_secs(10 * 24 * 3600)), fresh), CIMD_CACHE_MAX_TTL);
+        // `no-store` / `no-cache` / `max-age=0` is zero: not cached at all.
+        assert_eq!(cimd_ttl(Some(Duration::ZERO), fresh), Duration::ZERO);
+        // No freshness information: the default LESS the age the answer already
+        // has — an origin's own value is already net of it.
+        let aged = Duration::from_secs(4 * 60);
+        assert_eq!(cimd_ttl(None, aged), CIMD_CACHE_DEFAULT_TTL - aged);
+        assert_eq!(cimd_ttl(None, Duration::from_secs(86400)), Duration::ZERO);
+        assert_eq!(
+            cimd_ttl(Some(Duration::from_secs(300)), Duration::from_secs(86400)),
+            Duration::from_secs(300)
+        );
+    }
+
+    /// The media type a document must be served as, by essence: parameters and
+    /// case are fine, anything else — or nothing — is not.
+    #[test]
+    fn cimd_media_type() {
+        use super::is_json_media_type;
+        assert!(is_json_media_type(Some("application/json")));
+        assert!(is_json_media_type(Some("application/json; charset=utf-8")));
+        assert!(is_json_media_type(Some("Application/JSON")));
+        assert!(!is_json_media_type(Some("text/html; charset=utf-8")));
+        assert!(!is_json_media_type(Some("text/plain")));
+        assert!(!is_json_media_type(Some("application/jose+json")));
+        assert!(!is_json_media_type(None));
+    }
+
+    /// Concurrent requests for one cold document share a single fetch, and one
+    /// host cannot take every permit: it gets [`CIMD_MAX_INFLIGHT_PER_HOST`] and
+    /// the excess is told to retry — with every slot given back afterwards.
+    #[tokio::test]
+    async fn cimd_fetches_are_coalesced_and_bounded_per_host() {
+        use super::{cimd_fixture, ClientCheck};
+        use serde_json::json;
+        let store = test_store();
+        let check = |id: &'static str, redirect: &'static str| store.validate_client(id, redirect);
+        let native = |id: &str| {
+            json!({ "client_id": id, "redirect_uris": ["http://127.0.0.1/cb"] }).to_string()
+        };
+        const REDIRECT: &str = "http://127.0.0.1:4242/cb";
+
+        // Three misses at once for one document: one fetch, three admissions.
+        const HERD: &str = "https://cimd-herd.claude.ai/client.json";
+        cimd_fixture::serve(HERD, &native(HERD));
+        let (a, b, c) =
+            tokio::join!(check(HERD, REDIRECT), check(HERD, REDIRECT), check(HERD, REDIRECT));
+        assert_eq!((a, b, c), (ClientCheck::Allowed, ClientCheck::Allowed, ClientCheck::Allowed));
+        assert_eq!(cimd_fixture::hits(HERD), 1, "concurrent misses must share one fetch");
+
+        // A failure is shared the same way: three misses for a document whose
+        // origin is down make ONE attempt, and all three are told to retry — none
+        // queues behind the others for a fetch of its own.
+        const DOWN: &str = "https://cimd-herd-down.claude.ai/client.json";
+        cimd_fixture::fail(DOWN, "origin down");
+        let (a, b, c) =
+            tokio::join!(check(DOWN, REDIRECT), check(DOWN, REDIRECT), check(DOWN, REDIRECT));
+        for verdict in [a, b, c] {
+            assert!(matches!(verdict, ClientCheck::MetadataUnavailable(_)), "{verdict:?}");
+        }
+        assert_eq!(cimd_fixture::hits(DOWN), 1, "concurrent misses must share one failure");
+
+        // Five distinct documents on ONE host at once: four fetch, the fifth is
+        // told to retry rather than taking a fifth slot for that host.
+        const DOCS: [&str; 5] = [
+            "https://cimd-busy.claude.ai/one.json",
+            "https://cimd-busy.claude.ai/two.json",
+            "https://cimd-busy.claude.ai/three.json",
+            "https://cimd-busy.claude.ai/four.json",
+            "https://cimd-busy.claude.ai/five.json",
+        ];
+        assert_eq!(DOCS.len(), super::CIMD_MAX_INFLIGHT_PER_HOST + 1);
+        for id in DOCS {
+            cimd_fixture::serve(id, &native(id));
+        }
+        let (one, two, three, four, five) = tokio::join!(
+            check(DOCS[0], REDIRECT),
+            check(DOCS[1], REDIRECT),
+            check(DOCS[2], REDIRECT),
+            check(DOCS[3], REDIRECT),
+            check(DOCS[4], REDIRECT)
+        );
+        for verdict in [one, two, three, four] {
+            assert_eq!(verdict, ClientCheck::Allowed);
+        }
+        match five {
+            ClientCheck::MetadataUnavailable(why) => {
+                assert!(why.contains("cimd-busy.claude.ai"), "{why}")
+            }
+            other => panic!("the fifth fetch for one host must be refused, got {other:?}"),
+        }
+        // Slots and single-flight entries are released, not leaked.
+        assert!(store.cimd.hosts.lock().unwrap().is_empty());
+        assert!(store.cimd.fetching.lock().unwrap().is_empty());
+        // The refused one succeeds on retry (its document was never fetched).
+        assert_eq!(check(DOCS[4], REDIRECT).await, ClientCheck::Allowed);
+    }
+
+    /// A fetcher dropped mid-fetch while a waiter is in the flight hands over:
+    /// the flight stays where the waiter and any newcomer find it, the waiter
+    /// takes over the one fetch, and nobody fetches the document twice at once.
+    #[tokio::test]
+    async fn cimd_cancelled_fetcher_hands_over_to_a_waiter() {
+        use super::{cimd_fixture, ClientCheck};
+        use serde_json::json;
+        let store = test_store();
+        const HANDOVER: &str = "https://cimd-handover.claude.ai/client.json";
+        let request = |store: super::AuthStore| async move {
+            store.validate_client(HANDOVER, "http://127.0.0.1:1/cb").await
+        };
+        // The fetcher's fetch hangs (an origin that has not answered)…
+        cimd_fixture::hang(HANDOVER);
+        let fetcher = tokio::spawn(request(store.clone()));
+        tokio::task::yield_now().await;
+        // …a waiter joins the flight and waits for that fetch…
+        let waiter = tokio::spawn(request(store.clone()));
+        tokio::task::yield_now().await;
+        assert_eq!(cimd_fixture::hits(HANDOVER), 1, "the waiter must not fetch for itself");
+        // …and the fetcher is dropped. The flight survives for its waiter, which
+        // takes over the fetch (the origin answers now); a newcomer arriving then
+        // finds the one flight, or the document it cached, and fetches nothing.
+        let doc = json!({ "client_id": HANDOVER, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve(HANDOVER, &doc.to_string());
+        fetcher.abort();
+        assert!(fetcher.await.unwrap_err().is_cancelled());
+        assert!(store.cimd.fetching.lock().unwrap().contains_key(HANDOVER), "flight must survive");
+        let newcomer = tokio::spawn(request(store.clone()));
+        assert_eq!(waiter.await.unwrap(), ClientCheck::Allowed);
+        assert_eq!(newcomer.await.unwrap(), ClientCheck::Allowed);
+        assert_eq!(
+            cimd_fixture::hits(HANDOVER),
+            2,
+            "one attempt each by fetcher and waiter, none more"
+        );
+        assert!(
+            store.cimd.fetching.lock().unwrap().is_empty(),
+            "the last one out retires the flight"
+        );
+        assert!(store.cimd.hosts.lock().unwrap().is_empty());
+    }
+
+    /// A `client_id` spelt otherwise than canonically is the same vetted host to
+    /// the trust policy, and fetched — from the URL as given, which its document
+    /// must repeat.
+    #[tokio::test]
+    async fn cimd_client_id_is_taken_as_given() {
+        use super::{cimd_fixture, ClientCheck};
+        use serde_json::json;
+        let store = test_store();
+        const SPELT: &str = "https://Cimd-Spelling.claude.ai:443/client.json";
+        let doc = json!({ "client_id": SPELT, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve(SPELT, &doc.to_string());
+        assert_eq!(
+            store.validate_client(SPELT, "http://127.0.0.1:1/cb").await,
+            ClientCheck::Allowed
+        );
+        assert_eq!(cimd_fixture::hits(SPELT), 1, "fetched from the URL as given");
+        // The same document under a differently spelt id is a different client,
+        // and its document, saying otherwise, does not vouch for it.
+        const OTHERWISE: &str = "https://cimd-spelling.claude.ai/client.json";
+        cimd_fixture::serve(OTHERWISE, &doc.to_string());
+        assert_eq!(
+            store.validate_client(OTHERWISE, "http://127.0.0.1:1/cb").await,
+            ClientCheck::Refused
+        );
+    }
+
+    /// The two rules a flight lives by. Publishing retires it at once, however
+    /// many requests still hold it — they read the outcome from their own handle,
+    /// and a newcomer must not join a published flight to reuse an outcome the
+    /// origin said not to reuse (`no-store`) or a failure that may be over. An
+    /// UNPUBLISHED flight, its fetcher cancelled, stays for its holders and is
+    /// retired by the last of them, so a waiter can take over the fetch and no
+    /// entry is left behind. Neither ever touches a newer flight for the key.
+    #[test]
+    fn cimd_flight_retirement_rules() {
+        use super::{CimdState, Flight, FlightGuard};
+        let state = CimdState::new();
+        let key = "https://cimd-rules.claude.ai/client.json";
+        let join = || -> Flight {
+            std::sync::Arc::clone(state.fetching.lock().unwrap().entry(key.to_owned()).or_default())
+        };
+        let held = || state.fetching.lock().unwrap().contains_key(key);
+
+        // Published while a waiter still holds it: retired at once.
+        let (fetcher, waiter) = (join(), join());
+        let (fetcher_guard, waiter_guard) = (
+            FlightGuard { state: &state, key, flight: &fetcher },
+            FlightGuard { state: &state, key, flight: &waiter },
+        );
+        state.retire_flight(key, &fetcher);
+        assert!(!held(), "a published flight is retired however many hold it");
+        // A newer flight for the key is not touched by the old one's holders leaving.
+        let newer = join();
+        drop(fetcher_guard);
+        drop(waiter_guard);
+        assert!(held(), "an old flight's holders must not retire a newer flight");
+        state.retire_flight(key, &fetcher);
+        assert!(held(), "nor does retiring the old flight");
+        state.retire_flight(key, &newer);
+        assert!(!held());
+
+        // Unpublished — the fetcher is cancelled — with a waiter: stays for the
+        // waiter; the last holder out retires it.
+        let (fetcher, waiter) = (join(), join());
+        let waiter_guard = FlightGuard { state: &state, key, flight: &waiter };
+        drop(FlightGuard { state: &state, key, flight: &fetcher });
+        drop(fetcher);
+        assert!(held(), "a cancelled fetcher leaves the flight for its waiter");
+        drop(waiter_guard);
+        assert!(!held(), "the last holder out retires an unpublished flight");
+    }
+
+    /// A request dropped mid-fetch — the client reset the stream, so the
+    /// authorize future was dropped — leaves nothing behind: not its single-flight
+    /// entry, not its host slot, not its permit. The next request for the same
+    /// document starts afresh and succeeds.
+    #[tokio::test]
+    async fn cimd_cancelled_fetch_leaves_nothing_behind() {
+        use super::{cimd_fixture, ClientCheck, CIMD_MAX_INFLIGHT};
+        use serde_json::json;
+        let store = test_store();
+        const GONE: &str = "https://cimd-gone.claude.ai/client.json";
+        let doc = json!({ "client_id": GONE, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve(GONE, &doc.to_string());
+        // The leader runs until its fetch suspends (the fixture yields there, as a
+        // real fetch would), then is aborted — as a dropped connection drops the
+        // authorize future.
+        let leader = tokio::spawn({
+            let store = store.clone();
+            async move { store.validate_client(GONE, "http://127.0.0.1:1/cb").await }
+        });
+        tokio::task::yield_now().await;
+        assert!(store.cimd.fetching.lock().unwrap().contains_key(GONE), "leader must be mid-fetch");
+        assert_eq!(cimd_fixture::hits(GONE), 1);
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+        assert!(
+            store.cimd.fetching.lock().unwrap().is_empty(),
+            "a dropped fetch retires its flight"
+        );
+        assert!(store.cimd.hosts.lock().unwrap().is_empty(), "…and gives its host slot back");
+        assert_eq!(store.cimd.inflight.available_permits(), CIMD_MAX_INFLIGHT, "…and its permit");
+        // Nothing was cached (the fetch never completed), so the next request
+        // fetches afresh — and succeeds.
+        assert_eq!(
+            store.validate_client(GONE, "http://127.0.0.1:1/cb").await,
+            ClientCheck::Allowed
+        );
+        assert_eq!(cimd_fixture::hits(GONE), 2);
+    }
+
+    /// `/oauth/authorize` with a CIMD client: the document's redirects get the
+    /// checks a DCR registration gets — hosted-redirect allow-list included, and
+    /// checked BEFORE any fetch — the document is cached, an invalid document is
+    /// an unknown client (remembered as one, briefly), and an unfetchable one is
+    /// a retry, not an unknown client (and not remembered).
+    #[tokio::test]
+    async fn cimd_client_authorization() {
+        use super::{cimd_fixture, ClientCheck};
+        use serde_json::json;
+        let store = test_store();
+        const CHATGPT_REDIRECT: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
+        let check = |id: &'static str, redirect: &'static str| store.validate_client(id, redirect);
+
+        // ChatGPT, exactly as it identifies itself: its real client_id and document,
+        // served by the fixture. Its redirect is same-origin AND allow-listed.
+        const HOSTED: &str = "https://chatgpt.com/oauth/client.json";
+        let hosted_doc = json!({
+            "client_id": HOSTED,
+            "client_name": "ChatGPT",
+            "redirect_uris": [CHATGPT_REDIRECT],
+            "token_endpoint_auth_method": "private_key_jwt",
+            "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+        });
+        cimd_fixture::serve(HOSTED, &hosted_doc.to_string());
+        assert_eq!(check(HOSTED, CHATGPT_REDIRECT).await, ClientCheck::Allowed);
+        // A redirect the document does NOT list is refused, allow-listed or not.
+        let other_vendor = "https://claude.ai/api/mcp/auth_callback";
+        assert_eq!(check(HOSTED, other_vendor).await, ClientCheck::Refused);
+        // Cached: with its URL now failing, the client still passes.
+        cimd_fixture::fail(HOSTED, "origin down");
+        assert_eq!(check(HOSTED, CHATGPT_REDIRECT).await, ClientCheck::Allowed);
+
+        // Another origin's document borrowing ChatGPT's (allow-listed) redirect is
+        // refused: a self-asserted document may not point the code at another party.
+        const CROSS: &str = "https://cimd-cross.claude.ai/client.json";
+        let cross_doc = json!({ "client_id": CROSS, "redirect_uris": [CHATGPT_REDIRECT] });
+        cimd_fixture::serve(CROSS, &cross_doc.to_string());
+        assert_eq!(check(CROSS, CHATGPT_REDIRECT).await, ClientCheck::Refused);
+
+        // A document listing a redirect that is NOT allow-listed gains nothing: the
+        // allow-list is checked before the fetch, so the document is never asked
+        // for (were it, this fixture would turn the verdict into Unavailable).
+        const ROGUE: &str = "https://cimd-rogue.claude.ai/client.json";
+        cimd_fixture::fail(ROGUE, "must not be fetched");
+        let rogue_redirect = "https://cimd-rogue.claude.ai/callback";
+        assert_eq!(check(ROGUE, rogue_redirect).await, ClientCheck::Refused);
+        assert_eq!(cimd_fixture::hits(ROGUE), 0);
+
+        // Claude-Code-shaped: loopback redirects match port-agnostically.
+        const LOOPBACK: &str = "https://cimd-loopback.claude.ai/client-metadata";
+        let loopback_doc = json!({
+            "client_id": LOOPBACK,
+            "client_name": "Native",
+            "redirect_uris": ["http://localhost/callback", "http://127.0.0.1/callback"],
+            "token_endpoint_auth_method": "none",
+        });
+        cimd_fixture::serve(LOOPBACK, &loopback_doc.to_string());
+        assert_eq!(check(LOOPBACK, "http://localhost:3118/callback").await, ClientCheck::Allowed);
+        assert_eq!(check(LOOPBACK, "http://127.0.0.1:51234/callback").await, ClientCheck::Allowed);
+        assert_eq!(check(LOOPBACK, "http://127.0.0.1:51234/other").await, ClientCheck::Refused);
+
+        // Unfetchable: a retry, not an unknown client — and not remembered, so
+        // once the origin is back the next request fetches the document.
+        const DOWN: &str = "https://cimd-down.claude.ai/client.json";
+        cimd_fixture::fail(DOWN, "connection refused");
+        let verdict = check(DOWN, "http://127.0.0.1:9/cb").await;
+        assert!(matches!(verdict, ClientCheck::MetadataUnavailable(_)), "{verdict:?}");
+        let down_doc = json!({ "client_id": DOWN, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve(DOWN, &down_doc.to_string());
+        assert_eq!(check(DOWN, "http://127.0.0.1:9/cb").await, ClientCheck::Allowed);
+        assert_eq!(cimd_fixture::hits(DOWN), 2, "a transient failure is retried");
+
+        // A document about ANOTHER URL is an unknown client (misconfigured or
+        // hostile) — remembered as one, so the repeat costs no fetch.
+        const LIAR: &str = "https://cimd-liar.claude.ai/client.json";
+        let liar_doc = json!({ "client_id": HOSTED, "redirect_uris": [CHATGPT_REDIRECT] });
+        cimd_fixture::serve(LIAR, &liar_doc.to_string());
+        assert_eq!(check(LIAR, CHATGPT_REDIRECT).await, ClientCheck::Refused);
+        assert_eq!(check(LIAR, CHATGPT_REDIRECT).await, ClientCheck::Refused);
+        assert_eq!(cimd_fixture::hits(LIAR), 1, "an invalid document is remembered");
+
+        // Nothing at the URL (404) is likewise about the URL: remembered, so even a
+        // document appearing there is not seen until the negative entry lapses.
+        const MISSING: &str = "https://cimd-missing.claude.ai/client.json";
+        cimd_fixture::not_found(MISSING);
+        assert_eq!(check(MISSING, "http://127.0.0.1:7/cb").await, ClientCheck::Refused);
+        let late_doc = json!({ "client_id": MISSING, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve(MISSING, &late_doc.to_string());
+        assert_eq!(check(MISSING, "http://127.0.0.1:7/cb").await, ClientCheck::Refused);
+        assert_eq!(cimd_fixture::hits(MISSING), 1, "a missing document is remembered");
+
+        // A document with no cache hint that some cache along the way held for a
+        // day is not given ten fresh minutes here: the default lifetime is spent,
+        // so the next request fetches again.
+        const AGED: &str = "https://cimd-aged.claude.ai/client.json";
+        let aged_doc = json!({ "client_id": AGED, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve_aged(AGED, &aged_doc.to_string(), Duration::from_secs(86400));
+        assert_eq!(check(AGED, "http://127.0.0.1:3/cb").await, ClientCheck::Allowed);
+        assert_eq!(check(AGED, "http://127.0.0.1:3/cb").await, ClientCheck::Allowed);
+        assert_eq!(cimd_fixture::hits(AGED), 2, "a spent default lifetime is not cached");
+
+        // Whereas a PER-REQUEST failure never poisons a real client: HOSTED was
+        // probed above with a redirect its document does not list, and its
+        // legitimate redirect still passes from the (positive) cache.
+        assert_eq!(check(HOSTED, other_vendor).await, ClientCheck::Refused);
+        assert_eq!(check(HOSTED, CHATGPT_REDIRECT).await, ClientCheck::Allowed);
+
+        // A document served `no-store` is honoured, then NOT reused: once its URL
+        // fails, so does the next authorize (contrast HOSTED above, which was cached).
+        const VOLATILE: &str = "https://claude.ai/oauth/claude-code-client-metadata";
+        let volatile_doc = json!({
+            "client_id": VOLATILE,
+            "client_name": "Claude Code",
+            "redirect_uris": ["http://localhost/callback", "http://127.0.0.1/callback"],
+            "token_endpoint_auth_method": "none",
+        });
+        cimd_fixture::serve_uncacheable(VOLATILE, &volatile_doc.to_string());
+        assert_eq!(check(VOLATILE, "http://localhost:3118/callback").await, ClientCheck::Allowed);
+        cimd_fixture::fail(VOLATILE, "origin down");
+        let verdict = check(VOLATILE, "http://localhost:3118/callback").await;
+        assert!(matches!(verdict, ClientCheck::MetadataUnavailable(_)), "{verdict:?}");
+
+        // A document served as anything but application/json is not a document.
+        const HTML: &str = "https://cimd-html.claude.ai/client.json";
+        let html_doc = json!({ "client_id": HTML, "redirect_uris": ["http://127.0.0.1/cb"] });
+        cimd_fixture::serve_as(HTML, &html_doc.to_string(), "text/html; charset=utf-8");
+        assert_eq!(check(HTML, "http://127.0.0.1:7/cb").await, ClientCheck::Refused);
+
+        // DCR clients are untouched: an unregistered ordinary id is refused.
+        assert_eq!(check("client-unknown", "http://127.0.0.1:1/cb").await, ClientCheck::Refused);
+    }
+
+    /// The AS advertises CIMD — which is what makes Claude and ChatGPT select it
+    /// over DCR, and would be an outage without the implementation behind it —
+    /// alongside the `none` that both require to go with it, and only where the
+    /// deployment opted in.
+    #[tokio::test]
+    async fn as_metadata_advertises_cimd_only_where_enabled() {
+        let metadata = |store: super::AuthStore| async {
+            let resp = super::authorization_server_metadata(axum::extract::State(store)).await;
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.expect("body");
+            serde_json::from_slice::<serde_json::Value>(&body).expect("JSON")
+        };
+        let on = metadata(test_store()).await;
+        assert_eq!(on["client_id_metadata_document_supported"], serde_json::json!(true));
+        assert_eq!(on["token_endpoint_auth_methods_supported"], serde_json::json!(["none"]));
+        let off = metadata(test_store().with_cimd(false)).await;
+        assert_eq!(off["client_id_metadata_document_supported"], serde_json::json!(false));
+        assert_eq!(off["token_endpoint_auth_methods_supported"], serde_json::json!(["none"]));
+    }
+
+    /// `/oauth/authorize` with a URL `client_id` off the vendor trust policy: the
+    /// same "not approved" page (or JSON) a hosted redirect off the allow-list
+    /// gets — 403, naming the contact — and no fetch.
+    #[tokio::test]
+    async fn authorize_points_an_unvetted_cimd_origin_at_the_contact() {
+        use axum::extract::{Query, State};
+        let store = test_store();
+        const STRANGER: &str = "https://cimd-authorize-stranger.test/client.json";
+        super::cimd_fixture::fail(STRANGER, "must not be fetched");
+        let query = || super::AuthorizeQuery {
+            response_type: Some("code".into()),
+            client_id: STRANGER.into(),
+            redirect_uri: "http://127.0.0.1:1/cb".into(),
+            state: Some("xyz".into()),
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            scope: None,
+            resource: None,
+        };
+        let body_of = |resp: axum::response::Response| async {
+            let content_type =
+                resp.headers()[axum::http::header::CONTENT_TYPE].to_str().unwrap().to_owned();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            (content_type, String::from_utf8(bytes.to_vec()).unwrap())
+        };
+        let resp = super::authorize(State(store.clone()), html_headers(), Query(query())).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        let (content_type, html) = body_of(resp).await;
+        assert!(content_type.starts_with("text/html"), "{content_type}");
+        assert!(html.contains(super::CONTACT), "the page must name the contact");
+        assert!(!html.contains(STRANGER), "the page reflects nothing");
+        let resp = super::authorize(State(store.clone()), json_headers(), Query(query())).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        let (content_type, json) = body_of(resp).await;
+        assert!(content_type.contains("json"), "{content_type}");
+        assert!(json.contains("invalid_client") && json.contains(super::CONTACT), "{json}");
+        assert_eq!(super::cimd_fixture::hits(STRANGER), 0, "nothing is fetched off-policy");
+    }
+
+    /// The transient verdict at the endpoint. A vetted CIMD client whose document
+    /// could not be fetched RIGHT NOW — the origin unreachable, or answering with
+    /// a status the client may retry (425 Too Early here) — is told to retry:
+    /// `503 temporarily_unavailable` to a programmatic caller, the sign-in error
+    /// page to a browser. Not `invalid_client`, which would have the user re-add
+    /// the connector. Neither body reflects the `client_id` URL or the cause, and
+    /// nothing is remembered: the next request fetches again.
+    #[tokio::test]
+    async fn authorize_tells_a_cimd_client_to_retry_when_its_document_is_unavailable() {
+        use axum::extract::{Query, State};
+        let store = test_store();
+        const DOWN: &str = "https://cimd-authorize-down.claude.ai/client.json";
+        const EARLY: &str = "https://cimd-authorize-early.claude.ai/client.json";
+        super::cimd_fixture::fail(DOWN, "connection reset by peer");
+        super::cimd_fixture::answer(EARLY, 425);
+        let query = |client_id: &str| super::AuthorizeQuery {
+            response_type: Some("code".into()),
+            client_id: client_id.into(),
+            redirect_uri: "http://127.0.0.1:1/cb".into(),
+            state: Some("xyz".into()),
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            scope: None,
+            resource: None,
+        };
+        let body_of = |resp: axum::response::Response| async {
+            let content_type =
+                resp.headers()[axum::http::header::CONTENT_TYPE].to_str().unwrap().to_owned();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            (content_type, String::from_utf8(bytes.to_vec()).unwrap())
+        };
+        for (id, cause) in [(DOWN, "reset"), (EARLY, "425")] {
+            let resp =
+                super::authorize(State(store.clone()), json_headers(), Query(query(id))).await;
+            assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE, "{id}");
+            let (content_type, json) = body_of(resp).await;
+            assert!(content_type.contains("json"), "{content_type}");
+            assert!(json.contains("temporarily_unavailable"), "{json}");
+            assert!(!json.contains("invalid_client"), "a retry, not a client to re-add: {json}");
+            assert!(
+                !json.contains(id) && !json.contains(cause),
+                "the body reflects nothing: {json}"
+            );
+            let resp =
+                super::authorize(State(store.clone()), html_headers(), Query(query(id))).await;
+            assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE, "{id}");
+            let (content_type, html) = body_of(resp).await;
+            assert!(content_type.starts_with("text/html"), "{content_type}");
+            assert!(html.contains("Try again in a moment"), "{html}");
+            assert!(!html.contains(id) && !html.contains(cause), "the page reflects nothing");
+            assert_eq!(super::cimd_fixture::hits(id), 2, "{id}: not remembered, so fetched again");
+        }
     }
 
     /// `OAUTH_ALLOWED_REDIRECT_PREFIXES` entries parse to `(host, path)` only for a
@@ -2559,7 +4233,10 @@ mod tests {
 
         let no_token = super::bearer_challenge(false, meta);
         assert!(no_token.starts_with("Bearer "));
-        assert!(!no_token.contains("error="), "a bare challenge must omit the error code: {no_token}");
+        assert!(
+            !no_token.contains("error="),
+            "a bare challenge must omit the error code: {no_token}"
+        );
         assert!(no_token.contains(&format!("resource_metadata=\"{meta}\"")));
     }
 
@@ -2571,10 +4248,7 @@ mod tests {
         use axum::http::{header::COOKIE, HeaderMap, HeaderValue};
         let mut h = HeaderMap::new();
         assert_eq!(super::connect_cookie(&h), None);
-        h.insert(
-            COOKIE,
-            HeaderValue::from_static("other=1; mcp_connect=bind-xyz; last=2"),
-        );
+        h.insert(COOKIE, HeaderValue::from_static("other=1; mcp_connect=bind-xyz; last=2"));
         assert_eq!(super::connect_cookie(&h).as_deref(), Some("bind-xyz"));
         // A different cookie name present but not ours -> None.
         let mut h2 = HeaderMap::new();
@@ -2598,21 +4272,12 @@ mod tests {
         // Grant known and longer than the default → the FULL remaining grant
         // (the old fixed 1h cap is gone: a 1-day grant mints a 1-day token).
         let far = now_ns + 86_400 * 1_000_000_000;
-        assert_eq!(
-            super::token_ttl(default, Some(far), now_ns),
-            Duration::from_secs(86_400)
-        );
+        assert_eq!(super::token_ttl(default, Some(far), now_ns), Duration::from_secs(86_400));
         // Grant known and shorter than the default (user picked 10 min) → that.
         let soon = now_ns + 600 * 1_000_000_000;
-        assert_eq!(
-            super::token_ttl(default, Some(soon), now_ns),
-            Duration::from_secs(600)
-        );
+        assert_eq!(super::token_ttl(default, Some(soon), now_ns), Duration::from_secs(600));
         // Grant already expired → zero (never a negative-wrap).
-        assert_eq!(
-            super::token_ttl(default, Some(now_ns - 1), now_ns),
-            Duration::ZERO
-        );
+        assert_eq!(super::token_ttl(default, Some(now_ns - 1), now_ns), Duration::ZERO);
     }
 
     /// RFC 7591 / guide: requested grant types are INTERSECTED with the
@@ -2662,12 +4327,18 @@ mod tests {
     }
 
     fn test_store_cfg(require_resource: bool) -> super::AuthStore {
-        use crate::identities::{Identities, IiInstance};
+        // As a deployment with CIMD on, and with CIMD state of its own so tests do
+        // not see each other's flights; the off case sets this itself.
+        new_store(require_resource).with_cimd(true)
+    }
+
+    /// A store exactly as [`super::AuthStore::new`] builds it with CIMD off, CIMD
+    /// state shared process-wide.
+    fn new_store(require_resource: bool) -> super::AuthStore {
         use candid::Principal;
-        let agent = crate::Agent::builder()
-            .with_url("https://ii.test")
-            .build()
-            .expect("test agent");
+        use imcp2_core::identities::{Identities, IiInstance};
+        let agent =
+            crate::Agent::builder().with_url("https://ii.test").build().expect("test agent");
         let ids = Identities::new(
             IiInstance {
                 name: "test",
@@ -2679,11 +4350,42 @@ mod tests {
         );
         super::AuthStore::new(
             ids,
-            super::SharedClients(super::ClientStore::with(std::collections::HashMap::new())),
+            super::SharedClients(super::ClientStore::with(
+                std::collections::HashMap::new(),
+                std::env::temp_dir(),
+            )),
             "https://mcp.test".into(),
             "/mcp".into(),
             require_resource,
+            false,
         )
+    }
+
+    /// A vendor's fetch failures are warned about at most once a minute — a caller
+    /// rotating paths on a vetted host cannot flood the log — and each vendor
+    /// has its own minute.
+    #[test]
+    fn cimd_warnings_are_sampled_per_vendor() {
+        let state = super::CimdState::new();
+        assert!(state.warn_permitted("claude.ai"));
+        assert!(!state.warn_permitted("claude.ai"));
+        assert!(state.warn_permitted("chatgpt.com"));
+        *state.warned.lock().unwrap().get_mut("claude.ai").unwrap() -=
+            std::time::Duration::from_secs(61);
+        assert!(state.warn_permitted("claude.ai"));
+    }
+
+    /// Every store in the process shares one CIMD state: the bundled binary
+    /// mounts a store per II instance, and the in-flight bounds must hold across
+    /// them — two mounts must not mean twice the fetches — as must the cache.
+    #[test]
+    fn cimd_state_is_shared_by_every_store() {
+        use std::sync::Arc;
+        let (a, b) = (new_store(false), new_store(false));
+        assert!(Arc::ptr_eq(&a.cimd, &b.cimd), "stores must share the process's CIMD state");
+        // The test stores keep their own, so tests do not see each other's flights.
+        let (c, d) = (test_store(), test_store());
+        assert!(!Arc::ptr_eq(&c.cimd, &d.cimd) && !Arc::ptr_eq(&c.cimd, &a.cimd));
     }
 
     /// A request header map that accepts HTML — i.e. a browser hitting the
@@ -2710,20 +4412,21 @@ mod tests {
     async fn seed_pending(store: &super::AuthStore, id: &str, cookie: &str) {
         // Record a pending authorization the way `authorize` does — through the
         // bounded insert — just without the browser redirect around it.
-        store.insert_pending(
-            id.to_string(),
-            super::AuthzPending {
-                client_id: "c".into(),
-                redirect_uri: "https://app.test/cb".into(),
-                client_state: String::new(),
-                code_challenge: Some("cc".into()),
-                cookie: cookie.into(),
-                created: std::time::Instant::now(),
-                code: None,
-                redeeming: false,
-            },
-        )
-        .await;
+        store
+            .insert_pending(
+                id.to_string(),
+                super::AuthzPending {
+                    client_id: "c".into(),
+                    redirect_uri: "https://app.test/cb".into(),
+                    client_state: String::new(),
+                    code_challenge: Some("cc".into()),
+                    cookie: cookie.into(),
+                    created: std::time::Instant::now(),
+                    code: None,
+                    redeeming: false,
+                },
+            )
+            .await;
     }
 
     // ---- Bounded state (CWE-770) --------------------------------------------
@@ -2755,7 +4458,7 @@ mod tests {
     // cap and that the connect just started is the one kept.)
     #[tokio::test]
     async fn pending_connects_are_capped() {
-        let cap = crate::identities::MAX_PENDING_CONNECTS;
+        let cap = imcp2_core::identities::MAX_PENDING_CONNECTS;
         let store = test_store();
         for i in 0..cap + 16 {
             seed_pending(&store, &format!("sess-{i}"), "bind").await;
@@ -2799,16 +4502,26 @@ mod tests {
         let redirect = "https://claude.ai/api/mcp/auth_callback";
         store.clients.seed("client-x", vec![redirect]).await;
         let backdate = || async {
-            store.clients.registrations.write().await.get_mut("client-x").expect("client").last_used = 0;
+            store
+                .clients
+                .registrations
+                .write()
+                .await
+                .get_mut("client-x")
+                .expect("client")
+                .last_used = 0;
         };
         let stamp = || async { store.clients.registrations.read().await["client-x"].last_used };
 
         backdate().await;
-        assert!(store.validate_client("client-x", redirect).await);
+        assert_eq!(store.validate_client("client-x", redirect).await, super::ClientCheck::Allowed);
         assert!(stamp().await > 0, "an accepted redirect refreshes the LRU stamp");
 
         backdate().await;
-        assert!(!store.validate_client("client-x", "https://claude.ai/api/mcp/auth_callback/nope").await);
+        assert_eq!(
+            store.validate_client("client-x", "https://claude.ai/api/mcp/auth_callback/nope").await,
+            super::ClientCheck::Refused
+        );
         assert_eq!(stamp().await, 0, "a rejected redirect must not refresh the stamp");
     }
 
@@ -2854,7 +4567,8 @@ mod tests {
         assert!(url.contains("state=sess-1"));
         assert!(url.contains("registration_key=PUBX"));
         // The callback lives under the instance's mount ({public_url}{mcp_path}).
-        let encoded = urlencoding::encode("https://mcp.test/mcp/oauth/connect/callback").into_owned();
+        let encoded =
+            urlencoding::encode("https://mcp.test/mcp/oauth/connect/callback").into_owned();
         assert!(url.contains(&format!("callback={encoded}")), "callback under the mount: {url}");
     }
 
@@ -2866,13 +4580,11 @@ mod tests {
     #[tokio::test]
     async fn auth_callbacks_declares_link_callbacks_verbatim() {
         use axum::extract::State;
-        use crate::identities::{Identities, IiInstance};
         use candid::Principal;
+        use imcp2_core::identities::{Identities, IiInstance};
         let make = |mcp_path: &'static str| {
-            let agent = crate::Agent::builder()
-                .with_url("https://ii.test")
-                .build()
-                .expect("test agent");
+            let agent =
+                crate::Agent::builder().with_url("https://ii.test").build().expect("test agent");
             super::AuthStore::new(
                 Identities::new(
                     IiInstance {
@@ -2883,9 +4595,13 @@ mod tests {
                     "https://mcp.test".into(),
                     agent,
                 ),
-                super::SharedClients(super::ClientStore::with(std::collections::HashMap::new())),
+                super::SharedClients(super::ClientStore::with(
+                    std::collections::HashMap::new(),
+                    std::env::temp_dir(),
+                )),
                 "https://mcp.test".into(),
                 mcp_path.into(),
+                false,
                 false,
             )
         };
@@ -2965,11 +4681,18 @@ mod tests {
         )
         .await;
 
-        assert_eq!(resp.status(), axum::http::StatusCode::FOUND, "authorize must 302, not render a page");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FOUND,
+            "authorize must 302, not render a page"
+        );
         let h = resp.headers();
         let location = h.get(axum::http::header::LOCATION).unwrap().to_str().unwrap();
         // The II link, with the connect params carried in the URL FRAGMENT.
-        assert!(location.starts_with("https://ii.test/mcp#"), "redirects to the II /mcp link: {location}");
+        assert!(
+            location.starts_with("https://ii.test/mcp#"),
+            "redirects to the II /mcp link: {location}"
+        );
         for needle in ["callback=", "state=", "registration_key="] {
             assert!(location.contains(needle), "fragment must carry `{needle}`: {location}");
         }
@@ -2991,9 +4714,9 @@ mod tests {
         // Canonical, plus security-irrelevant variance that must still match.
         for ok in [
             "https://mcp.test/mcp",
-            "https://mcp.test/mcp/",   // one trailing slash
-            "https://MCP.test/mcp",    // host case
-            "HTTPS://mcp.test/mcp",    // scheme case
+            "https://mcp.test/mcp/",    // one trailing slash
+            "https://MCP.test/mcp",     // host case
+            "HTTPS://mcp.test/mcp",     // scheme case
             "https://mcp.test:443/mcp", // explicit default port
         ] {
             assert!(super::resource_matches_issuer(ok, issuer), "must accept {ok}");
@@ -3007,14 +4730,14 @@ mod tests {
             "https://mcp.test/mcp-beta",
             "https://mcp.test:8443/mcp",
             "https://mcp.test/mcp#x",
-            "https://user@mcp.test/mcp",         // userinfo is not part of the identifier
-            "https://@mcp.test/mcp",             // empty userinfo (url erases it) — still refused
-            "https://:@mcp.test/mcp",            // empty user:pass userinfo — still refused
-            "https:\t//user@mcp.test/mcp",       // tab hides `://`; url strips it, parsing userinfo
-            "https://mcp.test\n/mcp",            // stripped newline must not smuggle content past the scan
+            "https://user@mcp.test/mcp", // userinfo is not part of the identifier
+            "https://@mcp.test/mcp",     // empty userinfo (url erases it) — still refused
+            "https://:@mcp.test/mcp",    // empty user:pass userinfo — still refused
+            "https:\t//user@mcp.test/mcp", // tab hides `://`; url strips it, parsing userinfo
+            "https://mcp.test\n/mcp",    // stripped newline must not smuggle content past the scan
             "https://mcp.test/mcp?tenant=other", // a query differs from the issuer's (none)
-            "https://mcp.test/mcp//",            // doubled trailing slash is a distinct path
-            "http://mcp.test/mcp",               // scheme downgrade
+            "https://mcp.test/mcp//",    // doubled trailing slash is a distinct path
+            "http://mcp.test/mcp",       // scheme downgrade
             "not-a-url",
         ] {
             assert!(!super::resource_matches_issuer(bad, issuer), "must refuse {bad}");
@@ -3041,24 +4764,60 @@ mod tests {
         };
 
         // A foreign resource is refused with `invalid_target` and never reaches II.
-        let foreign = super::authorize(State(store.clone()), json_headers(), Query(mk(Some("https://other.example/mcp")))).await;
-        assert_eq!(foreign.status(), axum::http::StatusCode::BAD_REQUEST, "a foreign resource must be refused");
+        let foreign = super::authorize(
+            State(store.clone()),
+            json_headers(),
+            Query(mk(Some("https://other.example/mcp"))),
+        )
+        .await;
+        assert_eq!(
+            foreign.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "a foreign resource must be refused"
+        );
         let body = axum::body::to_bytes(foreign.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "invalid_target");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+            "invalid_target"
+        );
 
         // A sibling instance's resource (same host, other path) is also foreign.
-        let sibling = super::authorize(State(store.clone()), json_headers(), Query(mk(Some("https://mcp.test/mcp-beta")))).await;
-        assert_eq!(sibling.status(), axum::http::StatusCode::BAD_REQUEST, "a sibling instance's resource must be refused");
+        let sibling = super::authorize(
+            State(store.clone()),
+            json_headers(),
+            Query(mk(Some("https://mcp.test/mcp-beta"))),
+        )
+        .await;
+        assert_eq!(
+            sibling.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "a sibling instance's resource must be refused"
+        );
 
         // This instance's own resource (and a trailing-slash variant) → 302 to II.
         for ok in ["https://mcp.test/mcp", "https://mcp.test/mcp/"] {
-            let resp = super::authorize(State(store.clone()), axum::http::HeaderMap::new(), Query(mk(Some(ok)))).await;
-            assert_eq!(resp.status(), axum::http::StatusCode::FOUND, "the canonical resource must be accepted: {ok}");
+            let resp = super::authorize(
+                State(store.clone()),
+                axum::http::HeaderMap::new(),
+                Query(mk(Some(ok))),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::FOUND,
+                "the canonical resource must be accepted: {ok}"
+            );
         }
 
         // A missing resource stays accepted (pre-RFC-8707 clients).
-        let none = super::authorize(State(store.clone()), axum::http::HeaderMap::new(), Query(mk(None))).await;
-        assert_eq!(none.status(), axum::http::StatusCode::FOUND, "a missing resource must remain accepted");
+        let none =
+            super::authorize(State(store.clone()), axum::http::HeaderMap::new(), Query(mk(None)))
+                .await;
+        assert_eq!(
+            none.status(),
+            axum::http::StatusCode::FOUND,
+            "a missing resource must remain accepted"
+        );
     }
 
     // RFC 8707 end-to-end: a token request carrying a FOREIGN `resource` is
@@ -3067,7 +4826,13 @@ mod tests {
     // protected /mcp accepts.
     #[tokio::test]
     async fn token_endpoint_enforces_resource_indicator() {
-        use axum::{body::Body, http::{header, Request, StatusCode}, middleware, routing::post, Router};
+        use axum::{
+            body::Body,
+            http::{header, Request, StatusCode},
+            middleware,
+            routing::post,
+            Router,
+        };
         use tower::ServiceExt;
 
         let store = test_store();
@@ -3107,10 +4872,20 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "a foreign resource must be refused at /oauth/token");
+        assert_eq!(
+            refused.status(),
+            StatusCode::BAD_REQUEST,
+            "a foreign resource must be refused at /oauth/token"
+        );
         let body = axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "invalid_target");
-        assert!(store.codes.read().await.contains_key("proof-code"), "a refused request must not consume the code");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+            "invalid_target"
+        );
+        assert!(
+            store.codes.read().await.contains_key("proof-code"),
+            "a refused request must not consume the code"
+        );
 
         // 2) Canonical resource → token minted and accepted by the protected /mcp.
         let exchange = make_app(store.clone())
@@ -3124,12 +4899,24 @@ mod tests {
             .unwrap();
         assert_eq!(exchange.status(), StatusCode::OK, "the canonical resource must be accepted");
         let body = axum::body::to_bytes(exchange.into_body(), usize::MAX).await.unwrap();
-        let token = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["access_token"].as_str().unwrap().to_owned();
+        let token = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["access_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let authed = make_app(store.clone())
-            .oneshot(Request::post("/mcp").header(header::AUTHORIZATION, format!("Bearer {token}")).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::post("/mcp")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(authed.status(), StatusCode::OK, "a token for this resource must be accepted at /mcp");
+        assert_eq!(
+            authed.status(),
+            StatusCode::OK,
+            "a token for this resource must be accepted at /mcp"
+        );
 
         // 3) Missing resource → still accepted (pre-RFC-8707 clients).
         store.codes.write().await.insert("proof-code-2".into(), seed_code());
@@ -3166,19 +4953,43 @@ mod tests {
 
         // Missing resource → refused with `invalid_request` (the strict delta).
         let missing = super::authorize(State(store.clone()), json_headers(), Query(mk(None))).await;
-        assert_eq!(missing.status(), axum::http::StatusCode::BAD_REQUEST, "strict mode must refuse a missing resource");
+        assert_eq!(
+            missing.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "strict mode must refuse a missing resource"
+        );
         let body = axum::body::to_bytes(missing.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "invalid_request");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+            "invalid_request"
+        );
 
         // Foreign resource → still `invalid_target`.
-        let foreign = super::authorize(State(store.clone()), json_headers(), Query(mk(Some("https://other.example/mcp")))).await;
+        let foreign = super::authorize(
+            State(store.clone()),
+            json_headers(),
+            Query(mk(Some("https://other.example/mcp"))),
+        )
+        .await;
         assert_eq!(foreign.status(), axum::http::StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(foreign.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "invalid_target");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+            "invalid_target"
+        );
 
         // Canonical resource → still reaches II.
-        let ok = super::authorize(State(store.clone()), axum::http::HeaderMap::new(), Query(mk(Some("https://mcp.test/mcp")))).await;
-        assert_eq!(ok.status(), axum::http::StatusCode::FOUND, "the canonical resource must still be accepted in strict mode");
+        let ok = super::authorize(
+            State(store.clone()),
+            axum::http::HeaderMap::new(),
+            Query(mk(Some("https://mcp.test/mcp"))),
+        )
+        .await;
+        assert_eq!(
+            ok.status(),
+            axum::http::StatusCode::FOUND,
+            "the canonical resource must still be accepted in strict mode"
+        );
     }
 
     // Strict RFC 8707 at `/oauth/token`: a missing `resource` is refused with
@@ -3186,11 +4997,17 @@ mod tests {
     // still mints a token.
     #[tokio::test]
     async fn token_strict_requires_resource() {
-        use axum::{body::Body, http::{header, Request, StatusCode}, routing::post, Router};
+        use axum::{
+            body::Body,
+            http::{header, Request, StatusCode},
+            routing::post,
+            Router,
+        };
         use tower::ServiceExt;
 
         let store = test_store_cfg(true);
-        let app = || Router::new().route("/oauth/token", post(super::token)).with_state(store.clone());
+        let app =
+            || Router::new().route("/oauth/token", post(super::token)).with_state(store.clone());
         let seed = || super::CodeGrant {
             client_id: "mcp-client".into(),
             code_challenge: Some(super::pkce_s256("verifier")),
@@ -3216,10 +5033,20 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "strict mode must refuse a missing resource at /oauth/token");
+        assert_eq!(
+            refused.status(),
+            StatusCode::BAD_REQUEST,
+            "strict mode must refuse a missing resource at /oauth/token"
+        );
         let body = axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "invalid_request");
-        assert!(store.codes.read().await.contains_key("proof-code"), "a refused request must not consume the code");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+            "invalid_request"
+        );
+        assert!(
+            store.codes.read().await.contains_key("proof-code"),
+            "a refused request must not consume the code"
+        );
 
         // Canonical resource → token minted.
         let ok = app()
@@ -3231,7 +5058,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(ok.status(), StatusCode::OK, "the canonical resource must mint a token in strict mode");
+        assert_eq!(
+            ok.status(),
+            StatusCode::OK,
+            "the canonical resource must mint a token in strict mode"
+        );
     }
 
     // A client turned away by the allow-list gets the on-brand HTML page, not a
@@ -3250,6 +5081,7 @@ mod tests {
             .to_string();
         assert!(csp.contains("default-src 'none'"), "{csp}");
         assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(csp.contains("img-src 'self'"), "{csp}");
         // No script on this page: the CSP must not open a script-src.
         assert!(!csp.contains("script-src"), "the error page needs no script-src: {csp}");
         let nonce = csp
@@ -3268,6 +5100,7 @@ mod tests {
         );
         assert!(!html.contains("__"), "every template placeholder must be substituted: {html}");
         assert!(!html.contains("<script"), "the error page carries no script");
+        assert!(html.contains("rel=icon href=/favicon.svg"), "{html}");
         assert!(
             html.contains(&format!("<style nonce=\"{nonce}\">")),
             "the inline style nonce must match the CSP nonce"
@@ -3296,7 +5129,12 @@ mod tests {
             resource: None,
         };
         let content_type = |resp: &axum::response::Response| {
-            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string()
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
         };
 
         // -- Browser (Accept: text/html): friendly on-brand HTML in both cases. --
@@ -3308,7 +5146,10 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
-        assert!(content_type(&resp).starts_with("text/html"), "an allow-list rejection renders HTML for a browser");
+        assert!(
+            content_type(&resp).starts_with("text/html"),
+            "an allow-list rejection renders HTML for a browser"
+        );
         let html = String::from_utf8(
             axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
         )
@@ -3324,7 +5165,10 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
-        assert!(content_type(&resp).starts_with("text/html"), "an unknown client renders HTML for a browser");
+        assert!(
+            content_type(&resp).starts_with("text/html"),
+            "an unknown client renders HTML for a browser"
+        );
         let html = String::from_utf8(
             axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
         )
@@ -3335,7 +5179,11 @@ mod tests {
         // -- Machine (Accept: application/json): RFC-style JSON in both cases. --
         for (client_id, redirect_uri, want_status) in [
             ("client-legacy", "https://example.com/cb", axum::http::StatusCode::FORBIDDEN),
-            ("client-nope", "https://claude.ai/api/mcp/auth_callback", axum::http::StatusCode::BAD_REQUEST),
+            (
+                "client-nope",
+                "https://claude.ai/api/mcp/auth_callback",
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
         ] {
             let resp = super::authorize(
                 State(store.clone()),
@@ -3344,7 +5192,10 @@ mod tests {
             )
             .await;
             assert_eq!(resp.status(), want_status);
-            assert!(content_type(&resp).contains("json"), "a machine caller keeps JSON for {client_id}");
+            assert!(
+                content_type(&resp).contains("json"),
+                "a machine caller keeps JSON for {client_id}"
+            );
         }
     }
 
@@ -3421,21 +5272,32 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        assert!(csp.contains("default-src 'none'") && csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(
+            csp.contains("default-src 'none'") && csp.contains("frame-ancestors 'none'"),
+            "{csp}"
+        );
         assert!(!csp.contains("script-src"), "the error screen needs no script-src: {csp}");
         let html = String::from_utf8(
             axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
         )
         .unwrap();
         assert!(html.contains("PKCE"), "the diagnostic should name the missing security parameter");
-        assert!(html.contains(&format!("mailto:{}", super::CONTACT)), "the screen names the contact");
+        assert!(
+            html.contains(&format!("mailto:{}", super::CONTACT)),
+            "the screen names the contact"
+        );
         assert!(!html.contains("__"), "every placeholder must be substituted: {html}");
 
         // Machine: the RFC-style JSON error is preserved.
         let resp = super::authorize(State(store.clone()), json_headers(), Query(mk())).await;
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
-        let ctype =
-            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+        let ctype = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(ctype.contains("json"), "a machine caller keeps JSON: {ctype}");
     }
 
@@ -3482,6 +5344,7 @@ mod tests {
             .to_string();
         assert!(csp.contains("default-src 'none'"), "{csp}");
         assert!(csp.contains("connect-src 'self'"), "{csp}");
+        assert!(csp.contains("img-src 'self'"), "{csp}");
         // Never legitimately framed (II top-level-navigates here): deny UI redress.
         assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
         // Pull the nonce out of the CSP and confirm the inline <script> uses it.
@@ -3509,8 +5372,12 @@ mod tests {
             html.contains(&format!("<style nonce=\"{nonce}\">")),
             "the inline style nonce must match the CSP nonce"
         );
+        assert!(html.contains("rel=icon href=/favicon.svg"), "{html}");
         assert!(html.contains("location.hash"), "the page reads the fragment client-side");
-        assert!(html.contains("/mcp-beta/oauth/connect/redeem"), "posts to the instance's redeem path");
+        assert!(
+            html.contains("/mcp-beta/oauth/connect/redeem"),
+            "posts to the instance's redeem path"
+        );
         assert!(!html.contains("__REDEEM_URL__"), "the redeem-URL placeholder must be substituted");
         // Every handshake/redeem failure lands on this page, so it carries the
         // "contact us to report it" line (hidden until the script adds `.error`),
@@ -3538,139 +5405,6 @@ mod tests {
         }
     }
 
-    // A well-formed fragment payload — agent-js `DelegationChain.toJSON()`
-    // exactly as II's #4093 frontend emits it (hex byte fields, HEX-string
-    // expiration, principal-text targets, top-level `publicKey` = der(P_reg)),
-    // carrying rev3's TWO hops (`P_reg -> Y` canister-signed, `Y -> X`
-    // browser-signed) — decodes into `(der(P_reg), [both hops in order])`.
-    #[test]
-    fn parse_registration_delegation_round_trips_two_hops() {
-        let der_preg = vec![1u8, 2, 3];
-        let der_y = vec![7u8, 7, 7]; // II's ephemeral browser-held key
-        let der_x = vec![9u8, 8, 7, 6]; // our registration key
-        let sig_canister = vec![4u8, 5, 6];
-        let sig_y = vec![1u8, 9, 9];
-        let chain_json = serde_json::json!({
-            "delegations": [
-                {
-                    "delegation": {
-                        "pubkey": hex::encode(&der_y),
-                        "expiration": format!("{:x}", 66_u64), // BigInt.toString(16)
-                        "targets": ["aaaaa-aa"],
-                    },
-                    "signature": hex::encode(&sig_canister),
-                },
-                {
-                    "delegation": {
-                        "pubkey": hex::encode(&der_x),
-                        "expiration": format!("{:x}", 66_u64),
-                    },
-                    "signature": hex::encode(&sig_y),
-                },
-            ],
-            "publicKey": hex::encode(&der_preg),
-        })
-        .to_string();
-        let (uk, chain) = super::parse_registration_delegation(&chain_json).expect("parse");
-        assert_eq!(uk, der_preg);
-        assert_eq!(chain.len(), 2, "both hops preserved, in order");
-        // Hop 1: canister-signed P_reg -> Y. Its `targets` round-trips from
-        // principal text (`aaaaa-aa` here as a stand-in; live chains carry the
-        // II canister id).
-        assert_eq!(chain[0].delegation.pubkey, der_y);
-        assert_eq!(chain[0].delegation.expiration, 66);
-        assert_eq!(chain[0].signature, sig_canister);
-        assert_eq!(
-            chain[0].delegation.targets.as_ref().unwrap()[0],
-            candid::Principal::management_canister()
-        );
-        // Hop 2: browser-signed Y -> X.
-        assert_eq!(chain[1].delegation.pubkey, der_x);
-        assert_eq!(chain[1].signature, sig_y);
-        assert_eq!(chain[1].delegation.targets, None);
-        // Neither hop carries a permissions field; the access level was chosen
-        // at consent and stored by II under P_reg (recovered from caller()), so
-        // it never rides the delegation or the fragment.
-        assert!(chain.iter().all(|d| d.delegation.permissions.is_none()));
-    }
-
-    // Malformed input fails with a clear error: non-JSON, bad hex, a
-    // non-hex expiration — and, critically, an UNKNOWN field inside the
-    // delegation (deny_unknown_fields): every delegation field is covered by
-    // the canister signature, so silently dropping one could never re-hash to
-    // what II signed (the #40 outage class) — fail fast instead.
-    #[test]
-    fn parse_registration_delegation_rejects_bad_input() {
-        assert!(super::parse_registration_delegation("not json").is_err());
-
-        let bad_hex = serde_json::json!({
-            "delegations": [{
-                "delegation": { "pubkey": "zz", "expiration": "1" },
-                "signature": "0102",
-            }],
-            "publicKey": "010203",
-        })
-        .to_string();
-        let err = super::parse_registration_delegation(&bad_hex).expect_err("bad hex must fail");
-        assert!(err.contains("not valid hex"), "got: {err}");
-
-        let bad_exp = serde_json::json!({
-            "delegations": [{
-                "delegation": { "pubkey": "0102", "expiration": "not-hex" },
-                "signature": "0102",
-            }],
-            "publicKey": "010203",
-        })
-        .to_string();
-        let err = super::parse_registration_delegation(&bad_exp).expect_err("bad expiration must fail");
-        assert!(err.contains("expiration"), "got: {err}");
-
-        // A field this parser does not carry (e.g. a future `permissions`)
-        // must fail fast rather than be silently dropped.
-        let unknown_field = serde_json::json!({
-            "delegations": [{
-                "delegation": { "pubkey": "0102", "expiration": "1", "permissions": "queries" },
-                "signature": "0102",
-            }],
-            "publicKey": "010203",
-        })
-        .to_string();
-        let err = super::parse_registration_delegation(&unknown_field)
-            .expect_err("an unknown delegation field must fail fast, not silently drop");
-        assert!(err.contains("permissions"), "got: {err}");
-    }
-
-    // CWE-770 guard: an oversized delegation payload is rejected BEFORE any
-    // JSON parse, so an attacker-sized payload can't force large allocations.
-    // A legit chain is a few KB, far below the cap.
-    #[test]
-    fn parse_registration_delegation_bounds_input_size() {
-        let huge = "A".repeat(super::MAX_REG_DELEGATION_JSON + 1);
-        let err = super::parse_registration_delegation(&huge).expect_err("oversized delegation rejected");
-        assert!(err.contains("exceeds"), "got: {err}");
-
-        // At-cap input proceeds past the size check (and fails on content,
-        // not on size) — the bound doesn't clip legitimate-shaped requests.
-        let at_cap = "A".repeat(super::MAX_REG_DELEGATION_JSON);
-        let err = super::parse_registration_delegation(&at_cap).expect_err("fails on content, not size");
-        assert!(!err.contains("exceeds"), "at-cap input must pass the size check: {err}");
-    }
-
-    // The CSP nonce must use the STANDARD base64 alphabet: CSP2's base64-value
-    // grammar has no `-`/`_`, so a base64url nonce risks a strict parser dropping
-    // the source and blocking the inline script (breaking the callback page).
-    #[test]
-    fn csp_nonce_is_standard_base64() {
-        for _ in 0..16 {
-            let n = super::csp_nonce();
-            assert!(
-                !n.contains('-') && !n.contains('_'),
-                "CSP nonce must not use base64url characters: {n}"
-            );
-            assert!(n.len() >= 22, "128-bit nonce floor: {n}");
-        }
-    }
-
     // Redemption is SINGLE-FLIGHT per connect: the first claim wins, a concurrent
     // claim is refused while mid-flight, a released (failed) claim can be retried,
     // and once a code exists every later claim returns it (idempotent) instead of
@@ -3681,7 +5415,10 @@ mod tests {
         seed_pending(&store, "sess-r", "bind-r").await;
 
         // First claim wins; a concurrent second claim is refused.
-        assert!(matches!(super::claim_redemption(&store, "sess-r").await, super::RedeemClaim::Claimed));
+        assert!(matches!(
+            super::claim_redemption(&store, "sess-r").await,
+            super::RedeemClaim::Claimed
+        ));
         assert!(matches!(
             super::claim_redemption(&store, "sess-r").await,
             super::RedeemClaim::InProgress
@@ -3689,7 +5426,10 @@ mod tests {
 
         // A failed attempt releases the claim, so a genuine retry proceeds.
         super::release_redemption(&store, "sess-r").await;
-        assert!(matches!(super::claim_redemption(&store, "sess-r").await, super::RedeemClaim::Claimed));
+        assert!(matches!(
+            super::claim_redemption(&store, "sess-r").await,
+            super::RedeemClaim::Claimed
+        ));
 
         // Once the code is minted, later claims return it rather than redeeming.
         store.authz.write().await.get_mut("sess-r").unwrap().code = Some("mcp-code-x".into());
@@ -3719,10 +5459,7 @@ mod tests {
         let redeem = super::connect_redeem(
             State(store),
             axum::http::HeaderMap::new(),
-            axum::Json(super::RedeemBody {
-                state: "sess-x".into(),
-                delegation: String::new(),
-            }),
+            axum::Json(super::RedeemBody { state: "sess-x".into(), delegation: String::new() }),
         )
         .await;
         assert_eq!(redeem.status(), axum::http::StatusCode::BAD_REQUEST);

@@ -43,7 +43,7 @@
       }
       header {
         padding: 1.5rem 1.5rem 0.5rem;
-        max-width: 60rem;
+        max-width: 96rem;
         margin: 0 auto;
       }
       h1 {
@@ -55,9 +55,33 @@
         font-size: 0.85rem;
       }
       main {
-        max-width: 60rem;
+        max-width: 96rem;
         margin: 0 auto;
         padding: 1rem 1.5rem 4rem;
+      }
+      /* One column per monitored instance, side by side where the viewport
+         allows and stacked where it doesn't; a single instance fills the row. */
+      .instances {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(min(100%, 30rem), 1fr));
+        gap: 1.5rem;
+        align-items: start;
+      }
+      .instance > h2 {
+        font-size: 1.15rem;
+        margin: 0 0 0.6rem;
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+      }
+      .instance > h2 .badge {
+        font-size: 0.7rem;
+      }
+      .summary {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.4rem 1rem;
+        margin-top: 0.35rem;
       }
       .controls {
         display: flex;
@@ -65,15 +89,6 @@
         gap: 0.75rem;
         align-items: center;
         margin: 1rem 0;
-      }
-      .controls input {
-        padding: 0.45rem 0.6rem;
-        border: 1px solid var(--border);
-        border-radius: 0.5rem;
-        background: var(--card);
-        color: var(--text);
-        font-size: 0.85rem;
-        min-width: 14rem;
       }
       button {
         padding: 0.45rem 0.9rem;
@@ -261,9 +276,10 @@
     <header>
       <h1>IMCP Status Dashboard</h1>
       <div class="sub">
-        Health of the IC&nbsp;MCP server and its linked Internet Identity
-        instance.
+        Health of each IC&nbsp;MCP server instance and the Internet Identity
+        instances it is linked to, side by side.
       </div>
+      <div class="summary sub" id="summary"></div>
     </header>
     <main>
       <div class="controls">
@@ -309,11 +325,15 @@
         </div>`;
       }
 
-      // Tabbed navigation: one tab per section plus a Suggestions tab. The active
-      // tab is remembered across refreshes and defaults to the first section that
-      // isn't passing, so problems surface without hunting through the tabs.
-      let lastReport = null;
-      let activeTab = null;
+      // Tabbed navigation, per instance: one tab per section plus a Suggestions
+      // tab. Each column remembers its active tab across refreshes and defaults
+      // to the first section that isn't passing, so problems surface without
+      // hunting through the tabs.
+      let lastData = null;
+      /** @type {Record<string, string>} instance name -> active tab id */
+      // Null prototype: instance names are operator-chosen, and a plain object
+      // would treat "__proto__" or "constructor" as inherited properties.
+      const activeTabs = Object.create(null);
 
       function fmtTime(epochSec) {
         if (typeof epochSec !== "number" || !isFinite(epochSec)) return "";
@@ -355,7 +375,7 @@
         return `<div class="deployment sub">Running deployment: ${inner}${redeployed}${builtStr}</div>`;
       }
 
-      function renderPanel(report) {
+      function renderPanel(report, activeTab) {
         if (activeTab === "suggestions") {
           return `<section class="card">
             <ul class="suggestions">${(report.suggestions || [])
@@ -368,75 +388,103 @@
         return `<section class="card">${sec.checks.map(renderCheck).join("")}</section>`;
       }
 
-      function render(report) {
-        lastReport = report;
-        const t = report.targets;
+      function renderInstance(inst) {
+        const name = inst.name;
+        const t = inst.targets;
 
-        const tabs = report.sections.map((s) => ({
+        const tabs = inst.sections.map((s) => ({
           id: s.id,
           title: s.title,
           status: s.status,
         }));
-        if (report.suggestions?.length) {
+        if (inst.suggestions?.length) {
           tabs.push({
             id: "suggestions",
             title: "Suggestions",
-            count: report.suggestions.length,
+            count: inst.suggestions.length,
           });
         }
-        if (!tabs.some((x) => x.id === activeTab)) {
-          const firstBad = report.sections.find((s) => s.status !== "pass");
-          activeTab = firstBad ? firstBad.id : tabs[0] && tabs[0].id;
+        if (!tabs.some((x) => x.id === activeTabs[name])) {
+          const firstBad = inst.sections.find((s) => s.status !== "pass");
+          activeTabs[name] = firstBad ? firstBad.id : tabs[0] && tabs[0].id;
         }
+        const activeTab = activeTabs[name];
 
         // One entry per II instance the server advertises at /version, so a
         // deployment serving both /mcp and /mcp-beta shows both here rather
         // than only whichever one a single field happened to hold.
-        const iiFacts = report.facts?.iiInstances ?? {};
+        const iiFacts = inst.facts?.iiInstances ?? {};
         const iiNames = Object.keys(iiFacts);
         const ii = (t.iiOrigins ?? []).length
           ? t.iiOrigins
               .map((origin, i) => {
-                const name = iiNames[i];
-                const canister = name ? iiFacts[name]?.canisterId : undefined;
+                const iiName = iiNames[i];
+                const canister = iiName ? iiFacts[iiName]?.canisterId : undefined;
                 return (
                   `<code>${esc(origin)}</code>` +
-                  (name ? ` <span class="sub">(${esc(name)})</span>` : "") +
+                  (iiName ? ` <span class="sub">(${esc(iiName)})</span>` : "") +
                   (canister ? ` <span class="sub">canister <code>${esc(canister)}</code></span>` : "")
                 );
               })
               .join(" &nbsp;·&nbsp; ")
           : `<code>(unresolved)</code>`;
-        const parts = [];
-        parts.push(`<div class="overall">
-          ${dot(report.overall)}
-          <div>
-            <div><strong>Overall: </strong>${badge(report.overall)}</div>
-            <div class="sub">MCP: <code>${esc(t.mcpOrigin)}</code> &nbsp;·&nbsp; II: ${ii}</div>
-            ${deploymentHtml(report.deployment)}
+        const probed = inst.generatedAt
+          ? ` &nbsp;·&nbsp; probed ${esc(new Date(inst.generatedAt).toLocaleTimeString())}`
+          : "";
+
+        return `<div class="instance" data-instance="${esc(name)}">
+          <h2>${esc(name)} ${badge(inst.overall)}</h2>
+          <div class="overall">
+            ${dot(inst.overall)}
+            <div>
+              <div class="sub">MCP: <code>${esc(t.mcpOrigin)}</code>${probed}</div>
+              <div class="sub">II: ${ii}</div>
+              ${deploymentHtml(inst.deployment)}
+            </div>
           </div>
-        </div>`);
-
-        parts.push(`<div class="tabs">${tabs
-          .map(
-            (x) =>
-              `<button class="tab ${x.id === activeTab ? "active" : ""}" data-tab="${esc(x.id)}">${x.status ? dot(x.status) : ""}<span>${esc(x.title)}</span>${x.status ? badge(x.status) : `<span class="count">(${x.count})</span>`}</button>`,
-          )
-          .join("")}</div>`);
-
-        parts.push(renderPanel(report));
-
-        $("content").innerHTML = parts.join("");
-        $("updated").textContent =
-          "updated " + new Date(report.generatedAt).toLocaleTimeString();
+          <div class="tabs">${tabs
+            .map(
+              (x) =>
+                `<button class="tab ${x.id === activeTab ? "active" : ""}" data-tab="${esc(x.id)}">${x.status ? dot(x.status) : ""}<span>${esc(x.title)}</span>${x.status ? badge(x.status) : `<span class="count">(${x.count})</span>`}</button>`,
+            )
+            .join("")}</div>
+          ${renderPanel(inst, activeTab)}
+        </div>`;
       }
 
-      // Tab clicks re-render from the cached report (no refetch).
+      // The API serves an envelope of instances. A single-instance report (an
+      // older server behind a newer page, mid-deploy) is wrapped so the page
+      // still renders it as one column.
+      function toInstances(data) {
+        if (Array.isArray(data.instances)) return data.instances;
+        let name = "instance";
+        try {
+          name = new URL(data.targets.mcpOrigin).hostname;
+        } catch {}
+        return [{ name, ...data }];
+      }
+
+      function render(data) {
+        lastData = data;
+        const instances = toInstances(data);
+        $("summary").innerHTML = instances
+          .map((i) => `<span>${dot(i.overall)} ${esc(i.name)} ${badge(i.overall)}</span>`)
+          .join("");
+        $("content").innerHTML =
+          `<div class="instances">${instances.map(renderInstance).join("")}</div>`;
+        const at = data.generatedAt ?? instances[0]?.generatedAt;
+        $("updated").textContent = at
+          ? "updated " + new Date(at).toLocaleTimeString()
+          : "";
+      }
+
+      // Tab clicks re-render from the cached data (no refetch).
       $("content").addEventListener("click", (e) => {
         const tab = e.target.closest(".tab");
-        if (tab && lastReport) {
-          activeTab = tab.dataset.tab;
-          render(lastReport);
+        const column = e.target.closest(".instance");
+        if (tab && column && lastData) {
+          activeTabs[column.dataset.instance] = tab.dataset.tab;
+          render(lastData);
         }
       });
 
@@ -451,7 +499,7 @@
         btn.disabled = true;
         btn.textContent = "Refreshing…";
         try {
-          // Targets are fixed by the server at startup (the server does not
+          // Instances are fixed by the server at startup (the server does not
           // accept per-request targets), so no target params are sent.
           // Path-relative so the dashboard works both at the site root and
           // when mounted under a sub-path (e.g. behind Caddy at /status/).

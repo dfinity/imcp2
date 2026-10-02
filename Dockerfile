@@ -1,5 +1,5 @@
-# Multi-stage build for the MCP server. The WASM Candid codec under static/wasm
-# is prebuilt and committed, so no wasm toolchain is needed here.
+# Multi-stage build for the MCP server. Everything the binary serves is
+# compiled in via include_str!, so the runtime image carries only the binary.
 FROM rust:1-slim-bookworm AS build
 WORKDIR /app
 # GIT_SHA / BUILD_TIME are baked into the binary (option_env! in main.rs) and
@@ -11,8 +11,9 @@ ENV GIT_SHA=${GIT_SHA}
 ENV BUILD_TIME=${BUILD_TIME}
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-# static/ is needed at build time too: tools.rs include_str!s the candid/OQL references.
-COPY static ./static
+# The workspace member crates (imcp2-core carries the tool surface and its
+# compiled-in candid/OQL references under crates/imcp2-core/static).
+COPY crates ./crates
 RUN cargo build --release
 
 FROM debian:bookworm-slim
@@ -21,8 +22,6 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/target/release/imcp2 /usr/local/bin/imcp2
-# Static assets (signing frontend + WASM codec) are served relative to the workdir.
-COPY static ./static
 # See deploy/native/imcp2.service: the per-request log line is debug-level, and
 # is worth keeping on a deployed host.
 ENV RUST_LOG=info,imcp2::metrics=debug

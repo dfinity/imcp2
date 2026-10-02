@@ -1,0 +1,8 @@
+{
+  "name": "imcp2-mcpb-cli",
+  "private": true,
+  "description": "The MCPB CLI that .github/scripts/build-mcpb.sh packs the Claude Desktop bundle with. package-lock.json pins its whole dependency tree, integrity hashes included; the script installs it with `npm ci --ignore-scripts`.",
+  "dependencies": {
+    "@anthropic-ai/mcpb": "2.1.2"
+  }
+}

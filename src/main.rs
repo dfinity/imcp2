@@ -1,7 +1,8 @@
 //! Deployment binary for the [`imcp2`] library: serves the production Internet
-//! Identity instance at `/mcp` and adds the deployment niceties (the landing
-//! page, a `/version` probe with live-session gauges, request logging,
-//! env-driven config, drained graceful shutdown).
+//! Identity instance at `/mcp` and adds the deployment niceties (permanent
+//! redirects to the landing site's home on internetcomputer.org, a `/version`
+//! probe with live-session gauges, request logging, env-driven config, drained
+//! graceful shutdown).
 //!
 //!   * `/mcp`: the MCP endpoint against **production** Internet Identity, with
 //!     its OAuth AS at `/mcp/oauth/*` (issuer `<PUBLIC_URL>/mcp`). Always
@@ -22,11 +23,14 @@
 //! `$OPENAI_APPS_CHALLENGE_TOKEN` (serve the OpenAI Apps domain-verification
 //! token at `/.well-known/openai-apps-challenge`; 404 while unset).
 //!
-//! Also serves `/sitemap.xml` and `/robots.txt`, both built from `$PUBLIC_URL`
-//! so each deployment advertises its own origin.
+//! Also serves `/robots.txt` (keeping crawlers off the machine surface) and
+//! `/favicon.svg` (the tab icon the connect screens link).
 
-use axum::{response::Html, routing::get, Json, Router};
-use imcp2::{auth_callbacks_router, Agent, IiInstance, McpConfig, McpServer, SharedClients, IC_URL};
+use axum::{routing::get, Json, Router};
+use imcp2::{
+    auth_callbacks_router, ii_app_metadata_router, Agent, IiInstance, McpConfig, McpServer,
+    SharedClients, IC_URL,
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Bind address. Honours `$PORT` (set by most PaaS), defaulting to 8000.
@@ -38,6 +42,17 @@ fn bind_address() -> String {
 /// Public base URL clients use to reach this server. Override with PUBLIC_URL.
 fn public_url() -> String {
     std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
+}
+
+/// Directory imcp2 creates its operational files in (today: the persisted
+/// client-registration store). Set with `IMCP2_STATE_DIR`; defaults to the
+/// process's current working directory, so a bare local run keeps
+/// `oauth-clients.json` under the directory it was launched from, as before. The
+/// native deployment points it at the unit's `StateDirectory` (`/var/lib/imcp2`).
+fn state_dir() -> std::path::PathBuf {
+    std::env::var_os("IMCP2_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
 /// Whether to enforce strict RFC 8707 resource indicators: require a `resource`
@@ -64,6 +79,24 @@ fn serve_beta() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether to advertise and accept Client ID Metadata Documents, the
+/// registration mode Claude and ChatGPT prefer over DCR. **On by default**; a
+/// falsey `$OAUTH_CIMD_ENABLED` (`0`/`false`/`no`/`off`) switches it off. Read
+/// once and handed to every instance, so switching means setting it and
+/// redeploying.
+///
+/// TODO: remove the variable (pass `true` to every instance) once CIMD has run
+/// in production for a while; it exists only as a kill switch for the roll-out.
+fn cimd_enabled() -> bool {
+    cimd_enabled_by(std::env::var("OAUTH_CIMD_ENABLED").ok().as_deref())
+}
+
+fn cimd_enabled_by(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+    })
+}
+
 /// Whether to serve the Prometheus exposition at `/metrics`. Off unless
 /// `$MCP_SERVE_METRICS` is truthy (`1`/`true`/`yes`/`on`).
 ///
@@ -79,16 +112,41 @@ fn serve_metrics() -> bool {
         .unwrap_or(false)
 }
 
-/// The landing page served at `/`: a self-contained design bundle exported from
-/// Claude Design (`assets/index.html`, compiled in via `include_str!`, no
-/// runtime file I/O). It is a single HTML document that inlines its own fonts,
-/// images, styles, and render runtime as an embedded resource bundle and unpacks
-/// itself client-side — so it stays self-contained (no external fonts, scripts,
-/// or images) despite the richer look. It shares the connect flow's ICP identity
-/// — parchment grid, editorial serif, rust accent, "Hosted by DFINITY" mark — so
-/// the root page and the connect screens read as one product, and walks through
-/// what an agent can do: discovery, identity, on-network queries, actions, skills.
-const INDEX_HTML: &str = include_str!("assets/index.html");
+/// The landing site's home. The human-facing pages this origin used to serve
+/// itself — the landing page and its `/privacy-policy`, `/support` and
+/// `/terms` subpages — are maintained in one place, dfinity/internetcomputer-org
+/// (`public/icp-mcp/`), and served at internetcomputer.org under this prefix.
+/// This origin answers their old paths with permanent redirects instead of
+/// copies, so every published link keeps working — the directory listings'
+/// policy URLs, old bookmarks, search results — while the content exists
+/// exactly once. `/status/` is not among them and is not redirected here: the
+/// status dashboard is published by the fronting proxy on staging only (see
+/// `SERVE_STATUS` in deploy/native); production's origin does not publish it,
+/// and the public status surface is status.internetcomputer.org.
+const LANDING_SITE: &str = "https://internetcomputer.org/icp-mcp";
+
+/// The page paths this origin used to serve, each answered with a permanent
+/// redirect (308) to its home under [`LANDING_SITE`]. The targets carry the
+/// trailing slash the static site canonicalizes to, so a client lands in one
+/// hop.
+fn landing_redirects_router() -> Router {
+    const PAGES: &[(&str, &str)] = &[
+        ("/", "/"),
+        ("/privacy-policy", "/privacy-policy/"),
+        ("/support", "/support/"),
+        ("/terms", "/terms/"),
+    ];
+    let mut router = Router::new();
+    for (path, target) in PAGES {
+        router = router.route(
+            path,
+            get(move || async move {
+                axum::response::Redirect::permanent(&format!("{LANDING_SITE}{target}"))
+            }),
+        );
+    }
+    router
+}
 
 /// `GET /metrics` — the Prometheus exposition for `registry`. Its own router so
 /// the gate stays one line at the call site (see [`serve_metrics`]) and the
@@ -145,93 +203,46 @@ fn metrics_router(registry: prometheus::Registry, metrics: imcp2::metrics::Metri
     )
 }
 
-/// The public, human-facing pages this origin serves, as absolute-path
-/// suffixes. This is the sitemap's and robots.txt's shared idea of "content":
-/// every other route is machine surface that a crawler has no use for and that
-/// we do not want indexed — `/mcp` (+ `/mcp-beta`) answer 401 to an
-/// unauthenticated fetch, `/version` is an operations probe, `/status/` is the
-/// dashboard, and `/.well-known/*` documents are for clients, not readers.
-/// Keep in step with the page routes registered in `main`.
-const PUBLIC_PAGES: &[&str] = &["/", "/privacy-policy", "/terms", "/support"];
+/// The tab icon, from forumic.com: the ICP infinity mark on transparency, so it
+/// reads against both the light and dark browser chrome.
+const FAVICON_SVG: &str = include_str!("assets/favicon.svg");
 
-/// Escape the five XML metacharacters. `PUBLIC_URL` is operator-supplied, so a
-/// stray `&` in it must not produce a malformed sitemap that a crawler rejects
-/// wholesale.
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
+/// `GET /robots.txt` — keeps crawlers off the machine surface. Nothing here is
+/// a security control: the paths it names are already either authenticated or
+/// harmless, and robots.txt is advisory. There is no sitemap any more — the
+/// human-facing pages moved to [`LANDING_SITE`] and this origin answers their
+/// paths with redirects a crawler may follow — so this exists purely so the
+/// MCP and probe endpoints stay out of search results.
+const ROBOTS_TXT: &str = "User-agent: *\n\
+    Allow: /\n\
+    Disallow: /mcp\n\
+    Disallow: /mcp-beta\n\
+    Disallow: /version\n\
+    Disallow: /status/\n\
+    Disallow: /.well-known/\n";
 
-/// `GET /sitemap.xml` — a [sitemaps.org] 0.9 urlset naming the public pages.
-///
-/// The entries must be absolute, so they are built from `PUBLIC_URL` at
-/// startup rather than baked in: staging and production then each advertise
-/// their own origin instead of both claiming production's. A trailing slash on
-/// the configured value is trimmed so the joins can't yield `//privacy-policy`.
-///
-/// Deliberately `<loc>`-only: `<lastmod>` would have to come from build time,
-/// which changes on every redeploy whether or not a page did, and `changefreq`
-/// and `priority` are ignored by the major crawlers.
-///
-/// [sitemaps.org]: https://www.sitemaps.org/protocol.html
-fn sitemap_xml(public_url: &str) -> String {
-    let origin = xml_escape(public_url.trim_end_matches('/'));
-    let urls: String = PUBLIC_PAGES
-        .iter()
-        .map(|p| format!("  <url><loc>{origin}{}</loc></url>\n", if *p == "/" { "/" } else { p }))
-        .collect();
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n\
-         {urls}</urlset>\n"
-    )
-}
-
-/// `GET /robots.txt` — points crawlers at the sitemap (its only discovery
-/// path, short of submitting it to each search console by hand) and keeps them
-/// off the machine surface. Nothing here is a security control: the paths it
-/// names are already either authenticated or harmless, and robots.txt is
-/// advisory. It exists so crawl budget goes to the four pages that are worth
-/// reading and so the MCP and probe endpoints stay out of search results.
-fn robots_txt(public_url: &str) -> String {
-    let origin = public_url.trim_end_matches('/');
-    format!(
-        "User-agent: *\n\
-         Allow: /\n\
-         Disallow: /mcp\n\
-         Disallow: /mcp-beta\n\
-         Disallow: /version\n\
-         Disallow: /status/\n\
-         Disallow: /.well-known/\n\
-         \n\
-         Sitemap: {origin}/sitemap.xml\n"
-    )
-}
-
-/// Serve `/sitemap.xml` and `/robots.txt` for the given public origin, each
-/// with the content type its consumers expect (`application/xml` and
-/// `text/plain`).
-fn site_metadata_router(public_url: &str) -> Router {
-    let sitemap = sitemap_xml(public_url);
-    let robots = robots_txt(public_url);
+/// Serve `/robots.txt` and `/favicon.svg`, each with the content type its
+/// consumers expect (`text/plain` and `image/svg+xml`). The favicon stays
+/// served with the landing pages gone: the connect and error screens link
+/// `/favicon.svg` for their tab icon.
+fn site_metadata_router() -> Router {
     Router::new()
         .route(
-            "/sitemap.xml",
-            get(move || {
-                let sitemap = sitemap.clone();
-                async move { ([(axum::http::header::CONTENT_TYPE, "application/xml")], sitemap) }
+            "/favicon.svg",
+            get(|| async {
+                (
+                    [
+                        (axum::http::header::CONTENT_TYPE, "image/svg+xml"),
+                        (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+                    ],
+                    FAVICON_SVG,
+                )
             }),
         )
         .route(
             "/robots.txt",
-            get(move || {
-                let robots = robots.clone();
-                async move {
-                    ([(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], robots)
-                }
+            get(|| async {
+                ([(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], ROBOTS_TXT)
             }),
         )
 }
@@ -265,46 +276,6 @@ fn openai_apps_challenge_router(token: Option<String>) -> Router {
     )
 }
 
-/// The privacy policy served at `/privacy-policy` — the URL the Anthropic
-/// connectors-directory listing points at, and the target of the landing
-/// page's footer link. The markup lives in
-/// `assets/privacy-policy.html` (compiled in via `include_str!`, no runtime
-/// file I/O) and shares the connect flow's ICP identity so it reads as the
-/// same product. Its one substitution is the shared DFINITY wordmark
-/// (`assets/dfinity-logo.svg`), inlined once on first use so the served page
-/// stays fully self-contained (no external fonts, scripts, or images).
-const PRIVACY_POLICY_HTML: &str = include_str!("assets/privacy-policy.html");
-const DFINITY_LOGO_SVG: &str = include_str!("assets/dfinity-logo.svg");
-
-fn privacy_policy_page() -> &'static str {
-    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PAGE.get_or_init(|| PRIVACY_POLICY_HTML.replace("__LOGO__", DFINITY_LOGO_SVG))
-}
-
-/// The support page served at `/support` — the customer-support URL the
-/// directory listings (OpenAI requires a URL, not just an address) point at.
-/// Same construction as `/privacy-policy`: a self-contained document sharing
-/// the connect flow's ICP identity, with the DFINITY wordmark as its one
-/// substitution. It routes users to mcp@dfinity.org, the status dashboard,
-/// id.ai's access management, GitHub issues, and the security policy.
-const SUPPORT_HTML: &str = include_str!("assets/support.html");
-
-fn support_page() -> &'static str {
-    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PAGE.get_or_init(|| SUPPORT_HTML.replace("__LOGO__", DFINITY_LOGO_SVG))
-}
-
-/// The Terms of Service served at `/terms` — the terms URL the directory
-/// listings point at, and the usage contract the privacy policy's
-/// performance-of-service legal basis rests on. Same construction as
-/// `/privacy-policy` and `/support`.
-const TERMS_HTML: &str = include_str!("assets/terms.html");
-
-fn terms_page() -> &'static str {
-    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PAGE.get_or_init(|| TERMS_HTML.replace("__LOGO__", DFINITY_LOGO_SVG))
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // When this process started — i.e. when the deployment last (re)started.
@@ -329,9 +300,20 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("built ic-agent against {IC_URL}");
     let public_url = public_url();
 
+    // The directory all operational files live in (the client-registration
+    // store today). One place, injected into every instance's McpConfig.
+    let state_dir = state_dir();
+
     // Dynamic client registrations are II-agnostic (redirect allow-list only),
-    // so all instances share one store (and one persisted snapshot).
-    let clients = SharedClients::load();
+    // so all instances share one store (and one persisted snapshot), loaded from
+    // the operational directory.
+    let clients = SharedClients::load(&state_dir);
+
+    // Client ID Metadata Documents: on for every instance unless the deploy says no.
+    let cimd_on = cimd_enabled();
+    if !cimd_on {
+        tracing::warn!("OAUTH_CIMD_ENABLED is off: Client ID Metadata Documents are disabled");
+    }
 
     // Production Internet Identity at `/mcp`: always served, and the origin's
     // default instance (it answers the plain-root discovery probes). A
@@ -342,7 +324,9 @@ async fn main() -> anyhow::Result<()> {
         public_url: public_url.clone(),
         mcp_path: "/mcp".into(),
         clients: clients.clone(),
+        state_dir: state_dir.clone(),
         require_resource: require_resource(),
+        cimd_enabled: cimd_on,
     });
     prod.spawn_session_reaper();
 
@@ -355,7 +339,9 @@ async fn main() -> anyhow::Result<()> {
             public_url: public_url.clone(),
             mcp_path: "/mcp-beta".into(),
             clients,
+            state_dir,
             require_resource: require_resource(),
+            cimd_enabled: cimd_on,
         });
         beta.spawn_session_reaper();
         Some(beta)
@@ -410,10 +396,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut app = Router::new()
-        .route("/", get(|| async { Html(INDEX_HTML) }))
-        .route("/privacy-policy", get(|| async { Html(privacy_policy_page()) }))
-        .route("/support", get(|| async { Html(support_page()) }))
-        .route("/terms", get(|| async { Html(terms_page()) }))
+        // The old landing-site paths: permanent redirects to their one home.
+        .merge(landing_redirects_router())
         // Unauthenticated build/version probe so operators and the status
         // dashboard can confirm exactly which deployment is live: the running
         // commit (baked in at build time via GIT_SHA), the build time
@@ -476,11 +460,9 @@ async fn main() -> anyhow::Result<()> {
         .merge(prod.root_well_known_router())
         // OpenAI Apps domain verification: inert (404) until
         // $OPENAI_APPS_CHALLENGE_TOKEN is set for a directory submission.
-        .merge(openai_apps_challenge_router(
-            std::env::var("OPENAI_APPS_CHALLENGE_TOKEN").ok(),
-        ))
-        // /sitemap.xml + /robots.txt, built from this deployment's PUBLIC_URL.
-        .merge(site_metadata_router(&public_url));
+        .merge(openai_apps_challenge_router(std::env::var("OPENAI_APPS_CHALLENGE_TOKEN").ok()))
+        // /robots.txt + /favicon.svg (the icon the connect screens link).
+        .merge(site_metadata_router());
 
     // Prometheus exposition, only when $MCP_SERVE_METRICS opts in — see
     // `serve_metrics()`. The recording middleware below stays on either way, so
@@ -497,15 +479,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Staging additionally serves the beta II instance at `/mcp-beta`.
     if let Some(beta) = &beta {
-        app = app
-            .nest_service(beta.mcp_path(), beta.mcp_router())
-            .merge(beta.well_known_router());
+        app = app.nest_service(beta.mcp_path(), beta.mcp_router()).merge(beta.well_known_router());
     }
 
     // The II auth-callback allow-list is origin-global: one document declares
     // every served instance's callbacks (prod always, beta only on staging).
+    // So is the app-metadata document, which names this origin on II's screens.
     let app = app
         .merge(auth_callbacks_router(&servers))
+        .merge(ii_app_metadata_router())
         // Request metrics and a per-request debug log line, as separate layers so
         // an embedder can take either alone. The log keeps the full path (never
         // the query string); the metrics bound every label — see imcp2::metrics.
@@ -513,9 +495,7 @@ async fn main() -> anyhow::Result<()> {
             metrics.clone(),
             imcp2::metrics::write_request_metrics,
         ))
-        .layer(axum::middleware::from_fn(
-            imcp2::metrics::write_request_logs,
-        ));
+        .layer(axum::middleware::from_fn(imcp2::metrics::write_request_logs));
 
     let bind = bind_address();
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -539,9 +519,7 @@ async fn main() -> anyhow::Result<()> {
     // serve error (accept failure, etc.) still cancels the tokens before the
     // error propagates. (Stateless, no long-lived SSE, so there's nothing for
     // the tokens to cut post-drain.)
-    let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
+    let serve_result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await;
     prod.shutdown();
     if let Some(beta) = &beta {
         beta.shutdown();
@@ -588,12 +566,26 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        metrics_router, openai_apps_challenge_router, serve_metrics, site_metadata_router,
-        sitemap_xml, PUBLIC_PAGES,
+        landing_redirects_router, metrics_router, openai_apps_challenge_router, serve_metrics,
+        site_metadata_router,
     };
+
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// `OAUTH_CIMD_ENABLED`'s reading: on unless it says off.
+    #[test]
+    fn cimd_opt_out_values() {
+        use super::cimd_enabled_by;
+        let on = [None, Some(""), Some(" "), Some("1"), Some("true"), Some("yes"), Some("on")];
+        for value in on.into_iter().chain([Some("disabled"), Some("2")]) {
+            assert!(cimd_enabled_by(value), "{value:?} should leave CIMD on");
+        }
+        for value in [Some("0"), Some("false"), Some("No"), Some("OFF"), Some(" 0 ")] {
+            assert!(!cimd_enabled_by(value), "{value:?} should switch CIMD off");
+        }
+    }
 
     /// The exposition must be **off** unless asked for, and the ask must be
     /// explicit. This is the security-relevant half of the gate: the native host
@@ -659,8 +651,8 @@ mod tests {
         assert!(body.contains("imcp2_metrics_scrape_duration_seconds_count 1"), "{body}");
     }
 
-    async fn fetch(public_url: &str, path: &str) -> (StatusCode, String, Option<String>) {
-        let resp = site_metadata_router(public_url)
+    async fn fetch(path: &str) -> (StatusCode, String, Option<String>) {
+        let resp = site_metadata_router()
             .oneshot(Request::get(path).body(axum::body::Body::empty()).unwrap())
             .await
             .unwrap();
@@ -671,57 +663,59 @@ mod tests {
         (status, String::from_utf8(body.to_vec()).unwrap(), content_type)
     }
 
-    // Every public page must appear exactly once, as an ABSOLUTE url on the
-    // configured origin: a sitemap of relative paths, or one naming another
-    // deployment's origin, is rejected or ignored by crawlers.
+    // With the pages moved out, robots.txt only keeps crawlers off the machine
+    // surface — and must no longer advertise a sitemap this origin doesn't
+    // serve.
     #[tokio::test]
-    async fn sitemap_lists_every_public_page_as_an_absolute_url() {
-        let (status, body, content_type) =
-            fetch("https://mcp.internetcomputer.org", "/sitemap.xml").await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(content_type.as_deref(), Some("application/xml"));
-        for page in PUBLIC_PAGES {
-            let loc = format!("<loc>https://mcp.internetcomputer.org{page}</loc>");
-            assert_eq!(body.matches(&loc).count(), 1, "{page} should appear once in:\n{body}");
-        }
-        assert_eq!(body.matches("<loc>").count(), PUBLIC_PAGES.len());
-        // The machine surface stays out: these must never be advertised.
-        for hidden in ["/version", "/status/", "/.well-known", "/mcp<", "/mcp-beta"] {
-            assert!(!body.contains(hidden), "sitemap must not list {hidden}:\n{body}");
-        }
-    }
-
-    // A trailing slash on PUBLIC_URL must not produce `//privacy-policy`, and
-    // the root entry must stay exactly one slash.
-    #[tokio::test]
-    async fn sitemap_normalizes_a_trailing_slash_on_the_public_url() {
-        let body = sitemap_xml("https://example.test/");
-        assert!(body.contains("<loc>https://example.test/</loc>"));
-        assert!(body.contains("<loc>https://example.test/terms</loc>"));
-        assert!(!body.contains("//terms"));
-    }
-
-    // An operator-supplied origin is escaped, so a stray metacharacter cannot
-    // emit a malformed document that a crawler discards wholesale.
-    #[tokio::test]
-    async fn sitemap_escapes_xml_metacharacters_in_the_origin() {
-        let body = sitemap_xml("https://example.test/?a=1&b=2");
-        assert!(body.contains("&amp;b=2"), "{body}");
-        assert!(!body.contains("&b=2"));
-    }
-
-    // robots.txt is the sitemap's only discovery path for a crawler that was
-    // never handed the URL directly, so the absolute reference must be there.
-    #[tokio::test]
-    async fn robots_points_at_the_sitemap_and_excludes_the_machine_surface() {
-        let (status, body, content_type) =
-            fetch("https://mcp.internetcomputer.org/", "/robots.txt").await;
+    async fn robots_excludes_the_machine_surface_and_names_no_sitemap() {
+        let (status, body, content_type) = fetch("/robots.txt").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(content_type.as_deref(), Some("text/plain; charset=utf-8"));
-        assert!(body.contains("Sitemap: https://mcp.internetcomputer.org/sitemap.xml"), "{body}");
         for path in ["/mcp", "/mcp-beta", "/version", "/status/", "/.well-known/"] {
             assert!(body.contains(&format!("Disallow: {path}\n")), "{path} missing:\n{body}");
         }
+        assert!(!body.contains("Sitemap:"), "no sitemap is served any more:\n{body}");
+    }
+
+    // Every page this origin used to serve itself answers with a permanent
+    // redirect to its one home on the landing site — canonical trailing-slash
+    // form, so a client lands in one hop. The absolute targets are pinned: a
+    // typo'd LANDING_SITE would otherwise ship a working-looking 308 to
+    // nowhere.
+    #[tokio::test]
+    async fn old_page_paths_redirect_permanently_to_the_landing_site() {
+        for (path, target) in [
+            ("/", "https://internetcomputer.org/icp-mcp/"),
+            ("/privacy-policy", "https://internetcomputer.org/icp-mcp/privacy-policy/"),
+            ("/support", "https://internetcomputer.org/icp-mcp/support/"),
+            ("/terms", "https://internetcomputer.org/icp-mcp/terms/"),
+        ] {
+            let resp = landing_redirects_router()
+                .oneshot(Request::get(path).body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT, "{path}");
+            let location =
+                resp.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or("");
+            assert_eq!(location, target, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn favicon_is_served_as_a_cacheable_svg() {
+        let resp = site_metadata_router()
+            .oneshot(Request::get("/favicon.svg").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let header = |n: &str| resp.headers().get(n).map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(header("content-type").as_deref(), Some("image/svg+xml"));
+        assert_eq!(header("cache-control").as_deref(), Some("public, max-age=86400"));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let svg = String::from_utf8(body.to_vec()).unwrap();
+        assert!(svg.contains("<svg"), "{svg}");
+        // Transparent, so the browser's own chrome shows through in either theme.
+        assert!(!svg.contains("<rect"), "the mark must stay transparent: {svg}");
     }
 
     async fn challenge(token: Option<&str>) -> (StatusCode, String, Option<String>) {
@@ -735,10 +729,8 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .map(|v| v.to_str().unwrap().to_string());
+        let content_type =
+            resp.headers().get("content-type").map(|v| v.to_str().unwrap().to_string());
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8(body.to_vec()).unwrap(), content_type)
     }

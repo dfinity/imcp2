@@ -1,0 +1,18 @@
+# Formatting configuration for the workspace. Checked in so that the
+# `cargo fmt --all` step CONTRIBUTING.md asks for produces the style already in
+# the tree, instead of a whole-repo reformat: with no config, rustfmt's stock
+# `fn_call_width`/`chain_width` of 60 split calls and method chains that this
+# codebase keeps on one line, which turned the documented pre-PR step into
+# thousands of lines of unrelated diff.
+
+# The column budget the code is written to. This is also rustfmt's default, but
+# it is stated explicitly because `use_small_heuristics` below derives every
+# per-construct width from it — the two settings are one decision.
+max_width = 100
+
+# Let calls, method chains, struct literals and array literals use the whole
+# 100-column budget rather than the stock 60. This is the tree's prevailing
+# style: single-line chains such as
+# `self.requests.with_label_values(&[route, method, &status]).inc();` stay
+# intact instead of being split across three lines.
+use_small_heuristics = "Max"

@@ -21,13 +21,22 @@
   }
 }
 __DOMAIN__ {
-  # Status dashboard (internal Node service on :8137), published under /status/.
+  # Status dashboard (internal Node service on :8137), published under /status/
+  # on STAGING ONLY. deploy.sh keeps the block between the two STATUS marker
+  # comment lines below when SERVE_STATUS is set (deploy-native.yml sets it
+  # for the staging environment) and deletes it otherwise, so production does
+  # not publish the dashboard at its origin: the public status surface is
+  # status.internetcomputer.org, which the dashboard's Statuspage pusher feeds.
+  # The imcp-status service itself still runs on every host (see deploy.sh);
+  # only its exposure at /status/ is staging-only.
   # handle_path strips the /status prefix, so the dashboard sees /, /api/status,
   # etc. as if mounted at the root; its assets are loaded path-relative.
+  # __STATUS_BEGIN__
   redir /status /status/ 308
   handle_path /status/* {
     reverse_proxy 127.0.0.1:8137
   }
+  # __STATUS_END__
 
   # The app serves /metrics on its own port (imcp2.service sets
   # MCP_SERVE_METRICS=1); a scraper reaches it on the host's private address.

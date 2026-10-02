@@ -1,19 +1,44 @@
 # ICP MCP Privacy Policy (source text)
 
 > This is the source text for the page served at
-> `https://mcp.internetcomputer.org/privacy-policy`
-> (`src/assets/privacy-policy.html`). Keep the two in sync: the served page is
+> `https://internetcomputer.org/icp-mcp/privacy-policy/`
+> (dfinity/internetcomputer-org, `public/icp-mcp/privacy-policy/index.html`;
+> the old `https://mcp.internetcomputer.org/privacy-policy` permanently
+> redirects there). Keep the two in sync: the served page is
 > what users and directory reviews actually see. Technical claims are drawn
 > from this repository's behaviour; re-verify them against the deployed
 > release whenever the policy is republished (and update section 3 if the
 > hosting region ever changes). Operational and review notes are maintained
 > outside this repository.
+>
+> **Pending legal review (2026-09-01, #174):** two write-gate wording updates
+> below bring this source text up to #166's behaviour — every state-changing
+> call now fetches the target application's published declarations first.
+> They are the widened trigger "Websites you ask the Service to look up, or
+> act on" (section 2) and the action-reach clarification under "The
+> authorization is not restricted to particular applications". Both replace
+> legally reviewed sentences, so the served page must not be updated to them
+> until legal signs them off.
+>
+> **Hosting model to re-verify before the next republication (2026-09-01,
+> #122):** the public origin `mcp.internetcomputer.org` is now fronted by
+> Internet Computer HTTP-gateway infrastructure, which terminates TLS for
+> client connections (observed 2026-09-01: the origin resolves to
+> gateway-fleet addresses registered to DFINITY Stiftung and serves the
+> gateway fleet's certificate; only the MCP and OAuth paths reach the
+> application, other paths answer with redirects at that edge). Sections 2
+> ("Our hosting provider"), 3 and 5 still describe the application host alone
+> (Amazon Web Services in Frankfurt, our web server's logging posture, the
+> hosts' journal). Whether the application host itself moved, and what the
+> fronting layer logs and where, is operator knowledge this repository does
+> not hold — reconcile those sections with the operators and legal before
+> republishing.
 
 ---
 
 ## ICP MCP Privacy Policy
 
-**Effective Date: August 3, 2026**
+**Effective Date: August 28, 2026**
 
 We, DFINITY Stiftung, Genferstrasse 11, 8002 Zürich, Switzerland ("DFINITY
 Foundation") disclose in this ICP MCP Privacy Policy ("Privacy Policy") how we
@@ -84,8 +109,13 @@ rejects action requests; the restriction does not depend on the Service alone.
 **The authorization is not restricted to particular applications.** Whichever
 level you choose applies to any application your assistant is directed to: the
 Service derives a per-application identity on demand for whichever application
-is named at the time. Combined with a duration of up to 30 days, that is a
-broad credential, so choose the shortest duration that suits your task, and
+is named at the time. That describes the credential, not an unlimited reach
+for actions: an action that changes state reaches only an application whose
+operator has published the standard declaration naming the services it exposes
+(see "Websites you ask the Service to look up, or act on" in section 2), and
+it is signed with the identity derived for that application alone. Even so,
+combined with a duration of up to 30 days the authorization is a broad
+credential, so choose the shortest duration that suits your task, and
 revoke connections you are no longer using at
 [id.ai/manage/settings](https://id.ai/manage/settings).
 
@@ -138,9 +168,7 @@ keeps, for the remainder of the session: the application's domain, the
 account number used, the per-application key it generated, and Internet
 Identity's signed authorization for that application (itself valid for at
 most one hour). Keeping this avoids re-deriving an authorization on every
-call to the same application. The Service's own origin is treated as one
-such application when you use the canister-management tools, and the
-identity derived for it is stable across your connections. All of this is
+call to the same application. All of this is
 held in memory only, bounded in size, and discarded when the session ends or
 the Service restarts. Legal basis: performance of the service you requested.
 
@@ -189,13 +217,15 @@ retains, or publishes is governed by that application, not by this Privacy
 Policy, and may be publicly accessible. Actions that change state become part
 of that application's state on a public network.
 
-**Websites you ask the Service to look up.** When you ask it to find the
-application behind a web address, the Service fetches metadata from that
-address, which discloses the request to whoever runs that site.
+**Websites you ask the Service to look up, or act on.** When you ask it to
+find the application behind a web address, and again when you ask it to act
+at an application, the Service fetches metadata from that application's web
+address — for an action, the application's published service declarations
+and identity configuration, read before the action is submitted — which
+discloses the request to whoever runs that site.
 
-**Two services DFINITY Foundation operates**: the public canister-metadata
-service at `dashboard.internetcomputer.org` and the developer-skills service
-at `skills.internetcomputer.org`.
+**A service DFINITY Foundation operates**: the public canister-metadata
+service at `dashboard.internetcomputer.org`.
 
 **Our hosting provider.** The Service runs on servers we rent from Amazon Web
 Services, which processes data on our behalf as a processor under its
@@ -289,10 +319,11 @@ Internet Identity gives each application a different identity for you, so
 applications cannot recognise you across applications. The Service is a
 participant in that design and we want to be plain about what it can see.
 While a session is live it holds, in memory, the per-application identities
-it has derived for you, including a stable identity for you at its own
-origin that the canister-management tools act as; software holding that
-stable identity could in principle associate separate sessions with the same
-user. Three things limit that in practice: none of these identifiers is
+it has derived for you. Internet Identity derives the same identity each time
+for a given application and account, so software holding one of them could in
+principle tell that two separate sessions visiting that application belong to
+the same user. Three things limit what the Service could link
+in practice: none of these identifiers is
 written to logs, which carry only a per-connection identifier that is new
 for every connection (section 5); the applications you visit are not written
 to logs either; and nothing the Service discloses to an application lets

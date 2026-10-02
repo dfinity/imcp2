@@ -1,9 +1,8 @@
 # Reusable native deploy: cross-build the binary for inputs.arch (arm64 or amd64),
-# then ship it over SSH and (re)start the systemd services. Called by deploy.yml
-# (main -> staging) and deploy-release.yml (release-* tags -> production). Each
-# caller supplies its own environment, runner labels and architecture; the release
-# caller additionally pins an explicit ref, so a rollback can name an earlier tag.
-# See deploy/native/README.md.
+# then ship it over SSH and (re)start the systemd services. Called by
+# deploy-candidate.yml (rc-* tags -> staging), which supplies the environment,
+# runner labels and architecture, and on a manual run pins an explicit ref so a
+# rollback can name an earlier tag. See deploy/native/README.md.
 #
 # Split into two jobs on purpose:
 #
@@ -99,10 +98,9 @@ jobs:
     # Amazon Linux 2023 compatibility regardless of architecture.
     runs-on: ${{ fromJSON(inputs.build_runs_on) }}
     steps:
-      # Where a commit SHA appears below, the action is pinned against tag movement
-      # (supply-chain hardening) and the trailing comment records the readable
-      # version. actions/{setup-node,upload-artifact,download-artifact} still float
-      # on their major tag; pin them the same way when their SHAs are to hand.
+      # Every third-party action below is pinned to a commit SHA against tag
+      # movement (supply-chain hardening), and the trailing comment records the
+      # readable version.
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -112,7 +110,7 @@ jobs:
       # network-free, and the dashboard is shipped (and run as a systemd service)
       # by deploy.sh, so a regression here should stop the rollout.
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
 
@@ -139,7 +137,7 @@ jobs:
         run: deploy/native/build.sh
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: imcp2-binary
           path: build-out/imcp2
@@ -158,8 +156,8 @@ jobs:
     environment: ${{ inputs.environment }}
     steps:
       # Check out the exact commit the build job resolved, not inputs.ref. The
-      # binary arrives as an artifact from that commit, but deploy.sh ships static/
-      # and monitoring/ straight from this checkout — so if inputs.ref is a branch
+      # binary arrives as an artifact from that commit, but deploy.sh ships
+      # monitoring/ straight from this checkout — so if inputs.ref is a branch
       # (or a retagged tag) that moved while the build ran or while this job waited
       # on the environment's approval gate, the host would get assets from one
       # commit and a binary from another. The /version assertion below would not
@@ -171,7 +169,7 @@ jobs:
           ref: ${{ needs.build.outputs.sha }}
 
       - name: Download binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: imcp2-binary
           path: build-out
@@ -242,10 +240,20 @@ jobs:
           # Expose the beta II instance at /mcp-beta on staging only; production
           # serves /mcp (production II) alone. Empty string reads as off.
           MCP_SERVE_BETA: ${{ inputs.environment == 'staging' && '1' || '' }}
+          # Publish the status dashboard at /status/ on staging only. Production
+          # keeps running the imcp-status service (its Statuspage pusher feeds
+          # status.internetcomputer.org) but does not expose it at its origin.
+          SERVE_STATUS: ${{ inputs.environment == 'staging' && '1' || '' }}
           # OpenAI Apps domain verification (ChatGPT-directory submission).
           # Unset -> endpoint 404s. An optional secret that neither caller
           # passes arrives here as the empty string.
           OPENAI_APPS_CHALLENGE_TOKEN: ${{ secrets.OPENAI_APPS_CHALLENGE_TOKEN }}
+          # Client ID Metadata Documents: on, unless this GitHub Environment
+          # defines the OAUTH_CIMD_ENABLED variable as `0` (this job runs in that
+          # environment, so its variables resolve here). Unset arrives as the
+          # empty string, which the server reads as on. A roll-out kill switch
+          # only, to be removed.
+          OAUTH_CIMD_ENABLED: ${{ vars.OAUTH_CIMD_ENABLED }}
         run: deploy/native/deploy.sh
 
       # Confirm the host is actually running the commit we just shipped, rather

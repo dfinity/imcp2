@@ -13,39 +13,38 @@ use tower::ServiceExt;
 
 const PUBLIC_URL: &str = "https://mcp.example.com";
 
-/// Point the OAuth client-registration store at a throwaway temp path BEFORE
-/// any `SharedClients::load()`, so these tests neither read nor write a
-/// developer's real `oauth-clients.json`. The authorize-path assertions rely on
-/// an EMPTY registration set (unknown/unregistered clients are rejected); a
-/// stray real registration for `client_id=unknown`/`x` would otherwise flip
-/// them. `load()` treats a missing file as empty, so a fresh, deleted path
-/// gives a deterministic empty set. Set exactly once (env is process-global).
-fn isolate_client_store() {
+/// A throwaway operational-files directory for these tests, so they neither read
+/// nor write a developer's real `oauth-clients.json`. The authorize-path
+/// assertions rely on an EMPTY registration set (unknown/unregistered clients are
+/// rejected); a stray real registration for `client_id=unknown`/`x` would flip
+/// them, so the store file is cleared once. `SharedClients::load` treats a
+/// missing file as empty, giving a deterministic empty set. One fixed directory,
+/// shared by every `app()` in this binary.
+fn test_state_dir() -> std::path::PathBuf {
     use std::sync::Once;
     static ONCE: Once = Once::new();
+    let dir = std::env::temp_dir().join("imcp2-router-tests");
     ONCE.call_once(|| {
-        let mut path = std::env::temp_dir();
-        path.push("imcp2-router-tests-oauth-clients.json");
-        let _ = std::fs::remove_file(&path); // drop any stale file from a prior run
-        std::env::set_var("OAUTH_CLIENTS_FILE", &path);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_file(dir.join("oauth-clients.json")); // drop any stale file
     });
+    dir
 }
 
 fn server(instance: imcp2::IiInstance, mcp_path: &str) -> imcp2::McpServer {
-    isolate_client_store();
-    let agent = imcp2::Agent::builder()
-        .with_url(imcp2::IC_URL)
-        .build()
-        .expect("build agent");
+    let state_dir = test_state_dir();
+    let agent = imcp2::Agent::builder().with_url(imcp2::IC_URL).build().expect("build agent");
     imcp2::McpServer::new(imcp2::McpConfig {
         agent,
         instance,
         public_url: PUBLIC_URL.into(),
         mcp_path: mcp_path.into(),
-        clients: imcp2::SharedClients::load(),
+        clients: imcp2::SharedClients::load(&state_dir),
+        state_dir,
         // Lenient: these router contract tests drive flows that don't carry a
         // `resource`; strict RFC 8707 is covered by the auth unit tests.
         require_resource: false,
+        cimd_enabled: false,
     })
 }
 
@@ -64,13 +63,11 @@ fn app() -> Router {
         .merge(beta.well_known_router())
         .merge(prod.root_well_known_router())
         .merge(imcp2::auth_callbacks_router(&[&prod, &beta]))
+        .merge(imcp2::ii_app_metadata_router())
 }
 
 async fn get_json(app: Router, path: &str) -> (StatusCode, serde_json::Value) {
-    let resp = app
-        .oneshot(Request::get(path).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
+    let resp = app.oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
@@ -81,10 +78,9 @@ async fn get_json(app: Router, path: &str) -> (StatusCode, serde_json::Value) {
 async fn protected_resource_metadata_follows_each_mount() {
     // Prod (the default `/mcp` instance): served path-inserted (RFC 9728 §3.1)
     // and, as the default instance, at the plain root.
-    for path in [
-        "/.well-known/oauth-protected-resource/mcp",
-        "/.well-known/oauth-protected-resource",
-    ] {
+    for path in
+        ["/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-protected-resource"]
+    {
         let (status, doc) = get_json(app(), path).await;
         assert_eq!(status, StatusCode::OK, "GET {path}");
         assert_eq!(doc["resource"], format!("{PUBLIC_URL}/mcp"), "GET {path}");
@@ -109,15 +105,9 @@ async fn authorization_server_metadata_is_a_path_issuer_per_instance() {
         let (status, doc) = get_json(app(), path).await;
         assert_eq!(status, StatusCode::OK, "GET {path}");
         assert_eq!(doc["issuer"], format!("{PUBLIC_URL}/mcp"), "GET {path}");
-        assert_eq!(
-            doc["authorization_endpoint"],
-            format!("{PUBLIC_URL}/mcp/oauth/authorize")
-        );
+        assert_eq!(doc["authorization_endpoint"], format!("{PUBLIC_URL}/mcp/oauth/authorize"));
         assert_eq!(doc["token_endpoint"], format!("{PUBLIC_URL}/mcp/oauth/token"));
-        assert_eq!(
-            doc["registration_endpoint"],
-            format!("{PUBLIC_URL}/mcp/oauth/register")
-        );
+        assert_eq!(doc["registration_endpoint"], format!("{PUBLIC_URL}/mcp/oauth/register"));
         // RFC 9207: we emit `iss` on authorization responses, so the AS metadata
         // MUST advertise the parameter.
         assert_eq!(doc["authorization_response_iss_parameter_supported"], true);
@@ -131,10 +121,7 @@ async fn authorization_server_metadata_is_a_path_issuer_per_instance() {
         let (status, doc) = get_json(app(), path).await;
         assert_eq!(status, StatusCode::OK, "GET {path}");
         assert_eq!(doc["issuer"], format!("{PUBLIC_URL}/mcp-beta"), "GET {path}");
-        assert_eq!(
-            doc["authorization_endpoint"],
-            format!("{PUBLIC_URL}/mcp-beta/oauth/authorize")
-        );
+        assert_eq!(doc["authorization_endpoint"], format!("{PUBLIC_URL}/mcp-beta/oauth/authorize"));
     }
 }
 
@@ -158,16 +145,38 @@ async fn auth_callbacks_document_declares_every_mount() {
     );
 }
 
+/// The app-metadata document has to meet Internet Identity's requirements or
+/// it is discarded whole — silently, on a screen this server never sees.
+#[tokio::test]
+async fn ii_app_metadata_document_meets_ii_requirements() {
+    let (status, doc) = get_json(app(), "/.well-known/ii-app-metadata").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let name = doc["name"].as_str().expect("name is a string");
+    assert!(!name.trim().is_empty(), "a blank name reads as absent to II");
+    assert!(
+        name.chars().count() <= 40,
+        "name must fit II's 40-code-point cap, got {} in {name:?}",
+        name.chars().count()
+    );
+
+    for field in ["privacyPolicyUrl", "termsOfServiceUrl"] {
+        let url = doc[field].as_str().unwrap_or_else(|| panic!("{field} is a string"));
+        // II takes `https` only, and refuses userinfo (which would let a URL
+        // read as one host and resolve to another).
+        assert!(url.starts_with("https://"), "{field} must be https, got {url}");
+        let authority = url.trim_start_matches("https://").split('/').next().unwrap_or_default();
+        assert!(!authority.contains('@'), "{field} must not carry userinfo, got {url}");
+    }
+}
+
 #[tokio::test]
 async fn unauthenticated_mcp_requests_get_the_path_aware_challenge() {
     // The MCP service is the mount's fallback, so the bare path, the
     // trailing-slash form, and sub-paths are all gated — same breadth
     // `nest_service` used to give it.
     for path in ["/mcp", "/mcp/", "/mcp/sub"] {
-        let resp = app()
-            .oneshot(Request::post(path).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let resp = app().oneshot(Request::post(path).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "POST {path}");
         let challenge = resp
             .headers()
@@ -189,16 +198,11 @@ async fn unauthenticated_mcp_requests_get_the_path_aware_challenge() {
     }
 
     // Beta's challenge points at beta's document.
-    let resp = app()
-        .oneshot(Request::post("/mcp-beta").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
+    let resp =
+        app().oneshot(Request::post("/mcp-beta").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let challenge = resp
-        .headers()
-        .get("www-authenticate")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+    let challenge =
+        resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default();
     assert!(
         challenge.contains("/.well-known/oauth-protected-resource/mcp-beta\""),
         "beta challenge: {challenge}"
@@ -209,8 +213,9 @@ async fn unauthenticated_mcp_requests_get_the_path_aware_challenge() {
 /// (capped, LRU-evicted, with coalesced write-through): a loopback redirect
 /// registers, that `client_id` is then accepted at `/oauth/authorize` (which also
 /// marks it recently used, keeping it ahead of the LRU eviction), the
-/// registration lands in `OAUTH_CLIENTS_FILE` so it survives a restart, and a
-/// redirect off the hosted allow-list is refused before anything is stored.
+/// registration lands in the state directory's `oauth-clients.json` so it
+/// survives a restart, and a redirect off the hosted allow-list is refused
+/// before anything is stored.
 #[tokio::test]
 async fn dynamic_client_registration_round_trips_and_persists() {
     // One app, cloned per request, so both calls share the same client store.
@@ -262,8 +267,9 @@ async fn dynamic_client_registration_round_trips_and_persists() {
     assert_eq!(doc["error"], "invalid_redirect_uri");
 
     // Registrations are persisted (coalesced, so on a background task): poll
-    // briefly for the write rather than assuming it has already landed.
-    let path = std::env::var("OAUTH_CLIENTS_FILE").expect("isolated store path");
+    // briefly for the write rather than assuming it has already landed. The store
+    // file is `{state_dir}/oauth-clients.json` (see `test_state_dir`).
+    let path = test_state_dir().join("oauth-clients.json");
     let mut persisted = String::new();
     for _ in 0..100 {
         persisted = std::fs::read_to_string(&path).unwrap_or_default();
@@ -274,12 +280,10 @@ async fn dynamic_client_registration_round_trips_and_persists() {
     }
     assert!(
         persisted.contains(&client_id),
-        "the registration must reach {path} so it survives a restart"
+        "the registration must reach {} so it survives a restart",
+        path.display()
     );
-    assert!(
-        !persisted.contains("attacker.example"),
-        "a refused registration must never be stored"
-    );
+    assert!(!persisted.contains("attacker.example"), "a refused registration must never be stored");
 }
 
 /// Open DCR is unauthenticated, so a single `POST /oauth/register` must not be
@@ -358,11 +362,8 @@ async fn invalid_token_challenge_carries_rfc6750_error() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let challenge = resp
-        .headers()
-        .get("www-authenticate")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+    let challenge =
+        resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default();
     assert!(
         challenge.contains("error=\"invalid_token\""),
         "presented-but-invalid token must carry the RFC 6750 error: {challenge}"
@@ -441,10 +442,7 @@ async fn oauth_endpoints_live_under_each_mount() {
         ("/mcp/oauth/connect/callback", "/mcp/oauth/connect/redeem"),
         ("/mcp-beta/oauth/connect/callback", "/mcp-beta/oauth/connect/redeem"),
     ] {
-        let resp = app()
-            .oneshot(Request::get(page).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let resp = app().oneshot(Request::get(page).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "GET {page}");
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&bytes);

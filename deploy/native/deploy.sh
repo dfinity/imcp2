@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Deploy imcp2 to an existing Amazon Linux 2023 (arm64) host WITHOUT Docker on the
-# box: ships the prebuilt binary + static assets, then runs the app and Caddy as
+# box: ships the prebuilt binary, then runs the app and Caddy as
 # native systemd services. Re-runnable (idempotent) — also use it to push updates.
 #
 # Prereqs:
@@ -69,26 +69,66 @@ echo ">> architecture ok ($built_for -> $HOST)"
 echo ">> staging $REMOTE_DIR"
 $SSH "sudo install -d -o \$(id -un) -g \$(id -gn) $REMOTE_DIR"
 
-echo ">> shipping binary + static assets"
+# Only the binary: every asset the server serves (landing page, favicon,
+# privacy policy, support, terms, connect-error page, the skill:// bundle) is
+# compiled into it with `include_str!`, so there is nothing to place beside it.
+echo ">> shipping binary"
 tar -C "$repo_root/build-out" -cf - imcp2 | $SSH "tar -C $REMOTE_DIR -xf - && chmod +x $REMOTE_DIR/imcp2"
-tar -C "$repo_root" -cf - static | $SSH "tar -C $REMOTE_DIR -xf -"
 # Status dashboard (Node tool): shipped as source — it has no build step.
 tar -C "$repo_root" -cf - monitoring | $SSH "tar -C $REMOTE_DIR -xf -"
 
 echo ">> rendering + installing units and Caddyfile, then (re)starting services"
 # MCP_SERVE_BETA is set (to "1") only for the staging deployment, so /mcp-beta
 # is exposed there and not in production; it defaults to empty (off) otherwise.
-unit_mcp="$(sed -e "s#__PUBLIC_URL__#https://$DOMAIN#g" -e "s#__MCP_SERVE_BETA__#${MCP_SERVE_BETA:-}#g" -e "s#__OPENAI_APPS_CHALLENGE_TOKEN__#${OPENAI_APPS_CHALLENGE_TOKEN:-}#g" "$here/imcp2.service")"
-caddyfile="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__ACME_EMAIL__#$ACME_EMAIL#g" "$here/Caddyfile")"
+# OAUTH_CIMD_ENABLED comes from the GitHub Environment's variable of that name:
+# Client ID Metadata Documents are on unless it is a falsey value (0/false/no/off);
+# empty (unset) is on. A roll-out kill switch only, to be removed.
+unit_mcp="$(sed -e "s#__PUBLIC_URL__#https://$DOMAIN#g" -e "s#__MCP_SERVE_BETA__#${MCP_SERVE_BETA:-}#g" -e "s#__OPENAI_APPS_CHALLENGE_TOKEN__#${OPENAI_APPS_CHALLENGE_TOKEN:-}#g" -e "s#__OAUTH_CIMD_ENABLED__#${OAUTH_CIMD_ENABLED:-}#g" "$here/imcp2.service")"
+# SERVE_STATUS likewise is set (to "1") only for the staging deployment. Staging
+# keeps the Caddyfile's marked /status/ block (minus the marker lines) so the
+# dashboard is published at https://$DOMAIN/status/; production deletes the whole
+# block, so its origin does not publish the dashboard -- the public status surface
+# is status.internetcomputer.org. The imcp-status service is still installed and
+# started on every host below: the Statuspage pusher that feeds that page runs
+# inside it, and only the dashboard's exposure at /status/ is staging-only.
+if [ -n "${SERVE_STATUS:-}" ]; then
+  status_block=(-e '/__STATUS_BEGIN__/d' -e '/__STATUS_END__/d')
+else
+  status_block=(-e '/__STATUS_BEGIN__/,/__STATUS_END__/d')
+fi
+caddyfile="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__ACME_EMAIL__#$ACME_EMAIL#g" "${status_block[@]}" "$here/Caddyfile")"
 caddy_unit="$(cat "$here/caddy.service")"
-# Pin the dashboard's SSRF allowlist to this deployment's own host. It used to be
-# the PARENT domain (${DOMAIN#*.}) because the dashboard guessed the II origin by
-# stripping the `mcp.` label — on mcp.internetcomputer.org that silently
-# allowlisted all of internetcomputer.org. The II origins now come from the
-# server's /version and are covered by the dashboard's built-in id.ai suffixes,
-# so only the MCP host itself needs adding.
+# The dashboard shows the monitored instances side by side. Every host renders
+# the same set by default -- staging and production -- so the page reads the same
+# wherever it is served. STATUS_TARGETS replaces the set (whitespace-separated
+# name=origin entries, see monitoring/mcp-status/README.md), and STATUS_TARGET_II
+# the II pins. The default pin belongs to the default set: production's II is
+# pinned because that origin's edge answers /version with a redirect, so its
+# pairing cannot be read from the server (drop the pin once the edge forwards
+# /version) -- but a custom set gets no pin it did not ask for, since a pin for a
+# target that is not in the list makes the dashboard refuse to start. `-` rather
+# than `:-`, so an explicit empty STATUS_TARGET_II clears the default pin.
+if [ "${STATUS_TARGETS+set}" = set ]; then
+  status_targets="$STATUS_TARGETS"
+  status_target_ii="${STATUS_TARGET_II-}"
+else
+  status_targets="staging=https://mcp.beta.id.ai production=https://mcp.internetcomputer.org"
+  status_target_ii="${STATUS_TARGET_II-production=https://id.ai}"
+fi
+# The dashboard's SSRF allowlist: this host plus each target's host. Entries are
+# matched as suffixes (like the built-in id.ai), so a listed host also admits its
+# own subdomains -- the rule this deployment's own host has always been under.
+# It used to be the PARENT domain (${DOMAIN#*.}) because the dashboard guessed
+# the II origin by stripping the `mcp.` label -- on mcp.internetcomputer.org that
+# silently allowlisted all of internetcomputer.org. The II origins now come from
+# each server's /version (or a pin) and are covered by the built-in id.ai
+# suffixes, so only the MCP hosts need adding.
 status_allowed="$DOMAIN"
-unit_status="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__ALLOWED_HOSTS__#$status_allowed#g" "$here/imcp-status.service")"
+for entry in $status_targets; do
+  h="${entry#*=}"; h="${h#*://}"; h="${h%%[/:]*}"
+  case ",$status_allowed," in *",$h,"*) ;; *) status_allowed="$status_allowed,$h" ;; esac
+done
+unit_status="$(sed -e "s#__DOMAIN__#$DOMAIN#g" -e "s#__TARGETS__#$status_targets#g" -e "s#__TARGET_II__#$status_target_ii#g" -e "s#__ALLOWED_HOSTS__#$status_allowed#g" "$here/imcp-status.service")"
 
 $SSH "sudo bash -s" <<EOF
 set -e
@@ -106,6 +146,26 @@ node_major="\$(node -v 2>/dev/null | cut -c2- | cut -d. -f1)"
 if [ -z "\$node_major" ] || [ "\$node_major" -lt 20 ] 2>/dev/null; then
   dnf install -y -q nodejs20 >/dev/null 2>&1 || dnf install -y -q nodejs >/dev/null 2>&1 || true
 fi
+# Dedicated UID for the dashboard: it can carry a Statuspage API key in its
+# environment, so it must not share a user with the internet-facing imcp2
+# service (same-UID processes can read each other's /proc/<pid>/environ).
+id imcp-status >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin imcp-status
+# Root-only directory for the optional Statuspage credentials
+# (/etc/imcp-status/statuspage.env, mode 600 — see the mcp-status README).
+# Provisioned here so the documented setup step works on a fresh host; systemd
+# reads the EnvironmentFile as root, so no other user needs access.
+install -d -m 700 -o root -g root /etc/imcp-status
+# Execute a ROOT-OWNED copy of the dashboard source, not the staged copy under
+# $REMOTE_DIR: the staging tree is owned (and writable) by the deploy/SSH user,
+# which is also the UID the internet-facing imcp2.service runs as — a
+# compromised main service could edit server.js there and have the next
+# dashboard restart run its code in the secret-bearing service. Refresh the
+# copy on every deploy; strip group/other write (files stay world-readable, so
+# the unprivileged imcp-status user can run them).
+rm -rf /opt/imcp-status
+cp -a $REMOTE_DIR/monitoring/mcp-status /opt/imcp-status
+chown -R root:root /opt/imcp-status
+chmod -R go-w /opt/imcp-status
 cat > /etc/systemd/system/imcp-status.service <<'UNIT'
 $unit_status
 UNIT
@@ -214,27 +274,36 @@ echo ">> external check:"
 curl -sS --max-time 20 -o /dev/null -w "https://$DOMAIN/ -> HTTP %{http_code} (TLS verify %{ssl_verify_result})\n" "https://$DOMAIN/" || true
 curl -sS --max-time 20 -o /dev/null -w "https://$DOMAIN/status/ -> HTTP %{http_code}\n" "https://$DOMAIN/status/" || true
 
-# ...and /metrics must NOT be reachable on the public origin. Caddy answers it
-# with a 404; losing that one block would publish the exposition, so assert it on
-# every deploy. The assertion is "exactly the configured 404": any other code —
-# a proxied 500, a `000` from an unreachable or stalled origin — has not disproved
-# exposure, so it retries (Caddy may be reloading) and then fails hard.
+# /metrics must NOT be reachable on the public origin: the Caddyfile answers it
+# with a 404, and losing that one block would publish the exposition. Ask Caddy
+# itself, from the host, with $DOMAIN pinned to loopback so its site block
+# answers: production's public name now resolves to a fronting edge that
+# redirects every non-MCP path, so the public answer says nothing about this
+# host. -k because the question is the route, not the certificate.
 hidden=""
 for attempt in 1 2 3 4 5; do
-  code="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "https://$DOMAIN/metrics" || echo 000)"
-  if [ "$code" = 200 ]; then
-    echo "FATAL: https://$DOMAIN/metrics answered 200 — the Prometheus exposition is public" >&2
-    exit 1
-  fi
+  code="$($SSH "curl -ksS --max-time 10 -o /dev/null -w '%{http_code}' --resolve '$DOMAIN:443:127.0.0.1' 'https://$DOMAIN/metrics'" || echo 000)"
   if [ "$code" = 404 ]; then
     hidden=1
-    echo "https://$DOMAIN/metrics -> HTTP 404 (not published, as intended)"
+    echo "caddy on the host: https://$DOMAIN/metrics -> HTTP 404 (not published, as intended)"
     break
   fi
-  echo "https://$DOMAIN/metrics -> HTTP $code, expected 404 (attempt $attempt)" >&2
+  echo "caddy on the host: https://$DOMAIN/metrics -> HTTP $code, expected 404 (attempt $attempt)" >&2
   sleep 3
 done
 if [ -z "$hidden" ]; then
-  echo "FATAL: https://$DOMAIN/metrics never answered the configured 404, so its exposure is unproven" >&2
+  echo "FATAL: Caddy never answered the configured 404 for /metrics, so its exposure is unproven" >&2
   exit 1
 fi
+
+# Through the public name too, redirects followed: the exposition's own marker
+# in the body is what proves it public, whatever sits in front. A status alone
+# proves nothing either way (an edge's 200 page, a redirect elsewhere).
+public="$(mktemp)"
+summary="$(curl -sSL --max-redirs 5 --max-time 20 -o "$public" -w '%{http_code} at %{url_effective}' "https://$DOMAIN/metrics")" || summary="${summary:-000} (request failed)"
+if grep -q imcp2_build_info "$public"; then
+  echo "FATAL: https://$DOMAIN/metrics serves the Prometheus exposition publicly ($summary)" >&2
+  exit 1
+fi
+rm -f "$public"
+echo "https://$DOMAIN/metrics -> $summary; no exposition in the body"
