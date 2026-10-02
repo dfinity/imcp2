@@ -1,328 +1,511 @@
-# Scoping: Client ID Metadata Documents (CIMD) for imcp2
+# Client ID Metadata Documents (CIMD) for imcp2: design record
 
-Status: **draft / scoping**. Analysis and design only; no code changes land in
-this document. It expands the top-ranked improvement from the MCP 2026-07-28
-alignment scoping doc (PR #126, `docs/scoping-mcp-2026-07-28-alignment.md`; #1,
-"CIMD replacing open DCR") into an implementable plan, and folds in the
-correction from that PR's review: imcp2's existing same-origin URL check
-(`skills.rs`'s `markdown_url_for_base`) is **not** a usable SSRF guard for a
-CIMD fetch — the real building block is the address-pinned fetcher in
-`discover.rs`.
+Status: **implemented**.
 
-Spec-strength labels (MUST / SHOULD / MAY) below follow the 2026-07-28 revision's
-authorization section and the OAuth **Client ID Metadata Document** draft it
-references. The exact draft version should be pinned before implementation (see
-[Open questions](#8-open-questions--decisions)).
+- #191 added CIMD as a registration mode beside open DCR, opt-in through `OAUTH_CIMD_ENABLED`.
+- #203 made it a `McpConfig` field, on by default in the `imcp2` binary, with
+  `OAUTH_CIMD_ENABLED` kept as a kill switch.
 
-## Headline recommendation
+This document began as the scoping plan for that work. It now records what was built, the
+decisions that settled the plan's open questions (section 8), and where the plan was revised or
+overtaken (sections 4 and 6). Code is referenced by symbol (file plus function, type, or
+constant), never by line number. Bare numbers are dfinity/imcp2 PRs. The code cites this document
+by section ("PR #143 §3.4", "§3.5"), so those section numbers are kept stable.
 
-Adopt CIMD **trust-policy-gated and additive**: imcp2 fetches a Client ID
-Metadata Document **only when the `client_id` URL's host is already on the
-curated vendor trust policy**, keeps open DCR for everything else, and never
-trusts the document's display fields. This delivers the two real wins — spec
-alignment and a DNS/TLS-authenticated domain key for branding — while collapsing
-the new outbound-fetch surface to a finite set of vetted hosts instead of an
-arbitrary-URL SSRF primitive on the unauthenticated `/authorize` path.
+The original plan expanded the top-ranked improvement of the MCP 2026-07-28 alignment scoping
+(#126, "CIMD replacing open DCR"). It folded in one correction from that review: imcp2's
+same-origin URL check (`skills.rs`, `markdown_url_for_base`) is not an SSRF guard for a CIMD fetch.
+That check compares only a candidate's host, not its port, against the configured skills origin.
+It protects a fetch only when that origin is fixed, and a CIMD URL is chosen by the caller. The
+address-pinned fetcher behind discovery is the right building block.
 
-- **Impact:** High (spec alignment + non-spoofable branding key).
-- **Effort:** Medium.
-- **Tractability:** High — imcp2-only for the core (no rmcp, no II). Only the
-  branding *display* half needs II coordination.
+## Summary
 
----
+CIMD is **trust-policy-gated and additive**:
+
+- imcp2 fetches a Client ID Metadata Document only when the `client_id` URL is on a vetted vendor
+  domain.
+- It keeps open DCR for everything else.
+- It never trusts the document's display fields.
+
+The new outbound-fetch surface on the unauthenticated `/oauth/authorize` path is therefore
+confined to the vetted vendor domains and their subdomains, not an arbitrary-URL SSRF primitive.
+Even those hosts are fetched under the SSRF guard.
 
 ## 1. What CIMD is, and the spec obligations
 
-Under MCP 2026-07-28, Dynamic Client Registration (RFC 7591) is **DEPRECATED**
-and CIMD is the intended replacement. Instead of POSTing a registration body and
-receiving a server-minted `client_id`, a client presents its `client_id` **as an
-`https` URL** that resolves to a JSON metadata document (`client_name`,
-`redirect_uris`, `logo_uri`, …). The identity is then **DNS/TLS-authenticated**:
-nobody can serve a document at `https://chatgpt.com/…` without controlling that
-domain.
+Under MCP 2026-07-28, Dynamic Client Registration (RFC 7591) is **deprecated** and CIMD is the
+preferred replacement. A client does not POST a registration body and receive a server-minted
+`client_id`. Instead, it presents its `client_id` **as an `https` URL**, and the JSON document at
+that URL is its registration (`redirect_uris`, `client_name`, how it authenticates). Nobody can
+serve a document at `https://chatgpt.com/…` without controlling that domain, so the URL's **host**
+is DNS/TLS-authenticated.
 
-Authorization-server obligations (paraphrased; pin exact strengths at
-implementation time):
+Authorization-server obligations, from the OAuth CIMD draft
+(`draft-ietf-oauth-client-id-metadata-document`, cited by name in `src/auth.rs`; the code does not
+pin a numbered revision):
 
-- **SHOULD** support CIMD and advertise
-  `client_id_metadata_document_supported: true` in AS metadata.
-- On a URL-form `client_id`, the AS **SHOULD** fetch the document, **MUST**
-  validate `client_id` equals the fetched URL exactly, **MUST** validate the
-  request's redirect URI against the document's `redirect_uris`, and **MUST**
-  validate the JSON structure / required fields.
+- **SHOULD** support CIMD and advertise `client_id_metadata_document_supported: true`.
+- On a URL-form `client_id`:
+  - **SHOULD** fetch the document;
+  - **MUST** validate that the document's `client_id` equals the URL;
+  - **MUST** validate the request's redirect URI against the document's `redirect_uris`;
+  - **MUST** validate the JSON structure and required fields.
 - **SHOULD** cache per the response's HTTP cache headers.
 - **SHOULD** consider SSRF when fetching an attacker-influenced URL.
-- **MAY** implement a domain-based trust policy (the hook this design leans on).
+- **MAY** apply a domain-based trust policy, which is the hook this design leans on.
 
-CIMD provides **no signing or attestation** of the document's contents — the
-display fields (`client_name`, `logo_uri`) are exactly as spoofable as a DCR
-body. The only cryptographically meaningful fact is the **host** of the URL.
+CIMD provides **no signing or attestation** of the document's contents. The display fields
+(`client_name`, `logo_uri`) are exactly as spoofable as a DCR body. The only meaningful fact is the
+**host** of the URL, and it authenticates the *document*, not the party using it. A public client
+with loopback redirects can be impersonated by any local program that presents its `client_id`
+(see 4).
 
-## 2. Where imcp2 stands today
+## 2. Context: imcp2 before CIMD
 
-**Open DCR.** `POST /oauth/register` (`auth.rs:2095`, unauthenticated) stores a
-`ClientReg` of `redirect_uris` (`auth.rs:175`) under a server-minted
-`client-<uuid>`. The store is bounded (`MAX_CLIENTS` = 10 000, `auth.rs:137`;
-`MAX_REDIRECT_URIS` = 16, `auth.rs:147`), LRU-evicted, and atomically persisted.
+- **Open DCR.** `POST /oauth/register` (`register`, unauthenticated) stores a `ClientReg` of
+  `redirect_uris` under a server-minted `client-{uuid}`.
+  - The store is bounded (`MAX_CLIENTS`, `MAX_REDIRECT_URIS`, `MAX_REDIRECT_URI_LEN`),
+    LRU-evicted (`make_room_for_client`), and atomically persisted.
+  - All of this is unchanged; DCR remains.
+- **The phishing defense is a hosted-redirect allow-list.**
+  - `DEFAULT_ALLOWED_REDIRECTS` is a curated list of `(domain, path, pin)` vendor callback
+    entries.
+  - `OAUTH_ALLOWED_REDIRECT_PREFIXES` lets operators add entries; `allowed_redirects` returns the
+    effective list.
+  - `redirect_uri_permitted` enforces host **and** pinned path at registration and at
+    authorization (`validate_client` → `redirect_allowed`). Loopback is exempt (RFC 8252).
+- **An SSRF-safe fetcher already existed, inside discovery** (`crates/imcp2-core/src/discover.rs`).
+  - `resolve_public_url` is `https`-only and refuses a host unless every resolved address is
+    globally routable.
+  - The client is pinned to the validated addresses, so a re-resolution cannot rebind the
+    connection.
+  - Bodies are read under a byte cap.
 
-**Phishing defense = a hosted-redirect allow-list.** `DEFAULT_ALLOWED_REDIRECTS`
-(`auth.rs:434`) is a curated list of `(vendor-host, callback-path-prefix)` pairs;
-`redirect_uri_permitted` (`auth.rs:545`) enforces host **and** a pinned path
-(MCP05 / CWE-601 hardening), at both register time and authorize time
-(`validate_client`, `auth.rs:834`; `redirect_allowed`, `auth.rs:643`). Loopback
-is exempt (RFC 8252). `allowed_redirects()` (`auth.rs:457`) is overridable via
-`OAUTH_ALLOWED_REDIRECT_PREFIXES`.
+  That was the right foundation. Discovery's reader and redirect policy were not, because both
+  serve an opportunistic crawl:
+  - **The reader is lossy.** Discovery's reader stops at the cap and returns what it has without
+    saying so, decodes lossily, and hands back a partial body when a transfer fails. A truncated
+    document whose prefix happens to be valid JSON could then be accepted as client metadata.
+  - **The redirect policy is loose.** Discovery's redirect policy (`ssrf_redirect_policy`,
+    `redirect_hop_ok`) follows any `https` hop to a globally routable IP literal, and any hop to
+    the same host name, without comparing ports. A vetted `client_id` could then bounce the fetch
+    to an unvetted public address, or to the vetted host on another port such as `:8443`. That
+    gets around the origin gate of 3.1.
 
-**AS metadata.** `authorization_server_metadata` (`auth.rs:2179`) advertises the
-`registration_endpoint` (`auth.rs:2185`), `authorization_code` grant, and S256.
+  Section 3.3 describes the strict fetcher that replaces both.
 
-**An SSRF-safe outbound fetcher already exists — but it is private and
-discovery-specific.** `discover.rs` fetches attacker-influenced app URLs safely:
+## 3. Design as implemented
 
-- `resolve_public_url` (`discover.rs:1106`): `https`-only, resolves the host and
-  rejects the fetch unless **every** resolved address is globally routable
-  (`ip_is_global`, `discover.rs:1056`, hardened against IPv6 transition prefixes
-  in PR #133).
-- `site_client` (`discover.rs:1182`): a reqwest client **pinned to the
-  pre-validated addresses** (`resolve_to_addrs`), so no re-resolution can rebind
-  the connection to an internal address between validation and connect; 15 s
-  timeout; `ssrf_redirect_policy` (`discover.rs:1160`) that follows only bounded,
-  `https`, global-IP-or-same-host redirects.
-- Response-size caps and chunked reads (`discover.rs:1202-1205`) so a hostile
-  body can't exhaust memory.
+### 3.1 What counts as a CIMD `client_id`, and the trust gate
 
-This is the correct foundation for a CIMD fetch. `skills.rs`'s
-`markdown_url_for_base` is **not**: it only compares a candidate host against a
-fixed trusted origin (ignoring ports) and rejects `169.254.169.254` merely
-because that host differs from the skills origin — a protection that evaporates
-when the URL is itself attacker-selected.
+`validate_client` (`src/auth.rs`) treats a `client_id` as CIMD only when CIMD is enabled for the
+instance (see 3.8) and `cimd_client_id` accepts its shape:
 
-## 3. Design: trust-policy-gated, additive CIMD
+- `https`, a host, and a path beyond `/`;
+- no fragment and no userinfo (a query is tolerated);
+- at most `CIMD_MAX_CLIENT_ID_LEN` bytes (the redirect-URI cap);
+- it must serialize back to the identifier exactly as given (`parsed_as_given`), apart from
+  scheme and host case and an explicit `:443`. That refuses everything the URL parser would
+  silently rewrite.
 
-### 3.1 The gating decision (the crux)
+Anything else is an ordinary DCR identifier. A URL `client_id` on an instance with CIMD off is an
+unknown client.
 
-**Fetch a CIMD only when the `client_id` URL's ORIGIN is on the trust policy** —
-an exact `https://<vetted-host>` on the default 443 port. A URL whose origin is
-not vetted is not fetched at all.
+**The trust gate runs before anything else** (`cimd_origin_trusted`):
 
-Match the **origin, not the bare host**: `resolve_public_url` uses the
-caller-supplied port (`discover.rs:1113`), so a host-only check would let
-`https://claude.ai:8443/…` past a `claude.ai` gate and on to a non-default port —
-a service that was never vetted. Require the default HTTPS port (reject any
-explicit non-443 port, and any userinfo or other non-canonical authority) **before**
-the DNS lookup or fetch.
+- The URL must be `https` on the default port.
+- Its host must equal, or be a dot-boundary subdomain of, a domain of the hosted-redirect
+  allow-list (`vetted_domain` over `allowed_redirects`, including operator entries).
+- The gate matches the **origin**, not the bare host. The SSRF guard connects to the port the URL
+  names, so a host-only check would let `https://claude.ai:8443/…` past a `claude.ai` gate.
+- **This is wider than the plan**, which proposed exact `https://<vetted-host>` origins. The gate
+  instead reuses `redirect_uri_permitted`'s host rule over the same list, so there is one rule
+  for who is vetted. That admits every subdomain of a vetted domain (see 5 for the DoS
+  consequence).
 
-Why gate rather than fetch any URL:
+A URL off the gate is refused before any request goes out (`ClientCheck::UntrustedClientOrigin`).
+The browser gets the same "not approved" page as a hosted redirect off the allow-list; a non-HTML
+client gets `403 invalid_client` naming the contact.
 
-- It reduces the new SSRF/DoS surface from "any URL an unauthenticated caller
-  supplies to `/authorize`" to "a finite, curated set of vendor hosts."
-- It still yields both payoffs: standards alignment, and a DNS-authenticated
-  domain to key branding on.
-- It matches imcp2's current posture — the allow-list already makes DCR
-  effectively "closed." Non-vetted clients simply keep using DCR.
-- It is forward-compatible: [Phase 3](#6-phasing) can open CIMD to general
-  (still SSRF-guarded) fetching if the ecosystem moves and the risk is accepted.
+**The redirect check also runs before any fetch.** A request whose `redirect_uri` fails
+`redirect_uri_permitted` is refused without asking even a vetted host for a document.
 
 ### 3.2 Request flow
 
-At `/oauth/authorize` (`auth.rs:1012`), branch on the shape of `client_id`:
+At `/oauth/authorize`, `validate_client` returns one of four verdicts:
 
-1. **Opaque `client-<uuid>`** → the existing DCR path (`validate_client`),
-   unchanged.
-2. **`https` URL** →
-   - If the URL's **origin** (scheme + host + default 443 port) is **not** on the
-     client-id trust policy → **reject** with a clear error naming the contact
-     for allow-listing (mirroring the DCR hosted-redirect rejection). *(Reject vs
-     silent DCR-fallback is an open question — see §8.)*
-   - If on the policy → fetch the document through the SSRF-safe fetcher (§3.3),
-     then validate (§3.4). On success, treat the verified URL as the
-     `client_id` for the rest of the code+token flow; cache the document (§3.5).
+| Verdict | When | What the caller sees |
+|---|---|---|
+| `Allowed` | A DCR client with that registered redirect, or a CIMD client whose validated document lists it | The sign-in proceeds to Internet Identity |
+| `Refused` | Unknown client, an invalid document (including a cached negative entry), or a redirect not listed or not permitted | The existing refusal paths |
+| `UntrustedClientOrigin` | A URL `client_id` off the trust gate | The "not approved" page, or `403 invalid_client` |
+| `MetadataUnavailable` | A transient failure, or the in-flight fetch bounds are full so no fetch was attempted (see 3.5) | `503 temporarily_unavailable`, "try again in a moment"; nothing about the cause is reflected |
 
-### 3.3 The fetcher (Phase 0 prerequisite)
+On success, the CIMD URL is the `client_id` for the rest of the code and token flow.
 
-Reuse the `discover.rs` machinery rather than writing a second SSRF guard.
-Because those functions are currently private to `discover.rs`, **Phase 0** is a
-small refactor: extract `resolve_public_url` / `site_client` /
-`ssrf_redirect_policy` into a shared `pub(crate)` module (e.g. `src/net.rs`). No
-behavior change; independently useful.
+### 3.3 The fetcher
 
-**Do NOT reuse discovery's capped *reader* unchanged.** The best-effort reader
-(`discover.rs:1207-1228`) deliberately returns lossy, partial text on a stream
-error or once the cap is reached, **without signaling** — correct for scraping an
-app bundle, unsafe at an auth boundary: a truncated or over-limit response whose
-prefix happens to be valid JSON would be accepted as client metadata. CIMD needs
-a **strict** reader instead. Leave the best-effort wrapper for discovery.
+`imcp2_core::public_fetch::fetch_public_document` is one SSRF-guarded GET of a small public
+document. It reuses discovery's `resolve_public_url` and `read_capped_bytes` (both reshaped for
+this in #191; see 6), but is **strict** where the crawl is opportunistic:
 
-CIMD-specific fetch parameters:
+- **Address safety.** Every resolved address must be public, and the client is pinned to them.
+  The connection is direct: no proxy is taken from the environment, since a proxy would resolve
+  the host itself and the pin would bind nothing.
+- **No redirects.** Any non-`200` is an error, so no other URL's bytes (another host, port, or
+  path) can stand in for the document.
+- **Strict body.** A body over the cap, a transfer that fails part-way, or invalid UTF-8 is an
+  error, never a shorter or normalized document.
+- **One deadline** over the whole operation, DNS included (`CIMD_FETCH_TIMEOUT`, 5 s). Claude
+  waits at most 10 s for the authorize endpoint, so the fetch it triggers must finish well inside
+  that.
+- **Typed failures** (`FetchError`). The caller can tell what is about the URL from what is about
+  the moment (sorted in `classify_fetch_error`; see 3.5).
 
-- `GET`, `Accept: application/json`; require a JSON content type on the response.
-- A **tighter response-size cap** than discovery's 256 KB metadata cap — a CIMD
-  is a few KB; propose 64 KB.
-- A **strict capped read** that **fails closed** — rejects (never truncates) an
-  over-limit body, a stream error, or invalid UTF-8 — so a partial body is never
-  parsed as a document.
-- Keep the 15 s timeout, address pinning, and `https`-only.
-- **Do NOT reuse discovery's redirect policy.** `ssrf_redirect_policy` /
-  `redirect_hop_ok` (`discover.rs:1145-1153`) follow any *global-IP literal* and
-  any *same-host* hop **without a port check** — so a vetted `client_id` could
-  redirect the fetch to an unvetted public IP or to `vetted-host:8443`, escaping
-  the exact-origin gate of §3.1. A CIMD document is served directly at its URL, so
-  **disable redirects entirely** (recommended); if a vendor genuinely needs one,
-  require an **exact same-origin** hop (scheme + host + port all equal to the
-  vetted origin), never the discovery policy.
+The CIMD layer sets the fetcher's cap to `CIMD_MAX_BYTES` (8 KB; the draft recommends under 5 KB,
+and real ones are under 1 KB) in `fetch_client_metadata_document`. The fetcher enforces it
+strictly (`FetchError::TooLarge`). `fetch_and_validate_client_metadata` then requires the
+response to be served as `application/json` (`is_json_media_type`) before parsing it.
 
 ### 3.4 Validation
 
-Validation splits into two kinds, and the split matters for caching (§3.5):
+Validation splits into two kinds, and the split decides what may be cached (3.5):
 
-**Document-intrinsic** (a property of the URL/document alone — cacheable):
+- **Document-intrinsic** outcomes are about the URL alone, and their result is cacheable,
+  positively or negatively. They are checked in this order:
+  1. the fetch outcome: a fetch failure about the URL counts, one about the moment does not
+     (`classify_fetch_error`; the lists are in 3.5);
+  2. the media type;
+  3. the document's content (below).
+- **Per-request** checks depend on this request's `redirect_uri` and are never cached (the last
+  paragraph of this section).
 
-- The fetch succeeded, the JSON parses, required fields are present and
-  well-typed, and arrays are size-bounded (same spirit as `MAX_REDIRECT_URIS`).
-- The document's `client_id` value is a **plain string match** against the
-  requested URL — no normalization. (Hosted redirects already use exact string
-  membership, `auth.rs:648`; normalizing the client id would also mint aliases
-  that disagree with the raw-URL cache key of §3.5.)
+`parse_client_metadata` checks only what the document says about itself:
 
-**Per-request** (depends on *this* request's `redirect_uri` — **never cached**):
+- The document's `client_id` equals the URL **byte for byte**, with no normalization.
+- It carries no `client_secret` or `client_secret_expires_at`. A member of either name with any
+  value, `null` included, is refused.
+- It can authenticate as a **public** client. Either `token_endpoint_auth_method` is `none`
+  (absent counts as `none`), or `none` appears in `token_endpoint_auth_methods_supported`, which
+  is ChatGPT's form.
+- `grant_types` and `response_types`, if present, include `authorization_code` and `code`.
+- `redirect_uris` is non-empty, has at most `MAX_REDIRECT_URIS` entries, and each is at most
+  `MAX_REDIRECT_URI_LEN` bytes.
+- A member the server reads, of the wrong type (an explicit `null` included), makes the document
+  invalid. The members it reads are `client_id`, `client_name`, `redirect_uris`,
+  `token_endpoint_auth_method`, `token_endpoint_auth_methods_supported`, `grant_types`, and
+  `response_types`. Every other member, `logo_uri` and the other display fields included, is
+  ignored without a type check.
+- Of the listed redirects, only those that pass `redirect_uri_permitted` **and** are either
+  loopback or **same-origin with the document URL** are kept. If none are left, the document is
+  invalid.
+  - The same-origin rule goes beyond the original plan. The document is self-asserted, so this is
+    what ties the code's destination to the party that published it.
+  - It means a vetted CIMD origin cannot list another vendor's callback.
 
-- The request's `redirect_uri` is a member of the cached document's
-  `redirect_uris` **and** still passes `redirect_uri_permitted` (`auth.rs:545`).
-  Keeping the existing host+path pin is deliberate belt-and-suspenders: if a
-  vetted vendor's domain is ever compromised, the path pin still limits where a
-  code can land. These checks run **on every request** against the (positively)
-  cached document — they must never contribute to a negative-cache entry, or a
-  bad-redirect probe of a real client would poison later legitimate requests
-  (§3.5).
+Per request, the requested `redirect_uri` must be one of the kept redirects (loopback
+port-agnostically, per RFC 8252 §7.3) through the same `redirect_allowed` check a DCR registration
+gets. This check runs on **every** request against the cached document and never feeds the
+negative cache. Otherwise a probe with a bad redirect could lock out a real client.
 
-### 3.5 Caching
+### 3.5 Caching, coalescing, and bounds
 
-- Cache **validated** documents keyed by the `client_id` URL, honoring
-  `Cache-Control` / `ETag` with a **TTL floor and ceiling** so a hostile
-  `max-age` can neither pin a stale doc forever nor force a re-fetch per request.
-- Bounded LRU, like the DCR store. **In-memory only** is likely sufficient (a
-  cache miss just re-fetches), unlike DCR registrations which must survive a
-  restart — but confirm (§8).
-- Also **negative-cache** URLs that fail a **document-intrinsic** check (§3.4) —
-  didn't resolve to a valid CIMD, bad JSON, `client_id` ≠ URL — so a repeat of
-  the same bogus path is cheap. **Never** negative-cache a **per-request**
-  failure: a caller could otherwise request a *real* CIMD URL with a non-member
-  `redirect_uri`, cache that URL as "invalid," and lock out the legitimate
-  client. The redirect membership/policy checks always re-run per request against
-  the positively-cached document.
-- Note the cache is *not* the outbound-DoS control (path variation defeats it —
-  §5); the rate/concurrency cap is.
+All of this lives in one `CimdState` per **process**, shared by every mounted instance
+(`CimdState::shared`). The bounds hold per process, and a document fetched for one mount serves
+the other.
 
-### 3.6 Re-keying the allow-list
+- **One cache, two kinds of entry.** `CimdState::cache` is keyed by the raw `client_id` URL. It
+  holds at most `CIMD_CACHE_MAX` (512) entries, counting validated documents and negative entries
+  together.
+  - **When full** (`remember_client_metadata`), expired entries are dropped first. If that frees
+    nothing, the entry closest to expiry is removed, whichever kind it is. That is an LRU stand-in
+    that needs no write per hit.
+- **Validated documents.**
+  - **Lifetime.** The origin's remaining freshness is computed by `imcp2_core::public_fetch`
+    (reported as `PublicDocument::cache_max_age`). It is `s-maxage`, else `max-age`, across every
+    `Cache-Control` line combined, else `Expires` less `Date`. The response's current age (the
+    larger of `Age` and the time since `Date`) is subtracted.
+  - **Bounds.** `cimd_ttl` caps that at `CIMD_CACHE_MAX_TTL` (24 h). With no freshness
+    information, it uses `CIMD_CACHE_DEFAULT_TTL` (10 min) less the response's age.
+  - **No floor**, unlike the plan, which proposed one so that a hostile `max-age` could not force
+    a re-fetch per request. The lifetime is zero, and the document is not reused
+    (`fetch_and_cache_client_metadata` remembers only a non-zero lifetime), when any of these
+    hold:
+    - `no-store`, `no-cache`, or `private`;
+    - `Vary: *`, or a `Cache-Control` or `Vary` line that cannot be decoded;
+    - a zero or invalid `max-age`/`s-maxage`, or an invalid or past `Expires`;
+    - freshness the response's age has already used up.
 
-Introduce a **client-id-ORIGIN trust policy** (the spec's "domain allowed via
-trust policy") — exact `https://<host>` entries on the default 443 port, matched
-as origins so the port gap in §3.1 cannot slip a non-default port past a host
-check. Recommendation: derive it from the *same curated vendor set* that backs
-`DEFAULT_ALLOWED_REDIRECTS` (`auth.rs:434`) so there is one source of truth for
-"who is a vetted vendor," rather than a second independent list.
-`redirect_uri_permitted` continues to gate the redirect leg.
+    A redirect the client withdraws is therefore gone with the next request. The accepted cost: a
+    valid document from an origin that forbids reuse is fetched on every request. That is the
+    origin's choice, and it is contained like every other fetch, by single-flight and the
+    in-flight bounds.
+  - **No revalidation.** The plan's `ETag` handling was not built. No conditional
+    (`If-None-Match`) request is made, so an expired entry is fetched again in full.
+- **Negative entries.** A URL whose document fails a document-intrinsic check is held in the same
+  cache as invalid for `CIMD_NEGATIVE_TTL` (60 s), so repeating the same bogus path costs no
+  fetch. That covers:
+  - the guard refusing the URL;
+  - any non-`200` answer that is not retryable: a `404`, a redirect, another `4xx`, or a `2xx`
+    other than `200` such as `204` or `206`;
+  - an oversized or non-UTF-8 body;
+  - the wrong media type;
+  - a failed validation.
 
-### 3.7 Advertise support
+  Never remembered:
+  - **transient failures** (`classify_fetch_error`): unresolved DNS, the deadline, a failed
+    connection, a body transfer that fails part-way, a `5xx`, or the retryable `408`, `421`, `425`,
+    `429`;
+  - a refusal by the in-flight bounds below;
+  - **per-request failures** (see 3.4).
+- **Single-flight.** Concurrent requests that miss the cache for one URL share one fetch and its
+  outcome (`Flight`), including a failure or an uncacheable document.
+  - A fetcher cancelled mid-way hands over to a waiter.
+  - Once the fetcher has its outcome, it retires the flight before publishing it, still under the
+    flight's lock (`CimdState::retire_flight`). A request arriving after that goes to the cache or
+    fetches afresh. It never joins the old flight to reuse a `no-store` document or a transient
+    failure.
+  - A flight that never publishes, because every request in it was cancelled, is removed by the
+    last holder out (`FlightGuard`). Either way, only that flight's own entry is removed, never a
+    newer one.
+- **In-flight bounds.**
+  - At most `CIMD_MAX_INFLIGHT` (16) fetches process-wide, and `CIMD_MAX_INFLIGHT_PER_HOST` (4)
+    per exact `client_id` host (`HostSlot`, keyed by `host_key`, not by the vetted domain).
+    Requests sharing a single-flight do not each take a slot.
+  - A request over the bounds gets `MetadataUnavailable`; it is not queued.
+  - There is **deliberately no rate cap**. An in-flight slot frees within the 5 s deadline. A rate
+    budget, by contrast, is something a flood of made-up paths could use up to lock real clients
+    out. Rate limiting, if wanted, goes in front of the server (see the README).
+- **Logging.** A fetch failure at a vetted domain is logged at warn at most once a minute per
+  domain (`CimdState::warn_permitted`), and the rest at debug. A caller rotating made-up paths
+  cannot flood the log.
 
-Add `client_id_metadata_document_supported: true` to
-`authorization_server_metadata` (`auth.rs:2179`).
+### 3.6 One source of truth for "vetted vendor"
 
-## 4. How this subsumes the branding work
+The CIMD trust gate reads the redirect allow-list itself (`vetted_domain` over
+`allowed_redirects`, operator entries included). The gate keeps no vendor registry of its own.
 
-The one non-spoofable fact CIMD yields is the **`client_id` domain**
-(DNS/TLS-authenticated). Key the curated vendor name/logo table on that domain —
-**never** on the document's `client_name`/`logo_uri`, which carry no attestation.
-This is precisely the security spine of the client-branding scoping proposal
-(PR #103) — branding derived from the vetted vendor, never from client-supplied
-metadata — but with a cleaner cryptographic key than the redirect-path
-allow-list.
+Branding, as designed in #200 (see 4), does keep a curated domain list (`CONNECTORS` in
+`src/branding.rs`).
+- A test (`connector_domains_are_the_compiled_in_allow_list_vendors`) holds it equal to the
+  compiled-in `DEFAULT_ALLOWED_REDIRECTS` domains.
+- A redirect is branded only when a compiled-in entry admits it, so operator-added entries are
+  never branded.
 
-Caveat: CIMD unblocks the *key*, not the *display*. Rendering the connecting
-client's name/logo on the consent screen is II-side, and II must apply the spec's
-`icons` security rules (HTTPS/`data:` only, MIME allow-list, no inlined SVG).
-That half still needs II coordination.
+### 3.7 Advertisement
+
+`authorization_server_metadata` advertises `client_id_metadata_document_supported` (true when
+CIMD is enabled for the instance) and `token_endpoint_auth_methods_supported: ["none"]`. The
+`registration_endpoint` stays advertised for DCR.
+
+### 3.8 Configuration and rollout
+
+- **Embedding hosts** set `McpConfig::cimd_enabled` per instance.
+- **The `imcp2` binary** has it on for every instance unless `OAUTH_CIMD_ENABLED` is falsey
+  (`0`, `false`, `no`, `off`; read once at startup by `cimd_enabled` in `src/main.rs`).
+- **History.** #191 shipped CIMD opt-in (`OAUTH_CIMD_ENABLED=1`). #203 made it the default. The
+  variable is now a roll-out kill switch, marked in the code for removal once CIMD has run in
+  production for a while.
+- **Rollback.** If a vendor's document turns out to be shaped in a way this implementation
+  refuses, set `OAUTH_CIMD_ENABLED=0` and **redeploy**.
+  - On the native deploy, the value is rendered into the systemd unit at deploy time
+    (`deploy/native/deploy.sh`), so a restart or a changed variable alone leaves CIMD on.
+  - A `workflow_dispatch` of the same ref is enough; no rebuild is needed.
+  - Claude and ChatGPT both select CIMD as soon as an authorization server advertises it, and
+    re-read the metadata within minutes, falling back to DCR.
+
+## 4. Branding: overtaken by #103 and #200
+
+The plan proposed keying the curated vendor name and logo on the CIMD `client_id` domain, on the
+grounds that it is a cleaner, DNS-authenticated key than the redirect allow-list. That is not the
+design that was adopted.
+
+Branding is specified in #103 and implemented in #200, which is in review and not yet on main.
+It keys on **the redirect validated for each connect**, and only for redirects admitted by a
+compiled-in `DEFAULT_ALLOWED_REDIRECTS` entry. The reasons:
+
+- **One key covers both registration modes.** DCR and CIMD clients alike, with no second code
+  path.
+- **For CIMD clients the redirect key is at least as strong, and for native clients it is the
+  only sound one.**
+  - **Web clients:** the two keys agree. 3.4 requires a hosted redirect to be same-origin with the
+    document URL, so the redirect's origin is the `client_id`'s origin.
+  - **Native clients:** the plan's key fails. Loopback redirects are exempt from the same-origin
+    rule and are matched on any port, and a CIMD client is public, with no secret. Any local
+    program can therefore present a vetted vendor's `client_id` with its own loopback port and
+    pass validation. An example is Claude Code's `https://claude.ai/oauth/claude-code-client-metadata`.
+    A `client_id`-keyed brand would show that program as the vendor.
+  - The redirect key leaves every loopback connect anonymous. Loopback-only CIMD clients such as
+    Claude Code therefore get no branding, which differs from what the plan intended.
+- **Branding is narrower than the CIMD gate.** It ignores operator-added allow-list entries.
+- **It answers the question that matters on the consent screen.** That question is where this
+  connect's authorization code goes, and the redirect decides that. #103 also explains why
+  nothing about branding may ride the connect link.
+
+What carries over unchanged is the security spine: branding comes from the server's curated
+table, never from the document's `client_name` or `logo_uri`. No CIMD document field is ever
+displayed. `client_name` is parsed (a wrong-typed one invalidates the document) but never shown or
+logged, and nothing reads the document's logo or icons. The spec's `icons` rules therefore never
+come into play: the logo II would show is a bundled image the server serves itself.
+
+**The plan's caveat still holds:** this server supplies only the key and the curated name and
+logo. Showing them on the consent screen is Internet Identity's side, and #103 lists what II must
+do. Until II renders them, #200's branding endpoints are inert.
 
 ## 5. Security analysis
 
-- **SSRF:** gated to trust-policy origins, so no arbitrary-URL fetch — and even a
-  vetted origin is fetched through the address-pinned, all-IPs-global fetcher, so
-  a compromised/misconfigured vendor DNS pointing at an internal address is still
-  rejected. CIMD also **disables cross-origin redirects** (§3.3), so a vetted URL
-  can't be bounced to an unvetted public IP or a different port.
-- **DoS (outbound amplification):** the fetch hangs off the *unauthenticated*
-  `/authorize` path. Origin-gating bounds it to known **hosts**, but **not** to a
-  bounded number of fetches: an attacker can vary the URL **path** on a vetted
-  host (`https://claude.ai/a`, `/b`, …), and each distinct URL is a distinct
-  cache key and a fresh up-to-15 s fetch, so the cache does not bound misses. A
-  **concurrency + rate cap on outbound CIMD fetches is therefore required, not
-  optional** — cap it per client-id host (and globally) so path variation on one
-  vetted host cannot fan out, and negative-cache **document-intrinsic** failures
-  (non-CIMD / bad URLs — never per-request redirect failures, §3.5) so a repeat
-  of the same bogus path is cheap. (This project treats availability
-  hardening as discretionary, but here the control is load-bearing, not a
-  nicety.)
-- **Phishing:** unchanged posture. The curated trust policy remains the phishing
-  defense; CIMD only re-keys it from redirect-URI-host to the DNS-authenticated
-  client-id-origin. Mandatory consent-screen hostname display stays.
-- **Display-field spoofing:** never trust `client_name`/`logo_uri`; brand from
-  the vetted vendor keyed on the verified domain.
-- **Confused deputy:** the existing `sid`-cookie consent binding is unaffected.
+- **SSRF.**
+  - Only trust-gated origins are fetched.
+  - Each fetch goes through the address-pinned, all-addresses-public, no-proxy fetcher, so a
+    vetted vendor's DNS pointing at an internal address is still refused.
+  - No redirect is followed, so a vetted URL cannot be bounced to another host, port, or path.
+- **Outbound amplification (DoS).** The fetch hangs off the unauthenticated `/oauth/authorize`.
+  The gate bounds it to the vetted domains, but not to a number of hosts or fetches. Each of these
+  makes every URL a cache miss:
+  - path variation on a vetted host (`https://claude.ai/a`, `/b`, …);
+  - subdomain variation under a vetted domain (`https://x1.claude.ai/…`, `https://x2.claude.ai/…`),
+    where each name is a separate host.
 
-## 6. Phasing
+  **What bounds it:** the in-flight caps (16 process-wide, and 4 per exact host), single-flight
+  per URL, the 60 s negative cache for repeated bogus paths, the redirect check before any fetch,
+  and the 5 s deadline.
 
-- **Phase 0 — shared SSRF fetcher.** Extract the `discover.rs` fetcher into a
-  `pub(crate)` module. No behavior change.
-- **Phase 1 — CIMD accept path.** URL-form `client_id` in `/oauth/authorize`:
-  origin-gate → SSRF-safe fetch (strict reader) → validate (`client_id`==URL
-  string match, redirect membership + path pin, JSON structure) → cache. Add the
-  client-id-origin policy. Advertise the metadata flag. **Keep DCR** as deprecated
-  backward-compat. **Acceptance criterion — the endpoint MUST NOT ship without its
-  outbound-DoS control:** a per-host + global concurrency/rate cap on CIMD fetches
-  plus negative-caching (§5), so path variation on a vetted host cannot fan out.
-- **Phase 2 — branding.** Key the vendor name/logo table on the verified domain;
-  coordinate the display rules with II.
-- **Phase 3 — (optional, later).** Open CIMD beyond the trust policy to general
-  SSRF-guarded fetching, if/when the ecosystem moves and the added surface is
-  accepted.
+  **The residual:**
+  - **Slots can be kept busy.** A sustained flood can occupy the slots, so a real client whose
+    document is not cached may be told to retry. A cached document needs no slot, and the
+    default lifetime is 10 minutes.
+  - **Subdomain floods escape the per-host cap.** Because `HostSlot` is keyed by the full host,
+    one domain's subdomains can take all 16 process-wide slots. A name that does not resolve is a
+    transient failure, never negative-cached, so such a flood is bounded only by the process-wide
+    cap and the 5 s deadline.
+  - **Negative entries share the cache.** When it is full, the entry closest to expiry is
+    evicted. Every negative entry expires within 60 s, so a flood can push a cached document out
+    at most 60 s before it would expire anyway. The exception is a document whose own lifetime is
+    60 s or less. A document pushed out early needs a slot to be fetched again.
+  - **The rate cap was dropped on purpose.** The plan called a concurrency *and rate* cap
+    load-bearing here. As built, the load is carried by the in-flight bounds without a rate cap
+    (see 3.5). That follows the project's treatment of availability hardening as discretionary,
+    and a rate limiter in front of the server is the documented mitigation.
+- **Phishing.** The posture is unchanged. The curated allow-list remains the defense. A
+  self-asserted document admits no redirect a DCR client could not already register, and the
+  same-origin rule (3.4) ties a CIMD client's hosted redirects to its own origin.
+- **Display-field spoofing.** No CIMD-supplied field is ever displayed (see 4).
+- **Client authentication.** Only public clients are supported. A document that requires a
+  secret-based method is invalid, and the token exchange still requires the connect's PKCE
+  (S256) verifier.
+- **Confused deputy.** The browser-binding cookie (`CONNECT_COOKIE`) that ties a connect to the
+  browser that started it is unaffected.
 
-## 7. What stays the same (compatibility)
+## 6. Phasing: outcome
 
-DCR at `/oauth/register` remains (deprecated, not removed before 2027-07-28):
-real clients — chatgpt.com, claude.ai, cursor.com, and so on — will keep sending
-DCR bodies for a long time. CIMD is **purely additive**: a client presenting a
-URL `client_id` on a vetted domain uses CIMD; everything else uses DCR.
+- **Phase 0 (shared SSRF fetcher): done, in a different shape, and not behavior-neutral.** The
+  plan was to extract discovery's fetcher into a shared module with no behavior change. Instead,
+  `imcp2_core::public_fetch` was added on top of discovery's SSRF guard, which #191 changed in
+  three ways:
+  - `resolve_public_url` became crate-visible and returns a typed `ResolveError`, which separates
+    a refused URL from a resolver outage. That is what lets a DNS failure be transient rather
+    than cached as a refusal.
+  - The byte-level `read_capped_bytes` was split out of discovery's lossy reader.
+  - The shared public-address check was tightened, for discovery too. IPv6 is now refused by
+    default outside `2000::/3`. Inside `2001::/23` only the IANA-listed globally reachable
+    assignments pass. `3fff::/20` and `192.88.99.0/24` (except `192.88.99.2`) are refused. So the
+    discovery crawl now refuses some addresses it used to accept.
 
-## 8. Open questions / decisions
+  Discovery's redirect handling and fail-soft reading are unchanged. `public_fetch` adds the
+  strict reader and the no-redirect policy.
+- **Phase 1 (CIMD accept path): done.** Shipped in #191, defaulted on in #203.
+  - The plan's elements all shipped: the trust gate, the SSRF-safe strict fetch, `client_id`
+    string match, redirect membership plus path pin, structure checks, caching, and the
+    metadata flag.
+  - **Different from the plan:**
+    - the trust gate matches a vetted domain or any dot-boundary subdomain of it, not an exact
+      origin (see 3.1);
+    - there is no cache floor and no `ETag` revalidation (see 3.5).
+  - **Beyond the plan:** the same-origin redirect rule and the public-client checks.
+  - **The acceptance criterion was revised rather than met as written.** The plan required a
+    per-host and global concurrency and rate cap plus negative caching. What shipped has the
+    in-flight caps, single-flight, and the negative cache, and deliberately drops the rate cap
+    (see 3.5 and 5).
+- **Phase 2 (branding): redesigned, in review.** Keyed on the validated redirect rather than the
+  CIMD domain: specified in #103, implemented in #200, not yet on main. Nothing is displayed until
+  Internet Identity renders it (see 4).
+- **Phase 3 (CIMD beyond the trust policy): not planned.** Opening CIMD to general fetching would
+  widen the outbound surface to arbitrary URLs. It needs a deliberate decision, and the in-flight
+  bounds and negative cache would carry the whole load.
 
-1. **Non-vetted URL `client_id`:** hard reject, or silently fall back to DCR? A
-   reject is clearer and avoids a confusing partial-support surface; a fallback
-   is more permissive. Recommend reject with an allow-listing contact.
-2. **One list or two:** reuse the `DEFAULT_ALLOWED_REDIRECTS` vendor set as the
-   client-id-origin policy, or maintain a separate list? Recommend one source of
-   truth.
-3. **Cache lifetime & persistence:** in-memory only vs persisted; TTL floor /
-   ceiling values; cache size cap.
-4. **Redirect validation strictness:** is document membership sufficient for a
-   vetted domain, or keep the additional `redirect_uri_permitted` path pin?
-   Recommend keep it.
-5. **Response-size cap** for a CIMD (proposed 64 KB) and array-length bounds.
-6. **Spec version pinning:** which exact CIMD draft the 2026-07-28 revision
-   references, and any normative fields beyond the ones named here.
-7. **`iss` interaction:** none expected (RFC 9207 `iss` already shipped), but
-   confirm the metadata document and the authorization response don't collide.
+## 7. Compatibility
 
-## Citations
+- **DCR at `/oauth/register` remains.** It is deprecated in the spec but not removed, and some
+  real clients still send DCR bodies.
+- **CIMD is purely additive.** A URL `client_id` on a vetted origin uses CIMD; everything else
+  uses DCR. With CIMD off, a URL `client_id` is an unknown client, and the metadata stops
+  advertising the mechanism, so clients fall back to DCR.
 
-- DCR / client store: `auth.rs:2095` (`register`), `auth.rs:2058`
-  (`RegisterRequest`), `auth.rs:175` (`ClientReg`), `auth.rs:137`/`147` (bounds).
-- Allow-list: `auth.rs:434` (`DEFAULT_ALLOWED_REDIRECTS`), `auth.rs:457`
-  (`allowed_redirects`), `auth.rs:545` (`redirect_uri_permitted`), `auth.rs:614`
-  (`is_wellformed_hosted_redirect`), `auth.rs:643` (`redirect_allowed`).
-- Flow: `auth.rs:1012` (`authorize`), `auth.rs:834` (`validate_client`).
-- AS metadata: `auth.rs:2179` (`authorization_server_metadata`), `auth.rs:2185`
-  (`registration_endpoint`).
-- SSRF-safe fetcher: `discover.rs:1106` (`resolve_public_url`), `discover.rs:1182`
-  (`site_client`), `discover.rs:1160` (`ssrf_redirect_policy`), `discover.rs:1145`
-  (`redirect_hop_ok`), `discover.rs:1056`/`1063`/`1079`
-  (`ip_is_global`/`ipv4`/`ipv6`), `discover.rs:1202-1205` (size caps).
+## 8. Decisions on the plan's open questions
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Non-vetted URL `client_id`: reject, or fall back to DCR? | **Reject**, before any fetch, with the "not approved" page or `403 invalid_client` naming the contact (3.1). |
+| 2 | One list or two? | **One for the gate.** It reads the hosted-redirect allow-list (3.6). Branding (#200) keeps a curated subset, held equal to the compiled-in domains by a test. |
+| 3 | Cache lifetime and persistence | **In memory, per process.** Origin freshness capped at 24 h, default 10 min. **No floor**, so withdrawn redirects drop out at once; the accepted cost is a fetch per request for a reuse-forbidding origin, bounded by the in-flight caps. No `ETag` revalidation. One 512-entry cache holds validated and negative entries (60 s) together (3.5). |
+| 4 | Is document membership enough, or keep the path pin? | **Keep the pin, and add more.** A kept redirect must pass `redirect_uri_permitted` and be loopback or same-origin with the document (3.4). |
+| 5 | Response-size cap and array bounds | **8 KB** (the plan proposed 64 KB). `redirect_uris` bounded as in DCR: at most 16 entries of 2048 bytes each (3.3, 3.4). |
+| 6 | Spec version pinning | The code follows the CIMD draft's requirements as named in section 1 and cites the draft by name, without a numbered revision. |
+| 7 | `iss` interaction | None. RFC 9207 `iss` is unaffected, and the metadata advertises both. |
+
+## 9. Tests (CIMD-specific)
+
+In `src/auth.rs`:
+
+- **Shape and identity:** `cimd_client_id_shape`, `cimd_client_id_is_taken_as_given`,
+  `cimd_host_key_is_one_spelling_per_host`.
+- **Document validation:** `client_metadata_parsing`. It runs on the real ChatGPT and Claude Code
+  documents and covers the rules in 3.4.
+- **Trust gate and authorization:** `cimd_origin_trust_policy`, `cimd_client_authorization`,
+  `authorize_points_an_unvetted_cimd_origin_at_the_contact`,
+  `authorize_tells_a_cimd_client_to_retry_when_its_document_is_unavailable`.
+- **Fetch handling:** `cimd_fetch_error_classification`, `cimd_media_type`,
+  `cimd_cache_ttl_is_bounded`.
+- **Concurrency:** `cimd_fetches_are_coalesced_and_bounded_per_host`,
+  `cimd_cancelled_fetcher_hands_over_to_a_waiter`, `cimd_cancelled_fetch_leaves_nothing_behind`,
+  `cimd_flight_retirement_rules`, `cimd_state_is_shared_by_every_store`,
+  `cimd_warnings_are_sampled_per_vendor`.
+- **Advertisement:** `as_metadata_advertises_cimd_only_where_enabled`.
+
+In `crates/imcp2-core/src/public_fetch.rs` (the strict fetch that 3.3 and 5 rely on):
+
+- **Guard and deadline:** `guard_refuses_before_fetching`, `one_deadline_covers_the_whole_fetch`,
+  `unresolvable_host_is_unreachable_not_refused`.
+- **Response acceptance:** `accept_refuses_redirects_and_errors`,
+  `accept_takes_only_a_complete_valid_body`.
+- **Freshness:** `freshness_honours_age_and_every_cache_control_line`, `cache_control_lifetime`,
+  `delta_seconds_is_ascii_digits_only`.
+
+In `src/main.rs`: **kill switch**, `cimd_opt_out_values`.
+
+## 10. Where it lives
+
+- `src/auth.rs`, section "Client ID Metadata Documents (CIMD)":
+  - constants: `CIMD_*`;
+  - shape and gate: `cimd_client_id`, `parsed_as_given`, `cimd_origin_trusted`, `vetted_domain`,
+    `host_key`;
+  - document handling: `parse_client_metadata`, `is_json_media_type`, `cimd_ttl`,
+    `classify_fetch_error`, `fetch_client_metadata_document`,
+    `fetch_and_validate_client_metadata`;
+  - state and outcomes: `CimdState`, `HostSlot`, `Flight`, `FlightGuard`, `CimdError`,
+    `ClientCheck`;
+  - the flow:
+    - `AuthStore::validate_client`;
+    - `AuthStore::client_metadata_for`;
+    - `AuthStore::fetch_and_cache_client_metadata`, which applies the in-flight bounds, warn
+      sampling, the negative lifetime, and skips the cache when the lifetime is zero;
+    - `AuthStore::remember_client_metadata`;
+  - advertisement: `authorization_server_metadata`.
+- `crates/imcp2-core/src/public_fetch.rs`: `fetch_public_document`, `FetchError`,
+  `PublicDocument`. `crates/imcp2-core/src/discover.rs`: `resolve_public_url`, `ResolveError`,
+  `read_capped_bytes`.
+- `src/lib.rs` (`McpConfig::cimd_enabled`) and `src/main.rs` (`cimd_enabled`,
+  `OAUTH_CIMD_ENABLED`): configuration. `deploy/native/` renders the variable into the unit.
+- `README.md` and `deploy/native/README.md`: the operator-facing description and the
+  `OAUTH_CIMD_ENABLED` entry.
