@@ -25,7 +25,8 @@ CIMD is **trust-policy-gated and additive**:
 
 - imcp2 fetches a Client ID Metadata Document only when the `client_id` URL is on a vetted vendor
   domain.
-- It keeps open DCR for everything else.
+- It keeps open DCR for ordinary (non-URL) client IDs. A URL `client_id` off the trust policy is
+  refused, never handed to DCR.
 - It never trusts the document's display fields.
 
 The new outbound-fetch surface on the unauthenticated `/oauth/authorize` path is therefore
@@ -219,8 +220,10 @@ the other.
   holds at most `CIMD_CACHE_MAX` (512) entries, counting validated documents and negative entries
   together.
   - **When full** (`remember_client_metadata`), expired entries are dropped first. If that frees
-    nothing, the entry closest to expiry is removed, whichever kind it is. That is an LRU stand-in
-    that needs no write per hit.
+    nothing, the entry closest to expiry is removed, whichever kind it is. This is earliest-expiry
+    eviction, not LRU: no access recency is recorded, so a heavily used document can be evicted
+    just because it expires first. (The code calls it an LRU stand-in; it was chosen because it
+    needs no write per cache hit.)
 - **Validated documents.**
   - **Lifetime.** The origin's remaining freshness is computed by `imcp2_core::public_fetch`
     (reported as `PublicDocument::cache_max_age`). It is `s-maxage`, else `max-age`, across every
@@ -237,10 +240,12 @@ the other.
     - a zero or invalid `max-age`/`s-maxage`, or an invalid or past `Expires`;
     - freshness the response's age has already used up.
 
-    A redirect the client withdraws is therefore gone with the next request. The accepted cost: a
-    valid document from an origin that forbids reuse is fetched on every request. That is the
-    origin's choice, and it is contained like every other fetch, by single-flight and the
-    in-flight bounds.
+    So when an origin forbids reuse, a redirect the client withdraws is gone with the next request.
+    A document cached with positive freshness stays authoritative until its lifetime runs out (10
+    min by default, at most 24 h), so a withdrawal from such an origin takes effect only then. The
+    accepted cost of having no floor: a valid document from an origin that forbids reuse is
+    fetched on every request. That is the origin's choice, and it is contained like every other
+    fetch, by single-flight and the in-flight bounds.
   - **No revalidation.** The plan's `ETag` handling was not built. No conditional
     (`If-None-Match`) request is made, so an expired entry is fetched again in full.
 - **Negative entries.** A URL whose document fails a document-intrinsic check is held in the same
@@ -380,9 +385,11 @@ do. Until II renders them, #200's branding endpoints are inert.
     transient failure, never negative-cached, so such a flood is bounded only by the process-wide
     cap and the 5 s deadline.
   - **Negative entries share the cache.** When it is full, the entry closest to expiry is
-    evicted. Every negative entry expires within 60 s, so a flood can push a cached document out
-    at most 60 s before it would expire anyway. The exception is a document whose own lifetime is
-    60 s or less. A document pushed out early needs a slot to be fetched again.
+    evicted. Every negative entry expires within 60 s of being stored, so while a flood keeps the
+    cache full, the victim is a negative entry unless a validated document has even less time
+    left. A flood can therefore displace a validated document only in its last 60 s or so of
+    life: at any moment for a document whose whole lifetime is that short, and near the end for
+    any other. A document pushed out early needs a slot to be fetched again.
   - **The rate cap was dropped on purpose.** The plan called a concurrency *and rate* cap
     load-bearing here. As built, the load is carried by the in-flight bounds without a rate cap
     (see 3.5). That follows the project's treatment of availability hardening as discretionary,
@@ -438,9 +445,12 @@ do. Until II renders them, #200's branding endpoints are inert.
 
 - **DCR at `/oauth/register` remains.** It is deprecated in the spec but not removed, and some
   real clients still send DCR bodies.
-- **CIMD is purely additive.** A URL `client_id` on a vetted origin uses CIMD; everything else
-  uses DCR. With CIMD off, a URL `client_id` is an unknown client, and the metadata stops
-  advertising the mechanism, so clients fall back to DCR.
+- **CIMD is purely additive.**
+  - A URL `client_id` on a vetted origin uses CIMD.
+  - A URL `client_id` on any other origin is refused (3.1).
+  - Every other client ID is looked up as a DCR registration, as before.
+- **With CIMD off**, a URL `client_id` is an unknown client, and the metadata stops advertising
+  the mechanism, so clients fall back to DCR.
 
 ## 8. Decisions on the plan's open questions
 
@@ -448,7 +458,7 @@ do. Until II renders them, #200's branding endpoints are inert.
 |---|---|---|
 | 1 | Non-vetted URL `client_id`: reject, or fall back to DCR? | **Reject**, before any fetch, with the "not approved" page or `403 invalid_client` naming the contact (3.1). |
 | 2 | One list or two? | **One for the gate.** It reads the hosted-redirect allow-list (3.6). Branding (#200) keeps a curated subset, held equal to the compiled-in domains by a test. |
-| 3 | Cache lifetime and persistence | **In memory, per process.** Origin freshness capped at 24 h, default 10 min. **No floor**, so withdrawn redirects drop out at once; the accepted cost is a fetch per request for a reuse-forbidding origin, bounded by the in-flight caps. No `ETag` revalidation. One 512-entry cache holds validated and negative entries (60 s) together (3.5). |
+| 3 | Cache lifetime and persistence | **In memory, per process.** Origin freshness capped at 24 h, default 10 min. **No floor**, so an origin that forbids reuse has a withdrawn redirect drop out on the next request (a document cached with positive freshness stays until it expires); the accepted cost is a fetch per request for such an origin, bounded by the in-flight caps. No `ETag` revalidation. One 512-entry cache holds validated and negative entries (60 s) together (3.5). |
 | 4 | Is document membership enough, or keep the path pin? | **Keep the pin, and add more.** A kept redirect must pass `redirect_uri_permitted` and be loopback or same-origin with the document (3.4). |
 | 5 | Response-size cap and array bounds | **8 KB** (the plan proposed 64 KB). `redirect_uris` bounded as in DCR: at most 16 entries of 2048 bytes each (3.3, 3.4). |
 | 6 | Spec version pinning | The code follows the CIMD draft's requirements as named in section 1 and cites the draft by name, without a numbered revision. |
