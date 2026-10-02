@@ -283,8 +283,12 @@ the other.
     budget, by contrast, is something a flood of made-up paths could use up to lock real clients
     out. Rate limiting, if wanted, goes in front of the server (see the README).
 - **Logging.** A fetch failure at a vetted domain is logged at warn at most once a minute per
-  domain (`CimdState::warn_permitted`), and the rest at debug. A caller rotating made-up paths
-  cannot flood the log.
+  domain (`CimdState::warn_permitted`), and the rest at debug.
+  - `validate_client` adds one debug event per refused or unavailable request.
+  - At the binary's default filter (`info`, unless `RUST_LOG` says otherwise), a caller rotating
+    made-up paths therefore cannot flood the log.
+  - With debug logging enabled, every failure is still logged and such a flood reaches the
+    output.
 
 ### 3.6 One source of truth for "vetted vendor"
 
