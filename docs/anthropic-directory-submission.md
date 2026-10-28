@@ -33,6 +33,14 @@ not published in the docs.
 - **2026-09-28** — submitted through the portal as **"Internet Computer"**,
   URL slug **`icp`** (manage page: <https://claude.ai/directory/manage/icp>).
   Status **In review** since then; no reviewer feedback as of 2026-10-27.
+- **2026-09-25 to 2026-10-01** — OAuth disruption overlapping the submission
+  date, caused by the DCR-to-CIMD migration (CIMD became the default
+  registration mode in [#203](https://github.com/dfinity/imcp2/pull/203),
+  merged 2026-09-24): a user reported DCR failing with HTTP 400 "redirect URI
+  not permitted" on 2026-09-25, and OpenAI's reviewer could not complete the
+  sign-in flow on 2026-10-01. A reviewer who tried the connector in that
+  window would have failed at sign-in. The fix is live; if feedback cites a
+  sign-in failure, answer with this timeline and ask for a re-test.
 
 ## Where and how submission happens
 
