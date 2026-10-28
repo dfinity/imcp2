@@ -598,7 +598,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Calls a canister's *update* method (as opposed to read-only queries which go through canister_query). Method names and argument types come from the canister's Candid interface, which get_canister_candid returns. Runs anonymously unless given a derivation origin, which acts as the user's account at that app.",
+        description = "Calls a canister's *update* method (as opposed to read-only queries which go through canister_query). Method names and argument types come from the canister's Candid interface, which get_canister_candid returns; the canister must publish that interface, and an update call to a canister that publishes none, or whose interface cannot be read, is refused. Runs anonymously unless given a derivation origin, which acts as the user's account at that app.",
         annotations(title = "Make a canister update call", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterUpdateCallOutput>(),
     )]
@@ -611,7 +611,6 @@ impl IcCanisterTools {
             app_url,
             derivation_origin,
             account,
-            candid,
         }): Parameters<calls::CanisterUpdateCallArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
@@ -619,17 +618,22 @@ impl IcCanisterTools {
             Ok(p) => p,
             Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
         };
-        // The financial-transactions gate (see `compliance`), in four scopes,
-        // before any network work: the standardized value-moving method names
-        // (the ICRC transfer/approval surface) and the mixed-purpose
-        // governance entry point manage_neuron, both refused on EVERY
-        // canister; the system ledgers'/cycles-minting canister's own
-        // value-moving methods on those canisters; and EVERY update method on
-        // a listed financial-service canister, so a refusal here does not
-        // depend on the method name alone. Each scope's refusal claims only
-        // what that scope knows about the call, and points the user outside
-        // this connector. Queries need no gate — a query cannot commit state,
-        // so it cannot move funds.
+        // The financial-transactions gate (see `compliance`): every scope
+        // decided from the request alone runs here, before any network work —
+        // the standardized value-moving method names (the ICRC transfer/approval
+        // surface) and the mixed-purpose governance entry point manage_neuron,
+        // both refused on EVERY canister; the system ledgers'/cycles-minting
+        // canister's own value-moving methods on those canisters; EVERY update
+        // method on a listed financial-service canister, so a refusal here does
+        // not depend on the method name alone; and a call addressed to any
+        // other ICRC-1 / ICRC-2 ledger method by name. The one scope that needs
+        // the canister's interface — a financial canister detected from the
+        // ICRC methods it declares — runs below, once the canister's published
+        // interface has been read; an update call needs that interface, so a
+        // canister that gives none is refused there.
+        // Each scope's refusal claims only what that scope knows about the
+        // call, and points the user outside this connector. Queries need no
+        // gate — a query cannot commit state, so it cannot move funds.
         if let Some(refusal) = compliance::disallowed_update_method(&principal, &method) {
             return Ok(err(refusal));
         }
@@ -657,10 +661,63 @@ impl IcCanisterTools {
             Err(refusal) => return Ok(err(refusal)),
         };
         // The interface to encode/decode against: the canister's own
-        // candid:service if exposed, else the caller-supplied `candid`. Update calls
-        // are never redirected (OQL is read-only), so no oql_query_redirect here.
-        let did = calls::resolve_did(&self.agent, principal, candid.as_deref()).await;
-        let arg_bytes = match calls::encode_args(did.as_deref(), &method, &args) {
+        // candid:service, which an update call REQUIRES — no caller-supplied
+        // fallback here, unlike canister_query (a query cannot commit state).
+        // Update calls are never redirected (OQL is read-only), so no
+        // oql_query_redirect here. Read with the outcome kept, not through
+        // resolve_did: the refusal below says whether the interface is missing
+        // or the read failed.
+        let read = calls::read_candid_service(&self.agent, principal).await;
+        // The interface scope of the financial-transactions gate (see
+        // `compliance`): a canister whose declared interface provides an ICRC-1 /
+        // ICRC-2 method is a financial canister, and every update call to it is
+        // refused — decided from the canister itself, here and only here. The
+        // interface is first in hand at this point: reading it IS a contact with
+        // the canister, which the discoverability gate above has to admit first
+        // (an undeclared ledger is refused as undeclared), and the read just
+        // made is the one the encoding needs, so this costs no round-trip. It
+        // runs before the arguments are encoded (an argument error must not mask
+        // the policy refusal) and before anything is signed. The scope always
+        // has the interface, because an update call to a canister that gives it
+        // none is refused (per review and the maintainer's direction): a
+        // canister that publishes none, one whose published text the parser
+        // cannot read, and one whose read FAILED — a transport, HTTP or
+        // certificate error, refused with a retry message — each get
+        // `unchecked_update_refusal`, so no update this server sends went
+        // unchecked. What the guard still does not judge is a bespoke method on
+        // a canister whose published interface is not a ledger's.
+        let did = match read {
+            calls::CandidServiceRead::Published(did) => did,
+            calls::CandidServiceRead::NotText => {
+                return Ok(err(compliance::unchecked_update_refusal(
+                    &method,
+                    &compliance::MissingInterface::Unreadable,
+                )));
+            }
+            calls::CandidServiceRead::NotPublished => {
+                return Ok(err(compliance::unchecked_update_refusal(
+                    &method,
+                    &compliance::MissingInterface::NotPublished,
+                )));
+            }
+            calls::CandidServiceRead::Failed(error) => {
+                return Ok(err(compliance::unchecked_update_refusal(
+                    &method,
+                    &compliance::MissingInterface::ReadFailed(error),
+                )));
+            }
+        };
+        let Some(declared) = calls::declared_methods(&did) else {
+            return Ok(err(compliance::unchecked_update_refusal(
+                &method,
+                &compliance::MissingInterface::Unreadable,
+            )));
+        };
+        if let Some(refusal) = compliance::disallowed_update_on_ledger_interface(&method, &declared)
+        {
+            return Ok(err(refusal));
+        }
+        let arg_bytes = match calls::encode_args(Some(&did), &method, &args) {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
         };
@@ -675,7 +732,7 @@ impl IcCanisterTools {
             Err(e) => return Ok(err(format!("call failed: {e}"))),
         };
         // Decode against the Candid interface so field names are recovered.
-        let reply = calls::decode_reply(did.as_deref(), &method, &reply_bytes);
+        let reply = calls::decode_reply(Some(&did), &method, &reply_bytes);
         let (derived_for_origin, requested, derivation_origin_source) = match &target {
             Some(t) => (Some(t.origin.clone()), Some(t.requested.clone()), Some(t.source.clone())),
             None => (None, None, None),

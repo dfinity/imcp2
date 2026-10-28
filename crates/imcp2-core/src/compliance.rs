@@ -13,9 +13,11 @@
 //! creation and funding are the one exception — they point at the user's own
 //! icp CLI, which is where this connector already says that work happens.
 //!
-//! The guard has four groups (the method groups are split per review, so an
-//! app that happens to name a non-financial method `transfer` or `approve`
-//! keeps working):
+//! The guard has six scopes — five decided from the request alone, before any
+//! network work, and one decided from the canister's own declared interface
+//! once `canister_update_call` has read it (the method groups are split per
+//! review, so an app that happens to name a non-financial method `transfer` or
+//! `approve` keeps working):
 //!
 //!   * **Standardized value-moving methods, matched literally on every
 //!     canister.** Token ledgers on the Internet Computer follow the ICRC
@@ -56,6 +58,37 @@
 //!     destination, the refusal says so and claims nothing about the call
 //!     itself: `store` on a wallet backend is refused for where it goes, not
 //!     for what it does (per review).
+//!   * **ICRC ledger methods by name, refused on every canister.** A call
+//!     addressed to any other `icrc1_*` / `icrc2_*` method — a balance read,
+//!     the metadata, an allowance query invoked as an update — is refused
+//!     before any network work: the caller is addressing the canister as an
+//!     ICRC ledger, and a canister that provides those methods is a financial
+//!     canister (next scope). The register disclaims the call: a balance read
+//!     is not a transfer, and the guard says only that the name is a ledger
+//!     method's.
+//!   * **Financial canisters detected from the canister itself, refused
+//!     entirely.** Once the interface is in hand — the canister's own
+//!     published `candid:service`, which `canister_update_call` reads before
+//!     anything is encoded or signed, and the only interface an update call
+//!     is ever checked against — a canister whose declared interface provides
+//!     ANY `icrc1_*` / `icrc2_*` method (a query such as `icrc1_balance_of`
+//!     included) is a financial canister, and every update call to it gets the
+//!     destination register, naming the standard(s) and the methods that
+//!     established them. That covers every ICRC-1/ICRC-2 ledger — the ICP
+//!     ledger, the cycles ledger, every SNS and chain-key ledger, every token
+//!     built on the ic-icrc1 ledger — with no list to keep current. An update
+//!     call NEEDS that published interface, so this scope always has it (per
+//!     review and the maintainer's direction): a canister that publishes none
+//!     — a CERTIFIED absence, the certificate proving the path is not in the
+//!     state tree — one whose published text the parser cannot read, and one
+//!     whose read FAILED (a transport, HTTP or certificate error) are each
+//!     refused with [`unchecked_update_refusal`], which says which it was and
+//!     what follows (publish the interface; retry). No update this server
+//!     sends went unchecked, and no caller-supplied text is consulted for an
+//!     update call (`canister_query` keeps its `candid` fallback: a query
+//!     cannot commit state). Other ICRC token namespaces (`icrc4_`, `icrc7_`,
+//!     `icrc37_`, `icrc152_`) are not detected this way; their value-moving
+//!     names are refused literally above.
 //!
 //! Why the standardized surface is where real funds live: tokens are only
 //! valuable if they can be exchanged or used, and the ICP ecosystem's
@@ -75,7 +108,14 @@
 //!     a policy paragraph inside `canister_update_call`'s description would
 //!     read as a hint that the tool is usable for financial transactions.
 //!     This guard enforces the policy for the standardized ledger surface,
-//!     where real funds overwhelmingly live (see above).
+//!     where real funds overwhelmingly live (see above), and — from the
+//!     canister's own interface, which every update call must have published
+//!     — for every canister that provides ICRC methods; a canister whose
+//!     interface is missing, unreadable or failed to read gets no update call
+//!     at all. What is not detected is a bespoke value-moving method under an
+//!     unrelated name on a canister whose published interface is not a
+//!     ledger's, and that limit is stated wherever the guard is described,
+//!     never implied away.
 //!     Likewise the canister list is curated and static, while exchanges
 //!     create per-pair pool/farm canisters dynamically and new services
 //!     launch: entries cover each service's central canisters (verified
@@ -89,6 +129,7 @@
 //!     ecosystem's ICRC-integrated platforms. The stated policy covers them.
 
 use candid::Principal;
+use std::collections::BTreeSet;
 
 /// Standardized value-moving methods, refused on EVERY canister, matched
 /// literally (the ICRC token standards fix these exact names; Candid method
@@ -425,13 +466,50 @@ const DISALLOWED_FINANCE_CANISTERS: &[(&str, &str, &str)] = &[
 /// [`DISALLOWED_FINANCE_CANISTERS`].
 const CK_LEDGER_WHY: &str = "its update surface transfers the token or grants spending approvals";
 
-/// The financial-transactions gate: `Some(refusal)` when the call is
-/// disallowed, `None` when it may proceed. Four scopes, checked in order: the
-/// mixed-purpose entry points and the standardized value-moving method names
-/// (both refused on every canister), the abstract names scoped to the system
-/// ledger where they are financial, and the finance-canister list — on a
-/// listed canister EVERY update method is refused, so `None` never depends on
-/// the method name alone. Method matching is literal — the IC matches method
+/// The ICRC token-ledger namespaces, with the standard each names: a method
+/// whose name starts with one of these prefixes is an ICRC-1 / ICRC-2 ledger
+/// method, and a canister that provides one is a financial canister (see the
+/// module doc). Literal prefixes WITH the underscore, so
+/// `icrc10_supported_standards` (ICRC-10, a generic capability listing) and
+/// `icrc21_canister_call_consent_message` (ICRC-21, consent messages) do not
+/// match.
+const ICRC_LEDGER_PREFIXES: &[(&str, &str)] = &[("icrc1_", "ICRC-1"), ("icrc2_", "ICRC-2")];
+
+/// The ICRC-1 / ICRC-2 standard `method` is named for, if any.
+fn icrc_ledger_standard(method: &str) -> Option<&'static str> {
+    ICRC_LEDGER_PREFIXES.iter().find(|(prefix, _)| method.starts_with(prefix)).map(|(_, s)| *s)
+}
+
+/// How many of a financial canister's ICRC method names a refusal lists before
+/// summarizing the rest — enough to make the evidence checkable against
+/// `get_canister_candid`, not the whole ledger interface.
+const MAX_LISTED_METHODS: usize = 5;
+
+/// The destination register: what is disallowed is the service the call goes
+/// to, not this call, so the message says that and claims nothing about the
+/// method (per review — `store` on a wallet backend is not a transfer). Shared
+/// by the listed-canister blanket and the interface scope, so both carry the
+/// same pinned phrases by construction.
+fn destination_refusal(method: &str, service: &str, why: &str) -> String {
+    format!(
+        "`{method}` is an update call to {service} — {why}. Every state-changing \
+         call to that service is refused, so this refusal does not mean this \
+         particular call moves assets. State-changing calls to financial services \
+         are not supported by this server, to protect the user. {NEUTRAL_REDIRECT}"
+    )
+}
+
+/// The financial-transactions gate, the scopes decided from the request alone:
+/// `Some(refusal)` when the call is disallowed, `None` when it may proceed.
+/// Five scopes, checked in order: the mixed-purpose entry points and the
+/// standardized value-moving method names (both refused on every canister),
+/// the abstract names scoped to the system ledger where they are financial,
+/// the finance-canister list — on a listed canister EVERY update method is
+/// refused, so `None` never depends on the method name alone — and, last, a
+/// call addressed to any other ICRC-1 / ICRC-2 ledger method by name. The
+/// sixth scope, decided from the canister's own declared interface, is
+/// [`disallowed_update_on_ledger_interface`], which the tool runs once it has
+/// read that interface. Method matching is literal — the IC matches method
 /// names by exact bytes, so a differently-spelled name would not reach the
 /// real method anyway.
 ///
@@ -443,9 +521,12 @@ const CK_LEDGER_WHY: &str = "its update surface transfers the token or grants sp
 ///   * a mixed-purpose entry point: some of its commands move assets and the
 ///     method is disabled as a whole, so this call is not classified;
 ///   * a listed canister: every state-changing call to that service is
-///     refused, which again says nothing about this particular call.
+///     refused, which again says nothing about this particular call;
+///   * a call addressed to an ICRC ledger method by name: the caller is
+///     treating the canister as a ledger, so the call is refused and, again,
+///     not classified.
 ///
-/// All three name the method, state the policy and why it exists, and tell the
+/// All four name the method, state the policy and why it exists, and tell the
 /// agent what to recommend to the user instead: performing the operation
 /// outside this connector in a trusted interface they control, or, for the
 /// creation/funding methods, with their own icp CLI.
@@ -494,16 +575,134 @@ pub fn disallowed_update_method(canister_id: &Principal, method: &str) -> Option
              {instead}"
         ));
     }
-    let (_, service, why) = DISALLOWED_FINANCE_CANISTERS.iter().find(|(c, _, _)| *c == canister)?;
     // The blanket: what is disallowed here is the destination, not this call,
     // so the message says that and claims nothing about the method (per
     // review — `store` on a wallet backend is not a transfer).
+    if let Some((_, service, why)) =
+        DISALLOWED_FINANCE_CANISTERS.iter().find(|(c, _, _)| *c == canister)
+    {
+        return Some(destination_refusal(method, service, why));
+    }
+    // Last, a call addressed to an ICRC ledger method by name — any `icrc1_*` /
+    // `icrc2_*` beyond the exact value-moving names above. The caller is
+    // treating the canister as a ledger, which makes it a financial canister
+    // (see `disallowed_update_on_ledger_interface`); the register disclaims the
+    // call, since a balance read invoked as an update is not a transfer.
+    let standard = icrc_ledger_standard(method)?;
     Some(format!(
-        "`{method}` is an update call to {service} — {why}. Every state-changing \
-         call to that service is refused, so this refusal does not mean this \
-         particular call moves assets. State-changing calls to financial services \
-         are not supported by this server, to protect the user. {NEUTRAL_REDIRECT}"
+        "`{method}` is named as an {standard} ledger method. A canister that provides \
+         ICRC-1 or ICRC-2 methods is treated as a financial service and update calls \
+         to it are refused, so this refusal does not mean this particular call moves \
+         assets. Financial transactions (token transfers, spending approvals, payments, \
+         or trades) are not supported by this server, to protect the user. \
+         {NEUTRAL_REDIRECT}"
     ))
+}
+
+/// The interface scope of the gate, decided from the canister itself:
+/// `Some(refusal)` when `declared` — the method names the canister's Candid
+/// interface declares, as `calls::declared_methods` read them — includes an
+/// ICRC-1 / ICRC-2 ledger method, `None` otherwise. A canister that provides
+/// those methods is a financial canister, and EVERY update call to it is refused
+/// with the destination register: the rule is about where the call goes, so the
+/// message names the standard(s) and the methods that established them and
+/// claims nothing about this call.
+///
+/// Runs only where the interface is legitimately in hand — after the
+/// discoverability gate admitted the canister and `canister_update_call` read
+/// the interface it encodes against — and AFTER [`disallowed_update_method`],
+/// whose scopes are cheaper and more specific. A canister that publishes no
+/// interface, one the parser cannot read, and a read that FAILED never reach
+/// here: the caller refuses each with [`unchecked_update_refusal`], since an
+/// update call needs the published interface.
+pub fn disallowed_update_on_ledger_interface(
+    method: &str,
+    declared: &BTreeSet<String>,
+) -> Option<String> {
+    let ledger_methods: Vec<(&String, &'static str)> = declared
+        .iter()
+        .filter_map(|name| icrc_ledger_standard(name).map(|standard| (name, standard)))
+        .collect();
+    if ledger_methods.is_empty() {
+        return None;
+    }
+    // The standards present, in the table's order ("ICRC-1 and ICRC-2").
+    let standards = ICRC_LEDGER_PREFIXES
+        .iter()
+        .map(|(_, standard)| *standard)
+        .filter(|standard| ledger_methods.iter().any(|(_, s)| s == standard))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let mut listed = ledger_methods
+        .iter()
+        .take(MAX_LISTED_METHODS)
+        .map(|(name, _)| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if ledger_methods.len() > MAX_LISTED_METHODS {
+        listed.push_str(&format!(", and {} more", ledger_methods.len() - MAX_LISTED_METHODS));
+    }
+    let service =
+        format!("a canister whose Candid interface declares {standards} ledger methods ({listed})");
+    Some(destination_refusal(
+        method,
+        &service,
+        "a canister that provides the ICRC token-ledger interface is treated as a financial \
+         service as a whole",
+    ))
+}
+
+/// Why `canister_update_call` has no interface to check a call against — each
+/// a refusal, since an update call needs the canister's published interface,
+/// and each with its own next step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissingInterface {
+    /// The canister publishes no `candid:service` — a certified absence, which
+    /// is also what the state tree says of an id no canister occupies.
+    NotPublished,
+    /// The canister publishes something this server cannot read: bytes that
+    /// are not text, text that is not valid Candid or declares no service, or
+    /// text over the size / depth limits (CWE-674).
+    Unreadable,
+    /// The read failed — a transport, HTTP or certificate error — with its text.
+    ReadFailed(String),
+}
+
+/// The refusal for an update whose target could not be checked: the interface
+/// scope needs the canister's own published interface, and there is none in
+/// hand — `missing` says why. Refused rather than sent unchecked (per review and
+/// the maintainer's direction: a canister must publish its interface to receive
+/// update calls, and a failed read must not be the way past the scope). The
+/// register claims nothing about the call: the guard learned nothing about it.
+pub fn unchecked_update_refusal(method: &str, missing: &MissingInterface) -> String {
+    let (what, next) = match missing {
+        MissingInterface::NotPublished => (
+            "the canister publishes no Candid interface (no `candid:service` metadata), or no \
+             canister exists at this id"
+                .to_string(),
+            "A canister receives update calls through this server only once it publishes its \
+             interface.",
+        ),
+        MissingInterface::Unreadable => (
+            "the canister's published Candid interface could not be read by this server (not \
+             text, not valid Candid, no service declared, or over its size or depth limits)"
+                .to_string(),
+            "Until the canister publishes a readable interface, no update call to it is sent.",
+        ),
+        MissingInterface::ReadFailed(error) => (
+            format!("the canister's Candid interface could not be read ({error})"),
+            "Retry: an error that persists means this server cannot reach the interface it \
+             needs, or the canister id is not one the network routes.",
+        ),
+    };
+    format!(
+        "`{method}` was not sent: {what}. An update call is checked against the canister's \
+         published interface before it is sent — a canister that provides the ICRC token-ledger \
+         interface is treated as a financial service as a whole — and a call that cannot be \
+         checked is refused rather than sent unchecked, to protect the user. This refusal is \
+         about the check that could not run, so it does not mean this particular call moves \
+         assets. {next} {NEUTRAL_REDIRECT}"
+    )
 }
 
 #[cfg(test)]
@@ -526,6 +725,30 @@ mod tests {
     /// The clause a listed-canister refusal must carry: the rule is about the
     /// destination, so the message states that rather than the call.
     const DESTINATION_RULE: &str = "Every state-changing call to that service is refused";
+    /// The one claim only a value-moving method's refusal may make.
+    const ITSELF: &str = "the call itself carries out that operation";
+    /// The disclaimer every other register must carry.
+    const NOT_THIS_CALL: &str = "does not mean this particular call moves assets";
+    /// The clause the interface scope's refusal must carry: the evidence is what
+    /// the canister itself declares.
+    const INTERFACE_RULE: &str = "whose Candid interface declares";
+    /// The clause the missing-interface refusal must carry: an update call needs
+    /// the published interface, and the check could not run without it.
+    const UNCHECKED_RULE: &str =
+        "checked against the canister's published interface before it is sent";
+    /// Every way an update call can lack the interface it needs.
+    fn every_missing_interface() -> [MissingInterface; 3] {
+        [
+            MissingInterface::NotPublished,
+            MissingInterface::Unreadable,
+            MissingInterface::ReadFailed("The request timed out.".to_string()),
+        ]
+    }
+
+    /// A declared method set, as `calls::declared_methods` would read it.
+    fn declared(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
 
     // Every standardized value-moving method is refused on ANY canister, in
     // its exact standard spelling — the ICRC token surface and the NNS/SNS
@@ -620,17 +843,15 @@ mod tests {
         }
     }
 
-    // Reads, fees, metadata, and legacy DIP20-style names on arbitrary
-    // canisters stay callable. The cycles-minting canister's method names are
-    // in the list too: they are refused on the CMC itself (above), and an
-    // unrelated canister's method that happens to share the name is not a
-    // funding completion.
+    // Reads, fees, and legacy DIP20-style names on arbitrary canisters stay
+    // callable (an ICRC-named read is the exception: it addresses the canister
+    // as a ledger — see `icrc_named_calls_are_refused_pre_network`). The
+    // cycles-minting canister's method names are in the list too: they are
+    // refused on the CMC itself (above), and an unrelated canister's method
+    // that happens to share the name is not a funding completion.
     #[test]
     fn allows_non_financial_methods() {
         for method in [
-            "icrc1_balance_of",
-            "icrc1_metadata",
-            "icrc1_fee",
             "transfer_fee",
             "get_transactions",
             "notify_create_canister",
@@ -770,9 +991,6 @@ mod tests {
     // edit that collapses them back into one message fails here.
     #[test]
     fn each_scope_gets_the_refusal_register_that_is_true_of_it() {
-        const ITSELF: &str = "the call itself carries out that operation";
-        const NOT_THIS_CALL: &str = "does not mean this particular call moves assets";
-
         // A method that IS the operation: transfers, approvals, and the
         // funding completions that finish a payment.
         for (canister, method) in [
@@ -803,5 +1021,229 @@ mod tests {
         assert!(msg.contains(DESTINATION_RULE), "{msg}");
         assert!(msg.contains(NOT_THIS_CALL), "{msg}");
         assert!(!msg.contains(ITSELF), "{msg}");
+
+        // A financial canister detected from its own interface: the destination
+        // register again, with the interface as the evidence.
+        let ledger = declared(&["icrc1_transfer", "icrc1_balance_of", "set_message"]);
+        let msg =
+            disallowed_update_on_ledger_interface("set_message", &ledger).expect("must be refused");
+        assert!(msg.contains(DESTINATION_RULE), "{msg}");
+        assert!(msg.contains(NOT_THIS_CALL), "{msg}");
+        assert!(msg.contains(INTERFACE_RULE), "{msg}");
+        assert!(!msg.contains(ITSELF), "{msg}");
+
+        // A call addressed to an ICRC ledger method by name, with no interface in
+        // hand: disclaimed, and neither of the other two registers.
+        let msg =
+            disallowed_update_method(&any_canister(), "icrc1_balance_of").expect("must be refused");
+        assert!(msg.contains(NOT_THIS_CALL), "{msg}");
+        assert!(!msg.contains(ITSELF), "{msg}");
+        assert!(!msg.contains(DESTINATION_RULE), "{msg}");
+
+        // No interface to check against — not published, unreadable, or a read
+        // that failed: nothing was learned about the call or the canister, so
+        // the message says only that the check could not run — disclaimed, and
+        // none of the other registers.
+        for missing in every_missing_interface() {
+            let msg = unchecked_update_refusal("set_message", &missing);
+            assert!(msg.contains(UNCHECKED_RULE), "{msg}");
+            assert!(msg.contains(NOT_THIS_CALL), "{msg}");
+            assert!(!msg.contains(ITSELF), "{msg}");
+            assert!(!msg.contains(DESTINATION_RULE), "{msg}");
+            assert!(!msg.contains(INTERFACE_RULE), "{msg}");
+        }
+    }
+
+    // A canister that provides an ICRC-1 / ICRC-2 method is a financial canister:
+    // every update call to it is refused, whatever the method is called, and the
+    // refusal names the standard(s) and the methods that established them —
+    // enough to check against get_canister_candid, summarizing the rest.
+    #[test]
+    fn an_icrc_interface_makes_every_update_refused() {
+        let ledger = declared(&["greet", "set_message", "icrc1_transfer", "icrc1_balance_of"]);
+        for method in ["set_message", "greet", "http_request_update"] {
+            let msg = disallowed_update_on_ledger_interface(method, &ledger)
+                .unwrap_or_else(|| panic!("{method} on an ICRC-1 canister must be refused"));
+            assert!(msg.contains(&format!("`{method}`")), "{msg}");
+            assert!(msg.contains("ICRC-1 ledger methods"), "{msg}");
+            assert!(
+                msg.contains("`icrc1_balance_of`") && msg.contains("`icrc1_transfer`"),
+                "{msg}"
+            );
+        }
+        let approvals = declared(&["icrc2_allowance", "set_message"]);
+        let msg = disallowed_update_on_ledger_interface("set_message", &approvals).unwrap();
+        assert!(msg.contains("ICRC-2 ledger methods (`icrc2_allowance`)"), "{msg}");
+        let both = declared(&["icrc1_transfer", "icrc2_approve", "x"]);
+        let msg = disallowed_update_on_ledger_interface("x", &both).unwrap();
+        assert!(msg.contains("ICRC-1 and ICRC-2 ledger methods"), "{msg}");
+        // Seven ICRC names: five are listed, the rest counted.
+        let many = declared(&[
+            "icrc1_name",
+            "icrc1_symbol",
+            "icrc1_decimals",
+            "icrc1_fee",
+            "icrc1_metadata",
+            "icrc1_total_supply",
+            "icrc1_transfer",
+            "store",
+        ]);
+        let msg = disallowed_update_on_ledger_interface("store", &many).unwrap();
+        assert!(msg.contains(", and 2 more)"), "{msg}");
+        assert_eq!(msg.matches("`icrc1_").count(), 5, "{msg}");
+        // The real ICP ledger's surface (the methods of its service constructor).
+        let icp = declared(&[
+            "transfer",
+            "account_balance",
+            "transfer_fee",
+            "send_dfx",
+            "account_balance_dfx",
+            "query_blocks",
+            "icrc1_balance_of",
+            "icrc1_transfer",
+            "icrc2_approve",
+            "icrc2_transfer_from",
+            "icrc21_canister_call_consent_message",
+            "icrc10_supported_standards",
+        ]);
+        let msg = disallowed_update_on_ledger_interface("remove_approval", &icp).unwrap();
+        assert!(msg.contains("ICRC-1 and ICRC-2 ledger methods"), "{msg}");
+    }
+
+    // The rule is "provides an ICRC-1 / ICRC-2 function", not "implements the
+    // standard": a lone query such as icrc1_balance_of is enough.
+    #[test]
+    fn a_query_only_icrc_method_still_counts() {
+        let index = declared(&["icrc1_balance_of", "get_message", "set_message"]);
+        assert!(disallowed_update_on_ledger_interface("set_message", &index).is_some());
+    }
+
+    // The prefixes are literal, underscore included: the generic ICRC-10 listing
+    // and the ICRC-21 consent message are not ledger methods, nor are other
+    // token namespaces, re-spellings, or a name that merely contains the prefix.
+    // The e2e `app` fixture (greet/whoami/get_message/set_message/get_api_doc)
+    // is the plain shape that must stay callable.
+    #[test]
+    fn icrc_prefixes_are_literal() {
+        for names in [
+            vec!["icrc10_supported_standards", "set_message"],
+            vec!["icrc21_canister_call_consent_message", "set_message"],
+            vec!["icrc7_transfer", "set_message"],
+            vec!["ICRC1_transfer", "set_message"],
+            vec!["my_icrc1_transfer", "set_message"],
+            vec!["greet", "whoami", "get_message", "set_message", "get_api_doc"],
+            vec![],
+        ] {
+            let set = declared(&names);
+            assert_eq!(
+                disallowed_update_on_ledger_interface("set_message", &set),
+                None,
+                "{names:?} must not be a financial canister"
+            );
+        }
+    }
+
+    // The interface refusal is the destination register, in the same plain
+    // protective terms as the listed-canister one: it names the method, the
+    // standard, the policy, and the redirect, claims nothing about this call,
+    // and names no venue.
+    #[test]
+    fn ledger_interface_refusal_uses_the_destination_register() {
+        let ledger = declared(&["icrc1_transfer", "icrc1_balance_of", "set_message"]);
+        let msg =
+            disallowed_update_on_ledger_interface("set_message", &ledger).expect("must be refused");
+        assert!(msg.contains("`set_message`"), "{msg}");
+        assert!(msg.contains(INTERFACE_RULE), "{msg}");
+        assert!(msg.contains("ICRC-1 ledger methods"), "{msg}");
+        assert!(msg.contains(DESTINATION_RULE), "{msg}");
+        assert!(msg.contains(NOT_THIS_CALL), "{msg}");
+        assert!(!msg.contains(ITSELF), "{msg}");
+        assert!(msg.contains("not supported by this server, to protect the user"), "{msg}");
+        assert!(msg.contains("outside this connector"), "{msg}");
+        assert!(msg.contains("trusted interface they control"), "{msg}");
+        assert!(!msg.to_lowercase().contains("wallet"), "no venue may be named: {msg}");
+        assert!(!msg.contains(".com"), "no venue may be named: {msg}");
+        assert!(!msg.contains("marketplace"), "{msg}");
+        assert!(!msg.contains("compliance"), "{msg}");
+    }
+
+    // An update call needs the canister's published interface. Without one —
+    // not published, published but unreadable, or a read that FAILED — the call
+    // is refused with a message that names the method, says which it was and
+    // what follows (publish it; retry only for the failed read), claims nothing
+    // about the call — the guard learned nothing about it — and names no venue.
+    #[test]
+    fn an_update_without_a_readable_interface_is_refused() {
+        for missing in every_missing_interface() {
+            let msg = unchecked_update_refusal("set_message", &missing);
+            assert!(msg.contains("`set_message`"), "{msg}");
+            assert!(msg.contains("was not sent"), "{msg}");
+            assert!(msg.contains(UNCHECKED_RULE), "{msg}");
+            assert!(msg.contains(NOT_THIS_CALL), "{msg}");
+            assert!(!msg.contains(ITSELF), "{msg}");
+            assert!(!msg.contains(DESTINATION_RULE), "{msg}");
+            assert!(!msg.contains(INTERFACE_RULE), "{msg}");
+            assert!(msg.contains("to protect the user"), "{msg}");
+            assert!(msg.contains("outside this connector"), "{msg}");
+            assert!(msg.contains("trusted interface they control"), "{msg}");
+            assert!(!msg.to_lowercase().contains("wallet"), "no venue may be named: {msg}");
+            assert!(!msg.contains(".com"), "no venue may be named: {msg}");
+            assert!(!msg.contains("marketplace"), "{msg}");
+            assert!(!msg.contains("compliance"), "{msg}");
+            match missing {
+                MissingInterface::NotPublished => {
+                    assert!(msg.contains("publishes no Candid interface"), "{msg}");
+                    // A certified absence is also what an unoccupied id yields,
+                    // so the message must not assert that the canister exists.
+                    assert!(msg.contains("or no canister exists at this id"), "{msg}");
+                    assert!(msg.contains("only once it publishes its interface"), "{msg}");
+                    assert!(!msg.contains("Retry"), "nothing to retry: {msg}");
+                }
+                MissingInterface::Unreadable => {
+                    assert!(msg.contains("could not be read by this server"), "{msg}");
+                    assert!(msg.contains("not text, not valid Candid"), "{msg}");
+                    assert!(msg.contains("publishes a readable interface"), "{msg}");
+                    assert!(!msg.contains("Retry"), "nothing to retry: {msg}");
+                }
+                MissingInterface::ReadFailed(error) => {
+                    assert!(msg.contains(&error), "the error is named: {msg}");
+                    assert!(msg.contains("Retry"), "{msg}");
+                    assert!(msg.contains("canister id is not one the network routes"), "{msg}");
+                }
+            }
+        }
+    }
+
+    // Addressing a canister by an ICRC-1 / ICRC-2 method name is refused before
+    // any network work, even when no interface says the canister provides it:
+    // the caller is treating it as a ledger. The exact transfer/approval names
+    // keep their sharper register (they ARE the operation); the rest get the
+    // disclaiming one; ICRC-10 / ICRC-21 names and other token namespaces are
+    // not ledger methods here.
+    #[test]
+    fn icrc_named_calls_are_refused_pre_network() {
+        for method in ["icrc1_balance_of", "icrc1_metadata", "icrc1_fee", "icrc2_allowance"] {
+            let msg = disallowed_update_method(&any_canister(), method)
+                .unwrap_or_else(|| panic!("{method} must be refused on any canister"));
+            assert!(msg.contains(&format!("`{method}`")), "{msg}");
+            assert!(msg.contains("ledger method"), "{msg}");
+            assert!(msg.contains(NOT_THIS_CALL), "{msg}");
+            assert!(!msg.contains(ITSELF), "{msg}");
+            assert!(msg.contains("to protect the user"), "{msg}");
+            assert!(msg.contains("outside this connector"), "{msg}");
+        }
+        let msg = disallowed_update_method(&any_canister(), "icrc1_transfer").unwrap();
+        assert!(msg.contains(ITSELF), "{msg}");
+        for method in [
+            "icrc10_supported_standards",
+            "icrc21_canister_call_consent_message",
+            "icrc7_balance_of",
+            "ICRC1_balance_of",
+        ] {
+            assert!(
+                disallowed_update_method(&any_canister(), method).is_none(),
+                "{method} is not an ICRC-1 / ICRC-2 ledger method"
+            );
+        }
     }
 }
