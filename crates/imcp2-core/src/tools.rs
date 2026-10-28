@@ -619,17 +619,20 @@ impl IcCanisterTools {
             Ok(p) => p,
             Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
         };
-        // The financial-transactions gate (see `compliance`), in four scopes,
-        // before any network work: the standardized value-moving method names
-        // (the ICRC transfer/approval surface) and the mixed-purpose
-        // governance entry point manage_neuron, both refused on EVERY
-        // canister; the system ledgers'/cycles-minting canister's own
-        // value-moving methods on those canisters; and EVERY update method on
-        // a listed financial-service canister, so a refusal here does not
-        // depend on the method name alone. Each scope's refusal claims only
-        // what that scope knows about the call, and points the user outside
-        // this connector. Queries need no gate — a query cannot commit state,
-        // so it cannot move funds.
+        // The financial-transactions gate (see `compliance`): every scope
+        // decided from the request alone runs here, before any network work —
+        // the standardized value-moving method names (the ICRC transfer/approval
+        // surface) and the mixed-purpose governance entry point manage_neuron,
+        // both refused on EVERY canister; the system ledgers'/cycles-minting
+        // canister's own value-moving methods on those canisters; EVERY update
+        // method on a listed financial-service canister, so a refusal here does
+        // not depend on the method name alone; and a call addressed to any
+        // other ICRC-1 / ICRC-2 ledger method by name. The one scope that needs
+        // the canister's interface — a financial canister detected from the
+        // ICRC methods it declares — runs below, once resolve_did has read it.
+        // Each scope's refusal claims only what that scope knows about the
+        // call, and points the user outside this connector. Queries need no
+        // gate — a query cannot commit state, so it cannot move funds.
         if let Some(refusal) = compliance::disallowed_update_method(&principal, &method) {
             return Ok(err(refusal));
         }
@@ -660,6 +663,27 @@ impl IcCanisterTools {
         // candid:service if exposed, else the caller-supplied `candid`. Update calls
         // are never redirected (OQL is read-only), so no oql_query_redirect here.
         let did = calls::resolve_did(&self.agent, principal, candid.as_deref()).await;
+        // The interface scope of the financial-transactions gate (see
+        // `compliance`): a canister whose declared interface provides an ICRC-1 /
+        // ICRC-2 method is a financial canister, and every update call to it is
+        // refused — decided from the canister itself, here and only here. The
+        // interface is first in hand at this point: reading it IS a contact with
+        // the canister, which the discoverability gate above has to admit first
+        // (an undeclared ledger is refused as undeclared), and `resolve_did` has
+        // just read it for encoding, so this costs no round-trip. It runs before
+        // the arguments are encoded (an argument error must not mask the policy
+        // refusal) and before anything is signed. `resolve_did` consults the
+        // caller-supplied `candid` only when the canister publishes no
+        // interface, so a supplied text can only ADD a refusal, never hide one.
+        // No interface, or one the parser cannot read, fails OPEN: the guard is
+        // a guardrail, not a seal.
+        if let Some(refusal) =
+            did.as_deref().and_then(calls::declared_methods).and_then(|declared| {
+                compliance::disallowed_update_on_ledger_interface(&method, &declared)
+            })
+        {
+            return Ok(err(refusal));
+        }
         let arg_bytes = match calls::encode_args(did.as_deref(), &method, &args) {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
