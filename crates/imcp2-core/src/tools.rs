@@ -598,7 +598,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Calls a canister's *update* method (as opposed to read-only queries which go through canister_query). Method names and argument types come from the canister's Candid interface, which get_canister_candid returns. Runs anonymously unless given a derivation origin, which acts as the user's account at that app.",
+        description = "Calls a canister's *update* method (as opposed to read-only queries which go through canister_query). Method names and argument types come from the canister's Candid interface, which get_canister_candid returns; the canister must publish that interface, and an update call to a canister that publishes none, or whose interface cannot be read, is refused. Runs anonymously unless given a derivation origin, which acts as the user's account at that app.",
         annotations(title = "Make a canister update call", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterUpdateCallOutput>(),
     )]
@@ -611,7 +611,6 @@ impl IcCanisterTools {
             app_url,
             derivation_origin,
             account,
-            candid,
         }): Parameters<calls::CanisterUpdateCallArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
@@ -660,10 +659,12 @@ impl IcCanisterTools {
             Err(refusal) => return Ok(err(refusal)),
         };
         // The interface to encode/decode against: the canister's own
-        // candid:service if exposed, else the caller-supplied `candid`. Update calls
-        // are never redirected (OQL is read-only), so no oql_query_redirect here.
-        // Read with the outcome kept, not through resolve_did: the gate below
-        // must tell a FAILED read from a canister that publishes none.
+        // candid:service, which an update call REQUIRES — no caller-supplied
+        // fallback here, unlike canister_query (a query cannot commit state).
+        // Update calls are never redirected (OQL is read-only), so no
+        // oql_query_redirect here. Read with the outcome kept, not through
+        // resolve_did: the refusal below says whether the interface is missing
+        // or the read failed.
         let read = calls::read_candid_service(&self.agent, principal).await;
         // The interface scope of the financial-transactions gate (see
         // `compliance`): a canister whose declared interface provides an ICRC-1 /
@@ -674,28 +675,41 @@ impl IcCanisterTools {
         // (an undeclared ledger is refused as undeclared), and the read just
         // made is the one the encoding needs, so this costs no round-trip. It
         // runs before the arguments are encoded (an argument error must not mask
-        // the policy refusal) and before anything is signed. What the read
-        // established decides the rest (per review): a read that FAILED — a
-        // transport, HTTP or certificate error — refuses the call with a retry
-        // message, since the guard cannot tell a ledger from an app without the
-        // interface and a failed read must not be the way past it; a canister
-        // that publishes none is checked by the name scopes above only, with
-        // the caller-supplied `candid` consulted in its place — so a supplied
-        // text can only ADD a refusal, never hide one; and published text the
-        // parser cannot read fails OPEN the same way: the guard is a guardrail,
-        // not a seal.
-        if let calls::CandidServiceRead::Failed(error) = &read {
-            return Ok(err(compliance::unchecked_update_refusal(&method, error)));
-        }
-        let did = read.or_provided(candid.as_deref());
-        if let Some(refusal) =
-            did.as_deref().and_then(calls::declared_methods).and_then(|declared| {
-                compliance::disallowed_update_on_ledger_interface(&method, &declared)
-            })
+        // the policy refusal) and before anything is signed. The scope always
+        // has the interface, because an update call to a canister that gives it
+        // none is refused (per review and the maintainer's direction): a
+        // canister that publishes none, one whose published text the parser
+        // cannot read, and one whose read FAILED — a transport, HTTP or
+        // certificate error, refused with a retry message — each get
+        // `unchecked_update_refusal`, so no update this server sends went
+        // unchecked. What the guard still does not judge is a bespoke method on
+        // a canister whose published interface is not a ledger's.
+        let did = match read {
+            calls::CandidServiceRead::Published(did) => did,
+            calls::CandidServiceRead::NotPublished => {
+                return Ok(err(compliance::unchecked_update_refusal(
+                    &method,
+                    &compliance::MissingInterface::NotPublished,
+                )));
+            }
+            calls::CandidServiceRead::Failed(error) => {
+                return Ok(err(compliance::unchecked_update_refusal(
+                    &method,
+                    &compliance::MissingInterface::ReadFailed(error),
+                )));
+            }
+        };
+        let Some(declared) = calls::declared_methods(&did) else {
+            return Ok(err(compliance::unchecked_update_refusal(
+                &method,
+                &compliance::MissingInterface::Unreadable,
+            )));
+        };
+        if let Some(refusal) = compliance::disallowed_update_on_ledger_interface(&method, &declared)
         {
             return Ok(err(refusal));
         }
-        let arg_bytes = match calls::encode_args(did.as_deref(), &method, &args) {
+        let arg_bytes = match calls::encode_args(Some(&did), &method, &args) {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
         };
@@ -710,7 +724,7 @@ impl IcCanisterTools {
             Err(e) => return Ok(err(format!("call failed: {e}"))),
         };
         // Decode against the Candid interface so field names are recovered.
-        let reply = calls::decode_reply(did.as_deref(), &method, &reply_bytes);
+        let reply = calls::decode_reply(Some(&did), &method, &reply_bytes);
         let (derived_for_origin, requested, derivation_origin_source) = match &target {
             Some(t) => (Some(t.origin.clone()), Some(t.requested.clone()), Some(t.source.clone())),
             None => (None, None, None),

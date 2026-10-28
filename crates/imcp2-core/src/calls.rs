@@ -202,9 +202,8 @@ pub struct CanisterUpdateCallArgs {
     pub method: String,
     /// Arguments in textual Candid, e.g. `()` or `(record { owner = principal "..." })`; the
     /// `candid://textual-syntax` resource documents that syntax and `candid://reference` its
-    /// type system. Encoded against the method's declared types when the interface is available,
-    /// published or supplied in `candid`, so plain literals need no `: type` annotation.
-    /// Without an interface they are encoded as written and need their own annotations.
+    /// type system. Encoded against the method's declared types in the canister's published
+    /// interface, so plain literals need no `: type` annotation.
     #[serde(default = "default_args")]
     pub args: String,
     /// The website URL of the app that owns `canister_id`, which open_app returns.
@@ -222,10 +221,6 @@ pub struct CanisterUpdateCallArgs {
     /// app's default account. Ignored for anonymous calls.
     #[serde(default)]
     pub account: Option<String>,
-    /// The canister's Candid interface as `.did` text, for when the canister does not publish
-    /// its own. Supplying it keeps arguments and the reply typed.
-    #[serde(default)]
-    pub candid: Option<String>,
 }
 
 /// Output of `canister_update_call`.
@@ -379,11 +374,12 @@ pub fn default_args() -> String {
 // Candid interface resolution + encode/decode/call helpers.
 // ===========================================================================
 
-/// The interface to encode/decode against: the canister's own `candid:service`
-/// if exposed, else the caller-supplied `provided` definition — for a read that
-/// FAILED as well as for a canister that publishes none. The read-only paths
-/// fail open this way; `canister_update_call` reads with [`read_candid_service`]
-/// instead and refuses on a failed read before falling back.
+/// The interface to encode/decode against for the READ-ONLY paths: the
+/// canister's own `candid:service` if exposed, else the caller-supplied
+/// `provided` definition — for a read that FAILED as well as for a canister that
+/// publishes none, since a query cannot commit state. `canister_update_call`
+/// reads with [`read_candid_service`] instead, takes no fallback, and refuses
+/// unless the read is [`CandidServiceRead::Published`].
 pub async fn resolve_did(
     agent: &Agent,
     canister: Principal,
@@ -399,9 +395,9 @@ pub async fn candid_service(agent: &Agent, canister: Principal) -> Option<String
 }
 
 /// What reading a canister's `candid:service` metadata established — three
-/// outcomes, because the financial-transactions guard treats two of them
-/// differently (per review): a canister that publishes no interface is checked
-/// by name only, while a read that FAILED is not let past the check at all.
+/// outcomes, because an update call needs the published interface and the
+/// refusal for not having one says which it was (per review): a canister that
+/// publishes none is told to publish, while a read that FAILED is told to retry.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CandidServiceRead {
     /// The canister publishes the interface: its `.did` text.
@@ -425,9 +421,9 @@ impl CandidServiceRead {
         }
     }
 
-    /// The interface to encode against: the published text, else `provided` —
-    /// whether the canister publishes none or the read failed. A caller that
-    /// must tell those apart checks the outcome before calling this.
+    /// The interface to encode against on a read-only path: the published text,
+    /// else `provided` — whether the canister publishes none or the read failed.
+    /// The update path never calls this: it refuses instead of falling back.
     pub fn or_provided(self, provided: Option<&str>) -> Option<String> {
         self.published().or_else(|| provided.map(str::to_string))
     }
@@ -901,8 +897,9 @@ pub fn has_oql(did: &str) -> bool {
 /// `type S = service { … }; service : S` alias as well as a bare
 /// `service : { … }`. `None` when the interface cannot be read: it trips
 /// [`guard_candid_text`] (CWE-674), does not parse, or declares no actor (types
-/// only) — the caller then fails OPEN, as it does for [`is_query_method`].
-/// `Some(empty)` is a service that declares no methods.
+/// only) — `canister_update_call` then refuses the call
+/// (`compliance::unchecked_update_refusal`), since an update needs a readable
+/// published interface. `Some(empty)` is a service that declares no methods.
 ///
 /// Name-based only, like [`has_oql`]: the names are collected INSIDE the
 /// deep-stack closure (the AST is `!Send`, and its recursive `Drop` stays on that
@@ -2113,17 +2110,18 @@ mod tests {
         assert_eq!(names("service : {}"), Some(vec![]));
     }
 
-    // Fail-open on an over-limit interface: the CWE-674 guard trips BEFORE
-    // parsing and the caller gets `None` rather than a verdict — and the shallow
-    // twin proves the guard, not the shape, is why.
+    // An over-limit interface is unreadable, never parsed: the CWE-674 guard
+    // trips BEFORE parsing and the caller gets `None` rather than a verdict
+    // (which the update path turns into a refusal) — and the shallow twin
+    // proves the guard, not the shape, is why.
     #[test]
-    fn declared_methods_fails_open_on_an_over_limit_interface() {
+    fn declared_methods_is_none_for_an_over_limit_interface() {
         use super::declared_methods;
         let over_deep = format!(
             "service : {{ icrc1_balance_of : (text) -> ({}nat) query; set_message : (text) -> (text); }}",
             "vec ".repeat(5000),
         );
-        assert_eq!(declared_methods(&over_deep), None, "an over-limit interface must fail open");
+        assert_eq!(declared_methods(&over_deep), None, "an over-limit interface is unreadable");
         let shallow_twin =
             "service : { icrc1_balance_of : (text) -> (nat) query; set_message : (text) -> (text); }";
         assert_eq!(declared_methods(shallow_twin).map(|set| set.len()), Some(2));
@@ -2131,10 +2129,10 @@ mod tests {
 
     // What a candid:service read establishes, from the agent's result: only a
     // certified absence means the canister publishes none; every other error is
-    // a FAILED read, which the update path refuses rather than treats as "no
-    // interface" — a failed read must not be the way past the guard's interface
-    // scope. Bytes that are not text are a property of the canister, like an
-    // absent interface, not of the read.
+    // a FAILED read. The update path refuses both, with a different message for
+    // each (publish it / retry), so the two must not be confused. Bytes that are
+    // not text are a property of the canister, like an absent interface, not of
+    // the read.
     #[test]
     fn a_candid_service_read_distinguishes_absent_from_failed() {
         use super::{classify_candid_service_read as classify, CandidServiceRead::*};
@@ -2163,9 +2161,10 @@ mod tests {
         }
     }
 
-    // The interface to encode against: the published text wins; a caller-supplied
-    // text stands in when the canister publishes none — and when the read failed
-    // too, which is why the update path checks the outcome before falling back.
+    // The interface to encode against on a read-only path: the published text
+    // wins; a caller-supplied text stands in when the canister publishes none —
+    // and when the read failed too. (The update path never falls back: it
+    // refuses unless the read is Published.)
     #[test]
     fn or_provided_falls_back_for_absent_and_failed_reads() {
         use super::CandidServiceRead::*;

@@ -166,9 +166,9 @@ submission states, not from a narrower reading:
   the cycles-minting canister's funding-completion methods on those
   canisters, every update call to a canister whose own Candid interface
   declares ICRC-1 or ICRC-2 methods (every ICRC ledger and the ICP ledger,
-  detected from the canister itself; a call whose interface read fails is
-  refused rather than sent unchecked, and a canister that publishes no
-  interface is checked by name only), and every update call on the
+  detected from the canister itself; an update call needs that published
+  interface, so a canister that publishes none, or whose interface cannot be
+  read, is refused outright), and every update call on the
   financial-service canisters it carries. The refusal tells the user to perform the
   operation outside the connector, in a trusted interface they control, and
   names no venue.
