@@ -32,7 +32,8 @@ not published in the docs.
   described were removed, and ledger methods are refused (blocker 2).
 - **2026-09-28** — submitted through the portal as **"Internet Computer"**,
   URL slug **`icp`** (manage page: <https://claude.ai/directory/manage/icp>).
-  Status **In review** since then; no reviewer feedback as of 2026-10-27.
+  Status **In review** since then; the first reviewer feedback is the
+  2026-10-28 entry below.
 - **2026-09-25 to 2026-10-01** — OAuth disruption overlapping the submission
   date, caused by the DCR-to-CIMD migration (CIMD became the default
   registration mode in [#203](https://github.com/dfinity/imcp2/pull/203),
@@ -41,6 +42,32 @@ not published in the docs.
   sign-in flow on 2026-10-01. A reviewer who tried the connector in that
   window would have failed at sign-in. The fix is live; if feedback cites a
   sign-in failure, answer with this timeline and ask for a re-test.
+- **2026-10-28** — first reviewer feedback, by email from the Anthropic MCP
+  Directory team (the portal status was not re-checked). One **critical**
+  issue blocks the review: the financial guard matches method names only.
+  The reviewers confirmed that `icrc1_transfer`, `icrc2_approve`,
+  `icrc2_transfer_from` and `manage_neuron` are refused before they reach
+  the network, but update calls named `transfer`, `withdraw` and `swap`
+  passed the guard and reached the target canister, which rejected them only
+  because those methods do not exist there; on a declared canister that
+  moves value under non-standard names the guard would not stop the call.
+  Asked of us: (1) detect value-moving capability from the canister itself,
+  not only from standard method names — for example treat any declared
+  canister that exposes ICRC-1, ICRC-2 or ICP-ledger interfaces as a ledger
+  and refuse its updates — and refuse common non-standard value methods such
+  as `transfer`, `withdraw` and `swap`; (2) update the server instructions
+  so they no longer describe the guard as incomplete (the "a safeguard, not
+  a complete filter" clause); (3) reply on the same thread with a short
+  description of what the guard covers and how it decides. The rest passed:
+  all 10 tools, all three example use cases end to end against YetToDo
+  (creating, verifying and deleting a test todo without touching other
+  data), the manifest opt-in model, and the app/identity pairing check; the
+  error messages were singled out as among the clearest the reviewers had
+  seen. One **optional** suggestion — the unknown-app error told the model
+  to run a web search; ask the user for the app's URL instead — was already
+  addressed by [#212](https://github.com/dfinity/imcp2/pull/212) (merged
+  2026-10-28). The reviewers expect to move quickly once the guard change is
+  in place; blocker 2's description of the guard is to be updated with it.
 
 ## Where and how submission happens
 
