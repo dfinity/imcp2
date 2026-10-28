@@ -1,11 +1,15 @@
 //! The local MCP server: [`IcTools`] wrapped in a thin handler that adds the
-//! two **local-only login tools**. They cannot live in `imcp2-core` — they
-//! drive this binary's loopback listener and browser opener, which core cannot
-//! call back into — so this wrapper carries them in its own `#[tool_router]`,
-//! answers `tools/list` with the merged list, dispatches `tools/call` to its
-//! own router first, and forwards everything else to the inner [`IcTools`]
-//! handler verbatim. The hosted server contains none of this code, so its tool
-//! surface stays login-free by construction (a core-side test guards the
+//! two **local-only login tools** and the **deploy tool**. The login tools
+//! cannot live in `imcp2-core` — they drive this binary's loopback listener
+//! and browser opener, which core cannot call back into — so this wrapper
+//! carries them in its own `#[tool_router]`. The deploy tool
+//! (`icp_deploy_bundle`, [`IcDeployTools`]) cannot either, for a different
+//! reason: it runs on the icp CLI's project library, a git dependency the
+//! published crates cannot carry. The wrapper answers `tools/list` with the
+//! merged list, dispatches `tools/call` to its own router, then the deploy
+//! router, and forwards everything else to the inner [`IcTools`] handler
+//! verbatim. The hosted server contains none of this code, so its tool surface
+//! stays login- and deploy-free by construction (a core-side test guards the
 //! boundary too).
 
 use rmcp::handler::server::tool::ToolCallContext;
@@ -19,9 +23,11 @@ use rmcp::{schemars, tool, tool_router, ErrorData as McpError, RoleServer, Serve
 
 use crate::login::{BeginOutcome, Grant, LoginDriver, LoginStatus};
 use imcp2_core::IcTools;
+use imcp2_deploy::IcDeployTools;
 
 pub struct LocalServer {
     tools: IcTools,
+    deploy: IcDeployTools,
     login: LoginDriver,
     /// Whether the login flow will also try to open the browser itself —
     /// only phrasing: the link is always returned in-band.
@@ -159,8 +165,8 @@ fn human_minutes(mins: u64) -> String {
 
 #[tool_router]
 impl LocalServer {
-    pub fn new(tools: IcTools, login: LoginDriver, auto_open: bool) -> Self {
-        Self { tools, login, auto_open }
+    pub fn new(tools: IcTools, deploy: IcDeployTools, login: LoginDriver, auto_open: bool) -> Self {
+        Self { tools, deploy, login, auto_open }
     }
 
     #[tool(
@@ -266,7 +272,13 @@ impl ServerHandler for LocalServer {
              SIGNING IN. On this local server the user signs in through `authenticate`, which \
              returns an id.ai link for them to open. Sessions are held in memory, so the user \
              signs in again after a restart, when the grant expires, or if they revoke it at \
-             id.ai."
+             id.ai.\n\n\
+             DEPLOYING. This local server adds `icp_deploy_bundle`, the one exception to the \
+             rule above that no tool deploys: it deploys an icp project bundle (`icp project \
+             bundle --output <file>`, built in the user's environment) to the environment it \
+             names, creating the canisters that do not exist yet from the user's cycles \
+             balance and upgrading those passed in `canister_ids`. It needs an \"Actions & \
+             questions\" session, and it returns the canister-id mapping to pass back next time."
         ));
         info
     }
@@ -278,6 +290,7 @@ impl ServerHandler for LocalServer {
     ) -> Result<ListToolsResult, McpError> {
         let mut result = self.tools.list_tools(request, context).await?;
         result.tools.extend(Self::tool_router().list_all());
+        result.tools.extend(IcDeployTools::tool_router().list_all());
         Ok(result)
     }
 
@@ -289,13 +302,20 @@ impl ServerHandler for LocalServer {
         if Self::tool_router().has_route(&request.name) {
             let tcc = ToolCallContext::new(self, request, context);
             Self::tool_router().call(tcc).await
+        } else if IcDeployTools::tool_router().has_route(&request.name) {
+            let tcc = ToolCallContext::new(&self.deploy, request, context);
+            IcDeployTools::tool_router().call(tcc).await
         } else {
             self.tools.call_tool(request, context).await
         }
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        Self::tool_router().get(name).cloned().or_else(|| self.tools.get_tool(name))
+        Self::tool_router()
+            .get(name)
+            .cloned()
+            .or_else(|| IcDeployTools::tool_router().get(name).cloned())
+            .or_else(|| self.tools.get_tool(name))
     }
 
     async fn list_resources(
@@ -332,8 +352,9 @@ mod tests {
         );
         let slot = SessionSlot::new();
         let tools = IcTools::new(agent, identities.clone(), slot.resolver());
+        let deploy = IcDeployTools::new(identities.clone(), slot.resolver());
         let login = crate::login::LoginDriver::new(identities, slot, /* auto_open */ false);
-        LocalServer::new(tools, login, /* auto_open */ false)
+        LocalServer::new(tools, deploy, login, /* auto_open */ false)
     }
 
     // The wrapper's own router carries EXACTLY the two login tools — the rest
@@ -389,8 +410,9 @@ mod tests {
 
     // A REAL MCP round-trip over an in-process duplex pipe (the same
     // byte-stream shape stdio serves): initialize; tools/list is the merged
-    // surface (the 11 served core tools + the 2 login tools); tools/call dispatches
-    // login tools to the wrapper and everything else to IcTools; the login
+    // surface (the 10 served core tools + the 2 login tools + the deploy tool);
+    // tools/call dispatches login tools to the wrapper, the deploy tool to its
+    // router, and everything else to IcTools; the login
     // lifecycle (signed out → link → pending) runs through the MCP layer —
     // all with no network and no browser.
     #[tokio::test]
@@ -411,8 +433,18 @@ mod tests {
         assert!(instructions.contains("textual Candid"), "core guidance must survive the merge");
 
         let tools = client.list_all_tools().await.expect("tools/list");
-        assert_eq!(tools.len(), 12, "10 served core tools + authenticate + auth_status");
-        for expected in ["get_canister_candid", "canister_query", "authenticate", "auth_status"] {
+        assert_eq!(
+            tools.len(),
+            13,
+            "10 served core tools + authenticate + auth_status + icp_deploy_bundle"
+        );
+        for expected in [
+            "get_canister_candid",
+            "canister_query",
+            "authenticate",
+            "auth_status",
+            "icp_deploy_bundle",
+        ] {
             assert!(tools.iter().any(|t| &*t.name == expected), "missing {expected}");
         }
 
@@ -464,6 +496,20 @@ mod tests {
         .await;
         assert!(is_error, "an invalid canister id is a tool error");
         assert!(text.contains("invalid canister id"), "{text}");
+
+        // The deploy tool dispatches to its own router through the wrapper:
+        // signed out, it refuses before reading the bundle (the path named here
+        // does not exist, and must not be reached for) or touching the network.
+        let (is_error, text, _) = call(
+            "icp_deploy_bundle",
+            Some(serde_json::json!({
+                "bundle_path": "/nonexistent/bundle.tar.gz",
+                "environment": "ic"
+            })),
+        )
+        .await;
+        assert!(is_error, "a deploy without a session is a tool error");
+        assert!(text.contains("authenticated session"), "{text}");
 
         // Deferral: a protocol/meta tool is not just unlisted — calling it
         // fails with the router's standard "tool not found" error (the

@@ -1,0 +1,62 @@
+[package]
+name = "imcp2-deploy"
+version = "0.5.1"
+edition = "2021"
+description = "The imcp2 `icp_deploy_bundle` tool: deploys an icp project bundle through the icp CLI's own project library."
+license = "Apache-2.0"
+repository = "https://github.com/dfinity/imcp2"
+# NOT publishable, by construction: the deploy runs on `icp-project` (and its
+# siblings) pulled straight from the icp-cli git repository — those crates are
+# `publish = false` upstream, and crates.io refuses any crate with a git
+# dependency. That is why this is its own crate rather than a module of
+# `imcp2-core`, and why only `imcp2-local` (released as dist binaries, never
+# published) composes it: `imcp2-core` and `imcp2` keep publishing untouched.
+publish = false
+
+[dependencies]
+# The session engine (which Internet Identity session a call acts as, and
+# the management identity minted from it) and the `SessionResolver` seam.
+imcp2-core = { workspace = true }
+rmcp = { workspace = true, features = ["server", "macros"] }
+ic-agent = { workspace = true }
+candid = { workspace = true }
+# `rt-multi-thread`: the sync-plugin runtime runs a wasm component on a
+# blocking thread (`block_in_place`), which only a multi-thread runtime has.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "fs"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+url = { workspace = true }
+async-trait = "0.1"
+# `icp-project` spells every path as a UTF-8 path.
+camino = "1"
+# A bundle is the `.tar.gz` that `icp project bundle` writes.
+tar = "0.4"
+flate2 = "1"
+# Each deploy extracts its bundle into a scratch directory that is removed
+# when the deploy ends, whichever way it ends.
+tempfile = "3"
+
+# The icp CLI's project library and the seams it is driven through, pinned to
+# one commit so the four stay in lockstep (they share a workspace version and
+# are not released independently). Bump the `rev` on all four together.
+#
+#   * icp-project: manifests, the deploy operation, the id/artifact stores.
+#   * icp-events: the progress event stream the operations report on.
+#   * icp-sync-plugin: the wasmtime runtime that runs a canister's sync plugin
+#     (the asset uploads of a frontend canister). The heavy one — it is what
+#     brings wasmtime into this workspace.
+#   * icp-canister-interfaces: the engine-canister registry id a created
+#     canister's subnet is looked up in.
+icp-project = { git = "https://github.com/dfinity/icp-cli", rev = "f4c7b6627cab56b091c01cc18102f5dd88aa811f" }
+icp-events = { git = "https://github.com/dfinity/icp-cli", rev = "f4c7b6627cab56b091c01cc18102f5dd88aa811f" }
+icp-sync-plugin = { git = "https://github.com/dfinity/icp-cli", rev = "f4c7b6627cab56b091c01cc18102f5dd88aa811f" }
+icp-canister-interfaces = { git = "https://github.com/dfinity/icp-cli", rev = "f4c7b6627cab56b091c01cc18102f5dd88aa811f" }
+
+[dev-dependencies]
+# The tests hand-build small bundles (a manifest plus a wasm) and load them
+# through the same host the tool uses.
+wat = "1"

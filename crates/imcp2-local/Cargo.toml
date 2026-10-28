@@ -23,6 +23,11 @@ dist = true
 # primitives the login listener wraps. The IC agent is constructed from
 # core's `ic_agent` re-export, so the process links exactly one ic-agent.
 imcp2-core = { workspace = true }
+# The `icp_deploy_bundle` tool: deploying an icp project bundle through the
+# icp CLI's project library. Its own crate because it pulls `icp-project` from
+# git, which the published crates cannot; this binary is dist-released, so it
+# can. (It is what brings wasmtime — the sync-plugin runtime — into the build.)
+imcp2-deploy = { path = "../imcp2-deploy" }
 rmcp = { workspace = true, features = ["server", "macros", "transport-io"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
 # The transient loopback login listener (component 5 of the design): three
