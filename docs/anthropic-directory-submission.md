@@ -67,7 +67,21 @@ not published in the docs.
   to run a web search; ask the user for the app's URL instead — was already
   addressed by [#212](https://github.com/dfinity/imcp2/pull/212) (merged
   2026-10-28). The reviewers expect to move quickly once the guard change is
-  in place; blocker 2's description of the guard is to be updated with it.
+  in place.
+- **2026-10-28** — the guard change landed on `main`.
+  [#213](https://github.com/dfinity/imcp2/pull/213) detects a financial
+  canister from the interface it publishes (any `icrc1_*` / `icrc2_*` method
+  refuses every update to it) and makes a published, readable interface a
+  requirement for any update call, refusing on a failed read rather than
+  sending the call unchecked; [#214](https://github.com/dfinity/imcp2/pull/214)
+  refuses a method name carrying a financial keyword (`transfer`, `withdraw`,
+  `swap`, …) as a whole word on every canister. Blocker 2 describes the guard
+  as it now is. Still to do before replying on the review thread: the server
+  instructions still call the guard "a safeguard, not a complete filter" (the
+  reviewers' second ask); a release carrying the change has to reach
+  production, where the reviewers re-test; and the reviewers' test app must
+  publish its `candid:service`, since an update to a canister that publishes
+  none is now refused.
 
 ## Where and how submission happens
 
