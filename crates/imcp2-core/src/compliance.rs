@@ -536,14 +536,24 @@ const FINANCIAL_KEYWORDS: &[&str] = &[
 /// Method names exempt from the keyword scope although they contain a keyword
 /// — a control handover (of a canister, a record, an app), not a value
 /// movement — matched LITERALLY, by exact bytes: `Transfer_Ownership` or
-/// `transfer_ownership_v2` are not exempt.
+/// `transfer_ownership_v2` are not exempt. Every entry records where the name
+/// comes from, so the list can be audited (per review): a name with no source
+/// does not get in, and an entry whose source goes away goes with it.
 const EXEMPT_METHODS: &[&str] = &[
+    // The `Ownable` access-control convention — OpenZeppelin's Solidity
+    // `transferOwnership(address)` — which app code ported from the EVM keeps
+    // when it hands a canister's or a record's admin role to a new principal;
+    // the snake_case form is the Rust (ic-cdk) spelling of the same method.
+    // Kept at the maintainer's direction as the one control-handover name
+    // worth exempting. No mainnet interface declaring either spelling has
+    // been verified yet (the IC token standards use `setOwner` — DIP20,
+    // Sonic — or `set_custodians` — DIP721 — which carry no keyword); should
+    // a canister whose `transfer_ownership` moves VALUE turn up (an NFT
+    // handover is one), the exemption goes. Controller handover has no entry:
+    // on the Internet Computer a canister's controllers change through the
+    // management canister's `update_settings`, never through an app method.
     "transfer_ownership",
     "transferOwnership",
-    "transfer_controller",
-    "transferController",
-    "transfer_controllers",
-    "transferControllers",
 ];
 
 /// The words of a method name, for whole-word keyword matching: maximal runs
@@ -948,10 +958,6 @@ mod tests {
             "trader",
             "transfer_ownership",
             "transferOwnership",
-            "transfer_controller",
-            "transferController",
-            "transfer_controllers",
-            "transferControllers",
         ] {
             assert!(
                 disallowed_update_method(&any_canister(), method).is_none(),
@@ -1186,6 +1192,8 @@ mod tests {
             ("icrc2_allowance", "allowance"),
             ("add_liquidity", "liquidity"),
             ("transfer_tokens_to_controller", "transfer"),
+            ("transfer_controller", "transfer"),
+            ("transferControllers", "transfer"),
             ("trade", "trade"),
         ] {
             assert_eq!(financial_keyword(method), Some(keyword), "{method}");
@@ -1203,10 +1211,6 @@ mod tests {
             "process_payment",
             "transfer_ownership",
             "transferOwnership",
-            "transfer_controller",
-            "transferController",
-            "transfer_controllers",
-            "transferControllers",
             "",
         ] {
             assert_eq!(financial_keyword(method), None, "{method}");
