@@ -239,7 +239,15 @@ transactions:**
   cycles ledgers' own `transfer`/`send_dfx`/`withdraw`/`create_canister`
   methods on those ledgers, the cycles-minting canister's funding-completion
   methods (`notify_top_up`, `notify_create_canister`, `notify_mint_cycles`,
-  `create_canister`), and refuses **every** update call on the
+  `create_canister`), refuses any method whose name carries a financial
+  keyword as a whole word (`transfer`, `withdraw`, `swap`, `trade`,
+  `exchange`, `pay`, `buy`, `deposit`, …, bar a literal list of
+  control-handover names such as `transfer_ownership`) on every canister,
+  and refuses **every** update call to a canister whose
+  own Candid interface declares ICRC-1 or ICRC-2 methods — every ICRC ledger
+  and the ICP ledger, detected from the canister itself; an update call needs
+  that published interface, so a canister that publishes none, or whose
+  interface cannot be read, is refused outright — and to the
   financial-service canisters it carries; the refusal tells the user to
   perform the operation
   outside the connector, in a trusted interface they control, and names no
@@ -471,9 +479,13 @@ next edit of the listing.
 >    "Actions & questions" is what permits such calls. A call with no
 >    `derivation_origin` is not signed with the delegation at all: it runs
 >    as the anonymous principal, so the access level does not decide it.
->    The connector's own checks still do — the financial-transactions guard
->    runs before any identity resolution or network I/O, so a call it refuses
->    is refused with or without an origin — and past that the canister
+>    The connector's own checks still do — the financial-transactions guard's
+>    name and canister-id checks run before any identity resolution or network
+>    I/O, and its interface check runs once the canister's declared interface
+>    is read, before the call is signed or sent (an update call needs that
+>    published interface: a canister that publishes none, or whose interface
+>    cannot be read, is refused rather than called), so a call it refuses is
+>    refused with or without an origin — and past that the canister
 >    decides. The server instructions describe both, so the assistant can
 >    explain which case a call is in. Access is revocable at
 >    any time at https://id.ai/manage/settings.
@@ -496,8 +508,15 @@ Topics: directory guidelines, first-party API usage, financial transactions,
 AI media generation, prompt injection, conversation-data collection, public
 documentation. **Financial transactions** is a clean acknowledgment: no
 tool initiates or executes a transfer of the user's funds — financial ledger
-methods are refused, and no funding or management tools are served (users run
-those operations with the icp CLI).
+methods are refused on every canister, every update call to a canister whose
+published interface declares ICRC-1/ICRC-2 methods is refused, and no funding
+or management tools are served (users run those operations with the icp CLI).
+State the limit in the same breath rather than implying a seal: every update
+call needs the canister's published interface — a canister that publishes
+none, or whose interface cannot be read, is refused outright — and the guard
+refuses every canister whose interface declares ICRC-1/ICRC-2 methods; what it
+does not judge is a bespoke method on a canister whose published interface is
+not a ledger's.
 **First-party API usage** is answered by describing the architecture as it
 is: DFINITY operates the connector itself; it reaches the network through
 public Internet Computer infrastructure (`icp-api.io`, `id.ai`) and forwards

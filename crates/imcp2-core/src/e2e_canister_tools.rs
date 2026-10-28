@@ -296,14 +296,28 @@ fn leb128(out: &mut Vec<u8>, mut n: u64) {
 }
 
 /// The interface of the plain (non-OQL) canister: a query to read, an update to
-/// write, and an API-doc method for `get_canister_api_doc` to find.
+/// write, and an API-doc method for `get_canister_api_doc` to find. It must
+/// never declare an `icrc1_` / `icrc2_` method: that would make it a financial
+/// canister to the guard's interface scope and refuse every write-path case
+/// below (the plain shape is pinned by `compliance::tests::icrc_prefixes_are_literal`).
 const APP_DID: &str = "service : {\n  \
     greet : (text) -> (text) query;\n  \
     whoami : () -> (principal) query;\n  \
     get_message : () -> (text) query;\n  \
     set_message : (text) -> (text);\n  \
-    icrc1_transfer : (text) -> (text);\n  \
     get_api_doc : () -> (text) query;\n\
+}";
+
+/// The interface of the ledger canister: ICRC-1 methods — the evidence the
+/// financial guard's interface scope keys on — next to an unrelated update that
+/// writes the store `get_message` reads, the write that scope must refuse.
+/// `icrc1_balance_of` is a query, so a read of a financial canister can be shown
+/// to still work.
+const LEDGER_DID: &str = "service : {\n  \
+    icrc1_balance_of : (text) -> (text) query;\n  \
+    icrc1_transfer : (text) -> (text);\n  \
+    get_message : () -> (text) query;\n  \
+    set_message : (text) -> (text);\n\
 }";
 
 /// What the app canister's `get_api_doc` returns.
@@ -405,12 +419,17 @@ struct Harness {
     oql: Principal,
     /// A canister publishing no `candid:service` metadata at all.
     opaque: Principal,
+    /// A canister whose published interface provides ICRC-1 methods — a
+    /// financial canister to the guard's interface scope — with an unrelated
+    /// update method alongside.
+    ledger: Principal,
     /// The principal the seeded session signs as at [`Self::origin`].
     principal: Principal,
     /// The session store, so a test that needs the user to hold an identity at
     /// a SECOND app can seed one ([`Identities::seed_app_identity`]).
     identities: Identities,
-    /// The app origin whose manifest declares [`Self::app`] and [`Self::oql`].
+    /// The app origin whose manifest declares [`Self::app`], [`Self::oql`] and
+    /// [`Self::ledger`].
     origin: String,
 }
 
@@ -446,13 +465,6 @@ impl Harness {
                     Method::query("whoami", Behavior::Caller),
                     Method::query("get_message", Behavior::Load),
                     Method::update("set_message", Behavior::Store),
-                    // A value-moving method name, declared and exported, that
-                    // writes to the SAME store `get_message` reads. The
-                    // financial-transactions gate is the only thing standing
-                    // between a tool call and that write, so a test that gets
-                    // the refusal AND an unchanged store has shown the gate
-                    // ran — an undeclared method would give both for free.
-                    Method::update("icrc1_transfer", Behavior::Store),
                     Method::query("get_api_doc", Behavior::Const(text_reply(API_DOC))),
                 ],
             ),
@@ -485,9 +497,30 @@ impl Harness {
         let plain = canister_wasm(None, &[Method::query("greet", Behavior::Echo)]);
         let opaque = install(&pic, plain).await;
 
-        // The app's published manifest declares the two canisters under test —
-        // and, deliberately, not `opaque`, which several cases rely on.
-        webfixture::serve(origin, webfixture::Site::declaring(&[app, oql]));
+        // A canister that provides ICRC-1 methods — a financial canister to the
+        // guard's interface scope — alongside an unrelated update that writes
+        // the store its `get_message` reads. `icrc1_transfer` is declared AND
+        // exported: the financial-transactions gate is the only thing standing
+        // between a tool call and that write, so a test that gets the refusal
+        // AND an unchanged store has shown the gate ran — an undeclared method
+        // would give both for free.
+        let ledger = install(
+            &pic,
+            canister_wasm(
+                Some(LEDGER_DID),
+                &[
+                    Method::query("icrc1_balance_of", Behavior::Const(text_reply("0"))),
+                    Method::update("icrc1_transfer", Behavior::Store),
+                    Method::query("get_message", Behavior::Load),
+                    Method::update("set_message", Behavior::Store),
+                ],
+            ),
+        )
+        .await;
+
+        // The app's published manifest declares the three canisters under test
+        // — and, deliberately, not `opaque`, which several cases rely on.
+        webfixture::serve(origin, webfixture::Site::declaring(&[app, oql, ledger]));
 
         // The server's own agent, pointed at this replica's gateway.
         let gateway = pic.make_live(None).await;
@@ -533,6 +566,7 @@ impl Harness {
             app,
             oql,
             opaque,
+            ledger,
             principal,
             identities,
             origin: origin.to_string(),
@@ -993,12 +1027,29 @@ async fn an_update_call_writes_state_a_query_reads_back() {
     assert_eq!(ok_text(&result), "(\"as an update\")");
 
     // --- the financial-transactions gate: refused before the network ---
-    // A value-moving method name is refused on EVERY canister. This canister
-    // really declares and exports `icrc1_transfer`, and it writes to the same
-    // store `get_message` reads — so the assertions below distinguish "the
-    // gate stopped this" from "the canister would have rejected it anyway".
+    // A value-moving method name is refused on EVERY canister. The ledger
+    // fixture really declares and exports `icrc1_transfer`, and it writes to
+    // the same store its `get_message` reads — so the assertions below
+    // distinguish "the gate stopped this" from "the canister would have
+    // rejected it anyway".
+    let ledger = h.ledger.to_text();
+    let read_ledger = || async {
+        let result = h
+            .call(
+                "canister_query",
+                serde_json::json!({
+                    "canister_id": ledger,
+                    "method": "get_message",
+                    "args": "()",
+                    "app_url": h.origin,
+                }),
+            )
+            .await;
+        ok_text(&result)
+    };
+    assert_eq!(read_ledger().await, "(\"\")", "the ledger fixture starts empty");
     let transfer = serde_json::json!({
-        "canister_id": app,
+        "canister_id": ledger,
         "method": "icrc1_transfer",
         "args": "(\"moved through the connector\")",
         "app_url": h.origin,
@@ -1011,7 +1062,7 @@ async fn an_update_call_writes_state_a_query_reads_back() {
         msg.contains("not supported by this server, to protect the user"),
         "the refusal must be the connector's policy, not the replica's: {msg}"
     );
-    assert_eq!(read_back().await, "(\"booked seat 14\")", "and the canister was never called");
+    assert_eq!(read_ledger().await, "(\"\")", "and the canister was never called");
 
     // The positive control for that last assertion: the method is live and
     // does mutate. Called from OUTSIDE the connector it writes, which is what
@@ -1019,7 +1070,7 @@ async fn an_update_call_writes_state_a_query_reads_back() {
     // canister that could not have done anything anyway.
     h.pic
         .update_call(
-            h.app,
+            h.ledger,
             Principal::anonymous(),
             "icrc1_transfer",
             Encode!(&"moved on the replica").expect("encode the transfer argument"),
@@ -1027,10 +1078,63 @@ async fn an_update_call_writes_state_a_query_reads_back() {
         .await
         .expect("the fixture's icrc1_transfer is callable on the replica");
     assert_eq!(
-        read_back().await,
+        read_ledger().await,
         "(\"moved on the replica\")",
         "the method the gate refused really does change state when it is reached"
     );
+
+    // --- a financial canister, detected from the canister itself ---
+    // The ledger fixture declares ICRC-1 methods, so EVERY update call to it is
+    // refused — `set_message` included, a name the gate knows nothing about —
+    // once its interface has been read. This is the one scope that runs after
+    // the network is touched: the refusal names the standard and the methods
+    // that established it, and the store shows the call never arrived.
+    let msg = refusal(
+        &h.call(
+            "canister_update_call",
+            serde_json::json!({
+                "canister_id": ledger,
+                "method": "set_message",
+                "args": "(\"written through the connector\")",
+                "app_url": h.origin,
+            }),
+        )
+        .await,
+    );
+    assert!(msg.contains("`set_message`"), "the refusal names the method: {msg}");
+    assert!(msg.contains("ICRC-1 ledger methods"), "the refusal names the standard: {msg}");
+    assert!(msg.contains("`icrc1_transfer`"), "and the method that established it: {msg}");
+    assert!(
+        msg.contains("Every state-changing call to that service is refused")
+            && msg.contains("does not mean this particular call moves assets"),
+        "the destination register, claiming nothing about this call: {msg}"
+    );
+    assert!(msg.contains("not supported by this server, to protect the user"), "{msg}");
+    assert_eq!(read_ledger().await, "(\"moved on the replica\")", "and nothing was written");
+    // The positive control again: the refused method is live on the replica.
+    h.pic
+        .update_call(
+            h.ledger,
+            Principal::anonymous(),
+            "set_message",
+            Encode!(&"written on the replica").expect("encode the message"),
+        )
+        .await
+        .expect("the ledger fixture's set_message is callable on the replica");
+    assert_eq!(read_ledger().await, "(\"written on the replica\")");
+    // Reads of a financial canister are not gated: a query cannot move value.
+    let result = h
+        .call(
+            "canister_query",
+            serde_json::json!({
+                "canister_id": ledger,
+                "method": "icrc1_balance_of",
+                "args": "(\"anyone\")",
+                "app_url": h.origin,
+            }),
+        )
+        .await;
+    assert_eq!(ok_text(&result), "(\"0\")", "a ledger's balance query still reads");
 
     // --- the update path signs as the app identity too ---
     // `is_anonymous` above says only that an origin was passed. This is the
@@ -1069,7 +1173,7 @@ async fn an_update_call_writes_state_a_query_reads_back() {
     refusal(&result);
     assert_eq!(
         read_back().await,
-        "(\"moved on the replica\")",
+        "(\"booked seat 14\")",
         "a rejected argument writes nothing — the store still holds the last write"
     );
 }
@@ -1432,6 +1536,122 @@ async fn a_read_that_cannot_run_says_what_to_fix() {
         .await,
     );
     assert!(msg.contains("query failed"), "the replica's rejection is surfaced: {msg}");
+
+    // --- an update call needs the canister's published interface ---
+    // The opaque canister publishes none (a certified absence): the update is
+    // refused with the "publish it" message, and the canister is never reached
+    // — `greet` is a query method the Internet Computer would have let run as
+    // an update, so a "call failed" or a reply would mean the call was sent.
+    let msg = refusal(
+        &h.call(
+            "canister_update_call",
+            serde_json::json!({
+                "canister_id": opaque,
+                "method": "greet",
+                "args": "(\"x\")",
+                "app_url": declares_all,
+            }),
+        )
+        .await,
+    );
+    assert!(msg.contains("publishes no Candid interface"), "no interface, no update: {msg}");
+    assert!(msg.contains("does not mean this particular call moves assets"), "{msg}");
+    assert!(!msg.contains("call failed"), "the call must not have been sent: {msg}");
+    // A published interface this server cannot read is no better: the refusal
+    // says so, and says a readable one is what unblocks the canister.
+    let garbled = install(
+        &h.pic,
+        canister_wasm(
+            Some("service : { greet : (text) -> ("),
+            &[Method::query("greet", Behavior::Echo)],
+        ),
+    )
+    .await;
+    // A canister id no subnet of this replica serves: the gateway cannot route
+    // the metadata read, so the read FAILS instead of proving the interface
+    // absent — a different refusal, with a retry message, since the canister
+    // itself was not judged.
+    let phantom = Principal::from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 1]);
+    let declares_more = "https://errors-more.e2e.test";
+    webfixture::serve(declares_more, webfixture::Site::declaring(&[garbled, phantom]));
+    let msg = refusal(
+        &h.call(
+            "canister_update_call",
+            serde_json::json!({
+                "canister_id": garbled.to_text(),
+                "method": "greet",
+                "args": "(\"x\")",
+                "app_url": declares_more,
+            }),
+        )
+        .await,
+    );
+    assert!(msg.contains("could not be read by this server"), "unreadable interface: {msg}");
+    assert!(msg.contains("publishes a readable interface"), "{msg}");
+    assert!(!msg.contains("call failed"), "the call must not have been sent: {msg}");
+    let msg = refusal(
+        &h.call(
+            "canister_update_call",
+            serde_json::json!({
+                "canister_id": phantom.to_text(),
+                "method": "greet",
+                "args": "(\"x\")",
+                "app_url": declares_more,
+            }),
+        )
+        .await,
+    );
+    assert!(msg.contains("could not be read ("), "a failed read names its error: {msg}");
+    assert!(msg.contains("Retry"), "and is the one case worth retrying: {msg}");
+    assert!(msg.contains("does not mean this particular call moves assets"), "{msg}");
+    assert!(!msg.contains("call failed"), "the call must not have been sent: {msg}");
+    // An id inside this subnet's range that no canister occupies any more —
+    // the common mainnet shape of a nonexistent canister — is a certified
+    // absence too: the same "publishes none" refusal, whose wording covers
+    // the id being unoccupied, and never a replica rejection.
+    let deleted =
+        install(&h.pic, canister_wasm(None, &[Method::query("greet", Behavior::Echo)])).await;
+    h.pic.stop_canister(deleted, None).await.expect("stop the canister");
+    h.pic.delete_canister(deleted, None).await.expect("delete the canister");
+    let declares_deleted = "https://errors-deleted.e2e.test";
+    webfixture::serve(declares_deleted, webfixture::Site::declaring(&[deleted]));
+    let msg = refusal(
+        &h.call(
+            "canister_update_call",
+            serde_json::json!({
+                "canister_id": deleted.to_text(),
+                "method": "greet",
+                "args": "(\"x\")",
+                "app_url": declares_deleted,
+            }),
+        )
+        .await,
+    );
+    assert!(msg.contains("or no canister exists at this id"), "a deleted canister: {msg}");
+    assert!(msg.contains("publishes no Candid interface"), "{msg}");
+    assert!(!msg.contains("call failed"), "the call must not have been sent: {msg}");
+
+    // --- a keyword-named call is refused by name, before the network ---
+    // `withdraw` carries a financial keyword, so the call is refused on any
+    // canister without an interface being read — this one publishes none, and
+    // exports no such method, so the wording is the proof the gate answered.
+    let msg = refusal(
+        &h.call(
+            "canister_update_call",
+            serde_json::json!({
+                "canister_id": opaque,
+                "method": "withdraw",
+                "args": "(\"x\")",
+                "app_url": declares_all,
+            }),
+        )
+        .await,
+    );
+    assert!(msg.contains("`withdraw`"), "{msg}");
+    assert!(
+        msg.contains("refused on every canister rather than judged app by app"),
+        "the keyword scope's own wording: {msg}"
+    );
 
     // --- canister_query needs exactly one of `method` and `oql` ---
     let msg = refusal(
