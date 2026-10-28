@@ -219,10 +219,15 @@ transactions:**
   venue (a refused canister-creation or funding-completion call points at the
   user-run icp CLI). The policy is stated in the server-level instructions —
   the field the directories scan — where it covers the whole surface at once,
-  and a unit test holds it there. What those instructions state is the policy
-  itself, not its implementation: the method families and canister scopes are
-  in the guard and in the refusal an attempted call receives, so the
-  instructions carry no copy of that list to keep in sync.
+  and a unit test holds it there. Those instructions state the policy and
+  describe the three checks that enforce it — by method name, by destination,
+  and by the canister's own published interface — plus the one thing none of
+  them judges, so a reader knows what the guard covers without being told it
+  is incomplete (the review asked for exactly that). The keyword list, the
+  interface markers and the canister ids are in the guard and in the refusal
+  an attempted call receives, so the instructions carry no copy of them to
+  keep in sync; the three example keywords they do name are pinned to the
+  guard by the same unit test.
 - The README and the server instructions both state explicitly that
   financial transactions are not supported. The landing page is no longer one
   of them: #165 moved it to <https://internetcomputer.org/icp-mcp/>,
