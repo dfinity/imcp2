@@ -46,6 +46,25 @@ pub use deploy::{deploy_bundle, BundleSource, DeployOutcome, DeployRequest, Requ
 /// --cycles`): 2 trillion cycles.
 pub const DEFAULT_CYCLES: u64 = 2_000_000_000_000;
 
+/// The skill that teaches an agent the deploy loop around this tool — bundle
+/// the project, call `icp_deploy_bundle` with the environment's canister-id
+/// mapping, write the returned mapping back — served as the MCP resource
+/// `skill://deploy-with-mcp` by the server that mounts the tool, next to
+/// core's bundled IC skills. Compiled in, like those: what a client reads is
+/// what was reviewed at build time.
+pub const DEPLOY_SKILL_NAME: &str = "deploy-with-mcp";
+/// Its title, for the resource listing.
+pub const DEPLOY_SKILL_TITLE: &str = "Deploy with this MCP server";
+/// The document itself (frontmatter + body), in the registry's SKILL.md shape.
+pub const DEPLOY_SKILL_MD: &str = include_str!("../static/skills/deploy-with-mcp.md");
+
+/// The skill document behind `skill://<path>`, when `path` names this crate's
+/// skill — matched like core's bundled skills (trimmed, ASCII
+/// case-insensitive), so the two lookups compose into one `skill://` space.
+pub fn skill_document(path: &str) -> Option<&'static str> {
+    path.trim().eq_ignore_ascii_case(DEPLOY_SKILL_NAME).then_some(DEPLOY_SKILL_MD)
+}
+
 /// Arguments of `icp_deploy_bundle`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeployBundleArgs {
@@ -336,6 +355,44 @@ mod tests {
 
     fn args(json: serde_json::Value) -> DeployBundleArgs {
         serde_json::from_value(json).expect("valid args")
+    }
+
+    // The skill is in the registry's SKILL.md shape (frontmatter naming it as
+    // the URI does, a description for the agent's trigger decision), teaches
+    // the three steps around the tool by name, and resolves under the same
+    // lookup rules as core's bundled skills.
+    #[test]
+    fn the_deploy_skill_is_a_well_formed_skill_document() {
+        let md = DEPLOY_SKILL_MD;
+        assert!(md.starts_with("---\n"), "frontmatter first");
+        let (front, body) = md[4..].split_once("\n---\n").expect("closed frontmatter");
+        assert!(front.lines().any(|l| l == format!("name: {DEPLOY_SKILL_NAME}")), "{front}");
+        assert!(front.lines().any(|l| l.starts_with("description: ")), "{front}");
+        assert!(front.contains(&format!("title: {DEPLOY_SKILL_TITLE}")), "{front}");
+        for needle in [
+            "icp project bundle",
+            "icp_deploy_bundle",
+            "canister_ids",
+            ".icp/data/mappings/<environment>.ids.json",
+            "bundle_path",
+            "bundle_base64",
+            "authenticate",
+            "icp_cycles_balance",
+        ] {
+            assert!(body.contains(needle), "the skill must mention `{needle}`");
+        }
+        // The steps are named in the order an agent performs them.
+        let step = |n: &str| body.find(n).unwrap_or_else(|| panic!("missing heading {n}"));
+        assert!(
+            step("## Step 1: Bundle") < step("## Step 2: Request")
+                && step("## Step 2: Request") < step("## Step 3: Update"),
+            "steps out of order"
+        );
+
+        assert_eq!(skill_document("deploy-with-mcp"), Some(md));
+        assert_eq!(skill_document(" Deploy-With-MCP "), Some(md));
+        assert_eq!(skill_document("deploy-with-mcp/references/x.md"), None);
+        assert_eq!(skill_document("icp-cli"), None);
     }
 
     // The group carries exactly the one tool, with honest annotations (it
