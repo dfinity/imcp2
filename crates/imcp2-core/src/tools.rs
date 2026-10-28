@@ -689,6 +689,12 @@ impl IcCanisterTools {
         // a canister whose published interface is not a ledger's.
         let did = match read {
             calls::CandidServiceRead::Published(did) => did,
+            calls::CandidServiceRead::NotText => {
+                return Ok(err(compliance::unchecked_update_refusal(
+                    &method,
+                    &compliance::MissingInterface::Unreadable,
+                )));
+            }
             calls::CandidServiceRead::NotPublished => {
                 return Ok(err(compliance::unchecked_update_refusal(
                     &method,

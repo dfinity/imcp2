@@ -1605,6 +1605,31 @@ async fn a_read_that_cannot_run_says_what_to_fix() {
     assert!(msg.contains("Retry"), "and is the one case worth retrying: {msg}");
     assert!(msg.contains("does not mean this particular call moves assets"), "{msg}");
     assert!(!msg.contains("call failed"), "the call must not have been sent: {msg}");
+    // An id inside this subnet's range that no canister occupies any more —
+    // the common mainnet shape of a nonexistent canister — is a certified
+    // absence too: the same "publishes none" refusal, whose wording covers
+    // the id being unoccupied, and never a replica rejection.
+    let deleted =
+        install(&h.pic, canister_wasm(None, &[Method::query("greet", Behavior::Echo)])).await;
+    h.pic.stop_canister(deleted, None).await.expect("stop the canister");
+    h.pic.delete_canister(deleted, None).await.expect("delete the canister");
+    let declares_deleted = "https://errors-deleted.e2e.test";
+    webfixture::serve(declares_deleted, webfixture::Site::declaring(&[deleted]));
+    let msg = refusal(
+        &h.call(
+            "canister_update_call",
+            serde_json::json!({
+                "canister_id": deleted.to_text(),
+                "method": "greet",
+                "args": "(\"x\")",
+                "app_url": declares_deleted,
+            }),
+        )
+        .await,
+    );
+    assert!(msg.contains("or no canister exists at this id"), "a deleted canister: {msg}");
+    assert!(msg.contains("publishes no Candid interface"), "{msg}");
+    assert!(!msg.contains("call failed"), "the call must not have been sent: {msg}");
 
     // --- a keyword-named call is refused by name, before the network ---
     // `withdraw` carries a financial keyword, so the call is refused on any

@@ -803,11 +803,12 @@ pub fn disallowed_update_on_ledger_interface(
 /// and each with its own next step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MissingInterface {
-    /// The canister publishes no `candid:service` (a certified absence), or
-    /// publishes bytes that are not text.
+    /// The canister publishes no `candid:service` — a certified absence, which
+    /// is also what the state tree says of an id no canister occupies.
     NotPublished,
-    /// The canister publishes text this server's parser cannot read: not valid
-    /// Candid, no service declared, or over the size / depth limits (CWE-674).
+    /// The canister publishes something this server cannot read: bytes that
+    /// are not text, text that is not valid Candid or declares no service, or
+    /// text over the size / depth limits (CWE-674).
     Unreadable,
     /// The read failed — a transport, HTTP or certificate error — with its text.
     ReadFailed(String),
@@ -822,13 +823,15 @@ pub enum MissingInterface {
 pub fn unchecked_update_refusal(method: &str, missing: &MissingInterface) -> String {
     let (what, next) = match missing {
         MissingInterface::NotPublished => (
-            "the canister publishes no Candid interface (no `candid:service` metadata)".to_string(),
+            "the canister publishes no Candid interface (no `candid:service` metadata), or no \
+             canister exists at this id"
+                .to_string(),
             "A canister receives update calls through this server only once it publishes its \
-             interface; this one does not.",
+             interface.",
         ),
         MissingInterface::Unreadable => (
             "the canister's published Candid interface could not be read by this server (not \
-             valid Candid, no service declared, or over its size or depth limits)"
+             text, not valid Candid, no service declared, or over its size or depth limits)"
                 .to_string(),
             "Until the canister publishes a readable interface, no update call to it is sent.",
         ),
@@ -843,8 +846,8 @@ pub fn unchecked_update_refusal(method: &str, missing: &MissingInterface) -> Str
          published interface before it is sent — a canister that provides the ICRC token-ledger \
          interface is treated as a financial service as a whole — and a call that cannot be \
          checked is refused rather than sent unchecked, to protect the user. This refusal is \
-         about the missing interface, so it does not mean this particular call moves assets. \
-         {next} {NEUTRAL_REDIRECT}"
+         about the check that could not run, so it does not mean this particular call moves \
+         assets. {next} {NEUTRAL_REDIRECT}"
     )
 }
 
@@ -1520,11 +1523,15 @@ mod tests {
             match missing {
                 MissingInterface::NotPublished => {
                     assert!(msg.contains("publishes no Candid interface"), "{msg}");
+                    // A certified absence is also what an unoccupied id yields,
+                    // so the message must not assert that the canister exists.
+                    assert!(msg.contains("or no canister exists at this id"), "{msg}");
                     assert!(msg.contains("only once it publishes its interface"), "{msg}");
                     assert!(!msg.contains("Retry"), "nothing to retry: {msg}");
                 }
                 MissingInterface::Unreadable => {
                     assert!(msg.contains("could not be read by this server"), "{msg}");
+                    assert!(msg.contains("not text, not valid Candid"), "{msg}");
                     assert!(msg.contains("publishes a readable interface"), "{msg}");
                     assert!(!msg.contains("Retry"), "nothing to retry: {msg}");
                 }
