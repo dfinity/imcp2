@@ -2696,7 +2696,7 @@ pub struct OpenAppOutput {
 /// Resolve an app NAME against the built-in set of well-known apps
 /// ([`KNOWN_APPS`]). Pure/offline — there is no on-chain directory mapping an app
 /// name to its front-end URL, so an unknown name yields no match and a `note`
-/// directing the agent to do a web search for the official URL.
+/// directing the agent to ask the user for the official URL.
 pub fn find_app_by_name(query: &str) -> FindAppOutput {
     match find_known_app(query) {
         Some(app) => {
@@ -2725,9 +2725,8 @@ pub fn find_app_by_name(query: &str) -> FindAppOutput {
                 note: format!(
                     "\"{query}\" is not in the connector's small built-in set of well-known apps \
                      ({known}). There is no on-chain directory mapping an app NAME to its URL, so \
-                     do a WEB SEARCH for the app's official front-end URL (or ask the user for it), \
-                     then call open_app with that URL. Do NOT guess or \
-                     fabricate a domain from the name — a lookalike domain (e.g. <name>.com/.app) is \
+                     ask the user for the app's official front-end URL, then call open_app with \
+                     that URL. Do NOT guess or fabricate a domain from the name — a lookalike domain (e.g. <name>.com/.app) is \
                      typically an unrelated or squatted site, and an identity derived there would be \
                      wrong."
                 ),
@@ -3747,10 +3746,12 @@ mod tests {
             assert_eq!(known_app_derivation_origin(app), known_derivation_origin(&host).unwrap());
         }
 
-        // An unknown app: no match, and the note points to a web search.
+        // An unknown app: no match, and the note sends the model to the user for
+        // the URL, not to another tool.
         let unknown = find_app_by_name("Totally Unknown DApp");
         assert!(unknown.matches.is_empty());
-        assert!(unknown.note.to_lowercase().contains("web search"), "note: {}", unknown.note);
+        assert!(unknown.note.contains("ask the user"), "note: {}", unknown.note);
+        assert!(!unknown.note.to_lowercase().contains("web search"), "note: {}", unknown.note);
         // Blank / punctuation-only input doesn't match anything.
         assert!(find_app_by_name("   /  ").matches.is_empty());
         // Token-boundary matching: a word that merely CONTAINS an alias as a

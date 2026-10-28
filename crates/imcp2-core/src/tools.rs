@@ -1282,7 +1282,7 @@ impl IcCanisterTools {
             discover::AppQuery::Known(m) => (m.app_url, "known_app_registry"),
             discover::AppQuery::Url(u) => (u, "as_provided"),
             discover::AppQuery::UnknownName => {
-                // Echo find_app_by_name's web-search/ask guidance (it builds the
+                // Echo find_app_by_name's ask-the-user guidance (it builds the
                 // "not a known app; don't guess a domain" note from the registry).
                 return Ok(err(discover::find_app_by_name(&query).note));
             }
@@ -1974,7 +1974,7 @@ fn app_url_error_with_guidance(app_url: &str, e: String) -> String {
     }
     msg.push_str(
         " If you arrived at this URL by guessing from an app name, don't guess again — call \
-         open_app with the name, WEB SEARCH the app's official URL, or ask the user.",
+         open_app with the name, or ask the user for the app's official URL.",
     );
     msg
 }
@@ -2005,7 +2005,7 @@ fn unverified_app_url_error(application_origin: &str) -> String {
         "If you arrived at this URL by GUESSING from an app name, stop guessing — a lookalike \
          domain is an unrelated or squatted site, and an identity derived there is wrong: \
          (1) call open_app with the app's name (well-known apps resolve offline); \
-         (2) if it's not known, WEB SEARCH the app's official URL; (3) or ask the user for it. \
+         (2) if it's not known, ask the user for the app's official URL. \
          If this origin genuinely IS the app's canonical Internet Identity origin (e.g. a \
          non-IC-hosted app the user pointed you at), pass it explicitly as `derivation_origin` \
          to proceed deliberately.",
@@ -3030,6 +3030,29 @@ mod tests {
         }
     }
 
+    // The guidance in an error reaches the model exactly like a description does,
+    // so the errors that tell it how to find an app's URL are held to the same
+    // gate: an unknown name once sent the model off to a web search.
+    #[test]
+    fn app_url_guidance_respects_marketplace_policy() {
+        for (what, text) in [
+            ("unknown-app note", super::discover::find_app_by_name("Totally Unknown DApp").note),
+            ("lookalike refusal", super::unverified_app_url_error("https://multidex.com")),
+            ("plain refusal", super::unverified_app_url_error("https://example.com")),
+            (
+                "fetch-error guidance",
+                super::app_url_error_with_guidance(
+                    "multi.dex",
+                    "could not resolve multi.dex: no such host".to_string(),
+                ),
+            ),
+        ] {
+            if let Some(violation) = policy_violation(&text) {
+                panic!("{what} {violation}: {text}");
+            }
+        }
+    }
+
     /// The first policy violation in one model-readable string, or `None`.
     /// Phrases are matched on collapsed whitespace, so a line break (or a
     /// whitespace-class invisible) between two words cannot hide one.
@@ -3382,7 +3405,7 @@ mod tests {
         let msg = super::unverified_app_url_error("https://multidex.com");
         assert!(msg.contains("NO evidence"), "{msg}");
         assert!(msg.contains("open_app"), "{msg}");
-        assert!(msg.contains("WEB SEARCH"), "{msg}");
+        assert!(msg.contains("ask the user"), "{msg}");
         assert!(msg.contains("DID YOU MEAN MULTI/DEX"), "{msg}");
         assert!(msg.contains("https://multidex.ai"), "{msg}");
         assert!(msg.contains("`derivation_origin`"), "escape hatch missing: {msg}");
