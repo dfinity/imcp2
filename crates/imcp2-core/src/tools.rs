@@ -2214,12 +2214,17 @@ fn identity_annotation(target: &IdentityTarget) -> String {
 /// usable for financial transactions, which is the one thing it must not
 /// suggest. `financial_policy_is_a_server_instruction_not_a_description`
 /// holds that line across every served description, and the directive scan
-/// covers the schemas too. What the paragraph does NOT do is restate
-/// [`crate::compliance`]'s method families and canister scopes: that list would
-/// have to be kept in sync forever, and a refused call already gets a refusal
-/// accurate for its own scope. Neither surface names a venue for a refused
-/// operation.
-const SERVER_INSTRUCTIONS: &str = "Tools for the Internet Computer: read what a canister offers, read and write its data, and act as the user's own identity at an app.\n\nCANISTERS. Each canister publishes a Candid interface declaring its methods and their types. Method arguments and replies are textual Candid, the `(...)` syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`; candid_syntax_guide returns that syntax; the full type system is served as an MCP resource, `candid://reference`. Some canisters additionally declare an OQL surface. This server reads those through OQL and refuses a Candid `method` query on them; update calls are unaffected. icp_oql_guide documents the dialect. IC how-to guides are served as `skill://<name>` resources.\n\nAPPS AND IDENTITY. An app is a website backed by canisters. Internet Identity gives the user a different principal at each app, derived from that app's derivation origin, which is not always the app's visible URL; open_app resolve it, and the tools that act as the user take the resolved value. Within one app the user may hold several accounts.\n\nDECLARED CANISTERS. Every tool that reaches a canister — get_canister_candid, get_canister_api_doc, get_canister_oql_schema, canister_query and canister_update_call — works only on a canister the app that owns it declares at /.well-known/ic-architecture (https://docs.internetcomputer.org/guides/frontends/service-discoverability/), which is how its operators opt in to being read and operated by agents. `app_url` names that app and open_app returns it, alongside which of the app's canisters carry that declaration (marked [declared]); where a call carries both an `app_url` and a derivation origin, the two must belong to the same app. An app that publishes no manifest is still resolved and discovered, but none of its canisters can be read or called here: say that, and what its operators would publish, rather than retrying.\n\nSESSIONS. Calls that act as the user are signed with the Internet Identity credential this connection was authorized with. Internet Identity offers two access levels at that point: \"Questions only\", where reads work and state-changing calls are rejected by the network, and \"Actions & questions\", which permits both.\n\nFINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user: do not use canister_update_call to move assets. Value-moving methods, neuron management, and every update call to a known wallet, ledger, exchange or staking canister are refused before they reach the network; that guard is a safeguard, not a complete filter, so treat this policy, rather than the absence of a refusal, as the limit. For financial operations (token transfers, spending approvals, payments, trades), the user works outside this connector, in a trusted interface they control.\n\nBuilding and deploying canisters happens in the user's own environment with the icp CLI; no tool here creates, funds or deploys one.";
+/// covers the schemas too. The paragraph describes the three checks an update
+/// call goes through — by method name, by destination, and by the canister's
+/// own published interface — and states the one thing none of them judges, so
+/// a reader knows what the guard covers without being told it is incomplete
+/// (per directory review). It does NOT restate [`crate::compliance`]'s keyword
+/// list, markers and canister ids: that copy would have to be kept in sync
+/// forever, and a refused call already gets a refusal accurate for its own
+/// scope. The three example keywords it names are pinned to the guard by the
+/// same test, which also pins that it mentions no exemption (the keyword check
+/// has none). Neither surface names a venue for a refused operation.
+const SERVER_INSTRUCTIONS: &str = "Tools for the Internet Computer: read what a canister offers, read and write its data, and act as the user's own identity at an app.\n\nCANISTERS. Each canister publishes a Candid interface declaring its methods and their types. Method arguments and replies are textual Candid, the `(...)` syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`; candid_syntax_guide returns that syntax; the full type system is served as an MCP resource, `candid://reference`. Some canisters additionally declare an OQL surface. This server reads those through OQL and refuses a Candid `method` query on them; update calls are unaffected. icp_oql_guide documents the dialect. IC how-to guides are served as `skill://<name>` resources.\n\nAPPS AND IDENTITY. An app is a website backed by canisters. Internet Identity gives the user a different principal at each app, derived from that app's derivation origin, which is not always the app's visible URL; open_app resolve it, and the tools that act as the user take the resolved value. Within one app the user may hold several accounts.\n\nDECLARED CANISTERS. Every tool that reaches a canister — get_canister_candid, get_canister_api_doc, get_canister_oql_schema, canister_query and canister_update_call — works only on a canister the app that owns it declares at /.well-known/ic-architecture (https://docs.internetcomputer.org/guides/frontends/service-discoverability/), which is how its operators opt in to being read and operated by agents. `app_url` names that app and open_app returns it, alongside which of the app's canisters carry that declaration (marked [declared]); where a call carries both an `app_url` and a derivation origin, the two must belong to the same app. An app that publishes no manifest is still resolved and discovered, but none of its canisters can be read or called here: say that, and what its operators would publish, rather than retrying.\n\nSESSIONS. Calls that act as the user are signed with the Internet Identity credential this connection was authorized with. Internet Identity offers two access levels at that point: \"Questions only\", where reads work and state-changing calls are rejected by the network, and \"Actions & questions\", which permits both.\n\nFINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user: do not use canister_update_call to move assets. Before an update call is sent it is checked three ways. By method name, on every canister: the ICRC ledger methods, neuron management, and any name carrying a financial keyword as a whole word (transfer, withdraw, swap and the like) are refused. By destination: every update call to the known wallet, ledger, exchange and staking canisters is refused. By the canister's own published Candid interface, read before anything is encoded: a canister that declares ICRC-1 or ICRC-2 methods is a financial service and receives no update call, and a canister whose interface is missing or unreadable receives none either. A refusal says which check applied and claims nothing beyond it. Not judged: a bespoke value-moving method under an unrelated name on a canister whose interface is not a ledger's. For financial operations (token transfers, spending approvals, payments, trades), the user works outside this connector, in a trusted interface they control.\n\nBuilding and deploying canisters happens in the user's own environment with the icp CLI; no tool here creates, funds or deploys one.";
 
 impl ServerHandler for IcTools {
     async fn list_tools(
@@ -2809,16 +2814,22 @@ mod tests {
     // canister_update_call's description reads as a hint that the tool is
     // usable for financial transactions, which is the one thing it must not
     // suggest. Pin both sides — no tool description carries financial
-    // language, and the instructions state the denial, the limit of the guard
-    // that backs it, and the redirect. The refused method families are
-    // deliberately NOT restated here or in the instructions: they were a copy
-    // of `compliance` that had to be kept in sync, and an attempted call is
-    // refused with a message accurate for its own scope. What the instructions
-    // must not do is promise more than the guard delivers, so the
-    // safeguard-not-a-filter clause is pinned in its place. Neither surface
-    // names a venue for a refused operation: metadata answering a refused
-    // financial operation with a specific transactional service would read as
-    // a redirect from one such route to another.
+    // language, and the instructions state the denial, the three checks that
+    // enforce it (by name, by destination, by the canister's own interface),
+    // the one thing those checks do not judge, and the redirect. Directory
+    // review asked that the instructions describe what the guard covers
+    // rather than call it incomplete, so the old "a safeguard, not a complete
+    // filter" clause is pinned OUT. The keyword list, markers and canister ids
+    // are deliberately NOT restated in the instructions: they were a copy of
+    // `compliance` that had to be kept in sync, and an attempted call is
+    // refused with a message accurate for its own scope — the three example
+    // keywords the paragraph does name are checked against the guard here, and
+    // so is the absence of any exemption: the keyword check has none, so the
+    // paragraph must not mention one (an earlier version named
+    // `transfer_ownership` as exempt, which the guard no longer honours).
+    // Neither surface names a venue for a refused operation: metadata
+    // answering a refused financial operation with a specific transactional
+    // service would read as a redirect from one such route to another.
     #[test]
     fn financial_policy_is_a_server_instruction_not_a_description() {
         for tool in super::IcTools::all_tools() {
@@ -2828,9 +2839,38 @@ mod tests {
         }
         let ins = super::SERVER_INSTRUCTIONS;
         assert!(ins.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user"));
+        for check in ["By method name", "By destination", "published Candid interface"] {
+            assert!(ins.contains(check), "the instructions must describe the {check} check: {ins}");
+        }
+        assert!(ins.contains("Not judged:"), "the instructions must state the limit: {ins}");
         assert!(
-            ins.contains("a safeguard, not a complete filter"),
-            "the instructions must not present the guard as complete coverage: {ins}"
+            !ins.contains("not a complete filter") && !ins.contains("safeguard"),
+            "the instructions describe what the guard covers rather than calling it \
+             incomplete (per directory review): {ins}"
+        );
+        // The example keywords the paragraph names are real: each is refused
+        // by the guard on an arbitrary canister.
+        for keyword in ["transfer", "withdraw", "swap"] {
+            assert!(ins.contains(keyword), "the paragraph names {keyword}: {ins}");
+            assert!(
+                crate::compliance::disallowed_update_method(
+                    &candid::Principal::management_canister(),
+                    keyword
+                )
+                .is_some(),
+                "{keyword} is named in the instructions but not refused by the guard"
+            );
+        }
+        // ...and the paragraph names no exemption, because the guard has none:
+        // the ownership-handover name once mentioned as exempt is refused.
+        assert!(!ins.contains("exempt"), "the keyword check has no exemption: {ins}");
+        assert!(
+            crate::compliance::disallowed_update_method(
+                &candid::Principal::management_canister(),
+                "transfer_ownership"
+            )
+            .is_some(),
+            "transfer_ownership must be refused: nothing is exempt from the keyword check"
         );
         assert!(ins.contains("outside this connector, in a trusted interface they control"));
         assert!(!ins.contains("oisy.com"), "the instructions name no venue: {ins}");

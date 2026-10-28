@@ -166,8 +166,7 @@ submission states, not from a narrower reading:
   the cycles-minting canister's funding-completion methods on those
   canisters, any method whose name carries a financial keyword as a whole
   word (`transfer`, `withdraw`, `swap`, `trade`, `exchange`, `pay`, `buy`,
-  `deposit`, …, bar a literal list of control-handover names such as
-  `transfer_ownership`) on every canister, every update call to a canister
+  `deposit`, …, with no exemptions) on every canister, every update call to a canister
   whose own Candid interface declares ICRC-1 or ICRC-2 methods (every ICRC
   ledger and the ICP ledger, detected from the canister itself; an update
   call needs that published interface, so a canister that publishes none, or
@@ -184,11 +183,13 @@ submission states, not from a narrower reading:
   canister, a URL with no Internet-Computer evidence). The
   financial-transactions policy is a separate, server-wide matter and is
   stated where the scan reads it: in the server-level instructions, covering
-  the whole surface at once. Those instructions state the policy, not its
-  implementation — the method families and canister scopes live in the guard
-  and in the refusal each attempted call receives, rather than in a copy that
-  would have to be kept in sync. So no description promises a behavior
-  the tool does not have, and no refusal is hidden.
+  the whole surface at once. Those instructions state the policy and describe
+  the three checks that enforce it (by method name, by destination, by the
+  canister's own published interface) and the one thing none of them judges;
+  the keyword list, the interface markers and the canister ids live in the
+  guard and in the refusal each attempted call receives, rather than in a
+  copy that would have to be kept in sync. So no description promises a
+  behavior the tool does not have, and no refusal is hidden.
 - **The commerce and speculation rules have nothing to attach to.** The
   plugin sells nothing (no physical goods, no digital goods or
   subscriptions, no checkout) and offers no speculation product: no trading,
