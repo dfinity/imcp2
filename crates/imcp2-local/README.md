@@ -7,7 +7,9 @@ It serves the same tools as the hosted server at
 [mcp.internetcomputer.org](https://mcp.internetcomputer.org) — canister reads
 and writes in textual Candid, app discovery, OQL, canister management —
 against the same **IC mainnet** and the same **production Internet
-Identity**. What it drops is the hosted server's entire OAuth 2.1 layer: a
+Identity**, plus one tool of its own, `icp_deploy_bundle`, which deploys an
+icp project bundle (see [Deploying a project bundle](#deploying-a-project-bundle)).
+What it drops is the hosted server's entire OAuth 2.1 layer: a
 single-user process reached over a pipe needs no bearer tokens, so your II
 login never passes through a third-party server.
 
@@ -135,6 +137,49 @@ screen, and the tab says it can be closed — the session is live. `auth_status`
 Sessions are **in memory only**: you sign in again after a restart, when the
 grant expires, or if you revoke it at id.ai (Manage access). Signing in again
 is the same one-step browser round-trip — no client restart needed.
+
+## Deploying a project bundle
+
+`icp_deploy_bundle` deploys an [icp CLI](https://github.com/dfinity/icp-cli)
+project to the Internet Computer as you, running the same phases as
+`icp deploy` through the CLI's own project library: it creates the canisters
+that do not exist yet (funded from your cycles-ledger balance, 2T cycles each
+by default), wires their ids into each other's environment variables, applies
+the manifest's settings, installs or upgrades the code (with the Candid
+compatibility check on upgrades), and runs the sync steps that upload a
+frontend's assets.
+
+It takes:
+
+- the **bundle** — the self-contained archive `icp project bundle --output
+  <file>` writes, by absolute path (`bundle_path`) or inline (`bundle_base64`);
+- the **environment** to deploy, by name, among those the bundle declares
+  (`ic` for a bundle built with the defaults). It must target a connected
+  network; a locally launched (managed) network is refused, since there is
+  none to launch here;
+- optionally the **canister ids** from an earlier deploy (`canister_ids`, a
+  name → id map: the contents of the CLI's `<environment>.ids.json`, or what a
+  previous call returned). Canisters named there are upgraded in place; the
+  rest are created.
+
+It answers with the status (`deployed`, `failed`, `nothing_to_deploy`), the
+resulting canister-id mapping — pass it back next time to upgrade — the
+canisters created, and a log of each phase. A failed deploy still reports every
+canister it created before failing, so the run can be picked up rather than
+repeated.
+
+Calls are signed as your **management identity** (your default II account at
+the hosted server's origin, see `IMCP2_MANAGEMENT_ORIGIN`): the same principal
+`icp_cycles_balance` reports and the canister lifecycle tools act as, so a
+canister deployed here stays manageable there. The session must have been
+granted "Actions & questions" at sign-in. The bundle is extracted into a
+scratch directory for the duration of the deploy and removed afterwards;
+nothing is written to the project it came from.
+
+Why only here: the tool is built on `icp-project`, a crate the icp CLI does not
+publish, so it is pulled from git — which the crates.io-published `imcp2-core`
+and `imcp2` cannot do. It lives in its own `imcp2-deploy` crate, composed into
+this binary alone.
 
 ## Upgrading
 
