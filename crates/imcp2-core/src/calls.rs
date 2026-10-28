@@ -4,7 +4,8 @@
 //! `canister_update_call` (invoke an update method). The LLM only ever deals with
 //! textual Candid — the binary encoding/decoding against a method's declared types
 //! happens here, and the `.did` interface is resolved from the canister's own
-//! `candid:service` metadata (or a caller-supplied definition).
+//! `candid:service` metadata (or, for a query, a caller-supplied definition; an
+//! update call needs the published one).
 //!
 //! The `#[tool]` entry points live on `IcTools` in `main.rs` (they need the
 //! agent, identities, and request context); this module owns their argument and

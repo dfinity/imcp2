@@ -628,7 +628,9 @@ impl IcCanisterTools {
         // not depend on the method name alone; and a call addressed to any
         // other ICRC-1 / ICRC-2 ledger method by name. The one scope that needs
         // the canister's interface — a financial canister detected from the
-        // ICRC methods it declares — runs below, once resolve_did has read it.
+        // ICRC methods it declares — runs below, once the canister's published
+        // interface has been read; an update call needs that interface, so a
+        // canister that gives none is refused there.
         // Each scope's refusal claims only what that scope knows about the
         // call, and points the user outside this connector. Queries need no
         // gate — a query cannot commit state, so it cannot move funds.
