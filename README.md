@@ -199,7 +199,7 @@ Acting **for the user** at an app:
    (it resolves the origin and discovers the canisters concurrently under the hood).
    **Never guess a domain from a name** — a lookalike like `<name>.com` is an
    unrelated or squatted site. The tool enforces this: a bare *unknown* name is
-   refused (find the real URL — web-search or ask the user), and a URL that resolves
+   refused (ask the user for the real URL), and a URL that resolves
    to `app_url_default` while showing **no IC evidence** (no valid `x-ic-canister-id`
    gateway header, no declared derivation origin) is refused too; when the host
    resembles a known app the error names it and gives the real URL (a
