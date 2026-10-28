@@ -1537,10 +1537,11 @@ async fn a_read_that_cannot_run_says_what_to_fix() {
     );
     assert!(msg.contains("query failed"), "the replica's rejection is surfaced: {msg}");
 
-    // --- the guard's interface scope fails open on an unreadable canister ---
-    // With no interface to read there is nothing to classify, so an update to
-    // the opaque canister goes through: `greet` is a query method, and the
-    // Internet Computer lets a query method be called as an update.
+    // --- the guard's interface scope on a canister that publishes none ---
+    // A certified absence: with no interface to read, the name scopes decide
+    // and nothing else does, so an update to the opaque canister goes through:
+    // `greet` is a query method, and the Internet Computer lets a query method
+    // be called as an update.
     let result = h
         .call(
             "canister_update_call",
@@ -1557,6 +1558,31 @@ async fn a_read_that_cannot_run_says_what_to_fix() {
         "(\"x\")",
         "no interface: nothing for the interface scope to refuse on"
     );
+    // --- a read that FAILS is not an absent interface ---
+    // A canister id no subnet of this replica serves: the gateway cannot route
+    // the metadata read, so the read fails instead of proving the interface
+    // absent. That call is refused with a retry message — the guard cannot
+    // check the canister, and a failed read must not be the way past the check
+    // — and the wording is the proof: sent on, the call would have failed at
+    // the replica, and the tool would report "call failed".
+    let phantom = Principal::from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 1]);
+    let declares_phantom = "https://errors-phantom.e2e.test";
+    webfixture::serve(declares_phantom, webfixture::Site::declaring(&[phantom]));
+    let msg = refusal(
+        &h.call(
+            "canister_update_call",
+            serde_json::json!({
+                "canister_id": phantom.to_text(),
+                "method": "greet",
+                "args": "(\"x\")",
+                "app_url": declares_phantom,
+            }),
+        )
+        .await,
+    );
+    assert!(msg.contains("could not be read"), "a failed read refuses the call: {msg}");
+    assert!(msg.contains("does not mean this particular call moves assets"), "{msg}");
+    assert!(!msg.contains("call failed"), "the call must not have been sent: {msg}");
     // A caller-supplied interface is consulted only because the canister
     // publishes none — and it can only ADD a refusal: declare ICRC-1 methods
     // for the same canister and the same call is refused as a financial one.

@@ -76,10 +76,18 @@
 //!     destination register, naming the standard(s) and the methods that
 //!     established them. That covers every ICRC-1/ICRC-2 ledger — the ICP
 //!     ledger, the cycles ledger, every SNS and chain-key ledger, every token
-//!     built on the ic-icrc1 ledger — with no list to keep current. No
-//!     interface, or one the parser cannot read, fails open. Other ICRC token
-//!     namespaces (`icrc4_`, `icrc7_`, `icrc37_`, `icrc152_`) are not detected
-//!     this way; their value-moving names are refused literally above.
+//!     built on the ic-icrc1 ledger — with no list to keep current. What the
+//!     read establishes decides what happens without an interface (per
+//!     review): a canister that publishes none — a CERTIFIED absence — is
+//!     checked by name only, the scopes above still applying and a
+//!     caller-supplied text read in its place; a read that FAILS (a transport,
+//!     HTTP or certificate error) refuses the update with a retry message
+//!     ([`unchecked_update_refusal`]), because a failed read must not be the
+//!     way past this scope; and published text the parser cannot read fails
+//!     open like an absent interface, since a canister that wants to hide its
+//!     interface need only not publish it. Other ICRC token namespaces
+//!     (`icrc4_`, `icrc7_`, `icrc37_`, `icrc152_`) are not detected this way;
+//!     their value-moving names are refused literally above.
 //!
 //! Why the standardized surface is where real funds live: tokens are only
 //! valuable if they can be exchanged or used, and the ICP ecosystem's
@@ -101,8 +109,10 @@
 //!     This guard enforces the policy for the standardized ledger surface,
 //!     where real funds overwhelmingly live (see above), and — from the
 //!     canister's own interface — for every canister that provides ICRC
-//!     methods; a canister that publishes no interface and names nothing
-//!     financial is not detected.
+//!     methods, refusing the update outright when that interface cannot be
+//!     read; a canister that publishes no interface and names nothing
+//!     financial is not detected, and that limit is stated wherever the guard
+//!     is described, never implied away.
 //!     Likewise the canister list is curated and static, while exchanges
 //!     create per-pair pool/farm canisters dynamically and new services
 //!     launch: entries cover each service's central canisters (verified
@@ -598,9 +608,11 @@ pub fn disallowed_update_method(canister_id: &Principal, method: &str) -> Option
 /// Runs only where the interface is legitimately in hand — after the
 /// discoverability gate admitted the canister and `canister_update_call` read
 /// the interface it encodes against — and AFTER [`disallowed_update_method`],
-/// whose scopes are cheaper and more specific. No interface, or one that cannot
-/// be parsed, never reaches here: the caller fails open (a guardrail, not a
-/// seal).
+/// whose scopes are cheaper and more specific. A canister that publishes no
+/// interface, or one the parser cannot read, never reaches here: the caller
+/// fails open (a guardrail, not a seal). A read that FAILED does not reach here
+/// either: the caller refuses with [`unchecked_update_refusal`] instead of
+/// guessing.
 pub fn disallowed_update_on_ledger_interface(
     method: &str,
     declared: &BTreeSet<String>,
@@ -638,6 +650,26 @@ pub fn disallowed_update_on_ledger_interface(
     ))
 }
 
+/// The refusal for an update whose target could not be checked: the interface
+/// scope needs the canister's own interface, and the read of it FAILED — a
+/// transport, HTTP or certificate error (`error` is its text), not a canister
+/// that publishes none, which is checked by name only (see the module doc).
+/// Refused rather than sent unchecked, with a retry message, because a failed
+/// read must not be the way past the scope (per review). The register claims
+/// nothing about the call: the guard learned nothing about it.
+pub fn unchecked_update_refusal(method: &str, error: &str) -> String {
+    format!(
+        "`{method}` was not sent: the canister's Candid interface could not be read ({error}). \
+         An update call is checked against that interface before it is sent — a canister that \
+         provides the ICRC token-ledger interface is treated as a financial service as a whole \
+         — and a call that cannot be checked is refused rather than sent unchecked, to protect \
+         the user. This refusal is about the read that failed, so it does not mean this \
+         particular call moves assets. Retry: a canister that publishes no interface is not \
+         refused this way, so an error that persists means this server cannot read the \
+         interface it needs, or the canister id is not one the network routes. {NEUTRAL_REDIRECT}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +697,8 @@ mod tests {
     /// The clause the interface scope's refusal must carry: the evidence is what
     /// the canister itself declares.
     const INTERFACE_RULE: &str = "whose Candid interface declares";
+    /// The clause the failed-read refusal must carry: the check could not run.
+    const UNCHECKED_RULE: &str = "could not be read";
 
     /// A declared method set, as `calls::declared_methods` would read it.
     fn declared(names: &[&str]) -> BTreeSet<String> {
@@ -960,6 +994,16 @@ mod tests {
         assert!(msg.contains(NOT_THIS_CALL), "{msg}");
         assert!(!msg.contains(ITSELF), "{msg}");
         assert!(!msg.contains(DESTINATION_RULE), "{msg}");
+
+        // A read of the interface that failed: nothing was learned about the
+        // call or the canister, so the message says only that the check could
+        // not run — disclaimed, and none of the other registers.
+        let msg = unchecked_update_refusal("set_message", "The request timed out.");
+        assert!(msg.contains(UNCHECKED_RULE), "{msg}");
+        assert!(msg.contains(NOT_THIS_CALL), "{msg}");
+        assert!(!msg.contains(ITSELF), "{msg}");
+        assert!(!msg.contains(DESTINATION_RULE), "{msg}");
+        assert!(!msg.contains(INTERFACE_RULE), "{msg}");
     }
 
     // A canister that provides an ICRC-1 / ICRC-2 method is a financial canister:
@@ -1067,6 +1111,32 @@ mod tests {
         assert!(msg.contains(NOT_THIS_CALL), "{msg}");
         assert!(!msg.contains(ITSELF), "{msg}");
         assert!(msg.contains("not supported by this server, to protect the user"), "{msg}");
+        assert!(msg.contains("outside this connector"), "{msg}");
+        assert!(msg.contains("trusted interface they control"), "{msg}");
+        assert!(!msg.to_lowercase().contains("wallet"), "no venue may be named: {msg}");
+        assert!(!msg.contains(".com"), "no venue may be named: {msg}");
+        assert!(!msg.contains("marketplace"), "{msg}");
+        assert!(!msg.contains("compliance"), "{msg}");
+    }
+
+    // A read of the canister's interface that FAILED is not an absent
+    // interface: the update is refused with a retry message that names the
+    // method and the error, says what a persistent error means, claims nothing
+    // about the call — the guard learned nothing about it — and names no venue.
+    #[test]
+    fn an_unreadable_interface_refuses_the_update_with_a_retry() {
+        let msg = unchecked_update_refusal("set_message", "The request timed out.");
+        assert!(msg.contains("`set_message`"), "{msg}");
+        assert!(msg.contains("The request timed out."), "{msg}");
+        assert!(msg.contains(UNCHECKED_RULE), "{msg}");
+        assert!(msg.contains("was not sent"), "{msg}");
+        assert!(msg.contains("Retry"), "{msg}");
+        assert!(msg.contains("publishes no interface is not refused this way"), "{msg}");
+        assert!(msg.contains(NOT_THIS_CALL), "{msg}");
+        assert!(!msg.contains(ITSELF), "{msg}");
+        assert!(!msg.contains(DESTINATION_RULE), "{msg}");
+        assert!(!msg.contains(INTERFACE_RULE), "{msg}");
+        assert!(msg.contains("to protect the user"), "{msg}");
         assert!(msg.contains("outside this connector"), "{msg}");
         assert!(msg.contains("trusted interface they control"), "{msg}");
         assert!(!msg.to_lowercase().contains("wallet"), "no venue may be named: {msg}");

@@ -662,21 +662,32 @@ impl IcCanisterTools {
         // The interface to encode/decode against: the canister's own
         // candid:service if exposed, else the caller-supplied `candid`. Update calls
         // are never redirected (OQL is read-only), so no oql_query_redirect here.
-        let did = calls::resolve_did(&self.agent, principal, candid.as_deref()).await;
+        // Read with the outcome kept, not through resolve_did: the gate below
+        // must tell a FAILED read from a canister that publishes none.
+        let read = calls::read_candid_service(&self.agent, principal).await;
         // The interface scope of the financial-transactions gate (see
         // `compliance`): a canister whose declared interface provides an ICRC-1 /
         // ICRC-2 method is a financial canister, and every update call to it is
         // refused — decided from the canister itself, here and only here. The
         // interface is first in hand at this point: reading it IS a contact with
         // the canister, which the discoverability gate above has to admit first
-        // (an undeclared ledger is refused as undeclared), and `resolve_did` has
-        // just read it for encoding, so this costs no round-trip. It runs before
-        // the arguments are encoded (an argument error must not mask the policy
-        // refusal) and before anything is signed. `resolve_did` consults the
-        // caller-supplied `candid` only when the canister publishes no
-        // interface, so a supplied text can only ADD a refusal, never hide one.
-        // No interface, or one the parser cannot read, fails OPEN: the guard is
-        // a guardrail, not a seal.
+        // (an undeclared ledger is refused as undeclared), and the read just
+        // made is the one the encoding needs, so this costs no round-trip. It
+        // runs before the arguments are encoded (an argument error must not mask
+        // the policy refusal) and before anything is signed. What the read
+        // established decides the rest (per review): a read that FAILED — a
+        // transport, HTTP or certificate error — refuses the call with a retry
+        // message, since the guard cannot tell a ledger from an app without the
+        // interface and a failed read must not be the way past it; a canister
+        // that publishes none is checked by the name scopes above only, with
+        // the caller-supplied `candid` consulted in its place — so a supplied
+        // text can only ADD a refusal, never hide one; and published text the
+        // parser cannot read fails OPEN the same way: the guard is a guardrail,
+        // not a seal.
+        if let calls::CandidServiceRead::Failed(error) = &read {
+            return Ok(err(compliance::unchecked_update_refusal(&method, error)));
+        }
+        let did = read.or_provided(candid.as_deref());
         if let Some(refusal) =
             did.as_deref().and_then(calls::declared_methods).and_then(|declared| {
                 compliance::disallowed_update_on_ledger_interface(&method, &declared)
