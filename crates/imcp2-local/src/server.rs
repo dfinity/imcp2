@@ -16,7 +16,8 @@ use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult, Tool,
+    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult, Resource,
+    ResourceContents, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{schemars, tool, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
@@ -278,7 +279,9 @@ impl ServerHandler for LocalServer {
              bundle --output <file>`, built in the user's environment) to the environment it \
              names, creating the canisters that do not exist yet from the user's cycles \
              balance and upgrading those passed in `canister_ids`. It needs an \"Actions & \
-             questions\" session, and it returns the canister-id mapping to pass back next time."
+             questions\" session, and it returns the canister-id mapping to pass back next time. \
+             The `skill://deploy-with-mcp` resource walks through the loop: bundle, deploy, \
+             write the mapping back into the project."
         ));
         info
     }
@@ -323,7 +326,14 @@ impl ServerHandler for LocalServer {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        self.tools.list_resources(request, context).await
+        let mut result = self.tools.list_resources(request, context).await?;
+        // The one skill this server adds, next to core's bundled IC skills: the
+        // deploy loop around `icp_deploy_bundle`, which only exists here.
+        result.resources.push(Resource::new(
+            format!("skill://{}", imcp2_deploy::DEPLOY_SKILL_NAME),
+            format!("IC skill: {}", imcp2_deploy::DEPLOY_SKILL_TITLE),
+        ));
+        Ok(result)
     }
 
     async fn read_resource(
@@ -331,6 +341,11 @@ impl ServerHandler for LocalServer {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
+        if let Some(md) =
+            request.uri.strip_prefix("skill://").and_then(imcp2_deploy::skill_document)
+        {
+            return Ok(ReadResourceResult::new(vec![ResourceContents::text(md, request.uri)]));
+        }
         self.tools.read_resource(request, context).await
     }
 }
@@ -554,8 +569,13 @@ mod tests {
         assert_eq!(
             skills.len(),
             imcp2_core::skills::BUNDLED_SKILLS.len()
-                + imcp2_core::skills::BUNDLED_SKILL_REFERENCES.len(),
-            "every bundled document must be advertised: {skills:?}"
+                + imcp2_core::skills::BUNDLED_SKILL_REFERENCES.len()
+                + 1,
+            "every bundled document, plus this server's deploy skill, must be advertised: {skills:?}"
+        );
+        assert!(
+            skills.iter().any(|u| u == "skill://deploy-with-mcp"),
+            "the deploy skill is advertised: {skills:?}"
         );
 
         for uri in &skills {
@@ -602,6 +622,12 @@ mod tests {
         );
         let api_reference = one("skill://writing-motoko/references/api-reference.md").await;
         assert!(!api_reference.trim().is_empty());
+
+        // This server's own skill arrives whole through the same surface, and
+        // names the tool it teaches — which only this server lists.
+        let deploy = one("skill://deploy-with-mcp").await;
+        assert_eq!(deploy, imcp2_deploy::DEPLOY_SKILL_MD);
+        assert!(deploy.contains("icp_deploy_bundle"), "{deploy:.400}");
 
         // An unknown skill, and an unknown companion of a real skill, are both
         // resource-not-found — not a panic, a disconnect, or a silent empty.

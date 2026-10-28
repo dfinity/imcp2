@@ -176,6 +176,15 @@ granted "Actions & questions" at sign-in. The bundle is extracted into a
 scratch directory for the duration of the deploy and removed afterwards;
 nothing is written to the project it came from.
 
+The server also serves a skill for the agent, `skill://deploy-with-mcp`,
+next to the IC skills the core surface bundles. It walks through the loop
+above from the agent's side: bundle the project with `icp project bundle`,
+call `icp_deploy_bundle` with the environment's
+`.icp/data/mappings/<environment>.ids.json` as `canister_ids`, and write the
+mapping the tool returns back into that file so the next deploy upgrades
+rather than creates. The document lives at
+`crates/imcp2-deploy/static/skills/deploy-with-mcp.md`.
+
 Why only here: the tool is built on `icp-project`, a crate the icp CLI does not
 publish, so it is pulled from git — which the crates.io-published `imcp2-core`
 and `imcp2` cannot do. It lives in its own `imcp2-deploy` crate, composed into
