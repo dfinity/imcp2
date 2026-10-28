@@ -70,9 +70,10 @@
 //!     A call whose method name contains a financial / crypto keyword
 //!     (`transfer`, `withdraw`, `swap`, `trade`, `exchange`, `pay`, `buy`,
 //!     `deposit`, … — [`FINANCIAL_KEYWORDS`]) is refused before any network
-//!     work, modulo a literal list of exempt control-handover names
-//!     ([`EXEMPT_METHODS`], `transfer_ownership` and its spellings). Matching
-//!     is by WHOLE WORD: the name is split on `_`, `-`, digits and camelCase
+//!     work, with no exemption list: a name that carries a keyword is refused
+//!     whatever the app means by it (the ownership-handover names exempted at
+//!     first had no verified canister behind them and went, per review).
+//!     Matching is by WHOLE WORD: the name is split on `_`, `-`, digits and camelCase
 //!     humps and lowercased, so `swapTokens`, `withdraw_all` and `Transfer`
 //!     match while `payload`, `buyer` and `swapped` do not — a substring test
 //!     would refuse every `set_payload`. The guard cannot know what an
@@ -145,8 +146,11 @@
 //!     refusing a real ledger's, pool's or DIP20 token's method is worth more
 //!     than allowing an app's non-financial one, so such names are now
 //!     refused on every canister by whole-word keyword, with a register that
-//!     says so rather than classifying the call, and a literal exemption list
-//!     for the control-handover names. Still unlisted, on purpose: `approve`,
+//!     says so rather than classifying the call, and no exemption list (a
+//!     literal list of control-handover names, `transfer_ownership` and its
+//!     camelCase spelling, was carried at first; no mainnet interface
+//!     declaring either could be found, so it went — a name with no source
+//!     does not get in). Still unlisted, on purpose: `approve`,
 //!     `send`, `claim`, `reward`, `balance`, `token`, `wallet`, `ledger`,
 //!     `order`, `fee`, `cycles` (ordinary app verbs and nouns far more often
 //!     than value operations), and derived forms such as `payment` or
@@ -546,29 +550,6 @@ const FINANCIAL_KEYWORDS: &[&str] = &[
     "bridge",
 ];
 
-/// Method names exempt from the keyword scope although they contain a keyword
-/// — a control handover (of a canister, a record, an app), not a value
-/// movement — matched LITERALLY, by exact bytes: `Transfer_Ownership` or
-/// `transfer_ownership_v2` are not exempt. Every entry records where the name
-/// comes from, so the list can be audited (per review): a name with no source
-/// does not get in, and an entry whose source goes away goes with it.
-const EXEMPT_METHODS: &[&str] = &[
-    // The `Ownable` access-control convention — OpenZeppelin's Solidity
-    // `transferOwnership(address)` — which app code ported from the EVM keeps
-    // when it hands a canister's or a record's admin role to a new principal;
-    // the snake_case form is the Rust (ic-cdk) spelling of the same method.
-    // Kept at the maintainer's direction as the one control-handover name
-    // worth exempting. No mainnet interface declaring either spelling has
-    // been verified yet (the IC token standards use `setOwner` — DIP20,
-    // Sonic — or `set_custodians` — DIP721 — which carry no keyword); should
-    // a canister whose `transfer_ownership` moves VALUE turn up (an NFT
-    // handover is one), the exemption goes. Controller handover has no entry:
-    // on the Internet Computer a canister's controllers change through the
-    // management canister's `update_settings`, never through an app method.
-    "transfer_ownership",
-    "transferOwnership",
-];
-
 /// The words of a method name, for whole-word keyword matching: maximal runs
 /// of ASCII letters, split additionally at a lower→upper boundary and before
 /// the last upper of an upper run that a lower follows (`HTTPRequest` →
@@ -604,12 +585,11 @@ fn name_words(method: &str) -> Vec<String> {
     words
 }
 
-/// The first financial keyword `method` carries as a whole word, unless the
-/// name is one of the literal [`EXEMPT_METHODS`].
+/// The first financial keyword `method` carries as a whole word. There is no
+/// exemption list: `transfer_ownership` is refused like `transfer_tokens`,
+/// since the guard cannot tell a control handover from a value movement by
+/// the name, and no canister has been found that needs the distinction.
 pub(crate) fn financial_keyword(method: &str) -> Option<&'static str> {
-    if EXEMPT_METHODS.contains(&method) {
-        return None;
-    }
     name_words(method)
         .into_iter()
         .find_map(|word| FINANCIAL_KEYWORDS.iter().copied().find(|keyword| *keyword == word))
@@ -1010,8 +990,8 @@ mod tests {
 
     // Reads and generic names on arbitrary canisters stay callable: a word
     // that merely contains a keyword (`payload`, `buyer`, `swapped`, `trader`)
-    // is not that keyword, `approve`/`send`/`claim` are deliberately not
-    // keywords, and the literal exemptions are control handovers. (An
+    // is not that keyword, and `approve`/`send`/`claim` are deliberately not
+    // keywords. (An
     // ICRC-named read is refused — it addresses the canister as a ledger — and
     // `transfer_fee` is the keyword scope's accepted false positive.) The
     // cycles-minting canister's non-keyword names are here too: refused on the
@@ -1035,8 +1015,6 @@ mod tests {
             "get_buyer",
             "swapped",
             "trader",
-            "transfer_ownership",
-            "transferOwnership",
         ] {
             assert!(
                 disallowed_update_method(&any_canister(), method).is_none(),
@@ -1265,11 +1243,14 @@ mod tests {
     }
 
     // A keyword matches a whole word only — in any spelling convention — and
-    // the literal exemptions are the one way around it.
+    // nothing is exempt: an ownership handover is refused like any other
+    // `transfer`.
     #[test]
     fn financial_keyword_matches_whole_words_only() {
         for (method, keyword) in [
             ("swapTokens", "swap"),
+            ("transfer_ownership", "transfer"),
+            ("transferOwnership", "transfer"),
             ("withdraw_all", "withdraw"),
             ("icrc1_transfer", "transfer"),
             ("Transfer", "transfer"),
@@ -1301,8 +1282,6 @@ mod tests {
             "send",
             "claim",
             "process_payment",
-            "transfer_ownership",
-            "transferOwnership",
             "",
         ] {
             assert_eq!(financial_keyword(method), None, "{method}");
@@ -1333,29 +1312,30 @@ mod tests {
         }
     }
 
-    // Exemptions are literal: the exact spellings pass, anything else that
-    // contains the keyword does not.
+    // No name is exempt: the ownership-handover spellings once carried as
+    // exemptions are refused by the `transfer` keyword like every other
+    // spelling (per review — no canister declaring them could be found, and a
+    // name with no source does not get in).
     #[test]
-    fn exemptions_are_literal() {
-        for method in EXEMPT_METHODS {
-            assert!(
-                disallowed_update_method(&any_canister(), method).is_none(),
-                "{method} is a literal exemption"
-            );
-        }
-        for method in ["Transfer_Ownership", "transfer_ownership_v2", "transfer_owner"] {
+    fn no_name_is_exempt() {
+        for method in [
+            "transfer_ownership",
+            "transferOwnership",
+            "Transfer_Ownership",
+            "transfer_ownership_v2",
+            "transfer_owner",
+        ] {
             let msg = disallowed_update_method(&any_canister(), method)
-                .unwrap_or_else(|| panic!("{method} is not literally exempt"));
+                .unwrap_or_else(|| panic!("{method} must be refused: nothing is exempt"));
             assert!(msg.contains(NAME_RULE), "{msg}");
         }
     }
 
-    // The lists stay well-formed: keywords unique, lowercase, alphabetic, and
+    // The keyword list stays well-formed: unique, lowercase, alphabetic, and
     // none of them a word of the mixed-purpose entry point (one register per
-    // name); every exemption unique and actually carrying a keyword, so no
-    // entry is dead.
+    // name).
     #[test]
-    fn keyword_and_exemption_lists_are_well_formed() {
+    fn keyword_list_is_well_formed() {
         let mut keywords: Vec<&str> = FINANCIAL_KEYWORDS.to_vec();
         for keyword in &keywords {
             assert!(
@@ -1370,18 +1350,6 @@ mod tests {
         for (method, _) in MIXED_PURPOSE_METHODS {
             assert_eq!(financial_keyword(method), None, "{method} has its own register");
         }
-        let mut exempt: Vec<&str> = EXEMPT_METHODS.to_vec();
-        for method in &exempt {
-            let words = name_words(method);
-            assert!(
-                words.iter().any(|w| FINANCIAL_KEYWORDS.contains(&w.as_str())),
-                "{method} carries no keyword, so the exemption is dead"
-            );
-        }
-        let total = exempt.len();
-        exempt.sort_unstable();
-        exempt.dedup();
-        assert_eq!(exempt.len(), total, "duplicate exemptions");
     }
 
     // A canister that provides an ICRC-1 / ICRC-2 method is a financial canister:

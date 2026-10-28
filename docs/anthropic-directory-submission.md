@@ -206,8 +206,8 @@ transactions:**
   methods (`notify_top_up`, `notify_create_canister`, `notify_mint_cycles`,
   `create_canister`), refuses any method whose name carries a financial
   keyword as a whole word (`transfer`, `withdraw`, `swap`, `trade`,
-  `exchange`, `pay`, `buy`, `deposit`, …, bar a literal list of
-  control-handover names such as `transfer_ownership`) on every canister,
+  `exchange`, `pay`, `buy`, `deposit`, …, with no exemptions) on every
+  canister,
   and refuses **every** update call to a canister whose
   own Candid interface declares ICRC-1 or ICRC-2 methods — every ICRC ledger
   and the ICP ledger, detected from the canister itself; an update call needs

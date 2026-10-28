@@ -166,8 +166,7 @@ submission states, not from a narrower reading:
   the cycles-minting canister's funding-completion methods on those
   canisters, any method whose name carries a financial keyword as a whole
   word (`transfer`, `withdraw`, `swap`, `trade`, `exchange`, `pay`, `buy`,
-  `deposit`, …, bar a literal list of control-handover names such as
-  `transfer_ownership`) on every canister, every update call to a canister
+  `deposit`, …, with no exemptions) on every canister, every update call to a canister
   whose own Candid interface declares ICRC-1 or ICRC-2 methods (every ICRC
   ledger and the ICP ledger, detected from the canister itself; an update
   call needs that published interface, so a canister that publishes none, or
