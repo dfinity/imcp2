@@ -15,7 +15,7 @@ use candid::{
     types::Label,
     Principal,
 };
-use ic_agent::Agent;
+use ic_agent::{Agent, AgentError};
 // rmcp re-exports schemars 1.x; the `#[tool]` output-schema machinery requires
 // THAT version's `JsonSchema`, so derive the MCP types against it.
 use rmcp::schemars;
@@ -202,9 +202,8 @@ pub struct CanisterUpdateCallArgs {
     pub method: String,
     /// Arguments in textual Candid, e.g. `()` or `(record { owner = principal "..." })`; the
     /// `candid://textual-syntax` resource documents that syntax and `candid://reference` its
-    /// type system. Encoded against the method's declared types when the interface is available,
-    /// published or supplied in `candid`, so plain literals need no `: type` annotation.
-    /// Without an interface they are encoded as written and need their own annotations.
+    /// type system. Encoded against the method's declared types in the canister's published
+    /// interface, so plain literals need no `: type` annotation.
     #[serde(default = "default_args")]
     pub args: String,
     /// The website URL of the app that owns `canister_id`, which open_app returns.
@@ -222,10 +221,6 @@ pub struct CanisterUpdateCallArgs {
     /// app's default account. Ignored for anonymous calls.
     #[serde(default)]
     pub account: Option<String>,
-    /// The canister's Candid interface as `.did` text, for when the canister does not publish
-    /// its own. Supplying it keeps arguments and the reply typed.
-    #[serde(default)]
-    pub candid: Option<String>,
 }
 
 /// Output of `canister_update_call`.
@@ -379,23 +374,86 @@ pub fn default_args() -> String {
 // Candid interface resolution + encode/decode/call helpers.
 // ===========================================================================
 
-/// The interface to encode/decode against: the canister's own `candid:service`
-/// if exposed, else the caller-supplied `provided` definition.
+/// The interface to encode/decode against for the READ-ONLY paths: the
+/// canister's own `candid:service` if exposed, else the caller-supplied
+/// `provided` definition — for a read that FAILED as well as for a canister that
+/// publishes none, since a query cannot commit state. `canister_update_call`
+/// reads with [`read_candid_service`] instead, takes no fallback, and refuses
+/// unless the read is [`CandidServiceRead::Published`].
 pub async fn resolve_did(
     agent: &Agent,
     canister: Principal,
     provided: Option<&str>,
 ) -> Option<String> {
-    if let Some(did) = candid_service(agent, canister).await {
-        return Some(did);
-    }
-    provided.map(str::to_string)
+    read_candid_service(agent, canister).await.or_provided(provided)
 }
 
-/// The canister's `candid:service` interface (`.did` text), if exposed.
+/// The canister's `candid:service` interface (`.did` text), if exposed: `None`
+/// for a canister that publishes none AND for a read that failed.
 pub async fn candid_service(agent: &Agent, canister: Principal) -> Option<String> {
-    let raw = agent.read_state_canister_metadata(canister, "candid:service").await.ok()?;
-    String::from_utf8(raw).ok()
+    read_candid_service(agent, canister).await.published()
+}
+
+/// What reading a canister's `candid:service` metadata established — three
+/// outcomes, because an update call needs the published interface and the
+/// refusal for not having one says which it was (per review): a canister that
+/// publishes none is told to publish, while a read that FAILED is told to retry.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CandidServiceRead {
+    /// The canister publishes the interface: its `.did` text.
+    Published(String),
+    /// The canister publishes no `candid:service` — a CERTIFIED absence: the
+    /// replica's state tree proves the path is not there — or publishes bytes
+    /// that are not text. A property of the canister, not of this read.
+    NotPublished,
+    /// The read itself failed, so whether the canister publishes an interface
+    /// is unknown: a transport, HTTP or certificate error, or a lookup the
+    /// certificate could not settle. Carries the error's text.
+    Failed(String),
+}
+
+impl CandidServiceRead {
+    /// The published text, if any.
+    pub fn published(self) -> Option<String> {
+        match self {
+            Self::Published(did) => Some(did),
+            Self::NotPublished | Self::Failed(_) => None,
+        }
+    }
+
+    /// The interface to encode against on a read-only path: the published text,
+    /// else `provided` — whether the canister publishes none or the read failed.
+    /// The update path never calls this: it refuses instead of falling back.
+    pub fn or_provided(self, provided: Option<&str>) -> Option<String> {
+        self.published().or_else(|| provided.map(str::to_string))
+    }
+}
+
+/// Read the canister's `candid:service` metadata and say what the read
+/// established (see [`CandidServiceRead`]).
+pub async fn read_candid_service(agent: &Agent, canister: Principal) -> CandidServiceRead {
+    classify_candid_service_read(
+        agent.read_state_canister_metadata(canister, "candid:service").await,
+    )
+}
+
+/// The classification behind [`read_candid_service`], over the agent's result.
+/// Only a certified absence (`LookupPathAbsent`: the certificate proves the
+/// path is not in the state tree) means the canister publishes none. Every
+/// other error — an HTTP or transport error, a certificate that did not
+/// verify, a path the certificate leaves unknown — is a failed read, since
+/// none of them says anything about the canister.
+pub(crate) fn classify_candid_service_read(
+    result: Result<Vec<u8>, AgentError>,
+) -> CandidServiceRead {
+    match result {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(did) => CandidServiceRead::Published(did),
+            Err(_) => CandidServiceRead::NotPublished,
+        },
+        Err(AgentError::LookupPathAbsent(_)) => CandidServiceRead::NotPublished,
+        Err(e) => CandidServiceRead::Failed(e.to_string()),
+    }
 }
 
 /// Maximum byte length of caller-supplied textual Candid we will parse. Real
@@ -839,8 +897,9 @@ pub fn has_oql(did: &str) -> bool {
 /// `type S = service { … }; service : S` alias as well as a bare
 /// `service : { … }`. `None` when the interface cannot be read: it trips
 /// [`guard_candid_text`] (CWE-674), does not parse, or declares no actor (types
-/// only) — the caller then fails OPEN, as it does for [`is_query_method`].
-/// `Some(empty)` is a service that declares no methods.
+/// only) — `canister_update_call` then refuses the call
+/// (`compliance::unchecked_update_refusal`), since an update needs a readable
+/// published interface. `Some(empty)` is a service that declares no methods.
 ///
 /// Name-based only, like [`has_oql`]: the names are collected INSIDE the
 /// deep-stack closure (the AST is `!Send`, and its recursive `Drop` stays on that
@@ -2051,20 +2110,70 @@ mod tests {
         assert_eq!(names("service : {}"), Some(vec![]));
     }
 
-    // Fail-open on an over-limit interface: the CWE-674 guard trips BEFORE
-    // parsing and the caller gets `None` rather than a verdict — and the shallow
-    // twin proves the guard, not the shape, is why.
+    // An over-limit interface is unreadable, never parsed: the CWE-674 guard
+    // trips BEFORE parsing and the caller gets `None` rather than a verdict
+    // (which the update path turns into a refusal) — and the shallow twin
+    // proves the guard, not the shape, is why.
     #[test]
-    fn declared_methods_fails_open_on_an_over_limit_interface() {
+    fn declared_methods_is_none_for_an_over_limit_interface() {
         use super::declared_methods;
         let over_deep = format!(
             "service : {{ icrc1_balance_of : (text) -> ({}nat) query; set_message : (text) -> (text); }}",
             "vec ".repeat(5000),
         );
-        assert_eq!(declared_methods(&over_deep), None, "an over-limit interface must fail open");
+        assert_eq!(declared_methods(&over_deep), None, "an over-limit interface is unreadable");
         let shallow_twin =
             "service : { icrc1_balance_of : (text) -> (nat) query; set_message : (text) -> (text); }";
         assert_eq!(declared_methods(shallow_twin).map(|set| set.len()), Some(2));
+    }
+
+    // What a candid:service read establishes, from the agent's result: only a
+    // certified absence means the canister publishes none; every other error is
+    // a FAILED read. The update path refuses both, with a different message for
+    // each (publish it / retry), so the two must not be confused. Bytes that are
+    // not text are a property of the canister, like an absent interface, not of
+    // the read.
+    #[test]
+    fn a_candid_service_read_distinguishes_absent_from_failed() {
+        use super::{classify_candid_service_read as classify, CandidServiceRead::*};
+        use ic_agent::{agent_error::HttpErrorPayload, AgentError};
+        assert_eq!(classify(Ok(b"service : {}".to_vec())), Published("service : {}".to_string()));
+        assert_eq!(classify(Ok(vec![0xff, 0xfe])), NotPublished, "not text: nothing to read");
+        assert_eq!(
+            classify(Err(AgentError::LookupPathAbsent(vec![]))),
+            NotPublished,
+            "a certified absence is the one error that means 'publishes none'"
+        );
+        for error in [
+            AgentError::HttpError(HttpErrorPayload {
+                status: 502,
+                content_type: None,
+                content: b"bad gateway".to_vec(),
+            }),
+            AgentError::TimeoutWaitingForResponse(),
+            AgentError::CertificateVerificationFailed(),
+            AgentError::LookupPathUnknown(vec![]),
+            AgentError::LookupPathError(vec![]),
+            AgentError::InvalidReplicaUrl("x".into()),
+        ] {
+            let text = error.to_string();
+            assert_eq!(classify(Err(error)), Failed(text.clone()), "{text}");
+        }
+    }
+
+    // The interface to encode against on a read-only path: the published text
+    // wins; a caller-supplied text stands in when the canister publishes none —
+    // and when the read failed too. (The update path never falls back: it
+    // refuses unless the read is Published.)
+    #[test]
+    fn or_provided_falls_back_for_absent_and_failed_reads() {
+        use super::CandidServiceRead::*;
+        assert_eq!(Published("a".into()).or_provided(Some("b")), Some("a".to_string()));
+        assert_eq!(NotPublished.or_provided(Some("b")), Some("b".to_string()));
+        assert_eq!(NotPublished.or_provided(None), None);
+        assert_eq!(Failed("boom".into()).or_provided(Some("b")), Some("b".to_string()));
+        assert_eq!(Failed("boom".into()).or_provided(None), None);
+        assert_eq!(Failed("boom".into()).published(), None);
     }
 
     // is_query_method classifies a method by its Candid mode so canister_query can

@@ -91,10 +91,19 @@
 //!     destination register, naming the standard(s) and the methods that
 //!     established them. That covers every ICRC-1/ICRC-2 ledger — the ICP
 //!     ledger, the cycles ledger, every SNS and chain-key ledger, every token
-//!     built on the ic-icrc1 ledger — with no list to keep current. No
-//!     interface, or one the parser cannot read, fails open. Other ICRC token
-//!     namespaces (`icrc4_`, `icrc7_`, `icrc37_`, `icrc152_`) are not detected
-//!     this way; their value-moving names are refused literally above.
+//!     built on the ic-icrc1 ledger — with no list to keep current. An update
+//!     call NEEDS that published interface, so this scope always has it (per
+//!     review and the maintainer's direction): a canister that publishes none
+//!     — a CERTIFIED absence, the certificate proving the path is not in the
+//!     state tree — one whose published text the parser cannot read, and one
+//!     whose read FAILED (a transport, HTTP or certificate error) are each
+//!     refused with [`unchecked_update_refusal`], which says which it was and
+//!     what follows (publish the interface; retry). No update this server
+//!     sends went unchecked, and no caller-supplied text is consulted for an
+//!     update call (`canister_query` keeps its `candid` fallback: a query
+//!     cannot commit state). Other ICRC token namespaces (`icrc4_`, `icrc7_`,
+//!     `icrc37_`, `icrc152_`) are not detected this way; their value-moving
+//!     names are refused literally above.
 //!
 //! Why the standardized surface is where real funds live: tokens are only
 //! valuable if they can be exchanged or used, and the ICP ecosystem's
@@ -115,9 +124,13 @@
 //!     read as a hint that the tool is usable for financial transactions.
 //!     This guard enforces the policy for the standardized ledger surface,
 //!     where real funds overwhelmingly live (see above), and — from the
-//!     canister's own interface — for every canister that provides ICRC
-//!     methods; a canister that publishes no interface and names nothing
-//!     financial is not detected.
+//!     canister's own interface, which every update call must have published
+//!     — for every canister that provides ICRC methods; a canister whose
+//!     interface is missing, unreadable or failed to read gets no update call
+//!     at all. What is not detected is a bespoke value-moving method under an
+//!     unrelated name on a canister whose published interface is not a
+//!     ledger's, and that limit is stated wherever the guard is described,
+//!     never implied away.
 //!     Likewise the canister list is curated and static, while exchanges
 //!     create per-pair pool/farm canisters dynamically and new services
 //!     launch: entries cover each service's central canisters (verified
@@ -744,9 +757,10 @@ pub fn disallowed_update_method(canister_id: &Principal, method: &str) -> Option
 /// Runs only where the interface is legitimately in hand — after the
 /// discoverability gate admitted the canister and `canister_update_call` read
 /// the interface it encodes against — and AFTER [`disallowed_update_method`],
-/// whose scopes are cheaper and more specific. No interface, or one that cannot
-/// be parsed, never reaches here: the caller fails open (a guardrail, not a
-/// seal).
+/// whose scopes are cheaper and more specific. A canister that publishes no
+/// interface, one the parser cannot read, and a read that FAILED never reach
+/// here: the caller refuses each with [`unchecked_update_refusal`], since an
+/// update call needs the published interface.
 pub fn disallowed_update_on_ledger_interface(
     method: &str,
     declared: &BTreeSet<String>,
@@ -784,6 +798,56 @@ pub fn disallowed_update_on_ledger_interface(
     ))
 }
 
+/// Why `canister_update_call` has no interface to check a call against — each
+/// a refusal, since an update call needs the canister's published interface,
+/// and each with its own next step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissingInterface {
+    /// The canister publishes no `candid:service` (a certified absence), or
+    /// publishes bytes that are not text.
+    NotPublished,
+    /// The canister publishes text this server's parser cannot read: not valid
+    /// Candid, no service declared, or over the size / depth limits (CWE-674).
+    Unreadable,
+    /// The read failed — a transport, HTTP or certificate error — with its text.
+    ReadFailed(String),
+}
+
+/// The refusal for an update whose target could not be checked: the interface
+/// scope needs the canister's own published interface, and there is none in
+/// hand — `missing` says why. Refused rather than sent unchecked (per review and
+/// the maintainer's direction: a canister must publish its interface to receive
+/// update calls, and a failed read must not be the way past the scope). The
+/// register claims nothing about the call: the guard learned nothing about it.
+pub fn unchecked_update_refusal(method: &str, missing: &MissingInterface) -> String {
+    let (what, next) = match missing {
+        MissingInterface::NotPublished => (
+            "the canister publishes no Candid interface (no `candid:service` metadata)".to_string(),
+            "A canister receives update calls through this server only once it publishes its \
+             interface; this one does not.",
+        ),
+        MissingInterface::Unreadable => (
+            "the canister's published Candid interface could not be read by this server (not \
+             valid Candid, no service declared, or over its size or depth limits)"
+                .to_string(),
+            "Until the canister publishes a readable interface, no update call to it is sent.",
+        ),
+        MissingInterface::ReadFailed(error) => (
+            format!("the canister's Candid interface could not be read ({error})"),
+            "Retry: an error that persists means this server cannot reach the interface it \
+             needs, or the canister id is not one the network routes.",
+        ),
+    };
+    format!(
+        "`{method}` was not sent: {what}. An update call is checked against the canister's \
+         published interface before it is sent — a canister that provides the ICRC token-ledger \
+         interface is treated as a financial service as a whole — and a call that cannot be \
+         checked is refused rather than sent unchecked, to protect the user. This refusal is \
+         about the missing interface, so it does not mean this particular call moves assets. \
+         {next} {NEUTRAL_REDIRECT}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,6 +878,18 @@ mod tests {
     /// The clause the keyword scope's refusal must carry: the name is refused
     /// everywhere, which is all the guard knows.
     const NAME_RULE: &str = "refused on every canister rather than judged app by app";
+    /// The clause the missing-interface refusal must carry: an update call needs
+    /// the published interface, and the check could not run without it.
+    const UNCHECKED_RULE: &str =
+        "checked against the canister's published interface before it is sent";
+    /// Every way an update call can lack the interface it needs.
+    fn every_missing_interface() -> [MissingInterface; 3] {
+        [
+            MissingInterface::NotPublished,
+            MissingInterface::Unreadable,
+            MissingInterface::ReadFailed("The request timed out.".to_string()),
+        ]
+    }
 
     /// A declared method set, as `calls::declared_methods` would read it.
     fn declared(names: &[&str]) -> BTreeSet<String> {
@@ -1148,6 +1224,19 @@ mod tests {
         assert!(msg.contains(ITSELF) && !msg.contains(NAME_RULE), "{msg}");
         let msg = disallowed_update_method(&listed, "swap").expect("must be refused");
         assert!(msg.contains(DESTINATION_RULE) && !msg.contains(NAME_RULE), "{msg}");
+
+        // No interface to check against — not published, unreadable, or a read
+        // that failed: nothing was learned about the call or the canister, so
+        // the message says only that the check could not run — disclaimed, and
+        // none of the other registers.
+        for missing in every_missing_interface() {
+            let msg = unchecked_update_refusal("set_message", &missing);
+            assert!(msg.contains(UNCHECKED_RULE), "{msg}");
+            assert!(msg.contains(NOT_THIS_CALL), "{msg}");
+            assert!(!msg.contains(ITSELF), "{msg}");
+            assert!(!msg.contains(DESTINATION_RULE), "{msg}");
+            assert!(!msg.contains(INTERFACE_RULE), "{msg}");
+        }
     }
 
     // Whole-word splitting: snake_case, kebab-case, camelCase humps (an acronym
@@ -1403,6 +1492,49 @@ mod tests {
         assert!(!msg.contains(".com"), "no venue may be named: {msg}");
         assert!(!msg.contains("marketplace"), "{msg}");
         assert!(!msg.contains("compliance"), "{msg}");
+    }
+
+    // An update call needs the canister's published interface. Without one —
+    // not published, published but unreadable, or a read that FAILED — the call
+    // is refused with a message that names the method, says which it was and
+    // what follows (publish it; retry only for the failed read), claims nothing
+    // about the call — the guard learned nothing about it — and names no venue.
+    #[test]
+    fn an_update_without_a_readable_interface_is_refused() {
+        for missing in every_missing_interface() {
+            let msg = unchecked_update_refusal("set_message", &missing);
+            assert!(msg.contains("`set_message`"), "{msg}");
+            assert!(msg.contains("was not sent"), "{msg}");
+            assert!(msg.contains(UNCHECKED_RULE), "{msg}");
+            assert!(msg.contains(NOT_THIS_CALL), "{msg}");
+            assert!(!msg.contains(ITSELF), "{msg}");
+            assert!(!msg.contains(DESTINATION_RULE), "{msg}");
+            assert!(!msg.contains(INTERFACE_RULE), "{msg}");
+            assert!(msg.contains("to protect the user"), "{msg}");
+            assert!(msg.contains("outside this connector"), "{msg}");
+            assert!(msg.contains("trusted interface they control"), "{msg}");
+            assert!(!msg.to_lowercase().contains("wallet"), "no venue may be named: {msg}");
+            assert!(!msg.contains(".com"), "no venue may be named: {msg}");
+            assert!(!msg.contains("marketplace"), "{msg}");
+            assert!(!msg.contains("compliance"), "{msg}");
+            match missing {
+                MissingInterface::NotPublished => {
+                    assert!(msg.contains("publishes no Candid interface"), "{msg}");
+                    assert!(msg.contains("only once it publishes its interface"), "{msg}");
+                    assert!(!msg.contains("Retry"), "nothing to retry: {msg}");
+                }
+                MissingInterface::Unreadable => {
+                    assert!(msg.contains("could not be read by this server"), "{msg}");
+                    assert!(msg.contains("publishes a readable interface"), "{msg}");
+                    assert!(!msg.contains("Retry"), "nothing to retry: {msg}");
+                }
+                MissingInterface::ReadFailed(error) => {
+                    assert!(msg.contains(&error), "the error is named: {msg}");
+                    assert!(msg.contains("Retry"), "{msg}");
+                    assert!(msg.contains("canister id is not one the network routes"), "{msg}");
+                }
+            }
+        }
     }
 
     // Addressing a canister by an ICRC-1 / ICRC-2 method name is refused before

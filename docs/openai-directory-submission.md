@@ -169,9 +169,11 @@ submission states, not from a narrower reading:
   `deposit`, …, bar a literal list of control-handover names such as
   `transfer_ownership`) on every canister, every update call to a canister
   whose own Candid interface declares ICRC-1 or ICRC-2 methods (every ICRC
-  ledger and the ICP ledger, detected from the canister itself), and every
-  update call on the financial-service canisters it carries. The refusal
-  tells the user to perform the
+  ledger and the ICP ledger, detected from the canister itself; an update
+  call needs that published interface, so a canister that publishes none, or
+  whose interface cannot be read, is refused outright), and every update call
+  on the financial-service canisters it carries. The refusal tells the user to
+  perform the
   operation outside the connector, in a trusted interface they control, and
   names no venue.
 - **The descriptions match the behavior**, as the guidelines require ("tools

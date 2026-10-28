@@ -1537,29 +1537,11 @@ async fn a_read_that_cannot_run_says_what_to_fix() {
     );
     assert!(msg.contains("query failed"), "the replica's rejection is surfaced: {msg}");
 
-    // --- the guard's interface scope fails open on an unreadable canister ---
-    // With no interface to read there is nothing to classify, so an update to
-    // the opaque canister goes through: `greet` is a query method, and the
-    // Internet Computer lets a query method be called as an update.
-    let result = h
-        .call(
-            "canister_update_call",
-            serde_json::json!({
-                "canister_id": opaque,
-                "method": "greet",
-                "args": "(\"x\")",
-                "app_url": declares_all,
-            }),
-        )
-        .await;
-    assert_eq!(
-        ok_text(&result),
-        "(\"x\")",
-        "no interface: nothing for the interface scope to refuse on"
-    );
-    // A caller-supplied interface is consulted only because the canister
-    // publishes none — and it can only ADD a refusal: declare ICRC-1 methods
-    // for the same canister and the same call is refused as a financial one.
+    // --- an update call needs the canister's published interface ---
+    // The opaque canister publishes none (a certified absence): the update is
+    // refused with the "publish it" message, and the canister is never reached
+    // — `greet` is a query method the Internet Computer would have let run as
+    // an update, so a "call failed" or a reply would mean the call was sent.
     let msg = refusal(
         &h.call(
             "canister_update_call",
@@ -1568,13 +1550,61 @@ async fn a_read_that_cannot_run_says_what_to_fix() {
                 "method": "greet",
                 "args": "(\"x\")",
                 "app_url": declares_all,
-                "candid": LEDGER_DID,
             }),
         )
         .await,
     );
-    assert!(msg.contains("whose Candid interface declares"), "{msg}");
-    assert!(msg.contains("ICRC-1 ledger methods"), "{msg}");
+    assert!(msg.contains("publishes no Candid interface"), "no interface, no update: {msg}");
+    assert!(msg.contains("does not mean this particular call moves assets"), "{msg}");
+    assert!(!msg.contains("call failed"), "the call must not have been sent: {msg}");
+    // A published interface this server cannot read is no better: the refusal
+    // says so, and says a readable one is what unblocks the canister.
+    let garbled = install(
+        &h.pic,
+        canister_wasm(
+            Some("service : { greet : (text) -> ("),
+            &[Method::query("greet", Behavior::Echo)],
+        ),
+    )
+    .await;
+    // A canister id no subnet of this replica serves: the gateway cannot route
+    // the metadata read, so the read FAILS instead of proving the interface
+    // absent — a different refusal, with a retry message, since the canister
+    // itself was not judged.
+    let phantom = Principal::from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 1]);
+    let declares_more = "https://errors-more.e2e.test";
+    webfixture::serve(declares_more, webfixture::Site::declaring(&[garbled, phantom]));
+    let msg = refusal(
+        &h.call(
+            "canister_update_call",
+            serde_json::json!({
+                "canister_id": garbled.to_text(),
+                "method": "greet",
+                "args": "(\"x\")",
+                "app_url": declares_more,
+            }),
+        )
+        .await,
+    );
+    assert!(msg.contains("could not be read by this server"), "unreadable interface: {msg}");
+    assert!(msg.contains("publishes a readable interface"), "{msg}");
+    assert!(!msg.contains("call failed"), "the call must not have been sent: {msg}");
+    let msg = refusal(
+        &h.call(
+            "canister_update_call",
+            serde_json::json!({
+                "canister_id": phantom.to_text(),
+                "method": "greet",
+                "args": "(\"x\")",
+                "app_url": declares_more,
+            }),
+        )
+        .await,
+    );
+    assert!(msg.contains("could not be read ("), "a failed read names its error: {msg}");
+    assert!(msg.contains("Retry"), "and is the one case worth retrying: {msg}");
+    assert!(msg.contains("does not mean this particular call moves assets"), "{msg}");
+    assert!(!msg.contains("call failed"), "the call must not have been sent: {msg}");
 
     // --- a keyword-named call is refused by name, before the network ---
     // `withdraw` carries a financial keyword, so the call is refused on any
