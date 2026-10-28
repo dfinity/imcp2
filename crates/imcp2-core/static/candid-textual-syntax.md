@@ -17,10 +17,14 @@ Quick reminders:
 declared Candid types** whenever they can read the canister's interface — so plain literals coerce to what
 the method expects (`42` → `nat64`, `1` → `float64`, the right `opt`/`vec`
 element types, etc.) and you usually **don't** need `: type` annotations.
+`canister_update_call` always has that interface: an update call to a canister
+that publishes none, or whose interface cannot be read, is refused rather than
+sent.
 
-Annotations and the footguns below only bite in the **fallback**: when the
-canister's `candid:service` interface can't be read (access-restricted), args
-are encoded by *inference from the literals alone*. In that mode:
+Annotations and the footguns below only bite in `canister_query`'s **fallback**:
+when the canister's `candid:service` interface can't be read and no `candid`
+text is supplied, its args are encoded by *inference from the literals alone*.
+In that mode:
 
 - **Numbers default to `int` (whole) and `float64` (decimal).** A bare `42`
   encodes as `int`, not `nat`/`nat64`/…; a bare `1.5` as `float64`, not

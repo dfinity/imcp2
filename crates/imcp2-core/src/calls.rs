@@ -403,9 +403,14 @@ pub async fn candid_service(agent: &Agent, canister: Principal) -> Option<String
 pub enum CandidServiceRead {
     /// The canister publishes the interface: its `.did` text.
     Published(String),
+    /// The canister publishes `candid:service` bytes that are not text — a
+    /// property of the canister, like unparseable text: published, unreadable.
+    NotText,
     /// The canister publishes no `candid:service` — a CERTIFIED absence: the
-    /// replica's state tree proves the path is not there — or publishes bytes
-    /// that are not text. A property of the canister, not of this read.
+    /// replica's state tree proves the path is not there, which is also what
+    /// the tree says of a canister id in a subnet's range that no canister
+    /// occupies (never created, or deleted). A property of the canister, not
+    /// of this read.
     NotPublished,
     /// The read itself failed, so whether the canister publishes an interface
     /// is unknown: a transport, HTTP or certificate error, or a lookup the
@@ -418,7 +423,7 @@ impl CandidServiceRead {
     pub fn published(self) -> Option<String> {
         match self {
             Self::Published(did) => Some(did),
-            Self::NotPublished | Self::Failed(_) => None,
+            Self::NotText | Self::NotPublished | Self::Failed(_) => None,
         }
     }
 
@@ -450,7 +455,7 @@ pub(crate) fn classify_candid_service_read(
     match result {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(did) => CandidServiceRead::Published(did),
-            Err(_) => CandidServiceRead::NotPublished,
+            Err(_) => CandidServiceRead::NotText,
         },
         Err(AgentError::LookupPathAbsent(_)) => CandidServiceRead::NotPublished,
         Err(e) => CandidServiceRead::Failed(e.to_string()),
@@ -2132,14 +2137,14 @@ mod tests {
     // certified absence means the canister publishes none; every other error is
     // a FAILED read. The update path refuses both, with a different message for
     // each (publish it / retry), so the two must not be confused. Bytes that are
-    // not text are a property of the canister, like an absent interface, not of
-    // the read.
+    // not text are published and unreadable — a property of the canister, like
+    // unparseable text, not of the read — and get their own outcome.
     #[test]
     fn a_candid_service_read_distinguishes_absent_from_failed() {
         use super::{classify_candid_service_read as classify, CandidServiceRead::*};
         use ic_agent::{agent_error::HttpErrorPayload, AgentError};
         assert_eq!(classify(Ok(b"service : {}".to_vec())), Published("service : {}".to_string()));
-        assert_eq!(classify(Ok(vec![0xff, 0xfe])), NotPublished, "not text: nothing to read");
+        assert_eq!(classify(Ok(vec![0xff, 0xfe])), NotText, "published, but not text");
         assert_eq!(
             classify(Err(AgentError::LookupPathAbsent(vec![]))),
             NotPublished,
@@ -2172,6 +2177,8 @@ mod tests {
         assert_eq!(Published("a".into()).or_provided(Some("b")), Some("a".to_string()));
         assert_eq!(NotPublished.or_provided(Some("b")), Some("b".to_string()));
         assert_eq!(NotPublished.or_provided(None), None);
+        assert_eq!(NotText.or_provided(Some("b")), Some("b".to_string()));
+        assert_eq!(NotText.published(), None);
         assert_eq!(Failed("boom".into()).or_provided(Some("b")), Some("b".to_string()));
         assert_eq!(Failed("boom".into()).or_provided(None), None);
         assert_eq!(Failed("boom".into()).published(), None);
