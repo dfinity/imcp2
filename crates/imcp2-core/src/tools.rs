@@ -626,8 +626,9 @@ impl IcCanisterTools {
         // both refused on EVERY canister; the system ledgers'/cycles-minting
         // canister's own value-moving methods on those canisters; EVERY update
         // method on a listed financial-service canister, so a refusal here does
-        // not depend on the method name alone; and a call addressed to any
-        // other ICRC-1 / ICRC-2 ledger method by name. The one scope that needs
+        // not depend on the method name alone; a call addressed to any other
+        // ICRC-1 / ICRC-2 ledger method by name; and a method name that carries
+        // a financial keyword as a whole word. The one scope that needs
         // the canister's interface — a financial canister detected from the
         // ICRC methods it declares — runs below, once resolve_did has read it.
         // Each scope's refusal claims only what that scope knows about the
