@@ -164,12 +164,16 @@ submission states, not from a narrower reading:
   governance method `manage_neuron` — neuron staking and disbursement) on
   every canister, the ICP and cycles ledgers' own value-moving methods and
   the cycles-minting canister's funding-completion methods on those
-  canisters, every update call to a canister whose own Candid interface
-  declares ICRC-1 or ICRC-2 methods (every ICRC ledger and the ICP ledger,
-  detected from the canister itself; an update call needs that published
-  interface, so a canister that publishes none, or whose interface cannot be
-  read, is refused outright), and every update call on the
-  financial-service canisters it carries. The refusal tells the user to perform the
+  canisters, any method whose name carries a financial keyword as a whole
+  word (`transfer`, `withdraw`, `swap`, `trade`, `exchange`, `pay`, `buy`,
+  `deposit`, …, bar a literal list of control-handover names such as
+  `transfer_ownership`) on every canister, every update call to a canister
+  whose own Candid interface declares ICRC-1 or ICRC-2 methods (every ICRC
+  ledger and the ICP ledger, detected from the canister itself; an update
+  call needs that published interface, so a canister that publishes none, or
+  whose interface cannot be read, is refused outright), and every update call
+  on the financial-service canisters it carries. The refusal tells the user to
+  perform the
   operation outside the connector, in a trusted interface they control, and
   names no venue.
 - **The descriptions match the behavior**, as the guidelines require ("tools

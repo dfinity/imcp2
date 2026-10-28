@@ -13,11 +13,10 @@
 //! creation and funding are the one exception — they point at the user's own
 //! icp CLI, which is where this connector already says that work happens.
 //!
-//! The guard has six scopes — five decided from the request alone, before any
+//! The guard has seven scopes — six decided from the request alone, before any
 //! network work, and one decided from the canister's own declared interface
-//! once `canister_update_call` has read it (the method groups are split per
-//! review, so an app that happens to name a non-financial method `transfer` or
-//! `approve` keeps working):
+//! once `canister_update_call` has read it (the scopes are split per review so
+//! that each refusal says only what its scope knows about the call):
 //!
 //!   * **Standardized value-moving methods, matched literally on every
 //!     canister.** Token ledgers on the Internet Computer follow the ICRC
@@ -36,9 +35,10 @@
 //!     says exactly that instead of calling the caller's command a transfer.
 //!   * **Abstract names, scoped to the system canister where they are
 //!     financial.** `transfer` on the ICP ledger or `withdraw` on the cycles
-//!     ledger moves the user's funds; the same names on an arbitrary app
-//!     canister are often something else entirely, so they are refused only
-//!     on those specific canister ids. The cycles-minting canister's whole
+//!     ledger moves the user's funds, so on those specific canister ids they
+//!     get the precise register and label; on any other canister the same
+//!     names fall to the keyword scope below, which refuses them by name with
+//!     a register that claims less. The cycles-minting canister's whole
 //!     user-callable update surface is here too — `notify_top_up`,
 //!     `notify_create_canister`, `notify_mint_cycles`, `create_canister` —
 //!     because each one *completes* a funding operation: the ICP debit
@@ -66,6 +66,21 @@
 //!     canister (next scope). The register disclaims the call: a balance read
 //!     is not a transfer, and the guard says only that the name is a ledger
 //!     method's.
+//!   * **Financial keywords in the method name, refused on every canister.**
+//!     A call whose method name contains a financial / crypto keyword
+//!     (`transfer`, `withdraw`, `swap`, `trade`, `exchange`, `pay`, `buy`,
+//!     `deposit`, … — [`FINANCIAL_KEYWORDS`]) is refused before any network
+//!     work, modulo a literal list of exempt control-handover names
+//!     ([`EXEMPT_METHODS`], `transfer_ownership` and its spellings). Matching
+//!     is by WHOLE WORD: the name is split on `_`, `-`, digits and camelCase
+//!     humps and lowercased, so `swapTokens`, `withdraw_all` and `Transfer`
+//!     match while `payload`, `buyer` and `swapped` do not — a substring test
+//!     would refuse every `set_payload`. The guard cannot know what an
+//!     arbitrary app's `transfer` does, so the register says exactly that:
+//!     the name is refused everywhere rather than judged app by app, and the
+//!     call is not classified. Checked last of the request-only scopes, so a
+//!     ledger-scoped name keeps its precise register and a listed canister
+//!     keeps its destination register.
 //!   * **Financial canisters detected from the canister itself, refused
 //!     entirely.** Once the interface is in hand — the canister's own
 //!     published `candid:service`, which `canister_update_call` reads before
@@ -122,11 +137,20 @@
 //!     against the IC dashboard's registry and the services' own published
 //!     sources), and the standardized-methods group plus the stated policy
 //!     cover the rest.
-//!   * Legacy pre-ICRC token standards (DIP20/EXT `transfer`/`transferFrom`/
-//!     `approve` on arbitrary canisters) are deliberately NOT matched: the
-//!     names are too abstract to block everywhere without breaking
-//!     non-financial apps (per review), and those standards sit outside the
-//!     ecosystem's ICRC-integrated platforms. The stated policy covers them.
+//!   * Generic value-moving names (`transfer`, `withdraw`, `swap`, … on
+//!     arbitrary canisters) were deliberately unmatched between #154 and the
+//!     keyword scope: review on #154 found them too abstract to refuse
+//!     everywhere without breaking non-financial apps, and this note recorded
+//!     that the stated policy covered them. The maintainer reversed that:
+//!     refusing a real ledger's, pool's or DIP20 token's method is worth more
+//!     than allowing an app's non-financial one, so such names are now
+//!     refused on every canister by whole-word keyword, with a register that
+//!     says so rather than classifying the call, and a literal exemption list
+//!     for the control-handover names. Still unlisted, on purpose: `approve`,
+//!     `send`, `claim`, `reward`, `balance`, `token`, `wallet`, `ledger`,
+//!     `order`, `fee`, `cycles` (ordinary app verbs and nouns far more often
+//!     than value operations), and derived forms such as `payment` or
+//!     `withdrawal` (one line each to add).
 
 use candid::Principal;
 use std::collections::BTreeSet;
@@ -175,10 +199,11 @@ const CYCLES_LEDGER: &str = "um5iw-rqaaa-aaaaq-qaaba-cai";
 /// from it).
 const CYCLES_MINTING_CANISTER: &str = "rkp4c-7iaaa-aaaaa-aaaca-cai";
 
-/// Abstract method names refused only on the specific system canister where
-/// they are financial: (canister id, method, label). On any other canister
-/// these names are allowed — an app's own `transfer` is often not a token
-/// transfer at all.
+/// Abstract method names refused on the specific system canister where they
+/// are financial, with the precise label and register: (canister id, method,
+/// label). On any other canister the ones that carry a financial keyword
+/// (`transfer`, `withdraw`, `withdraw_from`, `notify_mint_cycles`) fall to
+/// the keyword scope, whose refusal claims less; the rest are allowed there.
 const DISALLOWED_CANISTER_METHODS: &[(&str, &str, &str)] = &[
     // The ICP ledger's pre-ICRC surface.
     (ICP_LEDGER, "transfer", "the ICP ledger's legacy transfer"),
@@ -392,7 +417,8 @@ const DISALLOWED_FINANCE_CANISTERS: &[(&str, &str, &str)] = &[
         "its update surface is the content store behind the exchange UI",
     ),
     // --- Exchanges: Sonic (plus the legacy DIP-20 ledgers its DAO operates,
-    // whose transfer names the ICRC group deliberately does not match) ---
+    // whose legacy `transfer` the keyword scope refuses everywhere; the list
+    // still closes the rest of their surface) ---
     (
         "3xwpq-ziaaa-aaaah-qcn4a-cai",
         "the Sonic exchange swap canister",
@@ -485,6 +511,110 @@ fn icrc_ledger_standard(method: &str) -> Option<&'static str> {
 /// `get_canister_candid`, not the whole ledger interface.
 const MAX_LISTED_METHODS: usize = 5;
 
+/// Financial / crypto keywords: a method whose name contains one of these as a
+/// WHOLE WORD (see [`name_words`]) is refused on every canister. Admission
+/// rule: a word that names a value operation and is rare as an ordinary app
+/// verb. The first row is the maintainer's list; the second adds the value
+/// verbs. Deliberately absent — ordinary app verbs and nouns far more often
+/// than value operations: `approve`, `send`, `claim`, `reward`, `balance`,
+/// `token`, `wallet`, `ledger`, `order`, `fee`, `cycles`; and derived forms
+/// (`payment`, `payout`, `withdrawal`, `trading`, `staking`, plurals), which
+/// whole-word matching does not reach — add a form here to match it.
+const FINANCIAL_KEYWORDS: &[&str] = &[
+    "trade",
+    "swap",
+    "transfer",
+    "withdraw",
+    "exchange",
+    "pay",
+    "buy",
+    "deposit",
+    "purchase",
+    "sell",
+    "mint",
+    "burn",
+    "stake",
+    "unstake",
+    "redeem",
+    "refund",
+    "liquidity",
+    "allowance",
+    "escrow",
+    "loan",
+    "lend",
+    "borrow",
+    "bridge",
+];
+
+/// Method names exempt from the keyword scope although they contain a keyword
+/// — a control handover (of a canister, a record, an app), not a value
+/// movement — matched LITERALLY, by exact bytes: `Transfer_Ownership` or
+/// `transfer_ownership_v2` are not exempt. Every entry records where the name
+/// comes from, so the list can be audited (per review): a name with no source
+/// does not get in, and an entry whose source goes away goes with it.
+const EXEMPT_METHODS: &[&str] = &[
+    // The `Ownable` access-control convention — OpenZeppelin's Solidity
+    // `transferOwnership(address)` — which app code ported from the EVM keeps
+    // when it hands a canister's or a record's admin role to a new principal;
+    // the snake_case form is the Rust (ic-cdk) spelling of the same method.
+    // Kept at the maintainer's direction as the one control-handover name
+    // worth exempting. No mainnet interface declaring either spelling has
+    // been verified yet (the IC token standards use `setOwner` — DIP20,
+    // Sonic — or `set_custodians` — DIP721 — which carry no keyword); should
+    // a canister whose `transfer_ownership` moves VALUE turn up (an NFT
+    // handover is one), the exemption goes. Controller handover has no entry:
+    // on the Internet Computer a canister's controllers change through the
+    // management canister's `update_settings`, never through an app method.
+    "transfer_ownership",
+    "transferOwnership",
+];
+
+/// The words of a method name, for whole-word keyword matching: maximal runs
+/// of ASCII letters, split additionally at a lower→upper boundary and before
+/// the last upper of an upper run that a lower follows (`HTTPRequest` →
+/// `http`, `request`); digits and every other byte separate; each word
+/// lowercased. So `swapTokens` → `swap`, `tokens`; `icrc1_transfer` → `icrc`,
+/// `transfer`; `withdraw2` → `withdraw`; `payload` stays one word. The one
+/// corner: an all-caps keyword with a lowercase plural (`SWAPs`) splits as
+/// `swa`, `ps` and misses — no Internet Computer interface spells names that
+/// way.
+fn name_words(method: &str) -> Vec<String> {
+    let chars: Vec<char> = method.chars().collect();
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if !c.is_ascii_alphabetic() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        if c.is_ascii_uppercase() && !current.is_empty() {
+            let prev = chars[i - 1];
+            let next_is_lower = chars.get(i + 1).is_some_and(|n| n.is_ascii_lowercase());
+            if prev.is_ascii_lowercase() || (prev.is_ascii_uppercase() && next_is_lower) {
+                words.push(std::mem::take(&mut current));
+            }
+        }
+        current.push(c.to_ascii_lowercase());
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// The first financial keyword `method` carries as a whole word, unless the
+/// name is one of the literal [`EXEMPT_METHODS`].
+pub(crate) fn financial_keyword(method: &str) -> Option<&'static str> {
+    if EXEMPT_METHODS.contains(&method) {
+        return None;
+    }
+    name_words(method)
+        .into_iter()
+        .find_map(|word| FINANCIAL_KEYWORDS.iter().copied().find(|keyword| *keyword == word))
+}
+
 /// The destination register: what is disallowed is the service the call goes
 /// to, not this call, so the message says that and claims nothing about the
 /// method (per review — `store` on a wallet backend is not a transfer). Shared
@@ -501,13 +631,14 @@ fn destination_refusal(method: &str, service: &str, why: &str) -> String {
 
 /// The financial-transactions gate, the scopes decided from the request alone:
 /// `Some(refusal)` when the call is disallowed, `None` when it may proceed.
-/// Five scopes, checked in order: the mixed-purpose entry points and the
+/// Six scopes, checked in order: the mixed-purpose entry points and the
 /// standardized value-moving method names (both refused on every canister),
 /// the abstract names scoped to the system ledger where they are financial,
 /// the finance-canister list — on a listed canister EVERY update method is
-/// refused, so `None` never depends on the method name alone — and, last, a
-/// call addressed to any other ICRC-1 / ICRC-2 ledger method by name. The
-/// sixth scope, decided from the canister's own declared interface, is
+/// refused, so `None` never depends on the method name alone — a call
+/// addressed to any other ICRC-1 / ICRC-2 ledger method by name, and, last, a
+/// method name that carries a financial keyword as a whole word. The seventh
+/// scope, decided from the canister's own declared interface, is
 /// [`disallowed_update_on_ledger_interface`], which the tool runs once it has
 /// read that interface. Method matching is literal — the IC matches method
 /// names by exact bytes, so a differently-spelled name would not reach the
@@ -524,9 +655,11 @@ fn destination_refusal(method: &str, service: &str, why: &str) -> String {
 ///     refused, which again says nothing about this particular call;
 ///   * a call addressed to an ICRC ledger method by name: the caller is
 ///     treating the canister as a ledger, so the call is refused and, again,
-///     not classified.
+///     not classified;
+///   * a keyword-named method: the name is refused on every canister rather
+///     than judged app by app, so the call is not classified.
 ///
-/// All four name the method, state the policy and why it exists, and tell the
+/// All five name the method, state the policy and why it exists, and tell the
 /// agent what to recommend to the user instead: performing the operation
 /// outside this connector in a trusted interface they control, or, for the
 /// creation/funding methods, with their own icp CLI.
@@ -588,14 +721,27 @@ pub fn disallowed_update_method(canister_id: &Principal, method: &str) -> Option
     // treating the canister as a ledger, which makes it a financial canister
     // (see `disallowed_update_on_ledger_interface`); the register disclaims the
     // call, since a balance read invoked as an update is not a transfer.
-    let standard = icrc_ledger_standard(method)?;
+    if let Some(standard) = icrc_ledger_standard(method) {
+        return Some(format!(
+            "`{method}` is named as an {standard} ledger method. A canister that provides \
+             ICRC-1 or ICRC-2 methods is treated as a financial service and update calls \
+             to it are refused, so this refusal does not mean this particular call moves \
+             assets. Financial transactions (token transfers, spending approvals, payments, \
+             or trades) are not supported by this server, to protect the user. \
+             {NEUTRAL_REDIRECT}"
+        ));
+    }
+    // Last, a method name that carries a financial keyword — the weakest
+    // evidence the guard acts on, so the weakest claim: the name is refused
+    // everywhere rather than judged app by app, and nothing is said about what
+    // this call does.
+    let keyword = financial_keyword(method)?;
     Some(format!(
-        "`{method}` is named as an {standard} ledger method. A canister that provides \
-         ICRC-1 or ICRC-2 methods is treated as a financial service and update calls \
-         to it are refused, so this refusal does not mean this particular call moves \
-         assets. Financial transactions (token transfers, spending approvals, payments, \
-         or trades) are not supported by this server, to protect the user. \
-         {NEUTRAL_REDIRECT}"
+        "`{method}` has the financial keyword `{keyword}` in its name. Method names that \
+         contain a financial keyword are refused on every canister rather than judged app \
+         by app, so this refusal does not mean this particular call moves assets. \
+         Financial transactions (token transfers, spending approvals, payments, or \
+         trades) are not supported by this server, to protect the user. {NEUTRAL_REDIRECT}"
     ))
 }
 
@@ -732,6 +878,9 @@ mod tests {
     /// The clause the interface scope's refusal must carry: the evidence is what
     /// the canister itself declares.
     const INTERFACE_RULE: &str = "whose Candid interface declares";
+    /// The clause the keyword scope's refusal must carry: the name is refused
+    /// everywhere, which is all the guard knows.
+    const NAME_RULE: &str = "refused on every canister rather than judged app by app";
     /// The clause the missing-interface refusal must carry: an update call needs
     /// the published interface, and the check could not run without it.
     const UNCHECKED_RULE: &str =
@@ -775,47 +924,63 @@ mod tests {
         }
     }
 
-    // Matching is literal: a differently-spelled name is NOT the standard
-    // method (Candid method names are case-sensitive), so it is allowed on an
-    // unlisted canister — it could never reach the ledger method on chain
-    // anyway. (On a finance-listed canister every update call is refused
-    // regardless of spelling, so the property is observable only off the list.)
+    // The standard names are matched literally: a differently-spelled name is
+    // NOT the standard method (Candid method names are case-sensitive), so it
+    // never gets the standard's label or the "the call itself" register. It is
+    // still refused — by the keyword scope, which sees the word `transfer` in
+    // every one of these spellings — but with the weaker, disclaiming register.
     #[test]
-    fn matching_is_literal_not_normalized() {
+    fn standard_names_stay_literal_while_keywords_catch_variants() {
         for method in ["ICRC1_Transfer", "icrc1-transfer", " icrc1_transfer ", "Transfer"] {
-            assert!(
-                disallowed_update_method(&any_canister(), method).is_none(),
-                "{method} is not the standard spelling and must not match"
-            );
+            let msg = disallowed_update_method(&any_canister(), method).unwrap_or_else(|| {
+                panic!("{method} carries the keyword transfer: must be refused")
+            });
+            assert!(msg.contains(NAME_RULE), "{msg}");
+            assert!(!msg.contains(ITSELF), "{method} is not the standard spelling: {msg}");
+            assert!(!msg.contains("an ICRC-1 token transfer"), "{msg}");
         }
     }
 
-    // Abstract names are refused only on the system canister where they are
-    // financial — and allowed on any other canister, so an app whose own
-    // `transfer`/`withdraw` is non-financial keeps working.
+    // The system canisters' own names are refused there with the precise
+    // register and label. Elsewhere, the ones that carry no financial keyword
+    // stay allowed; the ones that do (`transfer`, `withdraw`, `withdraw_from`,
+    // and `notify_mint_cycles` with its `mint`) fall to the keyword scope,
+    // which refuses them by name with the weaker, disclaiming register — never
+    // the system canister's label.
     #[test]
-    fn abstract_names_are_scoped_to_their_ledger() {
+    fn system_canister_names_keep_their_register_and_scope() {
         for (canister, method) in [
-            (icp_ledger(), "transfer"),
             (icp_ledger(), "send_dfx"),
             (icp_ledger(), "notify_dfx"),
-            (cycles_ledger(), "withdraw"),
-            (cycles_ledger(), "withdraw_from"),
             (cycles_ledger(), "create_canister"),
             (cycles_ledger(), "create_canister_from"),
             (cmc(), "notify_top_up"),
             (cmc(), "notify_create_canister"),
-            (cmc(), "notify_mint_cycles"),
             (cmc(), "create_canister"),
         ] {
             assert!(
                 disallowed_update_method(&canister, method).is_some(),
-                "{method} must be refused on its ledger"
+                "{method} must be refused on its canister"
             );
             assert!(
                 disallowed_update_method(&any_canister(), method).is_none(),
                 "{method} must be allowed on an unrelated canister"
             );
+        }
+        for (canister, method, label) in [
+            (icp_ledger(), "transfer", "the ICP ledger's legacy transfer"),
+            (cycles_ledger(), "withdraw", "a cycles-ledger withdrawal"),
+            (cycles_ledger(), "withdraw_from", "a cycles-ledger delegated withdrawal"),
+            (cmc(), "notify_mint_cycles", "a cycles mint to a cycles-ledger account"),
+        ] {
+            let msg =
+                disallowed_update_method(&canister, method).expect("refused on its own canister");
+            assert!(msg.contains(label) && msg.contains(ITSELF), "{msg}");
+            let msg = disallowed_update_method(&any_canister(), method).unwrap_or_else(|| {
+                panic!("{method} carries a financial keyword: refused anywhere")
+            });
+            assert!(msg.contains(NAME_RULE), "{msg}");
+            assert!(!msg.contains(label) && !msg.contains(ITSELF), "{msg}");
         }
     }
 
@@ -843,16 +1008,18 @@ mod tests {
         }
     }
 
-    // Reads, fees, and legacy DIP20-style names on arbitrary canisters stay
-    // callable (an ICRC-named read is the exception: it addresses the canister
-    // as a ledger — see `icrc_named_calls_are_refused_pre_network`). The
-    // cycles-minting canister's method names are in the list too: they are
-    // refused on the CMC itself (above), and an unrelated canister's method
-    // that happens to share the name is not a funding completion.
+    // Reads and generic names on arbitrary canisters stay callable: a word
+    // that merely contains a keyword (`payload`, `buyer`, `swapped`, `trader`)
+    // is not that keyword, `approve`/`send`/`claim` are deliberately not
+    // keywords, and the literal exemptions are control handovers. (An
+    // ICRC-named read is refused — it addresses the canister as a ledger — and
+    // `transfer_fee` is the keyword scope's accepted false positive.) The
+    // cycles-minting canister's non-keyword names are here too: refused on the
+    // CMC itself (above), an unrelated canister's method that shares the name
+    // is not a funding completion.
     #[test]
     fn allows_non_financial_methods() {
         for method in [
-            "transfer_fee",
             "get_transactions",
             "notify_create_canister",
             "notify_top_up",
@@ -860,12 +1027,16 @@ mod tests {
             "set_name",
             "register_user",
             "http_request_update",
-            // Abstract names on a non-ledger canister (per review: an app's
-            // own transfer/approve is often not financial at all).
-            "transfer",
-            "transferFrom",
             "approve",
-            "withdraw",
+            "send",
+            "claim",
+            "set_payload",
+            "upload_payload",
+            "get_buyer",
+            "swapped",
+            "trader",
+            "transfer_ownership",
+            "transferOwnership",
         ] {
             assert!(
                 disallowed_update_method(&any_canister(), method).is_none(),
@@ -882,6 +1053,8 @@ mod tests {
     // must NOT do is classify the call: `store` on a wallet backend is refused
     // because of where it goes, not because it moves anything (per review), so
     // the message says the destination rule out loud and says so explicitly.
+    // (`swap` is a keyword too, so this loop also pins that a listed service's
+    // destination register wins over the keyword scope's name register.)
     #[test]
     fn refuses_every_update_on_finance_canisters() {
         for (id, service, why) in DISALLOWED_FINANCE_CANISTERS {
@@ -1040,6 +1213,21 @@ mod tests {
         assert!(!msg.contains(ITSELF), "{msg}");
         assert!(!msg.contains(DESTINATION_RULE), "{msg}");
 
+        // A keyword in the method name: refused everywhere rather than judged,
+        // so disclaimed — and neither the operation nor the destination claim.
+        let msg = disallowed_update_method(&any_canister(), "swapTokens").expect("must be refused");
+        assert!(msg.contains(NAME_RULE), "{msg}");
+        assert!(msg.contains(NOT_THIS_CALL), "{msg}");
+        assert!(!msg.contains(ITSELF), "{msg}");
+        assert!(!msg.contains(DESTINATION_RULE), "{msg}");
+        // ...while the sharper scopes keep precedence over it: the ICP ledger's
+        // own `transfer` is the operation, and `swap` on a listed exchange is
+        // refused for its destination.
+        let msg = disallowed_update_method(&icp_ledger(), "transfer").expect("must be refused");
+        assert!(msg.contains(ITSELF) && !msg.contains(NAME_RULE), "{msg}");
+        let msg = disallowed_update_method(&listed, "swap").expect("must be refused");
+        assert!(msg.contains(DESTINATION_RULE) && !msg.contains(NAME_RULE), "{msg}");
+
         // No interface to check against — not published, unreadable, or a read
         // that failed: nothing was learned about the call or the canister, so
         // the message says only that the check could not run — disclaimed, and
@@ -1052,6 +1240,148 @@ mod tests {
             assert!(!msg.contains(DESTINATION_RULE), "{msg}");
             assert!(!msg.contains(INTERFACE_RULE), "{msg}");
         }
+    }
+
+    // Whole-word splitting: snake_case, kebab-case, camelCase humps (an acronym
+    // run keeps its last capital with the word that follows), digits and other
+    // bytes as separators, everything lowercased.
+    #[test]
+    fn name_words_splits_snake_camel_and_digits() {
+        let words = |m: &str| name_words(m);
+        assert_eq!(words("swapTokens"), ["swap", "tokens"]);
+        assert_eq!(words("withdraw_all"), ["withdraw", "all"]);
+        assert_eq!(words("icrc1_transfer"), ["icrc", "transfer"]);
+        assert_eq!(words("ICRC1Transfer"), ["icrc", "transfer"]);
+        assert_eq!(words("Transfer"), ["transfer"]);
+        assert_eq!(words("withdraw2"), ["withdraw"]);
+        assert_eq!(words("payload"), ["payload"]);
+        assert_eq!(words("transferOwnership"), ["transfer", "ownership"]);
+        assert_eq!(words("HTTPRequest"), ["http", "request"]);
+        assert_eq!(words("getHTTPResponse"), ["get", "http", "response"]);
+        assert_eq!(words("icrc1-transfer"), ["icrc", "transfer"]);
+        assert_eq!(words(" icrc1_transfer "), ["icrc", "transfer"]);
+        assert!(words("").is_empty());
+        assert!(words("42").is_empty());
+    }
+
+    // A keyword matches a whole word only — in any spelling convention — and
+    // the literal exemptions are the one way around it.
+    #[test]
+    fn financial_keyword_matches_whole_words_only() {
+        for (method, keyword) in [
+            ("swapTokens", "swap"),
+            ("withdraw_all", "withdraw"),
+            ("icrc1_transfer", "transfer"),
+            ("Transfer", "transfer"),
+            ("TRANSFER", "transfer"),
+            ("withdraw2", "withdraw"),
+            ("pay_invoice", "pay"),
+            ("buy_ticket", "buy"),
+            ("exchange_rate", "exchange"),
+            ("key_exchange", "exchange"),
+            ("deposit_count", "deposit"),
+            ("notify_mint_cycles", "mint"),
+            ("icrc2_allowance", "allowance"),
+            ("add_liquidity", "liquidity"),
+            ("transfer_tokens_to_controller", "transfer"),
+            ("transfer_controller", "transfer"),
+            ("transferControllers", "transfer"),
+            ("trade", "trade"),
+        ] {
+            assert_eq!(financial_keyword(method), Some(keyword), "{method}");
+        }
+        for method in [
+            "payload",
+            "set_payload",
+            "buyer",
+            "swapped",
+            "trader",
+            "get_transactions",
+            "approve",
+            "send",
+            "claim",
+            "process_payment",
+            "transfer_ownership",
+            "transferOwnership",
+            "",
+        ] {
+            assert_eq!(financial_keyword(method), None, "{method}");
+        }
+    }
+
+    // Every keyword refuses a method named for it on any canister, with the
+    // name register: the method and the keyword named, the disclaimer, the
+    // policy, the redirect, and no venue.
+    #[test]
+    fn refuses_keyword_names_on_every_canister() {
+        for keyword in FINANCIAL_KEYWORDS {
+            let method = format!("do_{keyword}_now");
+            let msg = disallowed_update_method(&any_canister(), &method)
+                .unwrap_or_else(|| panic!("{method} must be refused on any canister"));
+            assert!(msg.contains(&format!("`{method}`")), "{msg}");
+            assert!(msg.contains(&format!("keyword `{keyword}`")), "{msg}");
+            assert!(msg.contains(NAME_RULE), "{msg}");
+            assert!(msg.contains(NOT_THIS_CALL), "{msg}");
+            assert!(!msg.contains(ITSELF), "{msg}");
+            assert!(msg.contains("not supported by this server, to protect the user"), "{msg}");
+            assert!(msg.contains("outside this connector"), "{msg}");
+            assert!(msg.contains("trusted interface they control"), "{msg}");
+            assert!(!msg.to_lowercase().contains("wallet"), "no venue may be named: {msg}");
+            assert!(!msg.contains(".com"), "no venue may be named: {msg}");
+            assert!(!msg.contains("marketplace"), "{msg}");
+            assert!(!msg.contains("compliance"), "{msg}");
+        }
+    }
+
+    // Exemptions are literal: the exact spellings pass, anything else that
+    // contains the keyword does not.
+    #[test]
+    fn exemptions_are_literal() {
+        for method in EXEMPT_METHODS {
+            assert!(
+                disallowed_update_method(&any_canister(), method).is_none(),
+                "{method} is a literal exemption"
+            );
+        }
+        for method in ["Transfer_Ownership", "transfer_ownership_v2", "transfer_owner"] {
+            let msg = disallowed_update_method(&any_canister(), method)
+                .unwrap_or_else(|| panic!("{method} is not literally exempt"));
+            assert!(msg.contains(NAME_RULE), "{msg}");
+        }
+    }
+
+    // The lists stay well-formed: keywords unique, lowercase, alphabetic, and
+    // none of them a word of the mixed-purpose entry point (one register per
+    // name); every exemption unique and actually carrying a keyword, so no
+    // entry is dead.
+    #[test]
+    fn keyword_and_exemption_lists_are_well_formed() {
+        let mut keywords: Vec<&str> = FINANCIAL_KEYWORDS.to_vec();
+        for keyword in &keywords {
+            assert!(
+                !keyword.is_empty() && keyword.chars().all(|c| c.is_ascii_lowercase()),
+                "{keyword}"
+            );
+        }
+        let total = keywords.len();
+        keywords.sort_unstable();
+        keywords.dedup();
+        assert_eq!(keywords.len(), total, "duplicate keywords");
+        for (method, _) in MIXED_PURPOSE_METHODS {
+            assert_eq!(financial_keyword(method), None, "{method} has its own register");
+        }
+        let mut exempt: Vec<&str> = EXEMPT_METHODS.to_vec();
+        for method in &exempt {
+            let words = name_words(method);
+            assert!(
+                words.iter().any(|w| FINANCIAL_KEYWORDS.contains(&w.as_str())),
+                "{method} carries no keyword, so the exemption is dead"
+            );
+        }
+        let total = exempt.len();
+        exempt.sort_unstable();
+        exempt.dedup();
+        assert_eq!(exempt.len(), total, "duplicate exemptions");
     }
 
     // A canister that provides an ICRC-1 / ICRC-2 method is a financial canister:

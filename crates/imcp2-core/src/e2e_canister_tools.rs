@@ -1631,6 +1631,28 @@ async fn a_read_that_cannot_run_says_what_to_fix() {
     assert!(msg.contains("publishes no Candid interface"), "{msg}");
     assert!(!msg.contains("call failed"), "the call must not have been sent: {msg}");
 
+    // --- a keyword-named call is refused by name, before the network ---
+    // `withdraw` carries a financial keyword, so the call is refused on any
+    // canister without an interface being read — this one publishes none, and
+    // exports no such method, so the wording is the proof the gate answered.
+    let msg = refusal(
+        &h.call(
+            "canister_update_call",
+            serde_json::json!({
+                "canister_id": opaque,
+                "method": "withdraw",
+                "args": "(\"x\")",
+                "app_url": declares_all,
+            }),
+        )
+        .await,
+    );
+    assert!(msg.contains("`withdraw`"), "{msg}");
+    assert!(
+        msg.contains("refused on every canister rather than judged app by app"),
+        "the keyword scope's own wording: {msg}"
+    );
+
     // --- canister_query needs exactly one of `method` and `oql` ---
     let msg = refusal(
         &h.call("canister_query", serde_json::json!({ "canister_id": app, "app_url": h.origin }))

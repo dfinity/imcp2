@@ -204,7 +204,11 @@ transactions:**
   cycles ledgers' own `transfer`/`send_dfx`/`withdraw`/`create_canister`
   methods on those ledgers, the cycles-minting canister's funding-completion
   methods (`notify_top_up`, `notify_create_canister`, `notify_mint_cycles`,
-  `create_canister`), and refuses **every** update call to a canister whose
+  `create_canister`), refuses any method whose name carries a financial
+  keyword as a whole word (`transfer`, `withdraw`, `swap`, `trade`,
+  `exchange`, `pay`, `buy`, `deposit`, …, bar a literal list of
+  control-handover names such as `transfer_ownership`) on every canister,
+  and refuses **every** update call to a canister whose
   own Candid interface declares ICRC-1 or ICRC-2 methods — every ICRC ledger
   and the ICP ledger, detected from the canister itself; an update call needs
   that published interface, so a canister that publishes none, or whose
