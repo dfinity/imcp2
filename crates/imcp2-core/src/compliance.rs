@@ -83,10 +83,10 @@
 //!     keeps its destination register.
 //!   * **Financial canisters detected from the canister itself, refused
 //!     entirely.** Once the interface is in hand — the canister's own
-//!     `candid:service`, else the caller-supplied `candid`, which
-//!     `resolve_did` consults only when the canister publishes none, so it can
-//!     only ADD a refusal — a canister whose declared interface provides ANY
-//!     `icrc1_*` / `icrc2_*` method (a query such as `icrc1_balance_of`
+//!     published `candid:service`, which `canister_update_call` reads before
+//!     anything is encoded or signed, and the only interface an update call
+//!     is ever checked against — a canister whose declared interface provides
+//!     ANY `icrc1_*` / `icrc2_*` method (a query such as `icrc1_balance_of`
 //!     included) is a financial canister, and every update call to it gets the
 //!     destination register, naming the standard(s) and the methods that
 //!     established them. That covers every ICRC-1/ICRC-2 ledger — the ICP
