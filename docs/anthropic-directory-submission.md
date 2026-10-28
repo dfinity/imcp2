@@ -3,13 +3,15 @@
 Everything needed to submit the production deployment
 (`https://mcp.internetcomputer.org/mcp`) to Anthropic's Connectors Directory —
 the catalog that serves Claude.ai, Claude Desktop, Claude Mobile, Cowork, and
-Claude Code. Field drafts below are pre-filled from this repo and the live
-deployment; paste and adapt them in the portal.
+Claude Code. The listing is submitted and under review (see the log below).
+The field drafts further down are what the submission was built from, with
+the two fields submitted differently marked inline; keep them current for the
+next edit of the listing.
 
-Verified against the official docs on **2026-10-23** (first written against
-their 2026-07-31 versions; the portal, submitter and review-status facts
-below are from the current pages). The portal UI may add details (e.g. exact
-icon dimensions) not published in the docs.
+Verified against the official docs on **2026-07-31**; the portal location,
+who can submit, the status model, and the review model re-verified
+**2026-10-23**. The portal UI may add details (e.g. exact icon dimensions)
+not published in the docs.
 
 > **Server-state claims re-verified 2026-09-01.** Tool-surface numbers below
 > were regenerated from a live scan of a deployed instance of the current
@@ -23,35 +25,22 @@ icon dimensions) not published in the docs.
 
 ## Submission log
 
-- **2026-09-28 — submitted** as **"Internet Computer"** (slug
-  `internet-computer`). Status **In review** ever since; no reviewer feedback
-  as of 2026-10-23. In the status model below, *In review* means a person is
-  checking the listing and the next move is Anthropic's — nothing is owed
-  from our side until the status changes or mcp-review writes.
-- **The submission date fell inside an OAuth disruption** (2026-09-25 to
-  2026-10-01) caused by the DCR-to-CIMD migration (CIMD became the default
-  registration mode in [#203](https://github.com/dfinity/imcp2/pull/203),
-  merged 2026-09-24): a user reported DCR failing with HTTP 400 "redirect URI
-  not permitted" on 2026-09-25, and OpenAI's reviewer could not complete the
-  sign-in flow on 2026-10-01. A reviewer who tried the connector in that
-  window would have failed at sign-in. The fix is live. If feedback cites a
-  sign-in failure, answer with this timeline and ask for a re-test.
-- **2026-07-31 — pre-submission email** to <mcp-review@anthropic.com>, asking
-  ahead about the financial-transactions acknowledgment, got an automated
-  acknowledgement (ticket #120537913, from directory@mail.anthropic.com) and
-  no human reply. The question it asked is now moot: the funding tools it
-  described were removed and ledger methods are refused (blocker 2 below).
-- **If the status does not move:** escalate to <mcp-review@anthropic.com>
-  with the listing name, the submitting organization, and the status the
-  portal shows — the channel and the three details the status doc asks for.
+- **2026-07-31** — pre-submission email to <mcp-review@anthropic.com> asking
+  ahead about the financial-transactions acknowledgment. It got an automated
+  acknowledgement (ticket `#120537913`, from directory@mail.anthropic.com)
+  and no human reply. The question it asked is moot now: the funding tools it
+  described were removed, and ledger methods are refused (blocker 2).
+- **2026-09-28** — submitted through the portal as **"Internet Computer"**,
+  URL slug **`icp`** (manage page: <https://claude.ai/directory/manage/icp>).
+  Status **In review** since then; no reviewer feedback as of 2026-10-27.
 
 ## Where and how submission happens
 
-- **Portal:** <https://claude.ai/directory/manage> — the same page shows
-  each listing's status and reviewer feedback afterwards.
-- **Who can submit:** anyone on a **paid Claude plan**, through the portal.
-  (The docs no longer restrict submission to an Owner of a Team or Enterprise
-  organization.)
+- **Portal:** <https://claude.ai/directory/manage> — new listings, and the
+  status and reviewer feedback of submitted ones. This listing's page is
+  <https://claude.ai/directory/manage/icp>.
+- **Who can submit:** anyone on a **paid Claude plan** can submit through the
+  portal; no organization role is required.
 - **Governing documents:**
   [Anthropic Software Directory Policy](https://support.claude.com/en/articles/13145358)
   (effective 2026-04-15) and
@@ -60,19 +49,21 @@ icon dimensions) not published in the docs.
 - **Process docs:**
   [Submission](https://claude.com/docs/connectors/building/submission),
   [Review criteria](https://claude.com/docs/connectors/building/review-criteria),
-  [Authentication](https://claude.com/docs/connectors/building/authentication),
-  [Submission status](https://claude.com/docs/directory/submission-status).
+  [Submission status](https://claude.com/docs/directory/submission-status),
+  [Authentication](https://claude.com/docs/connectors/building/authentication).
 - **Review:** automated policy scan first, then listing as a *Community*
   connector; Anthropic may escalate to a human *Verified* review on its own,
-  in which reviewers run a functional test of each tool. No published SLA
-  ("review times vary with queue volume"). Escalations and special requests:
-  <mcp-review@anthropic.com> — include the listing name, the submitting
-  organization, and the status the portal shows.
-- **Listing status** (MCP connectors): *Draft*, *In review*, *Changes
-  requested*, *Not approved*, *Approved*, *Published*. *In review* means a
-  person is checking the listing and Anthropic acts next. Editing an
-  *Approved* listing before it is published returns it to *Draft* for another
-  review — so leave the listing alone once approved until it is published.
+  in which reviewers run a functional test of each tool (hence the
+  test-credentials requirement under blocker 3). No published SLA ("review
+  times vary with queue volume").
+- **Statuses** an MCP connector listing moves through: *Draft*, *In review*,
+  *Changes requested*, *Not approved*, *Approved*, *Published*. *In review*
+  means a person is checking the listing and the next move is Anthropic's.
+  Editing an *Approved* listing before it is published returns it to draft
+  for another review.
+- **Escalations and special requests:** <mcp-review@anthropic.com>, giving
+  the listing name, the submitting organization, and the status the portal
+  shows.
 - **Not required:** listing in the open MCP Registry
   (registry.modelcontextprotocol.io) — the directory docs state its
   domain-ownership proof "applies only to the open MCP Registry, not the
@@ -119,7 +110,7 @@ on unless `OAUTH_CIMD_ENABLED=0`), so Claude selects CIMD and registers nothing.
 
 ## Blockers to resolve before submitting
 
-### 1. Privacy policy URL (hard blocker)
+### 1. Privacy policy URL (hard blocker) — resolved
 
 > "Missing or incomplete privacy policies result in immediate rejection."
 
@@ -183,9 +174,8 @@ current draft: the identifier-linkability wording and the updated third-party
 list). The MCP server no longer serves a copy:
 `https://mcp.internetcomputer.org/privacy-policy` answers with a permanent
 redirect to that home ([#165](https://github.com/dfinity/imcp2/pull/165); the
-gateway front redirects it as well). The canonical URL is the one entered in
-the portal (submission of 2026-09-28).
-The reviewed source
+gateway front redirects it as well). That canonical URL is what the
+2026-09-28 submission entered in the portal. The reviewed source
 text is [`icp-mcp-privacy-policy-draft.md`](icp-mcp-privacy-policy-draft.md).
 
 ### 2. Financial-transactions policy
@@ -241,10 +231,12 @@ financial-transactions acknowledgment is made on that basis, without
 qualifications.
 
 **mcp-review thread:** an email to <mcp-review@anthropic.com> (2026-07-31)
-asked ahead about this acknowledgment. It got an automated acknowledgement
-(ticket #120537913) and no human reply, and the question it asked is moot —
-the funding tools it described are gone (see the submission log). No reply
-was needed to submit; if one arrives, answer with the posture above.
+asked ahead about this acknowledgment, describing the funding tools the
+server served at the time. It got an automated acknowledgement only (ticket
+`#120537913`, from directory@mail.anthropic.com) and no human reply, and the
+question is moot: those tools are gone and ledger methods are refused, as
+above. The submission made the acknowledgment on that basis; if a reviewer
+raises it, answer with the posture above.
 
 Related point for the same step: the **model-readable metadata describes the
 surface and the constraints on using it, without attempting to manipulate
@@ -289,13 +281,16 @@ right call for this connector: Internet Identity is passkey-based and
 device-bound, so a "shared account" would mean circulating a recovery phrase,
 and every read-only tool works against public network state, so a
 freshly-created identity exercises the bulk of the surface within a minute.
+The instructions went in with the 2026-09-28 submission package (the draft is
+under *Reviewer test instructions* below).
 
 One tension to be ready for: the review criteria say *"Test credentials:
-required, and they must be for a fully populated account,"* and a *Verified*
-review runs a functional test of each tool. Self-serve sign-up is a
-reasonable answer for an authentication system nobody can pre-provision into,
-but a reviewer may still ask for a populated account — most plausibly to
-exercise `canister_update_call` against an app where the identity has data.
+required, and they must be for a fully populated account"*, and in a Verified
+review the reviewers run a functional test of each tool. Self-serve sign-up
+is a reasonable answer for an authentication system nobody can pre-provision
+into, but a reviewer may still ask for a populated account — most plausibly
+to exercise `canister_update_call` against an app where the identity has
+data.
 If that comes back, the fallback is a dedicated identity with a recovery
 phrase in the team vault and an account at a demo app. (No controlled canister or
 cycles balance is needed: the connector has no canister-management tools.)
@@ -315,6 +310,13 @@ Before submitting, have the operators confirm production runs a `vX.Y.Z`
 release cut from current `main` (on-host `curl localhost:8000/version`, or the
 deploy workflow's record) — or have the fronting layer forward `/version`
 again so the check works from anywhere.
+
+Since then the release scheme from
+[#204](https://github.com/dfinity/imcp2/pull/204) is in place — an
+`rc-X.Y.Z-N` tag deploys a candidate to staging, the matching `vX.Y.Z` tag
+publishes the crates (which production embeds) and the local MCP — and the
+crates are at 0.5.1. The on-host check above is still how the exact commit
+production runs gets confirmed.
 
 ### 5. Icon asset — ready
 
@@ -336,16 +338,22 @@ the served pages keep using the DFINITY wordmark
 
 ## Portal field drafts
 
-Paste-and-adapt; portal limits in parentheses.
+What the 2026-09-28 submission was built from; portal limits in parentheses.
+Two fields went in differently from their drafts and are marked
+**superseded** below with what was submitted. Keep the rest current for the
+next edit of the listing.
 
 - **Server URL:** `https://mcp.internetcomputer.org/mcp`
 - **Transport:** Streamable HTTP
 - **Authentication mode:** OAuth 2.0 with Dynamic Client Registration
   (`oauth_dcr`)
-- **Name** (≤100 chars): `Internet Computer (ICP)` — matches what users
-  search; the landing page's `ICP MCP` is the alternative. The display name is
-  hard to change after publication.
-- **URL slug** (permanent): `internet-computer`
+- **Name** (≤100 chars): **submitted as `Internet Computer`**, which
+  supersedes the draft `Internet Computer (ICP)` (the landing page's `ICP MCP`
+  was the other alternative). The display name is hard to change after
+  publication.
+- **URL slug** (permanent once published): **submitted as `icp`**, which
+  supersedes the draft `internet-computer`; the manage page is
+  <https://claude.ai/directory/manage/icp>.
 - **Tagline** (≤55 chars): `Connect your AI chat to the Internet Computer`
 - **Description** (≤2000 chars, draft):
 
@@ -469,10 +477,10 @@ conversation beyond tool arguments and generates no media.
 
 ## Submission-day checklist
 
-- [x] Privacy policy entered in the portal — `https://internetcomputer.org/icp-mcp/privacy-policy/`, the page's one home (live; the old mcp.internetcomputer.org URL permanently redirects there) (blocker 1)
+- [x] Privacy policy entered in the portal — `https://internetcomputer.org/icp-mcp/privacy-policy/`, the page's one home (live; the old mcp.internetcomputer.org URL permanently redirects there), entered with the 2026-09-28 submission (blocker 1)
 - [x] Financial-transactions acknowledgment is a clean yes (blocker 2): the server does not support financial transactions. No mcp-review reply is needed; if one arrives, answer with the stated posture. The first-party-API/data-handling question was NOT in the 2026-07-31 email: raise it with mcp-review only if the portal's data-handling options don't fit
-- [x] Reviewer access settled: self-serve Internet Identity, instructions in the test-credentials field (blocker 3) — if a reviewer asks for a populated account, provision a demo-app account (no funding needed: there are no funding or canister-management tools)
-- [x] `vX.Y.Z` release cut: the crates are at `0.5.1` and `v0.5.1` is tagged — cut on 2026-09-24, before the candidate scheme landed, so it passed no staging-candidate gate. From 0.6.0 on, releases follow the `rc-X.Y.Z-N` → `vX.Y.Z` promotion from [#204](https://github.com/dfinity/imcp2/pull/204) (an `rc-*` tag deploys the candidate to staging, the matching `v*` tag publishes the crates; production embeds the published crate). Externally `/version` is still cut off by the gateway front, so which commit production runs is checked on-host or via the deploy workflow's record (blocker 4)
+- [x] Reviewer access settled: self-serve Internet Identity, test-account instructions included in the submission package (blocker 3) — if a reviewer asks for a populated account, provision a demo-app account (no funding needed: there are no funding or canister-management tools)
+- [x] Release cut: the crates are at 0.5.1 and the `rc-*` (staging candidate) / `v*` (release) tag scheme from [#204](https://github.com/dfinity/imcp2/pull/204) is in place. Confirming the exact commit production runs stays an on-host check or the deploy workflow's record — externally `/version` is cut off by the gateway front (blocker 4)
 - [x] Square PNG icon exported — `docs/assets/icp-logo-{1024,512}.png` (blocker 5)
 - [ ] Every tool exercised once by the submitter (portal asks you to confirm this; MCP Inspector or a custom connector in Claude both count)
-- [ ] Submitter is on a paid Claude plan (the docs no longer require an Owner of a Team/Enterprise org); follow-ups and escalations go from the same submitting organization the listing was filed under
+- [ ] Submitter is on a paid Claude plan (the portal's only access requirement; no organization role is needed)

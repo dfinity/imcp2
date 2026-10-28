@@ -213,7 +213,7 @@ Positive:
 Negative:
 1. "Open https://no-ic.example.com" (a reserved domain with no Internet
    Computer presence) → refused by the IC-evidence gate with guidance
-   (web-search or ask the user for the real URL) rather than resolved to a
+   (ask the user for the real URL) rather than resolved to a
    wrong identity.
 2. A state-changing call as your app account (canister_update_call with a
    `derivation_origin`, so it is signed with the session's delegation) on a
