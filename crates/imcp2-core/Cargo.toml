@@ -54,3 +54,8 @@ e2e = ["dep:pocket-ic", "dep:wat", "rmcp/client"]
 # Synthetic responses for pinning `public_fetch`'s acceptance rules without a
 # network (`reqwest::Response: From<http::Response<_>>`).
 http = { workspace = true }
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs: the
+# `mcp_get_delegation` retry tests in `identities.rs` read the real backoff
+# `sleep`s off a paused clock instead of waiting them out. A feature on a
+# dependency the crate already has, so the lockfile does not change.
+tokio = { workspace = true, features = ["test-util"] }
