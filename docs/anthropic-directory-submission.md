@@ -188,8 +188,9 @@ transactions**, and the portal's compliance step requires acknowledging this.
 transactions:**
 
 - **The connector serves no funding, creation, or canister-management
-  tools.** Creating, funding, and deploying canisters is work the user does
-  with the icp CLI in their own terminal. The generic `canister_update_call`
+  tools.** Creating and funding canisters is work the user does with the icp
+  CLI in their own terminal; deploying happens there as well, or through a
+  proxy deployment service. The generic `canister_update_call`
   is not a way around that either: management-canister lifecycle calls must
   carry the TARGET canister as the request's effective canister id, which the
   update-call path does not set (it defaults to the callee, `aaaaa-aa`), so
