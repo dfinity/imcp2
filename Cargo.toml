@@ -33,7 +33,7 @@ exclude = [
 ]
 
 [workspace]
-members = [".", "crates/imcp2-core", "crates/imcp2-local"]
+members = [".", "crates/imcp2-core", "crates/imcp2-deploy", "crates/imcp2-local"]
 
 # The hosted server releases to crates.io (publish-crate.yml), never as dist
 # binaries — dist releases only imcp2-local (see dist-workspace.toml).
