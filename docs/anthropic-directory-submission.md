@@ -71,8 +71,14 @@ not published in the docs.
   flow still runs, and the unknown-app error asks for the URL. The reply on
   the ticket thread described the three checks and quoted the new
   instructions paragraph. **Approved** the same day; **Published** by the
-  submitter at <https://claude.ai/directory/connectors/icp>, with the *Community* label
-  the directory gives by default.
+  submitter at <https://claude.ai/directory/connectors/icp>. The public
+  catalog behind the directory page took about 80 minutes to pick the record
+  up (it answered nothing for the slug until ~00:10 UTC on 2026-10-29, then
+  consistently). The record carries the *partner* tier — the human review's
+  outcome, shown as the **Verified** checkmark — rather than the *Community*
+  label the directory gives by default, and lists all 10 tools. It carries no
+  icon (`media.icons` is empty, so the listing shows a placeholder letter) and
+  no categories, both fixable through a listing edit (see the checklist).
 
 ## Where and how submission happens
 
@@ -570,4 +576,5 @@ conversation beyond tool arguments and generates no media.
 - [x] Square PNG icon exported — `docs/assets/icp-logo-{1024,512}.png` (blocker 5)
 - [x] Every tool exercised once by the submitter (portal asks you to confirm this; MCP Inspector or a custom connector in Claude both count) — confirmed with the 2026-09-28 submission; the reviewer's own run then passed all 10 tools
 - [x] Submitter is on a paid Claude plan (the portal's only access requirement; no organization role is needed)
-- [x] Review passed (2026-10-28, after the 0.6.0 guard change the reviewer asked for) and the listing published at <https://claude.ai/directory/connectors/icp>
+- [x] Review passed (2026-10-28, after the 0.6.0 guard change the reviewer asked for) and the listing published at <https://claude.ai/directory/connectors/icp>, with the Verified checkmark
+- [ ] Icon and categories: the live catalog record has no icon and no categories, so the listing shows a placeholder letter and is not browsable by topic. Add the 1024×1024 PNG from blocker 5 and pick categories through a listing edit in the portal; edits go through review, and the live listing stays up meanwhile
