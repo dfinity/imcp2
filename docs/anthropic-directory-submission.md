@@ -3,10 +3,11 @@
 Everything needed to submit the production deployment
 (`https://mcp.internetcomputer.org/mcp`) to Anthropic's Connectors Directory —
 the catalog that serves Claude.ai, Claude Desktop, Claude Mobile, Cowork, and
-Claude Code. The listing is submitted and under review (see the log below).
-The field drafts further down are what the submission was built from, with
-the two fields submitted differently marked inline; keep them current for the
-next edit of the listing.
+Claude Code. The listing passed review and is **published** at
+<https://claude.ai/directory/connectors/icp> (see the log below). The field drafts
+further down are what the submission was built from, with the fields
+submitted differently marked inline; keep them current for the next edit of
+the listing.
 
 Verified against the official docs on **2026-07-31**; the portal location,
 who can submit, the status model, and the review model re-verified
@@ -32,7 +33,52 @@ not published in the docs.
   described were removed, and ledger methods are refused (blocker 2).
 - **2026-09-28** — submitted through the portal as **"Internet Computer"**,
   URL slug **`icp`** (manage page: <https://claude.ai/directory/manage/icp>).
-  Status **In review** since then; no reviewer feedback as of 2026-10-27.
+  Status **In review** from then on, with no reviewer contact for four weeks.
+- **2026-10-27** — a status email to <directory@anthropic.com> (the address
+  the portal's *Get help* card gives; <mcp-review@anthropic.com> had never
+  answered) opened ticket `#149984160`, and a reviewer picked the listing up
+  the same day. Two rounds were about reviewer access: the Okta-backed SSO
+  test account in the portal instructions (blocker 3) was reported as not
+  working, and the Okta System Log showed why — every attempt carried a
+  zero-width space (U+200B) before the `@` of the username, inserted
+  somewhere between the portal's text and the reviewer's clipboard. The
+  portal instructions were changed to the bare username, which Okta's
+  short-match sign-in accepts, and the reviewer got in. The review itself
+  passed all 10 tools and the three example use cases end to end against
+  YetToDo, and raised one *Critical Priority* finding: the financial guard
+  matched method names only, so update calls named `transfer`, `withdraw`
+  and `swap` reached the target canister (which rejected them as unknown).
+  Asked for: detecting a ledger from the canister itself (ICRC-1, ICRC-2 or
+  ICP-ledger interfaces), refusing common non-standard value names, a short
+  description of what the guard covers and how it decides, and server
+  instructions that no longer describe the guard as incomplete. One optional
+  suggestion: the unknown-app error should ask the user for the app's URL
+  rather than suggest a web search.
+- **2026-10-28** — all of it shipped as **0.6.0**: the unknown-app error asks
+  for the URL ([#212](https://github.com/dfinity/imcp2/pull/212)), every
+  update to a canister whose published interface declares ICRC-1/ICRC-2
+  methods is refused and an unreadable or missing interface refuses the call
+  ([#213](https://github.com/dfinity/imcp2/pull/213)), whole-word financial
+  keywords in a method name are refused on every canister
+  ([#214](https://github.com/dfinity/imcp2/pull/214)), the server
+  instructions describe the three checks and the exemption list is gone
+  ([#215](https://github.com/dfinity/imcp2/pull/215)), version bump
+  ([#217](https://github.com/dfinity/imcp2/pull/217)); `rc-0.6.0-1` went to
+  staging and `v0.6.0` to crates.io and the GitHub release, and production
+  was updated. Verified on production through the directory connector: the
+  three calls from the review are refused by keyword, an update to the Oisy
+  backend is refused by destination, a legitimate YetToDo create/verify/delete
+  flow still runs, and the unknown-app error asks for the URL. The reply on
+  the ticket thread described the three checks and quoted the new
+  instructions paragraph. **Approved** the same day; **Published** by the
+  submitter at <https://claude.ai/directory/connectors/icp>. The public
+  catalog behind the directory page took about 80 minutes to pick the record
+  up (it answered nothing for the slug until ~00:10 UTC on 2026-10-29, then
+  consistently). The record carries the *partner* tier — the human review's
+  outcome, shown as the **Verified** checkmark — rather than the *Community*
+  label the directory gives by default, and lists all 10 tools. It carries no
+  icon (`media.icons` is empty, so the listing shows a placeholder letter) and
+  no categories, both fixable through a listing edit (see the checklist).
 
 ## Where and how submission happens
 
@@ -63,7 +109,10 @@ not published in the docs.
   for another review.
 - **Escalations and special requests:** <mcp-review@anthropic.com>, giving
   the listing name, the submitting organization, and the status the portal
-  shows.
+  shows. In practice <directory@anthropic.com>, the address on the portal's
+  *Get help* card, is what reached a person: it opened a ticket and got a
+  reviewer's reply within hours, where mcp-review had stayed silent since
+  July.
 - **Not required:** listing in the open MCP Registry
   (registry.modelcontextprotocol.io) — the directory docs state its
   domain-ownership proof "applies only to the open MCP Registry, not the
@@ -308,6 +357,21 @@ If that comes back, the fallback is a dedicated identity with a recovery
 phrase in the team vault and an account at a demo app. (No controlled canister or
 cycles balance is needed: the connector has no canister-management tools.)
 
+**What went in, and what the review taught (2026-10-27):** the portal's
+test-credentials field was filled with an SSO test account instead of the
+self-serve text — Internet Identity's *SSO* option with the company domain
+`yettodo.org`, signing in through an Okta integrator org (user
+`anthropic-icp-mcp`, password in the portal field) to an
+account at the YetToDo demo app that already holds data, which is exactly the
+"populated account" the criteria ask for. The reviewer's first attempts
+failed because the username reached Okta with an invisible zero-width space
+before the `@`; the fix was to give the bare username with no domain (Okta's
+*Allow short match* setting accepts it) and to ask the reviewer to type it.
+Keep the credentials field free of `@` and of anything that could be
+mistaken for Markdown, and verify a sign-in from a clean browser after every
+edit of that field. The Okta integrator org is free and is deactivated after
+a period of inactivity, so sign in to its admin console every couple of months.
+
 ### 4. Production build can no longer be verified from outside
 
 Production has been redeployed since this document first flagged it as
@@ -328,7 +392,7 @@ Since then the release scheme from
 [#204](https://github.com/dfinity/imcp2/pull/204) is in place — an
 `rc-X.Y.Z-N` tag deploys a candidate to staging, the matching `vX.Y.Z` tag
 publishes the crates (which production embeds) and the local MCP — and the
-crates are at 0.5.1. The on-host check above is still how the exact commit
+crates are at 0.6.0. The on-host check above is still how the exact commit
 production runs gets confirmed.
 
 ### 5. Icon asset — ready
@@ -431,6 +495,10 @@ next edit of the listing.
 
 ### Reviewer test instructions (draft for the test-credentials field)
 
+**Superseded in the portal** by the SSO test-account instructions described
+under blocker 3; the draft below is the self-serve version it replaced, kept
+for the next listing that cannot provision an account.
+
 > 1. No shared test account is needed, and none would work well: Internet
 >    Identity is passkey-based and device-bound. Create your own at
 >    https://id.ai — it takes under a minute — then add the connector by
@@ -504,7 +572,9 @@ conversation beyond tool arguments and generates no media.
 - [x] Privacy policy entered in the portal — `https://internetcomputer.org/icp-mcp/privacy-policy/`, the page's one home (live; the old mcp.internetcomputer.org URL permanently redirects there), entered with the 2026-09-28 submission (blocker 1)
 - [x] Financial-transactions acknowledgment is a clean yes (blocker 2): the server does not support financial transactions. No mcp-review reply is needed; if one arrives, answer with the stated posture. The first-party-API/data-handling question was NOT in the 2026-07-31 email: raise it with mcp-review only if the portal's data-handling options don't fit
 - [x] Reviewer access settled: self-serve Internet Identity, test-account instructions included in the submission package (blocker 3) — if a reviewer asks for a populated account, provision a demo-app account (no funding needed: there are no funding or canister-management tools)
-- [x] Release cut: the crates are at 0.5.1 and the `rc-*` (staging candidate) / `v*` (release) tag scheme from [#204](https://github.com/dfinity/imcp2/pull/204) is in place. Confirming the exact commit production runs stays an on-host check or the deploy workflow's record — externally `/version` is cut off by the gateway front (blocker 4)
+- [x] Release cut: the crates are at 0.6.0 and the `rc-*` (staging candidate) / `v*` (release) tag scheme from [#204](https://github.com/dfinity/imcp2/pull/204) is in place. Confirming the exact commit production runs stays an on-host check or the deploy workflow's record — externally `/version` is cut off by the gateway front (blocker 4)
 - [x] Square PNG icon exported — `docs/assets/icp-logo-{1024,512}.png` (blocker 5)
-- [ ] Every tool exercised once by the submitter (portal asks you to confirm this; MCP Inspector or a custom connector in Claude both count)
-- [ ] Submitter is on a paid Claude plan (the portal's only access requirement; no organization role is needed)
+- [x] Every tool exercised once by the submitter (portal asks you to confirm this; MCP Inspector or a custom connector in Claude both count) — confirmed with the 2026-09-28 submission; the reviewer's own run then passed all 10 tools
+- [x] Submitter is on a paid Claude plan (the portal's only access requirement; no organization role is needed)
+- [x] Review passed (2026-10-28, after the 0.6.0 guard change the reviewer asked for) and the listing published at <https://claude.ai/directory/connectors/icp>, with the Verified checkmark
+- [ ] Icon and categories: the live catalog record has no icon and no categories, so the listing shows a placeholder letter and is not browsable by topic. Add the 1024×1024 PNG from blocker 5 and pick categories through a listing edit in the portal; edits go through review, and the live listing stays up meanwhile

@@ -1,4 +1,4 @@
-﻿# Candid type reference
+# Candid type reference
 
 > For the complete documentation index, see [llms.txt](/llms.txt)
 
@@ -150,7 +150,7 @@ The `int` type contains all whole numbers. It is unbounded and can represent arb
 
 The types `nat8`, `nat16`, `nat32`, `nat64`, `int8`, `int16`, `int32`, and `int64` represent numbers with a representation of that many bits and can be used in more “low-level” interfaces.
 
-The range of `natN` is `{0 …​ 2^N-1}`, and the range of `intN` is `-2^(N-1) …​ 2^(N-1)-1`.
+The range of `natN` is `{0 … 2^N-1}`, and the range of `intN` is `-2^(N-1) … 2^(N-1)-1`.
 
 The on-wire representation is exactly that many bits long. So for small values, `nat` is more space-efficient than `nat64`.
 
@@ -304,7 +304,7 @@ vec { "john@doe.com"; "john.doe@example.com" };
 `vec record { KeyType; ValueType }` can translate to `BTreeMap` or `HashMap`.
 
 #### Corresponding JavaScript values
-`Array`, e.g. `[ "text", "text2", …​ ]`
+`Array`, e.g. `[ "text", "text2", … ]`
 
 ## Type opt t
 
