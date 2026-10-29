@@ -152,8 +152,9 @@ submission states, not from a narrower reading:
 
 - **The plugin is not a financial tool.** Its purpose is reading, building,
   and operating canisters. It serves no funding, trading, creation, or
-  dedicated canister-management tools — creating, funding, and deploying
-  canisters is work the user does with the icp CLI in their own terminal. The
+  dedicated canister-management tools — creating and funding canisters is work
+  the user does with the icp CLI in their own terminal, and deploying happens
+  there as well, or through a proxy deployment service. The
   generic `canister_update_call` does not reach management-canister lifecycle
   methods either: those calls must carry the target canister as the request's
   effective canister id, and the update-call path does not set one, so the
