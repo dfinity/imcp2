@@ -1108,7 +1108,7 @@ pub fn closest_entity(start: &str, entities: &[String]) -> Option<String> {
             continue;
         }
         let d = levenshtein(&lc, &el);
-        if d <= bound && best.map_or(true, |(bd, _)| d < bd) {
+        if d <= bound && best.is_none_or(|(bd, _)| d < bd) {
             best = Some((d, e));
         }
     }
@@ -2876,7 +2876,7 @@ mod tests {
         let at_cap_entity = "a".repeat(MAX_FUZZY_NAME_LEN); // len == cap
         let at_cap_typo = format!("{}b", "a".repeat(MAX_FUZZY_NAME_LEN - 1)); // one edit away, len == cap
         assert_eq!(
-            closest_entity(&at_cap_typo, &[at_cap_entity.clone()]).as_deref(),
+            closest_entity(&at_cap_typo, std::slice::from_ref(&at_cap_entity)).as_deref(),
             Some(at_cap_entity.as_str()),
             "a near-miss exactly at the cap length must still be suggested"
         );

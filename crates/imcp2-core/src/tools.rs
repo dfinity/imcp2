@@ -2108,7 +2108,7 @@ fn canonicalize_derivation_origin(cleaned: &str) -> Result<String, String> {
     // also rejects a host-less input ("https://") and embedded spaces/invalid chars.
     let parsed = url::Url::parse(&origin).ok().filter(|u| {
         u.scheme() == "https"
-            && u.host_str().map_or(false, |h| !h.is_empty())
+            && u.host_str().is_some_and(|h| !h.is_empty())
             && u.username().is_empty()
             && u.password().is_none()
     });
@@ -2164,9 +2164,9 @@ fn clean_app_url(raw: &str) -> Result<String, String> {
     // caller supplied) and `https://` would yield no host. Reject both up front with a
     // clear message instead of a late, indirect downstream failure.
     let candidate = if u.contains("://") { u.clone() } else { format!("https://{u}") };
-    let valid = url::Url::parse(&candidate).ok().map_or(false, |parsed| {
+    let valid = url::Url::parse(&candidate).ok().is_some_and(|parsed| {
         parsed.scheme() == "https"
-            && parsed.host_str().map_or(false, |h| !h.is_empty())
+            && parsed.host_str().is_some_and(|h| !h.is_empty())
             && parsed.username().is_empty()
             && parsed.password().is_none()
     });
