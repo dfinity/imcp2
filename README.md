@@ -1133,13 +1133,23 @@ mcp_get_delegation :
   default account, or a specific number when an `account` name was given — resolved
   from `mcp_get_accounts` (see [Listing accounts](#listing-accounts) below).
 - `max_ttl` is in **nanoseconds**; the server passes `null`, so II applies its
-  default (≤ 1 hour, and never past the grant).
+  own cap: an MCP delegation lives at most **5 minutes**
+  (`MCP_MAX_EXPIRATION_PERIOD_NS` in II's `mcp.rs`), and never past the grant.
 - These methods live on the **same II instance** as the connect-time login:
   `II_URL` (default `https://beta.id.ai`) is the browser login origin and
   `II_CANISTER_ID` (default `fgte5-ciaaa-aaaad-aaatq-cai`, that instance's
   canister) is the canister these calls target, over `https://icp-api.io`.
 - Derived delegations are cached per `(session, derivation_origin, account_number)` and
-  reused until they near expiry, then re-derived.
+  reused until they near expiry, then re-derived. With the 5-minute cap and the
+  server's 30 s re-derive margin, a cached delegation serves for at most about
+  4.5 minutes, so an app in continuous use re-derives every few minutes — one
+  `mcp_prepare_delegation` update plus a `mcp_get_delegation` query each time.
+- That query is answered by a single replica, which may not yet have caught up
+  with the `prepare` update; II then answers `NoSuchDelegation` even though the
+  delegation exists. The server re-sends the same `get` (same per-app key, same
+  prepared account and expiration) after 1, 2 and 3 seconds — as II's own
+  frontend does — and only reports the failure if the delegation still has not
+  appeared. `Unauthorized` is never retried: it means the grant is gone.
 
 ### Listing accounts
 
