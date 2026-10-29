@@ -167,7 +167,7 @@ at a given application, the Service derives the identity you use there and
 keeps, for the remainder of the session: the application's domain, the
 account number used, the per-application key it generated, and Internet
 Identity's signed authorization for that application (itself valid for at
-most one hour). Keeping this avoids re-deriving an authorization on every
+most five minutes). Keeping this avoids re-deriving an authorization on every
 call to the same application. All of this is
 held in memory only, bounded in size, and discarded when the session ends or
 the Service restarts. Legal basis: performance of the service you requested.
@@ -275,7 +275,7 @@ applications to direct the Service at.
 |---|---|
 | Session and authorization data (signing key, access level, duration) | In volatile memory only, never written to disk. Discarded when the duration you chose elapses (at most 30 days) or when the Service restarts, whichever comes first. |
 | Requests and results | Processed transiently; not retained after the call completes. |
-| Per-application connection material (application domain, account number, per-application key, signed authorization) | In memory, per session; an entry is replaced when refreshed and all are discarded when the session ends or the Service restarts. The signed authorization itself expires at most one hour after issue. |
+| Per-application connection material (application domain, account number, per-application key, signed authorization) | In memory, per session; an entry is replaced when refreshed and all are discarded when the session ends or the Service restarts. The signed authorization itself expires at most five minutes after issue. |
 | Authorization codes and access tokens | In memory only; codes expire after two minutes, tokens no later than the session duration you chose. |
 | Connection (OAuth) registrations | Stored on disk so an assistant can reconnect across restarts. There is currently **no time limit**: a registration is kept until it is displaced once the store reaches its cap of 10,000, which for a rarely-used deployment can mean indefinitely. |
 | Technical logs | Up to three months, then deleted. |
@@ -348,12 +348,12 @@ You can also act directly, without contacting us:
   connection for your Internet Identity so you can review and revoke access
   even if you no longer remember which assistant sessions are active.
   Revocation is carried out by Internet Identity and takes effect in two
-  steps: within at most five minutes, Internet Identity stops honouring the
-  connection, so the Service can no longer obtain authorizations for any
-  application; authorizations already issued for particular applications
-  remain usable until they expire, at most one hour after they were issued.
-  The practical worst case between revoking and all activity stopping is
-  therefore about one hour.
+  steps: immediately, Internet Identity stops honouring the connection, so
+  the Service can no longer obtain authorizations for any application;
+  authorizations already issued for particular applications remain usable
+  until they expire, at most five minutes after they were issued. The
+  practical worst case between revoking and all activity stopping is
+  therefore about five minutes.
 
 If you believe we have handled your personal data unlawfully, you may lodge a
 complaint with the Swiss Federal Data Protection and Information Commissioner
