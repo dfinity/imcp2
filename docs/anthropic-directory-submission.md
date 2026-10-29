@@ -4,7 +4,7 @@ Everything needed to submit the production deployment
 (`https://mcp.internetcomputer.org/mcp`) to Anthropic's Connectors Directory —
 the catalog that serves Claude.ai, Claude Desktop, Claude Mobile, Cowork, and
 Claude Code. The listing passed review and is **published** at
-<https://claude.ai/directory/icp> (see the log below). The field drafts
+<https://claude.ai/directory/connectors/icp> (see the log below). The field drafts
 further down are what the submission was built from, with the fields
 submitted differently marked inline; keep them current for the next edit of
 the listing.
@@ -71,7 +71,7 @@ not published in the docs.
   flow still runs, and the unknown-app error asks for the URL. The reply on
   the ticket thread described the three checks and quoted the new
   instructions paragraph. **Approved** the same day; **Published** by the
-  submitter at <https://claude.ai/directory/icp>, with the *Community* label
+  submitter at <https://claude.ai/directory/connectors/icp>, with the *Community* label
   the directory gives by default.
 
 ## Where and how submission happens
@@ -570,4 +570,4 @@ conversation beyond tool arguments and generates no media.
 - [x] Square PNG icon exported — `docs/assets/icp-logo-{1024,512}.png` (blocker 5)
 - [x] Every tool exercised once by the submitter (portal asks you to confirm this; MCP Inspector or a custom connector in Claude both count) — confirmed with the 2026-09-28 submission; the reviewer's own run then passed all 10 tools
 - [x] Submitter is on a paid Claude plan (the portal's only access requirement; no organization role is needed)
-- [x] Review passed (2026-10-28, after the 0.6.0 guard change the reviewer asked for) and the listing published at <https://claude.ai/directory/icp>
+- [x] Review passed (2026-10-28, after the 0.6.0 guard change the reviewer asked for) and the listing published at <https://claude.ai/directory/connectors/icp>
