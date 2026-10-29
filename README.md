@@ -995,11 +995,25 @@ none of them can be filled at the expense of an authenticated user:
 | State | Cap | When full |
 | --- | --- | --- |
 | Client registrations (`POST /oauth/register`) | 10 000 | least-recently-used registration is evicted; every `/oauth/authorize` marks its client used, so a flood evicts its own unused entries first, and an evicted client re-registers (DCR is automatic) |
-| Connects in flight (`GET /oauth/authorize`, one session + one pending-authz entry each) | 1 024 | oldest pending connect is evicted; sessions holding a live grant are never touched |
+| Connects in flight (`GET /oauth/authorize`, one session + one pending-authz entry each) | 1 024, each entry about 6 KiB at most | oldest pending connect is evicted; sessions holding a live grant are never touched |
 | Sessions overall | 20 000 | a **new connect is refused** (`503`, on-brand "server is busy, try again" screen) rather than evicting an authenticated user's live grant |
 | Authorization codes | 4 096 | closest-to-expiry code is evicted (inserting one requires a completed II consent) |
 | Access tokens | 20 000 | closest-to-expiry token is evicted |
 | Per-app delegation cache, **per session** | 64 origins/accounts | entry nearest expiry is evicted (it would be re-derived anyway) |
+
+A count bounds a map only as far as its entries are bounded too. Each
+registration holds at most 16 redirect URIs of at most 2 KiB. Each connect in
+flight holds strings the request chose, and `GET /oauth/authorize` refuses one
+(`400 invalid_request`, before the session is minted) unless the client's `state`
+is at most 2 KiB, the `code_challenge` has the S256 shape (exactly 43 base64url
+characters, the only shape `/oauth/token` can ever match), and the
+`redirect_uri` is at most 2 KiB plus a `:port`. A loopback redirect needs that
+last cap because it is matched after URL parsing but stored as sent, so padding
+the parser discards (tabs, `/.` segments, a zero-padded port) would otherwise
+be stored too. With a `client_id` of at most 2 KiB as well, a connect's strings
+come to about 6 KiB at most, and 1 024 of them to about 6 MiB per instance.
+Without the caps, hyper's 64 KiB request-URI limit was the only bound, which is
+about 64 MiB per instance.
 
 The per-instance reaper (60s cadence — `spawn_session_reaper`, which a deployment
 must call) drops expired grants, **connects abandoned mid-handshake** (a session
