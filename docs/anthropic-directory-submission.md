@@ -35,17 +35,22 @@ not published in the docs.
   URL slug **`icp`** (manage page: <https://claude.ai/directory/manage/icp>).
   Status **In review** from then on, with no reviewer contact for four weeks.
 - **2026-09-25 to early October** — OAuth disruption overlapping the
-  submission date. The DCR-to-CIMD migration
-  ([#203](https://github.com/dfinity/imcp2/pull/203), merged 2026-09-24,
-  CIMD on by default) broke dynamic client registration for ChatGPT: a user
-  wrote to mcp@dfinity.org on 2026-09-25 that reinstalling the connector
-  failed with HTTP 400, redirect URI
-  `https://chatgpt.com/connector_platform_oauth_redirect` not permitted, and
-  OpenAI's reviewer could not complete the sign-in flow on 2026-10-01 (see
-  [`openai-directory-submission.md`](openai-directory-submission.md)). Any
-  reviewer trying the connector in that window would have failed at sign-in.
-  Fixed, and confirmed to the reporter on 2026-10-05. The Anthropic reviewer
-  did not try the connector until 2026-10-27, after the fix.
+  submission date. The switch to CIMD-by-default alongside DCR
+  ([#191](https://github.com/dfinity/imcp2/pull/191) and
+  [#203](https://github.com/dfinity/imcp2/pull/203), merged 2026-09-23/24)
+  broke dynamic client registration for ChatGPT: a user wrote to
+  mcp@dfinity.org on 2026-09-25 that reinstalling the connector failed with
+  HTTP 400, redirect URI
+  `https://chatgpt.com/connector_platform_oauth_redirect` not permitted,
+  before Internet Identity sign-in, and OpenAI's reviewer reported on
+  2026-10-01 being unable to complete the sign-in or OAuth flow (see
+  [`openai-directory-submission.md`](openai-directory-submission.md)). A
+  reviewer trying the connector from ChatGPT in that window would have
+  failed before sign-in; whether claude.ai's registration was affected is
+  not recorded. On 2026-10-05 the reporter was told the migration was
+  complete and all clients should work again; what changed on the server is
+  not recorded in this repository. The Anthropic reviewer did not try the
+  connector until 2026-10-27.
 - **2026-10-27** — a status email to <directory@anthropic.com> (the address
   the portal's *Get help* card gives; <mcp-review@anthropic.com> had never
   answered) opened ticket `#149984160`, and a reviewer picked the listing up

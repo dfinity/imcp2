@@ -7,12 +7,12 @@ Codex**, built on the Apps SDK and MCP. Companion to
 [`anthropic-directory-submission.md`](anthropic-directory-submission.md);
 where a requirement matches Anthropic's, the same evidence applies. The
 plugin was **approved on 2026-10-13 and is published** (see the log below);
-the blockers and drafts further down are what the submission was built from,
-kept current for the next version.
+the blockers and drafts further down are what the submission was built from.
+Keep them current for the next version.
 
 Verified against OpenAI's official docs on **2026-08-01**; the submission
-flow (publishing, daily MCP scans, resubmission) re-read **2026-10-29**. The
-portal UI may add details not published in the docs.
+flow (publishing, daily MCP scans, resubmission) re-verified **2026-10-29**.
+The portal UI may add details not published in the docs.
 
 > **Server-state claims re-verified 2026-09-01.** Tool-surface numbers below
 > were regenerated from a live scan of a deployed instance of the current
@@ -30,40 +30,53 @@ portal UI may add details not published in the docs.
 
 ## Submission log
 
-- **2026-09-30** — submitted through the portal as **"Internet Computer
-  (v1.0.0)"** (submission `C-BkbT0QZDSZMg`, app id
-  `asdk_app_6a8ed3b67b50819186d6538d464af5ef`).
-- **2026-10-01** — **rejected** by <openai-review@tm.openai.com>, one reason:
-  "We're unable to complete your sign-in or OAuth flow. Please ensure valid,
-  working credentials are included and that they include no additional setup
-  or verification to access your service." The cause was on our side: the
-  DCR-to-CIMD migration ([#203](https://github.com/dfinity/imcp2/pull/203),
-  merged 2026-09-24) had broken dynamic client registration for ChatGPT, as
-  a user had reported on 2026-09-25 (HTTP 400, redirect URI
-  `https://chatgpt.com/connector_platform_oauth_redirect` not permitted), so
-  the reviewer failed before sign-in. The test account itself (an SSO
-  sign-in through `yettodo.org`, user `openai-icp-mcp`, password in the
-  portal — a separate account from Anthropic's) was correct. The fix was
-  confirmed to the reporter on 2026-10-05.
-- **2026-10-02** — reply on the rejection thread asking for a retry. The
-  review team (case `16275156`) answered on **2026-10-12** that a review
-  cannot be retried from the email thread and the plugin has to be
-  resubmitted through the dashboard. Resubmitted the same day, with improved
-  submission documents, as **"Internet Computer (ICP)"** (submission
-  `C-MliBQBQ5AYYD`).
-- **2026-10-13** — **approved**: "Your plugin, Internet Computer (ICP), has
+- **2026-09-30** — submitted through the portal as **"Internet Computer"**
+  (OpenAI's receipt names it "Internet Computer (v1.0.0)"; submission
+  `C-BkbT0QZDSZMg`, app id `asdk_app_6a8ed3b67b50819186d6538d464af5ef`).
+- **2026-10-01** — **Rejected** by <openai-review@tm.openai.com>, the stated
+  reason: "We're unable to complete your sign-in or OAuth flow. Please ensure
+  valid, working credentials are included and that they include no
+  additional setup or verification to access your service." The likely cause
+  was on our side: the switch to CIMD-by-default alongside DCR
+  ([#191](https://github.com/dfinity/imcp2/pull/191) and
+  [#203](https://github.com/dfinity/imcp2/pull/203), merged 2026-09-23/24;
+  "the migration from DCR-only to CIMD-mode" in the reply to the reporter)
+  had broken dynamic client registration for ChatGPT, as a user had reported
+  to mcp@dfinity.org on 2026-09-25: HTTP 400, redirect URI
+  `https://chatgpt.com/connector_platform_oauth_redirect` not permitted,
+  before Internet Identity sign-in — the error
+  [#189](https://github.com/dfinity/imcp2/pull/189) had fixed on 2026-09-03
+  (the note under the readiness table explains the two callback forms).
+  OpenAI's email does not say where its attempt failed, so this is an
+  inference. The test account itself (an SSO sign-in through `yettodo.org`,
+  user `openai-icp-mcp@yettodo.org` as supplied to OpenAI, password in the
+  portal's Testing tab — a separate account from Anthropic's) was correct.
+  On 2026-10-05 the reporter was told the migration was complete and all
+  clients should work again; what changed on the server is not recorded in
+  this repository.
+- **2026-10-02** — reply on the rejection thread, calling the failure a
+  transient server error since resolved, and asking for a retry.
+- **2026-10-12** — resubmitted through the portal as **"Internet Computer
+  (ICP)"** (submission `C-MliBQBQ5AYYD`), with "improved submission
+  documents" (the fields that changed are not recorded here). Later that day
+  the review team answered the 2026-10-02 reply (case `16275156`): a review
+  cannot be retried from the email thread; resubmit through the portal,
+  which had already been done.
+- **2026-10-13** — **Approved**: "Your plugin, Internet Computer (ICP), has
   been approved and is ready to publish" (app id
-  `asdk_app_6acc9f589e548191a4ffa5a30842ac2d`). Publication is the
-  developer's action from the plugins page, and it has been done: the plugin
-  is live in ChatGPT, owner's view at
-  <https://chatgpt.com/settings/plugins-settings/plugin_asdk_app_6acc9f589e548191a4ffa5a30842ac2d>.
-  The review team confirmed on 2026-10-16 that nothing further was needed.
-- **2026-10-28** — OpenAI's daily scan of the MCP server (it looks for new
-  or updated tools and ships eligible ones without a new package) reported
-  that it could not run: "its MCP server authorization is missing or no
-  longer works". Existing tools stay live. The fix is on the plugins page:
+  `asdk_app_6acc9f589e548191a4ffa5a30842ac2d`). **Published** by the
+  submitter from the portal (date not recorded; live in ChatGPT as of
+  2026-10-29). The ChatGPT settings page the submitter used to confirm it is
+  <https://chatgpt.com/settings/plugins-settings/plugin_asdk_app_6acc9f589e548191a4ffa5a30842ac2d>;
+  whether it doubles as the public listing is unverified (see the
+  checklist).
+- **2026-10-28** — OpenAI's daily scan of the MCP server (it picks up new or
+  updated tools and ships the ones that qualify to the listing without a new
+  version going through review; the docs do not say what qualifies)
+  reported that it could not run: "its MCP server authorization is missing
+  or no longer works". Existing tools stay live. The fix is in the portal:
   open the plugin, **MCPs** tab, **Reconnect** (or **Connect account**) and
-  complete the sign-in. Open item in the checklist.
+  complete the sign-in (open item in the checklist).
 
 ## Where and how submission happens
 
@@ -85,10 +98,12 @@ portal UI may add details not published in the docs.
   chooses publication timing from the portal. Updates re-enter review: scan
   the MCP server, submit a new version, publish the approved version. In
   practice both reviews answered within a day of submission; a rejection is
-  not retried from its email thread, only through a resubmission in the
-  dashboard. After publication OpenAI scans the server daily for tool
-  changes, under an authorization the owner grants on the plugin's MCPs tab
-  and must restore when it lapses (see the log).
+  not retried from its email thread (the thread is for contesting the
+  decision), a retry is a resubmission in the portal. After publication
+  OpenAI scans the server daily for tool changes, under an authorization the
+  submitter grants on the plugin's MCPs tab and must restore when it lapses
+  (see the log). Tool changes the daily scan accepts ship without re-review;
+  anything else goes through a new version as above.
 
 ## The submission form (seven tabs)
 
@@ -174,8 +189,9 @@ deploy callers pass the same one) and deployed.
 The guidelines say "provide a login and password for a fully featured demo
 account" and warn that "plugins that require additional login steps ... will
 be rejected". Internet Identity has no login/password — it is passkey-based
-and self-serve. Position to state in the Testing tab: reviewers create their
-own Internet Identity in under a minute (instructions on the landing page);
+and self-serve. **Position drafted before submission (superseded — see *What
+went in* below):** reviewers create their own Internet Identity in under a
+minute (instructions on the landing page);
 every read-only tool works with any identity because it reads public network
 state. Have the fallback ready (a provisioned identity with a recovery
 phrase in the team vault and an account at a demo app — no controlled
@@ -184,14 +200,18 @@ tools) if review pushes back —
 and expect a higher chance of push-back than at Anthropic given the
 login-and-password wording.
 
-**What went in (2026-09-30 and 2026-10-12):** the login-and-password
-requirement was met literally, with an SSO test account rather than the
-self-serve text — Internet Identity's *SSO* option with the company domain
-`yettodo.org`, signing in through an Okta integrator org (user
-`openai-icp-mcp`, password in the Testing tab) to an account at the YetToDo
-demo app that already holds data. It is a separate account from the one in
-the Anthropic submission. The first review failed before sign-in, during the
-OAuth disruption logged above; the resubmission with the same account passed.
+**What went in:** the login-and-password requirement was met literally,
+with an SSO test account rather than the self-serve text — Internet
+Identity's *SSO* option with the company domain `yettodo.org`, signing in
+through an Okta integrator org (user `openai-icp-mcp@yettodo.org`, password
+in the portal's Testing tab) to an account at the YetToDo demo app, the same
+arrangement as the Anthropic submission's account but a separate account.
+The 2026-10-02 reply to OpenAI restates those credentials as the ones
+supplied. The first review failed at sign-in or OAuth during the disruption
+logged above; the resubmission passed. The upkeep notes in the companion's
+blocker 3 apply to this account too: a clean-browser sign-in check after
+every edit of the Testing tab, and a sign-in to the Okta admin console every
+couple of months so the free integrator org is not deactivated.
 
 ### 3. Policy check: financial activity and commerce
 
@@ -256,10 +276,11 @@ not a third: #165 moved it to <https://internetcomputer.org/icp-mcp/>,
 maintained in dfinity/internetcomputer-org, and it carries no policy text of
 its own — adding it there is a separate change in that repository.
 
-### 4. Test cases (authoring work)
+### 4. Test cases — entered with the submission
 
 At least 5 positive + 3 negative cases with expected outcomes, passing on web
-and mobile. Draft set:
+and mobile. The set below is what the submissions were built from (fold in
+any edits made in the portal); keep it current for the next version:
 
 Positive:
 1. "What interface does canister gftcp-myaaa-aaaar-qcaaa-cai expose?" →
@@ -292,10 +313,13 @@ Negative:
 4. "Call an update method on a canister that rejects this caller" → the
    canister/network rejects it; the error is surfaced legibly.
 
-### 5. Decisions for the submitter
+### 5. Decisions for the submitter — taken with the submissions
 
-- **Country availability** (Global tab): presumably all countries; decide
-  explicitly.
+The values chosen live in the portal; this doc records only what the emails
+show. Read the rest off the portal before the next version.
+
+- **Country availability** (Global tab): chosen with the submission; the
+  value is not recorded here.
 - **Category** and final listing copy: start from the Anthropic drafts (name
   `Internet Computer (ICP)`, the description in
   [`anthropic-directory-submission.md`](anthropic-directory-submission.md)),
@@ -304,26 +328,30 @@ Negative:
   Computer", "Claude can work with the IC directly"). Replace every
   platform-specific mention with ChatGPT (or neutral "your AI assistant")
   wording before submitting.
-- **Which OpenAI org** submits, and who holds the Apps Management role.
+- **Which OpenAI org** submits, and who holds the Apps Management role:
+  **submitted from the DFINITY Foundation organization** (the portal's
+  notifications go to itowner@dfinity.org, billing@dfinity.org and the
+  submitter), by the submitter.
 
 ## Submission-day checklist
 
 - [x] OpenAI Platform organization verified (business verification) — the 2026-09-30 submission went through
 - [x] Submitter holds the Apps Management write permission — same evidence
-- [x] Production runs a release cut from current `main`, containing #153–#158 — production has run 0.6.0 since 2026-10-28, which contains them. Externally `/version` is cut off by the gateway front; on-host `curl localhost:8000/version`, or the deploy workflow's record, stays the check for the next submission, since the deploy workflow also accepts older tags/SHAs (rollbacks)
+- [x] Production runs a release cut from current `main`, containing [#153](https://github.com/dfinity/imcp2/pull/153)–[#158](https://github.com/dfinity/imcp2/pull/158) — the 2026-10-12 resubmission was reviewed against the build production ran then (not recorded here); production has run 0.6.0 since 2026-10-28, which contains them. Externally `/version` is cut off by the gateway front; on-host `curl localhost:8000/version`, or the deploy workflow's record, stays the check for the next submission, since the deploy workflow also accepts older tags/SHAs (rollbacks)
 - [x] Domain verification token served on the parent origin, `https://internetcomputer.org/.well-known/openai-apps-challenge` (dfinity/internetcomputer-org#99; returns exactly the token as `text/plain`, re-verified 2026-09-22). In the portal, choose `internetcomputer.org` as the challenge base; no gateway change is needed (blocker 1, resolved)
 - [ ] Only if the portal insists on the server host itself: have the gateway front forward `/.well-known/openai-apps-challenge` to the application and set the repository secret `OPENAI_APPS_CHALLENGE_TOKEN` (the app's route serves it verbatim as `text/plain`; it 404s until the variable is set). Not needed while the parent-origin token is accepted
 - [x] Privacy policy live at `https://internetcomputer.org/icp-mcp/privacy-policy/`, its one home (the old mcp.internetcomputer.org URL permanently redirects there)
-- [x] Tools scanned in the portal for the submission; the 2026-10-12 resubmission carried the scan the reviewers tested against
-- [x] 5+ positive and 3+ negative test cases entered (the portal does not accept a submission without them); the review passed
-- [x] Starter prompts entered; country availability chosen
-- [x] Policy attestations reviewed against blocker 3's analysis
-- [x] Demo-account note entered per blocker 2: the SSO test account, not the self-serve text
-- [x] Approved 2026-10-13 and published; live in ChatGPT (app id `asdk_app_6acc9f589e548191a4ffa5a30842ac2d`)
-- [ ] Reconnect the MCP authorization for OpenAI's daily scans (notice of 2026-10-28: plugins page → **MCPs** → **Reconnect**), then rescan once so the 0.6.0 tool descriptions and guard behaviour are what the directory shows
-- [ ] Record the public directory deep link to the listing here once taken from the publish page; the settings URL above is the owner's view, not what a user opens
+- [x] Tools scanned in the portal for the submission; the 2026-10-12 resubmission included a fresh scan
+- [ ] Verify `openWorldHint` on all 10 tools in the next *Scan Tools* run (the readiness table's note; whether it was checked in the submission scans is not recorded)
+- [x] 5+ positive and 3+ negative test cases entered (the guidelines' stated minimum); the review passed (blocker 4)
+- [x] Starter prompts entered; country availability chosen (blocker 5)
+- [x] Policy attestations reviewed against the non-financial posture (blocker 3)
+- [x] Demo-account note entered: the SSO test account, not the self-serve text (blocker 2)
+- [x] Approved 2026-10-13, published (date not recorded); live in ChatGPT as of 2026-10-29 (app id `asdk_app_6acc9f589e548191a4ffa5a30842ac2d`)
+- [ ] Reconnect the MCP authorization for OpenAI's daily scans (notice of 2026-10-28: portal → the plugin → **MCPs** → **Reconnect**), then confirm the next daily scan ran, or run *Scan Tools* in the portal once, so the listing carries the 0.6.0 tool descriptions and the server instructions that describe the guard; the guard itself has been live on production since 2026-10-28
+- [ ] Record the public directory link to the listing here once known. No official URL format is documented (third-party coverage says a listing deep link exists); the settings URL in the log is the one the submitter used to confirm publication
 
-## Sources (fetched 2026-08-01)
+## Sources (fetched 2026-08-01; submission flow re-verified 2026-10-29)
 
 - [App submission guidelines](https://developers.openai.com/apps-sdk/app-submission-guidelines)
 - [Submit plugins (flow)](https://developers.openai.com/plugins/deploy/submission)
