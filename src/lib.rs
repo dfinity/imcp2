@@ -74,6 +74,7 @@
 //! and `II_URL_PROD` / `II_CANISTER_ID_PROD` (the Internet Identity instances).
 
 mod auth;
+mod branding;
 // Docs live in the module itself (`//!` in src/metrics.rs): an outer doc
 // comment here would resolve its intra-doc links in *this* scope rather than
 // the module's, silently breaking the links to `Registry` and `MatchedPath`.
@@ -246,9 +247,14 @@ impl McpServer {
     ///   * `/.well-known/oauth-authorization-server` — the OIDC-style
     ///     alternate location of the AS metadata (some clients derive
     ///     `<issuer>/.well-known/…` instead of RFC 8414 path insertion);
-    ///   * everything else — the MCP streamable-HTTP endpoint (the router
+    ///   * `/branding?state=…` and `/branding/{slug}/logo` — verified-connector
+    ///     branding for Internet Identity's consent screen, CORS-open: the
+    ///     first answers for one pending connect (from its validated
+    ///     `redirect_uri`, `no-store`, `404` otherwise), the second serves a
+    ///     curated connector's static logo;
+    ///   * every other path — the MCP streamable-HTTP endpoint (the router
     ///     fallback, so the bare mount path, its trailing-slash form, and
-    ///     sub-paths all reach it), bearer-token gated, with the CORS
+    ///     unmatched sub-paths all reach it), bearer-token gated, with the CORS
     ///     preflight answered before authentication and `WWW-Authenticate`
     ///     exposed cross-origin.
     ///
@@ -340,9 +346,21 @@ impl McpServer {
             .with_state(self.store.clone())
             .layer(permissive_cors());
 
+        // Verified-connector branding (see [`branding`]), rooted at the issuer so
+        // II reaches it same-origin with the #4091-validated callback: the
+        // session-bound metadata (`/branding?state=…`, answered from that pending
+        // connect's validated redirect) and the static per-connector logo.
+        // CORS-open, like the other endpoints II fetches cross-origin.
+        let branding = Router::new()
+            .route("/branding", get(branding::branding_metadata))
+            .route("/branding/{slug}/logo", get(branding::branding_logo))
+            .with_state(self.store.clone())
+            .layer(permissive_cors());
+
         Router::new()
             .nest("/oauth", oauth)
             .merge(oidc_alternate)
+            .merge(branding)
             // Everything else is the MCP endpoint: the bare mount path, its
             // trailing-slash form, and any sub-path (the streamable service
             // dispatches on method, not path) — same breadth `nest_service`
