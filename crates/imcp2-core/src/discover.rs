@@ -769,7 +769,7 @@ fn header_is_ic_principal(headers: &reqwest::header::HeaderMap) -> bool {
         .get("x-ic-canister-id")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
-        .map_or(false, |v| Principal::from_text(v).is_ok())
+        .is_some_and(|v| Principal::from_text(v).is_ok())
 }
 
 /// Whether `resp` is evidence that `expected_origin` itself is IC-served: it carries a
@@ -3292,7 +3292,7 @@ mod tests {
         // Bounded: a hostile manifest can't produce unbounded findings.
         let huge = format!(
             r#"{{"canisters":[{}]}}"#,
-            std::iter::repeat(r#"{"id":"aaaaa-aa"}"#).take(500).collect::<Vec<_>>().join(",")
+            std::iter::repeat_n(r#"{"id":"aaaaa-aa"}"#, 500).collect::<Vec<_>>().join(",")
         );
         assert_eq!(canisters_from_app_manifest(&huge).len(), MAX_MANIFEST_CANISTERS);
 
@@ -3377,10 +3377,12 @@ mod tests {
         // false statement — the count is carried so the refusal can say so.
         let over = format!(
             r#"{{"canisters":[{}]}}"#,
-            std::iter::repeat(r#"{"id":"hmxr2-pqaaa-aaabq-qaaaa-cai"}"#)
-                .take(MAX_MANIFEST_CANISTERS + 7)
-                .collect::<Vec<_>>()
-                .join(",")
+            std::iter::repeat_n(
+                r#"{"id":"hmxr2-pqaaa-aaabq-qaaaa-cai"}"#,
+                MAX_MANIFEST_CANISTERS + 7
+            )
+            .collect::<Vec<_>>()
+            .join(",")
         );
         let over = manifest_canister_ids(&over).expect("a manifest document");
         assert_eq!(over.ids.len(), MAX_MANIFEST_CANISTERS);

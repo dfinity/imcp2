@@ -458,10 +458,8 @@ fn format_status(target: Principal, bytes: &[u8]) -> String {
                 CanisterRunStatus::Stopping => "stopping",
                 CanisterRunStatus::Stopped => "stopped",
             };
-            let module_hash = s
-                .module_hash
-                .map(|h| hex::encode(h))
-                .unwrap_or_else(|| "(none — empty canister)".into());
+            let module_hash =
+                s.module_hash.map(hex::encode).unwrap_or_else(|| "(none — empty canister)".into());
             let controllers = s
                 .settings
                 .controllers
