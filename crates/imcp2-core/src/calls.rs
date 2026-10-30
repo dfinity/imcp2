@@ -13,7 +13,7 @@
 
 use candid::{
     types::value::{IDLArgs, IDLField, IDLValue},
-    types::Label,
+    types::{Label, Type, TypeEnv, TypeInner},
     Principal,
 };
 use ic_agent::{Agent, AgentError};
@@ -45,15 +45,65 @@ pub struct GetCandidArgs {
     /// interface read itself is anonymous: this call acts as no identity.
     #[serde(default, alias = "domain")]
     pub derivation_origin: Option<String>,
+    /// Return only these methods: each one's signature together with every type
+    /// definition it uses, transitively, as a valid `.did` restricted to them. The
+    /// cheap way to read one method of a large interface. A name the service does
+    /// not declare is an error that lists the declared names.
+    #[serde(default)]
+    pub methods: Option<Vec<String>>,
+    /// How to render the interface. `full` (the default): the `.did` text, with
+    /// type definitions. `summary`: one `name : (args) -> (results)` line per
+    /// method and no type definitions — the cheap first call on a large
+    /// interface, to find the method to then ask for with `methods`. With
+    /// `methods`, a summary covers only those.
+    #[serde(default)]
+    pub view: Option<CandidView>,
 }
 
-/// Output of `get_canister_candid`.
+/// How `get_canister_candid` renders an interface: its `view` argument, echoed
+/// in its output.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+// Inlined wherever it is used, so a tool schema shows the two values in place
+// rather than behind a `$ref` into `$defs`, which not every client resolves.
+#[schemars(inline)]
+pub enum CandidView {
+    /// The interface as `.did` text: every method the reply covers, together
+    /// with the type definitions those methods use.
+    #[default]
+    Full,
+    /// One `name : (args) -> (results)` line per method, type names left
+    /// unexpanded and no type definitions: a cheap index of a large interface.
+    Summary,
+}
+
+/// Output of `get_canister_candid`. The interface text itself is the reply's
+/// FIRST text content block and deliberately not a field here: a large interface
+/// runs to tens of KB, and carrying it in both the text and the structured
+/// content doubled the reply, which got it truncated by the client. This object
+/// describes that block instead — how it renders the interface, which methods it
+/// covers, and how big the complete interface is.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct GetCandidOutput {
     /// The canister whose interface was read.
     pub canister_id: String,
-    /// The Candid (`.did`) interface text.
-    pub candid: String,
+    /// How the first text block renders the interface: `full` is `.did` text with
+    /// type definitions, `summary` one signature line per method without them.
+    pub view: CandidView,
+    /// The methods the first text block is restricted to, sorted by name (the
+    /// order Candid keeps a service's methods in). Absent when it covers every
+    /// method.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub methods: Option<Vec<String>>,
+    /// Byte length of the complete published `.did` — what a `full` reply with no
+    /// `methods` carries as its first text block.
+    pub candid_bytes: usize,
+    /// How many methods the service declares in total, whatever the reply covers.
+    /// Null when the interface could not be parsed, which only the `full` view with
+    /// no `methods` survives (its text block is the published text verbatim).
+    pub method_count: Option<usize>,
     /// True when the canister declares an OQL query surface. Reads then go through
     /// get_canister_oql_schema and canister_query's `oql` argument, and this server refuses
     /// a Candid `method` query on the canister. Update calls are unaffected.
@@ -892,9 +942,239 @@ pub fn has_oql(did: &str) -> bool {
         let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() else {
             return false;
         };
-        env.get_method(&actor, "schema").is_ok() && env.get_method(&actor, "execute").is_ok()
+        oql_declared(&env, &actor)
     })
     .unwrap_or(false)
+}
+
+/// The OQL predicate over a parsed interface — BOTH a `schema` and an `execute`
+/// method — shared by [`has_oql`] and [`render_candid`] so the `oql` flag
+/// `get_canister_candid` reports can never drift from the detection every other
+/// path uses.
+fn oql_declared(env: &TypeEnv, actor: &Type) -> bool {
+    env.get_method(actor, "schema").is_ok() && env.get_method(actor, "execute").is_ok()
+}
+
+/// The API-documentation method names a canister may declare, in the order
+/// [`api_doc_method`] checks them (a canister uses one naming style).
+const API_DOC_METHODS: [&str; 2] = ["getApiDoc", "get_api_doc"];
+
+/// The API-doc predicate over a parsed interface, shared by [`api_doc_method`]
+/// and [`render_candid`] for the same reason as [`oql_declared`].
+fn api_doc_declared(env: &TypeEnv, actor: &Type) -> Option<&'static str> {
+    API_DOC_METHODS.into_iter().find(|m| env.get_method(actor, m).is_ok())
+}
+
+/// Column width the summary lines are laid out at: wide enough that a method's
+/// signature stays on ONE line — the listing's whole point — so only a signature
+/// longer than this wraps.
+const SUMMARY_LINE_WIDTH: usize = 10_000;
+
+/// Declared method names an unknown-method error lists before cutting off. The
+/// error exists so a mistyped name is repaired in one step; listing every name
+/// of a very large service would defeat that by its own size.
+const MAX_LISTED_METHODS: usize = 100;
+
+/// What [`render_candid`] made of a canister's interface for one
+/// `get_canister_candid` reply: the reply's first text block, plus the facts its
+/// structured output states about it — all from a single parse.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CandidRendering {
+    /// The reply's first text block: the complete `.did` verbatim, a `.did`
+    /// restricted to the requested methods, or the summary lines.
+    pub text: String,
+    /// The methods `text` is restricted to, sorted by name; `None` when it covers
+    /// every method.
+    pub methods: Option<Vec<String>>,
+    /// Methods the service declares in total; `None` when the interface could not
+    /// be parsed, which only the verbatim full view survives.
+    pub method_count: Option<usize>,
+    /// Type definitions a restricted `.did` carries — the ones the requested
+    /// methods use, transitively. `None` for every other rendering.
+    pub types_included: Option<usize>,
+    /// What [`has_oql`] says of the same interface.
+    pub oql: bool,
+    /// Whether [`api_doc_method`] finds a method on the same interface.
+    pub api_doc_available: bool,
+}
+
+/// Render a canister's published `.did` text the way `get_canister_candid` was
+/// asked to, and establish the facts the reply states about it, in ONE parse:
+///
+/// * `Full` with no `methods` — the published text **verbatim** (never
+///   re-printed: comments and declaration order survive), with the capability
+///   flags; an interface that cannot be parsed still comes back this way, with
+///   both flags false and no method count, exactly as [`has_oql`] and
+///   [`api_doc_method`] degrade.
+/// * `Full` with `methods` — a `.did` restricted to those methods: their
+///   signatures plus every type definition they use, transitively (the closure
+///   `candid_parser`'s own binding generators compute), printed by candid's
+///   printer. The service's init arguments are dropped — they are not needed
+///   to call a method — so the result is a plain `service : { … }` that parses
+///   and encodes against those methods.
+/// * `Summary` — one `name : (args) -> (results) [query]` line per method (all
+///   of them, or the `methods` asked for), type names unexpanded and no type
+///   definitions. Not a valid `.did` on its own, by design: it is the cheap
+///   index of a large interface.
+///
+/// Method names are trimmed and de-duplicated; a name the service does not
+/// declare is an error listing the declared names, so a mistyped name is
+/// repaired in one step. A view other than the verbatim one needs the
+/// interface parsed, so for an interface that trips [`guard_candid_text`]
+/// (CWE-674), does not parse, or declares no service it is an error naming the
+/// verbatim read that is still available. Untrusted text: guarded and parsed on
+/// the deep stack like every sibling here, and nothing but `String`s crosses
+/// back from the parse.
+pub fn render_candid(
+    did: &str,
+    view: CandidView,
+    methods: Option<&[String]>,
+) -> Result<CandidRendering, String> {
+    let selection: Option<Vec<String>> = methods.map(|names| {
+        let mut seen = BTreeSet::new();
+        names
+            .iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty() && seen.insert(name.clone()))
+            .collect()
+    });
+    if selection.as_ref().is_some_and(Vec::is_empty) {
+        return Err("`methods` names no method; omit `methods` to read the whole interface, or \
+                    name at least one method"
+            .into());
+    }
+    let verbatim = view == CandidView::Full && selection.is_none();
+    // The interface as published, with nothing established about it — what the
+    // verbatim view falls back to when the text cannot be parsed.
+    let unparsed = || CandidRendering {
+        text: did.to_string(),
+        methods: None,
+        method_count: None,
+        types_included: None,
+        oql: false,
+        api_doc_available: false,
+    };
+    let only_verbatim = |reason: String| {
+        format!(
+            "only the complete interface can be read from this canister — {reason}; omit \
+             `view` and `methods` to read it ({} bytes)",
+            did.len()
+        )
+    };
+    if let Err(e) = guard_candid_text("the `candid` interface", did) {
+        return if verbatim { Ok(unparsed()) } else { Err(only_verbatim(e)) };
+    }
+    on_deep_stack(|| {
+        let (env, actor) = match candid_parser::utils::CandidSource::Text(did).load() {
+            Ok((env, Some(actor))) => (env, actor),
+            Ok((_, None)) if verbatim => return Ok(unparsed()),
+            Ok((_, None)) => return Err(only_verbatim("it declares no service".into())),
+            Err(_) if verbatim => return Ok(unparsed()),
+            Err(e) => return Err(only_verbatim(format!("it does not parse as Candid: {e}"))),
+        };
+        let service = match env.as_service(&actor) {
+            Ok(service) => service,
+            Err(_) if verbatim => return Ok(unparsed()),
+            Err(e) => return Err(only_verbatim(format!("its service type is unusable: {e}"))),
+        };
+        let oql = oql_declared(&env, &actor);
+        let api_doc_available = api_doc_declared(&env, &actor).is_some();
+        let method_count = Some(service.len());
+
+        // The methods the reply covers — sorted by name, the order the Candid
+        // parser keeps a service's methods in whatever order the text lists them.
+        let covered: Vec<(String, Type)> = match &selection {
+            None => service.to_vec(),
+            Some(names) => {
+                let unknown: Vec<&String> =
+                    names.iter().filter(|n| !service.iter().any(|(m, _)| m == *n)).collect();
+                if !unknown.is_empty() {
+                    return Err(unknown_methods_error(&unknown, service));
+                }
+                service.iter().filter(|(m, _)| names.contains(m)).cloned().collect()
+            }
+        };
+        let methods = selection.as_ref().map(|_| covered.iter().map(|(m, _)| m.clone()).collect());
+        let (text, types_included) = match view {
+            CandidView::Full if selection.is_none() => (did.to_string(), None),
+            CandidView::Full => {
+                let (text, types) = restricted_did(&env, covered)?;
+                (text, Some(types))
+            }
+            CandidView::Summary => (summary_lines(&env, &covered)?, None),
+        };
+        Ok(CandidRendering { text, methods, method_count, types_included, oql, api_doc_available })
+    })
+    .unwrap_or_else(|| Err("could not spawn a thread to parse the interface".into()))
+}
+
+/// The `.did` of a service reduced to `methods`: those methods and every type
+/// definition they use, transitively, and nothing else. Returns the text and
+/// the number of type definitions it carries. Must run on the deep stack — it
+/// walks and prints the parsed, untrusted interface (CWE-674).
+fn restricted_did(env: &TypeEnv, methods: Vec<(String, Type)>) -> Result<(String, usize), String> {
+    let projected: Type = TypeInner::Service(methods).into();
+    // Every type definition reachable from the projected service's signatures:
+    // the same closure the binding generators use, so a recursive or mutually
+    // recursive definition is chased exactly once.
+    let needed: Vec<String> = candid_parser::bindings::analysis::chase_actor(env, &projected)
+        .map_err(|e| format!("could not resolve the types those methods use: {e}"))?
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut subset = TypeEnv::new();
+    for name in &needed {
+        let ty = env
+            .find_type(name)
+            .map_err(|e| format!("could not resolve the types those methods use: {e}"))?;
+        subset.0.insert(name.clone(), ty.clone());
+    }
+    Ok((candid::pretty::candid::compile(&subset, &Some(projected)), needed.len()))
+}
+
+/// One `name : (args) -> (results) [query]` line per method, each signature on
+/// its own line (see [`SUMMARY_LINE_WIDTH`]), type names left unexpanded. Must
+/// run on the deep stack, like [`restricted_did`].
+fn summary_lines(env: &TypeEnv, methods: &[(String, Type)]) -> Result<String, String> {
+    use candid::pretty::candid::{pp_function, pp_text};
+    let mut lines = Vec::with_capacity(methods.len());
+    for (name, ty) in methods {
+        // A method declared through a named function type (`m : MyFunc`) is
+        // listed with that type resolved: the signature is what the line is for.
+        let func =
+            env.as_func(ty).map_err(|e| format!("method `{name}` has no function type: {e}"))?;
+        lines.push(format!(
+            "{} : {}",
+            pp_text(name).pretty(SUMMARY_LINE_WIDTH),
+            pp_function(func).pretty(SUMMARY_LINE_WIDTH)
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// The error for `methods` naming what the service does not declare: the
+/// unknown names, then the declared ones (up to [`MAX_LISTED_METHODS`]), so
+/// the caller can correct the name without a second read.
+fn unknown_methods_error(unknown: &[&String], service: &[(String, Type)]) -> String {
+    let unknown = unknown.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ");
+    let listed = service
+        .iter()
+        .take(MAX_LISTED_METHODS)
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = service.len().saturating_sub(MAX_LISTED_METHODS);
+    let more = if rest > 0 {
+        format!(", and {rest} more (`view: \"summary\"` lists them all)")
+    } else {
+        String::new()
+    };
+    let count = service.len();
+    let plural = if count == 1 { "" } else { "s" };
+    format!(
+        "the service declares no method named {unknown}; it declares {count} method{plural}: \
+         {listed}{more}"
+    )
 }
 
 /// Every method name the service in `did` declares — read from the actor through
@@ -1471,7 +1751,7 @@ pub fn api_doc_method(did: &str) -> Option<&'static str> {
         let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() else {
             return None;
         };
-        ["getApiDoc", "get_api_doc"].into_iter().find(|m| env.get_method(&actor, m).is_ok())
+        api_doc_declared(&env, &actor)
     })
     .flatten()
 }
@@ -2990,5 +3270,251 @@ mod tests {
         // trip the anonymous-read auth hint (only `variant { none }` counts).
         assert!(!candid_reply_is_empty("(variant { err = \"not found\" })"));
         assert!(!candid_reply_is_empty("(variant { error = \"nope\" })"));
+    }
+
+    // An interface with the shapes the views have to get right: a comment and a
+    // declaration order the printer would not preserve (so "verbatim" is
+    // observable), a recursive type, a type reachable only through another, an
+    // unused type, a method declared through a named function type, every call
+    // mode, an OQL pair, an API-doc method, and a service constructor whose init
+    // argument type nothing else uses.
+    const VIEWS_DID: &str = "// Registry interface.\n\
+        type Page = record { offset : nat; limit : nat };\n\
+        type Engine = record { id : nat; name : text; children : vec Engine };\n\
+        type ListResult = variant { ok : vec Engine; err : Error };\n\
+        type Error = variant { NotFound; Unauthorized : text };\n\
+        type Unused = record { x : nat };\n\
+        type Callback = func (nat) -> (text) query;\n\
+        type InitArgs = record { admin : principal };\n\
+        service : (InitArgs) -> {\n  \
+          listVisibleEngines : (Page) -> (ListResult) query;\n  \
+          createEngine : (text) -> (Engine);\n  \
+          notify : (text) -> () oneway;\n  \
+          subscribe : Callback;\n  \
+          schema : () -> (text) query;\n  \
+          execute : (text) -> (text) query;\n  \
+          get_api_doc : () -> (text) query;\n\
+        }\n";
+
+    // The default view hands back the published text byte for byte — never a
+    // re-print, which would drop the comment and reorder the declarations — and
+    // the facts the structured output states come from the same parse the
+    // capability flags always came from.
+    #[test]
+    fn render_candid_full_view_is_the_published_text_verbatim() {
+        use super::{api_doc_method, has_oql, render_candid, CandidView};
+        let r = render_candid(VIEWS_DID, CandidView::Full, None).expect("renders");
+        assert_eq!(r.text, VIEWS_DID, "the complete interface is the published text itself");
+        assert_eq!(r.methods, None, "nothing restricts it");
+        assert_eq!(r.method_count, Some(7));
+        assert_eq!(r.types_included, None, "only a restricted .did counts its definitions");
+        assert!(r.oql, "schema + execute are declared");
+        assert_eq!(r.oql, has_oql(VIEWS_DID), "the flag is the one has_oql reports");
+        assert!(r.api_doc_available);
+        assert_eq!(r.api_doc_available, api_doc_method(VIEWS_DID).is_some());
+
+        // Without the pair / the doc method, both flags are false on the same path.
+        let plain = "service : { greet : (text) -> (text) query }";
+        let r = render_candid(plain, CandidView::Full, None).expect("renders");
+        assert!(!r.oql && !r.api_doc_available);
+        assert_eq!(r.method_count, Some(1));
+    }
+
+    // The summary is one line per method, sorted by name (as the Candid parser
+    // orders a service's methods), with the mode and the type names as written —
+    // no definitions, nothing wrapped — and a method declared through a named
+    // function type shows its signature.
+    #[test]
+    fn render_candid_summary_lists_one_signature_per_method() {
+        use super::{render_candid, CandidView};
+        let r = render_candid(VIEWS_DID, CandidView::Summary, None).expect("renders");
+        assert_eq!(
+            r.text.lines().collect::<Vec<_>>(),
+            vec![
+                "createEngine : (text) -> (Engine)",
+                "execute : (text) -> (text) query",
+                "get_api_doc : () -> (text) query",
+                "listVisibleEngines : (Page) -> (ListResult) query",
+                "notify : (text) -> () oneway",
+                "schema : () -> (text) query",
+                "subscribe : (nat) -> (text) query",
+            ]
+        );
+        assert_eq!(r.methods, None, "a summary of everything restricts nothing");
+        assert_eq!(r.method_count, Some(7));
+        assert!(r.oql && r.api_doc_available, "the flags come along with every view");
+
+        // A wide inline signature stays on its one line: the listing is grep-able.
+        let wide = format!(
+            "service : {{ m : (record {{ {} }}) -> (vec record {{ a : nat; b : text }}) }}",
+            (0..40).map(|i| format!("field_{i} : opt vec nat64")).collect::<Vec<_>>().join("; ")
+        );
+        let r = render_candid(&wide, CandidView::Summary, None).expect("renders");
+        assert_eq!(r.text.lines().count(), 1, "one method, one line: {}", r.text);
+        assert!(r.text.starts_with("m : (record { field_"), "{}", r.text);
+        assert!(r.text.contains("field_0 : opt vec nat64;"), "{}", r.text);
+
+        // Restricted to some methods: those lines only, sorted by name whatever
+        // the order asked, trimmed and de-duplicated.
+        let names = [" execute ".to_string(), "createEngine".into(), "execute".into()];
+        let r = render_candid(VIEWS_DID, CandidView::Summary, Some(&names)).expect("renders");
+        assert_eq!(
+            r.text.lines().collect::<Vec<_>>(),
+            vec!["createEngine : (text) -> (Engine)", "execute : (text) -> (text) query"]
+        );
+        assert_eq!(r.methods.as_deref(), Some(&["createEngine".to_string(), "execute".into()][..]));
+        assert_eq!(r.method_count, Some(7), "the total is the service's, not the selection's");
+    }
+
+    // `methods` yields a `.did` that is complete for exactly those methods:
+    // every type definition they use, transitively (through a variant into a
+    // recursive record, here), none they don't, no init arguments — and it
+    // parses, resolves the methods, and encodes their arguments exactly as the
+    // full interface does, so it serves as canister_query's `candid` fallback.
+    #[test]
+    fn render_candid_methods_view_carries_only_the_types_the_methods_use() {
+        use super::{encode_args, render_candid, CandidView};
+        let names = ["listVisibleEngines".to_string()];
+        let r = render_candid(VIEWS_DID, CandidView::Full, Some(&names)).expect("renders");
+        assert_eq!(r.methods.as_deref(), Some(&names[..]));
+        assert_eq!(r.method_count, Some(7));
+        assert_eq!(r.types_included, Some(4), "Page, ListResult, Engine, Error: {}", r.text);
+        for present in ["type Page =", "type ListResult =", "type Engine =", "type Error ="] {
+            assert!(r.text.contains(present), "{present} must be carried: {}", r.text);
+        }
+        for absent in ["Unused", "Callback", "InitArgs", "createEngine", "schema", "// Registry"] {
+            assert!(!r.text.contains(absent), "{absent} must not be carried: {}", r.text);
+        }
+        assert!(r.text.contains("service : {"), "a plain service, no constructor: {}", r.text);
+        assert!(r.text.len() < VIEWS_DID.len(), "smaller than the interface: {}", r.text);
+        assert!(r.oql && r.api_doc_available, "the flags describe the whole canister");
+
+        let (env, actor) =
+            candid_parser::utils::CandidSource::Text(&r.text).load().expect("valid .did");
+        let actor = actor.expect("declares a service");
+        let func = env.get_method(&actor, "listVisibleEngines").expect("the method is declared");
+        assert!(func.is_query());
+        assert!(env.get_method(&actor, "createEngine").is_err(), "no other method");
+        let args = "(record { offset = 0; limit = 10 })";
+        assert_eq!(
+            encode_args(Some(&r.text), "listVisibleEngines", args).expect("encodes"),
+            encode_args(Some(VIEWS_DID), "listVisibleEngines", args).expect("encodes"),
+            "the restricted .did types the arguments exactly as the full one does"
+        );
+
+        // Several methods, asked in any order, come back sorted by name with the
+        // union of their types; a method declared through a named function type
+        // carries that definition.
+        let names = ["subscribe".to_string(), "createEngine".into()];
+        let r = render_candid(VIEWS_DID, CandidView::Full, Some(&names)).expect("renders");
+        assert_eq!(
+            r.methods.as_deref(),
+            Some(&["createEngine".to_string(), "subscribe".into()][..])
+        );
+        assert_eq!(r.types_included, Some(2), "Engine and Callback: {}", r.text);
+        assert!(
+            r.text.contains("type Callback =") && r.text.contains("type Engine ="),
+            "{}",
+            r.text
+        );
+        assert!(!r.text.contains("Page") && !r.text.contains("Error"), "{}", r.text);
+        let (env, actor) =
+            candid_parser::utils::CandidSource::Text(&r.text).load().expect("valid .did");
+        let actor = actor.expect("declares a service");
+        assert!(env.get_method(&actor, "subscribe").expect("declared").is_query());
+        assert!(!env.get_method(&actor, "createEngine").expect("declared").is_query());
+
+        // A method using no named type at all is a `.did` with no definitions.
+        let names = ["notify".to_string()];
+        let r = render_candid(VIEWS_DID, CandidView::Full, Some(&names)).expect("renders");
+        assert_eq!(r.types_included, Some(0));
+        assert!(!r.text.contains("type "), "{}", r.text);
+        assert!(r.text.contains("notify : (text) -> () oneway"), "{}", r.text);
+    }
+
+    // A selection the service cannot satisfy is an error the caller repairs in
+    // one step: it names the unknown methods and lists the declared ones — up to
+    // a cap, past which it says how many more there are and where to see them.
+    #[test]
+    fn render_candid_rejects_unknown_and_empty_selections_naming_the_declared_methods() {
+        use super::{render_candid, CandidView, MAX_LISTED_METHODS};
+        let names = ["listEngines".to_string(), "createEngine".into(), "nope".into()];
+        for view in [CandidView::Full, CandidView::Summary] {
+            let e = render_candid(VIEWS_DID, view, Some(&names)).expect_err("unknown methods");
+            assert!(e.contains("`listEngines`") && e.contains("`nope`"), "{e}");
+            assert!(!e.contains("`createEngine`"), "a declared method is not 'unknown': {e}");
+            assert!(
+                e.contains(
+                    "it declares 7 methods: createEngine, execute, get_api_doc, \
+                     listVisibleEngines, notify, schema, subscribe"
+                ),
+                "{e}"
+            );
+            assert!(!e.contains("more"), "all seven fit the list: {e}");
+        }
+        // An empty selection — or one that is empty once trimmed — is refused too,
+        // rather than silently widening to the whole (possibly huge) interface.
+        for empty in [vec![], vec!["  ".to_string(), String::new()]] {
+            for view in [CandidView::Full, CandidView::Summary] {
+                let e = render_candid(VIEWS_DID, view, Some(&empty)).expect_err("names nothing");
+                assert!(e.contains("names no method; omit `methods`"), "{e}");
+                assert!(!e.contains("  "), "one continuous sentence: {e}");
+            }
+        }
+        // Past the cap, the list is cut and the rest counted, with the summary
+        // view named as the way to see every name. (Zero-padded names, so the
+        // by-name order the parser imposes is the numeric one.)
+        let total = MAX_LISTED_METHODS + 50;
+        let many = format!(
+            "service : {{ {} }}",
+            (0..total).map(|i| format!("m{i:03} : () -> ()")).collect::<Vec<_>>().join("; ")
+        );
+        let e = render_candid(&many, CandidView::Full, Some(&["zzz".to_string()]))
+            .expect_err("unknown method");
+        assert!(e.contains(&format!("it declares {total} methods: m000, m001,")), "{e}");
+        assert!(e.contains(&format!("m{:03}, and 50 more", MAX_LISTED_METHODS - 1)), "{e}");
+        assert!(!e.contains(&format!("m{MAX_LISTED_METHODS:03},")), "cut at the cap: {e}");
+        assert!(e.contains("`view: \"summary\"`"), "{e}");
+    }
+
+    // Every view but the verbatim one needs the interface parsed. An interface
+    // that cannot be — it trips the CWE-674 guard, does not parse, or declares
+    // no service — still comes back verbatim from the default view, with the
+    // flags false and no method count (exactly how has_oql/api_doc_method
+    // degrade), while the other views say so and name the read that works.
+    #[test]
+    fn render_candid_needs_a_parseable_interface_for_every_view_but_the_verbatim_one() {
+        use super::{render_candid, CandidRendering, CandidView, MAX_CANDID_TYPE_DECLS};
+        let too_many_types = format!(
+            "{}service : {{ m : () -> () }}",
+            (0..=MAX_CANDID_TYPE_DECLS).map(|i| format!("type t{i} = nat; ")).collect::<String>()
+        );
+        let unparseable = "service : { greet : (text) -> (text) query; !!!";
+        let no_service = "type A = record { x : nat };";
+        let names = ["m".to_string()];
+        for did in [too_many_types.as_str(), unparseable, no_service] {
+            assert_eq!(
+                render_candid(did, CandidView::Full, None).expect("verbatim"),
+                CandidRendering {
+                    text: did.to_string(),
+                    methods: None,
+                    method_count: None,
+                    types_included: None,
+                    oql: false,
+                    api_doc_available: false,
+                },
+                "the verbatim view survives an interface that cannot be parsed"
+            );
+            for (view, methods) in [
+                (CandidView::Summary, None),
+                (CandidView::Full, Some(&names[..])),
+                (CandidView::Summary, Some(&names[..])),
+            ] {
+                let e = render_candid(did, view, methods).expect_err("needs a parse");
+                assert!(e.contains("only the complete interface can be read"), "{e}");
+                assert!(e.contains(&format!("({} bytes)", did.len())), "says its size: {e}");
+                assert!(e.contains("omit `view` and `methods`"), "names the read that works: {e}");
+            }
+        }
     }
 }
