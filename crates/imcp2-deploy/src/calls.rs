@@ -20,7 +20,10 @@ use icp_project::calls::{Authority, Call, CallError, CanisterCalls, RouteTo};
 /// [`CanisterCalls`] over an `ic-agent`.
 pub struct AgentCalls {
     agent: Agent,
-    /// Read once at construction: it cannot change for the life of the agent.
+    /// The agent's principal, read once here. [`CanisterCalls::caller`] is
+    /// infallible while [`Agent::get_principal`] is not (an identity may
+    /// decline to name its sender), so the one place the failure can be
+    /// reported is construction; the agent's identity cannot change after it.
     caller: Principal,
 }
 

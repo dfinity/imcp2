@@ -196,9 +196,13 @@ pub async fn deploy_bundle(
             .map_err(RequestError)?;
     }
 
-    let host = host::host_for(&dir);
+    let host = host::host_for(&dir).map_err(RequestError)?;
     let selection = EnvironmentSelection::Named(request.environment.clone());
     let env = host.get_environment(&selection).await.map_err(|e| RequestError(error_chain(&e)))?;
+    // Before any phase runs: a script step is refused here, not at the phase
+    // that would reach it after canisters have been created.
+    host::refuse_scripts(env.canisters.values().map(|(_, canister)| canister))
+        .map_err(RequestError)?;
 
     // Seed the id store with the mapping the caller passed: from here on the
     // operation sees those canisters as existing, exactly as it would see the
@@ -292,13 +296,15 @@ pub async fn deploy_bundle(
     match host.ids_by_environment(&selection).await {
         Ok(ids) => outcome.canister_ids = ids.into_iter().collect(),
         Err(e) => {
-            // The created list is the fallback: those ids were reported before
-            // being recorded, so they are known even when the store is not.
-            for (name, id) in &outcome.created {
-                outcome.canister_ids.insert(name.clone(), *id);
-            }
             outcome.log.push(format!("reading the canister ids back failed: {}", error_chain(&e)));
         }
+    }
+    // A created id is reported before it is recorded, so the created list is
+    // the authority: it fills in whatever the store failed to record — or to
+    // read back — because a mapping missing a canister that exists would have
+    // the retry create it again.
+    for (name, id) in &outcome.created {
+        outcome.canister_ids.insert(name.clone(), *id);
     }
 
     drop(scratch);
@@ -385,16 +391,20 @@ mod tests {
             "canisters:\n  - name: backend\n    build:\n      steps:\n        - type: pre-built\n          \
              path: canisters/backend.wasm\n          sha256: {sha256}\n"
         );
+        archive(&[("icp.yaml", manifest.as_bytes()), ("canisters/backend.wasm", wasm)])
+    }
+
+    fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
             Vec::new(),
             flate2::Compression::fast(),
         ));
-        for (path, data) in [("icp.yaml", manifest.as_bytes()), ("canisters/backend.wasm", wasm)] {
+        for (path, data) in entries {
             let mut header = tar::Header::new_gnu();
             header.set_size(data.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            archive.append_data(&mut header, path, data).unwrap();
+            archive.append_data(&mut header, path, *data).unwrap();
         }
         let mut encoder = archive.into_inner().unwrap();
         encoder.flush().unwrap();
@@ -503,6 +513,58 @@ mod tests {
             .await
             .expect_err("no such canister");
         assert!(err.0.contains("frontend"), "{err}");
+    }
+
+    // A bundle never carries a script step, and this server never runs one:
+    // a manifest that declares one is refused as a request error, before any
+    // phase — so no canister is created ahead of a sync step that would then
+    // be refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_script_step_is_refused_before_any_phase_runs() {
+        let manifest = "canisters:\n  - name: backend\n    build:\n      steps:\n        \
+                        - type: script\n          command: touch /tmp/pwned\n";
+        let bytes = archive(&[("icp.yaml", manifest.as_bytes())]);
+        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
+            .await
+            .expect_err("a script step is refused");
+        assert!(err.0.contains("backend") && err.0.contains("script build step"), "{err}");
+    }
+
+    // The manifest's paths are confined to the extracted bundle: a variable
+    // file outside it is refused at load — before any phase, since the value
+    // would otherwise be sent to the canister as a setting — and a wasm
+    // outside it fails the build phase, whether absolute or climbing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paths_that_lead_outside_the_bundle_are_refused() {
+        let (wasm, sha) = wasm();
+        let manifest = format!(
+            "canisters:\n  - name: backend\n    settings:\n      environment_variables:\n        \
+             SECRET:\n          path: /etc/hostname\n    build:\n      steps:\n        \
+             - type: pre-built\n          path: canisters/backend.wasm\n          sha256: {sha}\n"
+        );
+        let bytes =
+            archive(&[("icp.yaml", manifest.as_bytes()), ("canisters/backend.wasm", &wasm)]);
+        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
+            .await
+            .expect_err("a variable file outside the bundle is refused");
+        assert!(err.0.contains("outside the bundle"), "{err}");
+
+        for path in ["/etc/hostname", "../../../../etc/hostname"] {
+            let manifest = format!(
+                "canisters:\n  - name: backend\n    build:\n      steps:\n        - type: pre-built\n          \
+                 path: {path}\n          sha256: {sha}\n"
+            );
+            let bytes = archive(&[("icp.yaml", manifest.as_bytes())]);
+            let outcome = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
+                .await
+                .expect("the request is valid");
+            assert_eq!(outcome.status, Status::Failed);
+            assert!(
+                outcome.log.iter().any(|l| l.contains("outside the bundle")),
+                "{path}: {:?}",
+                outcome.log
+            );
+        }
     }
 
     // The log is what the agent (and the user) read to learn how far a deploy
