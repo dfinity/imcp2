@@ -7,8 +7,9 @@ It serves the same tools as the hosted server at
 [mcp.internetcomputer.org](https://mcp.internetcomputer.org) — canister reads
 and writes in textual Candid, app discovery, OQL, canister management —
 against the same **IC mainnet** and the same **production Internet
-Identity**, plus one tool of its own, `icp_deploy_bundle`, which deploys an
-icp project bundle (see [Deploying a project bundle](#deploying-a-project-bundle)).
+Identity**, plus two tools of its own: `icp_deploy_bundle`, which deploys an
+icp project bundle (see [Deploying a project bundle](#deploying-a-project-bundle)),
+and `icp_cycles_balance`, which reports the balance those deploys draw on.
 What it drops is the hosted server's entire OAuth 2.1 layer: a
 single-user process reached over a pipe needs no bearer tokens, so your II
 login never passes through a third-party server.

@@ -54,6 +54,10 @@ mod e2e_canister_tools;
 /// crate links.
 pub use ic_agent::{self, Agent};
 pub use identities::{IiInstance, SessionGauges};
+/// The cycles-ledger balance of a session's management principal: the
+/// `icp_cycles_balance` tool's logic, for an embedder that serves that tool
+/// on its own surface (the local server's deploy tools do).
+pub use management::{cycles_balance, CyclesBalance};
 pub use tools::{IcCanisterTools, IcProtocolTools, IcTools, SessionResolver};
 
 /// A sensible default IC API boundary node (the public mainnet endpoint) for

@@ -3,7 +3,7 @@
 //! cannot live in `imcp2-core` — they drive this binary's loopback listener
 //! and browser opener, which core cannot call back into — so this wrapper
 //! carries them in its own `#[tool_router]`. The deploy tool
-//! (`icp_deploy_bundle`, [`IcDeployTools`]) cannot either, for a different
+//! (`icp_deploy_bundle` and `icp_cycles_balance`, [`IcDeployTools`]) cannot either, for a different
 //! reason: it runs on the icp CLI's project library, a git dependency the
 //! published crates cannot carry. The wrapper answers `tools/list` with the
 //! merged list, dispatches `tools/call` to its own router, then the deploy
@@ -278,8 +278,9 @@ impl ServerHandler for LocalServer {
              rule above that no tool deploys: it deploys an icp project bundle (`icp project \
              bundle --output <file>`, built in the user's environment) to the environment it \
              names, creating the canisters that do not exist yet from the user's cycles \
-             balance and upgrading those passed in `canister_ids`. It needs an \"Actions & \
-             questions\" session, and it returns the canister-id mapping to pass back next time. \
+             balance (`icp_cycles_balance` reports it) and upgrading those passed in \
+             `canister_ids`. It needs an \"Actions & questions\" session, and it returns the \
+             canister-id mapping to pass back next time. \
              The `skill://deploy-with-mcp` resource walks through the loop: bundle, deploy, \
              write the mapping back into the project."
         ));
@@ -450,8 +451,9 @@ mod tests {
         let tools = client.list_all_tools().await.expect("tools/list");
         assert_eq!(
             tools.len(),
-            13,
-            "10 served core tools + authenticate + auth_status + icp_deploy_bundle"
+            14,
+            "10 served core tools + authenticate + auth_status + icp_deploy_bundle + \
+             icp_cycles_balance"
         );
         for expected in [
             "get_canister_candid",
@@ -459,6 +461,7 @@ mod tests {
             "authenticate",
             "auth_status",
             "icp_deploy_bundle",
+            "icp_cycles_balance",
         ] {
             assert!(tools.iter().any(|t| &*t.name == expected), "missing {expected}");
         }

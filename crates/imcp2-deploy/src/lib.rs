@@ -1,6 +1,7 @@
 //! imcp2-deploy — the `icp_deploy_bundle` MCP tool: deploy an icp project
 //! bundle to the Internet Computer as the user, through the icp CLI's own
-//! project library (`icp-project`, the code behind `icp deploy`).
+//! project library (`icp-project`, the code behind `icp deploy`). Next to it,
+//! `icp_cycles_balance`: the balance those deploys create canisters from.
 //!
 //! The tool takes a bundle (the `.tar.gz` that `icp project bundle` writes),
 //! the name of an environment the bundle declares, and optionally the canister
@@ -26,7 +27,7 @@ use base64::Engine;
 use camino::Utf8PathBuf;
 use candid::Principal;
 use ic_agent::Identity;
-use imcp2_core::{identities::Identities, SessionResolver};
+use imcp2_core::{cycles_balance, identities::Identities, CyclesBalance, SessionResolver};
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{CallToolResult, ContentBlock},
@@ -259,8 +260,13 @@ pub fn request_from_args(args: DeployBundleArgs) -> Result<DeployRequest, String
     })
 }
 
-/// The deploy tool group: one tool, `icp_deploy_bundle`, served alongside the
-/// core surface by the binary that composes it.
+/// The deploy tool group, served alongside the core surface by the binary
+/// that composes it: `icp_deploy_bundle`, and `icp_cycles_balance` — the
+/// check a deploy that will create canisters starts with. The core surface
+/// has a tool of that name too, in its protocol/meta half, which the local
+/// server does not serve; this one is the same logic on the surface the
+/// deploy loop runs on. Should the core half be served alongside one day,
+/// drop this copy rather than list the name twice.
 #[derive(Clone)]
 pub struct IcDeployTools {
     identities: Identities,
@@ -311,7 +317,30 @@ impl IcDeployTools {
             }
         }
     }
+
+    #[tool(
+        description = "Return the cycles-ledger balance of the principal icp_deploy_bundle deploys as (your management identity), and that principal. Call it before a deploy that will create canisters, to check the balance covers them (2T cycles each by default), and to get the principal to add as a controller of a canister created elsewhere.",
+        annotations(title = "Check your cycles balance", read_only_hint = true, destructive_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<CyclesBalance>(),
+    )]
+    async fn icp_cycles_balance(
+        &self,
+        Parameters(_args): Parameters<NoArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(sid) = (self.session)(&ctx) else {
+            return Ok(err("checking your cycles balance needs an authenticated session".into()));
+        };
+        match cycles_balance(&self.identities, &sid).await {
+            Ok(balance) => Ok(ok_structured(balance.human(), &balance)),
+            Err(e) => Ok(err(e)),
+        }
+    }
 }
+
+/// `icp_cycles_balance` takes no arguments.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct NoArgs {}
 
 /// Same contract as the core surface's result builder: the human-readable
 /// text plus `structuredContent` conforming to the declared `outputSchema`.
@@ -395,15 +424,23 @@ mod tests {
         assert_eq!(skill_document("icp-cli"), None);
     }
 
-    // The group carries exactly the one tool, with honest annotations (it
-    // creates canisters and can wipe state) and an object-rooted outputSchema
-    // like every tool on the core surface.
+    // The group carries the deploy tool, with honest annotations (it creates
+    // canisters and can wipe state) and an object-rooted outputSchema like
+    // every tool on the core surface, and the read-only balance check beside
+    // it.
     #[test]
-    fn the_router_carries_the_one_deploy_tool() {
+    fn the_router_carries_the_deploy_tool_and_the_balance_check() {
         let tools = IcDeployTools::tool_router().list_all();
-        assert_eq!(tools.len(), 1);
-        let tool = &tools[0];
-        assert_eq!(&*tool.name, "icp_deploy_bundle");
+        assert_eq!(tools.len(), 2);
+        let balance = tools.iter().find(|t| &*t.name == "icp_cycles_balance").expect("balance");
+        let ann = balance.annotations.clone().expect("annotations");
+        assert_eq!(ann.read_only_hint, Some(true));
+        let output =
+            serde_json::to_value(balance.output_schema.as_ref().expect("outputSchema")).unwrap();
+        assert!(output["properties"]["balance"].is_object(), "{output}");
+        assert!(output["properties"]["principal"].is_object(), "{output}");
+
+        let tool = tools.iter().find(|t| &*t.name == "icp_deploy_bundle").expect("deploy");
         let ann = tool.annotations.clone().expect("annotations");
         assert_eq!(ann.read_only_hint, Some(false));
         assert_eq!(ann.destructive_hint, Some(true));
