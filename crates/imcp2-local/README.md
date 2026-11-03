@@ -169,17 +169,33 @@ canisters created, and a log of each phase. A failed deploy still reports every
 canister it created before failing, so the run can be picked up rather than
 repeated.
 
-Calls are signed as your **CLI identity**: your default II account at
-`https://cli.id.ai`, the origin `icp identity link web` signs in at. That is
-the principal the icp CLI deploys as on your machine, so canisters deployed
-here are the ones `icp` lists and controls, and they are funded from the same
-cycles balance. `icp_cycles_balance` reports that balance and principal. It is
+Calls are signed as your **default Internet Identity account at
+`https://cli.id.ai`**, the origin `icp identity link web` links an icp CLI
+identity to. When the CLI's selected identity is such a link to the same
+account, `icp` and this tool deploy as the same principal: the canisters are
+the ones `icp` lists and controls, and they are funded from the same cycles
+balance. An `icp` identity that is a local key (`icp identity new`) or a link
+to another account is a different principal, which shares neither.
+`icp_cycles_balance` reports the balance and the principal used here, read
+from the Internet Computer whatever `IMCP2_IC_URL` says; compare it with
+`icp identity principal` before treating the two as interchangeable. It is
 not the management identity the canister lifecycle tools act as (see
 `IMCP2_MANAGEMENT_ORIGIN`); to reach a deployed canister through those tools,
 add their principal as a controller. The session must have been granted
-"Actions & questions" at sign-in. The bundle is extracted into a
-scratch directory for the duration of the deploy and removed afterwards;
-nothing is written to the project it came from.
+"Actions & questions" at sign-in.
+
+One deploy runs at a time: a second call while one is running is refused
+rather than queued, since the mapping it carries would be stale by the time
+it ran. The bundle is extracted into a working directory under your local
+data directory — `~/.local/share/imcp2-local/deploys/` on Linux,
+`~/Library/Application Support/imcp2-local/deploys/` on macOS,
+`%LOCALAPPDATA%\imcp2-local\deploys\` on Windows — removed once the deploy
+has returned its answer. A deploy that never returns (the server stopped
+mid-way, the call cancelled) leaves its directory there, and inside it
+`.icp/data/mappings/<environment>.ids.json` records every canister the
+deploy had created: merge it into the project's mapping before deploying
+again, then delete the directory. Nothing is written to the project the
+bundle came from.
 
 The server also serves a skill for the agent, `skill://deploy-with-mcp`,
 next to the IC skills the core surface bundles. It walks through the loop

@@ -279,9 +279,12 @@ impl ServerHandler for LocalServer {
              bundle --output <file>`, built in the user's environment) to the environment it \
              names, creating the canisters that do not exist yet from the user's cycles \
              balance (`icp_cycles_balance` reports it) and upgrading those passed in \
-             `canister_ids`. It deploys as the user's CLI identity (the principal `icp \
-             identity link web` signs in as), not the management identity the canister \
-             tools act as. It needs an \"Actions & questions\" session, and it returns the \
+             `canister_ids`. It deploys as the user's default Internet Identity account at \
+             https://cli.id.ai — the principal `icp identity link web` links the CLI to, and \
+             so the CLI's own only when the CLI's selected identity is that link; a local key \
+             or another account is a different principal, which `icp identity principal` \
+             shows — not as the management identity the canister tools act as. It needs an \
+             \"Actions & questions\" session, runs one deploy at a time, and returns the \
              canister-id mapping to pass back next time. \
              The `skill://deploy-with-mcp` resource walks through the loop: bundle, deploy, \
              write the mapping back into the project."
@@ -329,13 +332,18 @@ impl ServerHandler for LocalServer {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
+        let first_page = request.as_ref().and_then(|r| r.cursor.as_ref()).is_none();
         let mut result = self.tools.list_resources(request, context).await?;
         // The one skill this server adds, next to core's bundled IC skills: the
-        // deploy loop around `icp_deploy_bundle`, which only exists here.
-        result.resources.push(Resource::new(
-            format!("skill://{}", imcp2_deploy::DEPLOY_SKILL_NAME),
-            format!("IC skill: {}", imcp2_deploy::DEPLOY_SKILL_TITLE),
-        ));
+        // deploy loop around `icp_deploy_bundle`, which only exists here. Core
+        // lists everything on one page today; should it ever page, the skill
+        // belongs on the first page alone, not on every one.
+        if first_page {
+            result.resources.push(Resource::new(
+                format!("skill://{}", imcp2_deploy::DEPLOY_SKILL_NAME),
+                format!("IC skill: {}", imcp2_deploy::DEPLOY_SKILL_TITLE),
+            ));
+        }
         Ok(result)
     }
 
@@ -436,7 +444,9 @@ mod tests {
     #[tokio::test]
     async fn a_real_mcp_client_sees_the_merged_surface_and_the_login_flow() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server = test_server().serve(server_io);
+        let local = test_server();
+        let deploy_tools = local.deploy.clone();
+        let server = local.serve(server_io);
         let client = ().serve(client_io);
         let (server, client) = tokio::join!(server, client);
         let server = server.expect("server up");
@@ -517,9 +527,10 @@ mod tests {
         assert!(is_error, "an invalid canister id is a tool error");
         assert!(text.contains("invalid canister id"), "{text}");
 
-        // The deploy tool dispatches to its own router through the wrapper:
-        // signed out, it refuses before reading the bundle (the path named here
-        // does not exist, and must not be reached for) or touching the network.
+        // The deploy tools dispatch to their own router through the wrapper:
+        // signed out, `icp_deploy_bundle` refuses before reading the bundle
+        // (the path named here does not exist, and must not be reached for)
+        // or touching the network.
         let (is_error, text, _) = call(
             "icp_deploy_bundle",
             Some(serde_json::json!({
@@ -530,6 +541,31 @@ mod tests {
         .await;
         assert!(is_error, "a deploy without a session is a tool error");
         assert!(text.contains("authenticated session"), "{text}");
+
+        // While a deploy runs, a second is refused before anything else —
+        // before even the session check — so two cannot create two sets of
+        // canisters from one stale mapping.
+        let busy = deploy_tools.claim().expect("no deploy is running");
+        let (is_error, text, _) = call(
+            "icp_deploy_bundle",
+            Some(serde_json::json!({
+                "bundle_path": "/nonexistent/bundle.tar.gz",
+                "environment": "ic"
+            })),
+        )
+        .await;
+        assert!(is_error, "a second deploy is a tool error");
+        assert!(text.contains("already running"), "{text}");
+        drop(busy);
+        let (_, text, _) = call(
+            "icp_deploy_bundle",
+            Some(serde_json::json!({
+                "bundle_path": "/nonexistent/bundle.tar.gz",
+                "environment": "ic"
+            })),
+        )
+        .await;
+        assert!(text.contains("authenticated session"), "released: {text}");
 
         // Deferral: a protocol/meta tool is not just unlisted — calling it
         // fails with the router's standard "tool not found" error (the
@@ -567,6 +603,16 @@ mod tests {
         let client = ().serve(client_io);
         let (server, client) = tokio::join!(server, client);
         let (server, client) = (server.expect("server up"), client.expect("client up"));
+
+        // The deploy skill joins the first page only: a client that follows a
+        // cursor must not meet it again.
+        let mut page = rmcp::model::PaginatedRequestParams::default();
+        page.cursor = Some("next".into());
+        let later = client.list_resources(Some(page)).await.expect("resources/list with a cursor");
+        assert!(
+            !later.resources.iter().any(|r| r.uri == "skill://deploy-with-mcp"),
+            "the deploy skill must not repeat on a later page"
+        );
 
         let resources = client.list_all_resources().await.expect("resources/list");
         let skills: Vec<String> =
