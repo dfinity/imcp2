@@ -589,6 +589,41 @@ mod tests {
         assert!(err.0.contains("mainnet2") && err.0.contains("not the Internet Computer"), "{err}");
     }
 
+    // A gzip-compressed module is held to what it expands to, since the
+    // library gunzips it in memory to read its interface: one that hashes
+    // correctly but expands past the module limit is refused before any
+    // phase.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gzipped_wasm_that_expands_past_the_module_limit_is_refused() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&vec![0u8; host::MAX_WASM_BYTES as usize + 1]).unwrap();
+        let gz = encoder.finish().unwrap();
+        let sha = hex::encode(Sha256::digest(&gz));
+        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bundle(&sha, &gz), "ic"))
+            .await
+            .expect_err("an over-large gzipped module is refused");
+        assert!(err.0.contains("backend") && err.0.contains("expands past"), "{err}");
+    }
+
+    // Two canisters whose names differ only in case would share build
+    // output on a case-insensitive disk; refused before any phase.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn canister_names_that_differ_only_in_case_are_refused() {
+        let (wasm, sha) = wasm();
+        let manifest = format!(
+            "canisters:\n  - name: backend\n    build:\n      steps:\n        - type: pre-built\n          \
+             path: canisters/backend.wasm\n          sha256: {sha}\n  - name: Backend\n    build:\n      \
+             steps:\n        - type: pre-built\n          path: canisters/backend.wasm\n          \
+             sha256: {sha}\n"
+        );
+        let bytes =
+            archive(&[("icp.yaml", manifest.as_bytes()), ("canisters/backend.wasm", &wasm)]);
+        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
+            .await
+            .expect_err("case-colliding names are refused");
+        assert!(err.0.contains("differ only in letter case"), "{err}");
+    }
+
     // A `bundle_path` is read only when it is a regular file: a directory
     // here, and by the same check a device or a pipe, whose length says
     // nothing about what reading it would produce.
