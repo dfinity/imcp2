@@ -63,7 +63,7 @@ use icp_project::{
         Access, AccessError, CollectFriendlyDomains, Configuration, NetworkAccess, NetworkUrls,
         RootKeySource, RootKeySpec,
     },
-    prelude::IC_ROOT_KEY,
+    prelude::{IC, IC_MAINNET_NETWORK_API_URL, IC_ROOT_KEY},
     random::HostRandom,
     store_artifact::ArtifactStore,
     store_id::AccessImpl,
@@ -107,28 +107,40 @@ impl std::error::Error for Unsupported {}
 ///
 /// A bundle's manifest inlines its networks, and a manifest may declare any:
 /// a managed one the icp CLI would launch, a connected one with a root key to
-/// fetch or a key spelled out. This server deploys to mainnet only, so the
-/// one configuration honoured is a connected network with the pinned mainnet
-/// root key — which is what every manifest's `ic` is. [`check_bundle`]
-/// refuses the rest before any phase runs; this is the seam's own refusal,
-/// for the library's own calls.
+/// fetch or a key spelled out — or one that claims the mainnet root key over
+/// an endpoint of its choosing, which would send the user's signed calls
+/// wherever it points. This server deploys to mainnet only, so the one
+/// network honoured is the reserved `ic`: the project loader supplies it with
+/// the mainnet endpoint and the pinned root key, and refuses a manifest that
+/// redeclares the name. [`check_bundle`] refuses the rest before any phase
+/// runs; this is the seam's own refusal, for the library's own calls.
 pub struct IcMainnet;
 
 impl IcMainnet {
-    /// The connected configuration of `network`, if it is mainnet.
+    /// The connected configuration of `network`, if it is the reserved `ic`
+    /// network as the loader supplies it: that name, the mainnet endpoint and
+    /// the mainnet root key.
     pub fn mainnet(network: &Network) -> Result<&icp_project::network::Connected, Unsupported> {
-        match &network.configuration {
-            Configuration::Connected { connected }
-                if matches!(connected.root_key, RootKeySpec::Mainnet) =>
-            {
-                Ok(connected)
-            }
-            _ => Err(Unsupported(format!(
+        let refuse = || {
+            Unsupported(format!(
                 "network '{}' is not the Internet Computer; this server deploys to the `ic` \
                  network only. Deploy to the `ic` environment, or deploy elsewhere with `icp \
                  deploy`",
                 network.name
-            ))),
+            ))
+        };
+        if network.name != IC {
+            return Err(refuse());
+        }
+        match &network.configuration {
+            Configuration::Connected { connected }
+                if matches!(connected.root_key, RootKeySpec::Mainnet)
+                    && connected.api_url.as_str().trim_end_matches('/')
+                        == IC_MAINNET_NETWORK_API_URL =>
+            {
+                Ok(connected)
+            }
+            _ => Err(refuse()),
         }
     }
 }
@@ -287,6 +299,20 @@ impl BundleFs {
             }
         }
         out
+    }
+
+    /// Whether `dir` is spelled under the bundle root without climbing: the
+    /// root itself or a descendant, by path alone. A spelling that
+    /// normalizes into the root but is not written under it (`/etc`,
+    /// `<root>/../x`) is not held, because a reader that takes the spelling
+    /// as a host path would leave the bundle.
+    pub fn holds_dir(&self, dir: &Utf8Path) -> bool {
+        match dir.strip_prefix(&self.0.root) {
+            Ok(rest) => rest
+                .components()
+                .all(|c| matches!(c, Utf8Component::Normal(_) | Utf8Component::CurDir)),
+            Err(_) => false,
+        }
     }
 
     /// Whether the bundle holds a file at `path`.
@@ -551,10 +577,19 @@ impl ScriptRunner for NoScripts {
 /// phase runs, so a bundle that would fail at its build or sync phase, or
 /// be refused there, does not first spend cycles creating canisters.
 ///
-/// Each canister is built by exactly one pre-built step naming a wasm in the
-/// archive that hashes to the checksum the manifest records; each sync step
-/// is a plugin in the archive (hashing to its checksum, if one is recorded);
-/// no step is a script. The environment's network is the Internet Computer.
+/// Each canister lives in a directory under the bundle root, and is built by
+/// exactly one pre-built step naming a wasm in the archive that hashes to the
+/// checksum the manifest records; each sync step is a plugin in the archive
+/// (hashing to its checksum, if one is recorded); no step is a script. The
+/// environment's network is the Internet Computer.
+///
+/// The directory check matters because not every reader goes through
+/// [`BundleFs`]: the sync-plugin runtime takes the canister directory as a
+/// host path and confines a plugin's declared files to the project directory
+/// only when the canister's lies inside it — a canister directory outside the
+/// project is its own sandbox root. A manifest may spell a canister's path
+/// absolutely, and the bundle can carry the `canister.yaml` the loader looks
+/// for at that spelling, so the directory must be held to the root here.
 pub fn check_bundle<'a>(
     fs: &BundleFs,
     network: &Network,
@@ -564,6 +599,12 @@ pub fn check_bundle<'a>(
     for (dir, canister) in canisters {
         let name = &canister.name;
         let at = |e: Unsupported| format!("canister '{name}': {e}");
+        if !fs.holds_dir(dir) {
+            return Err(at(Unsupported(format!(
+                "its directory '{dir}' is not under the bundle root; a bundle's canisters live \
+                 under its root, which is where `icp project bundle` puts them"
+            ))));
+        }
         let present = |path: &Utf8Path| -> Result<Vec<u8>, String> {
             fs.read_bytes(&dir.join(path)).map_err(|e| format!("canister '{name}': {e}"))
         };
@@ -690,7 +731,7 @@ pub fn extract_bundle(bytes: &[u8], into: &Utf8Path) -> Result<BundleFs, String>
         // store. A bundle never carries it (`icp project bundle` writes
         // manifests, modules, plugins, argument files and images), and one
         // that did could point a deploy at canisters the caller never named.
-        if path.components().next().is_some_and(|c| c.as_str() == STATE_DIR) {
+        if fs.normalize(&path).components().next().is_some_and(|c| c.as_str() == STATE_DIR) {
             return Err(format!(
                 "the archive entry '{path}' is under `{STATE_DIR}/`, the project state a bundle \
                  never carries; rebuild it with `icp project bundle`"
@@ -789,7 +830,25 @@ mod tests {
     // with the way out, not deep inside the deploy.
     #[tokio::test]
     async fn only_the_ic_network_is_served() {
-        for network in [managed("local"), connected("testnet", RootKeySpec::Fetch)] {
+        // A manifest may declare a network of any name, and it may claim the
+        // mainnet root key over an endpoint of its own: refused, like a
+        // network to be launched or one whose key would be fetched. So is
+        // the reserved name over another endpoint, should a loader ever let
+        // that through.
+        let mut elsewhere = connected("mainnet2", RootKeySpec::Mainnet);
+        let Configuration::Connected { connected: config } = &mut elsewhere.configuration else {
+            unreachable!()
+        };
+        config.api_url = "http://127.0.0.1:4943".parse().unwrap();
+        let mut ic_elsewhere = elsewhere.clone();
+        ic_elsewhere.name = "ic".into();
+        for network in [
+            managed("local"),
+            connected("testnet", RootKeySpec::Fetch),
+            connected("mainnet2", RootKeySpec::Mainnet),
+            elsewhere,
+            ic_elsewhere,
+        ] {
             let err = match IcMainnet.urls(&network).await {
                 Err(e) => e.to_string(),
                 Ok(_) => panic!("{} must be refused", network.name),
@@ -888,6 +947,42 @@ mod tests {
         let err = extract_bundle(&bytes, &into).unwrap_err();
         assert!(err.contains("`.icp/`"), "{err}");
         assert!(!into.join(".icp").exists());
+
+        // The same entry spelled `./.icp/...`: the archive path's first
+        // component is `.`, extraction writes it into `.icp/` all the same.
+        let (_dir, into) = scratch();
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let data: &[u8] = b"{\"backend\": \"aaaaa-aa\"}";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("./.icp/data/mappings/ic.ids.json").unwrap();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append(&header, data).unwrap();
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+        let err = extract_bundle(&bytes, &into).unwrap_err();
+        assert!(err.contains("`.icp/`"), "{err}");
+        assert!(!into.join(".icp").exists());
+    }
+
+    // A canister directory is held to the bundle root by its spelling, since
+    // the sync-plugin runtime takes it as a host path: inside by name is
+    // held, and `/etc` or a climb out of the root is not, however it would
+    // normalize.
+    #[test]
+    fn a_canister_directory_is_under_the_root_by_spelling() {
+        let (_dir, into) = scratch();
+        let fs = extract_bundle(&archive(&[("icp.yaml", b"canisters: []")]), &into).unwrap();
+        let root = fs.root().to_path_buf();
+        assert!(fs.holds_dir(&root));
+        assert!(fs.holds_dir(&root.join("backend")));
+        assert!(fs.holds_dir(&root.join("./backend")));
+        assert!(!fs.holds_dir(Utf8Path::new("/etc")));
+        assert!(!fs.holds_dir(&root.join("../elsewhere")));
+        assert!(!fs.holds_dir(&root.join("backend/../../elsewhere")));
     }
 
     // The index is the filesystem: what extraction wrote is readable by any
