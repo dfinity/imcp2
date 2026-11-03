@@ -546,9 +546,49 @@ mod tests {
         assert!(err.0.contains("backend") && err.0.contains("script build step"), "{err}");
     }
 
-    // The manifest can name only what the archive carried: a variable file
-    // the bundle does not hold is refused at load — before any phase, since
-    // the value would otherwise be sent to the canister as a setting — and so
+    // A canister directory the manifest spells absolutely resolves inside the
+    // bundle for every reader that goes through the bundle filesystem — the
+    // loader finds the `canister.yaml` it looks for there — but the
+    // sync-plugin runtime takes the directory as a host path and would make
+    // `/etc` its sandbox root. Refused before any phase.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_canister_directory_outside_the_root_is_refused() {
+        let (wasm, sha) = wasm();
+        let canister = format!(
+            "name: backend\nbuild:\n  steps:\n    - type: pre-built\n      path: backend.wasm\n      \
+             sha256: {sha}\n"
+        );
+        let bytes = archive(&[
+            ("icp.yaml", b"canisters:\n  - /etc\n"),
+            ("etc/canister.yaml", canister.as_bytes()),
+            ("etc/backend.wasm", &wasm),
+        ]);
+        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
+            .await
+            .expect_err("a canister directory outside the root is refused");
+        assert!(err.0.contains("backend") && err.0.contains("not under the bundle root"), "{err}");
+    }
+
+    // A manifest may declare a connected network that claims the mainnet root
+    // key over an endpoint of its own; an environment on it is refused like
+    // every network that is not the reserved `ic`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_network_claiming_mainnet_elsewhere_is_refused() {
+        let (wasm, sha) = wasm();
+        let manifest = format!(
+            "networks:\n  - name: mainnet2\n    mode: connected\n    url: http://127.0.0.1:4943\n    \
+             root-key: mainnet\nenvironments:\n  - name: elsewhere\n    network: mainnet2\n\
+             canisters:\n  - name: backend\n    build:\n      steps:\n        - type: pre-built\n          \
+             path: canisters/backend.wasm\n          sha256: {sha}\n"
+        );
+        let bytes =
+            archive(&[("icp.yaml", manifest.as_bytes()), ("canisters/backend.wasm", &wasm)]);
+        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "elsewhere"))
+            .await
+            .expect_err("a network that is not `ic` is refused");
+        assert!(err.0.contains("mainnet2") && err.0.contains("not the Internet Computer"), "{err}");
+    }
+
     // A `bundle_path` is read only when it is a regular file: a directory
     // here, and by the same check a device or a pipe, whose length says
     // nothing about what reading it would produce.
@@ -562,6 +602,9 @@ mod tests {
         assert!(err.0.contains("not a regular file"), "{}", err.0);
     }
 
+    // The manifest can name only what the archive carried: a variable file
+    // the bundle does not hold is refused at load — before any phase, since
+    // the value would otherwise be sent to the canister as a setting — and so
     // is a wasm, whether the path is absolute or climbing. Nothing on the
     // machine is reached for, whatever exists at that spelling.
     #[tokio::test(flavor = "multi_thread")]
