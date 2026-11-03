@@ -11,9 +11,16 @@
 //! bundle` writes, treated as untrusted input. The rule it is held to is the
 //! library's own, `icp_project::untrusted`, the one `icp --untrusted`
 //! applies (dfinity/icp-cli#873, on #868 for what `icp project bundle`
-//! writes; issue #865): this crate pins icp-cli's main at their merge,
-//! composes the rule as the CLI does, and adds the bounds on the archive
-//! itself and the checks on the bundle's shape. The deploy pipeline over it
-//! and the MCP tools that expose it follow in their own changes.
+//! writes; issue #865): this crate pins icp-cli's main at
+//! their merge, composes the rule as the CLI does, and adds the bounds on the
+//! archive itself and the checks on the bundle's shape. [`deploy_bundle`]
+//! runs the library's deploy operation over it as a given identity: create
+//! the canisters the bundle names that do not exist yet, wire their ids,
+//! install or upgrade, run the sync steps. The MCP tools that expose it
+//! follow in their own change.
 
+mod calls;
+mod deploy;
 pub mod host;
+
+pub use deploy::{deploy_bundle, BundleSource, DeployOutcome, DeployRequest, RequestError, Status};
