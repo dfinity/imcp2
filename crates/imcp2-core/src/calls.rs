@@ -60,16 +60,20 @@ pub struct GetCandidArgs {
     pub methods: Option<Vec<String>>,
 }
 
-/// Output of `get_canister_candid`. The interface text itself is the reply's
-/// text and deliberately not a field here: a large interface runs to tens of
-/// KB, and carrying it in both the text and the structured content doubled the
-/// reply, which got it truncated by the client. This object describes that text
-/// instead — which methods it covers, how big it is, and whether its comments
-/// survived.
+/// Output of `get_canister_candid`. Carries the interface text as `candid`,
+/// because clients that read the structured content show the model nothing
+/// else. A reply is kept to 5 KB, except for the two renderings that cannot be
+/// cut further: an interface that could not be parsed, and the one method asked
+/// for when it is over the limit even with its comments stripped. Those are
+/// carried whole here too, since a client that reads only this object has no
+/// other way to get the interface.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct GetCandidOutput {
     /// The canister whose interface was read.
     pub canister_id: String,
+    /// The Candid (`.did`) interface text: the complete interface, or one
+    /// restricted to `methods`.
+    pub candid: String,
     /// The methods the interface text is restricted to, sorted by name (the
     /// order Candid keeps a service's methods in). Absent when the text is the
     /// complete interface.

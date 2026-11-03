@@ -1726,13 +1726,17 @@ async fn candid_methods_read_one_commented_method_without_the_whole_interface() 
         h.call("get_canister_candid", args)
     };
 
-    // --- the complete interface: verbatim, described but not repeated ---
+    // --- the complete interface: verbatim, in the text and the structured object ---
     let result = call(serde_json::json!({})).await;
     assert_eq!(ok_text(&result), APP_DID, "the published text, byte for byte");
     let structured = ok_structured(&result);
     assert_eq!(structured["bytes"], serde_json::json!(APP_DID.len()));
     assert_eq!(structured["best_effort"], serde_json::json!(false));
-    assert!(structured.get("candid").is_none(), "no second copy of the text: {structured}");
+    assert_eq!(
+        structured["candid"],
+        serde_json::json!(APP_DID),
+        "the structured object carries the text: {structured}"
+    );
     assert!(structured.get("methods").is_none(), "nothing restricts it: {structured}");
     let total: usize = blocks(&result).iter().map(String::len).sum();
     assert!(total < APP_DID.len() + 1_000, "the .did plus a short note, {total} bytes");
