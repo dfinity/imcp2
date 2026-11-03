@@ -2638,13 +2638,13 @@ mod tests {
         assert!(typed.contains("url ="), "typed should have `url`: {typed}");
     }
 
-    // A large interface must be readable in one small reply, and never shipped
-    // twice. Pin the surface a client sees for that: the `methods` argument and
-    // an output schema that describes the interface text — its size, whether
-    // its comments survived, what it covers — without a field for the text
-    // itself.
+    // A large interface must be readable in one small reply, and a client that
+    // reads only the structured content must still get the interface. Pin the
+    // surface a client sees for that: the `methods` argument and an output
+    // schema that carries the interface text as `candid` alongside its size,
+    // whether its comments survived and what it covers.
     #[test]
-    fn get_canister_candid_advertises_methods_and_never_repeats_the_interface() {
+    fn get_canister_candid_advertises_methods_and_carries_the_interface() {
         let tool = super::IcTools::all_tools()
             .into_iter()
             .find(|t| &*t.name == "get_canister_candid")
@@ -2664,21 +2664,16 @@ mod tests {
         let output = serde_json::to_value(tool.output_schema.as_ref().expect("output schema"))
             .expect("output schema");
         let properties = output["properties"].as_object().expect("object-rooted");
-        for present in ["methods", "bytes", "best_effort", "oql", "declared_by"] {
+        for present in ["candid", "methods", "bytes", "best_effort", "oql", "declared_by"] {
             assert!(properties.contains_key(present), "{present} must be declared: {output}");
         }
-        assert!(
-            !properties.contains_key("candid"),
-            "the interface text is returned as text, never as structured content: {output}"
-        );
     }
 
     // The reply a read assembles, without a replica: the interface comes first,
-    // the notes follow, and the structured object describes the text without
-    // carrying it — so a full-interface reply is the `.did` plus a short note,
+    // the notes follow, and the structured object carries the text too — so a full-interface reply is the `.did` plus a short note,
     // and a restricted one says what it covers and what it cost.
     #[test]
-    fn candid_reply_puts_the_interface_first_and_the_text_only_there() {
+    fn candid_reply_puts_the_interface_first_and_in_the_structured_output() {
         let did = "// Paging.\n\
                    type Args = record { page : nat };\n\
                    service : {\n  \
