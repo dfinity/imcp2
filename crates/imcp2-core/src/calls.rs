@@ -1042,15 +1042,13 @@ pub fn render_candid(
     view: CandidView,
     methods: Option<&[String]>,
 ) -> Result<CandidRendering, String> {
-    let selection: Option<Vec<String>> = methods.map(|names| {
-        let mut seen = BTreeSet::new();
-        names
-            .iter()
-            .map(|name| name.trim().to_string())
-            .filter(|name| !name.is_empty() && seen.insert(name.clone()))
-            .collect()
+    // Trimmed, de-duplicated, and a set: membership below is a lookup, not a
+    // scan, so a request naming thousands of methods against a service that
+    // declares thousands costs (n + m) log n, not n × m.
+    let selection: Option<BTreeSet<String>> = methods.map(|names| {
+        names.iter().map(|name| name.trim().to_string()).filter(|name| !name.is_empty()).collect()
     });
-    if selection.as_ref().is_some_and(Vec::is_empty) {
+    if selection.as_ref().is_some_and(BTreeSet::is_empty) {
         return Err("`methods` names no method; omit `methods` to read the whole interface, or \
                     name at least one method"
             .into());
@@ -1098,8 +1096,9 @@ pub fn render_candid(
         let covered: Vec<(String, Type)> = match &selection {
             None => service.to_vec(),
             Some(names) => {
+                let declared: BTreeSet<&str> = service.iter().map(|(m, _)| m.as_str()).collect();
                 let unknown: Vec<&String> =
-                    names.iter().filter(|n| !service.iter().any(|(m, _)| m == *n)).collect();
+                    names.iter().filter(|n| !declared.contains(n.as_str())).collect();
                 if !unknown.is_empty() {
                     return Err(unknown_methods_error(&unknown, service));
                 }
