@@ -250,7 +250,8 @@ async fn dynamic_client_registration_round_trips_and_persists() {
         .oneshot(
             Request::get(format!(
                 "/mcp/oauth/authorize?response_type=code&client_id={client_id}\
-                 &redirect_uri=http://127.0.0.1:4321/cb&code_challenge=abc\
+                 &redirect_uri=http://127.0.0.1:4321/cb\
+                 &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\
                  &code_challenge_method=S256"
             ))
             .body(Body::empty())
@@ -260,6 +261,37 @@ async fn dynamic_client_registration_round_trips_and_persists() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FOUND, "a registered client can start a sign-in");
     assert!(resp.headers().contains_key("set-cookie"), "the binding cookie must be set");
+
+    // What a connect stores is bounded as the server decodes it: a `state` of
+    // 2048 bytes (the cap) is accepted though it arrives as 6144 percent-encoded
+    // characters, one more byte is refused, and so is a redirect that matches
+    // the registration only once the URL parser has stripped its encoded tabs.
+    // These run on the same app and register nothing, so they schedule no write.
+    for (state, redirect, want) in [
+        ("%41".repeat(2048), "http://127.0.0.1:4321/cb".to_string(), StatusCode::FOUND),
+        ("%41".repeat(2049), "http://127.0.0.1:4321/cb".to_string(), StatusCode::BAD_REQUEST),
+        (
+            "xyz".to_string(),
+            format!("http://127.0.0.1:4321/c{}b", "%09".repeat(3000)),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/mcp/oauth/authorize?response_type=code&client_id={client_id}\
+                     &redirect_uri={redirect}&state={state}\
+                     &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\
+                     &code_challenge_method=S256"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), want, "state {} chars, redirect {redirect:.40}", state.len());
+    }
 
     // A hosted redirect that isn't allow-listed is refused (nothing stored).
     let (status, doc) = register(r#"{"redirect_uris":["https://attacker.example/cb"]}"#).await;

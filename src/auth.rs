@@ -170,6 +170,32 @@ const MAX_CLIENTS: usize = 10_000;
 const MAX_REDIRECT_URIS: usize = 16;
 const MAX_REDIRECT_URI_LEN: usize = 2_048;
 
+/// Bounds on what a SINGLE `/oauth/authorize` request stores in its pending
+/// connect ([`AuthzPending`]). The endpoint is unauthenticated, and
+/// [`MAX_PENDING_CONNECTS`](imcp2_core::identities::MAX_PENDING_CONNECTS) bounds
+/// only the NUMBER of connects in flight, not the size of any one: without these
+/// the client's `state`, its `code_challenge` and a loopback `redirect_uri` were
+/// limited only by hyper's 64 KiB request URI, so a bare request loop could pin
+/// about 64 MiB per instance (CWE-770). A loopback redirect needs its own cap
+/// because it is matched on its PARSED form ([`loopback_match`]) but stored as
+/// given, so padding the parser discards (tabs, dot segments, a zero-padded
+/// port) would otherwise ride along. With the caps an entry's strings total at
+/// most `CIMD_MAX_CLIENT_ID_LEN + MAX_AUTHORIZE_REDIRECT_URI_LEN +
+/// MAX_CLIENT_STATE_LEN + PKCE_S256_CHALLENGE_LEN`, about 6 KiB, so a full map
+/// holds about 6 MiB.
+///
+/// - `state` is opaque to the server and RFC 6749 sets no maximum; real clients
+///   send 22 to about 170 bytes, so the redirect-URI cap of 2 KiB is generous.
+/// - An S256 challenge is the unpadded base64url of a SHA-256 digest: exactly 43
+///   characters ([`is_s256_challenge`]). `/oauth/token` compares
+///   `pkce_s256(verifier)` with it byte for byte, so a value of any other shape
+///   could never be exchanged, and refusing it turns away no working client.
+/// - A requested redirect is a registered one (at most [`MAX_REDIRECT_URI_LEN`])
+///   or a registered loopback URI on another port, which adds at most `:65535`.
+const MAX_CLIENT_STATE_LEN: usize = 2_048;
+const PKCE_S256_CHALLENGE_LEN: usize = 43;
+const MAX_AUTHORIZE_REDIRECT_URI_LEN: usize = MAX_REDIRECT_URI_LEN + ":65535".len();
+
 /// Floor on the interval between write-throughs of the registration store. The
 /// store is re-serialized in full on every write, so writing once per
 /// registration made N unauthenticated registrations cost O(N²) disk I/O; a
@@ -1421,7 +1447,8 @@ pub struct AuthStore {
     tokens: Arc<RwLock<HashMap<String, TokenInfo>>>,
     /// Auth-code connects in flight, keyed by `session_id` (= the II connect
     /// `state`). Bounded at [`imcp2_core::identities::MAX_PENDING_CONNECTS`] (one
-    /// entry per pending connect, same as the session map) and swept of expired
+    /// entry per pending connect, same as the session map), each entry's size by
+    /// the per-request caps at [`MAX_CLIENT_STATE_LEN`], and swept of expired
     /// entries by [`AuthStore::reap_expired`].
     authz: Arc<RwLock<HashMap<String, AuthzPending>>>,
     /// Minted authorization codes awaiting exchange at `/oauth/token`.
@@ -2123,6 +2150,46 @@ pub async fn authorize(
             "Your MCP client's request used an unsupported PKCE method (only S256 is supported). \
              The client may be out of date. Try updating it. If that doesn't help, remove the \
              connector and add it again.",
+        );
+    }
+    // Bound what the pending connect will hold (see [`MAX_CLIENT_STATE_LEN`]),
+    // here, before the session is minted and the connect recorded, so a refusal
+    // leaves neither behind. A challenge of any other shape could never pass
+    // `/oauth/token`, so refusing it now only spares the user an II sign-in that
+    // was bound to fail.
+    if !is_s256_challenge(&code_challenge) {
+        return signin_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "code_challenge must be an unpadded base64url SHA-256 digest (RFC 7636 S256)",
+            SIGNIN_HEADLINE,
+            "Your MCP client's request carried a malformed security check (PKCE). The client may \
+             be out of date. Try updating it. If that doesn't help, remove the connector and add \
+             it again.",
+        );
+    }
+    if let Some(state) = q.state.as_deref().filter(|s| s.len() > MAX_CLIENT_STATE_LEN) {
+        return signin_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!("state is too long ({} bytes, max {MAX_CLIENT_STATE_LEN})", state.len()),
+            SIGNIN_HEADLINE,
+            MALFORMED_DIAGNOSTIC,
+        );
+    }
+    if q.redirect_uri.len() > MAX_AUTHORIZE_REDIRECT_URI_LEN {
+        return signin_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!(
+                "redirect_uri is too long ({} bytes, max {MAX_AUTHORIZE_REDIRECT_URI_LEN})",
+                q.redirect_uri.len()
+            ),
+            SIGNIN_HEADLINE,
+            MALFORMED_DIAGNOSTIC,
         );
     }
     // RFC 8707 Resource Indicators (MCP authorization): a token must only be
@@ -2850,6 +2917,16 @@ async fn issue_token(store: &AuthStore, session_id: &str) -> Response {
 fn pkce_s256(verifier: &str) -> String {
     let digest = Sha256::digest(verifier.as_bytes());
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+/// Whether `challenge` has the shape of an S256 code challenge (RFC 7636 §4.2):
+/// exactly [`PKCE_S256_CHALLENGE_LEN`] characters of the unpadded base64url
+/// alphabet `[A-Za-z0-9_-]`. Every value [`pkce_s256`] can produce has this
+/// shape, so nothing refused here could ever have been exchanged at
+/// `/oauth/token`.
+fn is_s256_challenge(challenge: &str) -> bool {
+    challenge.len() == PKCE_S256_CHALLENGE_LEN
+        && challenge.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 // ---- Dynamic client registration ---------------------------------------
@@ -4470,6 +4547,227 @@ mod tests {
             authz.contains_key(&format!("sess-{}", cap + 15)),
             "the connect just started is never the one evicted"
         );
+    }
+
+    /// RFC 7636 Appendix B's challenge: what a spec-conformant S256 client sends.
+    const RFC7636_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    /// An authorize request from `client-x` that passes every check, for a test
+    /// to break in exactly one place.
+    fn valid_authorize_query(redirect_uri: &str) -> super::AuthorizeQuery {
+        super::AuthorizeQuery {
+            response_type: Some("code".into()),
+            client_id: "client-x".into(),
+            redirect_uri: redirect_uri.into(),
+            state: Some("xyz".into()),
+            code_challenge: Some(RFC7636_CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
+            scope: None,
+            resource: None,
+        }
+    }
+
+    /// Fill `store`'s session map with exactly
+    /// [`MAX_PENDING_CONNECTS`](imcp2_core::identities::MAX_PENDING_CONNECTS)
+    /// pending connects and return their ids. Minting one more session then
+    /// evicts one of them (the session map's admission bound), so whether they
+    /// all survive a request tells whether it minted a session: the map is
+    /// private to `imcp2-core`, and `authorize` mints under a random id.
+    async fn fill_session_map(store: &super::AuthStore) -> Vec<String> {
+        let ids: Vec<String> = (0..imcp2_core::identities::MAX_PENDING_CONNECTS)
+            .map(|i| format!("sess-probe-{i}"))
+            .collect();
+        for id in &ids {
+            store.identities.registration_pubkey_b64(id).await.expect("room for the probe");
+        }
+        ids
+    }
+
+    /// How many of `ids` still have a session.
+    async fn sessions_left(store: &super::AuthStore, ids: &[String]) -> usize {
+        let mut left = 0;
+        for id in ids {
+            left += usize::from(store.identities.session_principal(id).await.is_some());
+        }
+        left
+    }
+
+    /// Run `query` through `authorize` as a programmatic caller and assert that it
+    /// is refused as `invalid_request` without a trace: no pending connect is
+    /// recorded and no session is minted (`probe` is from [`fill_session_map`]).
+    async fn assert_refused_without_trace(
+        store: &super::AuthStore,
+        probe: &[String],
+        query: super::AuthorizeQuery,
+        what: &str,
+    ) {
+        use axum::extract::{Query, State};
+        let resp = super::authorize(State(store.clone()), json_headers(), Query(query)).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST, "{what} must be refused");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "invalid_request", "{what}: {body}");
+        assert!(store.authz.read().await.is_empty(), "{what} must record no pending connect");
+        assert_eq!(sessions_left(store, probe).await, probe.len(), "{what} must mint no session");
+    }
+
+    // The S256 shape check accepts everything `pkce_s256` can produce and
+    // nothing else: no padding, no standard-base64 `+` or `/`, no other length.
+    #[test]
+    fn is_s256_challenge_accepts_exactly_the_s256_shape() {
+        assert!(super::is_s256_challenge(RFC7636_CHALLENGE));
+        for verifier in ["verifier", "", "~.-_", "v".repeat(128).as_str()] {
+            let challenge = pkce_s256(verifier);
+            assert!(super::is_s256_challenge(&challenge), "must accept {challenge}");
+        }
+
+        for bad in [
+            String::new(),
+            RFC7636_CHALLENGE[..42].to_string(),
+            format!("{RFC7636_CHALLENGE}A"),
+            // `=`-padded (44 characters), and 43 characters ending in `=`.
+            format!("{RFC7636_CHALLENGE}="),
+            format!("{}=", &RFC7636_CHALLENGE[..42]),
+            // Standard base64's `+` and `/` in place of `-` and `_`.
+            RFC7636_CHALLENGE.replace('-', "+"),
+            format!("{}/", &RFC7636_CHALLENGE[..42]),
+            // 43 bytes, but not of the alphabet.
+            format!("{}é", &RFC7636_CHALLENGE[..41]),
+            "A".repeat(300 * 1024),
+        ] {
+            assert!(!super::is_s256_challenge(&bad), "must refuse {bad:.60}");
+        }
+    }
+
+    // A malformed challenge is refused at `/oauth/authorize`, before anything is
+    // minted or recorded, rather than after a sign-in whose code could never be
+    // exchanged. The RFC 7636 challenge still goes through, and minting its
+    // session is visible to the probe, so the probe can tell.
+    #[tokio::test]
+    async fn authorize_refuses_a_malformed_challenge_before_minting_anything() {
+        use axum::extract::{Query, State};
+        let redirect = "https://claude.ai/api/mcp/auth_callback";
+        let store = test_store();
+        store.clients.seed("client-x", vec![redirect]).await;
+        let probe = fill_session_map(&store).await;
+        let with_challenge = |challenge: &str| super::AuthorizeQuery {
+            code_challenge: Some(challenge.into()),
+            ..valid_authorize_query(redirect)
+        };
+
+        for (bad, what) in [
+            (RFC7636_CHALLENGE[..42].to_string(), "a 42-character challenge"),
+            (format!("{RFC7636_CHALLENGE}A"), "a 44-character challenge"),
+            (format!("{RFC7636_CHALLENGE}="), "an `=`-padded challenge"),
+            (RFC7636_CHALLENGE.replace('-', "+"), "a challenge with `+`"),
+            (format!("{}/", &RFC7636_CHALLENGE[..42]), "a challenge with `/`"),
+            ("A".repeat(300 * 1024), "a 300 KiB challenge"),
+        ] {
+            assert_refused_without_trace(&store, &probe, with_challenge(&bad), what).await;
+        }
+
+        // A browser gets the friendly screen naming the cause.
+        let resp = super::authorize(
+            State(store.clone()),
+            html_headers(),
+            Query(with_challenge(&"A".repeat(300 * 1024))),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let html = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("PKCE") && html.contains("report it"), "{html}");
+
+        let resp = super::authorize(
+            State(store.clone()),
+            axum::http::HeaderMap::new(),
+            Query(with_challenge(RFC7636_CHALLENGE)),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FOUND, "a valid challenge is accepted");
+        let authz = store.authz.read().await;
+        assert_eq!(authz.len(), 1);
+        let pending = authz.values().next().unwrap();
+        assert_eq!(pending.code_challenge.as_deref(), Some(RFC7636_CHALLENGE));
+        assert_eq!(sessions_left(&store, &probe).await, probe.len() - 1, "the probe sees a mint");
+    }
+
+    // The client's `state` is capped: over the cap is refused before anything is
+    // minted or recorded, and a `state` exactly at the cap is stored whole.
+    #[tokio::test]
+    async fn authorize_bounds_the_client_state() {
+        use axum::extract::{Query, State};
+        let redirect = "https://claude.ai/api/mcp/auth_callback";
+        let store = test_store();
+        store.clients.seed("client-x", vec![redirect]).await;
+        let probe = fill_session_map(&store).await;
+        let with_state = |len: usize| super::AuthorizeQuery {
+            state: Some("s".repeat(len)),
+            ..valid_authorize_query(redirect)
+        };
+
+        for (len, what) in [
+            (300 * 1024, "a 300 KiB state"),
+            (super::MAX_CLIENT_STATE_LEN + 1, "a state one byte over the cap"),
+        ] {
+            assert_refused_without_trace(&store, &probe, with_state(len), what).await;
+        }
+
+        let resp = super::authorize(
+            State(store.clone()),
+            axum::http::HeaderMap::new(),
+            Query(with_state(super::MAX_CLIENT_STATE_LEN)),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FOUND, "a state at the cap is accepted");
+        let authz = store.authz.read().await;
+        assert_eq!(authz.len(), 1);
+        let pending = authz.values().next().unwrap();
+        assert_eq!(pending.client_state, "s".repeat(super::MAX_CLIENT_STATE_LEN));
+        assert_eq!(sessions_left(&store, &probe).await, probe.len() - 1);
+    }
+
+    // A loopback redirect is matched on its parsed form but stored as given, so
+    // padding the parser discards passes the match; the length cap is what stops
+    // it. A registered loopback URI at the registration cap, asked for on the
+    // longest port, still fits.
+    #[tokio::test]
+    async fn authorize_bounds_a_padded_loopback_redirect() {
+        use axum::extract::{Query, State};
+        let store = test_store();
+        let path = "p".repeat(super::MAX_REDIRECT_URI_LEN - "http://127.0.0.1/".len());
+        let longest = format!("http://127.0.0.1/{path}");
+        assert_eq!(longest.len(), super::MAX_REDIRECT_URI_LEN);
+        store.clients.seed("client-x", vec!["http://127.0.0.1/cb", longest.as_str()]).await;
+        let probe = fill_session_map(&store).await;
+
+        for (padded, what) in [
+            (format!("http://127.0.0.1:{}4321/cb", "0".repeat(60_000)), "a zero-padded port"),
+            (format!("http://127.0.0.1:4321/c{}b", "\t".repeat(60_000)), "tabs in the path"),
+            (format!("http://127.0.0.1:4321{}/cb", "/.".repeat(30_000)), "dot segments"),
+        ] {
+            assert_eq!(
+                store.validate_client("client-x", &padded).await,
+                super::ClientCheck::Allowed,
+                "{what} passes the loopback match, so only the cap stops it"
+            );
+            assert_refused_without_trace(&store, &probe, valid_authorize_query(&padded), what)
+                .await;
+        }
+
+        let on_longest_port = format!("http://127.0.0.1:65535/{path}");
+        assert_eq!(on_longest_port.len(), super::MAX_AUTHORIZE_REDIRECT_URI_LEN);
+        let resp = super::authorize(
+            State(store.clone()),
+            axum::http::HeaderMap::new(),
+            Query(valid_authorize_query(&on_longest_port)),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FOUND, "the longest real redirect fits");
+        let authz = store.authz.read().await;
+        assert_eq!(authz.values().next().unwrap().redirect_uri, on_longest_port);
     }
 
     // The registration store is LRU-bounded: open (unauthenticated) DCR means the
