@@ -1748,6 +1748,7 @@ async fn candid_views_read_one_method_without_the_whole_interface() {
             "3/5 greet : (text) -> (text) query",
             "4/5 set_message : (text) -> (text)",
             "5/5 whoami : () -> (principal) query",
+            "// end of summary (5/5)",
         ]
     );
     assert!(all_text(&result).contains("`methods: [\"<name>\"]`"), "{}", all_text(&result));

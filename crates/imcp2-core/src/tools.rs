@@ -146,7 +146,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Fetch a canister's Candid interface: the `.did` text declaring the methods and argument types a caller needs in order to call it. A large interface runs to tens of KB, so on a canister with many methods pass `view: \"summary\"` first (one signature line per method, numbered `i/N` so a reply the client cut short is visible, no type definitions) and then `methods: [\"<name>\"]` for the method to call, which returns its signature with every type definition it uses as a small valid `.did`. The interface text is the first content block; the structured object carries its size and method count, never the text. Also reports whether the canister declares an OQL surface, which this server reads through the OQL tools rather than with a Candid query, and whether it declares the API doc get_canister_api_doc reads.",
+        description = "Fetch a canister's Candid interface: the `.did` text declaring the methods and argument types a caller needs in order to call it. A large interface runs to tens of KB, so on a canister with many methods pass `view: \"summary\"` first (one signature line per method, numbered `i/N` and closed by an end line so a reply the client cut short is visible, no type definitions) and then `methods: [\"<name>\"]` for the method to call, which returns its signature with every type definition it uses as a small valid `.did`. The interface text is the first content block; the structured object carries its size and method count, never the text. Also reports whether the canister declares an OQL surface, which this server reads through the OQL tools rather than with a Candid query, and whether it declares the API doc get_canister_api_doc reads.",
         annotations(title = "Get Candid interface", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::GetCandidOutput>(),
     )]
@@ -2490,17 +2490,19 @@ fn candid_reply(
         )),
         (calls::CandidView::Summary, None) => blocks.push(format!(
             "Summary of all {declared} methods the canister declares: one `i/{declared} name : \
-             (args) -> (results)` line each, type names left unexpanded; a reply whose last \
-             line is not `{declared}/{declared}` was cut short. For a method's signature \
-             together with the type definitions it uses, call again with `methods: \
-             [\"<name>\"]`; the complete interface is {} bytes.",
+             (args) -> (results)` line each, type names left unexpanded, then the closing line \
+             `// end of summary ({declared}/{declared})`; a reply that does not end with that \
+             line was cut short. For a method's signature together with the type definitions \
+             it uses, call again with `methods: [\"<name>\"]`; the complete interface is {} \
+             bytes.",
             did.len()
         )),
         (calls::CandidView::Summary, Some(covered)) => blocks.push(format!(
             "Summary of {n} of the {declared} methods the canister declares: one `i/{n} name : \
-             (args) -> (results)` line each, type names left unexpanded; a reply whose last \
-             line is not `{n}/{n}` was cut short. Omit `view` to get these methods with the \
-             type definitions they use; the complete interface is {} bytes.",
+             (args) -> (results)` line each, type names left unexpanded, then the closing line \
+             `// end of summary ({n}/{n})`; a reply that does not end with that line was cut \
+             short. Omit `view` to get these methods with the type definitions they use; the \
+             complete interface is {} bytes.",
             did.len(),
             n = covered.len()
         )),
@@ -2729,10 +2731,10 @@ mod tests {
 
         // The summary: the lines, then a note saying how to get a method's types.
         let (blocks, output) = reply(CandidView::Summary, None).expect("renders");
-        assert_eq!(blocks[0].lines().count(), 4, "{}", blocks[0]);
-        assert!(blocks[0].lines().last().is_some_and(|l| l.starts_with("4/4 ")), "{}", blocks[0]);
+        assert_eq!(blocks[0].lines().count(), 5, "4 methods and the closing line: {}", blocks[0]);
+        assert_eq!(blocks[0].lines().last(), Some("// end of summary (4/4)"), "{}", blocks[0]);
         assert!(blocks[1].starts_with("Summary of all 4 methods"), "{}", blocks[1]);
-        assert!(blocks[1].contains("not `4/4` was cut short"), "{}", blocks[1]);
+        assert!(blocks[1].contains("`// end of summary (4/4)`"), "{}", blocks[1]);
         assert!(blocks[1].contains("`methods: [\"<name>\"]`"), "{}", blocks[1]);
         assert!(blocks[1].contains(&format!("{} bytes", did.len())), "{}", blocks[1]);
         assert_eq!(structured(&output)["view"], serde_json::json!("summary"));
@@ -2758,9 +2760,9 @@ mod tests {
         assert_eq!(s["method_count"], serde_json::json!(4));
 
         let (blocks, _) = reply(CandidView::Summary, Some(&names)).expect("renders");
-        assert_eq!(blocks[0], "1/1 list : (Args) -> (vec text) query");
+        assert_eq!(blocks[0], "1/1 list : (Args) -> (vec text) query\n// end of summary (1/1)");
         assert!(blocks[1].starts_with("Summary of 1 of the 4 methods"), "{}", blocks[1]);
-        assert!(blocks[1].contains("not `1/1` was cut short"), "{}", blocks[1]);
+        assert!(blocks[1].contains("`// end of summary (1/1)`"), "{}", blocks[1]);
 
         // A rendering error is the reply's error, verbatim.
         let e = reply(CandidView::Full, Some(&["lost".to_string()])).expect_err("unknown");

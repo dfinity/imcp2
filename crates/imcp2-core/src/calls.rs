@@ -53,11 +53,11 @@ pub struct GetCandidArgs {
     pub methods: Option<Vec<String>>,
     /// How to render the interface. `full` (the default): the `.did` text, with
     /// type definitions. `summary`: one `i/N name : (args) -> (results)` line per
-    /// method and no type definitions — the cheap first call on a large
-    /// interface, to find the method to then ask for with `methods`. The `i/N`
-    /// counter is over the lines of that reply: if the last line you see is not
-    /// `N/N`, the client cut the reply short. With `methods`, a summary covers
-    /// only those.
+    /// method, closed by a `// end of summary (N/N)` line, and no type
+    /// definitions — the cheap first call on a large interface, to find the
+    /// method to then ask for with `methods`. `N` counts that reply's lines: a
+    /// reply that does not end with the closing line, or whose counters skip,
+    /// was cut short by the client. With `methods`, a summary covers only those.
     #[serde(default)]
     pub view: Option<CandidView>,
 }
@@ -76,9 +76,10 @@ pub enum CandidView {
     /// with the type definitions those methods use.
     #[default]
     Full,
-    /// One `i/N name : (args) -> (results)` line per method, type names left
-    /// unexpanded and no type definitions: a cheap index of a large interface,
-    /// numbered so a reply the client cut short is visible.
+    /// One `i/N name : (args) -> (results)` line per method and a closing
+    /// `// end of summary (N/N)` line, type names left unexpanded and no type
+    /// definitions: a cheap index of a large interface, numbered and closed so
+    /// a reply the client cut short is visible.
     Summary,
 }
 
@@ -93,8 +94,8 @@ pub struct GetCandidOutput {
     /// The canister whose interface was read.
     pub canister_id: String,
     /// How the first text block renders the interface: `full` is `.did` text with
-    /// type definitions, `summary` one numbered signature line per method without
-    /// them.
+    /// type definitions, `summary` one numbered signature line per method and a
+    /// closing line, without them.
     pub view: CandidView,
     /// The methods the first text block is restricted to, sorted by name (the
     /// order Candid keeps a service's methods in). Absent when it covers every
@@ -969,10 +970,15 @@ fn api_doc_declared(env: &TypeEnv, actor: &Type) -> Option<&'static str> {
     API_DOC_METHODS.into_iter().find(|m| env.get_method(actor, m).is_ok())
 }
 
-/// Column width the summary lines are laid out at: wide enough that a method's
-/// signature stays on ONE line — the listing's whole point — so only a signature
-/// longer than this wraps.
-const SUMMARY_LINE_WIDTH: usize = 10_000;
+/// Layout width the summary signatures are rendered at. The printer breaks a
+/// group only where it would overrun the width, and no text reaches this one,
+/// so every signature lays out on ONE line whatever its length: the
+/// one-line-per-method contract is unconditional, with no continuation line for
+/// the `i/N` counters to miss (a fixed width, however generous, let an inline
+/// record past it wrap). The layout pass stays linear, since a group that fits
+/// is measured once and never revisited, and the printer only compares positions
+/// against the width — it never adds to it — so the maximum is safe.
+const SUMMARY_LINE_WIDTH: usize = usize::MAX;
 
 /// Declared method names an unknown-method error lists before cutting off. The
 /// error exists so a mistyped name is repaired in one step; listing every name
@@ -1017,10 +1023,11 @@ pub struct CandidRendering {
 ///   to call a method — so the result is a plain `service : { … }` that parses
 ///   and encodes against those methods.
 /// * `Summary` — one `i/N name : (args) -> (results) [query]` line per method
-///   (all of them, or the `methods` asked for), type names unexpanded and no
-///   type definitions. Not a valid `.did` on its own, by design: it is the
-///   cheap index of a large interface, and its counter is what makes a reply
-///   the client cut short visible (see [`summary_lines`]).
+///   (all of them, or the `methods` asked for) and a closing
+///   `// end of summary (N/N)` line, type names unexpanded and no type
+///   definitions. Not a valid `.did` on its own, by design: it is the cheap
+///   index of a large interface, and its counters and closing line are what
+///   make a reply the client cut short visible (see [`summary_lines`]).
 ///
 /// Method names are trimmed and de-duplicated; a name the service does not
 /// declare is an error listing the declared names, so a mistyped name is
@@ -1138,18 +1145,20 @@ fn restricted_did(env: &TypeEnv, methods: Vec<(String, Type)>) -> Result<(String
 }
 
 /// One `i/N name : (args) -> (results) [query]` line per method, each signature
-/// on its own line (see [`SUMMARY_LINE_WIDTH`]), type names left unexpanded.
+/// on one line (see [`SUMMARY_LINE_WIDTH`]) with type names left unexpanded,
+/// then a closing `// end of summary (N/N)` line.
 ///
 /// `i/N` counts the lines of THIS listing (not the service's methods), so a
-/// reply a client cut short is visible to the model that reads it: the last
-/// line it sees is not `N/N`, or the sequence skips. A checksum could not do
-/// this job — the client trims the result after receiving it whole, and a
-/// model cannot recompute a hash over what it was shown — but it can read a
-/// counter. Must run on the deep stack, like [`restricted_did`].
+/// reply a client cut short is visible to the model that reads it: the closing
+/// line is missing — a cut anywhere, inside the last line included, takes it
+/// with it — or the sequence skips. A checksum could not do this job — the
+/// client trims the result after receiving it whole, and a model cannot
+/// recompute a hash over what it was shown — but it can read a counter and
+/// look for a last line. Must run on the deep stack, like [`restricted_did`].
 fn summary_lines(env: &TypeEnv, methods: &[(String, Type)]) -> Result<String, String> {
     use candid::pretty::candid::{pp_function, pp_text};
     let total = methods.len();
-    let mut lines = Vec::with_capacity(total);
+    let mut lines = Vec::with_capacity(total + 1);
     for (i, (name, ty)) in methods.iter().enumerate() {
         // A method declared through a named function type (`m : MyFunc`) is
         // listed with that type resolved: the signature is what the line is for.
@@ -1162,6 +1171,7 @@ fn summary_lines(env: &TypeEnv, methods: &[(String, Type)]) -> Result<String, St
             pp_function(func).pretty(SUMMARY_LINE_WIDTH)
         ));
     }
+    lines.push(format!("// end of summary ({total}/{total})"));
     Ok(lines.join("\n"))
 }
 
@@ -3337,8 +3347,8 @@ mod tests {
     // orders a service's methods), with the mode and the type names as written —
     // no definitions, nothing wrapped — and a method declared through a named
     // function type shows its signature. Every line is numbered `i/N` over the
-    // listing, so a reply the client cut short is visible to whoever reads what
-    // is left of it.
+    // listing and a closing line ends it, so a reply the client cut short is
+    // visible to whoever reads what is left of it.
     #[test]
     fn render_candid_summary_lists_one_signature_per_method() {
         use super::{render_candid, CandidView};
@@ -3353,24 +3363,32 @@ mod tests {
                 "5/7 notify : (text) -> () oneway",
                 "6/7 schema : () -> (text) query",
                 "7/7 subscribe : (nat) -> (text) query",
+                "// end of summary (7/7)",
             ]
         );
-        for (i, line) in r.text.lines().enumerate() {
+        for (i, line) in r.text.lines().take(7).enumerate() {
             assert!(line.starts_with(&format!("{}/7 ", i + 1)), "numbered in order: {line}");
         }
         assert_eq!(r.methods, None, "a summary of everything restricts nothing");
         assert_eq!(r.method_count, Some(7));
         assert!(r.oql && r.api_doc_available, "the flags come along with every view");
 
-        // A wide inline signature stays on its one line: the listing is grep-able.
+        // A wide inline signature stays on its one line however wide — the
+        // printer never breaks it (SUMMARY_LINE_WIDTH), so no continuation line
+        // escapes the counters. 600 fields is well past the 10,000 columns a
+        // fixed width once allowed, where review caught the record wrapping.
         let wide = format!(
             "service : {{ m : (record {{ {} }}) -> (vec record {{ a : nat; b : text }}) }}",
-            (0..40).map(|i| format!("field_{i} : opt vec nat64")).collect::<Vec<_>>().join("; ")
+            (0..600).map(|i| format!("field_{i} : opt vec nat64")).collect::<Vec<_>>().join("; ")
         );
         let r = render_candid(&wide, CandidView::Summary, None).expect("renders");
-        assert_eq!(r.text.lines().count(), 1, "one method, one line: {}", r.text);
-        assert!(r.text.starts_with("1/1 m : (record { field_"), "{}", r.text);
-        assert!(r.text.contains("field_0 : opt vec nat64;"), "{}", r.text);
+        let lines: Vec<&str> = r.text.lines().collect();
+        assert_eq!(lines.len(), 2, "one method on one line, then the closing line: {}", r.text);
+        assert!(lines[0].len() > 10_000, "wider than any fixed width: {} columns", lines[0].len());
+        assert!(lines[0].starts_with("1/1 m : (record { field_"), "{}", r.text);
+        assert!(lines[0].contains("field_599 : opt vec nat64"), "{}", lines[0]);
+        assert!(lines[0].ends_with("}) -> (vec record { a : nat; b : text })"), "{}", lines[0]);
+        assert_eq!(lines[1], "// end of summary (1/1)");
 
         // Restricted to some methods: those lines only, sorted by name whatever
         // the order asked, trimmed and de-duplicated — and numbered over the
@@ -3380,7 +3398,11 @@ mod tests {
         let r = render_candid(VIEWS_DID, CandidView::Summary, Some(&names)).expect("renders");
         assert_eq!(
             r.text.lines().collect::<Vec<_>>(),
-            vec!["1/2 createEngine : (text) -> (Engine)", "2/2 execute : (text) -> (text) query"]
+            vec![
+                "1/2 createEngine : (text) -> (Engine)",
+                "2/2 execute : (text) -> (text) query",
+                "// end of summary (2/2)",
+            ]
         );
         assert_eq!(r.methods.as_deref(), Some(&["createEngine".to_string(), "execute".into()][..]));
         assert_eq!(r.method_count, Some(7), "the total is the service's, not the selection's");
