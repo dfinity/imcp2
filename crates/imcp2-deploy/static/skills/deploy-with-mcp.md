@@ -39,7 +39,9 @@ not know the canisters already exist and would create a second set.
 - Cycles. Every canister the bundle names that does not exist yet is created
   from the user's cycles balance, 2T cycles each unless `cycles` says
   otherwise. `icp_cycles_balance` reports the balance and the principal
-  it belongs to. Before a deploy that will create canisters, tell the user how
+  it belongs to: the user's CLI identity, the same principal `icp identity
+  link web` signs in as, so a canister deployed here is one `icp` controls
+  too. Before a deploy that will create canisters, tell the user how
   many and confirm; creation is not undone by a later failure.
 - An environment on the `ic` network (mainnet), which every manifest has.
   The tool deploys to the Internet Computer only: an environment on any other

@@ -169,11 +169,15 @@ canisters created, and a log of each phase. A failed deploy still reports every
 canister it created before failing, so the run can be picked up rather than
 repeated.
 
-Calls are signed as your **management identity** (your default II account at
-the hosted server's origin, see `IMCP2_MANAGEMENT_ORIGIN`): the same principal
-`icp_cycles_balance` reports and the canister lifecycle tools act as, so a
-canister deployed here stays manageable there. The session must have been
-granted "Actions & questions" at sign-in. The bundle is extracted into a
+Calls are signed as your **CLI identity**: your default II account at
+`https://cli.id.ai`, the origin `icp identity link web` signs in at. That is
+the principal the icp CLI deploys as on your machine, so canisters deployed
+here are the ones `icp` lists and controls, and they are funded from the same
+cycles balance. `icp_cycles_balance` reports that balance and principal. It is
+not the management identity the canister lifecycle tools act as (see
+`IMCP2_MANAGEMENT_ORIGIN`); to reach a deployed canister through those tools,
+add their principal as a controller. The session must have been granted
+"Actions & questions" at sign-in. The bundle is extracted into a
 scratch directory for the duration of the deploy and removed afterwards;
 nothing is written to the project it came from.
 
@@ -208,7 +212,7 @@ Internet Identity (`https://id.ai`). Environment overrides, mainly for tests:
 | `IMCP2_IC_URL` | IC API endpoint. |
 | `IMCP2_FETCH_ROOT_KEY` | Truthy: trust the endpoint's fetched root key — honoured **only** when `IMCP2_IC_URL` targets loopback (a local replica / PocketIC); startup refuses otherwise. |
 | `II_URL_PROD` / `II_CANISTER_ID_PROD` | Override the Internet Identity instance (e.g. beta II, or an II canister in PocketIC). |
-| `IMCP2_MANAGEMENT_ORIGIN` | Derivation origin of the canister-management identity. Defaults to the hosted server's origin so the same anchor keeps the same controller principal locally and hosted. |
+| `IMCP2_MANAGEMENT_ORIGIN` | Derivation origin of the canister-management identity. Defaults to the hosted server's origin so the same anchor keeps the same controller principal locally and hosted. The deploy tools do not use it; they act at `https://cli.id.ai`. |
 | `IMCP2_NO_OPEN` | Truthy: never auto-open the browser on sign-in (the link is still returned in-band). |
 
 All diagnostics go to stderr (`RUST_LOG` filters them); stdout is the MCP

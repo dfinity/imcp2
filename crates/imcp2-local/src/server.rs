@@ -279,7 +279,9 @@ impl ServerHandler for LocalServer {
              bundle --output <file>`, built in the user's environment) to the environment it \
              names, creating the canisters that do not exist yet from the user's cycles \
              balance (`icp_cycles_balance` reports it) and upgrading those passed in \
-             `canister_ids`. It needs an \"Actions & questions\" session, and it returns the \
+             `canister_ids`. It deploys as the user's CLI identity (the principal `icp \
+             identity link web` signs in as), not the management identity the canister \
+             tools act as. It needs an \"Actions & questions\" session, and it returns the \
              canister-id mapping to pass back next time. \
              The `skill://deploy-with-mcp` resource walks through the loop: bundle, deploy, \
              write the mapping back into the project."

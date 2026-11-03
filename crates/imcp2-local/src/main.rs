@@ -8,7 +8,9 @@
 //!
 //! On top of the core surface it serves `icp_deploy_bundle` (from
 //! `imcp2-deploy`): deploying an icp project bundle through the icp CLI's own
-//! project library, as the user's management identity. Local-only because
+//! project library, as the user's CLI identity (their default II account at
+//! `https://cli.id.ai`, the principal `icp identity link web` signs in as, so
+//! `icp` and this tool deploy as the same controller). Local-only because
 //! that library is a git dependency the published crates cannot carry.
 //!
 //! Signing in is a built-in browser handshake (see `login`): the
@@ -31,7 +33,8 @@
 //!     management identity (default `https://mcp.internetcomputer.org`, the
 //!     hosted server's origin, so the same anchor gets the SAME controller/
 //!     funder principal locally and hosted — canisters created through one
-//!     stay manageable through the other).
+//!     stay manageable through the other). Not used by the deploy tools,
+//!     which act at `https://cli.id.ai`.
 //!   * `IMCP2_NO_OPEN` — truthy disables the best-effort browser auto-open on
 //!     sign-in (the link is always returned in-band regardless).
 

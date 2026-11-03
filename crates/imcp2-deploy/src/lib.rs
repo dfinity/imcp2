@@ -11,10 +11,15 @@
 //! upgraded in place; every phase of `icp deploy` runs — including the sync
 //! steps that upload a frontend canister's assets.
 //!
-//! Calls are signed as the connection's **management identity** (see
-//! `imcp2_core::identities`): the user's default Internet Identity account at
-//! the server's own origin, the same stable principal the canister lifecycle
-//! tools act as, so a canister created here stays manageable there.
+//! Calls are signed as the user's **CLI identity**: their default Internet
+//! Identity account at [`CLI_ORIGIN`] (`https://cli.id.ai`), the origin
+//! `icp identity link web` derives at. It is the principal the icp CLI already
+//! deploys as on the user's machine, so canisters created here are the ones
+//! `icp` lists and controls, and the cycles that fund them are the CLI's. This
+//! is deliberately NOT the management identity the canister lifecycle tools
+//! act as (the default account at the server's own origin): a canister a
+//! deploy creates is controlled by the CLI principal, and reaching it through
+//! the lifecycle tools means adding their principal as a controller first.
 //!
 //! This crate is composed into the local server only. It depends on
 //! `icp-project` straight from the icp-cli repository, which crates.io does
@@ -26,8 +31,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use base64::Engine;
 use camino::Utf8PathBuf;
 use candid::Principal;
-use ic_agent::Identity;
-use imcp2_core::{cycles_balance, identities::Identities, CyclesBalance, SessionResolver};
+use ic_agent::{identity::DelegatedIdentity, Identity};
+use imcp2_core::{cycles_balance_of, identities::Identities, CyclesBalance, SessionResolver};
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{CallToolResult, ContentBlock},
@@ -274,10 +279,22 @@ pub struct IcDeployTools {
     session: SessionResolver,
 }
 
+/// The derivation origin of the identity the deploy tools act as: the one the
+/// icp CLI's `icp identity link web` (with no `--app`) signs in at. Internet
+/// Identity derives one principal per anchor per origin, so a delegation at
+/// this origin IS the user's CLI identity.
+pub const CLI_ORIGIN: &str = "https://cli.id.ai";
+
 #[tool_router(vis = "pub")]
 impl IcDeployTools {
     pub fn new(identities: Identities, session: SessionResolver) -> Self {
         Self { identities, session }
+    }
+
+    /// The session's CLI identity: its default account at [`CLI_ORIGIN`],
+    /// derived on demand like any other per-app delegation.
+    async fn cli_identity(&self, sid: &str) -> Result<DelegatedIdentity, String> {
+        self.identities.delegated_identity(sid, CLI_ORIGIN, None).await
     }
 
     #[tool(
@@ -300,7 +317,7 @@ impl IcDeployTools {
         if let Err(e) = self.identities.require_write(&sid).await {
             return Ok(err(e));
         }
-        let identity: Arc<dyn Identity> = match self.identities.management_identity(&sid).await {
+        let identity: Arc<dyn Identity> = match self.cli_identity(&sid).await {
             Ok(id) => Arc::new(id),
             Err(e) => return Ok(err(e)),
         };
@@ -318,7 +335,7 @@ impl IcDeployTools {
     }
 
     #[tool(
-        description = "Return the cycles-ledger balance of the principal icp_deploy_bundle deploys as (your management identity), and that principal. Call it before a deploy that will create canisters, to check the balance covers them (2T cycles each by default), and to get the principal to add as a controller of a canister created elsewhere.",
+        description = "Return the cycles-ledger balance of the principal icp_deploy_bundle deploys as, and that principal. It is your CLI identity: the same principal `icp identity link web` signs in as, so it matches what `icp identity principal` prints for that identity. Call it before a deploy that will create canisters, to check the balance covers them (2T cycles each by default), and to get the principal to add as a controller of a canister created elsewhere.",
         annotations(title = "Check your cycles balance", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<CyclesBalance>(),
     )]
@@ -330,7 +347,16 @@ impl IcDeployTools {
         let Some(sid) = (self.session)(&ctx) else {
             return Ok(err("checking your cycles balance needs an authenticated session".into()));
         };
-        match cycles_balance(&self.identities, &sid).await {
+        let identity = match self.cli_identity(&sid).await {
+            Ok(id) => id,
+            Err(e) => return Ok(err(e)),
+        };
+        let principal = match identity.sender() {
+            Ok(p) => p,
+            Err(e) => return Ok(err(format!("could not derive your principal: {e}"))),
+        };
+        let agent = self.identities.agent_as(identity);
+        match cycles_balance_of(&agent, principal).await {
             Ok(balance) => Ok(ok_structured(balance.human(), &balance)),
             Err(e) => Ok(err(e)),
         }
