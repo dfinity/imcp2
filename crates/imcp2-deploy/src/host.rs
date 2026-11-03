@@ -88,11 +88,26 @@ pub const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
 /// seeds it from the caller's mapping; the archive may not supply it.
 const STATE_DIR: &str = ".icp";
 
-/// The most entries an archive may hold. The byte budget alone would admit
-/// millions of empty files, each a path in the index the loader walks; a
-/// real bundle is a manifest, a few modules and plugins, and a frontend's
-/// assets, well inside this.
+/// The most files and directories an archive may extract to, counting the
+/// directories its entries' paths imply and extraction creates on the way.
+/// The byte budget alone would admit millions of empty files, each a path in
+/// the index the loader walks, or a few files at the bottom of millions of
+/// directories, each an inode; a real bundle is a manifest, a few modules and
+/// plugins, and a frontend's assets, well inside this.
 pub const MAX_BUNDLE_ENTRIES: usize = 250_000;
+
+/// The longest path an archive entry may have, in bytes: Linux's own `PATH_MAX`,
+/// past which no path can be created anyway. Counting the directories a path
+/// implies costs a lookup per component, so the path is held to a length first.
+pub const MAX_ENTRY_PATH_BYTES: usize = 4096;
+
+/// What loading the project may read in all: the manifests, and the argument
+/// and variable files the loader reads into each canister. Each read is
+/// retained, and the loader reads a file once per canister that names it,
+/// so the extraction budget bounds none of this: fifty canisters naming one
+/// file of 100 MiB would hold 5 GiB. A canister's arguments fit in one
+/// ingress message, so a real project reads a few MiB at most.
+pub const MAX_PROJECT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The most a gzip-compressed module may expand to: 100 MiB, the IC's own
 /// ceiling on a module. The library gunzips a module in memory to read its
@@ -481,6 +496,92 @@ impl FileSystem for BundleFs {
     }
 }
 
+/// [`BundleFs`] with a budget on what is read through it: the filesystem
+/// the project loader is given, so what it retains is bounded.
+///
+/// The loader reads a manifest, an argument file or a variable file into the
+/// canister that names it, once per canister, and keeps it for the life of
+/// the project. Every read is charged by the file's size before it is made;
+/// the rest of the trait passes through.
+struct Metered {
+    inner: BundleFs,
+    left: Mutex<u64>,
+}
+
+impl Metered {
+    fn new(inner: BundleFs, budget: u64) -> Self {
+        Self { inner, left: Mutex::new(budget) }
+    }
+
+    /// Charge `path`'s size to the budget, or refuse the read.
+    fn charge(&self, path: &Utf8Path) -> Result<(), FsError> {
+        let on_disk = self.inner.locate(path)?;
+        let size = std::fs::metadata(&on_disk)
+            .map_err(|e| BundleFsError::Io(self.inner.normalize(path), e))?
+            .len();
+        let mut left = self.left.lock().unwrap_or_else(PoisonError::into_inner);
+        if size > *left {
+            return Err(FsError::new(Unsupported(format!(
+                "loading the project reads more than {} bytes of manifests, argument files and \
+                 variable files in all, more than a project ever holds; a canister's arguments \
+                 fit in one message",
+                MAX_PROJECT_BYTES
+            ))));
+        }
+        *left -= size;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl FileSystem for Metered {
+    async fn read(&self, path: &Utf8Path) -> Result<Vec<u8>, FsError> {
+        self.charge(path)?;
+        self.inner.read(path).await
+    }
+
+    async fn read_to_string(&self, path: &Utf8Path) -> Result<String, FsError> {
+        self.charge(path)?;
+        self.inner.read_to_string(path).await
+    }
+
+    async fn write(&self, path: &Utf8Path, contents: &[u8]) -> Result<(), FsError> {
+        self.inner.write(path, contents).await
+    }
+
+    async fn create_dir_all(&self, path: &Utf8Path) -> Result<(), FsError> {
+        self.inner.create_dir_all(path).await
+    }
+
+    async fn copy(&self, from: &Utf8Path, to: &Utf8Path) -> Result<(), FsError> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn exists(&self, path: &Utf8Path) -> bool {
+        self.inner.exists(path).await
+    }
+
+    async fn is_file(&self, path: &Utf8Path) -> bool {
+        self.inner.is_file(path).await
+    }
+
+    async fn is_dir(&self, path: &Utf8Path) -> bool {
+        self.inner.is_dir(path).await
+    }
+
+    async fn read_dir(&self, path: &Utf8Path) -> Result<Vec<Utf8PathBuf>, FsError> {
+        self.inner.read_dir(path).await
+    }
+
+    async fn canonicalize(&self, path: &Utf8Path) -> Option<Utf8PathBuf> {
+        self.inner.canonicalize(path).await
+    }
+
+    async fn scratch_dir(&self) -> Result<Box<dyn Scratch>, FsError> {
+        self.inner.scratch_dir().await
+    }
+}
+
 // ── Wasms, recipes, scripts ───────────────────────────────────────────────
 
 /// Wasm resolution for a bundle: the archive carries every module it names,
@@ -719,17 +820,35 @@ pub fn check_bundle<'a>(
 /// The host for the bundle extracted into `fs`: its manifest is the project,
 /// its `.icp` directory the id and artifact stores, and nothing outside it is
 /// reachable.
+///
+/// The project is loaded through a [`Metered`] view of the bundle, so what
+/// the loader reads and retains — once per canister that names a file — stays
+/// within [`MAX_PROJECT_BYTES`]; the phases read the bundle itself.
+///
+/// What is not bounded here: the sync-plugin runtime (`icp-sync-plugin`'s
+/// wasmtime runner) holds a plugin to a compute-time budget and a stack
+/// limit, and each of its linear memories to the wasm32 address space, but
+/// sets no store limiter, so a plugin may allocate up to that space before
+/// its time runs out. The runner builds its own engine and store, so the
+/// limiter belongs there, upstream; until it has one, a bundle's plugins run
+/// with the memory bound the icp CLI gives them.
 pub fn host_for(fs: BundleFs) -> Host {
+    host_within(fs, MAX_PROJECT_BYTES)
+}
+
+/// [`host_for`] with the project-loading budget as a parameter, so a test can
+/// reach it without a quarter of a gigabyte of argument files.
+fn host_within(fs: BundleFs, project_bytes: u64) -> Host {
     // The directory IS the project root: no climbing to a workspace above it.
     let root = fs.root().to_path_buf();
     let locate: Arc<dyn ProjectRootLocate> =
         Arc::new(ProjectRootLocateImpl::new(root.clone(), Some(root)));
     let files: Arc<dyn FileSystem> = Arc::new(fs.clone());
-    let wasm: Arc<dyn Fetch> = Arc::new(BundledWasm(fs));
+    let wasm: Arc<dyn Fetch> = Arc::new(BundledWasm(fs.clone()));
     let project = Lazy::<_, Project>::new(ProjectLoadImpl {
         project_root_locate: locate.clone(),
         recipe: Arc::new(NoRecipes),
-        files: files.clone(),
+        files: Arc::new(Metered::new(fs, project_bytes)),
     });
     let no_scripts = Arc::new(NoScripts { prebuilt: Builder::new(wasm.clone(), files.clone()) });
     Host {
@@ -756,15 +875,16 @@ pub fn host_for(fs: BundleFs) -> Host {
 /// Only regular files and directories are written — `icp project bundle`
 /// writes nothing else, and a symlink or a device node is how an archive
 /// reaches past its directory — and their sizes may not add up to more than
-/// [`MAX_EXTRACTED_BYTES`]. `tar` refuses entry paths that would land outside
-/// `into`. What it extracts is then required to look like a bundle, i.e. to
-/// carry a project manifest at its root.
+/// [`MAX_EXTRACTED_BYTES`], nor their number, with the directories their
+/// paths imply, to more than [`MAX_BUNDLE_ENTRIES`]. `tar` refuses entry
+/// paths that would land outside `into`. What it extracts is then required
+/// to look like a bundle, i.e. to carry a project manifest at its root.
 pub fn extract_bundle(bytes: &[u8], into: &Utf8Path) -> Result<BundleFs, String> {
     extract_bundle_within(bytes, into, MAX_BUNDLE_ENTRIES)
 }
 
-/// [`extract_bundle`] with the entry cap as a parameter, so a test can reach
-/// it without writing a quarter of a million files.
+/// [`extract_bundle`] with the files-and-directories cap as a parameter, so a
+/// test can reach it without writing a quarter of a million files.
 fn extract_bundle_within(
     bytes: &[u8],
     into: &Utf8Path,
@@ -783,25 +903,44 @@ fn extract_bundle_within(
     let decoder = Limited { inner: flate2::read::GzDecoder::new(bytes), left: MAX_EXTRACTED_BYTES };
     let mut archive = tar::Archive::new(decoder);
     let mut total: u64 = 0;
-    let mut entries: usize = 0;
+    // Files and directories written so far, counting each directory an
+    // entry's path implies: `unpack_in` creates the missing parents of every
+    // entry, so a few files at the bottom of long, distinct directory chains
+    // would otherwise cost inodes the entry count never sees.
+    let mut objects: usize = 0;
+    let too_many = || {
+        format!(
+            "the bundle holds more than {max_entries} files and directories, more than a bundle \
+             ever has"
+        )
+    };
+    // The directories written as entries of their own; the ones files imply
+    // are read off the index.
+    let mut dirs: BTreeSet<Utf8PathBuf> = BTreeSet::new();
     for entry in archive.entries().map_err(unreadable)? {
         let mut entry = entry.map_err(unreadable)?;
-        entries += 1;
-        if entries > max_entries {
-            return Err(format!(
-                "the bundle holds more than {max_entries} entries, more than a bundle ever has"
-            ));
+        objects += 1;
+        if objects > max_entries {
+            return Err(too_many());
         }
         let kind = entry.header().entry_type();
         let path = entry.path().map_err(unreadable)?.into_owned();
         let path = Utf8PathBuf::from_path_buf(path)
             .map_err(|p| format!("the archive entry '{}' is not UTF-8", p.display()))?;
+        if path.as_str().len() > MAX_ENTRY_PATH_BYTES {
+            return Err(format!(
+                "an archive entry's path is {} bytes long, more than the {MAX_ENTRY_PATH_BYTES} \
+                 a path can be",
+                path.as_str().len()
+            ));
+        }
         if !(kind.is_file() || kind.is_dir()) {
             return Err(format!(
                 "the archive entry '{path}' is not a regular file or directory ({kind:?}), which \
                  a bundle never carries; rebuild it with `icp project bundle`"
             ));
         }
+        let rel = fs.normalize(&path);
         // `.icp` is the library's own state under the project root: the id
         // mappings a deploy reads to decide what exists, and the artifact
         // store. A bundle never carries it (`icp project bundle` writes
@@ -809,23 +948,40 @@ fn extract_bundle_within(
         // that did could point a deploy at canisters the caller never named.
         // Compared without regard to case: on a case-insensitive disk `.ICP`
         // is the same directory.
-        if fs
-            .normalize(&path)
-            .components()
-            .next()
-            .is_some_and(|c| c.as_str().eq_ignore_ascii_case(STATE_DIR))
-        {
+        if rel.components().next().is_some_and(|c| c.as_str().eq_ignore_ascii_case(STATE_DIR)) {
             return Err(format!(
                 "the archive entry '{path}' is under `{STATE_DIR}/`, the project state a bundle \
                  never carries; rebuild it with `icp project bundle`"
             ));
         }
+        // The parents this entry implies that nothing before it did. A
+        // directory is known once a file sits under it or an entry wrote it,
+        // and a known directory's own parents are known too, so the walk up
+        // stops at the first one.
+        let implied = {
+            let state = fs.0.state();
+            rel.ancestors()
+                .skip(1)
+                .filter(|dir| !dir.as_str().is_empty())
+                .take_while(|dir| {
+                    !dirs.contains(*dir) && State::under(&state.files, dir).next().is_none()
+                })
+                .count()
+        };
+        objects = objects.saturating_add(implied);
+        if objects > max_entries {
+            return Err(too_many());
+        }
         total = total.saturating_add(entry.size());
         if total > MAX_EXTRACTED_BYTES {
             return Err(too_large());
         }
-        if entry.unpack_in(fs.root().as_std_path()).map_err(unreadable)? && kind.is_file() {
-            fs.index(&path);
+        if entry.unpack_in(fs.root().as_std_path()).map_err(unreadable)? {
+            if kind.is_file() {
+                fs.index(&path);
+            } else {
+                dirs.insert(rel);
+            }
         }
     }
     if !fs.contains(Utf8Path::new(PROJECT_MANIFEST)) {
@@ -1061,25 +1217,105 @@ mod tests {
         assert!(!into.join(".icp").exists());
     }
 
+    // The cap counts files and directories alike, the directories by what
+    // the paths imply: nine files under one directory are ten objects.
     #[test]
     fn an_archive_with_too_many_entries_is_refused() {
         let (_dir, into) = scratch();
+        let paths: Vec<String> = (0..=8).map(|i| format!("f/{i}")).collect();
+        let bytes = empty_files(&paths);
+        let err = extract_bundle_within(&bytes, &into, 9).unwrap_err();
+        assert!(err.contains("more than 9 files and directories"), "{err}");
+        let (_dir, into) = scratch();
+        let err = extract_bundle_within(&bytes, &into, 10).unwrap_err();
+        assert!(err.contains(PROJECT_MANIFEST), "{err}");
+    }
+
+    // An entry's path implies the directories above it, which extraction
+    // creates whether or not the archive lists them: they count once each,
+    // however many entries share them, and an entry written as a directory
+    // counts as itself.
+    #[test]
+    fn the_directories_an_archive_implies_count_against_its_cap() {
+        // Two files at the bottom of one chain: 2 files + 3 directories.
+        let bytes = empty_files(&["a/b/c/x".into(), "a/b/c/y".into()]);
+        let (_dir, into) = scratch();
+        let err = extract_bundle_within(&bytes, &into, 4).unwrap_err();
+        assert!(err.contains("more than 4 files and directories"), "{err}");
+        assert!(!into.join("a/b/c/y").exists(), "the refused entry is not written");
+        let (_dir, into) = scratch();
+        let err = extract_bundle_within(&bytes, &into, 5).unwrap_err();
+        assert!(err.contains(PROJECT_MANIFEST), "{err}");
+
+        // Two files under distinct chains share nothing: 2 files + 6 dirs.
+        let bytes = empty_files(&["a/b/c/x".into(), "d/e/f/y".into()]);
+        let (_dir, into) = scratch();
+        let err = extract_bundle_within(&bytes, &into, 7).unwrap_err();
+        assert!(err.contains("more than 7 files and directories"), "{err}");
+        let (_dir, into) = scratch();
+        let err = extract_bundle_within(&bytes, &into, 8).unwrap_err();
+        assert!(err.contains(PROJECT_MANIFEST), "{err}");
+
+        // One file far down a chain is refused on its own, before it is
+        // written: the directories it would create are the cost.
+        let deep = (0..64).map(|_| "d").collect::<Vec<_>>().join("/") + "/x";
+        let bytes = empty_files(&[deep]);
+        let (_dir, into) = scratch();
+        let err = extract_bundle_within(&bytes, &into, 32).unwrap_err();
+        assert!(err.contains("more than 32 files and directories"), "{err}");
+        assert!(!into.join("d").exists());
+
+        // A directory entry counts as itself; a file under it then implies
+        // nothing new: 1 dir entry + 1 file.
         let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
             Vec::new(),
             flate2::Compression::fast(),
         ));
-        for i in 0..=8 {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive.append_data(&mut header, "a/", &b""[..]).unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append_data(&mut header, "a/x", &b""[..]).unwrap();
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+        let (_dir, into) = scratch();
+        let err = extract_bundle_within(&bytes, &into, 2).unwrap_err();
+        assert!(err.contains(PROJECT_MANIFEST), "{err}");
+        assert!(into.join("a/x").exists());
+    }
+
+    // Counting what a path implies costs a lookup per component, so the
+    // path is held to a length first — one no filesystem would take anyway.
+    #[test]
+    fn an_entry_path_past_the_length_limit_is_refused() {
+        let long = (0..=MAX_ENTRY_PATH_BYTES / 2).map(|_| "a").collect::<Vec<_>>().join("/");
+        assert!(long.len() > MAX_ENTRY_PATH_BYTES);
+        let bytes = empty_files(&[long]);
+        let (_dir, into) = scratch();
+        let err = extract_bundle(&bytes, &into).unwrap_err();
+        assert!(err.contains("bytes long"), "{err}");
+        assert!(!into.join("a").exists());
+    }
+
+    /// A gzipped tar of empty regular files at the given paths.
+    fn empty_files(paths: &[String]) -> Vec<u8> {
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for path in paths {
             let mut header = tar::Header::new_gnu();
             header.set_size(0);
             header.set_mode(0o644);
             header.set_cksum();
-            archive.append_data(&mut header, format!("f/{i}"), &b""[..]).unwrap();
+            archive.append_data(&mut header, path, &b""[..]).unwrap();
         }
-        let bytes = archive.into_inner().unwrap().finish().unwrap();
-        let err = extract_bundle_within(&bytes, &into, 8).unwrap_err();
-        assert!(err.contains("more than 8 entries"), "{err}");
-        let err = extract_bundle_within(&bytes, &into, 9).unwrap_err();
-        assert!(err.contains(PROJECT_MANIFEST), "{err}");
+        archive.into_inner().unwrap().finish().unwrap()
     }
 
     // A gzip-compressed module is bounded by what it expands to, read
@@ -1186,6 +1422,61 @@ mod tests {
         }
         let err = fs.locate(Utf8Path::new("/etc/hostname")).unwrap_err().to_string();
         assert!(err.contains("'etc/hostname' is not in the bundle"), "{err}");
+    }
+
+    // The loader reads an argument file into every canister that names it,
+    // so two canisters naming one file read it twice, and the budget counts
+    // both: what the project retains is bounded, not what the archive holds.
+    #[tokio::test]
+    async fn loading_the_project_is_held_to_its_read_budget() {
+        let manifest = "canisters:\n  - name: a\n    init_args:\n      path: args.bin\n      \
+                        format: bin\n    build:\n      steps:\n        - type: pre-built\n          \
+                        path: a.wasm\n  - name: b\n    init_args:\n      path: args.bin\n      \
+                        format: bin\n    build:\n      steps:\n        - type: pre-built\n          \
+                        path: a.wasm\n";
+        let args = [7u8; 1000];
+        let bytes = archive(&[("icp.yaml", manifest.as_bytes()), ("args.bin", &args)]);
+
+        // Room for the manifest and one read of the file, not two.
+        let (_dir, into) = scratch();
+        let fs = extract_bundle(&bytes, &into).unwrap();
+        let host = host_within(fs, manifest.len() as u64 + 1500);
+        let err = host.project.load().await.expect_err("the second read is over budget");
+        let chain = std::iter::successors(Some(&err as &dyn std::error::Error), |e| e.source())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(": ");
+        assert!(chain.contains("canister 'b'"), "{chain}");
+        assert!(chain.contains("loading the project reads more than"), "{chain}");
+
+        // Room for both.
+        let (_dir, into) = scratch();
+        let fs = extract_bundle(&bytes, &into).unwrap();
+        let host = host_within(fs, manifest.len() as u64 + 2000);
+        let project = host.project.load().await.unwrap();
+        assert_eq!(project.canisters.len(), 2);
+    }
+
+    // The budget is the loader's alone: the phases read the bundle itself,
+    // where a module is read as many times as the deploy needs it.
+    #[tokio::test]
+    async fn the_read_budget_meters_reads_and_nothing_else() {
+        let (_dir, into) = scratch();
+        let fs = extract_bundle(
+            &archive(&[("icp.yaml", b"canisters: []"), ("big", &[0u8; 100])]),
+            &into,
+        )
+        .unwrap();
+        let metered = Metered::new(fs.clone(), 150);
+        assert_eq!(metered.read(Utf8Path::new("big")).await.unwrap().len(), 100);
+        assert!(metered.is_file(Utf8Path::new("big")).await);
+        assert!(metered.exists(Utf8Path::new("big")).await);
+        let err = metered.read(Utf8Path::new("big")).await.unwrap_err().to_string();
+        assert!(err.contains("loading the project reads more than"), "{err}");
+        // A file the bundle does not hold is refused as such, not charged.
+        let err = metered.read(Utf8Path::new("missing")).await.unwrap_err().to_string();
+        assert!(err.contains("not in the bundle"), "{err}");
+        assert_eq!(fs.read(Utf8Path::new("big")).await.unwrap().len(), 100);
     }
 
     // A build writes its output to a scratch directory and the operation
