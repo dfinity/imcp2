@@ -94,13 +94,15 @@ use icp_project::{
         Access, AccessError, CollectFriendlyDomains, Configuration, NetworkAccess, NetworkUrls,
         RootKeySource, RootKeySpec,
     },
+    operations::wasm::extract_candid_service,
     prelude::{IC, IC_MAINNET_NETWORK_API_URL, IC_ROOT_KEY},
     random::HostRandom,
     store_artifact::ArtifactStore,
     store_id::AccessImpl,
     untrusted::{NoRecipes, Vetted},
-    Canister, Lazy, Network, Project, ProjectLoadImpl,
+    Canister, CanisterArgs, Lazy, Network, Project, ProjectLoadImpl,
 };
+use imcp2_core::guard_candid_text;
 use sha2::{Digest, Sha256};
 
 /// Archives above this are refused before anything is written: a bundle rides
@@ -487,8 +489,19 @@ impl ScriptRunner for NoScripts {
 /// runtime will read of them ([`check_declared`]).
 ///
 /// The work the check does is bounded by the archive, not by the manifest:
-/// a file is read, hashed and expanded once however many canisters name it
-/// ([`Verified`]), and the expansions are summed ([`MAX_WASM_BYTES_IN_ALL`]).
+/// a file is read, hashed, expanded and its interface guarded once however
+/// many canisters name it ([`Verified`]), and the expansions are summed
+/// ([`MAX_WASM_BYTES_IN_ALL`]).
+///
+/// The textual Candid the bundle carries is held to what the library can
+/// parse safely: its parser recurses without a depth guard, on the worker
+/// thread the deploy runs on, so a canister's `init_args`/`upgrade_args`
+/// value and the `candid:service` interface in its module are checked for
+/// size and nesting first ([`guard_candid_text`], the bound the call tools
+/// apply to caller-supplied Candid). The library parses the arguments at
+/// install and the interface at the upgrade compatibility check; a value it
+/// cannot parse fails there, but one that would overflow the stack aborts
+/// the process, so the bound comes first.
 ///
 /// Where each canister lives is the loader's business: it finds a canister
 /// directory through the confined filesystem, so one outside the bundle root
@@ -553,6 +566,19 @@ fn check_bundle_within<'a>(
             ))));
         };
         checksum_matches(&local.path, expected, &actual).map_err(at)?;
+        for (field, args) in
+            [("init_args", &canister.init_args), ("upgrade_args", &canister.upgrade_args)]
+        {
+            // The format type is not nameable from here (the library exposes
+            // it through this field alone); its default is `candid`, the one
+            // format that is parsed rather than decoded.
+            if let Some(CanisterArgs::Text { content, format }) = args {
+                if *format == Default::default() {
+                    guard_candid_text(&format!("`{field}`"), content)
+                        .map_err(|e| at(Unsupported(e)))?;
+                }
+            }
+        }
 
         for step in &canister.sync.steps {
             let SyncStep::Plugin(plugin) = step else { continue };
@@ -576,9 +602,9 @@ fn check_bundle_within<'a>(
 
 /// What [`check_bundle`] has read so far, by where each file lies on disk:
 /// a module or plugin that several canisters name — or one canister names
-/// under several spellings — is read, hashed and expanded once, so the work
-/// the check does is bounded by what the archive holds, not by what the
-/// manifest repeats.
+/// under several spellings — is read, hashed, expanded and its interface
+/// guarded once, so the work the check does is bounded by what the archive
+/// holds, not by what the manifest repeats.
 struct Verified {
     /// Each file's sha256, in hex, by its on-disk path.
     hashes: BTreeMap<Utf8PathBuf, String>,
@@ -589,7 +615,9 @@ struct Verified {
 impl Verified {
     /// The sha256 of the file at `path` under `dir`, read and hashed on first
     /// sight — when a gzip-compressed one is also held to [`MAX_WASM_BYTES`]
-    /// expanded, and its expansion counted against the sum.
+    /// expanded, its expansion counted against the sum, and the
+    /// `candid:service` interface a module carries held to what the library
+    /// can parse.
     fn sha256(
         &mut self,
         fs: &BundleFs,
@@ -610,6 +638,11 @@ impl Verified {
             )));
         }
         self.wasm_left -= expanded;
+        // Bounded above, so the extractor's own gunzip is bounded too.
+        if let Some(interface) = extract_candid_service(&bytes) {
+            guard_candid_text(&format!("the `candid:service` interface of '{path}'"), &interface)
+                .map_err(Unsupported)?;
+        }
         let hash = hex::encode(Sha256::digest(&bytes));
         self.hashes.insert(on_disk, hash.clone());
         Ok(hash)

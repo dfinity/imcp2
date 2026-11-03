@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
 };
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use candid::Principal;
 use ic_agent::{Agent, Identity};
 use icp_canister_interfaces::engine_canister::engine_canister_id;
@@ -50,6 +50,9 @@ impl fmt::Debug for BundleSource {
     }
 }
 
+/// The install modes `icp deploy --mode` takes, as the library spells them.
+pub const INSTALL_MODES: [&str; 4] = ["auto", "install", "reinstall", "upgrade"];
+
 /// Everything one deploy is given.
 #[derive(Debug)]
 pub struct DeployRequest {
@@ -59,8 +62,10 @@ pub struct DeployRequest {
     /// Canister ids to start from: a canister named here is upgraded in place
     /// instead of created. Each name must be a canister of the environment.
     pub canister_ids: BTreeMap<String, Principal>,
-    /// `auto`, `install`, `reinstall` or `upgrade` — validated upstream by the
-    /// install-mode resolution, as on the command line.
+    /// One of [`INSTALL_MODES`]: `auto`, `install`, `reinstall` or `upgrade`.
+    /// Checked at entry: the library resolves the mode only once it installs,
+    /// after the canisters have been created, and it panics on any other
+    /// spelling rather than failing the deploy.
     pub mode: String,
     /// Cycles to fund each canister this deploy creates.
     pub cycles: u128,
@@ -154,35 +159,16 @@ pub async fn deploy_bundle(
     identity: Arc<dyn Identity>,
     request: DeployRequest,
 ) -> Result<DeployOutcome, RequestError> {
+    if !INSTALL_MODES.contains(&request.mode.as_str()) {
+        return Err(RequestError(format!(
+            "mode must be one of {}, got '{}'",
+            INSTALL_MODES.map(|m| format!("'{m}'")).join(", "),
+            request.mode
+        )));
+    }
     let bytes = match request.bundle {
         BundleSource::Bytes(bytes) => bytes,
-        BundleSource::Path(path) => {
-            if !path.is_absolute() {
-                return Err(RequestError(format!(
-                    "bundle_path must be an absolute path on this machine, got '{path}'"
-                )));
-            }
-            let meta = tokio::fs::metadata(path.as_std_path())
-                .await
-                .map_err(|e| RequestError(format!("cannot read bundle '{path}': {e}")))?;
-            // A device or a pipe reports a length that says nothing about
-            // what a read of it produces (`/dev/zero` is 0 bytes long and
-            // endless; a FIFO blocks), so the size check below only means
-            // something for a regular file.
-            if !meta.is_file() {
-                return Err(RequestError(format!("bundle '{path}' is not a regular file")));
-            }
-            if meta.len() > host::MAX_BUNDLE_BYTES as u64 {
-                return Err(RequestError(format!(
-                    "bundle '{path}' is {} bytes, above the {} byte limit",
-                    meta.len(),
-                    host::MAX_BUNDLE_BYTES
-                )));
-            }
-            tokio::fs::read(path.as_std_path())
-                .await
-                .map_err(|e| RequestError(format!("cannot read bundle '{path}': {e}")))?
-        }
+        BundleSource::Path(path) => read_bundle_file(&path, host::MAX_BUNDLE_BYTES).await?,
     };
 
     // The scratch directory lives exactly as long as this function: the
@@ -209,13 +195,24 @@ pub async fn deploy_bundle(
     // Before any phase runs: a bundle that is not one — a script step, a wasm
     // that is missing or does not hash to its checksum, a network other than
     // the IC — is refused here, not at the phase that would reach it after
-    // canisters have been created.
-    host::check_bundle(
-        &fs,
-        &env.network,
-        env.canisters.values().map(|(dir, canister)| (dir.as_path(), canister)),
-    )
-    .map_err(RequestError)?;
+    // canisters have been created. The check reads, hashes and gunzips every
+    // module, up to a gigabyte of them, so like extraction it runs off the
+    // runtime's workers.
+    {
+        let fs = fs.clone();
+        let network = env.network.clone();
+        let canisters: Vec<_> = env.canisters.values().cloned().collect();
+        tokio::task::spawn_blocking(move || {
+            host::check_bundle(
+                &fs,
+                &network,
+                canisters.iter().map(|(dir, canister)| (dir.as_path(), canister)),
+            )
+        })
+        .await
+        .map_err(|e| RequestError(format!("bundle check panicked: {e}")))?
+        .map_err(RequestError)?;
+    }
 
     // Seed the id store with the mapping the caller passed: from here on the
     // operation sees those canisters as existing, exactly as it would see the
@@ -322,6 +319,50 @@ pub async fn deploy_bundle(
 
     drop(scratch);
     Ok(outcome)
+}
+
+/// Read the bundle at `path`, which must be an absolute path to a regular
+/// file of at most `limit` bytes, and nothing else: a device or a pipe reports
+/// a length that says nothing about what a read of it produces (`/dev/zero`
+/// is 0 bytes long and endless; a FIFO blocks on open), so the size check
+/// means something for a regular file only. The path is checked before it
+/// is opened, so a pipe is never opened; the open file is checked again, so
+/// a file replaced or grown between the two is still read to the limit and
+/// no further.
+async fn read_bundle_file(path: &Utf8Path, limit: usize) -> Result<Vec<u8>, RequestError> {
+    use tokio::io::AsyncReadExt;
+    if !path.is_absolute() {
+        return Err(RequestError(format!(
+            "bundle_path must be an absolute path on this machine, got '{path}'"
+        )));
+    }
+    let cannot = |e: std::io::Error| RequestError(format!("cannot read bundle '{path}': {e}"));
+    let too_large = |len: u64| {
+        RequestError(format!("bundle '{path}' is {len} bytes, above the {limit} byte limit"))
+    };
+    let not_regular = || RequestError(format!("bundle '{path}' is not a regular file"));
+    let meta = tokio::fs::metadata(path.as_std_path()).await.map_err(cannot)?;
+    if !meta.is_file() {
+        return Err(not_regular());
+    }
+    if meta.len() > limit as u64 {
+        return Err(too_large(meta.len()));
+    }
+    let file = tokio::fs::File::open(path.as_std_path()).await.map_err(cannot)?;
+    let meta = file.metadata().await.map_err(cannot)?;
+    if !meta.is_file() {
+        return Err(not_regular());
+    }
+    if meta.len() > limit as u64 {
+        return Err(too_large(meta.len()));
+    }
+    // One byte past the limit is enough to tell that the file outgrew it.
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(limit as u64 + 1).read_to_end(&mut bytes).await.map_err(cannot)?;
+    if bytes.len() > limit {
+        return Err(too_large(bytes.len() as u64));
+    }
+    Ok(bytes)
 }
 
 /// Turn the operation's event stream into one line per finished task:
@@ -627,6 +668,80 @@ mod tests {
     // A `bundle_path` is read only when it is a regular file: a directory
     // here, and by the same check a device or a pipe, whose length says
     // nothing about what reading it would produce.
+    // The library resolves the mode at install, after creation, and panics on
+    // a spelling it does not know: refused at entry instead, before anything
+    // is read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_mode_is_refused_at_entry() {
+        let mut bad = request(Vec::new(), "ic");
+        bad.mode = "yolo".into();
+        let err = deploy_bundle(Arc::new(AnonymousIdentity), bad).await.unwrap_err();
+        assert!(err.0.contains("mode must be one of"), "{}", err.0);
+        assert!(err.0.contains("'yolo'"), "{}", err.0);
+    }
+
+    // The file is read to the limit and one byte past it, never to its end:
+    // a file that grows between the size check and the read is still bounded.
+    #[tokio::test]
+    async fn a_bundle_file_is_read_to_its_limit_and_no_further() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("b.tar.gz")).unwrap();
+        std::fs::write(&path, [7u8; 32]).unwrap();
+        assert_eq!(read_bundle_file(&path, 32).await.unwrap().len(), 32);
+        let err = read_bundle_file(&path, 16).await.unwrap_err();
+        assert!(err.0.contains("above the 16 byte limit"), "{}", err.0);
+        let err = read_bundle_file(Utf8Path::new("relative/b.tar.gz"), 32).await.unwrap_err();
+        assert!(err.0.contains("absolute"), "{}", err.0);
+        let err = read_bundle_file(&path.with_file_name("missing"), 32).await.unwrap_err();
+        assert!(err.0.contains("cannot read bundle"), "{}", err.0);
+    }
+
+    // The Candid a bundle carries is parsed by the library without a depth
+    // guard, on the worker thread: an argument or an interface nested past
+    // the bound is refused before any phase, not left to overflow the stack
+    // at install or at the upgrade check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn candid_nested_past_the_bound_is_refused_up_front() {
+        let deep = format!("({}null)", "opt ".repeat(200));
+        let (wasm, sha) = wasm();
+        let manifest = format!(
+            "canisters:\n  - name: backend\n    init_args:\n      value: '{deep}'\n    build:\n      \
+             steps:\n        - type: pre-built\n          path: canisters/backend.wasm\n          \
+             sha256: {sha}\n"
+        );
+        let bytes =
+            archive(&[("icp.yaml", manifest.as_bytes()), ("canisters/backend.wasm", &wasm)]);
+        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
+            .await
+            .expect_err("a deeply nested init_args value is refused");
+        assert!(err.0.contains("`init_args` is nested too deeply"), "{err}");
+
+        let interface = format!("service : {{ f : ({}null) -> () }}", "opt ".repeat(200));
+        let wasm = wat::parse_str(format!(
+            "(module (@custom \"icp:public candid:service\" \"{interface}\"))"
+        ))
+        .unwrap();
+        let sha = hex::encode(Sha256::digest(&wasm));
+        let bytes = bundle(&sha, &wasm);
+        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
+            .await
+            .expect_err("a deeply nested interface is refused");
+        assert!(err.0.contains("`candid:service` interface"), "{err}");
+        assert!(err.0.contains("nested too deeply"), "{err}");
+
+        // A module with an ordinary interface deploys as before.
+        let wasm = wat::parse_str(
+            "(module (@custom \"icp:public candid:service\" \"service : { f : () -> () }\"))",
+        )
+        .unwrap();
+        let sha = hex::encode(Sha256::digest(&wasm));
+        let outcome =
+            deploy_bundle(Arc::new(AnonymousIdentity), request(bundle(&sha, &wasm), "ic"))
+                .await
+                .unwrap();
+        assert!(outcome.log.iter().any(|l| l == "Building canisters: ok"), "{:?}", outcome.log);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_bundle_path_that_is_not_a_regular_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();
