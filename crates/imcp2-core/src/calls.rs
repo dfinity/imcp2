@@ -13,7 +13,7 @@
 
 use candid::{
     types::value::{IDLArgs, IDLField, IDLValue},
-    types::{FieldDoc, Label, Type, TypeDoc, TypeEnv, TypeInner},
+    types::{FieldDoc, Function, Label, Type, TypeDoc, TypeEnv, TypeInner},
     Principal,
 };
 use candid_parser::syntax::{Binding, Dec, IDLProg, IDLType};
@@ -1181,6 +1181,10 @@ struct InterfaceDocs {
     methods: BTreeMap<String, Vec<String>>,
     /// On the `service` declaration itself.
     service: Vec<String>,
+    /// Inside the inline records and variants of a method's arguments and
+    /// results, by method name — one doc per argument, one per result — for the
+    /// methods that have any.
+    signatures: BTreeMap<String, (Vec<TypeDoc>, Vec<TypeDoc>)>,
 }
 
 fn interface_docs(prog: &IDLProg) -> InterfaceDocs {
@@ -1198,6 +1202,13 @@ fn interface_docs(prog: &IDLProg) -> InterfaceDocs {
         // hop, bounds the walk on any input without cutting a valid chain short.
         for binding in service_bindings(prog, &actor.typ, prog.decs.len() + 1) {
             docs.methods.insert(binding.id.clone(), binding.docs.clone());
+            if let IDLType::FuncT(func) = &binding.typ {
+                let args: Vec<TypeDoc> = func.args.iter().map(|ty| type_doc(ty, &[])).collect();
+                let rets: Vec<TypeDoc> = func.rets.iter().map(|ty| type_doc(ty, &[])).collect();
+                if args.iter().chain(&rets).any(|doc| !doc.fields.is_empty()) {
+                    docs.signatures.insert(binding.id.clone(), (args, rets));
+                }
+            }
         }
     }
     docs
@@ -1283,14 +1294,36 @@ fn print_subset(
         push_comment_lines(&mut out, docs.methods.get(name).map(Vec::as_slice), "  ");
         let ident = pp_text(name).pretty(DID_LINE_WIDTH).to_string();
         // A method declared through a named function type keeps that name.
-        let signature = match ty.as_ref() {
-            TypeInner::Func(func) => pp_function(func).pretty(DID_LINE_WIDTH).to_string(),
+        let signature = match (ty.as_ref(), docs.signatures.get(name)) {
+            (TypeInner::Func(func), Some((args, rets))) => signature_text(func, args, rets),
+            (TypeInner::Func(func), None) => pp_function(func).pretty(DID_LINE_WIDTH).to_string(),
             _ => pp_ty(ty).pretty(DID_LINE_WIDTH).to_string(),
         };
         out.push_str(&format!("  {ident} : {};\n", reindent(&signature, "  ")));
     }
     out.push('}');
     out
+}
+
+/// A method's signature with the field comments its inline argument and result
+/// records carry (`args` and `rets` hold one doc per type), laid out for the
+/// service body, two spaces in; the modes as candid prints them.
+fn signature_text(func: &Function, args: &[TypeDoc], rets: &[TypeDoc]) -> String {
+    use candid::pretty::candid::pp_modes;
+    let list = |types: &[Type], docs: &[TypeDoc]| {
+        types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| type_text(ty, docs.get(i), "  "))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "({}) -> ({}){}",
+        list(&func.args, args),
+        list(&func.rets, rets),
+        pp_modes(&func.modes).pretty(DID_LINE_WIDTH)
+    )
 }
 
 /// `// line` per comment line, at `indent`.
@@ -3535,6 +3568,14 @@ mod tests {
           // Engines the caller may see, a page at a time.\n  \
           listVisibleEngines : (Page) -> (ListResult) query;\n  \
           batch : (Batch) -> () query;\n  \
+          // Credits the caller.\n  \
+          credit : (record {\n    \
+            // Unit: e8s.\n    \
+            amount : nat;\n  \
+          }) -> (record {\n    \
+            // The new balance, in e8s.\n    \
+            balance : nat;\n  \
+          });\n  \
           createEngine : (text) -> (Engine);\n  \
           notify : (text) -> () oneway;\n  \
           subscribe : Callback;\n  \
@@ -3554,7 +3595,7 @@ mod tests {
         assert_eq!(r.text, SUBSET_DID, "the complete interface is the published text itself");
         assert_eq!(r.methods, None, "nothing restricts it");
         assert!(!r.best_effort);
-        assert_eq!(r.method_count, Some(8));
+        assert_eq!(r.method_count, Some(9));
         assert!(r.oql, "schema + execute are declared");
         assert_eq!(r.oql, has_oql(SUBSET_DID), "the flag is the one has_oql reports");
         assert!(r.api_doc_available);
@@ -3581,7 +3622,7 @@ mod tests {
         let r = render_candid(SUBSET_DID, Some(&names)).expect("renders");
         assert_eq!(r.methods.as_deref(), Some(&names[..]));
         assert!(!r.best_effort, "small enough to keep its comments: {}", r.text);
-        assert_eq!(r.method_count, Some(8));
+        assert_eq!(r.method_count, Some(9));
         for present in [
             "// Where a listing starts and how far it goes.",
             "type Page =",
@@ -3669,6 +3710,26 @@ mod tests {
         let (env, actor) =
             candid_parser::utils::CandidSource::Text(&r.text).load().expect("valid .did");
         assert!(env.get_method(&actor.expect("service"), "batch").is_ok(), "{}", r.text);
+
+        // Field comments inside a method's own inline argument and result
+        // records are carried as well, and the text still parses.
+        let names = ["credit".to_string()];
+        let r = render_candid(SUBSET_DID, Some(&names)).expect("renders");
+        for present in [
+            "// Credits the caller.",
+            "credit : (record {",
+            "// Unit: e8s.",
+            "amount : nat;",
+            "}) -> (record {",
+            "// The new balance, in e8s.",
+            "balance : nat;",
+        ] {
+            assert!(r.text.contains(present), "{present:?} must be carried:\n{}", r.text);
+        }
+        let (env, actor) =
+            candid_parser::utils::CandidSource::Text(&r.text).load().expect("valid .did");
+        let func = env.get_method(&actor.expect("service"), "credit").expect("declared");
+        assert_eq!((func.args.len(), func.rets.len()), (1, 1), "{}", r.text);
     }
 
     // A service declared through a chain of aliases keeps its method comments
@@ -3763,12 +3824,12 @@ mod tests {
         assert!(!e.contains("`createEngine`"), "a declared method is not 'unknown': {e}");
         assert!(
             e.contains(
-                "it declares 8 methods: batch, createEngine, execute, get_api_doc, \
+                "it declares 9 methods: batch, createEngine, credit, execute, get_api_doc, \
                  listVisibleEngines, notify, schema, subscribe"
             ),
             "{e}"
         );
-        assert!(!e.contains("more"), "all eight fit the list: {e}");
+        assert!(!e.contains("more"), "all nine fit the list: {e}");
         // An empty selection — or one that is empty once trimmed — is refused too,
         // rather than silently widening to the whole (possibly huge) interface.
         for empty in [vec![], vec!["  ".to_string(), String::new()]] {
