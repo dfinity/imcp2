@@ -16,6 +16,11 @@ use ic_agent::{
     Agent, AgentError,
 };
 use icp_project::calls::{Authority, Call, CallError, CanisterCalls, RouteTo};
+use imcp2_core::guard_candid_text;
+
+/// The metadata section the upgrade compatibility check reads from the
+/// deployed canister and parses as Candid.
+const CANDID_SERVICE: &str = "candid:service";
 
 /// [`CanisterCalls`] over an `ic-agent`.
 pub struct AgentCalls {
@@ -173,6 +178,13 @@ impl CanisterCalls for AgentCalls {
         builder.call().await.map_err(|e| Self::wrap(call.canister, &call.method, e))
     }
 
+    /// A `candid:service` section is parsed by the library's compatibility
+    /// check, on the worker thread and without a depth guard, and the
+    /// canister it comes from is whichever the caller's mapping named: so
+    /// the interface is held to the same bound as the bundle's own before
+    /// it is handed back ([`guard_candid_text`]). The check treats a
+    /// failed read as "cannot tell" and skips, which is the right outcome
+    /// for an interface too deep to compare.
     async fn metadata_section(
         &self,
         canister: Principal,
@@ -180,7 +192,21 @@ impl CanisterCalls for AgentCalls {
         // With no proxy there is one authority, and both values mean it.
         _authority: Authority,
     ) -> Result<Option<Vec<u8>>, CallError> {
-        self.certified_metadata_section(canister, path).await
+        let section = self.certified_metadata_section(canister, path).await?;
+        if path == CANDID_SERVICE {
+            if let Some(bytes) = &section {
+                let text = String::from_utf8_lossy(bytes);
+                guard_candid_text(&format!("the `{path}` section of {canister}"), &text).map_err(
+                    |why| CallError::Rejected {
+                        canister,
+                        method: "read_state(metadata)".to_owned(),
+                        code: None,
+                        message: why,
+                    },
+                )?;
+            }
+        }
+        Ok(section)
     }
 
     async fn controllers(&self, canister: Principal) -> Result<Option<Vec<Principal>>, CallError> {
