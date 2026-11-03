@@ -146,7 +146,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Fetch a canister's Candid interface: the `.did` text declaring the methods and argument types a caller needs in order to call it. On a canister with many methods it is not read whole: an interface over 5 KB is refused with the list of every method it declares, so take the method names from the guide get_canister_api_doc returns and pass them as `methods`, which returns just those methods with the type definitions they use and the interface's own comments on them, as a small valid `.did`. A selection over 5 KB is refused the same way, so ask for fewer at a time; a single method is always answered, with its comments stripped if that is what it takes. The structured object carries the interface text's size and whether its comments were stripped, never the text itself. Also reports whether the canister declares an OQL surface, which this server reads through the OQL tools rather than with a Candid query, and whether it declares the API doc get_canister_api_doc reads.",
+        description = "Fetch a canister's Candid interface: the `.did` text declaring the methods and argument types a caller needs in order to call it. On a canister with many methods it is not read whole: an interface over 5 KB is refused with the list of every method it declares, so take the method names from the guide get_canister_api_doc returns and pass them as `methods`, which returns just those methods with the type definitions they use and the interface's own comments on them, as a small valid `.did`. A selection over 5 KB is refused the same way, so ask for fewer at a time; a single method is always answered, with its comments stripped if that is what it takes. The structured object carries the interface text as `candid`, its size, and whether its comments were stripped. Also reports whether the canister declares an OQL surface, which this server reads through the OQL tools rather than with a Candid query, and whether it declares the API doc get_canister_api_doc reads.",
         annotations(title = "Get Candid interface", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::GetCandidOutput>(),
     )]
@@ -2444,9 +2444,8 @@ fn schema_for_output<T: schemars::JsonSchema + std::any::Any>(
 /// metadata read. `declared_by` / `declared_at` are the manifest that
 /// authorized the read, echoed into the output.
 ///
-/// The structured output never repeats the interface text (see
-/// [`calls::GetCandidOutput`]), so a reply is the interface plus short notes,
-/// never the interface twice. Every note is a text of its own, after the
+/// The structured output carries the interface text as `candid` too (see
+/// [`calls::GetCandidOutput`]). Every note is a text of its own, after the
 /// interface, so the interface stays clean, paste-able Candid.
 fn candid_reply(
     did: &str,
@@ -2458,6 +2457,7 @@ fn candid_reply(
     let rendering = calls::render_candid(did, methods)?;
     let output = calls::GetCandidOutput {
         canister_id,
+        candid: rendering.text.clone(),
         methods: rendering.methods.clone(),
         bytes: rendering.text.len(),
         best_effort: rendering.best_effort,
@@ -2708,7 +2708,11 @@ mod tests {
         assert_eq!(texts.len(), 3, "no selection note on the complete interface: {texts:?}");
         assert!(texts[1].contains("OQL") && texts[2].contains("api_doc_available=false"));
         let s = structured(&output);
-        assert!(s.get("candid").is_none(), "the text is not repeated: {s}");
+        assert_eq!(
+            s["candid"],
+            serde_json::json!(did),
+            "the structured object carries the text: {s}"
+        );
         assert!(s.get("methods").is_none(), "nothing restricts it: {s}");
         assert_eq!(s["bytes"], serde_json::json!(did.len()));
         assert_eq!(s["best_effort"], serde_json::json!(false));
