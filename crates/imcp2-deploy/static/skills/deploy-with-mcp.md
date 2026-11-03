@@ -39,10 +39,14 @@ not know the canisters already exist and would create a second set.
 - Cycles. Every canister the bundle names that does not exist yet is created
   from the user's cycles balance, 2T cycles each unless `cycles` says
   otherwise. `icp_cycles_balance` reports the balance and the principal
-  it belongs to: the user's CLI identity, the same principal `icp identity
-  link web` signs in as, so a canister deployed here is one `icp` controls
-  too. Before a deploy that will create canisters, tell the user how
-  many and confirm; creation is not undone by a later failure.
+  it belongs to: the user's default Internet Identity account at
+  `https://cli.id.ai`, the one `icp identity link web` links an icp CLI
+  identity to. If `icp identity principal` prints the same principal, the
+  CLI and this tool share canisters and cycles; if it prints another (a
+  local key, or a link to another account), they do not — say so before
+  the user switches between the two. Before a deploy that will create
+  canisters, tell the user how many and confirm; creation is not undone by
+  a later failure.
 - An environment on the `ic` network (mainnet), which every manifest has.
   The tool deploys to the Internet Computer only: an environment on any other
   network — the default `local`, a testnet — is refused. Deploy those with
@@ -178,4 +182,18 @@ interchangeably for that environment.
    environment is rejected before anything runs. Remove canisters from the
    file when they are removed from the project.
 6. **Expecting the server to keep state.** It keeps nothing between calls:
-   no bundle, no mapping. The project's mapping file is the record.
+   no bundle, no mapping. The project's mapping file is the record. The one
+   exception is the working directory of a call that never returned, see 8.
+7. **Deploying twice at once.** One deploy runs at a time on this server; a
+   second call while one runs is refused, not queued. Wait for the answer,
+   do step 3, then deploy again from the updated mapping.
+8. **A call that never returned.** If the server stopped mid-deploy or the
+   call was cancelled, the canisters it created are not lost: the deploy's
+   working directory is kept under the user's local data directory
+   (`~/.local/share/imcp2-local/deploys/` on Linux,
+   `~/Library/Application Support/imcp2-local/deploys/` on macOS,
+   `%LOCALAPPDATA%\imcp2-local\deploys\` on Windows), and its
+   `.icp/data/mappings/<environment>.ids.json` records every canister the
+   deploy had created. Do step 3 with that file's contents, delete the
+   directory, and only then deploy again; otherwise the retry creates a
+   second set.
