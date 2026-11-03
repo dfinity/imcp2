@@ -45,8 +45,10 @@ use serde::{Deserialize, Serialize};
 mod calls;
 mod deploy;
 mod host;
+mod identity;
 
 pub use deploy::{deploy_bundle, BundleSource, DeployOutcome, DeployRequest, RequestError, Status};
+use identity::RefreshingIdentity;
 
 /// The icp CLI's default funding for a canister it creates (`icp deploy
 /// --cycles`): 2 trillion cycles.
@@ -212,6 +214,10 @@ impl DeployBundleOutput {
     }
 }
 
+/// The longest `bundle_base64` that can decode to [`host::MAX_BUNDLE_BYTES`]
+/// bytes: four characters per three bytes, the last group padded.
+const MAX_BUNDLE_BASE64_CHARS: usize = host::MAX_BUNDLE_BYTES.div_ceil(3) * 4;
+
 /// Turn the tool's arguments into a request, rejecting what cannot be deployed
 /// before anything is read or written.
 pub fn request_from_args(args: DeployBundleArgs) -> Result<DeployRequest, String> {
@@ -222,9 +228,26 @@ pub fn request_from_args(args: DeployBundleArgs) -> Result<DeployRequest, String
         (None, None) => return Err("pass the bundle as bundle_path or bundle_base64".into()),
         (Some(path), None) => BundleSource::Path(Utf8PathBuf::from(path)),
         (None, Some(b64)) => {
+            let b64 = b64.trim();
+            // Bound the encoded text before allocating the decoded copy:
+            // base64 spends four characters per three bytes, so anything
+            // longer than this encodes more than the bundle limit.
+            if b64.len() > MAX_BUNDLE_BASE64_CHARS {
+                return Err(format!(
+                    "bundle_base64 encodes more than the {} byte bundle limit",
+                    host::MAX_BUNDLE_BYTES
+                ));
+            }
             let bytes = base64::engine::general_purpose::STANDARD
-                .decode(b64.trim())
+                .decode(b64)
                 .map_err(|e| format!("bundle_base64 is not valid base64: {e}"))?;
+            if bytes.len() > host::MAX_BUNDLE_BYTES {
+                return Err(format!(
+                    "the bundle is {} bytes, above the {} byte limit",
+                    bytes.len(),
+                    host::MAX_BUNDLE_BYTES
+                ));
+            }
             BundleSource::Bytes(bytes)
         }
     };
@@ -292,7 +315,8 @@ impl IcDeployTools {
     }
 
     /// The session's CLI identity: its default account at [`CLI_ORIGIN`],
-    /// derived on demand like any other per-app delegation.
+    /// derived on demand like any other per-app delegation. Good for the
+    /// next few minutes; a deploy uses [`RefreshingIdentity`] instead.
     async fn cli_identity(&self, sid: &str) -> Result<DelegatedIdentity, String> {
         self.identities.delegated_identity(sid, CLI_ORIGIN, None).await
     }
@@ -307,20 +331,26 @@ impl IcDeployTools {
         Parameters(args): Parameters<DeployBundleArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let request = match request_from_args(args) {
-            Ok(r) => r,
-            Err(e) => return Ok(err(e)),
-        };
+        // Who is asking comes before what they sent: an inline bundle is
+        // decoded only for a session allowed to deploy.
         let Some(sid) = (self.session)(&ctx) else {
             return Ok(err("deploying a bundle needs an authenticated session".into()));
         };
         if let Err(e) = self.identities.require_write(&sid).await {
             return Ok(err(e));
         }
-        let identity: Arc<dyn Identity> = match self.cli_identity(&sid).await {
-            Ok(id) => Arc::new(id),
+        let request = match request_from_args(args) {
+            Ok(r) => r,
             Err(e) => return Ok(err(e)),
         };
+        // A per-app delegation lives five minutes and a deploy can outlast
+        // it (an asset sync, several installs), so the identity the agent
+        // signs with is kept fresh for as long as the deploy runs.
+        let identity =
+            match RefreshingIdentity::start(self.identities.clone(), sid, CLI_ORIGIN).await {
+                Ok(id) => id,
+                Err(e) => return Ok(err(e)),
+            };
         match deploy_bundle(identity, request).await {
             Err(RequestError(e)) => Ok(err(e)),
             Ok(outcome) => {
@@ -492,6 +522,17 @@ mod tests {
         assert!(request_from_args(neither).unwrap_err().contains("bundle_path or bundle_base64"));
         let bad = args(serde_json::json!({ "bundle_base64": "***", "environment": "ic" }));
         assert!(request_from_args(bad).unwrap_err().contains("base64"));
+    }
+
+    // Four base64 characters past the bound is refused on length alone, before
+    // any decoding: the bundle limit is measured on the text, not after a copy
+    // of it has been allocated.
+    #[test]
+    fn an_oversized_inline_bundle_is_refused_before_decoding() {
+        let text = "A".repeat(MAX_BUNDLE_BASE64_CHARS + 4);
+        let big = args(serde_json::json!({ "bundle_base64": text, "environment": "ic" }));
+        let e = request_from_args(big).unwrap_err();
+        assert!(e.contains("encodes more than"), "{e}");
     }
 
     #[test]

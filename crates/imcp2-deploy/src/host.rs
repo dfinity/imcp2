@@ -82,6 +82,11 @@ pub const MAX_BUNDLE_BYTES: usize = 256 * 1024 * 1024;
 /// itself.
 pub const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// The directory under the project root where icp-project keeps its own
+/// state (`.icp/data/mappings/<env>.ids.json`, build artifacts). The deploy
+/// seeds it from the caller's mapping; the archive may not supply it.
+const STATE_DIR: &str = ".icp";
+
 /// A plain error for the seams below: each carries one sentence, and the
 /// library wraps it whole at its own boundary (`AccessError::new` and the
 /// like), so the sentence is what the user reads.
@@ -680,6 +685,17 @@ pub fn extract_bundle(bytes: &[u8], into: &Utf8Path) -> Result<BundleFs, String>
                  a bundle never carries; rebuild it with `icp project bundle`"
             ));
         }
+        // `.icp` is the library's own state under the project root: the id
+        // mappings a deploy reads to decide what exists, and the artifact
+        // store. A bundle never carries it (`icp project bundle` writes
+        // manifests, modules, plugins, argument files and images), and one
+        // that did could point a deploy at canisters the caller never named.
+        if path.components().next().is_some_and(|c| c.as_str() == STATE_DIR) {
+            return Err(format!(
+                "the archive entry '{path}' is under `{STATE_DIR}/`, the project state a bundle \
+                 never carries; rebuild it with `icp project bundle`"
+            ));
+        }
         total = total.saturating_add(entry.size());
         if total > MAX_EXTRACTED_BYTES {
             return Err(too_large());
@@ -860,6 +876,18 @@ mod tests {
         let err = extract_bundle(&bytes, &into).unwrap_err();
         assert!(err.contains("not a regular file or directory"), "{err}");
         assert!(!into.join("icp.yaml").exists());
+    }
+
+    #[test]
+    fn an_archive_carrying_project_state_is_refused() {
+        let (_dir, into) = scratch();
+        let bytes = archive(&[
+            ("icp.yaml", b"canisters: []"),
+            (".icp/data/mappings/ic.ids.json", b"{\"backend\": \"aaaaa-aa\"}"),
+        ]);
+        let err = extract_bundle(&bytes, &into).unwrap_err();
+        assert!(err.contains("`.icp/`"), "{err}");
+        assert!(!into.join(".icp").exists());
     }
 
     // The index is the filesystem: what extraction wrote is readable by any

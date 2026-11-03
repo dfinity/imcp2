@@ -165,6 +165,13 @@ pub async fn deploy_bundle(
             let meta = tokio::fs::metadata(path.as_std_path())
                 .await
                 .map_err(|e| RequestError(format!("cannot read bundle '{path}': {e}")))?;
+            // A device or a pipe reports a length that says nothing about
+            // what a read of it produces (`/dev/zero` is 0 bytes long and
+            // endless; a FIFO blocks), so the size check below only means
+            // something for a regular file.
+            if !meta.is_file() {
+                return Err(RequestError(format!("bundle '{path}' is not a regular file")));
+            }
             if meta.len() > host::MAX_BUNDLE_BYTES as u64 {
                 return Err(RequestError(format!(
                     "bundle '{path}' is {} bytes, above the {} byte limit",
@@ -542,6 +549,19 @@ mod tests {
     // The manifest can name only what the archive carried: a variable file
     // the bundle does not hold is refused at load — before any phase, since
     // the value would otherwise be sent to the canister as a setting — and so
+    // A `bundle_path` is read only when it is a regular file: a directory
+    // here, and by the same check a device or a pipe, whose length says
+    // nothing about what reading it would produce.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bundle_path_that_is_not_a_regular_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let mut local = request(Vec::new(), "ic");
+        local.bundle = BundleSource::Path(path);
+        let err = deploy_bundle(Arc::new(AnonymousIdentity), local).await.unwrap_err();
+        assert!(err.0.contains("not a regular file"), "{}", err.0);
+    }
+
     // is a wasm, whether the path is absolute or climbing. Nothing on the
     // machine is reached for, whatever exists at that spelling.
     #[tokio::test(flavor = "multi_thread")]
