@@ -1382,15 +1382,33 @@ fn type_text(ty: &Type, doc: Option<&TypeDoc>, indent: &str) -> String {
     }
 }
 
+/// Budget for the unknown names an error echoes back: the caller's own input,
+/// so a small share of the limit — the declared names are what helps.
+const MAX_UNKNOWN_NAMES_BYTES: usize = 1024;
+
 /// The error for `methods` naming what the service does not declare: the
-/// unknown names, then every declared one, so the caller can correct the name
-/// without a second read.
+/// unknown names (as many as fit a small budget, the rest counted), then every
+/// declared one, so the caller can correct the name without a second read.
 fn unknown_methods_error(unknown: &[&String], service: &[(String, Type)]) -> String {
-    let unknown = unknown.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ");
-    format!(
-        "the service declares no method named {unknown}; it declares {}",
-        declared_methods_list(service)
-    )
+    let quoted: Vec<String> = unknown.iter().map(|m| format!("`{m}`")).collect();
+    let (listed, omitted) =
+        budgeted_names(quoted.iter().map(String::as_str), MAX_UNKNOWN_NAMES_BYTES);
+    let declared = declared_methods_list(service);
+    match (listed.is_empty(), omitted) {
+        (false, 0) => {
+            format!("the service declares no method named {listed}; it declares {declared}")
+        }
+        (false, more) => format!(
+            "the service declares no method named {listed}, and {more} more; it declares {declared}"
+        ),
+        (true, count) => {
+            let plural = if count == 1 { "" } else { "s" };
+            format!(
+                "the service declares none of the {count} method{plural} asked for (the name{plural} \
+                 too long to repeat here); it declares {declared}"
+            )
+        }
+    }
 }
 
 /// `N methods: a, b, c` — every name the service declares, for the errors that
@@ -1401,29 +1419,36 @@ fn unknown_methods_error(unknown: &[&String], service: &[(String, Type)]) -> Str
 fn declared_methods_list(service: &[(String, Type)]) -> String {
     let count = service.len();
     let plural = if count == 1 { "" } else { "s" };
+    let names = service.iter().map(|(name, _)| name.as_str());
+    let (listed, omitted) = budgeted_names(names, MAX_SERVICE_SUBSET_BYTES);
+    match omitted {
+        0 => format!("{count} method{plural}: {listed}"),
+        omitted if listed.is_empty() => format!(
+            "{count} method{plural}, none of whose names fits in a \
+             {MAX_SERVICE_SUBSET_BYTES}-byte list ({omitted} omitted)"
+        ),
+        omitted => format!("{count} method{plural}: {listed}, and {omitted} more"),
+    }
+}
+
+/// `names` joined by `, `, as many as fit `budget` bytes — every name held to
+/// it, the first included: an identifier can be tens of KB on its own within
+/// the input guard — and how many did not fit.
+fn budgeted_names<'a>(names: impl IntoIterator<Item = &'a str>, budget: usize) -> (String, usize) {
     let mut listed = String::new();
-    let mut shown = 0;
-    for (name, _) in service {
-        // Every name is held to the budget, the first included: an identifier
-        // can be tens of KB on its own within the input guard.
+    let mut omitted = 0;
+    for name in names {
         let separator = if listed.is_empty() { 0 } else { 2 };
-        if listed.len() + separator + name.len() > MAX_SERVICE_SUBSET_BYTES {
+        if listed.len() + separator + name.len() > budget {
+            omitted += 1;
             continue;
         }
         if separator > 0 {
             listed.push_str(", ");
         }
         listed.push_str(name);
-        shown += 1;
     }
-    match count - shown {
-        0 => format!("{count} method{plural}: {listed}"),
-        omitted if shown == 0 => format!(
-            "{count} method{plural}, none of whose names fits in a \
-             {MAX_SERVICE_SUBSET_BYTES}-byte list ({omitted} omitted)"
-        ),
-        omitted => format!("{count} method{plural}: {listed}, and {omitted} more"),
-    }
+    (listed, omitted)
 }
 
 /// Every method name the service in `did` declares — read from the actor through
@@ -3862,6 +3887,25 @@ mod tests {
             format!("service : {{ {} : () -> () }}", "a".repeat(MAX_SERVICE_SUBSET_BYTES + 1));
         let e = render_candid(&only_wide, Some(&["zzz".to_string()])).expect_err("unknown method");
         assert!(e.contains("1 method, none of whose names fits"), "{e:.200}");
+        // The unknown names are the caller's own input and are budgeted too, so
+        // a flood of them — or one huge one — cannot push the declared names,
+        // the useful part, out of the error.
+        let flood: Vec<String> = (0..500).map(|i| format!("unknown_method_{i:03}")).collect();
+        let e = render_candid(SUBSET_DID, Some(&flood)).expect_err("unknown methods");
+        assert!(
+            e.starts_with("the service declares no method named `unknown_method_000`, "),
+            "{e:.200}"
+        );
+        assert!(e.contains(" more; it declares 9 methods: batch, createEngine"), "{e:.400}");
+        assert!(e.len() < 2 * MAX_SERVICE_SUBSET_BYTES, "kept small: {} bytes", e.len());
+        let huge = ["x".repeat(2 * MAX_SERVICE_SUBSET_BYTES)];
+        let e = render_candid(SUBSET_DID, Some(&huge)).expect_err("unknown method");
+        assert!(
+            e.starts_with("the service declares none of the 1 method asked for (the name too long"),
+            "{e:.200}"
+        );
+        assert!(e.contains("it declares 9 methods: batch"), "{e:.400}");
+        assert!(e.len() < MAX_SERVICE_SUBSET_BYTES, "kept small: {} bytes", e.len());
     }
 
     // A restricted read needs the interface parsed. An interface that cannot be —
