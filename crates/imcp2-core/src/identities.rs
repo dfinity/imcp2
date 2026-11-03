@@ -472,7 +472,9 @@ impl Identities {
     /// transport, route provider, and root key, so calls signed as `identity`
     /// go through the embedding application's boundary-node routing — never a
     /// second, hard-coded endpoint.
-    pub(crate) fn agent_as<I: ic_agent::Identity + 'static>(&self, identity: I) -> Agent {
+    /// A clone of the injected base agent signing as `identity`: the same
+    /// endpoint, root key and boundary-node routing as every other call.
+    pub fn agent_as<I: ic_agent::Identity + 'static>(&self, identity: I) -> Agent {
         let mut agent = self.agent.clone();
         agent.set_identity(identity);
         agent

@@ -2515,6 +2515,7 @@ dependencies = [
  "dirs",
  "hex",
  "imcp2-core",
+ "imcp2-deploy",
  "open",
  "pocket-ic",
  "reqwest 0.13.4",
