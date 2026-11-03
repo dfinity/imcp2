@@ -1001,11 +1001,25 @@ none of them can be filled at the expense of an authenticated user:
 | State | Cap | When full |
 | --- | --- | --- |
 | Client registrations (`POST /oauth/register`) | 10 000 | least-recently-used registration is evicted; every `/oauth/authorize` marks its client used, so a flood evicts its own unused entries first, and an evicted client re-registers (DCR is automatic) |
-| Connects in flight (`GET /oauth/authorize`, one session + one pending-authz entry each) | 1 024 | oldest pending connect is evicted; sessions holding a live grant are never touched |
+| Connects in flight (`GET /oauth/authorize`, one session + one pending-authz entry each) | 1 024, each entry about 6 KiB at most | oldest pending connect is evicted; sessions holding a live grant are never touched |
 | Sessions overall | 20 000 | a **new connect is refused** (`503`, on-brand "server is busy, try again" screen) rather than evicting an authenticated user's live grant |
 | Authorization codes | 4 096 | closest-to-expiry code is evicted (inserting one requires a completed II consent) |
 | Access tokens | 20 000 | closest-to-expiry token is evicted |
 | Per-app delegation cache, **per session** | 64 origins/accounts | entry nearest expiry is evicted (it would be re-derived anyway) |
+
+A count bounds a map only as far as its entries are bounded too. Each
+registration holds at most 16 redirect URIs of at most 2 KiB. Each connect in
+flight holds strings the request chose, and `GET /oauth/authorize` refuses one
+(`400 invalid_request`, before the session is minted) unless the client's `state`
+is at most 2 KiB, the `code_challenge` has the S256 shape (exactly 43 base64url
+characters, the only shape `/oauth/token` can ever match), and the
+`redirect_uri` is at most 2 KiB plus a `:port`. A loopback redirect needs that
+last cap because it is matched after URL parsing but stored as sent, so padding
+the parser discards (tabs, `/.` segments, a zero-padded port) would otherwise
+be stored too. With a `client_id` of at most 2 KiB as well, a connect's strings
+come to about 6 KiB at most, and 1 024 of them to about 6 MiB per instance.
+Without the caps, hyper's 64 KiB request-URI limit was the only bound, which is
+about 64 MiB per instance.
 
 The per-instance reaper (60s cadence — `spawn_session_reaper`, which a deployment
 must call) drops expired grants, **connects abandoned mid-handshake** (a session
@@ -1139,13 +1153,23 @@ mcp_get_delegation :
   default account, or a specific number when an `account` name was given — resolved
   from `mcp_get_accounts` (see [Listing accounts](#listing-accounts) below).
 - `max_ttl` is in **nanoseconds**; the server passes `null`, so II applies its
-  default (≤ 1 hour, and never past the grant).
+  own cap: an MCP delegation lives at most **5 minutes**
+  (`MCP_MAX_EXPIRATION_PERIOD_NS` in II's `mcp.rs`), and never past the grant.
 - These methods live on the **same II instance** as the connect-time login:
   `II_URL` (default `https://beta.id.ai`) is the browser login origin and
   `II_CANISTER_ID` (default `fgte5-ciaaa-aaaad-aaatq-cai`, that instance's
   canister) is the canister these calls target, over `https://icp-api.io`.
 - Derived delegations are cached per `(session, derivation_origin, account_number)` and
-  reused until they near expiry, then re-derived.
+  reused until they near expiry, then re-derived. With the 5-minute cap and the
+  server's 30 s re-derive margin, a cached delegation serves for at most about
+  4.5 minutes, so an app in continuous use re-derives every few minutes — one
+  `mcp_prepare_delegation` update plus a `mcp_get_delegation` query each time.
+- That query is answered by a single replica, which may not yet have caught up
+  with the `prepare` update; II then answers `NoSuchDelegation` even though the
+  delegation exists. The server re-sends the same `get` (same per-app key, same
+  prepared account and expiration) after 1, 2 and 3 seconds — as II's own
+  frontend does — and only reports the failure if the delegation still has not
+  appeared. `Unauthorized` is never retried: it means the grant is gone.
 
 ### Listing accounts
 
