@@ -304,6 +304,7 @@ const APP_DID: &str = "service : {\n  \
     greet : (text) -> (text) query;\n  \
     whoami : () -> (principal) query;\n  \
     get_message : () -> (text) query;\n  \
+    // Stores the message; the next get_message returns it.\n  \
     set_message : (text) -> (text);\n  \
     get_api_doc : () -> (text) query;\n\
 }";
@@ -1706,4 +1707,71 @@ async fn a_read_that_cannot_run_says_what_to_fix() {
     assert!(candid.contains("Candid"), "the textual-Candid guide comes back: {candid:.80}");
     let oql_guide = ok_text(&h.call("icp_oql_guide", serde_json::json!({})).await);
     assert!(oql_guide.contains("OQL"), "the OQL guide comes back: {oql_guide:.80}");
+}
+
+/// A large interface is read cheaply, over the real surface: `methods` returns
+/// the named method with the type definitions it uses and the interface's own
+/// comment on it, as a valid `.did`, and the structured output describes the
+/// text — its size, whether comments survived — without repeating it, so
+/// no reply carries the interface twice. The discoverability gate runs first
+/// for a restricted read as for the rest.
+#[tokio::test]
+async fn candid_methods_read_one_commented_method_without_the_whole_interface() {
+    let Some(h) = Harness::start("https://candid-methods.e2e.test").await else { return };
+    let app = h.app.to_text();
+    let call = |args: serde_json::Value| {
+        let mut args = args;
+        args["canister_id"] = serde_json::json!(app);
+        args["app_url"] = serde_json::json!(h.origin);
+        h.call("get_canister_candid", args)
+    };
+
+    // --- the complete interface: verbatim, described but not repeated ---
+    let result = call(serde_json::json!({})).await;
+    assert_eq!(ok_text(&result), APP_DID, "the published text, byte for byte");
+    let structured = ok_structured(&result);
+    assert_eq!(structured["bytes"], serde_json::json!(APP_DID.len()));
+    assert_eq!(structured["best_effort"], serde_json::json!(false));
+    assert!(structured.get("candid").is_none(), "no second copy of the text: {structured}");
+    assert!(structured.get("methods").is_none(), "nothing restricts it: {structured}");
+    let total: usize = blocks(&result).iter().map(String::len).sum();
+    assert!(total < APP_DID.len() + 1_000, "the .did plus a short note, {total} bytes");
+
+    // --- one method: a `.did` restricted to it, its comment kept, usable as
+    // canister_query's `candid` fallback ---
+    let result = call(serde_json::json!({ "methods": ["set_message"] })).await;
+    let did = ok_text(&result);
+    assert!(did.contains("// Stores the message; the next get_message returns it."), "{did}");
+    assert!(did.contains("set_message : (text) -> (text)"), "{did}");
+    assert!(!did.contains("greet"), "the other methods are left out: {did}");
+    let (env, actor) = candid_parser::utils::CandidSource::Text(&did).load().expect("valid .did");
+    let actor = actor.expect("declares a service");
+    assert!(!env.get_method(&actor, "set_message").expect("declared").is_query());
+    let structured = ok_structured(&result);
+    assert_eq!(structured["methods"], serde_json::json!(["set_message"]));
+    assert_eq!(structured["bytes"], serde_json::json!(did.len()));
+    assert_eq!(structured["best_effort"], serde_json::json!(false));
+    assert!(
+        all_text(&result).contains("restricted to 1 of the 5 methods"),
+        "{}",
+        all_text(&result)
+    );
+
+    // --- a mistyped name is repaired in one step: the error lists what the
+    // service declares ---
+    let msg = refusal(&call(serde_json::json!({ "methods": ["set_mesage"] })).await);
+    assert!(msg.contains("`set_mesage`") && msg.contains("set_message"), "{msg}");
+
+    // --- the gate still runs before a restricted read: an undeclared canister
+    // is refused with the manifest named ---
+    let msg = refusal(
+        &h.call(
+            "get_canister_candid",
+            serde_json::json!({
+                "canister_id": h.opaque.to_text(), "app_url": h.origin, "methods": ["greet"],
+            }),
+        )
+        .await,
+    );
+    assert!(msg.contains("/.well-known/ic-architecture"), "{msg}");
 }
