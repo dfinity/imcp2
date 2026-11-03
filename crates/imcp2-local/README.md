@@ -155,9 +155,9 @@ It takes:
 - the **bundle** — the self-contained archive `icp project bundle --output
   <file>` writes, by absolute path (`bundle_path`) or inline (`bundle_base64`);
 - the **environment** to deploy, by name, among those the bundle declares
-  (`ic` for a bundle built with the defaults). It must target a connected
-  network; a locally launched (managed) network is refused, since there is
-  none to launch here;
+  (`ic` for a bundle built with the defaults). It must be on the `ic`
+  network: the tool deploys to the Internet Computer only, so a locally
+  launched network or a testnet is refused;
 - optionally the **canister ids** from an earlier deploy (`canister_ids`, a
   name → id map: the contents of the CLI's `<environment>.ids.json`, or what a
   previous call returned). Canisters named there are upgraded in place; the

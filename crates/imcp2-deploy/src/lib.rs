@@ -80,8 +80,7 @@ pub struct DeployBundleArgs {
     pub bundle_base64: Option<String>,
     /// The environment to deploy, by name, among those the bundle's manifest
     /// declares — `ic` for a bundle built with the default settings. It must
-    /// target a connected network (mainnet or another reachable network), not
-    /// a locally launched one.
+    /// be on the `ic` network: this tool deploys to the Internet Computer only.
     pub environment: String,
     /// Canister ids to start from: canister name → canister id, the contents of
     /// the `<environment>.ids.json` file the icp CLI keeps (or the

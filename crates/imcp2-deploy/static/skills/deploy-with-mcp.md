@@ -41,9 +41,9 @@ not know the canisters already exist and would create a second set.
   otherwise. `icp_cycles_balance` reports the balance and the principal
   it belongs to. Before a deploy that will create canisters, tell the user how
   many and confirm; creation is not undone by a later failure.
-- An environment on a connected network. Every manifest has `ic` (mainnet).
-  An environment on a managed network, such as the default `local`, is
-  refused: there is no local replica on the server's side. Deploy those with
+- An environment on the `ic` network (mainnet), which every manifest has.
+  The tool deploys to the Internet Computer only: an environment on any other
+  network — the default `local`, a testnet — is refused. Deploy those with
   `icp deploy` in the project directory instead.
 
 ## Step 1: Bundle the project
@@ -165,9 +165,9 @@ interchangeably for that environment.
    duplicates. Always do step 3, including after a failure.
 2. **Passing a relative `bundle_path`.** The tool refuses it; the server's
    working directory is not the project's.
-3. **Deploying `local`.** Refused as a managed network. Use `icp deploy` in
-   the project directory for local work; use this tool for `ic` and other
-   connected networks.
+3. **Deploying `local`.** Refused: this tool deploys to the `ic` network
+   only. Use `icp deploy` in the project directory for local work and for
+   other networks.
 4. **Bundling a stale build.** `icp project bundle` builds first, so the
    bundle is current, but a bundle written earlier is not. Rebundle after
    every change.

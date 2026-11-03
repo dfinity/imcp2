@@ -188,21 +188,27 @@ pub async fn deploy_bundle(
     let dir = Utf8PathBuf::from_path_buf(scratch.path().to_path_buf()).map_err(|p| {
         RequestError(format!("scratch directory path is not UTF-8: {}", p.display()))
     })?;
-    {
+    let fs = {
         let dir = dir.clone();
         tokio::task::spawn_blocking(move || host::extract_bundle(&bytes, &dir))
             .await
             .map_err(|e| RequestError(format!("bundle extraction panicked: {e}")))?
-            .map_err(RequestError)?;
-    }
+            .map_err(RequestError)?
+    };
 
-    let host = host::host_for(&dir).map_err(RequestError)?;
+    let host = host::host_for(fs.clone());
     let selection = EnvironmentSelection::Named(request.environment.clone());
     let env = host.get_environment(&selection).await.map_err(|e| RequestError(error_chain(&e)))?;
-    // Before any phase runs: a script step is refused here, not at the phase
-    // that would reach it after canisters have been created.
-    host::refuse_scripts(env.canisters.values().map(|(_, canister)| canister))
-        .map_err(RequestError)?;
+    // Before any phase runs: a bundle that is not one — a script step, a wasm
+    // that is missing or does not hash to its checksum, a network other than
+    // the IC — is refused here, not at the phase that would reach it after
+    // canisters have been created.
+    host::check_bundle(
+        &fs,
+        &env.network,
+        env.canisters.values().map(|(dir, canister)| (dir.as_path(), canister)),
+    )
+    .map_err(RequestError)?;
 
     // Seed the id store with the mapping the caller passed: from here on the
     // operation sees those canisters as existing, exactly as it would see the
@@ -458,41 +464,44 @@ mod tests {
     }
 
     // The manifest's checksum is the bundle's integrity check: a wasm that
-    // does not hash to it fails the build phase, and the error says so.
+    // does not hash to it is refused before any phase, as a request error
+    // that names the canister and both digests.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_wasm_that_does_not_match_its_checksum_fails_the_build() {
+    async fn a_wasm_that_does_not_match_its_checksum_is_refused_up_front() {
         let (wasm, _) = wasm();
         let wrong = "0".repeat(64);
-        let outcome =
-            deploy_bundle(Arc::new(AnonymousIdentity), request(bundle(&wrong, &wasm), "ic"))
-                .await
-                .expect("the request is valid");
-        assert_eq!(outcome.status, Status::Failed);
-        // The operation's error names the canisters that failed to build; the
-        // cause is on the per-canister task, which the log carries.
-        let error = outcome.error.as_deref().unwrap();
-        assert!(error.contains("failed to build") && error.contains("backend"), "{error}");
-        assert!(outcome.log.iter().any(|l| l.contains("checksum mismatch")), "{:?}", outcome.log);
-        assert!(
-            outcome.log.iter().any(|l| l.starts_with("  build backend: failed")),
-            "{:?}",
-            outcome.log
-        );
+        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bundle(&wrong, &wasm), "ic"))
+            .await
+            .expect_err("a checksum mismatch is refused");
+        assert!(err.0.contains("backend") && err.0.contains("checksum mismatch"), "{err}");
+        assert!(err.0.contains(&wrong), "{err}");
     }
 
-    // A deploy to `local` would need the icp CLI's managed network; the
-    // refusal names the way out instead of failing on a missing descriptor.
+    // Only the IC: a deploy to `local` names the icp CLI's managed network,
+    // and is refused up front with the way out; a connected testnet is not
+    // the IC either.
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_local_environment_is_refused_as_managed() {
+    async fn environments_off_the_ic_network_are_refused() {
         let (wasm, sha) = wasm();
-        let mut request = request(bundle(&sha, &wasm), "local");
-        request.no_create = false;
-        let outcome = deploy_bundle(Arc::new(AnonymousIdentity), request)
+        let mut local = request(bundle(&sha, &wasm), "local");
+        local.no_create = false;
+        let err = deploy_bundle(Arc::new(AnonymousIdentity), local)
             .await
-            .expect("the request is valid");
-        assert_eq!(outcome.status, Status::Failed);
-        let error = outcome.error.as_deref().unwrap();
-        assert!(error.contains("managed") && error.contains("`ic`"), "{error}");
+            .expect_err("a managed network is refused");
+        assert!(err.0.contains("not the Internet Computer") && err.0.contains("`ic`"), "{err}");
+
+        let manifest = format!(
+            "networks:\n  - name: testnet\n    mode: connected\n    url: https://testnet.example\n    \
+             root-key: fetch\nenvironments:\n  - name: staging\n    network: testnet\n\
+             canisters:\n  - name: backend\n    build:\n      steps:\n        - type: pre-built\n          \
+             path: canisters/backend.wasm\n          sha256: {sha}\n"
+        );
+        let bytes =
+            archive(&[("icp.yaml", manifest.as_bytes()), ("canisters/backend.wasm", &wasm)]);
+        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "staging"))
+            .await
+            .expect_err("a testnet is refused");
+        assert!(err.0.contains("testnet") && err.0.contains("not the Internet Computer"), "{err}");
     }
 
     // Before anything is deployed: an environment the bundle does not
@@ -530,12 +539,13 @@ mod tests {
         assert!(err.0.contains("backend") && err.0.contains("script build step"), "{err}");
     }
 
-    // The manifest's paths are confined to the extracted bundle: a variable
-    // file outside it is refused at load — before any phase, since the value
-    // would otherwise be sent to the canister as a setting — and a wasm
-    // outside it fails the build phase, whether absolute or climbing.
+    // The manifest can name only what the archive carried: a variable file
+    // the bundle does not hold is refused at load — before any phase, since
+    // the value would otherwise be sent to the canister as a setting — and so
+    // is a wasm, whether the path is absolute or climbing. Nothing on the
+    // machine is reached for, whatever exists at that spelling.
     #[tokio::test(flavor = "multi_thread")]
-    async fn paths_that_lead_outside_the_bundle_are_refused() {
+    async fn paths_the_bundle_does_not_hold_are_refused() {
         let (wasm, sha) = wasm();
         let manifest = format!(
             "canisters:\n  - name: backend\n    settings:\n      environment_variables:\n        \
@@ -547,7 +557,7 @@ mod tests {
         let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
             .await
             .expect_err("a variable file outside the bundle is refused");
-        assert!(err.0.contains("outside the bundle"), "{err}");
+        assert!(err.0.contains("'etc/hostname' is not in the bundle"), "{err}");
 
         for path in ["/etc/hostname", "../../../../etc/hostname"] {
             let manifest = format!(
@@ -555,15 +565,10 @@ mod tests {
                  path: {path}\n          sha256: {sha}\n"
             );
             let bytes = archive(&[("icp.yaml", manifest.as_bytes())]);
-            let outcome = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
+            let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
                 .await
-                .expect("the request is valid");
-            assert_eq!(outcome.status, Status::Failed);
-            assert!(
-                outcome.log.iter().any(|l| l.contains("outside the bundle")),
-                "{path}: {:?}",
-                outcome.log
-            );
+                .expect_err("a wasm outside the bundle is refused");
+            assert!(err.0.contains("'etc/hostname' is not in the bundle"), "{path}: {err}");
         }
     }
 
