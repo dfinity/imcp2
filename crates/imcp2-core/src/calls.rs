@@ -3728,7 +3728,8 @@ mod tests {
         }
         let (env, actor) =
             candid_parser::utils::CandidSource::Text(&r.text).load().expect("valid .did");
-        let func = env.get_method(&actor.expect("service"), "credit").expect("declared");
+        let actor = actor.expect("service");
+        let func = env.get_method(&actor, "credit").expect("declared");
         assert_eq!((func.args.len(), func.rets.len()), (1, 1), "{}", r.text);
     }
 
