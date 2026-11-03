@@ -6,6 +6,13 @@
 //! authorization server: a single-user process reached over a pipe needs no
 //! bearer tokens — the OS process boundary is the auth gate.
 //!
+//! On top of the core surface it serves `icp_deploy_bundle` (from
+//! `imcp2-deploy`): deploying an icp project bundle through the icp CLI's own
+//! project library, as the user's CLI identity (their default II account at
+//! `https://cli.id.ai`, the principal `icp identity link web` signs in as, so
+//! `icp` and this tool deploy as the same controller). Local-only because
+//! that library is a git dependency the published crates cannot carry.
+//!
 //! Signing in is a built-in browser handshake (see `login`): the
 //! `authenticate` tool returns an id.ai link, a transient loopback listener
 //! receives II's callback, and the redeemed session lives in memory only.
@@ -26,7 +33,8 @@
 //!     management identity (default `https://mcp.internetcomputer.org`, the
 //!     hosted server's origin, so the same anchor gets the SAME controller/
 //!     funder principal locally and hosted — canisters created through one
-//!     stay manageable through the other).
+//!     stay manageable through the other). Not used by the deploy tools,
+//!     which act at `https://cli.id.ai`.
 //!   * `IMCP2_NO_OPEN` — truthy disables the best-effort browser auto-open on
 //!     sign-in (the link is always returned in-band regardless).
 
@@ -40,6 +48,7 @@ mod setup;
 mod e2e_local_login;
 
 use imcp2_core::{identities::Identities, IcTools, IiInstance};
+use imcp2_deploy::IcDeployTools;
 use login::SessionSlot;
 use rmcp::ServiceExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -167,11 +176,13 @@ async fn serve() -> anyhow::Result<()> {
     // hands core answers every tool call's "which session?" from it.
     let slot = SessionSlot::new();
     let tools = IcTools::new(agent, identities.clone(), slot.resolver());
+    let deploy = IcDeployTools::new(identities.clone(), slot.resolver());
     let auto_open = !truthy("IMCP2_NO_OPEN");
     let login = login::LoginDriver::new(identities, slot, auto_open);
 
-    let service =
-        server::LocalServer::new(tools, login, auto_open).serve(rmcp::transport::stdio()).await?;
+    let service = server::LocalServer::new(tools, deploy, login, auto_open)
+        .serve(rmcp::transport::stdio())
+        .await?;
     tracing::info!("imcp2-local serving MCP over stdio");
     // Runs until the client closes the pipe (or the service errors).
     service.waiting().await?;
