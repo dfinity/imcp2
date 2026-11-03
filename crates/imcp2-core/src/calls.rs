@@ -53,7 +53,9 @@ pub struct GetCandidArgs {
     /// refused with the list of every method the service declares, so ask for
     /// fewer at a time; a single method is always answered, with its comments
     /// stripped if that is what it takes. A name the service does not declare is
-    /// an error listing the declared names.
+    /// an error listing the declared names. Omitted, the complete interface is
+    /// returned when it keeps to the limit; a larger one is refused with the
+    /// list of every method it declares, so pass `methods`.
     #[serde(default)]
     pub methods: Option<Vec<String>>,
 }
@@ -976,10 +978,15 @@ pub struct CandidRendering {
 /// asked to, and establish the facts the reply states about it, in ONE parse:
 ///
 /// * No `methods` — the published text **verbatim** (never re-printed:
-///   comments and declaration order survive), with the capability flags; an
-///   interface that cannot be parsed — or that no parse thread could be spawned
-///   for — still comes back this way, with both flags false and no method
-///   count, exactly as [`has_oql`] and [`api_doc_method`] degrade.
+///   comments and declaration order survive), with the capability flags, when
+///   it keeps to [`MAX_SERVICE_SUBSET_BYTES`]; a larger interface is refused
+///   with every declared method listed, so the caller asks for the methods it
+///   needs — a reply that size would only be cut short by the client. An
+///   interface that cannot be parsed — or that no parse thread could be
+///   spawned for — still comes back verbatim whatever its size, with both
+///   flags false and no method count, exactly as [`has_oql`] and
+///   [`api_doc_method`] degrade: there is no method list to offer for it, and
+///   the text is the only read there is.
 /// * `methods` — a `.did` restricted to those methods: their signatures plus
 ///   every type definition they use, transitively (the closure `candid_parser`'s
 ///   own binding generators compute), in the interface's own order and WITH
@@ -1056,6 +1063,17 @@ pub fn render_candid(did: &str, methods: Option<&[String]>) -> Result<CandidRend
         let api_doc_available = api_doc_declared(&env, &actor).is_some();
         let method_count = Some(service.len());
         let Some(names) = &selection else {
+            // The complete interface, when it keeps to the limit; past it, the
+            // caller is sent to `methods` with every method named.
+            if did.len() > MAX_SERVICE_SUBSET_BYTES {
+                return Err(format!(
+                    "the complete interface is {} bytes, over the {MAX_SERVICE_SUBSET_BYTES}-byte \
+                     limit a reply keeps to: pass `methods` with the one or few methods to read \
+                     (the guide get_canister_api_doc returns names them). The service declares {}",
+                    did.len(),
+                    declared_methods_list(service)
+                ));
+            }
             return Ok(CandidRendering {
                 text: did.to_string(),
                 methods: None,
@@ -3687,6 +3705,14 @@ mod tests {
     fn render_candid_keeps_to_the_limit_by_refusing_several_or_stripping_one() {
         use super::{render_candid, MAX_SERVICE_SUBSET_BYTES};
         let did = chatty_did("a : (Chatty) -> () query; b : (Chatty) -> (); c : () -> ()");
+        // The complete interface is over the limit too: refused, with the size,
+        // the limit, the way out, and every method — rather than returned whole
+        // to be cut short by the client.
+        let e = render_candid(&did, None).expect_err("over the limit");
+        assert!(e.contains(&format!("the complete interface is {} bytes", did.len())), "{e}");
+        assert!(e.contains(&format!("over the {MAX_SERVICE_SUBSET_BYTES}-byte limit")), "{e}");
+        assert!(e.contains("pass `methods`") && e.contains("get_canister_api_doc"), "{e}");
+        assert!(e.contains("The service declares 3 methods: a, b, c"), "{e}");
         // Two methods sharing the chatty type: refused, naming the limit, the
         // size, the way out, and every method.
         let names = ["a".to_string(), "b".into()];
@@ -3791,6 +3817,9 @@ mod tests {
         let unparseable = "service : { greet : (text) -> (text) query; !!!";
         let no_service = "type A = record { x : nat };";
         let names = ["m".to_string()];
+        // `too_many_types` is far over the limit as well: an interface that
+        // cannot be parsed has no method list to offer, so it comes back whole.
+        assert!(too_many_types.len() > super::MAX_SERVICE_SUBSET_BYTES);
         for did in [too_many_types.as_str(), unparseable, no_service] {
             assert_eq!(
                 render_candid(did, None).expect("verbatim"),

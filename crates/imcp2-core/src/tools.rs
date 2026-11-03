@@ -146,7 +146,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Fetch a canister's Candid interface: the `.did` text declaring the methods and argument types a caller needs in order to call it. On a canister with many methods do not read it whole (it runs to tens of KB): take the method names from the guide get_canister_api_doc returns and pass them as `methods`, which returns just those methods with the type definitions they use and the interface's own comments on them, as a small valid `.did`. A selection over 5 KB is refused with the list of every method, so ask for fewer at a time; a single method is always answered, with its comments stripped if that is what it takes. The structured object carries the interface text's size and whether its comments were stripped, never the text itself. Also reports whether the canister declares an OQL surface, which this server reads through the OQL tools rather than with a Candid query, and whether it declares the API doc get_canister_api_doc reads.",
+        description = "Fetch a canister's Candid interface: the `.did` text declaring the methods and argument types a caller needs in order to call it. On a canister with many methods it is not read whole: an interface over 5 KB is refused with the list of every method it declares, so take the method names from the guide get_canister_api_doc returns and pass them as `methods`, which returns just those methods with the type definitions they use and the interface's own comments on them, as a small valid `.did`. A selection over 5 KB is refused the same way, so ask for fewer at a time; a single method is always answered, with its comments stripped if that is what it takes. The structured object carries the interface text's size and whether its comments were stripped, never the text itself. Also reports whether the canister declares an OQL surface, which this server reads through the OQL tools rather than with a Candid query, and whether it declares the API doc get_canister_api_doc reads.",
         annotations(title = "Get Candid interface", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::GetCandidOutput>(),
     )]
@@ -2468,7 +2468,16 @@ fn candid_reply(
     };
     let mut texts = vec![rendering.text];
     // What a restricted interface covers and what it cost — only then; the
-    // complete interface speaks for itself.
+    // complete interface speaks for itself, unless it is over the limit, which
+    // only an interface that could not be parsed (so offers no `methods`) is.
+    if rendering.methods.is_none() && did.len() > calls::MAX_SERVICE_SUBSET_BYTES {
+        texts.push(format!(
+            "This interface is {} bytes, over the {}-byte limit a reply keeps to, and comes back \
+             whole only because it could not be parsed to offer `methods`.",
+            did.len(),
+            calls::MAX_SERVICE_SUBSET_BYTES
+        ));
+    }
     if let Some(covered) = &rendering.methods {
         let declared = rendering.method_count.unwrap_or_default();
         texts.push(if rendering.best_effort {
@@ -2733,6 +2742,21 @@ mod tests {
         // A rendering error is the reply's error, verbatim.
         let e = reply(Some(&["lost".to_string()])).expect_err("unknown");
         assert!(e.contains("`lost`") && e.contains("create, execute, list, schema"), "{e}");
+
+        // An interface over the limit that cannot be parsed comes back whole,
+        // with a note saying why.
+        let unparseable = format!("service : {{ {} !!!", "m : () -> (); ".repeat(600));
+        assert!(unparseable.len() > super::calls::MAX_SERVICE_SUBSET_BYTES);
+        let (texts, _) = super::candid_reply(
+            &unparseable,
+            "aaaaa-aa".into(),
+            None,
+            "https://app.example".into(),
+            "/.well-known/ic-architecture".into(),
+        )
+        .expect("verbatim");
+        assert_eq!(texts[0], unparseable);
+        assert!(texts[1].contains("could not be parsed to offer `methods`"), "{}", texts[1]);
     }
 
     // Every tool must carry MCP annotations, else clients fall back to the unsafe
