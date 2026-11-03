@@ -1013,9 +1013,9 @@ pub struct CandidRendering {
 ///
 /// * `Full` with no `methods` — the published text **verbatim** (never
 ///   re-printed: comments and declaration order survive), with the capability
-///   flags; an interface that cannot be parsed still comes back this way, with
-///   both flags false and no method count, exactly as [`has_oql`] and
-///   [`api_doc_method`] degrade.
+///   flags; an interface that cannot be parsed — or that no parse thread could
+///   be spawned for — still comes back this way, with both flags false and no
+///   method count, exactly as [`has_oql`] and [`api_doc_method`] degrade.
 /// * `Full` with `methods` — a `.did` restricted to those methods: their
 ///   signatures plus every type definition they use, transitively (the closure
 ///   `candid_parser`'s own binding generators compute), printed by candid's
@@ -1076,7 +1076,7 @@ pub fn render_candid(
     if let Err(e) = guard_candid_text("the `candid` interface", did) {
         return if verbatim { Ok(unparsed()) } else { Err(only_verbatim(e)) };
     }
-    on_deep_stack(|| {
+    let rendered = on_deep_stack(|| {
         let (env, actor) = match candid_parser::utils::CandidSource::Text(did).load() {
             Ok((env, Some(actor))) => (env, actor),
             Ok((_, None)) if verbatim => return Ok(unparsed()),
@@ -1116,8 +1116,15 @@ pub fn render_candid(
             CandidView::Summary => (summary_lines(&env, &covered)?, None),
         };
         Ok(CandidRendering { text, methods, method_count, types_included, oql, api_doc_available })
-    })
-    .unwrap_or_else(|| Err("could not spawn a thread to parse the interface".into()))
+    });
+    match rendered {
+        Some(rendering) => rendering,
+        // No parse thread could be spawned (resource exhaustion): the text is
+        // already in hand, so the verbatim view degrades exactly as `has_oql`
+        // and `api_doc_method` do, and only a view that needs the parse fails.
+        None if verbatim => Ok(unparsed()),
+        None => Err(only_verbatim("no thread could be spawned to parse it".into())),
+    }
 }
 
 /// The `.did` of a service reduced to `methods`: those methods and every type
