@@ -52,10 +52,12 @@ pub struct GetCandidArgs {
     #[serde(default)]
     pub methods: Option<Vec<String>>,
     /// How to render the interface. `full` (the default): the `.did` text, with
-    /// type definitions. `summary`: one `name : (args) -> (results)` line per
+    /// type definitions. `summary`: one `i/N name : (args) -> (results)` line per
     /// method and no type definitions — the cheap first call on a large
-    /// interface, to find the method to then ask for with `methods`. With
-    /// `methods`, a summary covers only those.
+    /// interface, to find the method to then ask for with `methods`. The `i/N`
+    /// counter is over the lines of that reply: if the last line you see is not
+    /// `N/N`, the client cut the reply short. With `methods`, a summary covers
+    /// only those.
     #[serde(default)]
     pub view: Option<CandidView>,
 }
@@ -74,8 +76,9 @@ pub enum CandidView {
     /// with the type definitions those methods use.
     #[default]
     Full,
-    /// One `name : (args) -> (results)` line per method, type names left
-    /// unexpanded and no type definitions: a cheap index of a large interface.
+    /// One `i/N name : (args) -> (results)` line per method, type names left
+    /// unexpanded and no type definitions: a cheap index of a large interface,
+    /// numbered so a reply the client cut short is visible.
     Summary,
 }
 
@@ -90,7 +93,8 @@ pub struct GetCandidOutput {
     /// The canister whose interface was read.
     pub canister_id: String,
     /// How the first text block renders the interface: `full` is `.did` text with
-    /// type definitions, `summary` one signature line per method without them.
+    /// type definitions, `summary` one numbered signature line per method without
+    /// them.
     pub view: CandidView,
     /// The methods the first text block is restricted to, sorted by name (the
     /// order Candid keeps a service's methods in). Absent when it covers every
@@ -1012,10 +1016,11 @@ pub struct CandidRendering {
 ///   printer. The service's init arguments are dropped — they are not needed
 ///   to call a method — so the result is a plain `service : { … }` that parses
 ///   and encodes against those methods.
-/// * `Summary` — one `name : (args) -> (results) [query]` line per method (all
-///   of them, or the `methods` asked for), type names unexpanded and no type
-///   definitions. Not a valid `.did` on its own, by design: it is the cheap
-///   index of a large interface.
+/// * `Summary` — one `i/N name : (args) -> (results) [query]` line per method
+///   (all of them, or the `methods` asked for), type names unexpanded and no
+///   type definitions. Not a valid `.did` on its own, by design: it is the
+///   cheap index of a large interface, and its counter is what makes a reply
+///   the client cut short visible (see [`summary_lines`]).
 ///
 /// Method names are trimmed and de-duplicated; a name the service does not
 /// declare is an error listing the declared names, so a mistyped name is
@@ -1132,19 +1137,27 @@ fn restricted_did(env: &TypeEnv, methods: Vec<(String, Type)>) -> Result<(String
     Ok((candid::pretty::candid::compile(&subset, &Some(projected)), needed.len()))
 }
 
-/// One `name : (args) -> (results) [query]` line per method, each signature on
-/// its own line (see [`SUMMARY_LINE_WIDTH`]), type names left unexpanded. Must
-/// run on the deep stack, like [`restricted_did`].
+/// One `i/N name : (args) -> (results) [query]` line per method, each signature
+/// on its own line (see [`SUMMARY_LINE_WIDTH`]), type names left unexpanded.
+///
+/// `i/N` counts the lines of THIS listing (not the service's methods), so a
+/// reply a client cut short is visible to the model that reads it: the last
+/// line it sees is not `N/N`, or the sequence skips. A checksum could not do
+/// this job — the client trims the result after receiving it whole, and a
+/// model cannot recompute a hash over what it was shown — but it can read a
+/// counter. Must run on the deep stack, like [`restricted_did`].
 fn summary_lines(env: &TypeEnv, methods: &[(String, Type)]) -> Result<String, String> {
     use candid::pretty::candid::{pp_function, pp_text};
-    let mut lines = Vec::with_capacity(methods.len());
-    for (name, ty) in methods {
+    let total = methods.len();
+    let mut lines = Vec::with_capacity(total);
+    for (i, (name, ty)) in methods.iter().enumerate() {
         // A method declared through a named function type (`m : MyFunc`) is
         // listed with that type resolved: the signature is what the line is for.
         let func =
             env.as_func(ty).map_err(|e| format!("method `{name}` has no function type: {e}"))?;
         lines.push(format!(
-            "{} : {}",
+            "{}/{total} {} : {}",
+            i + 1,
             pp_text(name).pretty(SUMMARY_LINE_WIDTH),
             pp_function(func).pretty(SUMMARY_LINE_WIDTH)
         ));
@@ -3323,7 +3336,9 @@ mod tests {
     // The summary is one line per method, sorted by name (as the Candid parser
     // orders a service's methods), with the mode and the type names as written —
     // no definitions, nothing wrapped — and a method declared through a named
-    // function type shows its signature.
+    // function type shows its signature. Every line is numbered `i/N` over the
+    // listing, so a reply the client cut short is visible to whoever reads what
+    // is left of it.
     #[test]
     fn render_candid_summary_lists_one_signature_per_method() {
         use super::{render_candid, CandidView};
@@ -3331,15 +3346,18 @@ mod tests {
         assert_eq!(
             r.text.lines().collect::<Vec<_>>(),
             vec![
-                "createEngine : (text) -> (Engine)",
-                "execute : (text) -> (text) query",
-                "get_api_doc : () -> (text) query",
-                "listVisibleEngines : (Page) -> (ListResult) query",
-                "notify : (text) -> () oneway",
-                "schema : () -> (text) query",
-                "subscribe : (nat) -> (text) query",
+                "1/7 createEngine : (text) -> (Engine)",
+                "2/7 execute : (text) -> (text) query",
+                "3/7 get_api_doc : () -> (text) query",
+                "4/7 listVisibleEngines : (Page) -> (ListResult) query",
+                "5/7 notify : (text) -> () oneway",
+                "6/7 schema : () -> (text) query",
+                "7/7 subscribe : (nat) -> (text) query",
             ]
         );
+        for (i, line) in r.text.lines().enumerate() {
+            assert!(line.starts_with(&format!("{}/7 ", i + 1)), "numbered in order: {line}");
+        }
         assert_eq!(r.methods, None, "a summary of everything restricts nothing");
         assert_eq!(r.method_count, Some(7));
         assert!(r.oql && r.api_doc_available, "the flags come along with every view");
@@ -3351,16 +3369,18 @@ mod tests {
         );
         let r = render_candid(&wide, CandidView::Summary, None).expect("renders");
         assert_eq!(r.text.lines().count(), 1, "one method, one line: {}", r.text);
-        assert!(r.text.starts_with("m : (record { field_"), "{}", r.text);
+        assert!(r.text.starts_with("1/1 m : (record { field_"), "{}", r.text);
         assert!(r.text.contains("field_0 : opt vec nat64;"), "{}", r.text);
 
         // Restricted to some methods: those lines only, sorted by name whatever
-        // the order asked, trimmed and de-duplicated.
+        // the order asked, trimmed and de-duplicated — and numbered over the
+        // listing's own length, not the service's, since the counter is about
+        // the reply being complete.
         let names = [" execute ".to_string(), "createEngine".into(), "execute".into()];
         let r = render_candid(VIEWS_DID, CandidView::Summary, Some(&names)).expect("renders");
         assert_eq!(
             r.text.lines().collect::<Vec<_>>(),
-            vec!["createEngine : (text) -> (Engine)", "execute : (text) -> (text) query"]
+            vec!["1/2 createEngine : (text) -> (Engine)", "2/2 execute : (text) -> (text) query"]
         );
         assert_eq!(r.methods.as_deref(), Some(&["createEngine".to_string(), "execute".into()][..]));
         assert_eq!(r.method_count, Some(7), "the total is the service's, not the selection's");
