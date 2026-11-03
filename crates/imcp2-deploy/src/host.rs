@@ -34,9 +34,10 @@
 //! extracted directory, which is removed when the deploy ends.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     io::Read,
+    ops::Bound,
     sync::{Arc, Mutex, PoisonError},
 };
 
@@ -86,6 +87,18 @@ pub const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
 /// state (`.icp/data/mappings/<env>.ids.json`, build artifacts). The deploy
 /// seeds it from the caller's mapping; the archive may not supply it.
 const STATE_DIR: &str = ".icp";
+
+/// The most entries an archive may hold. The byte budget alone would admit
+/// millions of empty files, each a path in the index the loader walks; a
+/// real bundle is a manifest, a few modules and plugins, and a frontend's
+/// assets, well inside this.
+pub const MAX_BUNDLE_ENTRIES: usize = 250_000;
+
+/// The most a gzip-compressed module may expand to: 100 MiB, the IC's own
+/// ceiling on a module. The library gunzips a module in memory to read its
+/// Candid interface, with no bound of its own, so the bound is applied here
+/// before a deploy runs.
+pub const MAX_WASM_BYTES: u64 = 100 * 1024 * 1024;
 
 /// A plain error for the seams below: each carries one sentence, and the
 /// library wraps it whole at its own boundary (`AccessError::new` and the
@@ -219,14 +232,26 @@ impl Inner {
 }
 
 impl State {
+    /// The entries of `set` strictly under `rel`. A path set orders by
+    /// component, so a directory's descendants sit right after it: one
+    /// range lookup, then take while the prefix holds, never a scan.
+    fn under<'a>(
+        set: &'a BTreeSet<Utf8PathBuf>,
+        rel: &'a Utf8Path,
+    ) -> impl Iterator<Item = &'a Utf8PathBuf> + 'a {
+        set.range::<Utf8Path, _>((Bound::Excluded(rel), Bound::Unbounded))
+            .take_while(move |p| p.starts_with(rel))
+    }
+
     fn is_dir(&self, rel: &Utf8Path) -> bool {
         rel.as_str().is_empty()
             || self.scratch.contains(rel)
-            || self.files.iter().chain(&self.scratch).any(|p| p != rel && p.starts_with(rel))
+            || Self::under(&self.files, rel).next().is_some()
+            || Self::under(&self.scratch, rel).next().is_some()
     }
 
     fn in_scratch(&self, rel: &Utf8Path) -> bool {
-        self.scratch.iter().any(|s| rel != s && rel.starts_with(s))
+        rel.ancestors().skip(1).any(|a| self.scratch.contains(a))
     }
 }
 
@@ -425,10 +450,8 @@ impl FileSystem for BundleFs {
     async fn read_dir(&self, path: &Utf8Path) -> Result<Vec<Utf8PathBuf>, FsError> {
         let prefix = self.normalize(path);
         let state = self.0.state();
-        let mut children: Vec<Utf8PathBuf> = state
-            .files
-            .iter()
-            .chain(&state.scratch)
+        let mut children: Vec<Utf8PathBuf> = State::under(&state.files, &prefix)
+            .chain(State::under(&state.scratch, &prefix))
             .filter_map(|entry| entry.strip_prefix(&prefix).ok())
             .filter_map(|relative| relative.components().next())
             .map(|first| self.0.root.join(&prefix).join(first.as_str()))
@@ -508,6 +531,23 @@ fn verify_checksum(path: &Utf8Path, expected: &str, bytes: &[u8]) -> Result<(), 
     }
 }
 
+/// Hold a gzip-compressed module to `limit` bytes expanded, by streaming it
+/// through a bounded decoder into nothing. A module that is not gzip passes
+/// as it is: its size is its own.
+fn gunzipped_within(path: &Utf8Path, bytes: &[u8], limit: u64) -> Result<(), Unsupported> {
+    if !bytes.starts_with(&[0x1f, 0x8b]) {
+        return Ok(());
+    }
+    let mut decoder = Limited { inner: flate2::read::GzDecoder::new(bytes), left: limit };
+    match std::io::copy(&mut decoder, &mut std::io::sink()) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(Unsupported(format!(
+            "the gzip-compressed wasm '{path}' expands past {limit} bytes, the most a module \
+             can be, or is not valid gzip"
+        ))),
+    }
+}
+
 /// Recipe resolution for a bundle: a bundled manifest spells every canister
 /// out as explicit pre-built steps, so a recipe reference means the archive
 /// is not a bundle.
@@ -583,6 +623,11 @@ impl ScriptRunner for NoScripts {
 /// (hashing to its checksum, if one is recorded); no step is a script. The
 /// environment's network is the Internet Computer.
 ///
+/// Canister names must also differ by more than letter case: the library's
+/// artifact store keys a canister's build output by its name on disk, and
+/// a case-insensitive volume (macOS and Windows by default) would hand the
+/// last-built module to both.
+///
 /// The directory check matters because not every reader goes through
 /// [`BundleFs`]: the sync-plugin runtime takes the canister directory as a
 /// host path and confines a plugin's declared files to the project directory
@@ -596,6 +641,19 @@ pub fn check_bundle<'a>(
     canisters: impl IntoIterator<Item = (&'a Utf8Path, &'a Canister)>,
 ) -> Result<(), String> {
     IcMainnet::mainnet(network).map_err(|e| e.0)?;
+    let canisters: Vec<_> = canisters.into_iter().collect();
+    let mut by_folded: BTreeMap<String, &str> = BTreeMap::new();
+    for (_, canister) in &canisters {
+        if let Some(other) = by_folded.insert(canister.name.to_lowercase(), &canister.name) {
+            if other != canister.name {
+                return Err(format!(
+                    "canisters '{other}' and '{}' differ only in letter case; the build artifact \
+                     store keys files by canister name, which a case-insensitive disk would merge",
+                    canister.name
+                ));
+            }
+        }
+    }
     for (dir, canister) in canisters {
         let name = &canister.name;
         let at = |e: Unsupported| format!("canister '{name}': {e}");
@@ -638,6 +696,7 @@ pub fn check_bundle<'a>(
             ))));
         };
         verify_checksum(&local.path, expected, &wasm).map_err(at)?;
+        gunzipped_within(&local.path, &wasm, MAX_WASM_BYTES).map_err(at)?;
 
         for step in &canister.sync.steps {
             let SyncStep::Plugin(plugin) = step else { continue };
@@ -701,6 +760,16 @@ pub fn host_for(fs: BundleFs) -> Host {
 /// `into`. What it extracts is then required to look like a bundle, i.e. to
 /// carry a project manifest at its root.
 pub fn extract_bundle(bytes: &[u8], into: &Utf8Path) -> Result<BundleFs, String> {
+    extract_bundle_within(bytes, into, MAX_BUNDLE_ENTRIES)
+}
+
+/// [`extract_bundle`] with the entry cap as a parameter, so a test can reach
+/// it without writing a quarter of a million files.
+fn extract_bundle_within(
+    bytes: &[u8],
+    into: &Utf8Path,
+    max_entries: usize,
+) -> Result<BundleFs, String> {
     if bytes.len() > MAX_BUNDLE_BYTES {
         return Err(format!(
             "the bundle is {} bytes, above the {} byte limit",
@@ -714,8 +783,15 @@ pub fn extract_bundle(bytes: &[u8], into: &Utf8Path) -> Result<BundleFs, String>
     let decoder = Limited { inner: flate2::read::GzDecoder::new(bytes), left: MAX_EXTRACTED_BYTES };
     let mut archive = tar::Archive::new(decoder);
     let mut total: u64 = 0;
+    let mut entries: usize = 0;
     for entry in archive.entries().map_err(unreadable)? {
         let mut entry = entry.map_err(unreadable)?;
+        entries += 1;
+        if entries > max_entries {
+            return Err(format!(
+                "the bundle holds more than {max_entries} entries, more than a bundle ever has"
+            ));
+        }
         let kind = entry.header().entry_type();
         let path = entry.path().map_err(unreadable)?.into_owned();
         let path = Utf8PathBuf::from_path_buf(path)
@@ -731,7 +807,14 @@ pub fn extract_bundle(bytes: &[u8], into: &Utf8Path) -> Result<BundleFs, String>
         // store. A bundle never carries it (`icp project bundle` writes
         // manifests, modules, plugins, argument files and images), and one
         // that did could point a deploy at canisters the caller never named.
-        if fs.normalize(&path).components().next().is_some_and(|c| c.as_str() == STATE_DIR) {
+        // Compared without regard to case: on a case-insensitive disk `.ICP`
+        // is the same directory.
+        if fs
+            .normalize(&path)
+            .components()
+            .next()
+            .is_some_and(|c| c.as_str().eq_ignore_ascii_case(STATE_DIR))
+        {
             return Err(format!(
                 "the archive entry '{path}' is under `{STATE_DIR}/`, the project state a bundle \
                  never carries; rebuild it with `icp project bundle`"
@@ -948,6 +1031,16 @@ mod tests {
         assert!(err.contains("`.icp/`"), "{err}");
         assert!(!into.join(".icp").exists());
 
+        // Spelled `.ICP/`: the same directory on a case-insensitive disk.
+        let (_dir, into) = scratch();
+        let bytes = archive(&[
+            ("icp.yaml", b"canisters: []"),
+            (".ICP/data/mappings/ic.ids.json", b"{\"backend\": \"aaaaa-aa\"}"),
+        ]);
+        let err = extract_bundle(&bytes, &into).unwrap_err();
+        assert!(err.contains("`.icp/`"), "{err}");
+        assert!(!into.join(".ICP").exists());
+
         // The same entry spelled `./.icp/...`: the archive path's first
         // component is `.`, extraction writes it into `.icp/` all the same.
         let (_dir, into) = scratch();
@@ -966,6 +1059,73 @@ mod tests {
         let err = extract_bundle(&bytes, &into).unwrap_err();
         assert!(err.contains("`.icp/`"), "{err}");
         assert!(!into.join(".icp").exists());
+    }
+
+    #[test]
+    fn an_archive_with_too_many_entries_is_refused() {
+        let (_dir, into) = scratch();
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for i in 0..=8 {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, format!("f/{i}"), &b""[..]).unwrap();
+        }
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+        let err = extract_bundle_within(&bytes, &into, 8).unwrap_err();
+        assert!(err.contains("more than 8 entries"), "{err}");
+        let err = extract_bundle_within(&bytes, &into, 9).unwrap_err();
+        assert!(err.contains(PROJECT_MANIFEST), "{err}");
+    }
+
+    // A gzip-compressed module is bounded by what it expands to, read
+    // through a bounded decoder; a plain module passes as it is.
+    #[test]
+    fn a_gzipped_module_is_held_to_its_limit() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&[0u8; 4096]).unwrap();
+        let gz = encoder.finish().unwrap();
+        let path = Utf8Path::new("backend.wasm.gz");
+        gunzipped_within(path, &gz, 8192).unwrap();
+        let err = gunzipped_within(path, &gz, 1024).unwrap_err();
+        assert!(err.0.contains("expands past 1024"), "{err}");
+        gunzipped_within(path, b"\0asm plain", 1).unwrap();
+    }
+
+    // Directory lookups come from the index by range, not by scanning it:
+    // what is under a directory, and whether anything is.
+    #[test]
+    fn directory_lookups_follow_the_index() {
+        let (_dir, into) = scratch();
+        let fs = extract_bundle(
+            &archive(&[
+                ("icp.yaml", b"canisters: []"),
+                ("a/b/c.txt", b"1"),
+                ("a/b/d.txt", b"2"),
+                ("a/e.txt", b"3"),
+                ("ab/f.txt", b"4"),
+            ]),
+            &into,
+        )
+        .unwrap();
+        let state = fs.0.state();
+        assert!(state.is_dir(Utf8Path::new("a")));
+        assert!(state.is_dir(Utf8Path::new("a/b")));
+        assert!(!state.is_dir(Utf8Path::new("a/b/c.txt")));
+        assert!(!state.is_dir(Utf8Path::new("a/x")));
+        let under: Vec<_> = State::under(&state.files, Utf8Path::new("a")).collect();
+        assert_eq!(under.len(), 3, "{under:?}");
+        assert!(under.iter().all(|p| p.starts_with("a")), "{under:?}");
+        drop(state);
+        let children = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(fs.read_dir(&fs.root().join("a")))
+            .unwrap();
+        assert_eq!(children, vec![fs.root().join("a/b"), fs.root().join("a/e.txt")]);
     }
 
     // A canister directory is held to the bundle root by its spelling, since
