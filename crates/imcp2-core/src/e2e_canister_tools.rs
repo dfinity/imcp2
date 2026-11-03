@@ -1712,7 +1712,7 @@ async fn a_read_that_cannot_run_says_what_to_fix() {
 /// A large interface is read cheaply, over the real surface: `methods` returns
 /// the named method with the type definitions it uses and the interface's own
 /// comment on it, as a valid `.did`, and the structured output describes the
-/// text block — its size, whether comments survived — without repeating it, so
+/// text — its size, whether comments survived — without repeating it, so
 /// no reply carries the interface twice. The discoverability gate runs first
 /// for a restricted read as for the rest.
 #[tokio::test]

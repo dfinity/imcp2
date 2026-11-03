@@ -146,7 +146,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Fetch a canister's Candid interface: the `.did` text declaring the methods and argument types a caller needs in order to call it. On a canister with many methods do not read it whole (it runs to tens of KB): take the method names from the guide get_canister_api_doc returns and pass them as `methods`, which returns just those methods with the type definitions they use and the interface's own comments on them, as a small valid `.did`. A selection over 5 KB is refused with the list of every method, so ask for fewer at a time; a single method is always answered, with its comments stripped if that is what it takes. The interface text is the first content block; the structured object carries its size and whether comments were stripped, never the text. Also reports whether the canister declares an OQL surface, which this server reads through the OQL tools rather than with a Candid query, and whether it declares the API doc get_canister_api_doc reads.",
+        description = "Fetch a canister's Candid interface: the `.did` text declaring the methods and argument types a caller needs in order to call it. On a canister with many methods do not read it whole (it runs to tens of KB): take the method names from the guide get_canister_api_doc returns and pass them as `methods`, which returns just those methods with the type definitions they use and the interface's own comments on them, as a small valid `.did`. A selection over 5 KB is refused with the list of every method, so ask for fewer at a time; a single method is always answered, with its comments stripped if that is what it takes. The structured object carries the interface text's size and whether its comments were stripped, never the text itself. Also reports whether the canister declares an OQL surface, which this server reads through the OQL tools rather than with a Candid query, and whether it declares the API doc get_canister_api_doc reads.",
         annotations(title = "Get Candid interface", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::GetCandidOutput>(),
     )]
@@ -2438,16 +2438,16 @@ fn schema_for_output<T: schemars::JsonSchema + std::any::Any>(
 }
 
 /// Assemble a `get_canister_candid` reply from the `.did` text the canister
-/// published: the text blocks — the interface, complete or restricted to
-/// `methods`, first, then the notes — and the structured output. Pure, so every
-/// shape is testable without a replica; the handler supplies the authorization
-/// and the metadata read. `declared_by` / `declared_at` are the manifest that
+/// published: its texts — the interface, complete or restricted to `methods`,
+/// first, then the notes — and the structured output. Pure, so every shape is
+/// testable without a replica; the handler supplies the authorization and the
+/// metadata read. `declared_by` / `declared_at` are the manifest that
 /// authorized the read, echoed into the output.
 ///
 /// The structured output never repeats the interface text (see
 /// [`calls::GetCandidOutput`]), so a reply is the interface plus short notes,
-/// never the interface twice. Every note is its own block, after the first, so
-/// that block stays clean, paste-able Candid.
+/// never the interface twice. Every note is a text of its own, after the
+/// interface, so the interface stays clean, paste-able Candid.
 fn candid_reply(
     did: &str,
     canister_id: String,
@@ -2466,12 +2466,12 @@ fn candid_reply(
         declared_by,
         declared_at,
     };
-    let mut blocks = vec![rendering.text];
-    // What a restricted block covers and what it cost — only then; the complete
-    // interface speaks for itself.
+    let mut texts = vec![rendering.text];
+    // What a restricted interface covers and what it cost — only then; the
+    // complete interface speaks for itself.
     if let Some(covered) = &rendering.methods {
         let declared = rendering.method_count.unwrap_or_default();
-        blocks.push(if rendering.best_effort {
+        texts.push(if rendering.best_effort {
             format!(
                 "This interface is restricted to the method asked for, with the type definitions \
                  it uses (and the service's init arguments omitted). Its comments were STRIPPED: \
@@ -2493,11 +2493,11 @@ fn candid_reply(
         });
     }
     // Signal an OQL query surface structurally (`oql: true`). When set, the
-    // guidance pointer is a SEPARATE block, so the first block stays the raw
-    // `.did` (still valid, copy-pastable Candid) — the full primer is served on
-    // demand (see the OQL_USAGE_URI resource), never inlined.
+    // guidance pointer is a SEPARATE text, so the interface stays the raw `.did`
+    // (still valid, copy-pastable Candid) — the full primer is served on demand
+    // (see the OQL_USAGE_URI resource), never inlined.
     if rendering.oql {
-        blocks.push(format!(
+        texts.push(format!(
             "This canister exposes an OQL query surface (a JSON query language \
              over its data), so READ it through the OQL tools — a Candid `method` \
              query via canister_query is rejected here. Order: icp_oql_guide \
@@ -2514,7 +2514,7 @@ fn candid_reply(
     }
     // Same predicate get_canister_api_doc uses, so the flag gates that call:
     // true means a `getApiDoc`/`get_api_doc` method exists.
-    blocks.push(if rendering.api_doc_available {
+    texts.push(if rendering.api_doc_available {
         "This canister declares an API-doc method (api_doc_available=true): \
          get_canister_api_doc reads it for a prose \"how this app behaves\" guide \
          (units, auth, lifecycle, gotchas) — the declaration is what was detected, \
@@ -2527,7 +2527,7 @@ fn candid_reply(
          same."
             .to_string()
     });
-    Ok((blocks, output))
+    Ok((texts, output))
 }
 
 /// A success result carrying both the human-readable `text` and a machine-
@@ -2632,8 +2632,8 @@ mod tests {
     // A large interface must be readable in one small reply, and never shipped
     // twice. Pin the surface a client sees for that: the `methods` argument and
     // an output schema that describes the interface text — its size, whether
-    // its comments survived, what the block covers — without a field for the
-    // text itself.
+    // its comments survived, what it covers — without a field for the text
+    // itself.
     #[test]
     fn get_canister_candid_advertises_methods_and_never_repeats_the_interface() {
         let tool = super::IcTools::all_tools()
@@ -2660,14 +2660,14 @@ mod tests {
         }
         assert!(
             !properties.contains_key("candid"),
-            "the interface text is the first content block, never structured content: {output}"
+            "the interface text is returned as text, never as structured content: {output}"
         );
     }
 
-    // The reply a read assembles, without a replica: the interface is the first
-    // block, the notes follow, and the structured object describes the block
-    // without carrying the text — so a full-interface reply is the `.did` plus a
-    // short note, and a restricted one says what it covers and what it cost.
+    // The reply a read assembles, without a replica: the interface comes first,
+    // the notes follow, and the structured object describes the text without
+    // carrying it — so a full-interface reply is the `.did` plus a short note,
+    // and a restricted one says what it covers and what it cost.
     #[test]
     fn candid_reply_puts_the_interface_first_and_the_text_only_there() {
         let did = "// Paging.\n\
@@ -2694,10 +2694,10 @@ mod tests {
 
         // The complete interface: the text, then the OQL pointer and the API-doc
         // note (both describe the canister, not the selection), and nothing else.
-        let (blocks, output) = reply(None).expect("renders");
-        assert_eq!(blocks[0], did, "the interface is the first block, verbatim");
-        assert_eq!(blocks.len(), 3, "no selection note on the complete interface: {blocks:?}");
-        assert!(blocks[1].contains("OQL") && blocks[2].contains("api_doc_available=false"));
+        let (texts, output) = reply(None).expect("renders");
+        assert_eq!(texts[0], did, "the interface comes first, verbatim");
+        assert_eq!(texts.len(), 3, "no selection note on the complete interface: {texts:?}");
+        assert!(texts[1].contains("OQL") && texts[2].contains("api_doc_available=false"));
         let s = structured(&output);
         assert!(s.get("candid").is_none(), "the text is not repeated: {s}");
         assert!(s.get("methods").is_none(), "nothing restricts it: {s}");
@@ -2705,29 +2705,29 @@ mod tests {
         assert_eq!(s["best_effort"], serde_json::json!(false));
         assert_eq!(s["oql"], serde_json::json!(true));
         assert_eq!(s["declared_by"], serde_json::json!("https://app.example"));
-        let text: usize = blocks.iter().map(String::len).sum();
+        let text: usize = texts.iter().map(String::len).sum();
         assert!(text < did.len() + 2_000, "the did plus short notes, {text} bytes");
 
         // One method with its types and comments: a restricted `.did`, then a
         // note on what it covers; the structured object echoes the selection.
         let names = ["list".to_string()];
-        let (blocks, output) = reply(Some(&names)).expect("renders");
+        let (texts, output) = reply(Some(&names)).expect("renders");
         assert!(
-            blocks[0].contains("// Paging.") && blocks[0].contains("type Args ="),
+            texts[0].contains("// Paging.") && texts[0].contains("type Args ="),
             "{}",
-            blocks[0]
+            texts[0]
         );
-        assert!(blocks[0].contains("// Lists the names on a page."), "{}", blocks[0]);
-        assert!(!blocks[0].contains("create"), "{}", blocks[0]);
+        assert!(texts[0].contains("// Lists the names on a page."), "{}", texts[0]);
+        assert!(!texts[0].contains("create"), "{}", texts[0]);
         assert!(
-            blocks[1].starts_with("This interface is restricted to 1 of the 4 methods"),
+            texts[1].starts_with("This interface is restricted to 1 of the 4 methods"),
             "{}",
-            blocks[1]
+            texts[1]
         );
-        assert!(blocks[1].contains("own comments"), "{}", blocks[1]);
+        assert!(texts[1].contains("own comments"), "{}", texts[1]);
         let s = structured(&output);
         assert_eq!(s["methods"], serde_json::json!(["list"]));
-        assert_eq!(s["bytes"], serde_json::json!(blocks[0].len()));
+        assert_eq!(s["bytes"], serde_json::json!(texts[0].len()));
         assert_eq!(s["best_effort"], serde_json::json!(false));
 
         // A rendering error is the reply's error, verbatim.
