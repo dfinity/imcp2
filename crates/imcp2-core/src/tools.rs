@@ -2667,11 +2667,13 @@ mod tests {
         for present in ["candid", "methods", "bytes", "best_effort", "oql", "declared_by"] {
             assert!(properties.contains_key(present), "{present} must be declared: {output}");
         }
+        assert_eq!(properties["candid"]["type"], serde_json::json!("string"), "{output}");
     }
 
     // The reply a read assembles, without a replica: the interface comes first,
-    // the notes follow, and the structured object carries the text too — so a full-interface reply is the `.did` plus a short note,
-    // and a restricted one says what it covers and what it cost.
+    // the notes follow, and the structured object carries the text too — so a
+    // full-interface reply is the `.did` plus a short note, and a restricted one
+    // says what it covers and what it cost.
     #[test]
     fn candid_reply_puts_the_interface_first_and_in_the_structured_output() {
         let did = "// Paging.\n\

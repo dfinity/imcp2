@@ -62,7 +62,11 @@ pub struct GetCandidArgs {
 
 /// Output of `get_canister_candid`. Carries the interface text as `candid`,
 /// because clients that read the structured content show the model nothing
-/// else. A reply is kept to 5 KB, so the text stays small.
+/// else. A reply is kept to 5 KB, except for the two renderings that cannot be
+/// cut further: an interface that could not be parsed, and the one method asked
+/// for when it is over the limit even with its comments stripped. Those are
+/// carried whole here too, since a client that reads only this object has no
+/// other way to get the interface.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct GetCandidOutput {
     /// The canister whose interface was read.
