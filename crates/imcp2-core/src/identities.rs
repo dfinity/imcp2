@@ -31,7 +31,15 @@
 //!
 //! The derived `(user_key, chain, expiration)` is cached per `(session_id,
 //! domain, account_number)` with a margin under the delegation's expiration; it
-//! is reused until near-expiry, then re-derived.
+//! is reused until near-expiry, then re-derived. II caps every MCP account
+//! delegation at **5 minutes** (`MCP_MAX_EXPIRATION_PERIOD_NS` in II's
+//! `mcp.rs`; the server passes `max_ttl = null` and gets exactly that cap, or
+//! less near the grant's end), so with [`REDERIVE_MARGIN_NS`] a cached entry
+//! serves for at most about 4.5 minutes: an app in continuous use is re-derived
+//! every few minutes, at the cost of one `mcp_prepare_delegation` update plus a
+//! `mcp_get_delegation` query. That query is answered by a single replica that
+//! may not yet have caught up with the update, so it is retried on
+//! `NoSuchDelegation` ([`get_delegation_with_retry`]).
 //!
 //! ## Bounded state (CWE-770)
 //!
@@ -54,11 +62,12 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::Engine;
@@ -76,8 +85,27 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 /// Re-derive once the cached delegation is within this margin of expiry, so a
-/// call never goes out with an about-to-expire delegation.
+/// call never goes out with an about-to-expire delegation. Against II's
+/// 5-minute cap on MCP delegations this leaves a cached entry about 4.5 minutes
+/// of use before the next `prepare`/`get` round trip.
 const REDERIVE_MARGIN_NS: u64 = 30 * 1_000_000_000;
+
+/// Waits between successive `mcp_get_delegation` attempts when II answers
+/// `NoSuchDelegation` for a delegation `mcp_prepare_delegation` has JUST
+/// minted. `prepare` is an update: `call_and_wait` returns once the subnet has
+/// certified it. `get` is a query, answered by whichever single replica the
+/// boundary node picks, and that replica may still be a block or two behind
+/// the certified state — the signature is simply not in its copy of II's
+/// signature map yet. Nothing is wrong with the request, so the SAME request
+/// (same origin, account, per-app key and expiration) is sent again after a
+/// pause, as II's own frontend does (`retryGetDelegation` in
+/// `fetchDelegation.ts`: up to five tries, waiting 0, 1, 2, 3, 4 s). One
+/// immediate try plus these three waits — six seconds in all — covers the lag
+/// comfortably without stalling a tool call for long when something else is
+/// wrong. Only `NoSuchDelegation` is retried: `Unauthorized` means the grant is
+/// gone, and a transport or decode failure is reported as is.
+const GET_DELEGATION_BACKOFF: [Duration; 3] =
+    [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(3)];
 
 /// Ceiling on **connects in flight** — sessions minted by `/oauth/authorize`
 /// that have not (yet) redeemed a grant. That endpoint is UNAUTHENTICATED, so
@@ -1046,13 +1074,16 @@ impl Identities {
 
         // mcp_prepare_delegation(target_origin, opt account_number, session_key, opt max_ttl)
         //   -> variant { Ok: McpPrepareDelegation; Err: AccountDelegationError }
-        // `session_key` is the PER-APP key's DER pubkey. `max_ttl = null` uses
-        // II's default (<= 1 hour, and never past the grant). `account_number =
-        // null` selects the anchor's default account at `target_origin`; `Some(n)`
-        // selects a specific named account. The default is mutable, so II resolves
-        // the request to a concrete account at prepare time and returns it; we
-        // thread that resolved account into `mcp_get_delegation` so `get` reads the
-        // same account `prepare` signed for.
+        // `session_key` is the PER-APP key's DER pubkey. `max_ttl = null` leaves
+        // the lifetime to II, which caps every MCP delegation at 5 minutes
+        // (`MCP_MAX_EXPIRATION_PERIOD_NS`) and never past the grant — so this
+        // runs again every few minutes for an app in use (`REDERIVE_MARGIN_NS`).
+        // `account_number = null` selects the anchor's default account at
+        // `target_origin`; `Some(n)` selects a specific named account. The
+        // default is mutable, so II resolves the request to a concrete account at
+        // prepare time and returns it; we thread that resolved account into
+        // `mcp_get_delegation` so `get` reads the same account `prepare` signed
+        // for.
         let prepare_arg = Encode!(&origin, &account_number, &app_key_der, &None::<u64>)
             .map_err(|e| format!("could not encode prepare args: {e}"))?;
         let prepared = agent
@@ -1069,18 +1100,26 @@ impl Identities {
         //   -> variant { Ok: SignedDelegation; Err: AccountDelegationError } query
         // Thread the account + expiration `prepare` returned VERBATIM, or II
         // returns NoSuchDelegation (the default account is mutable between calls).
+        // A query can ALSO answer NoSuchDelegation when the replica serving it
+        // has not caught up with the `prepare` update yet, so this same request
+        // — same per-app key, same prepared account and expiration — is re-sent
+        // over `GET_DELEGATION_BACKOFF` before the failure is reported.
         let get_arg =
             Encode!(&origin, &prepared.account_number, &app_key_der, &prepared.expiration)
                 .map_err(|e| format!("could not encode get args: {e}"))?;
-        let got = agent
-            .query(&canister, "mcp_get_delegation")
-            .with_arg(get_arg)
-            .call()
-            .await
-            .map_err(|e| format!("mcp_get_delegation failed: {e}"))?;
-        let signed = Decode!(&got, GetReply)
-            .map_err(|e| format!("could not decode get reply: {e}"))?
-            .map_err(map_delegation_error)?;
+        let agent = &agent;
+        let signed = get_delegation_with_retry(session_id, || {
+            let get_arg = get_arg.clone();
+            async move {
+                agent
+                    .query(&canister, "mcp_get_delegation")
+                    .with_arg(get_arg)
+                    .call()
+                    .await
+                    .map_err(|e| format!("mcp_get_delegation failed: {e}"))
+            }
+        })
+        .await?;
 
         let chain = vec![signed.into_agent(&app_key_der)?];
         Ok(AppDelegation {
@@ -1286,15 +1325,76 @@ fn registration_identity(
     .map_err(|e| format!("invalid registration delegation chain: {e}"))
 }
 
+/// Fetch the delegation `mcp_prepare_delegation` just minted, re-sending the
+/// same `mcp_get_delegation` while II answers `NoSuchDelegation`, with the
+/// waits in [`GET_DELEGATION_BACKOFF`] between attempts (see there for why a
+/// freshly prepared delegation can be missing from a query reply). `query`
+/// sends ONE `mcp_get_delegation` — the identical request every time, so the
+/// per-app key and the prepared account/expiration are kept across attempts —
+/// and yields the raw reply bytes; this decodes them and decides. Anything but
+/// `NoSuchDelegation` ends the loop at once: a transport or decode failure is
+/// returned as is, and every other II error (above all `Unauthorized`, which
+/// means the grant is gone) goes through [`map_delegation_error`] unretried.
+async fn get_delegation_with_retry<F, Fut>(
+    session_id: &str,
+    mut query: F,
+) -> Result<IiSignedDelegation, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, String>>,
+{
+    let mut waits = GET_DELEGATION_BACKOFF.into_iter();
+    loop {
+        let reply = query().await?;
+        let decoded =
+            Decode!(&reply, GetReply).map_err(|e| format!("could not decode get reply: {e}"))?;
+        match decoded {
+            Ok(signed) => return Ok(signed),
+            Err(AccountDelegationError::NoSuchDelegation) => match waits.next() {
+                Some(wait) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        wait_ms = wait.as_millis() as u64,
+                        "mcp_get_delegation: the answering replica has not caught up with the \
+                         prepared delegation yet; retrying"
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+                None => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        attempts = GET_DELEGATION_BACKOFF.len() + 1,
+                        "mcp_get_delegation: the prepared delegation never became visible"
+                    );
+                    return Err(map_delegation_error(AccountDelegationError::NoSuchDelegation));
+                }
+            },
+            Err(e) => return Err(map_delegation_error(e)),
+        }
+    }
+}
+
 /// Render an `AccountDelegationError` as an actionable message. Any `Unauthorized`
-/// means the grant is gone → reconnect (do not retry).
+/// means the grant is gone → reconnect (do not retry). `NoSuchDelegation` is
+/// only ever answered by `mcp_get_delegation`, and reaches here only once
+/// [`get_delegation_with_retry`] has used up its whole schedule, so the message
+/// describes a delegation that stayed invisible through all of those attempts.
 fn map_delegation_error(e: AccountDelegationError) -> String {
     match e {
         AccountDelegationError::Unauthorized(_) => RECONNECT_MSG.to_string(),
         AccountDelegationError::NoSuchDelegation => {
-            "Internet Identity returned NoSuchDelegation — the prepared account/expiration were not \
-             threaded through. Retry the request."
-                .to_string()
+            let waited: Duration = GET_DELEGATION_BACKOFF.iter().sum();
+            format!(
+                "Internet Identity answered NoSuchDelegation for the delegation this server prepared \
+                 a moment ago: the lookup is a query, answered by a single replica, and that replica \
+                 had not yet caught up with the update that created the delegation. The server \
+                 already retried the lookup {} more times over {} seconds and it never appeared. \
+                 Retry the request once — that prepares a fresh delegation. If it fails the same \
+                 way again, Internet Identity is not serving freshly prepared delegations right \
+                 now: tell the user and stop retrying.",
+                GET_DELEGATION_BACKOFF.len(),
+                waited.as_secs()
+            )
         }
         AccountDelegationError::InternalCanisterError(t) => {
             format!("Internet Identity internal error: {t}")
@@ -1401,7 +1501,7 @@ struct IiAccountInfo {
 }
 
 /// One delegation as returned by II's `mcp_get_delegation`.
-#[derive(CandidType, Deserialize)]
+#[derive(CandidType, Deserialize, Debug)]
 struct IiDelegation {
     pubkey: Vec<u8>,
     expiration: u64,
@@ -1448,7 +1548,7 @@ pub(crate) fn permissions_from_text(
 }
 
 /// `SignedDelegation` as returned by II's `mcp_get_delegation`.
-#[derive(CandidType, Deserialize)]
+#[derive(CandidType, Deserialize, Debug)]
 struct IiSignedDelegation {
     delegation: IiDelegation,
     signature: Vec<u8>,
@@ -1481,6 +1581,10 @@ impl IiSignedDelegation {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::VecDeque, sync::Mutex};
+
+    use tokio::time::Instant;
+
     use super::*;
 
     /// Both built-in instance constructors must succeed: the fallible part is
@@ -2131,6 +2235,146 @@ mod tests {
             .into_agent(&app_key)
             .expect_err("an unrecognized permission must error, not silently drop");
         assert!(err.contains("unrecognized permission"), "got: {err}");
+    }
+
+    // ---- mcp_get_delegation retry (replica lag) -----------------------------
+
+    // `mcp_get_delegation`'s reply as II encodes it, over the wire mirror above.
+    type WireGetReply = std::result::Result<WireSignedDelegation, AccountDelegationError>;
+
+    // When (in tokio's clock) each scripted attempt was made.
+    type Attempts = Arc<Mutex<Vec<Instant>>>;
+
+    // Stand in for the network: a `query` closure for `get_delegation_with_retry`
+    // that answers from a script of raw `mcp_get_delegation` replies, one per
+    // attempt, and records when each attempt was made. The closure is the only
+    // thing the loop calls, so the record is exactly the request sequence II
+    // would have seen.
+    fn scripted_get(
+        replies: Vec<Result<Vec<u8>, String>>,
+    ) -> (impl FnMut() -> std::future::Ready<Result<Vec<u8>, String>>, Attempts) {
+        let attempts: Attempts = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&attempts);
+        let mut replies = VecDeque::from(replies);
+        let query = move || {
+            log.lock().expect("attempt log").push(Instant::now());
+            std::future::ready(replies.pop_front().expect("more attempts than scripted replies"))
+        };
+        (query, attempts)
+    }
+
+    fn no_such_delegation() -> Vec<u8> {
+        Encode!(&WireGetReply::Err(AccountDelegationError::NoSuchDelegation)).expect("encode")
+    }
+
+    fn delegation_reply(app_key: &[u8]) -> Vec<u8> {
+        Encode!(&WireGetReply::Ok(WireSignedDelegation {
+            delegation: WireDelegation {
+                pubkey: app_key.to_vec(),
+                expiration: 42,
+                targets: None,
+                permissions: None,
+            },
+            signature: vec![9, 9, 9],
+        }))
+        .expect("encode")
+    }
+
+    // A replica that has not caught up with the `prepare` update answers
+    // NoSuchDelegation for a delegation the subnet has already certified. The
+    // loop re-sends the SAME request after each scheduled wait and hands back
+    // the delegation as soon as a reply carries it, so the tool caller never
+    // sees the transient. Paused tokio time: the waits are the real `sleep`s,
+    // read off the clock rather than endured.
+    #[tokio::test(start_paused = true)]
+    async fn get_delegation_retries_until_a_lagging_replica_catches_up() {
+        let app_key = vec![1u8, 2, 3, 4];
+        let (query, attempts) = scripted_get(vec![
+            Ok(no_such_delegation()),
+            Ok(no_such_delegation()),
+            Ok(delegation_reply(&app_key)),
+        ]);
+        let start = Instant::now();
+        let signed = get_delegation_with_retry("sess", query)
+            .await
+            .expect("the third reply carries the delegation");
+        assert_eq!(signed.delegation.pubkey, app_key);
+
+        let attempts = attempts.lock().expect("attempt log");
+        assert_eq!(attempts.len(), 3, "stops at the first reply that carries it");
+        // No wait before the first attempt, then the scheduled waits, in order.
+        assert_eq!(attempts[0], start);
+        assert!(attempts[1] - attempts[0] >= GET_DELEGATION_BACKOFF[0]);
+        assert!(attempts[2] - attempts[1] >= GET_DELEGATION_BACKOFF[1]);
+    }
+
+    // When the delegation never shows up, the loop stops after the whole
+    // schedule — one try plus one per wait — and the error says what actually
+    // happened: a delegation the answering replica could not see yet, already
+    // retried by the server. (The earlier text blamed un-threaded parameters,
+    // which the code had long since threaded.)
+    #[tokio::test(start_paused = true)]
+    async fn get_delegation_gives_up_after_the_schedule_with_an_accurate_message() {
+        let tries = GET_DELEGATION_BACKOFF.len() + 1;
+        let (query, attempts) = scripted_get(vec![Ok(no_such_delegation()); tries]);
+        let start = Instant::now();
+        let err = get_delegation_with_retry("sess", query)
+            .await
+            .expect_err("a delegation that never appears is an error");
+        assert_eq!(
+            attempts.lock().expect("attempt log").len(),
+            tries,
+            "one try per slot, then stop"
+        );
+        let waited: Duration = GET_DELEGATION_BACKOFF.iter().sum();
+        assert!(start.elapsed() >= waited, "every scheduled wait was taken");
+        assert!(err.contains("not yet caught up"), "got: {err}");
+        assert!(err.contains("already retried"), "got: {err}");
+        assert!(!err.contains("threaded"), "the stale diagnosis must be gone: {err}");
+    }
+
+    // Only NoSuchDelegation is retried. `Unauthorized` means the grant is gone:
+    // one attempt, no wait, the reconnect message. A transport failure and an
+    // InternalCanisterError end the loop just as promptly — even with a good
+    // reply scripted behind them, which is never requested.
+    #[tokio::test(start_paused = true)]
+    async fn get_delegation_does_not_retry_anything_but_no_such_delegation() {
+        let unauthorized = Encode!(&WireGetReply::Err(AccountDelegationError::Unauthorized(
+            Principal::anonymous()
+        )))
+        .expect("encode");
+        let (query, attempts) = scripted_get(vec![Ok(unauthorized), Ok(delegation_reply(&[1]))]);
+        let start = Instant::now();
+        let err = get_delegation_with_retry("sess", query).await.expect_err("grant gone => error");
+        assert_eq!(err, RECONNECT_MSG);
+        assert_eq!(attempts.lock().expect("attempt log").len(), 1, "no retry after Unauthorized");
+        assert_eq!(start.elapsed(), Duration::ZERO, "and no wait either");
+
+        let (query, attempts) = scripted_get(vec![
+            Err("mcp_get_delegation failed: connection reset".into()),
+            Ok(delegation_reply(&[1])),
+        ]);
+        let err = get_delegation_with_retry("sess", query).await.expect_err("transport => error");
+        assert!(err.contains("connection reset"), "got: {err}");
+        assert_eq!(
+            attempts.lock().expect("attempt log").len(),
+            1,
+            "no retry after a transport failure"
+        );
+
+        let internal = Encode!(&WireGetReply::Err(AccountDelegationError::InternalCanisterError(
+            "boom".into()
+        )))
+        .expect("encode");
+        let (query, attempts) = scripted_get(vec![Ok(internal), Ok(delegation_reply(&[1]))]);
+        let err = get_delegation_with_retry("sess", query).await.expect_err("internal => error");
+        assert!(err.contains("boom"), "got: {err}");
+        assert_eq!(
+            attempts.lock().expect("attempt log").len(),
+            1,
+            "no retry after an internal error"
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO, "none of these waited");
     }
 
     // End-to-end: a read-only (`queries`) delegation from II must survive our full
