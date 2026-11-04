@@ -26,9 +26,11 @@
 //!   because the sync-plugin runtime needs real paths to mount.
 //! * **The bundle is checked before any phase runs** ([`check_bundle`]): every
 //!   canister built by one pre-built wasm in the archive that hashes to its
-//!   recorded checksum, every sync plugin in the archive, no script steps
-//!   (which the library would run as host subprocesses; [`NoScripts`] refuses
-//!   them again at the seams, as a backstop), and no network but `ic`.
+//!   recorded checksum, every sync plugin in the archive and what it declares
+//!   with it, no script steps (which the library would run as host
+//!   subprocesses; [`NoScripts`] refuses them again at the seams, as a
+//!   backstop), and no network but `ic`. The check's own work is bounded by
+//!   the archive, not by what the manifest repeats.
 //!
 //! The confinement comes from upstream: `icp project bundle` holds every path
 //! to the project it bundles, and dfinity/icp-cli#866 (issue #865) gives the
@@ -47,7 +49,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use icp_events::StepReporter;
 use icp_project::{
     canister::{
@@ -62,8 +64,8 @@ use icp_project::{
     files::{Confined, FileSystem, FsError, Scratch},
     host::{Host, Ignore},
     manifest::{
-        prebuilt::SourceField, BuildStep, ProjectRootLocate, ProjectRootLocateImpl, SyncStep,
-        PROJECT_MANIFEST,
+        plugin::NamedPaths, prebuilt::SourceField, BuildStep, ProjectRootLocate,
+        ProjectRootLocateImpl, SyncStep, PROJECT_MANIFEST,
     },
     network::{
         Access, AccessError, CollectFriendlyDomains, Configuration, NetworkAccess, NetworkUrls,
@@ -119,6 +121,22 @@ pub const MAX_PROJECT_BYTES: u64 = 256 * 1024 * 1024;
 /// Candid interface, with no bound of its own, so the bound is applied here
 /// before a deploy runs.
 pub const MAX_WASM_BYTES: u64 = 100 * 1024 * 1024;
+
+/// What the gzip-compressed modules of one bundle may expand to in all, each
+/// distinct module counted once: the extraction budget again, so that
+/// compressing a module buys nothing against it. [`check_bundle`] expands
+/// each module once to hold it to [`MAX_WASM_BYTES`]; without a sum, an
+/// archive of ten thousand kilobyte-sized gzip files each expanding to that
+/// limit would have the check decompress a terabyte before refusing anything.
+pub const MAX_WASM_BYTES_IN_ALL: u64 = MAX_EXTRACTED_BYTES;
+
+/// What one sync step's `files:` entries may hold in all, an entry counted
+/// each time it is declared: the sync-plugin runtime reads every declared
+/// file into a string of its own before the plugin runs, so a file declared
+/// a hundred times is held a hundred times over. A plugin's file inputs are
+/// its configuration, a few KiB; the directories it declares are mounted,
+/// not read, and cost nothing here.
+pub const MAX_PLUGIN_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A plain error for the seams below: each carries one sentence, and the
 /// library wraps it whole at its own boundary (`AccessError::new` and the
@@ -367,7 +385,10 @@ impl Fetch for BundledWasm {
 }
 
 fn verify_checksum(path: &Utf8Path, expected: &str, bytes: &[u8]) -> Result<(), Unsupported> {
-    let actual = hex::encode(Sha256::digest(bytes));
+    checksum_matches(path, expected, &hex::encode(Sha256::digest(bytes)))
+}
+
+fn checksum_matches(path: &Utf8Path, expected: &str, actual: &str) -> Result<(), Unsupported> {
     if actual.eq_ignore_ascii_case(expected) {
         Ok(())
     } else {
@@ -379,15 +400,16 @@ fn verify_checksum(path: &Utf8Path, expected: &str, bytes: &[u8]) -> Result<(), 
 }
 
 /// Hold a gzip-compressed module to `limit` bytes expanded, by streaming it
-/// through a bounded decoder into nothing. A module that is not gzip passes
-/// as it is: its size is its own.
-fn gunzipped_within(path: &Utf8Path, bytes: &[u8], limit: u64) -> Result<(), Unsupported> {
+/// through a bounded decoder into nothing, and say what it expanded to. A
+/// module that is not gzip passes as it is: its size is its own, and it
+/// expands to nothing.
+fn gunzipped_within(path: &Utf8Path, bytes: &[u8], limit: u64) -> Result<u64, Unsupported> {
     if !bytes.starts_with(&[0x1f, 0x8b]) {
-        return Ok(());
+        return Ok(0);
     }
     let mut decoder = Limited { inner: flate2::read::GzDecoder::new(bytes), left: limit };
     match std::io::copy(&mut decoder, &mut std::io::sink()) {
-        Ok(_) => Ok(()),
+        Ok(expanded) => Ok(expanded),
         Err(_) => Err(Unsupported(format!(
             "the gzip-compressed wasm '{path}' expands past {limit} bytes, the most a module \
              can be, or is not valid gzip"
@@ -474,6 +496,14 @@ impl ScriptRunner for NoScripts {
 /// a case-insensitive volume (macOS and Windows by default) would hand the
 /// last-built module to both.
 ///
+/// What a plugin declares under `dirs:` and `files:` is held to the bundle
+/// the way the runtime will hold it at sync, and the files to what the
+/// runtime will read of them ([`check_declared`]).
+///
+/// The work the check does is bounded by the archive, not by the manifest:
+/// a file is read, hashed and expanded once however many canisters name it
+/// ([`Verified`]), and the expansions are summed ([`MAX_WASM_BYTES_IN_ALL`]).
+///
 /// Where each canister lives is the loader's business: it finds a canister
 /// directory through the confined filesystem, so one outside the bundle root
 /// — which the sync-plugin runtime would take as its own sandbox root — is
@@ -482,6 +512,18 @@ pub fn check_bundle<'a>(
     fs: &BundleFs,
     network: &Network,
     canisters: impl IntoIterator<Item = (&'a Utf8Path, &'a Canister)>,
+) -> Result<(), String> {
+    check_bundle_within(fs, network, canisters, MAX_WASM_BYTES_IN_ALL, MAX_PLUGIN_INPUT_BYTES)
+}
+
+/// [`check_bundle`] with the two sums as parameters, so a test can reach
+/// them without a gigabyte of modules.
+fn check_bundle_within<'a>(
+    fs: &BundleFs,
+    network: &Network,
+    canisters: impl IntoIterator<Item = (&'a Utf8Path, &'a Canister)>,
+    wasm_in_all: u64,
+    plugin_input: u64,
 ) -> Result<(), String> {
     IcMainnet::mainnet(network).map_err(|e| e.0)?;
     let canisters: Vec<_> = canisters.into_iter().collect();
@@ -497,12 +539,10 @@ pub fn check_bundle<'a>(
             }
         }
     }
+    let mut verified = Verified { hashes: BTreeMap::new(), wasm_left: wasm_in_all };
     for (dir, canister) in canisters {
         let name = &canister.name;
         let at = |e: Unsupported| format!("canister '{name}': {e}");
-        let present = |path: &Utf8Path| -> Result<Vec<u8>, String> {
-            read_bytes(fs, &dir.join(path)).map_err(|e| format!("canister '{name}': {e}"))
-        };
 
         if canister.build.steps.iter().any(|s| matches!(s, BuildStep::Script(_))) {
             return Err(at(NoScripts::script_refused("build")));
@@ -524,7 +564,7 @@ pub fn check_bundle<'a>(
                     .into(),
             )));
         };
-        let wasm = present(&local.path)?;
+        let actual = verified.sha256(fs, dir, &local.path).map_err(at)?;
         let Some(expected) = adapter.sha256.as_deref() else {
             return Err(at(Unsupported(format!(
                 "the wasm '{}' carries no sha256, which a bundle always records; rebuild the \
@@ -532,8 +572,7 @@ pub fn check_bundle<'a>(
                 local.path
             ))));
         };
-        verify_checksum(&local.path, expected, &wasm).map_err(at)?;
-        gunzipped_within(&local.path, &wasm, MAX_WASM_BYTES).map_err(at)?;
+        checksum_matches(&local.path, expected, &actual).map_err(at)?;
 
         for step in &canister.sync.steps {
             let SyncStep::Plugin(plugin) = step else { continue };
@@ -544,10 +583,124 @@ pub fn check_bundle<'a>(
                         .into(),
                 )));
             };
-            let bytes = present(&local.path)?;
+            let actual = verified.sha256(fs, dir, &local.path).map_err(at)?;
             if let Some(expected) = plugin.sha256.as_deref() {
-                verify_checksum(&local.path, expected, &bytes).map_err(at)?;
+                checksum_matches(&local.path, expected, &actual).map_err(at)?;
             }
+            let paths = |named: &'a Option<_>| {
+                named.iter().flat_map(NamedPaths::entries).map(|entry| entry.path)
+            };
+            check_declared(fs, dir, paths(&plugin.dirs), paths(&plugin.files), plugin_input)
+                .map_err(at)?;
+        }
+    }
+    Ok(())
+}
+
+/// What [`check_bundle`] has read so far, by where each file lies on disk:
+/// a module or plugin that several canisters name — or one canister names
+/// under several spellings — is read, hashed and expanded once, so the work
+/// the check does is bounded by what the archive holds, not by what the
+/// manifest repeats.
+struct Verified {
+    /// Each file's sha256, in hex, by its on-disk path.
+    hashes: BTreeMap<Utf8PathBuf, String>,
+    /// What the gzip-compressed files seen so far may still expand to, in all.
+    wasm_left: u64,
+}
+
+impl Verified {
+    /// The sha256 of the file at `path` under `dir`, read and hashed on first
+    /// sight — when a gzip-compressed one is also held to [`MAX_WASM_BYTES`]
+    /// expanded, and its expansion counted against the sum.
+    fn sha256(
+        &mut self,
+        fs: &BundleFs,
+        dir: &Utf8Path,
+        path: &Utf8Path,
+    ) -> Result<String, Unsupported> {
+        let on_disk = locate(fs, &dir.join(path))?;
+        if let Some(hash) = self.hashes.get(&on_disk) {
+            return Ok(hash.clone());
+        }
+        let bytes =
+            std::fs::read(&on_disk).map_err(|e| Unsupported(format!("'{on_disk}': {e}")))?;
+        let expanded = gunzipped_within(path, &bytes, MAX_WASM_BYTES)?;
+        if expanded > self.wasm_left {
+            return Err(Unsupported(format!(
+                "the bundle's gzip-compressed modules expand to more than \
+                 {MAX_WASM_BYTES_IN_ALL} bytes in all, more than a bundle extracts to"
+            )));
+        }
+        self.wasm_left -= expanded;
+        let hash = hex::encode(Sha256::digest(&bytes));
+        self.hashes.insert(on_disk, hash.clone());
+        Ok(hash)
+    }
+}
+
+/// Hold a sync step's declared `dirs:` and `files:` to the bundle, by the
+/// runtime's own rule — each is written relative to the canister directory,
+/// may rise out of it with `..` but not above the bundle root, and may not
+/// be absolute — and to what is there: a `dirs:` entry names a directory, a
+/// `files:` entry a file the runtime will read into memory, or a directory
+/// it will mount. The files, counted as often as they are declared, are held
+/// to `budget` bytes in all.
+///
+/// The runtime refuses the same paths at sync, after the canisters have been
+/// created; this is before. Which of the two settings the plugin's interface
+/// accepts, and whether an entry carries a name, is settled by the plugin
+/// itself and stays the runtime's to tell.
+fn check_declared<'a>(
+    fs: &BundleFs,
+    dir: &Utf8Path,
+    dirs: impl IntoIterator<Item = &'a str>,
+    files: impl IntoIterator<Item = &'a str>,
+    budget: u64,
+) -> Result<(), Unsupported> {
+    let resolve = |path: &str| -> Result<Utf8PathBuf, Unsupported> {
+        let declared = Utf8Path::new(path);
+        if declared
+            .components()
+            .any(|c| matches!(c, Utf8Component::RootDir | Utf8Component::Prefix(_)))
+        {
+            return Err(Unsupported(format!(
+                "its sync step declares '{path}', an absolute path; a plugin's `dirs:` and \
+                 `files:` are written relative to the canister directory"
+            )));
+        }
+        fs.resolve(&dir.join(declared)).map_err(|_| {
+            Unsupported(format!(
+                "its sync step declares '{path}', which lies outside the bundle; a plugin's \
+                 `dirs:` and `files:` stay within the project"
+            ))
+        })
+    };
+    for path in dirs {
+        if !resolve(path)?.is_dir() {
+            return Err(Unsupported(format!(
+                "its sync step declares '{path}' under `dirs:`, which is not a directory in the \
+                 bundle"
+            )));
+        }
+    }
+    let mut left = budget;
+    for path in files {
+        let on_disk = resolve(path)?;
+        let meta = std::fs::metadata(&on_disk).map_err(|_| {
+            Unsupported(format!(
+                "its sync step declares '{path}' under `files:`, which is not in the bundle"
+            ))
+        })?;
+        if meta.is_file() {
+            if meta.len() > left {
+                return Err(Unsupported(format!(
+                    "its sync step's `files:` hold more than {budget} bytes in all, counting a \
+                     file each time it is declared, more than a plugin's inputs ever do; the \
+                     runtime reads every declared file into memory before the plugin runs"
+                )));
+            }
+            left -= meta.len();
         }
     }
     Ok(())
@@ -567,7 +720,9 @@ pub fn check_bundle<'a>(
 /// sets no store limiter, so a plugin may allocate up to that space before
 /// its time runs out. The runner builds its own engine and store, so the
 /// limiter belongs there, upstream; until it has one, a bundle's plugins run
-/// with the memory bound the icp CLI gives them.
+/// with the memory bound the icp CLI gives them. Nor is the number of
+/// canisters or steps a manifest declares: the phases do their work once per
+/// canister, and each canister costs the caller the cycles that create it.
 pub fn host_for(fs: BundleFs) -> Host {
     host_within(fs, MAX_PROJECT_BYTES)
 }
@@ -760,7 +915,11 @@ impl<R: Read> Read for Limited<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use icp_project::network::{Connected, Managed};
+    use icp_project::{
+        host::EnvironmentSelection,
+        network::{Connected, Managed},
+        Environment,
+    };
     use std::io::Write;
 
     fn managed(name: &str) -> Network {
@@ -1059,6 +1218,64 @@ mod tests {
         archive.into_inner().unwrap().finish().unwrap()
     }
 
+    /// A gzipped tar of the given regular files, then directory entries at
+    /// the given paths.
+    fn archive_with_dirs(files: &[(&str, &[u8])], dirs: &[&str]) -> Vec<u8> {
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (path, data) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, *data).unwrap();
+        }
+        for path in dirs {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_cksum();
+            archive.append_data(&mut header, path, &b""[..]).unwrap();
+        }
+        archive.into_inner().unwrap().finish().unwrap()
+    }
+
+    // A directory entry makes its parents known like a file does: two
+    // sibling directory entries under one chain are four directories, the
+    // shared parents counted once.
+    #[test]
+    fn the_parents_a_directory_entry_implies_are_counted_once() {
+        let bytes = archive_with_dirs(&[], &["a/b/c/", "a/b/d/"]);
+        let (_dir, into) = scratch();
+        let err = extract_bundle_within(&bytes, &into, 3).unwrap_err();
+        assert!(err.contains("more than 3 files and directories"), "{err}");
+        let (_dir, into) = scratch();
+        let err = extract_bundle_within(&bytes, &into, 4).unwrap_err();
+        assert!(err.contains(PROJECT_MANIFEST), "{err}");
+        assert!(into.join("a/b/d").is_dir());
+    }
+
+    // A directory the archive lists as an entry of its own, with nothing
+    // under it, is a directory of the bundle: it is on disk, so it is found
+    // and listed like any other.
+    #[tokio::test]
+    async fn an_empty_directory_entry_is_a_directory_of_the_bundle() {
+        let (_dir, into) = scratch();
+        let bytes = archive_with_dirs(&[("icp.yaml", b"canisters: []")], &["assets/"]);
+        let fs = extract_bundle(&bytes, &into).unwrap();
+        let root = fs.root().to_path_buf();
+        assert!(fs.is_dir(Utf8Path::new("assets")).await);
+        assert!(fs.exists(Utf8Path::new("assets")).await);
+        assert_eq!(
+            fs.read_dir(&root).await.unwrap(),
+            vec![root.join("assets"), root.join("icp.yaml")]
+        );
+        assert!(fs.read_dir(Utf8Path::new("assets")).await.unwrap().is_empty());
+    }
+
     // A gzip-compressed module is bounded by what it expands to, read
     // through a bounded decoder; a plain module passes as it is.
     #[test]
@@ -1067,10 +1284,10 @@ mod tests {
         encoder.write_all(&[0u8; 4096]).unwrap();
         let gz = encoder.finish().unwrap();
         let path = Utf8Path::new("backend.wasm.gz");
-        gunzipped_within(path, &gz, 8192).unwrap();
+        assert_eq!(gunzipped_within(path, &gz, 8192).unwrap(), 4096);
         let err = gunzipped_within(path, &gz, 1024).unwrap_err();
         assert!(err.0.contains("expands past 1024"), "{err}");
-        gunzipped_within(path, b"\0asm plain", 1).unwrap();
+        assert_eq!(gunzipped_within(path, b"\0asm plain", 1).unwrap(), 0);
     }
 
     // The confined filesystem serves what the archive carried, by any spelling
@@ -1170,5 +1387,131 @@ mod tests {
         let err = metered.read(Utf8Path::new("missing")).await.unwrap_err().to_string();
         assert!(err.contains("not in the bundle"), "{err}");
         assert_eq!(fs.read(Utf8Path::new("big")).await.unwrap().len(), 100);
+    }
+
+    /// The `ic` environment of the bundle `bytes`, as a deploy would load
+    /// it: extracted, then read through the host.
+    async fn environment(bytes: &[u8]) -> (tempfile::TempDir, BundleFs, Environment) {
+        let (dir, into) = scratch();
+        let fs = extract_bundle(bytes, &into).unwrap();
+        let env = host_for(fs.clone())
+            .get_environment(&EnvironmentSelection::Named("ic".into()))
+            .await
+            .unwrap();
+        (dir, fs, env)
+    }
+
+    fn check(
+        fs: &BundleFs,
+        env: &Environment,
+        wasm_in_all: u64,
+        plugin_input: u64,
+    ) -> Result<(), String> {
+        check_bundle_within(
+            fs,
+            &env.network,
+            env.canisters.values().map(|(dir, canister)| (dir.as_path(), canister)),
+            wasm_in_all,
+            plugin_input,
+        )
+    }
+
+    // A module is read, hashed and expanded once however many canisters name
+    // it, by whatever spelling: the sum of the expansions is a sum over the
+    // archive's files, so a manifest cannot multiply the work by repeating
+    // itself.
+    #[tokio::test]
+    async fn a_module_is_checked_once_however_many_canisters_name_it() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&[0u8; 4096]).unwrap();
+        let gz = encoder.finish().unwrap();
+        let sha = hex::encode(Sha256::digest(&gz));
+        let canister = |name: &str, path: &str| {
+            format!(
+                "  - name: {name}\n    build:\n      steps:\n        - type: pre-built\n          \
+                 path: {path}\n          sha256: {sha}\n"
+            )
+        };
+
+        // Three canisters, one module, two spellings: expanded once.
+        let manifest = format!(
+            "canisters:\n{}{}{}",
+            canister("a", "m.wasm.gz"),
+            canister("b", "./m.wasm.gz"),
+            canister("c", "m.wasm.gz")
+        );
+        let bytes = archive(&[("icp.yaml", manifest.as_bytes()), ("m.wasm.gz", &gz)]);
+        let (_dir, fs, env) = environment(&bytes).await;
+        check(&fs, &env, 4096, MAX_PLUGIN_INPUT_BYTES).unwrap();
+
+        // The same bytes at two paths are two modules: expanded twice, and
+        // the sum holds.
+        let manifest =
+            format!("canisters:\n{}{}", canister("a", "m.wasm.gz"), canister("b", "n.wasm.gz"));
+        let bytes =
+            archive(&[("icp.yaml", manifest.as_bytes()), ("m.wasm.gz", &gz), ("n.wasm.gz", &gz)]);
+        let (_dir, fs, env) = environment(&bytes).await;
+        let err = check(&fs, &env, 4096, MAX_PLUGIN_INPUT_BYTES).unwrap_err();
+        assert!(err.contains("canister 'b'") && err.contains("in all"), "{err}");
+        check(&fs, &env, 8192, MAX_PLUGIN_INPUT_BYTES).unwrap();
+    }
+
+    // What a plugin declares is held to the bundle before any phase, by the
+    // runtime's rule — relative to the canister directory, within the root,
+    // present, of the kind declared — and the files it will read are held
+    // to a sum, counting a file each time it is declared.
+    #[tokio::test]
+    async fn a_sync_step_declares_what_the_bundle_holds() {
+        let wasm = wat::parse_str("(module)").unwrap();
+        let sha = hex::encode(Sha256::digest(&wasm));
+        let bundle = |declared: &str| {
+            let canister = format!(
+                "name: backend\nbuild:\n  steps:\n    - type: pre-built\n      path: backend.wasm\n      \
+                 sha256: {sha}\nsync:\n  steps:\n    - type: plugin\n      path: plugin.wasm\n{declared}"
+            );
+            archive(&[
+                ("icp.yaml", b"canisters:\n  - canisters/backend\n"),
+                ("canisters/backend/canister.yaml", canister.as_bytes()),
+                ("canisters/backend/backend.wasm", &wasm),
+                ("canisters/backend/plugin.wasm", &wasm),
+                ("canisters/backend/config.txt", b"0123456789"),
+                ("canisters/backend/assets/index.html", b"<html>"),
+                ("shared/common.txt", b"abc"),
+            ])
+        };
+        let all = (MAX_WASM_BYTES_IN_ALL, MAX_PLUGIN_INPUT_BYTES);
+
+        let accepted = [
+            "      files:\n        config: config.txt\n        seed: assets\n",
+            "      files:\n        shared: ../../shared/common.txt\n",
+            "      dirs:\n        - assets\n      files:\n        - config.txt\n",
+        ];
+        for declared in accepted {
+            let (_dir, fs, env) = environment(&bundle(declared)).await;
+            check(&fs, &env, all.0, all.1).unwrap_or_else(|e| panic!("{declared}: {e}"));
+        }
+
+        let refused = [
+            ("      files:\n        config: missing.txt\n", "not in the bundle"),
+            ("      dirs:\n        - config.txt\n", "not a directory"),
+            ("      files:\n        etc: /etc/passwd\n", "an absolute path"),
+            ("      files:\n        up: ../../../x\n", "outside the bundle"),
+        ];
+        for (declared, reason) in refused {
+            let (_dir, fs, env) = environment(&bundle(declared)).await;
+            let err = check(&fs, &env, all.0, all.1).unwrap_err();
+            assert!(
+                err.contains("canister 'backend'") && err.contains(reason),
+                "{declared}: {err}"
+            );
+        }
+
+        // Ten bytes declared twice are twenty; a directory costs nothing.
+        let declared =
+            "      files:\n        a: config.txt\n        b: config.txt\n        seed: assets\n";
+        let (_dir, fs, env) = environment(&bundle(declared)).await;
+        let err = check(&fs, &env, all.0, 19).unwrap_err();
+        assert!(err.contains("`files:` hold more than 19 bytes in all"), "{err}");
+        check(&fs, &env, all.0, 20).unwrap();
     }
 }
