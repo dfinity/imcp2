@@ -14,20 +14,26 @@
 //! assumed but enforced, in three places:
 //!
 //! * **Extraction** writes only regular files and directories, within a total
-//!   size budget, under the scratch directory — and keeps the list of what it
-//!   wrote ([`extract_bundle`]).
-//! * **The filesystem the library reads through is that list**, not the disk
-//!   ([`BundleFs`]). A path the manifest names is normalized against the
-//!   bundle root (`..` cannot climb above it, an absolute path is re-anchored
-//!   at it) and looked up in the index; only a path the archive carried is
-//!   read, from where extraction put it. Nothing on the machine is reachable
-//!   by any spelling. The disk is the byte store because the sync-plugin
-//!   runtime needs real paths to mount.
+//!   size budget and an object budget, under the scratch directory
+//!   ([`extract_bundle`]).
+//! * **The filesystem the library reads through is confined to that
+//!   directory** — the library's own [`Confined`], the host filesystem held
+//!   to one root. A path the manifest names is resolved against the root
+//!   (`..` cannot climb above it, an absolute path elsewhere is refused, a
+//!   symlink pointing out leads nowhere) before the disk sees it. The loader
+//!   resolves every path a manifest names through that one seam, so nothing
+//!   on the machine is reachable by any spelling. The disk is the byte store
+//!   because the sync-plugin runtime needs real paths to mount.
 //! * **The bundle is checked before any phase runs** ([`check_bundle`]): every
 //!   canister built by one pre-built wasm in the archive that hashes to its
 //!   recorded checksum, every sync plugin in the archive, no script steps
 //!   (which the library would run as host subprocesses; [`NoScripts`] refuses
 //!   them again at the seams, as a backstop), and no network but `ic`.
+//!
+//! The confinement comes from upstream: `icp project bundle` holds every path
+//! to the project it bundles, and dfinity/icp-cli#866 (issue #865) gives the
+//! loader the same rule for a project that came from elsewhere. This crate
+//! pins that change; until it is on icp-cli's main, the pin is its branch.
 //!
 //! Everything the project library reads or writes — the manifest, the wasms,
 //! the `.icp` id and artifact stores, the build scratch — lives under the
@@ -37,12 +43,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     io::Read,
-    ops::Bound,
     sync::{Arc, Mutex, PoisonError},
 };
 
 use async_trait::async_trait;
-use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
+use camino::{Utf8Path, Utf8PathBuf};
 use icp_events::StepReporter;
 use icp_project::{
     canister::{
@@ -54,7 +59,7 @@ use icp_project::{
         },
         wasm::{Fetch, FetchError},
     },
-    files::{FileSystem, FsError, Scratch},
+    files::{Confined, FileSystem, FsError, Scratch},
     host::{Host, Ignore},
     manifest::{
         prebuilt::SourceField, BuildStep, ProjectRootLocate, ProjectRootLocateImpl, SyncStep,
@@ -90,8 +95,8 @@ const STATE_DIR: &str = ".icp";
 
 /// The most files and directories an archive may extract to, counting the
 /// directories its entries' paths imply and extraction creates on the way.
-/// The byte budget alone would admit millions of empty files, each a path in
-/// the index the loader walks, or a few files at the bottom of millions of
+/// The byte budget alone would admit millions of empty files, each a path
+/// the loader may walk, or a few files at the bottom of millions of
 /// directories, each an inode; a real bundle is a manifest, a few modules and
 /// plugins, and a frontend's assets, well inside this.
 pub const MAX_BUNDLE_ENTRIES: usize = 250_000;
@@ -206,294 +211,36 @@ impl Access for IcMainnet {
 
 // ── The filesystem ────────────────────────────────────────────────────────
 
-/// The extracted bundle, as the filesystem the project library reads through.
+/// The extracted bundle, as the filesystem the project library reads
+/// through: the library's own [`Confined`], rooted at the scratch directory.
 ///
-/// What the archive carried is an index of relative paths, filled in by
-/// [`extract_bundle`] as it writes each entry. Every path the library asks
-/// about is [normalized](BundleFs::normalize) against the bundle root and
-/// answered from that index: present, it is read from under the root; absent,
-/// it is "not in the bundle", whatever the disk holds at that spelling. So a
-/// manifest's `path:` — absolute, climbing, or plain — can name only what the
-/// archive brought with it.
-///
-/// The one place a write may land is a scratch directory this filesystem made
-/// (a pre-built build step copies its module there and the operation reads it
-/// back); written files join the index and leave it with the directory.
-#[derive(Clone, Debug)]
-pub struct BundleFs(Arc<Inner>);
+/// Every path the library asks about is resolved against that root before
+/// the disk sees it, so a manifest's `path:` — absolute, climbing, or plain —
+/// can name only what the archive brought with it; what is not there is
+/// "not in the bundle", whatever the machine holds at that spelling. A
+/// scratch directory the library asks for (a pre-built build step copies its
+/// module there and the operation reads it back) is made under the root too.
+pub type BundleFs = Confined;
 
-#[derive(Debug)]
-struct Inner {
-    /// Canonical, so the absolute paths the library derives from it strip
-    /// back to the index's relative spellings whatever the scratch directory's
-    /// own path goes through.
-    root: Utf8PathBuf,
-    state: Mutex<State>,
-}
-
-#[derive(Debug, Default)]
-struct State {
-    /// Every file in the bundle, relative to the root.
-    files: BTreeSet<Utf8PathBuf>,
-    /// Scratch directories currently held, relative to the root: the prefixes
-    /// a write is allowed under.
-    scratch: BTreeSet<Utf8PathBuf>,
-}
-
-impl Inner {
-    fn state(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+/// Where a file in the bundle is on disk, for a runtime that needs a real
+/// path, or why there is none: the path leaves the root, or nothing is there.
+pub fn locate(fs: &BundleFs, path: &Utf8Path) -> Result<Utf8PathBuf, Unsupported> {
+    let on_disk = fs.resolve(path).map_err(|e| Unsupported(e.to_string()))?;
+    if on_disk.is_file() {
+        Ok(on_disk)
+    } else {
+        Err(Unsupported(format!(
+            "'{}' is not in the bundle; a bundle carries every file its manifest names (`icp \
+             project bundle` writes one that does)",
+            on_disk.strip_prefix(fs.root()).unwrap_or(&on_disk)
+        )))
     }
 }
 
-impl State {
-    /// The entries of `set` strictly under `rel`. A path set orders by
-    /// component, so a directory's descendants sit right after it: one
-    /// range lookup, then take while the prefix holds, never a scan.
-    fn under<'a>(
-        set: &'a BTreeSet<Utf8PathBuf>,
-        rel: &'a Utf8Path,
-    ) -> impl Iterator<Item = &'a Utf8PathBuf> + 'a {
-        set.range::<Utf8Path, _>((Bound::Excluded(rel), Bound::Unbounded))
-            .take_while(move |p| p.starts_with(rel))
-    }
-
-    fn is_dir(&self, rel: &Utf8Path) -> bool {
-        rel.as_str().is_empty()
-            || self.scratch.contains(rel)
-            || Self::under(&self.files, rel).next().is_some()
-            || Self::under(&self.scratch, rel).next().is_some()
-    }
-
-    fn in_scratch(&self, rel: &Utf8Path) -> bool {
-        rel.ancestors().skip(1).any(|a| self.scratch.contains(a))
-    }
-}
-
-/// Why the bundle could not serve a request. Wrapped in [`FsError`] at the
-/// trait boundary, which displays it as itself.
-#[derive(Debug)]
-pub enum BundleFsError {
-    NotInBundle(Utf8PathBuf),
-    ReadOnly(Utf8PathBuf),
-    Io(Utf8PathBuf, std::io::Error),
-}
-
-impl fmt::Display for BundleFsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotInBundle(p) => write!(
-                f,
-                "'{p}' is not in the bundle; a bundle carries every file its manifest names \
-                 (`icp project bundle` writes one that does)"
-            ),
-            Self::ReadOnly(p) => write!(f, "cannot write '{p}': a bundle is read-only"),
-            Self::Io(p, e) => write!(f, "'{p}': {e}"),
-        }
-    }
-}
-
-impl std::error::Error for BundleFsError {}
-
-impl From<BundleFsError> for FsError {
-    fn from(e: BundleFsError) -> Self {
-        FsError::new(e)
-    }
-}
-
-impl BundleFs {
-    /// An empty filesystem rooted at `dir`, which must exist.
-    pub fn new(dir: &Utf8Path) -> Result<Self, String> {
-        let root = std::fs::canonicalize(dir)
-            .map_err(|e| format!("cannot resolve '{dir}': {e}"))
-            .and_then(|p| {
-            Utf8PathBuf::from_path_buf(p).map_err(|p| format!("'{}' is not UTF-8", p.display()))
-        })?;
-        Ok(Self(Arc::new(Inner { root, state: Mutex::default() })))
-    }
-
-    /// The directory the bundle is extracted into.
-    pub fn root(&self) -> &Utf8Path {
-        &self.0.root
-    }
-
-    /// Record a file extraction wrote, by its path in the archive.
-    fn index(&self, archive_path: &Utf8Path) {
-        self.0.state().files.insert(self.normalize(archive_path));
-    }
-
-    /// Resolve `path` to the relative spelling the index is keyed by: under
-    /// the root, with `.` dropped and `..` applied but never climbing above the
-    /// root, and an absolute path from elsewhere re-anchored at the root (so
-    /// it names what the bundle would hold there, which is nothing).
-    pub fn normalize(&self, path: &Utf8Path) -> Utf8PathBuf {
-        let path = path.strip_prefix(&self.0.root).unwrap_or(path);
-        let mut out = Utf8PathBuf::new();
-        for component in path.components() {
-            match component {
-                Utf8Component::Normal(part) => out.push(part),
-                Utf8Component::ParentDir => {
-                    out.pop();
-                }
-                Utf8Component::CurDir | Utf8Component::RootDir | Utf8Component::Prefix(_) => {}
-            }
-        }
-        out
-    }
-
-    /// Whether `dir` is spelled under the bundle root without climbing: the
-    /// root itself or a descendant, by path alone. A spelling that
-    /// normalizes into the root but is not written under it (`/etc`,
-    /// `<root>/../x`) is not held, because a reader that takes the spelling
-    /// as a host path would leave the bundle.
-    pub fn holds_dir(&self, dir: &Utf8Path) -> bool {
-        match dir.strip_prefix(&self.0.root) {
-            Ok(rest) => rest
-                .components()
-                .all(|c| matches!(c, Utf8Component::Normal(_) | Utf8Component::CurDir)),
-            Err(_) => false,
-        }
-    }
-
-    /// Whether the bundle holds a file at `path`.
-    pub fn contains(&self, path: &Utf8Path) -> bool {
-        self.0.state().files.contains(&self.normalize(path))
-    }
-
-    /// Where a file in the bundle is on disk, for a runtime that needs a real
-    /// path, or "not in the bundle".
-    pub fn locate(&self, path: &Utf8Path) -> Result<Utf8PathBuf, BundleFsError> {
-        let rel = self.normalize(path);
-        if self.0.state().files.contains(&rel) {
-            Ok(self.0.root.join(rel))
-        } else {
-            Err(BundleFsError::NotInBundle(rel))
-        }
-    }
-
-    fn read_bytes(&self, path: &Utf8Path) -> Result<Vec<u8>, BundleFsError> {
-        let on_disk = self.locate(path)?;
-        std::fs::read(&on_disk).map_err(|e| BundleFsError::Io(self.normalize(path), e))
-    }
-
-    fn write_bytes(&self, path: &Utf8Path, contents: &[u8]) -> Result<(), BundleFsError> {
-        let rel = self.normalize(path);
-        let mut state = self.0.state();
-        if !state.in_scratch(&rel) {
-            return Err(BundleFsError::ReadOnly(rel));
-        }
-        let on_disk = self.0.root.join(&rel);
-        if let Some(parent) = on_disk.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| BundleFsError::Io(rel.clone(), e))?;
-        }
-        std::fs::write(&on_disk, contents).map_err(|e| BundleFsError::Io(rel.clone(), e))?;
-        state.files.insert(rel);
-        Ok(())
-    }
-}
-
-/// A scratch directory under the root: on disk for as long as this is held,
-/// and in the index for exactly as long.
-struct ScratchDir {
-    _dir: tempfile::TempDir,
-    rel: Utf8PathBuf,
-    path: Utf8PathBuf,
-    fs: Arc<Inner>,
-}
-
-impl Scratch for ScratchDir {
-    fn path(&self) -> &Utf8Path {
-        &self.path
-    }
-}
-
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let mut state = self.fs.state();
-        state.scratch.remove(&self.rel);
-        state.files.retain(|f| !f.starts_with(&self.rel));
-    }
-}
-
-#[async_trait]
-impl FileSystem for BundleFs {
-    async fn read(&self, path: &Utf8Path) -> Result<Vec<u8>, FsError> {
-        Ok(self.read_bytes(path)?)
-    }
-
-    async fn read_to_string(&self, path: &Utf8Path) -> Result<String, FsError> {
-        let bytes = self.read_bytes(path)?;
-        String::from_utf8(bytes).map_err(|e| {
-            FsError::new(BundleFsError::Io(self.normalize(path), std::io::Error::other(e)))
-        })
-    }
-
-    async fn write(&self, path: &Utf8Path, contents: &[u8]) -> Result<(), FsError> {
-        Ok(self.write_bytes(path, contents)?)
-    }
-
-    /// A directory is implied by the files beneath it, so in a scratch area
-    /// there is nothing to create; anywhere else there is nothing that may be.
-    async fn create_dir_all(&self, path: &Utf8Path) -> Result<(), FsError> {
-        let rel = self.normalize(path);
-        let state = self.0.state();
-        if state.scratch.contains(&rel) || state.in_scratch(&rel) {
-            return Ok(());
-        }
-        Err(BundleFsError::ReadOnly(rel).into())
-    }
-
-    async fn copy(&self, from: &Utf8Path, to: &Utf8Path) -> Result<(), FsError> {
-        let contents = self.read_bytes(from)?;
-        Ok(self.write_bytes(to, &contents)?)
-    }
-
-    async fn exists(&self, path: &Utf8Path) -> bool {
-        let rel = self.normalize(path);
-        let state = self.0.state();
-        state.files.contains(&rel) || state.is_dir(&rel)
-    }
-
-    async fn is_file(&self, path: &Utf8Path) -> bool {
-        self.contains(path)
-    }
-
-    async fn is_dir(&self, path: &Utf8Path) -> bool {
-        self.0.state().is_dir(&self.normalize(path))
-    }
-
-    async fn read_dir(&self, path: &Utf8Path) -> Result<Vec<Utf8PathBuf>, FsError> {
-        let prefix = self.normalize(path);
-        let state = self.0.state();
-        let mut children: Vec<Utf8PathBuf> = State::under(&state.files, &prefix)
-            .chain(State::under(&state.scratch, &prefix))
-            .filter_map(|entry| entry.strip_prefix(&prefix).ok())
-            .filter_map(|relative| relative.components().next())
-            .map(|first| self.0.root.join(&prefix).join(first.as_str()))
-            .collect();
-        children.sort();
-        children.dedup();
-        Ok(children)
-    }
-
-    /// Nothing in the bundle is a symlink and every path is normalized on the
-    /// way in, so identity is the normalized path, under the root.
-    async fn canonicalize(&self, path: &Utf8Path) -> Option<Utf8PathBuf> {
-        let rel = self.normalize(path);
-        self.exists(&rel).await.then(|| self.0.root.join(rel))
-    }
-
-    async fn scratch_dir(&self) -> Result<Box<dyn Scratch>, FsError> {
-        let dir = tempfile::Builder::new()
-            .prefix(".scratch-")
-            .tempdir_in(&self.0.root)
-            .map_err(|e| FsError::new(BundleFsError::Io(".scratch".into(), e)))?;
-        let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
-            .map_err(|p| FsError::new(Unsupported(format!("'{}' is not UTF-8", p.display()))))?;
-        let rel = self.normalize(&path);
-        self.0.state().scratch.insert(rel.clone());
-        Ok(Box::new(ScratchDir { _dir: dir, rel, path, fs: self.0.clone() }))
-    }
+/// The bytes of a file in the bundle, read where [`locate`] says.
+fn read_bytes(fs: &BundleFs, path: &Utf8Path) -> Result<Vec<u8>, Unsupported> {
+    let on_disk = locate(fs, path)?;
+    std::fs::read(&on_disk).map_err(|e| Unsupported(format!("'{on_disk}': {e}")))
 }
 
 /// [`BundleFs`] with a budget on what is read through it: the filesystem
@@ -515,9 +262,9 @@ impl Metered {
 
     /// Charge `path`'s size to the budget, or refuse the read.
     fn charge(&self, path: &Utf8Path) -> Result<(), FsError> {
-        let on_disk = self.inner.locate(path)?;
+        let on_disk = locate(&self.inner, path).map_err(FsError::new)?;
         let size = std::fs::metadata(&on_disk)
-            .map_err(|e| BundleFsError::Io(self.inner.normalize(path), e))?
+            .map_err(|e| FsError::new(Unsupported(format!("'{on_disk}': {e}"))))?
             .len();
         let mut left = self.left.lock().unwrap_or_else(PoisonError::into_inner);
         if size > *left {
@@ -601,13 +348,12 @@ impl Fetch for BundledWasm {
         match source {
             SourceField::Local(local) => {
                 let path = base_dir.join(&local.path);
-                let on_disk = self.0.locate(&path).map_err(FetchError::new)?;
+                let on_disk = locate(&self.0, &path).map_err(FetchError::new)?;
                 if let Some(expected) = sha256 {
                     reporter.info(format!("Reading wasm: {}", local.path));
-                    let bytes = self.0.read_bytes(&path).map_err(FetchError::new)?;
+                    let bytes = read_bytes(&self.0, &path).map_err(FetchError::new)?;
                     reporter.info("Verifying checksum");
-                    verify_checksum(&self.0.normalize(&path), expected, &bytes)
-                        .map_err(FetchError::new)?;
+                    verify_checksum(&local.path, expected, &bytes).map_err(FetchError::new)?;
                 }
                 Ok(on_disk)
             }
@@ -718,24 +464,20 @@ impl ScriptRunner for NoScripts {
 /// phase runs, so a bundle that would fail at its build or sync phase, or
 /// be refused there, does not first spend cycles creating canisters.
 ///
-/// Each canister lives in a directory under the bundle root, and is built by
-/// exactly one pre-built step naming a wasm in the archive that hashes to the
-/// checksum the manifest records; each sync step is a plugin in the archive
-/// (hashing to its checksum, if one is recorded); no step is a script. The
-/// environment's network is the Internet Computer.
+/// Each canister is built by exactly one pre-built step naming a wasm in the
+/// archive that hashes to the checksum the manifest records; each sync step
+/// is a plugin in the archive (hashing to its checksum, if one is recorded);
+/// no step is a script. The environment's network is the Internet Computer.
 ///
 /// Canister names must also differ by more than letter case: the library's
 /// artifact store keys a canister's build output by its name on disk, and
 /// a case-insensitive volume (macOS and Windows by default) would hand the
 /// last-built module to both.
 ///
-/// The directory check matters because not every reader goes through
-/// [`BundleFs`]: the sync-plugin runtime takes the canister directory as a
-/// host path and confines a plugin's declared files to the project directory
-/// only when the canister's lies inside it — a canister directory outside the
-/// project is its own sandbox root. A manifest may spell a canister's path
-/// absolutely, and the bundle can carry the `canister.yaml` the loader looks
-/// for at that spelling, so the directory must be held to the root here.
+/// Where each canister lives is the loader's business: it finds a canister
+/// directory through the confined filesystem, so one outside the bundle root
+/// — which the sync-plugin runtime would take as its own sandbox root — is
+/// not found and the project does not load.
 pub fn check_bundle<'a>(
     fs: &BundleFs,
     network: &Network,
@@ -758,14 +500,8 @@ pub fn check_bundle<'a>(
     for (dir, canister) in canisters {
         let name = &canister.name;
         let at = |e: Unsupported| format!("canister '{name}': {e}");
-        if !fs.holds_dir(dir) {
-            return Err(at(Unsupported(format!(
-                "its directory '{dir}' is not under the bundle root; a bundle's canisters live \
-                 under its root, which is where `icp project bundle` puts them"
-            ))));
-        }
         let present = |path: &Utf8Path| -> Result<Vec<u8>, String> {
-            fs.read_bytes(&dir.join(path)).map_err(|e| format!("canister '{name}': {e}"))
+            read_bytes(fs, &dir.join(path)).map_err(|e| format!("canister '{name}': {e}"))
         };
 
         if canister.build.steps.iter().any(|s| matches!(s, BuildStep::Script(_))) {
@@ -870,7 +606,7 @@ fn host_within(fs: BundleFs, project_bytes: u64) -> Host {
 }
 
 /// Extract a bundle archive into `into`, which must exist and be empty, and
-/// return it as a filesystem indexed by what was written.
+/// return it as the filesystem the deploy reads through, confined to it.
 ///
 /// Only regular files and directories are written — `icp project bundle`
 /// writes nothing else, and a symlink or a device node is how an archive
@@ -897,7 +633,7 @@ fn extract_bundle_within(
             MAX_BUNDLE_BYTES
         ));
     }
-    let fs = BundleFs::new(into)?;
+    let fs = Confined::new(into).map_err(|e| e.to_string())?;
     let unreadable =
         |e: std::io::Error| format!("the bundle is not a readable .tar.gz archive: {e}");
     let decoder = Limited { inner: flate2::read::GzDecoder::new(bytes), left: MAX_EXTRACTED_BYTES };
@@ -914,8 +650,8 @@ fn extract_bundle_within(
              ever has"
         )
     };
-    // The directories written as entries of their own; the ones files imply
-    // are read off the index.
+    // The directories that exist so far, written as entries or implied by
+    // the paths of earlier ones, relative to the root.
     let mut dirs: BTreeSet<Utf8PathBuf> = BTreeSet::new();
     for entry in archive.entries().map_err(unreadable)? {
         let mut entry = entry.map_err(unreadable)?;
@@ -940,7 +676,17 @@ fn extract_bundle_within(
                  a bundle never carries; rebuild it with `icp project bundle`"
             ));
         }
-        let rel = fs.normalize(&path);
+        // Where the entry lands, relative to the root: `tar` refuses a path
+        // that would leave `into`, so resolving it against the root is only
+        // a matter of spelling (`./x` is `x`).
+        let rel = match fs.resolve(&path) {
+            Ok(resolved) => resolved.strip_prefix(fs.root()).unwrap_or(&resolved).to_path_buf(),
+            Err(_) => {
+                return Err(format!(
+                    "the archive entry '{path}' would land outside the extraction directory"
+                ))
+            }
+        };
         // `.icp` is the library's own state under the project root: the id
         // mappings a deploy reads to decide what exists, and the artifact
         // store. A bundle never carries it (`icp project bundle` writes
@@ -954,21 +700,17 @@ fn extract_bundle_within(
                  never carries; rebuild it with `icp project bundle`"
             ));
         }
-        // The parents this entry implies that nothing before it did. A
-        // directory is known once a file sits under it or an entry wrote it,
-        // and a known directory's own parents are known too, so the walk up
-        // stops at the first one.
-        let implied = {
-            let state = fs.0.state();
-            rel.ancestors()
-                .skip(1)
-                .filter(|dir| !dir.as_str().is_empty())
-                .take_while(|dir| {
-                    !dirs.contains(*dir) && State::under(&state.files, dir).next().is_none()
-                })
-                .count()
-        };
-        objects = objects.saturating_add(implied);
+        // The parents this entry implies that nothing before it did. A known
+        // directory's own parents are known too, so the walk up stops at the
+        // first one.
+        let implied: Vec<Utf8PathBuf> = rel
+            .ancestors()
+            .skip(1)
+            .filter(|dir| !dir.as_str().is_empty())
+            .take_while(|dir| !dirs.contains(*dir))
+            .map(Utf8Path::to_path_buf)
+            .collect();
+        objects = objects.saturating_add(implied.len());
         if objects > max_entries {
             return Err(too_many());
         }
@@ -977,14 +719,13 @@ fn extract_bundle_within(
             return Err(too_large());
         }
         if entry.unpack_in(fs.root().as_std_path()).map_err(unreadable)? {
-            if kind.is_file() {
-                fs.index(&path);
-            } else {
+            dirs.extend(implied);
+            if kind.is_dir() {
                 dirs.insert(rel);
             }
         }
     }
-    if !fs.contains(Utf8Path::new(PROJECT_MANIFEST)) {
+    if !fs.root().join(PROJECT_MANIFEST).is_file() {
         return Err(format!(
             "the archive carries no `{PROJECT_MANIFEST}` at its root, so it is not an icp \
              project bundle (`icp project bundle` writes one)"
@@ -1332,61 +1073,13 @@ mod tests {
         gunzipped_within(path, b"\0asm plain", 1).unwrap();
     }
 
-    // Directory lookups come from the index by range, not by scanning it:
-    // what is under a directory, and whether anything is.
-    #[test]
-    fn directory_lookups_follow_the_index() {
-        let (_dir, into) = scratch();
-        let fs = extract_bundle(
-            &archive(&[
-                ("icp.yaml", b"canisters: []"),
-                ("a/b/c.txt", b"1"),
-                ("a/b/d.txt", b"2"),
-                ("a/e.txt", b"3"),
-                ("ab/f.txt", b"4"),
-            ]),
-            &into,
-        )
-        .unwrap();
-        let state = fs.0.state();
-        assert!(state.is_dir(Utf8Path::new("a")));
-        assert!(state.is_dir(Utf8Path::new("a/b")));
-        assert!(!state.is_dir(Utf8Path::new("a/b/c.txt")));
-        assert!(!state.is_dir(Utf8Path::new("a/x")));
-        let under: Vec<_> = State::under(&state.files, Utf8Path::new("a")).collect();
-        assert_eq!(under.len(), 3, "{under:?}");
-        assert!(under.iter().all(|p| p.starts_with("a")), "{under:?}");
-        drop(state);
-        let children = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(fs.read_dir(&fs.root().join("a")))
-            .unwrap();
-        assert_eq!(children, vec![fs.root().join("a/b"), fs.root().join("a/e.txt")]);
-    }
-
-    // A canister directory is held to the bundle root by its spelling, since
-    // the sync-plugin runtime takes it as a host path: inside by name is
-    // held, and `/etc` or a climb out of the root is not, however it would
-    // normalize.
-    #[test]
-    fn a_canister_directory_is_under_the_root_by_spelling() {
-        let (_dir, into) = scratch();
-        let fs = extract_bundle(&archive(&[("icp.yaml", b"canisters: []")]), &into).unwrap();
-        let root = fs.root().to_path_buf();
-        assert!(fs.holds_dir(&root));
-        assert!(fs.holds_dir(&root.join("backend")));
-        assert!(fs.holds_dir(&root.join("./backend")));
-        assert!(!fs.holds_dir(Utf8Path::new("/etc")));
-        assert!(!fs.holds_dir(&root.join("../elsewhere")));
-        assert!(!fs.holds_dir(&root.join("backend/../../elsewhere")));
-    }
-
-    // The index is the filesystem: what extraction wrote is readable by any
-    // spelling that normalizes to it, and nothing else is, however the disk
-    // looks at the spelling — absolute, climbing, or a file that happens to
-    // exist under the root without having come from the archive.
+    // The confined filesystem serves what the archive carried, by any spelling
+    // that resolves to it, and refuses what resolves outside the root — an
+    // absolute path elsewhere, a climb above the root — whatever the machine
+    // holds at that spelling. (The filesystem's own tests, upstream, cover
+    // the spellings and the symlinks; this is the bundle seen through it.)
     #[tokio::test]
-    async fn the_bundle_serves_its_index_and_nothing_else() {
+    async fn the_bundle_serves_what_it_carries_and_nothing_outside_it() {
         let (_dir, into) = scratch();
         let fs = extract_bundle(
             &archive(&[("icp.yaml", b"canisters: []"), ("./canisters/a.wasm", b"wasm")]),
@@ -1398,30 +1091,30 @@ mod tests {
         for spelling in ["canisters/a.wasm", "./canisters/a.wasm", "canisters/../canisters/a.wasm"]
         {
             assert_eq!(fs.read(Utf8Path::new(spelling)).await.unwrap(), b"wasm", "{spelling}");
+            assert_eq!(
+                locate(&fs, Utf8Path::new(spelling)).unwrap(),
+                root.join("canisters/a.wasm")
+            );
         }
-        // The absolute paths the library derives from the root strip back.
+        // The absolute paths the library derives from the root resolve too.
         assert_eq!(fs.read(&root.join("canisters/a.wasm")).await.unwrap(), b"wasm");
-        assert_eq!(
-            fs.canonicalize(Utf8Path::new("canisters/a.wasm")).await,
-            Some(root.join("canisters/a.wasm"))
-        );
         assert!(fs.is_dir(Utf8Path::new("canisters")).await);
         assert!(fs.is_dir(&root).await);
-        assert!(!fs.is_dir(Utf8Path::new("canisters/a.wasm")).await);
         assert_eq!(
             fs.read_dir(&root).await.unwrap(),
             vec![root.join("canisters"), root.join("icp.yaml")]
         );
 
-        std::fs::write(root.join("planted"), b"not from the archive").unwrap();
-        for escape in ["/etc/hostname", "../../../../etc/hostname", "canisters/../../x", "planted"]
-        {
+        for escape in ["/etc/hostname", "../../../../etc/hostname", "canisters/../../x"] {
             let err = fs.read(Utf8Path::new(escape)).await.unwrap_err().to_string();
-            assert!(err.contains("not in the bundle"), "{escape}: {err}");
+            assert!(err.contains("is outside"), "{escape}: {err}");
             assert!(!fs.exists(Utf8Path::new(escape)).await, "{escape}");
+            let err = locate(&fs, Utf8Path::new(escape)).unwrap_err().to_string();
+            assert!(err.contains("is outside"), "{escape}: {err}");
         }
-        let err = fs.locate(Utf8Path::new("/etc/hostname")).unwrap_err().to_string();
-        assert!(err.contains("'etc/hostname' is not in the bundle"), "{err}");
+        // Inside the root but not there: not in the bundle.
+        let err = locate(&fs, Utf8Path::new("canisters/b.wasm")).unwrap_err().to_string();
+        assert!(err.contains("'canisters/b.wasm' is not in the bundle"), "{err}");
     }
 
     // The loader reads an argument file into every canister that names it,
@@ -1477,34 +1170,5 @@ mod tests {
         let err = metered.read(Utf8Path::new("missing")).await.unwrap_err().to_string();
         assert!(err.contains("not in the bundle"), "{err}");
         assert_eq!(fs.read(Utf8Path::new("big")).await.unwrap().len(), 100);
-    }
-
-    // A build writes its output to a scratch directory and the operation
-    // reads it back through the same filesystem; nowhere else may be written,
-    // and the scratch goes — from the disk and the index — with its holder.
-    #[tokio::test]
-    async fn a_build_output_lands_in_scratch_and_nowhere_else() {
-        let (_dir, into) = scratch();
-        let fs = extract_bundle(&archive(&[("icp.yaml", b"canisters: []")]), &into).unwrap();
-        let scratch = fs.scratch_dir().await.unwrap();
-        assert!(scratch.path().starts_with(fs.root()));
-        let out = scratch.path().join("out/module.wasm");
-        fs.write(&out, b"built").await.unwrap();
-        assert_eq!(fs.read(&out).await.unwrap(), b"built");
-        assert!(fs.is_file(&out).await);
-        assert!(fs.is_dir(scratch.path()).await);
-        assert!(fs.create_dir_all(&scratch.path().join("more")).await.is_ok());
-
-        let err = fs.write(Utf8Path::new("canisters/x.wasm"), b"no").await.unwrap_err().to_string();
-        assert!(err.contains("read-only"), "{err}");
-        let err = fs.write(Utf8Path::new("/tmp/x"), b"no").await.unwrap_err().to_string();
-        assert!(err.contains("read-only"), "{err}");
-        assert!(!fs.root().join("tmp/x").exists());
-        assert!(fs.create_dir_all(Utf8Path::new("elsewhere")).await.is_err());
-
-        let on_disk = out.clone();
-        drop(scratch);
-        assert!(!fs.exists(&out).await, "scratch leaves the index with its holder");
-        assert!(!on_disk.exists(), "and the disk");
     }
 }

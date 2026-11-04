@@ -44,6 +44,10 @@ tempfile = "3"
 # one commit so the four stay in lockstep (they share a workspace version and
 # are not released independently). Bump the `rev` on all four together.
 #
+# The pinned commit is the head of dfinity/icp-cli#866, the branch that adds
+# `files::Confined` (the filesystem the bundle host reads through, see
+# `src/host.rs`); once it is on icp-cli's main, re-pin to main.
+#
 #   * icp-project: manifests, the deploy operation, the id/artifact stores.
 #   * icp-events: the progress event stream the operations report on.
 #   * icp-sync-plugin: the wasmtime runtime that runs a canister's sync plugin
@@ -51,10 +55,10 @@ tempfile = "3"
 #     brings wasmtime into this workspace.
 #   * icp-canister-interfaces: the engine-canister registry id a created
 #     canister's subnet is looked up in.
-icp-project = { git = "https://github.com/dfinity/icp-cli", rev = "f4c7b6627cab56b091c01cc18102f5dd88aa811f" }
-icp-events = { git = "https://github.com/dfinity/icp-cli", rev = "f4c7b6627cab56b091c01cc18102f5dd88aa811f" }
-icp-sync-plugin = { git = "https://github.com/dfinity/icp-cli", rev = "f4c7b6627cab56b091c01cc18102f5dd88aa811f" }
-icp-canister-interfaces = { git = "https://github.com/dfinity/icp-cli", rev = "f4c7b6627cab56b091c01cc18102f5dd88aa811f" }
+icp-project = { git = "https://github.com/dfinity/icp-cli", rev = "7f3c23188fb7be50447f90c4c8c749934d4759a3" }
+icp-events = { git = "https://github.com/dfinity/icp-cli", rev = "7f3c23188fb7be50447f90c4c8c749934d4759a3" }
+icp-sync-plugin = { git = "https://github.com/dfinity/icp-cli", rev = "7f3c23188fb7be50447f90c4c8c749934d4759a3" }
+icp-canister-interfaces = { git = "https://github.com/dfinity/icp-cli", rev = "7f3c23188fb7be50447f90c4c8c749934d4759a3" }
 
 [dev-dependencies]
 # The tests hand-build small bundles (a manifest plus a wasm) and load them

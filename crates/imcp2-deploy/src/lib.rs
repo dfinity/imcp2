@@ -8,7 +8,11 @@
 //! crates (see `Cargo.toml`).
 //!
 //! [`host`] is the `icp_project::Host` for a bundle: the archive `icp project
-//! bundle` writes, treated as untrusted input. The deploy pipeline over it and
-//! the MCP tools that expose it follow in their own changes.
+//! bundle` writes, treated as untrusted input. The confinement of the files
+//! the library reads is the library's own (`icp_project::files::Confined`,
+//! added for this use by dfinity/icp-cli#866, issue #865): this crate pins
+//! that change and adds the bounds on the archive itself and the checks on
+//! the bundle's shape. The deploy pipeline over it and the MCP tools that
+//! expose it follow in their own changes.
 
 pub mod host;
