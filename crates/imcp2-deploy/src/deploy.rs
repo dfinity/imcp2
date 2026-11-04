@@ -607,7 +607,9 @@ mod tests {
         let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
             .await
             .expect_err("a canister directory outside the root is refused");
-        assert!(err.0.contains("backend") && err.0.contains("not under the bundle root"), "{err}");
+        // The confined filesystem finds nothing at `/etc`, so the loader does
+        // not find the canister: the spelling itself is the refusal.
+        assert!(err.0.contains("canister manifest") && err.0.contains("'/etc'"), "{err}");
     }
 
     // A manifest may declare a connected network that claims the mainnet root
@@ -755,8 +757,10 @@ mod tests {
     // The manifest can name only what the archive carried: a variable file
     // the bundle does not hold is refused at load — before any phase, since
     // the value would otherwise be sent to the canister as a setting — and so
-    // is a wasm, whether the path is absolute or climbing. Nothing on the
-    // machine is reached for, whatever exists at that spelling.
+    // is a wasm, whether the path is absolute or climbing: the vet asks the
+    // bundle's filesystem whether a regular file is there, and nothing
+    // outside the root is. Nothing on the machine is reached for, whatever
+    // exists at that spelling.
     #[tokio::test(flavor = "multi_thread")]
     async fn paths_the_bundle_does_not_hold_are_refused() {
         let (wasm, sha) = wasm();
@@ -770,7 +774,8 @@ mod tests {
         let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
             .await
             .expect_err("a variable file outside the bundle is refused");
-        assert!(err.0.contains("'etc/hostname' is not in the bundle"), "{err}");
+        assert!(err.0.contains("SECRET"), "{err}");
+        assert!(err.0.contains("'/etc/hostname' is outside"), "{err}");
 
         for path in ["/etc/hostname", "../../../../etc/hostname"] {
             let manifest = format!(
@@ -781,7 +786,11 @@ mod tests {
             let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
                 .await
                 .expect_err("a wasm outside the bundle is refused");
-            assert!(err.0.contains("'etc/hostname' is not in the bundle"), "{path}: {err}");
+            assert!(
+                err.0.contains("etc/hostname")
+                    && err.0.contains("not a regular file in the project"),
+                "{path}: {err}"
+            );
         }
     }
 
