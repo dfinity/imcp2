@@ -18,12 +18,14 @@
 //!   ([`extract_bundle`]).
 //! * **The filesystem the library reads through is confined to that
 //!   directory** — the library's own [`Confined`], the host filesystem held
-//!   to one root. A path the manifest names is resolved against the root
-//!   (`..` cannot climb above it, an absolute path elsewhere is refused, a
-//!   symlink pointing out leads nowhere) before the disk sees it. The loader
-//!   resolves every path a manifest names through that one seam, so nothing
-//!   on the machine is reachable by any spelling. The disk is the byte store
-//!   because the sync-plugin runtime needs real paths to mount.
+//!   to one root by the spelling of each path. A path the manifest names is
+//!   resolved against the root (`..` cannot climb above it, an absolute path
+//!   elsewhere is refused) before the disk sees it. The loader resolves
+//!   every path it reads through that one seam, so nothing on the machine
+//!   is reachable by any spelling. The check is lexical, which is why
+//!   extraction refuses a symlink: with none in the tree, no path under the
+//!   root leads out of it. The disk is the byte store because the
+//!   sync-plugin runtime needs real paths to mount.
 //! * **The bundle is checked before any phase runs** ([`check_bundle`]): every
 //!   canister built by one pre-built wasm in the archive that hashes to its
 //!   recorded checksum, every sync plugin in the archive and what it declares
@@ -32,10 +34,15 @@
 //!   backstop), and no network but `ic`. The check's own work is bounded by
 //!   the archive, not by what the manifest repeats.
 //!
-//! The confinement comes from upstream: `icp project bundle` holds every path
-//! to the project it bundles, and dfinity/icp-cli#866 (issue #865) gives the
-//! loader the same rule for a project that came from elsewhere. This crate
-//! pins that change; until it is on icp-cli's main, the pin is its branch.
+//! The confinement comes from upstream, as one rule split three ways
+//! (dfinity/icp-cli#863): the user's own project may link wherever it likes;
+//! `icp project bundle` writes an archive of regular files and directories,
+//! in-project links dereferenced and out-of-project links refused
+//! (dfinity/icp-cli#868); and a consumer of a bundle it does not trust
+//! refuses any other entry on the way in, after which the lexical
+//! [`Confined`] (dfinity/icp-cli#866) is complete. This crate is that
+//! consumer, and pins the stack; until it is on icp-cli's main, the pin is
+//! its head.
 //!
 //! Everything the project library reads or writes — the manifest, the wasms,
 //! the `.icp` id and artifact stores, the build scratch — lives under the
@@ -764,8 +771,10 @@ fn host_within(fs: BundleFs, project_bytes: u64) -> Host {
 /// return it as the filesystem the deploy reads through, confined to it.
 ///
 /// Only regular files and directories are written — `icp project bundle`
-/// writes nothing else, and a symlink or a device node is how an archive
-/// reaches past its directory — and their sizes may not add up to more than
+/// writes nothing else, a symlink or a device node is how an archive reaches
+/// past its directory, and the confinement the library reads through is
+/// lexical, so it holds only for a tree without links — and their sizes may
+/// not add up to more than
 /// [`MAX_EXTRACTED_BYTES`], nor their number, with the directories their
 /// paths imply, to more than [`MAX_BUNDLE_ENTRIES`]. `tar` refuses entry
 /// paths that would land outside `into`. What it extracts is then required
@@ -788,7 +797,7 @@ fn extract_bundle_within(
             MAX_BUNDLE_BYTES
         ));
     }
-    let fs = Confined::new(into).map_err(|e| e.to_string())?;
+    let fs = Confined::new(into);
     let unreadable =
         |e: std::io::Error| format!("the bundle is not a readable .tar.gz archive: {e}");
     let decoder = Limited { inner: flate2::read::GzDecoder::new(bytes), left: MAX_EXTRACTED_BYTES };
@@ -1055,8 +1064,8 @@ mod tests {
 
     // A symlink is how an archive reaches past its directory; a bundle
     // carries none, so one is refused rather than written — which is what
-    // lets the index below trust that every path under the root is a file
-    // extraction wrote.
+    // lets the confined filesystem, lexical as it is, trust that no path
+    // under the root leads out of it.
     #[test]
     fn an_archive_with_a_symlink_is_refused() {
         let (_dir, into) = scratch();
@@ -1294,7 +1303,7 @@ mod tests {
     // that resolves to it, and refuses what resolves outside the root — an
     // absolute path elsewhere, a climb above the root — whatever the machine
     // holds at that spelling. (The filesystem's own tests, upstream, cover
-    // the spellings and the symlinks; this is the bundle seen through it.)
+    // the spellings; this is the bundle seen through it.)
     #[tokio::test]
     async fn the_bundle_serves_what_it_carries_and_nothing_outside_it() {
         let (_dir, into) = scratch();
