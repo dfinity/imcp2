@@ -191,10 +191,14 @@ pub async fn deploy_bundle(
 
     let host = host::host_for(fs.clone());
     let selection = EnvironmentSelection::Named(request.environment.clone());
+    // The load is where the untrusted rule holds (a script step, a module or
+    // plugin fetched from a URL or resolving outside the root, a recipe: the
+    // project does not load), so the environment is the first thing a bundle
+    // outside it fails to give.
     let env = host.get_environment(&selection).await.map_err(|e| RequestError(error_chain(&e)))?;
-    // Before any phase runs: a bundle that is not one — a script step, a wasm
-    // that is missing or does not hash to its checksum, a network other than
-    // the IC — is refused here, not at the phase that would reach it after
+    // Before any phase runs: a bundle that is not one — a wasm that is
+    // missing or does not hash to its checksum, a network other than the IC
+    // — is refused here, not at the phase that would reach it after
     // canisters have been created. The check reads, hashes and gunzips every
     // module, up to a gigabyte of them, so like extraction it runs off the
     // runtime's workers.
@@ -573,9 +577,9 @@ mod tests {
     }
 
     // A bundle never carries a script step, and this server never runs one:
-    // a manifest that declares one is refused as a request error, before any
-    // phase — so no canister is created ahead of a sync step that would then
-    // be refused.
+    // the untrusted rule the project is loaded under refuses it at the load,
+    // as a request error naming the step, before any phase — so no canister
+    // is created ahead of a sync step that would then be refused.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_script_step_is_refused_before_any_phase_runs() {
         let manifest = "canisters:\n  - name: backend\n    build:\n      steps:\n        \
@@ -584,7 +588,11 @@ mod tests {
         let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
             .await
             .expect_err("a script step is refused");
-        assert!(err.0.contains("backend") && err.0.contains("script build step"), "{err}");
+        assert!(
+            err.0.contains("canister 'backend' has a build step that is not a pre-built module")
+                && err.0.contains("touch /tmp/pwned"),
+            "{err}"
+        );
     }
 
     // A canister directory the manifest spells absolutely resolves inside the
