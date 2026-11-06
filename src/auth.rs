@@ -1503,8 +1503,10 @@ struct AuthzPending {
     /// Phase 2 single-flight marker: `true` while a redemption attempt (the
     /// `mcp_register_v2` network call) is mid-flight for this connect, so a
     /// concurrent double-submit can't fire a second one. Set atomically by
-    /// [`claim_redemption`], cleared on failure so a genuine retry can proceed
-    /// (a completed attempt leaves `code` set instead, the idempotent path).
+    /// [`claim_redemption`], cleared when its [`RedemptionClaim`] is dropped —
+    /// after a failure, or if the request is cut off mid-flight — so a genuine
+    /// retry can proceed (a completed attempt leaves `code` set instead, the
+    /// idempotent path).
     /// Redemption is ALSO idempotent-on-`S` at II by design, so this is about
     /// determinism and not double-spending update calls, not correctness.
     redeeming: bool,
@@ -2585,7 +2587,8 @@ fn redeem_err(msg: &str) -> Response {
 /// Outcome of the atomic single-flight claim on a connect's redemption.
 enum RedeemClaim {
     /// Won the claim: this request runs the (only) in-flight redemption attempt.
-    Claimed,
+    /// The claim is held for as long as the returned [`RedemptionClaim`] lives.
+    Claimed(RedemptionClaim),
     /// A previous attempt already finished — return its code again (idempotent).
     Existing(String),
     /// Another attempt is mid-flight right now (a double-submit lost the race).
@@ -2600,7 +2603,8 @@ enum RedeemClaim {
 /// connect — a page double-submit can't fire two concurrent redemptions. (II
 /// would tolerate the race — within its 5-minute lifetime the delegation
 /// redeems repeatedly, and a retry with the same `S` just re-binds it — but one
-/// deterministic attempt is strictly better than racing two.)
+/// deterministic attempt is strictly better than racing two.) A won claim comes
+/// back as a [`RedemptionClaim`], which gives it back when dropped.
 async fn claim_redemption(store: &AuthStore, state: &str) -> RedeemClaim {
     let mut authz = store.authz.write().await;
     let Some(a) = authz.get_mut(state) else {
@@ -2613,15 +2617,43 @@ async fn claim_redemption(store: &AuthStore, state: &str) -> RedeemClaim {
         return RedeemClaim::InProgress;
     }
     a.redeeming = true;
-    RedeemClaim::Claimed
+    RedeemClaim::Claimed(RedemptionClaim {
+        authz: Arc::clone(&store.authz),
+        state: state.to_owned(),
+    })
 }
 
-/// Release a failed redemption claim so a genuine retry can proceed. (A
-/// successful attempt leaves `code` set, which [`claim_redemption`] returns
-/// directly — the `redeeming` marker no longer matters then.)
-async fn release_redemption(store: &AuthStore, state: &str) {
-    if let Some(a) = store.authz.write().await.get_mut(state) {
-        a.redeeming = false;
+/// A won redemption claim, given back when dropped so a genuine retry can
+/// proceed — on EVERY way out of [`connect_redeem`], including the one no code
+/// after an `.await` can see: the request future being dropped while
+/// `mcp_register_v2` is in flight, which is what happens when the browser
+/// disconnects or a fronting proxy times the request out. Releasing explicitly
+/// on the error path missed that case, and the connect then stayed marked
+/// `redeeming` until it expired, so every retry was turned away as "already
+/// being processed". Releasing after a success is harmless: the minted `code`
+/// is what [`claim_redemption`] returns first.
+struct RedemptionClaim {
+    authz: Arc<RwLock<HashMap<String, AuthzPending>>>,
+    state: String,
+}
+
+impl Drop for RedemptionClaim {
+    fn drop(&mut self) {
+        fn release(authz: &mut HashMap<String, AuthzPending>, state: &str) {
+            if let Some(a) = authz.get_mut(state) {
+                a.redeeming = false;
+            }
+        }
+        // `Drop` cannot await the tokio lock. Take it if it is free, which it
+        // normally is (nothing holds it across an `.await`); otherwise hand the
+        // release to the runtime, which runs it once the holder lets go. A claim
+        // can't be won in between: the entry still reads `redeeming` until then.
+        if let Ok(mut authz) = self.authz.try_write() {
+            release(&mut authz, &self.state);
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (authz, state) = (Arc::clone(&self.authz), std::mem::take(&mut self.state));
+            runtime.spawn(async move { release(&mut *authz.write().await, &state) });
+        }
     }
 }
 
@@ -2703,26 +2735,26 @@ pub async fn connect_redeem(
     // Single-flight: atomically claim this connect's redemption so a double-submit
     // can't fire two concurrent mcp_register_v2 calls (and a request racing a
     // just-finished attempt gets that attempt's code instead of redeeming again).
-    match claim_redemption(&store, &body.state).await {
-        RedeemClaim::Claimed => {}
+    // Held until this handler returns or is dropped mid-redemption, whichever
+    // comes first; either way, dropping it gives the claim back.
+    let _claim = match claim_redemption(&store, &body.state).await {
+        RedeemClaim::Claimed(claim) => claim,
         RedeemClaim::Existing(code) => {
-            return Json(
-                json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) }),
-            )
-            .into_response()
+            let redirect = build_redirect(&redirect_uri, &code, &client_state, &iss);
+            return Json(json!({ "redirect": redirect })).into_response();
         }
         RedeemClaim::InProgress => {
             return redeem_err(
                 "This connect request is already being processed. Wait a moment. \
                  If nothing happens, restart from your client.",
-            )
+            );
         }
         RedeemClaim::Vanished => {
             return redeem_err(
                 "This connect request is no longer available. Restart from your client.",
-            )
+            );
         }
-    }
+    };
     // Redeem: build a DelegatedIdentity from priv(X) + the chain and make one
     // authenticated mcp_register_v2 call. Success proves consent AND registration.
     match store.identities.redeem_registration_delegation(&body.state, user_key, chain).await {
@@ -2734,11 +2766,9 @@ pub async fn connect_redeem(
                 "registration delegation redeemed"
             );
         }
-        Err(e) => {
-            // Free the claim so a genuine retry can attempt redemption again.
-            release_redemption(&store, &body.state).await;
-            return redeem_err(&e);
-        }
+        // Returning drops `_claim`, which frees it so a genuine retry can attempt
+        // redemption again.
+        Err(e) => return redeem_err(&e),
     }
     // Mint the PKCE-bound code (idempotent): reserve under the `authz` lock,
     // insert into `codes` only after releasing it (consistent lock order with
@@ -5712,22 +5742,18 @@ mod tests {
         let store = test_store();
         seed_pending(&store, "sess-r", "bind-r").await;
 
-        // First claim wins; a concurrent second claim is refused.
-        assert!(matches!(
-            super::claim_redemption(&store, "sess-r").await,
-            super::RedeemClaim::Claimed
-        ));
+        // First claim wins; a concurrent second claim is refused while it is held.
+        let first = super::claim_redemption(&store, "sess-r").await;
+        assert!(matches!(first, super::RedeemClaim::Claimed(_)));
         assert!(matches!(
             super::claim_redemption(&store, "sess-r").await,
             super::RedeemClaim::InProgress
         ));
 
-        // A failed attempt releases the claim, so a genuine retry proceeds.
-        super::release_redemption(&store, "sess-r").await;
-        assert!(matches!(
-            super::claim_redemption(&store, "sess-r").await,
-            super::RedeemClaim::Claimed
-        ));
+        // A failed attempt drops its claim, so a genuine retry proceeds.
+        drop(first);
+        let retry = super::claim_redemption(&store, "sess-r").await;
+        assert!(matches!(retry, super::RedeemClaim::Claimed(_)));
 
         // Once the code is minted, later claims return it rather than redeeming.
         store.authz.write().await.get_mut("sess-r").unwrap().code = Some("mcp-code-x".into());
@@ -5741,6 +5767,60 @@ mod tests {
             super::claim_redemption(&store, "nope").await,
             super::RedeemClaim::Vanished
         ));
+    }
+
+    // A redemption cut off mid-flight gives its claim back. hyper drops a
+    // handler's future when the browser disconnects or a fronting proxy times
+    // the request out, so the code after the `mcp_register_v2` await never runs;
+    // the claim must not depend on it, or every retry for the connect would be
+    // refused as "already being processed" until the connect expired.
+    #[tokio::test]
+    async fn a_redemption_cut_off_mid_flight_gives_its_claim_back() {
+        let store = test_store();
+        seed_pending(&store, "sess-c", "bind-c").await;
+
+        let attempt = async {
+            let _claim = match super::claim_redemption(&store, "sess-c").await {
+                super::RedeemClaim::Claimed(claim) => claim,
+                _ => panic!("the first attempt wins the claim"),
+            };
+            // Stands in for the `mcp_register_v2` call, which never answers.
+            std::future::pending::<()>().await;
+        };
+        let cut_off = tokio::time::timeout(Duration::from_millis(10), attempt).await;
+        assert!(cut_off.is_err(), "the attempt is dropped mid-flight");
+
+        assert!(
+            matches!(
+                super::claim_redemption(&store, "sess-c").await,
+                super::RedeemClaim::Claimed(_)
+            ),
+            "a retry can claim the redemption again"
+        );
+    }
+
+    // `Drop` can't wait for the lock, so a claim dropped while something else
+    // holds it is released as soon as that holder lets go — and until then the
+    // connect still reads as in progress, so no second attempt slips in.
+    #[tokio::test]
+    async fn a_claim_dropped_under_a_held_lock_is_released_once_the_lock_frees() {
+        let store = test_store();
+        seed_pending(&store, "sess-l", "bind-l").await;
+        let claim = super::claim_redemption(&store, "sess-l").await;
+        assert!(matches!(claim, super::RedeemClaim::Claimed(_)));
+
+        let held = store.authz.read().await;
+        drop(claim);
+        assert!(held["sess-l"].redeeming, "not released while the lock is held");
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.authz.read().await["sess-l"].redeeming {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("released once the lock is free");
     }
 
     // The pinned callback page is served (with its strict CSP) and the redeem
