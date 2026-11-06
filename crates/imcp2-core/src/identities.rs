@@ -170,7 +170,12 @@ const II_CANISTER_ID_PROD_DEFAULT: &str = "rdmx6-jaaaa-aaaaa-aaadq-cai";
 /// stored grant expiration has passed. Per the spec, any `Unauthorized` means the
 /// session is over — the caller must start a fresh connect with a fresh session
 /// key; it must NOT retry.
-const RECONNECT_MSG: &str = "Your Internet Identity session is over (the grant expired, was revoked, \
+/// The one answer that ends a session for good: the grant expired, was revoked
+/// at id.ai, or was replaced by a newer connection, as Internet Identity itself
+/// reported it. Every other failure to derive or refresh a delegation is
+/// transient. Public so an embedder holding a long-lived signer (the local
+/// server's deploy tools) can tell the two apart and stop signing on this one.
+pub const RECONNECT_MSG: &str = "Your Internet Identity session is over (the grant expired, was revoked, \
      or was replaced by a newer connection). Reconnect with Internet Identity to continue — do not retry.";
 
 /// Shown when a tool needs update (write) access but the II session is
@@ -346,6 +351,10 @@ struct Session {
 /// A cached on-demand per-app account delegation. The chain ends at a per-app key
 /// distinct from the session key; its seed is kept so the identity can be rebuilt.
 struct AppDelegation {
+    /// The account II resolved the delegation to: the number it was asked
+    /// for, or, asked for the default (`None`), the concrete account that was
+    /// the default at prepare time (`None` when that is the unnamed one).
+    account_number: Option<u64>,
     user_key: Vec<u8>,
     chain: Vec<SignedDelegation>,
     expiration_ns: u64,
@@ -472,7 +481,9 @@ impl Identities {
     /// transport, route provider, and root key, so calls signed as `identity`
     /// go through the embedding application's boundary-node routing — never a
     /// second, hard-coded endpoint.
-    pub(crate) fn agent_as<I: ic_agent::Identity + 'static>(&self, identity: I) -> Agent {
+    /// A clone of the injected base agent signing as `identity`: the same
+    /// endpoint, root key and boundary-node routing as every other call.
+    pub fn agent_as<I: ic_agent::Identity + 'static>(&self, identity: I) -> Agent {
         let mut agent = self.agent.clone();
         agent.set_identity(identity);
         agent
@@ -995,18 +1006,35 @@ impl Identities {
         domain: &str,
         account_number: Option<u64>,
     ) -> Result<DelegatedIdentity, String> {
+        Ok(self.delegated_identity_resolved(session_id, domain, account_number).await?.0)
+    }
+
+    /// [`Self::delegated_identity`], also returning the account the delegation
+    /// was resolved to. Asked for the default account (`None`), II resolves it
+    /// to whichever account is the default at that moment — a choice the user
+    /// can change — and this is that account: `Some(n)` for a named one, `None`
+    /// for the unnamed one. A caller that must keep signing as the same
+    /// principal across re-derivations (a long deploy) asks for this account
+    /// explicitly from then on, rather than for "the default" again.
+    pub async fn delegated_identity_resolved(
+        &self,
+        session_id: &str,
+        domain: &str,
+        account_number: Option<u64>,
+    ) -> Result<(DelegatedIdentity, Option<u64>), String> {
         self.ensure_session(session_id).await?;
 
         // Reuse a cached, still-fresh delegation if present.
         if let Some(app) = self.cached_fresh(session_id, domain, account_number).await {
-            return build_identity(&app);
+            return Ok((build_identity(&app)?, app.account_number));
         }
 
         // Otherwise derive a fresh one on demand against the II canister.
         let app = self.derive_app_delegation(session_id, domain, account_number).await?;
         let identity = build_identity(&app)?;
+        let resolved = app.account_number;
         self.store(session_id, domain, account_number, app).await;
-        Ok(identity)
+        Ok((identity, resolved))
     }
 
     async fn cached_fresh(
@@ -1022,6 +1050,7 @@ impl Identities {
             return None;
         }
         Some(AppDelegation {
+            account_number: app.account_number,
             user_key: app.user_key.clone(),
             chain: app.chain.clone(),
             expiration_ns: app.expiration_ns,
@@ -1123,6 +1152,7 @@ impl Identities {
 
         let chain = vec![signed.into_agent(&app_key_der)?];
         Ok(AppDelegation {
+            account_number: prepared.account_number,
             user_key: prepared.user_key,
             chain,
             expiration_ns: prepared.expiration,
@@ -1172,6 +1202,7 @@ impl Identities {
             .signature
             .ok_or("the test delegation carried no signature")?;
         let app = AppDelegation {
+            account_number: None,
             user_key: anchor_der,
             chain: vec![SignedDelegation { delegation, signature }],
             expiration_ns: expiration,
@@ -1693,6 +1724,7 @@ mod tests {
         s.app_delegations.insert(
             (domain.to_string(), account),
             AppDelegation {
+                account_number: None,
                 user_key: vec![account.unwrap_or(0) as u8],
                 chain: vec![],
                 expiration_ns: exp,
@@ -1806,6 +1838,7 @@ mod tests {
 
     fn app_delegation(expiration_ns: u64) -> AppDelegation {
         AppDelegation {
+            account_number: None,
             user_key: Vec::new(),
             chain: Vec::new(),
             expiration_ns,
@@ -2434,6 +2467,7 @@ mod tests {
         // Build the delegated identity exactly as the server does; the chain
         // validates because the anchor's signature covers this read-only delegation.
         let app = AppDelegation {
+            account_number: None,
             user_key: user_der.clone(),
             chain: vec![signed.clone()],
             expiration_ns: expiration,
@@ -2489,6 +2523,7 @@ mod tests {
         let mut tampered = signed;
         tampered.delegation.permissions = None;
         let tampered_app = AppDelegation {
+            account_number: None,
             user_key: user_der,
             chain: vec![tampered],
             expiration_ns: expiration,
