@@ -2615,8 +2615,11 @@ const CONNECT_EXPIRED_MSG: &str = "This connect request has expired. Restart fro
 
 /// Reserve the authorization code for `state` once its redemption succeeded,
 /// under the `authz` lock: the code an earlier attempt already minted, else
-/// `fresh` (`true` = newly minted, still to be recorded in `codes`). Clears the
-/// connect's `redeeming` mark either way.
+/// `fresh` (`true` = newly minted, still to be recorded in `codes`). Leaves the
+/// connect's `redeeming` mark to the [`RedemptionClaim`] that set it: once a code
+/// is recorded, that code is what a later claim gets, and a refused connect must
+/// stay claimed until its own claim lets go, or a second registration could
+/// start before this one's guard clears the mark out from under it.
 ///
 /// Refused for a connect past [`CONNECT_TTL`], even one whose redemption passed
 /// the gate in time. `imcp2-core` reaps an unredeemed connect's session 15
@@ -2626,26 +2629,34 @@ const CONNECT_EXPIRED_MSG: &str = "This connect request has expired. Restart fro
 /// whose every signed call fails. Until [`EXPIRED_CONNECT_RETENTION`], the sweep
 /// had dropped the entry long before that, so this check is what keeps the
 /// promise now that expired connects are retained.
+///
+/// A refusal also discards the session the registration just granted
+/// ([`Identities::discard_session`]): no code will ever reach it, and with a
+/// grant recorded nothing else would drop it before the grant expired.
 async fn reserve_code(
     store: &AuthStore,
     state: &str,
     fresh: String,
 ) -> Result<(String, bool), &'static str> {
-    let mut authz = store.authz.write().await;
-    let Some(a) = authz.get_mut(state) else {
-        return Err("This connect request is no longer available. Restart from your client.");
-    };
-    a.redeeming = false;
-    if a.remaining().is_zero() {
-        return Err(CONNECT_EXPIRED_MSG);
-    }
-    Ok(match &a.code {
-        Some(existing) => (existing.clone(), false),
-        None => {
-            a.code = Some(fresh.clone());
-            (fresh, true)
+    let refused = {
+        let mut authz = store.authz.write().await;
+        match authz.get_mut(state) {
+            None => "This connect request is no longer available. Restart from your client.",
+            Some(a) if a.remaining().is_zero() => CONNECT_EXPIRED_MSG,
+            Some(a) => {
+                return Ok(match &a.code {
+                    Some(existing) => (existing.clone(), false),
+                    None => {
+                        a.code = Some(fresh.clone());
+                        (fresh, true)
+                    }
+                })
+            }
         }
-    })
+    };
+    // Outside the `authz` lock: the session map has its own.
+    store.identities.discard_session(state).await;
+    Err(refused)
 }
 
 /// A JSON error the pinned page reads and displays.
@@ -5025,6 +5036,11 @@ mod tests {
     // grant re-creates it with a key II never registered, so a code minted then
     // would be bound to a session that cannot sign; retaining expired connects
     // must not open that up. Within the TTL the code is minted, idempotently.
+    //
+    // The refusal also discards the session the registration granted (else it
+    // would hold its slot until the grant expired), and leaves the connect
+    // claimed until the attempt's own claim lets go, so no second registration
+    // can start in between.
     #[tokio::test(start_paused = true)]
     async fn no_code_is_minted_for_a_connect_past_its_ttl() {
         let store = test_store();
@@ -5036,11 +5052,26 @@ mod tests {
         let again = super::reserve_code(&store, "sess-in-time", "code-2".into()).await;
         assert_eq!(again, Ok(("code-1".to_owned(), false)), "the first code, idempotently");
 
+        // A late attempt: claimed in time, its registration granted, done after the TTL.
+        let claim = super::claim_redemption(&store, "sess-late").await;
+        assert!(matches!(claim, super::RedeemClaim::Claimed(_)));
+        store.identities.set_grant_expiration("sess-late", u64::MAX).await;
         tokio::time::advance(super::CONNECT_TTL).await;
+
         let late = super::reserve_code(&store, "sess-late", "code-3".into()).await;
         assert_eq!(late, Err(super::CONNECT_EXPIRED_MSG));
-        let authz = store.authz.read().await;
-        assert!(authz["sess-late"].code.is_none() && !authz["sess-late"].redeeming);
+        assert_eq!(
+            store.identities.grant_expiration_ns("sess-late").await,
+            None,
+            "the granted session no code will reach is discarded"
+        );
+        {
+            let authz = store.authz.read().await;
+            assert!(authz["sess-late"].code.is_none());
+            assert!(authz["sess-late"].redeeming, "still claimed by the late attempt");
+        }
+        drop(claim);
+        assert!(!store.authz.read().await["sess-late"].redeeming, "released by its own claim");
     }
 
     // ---- Connect: link + redeem ---------------------------------------------
