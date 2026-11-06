@@ -2172,7 +2172,7 @@ dependencies = [
 [[package]]
 name = "icp-canister-interfaces"
 version = "1.8.0"
-source = "git+https://github.com/dfinity/icp-cli?rev=ae3367ef80cfb2798bc2c8395e39ad6af76a9be5#ae3367ef80cfb2798bc2c8395e39ad6af76a9be5"
+source = "git+https://github.com/dfinity/icp-cli?rev=4bba4a648ac03296ceeccc5bd0f4571a7ffa635a#4bba4a648ac03296ceeccc5bd0f4571a7ffa635a"
 dependencies = [
  "bigdecimal",
  "candid",
@@ -2183,7 +2183,7 @@ dependencies = [
 [[package]]
 name = "icp-events"
 version = "1.8.0"
-source = "git+https://github.com/dfinity/icp-cli?rev=ae3367ef80cfb2798bc2c8395e39ad6af76a9be5#ae3367ef80cfb2798bc2c8395e39ad6af76a9be5"
+source = "git+https://github.com/dfinity/icp-cli?rev=4bba4a648ac03296ceeccc5bd0f4571a7ffa635a#4bba4a648ac03296ceeccc5bd0f4571a7ffa635a"
 dependencies = [
  "serde",
  "tokio",
@@ -2192,7 +2192,7 @@ dependencies = [
 [[package]]
 name = "icp-project"
 version = "1.8.0"
-source = "git+https://github.com/dfinity/icp-cli?rev=ae3367ef80cfb2798bc2c8395e39ad6af76a9be5#ae3367ef80cfb2798bc2c8395e39ad6af76a9be5"
+source = "git+https://github.com/dfinity/icp-cli?rev=4bba4a648ac03296ceeccc5bd0f4571a7ffa635a#4bba4a648ac03296ceeccc5bd0f4571a7ffa635a"
 dependencies = [
  "async-trait",
  "bigdecimal",
@@ -2240,7 +2240,7 @@ dependencies = [
 [[package]]
 name = "icp-sync-plugin"
 version = "1.8.0"
-source = "git+https://github.com/dfinity/icp-cli?rev=ae3367ef80cfb2798bc2c8395e39ad6af76a9be5#ae3367ef80cfb2798bc2c8395e39ad6af76a9be5"
+source = "git+https://github.com/dfinity/icp-cli?rev=4bba4a648ac03296ceeccc5bd0f4571a7ffa635a#4bba4a648ac03296ceeccc5bd0f4571a7ffa635a"
 dependencies = [
  "async-trait",
  "bytes",
