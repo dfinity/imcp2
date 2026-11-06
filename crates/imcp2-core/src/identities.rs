@@ -635,6 +635,30 @@ impl Identities {
         }
     }
 
+    /// Forget `session_id` outright, grant or not. For a connect whose
+    /// registration went through but whose authorization code will never be
+    /// issued: nothing can reach that session, yet with its grant recorded
+    /// neither the reaper nor the admission bound drops it before the grant
+    /// expires, up to 30 days on. A session that held a grant gets the "session
+    /// closed" log that pairs with its "session opened".
+    ///
+    /// The removal runs in a task of its own, so it completes even if the caller
+    /// is cut off while it waits for the lock (a dropped request): left behind,
+    /// the session would hold its slot for the rest of its grant.
+    pub async fn discard_session(&self, session_id: &str) {
+        let (sessions, instance) = (Arc::clone(&self.sessions), self.instance.name);
+        let session_id = session_id.to_owned();
+        let discard = tokio::spawn(async move {
+            let removed = sessions.write().await.remove(&session_id);
+            if removed.is_some_and(|s| s.grant_expiration_ns.is_some()) {
+                tracing::info!(instance, session_id = %session_id, "session closed");
+            }
+        });
+        // The task only removes a map entry; a join error (a panic in it) has
+        // nothing left for the caller to act on.
+        let _ = discard.await;
+    }
+
     /// The session's recorded grant expiration (ns since the epoch), if known —
     /// set authoritatively from the `mcp_register_v2` reply at connect redemption.
     /// Used to bound the OAuth access-token lifetime so a token never outlives the
@@ -1656,6 +1680,48 @@ mod tests {
         ids.set_permissions("sess2", "something-new").await;
         assert_eq!(ids.is_read_only("sess2").await, None);
         assert!(ids.require_write("sess2").await.is_ok());
+    }
+
+    // `discard_session` drops a session whatever it holds, a live grant included,
+    // which the reaper and the admission bound would otherwise keep until the
+    // grant expires; an unknown id is a no-op.
+    #[tokio::test]
+    async fn discard_session_drops_even_a_granted_session() {
+        let ids = test_ids();
+        seed_live(&ids, "granted").await;
+        ids.ensure_session("pending").await.expect("room for a session");
+
+        ids.discard_session("granted").await;
+        ids.discard_session("pending").await;
+        ids.discard_session("unknown").await;
+
+        assert_eq!(ids.grant_expiration_ns("granted").await, None);
+        assert!(ids.sessions.read().await.is_empty(), "both sessions are gone");
+    }
+
+    // A caller cut off while the discard waits for the lock (a dropped request)
+    // still gets the session discarded: the removal runs in a task of its own.
+    #[tokio::test]
+    async fn discard_session_completes_even_when_its_caller_is_cut_off() {
+        let ids = test_ids();
+        seed_live(&ids, "granted").await;
+
+        let held = ids.sessions.write().await;
+        let cut_off = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            ids.discard_session("granted"),
+        )
+        .await;
+        assert!(cut_off.is_err(), "the caller is dropped mid-discard");
+        drop(held);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while ids.sessions.read().await.contains_key("granted") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("discarded once the lock is free");
     }
 
     // An Identities store over a dummy II instance (tests never hit the network).
