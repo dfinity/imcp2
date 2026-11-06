@@ -144,8 +144,9 @@ const CONNECT_TTL: Duration = Duration::from_secs(600);
 /// finished after [`CONNECT_TTL`] is told its connect expired. Dropped at expiry,
 /// it could only be reported as unknown or already used: the same words as a
 /// restart or a reloaded callback page, which hid a slow sign-in behind them.
-/// Retention costs no live connect its slot, because [`make_room`] drops expired
-/// entries before anything else, and the map stays under its cap either way.
+/// Retention costs no live connect its slot: at the cap, admission evicts the
+/// oldest entry, and an expired entry is always older than a live one. The map
+/// stays under its cap either way.
 const EXPIRED_CONNECT_RETENTION: Duration = Duration::from_secs(3600);
 /// Lifetime of a minted authorization code.
 const CODE_TTL: Duration = Duration::from_secs(120);
@@ -1525,18 +1526,25 @@ struct AuthzPending {
 
 impl AuthzPending {
     /// How long this connect may still be redeemed for — zero once it is past
-    /// [`CONNECT_TTL`]. The single definition of "expired" for a pending connect:
-    /// the redeem gate, the reaper (through [`Self::forgotten`]), and the bound
-    /// ([`make_room`]) all read it.
+    /// [`CONNECT_TTL`]. The single definition of "expired" for a pending connect,
+    /// which the redeem gate reads.
     fn remaining(&self) -> Duration {
         CONNECT_TTL.saturating_sub(self.created.elapsed())
     }
 
-    /// Whether the reaper may drop this connect: it has been expired for
-    /// [`EXPIRED_CONNECT_RETENTION`]. Until then the redeem gate can still tell
-    /// a late sign-in that the connect expired.
+    /// How long this connect is still remembered for — zero once it has been
+    /// expired for [`EXPIRED_CONNECT_RETENTION`]. Until then the redeem gate can
+    /// still tell a late sign-in that the connect expired. The reaper drops what
+    /// it has run out of ([`Self::forgotten`]), and the bound ([`make_room`])
+    /// evicts by it, so at the cap the oldest connect goes first — never every
+    /// retained one at once.
+    fn retained_for(&self) -> Duration {
+        (CONNECT_TTL + EXPIRED_CONNECT_RETENTION).saturating_sub(self.created.elapsed())
+    }
+
+    /// Whether the reaper may drop this connect (see [`Self::retained_for`]).
     fn forgotten(&self) -> bool {
-        self.created.elapsed() >= CONNECT_TTL + EXPIRED_CONNECT_RETENTION
+        self.retained_for().is_zero()
     }
 }
 
@@ -1863,17 +1871,18 @@ impl AuthStore {
     }
 
     /// Record a connect awaiting its II handshake, bounding the map first
-    /// ([`make_room`]): `/oauth/authorize` is unauthenticated, so expired entries
-    /// go and — if the map is still at the cap — the oldest pending connect is
-    /// evicted, which makes an authorize flood churn its own entries out instead
-    /// of growing the map (CWE-770). The cap is shared with the session map, whose
-    /// entries pair 1:1 with these.
+    /// ([`make_room`]): `/oauth/authorize` is unauthenticated, so forgotten
+    /// entries go and — if the map is still at the cap — the oldest pending
+    /// connect is evicted (a retained expired one before any live one), which
+    /// makes an authorize flood churn its own entries out instead of growing the
+    /// map (CWE-770). The cap is shared with the session map, whose entries pair
+    /// 1:1 with these.
     async fn insert_pending(&self, session_id: String, pending: AuthzPending) {
         let mut authz = self.authz.write().await;
         make_room(
             &mut authz,
             imcp2_core::identities::MAX_PENDING_CONNECTS,
-            AuthzPending::remaining,
+            AuthzPending::retained_for,
         );
         authz.insert(session_id, pending);
     }
@@ -4621,6 +4630,30 @@ mod tests {
             authz.contains_key(&format!("sess-{}", cap + 15)),
             "the connect just started is never the one evicted"
         );
+    }
+
+    // At the cap, admitting a connect evicts only the OLDEST entry, so the other
+    // expired connects inside their retention still answer "expired". Evicting
+    // by redeemable time instead would purge every retained one in one go.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_map_evicts_only_its_oldest_retained_connect() {
+        let cap = imcp2_core::identities::MAX_PENDING_CONNECTS;
+        let store = test_store();
+        seed_pending(&store, "old-1", "bind").await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        seed_pending(&store, "old-2", "bind").await;
+        tokio::time::advance(super::CONNECT_TTL).await;
+        for i in 2..cap {
+            seed_pending(&store, &format!("live-{i}"), "bind").await;
+        }
+
+        seed_pending(&store, "newest", "bind").await;
+
+        let authz = store.authz.read().await;
+        assert_eq!(authz.len(), cap);
+        assert!(!authz.contains_key("old-1"), "the oldest connect makes the room");
+        assert!(authz.contains_key("old-2"), "the other expired connect is still retained");
+        assert!(authz.contains_key("live-2") && authz.contains_key("newest"));
     }
 
     /// RFC 7636 Appendix B's challenge: what a spec-conformant S256 client sends.
