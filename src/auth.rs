@@ -140,6 +140,13 @@ pub fn bearer_session_resolver() -> imcp2_core::SessionResolver {
 /// How long an authorization request and its pending II handshake stay valid
 /// before the user must restart.
 const CONNECT_TTL: Duration = Duration::from_secs(600);
+/// How long an EXPIRED pending connect is still remembered, so that a sign-in
+/// finished after [`CONNECT_TTL`] is told its connect expired. Dropped at expiry,
+/// it could only be reported as unknown or already used: the same words as a
+/// restart or a reloaded callback page, which hid a slow sign-in behind them.
+/// Retention costs no live connect its slot, because [`make_room`] drops expired
+/// entries before anything else, and the map stays under its cap either way.
+const EXPIRED_CONNECT_RETENTION: Duration = Duration::from_secs(3600);
 /// Lifetime of a minted authorization code.
 const CODE_TTL: Duration = Duration::from_secs(120);
 /// Fallback access-token lifetime, used only when the II grant's expiration is
@@ -1448,8 +1455,9 @@ pub struct AuthStore {
     /// Auth-code connects in flight, keyed by `session_id` (= the II connect
     /// `state`). Bounded at [`imcp2_core::identities::MAX_PENDING_CONNECTS`] (one
     /// entry per pending connect, same as the session map), each entry's size by
-    /// the per-request caps at [`MAX_CLIENT_STATE_LEN`], and swept of expired
-    /// entries by [`AuthStore::reap_expired`].
+    /// the per-request caps at [`MAX_CLIENT_STATE_LEN`], and swept by
+    /// [`AuthStore::reap_expired`] once an entry has been expired for
+    /// [`EXPIRED_CONNECT_RETENTION`].
     authz: Arc<RwLock<HashMap<String, AuthzPending>>>,
     /// Minted authorization codes awaiting exchange at `/oauth/token`.
     codes: Arc<RwLock<HashMap<String, CodeGrant>>>,
@@ -1497,7 +1505,10 @@ struct AuthzPending {
     /// delegation (the *consenter* proof) it closes the split-browser injection
     /// (see the module docs).
     cookie: String,
-    created: Instant,
+    /// When `/oauth/authorize` recorded this connect. Read on tokio's clock, which
+    /// is the system's monotonic clock except in a test that pauses it, so tests
+    /// can walk a connect past its TTL and retention without waiting them out.
+    created: tokio::time::Instant,
     /// The authorization code minted once the grant is confirmed (idempotent redeem).
     code: Option<String>,
     /// Phase 2 single-flight marker: `true` while a redemption attempt (the
@@ -1515,9 +1526,17 @@ struct AuthzPending {
 impl AuthzPending {
     /// How long this connect may still be redeemed for — zero once it is past
     /// [`CONNECT_TTL`]. The single definition of "expired" for a pending connect:
-    /// the redeem gate, the reaper, and the bound ([`make_room`]) all read it.
+    /// the redeem gate, the reaper (through [`Self::forgotten`]), and the bound
+    /// ([`make_room`]) all read it.
     fn remaining(&self) -> Duration {
         CONNECT_TTL.saturating_sub(self.created.elapsed())
+    }
+
+    /// Whether the reaper may drop this connect: it has been expired for
+    /// [`EXPIRED_CONNECT_RETENTION`]. Until then the redeem gate can still tell
+    /// a late sign-in that the connect expired.
+    fn forgotten(&self) -> bool {
+        self.created.elapsed() >= CONNECT_TTL + EXPIRED_CONNECT_RETENTION
     }
 }
 
@@ -1864,13 +1883,15 @@ impl AuthStore {
     /// all times; this is what returns the memory once a burst has passed, so an
     /// abandoned connect, an unexchanged code, or an expired token doesn't linger
     /// for the process's lifetime (CWE-770). Run on the same 60s timer as the
-    /// session reaper (`McpServer::spawn_session_reaper`).
+    /// session reaper (`McpServer::spawn_session_reaper`). An expired pending
+    /// connect is the one exception that is kept for a while: it goes only once
+    /// it has been expired for [`EXPIRED_CONNECT_RETENTION`] (see there for why).
     pub(crate) async fn reap_expired(&self) -> ReapedOauthState {
         let mut reaped = ReapedOauthState::default();
         {
             let mut authz = self.authz.write().await;
             let before = authz.len();
-            authz.retain(|_, a| !a.remaining().is_zero());
+            authz.retain(|_, a| !a.forgotten());
             reaped.pending = before - authz.len();
         }
         {
@@ -1902,7 +1923,8 @@ impl AuthStore {
 /// What one [`AuthStore::reap_expired`] sweep dropped, per map.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ReapedOauthState {
-    /// Pending connects past [`CONNECT_TTL`] (an abandoned `/oauth/authorize`).
+    /// Pending connects expired for [`EXPIRED_CONNECT_RETENTION`] (an abandoned
+    /// `/oauth/authorize`).
     pending: usize,
     /// Authorization codes past [`CODE_TTL`], never exchanged.
     codes: usize,
@@ -2259,7 +2281,7 @@ pub async fn authorize(
                 client_state: q.state.clone().unwrap_or_default(),
                 code_challenge: Some(code_challenge),
                 cookie: cookie.clone(),
-                created: Instant::now(),
+                created: tokio::time::Instant::now(),
                 code: None,
                 redeeming: false,
             },
@@ -4528,7 +4550,7 @@ mod tests {
                     client_state: String::new(),
                     code_challenge: Some("cc".into()),
                     cookie: cookie.into(),
-                    created: std::time::Instant::now(),
+                    created: tokio::time::Instant::now(),
                     code: None,
                     redeeming: false,
                 },
@@ -4880,6 +4902,41 @@ mod tests {
         let tokens = store.tokens.read().await;
         assert!(tokens.contains_key("live") && !tokens.contains_key("dead"));
         assert!(store.authz.read().await.contains_key("sess-live"));
+    }
+
+    // A sign-in finished after its connect's TTL is told the connect EXPIRED.
+    // The sweep used to drop the entry within a minute of expiry, after which
+    // the redeem could only answer "unknown or already used", the same words as
+    // a restart or a reloaded callback page. The entry now outlives its TTL by
+    // EXPIRED_CONNECT_RETENTION, sweeps included, and only then is forgotten.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_redeemed_after_its_ttl_is_reported_expired() {
+        async fn redeem_error(store: &super::AuthStore, state: &str) -> String {
+            let resp = super::connect_redeem(
+                axum::extract::State(store.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(super::RedeemBody { state: state.into(), delegation: String::new() }),
+            )
+            .await;
+            assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            json["error"].as_str().expect("an error message").to_owned()
+        }
+        let store = test_store();
+        seed_pending(&store, "sess-slow", "bind-slow").await;
+
+        // Well past the TTL, with the sweep having run: still known, as expired.
+        tokio::time::advance(super::CONNECT_TTL + Duration::from_secs(5 * 60)).await;
+        assert_eq!(store.reap_expired().await.pending, 0, "an expired connect is kept");
+        let error = redeem_error(&store, "sess-slow").await;
+        assert!(error.contains("has expired"), "{error}");
+
+        // Once the retention runs out, the sweep forgets it.
+        tokio::time::advance(super::EXPIRED_CONNECT_RETENTION).await;
+        assert_eq!(store.reap_expired().await.pending, 1, "then it is dropped");
+        let error = redeem_error(&store, "sess-slow").await;
+        assert!(error.contains("unknown or already used"), "{error}");
     }
 
     // ---- Connect: link + redeem ---------------------------------------------

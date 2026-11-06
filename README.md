@@ -1022,8 +1022,10 @@ about 64 MiB per instance.
 
 The per-instance reaper (60s cadence — `spawn_session_reaper`, which a deployment
 must call) drops expired grants, **connects abandoned mid-handshake** (a session
-that never redeemed a grant, after 15 minutes), pending authorizations past their
-10-minute TTL, unexchanged authorization codes, and expired access tokens.
+that never redeemed a grant, after 15 minutes), pending authorizations an hour
+after their 10-minute TTL (kept that long so a sign-in finished late is told it
+expired, not that it is unknown), unexchanged authorization codes, and expired
+access tokens.
 Registrations are the one long-lived map: they must survive a restart, so they
 are persisted — now on a coalescing background writer (at most one full write per
 2s) instead of one full rewrite per registration.

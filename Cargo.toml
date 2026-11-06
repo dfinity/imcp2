@@ -131,6 +131,11 @@ e2e = ["dep:pocket-ic"]
 # tower::ServiceExt::oneshot and read bodies via http-body-util.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs: the pending
+# connect tests in `auth.rs` walk a connect past its TTL and retention on a
+# paused clock instead of waiting them out. A feature on a dependency the crate
+# already has, so the lockfile does not change.
+tokio = { workspace = true, features = ["test-util"] }
 
 # The profile that 'dist' will build with
 [profile.dist]
