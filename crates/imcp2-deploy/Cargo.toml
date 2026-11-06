@@ -48,9 +48,11 @@ tempfile = "3"
 # #871: #866 adds `files::Confined` (the filesystem the bundle host reads
 # through, see `src/host.rs`), #868 has `icp project bundle` write an archive
 # of regular files and directories alone, and #871 states the rule for an
-# untrusted project (`icp_project::untrusted`, what `icp --untrusted`
-# applies), which the host composes as the CLI does. Once the stack is on
-# icp-cli's main, re-pin to main.
+# untrusted project (`icp_project::untrusted`, what `--untrusted` on `icp
+# build`, `deploy` and `sync` applies): what it runs is held to a list, with
+# each module's path judged by where it really resolves. The host composes
+# the rule as the CLI does. Once the stack is on icp-cli's main, re-pin to
+# main.
 #
 #   * icp-project: manifests, the deploy operation, the id/artifact stores.
 #   * icp-events: the progress event stream the operations report on.
@@ -59,10 +61,10 @@ tempfile = "3"
 #     brings wasmtime into this workspace.
 #   * icp-canister-interfaces: the engine-canister registry id a created
 #     canister's subnet is looked up in.
-icp-project = { git = "https://github.com/dfinity/icp-cli", rev = "ae3367ef80cfb2798bc2c8395e39ad6af76a9be5" }
-icp-events = { git = "https://github.com/dfinity/icp-cli", rev = "ae3367ef80cfb2798bc2c8395e39ad6af76a9be5" }
-icp-sync-plugin = { git = "https://github.com/dfinity/icp-cli", rev = "ae3367ef80cfb2798bc2c8395e39ad6af76a9be5" }
-icp-canister-interfaces = { git = "https://github.com/dfinity/icp-cli", rev = "ae3367ef80cfb2798bc2c8395e39ad6af76a9be5" }
+icp-project = { git = "https://github.com/dfinity/icp-cli", rev = "4bba4a648ac03296ceeccc5bd0f4571a7ffa635a" }
+icp-events = { git = "https://github.com/dfinity/icp-cli", rev = "4bba4a648ac03296ceeccc5bd0f4571a7ffa635a" }
+icp-sync-plugin = { git = "https://github.com/dfinity/icp-cli", rev = "4bba4a648ac03296ceeccc5bd0f4571a7ffa635a" }
+icp-canister-interfaces = { git = "https://github.com/dfinity/icp-cli", rev = "4bba4a648ac03296ceeccc5bd0f4571a7ffa635a" }
 
 [dev-dependencies]
 # The tests hand-build small bundles (a manifest plus a wasm) and load them

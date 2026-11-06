@@ -10,8 +10,9 @@
 //! [`host`] is the `icp_project::Host` for a bundle: the archive `icp project
 //! bundle` writes, treated as untrusted input. The rule it is held to is the
 //! library's own, `icp_project::untrusted`, the one `icp --untrusted`
-//! applies (dfinity/icp-cli#871, on #866 for the confined filesystem and
-//! #868 for what `icp project bundle` writes; issue #865): this crate pins
+//! applies (dfinity/icp-cli#871, on #866 for the confined filesystem this
+//! crate reads it through and #868 for what `icp project bundle` writes;
+//! issue #865): this crate pins
 //! that stack, composes the rule as the CLI does, and adds the bounds on the
 //! archive itself and the checks on the bundle's shape. The deploy pipeline
 //! over it and the MCP tools that expose it follow in their own changes.
