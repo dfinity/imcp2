@@ -2610,6 +2610,44 @@ fn not_allowlisted_page() -> Response {
     )
 }
 
+/// What the pinned page shows for a connect past [`CONNECT_TTL`].
+const CONNECT_EXPIRED_MSG: &str = "This connect request has expired. Restart from your client.";
+
+/// Reserve the authorization code for `state` once its redemption succeeded,
+/// under the `authz` lock: the code an earlier attempt already minted, else
+/// `fresh` (`true` = newly minted, still to be recorded in `codes`). Clears the
+/// connect's `redeeming` mark either way.
+///
+/// Refused for a connect past [`CONNECT_TTL`], even one whose redemption passed
+/// the gate in time. `imcp2-core` reaps an unredeemed connect's session 15
+/// minutes in, on the promise that no connect is redeemed past its TTL, and
+/// recording the grant on a reaped session re-creates it with a fresh key that
+/// II never registered: a code minted then would hand the client a session
+/// whose every signed call fails. Until [`EXPIRED_CONNECT_RETENTION`], the sweep
+/// had dropped the entry long before that, so this check is what keeps the
+/// promise now that expired connects are retained.
+async fn reserve_code(
+    store: &AuthStore,
+    state: &str,
+    fresh: String,
+) -> Result<(String, bool), &'static str> {
+    let mut authz = store.authz.write().await;
+    let Some(a) = authz.get_mut(state) else {
+        return Err("This connect request is no longer available. Restart from your client.");
+    };
+    a.redeeming = false;
+    if a.remaining().is_zero() {
+        return Err(CONNECT_EXPIRED_MSG);
+    }
+    Ok(match &a.code {
+        Some(existing) => (existing.clone(), false),
+        None => {
+            a.code = Some(fresh.clone());
+            (fresh, true)
+        }
+    })
+}
+
 /// A JSON error the pinned page reads and displays.
 fn redeem_err(msg: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
@@ -2749,7 +2787,7 @@ pub async fn connect_redeem(
         );
     };
     if expired {
-        return redeem_err("This connect request has expired. Restart from your client.");
+        return redeem_err(CONNECT_EXPIRED_MSG);
     }
     // Initiator proof: only the browser that STARTED this connect (holding the
     // `sid` cookie) may redeem. In the confused-deputy path the delegation lands
@@ -2827,21 +2865,9 @@ pub async fn connect_redeem(
     // insert into `codes` only after releasing it (consistent lock order with
     // `token_authorization_code`).
     let fresh = format!("mcp-code-{}", Uuid::new_v4());
-    let (code, newly_minted) = {
-        let mut authz = store.authz.write().await;
-        let Some(a) = authz.get_mut(&body.state) else {
-            return redeem_err(
-                "This connect request is no longer available. Restart from your client.",
-            );
-        };
-        a.redeeming = false;
-        match &a.code {
-            Some(existing) => (existing.clone(), false),
-            None => {
-                a.code = Some(fresh.clone());
-                (fresh, true)
-            }
-        }
+    let (code, newly_minted) = match reserve_code(&store, &body.state, fresh).await {
+        Ok(reserved) => reserved,
+        Err(msg) => return redeem_err(msg),
     };
     if newly_minted {
         let mut codes = store.codes.write().await;
@@ -4992,6 +5018,29 @@ mod tests {
         assert_eq!(store.reap_expired().await.pending, 1, "then it is dropped");
         let error = redeem_error(&store, "sess-slow").await;
         assert!(error.contains("unknown or already used"), "{error}");
+    }
+
+    // A redemption that passed the gate in time but finished after the TTL gets
+    // no code. The connect's session is reaped 15 minutes in, and recording the
+    // grant re-creates it with a key II never registered, so a code minted then
+    // would be bound to a session that cannot sign; retaining expired connects
+    // must not open that up. Within the TTL the code is minted, idempotently.
+    #[tokio::test(start_paused = true)]
+    async fn no_code_is_minted_for_a_connect_past_its_ttl() {
+        let store = test_store();
+        seed_pending(&store, "sess-in-time", "bind").await;
+        seed_pending(&store, "sess-late", "bind").await;
+
+        let minted = super::reserve_code(&store, "sess-in-time", "code-1".into()).await;
+        assert_eq!(minted, Ok(("code-1".to_owned(), true)));
+        let again = super::reserve_code(&store, "sess-in-time", "code-2".into()).await;
+        assert_eq!(again, Ok(("code-1".to_owned(), false)), "the first code, idempotently");
+
+        tokio::time::advance(super::CONNECT_TTL).await;
+        let late = super::reserve_code(&store, "sess-late", "code-3".into()).await;
+        assert_eq!(late, Err(super::CONNECT_EXPIRED_MSG));
+        let authz = store.authz.read().await;
+        assert!(authz["sess-late"].code.is_none() && !authz["sess-late"].redeeming);
     }
 
     // ---- Connect: link + redeem ---------------------------------------------
