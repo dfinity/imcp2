@@ -2673,6 +2673,8 @@ enum RedeemClaim {
     Existing(String),
     /// Another attempt is mid-flight right now (a double-submit lost the race).
     InProgress,
+    /// The connect is past [`CONNECT_TTL`]: no new attempt may start on it.
+    Expired,
     /// The pending connect vanished (expiry sweep / restart).
     Vanished,
 }
@@ -2695,6 +2697,12 @@ async fn claim_redemption(store: &AuthStore, state: &str) -> RedeemClaim {
     }
     if a.redeeming {
         return RedeemClaim::InProgress;
+    }
+    // Rechecked under the lock: the gate's snapshot can predate the TTL, and a
+    // registration started on an expired connect could only be refused at the
+    // mint, after II had already granted it.
+    if a.remaining().is_zero() {
+        return RedeemClaim::Expired;
     }
     a.redeeming = true;
     RedeemClaim::Claimed(RedemptionClaim {
@@ -2848,6 +2856,7 @@ pub async fn connect_redeem(
                  If nothing happens, restart from your client.",
             );
         }
+        RedeemClaim::Expired => return redeem_err(CONNECT_EXPIRED_MSG),
         RedeemClaim::Vanished => {
             return redeem_err(
                 "This connect request is no longer available. Restart from your client.",
@@ -5072,6 +5081,21 @@ mod tests {
         }
         drop(claim);
         assert!(!store.authz.read().await["sess-late"].redeeming, "released by its own claim");
+    }
+
+    // No attempt starts on a connect past its TTL, even for a request that passed
+    // the gate just before it: the claim rechecks the TTL under the lock, so such
+    // a request answers "expired" instead of starting a registration that could
+    // only be refused at the mint.
+    #[tokio::test(start_paused = true)]
+    async fn no_attempt_is_claimed_on_a_connect_past_its_ttl() {
+        let store = test_store();
+        seed_pending(&store, "sess-x", "bind").await;
+        tokio::time::advance(super::CONNECT_TTL).await;
+
+        let claim = super::claim_redemption(&store, "sess-x").await;
+        assert!(matches!(claim, super::RedeemClaim::Expired));
+        assert!(!store.authz.read().await["sess-x"].redeeming, "nothing was claimed");
     }
 
     // ---- Connect: link + redeem ---------------------------------------------
