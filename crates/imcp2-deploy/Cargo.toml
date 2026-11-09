@@ -39,6 +39,10 @@ flate2 = "1"
 # Each deploy extracts its bundle into a scratch directory that is removed
 # when the deploy ends, whichever way it ends.
 tempfile = "3"
+# The extraction directory is resolved to the spelling the disk knows it by
+# (see `extract_bundle`); `dunce` keeps a Windows path free of the `\\?\`
+# prefix, as icp-project's own host filesystem does.
+dunce = "1"
 
 # The icp CLI's project library and the seams it is driven through, pinned to
 # one commit so the four stay in lockstep (they share a workspace version and
@@ -50,9 +54,9 @@ tempfile = "3"
 # of regular files and directories alone, and #871 states the rule for an
 # untrusted project (`icp_project::untrusted`, what `--untrusted` on `icp
 # build`, `deploy` and `sync` applies): what it runs is held to a list, with
-# each module's path judged by where it really resolves. The host composes
-# the rule as the CLI does. Once the stack is on icp-cli's main, re-pin to
-# main.
+# what each step names a regular file judged by where it really resolves.
+# The host composes the rule as the CLI does. Once the stack is on icp-cli's
+# main, re-pin to main.
 #
 #   * icp-project: manifests, the deploy operation, the id/artifact stores.
 #   * icp-events: the progress event stream the operations report on.
@@ -61,10 +65,10 @@ tempfile = "3"
 #     brings wasmtime into this workspace.
 #   * icp-canister-interfaces: the engine-canister registry id a created
 #     canister's subnet is looked up in.
-icp-project = { git = "https://github.com/dfinity/icp-cli", rev = "4bba4a648ac03296ceeccc5bd0f4571a7ffa635a" }
-icp-events = { git = "https://github.com/dfinity/icp-cli", rev = "4bba4a648ac03296ceeccc5bd0f4571a7ffa635a" }
-icp-sync-plugin = { git = "https://github.com/dfinity/icp-cli", rev = "4bba4a648ac03296ceeccc5bd0f4571a7ffa635a" }
-icp-canister-interfaces = { git = "https://github.com/dfinity/icp-cli", rev = "4bba4a648ac03296ceeccc5bd0f4571a7ffa635a" }
+icp-project = { git = "https://github.com/dfinity/icp-cli", rev = "9056f29c4c2a574551a3334d34913ce04c2cf5cb" }
+icp-events = { git = "https://github.com/dfinity/icp-cli", rev = "9056f29c4c2a574551a3334d34913ce04c2cf5cb" }
+icp-sync-plugin = { git = "https://github.com/dfinity/icp-cli", rev = "9056f29c4c2a574551a3334d34913ce04c2cf5cb" }
+icp-canister-interfaces = { git = "https://github.com/dfinity/icp-cli", rev = "9056f29c4c2a574551a3334d34913ce04c2cf5cb" }
 
 [dev-dependencies]
 # The tests hand-build small bundles (a manifest plus a wasm) and load them

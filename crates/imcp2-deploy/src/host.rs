@@ -19,11 +19,12 @@
 //! host composes it as the CLI does:
 //!
 //! * **The loaded project is vetted** ([`Vetted`]) before it is handed out:
-//!   each build step is a pre-built module, each sync step a plugin, and the
-//!   file each names is within the project, judged by where it really is
-//!   once every link is followed and every `..` applied. A project with any
-//!   other step — a script, a download — or a module or plugin that resolves
-//!   outside the root fails the load, naming what was found. The loader is
+//!   each build step is a pre-built module, each sync step a plugin, and
+//!   what each names is a regular file within the project, judged by where
+//!   it really is once every link is followed and every `..` applied. A
+//!   project with any other step — a script, a download — or a module or
+//!   plugin that resolves outside the root, or to a directory or a pipe,
+//!   fails the load, naming what was found. The loader is
 //!   the one gate on the project's shape; the builder and syncer are the
 //!   library's own, and see no other step.
 //!
@@ -791,11 +792,22 @@ fn extract_bundle_within(
             MAX_BUNDLE_BYTES
         ));
     }
+    // The root as the disk knows it. The vet resolves each module's path
+    // through this filesystem and then asks it whether a regular file is at
+    // the resolved spelling, which the filesystem holds to the root by
+    // spelling alone; a root named through a link (macOS keeps its temporary
+    // directories under `/var`, a link to `/private/var`) would put every
+    // resolved path outside it. So the root is resolved once, here, before
+    // the filesystem is held to it.
+    let into = dunce::canonicalize(into)
+        .map_err(|e| format!("the extraction directory '{into}' cannot be resolved: {e}"))?;
+    let into = Utf8PathBuf::from_path_buf(into)
+        .map_err(|p| format!("the extraction directory '{}' is not UTF-8", p.display()))?;
     // A link is refused on the way in, so nothing under the root leads out
     // of it. Should one appear later, the filesystem follows it as the host
     // does, and the vet sees a module named through it for where it really
     // is, refusing one that resolves outside the root.
-    let fs = Confined::new(into);
+    let fs = Confined::new(&into);
     let unreadable =
         |e: std::io::Error| format!("the bundle is not a readable .tar.gz archive: {e}");
     let decoder = Limited { inner: flate2::read::GzDecoder::new(bytes), left: MAX_EXTRACTED_BYTES };
@@ -1127,8 +1139,44 @@ mod tests {
         let fs = extract_bundle(&bytes, &into).unwrap();
         symlink(into.join("nowhere.wasm"), into.join("gone.wasm")).unwrap();
         let err = chain(&host_for(fs).project.load().await.expect_err("a dangling link"));
-        assert!(err.contains("does not resolve to a file"), "{err}");
+        assert!(err.contains("does not resolve to anything"), "{err}");
         assert!(err.contains("gone.wasm"), "{err}");
+    }
+
+    // What a step names must be a regular file: a directory of the bundle
+    // named as a module is refused at the load, naming what was found. (A
+    // pipe cannot arrive in an archive: extraction writes files and
+    // directories alone.)
+    #[tokio::test]
+    async fn a_directory_named_as_a_module_fails_the_load() {
+        let manifest = "canisters:\n  - name: backend\n    build:\n      steps:\n        \
+                        - type: pre-built\n          path: assets\n";
+        let (_dir, into) = scratch();
+        let bytes = archive_with_dirs(&[("icp.yaml", manifest.as_bytes())], &["assets"]);
+        let fs = extract_bundle(&bytes, &into).unwrap();
+        let err = chain(&host_for(fs).project.load().await.expect_err("a directory"));
+        assert!(err.contains("not a regular file"), "{err}");
+        assert!(err.contains("assets"), "{err}");
+    }
+
+    // The root is taken as the disk knows it: named through a link, the
+    // extraction lands in the directory the link leads to, and the project
+    // in it loads — the vet's resolved paths lie under the root it was given.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_root_named_through_a_link_is_the_directory_it_leads_to() {
+        let manifest = "canisters:\n  - name: backend\n    build:\n      steps:\n        \
+                        - type: pre-built\n          path: backend.wasm\n";
+        let (dir, into) = scratch();
+        let alias = Utf8PathBuf::from_path_buf(dir.path().with_extension("alias")).unwrap();
+        std::os::unix::fs::symlink(&into, &alias).unwrap();
+        let bytes = archive(&[("icp.yaml", manifest.as_bytes()), ("backend.wasm", b"\0asm")]);
+        let fs = extract_bundle(&bytes, &alias).unwrap();
+        assert_eq!(fs.root(), dunce::canonicalize(&into).unwrap());
+        assert!(into.join("backend.wasm").is_file());
+        let project = host_for(fs).project.load().await.unwrap();
+        assert_eq!(project.canisters.len(), 1);
+        std::fs::remove_file(&alias).unwrap();
     }
 
     /// An error and its causes, outermost first.
