@@ -190,11 +190,22 @@ pub async fn deploy_bundle(
     };
 
     let host = host::host_for(fs.clone());
-    let selection = EnvironmentSelection::Named(request.environment.clone());
     // The load is where the untrusted rule holds (a script step, a module or
-    // plugin fetched from a URL or resolving outside the root, a recipe: the
-    // project does not load), so the environment is the first thing a bundle
-    // outside it fails to give.
+    // plugin fetched from a URL or not a regular file under the root, a
+    // recipe: the project does not load), so it is the first thing a bundle outside the
+    // rule fails. It reads the manifest and, through the metered view, every
+    // file a canister names, with the filesystem's own blocking reads: like
+    // extraction it runs off the runtime's workers, and the loader keeps
+    // what it loaded for every later ask.
+    {
+        let project = host.project.clone();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || handle.block_on(project.load()))
+            .await
+            .map_err(|e| RequestError(format!("project load panicked: {e}")))?
+            .map_err(|e| RequestError(error_chain(&e)))?;
+    }
+    let selection = EnvironmentSelection::Named(request.environment.clone());
     let env = host.get_environment(&selection).await.map_err(|e| RequestError(error_chain(&e)))?;
     // Before any phase runs: a bundle that is not one — a wasm that is
     // missing or does not hash to its checksum, a network other than the IC

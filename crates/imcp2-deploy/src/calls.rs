@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use candid::Principal;
 use ic_agent::{
     agent::{CallResponse, EffectiveId, SubnetType},
-    hash_tree::{Label, LookupResult},
+    hash_tree::{HashTree, Label, LookupResult},
     Agent, AgentError,
 };
 use icp_project::calls::{Authority, Call, CallError, CanisterCalls, RouteTo};
@@ -68,59 +68,20 @@ impl AgentCalls {
     }
 
     /// Ask the target's subnet to certify a metadata section, reporting only
-    /// what the certificate proves.
-    ///
-    /// The section path is requested together with `controllers`, because a
-    /// metadata path proven absent is equally what a canister that was never
-    /// created looks like — `controllers` is written at creation, so its
-    /// presence is what separates the two. A canister with no module installed
-    /// has no sections at all, which the certificate reports as an absent path
-    /// under a canister that exists, and so as `Ok(None)`.
+    /// what the certificate proves — see [`certified_section`] for what that
+    /// is.
     async fn certified_metadata_section(
         &self,
         canister: Principal,
         path: &str,
     ) -> Result<Option<Vec<u8>>, CallError> {
-        let metadata_path: Vec<Label<Vec<u8>>> = vec![
-            "canister".into(),
-            Label::from_bytes(canister.as_slice()),
-            "metadata".into(),
-            path.into(),
-        ];
-        let controllers_path: Vec<Label<Vec<u8>>> =
-            vec!["canister".into(), Label::from_bytes(canister.as_slice()), "controllers".into()];
-        let method = "read_state(metadata)";
+        let (metadata_path, controllers_path) = section_paths(canister, path);
         let cert = self
             .agent
-            .read_state_raw(vec![metadata_path.clone(), controllers_path.clone()], canister)
+            .read_state_raw(vec![metadata_path, controllers_path], canister)
             .await
-            .map_err(|err| Self::wrap(canister, method, err))?;
-
-        let unproven = |about: String| {
-            Err(CallError::Rejected {
-                canister,
-                method: method.to_owned(),
-                code: None,
-                message: format!("the certificate proves nothing about {about}"),
-            })
-        };
-        match cert.tree.lookup_path(&metadata_path) {
-            LookupResult::Found(bytes) => Ok(Some(bytes.to_vec())),
-            LookupResult::Absent => match cert.tree.lookup_path(&controllers_path) {
-                LookupResult::Found(_) => Ok(None),
-                LookupResult::Absent => Err(CallError::Rejected {
-                    canister,
-                    method: method.to_owned(),
-                    code: None,
-                    message: format!("canister {canister} does not exist"),
-                }),
-                _ => unproven(format!("canister {canister}")),
-            },
-            // Not proof of absence, just a certificate that says nothing about
-            // the path — reporting the section missing off this would be a
-            // guess, and a private section is exactly what it looks like.
-            _ => unproven(format!("section `{path}` of canister {canister}")),
-        }
+            .map_err(|err| Self::wrap(canister, READ_STATE_METADATA, err))?;
+        certified_section(canister, path, &cert.tree)
     }
 
     /// A subnet-scoped update: routed to a subnet rather than to any canister
@@ -149,6 +110,62 @@ impl AgentCalls {
                     .0)
             }
         }
+    }
+}
+
+/// The method name a certified metadata read reports itself under.
+const READ_STATE_METADATA: &str = "read_state(metadata)";
+
+/// A path into the state tree, label by label.
+type StatePath = Vec<Label<Vec<u8>>>;
+
+/// The two state-tree paths a metadata read asks for: the section, and the
+/// canister's controllers (see [`certified_section`] for why both).
+fn section_paths(canister: Principal, path: &str) -> (StatePath, StatePath) {
+    let canister_path = || vec![Label::from("canister"), Label::from_bytes(canister.as_slice())];
+    let mut metadata = canister_path();
+    metadata.extend(["metadata".into(), path.into()]);
+    let mut controllers = canister_path();
+    controllers.push("controllers".into());
+    (metadata, controllers)
+}
+
+/// What a certificate proves about section `path` of `canister`, and nothing
+/// more: `Some` for a section it holds, `None` for a canister it proves has
+/// no such section, and an error for a canister it proves absent or a path
+/// it says nothing about.
+///
+/// The section is read together with `controllers`, because a metadata path
+/// proven absent is equally what a canister that was never created looks
+/// like — `controllers` is written at creation, so its presence is what
+/// separates the two. A canister with no module installed has no sections
+/// at all, which the certificate reports as an absent path under a canister
+/// that exists, and so as `Ok(None)`.
+fn certified_section(
+    canister: Principal,
+    path: &str,
+    tree: &HashTree<Vec<u8>>,
+) -> Result<Option<Vec<u8>>, CallError> {
+    let (metadata_path, controllers_path) = section_paths(canister, path);
+    let rejected = |message: String| CallError::Rejected {
+        canister,
+        method: READ_STATE_METADATA.to_owned(),
+        code: None,
+        message,
+    };
+    let unproven =
+        |about: String| Err(rejected(format!("the certificate proves nothing about {about}")));
+    match tree.lookup_path(&metadata_path) {
+        LookupResult::Found(bytes) => Ok(Some(bytes.to_vec())),
+        LookupResult::Absent => match tree.lookup_path(&controllers_path) {
+            LookupResult::Found(_) => Ok(None),
+            LookupResult::Absent => Err(rejected(format!("canister {canister} does not exist"))),
+            _ => unproven(format!("canister {canister}")),
+        },
+        // Not proof of absence, just a certificate that says nothing about
+        // the path — reporting the section missing off this would be a
+        // guess, and a private section is exactly what it looks like.
+        _ => unproven(format!("section `{path}` of canister {canister}")),
     }
 }
 
@@ -246,5 +263,103 @@ impl CanisterCalls for AgentCalls {
             .await
             .map_err(|e| Self::wrap(subnet, "subnet_type", e))?;
         Ok(matches!(info.subnet_type(), Some(SubnetType::CloudEngine)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ic_agent::hash_tree::{fork, label, leaf, pruned};
+
+    const PATH: &str = "candid:service";
+
+    fn canister() -> Principal {
+        Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai").unwrap()
+    }
+
+    /// A state tree holding `node` under this canister's entry.
+    fn under_canister(node: HashTree<Vec<u8>>) -> HashTree<Vec<u8>> {
+        label("canister", label(Label::from_bytes(canister().as_slice()), node))
+    }
+
+    /// The `controllers` entry creation writes; its bytes are not read here.
+    fn controllers() -> HashTree<Vec<u8>> {
+        label("controllers", leaf(b"\x81\x41\x01".to_vec()))
+    }
+
+    fn rejection(result: Result<Option<Vec<u8>>, CallError>) -> String {
+        match result {
+            Err(CallError::Rejected { message, .. }) => message,
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    // A section the certificate holds is what the check parses.
+    #[test]
+    fn a_section_the_certificate_holds_is_returned() {
+        let tree = under_canister(fork(
+            controllers(),
+            label("metadata", label(PATH, leaf(b"service : {}".to_vec()))),
+        ));
+        assert_eq!(
+            certified_section(canister(), PATH, &tree).unwrap(),
+            Some(b"service : {}".to_vec())
+        );
+    }
+
+    // A canister that exists — its controllers are proven — with no such
+    // section: none installed yet, or a module without one. Either reads as
+    // "no section", not as "no canister".
+    #[test]
+    fn a_canister_proven_to_exist_without_the_section_has_none() {
+        let no_module = under_canister(controllers());
+        assert_eq!(certified_section(canister(), PATH, &no_module).unwrap(), None);
+        let other_section = under_canister(fork(
+            controllers(),
+            label("metadata", label("other", leaf(b"x".to_vec()))),
+        ));
+        assert_eq!(certified_section(canister(), PATH, &other_section).unwrap(), None);
+    }
+
+    // The tree proves another canister's entry and no entry for this one:
+    // the section is absent because the canister is.
+    #[test]
+    fn a_canister_the_certificate_proves_absent_does_not_exist() {
+        let other = Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap();
+        let tree = label("canister", label(Label::from_bytes(other.as_slice()), controllers()));
+        let message = rejection(certified_section(canister(), PATH, &tree));
+        assert_eq!(message, format!("canister {} does not exist", canister()));
+    }
+
+    // A pruned subtree where the section would be proves neither presence
+    // nor absence — a private section looks exactly like this — so no
+    // answer is given off it.
+    #[test]
+    fn a_pruned_section_proves_nothing() {
+        let tree = under_canister(fork(controllers(), pruned([0u8; 32])));
+        let message = rejection(certified_section(canister(), PATH, &tree));
+        assert_eq!(
+            message,
+            format!(
+                "the certificate proves nothing about section `{PATH}` of canister {}",
+                canister()
+            )
+        );
+    }
+
+    // The section is proven absent but the controllers are pruned: whether
+    // the canister exists is what the certificate does not say, so neither
+    // "no section" nor "no canister" is reported.
+    #[test]
+    fn a_pruned_controllers_entry_proves_nothing_about_the_canister() {
+        let tree = under_canister(fork(
+            pruned([0u8; 32]),
+            label("metadata", label("other", leaf(b"x".to_vec()))),
+        ));
+        let message = rejection(certified_section(canister(), PATH, &tree));
+        assert_eq!(
+            message,
+            format!("the certificate proves nothing about canister {}", canister())
+        );
     }
 }
