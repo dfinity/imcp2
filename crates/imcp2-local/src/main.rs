@@ -180,13 +180,20 @@ async fn serve() -> anyhow::Result<()> {
     // hands core answers every tool call's "which session?" from it.
     let slot = SessionSlot::new();
     let tools = IcTools::new(agent, identities.clone(), slot.resolver());
-    let deploy = IcDeployTools::new(identities.clone(), slot.resolver());
-    let deploy = match dirs::data_local_dir() {
-        Some(data) => deploy
-            .deploys_in(&data.join("imcp2-local").join("deploys"))
-            .map_err(anyhow::Error::msg)?,
-        None => deploy,
+    // A deploy cut off mid-run leaves the ids it created in its working
+    // directory, where the README says to look; with no local data directory
+    // to keep it under there is nowhere to say, so the server does not start
+    // rather than keeping records somewhere the user is not told of.
+    let Some(data) = dirs::data_local_dir() else {
+        anyhow::bail!(
+            "no local data directory for this user, so a deploy cut off mid-run would have \
+             nowhere to leave the canister ids it created: set HOME (on Linux, or \
+             XDG_DATA_HOME) and start again"
+        );
     };
+    let deploy = IcDeployTools::new(identities.clone(), slot.resolver())
+        .deploys_in(&data.join("imcp2-local").join("deploys"))
+        .map_err(anyhow::Error::msg)?;
     let auto_open = !truthy("IMCP2_NO_OPEN");
     let login = login::LoginDriver::new(identities, slot, auto_open);
 
