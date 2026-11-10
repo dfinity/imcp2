@@ -48,7 +48,7 @@ Published on [crates.io](https://crates.io/crates/imcp2), API docs on
 
 ```toml
 [dependencies]
-imcp2 = "0.6"
+imcp2 = "0.7"
 ```
 
 One `McpServer` serves one Internet Identity instance as two
@@ -127,6 +127,13 @@ shared `SharedClients`, one `auth_callbacks_router` over all of them) — exactl
 what the bundled binary does on staging, serving production Internet Identity at
 `/mcp` and beta at `/mcp-beta` (see below).
 
+A server built with `McpServer::new` keeps its sign-ins in its own memory, so a
+client has to come back to that process. To run several interchangeable processes
+behind a load balancer that is not sticky, build each server with
+**`McpServer::with_shared_sessions(config, &shared)`** instead, on one
+`SharedSessions` per process: see [Shared sessions](#shared-sessions-several-processes)
+below.
+
 ### Metrics (`imcp2::metrics`)
 
 Prometheus instrumentation, usable from the library (the `prometheus` crate at
@@ -152,6 +159,10 @@ instance (labelled `ii_instance`, because Prometheus's own `instance` target
 label renames a colliding exposed one to `exported_instance`), `build_info`, and
 process start time. `register_process_collector(&registry)` adds CPU/RSS/fd
 separately — un-namespaced `process_*` belongs to the application, not the crate.
+With [shared sessions](#shared-sessions-several-processes), register the
+engine's `imcp2_shared_*` series once per process with
+`SharedSessions::register_metrics(&registry)`; `live_sessions` and
+`active_sessions` then count the sessions open on that process.
 
 The bundled binary serves `/metrics` only when `$MCP_SERVE_METRICS` is set: the
 native deployment sets it and has Caddy hide the path publicly; a PaaS deployment
@@ -570,7 +581,13 @@ cargo run
 # honours $PORT (default 8000), $PUBLIC_URL (default http://localhost:8000),
 # $MCP_SERVE_BETA (set it to also serve the beta II instance at /mcp-beta, for staging),
 # and $MCP_SERVE_METRICS (set it to serve the Prometheus exposition at /metrics)
+
+cargo run -- --help               # every environment variable, the IMCP2_SHARED_* ones included
+cargo run -- shared-config-check  # check the shared-sessions configuration as a start would, then stop
+cargo run -- shared-key-check     # print the shared-sessions key checks (see Shared sessions)
 ```
+
+Any other argument is refused (exit status 2).
 
 The human-facing pages — the landing page and the `/privacy-policy`,
 `/support`, and `/terms` documents the connector directories require — are
@@ -597,7 +614,9 @@ only runtime file is the OAuth clients store, which the server always uses: it r
 the file on startup and writes it (best-effort) as client registrations change, so
 give it a writable directory. imcp2 creates its operational files in
 `IMCP2_STATE_DIR` (the clients store at `<dir>/oauth-clients.json`); it defaults to
-the working directory. On `SIGTERM` (what
+the working directory. With [shared sessions](#shared-sessions-several-processes)
+on, it also reads two files at start (this process's identity PEM and the keyring)
+and keeps no session state of its own on disk. On `SIGTERM` (what
 `systemctl stop`/`restart` sends) or `SIGINT`, the server drains in-flight requests
 before exiting, so a redeploy doesn't cut off calls mid-flight. Two requirements
 when hosting:
@@ -662,7 +681,7 @@ single JSON-RPC object, not an SSE stream. The POST handler still requires the d
 `Accept` header.
 
 ```bash
-TOKEN=mcp-token-…   # from the OAuth flow (client -> Internet Identity sign-in)
+TOKEN=mcp-token-…   # from the OAuth flow (client -> Internet Identity sign-in); imcp2_at1.… with shared sessions
 H=(-H "Accept: application/json, text/event-stream" -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN")
 
 # anonymous public read from a real mainnet canister (ICP ledger); pass
@@ -711,7 +730,13 @@ its AS issuer is `<PUBLIC_URL>/mcp` and everything OAuth lives under it:
   LRU-evicted store — see [Bounded state](#bounded-state-memory--disk)); requested `grant_types` are
   honoured (intersected with `authorization_code`). A **hosted** `redirect_uri` is
   rejected unless its host is on the allow-list (see the Companion-control note
-  below); loopback redirects are always accepted.
+  below); loopback redirects are always accepted. With
+  [shared sessions](#shared-sessions-several-processes) on, nothing is stored:
+  the server answers with a self-describing `imcp2_dcr1.…` client id that carries
+  the redirect URIs themselves (unsealed, at most 2048 characters), so every
+  process accepts it and it survives restarts without a file. Such ids are
+  accepted with sharing off too; `client-…` ids from the store keep working on the
+  process that issued them.
 - **Client ID Metadata Documents** — the MCP authorization spec's preferred
   registration, advertised as `client_id_metadata_document_supported: true`. A
   client may skip `/register` and use the https URL of its metadata document as
@@ -894,9 +919,13 @@ days).
 means an authenticated request in that window, and also the connect that redeems
 the grant (which is itself treated as activity) — so a freshly-connected session
 counts immediately, before its first tool call; it is not strictly "made an
-authenticated request". Prefer it for **timing a redeploy**: a restart wipes the
-in-memory session and token maps, forcing every connected client to reconnect, so
-the disruption falls on whoever is active at that moment, not on long-idle grants.
+authenticated request". Prefer it for **timing a redeploy**: without shared
+sessions, a restart wipes the in-memory session and token maps, forcing every
+connected client to reconnect, so the disruption falls on whoever is active at
+that moment, not on long-idle grants. (With
+[shared sessions](#shared-sessions-several-processes) a restart signs nobody
+out, since the sessions live in the session canister; both gauges then count
+the sessions open on this process, not the deployment's.)
 Because it is activity-based, a single reading is a point-in-time snapshot;
 sample it over time (scrape `/version` on a schedule, or read request rate from
 the request logs below) to find a genuinely low-traffic window before deploying.
@@ -918,6 +947,9 @@ that sweep. The same sweep logs `abandoned connects reaped` (with a `count`) for
 sign-ins that were started but never completed — those never opened a session, so
 they get no paired `closed` line. See
 [Bounded state](#bounded-state-memory--disk) for everything the sweep covers.
+With shared sessions, `session opened` / `session closed` are `info` only on the
+process that ran the sign-in's redeem or token step; a process that later opens
+the session to serve it logs them at `debug`.
 
 **Callback allow-list (`/.well-known/ii-auth-callbacks`).** II is moving to
 validate the connect callback named in the (attacker-craftable) link fragment
@@ -958,8 +990,10 @@ reaches (or is logged by) this server. (The chosen access level does come
 Server side:
 
 - **`X`, a per-connect registration keypair** bound to the connect cookie;
-  `priv(X)` never leaves the backend, and `pub(X)` rides the II link
-  (`registration_key`, base64url DER).
+  `priv(X)` never leaves the backend in the clear, and `pub(X)` rides the II link
+  (`registration_key`, base64url DER). (With shared sessions, X and S are both
+  derived from a random connect secret that rides sealed in the cookie, so any
+  backend can redeem; without the keyring the cookie is opaque.)
 - **A pinned callback page** at `GET …/oauth/connect/callback` — the *sole* reader
   of the returned fragment. It reads `location.hash` client-side, POSTs it (with
   the connect cookie) to `POST …/oauth/connect/redeem`, and reflects nothing into
@@ -1032,6 +1066,18 @@ Note the server itself does **no rate limiting**; these bounds cap what a flood
 can cost in memory and disk, not the request rate. Put a rate limiter in front
 (the reverse proxy) if you need that.
 
+With [shared sessions](#shared-sessions-several-processes), `/oauth/register` and
+`/oauth/authorize` store nothing: a registration is a self-describing client id, and
+a connect in flight rides in its sealed `mcp_connect` cookie (so `redirect_uri`
+plus `state` may come to at most 2600 bytes). A session is held in a process's
+memory only while it is being served there, at most `IMCP2_SHARED_ADOPTED_CAP`
+(50 000) per instance, a session idle for 15 minutes making room; a cache full of
+active sessions answers `503`, never evicting anyone. The other per-process bounds
+are the mirror of sealed records (`IMCP2_SHARED_MIRROR_CAP`, 500 000), a redeem
+claim per connect (1 024), the token-exchange cache (10 000 codes for 360 s), the
+activity reports (200 000) and the negative and replicated-read caches (10 000
+each). The canister bounds the rest (see the design record).
+
 ### Read-only sessions
 
 II's consent screen requires an explicit access-level choice: **"Questions
@@ -1054,7 +1100,9 @@ without opaque low-level errors:
 **The server generates a fresh per-connection Ed25519 session key `S` and binds it
 itself.** At connect redemption it signs one `mcp_register_v2(pub(S))` call as the
 registration key `X` (see the handshake above), which binds `S` to the user's
-anchor as a time-boxed grant. `priv(S)` never leaves the backend. The issued access
+anchor as a time-boxed grant. `priv(S)` never leaves the backend in the clear: with
+[shared sessions](#shared-sessions-several-processes) it is also stored in the
+session canister, sealed under the deployment keyring the backends hold. The issued access
 token is bound to the session key's principal
 (`self_authenticating(session_pubkey)`), which is exactly the identity the grant is
 bound to.
@@ -1067,7 +1115,8 @@ remain a deliberate non-goal: with the token matched to the grant there is nothi
 to refresh against — when the grant lapses, so does the token, and the client
 re-runs the authorization-code flow. (If the grant expiration isn't known at issue
 time, the token falls back to a 1h TTL; the grant is the hard ceiling at II either
-way.) Treat any `Unauthorized` from II
+way. A shared-sessions token always carries the grant's expiry from the session
+record, so it never falls back.) Treat any `Unauthorized` from II
 as "session over → reconnect": the server surfaces a reconnect message and does
 not retry.
 
@@ -1090,11 +1139,160 @@ OIDC-style `/mcp-beta/.well-known/…` alternate, resource metadata at
 `II_URL` (default `https://beta.id.ai`) and `II_CANISTER_ID` (default
 `fgte5-ciaaa-aaaad-aaatq-cai`).
 
-Sessions and tokens are per-instance (a `/mcp` token is not valid on
-`/mcp-beta` and vice versa), while dynamic client registrations are shared
+Sessions and tokens belong to one II instance (a `/mcp` token is not valid on
+`/mcp-beta` and vice versa), with or without shared sessions: shared, each
+instance is its own namespace in the session canister, and nothing sealed for one
+opens for the other. Dynamic client registrations are shared between instances
 (they only pin redirect URIs). II trust is by origin, so users enable this
 server's origin as their trusted MCP server in their **beta.id.ai** settings
 (a separate identity from their production anchor).
+
+## Shared sessions (several processes)
+
+Out of the box, each `imcp2` process keeps its sign-ins in memory: a client must keep
+reaching the process that signed it in, and a restart signs everyone out. **Shared
+sessions** lift both limits. Several processes, behind a load balancer that need not be
+sticky, share their OAuth and Internet Identity sessions through one ICP canister, the
+**session canister** (`crates/imcp2-session-canister`, shipped as a reproducibly built
+wasm with every release). Any process can then serve any hop of a sign-in and every
+later request.
+
+**When to use it:** to run more than one process for one public origin, or to redeploy
+without signing users out. With sharing off (the default), imcp2 behaves as before; the
+one difference is that it also accepts the `imcp2_dcr1.` client ids a sharing deployment
+issues.
+
+How it works:
+
+- **One sealed record per session.** At `/oauth/connect/redeem` the process stores the
+  session in the canister: the session key S with its session id, grant expiry and
+  access level, sealed (XChaCha20-Poly1305) under a **keyring** every process of the
+  deployment holds. The canister never sees inside, and no user principal, anchor,
+  client id or redirect URI is stored. A record goes when its grant expires (at most
+  30 days), or earlier if an idle timeout below the 30-day default is configured.
+- **Self-contained credentials.** The client id (`imcp2_dcr1.…`), the connect cookie
+  (`imcp2_cx1.…`), the code (`imcp2_ac1.…`) and the access token (`imcp2_at1.…`) carry
+  what the next hop needs, so no hop depends on the memory of the process that served
+  the previous one.
+- **Two canister updates per sign-in, none per request.** `put_session` at redeem and
+  `consume_code` at `/oauth/token`, about 2 s each. Every process mirrors the canister's
+  records (a free poll every second), so an authenticated MCP request is served from
+  memory.
+- **Trouble is a 503, not a sign-out.** A canister outage, replication lag, key drift
+  or a newer release's format answers `503` with `Retry-After: 5`, and at `/mcp` without
+  `WWW-Authenticate`, so clients retry. A client is sent to sign in again (401) only on
+  an authoritative fact: the session was purged, its grant expired, or its key was
+  retired.
+- **Restarts lose nothing.** A process keeps no session state on disk; on start it
+  rebuilds its mirror from the canister.
+
+The bundled binary turns it on with `IMCP2_SHARED_CANISTER_ID` (`imcp2 --help` lists the
+same variables; a blank value counts as unset):
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `IMCP2_SHARED_CANISTER_ID` | The session canister. Set: sharing is on. | unset: off |
+| `IMCP2_SHARED_IDENTITY_PEM_FILE` | This process's own identity, an unencrypted PEM: secp256k1 (`EC PRIVATE KEY` or PKCS#8) or Ed25519 (PKCS#8). Its principal must be on the canister's allow-list. | required |
+| `IMCP2_SHARED_KEYS_FILE` | The keyring file: `kid:base64` entries (kid 1 to 255, 32-byte keys), comma- or line-separated, in sealing-preference order. The same on every process. | set this or the next |
+| `IMCP2_SHARED_KEYS` | The keyring inline. Prefer the file: an environment is readable by every process of the same user. Both set is an error. | |
+| `IMCP2_SHARED_IC_URL` | The IC API endpoint the canister is called through. | `https://icp-api.io` |
+| `IMCP2_SHARED_FETCH_ROOT_KEY` | `1`/`true`/`yes`/`on`: trust the root key the endpoint reports. Local and test replicas only; refused for a mainnet endpoint. | off |
+| `IMCP2_SHARED_MIRROR_CAP` | Sealed records mirrored in memory (about 300 B each), 1000 to 5 000 000. | 500 000 |
+| `IMCP2_SHARED_ADOPTED_CAP` | Sessions each instance keeps open in memory, 100 to 500 000. | 50 000 |
+| `IMCP2_SHARED_POLL_MS` | The poll interval in ms, 100 to 30 000. | 1000 |
+
+Every setting is checked, and both files are read, before the server binds: a bad one
+exits with status 1 and an `Error:` line naming the variable (never quoting a key). An
+unreachable canister does not stop the start; the process runs, not ready, until the
+canister answers. On shutdown, after the drain, pending activity reports get at most 5 s.
+
+`imcp2 shared-config-check` runs exactly those checks on the same environment, then
+stops, with no network call: it prints the canister id, this process's principal (the
+one the allow-list must hold) and the keyring's kids and fingerprints, or exits 1 with
+the `Error:` line a start would print. With sharing off it says so and exits 0. Run it
+after changing the configuration or either file, before restarting onto them; the
+native deploy (`deploy/native`) runs the new binary's check on the host before it
+installs that binary or restarts anything.
+
+**What a deployment needs** (the runbook has every step):
+
+1. the session canister, installed from a release's `imcp2-session-canister.wasm.gz`,
+   with every process's principal on its allow-list;
+2. one identity (PEM) per process;
+3. one keyring for the whole deployment, and its key checks published in the canister.
+   `imcp2 shared-key-check` prints them from the keyring alone, with no network call, one
+   line per kid that is the Candid argument as is:
+
+   ```bash
+   IMCP2_SHARED_KEYS_FILE=/etc/imcp2/keys imcp2 shared-key-check
+   # record { kid = 1 : nat8; check = blob "\ea\f4\8e…" } /* fingerprint eaf48e9dd7cc754f */
+   dfx canister call <canister-id> admin_set_key_check '(<that line>, false)'
+   ```
+
+**Probes:**
+
+- **`GET /ready/shared`** answers `200 ready` once this process can serve shared
+  sessions (its first sync done, a verified key to seal under, its identity allowed),
+  `503 not ready` otherwise, and `404` with sharing off. Use it **only** to choose
+  upstreams for the MCP routes (for example Caddy's `health_uri /ready/shared`), never
+  as a liveness check or a gateway's global health: a process stays ready through a
+  canister outage on purpose, serving every session it holds, so a canister problem
+  never drains every process at once. The one exception is a snapshot load older than
+  a key rotation: no process then has a verified key to seal under until the key
+  checks are published again (runbook, 8.10).
+- **`/version`** gains a `shared` block: the canister, this process's principal, `up`,
+  `ready`, `synced`, `identity_refused`, the state of each key (`kids`), the feed
+  position and the time since the canister last answered. With sharing off the key is
+  absent.
+- **`/metrics`** gains the `imcp2_shared_*` series: reachability (`imcp2_shared_up`),
+  readiness, every canister call, key states, 503s by endpoint and reason, and the
+  canister's own counts (aggregate those with `max()`).
+
+**In a library,** build each server with `McpServer::with_shared_sessions` on one
+`SharedSessions` per process (`McpConfig` and `McpServer::new` are unchanged):
+
+```rust
+use imcp2::{Agent, McpServer, SealingKeys, SharedSessions, SharedSessionsConfig, IC_URL};
+
+// This process's own identity, on the canister's allow-list, in an agent of its own
+// (not McpConfig::agent). Keep query signature verification on (the default).
+let node_agent = Agent::builder().with_url(IC_URL).with_boxed_identity(node_identity).build()?;
+let mut cfg = SharedSessionsConfig::new(
+    node_agent,
+    canister_id,                                // the session canister
+    SealingKeys::from_file("/etc/imcp2/keys")?, // the same keyring on every process
+);
+cfg.mirror_cap = 500_000;                       // optional: every field has a default
+let shared = SharedSessions::new(cfg);          // no network call, no task yet
+shared.register_metrics(&registry)?;            // once per process
+
+let server = McpServer::with_shared_sessions(config, &shared); // instead of McpServer::new(config)
+server.spawn_session_reaper();                  // also starts the engine's sync loop, once
+// ... nest and merge the routers exactly as for McpServer::new; then, after draining:
+server.shutdown();
+shared.flush().await;                           // send pending activity reports
+```
+
+- **One engine, many servers.** Give every server of the process (production and beta
+  II, say) the same `SharedSessions`; each is its own namespace, so nothing crosses
+  instances.
+- **`SharedSessionsConfig`** (`#[non_exhaustive]`, so set fields after `new`):
+  `poll_interval` 1 s, `replicated_debounce` 30 s, `replicated_interval` 300 s,
+  `touch_flush_interval` 60 s, `status_interval` 900 s, `call_timeout` 10 s,
+  `token_call_deadline` 8 s, `mirror_cap` 500 000, `adopted_cap` 50 000.
+- **`SharedSessions::ready()`** is for choosing MCP upstreams only, as `/ready/shared`
+  above; `SharedSessions::status()` (or `McpServer::shared_status()`) is the `/version`
+  block, and holds nothing secret.
+- **Dropping the `McpServer` handle** once its routers are built is safe, as with
+  `McpServer::new`: the routers and the reaper keep the server attached until
+  `shutdown()`.
+
+Further reading: the design record,
+[`docs/scoping-shared-sessions.md`](docs/scoping-shared-sessions.md) (formats, the
+canister, the sync rules, the security analysis), and the operations runbook,
+[`docs/shared-sessions-operations.md`](docs/shared-sessions-operations.md) (creating the
+canister, keys and rotation, enabling and rolling back, incidents, monitoring). The
+staging host's wiring is in [`deploy/native/README.md`](deploy/native/README.md).
 
 ## Domain identities (on demand)
 

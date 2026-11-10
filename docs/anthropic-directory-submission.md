@@ -215,6 +215,23 @@ server actually does, it should cover at least:
   events that include session ids and the Service-scoped principal; the
   Service's own logs do not systematically record client IPs or user agents
   (Caddy runs without access logs).
+  When a deployment
+  enables shared sessions (several backends sharing sign-ins; off unless
+  `IMCP2_SHARED_CANISTER_ID` is set), the storage changes: each session is
+  also stored as an **encrypted record in an Internet Computer canister the
+  deployment operates**. The record is the session key sealed
+  (XChaCha20-Poly1305) under the operator's keyring, with the session id,
+  grant expiry and access level inside the seal; it holds no user principal,
+  anchor, client id or redirect URI. It is kept until the grant expires (at
+  most 30 days) or the configured idle purge removes it, and **sessions then
+  survive process restarts**. Client registrations are no longer stored (the
+  `imcp2_dcr1.` client id carries its redirect URIs), and codes and tokens are
+  self-contained sealed values. Codes are not stored; the backend that issues
+  an access token keeps it, sealed, in memory for about seven minutes (longer
+  only while that backend rebuilds its copy of the session records), so that
+  a retried exchange of the same code gets the same answer. See
+  [`scoping-shared-sessions.md`](scoping-shared-sessions.md), 9.1, for
+  everything the canister holds.
 - **Public-network consequence:** calls the user makes execute on the
   Internet Computer, a public network, as the user's per-app principal; what
   an application records or publishes when called is governed by that
@@ -596,3 +613,4 @@ conversation beyond tool arguments and generates no media.
 - [x] Submitter is on a paid Claude plan (the portal's only access requirement; no organization role is needed)
 - [x] Review passed (2026-10-28, after the 0.6.0 guard change the reviewer asked for) and the listing published at <https://claude.ai/directory/connectors/icp>, with the Verified checkmark
 - [ ] Icon and categories: the live catalog record has no icon and no categories, so the listing shows a placeholder letter and is not browsable by topic. Add the 1024×1024 PNG from blocker 5 and pick categories through a listing edit in the portal; edits go through review, and the live listing stays up meanwhile
+- [ ] <!-- NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions. --> **[NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions]** Before production enables shared sessions (release 0.7.0 ships them off): legal and product sign off the privacy-policy wording for encrypted session records in an Internet Computer canister and sessions surviving restarts (the "Storage/retention" bullet above, and the marked passages of [`icp-mcp-privacy-policy-draft.md`](icp-mcp-privacy-policy-draft.md)), the served policy is updated, and whether the listing's data-handling answers need a change is decided

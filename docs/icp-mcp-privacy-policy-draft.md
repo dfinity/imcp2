@@ -33,6 +33,23 @@
 > fronting layer logs and where, is operator knowledge this repository does
 > not hold — reconcile those sections with the operators and legal before
 > republishing.
+> a deployment can now run several servers that share sign-ins through an
+> Internet Computer canister the deployment operates
+> (`docs/scoping-shared-sessions.md`). With it enabled, an encrypted session
+> record (the session signing key, sealed under a key only the deployment's
+> servers hold; no user principal, anchor, client identifier or redirect
+> address) is stored in that canister until the grant expires (at most 30
+> days) or the configured idle purge removes it, and sessions survive restarts
+> of the Service. Sections "How signing in works", 1, 2, 3 and 4 carry proposed
+> wording for that case, each passage marked "NEEDS LEGAL/PRODUCT SIGN-OFF".
+> Decide with legal and product whether the policy describes it before any
+> deployment the policy covers enables it, and keep the served page unchanged
+> until then. Facts for the review: the canister's one pre-upgrade snapshot
+> holds a copy of the records present at the last canister upgrade until the
+> next one replaces it; a deleted record leaves a marker without the encrypted
+> content (record identifier, timestamps, reason) until ten minutes after the
+> grant's expiry; and the records sit on the nodes of one Internet Computer
+> subnet, whose locations the network's governance sets.
 
 ---
 
@@ -83,7 +100,14 @@ issuing a time-limited, scope-limited authorization for that key to act as
 you. The Service uses the session key with Internet Identity to obtain, for
 each application you interact with, a further short-lived authorization and
 per-application key (the connection material described in section 1), and
-those per-application keys are what actually sign your requests. All of
+those per-application keys are what actually sign your requests.
+<!-- NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions. Proposed sentence qualifying "the Service's key never leaves the Service" above. -->
+**[NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions]** Where the Service runs
+several servers that share sign-ins, the session signing key also leaves the
+server that generated it, but only encrypted, with a key that only the
+Service's servers hold: it is stored in an Internet Computer canister we
+operate, so that any of those servers can serve your session (see "Session
+and authorization data" in section 1). All of
 these are signing credentials the Service generated itself, so it is worth
 being precise about their limits: none of them is your Internet Identity
 key, none can be used to sign in as you anywhere else, and revoking the
@@ -132,12 +156,33 @@ the Service.
 the session duration and access level you chose. Purpose: performing the
 requests your assistant makes. Legal basis: performance of the service you
 requested.
+<!-- NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions. Proposed paragraph; the facts are in docs/scoping-shared-sessions.md, 9.1. -->
+**[NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions]** Where the Service runs
+several servers that share sign-ins ("shared sessions"), each session is also
+stored as an encrypted record in a canister (an application on the Internet
+Computer) that we operate for the Service. The record holds the session
+signing key with the session's identifier, its expiry, its access level and
+when it was created, encrypted with a key that only the Service's servers
+hold; the canister and the network's nodes cannot read it. It does not
+contain your Internet Identity anchor, your identity at any application, or
+anything about your assistant (no client identifier and no redirect
+address). Alongside it the canister keeps unencrypted technical data: a
+random record identifier, timestamps (created, used to complete the sign-in,
+expiry, and, only if an inactivity limit is configured, approximate last
+activity), one-way values that make each authorization code single-use,
+and which of our servers stored it. Because the sessions live there, they
+survive restarts of the Service. Purpose and legal basis: as above.
 During sign-in the Service also sets one transient cookie (`mcp_connect`;
 HttpOnly, Secure, SameSite=Lax), set and read by the server only and not
 accessible to scripts in web pages. It binds the sign-in to the browser that
 started it, protecting you against session-fixation attacks, and is not used
 for tracking. Legal basis: our legitimate interest in securing the sign-in,
 and it is strictly necessary for a function you requested.
+<!-- NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions. Proposed sentence on what the cookie carries in that mode. -->
+**[NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions]** With shared sessions the
+cookie carries the pending sign-in itself, encrypted (including your
+assistant's redirect address and a secret the sign-in is derived from), for
+at most ten minutes, and is cleared when the sign-in completes.
 
 **Requests and their results**: the requests your assistant makes
 (application and canister identifiers, method names, query and call
@@ -179,6 +224,16 @@ access tokens. A registration describes assistant software rather than you,
 but we treat it as pseudonymous personal data, because a redirect address can
 identify an organisation, a deployment, or a device. Legal basis: performance
 of the service you requested.
+<!-- NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions. Proposed sentence; registrations and codes are not stored in that mode, and an issued access token only in the issuing server's memory for about seven minutes (the token exchange's replay cache, docs/scoping-shared-sessions.md 6.7), longer only by a full fetch of the session feed that server runs meanwhile (its start, or a resync after a snapshot load), about 2 s per 1000 stored sessions. -->
+**[NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions]** With shared sessions, a
+new registration is not stored: the client identifier the Service returns
+carries the redirect address itself, unencrypted. Authorization codes and
+access tokens are encrypted values your assistant holds. Codes are not
+stored. An access token is kept only briefly: the server that issues it
+holds it, still encrypted, in memory for about seven minutes (longer only
+if that server is rebuilding its copy of the session records meanwhile), so
+that a retried exchange of the same code gets the same answer, and then
+discards it.
 
 **Technical logs**: see section 5 for exactly what these contain. Purposes:
 operating, securing, and debugging the Service, and abuse prevention. Legal
@@ -209,6 +264,11 @@ countries, and reach it through public API boundary nodes (`icp-api.io`).
 Internet Identity (`id.ai`) authenticates you. These are part of the Internet
 Computer and are governed by its DAO, the Network Nervous System, rather than
 operated by DFINITY Foundation.
+<!-- NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions. Proposed sentence; the canister's node operators are a new holder of (encrypted) session data. -->
+**[NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions]** With shared sessions,
+the nodes of the network's subnet that hosts our session canister also hold
+the encrypted session records described in section 1. Their operators cannot
+read them without the key, which only the Service's servers hold.
 
 **The applications you choose.** A question or action you direct at an
 application carries your request and your per-application identity to that
@@ -268,16 +328,24 @@ reads use the Internet Computer's shared anonymous principal, which
 identifies no one. This processing is inherent to the network's design and
 applies to every request, so take it into account when deciding which
 applications to direct the Service at.
+<!-- NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions. Proposed paragraph; a transfer we choose (where the canister runs), unlike requests the user directs. -->
+**[NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions]** With shared sessions, the
+encrypted session records of section 1 are held by the nodes of one Internet
+Computer subnet, chosen by us, whose locations the network's governance sets
+and which may include countries without an adequate level of data
+protection. The records are encrypted with a key that never leaves the
+Service's servers.
 
 ### 4. Data Retention
 
 | Category | Retained |
 |---|---|
-| Session and authorization data (signing key, access level, duration) | In volatile memory only, never written to disk. Discarded when the duration you chose elapses (at most 30 days) or when the Service restarts, whichever comes first. |
+| Session and authorization data (signing key, access level, duration) | In volatile memory only, never written to disk. Discarded when the duration you chose elapses (at most 30 days) or when the Service restarts, whichever comes first. **[NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions]** With shared sessions, see the next row instead: a restart no longer discards a session. |
+| **[NEEDS LEGAL/PRODUCT SIGN-OFF]** Encrypted session records (shared sessions only; section 1) <!-- NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions. Proposed row; facts in docs/scoping-shared-sessions.md 4.6, 13 item 16. --> | In our session canister on the Internet Computer, encrypted. Deleted when the duration you chose elapses (at most 30 days), or earlier if an inactivity limit is configured and the session goes unused for that long; a sign-in that is never completed is deleted after about six minutes. A session deleted before its expiry leaves a marker without its encrypted content (record identifier, timestamps, reason) until ten minutes after that expiry. A copy of the canister's state, taken before each upgrade of its software, is kept until the next upgrade and includes the records present then. Each of our servers also keeps a copy of the records in memory, still encrypted until a session is used there, discarded at expiry or restart. |
 | Requests and results | Processed transiently; not retained after the call completes. |
 | Per-application connection material (application domain, account number, per-application key, signed authorization) | In memory, per session; an entry is replaced when refreshed and all are discarded when the session ends or the Service restarts. The signed authorization itself expires at most five minutes after issue. |
-| Authorization codes and access tokens | In memory only; codes expire after two minutes, tokens no later than the session duration you chose. |
-| Connection (OAuth) registrations | Stored on disk so an assistant can reconnect across restarts. There is currently **no time limit**: a registration is kept until it is displaced once the store reaches its cap of 10,000, which for a rarely-used deployment can mean indefinitely. |
+| Authorization codes and access tokens | In memory only; codes expire after two minutes, tokens no later than the session duration you chose. **[NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions]** With shared sessions codes are not stored, and an access token only in the memory of the server that issued it, still encrypted, for about seven minutes after issue (longer only if that server is rebuilding its copy of the session records meanwhile), so that a retried exchange of the same code gets the same answer (or until that server restarts, if sooner); the same expiries apply. |
+| Connection (OAuth) registrations | Stored on disk so an assistant can reconnect across restarts. There is currently **no time limit**: a registration is kept until it is displaced once the store reaches its cap of 10,000, which for a rarely-used deployment can mean indefinitely. **[NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions]** With shared sessions, new registrations are not stored (section 1). |
 | Technical logs | Up to three months, then deleted. |
 | Aggregated operational metrics | Held in memory only, never written to disk: gauges are computed on demand, and the status dashboard keeps its most recent health report in memory until the next one replaces it or the process restarts. |
 
@@ -287,6 +355,10 @@ signing key and the per-application connection material stay in memory until
 the duration you originally chose elapses or the Service restarts. We intend
 to discard them as soon as a revocation is observed; until that ships, the
 table above describes the actual behaviour.
+<!-- NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions. Proposed sentence; a restart no longer discards the record in that mode. -->
+**[NEEDS LEGAL/PRODUCT SIGN-OFF: shared sessions]** With shared sessions, the
+encrypted session record also stays in our canister until that duration
+elapses (or an inactivity limit removes it), whatever restarts happen.
 
 ### 5. What Our Logs Contain
 
