@@ -716,7 +716,7 @@ expiry always comes first, and nodes send no activity reports ("touches") at all
 
 1. **The idle floor is set to T.** Nodes learn the new values within about 30 s.
 2. **Touches start,** seeded by each session's next request. They run only while the timeout is
-   below 2 570 040 s (about 29.7 days): above that, grant expiry always wins.
+   below 2 570 160 s (about 29.75 days): above that, grant expiry always wins.
 3. **No session is idle before T + idle + granularity + 300 s.** The granularity is
    `clamp(idle / 48, 5 min, 6 h)`. Activity after T is reported, and activity before T does not
    count, so lowering the timeout logs out no active user.
@@ -731,7 +731,9 @@ expiry always comes first, and nodes send no activity reports ("touches") at all
 | 14 d (`1209600`) | 6 h | T + 14 d 6 h 5 min |
 
 - **Touches cost update calls.** Each node flushes every 60 s, in batches of at most 2000, and
-  reports a session only once its activity has advanced by at least the granularity.
+  reports a session only once its activity has advanced by at least the granularity. A session
+  that comes back after a long idle period is reported sooner, on the next round but at most once
+  every 5 s per node, so that a put at a cap does not evict it first (6.2).
   `imcp2_shared_touch_backlog` shows what is pending.
 - **Raising the timeout** needs no floor: every deadline only moves later.
 - **"Within about 30 s"** is the sync loop's timing: a node's 1 s poll sees the new values or the
@@ -777,7 +779,9 @@ expiry always comes first, and nodes send no activity reports ("touches") at all
 - **Purge what you can identify** with `admin_purge_sessions`, by namespace or by creation time
   ([Appendix B](#appendix-b-candid-arguments)).
 - **Lower the idle timeout** (6.1). Eviction becomes possible once touches are in effect, and the
-  idle floor delays it: no earlier than the granularity + 2 min + 1 h after the lowering.
+  idle floor delays it: no earlier than the granularity + 2 min + 1 h after the lowering. The
+  trade-off: a user who returns to a session idle that long can lose it to a put in the seconds
+  before their node reports them, and signs in again (design record 4.5).
 
 ### 6.3 Allow-list
 

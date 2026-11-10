@@ -105,7 +105,7 @@ These were settled before the design.
 | D4 | **Queries are hints.** A query answer can add an AEAD-valid, consumed record to a mirror, but **never removes anything**. Only replicated reads (query methods called as updates) delete, move the cursor, start a resync, or justify a 401. | A query answer comes from one replica and is not certified. A sealed record cannot be forged; a tombstone or an absence can. | `Mirror::upsert` refuses a record under a final tombstone; only `Mirror::apply_final_tombstone` deletes. `Inner::poll_once` only adds; `Inner::replicated_fetch` alone deletes (6.3). |
 | D5 | **401 only on an authoritative fact.** Anything else (outage, lag, key drift, a newer format, a full cache) gets 503 `temporarily_unavailable` with `Retry-After: 5` and no `WWW-Authenticate`. | A 401 makes an MCP client run a full re-authorization. | `OpenError::{Invalid, Unavailable}`, `CodecError::Newer`, `Resolution`, `shared_flow::mcp_unavailable` (6.5, 6.6). |
 | D6 | **A snapshot load is disaster recovery.** The canister detects one from its own **canister history** (`canister_info`), which a snapshot load does not rewind. It then bumps `epoch` and raises `idle_floor_at`. Nodes discard their mirrors and resync. Operators replay admin changes from a journal. Sessions created after the snapshot must re-authorize. | Correct and simple. Automatic re-push from the nodes proved fragile in review. Routine upgrades never load snapshots. | `history.rs`, `State::observe_history`, `State::check_restore` (4.7). `canister_version` cannot be used (4.7). |
-| D7 | **Idle purge** at `max(last_active, idle_floor_at) + idle + granularity + 300 s`, and silent removal at grant expiry. Touches are batched and sent only when they can move a deadline. A record is evicted for capacity only when its `last_active` can be trusted. | Costs nothing at the 30 d default. Lowering the idle timeout later never logs out an active user. | `rules.rs` (4.4, 4.5), `TouchMap` (6.8). |
+| D7 | **Idle purge** at `max(last_active, idle_floor_at) + idle + granularity + 300 s`, and silent removal at grant expiry. Touches are batched and sent only when they can move a deadline. A record is evicted for capacity only when its `last_active` can be trusted, apart from a user returning in the seconds before the node's prompt report lands (4.5). | Costs nothing at the 30 d default. Lowering the idle timeout later never logs out an active user. | `rules.rs` (4.4, 4.5), `TouchMap` (6.8). |
 | D8 | **Additive library API.** `McpConfig` and `McpServer::new` are unchanged. The new entry point is `McpServer::with_shared_sessions(config, &shared)`. | ic-gateway builds `McpConfig` as a struct literal. | `src/lib.rs`, `src/shared/sessions.rs` (6.1). |
 
 ### 2.3 The rejected alternative: sealed credentials
@@ -359,8 +359,9 @@ a refused caller writes nothing at all.
 **`put_session`** (`State::put_session`)
 
 1. Check the caller.
-2. Validate the lengths: key 32, `op_id` 16, `code_lock` 16, and `sealed` 1 to 1024 bytes
-   (`MAX_SEALED_LEN`).
+2. Validate the lengths: key 32, `op_id` 16, `code_lock` 16, and `sealed` 3 to 1024 bytes
+   (`MIN_SEALED_LEN` to `MAX_SEALED_LEN`). The minimum is the envelope's header, so that every
+   record carries the key id (byte 2, `SEALED_KID_OFFSET`) a purge by kid matches against.
 3. Look at the key:
    - the same key with the same `op_id` → `Ok(existing)`, whatever the retry's other fields say;
    - a different `op_id` → `AlreadyExists`;
@@ -381,7 +382,9 @@ a refused caller writes nothing at all.
    any node gets the same record, and so the same token.
 4. `now > created + CONSUME_WINDOW` (300 s, canister clock) → `CodeExpired`.
 5. Consume: assign the next feed position, record `consumed_by = exchange_id` and `consumed_at =
-   now`, move the record from the `unconsumed` index into `by_seq` and `by_last_active`.
+   now`, set `last_active = now` (the exchange is the session's first use, and the time its tokens
+   carry, so a node that has not reported the session yet judges its age as the canister does,
+   4.4), and move the record from the `unconsumed` index into `by_seq` and `by_last_active`.
 
 *Refinement over the plan:* the plan checked the window first. As built, a consumed record answers
 its own exchange at any time, and another exchange is told the code was used rather than that it
@@ -413,8 +416,10 @@ expired.
 - Each page carries `head`, `epoch`, `now_ns`, `idle_timeout_secs`, `idle_floor_at` and
   `key_checks_version`, so a node learns configuration changes from the feed itself.
 - **Positions** are `max(head + 1, now_ns)` (`State::next_seq`). `head` is never lowered by the
-  canister. The clock term keeps new positions above everything a node has seen even after a
-  snapshot load rewinds `head`.
+  canister, but a snapshot load rewinds it, and until the canister notices the load (4.7) a page
+  can carry a `head` below a node's cursor under the old epoch. A node therefore compares
+  positions only within one epoch (6.3). The clock term keeps new positions above everything a
+  node has seen even after a snapshot load rewinds `head`.
 
 **Key checks**
 
@@ -477,10 +482,32 @@ canister and the nodes cannot drift. Every saturation errs towards keeping a ses
 - **`idle_purge_enabled(now, floor, idle)`:** the purge runs only once a full idle span has passed
   since the floor. Until then every deadline lies in the future, and gating on it lets the purge
   compare `last_active_at` with `idle_purge_cutoff` alone, without reading the floor per record.
-- **`touches_effective(idle) = idle + granularity + IDLE_SLACK + CLOCK_SKEW < MAX_GRANT`** (30 d,
-  II's grant cap). When this is false, grant expiry always removes a session before it could go
-  idle, so a touch would buy nothing. **It is false at the 30 d default,** so by default nodes send
-  no touches at all. The boundary is an idle timeout of 2 570 040 s.
+- **`reporting_matters(reported, grant_exp, idle) = reported + idle + granularity + IDLE_SLACK <
+  grant_exp + CLOCK_SKEW`**: the nodes' stopping rule (6.8). It is judged by the activity a node
+  last reported, never by the time of the request: a busy session's last report lags its activity
+  by up to a granularity, and a rule judged by now would stop while the stored deadline still
+  falls before grant expiry. The skew counts on the grant's side because the canister caps a
+  report at its own time, so a node whose clock runs ahead holds a later report than the canister
+  does.
+- **`touches_effective(idle) = reporting_matters(0, MAX_GRANT, idle)`**, i.e. `idle + granularity +
+  IDLE_SLACK < MAX_GRANT + CLOCK_SKEW` (30 d, II's grant cap, plus the skew between clocks). When
+  this is false, grant expiry always removes a session before it could go idle, so a touch would
+  buy nothing. **It is false at the 30 d default,** so by default nodes send no touches at all.
+  The boundary is an idle timeout of 2 570 160 s; the skew on the grant's side keeps touches on
+  for a timeout in doubt, so no untouched session can go idle shortly before its grant ends.
+- **`eviction_idle(idle) = granularity + 2 × TOUCH_FLUSH_INTERVAL + MIN_EVICT_IDLE`**: how long a
+  session must have gone without reported activity before `evictable` (4.5) may judge it unused;
+  16 320 s under a 7-day timeout.
+- **`report_promptly(now, reported, idle)`**: `now − reported + CLOCK_SKEW ≥ granularity +
+  MIN_EVICT_IDLE`, i.e. `eviction_idle` less two flush intervals and the skew. When a request
+  finds a session's reported activity this old, the node reports it at once instead of at its
+  next periodic flush (6.8). Below it the periodic flush is in time: sent within one interval (a
+  node counts its flush period from the start of the previous flush, 6.3) and answered within
+  another, its report reaches the canister before the session could be judged evictable, for a
+  node clock up to `CLOCK_SKEW` off. This needs `reported` to be no later than what the canister
+  holds; for a session not reported yet that is its consumption time, which `consume_code` records
+  as its first activity. The idle floor is ignored, which errs towards reporting, and a prompt
+  report is always a due one (`CLOCK_SKEW ≤ MIN_EVICT_IDLE`).
 
 Compile-time assertions (`const _` in `rules.rs`) pin the relations between the timings:
 
@@ -490,6 +517,7 @@ Compile-time assertions (`const _` in `rules.rs`) pin the relations between the 
 - `touch_granularity(MIN_IDLE_TIMEOUT) + IDLE_SLACK < MIN_IDLE_TIMEOUT`.
 - `!touches_effective(DEFAULT_IDLE_TIMEOUT)` and `touches_effective(7 d)`.
 - `MAX_GRANT + CLOCK_SKEW ≤ MAX_GRANT_ACCEPTED`, and `CLOCK_SKEW < TOMBSTONE_GRACE`.
+- `CLOCK_SKEW ≤ MIN_EVICT_IDLE`: a prompt report is always a due one.
 
 ### 4.5 Capacity and eviction
 
@@ -518,15 +546,30 @@ A candidate is evicted (tombstone, reason `evicted`) only if `evictable` holds, 
 - **`touches_effective(idle)`.** Otherwise no node sends touches, and no `last_active_at` means
   anything;
 - **`now + idle + granularity + IDLE_SLACK + CLOCK_SKEW < grant_expires_at`.** Nodes stop reporting
-  a session once a report could not move its deadline before grant expiry, so past this point a
-  busy session may look idle. For a grant II issued, this already implies the previous condition.
-  It is checked on its own because `put_session` accepts grants up to 31 d;
-- **`now − max(last_active_at, idle_floor_at) ≥ granularity + 2 × TOUCH_FLUSH_INTERVAL +
-  MIN_EVICT_IDLE`** (1 h). Activity up to one granularity plus two flushes old may not have been
-  reported yet, and the session must have been idle for an hour beyond that.
+  a session once `reporting_matters` fails for its last report, so past that point a busy session
+  may look idle. This condition is a conservative guard on that rule, by the canister's clock:
+  while it holds, any report a node can have made (at most `CLOCK_SKEW` ahead of now) still
+  passes `reporting_matters`, so a busy session is still being reported. For a grant II issued,
+  this already implies the previous condition. It is checked on its own because `put_session`
+  accepts grants up to 31 d;
+- **`now − max(last_active_at, idle_floor_at) ≥ eviction_idle(idle)`** (`granularity + 2 ×
+  TOUCH_FLUSH_INTERVAL + MIN_EVICT_IDLE`, with `MIN_EVICT_IDLE` 1 h). Activity up to one
+  granularity plus two flushes old may not have been reported yet, and the session must have been
+  idle for an hour beyond that.
 
 Otherwise the put gets `CapacityExceeded`. **At the 30 d default nothing is evictable**, so a full
 store refuses new sign-ins (the node answers 503) rather than logging out active users.
+
+**A session that resumes.** `evictable` judges the age of the *reported* activity, so it cannot see
+a user who has just come back after a long idle period. A node that serves such a session reports
+its activity on the loop's next round instead of at its next periodic flush (`report_promptly`,
+6.8), which narrows the gap from up to a minute plus the touch call to the moments before that
+report lands: the next round, or the rest of `PROMPT_FLUSH_SPACING` (5 s) since the previous flush
+if that is longer, then one call. A put that evicts the session in those moments still removes it,
+and its user signs in again. This needs a namespace, or the whole store, at its cap and a lowered
+idle timeout, and it is the price of keeping sign-ins working when the store is full; closing it
+entirely would take a coordinated two-phase eviction (13). The test
+`a_resumed_session_is_reported_before_a_put_at_the_cap_can_evict_it` runs the race both ways.
 
 ### 4.6 Purge timer
 
@@ -636,7 +679,7 @@ count, and none of it is part of a snapshot.
   but eviction at a capacity cap (4.5) has no such guard, because puts never probe. Between the
   start after a load and the first successful probe, a put at a cap can therefore evict a session
   whose touches after the snapshot were rewound. That needs effective touches (an idle timeout
-  below 2 570 040 s, 4.4), a store at a cap, and restored activity old enough to pass `evictable`.
+  below 2 570 160 s, 4.4), a store at a cap, and restored activity old enough to pass `evictable`.
   Each put evicts at most one record. A stored flag cannot close the window: a load rewinds the
   heap and stable memory alike, and the canister gets no hook when it is started, so a "probe seen
   since the start" mark would come back from the snapshot already set. The runbook's
@@ -989,8 +1032,10 @@ first complete fetch and after a failure (once its backoff has passed); otherwis
 
 **Around these,** once the initial fetch has completed:
 
-- **Touch flush** every `touch_flush_interval` (60 s), sending only when the idle timeout makes
-  touches matter (6.8), so never at the 30-day default.
+- **Touch flush** every `touch_flush_interval` (60 s), counted from the start of the previous
+  flush, sending only when the idle timeout makes touches matter (6.8), so never at the 30-day
+  default. A request that asks for a prompt report (6.8) brings it forward to the next round, no
+  sooner than `PROMPT_FLUSH_SPACING` (5 s) after the previous flush.
 - **Status read** (`get_status`, replicated) right after the initial fetch, then every
   `status_interval` (900 s), or 60 s after a failure, for the canister gauges.
 - **Housekeeping** every 60 s (`HOUSEKEEPING_INTERVAL`): `Mirror::prune`, `TouchMap::prune`,
@@ -1191,12 +1236,24 @@ again and again:
 
 - **Not at all** unless `touches_effective(idle)` holds. At the 30 d default it does not, so by
   default a node makes no touch calls.
-- **Only while a report can move the deadline:** an entry is kept only while `reported + idle +
-  granularity + IDLE_SLACK < grant_expires_at`. A tracked session stays until its grant expires, so
-  that its last report keeps suppressing new ones.
+- **Only while a report can move the deadline:** an entry is kept only while `reporting_matters`
+  (4.4) holds for its last report: `reported + idle + granularity + IDLE_SLACK < grant_expires_at
+  + CLOCK_SKEW`. A tracked session stays until its grant expires, so that its last report keeps
+  suppressing new ones.
 - **Coarsely:** a session is reported again once its activity has advanced by the granularity. A
   flush (every 60 s) sends the stalest first, in batches of 2000, at most 25 batches
   (`MAX_FLUSH_BATCHES`).
+- **Promptly when a session comes back** (4.5). `TouchMap::note` returns whether
+  `report_promptly` holds for the session's last report; `SharedSessions::note_activity` then sets
+  `Inner::prompt_flush`, and the loop's next round flushes, but no sooner than
+  `PROMPT_FLUSH_SPACING` (5 s) after the previous flush. The flag is cleared before the flush, so
+  a request noted during it asks again; a failed flush is retried by the next one, periodic or
+  prompt. A session seen on a node for the first time is judged by its consumption time, which is
+  what the canister holds until a report raises it (`consume_code` records it as the first
+  activity), so the node never judges a session younger than the canister does. Its first request
+  there may ask for a prompt report even if another node reported it since: that report was due
+  anyway and is only sent sooner. The extra cost is at most one update call per 5 s per node, and
+  only while touches are effective.
 - **Bounded:** at most `TOUCH_CAP` (200 000) sessions, evicting the soonest-expiring 1% when full.
   Losing an entry loses at most one report.
 - **Feedback:** `TouchMap::mark_reported` records accepted batches, `TouchMap::drop_unknown` drops
@@ -1617,6 +1674,11 @@ replica, `a_stopped_canister_leaves_a_node_unavailable_not_broken` checks the fi
 - **API crate:**
   - compile-time timing invariants (`rules.rs`);
   - the rules at their exact boundaries (`touches_are_effective_only_below_the_grant_cap`,
+    `touches_stay_on_while_an_untouched_session_could_go_idle_before_its_grant_ends`,
+    `reporting_stops_only_once_the_stored_deadline_passes_grant_expiry`,
+    `the_eviction_guard_implies_backends_still_report`,
+    `eviction_idle_is_the_age_evictable_requires`, `report_promptly_at_its_exact_threshold`,
+    `without_a_prompt_report_the_periodic_flush_lands_before_eviction`,
     `evictable_at_the_exact_edge`, `nothing_is_evicted_while_touches_are_off`,
     `cutoff_agrees_with_deadline_whenever_purge_is_enabled`);
   - the `.did` against every type and method (`every_did_type_has_an_equal_rust_type`,
@@ -1630,7 +1692,8 @@ replica, `a_stopped_canister_leaves_a_node_unavailable_not_broken` checks the fi
   - put (idempotency, conflicts, tombstones, validation) and capacity (nothing evicted at the
     default; the trustworthy-`last_active` rule; a full namespace and a full store; at most one
     eviction; the namespace bound);
-  - consume (proof, single use, window, entry into the feed);
+  - consume (proof, single use, window, entry into the feed, and the consumption time as the first
+    activity: `consuming_a_code_records_the_session_s_first_activity`);
   - touch (max-merge, validated batches);
   - feed paging and compaction;
   - every purge step, the floor and the backlog;
@@ -1659,8 +1722,12 @@ replica, `a_stopped_canister_leaves_a_node_unavailable_not_broken` checks the fi
   - the exchange budget (single flight, the schedule, spacing, the cap, cancellation) and its
     sweep (`a_sweep_empties_the_cache_once_the_ttl_has_passed`,
     `a_sweep_leaves_an_exchange_in_flight_to_land`);
-  - touch suppression, batching and eviction, and the rebase after a backward clock step
-    (`a_backward_clock_step_does_not_hold_back_the_next_report`);
+  - touch suppression, batching and eviction, the rebase after a backward clock step
+    (`a_backward_clock_step_does_not_hold_back_the_next_report`), and prompt reports
+    (`a_note_asks_for_a_prompt_report_once_the_session_could_be_evicted_first`,
+    `a_session_back_after_a_long_idle_is_reported_on_the_next_round`,
+    `a_resumed_session_is_reported_before_a_put_at_the_cap_can_evict_it`,
+    `a_late_exchange_does_not_make_a_session_look_younger_than_the_canister_judges_it`);
   - the stub registrar, and the II registrar's root check (`a_canister_signature_key_names_its_canister`);
   - metric registration;
   - the canister client over `MemoryCanister` (read modes, timeouts, rejects, decode quotas);
@@ -1873,6 +1940,11 @@ and every refused setting. No II sign-in ran in it; the PocketIC suite covers th
     so it holds the sealed records of that moment past their purge, until the next upgrade. They
     are useless without the keyring, and their II grants expire within 30 days, but the retention
     text of the privacy policy has to cover it (13).
+17. **A returning user can be evicted at a cap.** Eviction judges reported activity, so a user who
+    comes back to a session idle for hours can lose it to a put in the seconds before the node's
+    prompt report lands (4.5). It needs a lowered idle timeout and a namespace or the store at its
+    cap, and costs that user one sign-in. Closing it would take a two-phase eviction: mark a
+    candidate in the feed, and evict it only if no node touches it within a grace period.
 
 ## 14. ic-gateway follow-up
 
@@ -1896,7 +1968,8 @@ Not part of this work; recorded so the wiring stays additive.
   - `imcp2_session.did` (`CANDID`);
   - `constants.rs`: lengths, timings, limits, defaults, `KEY_CHECK_INFO`, tombstone reasons;
   - `rules.rs`: `touch_granularity`, `idle_deadline`, `idle_purge_enabled`, `idle_purge_cutoff`,
-    `touches_effective`, `evictable`, `namespace_of`;
+    `reporting_matters`, `touches_effective`, `eviction_idle`, `report_promptly`, `evictable`,
+    `namespace_of`;
   - `config.rs`: `Config`, `ConfigPatch`, `InstallArg`, `Config::apply`;
   - `types.rs`, `errors.rs`, `method.rs`;
   - `src/tests/{contract,wire}.rs`.
