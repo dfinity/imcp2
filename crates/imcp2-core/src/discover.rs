@@ -3884,15 +3884,18 @@ mod tests {
     // Live network: a KNOWN app skips the IC probe entirely (the registry answers).
     #[tokio::test]
     async fn resolve_app_identity_skips_probe_for_known_apps() {
-        // Also the regression pin for over-cap Layer 5 bodies: oisy.com answers
+        // Also the regression pin for over-cap Layer 5 bodies: multidex.ai answers
         // /.well-known/ii-derivation-origin with its SPA shell, which is larger
         // than MAX_DERIVATION_ORIGIN_BYTES. That must read as "declares nothing"
         // (Overflow::NotTheDocument — a one-line origin cannot be that big, so
         // what was served is not the Layer 5 document), NOT as a failed check.
         // Treating it as a failure refused to resolve a perfectly healthy app,
-        // which is how this test caught it.
-        let r = resolve_app_identity("oisy.com", false).await.expect("resolve");
+        // which is how this test caught it (on oisy.com, which has since started
+        // declaring its origin, so it now resolves as Declared — the app's own
+        // declaration wins over the registry).
+        let r = resolve_app_identity("multidex.ai", false).await.expect("resolve");
         assert_eq!(r.derivation_origin_source, DerivationSource::Known);
+        assert_eq!(r.derivation_origin, "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io");
         assert_eq!(r.application_is_ic, None, "known apps are not probed");
     }
 
