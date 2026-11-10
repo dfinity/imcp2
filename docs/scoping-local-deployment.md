@@ -503,7 +503,7 @@ the client provides one, and a `setup` subcommand in the binary for the rest.
 
 | Client | What the user does |
 |---|---|
-| Claude Desktop | **Double-click the `imcp2.mcpb` bundle** → Claude Desktop shows its install dialog → Enable. (MCPB is Claude Desktop's plugin format; the bundle carries the per-platform binary and installs it in one step.) |
+| Claude Desktop | **Double-click the `imcp2-local.mcpb` bundle** → Claude Desktop shows its install dialog → Enable. (MCPB is Claude Desktop's plugin format; the bundle carries a universal macOS binary and the Windows binary and installs the right one in one step.) |
 | Claude Code | Paste one command: `claude mcp add --transport stdio imcp2 -- <installed path>` |
 | Codex (CLI / IDE / desktop) | Paste one command: `codex mcp add imcp2 -- <installed path>` |
 | Cursor | Click the **"Add to Cursor"** install link on the docs page → Cursor opens its install prompt → Install. |
@@ -561,10 +561,13 @@ Two distinct layers, for two different verifiers:
     `.mcpb` and direct release downloads.
 - **Supply-chain provenance**, uniform across every artifact (all three platforms' binaries
   and the `.mcpb`): **GitHub artifact attestations** — Sigstore-based and keyless (OIDC), so
-  there are no long-lived signing secrets — verifiable with
-  `gh attestation verify imcp2-local -R dfinity/imcp2`. This layer proves an artifact came
-  from this repository's release workflow; it is for humans and auditors, and does not
-  satisfy the OS gates above (Gatekeeper recognizes only Apple-issued signatures).
+  there are no long-lived signing secrets — verifiable with `gh attestation verify`, pinned
+  to the signing workflow (`--signer-workflow`) and to the release's tag (`--source-ref`:
+  artifact names repeat across releases, so without it an older release's genuinely
+  attested file passes for a newer one's). This layer proves an artifact came from this
+  repository's release workflow for that release, and the bundle job applies the same check
+  to every archive it assembles from; it is for humans and auditors, and does not satisfy
+  the OS gates above (Gatekeeper recognizes only Apple-issued signatures).
 - **The `.mcpb` specifically.** Gatekeeper checks the **binary inside** the bundle
   (extraction inherits quarantine), so the per-OS signing above is the substance. The MCPB
   format does not currently specify bundle-level signing or install-time verification, so
@@ -577,8 +580,15 @@ Two distinct layers, for two different verifiers:
   Application certificate + an App Store Connect API key; an Azure Trusted Signing account
   (or an EV certificate); artifact attestations are free to enable.
 
-One artifact per platform, with the `.mcpb` manifest pointing at the right per-OS binary;
-building and signing these artifacts is a Stage 3 deliverable.
+One archive per platform, plus a single `.mcpb` for Claude Desktop. MCPB's
+`platform_overrides` key on the OS alone, not the CPU, so the bundle carries a universal
+macOS binary (the arm64 and x86_64 builds joined by `lipo`, each slice byte-identical to its
+attested archive) beside the Windows one, and Claude Desktop appends `.exe` itself. The
+bundle is assembled from the release's own published archives after they exist, and gets
+its own provenance attestation. Assembly runs third-party code (the MCPB CLI, installed
+from a checked-in lockfile with install scripts disabled), so it runs in a job holding
+only read access; a separate job with no such code attests and uploads the result.
+Building and signing these artifacts is a Stage 3 deliverable.
 
 ## Implementation Stages
 

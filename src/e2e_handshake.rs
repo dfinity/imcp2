@@ -340,6 +340,7 @@ async fn registration_delegation_end_to_end() {
         state_dir: state_dir.clone(),
         // The handshake under test carries no `resource`; keep it lenient.
         require_resource: false,
+        cimd_enabled: false,
     });
     let app = axum::Router::new()
         .nest_service(server.mcp_path(), server.mcp_router())

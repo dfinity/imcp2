@@ -1,6 +1,6 @@
 [package]
 name = "imcp2-local"
-version = "0.4.0"
+version = "0.6.1"
 edition = "2021"
 description = "Local MCP server for the Internet Computer: the imcp2 tool surface over stdio, with a built-in Internet Identity browser login."
 license = "Apache-2.0"
@@ -13,7 +13,7 @@ repository = "https://github.com/dfinity/imcp2"
 publish = false
 
 # The one dist-released app in this workspace: release binaries + installers
-# are built by dist (see dist-workspace.toml) on `imcp2-local-v*` tags.
+# are built by dist (see dist-workspace.toml) on the `vX.Y.Z` release tags.
 [package.metadata.dist]
 dist = true
 

@@ -23,10 +23,19 @@ See [Reaching a canister is gated on the discoverability manifest](#reaching-a-c
 **Not for financial operations.** IMCP2 is infrastructure tooling for reading,
 building, and operating canisters — it is not a wallet or trading tool, and
 financial operations (token transfers, spending approvals, payments, trades)
-are unsupported by policy. The standardized ledger surface is refused
-mechanically (`canister_update_call` rejects the ICRC-1/ICRC-2 and related
-ledger-standard transfer/approval methods on every canister), and the
-connector serves no funding or management tools: creating, funding, and topping up
+are unsupported by policy. The ledger surface is refused mechanically:
+`canister_update_call` rejects the ICRC-1/ICRC-2 and related ledger-standard
+transfer/approval methods and any method whose name carries a financial keyword
+(`transfer`, `withdraw`, `swap`, `trade`, `exchange`, `pay`, `buy`, `deposit`,
+… as whole words, with no exemptions) on every canister, and refuses every update call to a
+canister whose own Candid interface declares ICRC-1 or ICRC-2 methods — every
+ICRC ledger and the ICP ledger, detected from the canister itself — or that is
+one of the financial-service canisters it carries. An update call needs the
+canister's published interface: a canister that publishes none, or whose
+interface cannot be read, receives no update call through this server, so
+every update the server sends was checked against the canister's own
+interface. The connector serves no
+funding or management tools: creating, funding, and topping up
 canisters is done by the user with the
 [`icp` CLI](https://github.com/dfinity/icp-cli) in their own terminal.
 For financial operations, users act themselves outside the connector, in a
@@ -39,7 +48,7 @@ Published on [crates.io](https://crates.io/crates/imcp2), API docs on
 
 ```toml
 [dependencies]
-imcp2 = "0.4"
+imcp2 = "0.6"
 ```
 
 One `McpServer` serves one Internet Identity instance as two
@@ -81,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
         clients: SharedClients::load(&state_dir),
         state_dir,
         require_resource: true, // strict RFC 8707 (reject a missing `resource`)
+        cimd_enabled: true, // Client ID Metadata Documents (URL client_ids); false turns them off
     });
     server.spawn_session_reaper();
     let app = axum::Router::new()
@@ -154,15 +164,17 @@ Every tool declares an MCP `outputSchema` and, on success, attaches
 alongside the human-readable text, so a model knows the expected shape of each
 reply. The text is always present; the structured object is attached whenever
 the reply serializes to an object (which the schema guarantees for normal
-results).
+results). `get_canister_candid` carries its interface text in both, as the text
+and as the structured `candid` field: clients that read the structured object
+show the model nothing else, and a reply is kept to 5 KB.
 
 | Tool | Args | Returns |
 |------|------|---------|
 | `open_app` | `app` (name **or** URL) | **One-call entry point** when a user names/links an app: resolves the Internet Identity `derivation_origin` *and* discovers the canisters behind it, together. A name or bare host is matched to the known-app registry first (so a wrong-TLD guess repairs to the canonical URL); an explicit `https://` URL is resolved as given. An unknown bare name is *refused*, and so is a URL that would need its own origin assumed as the derivation origin while showing no IC evidence (never guessed). Also probes the app's own **declared** canisters and reports per-canister `oql`/`api_doc_available` capability flags — for **up to eight** eligible canisters, with both fields *omitted* (not false) on any beyond that, and on any candidate the app does not declare (which this connector cannot read, so it is not probed) — plus a data-access note (which canister is read through the OQL path, and the origin that path requires). No auth |
-| `get_canister_candid` | `canister_id`, `app_url?`, `derivation_origin?` | The canister's `candid:service` interface (`.did` text), plus two capability flags: `oql` (`true` when it exposes an OQL query surface — a `schema` + `execute` pair — with a pointer to `icp_oql_guide`) and `api_doc_available` (`true` when it declares a `getApiDoc`/`get_api_doc` method, gating `get_canister_api_doc`) |
+| `get_canister_candid` | `canister_id`, `app_url?`, `derivation_origin?`, `methods?` | The canister's `candid:service` interface (`.did` text) — the published text verbatim when it keeps to 5 KB; a larger interface is refused with the list of every method it declares (one that cannot be parsed comes back whole, there being no list to offer). **On a large interface, read less:** `methods` (a list of names, which the API doc from `get_canister_api_doc` supplies) returns only those methods with every type definition they use, transitively, in the interface's own order and with its `//` comments on the service, those methods, types and fields (nested records included, inside `opt` and `vec` too), as a small valid `.did` (init arguments omitted). A selection that comes to more than 5 KB with its comments is refused with the list of every declared method, so ask for fewer at a time; a single method is always answered, with its comments stripped if that is what it takes (`best_effort: true`). A name the service does not declare is an error listing the declared ones. Methods come sorted by name, as the Candid parser orders them. The structured object carries `candid` (the interface text), `methods`, `bytes` (the interface text's size, comments included), `best_effort`, and two capability flags: `oql` (`true` when it exposes an OQL query surface — a `schema` + `execute` pair — with a pointer to `icp_oql_guide`) and `api_doc_available` (`true` when it declares a `getApiDoc`/`get_api_doc` method, gating `get_canister_api_doc`) |
 | `get_canister_api_doc` | `canister_id`, `app_url?`, `derivation_origin?` | The canister's own prose API guide ("how this app behaves" — units, auth, lifecycle, mutation safety, polling, gotchas), from its `getApiDoc`/`get_api_doc` method. Call **only** when `get_canister_candid`/`open_app` report `api_doc_available`. Returns a **structured** result for every documentation outcome — `available` + the doc on success, else `available:false` with `expected`/`retry`/`next`, so "no compatible method was detected" is distinct from "no answer was obtained". An unusable `canister_id` is rejected before any lookup and is a plain error, not that shape; and `expected:true` is not proof of absence, since an interface the parser cannot read also comes up empty |
 | `canister_query` | `canister_id`, `method?` **or** `oql?`, `args?` (textual Candid), `app_url?`, `derivation_origin?`, `account?`, `candid?` | READ a canister — provide EITHER a Candid `query` `method` (with `args`) OR an `oql` query (a JSON object string, run against `execute`). A Candid `method` query may be anonymous or as your account and returns textual Candid; an `oql` query **requires** `derivation_origin` and returns `columns` + `rows` (a table) with `has_more`, validating `start` against the schema on an empty result. On an OQL canister a Candid `method` query is rejected — use `oql`. `candid` is a fallback: the `.did` interface text to encode/decode against when the canister exposes no `candid:service` metadata. Echoes `derived_for_origin` / `requested` so an origin mismatch is visible (never the principal — `get_app_principal` returns it on request) |
-| `canister_update_call` | `canister_id`, `method`, `args` (textual Candid), `app_url?`, `derivation_origin?`, `account?`, `candid?` | Make an UPDATE (state-changing) call; reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`). **The target must be declared by its app**: the call is made only when the app at `app_url` (from `open_app`; falling back to `derivation_origin` when no `app_url` is given) declares `canister_id` in its `/.well-known/ic-architecture` manifest — see [Reaching a canister is gated on the discoverability manifest](#reaching-a-canister-is-gated-on-the-discoverability-manifest). When `derivation_origin` is also given, the two must belong to the same app — the app at `app_url` is resolved to the derivation origin II derives its users from, and a mismatch is refused rather than signed. The reply echoes `declared_by` / `declared_at` (which origin authorized the write, and at which path). **Financial transactions are refused**: the ICRC-standard transfer/approval methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents) and the NNS/SNS governance method `manage_neuron` (neuron staking and disbursement) are disallowed on every canister, and the ICP and cycles ledgers' own value-moving methods (the legacy `transfer`, `withdraw`, the `create_canister` spends) and the cycles-minting canister's funding-completion methods (`notify_top_up`, `notify_create_canister`, `notify_mint_cycles`, `create_canister`) on those canisters; and **every** update call is refused on the financial-service canisters the guard carries — all to protect the user. The refusal directs the user to perform the operation outside the connector, in a trusted interface they control — or, for canister creation and funding, with the [icp CLI](https://github.com/dfinity/icp-cli) in their own terminal. The policy is stated in the server-level instructions, deliberately not in any tool description. `candid` is the same `.did` fallback as on `canister_query`, used when the interface isn't published on-chain. Echoes `derived_for_origin` / `requested` so an origin mismatch is visible (never the principal — `get_app_principal` returns it on request) |
+| `canister_update_call` | `canister_id`, `method`, `args` (textual Candid), `app_url?`, `derivation_origin?`, `account?` | Make an UPDATE (state-changing) call; reply as textual Candid; anonymous, or as your account at an app (identified by its canonical II `derivation_origin`, obtained once from `open_app`). **The target must be declared by its app**: the call is made only when the app at `app_url` (from `open_app`; falling back to `derivation_origin` when no `app_url` is given) declares `canister_id` in its `/.well-known/ic-architecture` manifest — see [Reaching a canister is gated on the discoverability manifest](#reaching-a-canister-is-gated-on-the-discoverability-manifest). When `derivation_origin` is also given, the two must belong to the same app — the app at `app_url` is resolved to the derivation origin II derives its users from, and a mismatch is refused rather than signed. The reply echoes `declared_by` / `declared_at` (which origin authorized the write, and at which path). **Financial transactions are refused**: the ICRC-standard transfer/approval methods (ICRC-1/ICRC-2 and the ICRC-4/-7/-37 equivalents) and the NNS/SNS governance method `manage_neuron` (neuron staking and disbursement) are disallowed on every canister, and the ICP and cycles ledgers' own value-moving methods (the legacy `transfer`, `withdraw`, the `create_canister` spends) and the cycles-minting canister's funding-completion methods (`notify_top_up`, `notify_create_canister`, `notify_mint_cycles`, `create_canister`) on those canisters; any other `icrc1_*`/`icrc2_*` method is refused by name as well, as is any method whose name carries a financial keyword as a whole word (`transfer`, `withdraw`, `swap`, `trade`, `exchange`, `pay`, `buy`, `deposit`, `mint`, `stake`, … — `swapTokens` and `withdraw_all` match, `payload` does not — with no exemptions, so `transfer_ownership` is refused too); and **every** update call is refused on a canister whose own Candid interface declares ICRC-1 or ICRC-2 methods — every ICRC ledger and the ICP ledger, detected from the interface the canister publishes — and on the financial-service canisters the guard carries — all to protect the user. **The canister must publish its interface**: an update call to a canister that publishes none, or whose interface cannot be read, is refused (there is no `candid` fallback here, unlike `canister_query`), so every update the server sends was checked against the canister's own interface. The refusal directs the user to perform the operation outside the connector, in a trusted interface they control — or, for canister creation and funding, with the [icp CLI](https://github.com/dfinity/icp-cli) in their own terminal. The policy is stated in the server-level instructions, deliberately not in any tool description. Echoes `derived_for_origin` / `requested` so an origin mismatch is visible (never the principal — `get_app_principal` returns it on request) |
 | `get_app_principal` | `derivation_origin`, `account?` | The principal you act as at an app. Identify the app by its `derivation_origin` (from `open_app`). Echoes `derived_for_origin` / `requested` so an origin mismatch is visible |
 | `list_app_accounts` | `derivation_origin` | The user's Internet Identity accounts at an app — the default account plus any named ones — with name, number, and the derivation origin they were listed for (no principals and no last-used timestamps: the listing exists to pick an account). Identify the app by its `derivation_origin` (from `open_app`) |
 | `candid_syntax_guide` | — | The textual-Candid value syntax the `args` of `canister_query` / `canister_update_call` take and their replies come back in: the literal form for each Candid type, and when a value needs an explicit `: type` annotation. The full type system stays available as the `candid://reference` MCP resource |
@@ -198,7 +210,7 @@ Acting **for the user** at an app:
    (it resolves the origin and discovers the canisters concurrently under the hood).
    **Never guess a domain from a name** — a lookalike like `<name>.com` is an
    unrelated or squatted site. The tool enforces this: a bare *unknown* name is
-   refused (find the real URL — web-search or ask the user), and a URL that resolves
+   refused (ask the user for the real URL), and a URL that resolves
    to `app_url_default` while showing **no IC evidence** (no valid `x-ic-canister-id`
    gateway header, no declared derivation origin) is refused too; when the host
    resembles a known app the error names it and gives the real URL (a
@@ -209,7 +221,10 @@ Acting **for the user** at an app:
    `canister_query` / `canister_update_call` act as the account without pre-fetching it.
 5. **`get_canister_candid`** to learn the interface, passing the `app_url` from step
    0–2 — its `oql` flag says whether OQL is available, its `api_doc_available` flag
-   whether to call **`get_canister_api_doc`** (call it only when that's true). For an
+   whether to call **`get_canister_api_doc`** (call it only when that's true). On a
+   canister with many methods, read the API doc first — it names the methods to
+   call — and then ask `get_canister_candid` for just those with `methods`, rather
+   than reading the whole interface. For an
    OQL canister, get the entity/field names from **`get_canister_oql_schema`** (pass
    the `derivation_origin` too).
 6. **Read** with `canister_query`: use the `oql` argument when OQL is available,
@@ -599,12 +614,17 @@ when hosting:
   falsey value (`0`/`false`/`no`/`off`) only if you must serve a client too old to
   send `resource`; that reopens the confused-deputy path for such clients, so
   prefer updating the client.
+- **`OAUTH_CIMD_ENABLED`** — Client ID Metadata Documents, **on by default**. A
+  falsey value (`0`/`false`/`no`/`off`) switches them off, in which case Claude
+  and ChatGPT register through DCR instead. A kill switch for the roll-out only,
+  to be removed once CIMD has run in production for a while.
 
 A `Dockerfile` is included (works on Render / Fly / Cloud Run / Koyeb). The
 reference deployment (`deploy/native/`, see its README) instead runs the binary
-and Caddy as native systemd units: pushes to `main` auto-deploy staging, and
-`release-*` tags deploy production, attaching the deployed binary to the GitHub
-release. For a
+and Caddy as native systemd units: an `rc-X.Y.Z-N` tag deploys that candidate to
+staging (attaching the deployed binary to a GitHub prerelease), and the matching
+`vX.Y.Z` tag publishes the crates and the local MCP binaries; production embeds
+the published crate. For a
 zero-signup public URL during testing, expose the local server with a tunnel:
 
 ```bash
@@ -716,11 +736,12 @@ its AS issuer is `<PUBLIC_URL>/mcp` and everything OAuth lives under it:
   once per process (however many instances the binary mounts), four per host, so
   one slow host cannot hold up the rest. The fetch connects directly, never
   through a proxy from the environment, so the address pin always binds. Claude and ChatGPT both select CIMD over DCR when it is
-  advertised — which it is only where `OAUTH_CIMD_ENABLED=1` is set (the deploy
-  template takes it from the GitHub Environment's variable of that name, so a
-  deploy never enables it by itself; to roll back, unset it and redeploy — the
-  value is read once at start-up, so the variable alone changes nothing — and
-  clients re-read the metadata within minutes and fall back to DCR). Only a
+  advertised — which it is by default: `McpConfig::cimd_enabled` for an embedding
+  host, and the `imcp2` binary has it on unless `OAUTH_CIMD_ENABLED` is falsey
+  (a roll-out kill switch, to be removed; the deploy template takes it from the
+  GitHub Environment's variable of that name and the value is read once at
+  start-up, so switching means setting it and redeploying — clients then re-read
+  the metadata within minutes and fall back to DCR). Only a
   document on a vetted vendor origin is fetched at all — a host on or under an
   allow-listed domain, default port (the trust policy of PR #143); any other URL
   `client_id` is refused before any request and pointed at the allow-listing
@@ -979,16 +1000,32 @@ none of them can be filled at the expense of an authenticated user:
 | State | Cap | When full |
 | --- | --- | --- |
 | Client registrations (`POST /oauth/register`) | 10 000 | least-recently-used registration is evicted; every `/oauth/authorize` marks its client used, so a flood evicts its own unused entries first, and an evicted client re-registers (DCR is automatic) |
-| Connects in flight (`GET /oauth/authorize`, one session + one pending-authz entry each) | 1 024 | oldest pending connect is evicted; sessions holding a live grant are never touched |
+| Connects in flight (`GET /oauth/authorize`, one session + one pending-authz entry each) | 1 024, each entry about 6 KiB at most | oldest pending connect is evicted; sessions holding a live grant are never touched |
 | Sessions overall | 20 000 | a **new connect is refused** (`503`, on-brand "server is busy, try again" screen) rather than evicting an authenticated user's live grant |
 | Authorization codes | 4 096 | closest-to-expiry code is evicted (inserting one requires a completed II consent) |
 | Access tokens | 20 000 | closest-to-expiry token is evicted |
 | Per-app delegation cache, **per session** | 64 origins/accounts | entry nearest expiry is evicted (it would be re-derived anyway) |
 
+A count bounds a map only as far as its entries are bounded too. Each
+registration holds at most 16 redirect URIs of at most 2 KiB. Each connect in
+flight holds strings the request chose, and `GET /oauth/authorize` refuses one
+(`400 invalid_request`, before the session is minted) unless the client's `state`
+is at most 2 KiB, the `code_challenge` has the S256 shape (exactly 43 base64url
+characters, the only shape `/oauth/token` can ever match), and the
+`redirect_uri` is at most 2 KiB plus a `:port`. A loopback redirect needs that
+last cap because it is matched after URL parsing but stored as sent, so padding
+the parser discards (tabs, `/.` segments, a zero-padded port) would otherwise
+be stored too. With a `client_id` of at most 2 KiB as well, a connect's strings
+come to about 6 KiB at most, and 1 024 of them to about 6 MiB per instance.
+Without the caps, hyper's 64 KiB request-URI limit was the only bound, which is
+about 64 MiB per instance.
+
 The per-instance reaper (60s cadence — `spawn_session_reaper`, which a deployment
 must call) drops expired grants, **connects abandoned mid-handshake** (a session
-that never redeemed a grant, after 15 minutes), pending authorizations past their
-10-minute TTL, unexchanged authorization codes, and expired access tokens.
+that never redeemed a grant, after 15 minutes), pending authorizations an hour
+after their 10-minute TTL (kept that long so a sign-in finished late is told it
+expired, not that it is unknown), unexchanged authorization codes, and expired
+access tokens.
 Registrations are the one long-lived map: they must survive a restart, so they
 are persisted — now on a coalescing background writer (at most one full write per
 2s) instead of one full rewrite per registration.
@@ -1117,13 +1154,23 @@ mcp_get_delegation :
   default account, or a specific number when an `account` name was given — resolved
   from `mcp_get_accounts` (see [Listing accounts](#listing-accounts) below).
 - `max_ttl` is in **nanoseconds**; the server passes `null`, so II applies its
-  default (≤ 1 hour, and never past the grant).
+  own cap: an MCP delegation lives at most **5 minutes**
+  (`MCP_MAX_EXPIRATION_PERIOD_NS` in II's `mcp.rs`), and never past the grant.
 - These methods live on the **same II instance** as the connect-time login:
   `II_URL` (default `https://beta.id.ai`) is the browser login origin and
   `II_CANISTER_ID` (default `fgte5-ciaaa-aaaad-aaatq-cai`, that instance's
   canister) is the canister these calls target, over `https://icp-api.io`.
 - Derived delegations are cached per `(session, derivation_origin, account_number)` and
-  reused until they near expiry, then re-derived.
+  reused until they near expiry, then re-derived. With the 5-minute cap and the
+  server's 30 s re-derive margin, a cached delegation serves for at most about
+  4.5 minutes, so an app in continuous use re-derives every few minutes — one
+  `mcp_prepare_delegation` update plus a `mcp_get_delegation` query each time.
+- That query is answered by a single replica, which may not yet have caught up
+  with the `prepare` update; II then answers `NoSuchDelegation` even though the
+  delegation exists. The server re-sends the same `get` (same per-app key, same
+  prepared account and expiration) after 1, 2 and 3 seconds — as II's own
+  frontend does — and only reports the failure if the delegation still has not
+  appeared. `Unauthorized` is never retried: it means the grant is gone.
 
 ### Listing accounts
 

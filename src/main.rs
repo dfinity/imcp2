@@ -79,6 +79,24 @@ fn serve_beta() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether to advertise and accept Client ID Metadata Documents, the
+/// registration mode Claude and ChatGPT prefer over DCR. **On by default**; a
+/// falsey `$OAUTH_CIMD_ENABLED` (`0`/`false`/`no`/`off`) switches it off. Read
+/// once and handed to every instance, so switching means setting it and
+/// redeploying.
+///
+/// TODO: remove the variable (pass `true` to every instance) once CIMD has run
+/// in production for a while; it exists only as a kill switch for the roll-out.
+fn cimd_enabled() -> bool {
+    cimd_enabled_by(std::env::var("OAUTH_CIMD_ENABLED").ok().as_deref())
+}
+
+fn cimd_enabled_by(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+    })
+}
+
 /// Whether to serve the Prometheus exposition at `/metrics`. Off unless
 /// `$MCP_SERVE_METRICS` is truthy (`1`/`true`/`yes`/`on`).
 ///
@@ -291,6 +309,12 @@ async fn main() -> anyhow::Result<()> {
     // the operational directory.
     let clients = SharedClients::load(&state_dir);
 
+    // Client ID Metadata Documents: on for every instance unless the deploy says no.
+    let cimd_on = cimd_enabled();
+    if !cimd_on {
+        tracing::warn!("OAUTH_CIMD_ENABLED is off: Client ID Metadata Documents are disabled");
+    }
+
     // Production Internet Identity at `/mcp`: always served, and the origin's
     // default instance (it answers the plain-root discovery probes). A
     // self-contained McpServer whose sessions/tokens never cross instances.
@@ -302,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
         clients: clients.clone(),
         state_dir: state_dir.clone(),
         require_resource: require_resource(),
+        cimd_enabled: cimd_on,
     });
     prod.spawn_session_reaper();
 
@@ -316,6 +341,7 @@ async fn main() -> anyhow::Result<()> {
             clients,
             state_dir,
             require_resource: require_resource(),
+            cimd_enabled: cimd_on,
         });
         beta.spawn_session_reaper();
         Some(beta)
@@ -543,9 +569,23 @@ mod tests {
         landing_redirects_router, metrics_router, openai_apps_challenge_router, serve_metrics,
         site_metadata_router,
     };
+
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// `OAUTH_CIMD_ENABLED`'s reading: on unless it says off.
+    #[test]
+    fn cimd_opt_out_values() {
+        use super::cimd_enabled_by;
+        let on = [None, Some(""), Some(" "), Some("1"), Some("true"), Some("yes"), Some("on")];
+        for value in on.into_iter().chain([Some("disabled"), Some("2")]) {
+            assert!(cimd_enabled_by(value), "{value:?} should leave CIMD on");
+        }
+        for value in [Some("0"), Some("false"), Some("No"), Some("OFF"), Some(" 0 ")] {
+            assert!(!cimd_enabled_by(value), "{value:?} should switch CIMD off");
+        }
+    }
 
     /// The exposition must be **off** unless asked for, and the ask must be
     /// explicit. This is the security-relevant half of the gate: the native host

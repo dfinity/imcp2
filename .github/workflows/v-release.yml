@@ -42,7 +42,7 @@ on:
   pull_request:
   push:
     tags:
-      - 'imcp2-local**[0-9]+.[0-9]+.[0-9]+*'
+      - 'v**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -302,3 +302,25 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+
+  custom-imcp2-local-install-note:
+    needs:
+      - plan
+      - announce
+    uses: ./.github/workflows/imcp2-local-install-note.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit
+
+  custom-imcp2-local-mcpb:
+    needs:
+      - plan
+      - announce
+    uses: ./.github/workflows/imcp2-local-mcpb.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit
+    permissions:
+      "attestations": "write"
+      "contents": "write"
+      "id-token": "write"

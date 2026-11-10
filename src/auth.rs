@@ -140,6 +140,14 @@ pub fn bearer_session_resolver() -> imcp2_core::SessionResolver {
 /// How long an authorization request and its pending II handshake stay valid
 /// before the user must restart.
 const CONNECT_TTL: Duration = Duration::from_secs(600);
+/// How long an EXPIRED pending connect is still remembered, so that a sign-in
+/// finished after [`CONNECT_TTL`] is told its connect expired. Dropped at expiry,
+/// it could only be reported as unknown or already used: the same words as a
+/// restart or a reloaded callback page, which hid a slow sign-in behind them.
+/// Retention costs no live connect its slot: at the cap, admission evicts the
+/// oldest entry, and an expired entry is always older than a live one. The map
+/// stays under its cap either way.
+const EXPIRED_CONNECT_RETENTION: Duration = Duration::from_secs(3600);
 /// Lifetime of a minted authorization code.
 const CODE_TTL: Duration = Duration::from_secs(120);
 /// Fallback access-token lifetime, used only when the II grant's expiration is
@@ -169,6 +177,32 @@ const MAX_CLIENTS: usize = 10_000;
 /// generous: 16 URIs, each within the 2 KB URL length most stacks already impose.
 const MAX_REDIRECT_URIS: usize = 16;
 const MAX_REDIRECT_URI_LEN: usize = 2_048;
+
+/// Bounds on what a SINGLE `/oauth/authorize` request stores in its pending
+/// connect ([`AuthzPending`]). The endpoint is unauthenticated, and
+/// [`MAX_PENDING_CONNECTS`](imcp2_core::identities::MAX_PENDING_CONNECTS) bounds
+/// only the NUMBER of connects in flight, not the size of any one: without these
+/// the client's `state`, its `code_challenge` and a loopback `redirect_uri` were
+/// limited only by hyper's 64 KiB request URI, so a bare request loop could pin
+/// about 64 MiB per instance (CWE-770). A loopback redirect needs its own cap
+/// because it is matched on its PARSED form ([`loopback_match`]) but stored as
+/// given, so padding the parser discards (tabs, dot segments, a zero-padded
+/// port) would otherwise ride along. With the caps an entry's strings total at
+/// most `CIMD_MAX_CLIENT_ID_LEN + MAX_AUTHORIZE_REDIRECT_URI_LEN +
+/// MAX_CLIENT_STATE_LEN + PKCE_S256_CHALLENGE_LEN`, about 6 KiB, so a full map
+/// holds about 6 MiB.
+///
+/// - `state` is opaque to the server and RFC 6749 sets no maximum; real clients
+///   send 22 to about 170 bytes, so the redirect-URI cap of 2 KiB is generous.
+/// - An S256 challenge is the unpadded base64url of a SHA-256 digest: exactly 43
+///   characters ([`is_s256_challenge`]). `/oauth/token` compares
+///   `pkce_s256(verifier)` with it byte for byte, so a value of any other shape
+///   could never be exchanged, and refusing it turns away no working client.
+/// - A requested redirect is a registered one (at most [`MAX_REDIRECT_URI_LEN`])
+///   or a registered loopback URI on another port, which adds at most `:65535`.
+const MAX_CLIENT_STATE_LEN: usize = 2_048;
+const PKCE_S256_CHALLENGE_LEN: usize = 43;
+const MAX_AUTHORIZE_REDIRECT_URI_LEN: usize = MAX_REDIRECT_URI_LEN + ":65535".len();
 
 /// Floor on the interval between write-throughs of the registration store. The
 /// store is re-serialized in full on every write, so writing once per
@@ -833,16 +867,14 @@ fn loopback_match(registered: &str, requested: &str) -> bool {
 // ones; were one added, the only attested fact is the HOST of the `client_id`
 // URL — never the self-asserted `client_name` or `logo_uri`.
 //
-// OPT-IN per deployment: `OAUTH_CIMD_ENABLED=1` advertises the mechanism and
-// accepts URL `client_id`s; unset, the metadata does not advertise it and a URL
-// `client_id` is an unknown client. Claude and ChatGPT both switch to CIMD the
-// moment an AS advertises it, so a routine deploy must never switch them over
-// by itself (the deploy template takes the variable from the GitHub
-// Environment). The rollback, should a vendor's document turn out to be shaped
-// in a way this implementation refuses, is to unset the variable AND redeploy:
-// it is rendered into the unit at deploy time and read here once at start-up
-// ([`cimd_enabled_by_env`]), so changing it alone changes nothing on the host.
-// Once the process restarts without it, the clients re-read the metadata within
+// Per deployment ([`crate::McpConfig::cimd_enabled`]): on, the metadata
+// advertises the mechanism and URL `client_id`s are accepted; off, a URL
+// `client_id` is an unknown client. Claude and ChatGPT both select CIMD the
+// moment an AS advertises it, so it is normally on: an embedding host sets the
+// field, and the `imcp2` binary has it on unless `OAUTH_CIMD_ENABLED`, a
+// roll-out kill switch slated for removal, says off. The rollback, should a
+// vendor's document turn out to be shaped in a way this implementation refuses,
+// is to switch it off and restart; the clients re-read the metadata within
 // minutes and fall back to DCR.
 
 /// Byte cap on a `client_id` URL before it is treated as CIMD at all: the URL
@@ -891,29 +923,6 @@ const CIMD_CACHE_MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// document does not list) never is, or a probe with a bad redirect could lock
 /// out a real client; nor is a transient (a deadline, a 5xx), which is retried.
 const CIMD_NEGATIVE_TTL: Duration = Duration::from_secs(60);
-
-/// Whether this process is deployed with CIMD on: `OAUTH_CIMD_ENABLED` set to
-/// an on-value ([`cimd_enabled_by`]). Read once (the env is process-static),
-/// like the allow-list's `OAUTH_ALLOWED_REDIRECT_PREFIXES`; each [`AuthStore`]
-/// takes its own copy at construction, which tests set directly.
-fn cimd_enabled_by_env() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let enabled = cimd_enabled_by(std::env::var("OAUTH_CIMD_ENABLED").ok().as_deref());
-        if enabled {
-            tracing::info!("OAUTH_CIMD_ENABLED is set: Client ID Metadata Documents are on");
-        }
-        enabled
-    })
-}
-
-/// The opt-in's reading of `OAUTH_CIMD_ENABLED`: `1`, `true`, `yes` and `on`
-/// (any case) switch CIMD on; unset, empty, or anything else leaves it off.
-fn cimd_enabled_by(value: Option<&str>) -> bool {
-    value.is_some_and(|v| {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    })
-}
 
 /// A validated Client ID Metadata Document: what this server needs from it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1496,8 +1505,10 @@ pub struct AuthStore {
     tokens: Arc<RwLock<HashMap<String, TokenInfo>>>,
     /// Auth-code connects in flight, keyed by `session_id` (= the II connect
     /// `state`). Bounded at [`imcp2_core::identities::MAX_PENDING_CONNECTS`] (one
-    /// entry per pending connect, same as the session map) and swept of expired
-    /// entries by [`AuthStore::reap_expired`].
+    /// entry per pending connect, same as the session map), each entry's size by
+    /// the per-request caps at [`MAX_CLIENT_STATE_LEN`], and swept by
+    /// [`AuthStore::reap_expired`] once an entry has been expired for
+    /// [`EXPIRED_CONNECT_RETENTION`].
     authz: Arc<RwLock<HashMap<String, AuthzPending>>>,
     /// Minted authorization codes awaiting exchange at `/oauth/token`.
     codes: Arc<RwLock<HashMap<String, CodeGrant>>>,
@@ -1526,8 +1537,8 @@ pub struct AuthStore {
     /// bounds — the PROCESS's ([`CimdState::shared`]), so every mounted instance
     /// draws on the same bounds; a test may give a store its own.
     cimd: Arc<CimdState>,
-    /// Whether URL `client_id`s are accepted and CIMD advertised: the process's
-    /// `OAUTH_CIMD_ENABLED` ([`cimd_enabled_by_env`]), or what a test set.
+    /// Whether URL `client_id`s are accepted and CIMD advertised
+    /// ([`crate::McpConfig::cimd_enabled`]).
     cimd_enabled: bool,
 }
 
@@ -1545,14 +1556,19 @@ struct AuthzPending {
     /// delegation (the *consenter* proof) it closes the split-browser injection
     /// (see the module docs).
     cookie: String,
-    created: Instant,
+    /// When `/oauth/authorize` recorded this connect. Read on tokio's clock, which
+    /// is the system's monotonic clock except in a test that pauses it, so tests
+    /// can walk a connect past its TTL and retention without waiting them out.
+    created: tokio::time::Instant,
     /// The authorization code minted once the grant is confirmed (idempotent redeem).
     code: Option<String>,
     /// Phase 2 single-flight marker: `true` while a redemption attempt (the
     /// `mcp_register_v2` network call) is mid-flight for this connect, so a
     /// concurrent double-submit can't fire a second one. Set atomically by
-    /// [`claim_redemption`], cleared on failure so a genuine retry can proceed
-    /// (a completed attempt leaves `code` set instead, the idempotent path).
+    /// [`claim_redemption`], cleared when its [`RedemptionClaim`] is dropped —
+    /// after a failure, or if the request is cut off mid-flight — so a genuine
+    /// retry can proceed (a completed attempt leaves `code` set instead, the
+    /// idempotent path).
     /// Redemption is ALSO idempotent-on-`S` at II by design, so this is about
     /// determinism and not double-spending update calls, not correctness.
     redeeming: bool,
@@ -1560,10 +1576,25 @@ struct AuthzPending {
 
 impl AuthzPending {
     /// How long this connect may still be redeemed for — zero once it is past
-    /// [`CONNECT_TTL`]. The single definition of "expired" for a pending connect:
-    /// the redeem gate, the reaper, and the bound ([`make_room`]) all read it.
+    /// [`CONNECT_TTL`]. The single definition of "expired" for a pending connect,
+    /// which the redeem gate reads.
     fn remaining(&self) -> Duration {
         CONNECT_TTL.saturating_sub(self.created.elapsed())
+    }
+
+    /// How long this connect is still remembered for — zero once it has been
+    /// expired for [`EXPIRED_CONNECT_RETENTION`]. Until then the redeem gate can
+    /// still tell a late sign-in that the connect expired. The reaper drops what
+    /// it has run out of ([`Self::forgotten`]), and the bound ([`make_room`])
+    /// evicts by it, so at the cap the oldest connect goes first — never every
+    /// retained one at once.
+    fn retained_for(&self) -> Duration {
+        (CONNECT_TTL + EXPIRED_CONNECT_RETENTION).saturating_sub(self.created.elapsed())
+    }
+
+    /// Whether the reaper may drop this connect (see [`Self::retained_for`]).
+    fn forgotten(&self) -> bool {
+        self.retained_for().is_zero()
     }
 }
 
@@ -1637,6 +1668,7 @@ impl AuthStore {
         public_url: String,
         mcp_path: String,
         require_resource: bool,
+        cimd_enabled: bool,
     ) -> Self {
         Self {
             clients: clients.0,
@@ -1648,12 +1680,12 @@ impl AuthStore {
             mcp_path,
             require_resource,
             cimd: CimdState::shared(),
-            cimd_enabled: cimd_enabled_by_env(),
+            cimd_enabled,
         }
     }
 
-    /// This store with CIMD switched on or off, whatever the environment says,
-    /// and with CIMD state of its own, so tests do not see each other's flights.
+    /// This store with CIMD switched on or off, and with CIMD state of its own,
+    /// so tests do not see each other's flights.
     #[cfg(test)]
     fn with_cimd(mut self, enabled: bool) -> Self {
         self.cimd_enabled = enabled;
@@ -1890,17 +1922,18 @@ impl AuthStore {
     }
 
     /// Record a connect awaiting its II handshake, bounding the map first
-    /// ([`make_room`]): `/oauth/authorize` is unauthenticated, so expired entries
-    /// go and — if the map is still at the cap — the oldest pending connect is
-    /// evicted, which makes an authorize flood churn its own entries out instead
-    /// of growing the map (CWE-770). The cap is shared with the session map, whose
-    /// entries pair 1:1 with these.
+    /// ([`make_room`]): `/oauth/authorize` is unauthenticated, so forgotten
+    /// entries go and — if the map is still at the cap — the oldest pending
+    /// connect is evicted (a retained expired one before any live one), which
+    /// makes an authorize flood churn its own entries out instead of growing the
+    /// map (CWE-770). The cap is shared with the session map, whose entries pair
+    /// 1:1 with these.
     async fn insert_pending(&self, session_id: String, pending: AuthzPending) {
         let mut authz = self.authz.write().await;
         make_room(
             &mut authz,
             imcp2_core::identities::MAX_PENDING_CONNECTS,
-            AuthzPending::remaining,
+            AuthzPending::retained_for,
         );
         authz.insert(session_id, pending);
     }
@@ -1924,13 +1957,15 @@ impl AuthStore {
     /// all times; this is what returns the memory once a burst has passed, so an
     /// abandoned connect, an unexchanged code, or an expired token doesn't linger
     /// for the process's lifetime (CWE-770). Run on the same 60s timer as the
-    /// session reaper (`McpServer::spawn_session_reaper`).
+    /// session reaper (`McpServer::spawn_session_reaper`). An expired pending
+    /// connect is the one exception that is kept for a while: it goes only once
+    /// it has been expired for [`EXPIRED_CONNECT_RETENTION`] (see there for why).
     pub(crate) async fn reap_expired(&self) -> ReapedOauthState {
         let mut reaped = ReapedOauthState::default();
         {
             let mut authz = self.authz.write().await;
             let before = authz.len();
-            authz.retain(|_, a| !a.remaining().is_zero());
+            authz.retain(|_, a| !a.forgotten());
             reaped.pending = before - authz.len();
         }
         {
@@ -1962,7 +1997,8 @@ impl AuthStore {
 /// What one [`AuthStore::reap_expired`] sweep dropped, per map.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ReapedOauthState {
-    /// Pending connects past [`CONNECT_TTL`] (an abandoned `/oauth/authorize`).
+    /// Pending connects expired for [`EXPIRED_CONNECT_RETENTION`] (an abandoned
+    /// `/oauth/authorize`).
     pending: usize,
     /// Authorization codes past [`CODE_TTL`], never exchanged.
     codes: usize,
@@ -2214,6 +2250,46 @@ pub async fn authorize(
              connector and add it again.",
         );
     }
+    // Bound what the pending connect will hold (see [`MAX_CLIENT_STATE_LEN`]),
+    // here, before the session is minted and the connect recorded, so a refusal
+    // leaves neither behind. A challenge of any other shape could never pass
+    // `/oauth/token`, so refusing it now only spares the user an II sign-in that
+    // was bound to fail.
+    if !is_s256_challenge(&code_challenge) {
+        return signin_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "code_challenge must be an unpadded base64url SHA-256 digest (RFC 7636 S256)",
+            SIGNIN_HEADLINE,
+            "Your MCP client's request carried a malformed security check (PKCE). The client may \
+             be out of date. Try updating it. If that doesn't help, remove the connector and add \
+             it again.",
+        );
+    }
+    if let Some(state) = q.state.as_deref().filter(|s| s.len() > MAX_CLIENT_STATE_LEN) {
+        return signin_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!("state is too long ({} bytes, max {MAX_CLIENT_STATE_LEN})", state.len()),
+            SIGNIN_HEADLINE,
+            MALFORMED_DIAGNOSTIC,
+        );
+    }
+    if q.redirect_uri.len() > MAX_AUTHORIZE_REDIRECT_URI_LEN {
+        return signin_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!(
+                "redirect_uri is too long ({} bytes, max {MAX_AUTHORIZE_REDIRECT_URI_LEN})",
+                q.redirect_uri.len()
+            ),
+            SIGNIN_HEADLINE,
+            MALFORMED_DIAGNOSTIC,
+        );
+    }
     // RFC 8707 Resource Indicators (MCP authorization): a token must only be
     // issued for THIS instance, so refuse a `resource` that names any other
     // server — the MCP spec requires the authorization server to bind tokens to
@@ -2279,7 +2355,7 @@ pub async fn authorize(
                 client_state: q.state.clone().unwrap_or_default(),
                 code_challenge: Some(code_challenge),
                 cookie: cookie.clone(),
-                created: Instant::now(),
+                created: tokio::time::Instant::now(),
                 code: None,
                 redeeming: false,
             },
@@ -2599,6 +2675,55 @@ fn not_allowlisted_page() -> Response {
     )
 }
 
+/// What the pinned page shows for a connect past [`CONNECT_TTL`].
+const CONNECT_EXPIRED_MSG: &str = "This connect request has expired. Restart from your client.";
+
+/// Reserve the authorization code for `state` once its redemption succeeded,
+/// under the `authz` lock: the code an earlier attempt already minted, else
+/// `fresh` (`true` = newly minted, still to be recorded in `codes`). Leaves the
+/// connect's `redeeming` mark to the [`RedemptionClaim`] that set it: once a code
+/// is recorded, that code is what a later claim gets, and a refused connect must
+/// stay claimed until its own claim lets go, or a second registration could
+/// start before this one's guard clears the mark out from under it.
+///
+/// Refused for a connect past [`CONNECT_TTL`], even one whose redemption passed
+/// the gate in time. `imcp2-core` reaps an unredeemed connect's session 15
+/// minutes in, on the promise that no connect is redeemed past its TTL, and
+/// recording the grant on a reaped session re-creates it with a fresh key that
+/// II never registered: a code minted then would hand the client a session
+/// whose every signed call fails. Until [`EXPIRED_CONNECT_RETENTION`], the sweep
+/// had dropped the entry long before that, so this check is what keeps the
+/// promise now that expired connects are retained.
+///
+/// A refusal also discards the session the registration just granted
+/// ([`Identities::discard_session`]): no code will ever reach it, and with a
+/// grant recorded nothing else would drop it before the grant expired.
+async fn reserve_code(
+    store: &AuthStore,
+    state: &str,
+    fresh: String,
+) -> Result<(String, bool), &'static str> {
+    let refused = {
+        let mut authz = store.authz.write().await;
+        match authz.get_mut(state) {
+            None => "This connect request is no longer available. Restart from your client.",
+            Some(a) if a.remaining().is_zero() => CONNECT_EXPIRED_MSG,
+            Some(a) => {
+                return Ok(match &a.code {
+                    Some(existing) => (existing.clone(), false),
+                    None => {
+                        a.code = Some(fresh.clone());
+                        (fresh, true)
+                    }
+                })
+            }
+        }
+    };
+    // Outside the `authz` lock: the session map has its own.
+    store.identities.discard_session(state).await;
+    Err(refused)
+}
+
 /// A JSON error the pinned page reads and displays.
 fn redeem_err(msg: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
@@ -2607,11 +2732,14 @@ fn redeem_err(msg: &str) -> Response {
 /// Outcome of the atomic single-flight claim on a connect's redemption.
 enum RedeemClaim {
     /// Won the claim: this request runs the (only) in-flight redemption attempt.
-    Claimed,
+    /// The claim is held for as long as the returned [`RedemptionClaim`] lives.
+    Claimed(RedemptionClaim),
     /// A previous attempt already finished — return its code again (idempotent).
     Existing(String),
     /// Another attempt is mid-flight right now (a double-submit lost the race).
     InProgress,
+    /// The connect is past [`CONNECT_TTL`]: no new attempt may start on it.
+    Expired,
     /// The pending connect vanished (expiry sweep / restart).
     Vanished,
 }
@@ -2622,7 +2750,8 @@ enum RedeemClaim {
 /// connect — a page double-submit can't fire two concurrent redemptions. (II
 /// would tolerate the race — within its 5-minute lifetime the delegation
 /// redeems repeatedly, and a retry with the same `S` just re-binds it — but one
-/// deterministic attempt is strictly better than racing two.)
+/// deterministic attempt is strictly better than racing two.) A won claim comes
+/// back as a [`RedemptionClaim`], which gives it back when dropped.
 async fn claim_redemption(store: &AuthStore, state: &str) -> RedeemClaim {
     let mut authz = store.authz.write().await;
     let Some(a) = authz.get_mut(state) else {
@@ -2634,15 +2763,68 @@ async fn claim_redemption(store: &AuthStore, state: &str) -> RedeemClaim {
     if a.redeeming {
         return RedeemClaim::InProgress;
     }
+    // Rechecked under the lock: the gate's snapshot can predate the TTL, and a
+    // registration started on an expired connect could only be refused at the
+    // mint, after II had already granted it.
+    if a.remaining().is_zero() {
+        return RedeemClaim::Expired;
+    }
     a.redeeming = true;
-    RedeemClaim::Claimed
+    RedeemClaim::Claimed(RedemptionClaim {
+        authz: Arc::clone(&store.authz),
+        state: state.to_owned(),
+        held: true,
+    })
 }
 
-/// Release a failed redemption claim so a genuine retry can proceed. (A
-/// successful attempt leaves `code` set, which [`claim_redemption`] returns
-/// directly — the `redeeming` marker no longer matters then.)
-async fn release_redemption(store: &AuthStore, state: &str) {
-    if let Some(a) = store.authz.write().await.get_mut(state) {
+/// A won redemption claim, given back so a genuine retry can proceed — by
+/// [`Self::release`] on a path that answers, and otherwise when dropped. The
+/// drop covers every way out of [`connect_redeem`], including the one no code
+/// after an `.await` can see: the request future being dropped while
+/// `mcp_register_v2` is in flight, which is what happens when the browser
+/// disconnects or a fronting proxy times the request out. Releasing only on the
+/// error path missed that case, and the connect then stayed marked `redeeming`
+/// until it expired, so every retry was turned away as "already being
+/// processed". Releasing after a success is harmless: the minted `code` is what
+/// [`claim_redemption`] returns first.
+struct RedemptionClaim {
+    authz: Arc<RwLock<HashMap<String, AuthzPending>>>,
+    state: String,
+    /// Whether the claim still needs giving back; [`Self::release`] clears it.
+    held: bool,
+}
+
+impl RedemptionClaim {
+    /// Give the claim back now, waiting for the lock, so that by the time the
+    /// caller answers, a retry the answer prompts finds the connect free. (A
+    /// drop can't wait, and may leave the release to the runtime for a moment.)
+    async fn release(mut self) {
+        clear_redeeming(&mut *self.authz.write().await, &self.state);
+        self.held = false;
+    }
+}
+
+impl Drop for RedemptionClaim {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        // `Drop` cannot await the tokio lock. Take it if it is free, which it
+        // normally is (nothing holds it across an `.await`); otherwise hand the
+        // release to the runtime, which runs it once the holder lets go. A claim
+        // can't be won in between: the entry still reads `redeeming` until then.
+        if let Ok(mut authz) = self.authz.try_write() {
+            clear_redeeming(&mut authz, &self.state);
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (authz, state) = (Arc::clone(&self.authz), std::mem::take(&mut self.state));
+            runtime.spawn(async move { clear_redeeming(&mut *authz.write().await, &state) });
+        }
+    }
+}
+
+/// Mark the pending connect `state` as no longer mid-redemption.
+fn clear_redeeming(authz: &mut HashMap<String, AuthzPending>, state: &str) {
+    if let Some(a) = authz.get_mut(state) {
         a.redeeming = false;
     }
 }
@@ -2689,7 +2871,7 @@ pub async fn connect_redeem(
         );
     };
     if expired {
-        return redeem_err("This connect request has expired. Restart from your client.");
+        return redeem_err(CONNECT_EXPIRED_MSG);
     }
     // Initiator proof: only the browser that STARTED this connect (holding the
     // `sid` cookie) may redeem. In the confused-deputy path the delegation lands
@@ -2725,26 +2907,27 @@ pub async fn connect_redeem(
     // Single-flight: atomically claim this connect's redemption so a double-submit
     // can't fire two concurrent mcp_register_v2 calls (and a request racing a
     // just-finished attempt gets that attempt's code instead of redeeming again).
-    match claim_redemption(&store, &body.state).await {
-        RedeemClaim::Claimed => {}
+    // Held until this handler gives it back or ends, or is dropped mid-redemption;
+    // dropping it gives the claim back too.
+    let claim = match claim_redemption(&store, &body.state).await {
+        RedeemClaim::Claimed(claim) => claim,
         RedeemClaim::Existing(code) => {
-            return Json(
-                json!({ "redirect": build_redirect(&redirect_uri, &code, &client_state, &iss) }),
-            )
-            .into_response()
+            let redirect = build_redirect(&redirect_uri, &code, &client_state, &iss);
+            return Json(json!({ "redirect": redirect })).into_response();
         }
         RedeemClaim::InProgress => {
             return redeem_err(
                 "This connect request is already being processed. Wait a moment. \
                  If nothing happens, restart from your client.",
-            )
+            );
         }
+        RedeemClaim::Expired => return redeem_err(CONNECT_EXPIRED_MSG),
         RedeemClaim::Vanished => {
             return redeem_err(
                 "This connect request is no longer available. Restart from your client.",
-            )
+            );
         }
-    }
+    };
     // Redeem: build a DelegatedIdentity from priv(X) + the chain and make one
     // authenticated mcp_register_v2 call. Success proves consent AND registration.
     match store.identities.redeem_registration_delegation(&body.state, user_key, chain).await {
@@ -2757,8 +2940,9 @@ pub async fn connect_redeem(
             );
         }
         Err(e) => {
-            // Free the claim so a genuine retry can attempt redemption again.
-            release_redemption(&store, &body.state).await;
+            // Free the claim before answering, so a genuine retry can attempt
+            // redemption again.
+            claim.release().await;
             return redeem_err(&e);
         }
     }
@@ -2766,21 +2950,9 @@ pub async fn connect_redeem(
     // insert into `codes` only after releasing it (consistent lock order with
     // `token_authorization_code`).
     let fresh = format!("mcp-code-{}", Uuid::new_v4());
-    let (code, newly_minted) = {
-        let mut authz = store.authz.write().await;
-        let Some(a) = authz.get_mut(&body.state) else {
-            return redeem_err(
-                "This connect request is no longer available. Restart from your client.",
-            );
-        };
-        a.redeeming = false;
-        match &a.code {
-            Some(existing) => (existing.clone(), false),
-            None => {
-                a.code = Some(fresh.clone());
-                (fresh, true)
-            }
-        }
+    let (code, newly_minted) = match reserve_code(&store, &body.state, fresh).await {
+        Ok(reserved) => reserved,
+        Err(msg) => return redeem_err(msg),
     };
     if newly_minted {
         let mut codes = store.codes.write().await;
@@ -2941,6 +3113,16 @@ fn pkce_s256(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
+/// Whether `challenge` has the shape of an S256 code challenge (RFC 7636 §4.2):
+/// exactly [`PKCE_S256_CHALLENGE_LEN`] characters of the unpadded base64url
+/// alphabet `[A-Za-z0-9_-]`. Every value [`pkce_s256`] can produce has this
+/// shape, so nothing refused here could ever have been exchanged at
+/// `/oauth/token`.
+fn is_s256_challenge(challenge: &str) -> bool {
+    challenge.len() == PKCE_S256_CHALLENGE_LEN
+        && challenge.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 // ---- Dynamic client registration ---------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -3080,9 +3262,8 @@ pub async fn authorization_server_metadata(State(store): State<AuthStore>) -> Re
         // identify itself with the https URL of its Client ID Metadata Document
         // instead of registering (see `cimd_client_id`). Claude and ChatGPT both
         // select CIMD over DCR when this is advertised alongside `none` above —
-        // which is why it is advertised only where the deployment opts in with
-        // `OAUTH_CIMD_ENABLED`, and a redeploy without that withdraws it (no
-        // rebuild; the value is read once at start-up).
+        // which is why it is advertised only where the deployment opts in
+        // (`McpConfig::cimd_enabled`), and switching that off withdraws it.
         "client_id_metadata_document_supported": store.cimd_enabled,
         // RFC 9207: we emit `iss` on every authorization response, so we MUST
         // advertise it here (a client that sees this flag rejects any response
@@ -3718,19 +3899,6 @@ mod tests {
         assert!(invalid(FetchError::Refused("private address".into())));
         assert!(invalid(FetchError::TooLarge("cap".into())));
         assert!(invalid(FetchError::NotUtf8("bytes".into())));
-    }
-
-    /// The deploy-time opt-in's reading of its variable: off unless it says on.
-    #[test]
-    fn cimd_opt_in_values() {
-        use super::cimd_enabled_by;
-        let off = [None, Some(""), Some(" "), Some("0"), Some("false"), Some("no"), Some("off")];
-        for value in off.into_iter().chain([Some("enabled"), Some("2")]) {
-            assert!(!cimd_enabled_by(value), "{value:?} should leave CIMD off");
-        }
-        for value in [Some("1"), Some("true"), Some("Yes"), Some("ON"), Some(" 1 ")] {
-            assert!(cimd_enabled_by(value), "{value:?} should turn CIMD on");
-        }
     }
 
     /// PR #143's trust policy: a document is fetched only from a vetted vendor
@@ -4457,13 +4625,13 @@ mod tests {
     }
 
     fn test_store_cfg(require_resource: bool) -> super::AuthStore {
-        // As deployed with `OAUTH_CIMD_ENABLED=1`, and with CIMD state of its own so
-        // tests do not see each other's flights; the off case sets this itself.
+        // As a deployment with CIMD on, and with CIMD state of its own so tests do
+        // not see each other's flights; the off case sets this itself.
         new_store(require_resource).with_cimd(true)
     }
 
-    /// A store exactly as [`super::AuthStore::new`] builds it: CIMD per the
-    /// environment (off under `cargo test`), CIMD state shared process-wide.
+    /// A store exactly as [`super::AuthStore::new`] builds it with CIMD off, CIMD
+    /// state shared process-wide.
     fn new_store(require_resource: bool) -> super::AuthStore {
         use candid::Principal;
         use imcp2_core::identities::{Identities, IiInstance};
@@ -4487,6 +4655,7 @@ mod tests {
             "https://mcp.test".into(),
             "/mcp".into(),
             require_resource,
+            false,
         )
     }
 
@@ -4550,7 +4719,7 @@ mod tests {
                     client_state: String::new(),
                     code_challenge: Some("cc".into()),
                     cookie: cookie.into(),
-                    created: std::time::Instant::now(),
+                    created: tokio::time::Instant::now(),
                     code: None,
                     redeeming: false,
                 },
@@ -4599,6 +4768,251 @@ mod tests {
             authz.contains_key(&format!("sess-{}", cap + 15)),
             "the connect just started is never the one evicted"
         );
+    }
+
+    // At the cap, admitting a connect evicts only the OLDEST entry, so the other
+    // expired connects inside their retention still answer "expired". Evicting
+    // by redeemable time instead would purge every retained one in one go.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_map_evicts_only_its_oldest_retained_connect() {
+        let cap = imcp2_core::identities::MAX_PENDING_CONNECTS;
+        let store = test_store();
+        seed_pending(&store, "old-1", "bind").await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        seed_pending(&store, "old-2", "bind").await;
+        tokio::time::advance(super::CONNECT_TTL).await;
+        for i in 2..cap {
+            seed_pending(&store, &format!("live-{i}"), "bind").await;
+        }
+
+        seed_pending(&store, "newest", "bind").await;
+
+        let authz = store.authz.read().await;
+        assert_eq!(authz.len(), cap);
+        assert!(!authz.contains_key("old-1"), "the oldest connect makes the room");
+        assert!(authz.contains_key("old-2"), "the other expired connect is still retained");
+        assert!(authz.contains_key("live-2") && authz.contains_key("newest"));
+    }
+
+    /// RFC 7636 Appendix B's challenge: what a spec-conformant S256 client sends.
+    const RFC7636_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    /// An authorize request from `client-x` that passes every check, for a test
+    /// to break in exactly one place.
+    fn valid_authorize_query(redirect_uri: &str) -> super::AuthorizeQuery {
+        super::AuthorizeQuery {
+            response_type: Some("code".into()),
+            client_id: "client-x".into(),
+            redirect_uri: redirect_uri.into(),
+            state: Some("xyz".into()),
+            code_challenge: Some(RFC7636_CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
+            scope: None,
+            resource: None,
+        }
+    }
+
+    /// Fill `store`'s session map with exactly
+    /// [`MAX_PENDING_CONNECTS`](imcp2_core::identities::MAX_PENDING_CONNECTS)
+    /// pending connects and return their ids. Minting one more session then
+    /// evicts one of them (the session map's admission bound), so whether they
+    /// all survive a request tells whether it minted a session: the map is
+    /// private to `imcp2-core`, and `authorize` mints under a random id.
+    async fn fill_session_map(store: &super::AuthStore) -> Vec<String> {
+        let ids: Vec<String> = (0..imcp2_core::identities::MAX_PENDING_CONNECTS)
+            .map(|i| format!("sess-probe-{i}"))
+            .collect();
+        for id in &ids {
+            store.identities.registration_pubkey_b64(id).await.expect("room for the probe");
+        }
+        ids
+    }
+
+    /// How many of `ids` still have a session.
+    async fn sessions_left(store: &super::AuthStore, ids: &[String]) -> usize {
+        let mut left = 0;
+        for id in ids {
+            left += usize::from(store.identities.session_principal(id).await.is_some());
+        }
+        left
+    }
+
+    /// Run `query` through `authorize` as a programmatic caller and assert that it
+    /// is refused as `invalid_request` without a trace: no pending connect is
+    /// recorded and no session is minted (`probe` is from [`fill_session_map`]).
+    async fn assert_refused_without_trace(
+        store: &super::AuthStore,
+        probe: &[String],
+        query: super::AuthorizeQuery,
+        what: &str,
+    ) {
+        use axum::extract::{Query, State};
+        let resp = super::authorize(State(store.clone()), json_headers(), Query(query)).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST, "{what} must be refused");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "invalid_request", "{what}: {body}");
+        assert!(store.authz.read().await.is_empty(), "{what} must record no pending connect");
+        assert_eq!(sessions_left(store, probe).await, probe.len(), "{what} must mint no session");
+    }
+
+    // The S256 shape check accepts everything `pkce_s256` can produce and
+    // nothing else: no padding, no standard-base64 `+` or `/`, no other length.
+    #[test]
+    fn is_s256_challenge_accepts_exactly_the_s256_shape() {
+        assert!(super::is_s256_challenge(RFC7636_CHALLENGE));
+        for verifier in ["verifier", "", "~.-_", "v".repeat(128).as_str()] {
+            let challenge = pkce_s256(verifier);
+            assert!(super::is_s256_challenge(&challenge), "must accept {challenge}");
+        }
+
+        for bad in [
+            String::new(),
+            RFC7636_CHALLENGE[..42].to_string(),
+            format!("{RFC7636_CHALLENGE}A"),
+            // `=`-padded (44 characters), and 43 characters ending in `=`.
+            format!("{RFC7636_CHALLENGE}="),
+            format!("{}=", &RFC7636_CHALLENGE[..42]),
+            // Standard base64's `+` and `/` in place of `-` and `_`.
+            RFC7636_CHALLENGE.replace('-', "+"),
+            format!("{}/", &RFC7636_CHALLENGE[..42]),
+            // 43 bytes, but not of the alphabet.
+            format!("{}é", &RFC7636_CHALLENGE[..41]),
+            "A".repeat(300 * 1024),
+        ] {
+            assert!(!super::is_s256_challenge(&bad), "must refuse {bad:.60}");
+        }
+    }
+
+    // A malformed challenge is refused at `/oauth/authorize`, before anything is
+    // minted or recorded, rather than after a sign-in whose code could never be
+    // exchanged. The RFC 7636 challenge still goes through, and minting its
+    // session is visible to the probe, so the probe can tell.
+    #[tokio::test]
+    async fn authorize_refuses_a_malformed_challenge_before_minting_anything() {
+        use axum::extract::{Query, State};
+        let redirect = "https://claude.ai/api/mcp/auth_callback";
+        let store = test_store();
+        store.clients.seed("client-x", vec![redirect]).await;
+        let probe = fill_session_map(&store).await;
+        let with_challenge = |challenge: &str| super::AuthorizeQuery {
+            code_challenge: Some(challenge.into()),
+            ..valid_authorize_query(redirect)
+        };
+
+        for (bad, what) in [
+            (RFC7636_CHALLENGE[..42].to_string(), "a 42-character challenge"),
+            (format!("{RFC7636_CHALLENGE}A"), "a 44-character challenge"),
+            (format!("{RFC7636_CHALLENGE}="), "an `=`-padded challenge"),
+            (RFC7636_CHALLENGE.replace('-', "+"), "a challenge with `+`"),
+            (format!("{}/", &RFC7636_CHALLENGE[..42]), "a challenge with `/`"),
+            ("A".repeat(300 * 1024), "a 300 KiB challenge"),
+        ] {
+            assert_refused_without_trace(&store, &probe, with_challenge(&bad), what).await;
+        }
+
+        // A browser gets the friendly screen naming the cause.
+        let resp = super::authorize(
+            State(store.clone()),
+            html_headers(),
+            Query(with_challenge(&"A".repeat(300 * 1024))),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let html = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("PKCE") && html.contains("report it"), "{html}");
+
+        let resp = super::authorize(
+            State(store.clone()),
+            axum::http::HeaderMap::new(),
+            Query(with_challenge(RFC7636_CHALLENGE)),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FOUND, "a valid challenge is accepted");
+        let authz = store.authz.read().await;
+        assert_eq!(authz.len(), 1);
+        let pending = authz.values().next().unwrap();
+        assert_eq!(pending.code_challenge.as_deref(), Some(RFC7636_CHALLENGE));
+        assert_eq!(sessions_left(&store, &probe).await, probe.len() - 1, "the probe sees a mint");
+    }
+
+    // The client's `state` is capped: over the cap is refused before anything is
+    // minted or recorded, and a `state` exactly at the cap is stored whole.
+    #[tokio::test]
+    async fn authorize_bounds_the_client_state() {
+        use axum::extract::{Query, State};
+        let redirect = "https://claude.ai/api/mcp/auth_callback";
+        let store = test_store();
+        store.clients.seed("client-x", vec![redirect]).await;
+        let probe = fill_session_map(&store).await;
+        let with_state = |len: usize| super::AuthorizeQuery {
+            state: Some("s".repeat(len)),
+            ..valid_authorize_query(redirect)
+        };
+
+        for (len, what) in [
+            (300 * 1024, "a 300 KiB state"),
+            (super::MAX_CLIENT_STATE_LEN + 1, "a state one byte over the cap"),
+        ] {
+            assert_refused_without_trace(&store, &probe, with_state(len), what).await;
+        }
+
+        let resp = super::authorize(
+            State(store.clone()),
+            axum::http::HeaderMap::new(),
+            Query(with_state(super::MAX_CLIENT_STATE_LEN)),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FOUND, "a state at the cap is accepted");
+        let authz = store.authz.read().await;
+        assert_eq!(authz.len(), 1);
+        let pending = authz.values().next().unwrap();
+        assert_eq!(pending.client_state, "s".repeat(super::MAX_CLIENT_STATE_LEN));
+        assert_eq!(sessions_left(&store, &probe).await, probe.len() - 1);
+    }
+
+    // A loopback redirect is matched on its parsed form but stored as given, so
+    // padding the parser discards passes the match; the length cap is what stops
+    // it. A registered loopback URI at the registration cap, asked for on the
+    // longest port, still fits.
+    #[tokio::test]
+    async fn authorize_bounds_a_padded_loopback_redirect() {
+        use axum::extract::{Query, State};
+        let store = test_store();
+        let path = "p".repeat(super::MAX_REDIRECT_URI_LEN - "http://127.0.0.1/".len());
+        let longest = format!("http://127.0.0.1/{path}");
+        assert_eq!(longest.len(), super::MAX_REDIRECT_URI_LEN);
+        store.clients.seed("client-x", vec!["http://127.0.0.1/cb", longest.as_str()]).await;
+        let probe = fill_session_map(&store).await;
+
+        for (padded, what) in [
+            (format!("http://127.0.0.1:{}4321/cb", "0".repeat(60_000)), "a zero-padded port"),
+            (format!("http://127.0.0.1:4321/c{}b", "\t".repeat(60_000)), "tabs in the path"),
+            (format!("http://127.0.0.1:4321{}/cb", "/.".repeat(30_000)), "dot segments"),
+        ] {
+            assert_eq!(
+                store.validate_client("client-x", &padded).await,
+                super::ClientCheck::Allowed,
+                "{what} passes the loopback match, so only the cap stops it"
+            );
+            assert_refused_without_trace(&store, &probe, valid_authorize_query(&padded), what)
+                .await;
+        }
+
+        let on_longest_port = format!("http://127.0.0.1:65535/{path}");
+        assert_eq!(on_longest_port.len(), super::MAX_AUTHORIZE_REDIRECT_URI_LEN);
+        let resp = super::authorize(
+            State(store.clone()),
+            axum::http::HeaderMap::new(),
+            Query(valid_authorize_query(&on_longest_port)),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FOUND, "the longest real redirect fits");
+        let authz = store.authz.read().await;
+        assert_eq!(authz.values().next().unwrap().redirect_uri, on_longest_port);
     }
 
     // The registration store is LRU-bounded: open (unauthenticated) DCR means the
@@ -4683,6 +5097,99 @@ mod tests {
         assert!(store.authz.read().await.contains_key("sess-live"));
     }
 
+    // A sign-in finished after its connect's TTL is told the connect EXPIRED.
+    // The sweep used to drop the entry within a minute of expiry, after which
+    // the redeem could only answer "unknown or already used", the same words as
+    // a restart or a reloaded callback page. The entry now outlives its TTL by
+    // EXPIRED_CONNECT_RETENTION, sweeps included, and only then is forgotten.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_redeemed_after_its_ttl_is_reported_expired() {
+        async fn redeem_error(store: &super::AuthStore, state: &str) -> String {
+            let resp = super::connect_redeem(
+                axum::extract::State(store.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(super::RedeemBody { state: state.into(), delegation: String::new() }),
+            )
+            .await;
+            assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            json["error"].as_str().expect("an error message").to_owned()
+        }
+        let store = test_store();
+        seed_pending(&store, "sess-slow", "bind-slow").await;
+
+        // Well past the TTL, with the sweep having run: still known, as expired.
+        tokio::time::advance(super::CONNECT_TTL + Duration::from_secs(5 * 60)).await;
+        assert_eq!(store.reap_expired().await.pending, 0, "an expired connect is kept");
+        let error = redeem_error(&store, "sess-slow").await;
+        assert!(error.contains("has expired"), "{error}");
+
+        // Once the retention runs out, the sweep forgets it.
+        tokio::time::advance(super::EXPIRED_CONNECT_RETENTION).await;
+        assert_eq!(store.reap_expired().await.pending, 1, "then it is dropped");
+        let error = redeem_error(&store, "sess-slow").await;
+        assert!(error.contains("unknown or already used"), "{error}");
+    }
+
+    // A redemption that passed the gate in time but finished after the TTL gets
+    // no code. The connect's session is reaped 15 minutes in, and recording the
+    // grant re-creates it with a key II never registered, so a code minted then
+    // would be bound to a session that cannot sign; retaining expired connects
+    // must not open that up. Within the TTL the code is minted, idempotently.
+    //
+    // The refusal also discards the session the registration granted (else it
+    // would hold its slot until the grant expired), and leaves the connect
+    // claimed until the attempt's own claim lets go, so no second registration
+    // can start in between.
+    #[tokio::test(start_paused = true)]
+    async fn no_code_is_minted_for_a_connect_past_its_ttl() {
+        let store = test_store();
+        seed_pending(&store, "sess-in-time", "bind").await;
+        seed_pending(&store, "sess-late", "bind").await;
+
+        let minted = super::reserve_code(&store, "sess-in-time", "code-1".into()).await;
+        assert_eq!(minted, Ok(("code-1".to_owned(), true)));
+        let again = super::reserve_code(&store, "sess-in-time", "code-2".into()).await;
+        assert_eq!(again, Ok(("code-1".to_owned(), false)), "the first code, idempotently");
+
+        // A late attempt: claimed in time, its registration granted, done after the TTL.
+        let claim = super::claim_redemption(&store, "sess-late").await;
+        assert!(matches!(claim, super::RedeemClaim::Claimed(_)));
+        store.identities.set_grant_expiration("sess-late", u64::MAX).await;
+        tokio::time::advance(super::CONNECT_TTL).await;
+
+        let late = super::reserve_code(&store, "sess-late", "code-3".into()).await;
+        assert_eq!(late, Err(super::CONNECT_EXPIRED_MSG));
+        assert_eq!(
+            store.identities.grant_expiration_ns("sess-late").await,
+            None,
+            "the granted session no code will reach is discarded"
+        );
+        {
+            let authz = store.authz.read().await;
+            assert!(authz["sess-late"].code.is_none());
+            assert!(authz["sess-late"].redeeming, "still claimed by the late attempt");
+        }
+        drop(claim);
+        assert!(!store.authz.read().await["sess-late"].redeeming, "released by its own claim");
+    }
+
+    // No attempt starts on a connect past its TTL, even for a request that passed
+    // the gate just before it: the claim rechecks the TTL under the lock, so such
+    // a request answers "expired" instead of starting a registration that could
+    // only be refused at the mint.
+    #[tokio::test(start_paused = true)]
+    async fn no_attempt_is_claimed_on_a_connect_past_its_ttl() {
+        let store = test_store();
+        seed_pending(&store, "sess-x", "bind").await;
+        tokio::time::advance(super::CONNECT_TTL).await;
+
+        let claim = super::claim_redemption(&store, "sess-x").await;
+        assert!(matches!(claim, super::RedeemClaim::Expired));
+        assert!(!store.authz.read().await["sess-x"].redeeming, "nothing was claimed");
+    }
+
     // ---- Connect: link + redeem ---------------------------------------------
 
     // The II link carries `registration_key` = base64url(DER(pub(X))) (the
@@ -4706,13 +5213,8 @@ mod tests {
     }
 
     /// Record a pending connect for `redirect` the way `authorize` does (through
-    /// the bounded insert), created at `created`.
-    async fn seed_pending_redirect(
-        store: &super::AuthStore,
-        id: &str,
-        redirect: &str,
-        created: std::time::Instant,
-    ) {
+    /// the bounded insert), created now on tokio's clock.
+    async fn seed_pending_redirect(store: &super::AuthStore, id: &str, redirect: &str) {
         store
             .insert_pending(
                 id.to_string(),
@@ -4722,7 +5224,7 @@ mod tests {
                     client_state: String::new(),
                     code_challenge: Some("cc".into()),
                     cookie: "k".into(),
-                    created,
+                    created: tokio::time::Instant::now(),
                     code: None,
                     redeeming: false,
                 },
@@ -4752,22 +5254,15 @@ mod tests {
     // drives navigation cannot make its own (valid) session read as a vetted
     // connector: there is no slug to add or swap, and its session's redirect is
     // loopback. Unknown, missing, and expired states all get the same 404.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn branding_is_bound_to_the_session() {
         use axum::http::StatusCode;
         let store = test_store();
-        let now = std::time::Instant::now();
-        seed_pending_redirect(
-            &store,
-            "sess-claude",
-            "https://claude.ai/api/mcp/auth_callback",
-            now,
-        )
-        .await;
-        seed_pending_redirect(&store, "sess-native", "http://127.0.0.1:5173/cb", now).await;
-        // Validation trims a trailing root dot, so branding must too.
-        seed_pending_redirect(&store, "sess-dot", "https://claude.ai./api/mcp/auth_callback", now)
+        seed_pending_redirect(&store, "sess-claude", "https://claude.ai/api/mcp/auth_callback")
             .await;
+        seed_pending_redirect(&store, "sess-native", "http://127.0.0.1:5173/cb").await;
+        // Validation trims a trailing root dot, so branding must too.
+        seed_pending_redirect(&store, "sess-dot", "https://claude.ai./api/mcp/auth_callback").await;
 
         // A vetted session reads as its connector, with the logo under the issuer.
         let (status, doc) = branding_for(&store, Some("sess-claude")).await;
@@ -4788,28 +5283,22 @@ mod tests {
         assert_eq!(branding_for(&store, Some("sess-unknown")).await.0, StatusCode::NOT_FOUND);
         assert_eq!(branding_for(&store, None).await.0, StatusCode::NOT_FOUND);
 
-        // An EXPIRED pending connect is gone for branding too (same definition of
-        // expired as the handshake: `AuthzPending::remaining`). Skipped only on a
-        // host whose monotonic clock started less than CONNECT_TTL ago.
-        if let Some(past) = now.checked_sub(super::CONNECT_TTL + std::time::Duration::from_secs(1))
-        {
-            seed_pending_redirect(
-                &store,
-                "sess-old",
-                "https://claude.ai/api/mcp/auth_callback",
-                past,
-            )
-            .await;
-            assert_eq!(branding_for(&store, Some("sess-old")).await.0, StatusCode::NOT_FOUND);
-        }
-
         // Read-only: the lookups neither consumed nor advanced the pending
         // connect, so the handshake proceeds exactly as if II never asked.
-        let authz = store.authz.read().await;
-        let pending = authz.get("sess-claude").expect("still pending");
-        assert_eq!(pending.redirect_uri, "https://claude.ai/api/mcp/auth_callback");
-        assert_eq!(pending.created, now);
-        assert!(pending.code.is_none() && !pending.redeeming);
+        {
+            let authz = store.authz.read().await;
+            let pending = authz.get("sess-claude").expect("still pending");
+            assert_eq!(pending.redirect_uri, "https://claude.ai/api/mcp/auth_callback");
+            assert!(!pending.remaining().is_zero());
+            assert!(pending.code.is_none() && !pending.redeeming);
+        }
+
+        // An EXPIRED connect is gone for branding, by the handshake's own
+        // definition of expired (`AuthzPending::remaining`) — even while the map
+        // still RETAINS it so the redeem gate can tell a late sign-in it expired.
+        tokio::time::advance(super::CONNECT_TTL).await;
+        assert!(store.authz.read().await.contains_key("sess-claude"), "retained after expiry");
+        assert_eq!(branding_for(&store, Some("sess-claude")).await.0, StatusCode::NOT_FOUND);
     }
 
     // The allow-list invariant (II #4091 matches by EXACT string equality): the
@@ -4841,6 +5330,7 @@ mod tests {
                 )),
                 "https://mcp.test".into(),
                 mcp_path.into(),
+                false,
                 false,
             )
         };
@@ -5653,22 +6143,18 @@ mod tests {
         let store = test_store();
         seed_pending(&store, "sess-r", "bind-r").await;
 
-        // First claim wins; a concurrent second claim is refused.
-        assert!(matches!(
-            super::claim_redemption(&store, "sess-r").await,
-            super::RedeemClaim::Claimed
-        ));
+        // First claim wins; a concurrent second claim is refused while it is held.
+        let first = super::claim_redemption(&store, "sess-r").await;
+        assert!(matches!(first, super::RedeemClaim::Claimed(_)));
         assert!(matches!(
             super::claim_redemption(&store, "sess-r").await,
             super::RedeemClaim::InProgress
         ));
 
-        // A failed attempt releases the claim, so a genuine retry proceeds.
-        super::release_redemption(&store, "sess-r").await;
-        assert!(matches!(
-            super::claim_redemption(&store, "sess-r").await,
-            super::RedeemClaim::Claimed
-        ));
+        // A failed attempt drops its claim, so a genuine retry proceeds.
+        drop(first);
+        let retry = super::claim_redemption(&store, "sess-r").await;
+        assert!(matches!(retry, super::RedeemClaim::Claimed(_)));
 
         // Once the code is minted, later claims return it rather than redeeming.
         store.authz.write().await.get_mut("sess-r").unwrap().code = Some("mcp-code-x".into());
@@ -5682,6 +6168,84 @@ mod tests {
             super::claim_redemption(&store, "nope").await,
             super::RedeemClaim::Vanished
         ));
+    }
+
+    // A redemption cut off mid-flight gives its claim back. hyper drops a
+    // handler's future when the browser disconnects or a fronting proxy times
+    // the request out, so the code after the `mcp_register_v2` await never runs;
+    // the claim must not depend on it, or every retry for the connect would be
+    // refused as "already being processed" until the connect expired.
+    #[tokio::test]
+    async fn a_redemption_cut_off_mid_flight_gives_its_claim_back() {
+        let store = test_store();
+        seed_pending(&store, "sess-c", "bind-c").await;
+
+        let attempt = async {
+            let _claim = match super::claim_redemption(&store, "sess-c").await {
+                super::RedeemClaim::Claimed(claim) => claim,
+                _ => panic!("the first attempt wins the claim"),
+            };
+            // Stands in for the `mcp_register_v2` call, which never answers.
+            std::future::pending::<()>().await;
+        };
+        let cut_off = tokio::time::timeout(Duration::from_millis(10), attempt).await;
+        assert!(cut_off.is_err(), "the attempt is dropped mid-flight");
+
+        assert!(
+            matches!(
+                super::claim_redemption(&store, "sess-c").await,
+                super::RedeemClaim::Claimed(_)
+            ),
+            "a retry can claim the redemption again"
+        );
+    }
+
+    // `Drop` can't wait for the lock, so a claim dropped while something else
+    // holds it is released as soon as that holder lets go — and until then the
+    // connect still reads as in progress, so no second attempt slips in.
+    #[tokio::test]
+    async fn a_claim_dropped_under_a_held_lock_is_released_once_the_lock_frees() {
+        let store = test_store();
+        seed_pending(&store, "sess-l", "bind-l").await;
+        let claim = super::claim_redemption(&store, "sess-l").await;
+        assert!(matches!(claim, super::RedeemClaim::Claimed(_)));
+
+        let held = store.authz.read().await;
+        drop(claim);
+        assert!(held["sess-l"].redeeming, "not released while the lock is held");
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.authz.read().await["sess-l"].redeeming {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("released once the lock is free");
+    }
+
+    // A failed redemption gives its claim back BEFORE the handler answers, even
+    // while the lock is busy: `release` waits for the lock rather than leaving
+    // the release to the runtime as a drop must, so a retry prompted by the
+    // error can never find the connect still "already being processed".
+    #[tokio::test]
+    async fn a_released_claim_is_free_by_the_time_release_returns() {
+        let store = test_store();
+        seed_pending(&store, "sess-f", "bind-f").await;
+        let super::RedeemClaim::Claimed(claim) = super::claim_redemption(&store, "sess-f").await
+        else {
+            panic!("the first attempt wins the claim");
+        };
+
+        let held = store.authz.read().await;
+        let unblock = async move {
+            tokio::task::yield_now().await;
+            drop(held);
+        };
+        tokio::join!(claim.release(), unblock);
+
+        let authz = store.authz.try_read().expect("no release is left pending");
+        assert!(!authz["sess-f"].redeeming, "released before `release` returned");
     }
 
     // The pinned callback page is served (with its strict CSP) and the redeem

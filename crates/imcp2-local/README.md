@@ -17,9 +17,81 @@ cannot spawn local processes; they keep using the hosted server.
 ## Install
 
 Release binaries (macOS arm64/x64, Linux x64/arm64, Windows x64) ship from
-this repository's GitHub releases with shell/PowerShell installers, built by
-`dist` from `imcp2-local-v*` tags. Until the first release is cut, build from
-source:
+this repository's GitHub releases, built by `dist` from the `vX.Y.Z` tags that
+also publish the crates. Candidates (`rc-*`) are prereleases, so GitHub's
+`latest` release is always a promoted version.
+
+**Verified install.** This binary acts as your Internet Identity, so prefer the
+path that establishes where the artifact came from. Download the archive, check
+that this repository's release workflow built it for that very release, then
+install it into a directory on your `PATH`:
+
+```sh
+# Resolve the newest release: candidates are prereleases and never `latest`.
+TAG=$(gh api repos/dfinity/imcp2/releases/latest --jq .tag_name)
+TARGET=aarch64-apple-darwin   # or x86_64-apple-darwin, {x86_64,aarch64}-unknown-linux-gnu
+
+# Chained: a failed download or a failed attestation stops the install.
+# --source-ref pins the attestation to $TAG itself: archive names repeat
+# across releases, so without it an older release's archive would pass.
+curl -fLO "https://github.com/dfinity/imcp2/releases/download/$TAG/imcp2-local-$TARGET.tar.xz" &&
+  gh attestation verify "imcp2-local-$TARGET.tar.xz" -R dfinity/imcp2 \
+    --signer-workflow dfinity/imcp2/.github/workflows/v-release.yml \
+    --source-ref "refs/tags/$TAG" --deny-self-hosted-runners &&
+  tar xf "imcp2-local-$TARGET.tar.xz" &&
+  mkdir -p ~/.local/bin &&
+  install "imcp2-local-$TARGET/imcp2-local" ~/.local/bin/
+```
+
+`~/.local/bin` stands in for any directory already on your `PATH`; the last
+two commands create it and copy the binary there, nothing edits your shell
+configuration.
+
+Releases tagged `imcp2-local-vX.Y.Z` predate this scheme: they are not what
+`latest` resolves to, and their archives were attested by
+`imcp2-local-release.yml`, the workflow's name at the time. To install one of
+those, set `TAG` to its tag and pass that filename to `--signer-workflow`;
+everything else above is the same.
+
+(Windows ships `imcp2-local-x86_64-pc-windows-msvc.zip`; verify it the same way.)
+
+**Installer script.** Shorter, and what the release notes lead with. It
+downloads the binary for your platform, installs it plus an auto-updater into
+`~/.cargo/bin`, and adds that directory to your PATH by appending a line to
+every shell profile it can find — `IMCP2_LOCAL_NO_MODIFY_PATH=1` and
+`IMCP2_LOCAL_DISABLE_UPDATE=1` opt out of those two. The shell script also
+compares a checksum baked into itself, but where `sha256sum` is missing (older
+macOS releases, for one) it prints a one-line "skipping" notice and installs
+anyway; the PowerShell installer checks none at all. Even where the shell
+checksum runs, it ships inside the very script being piped to a shell, so it
+catches a corrupted download rather than a bad release. On both platforms the
+attestation above is what establishes provenance.
+
+```sh
+# `latest` is the newest promoted release; each release's notes carry the
+# same command pinned to that release's tag.
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dfinity/imcp2/releases/latest/download/imcp2-local-installer.sh | sh
+```
+
+**Claude Desktop bundle.** Each release also carries `imcp2-local.mcpb`.
+Download it and double-click it: Claude Desktop installs and manages the
+server itself — nothing lands on your `PATH`, and no `setup` is needed. It
+holds a universal macOS binary (Apple Silicon and Intel) and the Windows one.
+It is not yet code-signed, so expect Claude Desktop's unverified-developer
+warning; on macOS, Gatekeeper may also refuse the server's first launch until
+you allow it under System Settings → Privacy & Security. Organizations that
+limit Claude Desktop to directory-listed extensions block it outright. The
+bundle is attested like the archives, but by its own workflow, and pinned to
+its release the same way:
+
+```sh
+# TAG: the release you downloaded the bundle from (resolved as above).
+gh attestation verify imcp2-local.mcpb -R dfinity/imcp2 \
+  --signer-workflow dfinity/imcp2/.github/workflows/imcp2-local-mcpb.yml \
+  --source-ref "refs/tags/$TAG" --deny-self-hosted-runners
+```
+
+**From source.**
 
 ```sh
 cargo build --release -p imcp2-local
@@ -106,12 +178,16 @@ screen. Concretely:
 ## Verifying a download
 
 Every platform archive carries a keyless provenance attestation proving it
-was built by this repository's release workflow:
+was built by this repository's release workflow from that release's tag (the
+Claude Desktop bundle is attested the same way by `imcp2-local-mcpb.yml`,
+which assembles it — see Install). Check both: archive names repeat across
+releases, so the tag is what tells this release's archive from an older one's:
 
 ```sh
-# (Windows archives are .zip — substitute the extension.)
+# <tag>: the release the archive came from. (Windows archives are .zip.)
 gh attestation verify imcp2-local-<target>.tar.xz -R dfinity/imcp2 \
-  --signer-workflow dfinity/imcp2/.github/workflows/imcp2-local-release.yml
+  --signer-workflow dfinity/imcp2/.github/workflows/v-release.yml \
+  --source-ref refs/tags/<tag> --deny-self-hosted-runners
 ```
 
 plus a SHA256 checksum alongside each archive. The convenience installers
@@ -125,11 +201,14 @@ installers, which are not subject to those OS gates.
 
 ## Releasing (maintainers)
 
-Binary releases are cut by pushing an `imcp2-local-vX.Y.Z` tag (the version
-must match this crate's `Cargo.toml`). Those tags must stay covered by the same
-protected-tag ruleset as `v*`: the generated workflow publishes whatever commit
-the tag names, so who can push the tag is the control that decides what ships; `.github/workflows/imcp2-local-release.yml`
-(generated by `dist` from `dist-workspace.toml`) builds the five platform
-archives, the installers, the updater companions, checksums, and the GitHub
-attestations. Plain `vX.Y.Z` tags remain the crates.io publish trigger for
-`imcp2`/`imcp2-core` and never ship binaries.
+Binary releases ship with every promoted version: the `vX.Y.Z` tag that
+publishes the crates also runs `.github/workflows/v-release.yml` (generated by
+`dist` from `dist-workspace.toml`), which builds the five platform archives, the
+installers, the updater companions, checksums, the GitHub attestations, and then
+the Claude Desktop bundle. The version must match this crate's `Cargo.toml`;
+the candidate workflow checks that before anything is deployed to staging, so a
+mismatched candidate never gets a prerelease and cannot be promoted (see the
+repository's CONTRIBUTING.md, "Releasing"), and dist checks it again.
+`v*` and `rc-*` tags must stay covered by the protected-tag ruleset: the
+generated workflow publishes whatever commit the tag names, so who can push the
+tag is the control that decides what ships.

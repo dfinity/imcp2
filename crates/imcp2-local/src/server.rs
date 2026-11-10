@@ -11,7 +11,7 @@
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, ListResourcesResult, ListToolsResult,
+    CallToolRequestParams, CallToolResult, ContentBlock, ListResourcesResult, ListToolsResult,
     PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult, Tool,
 };
 use rmcp::service::RequestContext;
@@ -116,7 +116,7 @@ fn access_word(permissions: &str) -> &str {
 /// (attached only when it serializes to a JSON object, which [`AuthOutput`]
 /// always does).
 fn ok_structured<T: serde::Serialize>(text: String, value: &T) -> CallToolResult {
-    let mut result = CallToolResult::success(vec![Content::text(text)]);
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
     result.structured_content = match serde_json::to_value(value) {
         Ok(v @ serde_json::Value::Object(_)) => Some(v),
         _ => None,
@@ -179,7 +179,7 @@ impl LocalServer {
     ) -> Result<CallToolResult, McpError> {
         let (text, output) = match self.login.begin(refresh).await {
             Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Could not start the sign-in: {e}"
                 ))]))
             }

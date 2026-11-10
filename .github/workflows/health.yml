@@ -20,11 +20,11 @@ name: Production health
 
 on:
   schedule:
-    # Every 15 minutes. GitHub's scheduler is best-effort and routinely drifts
-    # under load, so treat this as "noticed within the hour", not an SLA. Note
-    # that scheduled workflows are disabled automatically after 60 days without
-    # repository activity.
-    - cron: '*/15 * * * *'
+    # Every 8 hours, off the top of the hour (GitHub's scheduler is busiest
+    # there, and best-effort at any minute: a tick can land late, so this is
+    # "noticed within the shift", not an SLA). Note that scheduled workflows
+    # are disabled automatically after 60 days without repository activity.
+    - cron: '17 */8 * * *'
   # Manual run, for verifying the probe itself rather than waiting for a tick.
   workflow_dispatch:
 
@@ -39,12 +39,10 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-24.04
-    # Below the probe cadence, and deliberately so. `concurrency` above lets one
-    # run at a time without cancelling, so a wedged run does not just waste a
-    # slot — it queues every later tick behind itself. With the default 6-hour
-    # job timeout that is 24 missed probes, during which the monitor reports
-    # nothing and silence is indistinguishable from health. Failing fast and
-    # letting the next tick try again is strictly better than hanging.
+    # Far below the probe cadence, and deliberately so: a wedged run would
+    # otherwise sit silent for the default 6-hour job timeout, and silence is
+    # indistinguishable from health. Failing fast and letting the next tick
+    # try again is strictly better than hanging.
     timeout-minutes: 10
     env:
       MCP_ORIGIN: https://mcp.internetcomputer.org

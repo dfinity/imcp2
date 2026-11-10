@@ -1,6 +1,6 @@
 [package]
 name = "imcp2-core"
-version = "0.4.0"
+version = "0.6.1"
 edition = "2021"
 description = "Transport-agnostic components of the IMCP2 Internet Computer MCP server: the tool surface, the Internet Identity session engine, and the II connect-handshake primitives."
 license = "Apache-2.0"
@@ -54,3 +54,8 @@ e2e = ["dep:pocket-ic", "dep:wat", "rmcp/client"]
 # Synthetic responses for pinning `public_fetch`'s acceptance rules without a
 # network (`reqwest::Response: From<http::Response<_>>`).
 http = { workspace = true }
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs: the
+# `mcp_get_delegation` retry tests in `identities.rs` read the real backoff
+# `sleep`s off a paused clock instead of waiting them out. A feature on a
+# dependency the crate already has, so the lockfile does not change.
+tokio = { workspace = true, features = ["test-util"] }

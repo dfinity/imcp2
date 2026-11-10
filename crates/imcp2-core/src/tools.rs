@@ -146,13 +146,13 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Fetch a canister's Candid interface: the `.did` text declaring the methods and argument types a caller needs in order to call it. Also reports whether the canister declares an OQL surface, which this server reads through the OQL tools rather than with a Candid query, and whether it declares the API doc get_canister_api_doc reads.",
+        description = "Fetch a canister's Candid interface: the `.did` text declaring the methods and argument types a caller needs in order to call it. On a canister with many methods it is not read whole: an interface over 5 KB is refused with the list of every method it declares, so take the method names from the guide get_canister_api_doc returns and pass them as `methods`, which returns just those methods with the type definitions they use and the interface's own comments on them, as a small valid `.did`. A selection over 5 KB is refused the same way, so ask for fewer at a time; a single method is always answered, with its comments stripped if that is what it takes. The structured object carries the interface text as `candid`, its size, and whether its comments were stripped. Also reports whether the canister declares an OQL surface, which this server reads through the OQL tools rather than with a Candid query, and whether it declares the API doc get_canister_api_doc reads.",
         annotations(title = "Get Candid interface", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::GetCandidOutput>(),
     )]
     async fn get_canister_candid(
         &self,
-        Parameters(calls::GetCandidArgs { canister_id, app_url, derivation_origin }): Parameters<
+        Parameters(calls::GetCandidArgs { canister_id, app_url, derivation_origin, methods }): Parameters<
             calls::GetCandidArgs,
         >,
     ) -> Result<CallToolResult, McpError> {
@@ -181,60 +181,16 @@ impl IcCanisterTools {
         };
         match self.agent.read_state_canister_metadata(principal, "candid:service").await {
             Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(did) => {
-                    // Signal an OQL query surface structurally (`oql: true`). When
-                    // set, the guidance pointer is emitted as a SEPARATE content
-                    // block, so the first block stays the raw `.did` (still valid,
-                    // copy-pastable Candid) — the full primer is served on demand
-                    // (see the OQL_USAGE_URI resource), never inlined.
-                    let oql = calls::has_oql(&did);
-                    // Same predicate get_canister_api_doc uses, so the flag gates that
-                    // call: true means a `getApiDoc`/`get_api_doc` method exists.
-                    let api_doc_available = calls::api_doc_method(&did).is_some();
-                    let output = calls::GetCandidOutput {
-                        canister_id,
-                        candid: did.clone(),
-                        oql,
-                        api_doc_available,
-                        declared_by: declaration.origin.clone(),
-                        declared_at: declaration.path.to_string(),
-                    };
-                    // Assemble any capability notes as separate blocks so the first
-                    // block stays the raw, paste-able `.did`.
-                    let mut notes = Vec::new();
-                    if oql {
-                        notes.push(format!(
-                            "This canister exposes an OQL query surface (a JSON query language \
-                             over its data), so READ it through the OQL tools — a Candid `method` \
-                             query via canister_query is rejected here. Order: icp_oql_guide \
-                             (dialect, once) → get_canister_oql_schema (entities/fields) → \
-                             canister_query with the `oql` argument (run a JSON query, get a table). \
-                             Those wrap the `schema`/`execute` methods (no Candid escaping). This \
-                             server's OQL read path REQUIRES the app's derivation_origin and \
-                             rejects an anonymous OQL read (for now), rather than returning \
-                             silently empty — a connector rule, not a claim about how the \
-                             canister gates its data; pass the derivation_origin from open_app. \
-                             See icp_oql_guide (or the `{OQL_USAGE_URI}` resource) for the dialect. \
-                             canister_update_call then handles UPDATE calls only."
-                        ));
-                    }
-                    notes.push(if api_doc_available {
-                        "This canister declares an API-doc method (api_doc_available=true): \
-                         get_canister_api_doc reads it for a prose \"how this app behaves\" guide \
-                         (units, auth, lifecycle, gotchas) — the declaration is what was detected, \
-                         so the call can still come back empty."
-                            .to_string()
-                    } else {
-                        "No API-doc method was detected on this canister \
-                         (api_doc_available=false) — usually there is none, and the Candid types \
-                         above are the interface; an interface this parser cannot read looks the \
-                         same."
-                            .to_string()
-                    });
-                    let mut blocks = vec![did];
-                    blocks.extend(notes);
-                    Ok(ok_structured_blocks(blocks, &output))
-                }
+                Ok(did) => match candid_reply(
+                    &did,
+                    canister_id,
+                    methods.as_deref(),
+                    declaration.origin.clone(),
+                    declaration.path.to_string(),
+                ) {
+                    Ok((blocks, output)) => Ok(ok_structured_blocks(blocks, &output)),
+                    Err(e) => Ok(err(e)),
+                },
                 Err(e) => Ok(err(format!("metadata is not valid UTF-8: {e}"))),
             },
             Err(e) => Ok(err(format!("could not read candid:service metadata: {e}"))),
@@ -598,7 +554,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Calls a canister's *update* method (as opposed to read-only queries which go through canister_query). Method names and argument types come from the canister's Candid interface, which get_canister_candid returns. Runs anonymously unless given a derivation origin, which acts as the user's account at that app.",
+        description = "Calls a canister's *update* method (as opposed to read-only queries which go through canister_query). Method names and argument types come from the canister's Candid interface, which get_canister_candid returns; the canister must publish that interface, and an update call to a canister that publishes none, or whose interface cannot be read, is refused. Runs anonymously unless given a derivation origin, which acts as the user's account at that app. Usually called after open_app, which supplies app_url and derivation_origin.",
         annotations(title = "Make a canister update call", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterUpdateCallOutput>(),
     )]
@@ -611,7 +567,6 @@ impl IcCanisterTools {
             app_url,
             derivation_origin,
             account,
-            candid,
         }): Parameters<calls::CanisterUpdateCallArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
@@ -619,17 +574,23 @@ impl IcCanisterTools {
             Ok(p) => p,
             Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
         };
-        // The financial-transactions gate (see `compliance`), in four scopes,
-        // before any network work: the standardized value-moving method names
-        // (the ICRC transfer/approval surface) and the mixed-purpose
-        // governance entry point manage_neuron, both refused on EVERY
-        // canister; the system ledgers'/cycles-minting canister's own
-        // value-moving methods on those canisters; and EVERY update method on
-        // a listed financial-service canister, so a refusal here does not
-        // depend on the method name alone. Each scope's refusal claims only
-        // what that scope knows about the call, and points the user outside
-        // this connector. Queries need no gate — a query cannot commit state,
-        // so it cannot move funds.
+        // The financial-transactions gate (see `compliance`): every scope
+        // decided from the request alone runs here, before any network work —
+        // the standardized value-moving method names (the ICRC transfer/approval
+        // surface) and the mixed-purpose governance entry point manage_neuron,
+        // both refused on EVERY canister; the system ledgers'/cycles-minting
+        // canister's own value-moving methods on those canisters; EVERY update
+        // method on a listed financial-service canister, so a refusal here does
+        // not depend on the method name alone; a call addressed to any other
+        // ICRC-1 / ICRC-2 ledger method by name; and a method name that carries
+        // a financial keyword as a whole word. The one scope that needs
+        // the canister's interface — a financial canister detected from the
+        // ICRC methods it declares — runs below, once the canister's published
+        // interface has been read; an update call needs that interface, so a
+        // canister that gives none is refused there.
+        // Each scope's refusal claims only what that scope knows about the
+        // call, and points the user outside this connector. Queries need no
+        // gate — a query cannot commit state, so it cannot move funds.
         if let Some(refusal) = compliance::disallowed_update_method(&principal, &method) {
             return Ok(err(refusal));
         }
@@ -657,10 +618,63 @@ impl IcCanisterTools {
             Err(refusal) => return Ok(err(refusal)),
         };
         // The interface to encode/decode against: the canister's own
-        // candid:service if exposed, else the caller-supplied `candid`. Update calls
-        // are never redirected (OQL is read-only), so no oql_query_redirect here.
-        let did = calls::resolve_did(&self.agent, principal, candid.as_deref()).await;
-        let arg_bytes = match calls::encode_args(did.as_deref(), &method, &args) {
+        // candid:service, which an update call REQUIRES — no caller-supplied
+        // fallback here, unlike canister_query (a query cannot commit state).
+        // Update calls are never redirected (OQL is read-only), so no
+        // oql_query_redirect here. Read with the outcome kept, not through
+        // resolve_did: the refusal below says whether the interface is missing
+        // or the read failed.
+        let read = calls::read_candid_service(&self.agent, principal).await;
+        // The interface scope of the financial-transactions gate (see
+        // `compliance`): a canister whose declared interface provides an ICRC-1 /
+        // ICRC-2 method is a financial canister, and every update call to it is
+        // refused — decided from the canister itself, here and only here. The
+        // interface is first in hand at this point: reading it IS a contact with
+        // the canister, which the discoverability gate above has to admit first
+        // (an undeclared ledger is refused as undeclared), and the read just
+        // made is the one the encoding needs, so this costs no round-trip. It
+        // runs before the arguments are encoded (an argument error must not mask
+        // the policy refusal) and before anything is signed. The scope always
+        // has the interface, because an update call to a canister that gives it
+        // none is refused (per review and the maintainer's direction): a
+        // canister that publishes none, one whose published text the parser
+        // cannot read, and one whose read FAILED — a transport, HTTP or
+        // certificate error, refused with a retry message — each get
+        // `unchecked_update_refusal`, so no update this server sends went
+        // unchecked. What the guard still does not judge is a bespoke method on
+        // a canister whose published interface is not a ledger's.
+        let did = match read {
+            calls::CandidServiceRead::Published(did) => did,
+            calls::CandidServiceRead::NotText => {
+                return Ok(err(compliance::unchecked_update_refusal(
+                    &method,
+                    &compliance::MissingInterface::Unreadable,
+                )));
+            }
+            calls::CandidServiceRead::NotPublished => {
+                return Ok(err(compliance::unchecked_update_refusal(
+                    &method,
+                    &compliance::MissingInterface::NotPublished,
+                )));
+            }
+            calls::CandidServiceRead::Failed(error) => {
+                return Ok(err(compliance::unchecked_update_refusal(
+                    &method,
+                    &compliance::MissingInterface::ReadFailed(error),
+                )));
+            }
+        };
+        let Some(declared) = calls::declared_methods(&did) else {
+            return Ok(err(compliance::unchecked_update_refusal(
+                &method,
+                &compliance::MissingInterface::Unreadable,
+            )));
+        };
+        if let Some(refusal) = compliance::disallowed_update_on_ledger_interface(&method, &declared)
+        {
+            return Ok(err(refusal));
+        }
+        let arg_bytes = match calls::encode_args(Some(&did), &method, &args) {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
         };
@@ -675,7 +689,7 @@ impl IcCanisterTools {
             Err(e) => return Ok(err(format!("call failed: {e}"))),
         };
         // Decode against the Candid interface so field names are recovered.
-        let reply = calls::decode_reply(did.as_deref(), &method, &reply_bytes);
+        let reply = calls::decode_reply(Some(&did), &method, &reply_bytes);
         let (derived_for_origin, requested, derivation_origin_source) = match &target {
             Some(t) => (Some(t.origin.clone()), Some(t.requested.clone()), Some(t.source.clone())),
             None => (None, None, None),
@@ -710,7 +724,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Read from a canister, either by calling a Candid `query` method or by running an OQL query. Pass exactly one of the two. get_canister_candid says which path a canister uses; a Candid `method` query to an OQL canister is refused here. Runs anonymously unless given a derivation origin, which acts as the user's account at that app. OQL queries cannot be called anonymously.",
+        description = "Read from a canister, either by calling a Candid `query` method or by running an OQL query. Pass exactly one of the two. get_canister_candid says which path a canister uses; a Candid `method` query to an OQL canister is refused here. Runs anonymously unless given a derivation origin, which acts as the user's account at that app. OQL queries cannot be called anonymously. Usually called after open_app, which supplies app_url and derivation_origin.",
         annotations(title = "Query a canister (Candid method or OQL)", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<calls::CanisterQueryOutput>(),
     )]
@@ -1203,7 +1217,7 @@ impl IcCanisterTools {
     }
 
     #[tool(
-        description = "Open an app from its name or its URL: resolves the derivation origin the user's identity there is derived from, and discovers the canisters behind it. The app URL it returns is what canister_update_call takes as `app_url`.",
+        description = "Act as the user in any Internet Computer app (e.g. opencloud.org, OISY, NNS, Caffeine apps): open it by name or URL to get its canisters and the user's identity there, then read or write through them with canister_query and canister_update_call. Enables doing what the user asks in an ICP app, such as creating, managing, sending or checking things on their behalf. Resolves the derivation origin the user's identity is derived from and discovers the canisters the app declares. The app URL it returns is what canister_update_call takes as `app_url`.",
         annotations(title = "Open an app (resolve origin + discover canisters)", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<discover::OpenAppOutput>(),
     )]
@@ -1224,7 +1238,7 @@ impl IcCanisterTools {
             discover::AppQuery::Known(m) => (m.app_url, "known_app_registry"),
             discover::AppQuery::Url(u) => (u, "as_provided"),
             discover::AppQuery::UnknownName => {
-                // Echo find_app_by_name's web-search/ask guidance (it builds the
+                // Echo find_app_by_name's ask-the-user guidance (it builds the
                 // "not a known app; don't guess a domain" note from the registry).
                 return Ok(err(discover::find_app_by_name(&query).note));
             }
@@ -1916,7 +1930,7 @@ fn app_url_error_with_guidance(app_url: &str, e: String) -> String {
     }
     msg.push_str(
         " If you arrived at this URL by guessing from an app name, don't guess again — call \
-         open_app with the name, WEB SEARCH the app's official URL, or ask the user.",
+         open_app with the name, or ask the user for the app's official URL.",
     );
     msg
 }
@@ -1947,7 +1961,7 @@ fn unverified_app_url_error(application_origin: &str) -> String {
         "If you arrived at this URL by GUESSING from an app name, stop guessing — a lookalike \
          domain is an unrelated or squatted site, and an identity derived there is wrong: \
          (1) call open_app with the app's name (well-known apps resolve offline); \
-         (2) if it's not known, WEB SEARCH the app's official URL; (3) or ask the user for it. \
+         (2) if it's not known, ask the user for the app's official URL. \
          If this origin genuinely IS the app's canonical Internet Identity origin (e.g. a \
          non-IC-hosted app the user pointed you at), pass it explicitly as `derivation_origin` \
          to proceed deliberately.",
@@ -2050,7 +2064,7 @@ fn canonicalize_derivation_origin(cleaned: &str) -> Result<String, String> {
     // also rejects a host-less input ("https://") and embedded spaces/invalid chars.
     let parsed = url::Url::parse(&origin).ok().filter(|u| {
         u.scheme() == "https"
-            && u.host_str().map_or(false, |h| !h.is_empty())
+            && u.host_str().is_some_and(|h| !h.is_empty())
             && u.username().is_empty()
             && u.password().is_none()
     });
@@ -2106,9 +2120,9 @@ fn clean_app_url(raw: &str) -> Result<String, String> {
     // caller supplied) and `https://` would yield no host. Reject both up front with a
     // clear message instead of a late, indirect downstream failure.
     let candidate = if u.contains("://") { u.clone() } else { format!("https://{u}") };
-    let valid = url::Url::parse(&candidate).ok().map_or(false, |parsed| {
+    let valid = url::Url::parse(&candidate).ok().is_some_and(|parsed| {
         parsed.scheme() == "https"
-            && parsed.host_str().map_or(false, |h| !h.is_empty())
+            && parsed.host_str().is_some_and(|h| !h.is_empty())
             && parsed.username().is_empty()
             && parsed.password().is_none()
     });
@@ -2143,11 +2157,13 @@ fn identity_annotation(target: &IdentityTarget) -> String {
 /// factual description of what this surface is and how it behaves — the value
 /// encoding, what the two tool families act on, what a derivation origin is
 /// and what reads it gates, how values are stored, and the
-/// financial-transactions policy. It deliberately does not tell the model how
-/// to work: no ordering rules, no "call this first", no per-request routing
-/// chains. Directory review reads these instructions, and a client's model
-/// should be free to choose its own approach from an accurate description of
-/// the tools.
+/// financial-transactions policy. Beyond the one opening paragraph that says
+/// the server acts in ICP apps on the user's behalf and names open_app as the
+/// entry point (so a client that defers tool loading still learns what this
+/// server is for), it deliberately does not tell the model how to work: no
+/// per-request routing chains. Directory review reads these instructions, and
+/// a client's model should be free to choose its own approach from an accurate
+/// description of the tools.
 ///
 /// The financial-transactions policy is stated here, server-wide — it governs
 /// the whole surface rather than one tool — and deliberately in NO tool
@@ -2156,12 +2172,17 @@ fn identity_annotation(target: &IdentityTarget) -> String {
 /// usable for financial transactions, which is the one thing it must not
 /// suggest. `financial_policy_is_a_server_instruction_not_a_description`
 /// holds that line across every served description, and the directive scan
-/// covers the schemas too. What the paragraph does NOT do is restate
-/// [`crate::compliance`]'s method families and canister scopes: that list would
-/// have to be kept in sync forever, and a refused call already gets a refusal
-/// accurate for its own scope. Neither surface names a venue for a refused
-/// operation.
-const SERVER_INSTRUCTIONS: &str = "Tools for the Internet Computer: read what a canister offers, read and write its data, and act as the user's own identity at an app.\n\nCANISTERS. Each canister publishes a Candid interface declaring its methods and their types. Method arguments and replies are textual Candid, the `(...)` syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`; candid_syntax_guide returns that syntax; the full type system is served as an MCP resource, `candid://reference`. Some canisters additionally declare an OQL surface. This server reads those through OQL and refuses a Candid `method` query on them; update calls are unaffected. icp_oql_guide documents the dialect. IC how-to guides are served as `skill://<name>` resources.\n\nAPPS AND IDENTITY. An app is a website backed by canisters. Internet Identity gives the user a different principal at each app, derived from that app's derivation origin, which is not always the app's visible URL; open_app resolve it, and the tools that act as the user take the resolved value. Within one app the user may hold several accounts.\n\nDECLARED CANISTERS. Every tool that reaches a canister — get_canister_candid, get_canister_api_doc, get_canister_oql_schema, canister_query and canister_update_call — works only on a canister the app that owns it declares at /.well-known/ic-architecture (https://docs.internetcomputer.org/guides/frontends/service-discoverability/), which is how its operators opt in to being read and operated by agents. `app_url` names that app and open_app returns it, alongside which of the app's canisters carry that declaration (marked [declared]); where a call carries both an `app_url` and a derivation origin, the two must belong to the same app. An app that publishes no manifest is still resolved and discovered, but none of its canisters can be read or called here: say that, and what its operators would publish, rather than retrying.\n\nSESSIONS. Calls that act as the user are signed with the Internet Identity credential this connection was authorized with. Internet Identity offers two access levels at that point: \"Questions only\", where reads work and state-changing calls are rejected by the network, and \"Actions & questions\", which permits both.\n\nFINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user: do not use canister_update_call to move assets. Value-moving methods, neuron management, and every update call to a known wallet, ledger, exchange or staking canister are refused before they reach the network; that guard is a safeguard, not a complete filter, so treat this policy, rather than the absence of a refusal, as the limit. For financial operations (token transfers, spending approvals, payments, trades), the user works outside this connector, in a trusted interface they control.\n\nBuilding and deploying canisters happens in the user's own environment with the icp CLI; no tool here creates, funds or deploys one.";
+/// covers the schemas too. The paragraph describes the three checks an update
+/// call goes through — by method name, by destination, and by the canister's
+/// own published interface — and states the one thing none of them judges, so
+/// a reader knows what the guard covers without being told it is incomplete
+/// (per directory review). It does NOT restate [`crate::compliance`]'s keyword
+/// list, markers and canister ids: that copy would have to be kept in sync
+/// forever, and a refused call already gets a refusal accurate for its own
+/// scope. The three example keywords it names are pinned to the guard by the
+/// same test, which also pins that it mentions no exemption (the keyword check
+/// has none). Neither surface names a venue for a refused operation.
+const SERVER_INSTRUCTIONS: &str = "Tools for the Internet Computer: read what a canister offers, read and write its data, and act as the user's own identity at an app.\n\nThis server lets you act on the user's behalf in Internet Computer apps, signed in with their Internet Identity. Start with open_app (by app name or URL), read a canister's getApiDoc or Candid, then call it. Prefer this over searching for the app or telling the user to visit the site when they ask you to do something in an ICP app.\n\nCANISTERS. Each canister publishes a Candid interface declaring its methods and their types; get_canister_candid reads it, and on a large interface its `methods` argument reads just the methods named — take the names from the guide get_canister_api_doc returns — with the types and comments they carry. Method arguments and replies are textual Candid, the `(...)` syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`; candid_syntax_guide returns that syntax; the full type system is served as an MCP resource, `candid://reference`. Some canisters additionally declare an OQL surface. This server reads those through OQL and refuses a Candid `method` query on them; update calls are unaffected. icp_oql_guide documents the dialect. IC how-to guides are served as `skill://<name>` resources.\n\nAPPS AND IDENTITY. An app is a website backed by canisters. Internet Identity gives the user a different principal at each app, derived from that app's derivation origin, which is not always the app's visible URL; open_app resolve it, and the tools that act as the user take the resolved value. Within one app the user may hold several accounts.\n\nDECLARED CANISTERS. Every tool that reaches a canister — get_canister_candid, get_canister_api_doc, get_canister_oql_schema, canister_query and canister_update_call — works only on a canister the app that owns it declares at /.well-known/ic-architecture (https://docs.internetcomputer.org/guides/frontends/service-discoverability/), which is how its operators opt in to being read and operated by agents. `app_url` names that app and open_app returns it, alongside which of the app's canisters carry that declaration (marked [declared]); where a call carries both an `app_url` and a derivation origin, the two must belong to the same app. An app that publishes no manifest is still resolved and discovered, but none of its canisters can be read or called here: say that, and what its operators would publish, rather than retrying.\n\nSESSIONS. Calls that act as the user are signed with the Internet Identity credential this connection was authorized with. Internet Identity offers two access levels at that point: \"Questions only\", where reads work and state-changing calls are rejected by the network, and \"Actions & questions\", which permits both.\n\nFINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user: do not use canister_update_call to move assets. Before an update call is sent it is checked three ways. By method name, on every canister: the ICRC ledger methods, neuron management, and any name carrying a financial keyword as a whole word (transfer, withdraw, swap and the like) are refused. By destination: every update call to the known wallet, ledger, exchange and staking canisters is refused. By the canister's own published Candid interface, read before anything is encoded: a canister that declares ICRC-1 or ICRC-2 methods is a financial service and receives no update call, and a canister whose interface is missing or unreadable receives none either. A refusal says which check applied and claims nothing beyond it. Not judged: a bespoke value-moving method under an unrelated name on a canister whose interface is not a ledger's. For financial operations (token transfers, spending approvals, payments, trades), the user works outside this connector, in a trusted interface they control.\n\nBuilding and deploying canisters happens outside this server, either with the icp CLI in the user's own environment or through a proxy deployment service; no tool here creates, funds or deploys one.";
 
 impl ServerHandler for IcTools {
     async fn list_tools(
@@ -2201,33 +2222,28 @@ impl ServerHandler for IcTools {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
         let mut resources = vec![
-            RawResource::new(CANDID_TEXTUAL_URI, "Candid textual syntax (used by these tools)")
-                .no_annotation(),
-            RawResource::new(CANDID_REFERENCE_URI, "Candid type reference (full spec)")
-                .no_annotation(),
-            RawResource::new(OQL_USAGE_URI, "OQL query surface usage guide").no_annotation(),
+            Resource::new(CANDID_TEXTUAL_URI, "Candid textual syntax (used by these tools)"),
+            Resource::new(CANDID_REFERENCE_URI, "Candid type reference (full spec)"),
+            Resource::new(OQL_USAGE_URI, "OQL query surface usage guide"),
         ];
         // The IC skills, from the reviewed bundle compiled into this binary
         // ([`skills::BUNDLED_SKILLS`]) — the served surface retrieves nothing
         // dynamically. Each `skill://<name>` is read from the same bundle in
         // read_resource.
         for (name, title, _) in skills::BUNDLED_SKILLS {
-            resources.push(
-                RawResource::new(format!("{SKILL_URI_PREFIX}{name}"), format!("IC skill: {title}"))
-                    .no_annotation(),
-            );
+            resources.push(Resource::new(
+                format!("{SKILL_URI_PREFIX}{name}"),
+                format!("IC skill: {title}"),
+            ));
         }
         // The companion documents those skills link to, listed so a client can
         // see the whole bundle: every link inside a served skill resolves to
         // another served resource, never to a fetch.
         for (name, file, _) in skills::BUNDLED_SKILL_REFERENCES {
-            resources.push(
-                RawResource::new(
-                    format!("{SKILL_URI_PREFIX}{name}/references/{file}"),
-                    format!("IC skill reference: {name} / {file}"),
-                )
-                .no_annotation(),
-            );
+            resources.push(Resource::new(
+                format!("{SKILL_URI_PREFIX}{name}/references/{file}"),
+                format!("IC skill reference: {name} / {file}"),
+            ));
         }
         Ok(ListResourcesResult { resources, next_cursor: None, meta: None })
     }
@@ -2421,6 +2437,108 @@ fn schema_for_output<T: schemars::JsonSchema + std::any::Any>(
     })
 }
 
+/// Assemble a `get_canister_candid` reply from the `.did` text the canister
+/// published: its texts — the interface, complete or restricted to `methods`,
+/// first, then the notes — and the structured output. Pure, so every shape is
+/// testable without a replica; the handler supplies the authorization and the
+/// metadata read. `declared_by` / `declared_at` are the manifest that
+/// authorized the read, echoed into the output.
+///
+/// The structured output carries the interface text as `candid` too (see
+/// [`calls::GetCandidOutput`]). Every note is a text of its own, after the
+/// interface, so the interface stays clean, paste-able Candid.
+fn candid_reply(
+    did: &str,
+    canister_id: String,
+    methods: Option<&[String]>,
+    declared_by: String,
+    declared_at: String,
+) -> Result<(Vec<String>, calls::GetCandidOutput), String> {
+    let rendering = calls::render_candid(did, methods)?;
+    let output = calls::GetCandidOutput {
+        canister_id,
+        candid: rendering.text.clone(),
+        methods: rendering.methods.clone(),
+        bytes: rendering.text.len(),
+        best_effort: rendering.best_effort,
+        oql: rendering.oql,
+        api_doc_available: rendering.api_doc_available,
+        declared_by,
+        declared_at,
+    };
+    let mut texts = vec![rendering.text];
+    // What a restricted interface covers and what it cost — only then; the
+    // complete interface speaks for itself, unless it is over the limit, which
+    // only an interface that could not be parsed (so offers no `methods`) is.
+    if rendering.methods.is_none() && did.len() > calls::MAX_SERVICE_SUBSET_BYTES {
+        texts.push(format!(
+            "This interface is {} bytes, over the {}-byte limit a reply keeps to, and comes back \
+             whole only because it could not be parsed to offer `methods`.",
+            did.len(),
+            calls::MAX_SERVICE_SUBSET_BYTES
+        ));
+    }
+    if let Some(covered) = &rendering.methods {
+        let declared = rendering.method_count.unwrap_or_default();
+        texts.push(if rendering.best_effort {
+            format!(
+                "This interface is restricted to the method asked for, with the type definitions \
+                 it uses (and the service's init arguments omitted). Its comments were STRIPPED: \
+                 with them it came to more than {} bytes, so this is a best effort — the \
+                 signature and type definitions are complete, the explanations are not. The \
+                 complete interface is {} bytes.",
+                calls::MAX_SERVICE_SUBSET_BYTES,
+                did.len()
+            )
+        } else {
+            format!(
+                "This interface is restricted to {} of the {declared} methods the canister \
+                 declares, with the type definitions they use and the interface's own comments \
+                 on them (and the service's init arguments omitted): a valid Candid interface \
+                 for calling them. The complete interface is {} bytes.",
+                covered.len(),
+                did.len()
+            )
+        });
+    }
+    // Signal an OQL query surface structurally (`oql: true`). When set, the
+    // guidance pointer is a SEPARATE text, so the interface stays the raw `.did`
+    // (still valid, copy-pastable Candid) — the full primer is served on demand
+    // (see the OQL_USAGE_URI resource), never inlined.
+    if rendering.oql {
+        texts.push(format!(
+            "This canister exposes an OQL query surface (a JSON query language \
+             over its data), so READ it through the OQL tools — a Candid `method` \
+             query via canister_query is rejected here. Order: icp_oql_guide \
+             (dialect, once) → get_canister_oql_schema (entities/fields) → \
+             canister_query with the `oql` argument (run a JSON query, get a table). \
+             Those wrap the `schema`/`execute` methods (no Candid escaping). This \
+             server's OQL read path REQUIRES the app's derivation_origin and \
+             rejects an anonymous OQL read (for now), rather than returning \
+             silently empty — a connector rule, not a claim about how the \
+             canister gates its data; pass the derivation_origin from open_app. \
+             See icp_oql_guide (or the `{OQL_USAGE_URI}` resource) for the dialect. \
+             canister_update_call then handles UPDATE calls only."
+        ));
+    }
+    // Same predicate get_canister_api_doc uses, so the flag gates that call:
+    // true means a `getApiDoc`/`get_api_doc` method exists.
+    texts.push(if rendering.api_doc_available {
+        "This canister declares an API-doc method (api_doc_available=true): \
+         get_canister_api_doc reads it for a prose \"how this app behaves\" guide \
+         (units, auth, lifecycle, gotchas) — the declaration is what was detected, \
+         so the call can still come back empty."
+            .to_string()
+    } else {
+        "No API-doc method was detected on this canister \
+         (api_doc_available=false) — usually there is none, and the Candid types \
+         above are the interface; an interface this parser cannot read looks the \
+         same."
+            .to_string()
+    });
+    Ok((texts, output))
+}
+
 /// A success result carrying both the human-readable `text` and a machine-
 /// readable `value` that conforms to the tool's declared `outputSchema`.
 /// Clients that consume structured tool output get the typed form; the rest
@@ -2444,7 +2562,7 @@ fn ok_structured<T: serde::Serialize>(text: String, value: &T) -> CallToolResult
 /// text. The structured `value` is attached under the same object-rooted rule as
 /// [`ok_structured`].
 fn ok_structured_blocks<T: serde::Serialize>(texts: Vec<String>, value: &T) -> CallToolResult {
-    let mut result = CallToolResult::success(texts.into_iter().map(Content::text).collect());
+    let mut result = CallToolResult::success(texts.into_iter().map(ContentBlock::text).collect());
     result.structured_content = match serde_json::to_value(value) {
         Ok(v @ serde_json::Value::Object(_)) => Some(v),
         _ => None,
@@ -2477,7 +2595,7 @@ fn ok_canister_action(canister_id: String, r: Result<String, String>) -> CallToo
 }
 
 fn err(text: String) -> CallToolResult {
-    CallToolResult::error(vec![Content::text(text)])
+    CallToolResult::error(vec![ContentBlock::text(text)])
 }
 
 #[cfg(test)]
@@ -2518,6 +2636,128 @@ mod tests {
         let typed = decode_bytes_with_did(did, "stats", &bytes).expect("typed decode");
         assert!(typed.contains("name ="), "typed should have `name`: {typed}");
         assert!(typed.contains("url ="), "typed should have `url`: {typed}");
+    }
+
+    // A large interface must be readable in one small reply, and a client that
+    // reads only the structured content must still get the interface. Pin the
+    // surface a client sees for that: the `methods` argument and an output
+    // schema that carries the interface text as `candid` alongside its size,
+    // whether its comments survived and what it covers.
+    #[test]
+    fn get_canister_candid_advertises_methods_and_carries_the_interface() {
+        let tool = super::IcTools::all_tools()
+            .into_iter()
+            .find(|t| &*t.name == "get_canister_candid")
+            .expect("served");
+        let input = serde_json::to_value(&tool.input_schema).expect("input schema");
+        let methods = &input["properties"]["methods"];
+        assert!(methods.is_object(), "`methods` must be an argument: {input}");
+        assert_eq!(methods["items"]["type"], serde_json::json!("string"), "{methods}");
+        let required = serde_json::to_string(&input["required"]).unwrap_or_default();
+        assert!(!required.contains("methods"), "optional: {required}");
+        let description = tool.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("get_canister_api_doc") && description.contains("`methods`"),
+            "the description teaches the doc-first flow: {description}"
+        );
+
+        let output = serde_json::to_value(tool.output_schema.as_ref().expect("output schema"))
+            .expect("output schema");
+        let properties = output["properties"].as_object().expect("object-rooted");
+        for present in ["candid", "methods", "bytes", "best_effort", "oql", "declared_by"] {
+            assert!(properties.contains_key(present), "{present} must be declared: {output}");
+        }
+        assert_eq!(properties["candid"]["type"], serde_json::json!("string"), "{output}");
+    }
+
+    // The reply a read assembles, without a replica: the interface comes first,
+    // the notes follow, and the structured object carries the text too — so a
+    // full-interface reply is the `.did` plus a short note, and a restricted one
+    // says what it covers and what it cost.
+    #[test]
+    fn candid_reply_puts_the_interface_first_and_in_the_structured_output() {
+        let did = "// Paging.\n\
+                   type Args = record { page : nat };\n\
+                   service : {\n  \
+                     // Lists the names on a page.\n  \
+                     list : (Args) -> (vec text) query;\n  \
+                     create : (text) -> (nat);\n  \
+                     schema : () -> (text) query;\n  \
+                     execute : (text) -> (text) query;\n\
+                   }";
+        let reply = |methods: Option<&[String]>| {
+            super::candid_reply(
+                did,
+                "aaaaa-aa".into(),
+                methods,
+                "https://app.example".into(),
+                "/.well-known/ic-architecture".into(),
+            )
+        };
+        let structured = |output: &super::calls::GetCandidOutput| {
+            serde_json::to_value(output).expect("serializes")
+        };
+
+        // The complete interface: the text, then the OQL pointer and the API-doc
+        // note (both describe the canister, not the selection), and nothing else.
+        let (texts, output) = reply(None).expect("renders");
+        assert_eq!(texts[0], did, "the interface comes first, verbatim");
+        assert_eq!(texts.len(), 3, "no selection note on the complete interface: {texts:?}");
+        assert!(texts[1].contains("OQL") && texts[2].contains("api_doc_available=false"));
+        let s = structured(&output);
+        assert_eq!(
+            s["candid"],
+            serde_json::json!(did),
+            "the structured object carries the text: {s}"
+        );
+        assert!(s.get("methods").is_none(), "nothing restricts it: {s}");
+        assert_eq!(s["bytes"], serde_json::json!(did.len()));
+        assert_eq!(s["best_effort"], serde_json::json!(false));
+        assert_eq!(s["oql"], serde_json::json!(true));
+        assert_eq!(s["declared_by"], serde_json::json!("https://app.example"));
+        let text: usize = texts.iter().map(String::len).sum();
+        assert!(text < did.len() + 2_000, "the did plus short notes, {text} bytes");
+
+        // One method with its types and comments: a restricted `.did`, then a
+        // note on what it covers; the structured object echoes the selection.
+        let names = ["list".to_string()];
+        let (texts, output) = reply(Some(&names)).expect("renders");
+        assert!(
+            texts[0].contains("// Paging.") && texts[0].contains("type Args ="),
+            "{}",
+            texts[0]
+        );
+        assert!(texts[0].contains("// Lists the names on a page."), "{}", texts[0]);
+        assert!(!texts[0].contains("create"), "{}", texts[0]);
+        assert!(
+            texts[1].starts_with("This interface is restricted to 1 of the 4 methods"),
+            "{}",
+            texts[1]
+        );
+        assert!(texts[1].contains("own comments"), "{}", texts[1]);
+        let s = structured(&output);
+        assert_eq!(s["methods"], serde_json::json!(["list"]));
+        assert_eq!(s["bytes"], serde_json::json!(texts[0].len()));
+        assert_eq!(s["best_effort"], serde_json::json!(false));
+
+        // A rendering error is the reply's error, verbatim.
+        let e = reply(Some(&["lost".to_string()])).expect_err("unknown");
+        assert!(e.contains("`lost`") && e.contains("create, execute, list, schema"), "{e}");
+
+        // An interface over the limit that cannot be parsed comes back whole,
+        // with a note saying why.
+        let unparseable = format!("service : {{ {} !!!", "m : () -> (); ".repeat(600));
+        assert!(unparseable.len() > super::calls::MAX_SERVICE_SUBSET_BYTES);
+        let (texts, _) = super::candid_reply(
+            &unparseable,
+            "aaaaa-aa".into(),
+            None,
+            "https://app.example".into(),
+            "/.well-known/ic-architecture".into(),
+        )
+        .expect("verbatim");
+        assert_eq!(texts[0], unparseable);
+        assert!(texts[1].contains("could not be parsed to offer `methods`"), "{}", texts[1]);
     }
 
     // Every tool must carry MCP annotations, else clients fall back to the unsafe
@@ -2756,16 +2996,22 @@ mod tests {
     // canister_update_call's description reads as a hint that the tool is
     // usable for financial transactions, which is the one thing it must not
     // suggest. Pin both sides — no tool description carries financial
-    // language, and the instructions state the denial, the limit of the guard
-    // that backs it, and the redirect. The refused method families are
-    // deliberately NOT restated here or in the instructions: they were a copy
-    // of `compliance` that had to be kept in sync, and an attempted call is
-    // refused with a message accurate for its own scope. What the instructions
-    // must not do is promise more than the guard delivers, so the
-    // safeguard-not-a-filter clause is pinned in its place. Neither surface
-    // names a venue for a refused operation: metadata answering a refused
-    // financial operation with a specific transactional service would read as
-    // a redirect from one such route to another.
+    // language, and the instructions state the denial, the three checks that
+    // enforce it (by name, by destination, by the canister's own interface),
+    // the one thing those checks do not judge, and the redirect. Directory
+    // review asked that the instructions describe what the guard covers
+    // rather than call it incomplete, so the old "a safeguard, not a complete
+    // filter" clause is pinned OUT. The keyword list, markers and canister ids
+    // are deliberately NOT restated in the instructions: they were a copy of
+    // `compliance` that had to be kept in sync, and an attempted call is
+    // refused with a message accurate for its own scope — the three example
+    // keywords the paragraph does name are checked against the guard here, and
+    // so is the absence of any exemption: the keyword check has none, so the
+    // paragraph must not mention one (an earlier version named
+    // `transfer_ownership` as exempt, which the guard no longer honours).
+    // Neither surface names a venue for a refused operation: metadata
+    // answering a refused financial operation with a specific transactional
+    // service would read as a redirect from one such route to another.
     #[test]
     fn financial_policy_is_a_server_instruction_not_a_description() {
         for tool in super::IcTools::all_tools() {
@@ -2775,9 +3021,38 @@ mod tests {
         }
         let ins = super::SERVER_INSTRUCTIONS;
         assert!(ins.contains("FINANCIAL TRANSACTIONS ARE NOT SUPPORTED, to protect the user"));
+        for check in ["By method name", "By destination", "published Candid interface"] {
+            assert!(ins.contains(check), "the instructions must describe the {check} check: {ins}");
+        }
+        assert!(ins.contains("Not judged:"), "the instructions must state the limit: {ins}");
         assert!(
-            ins.contains("a safeguard, not a complete filter"),
-            "the instructions must not present the guard as complete coverage: {ins}"
+            !ins.contains("not a complete filter") && !ins.contains("safeguard"),
+            "the instructions describe what the guard covers rather than calling it \
+             incomplete (per directory review): {ins}"
+        );
+        // The example keywords the paragraph names are real: each is refused
+        // by the guard on an arbitrary canister.
+        for keyword in ["transfer", "withdraw", "swap"] {
+            assert!(ins.contains(keyword), "the paragraph names {keyword}: {ins}");
+            assert!(
+                crate::compliance::disallowed_update_method(
+                    &candid::Principal::management_canister(),
+                    keyword
+                )
+                .is_some(),
+                "{keyword} is named in the instructions but not refused by the guard"
+            );
+        }
+        // ...and the paragraph names no exemption, because the guard has none:
+        // the ownership-handover name once mentioned as exempt is refused.
+        assert!(!ins.contains("exempt"), "the keyword check has no exemption: {ins}");
+        assert!(
+            crate::compliance::disallowed_update_method(
+                &candid::Principal::management_canister(),
+                "transfer_ownership"
+            )
+            .is_some(),
+            "transfer_ownership must be refused: nothing is exempt from the keyword check"
         );
         assert!(ins.contains("outside this connector, in a trusted interface they control"));
         assert!(!ins.contains("oisy.com"), "the instructions name no venue: {ins}");
@@ -2971,6 +3246,29 @@ mod tests {
             "the schema scan no longer sees field documentation"
         );
         for (what, text) in surfaces {
+            if let Some(violation) = policy_violation(&text) {
+                panic!("{what} {violation}: {text}");
+            }
+        }
+    }
+
+    // The guidance in an error reaches the model exactly like a description does,
+    // so the errors that tell it how to find an app's URL are held to the same
+    // gate: an unknown name once sent the model off to a web search.
+    #[test]
+    fn app_url_guidance_respects_marketplace_policy() {
+        for (what, text) in [
+            ("unknown-app note", super::discover::find_app_by_name("Totally Unknown DApp").note),
+            ("lookalike refusal", super::unverified_app_url_error("https://multidex.com")),
+            ("plain refusal", super::unverified_app_url_error("https://example.com")),
+            (
+                "fetch-error guidance",
+                super::app_url_error_with_guidance(
+                    "multi.dex",
+                    "could not resolve multi.dex: no such host".to_string(),
+                ),
+            ),
+        ] {
             if let Some(violation) = policy_violation(&text) {
                 panic!("{what} {violation}: {text}");
             }
@@ -3329,7 +3627,7 @@ mod tests {
         let msg = super::unverified_app_url_error("https://multidex.com");
         assert!(msg.contains("NO evidence"), "{msg}");
         assert!(msg.contains("open_app"), "{msg}");
-        assert!(msg.contains("WEB SEARCH"), "{msg}");
+        assert!(msg.contains("ask the user"), "{msg}");
         assert!(msg.contains("DID YOU MEAN MULTI/DEX"), "{msg}");
         assert!(msg.contains("https://multidex.ai"), "{msg}");
         assert!(msg.contains("`derivation_origin`"), "escape hatch missing: {msg}");
