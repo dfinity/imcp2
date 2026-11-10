@@ -127,10 +127,19 @@ pub const MAX_PENDING_CONNECTS: usize = 1_024;
 const MAX_SESSIONS: usize = 20_000;
 
 /// How long a session that never redeemed a grant is kept before the reaper
-/// treats the connect as abandoned. Comfortably past `crate::auth`'s 10-minute
-/// `CONNECT_TTL`, after which the connect can no longer be redeemed anyway, so
-/// this only ever drops sessions that are already dead weight.
+/// treats the connect as abandoned. Comfortably past the hosted server's
+/// 10-minute `CONNECT_TTL`, after which no new redemption can start, so the
+/// redemptions this can cut short are ones that started in time and then ran
+/// past the 15 minutes. Those fail with [`SIGN_IN_DROPPED_MSG`] (see
+/// [`Identities::redeem_registration_delegation`]) rather than re-create the
+/// session with a key II never registered.
 const PENDING_CONNECT_TTL_NS: u64 = 15 * 60 * 1_000_000_000;
+
+/// What a redemption answers when its connect's session is gone: reaped (see
+/// [`PENDING_CONNECT_TTL_NS`]) or evicted at capacity, before or while the
+/// `mcp_register_v2` call ran. Shown to the user on the callback page.
+pub const SIGN_IN_DROPPED_MSG: &str = "This sign-in was dropped before it could finish: it took \
+     too long, or the server was busy. Start the sign-in again.";
 
 /// Per-session ceiling on cached per-app delegations. `store` inserts one per
 /// distinct `(derivation origin, account)` a session asks for, so a single
@@ -563,12 +572,14 @@ impl Identities {
         Some(Principal::self_authenticating(&der).to_text())
     }
 
-    /// Record the grant's expiration from the `mcp_register_v2` reply, at connect
-    /// redemption. The value is nanoseconds since the epoch.
+    /// Record a grant expiring at `expiration_ns` (nanoseconds since the epoch)
+    /// on `session_id`, creating the session if it doesn't exist. Connect
+    /// redemption does NOT use this: it records through `record_registration`,
+    /// which refuses rather than re-creates a session reaped mid-call, since a
+    /// re-created session's fresh key is not the one II registered.
     pub async fn set_grant_expiration(&self, session_id: &str, expiration_ns: u64) {
-        // Best effort: the redeem path ensured this session already, so a
-        // capacity refusal here means it was reaped mid-flight — nothing to
-        // record, and the client's next call gets the reconnect message.
+        // Best effort: a capacity refusal leaves nothing to record, and the
+        // client's next call gets the reconnect message.
         if let Err(e) = self.ensure_session(session_id).await {
             tracing::warn!(session_id = %session_id, "could not record the grant expiration: {e}");
             return;
@@ -582,30 +593,23 @@ impl Identities {
         // readers/writers of the session map.
         let opened = {
             let mut sessions = self.sessions.write().await;
-            match sessions.get_mut(session_id) {
-                Some(s) => {
-                    let was_live = s.grant_expiration_ns.is_some_and(|e| e > now);
-                    s.grant_expiration_ns = Some(expiration_ns);
-                    // Redeeming a grant is itself activity, so a freshly-opened
-                    // session counts as active immediately (before its first tool
-                    // call) on the `active_sessions` gauge.
-                    s.last_seen_ns.store(now, Ordering::Relaxed);
-                    !was_live && expiration_ns > now
-                }
-                None => false,
-            }
+            sessions.get_mut(session_id).is_some_and(|s| record_grant(s, expiration_ns, now))
         };
-        // "session opened" pairs 1:1 with the reaper's "session closed", so the
-        // two reconcile in the journal. A re-bind of an already-live grant (a
-        // redeem retry within the delegation's lifetime) is not a new open.
         if opened {
-            tracing::info!(
-                instance = self.instance.name,
-                session_id = %session_id,
-                expiration_ns,
-                "session opened"
-            );
+            self.log_session_opened(session_id, expiration_ns);
         }
+    }
+
+    /// The "session opened" log. It pairs 1:1 with the reaper's "session
+    /// closed", so the two reconcile in the journal; logged after the session
+    /// lock is released, so a slow log sink can't stall the session map.
+    fn log_session_opened(&self, session_id: &str, expiration_ns: u64) {
+        tracing::info!(
+            instance = self.instance.name,
+            session_id = %session_id,
+            expiration_ns,
+            "session opened"
+        );
     }
 
     /// Record the session's access level from the `mcp_register_v2` reply's
@@ -615,16 +619,12 @@ impl Identities {
     /// through to the ingress rejection fallback instead of the server wrongly
     /// considering the session writable.
     pub async fn set_permissions(&self, session_id: &str, permissions: &str) {
-        let level = match permissions.trim().to_ascii_lowercase().as_str() {
-            "queries" => Some(true),
-            "all" => Some(false),
-            other => {
-                tracing::warn!("mcp_register_v2 reply had unrecognized permissions {other:?}; access level left unknown");
-                return;
-            }
+        let Some(level) = access_level(permissions) else {
+            return;
         };
-        // Same best-effort posture as `set_grant_expiration`: recorded on the
-        // session the redeem path already created, or dropped with a warning.
+        let level = Some(level);
+        // Same best-effort posture as `set_grant_expiration` (and, like it, not
+        // what connect redemption uses).
         if let Err(e) = self.ensure_session(session_id).await {
             tracing::warn!(session_id = %session_id, "could not record the access level: {e}");
             return;
@@ -911,12 +911,12 @@ impl Identities {
         reg_user_key: Vec<u8>,
         chain: Vec<SignedDelegation>,
     ) -> Result<RegistrationOutcome, String> {
-        self.ensure_session(session_id).await?;
-
-        // priv(X) to sign the ingress as, and pub(S) to register.
+        // priv(X) to sign the ingress as, and pub(S) to register. The connect's
+        // session must still be here: one reaped or evicted since the connect
+        // began is not re-created, which would only mint a key II never sees.
         let (reg_seed, reg_der, session_der) = {
             let sessions = self.sessions.read().await;
-            let s = sessions.get(session_id).ok_or("no such session")?;
+            let s = sessions.get(session_id).ok_or(SIGN_IN_DROPPED_MSG)?;
             let reg_seed =
                 s.reg_key_seed.ok_or("no registration key was minted for this connect")?;
             let reg_der = s
@@ -962,11 +962,46 @@ impl Identities {
             .map_err(|e| format!("Internet Identity rejected registration: {e}"))?;
 
         // Record expiry + access level so the signer's expiry check and the
-        // read-only guard have what they need.
+        // read-only guard have what they need — on the session II just
+        // registered, or not at all (see `record_registration`).
         let permissions = outcome.permissions.as_text();
-        self.set_grant_expiration(session_id, outcome.expiration).await;
-        self.set_permissions(session_id, permissions).await;
+        self.record_registration(session_id, &session_der, outcome.expiration, permissions).await?;
         Ok(RegistrationOutcome { expiration_ns: outcome.expiration, permissions })
+    }
+
+    /// Record a successful `mcp_register_v2` — the grant's expiration and access
+    /// level — on the session it registered, in one step under the lock.
+    ///
+    /// Refused, with nothing recorded, when that session is gone or no longer
+    /// holds the key `session_der` that II just registered: it was reaped (15
+    /// minutes after its connect began, see [`PENDING_CONNECT_TTL_NS`]) or
+    /// evicted at capacity while the call was in flight. Re-creating it, as
+    /// [`Self::set_grant_expiration`] would, mints a fresh key II never
+    /// registered, so the client would get a session that cannot sign anything.
+    async fn record_registration(
+        &self,
+        session_id: &str,
+        session_der: &[u8],
+        expiration_ns: u64,
+        permissions: &str,
+    ) -> Result<(), String> {
+        let level = access_level(permissions);
+        let now = now_ns();
+        let opened = {
+            let mut sessions = self.sessions.write().await;
+            let s = sessions
+                .get_mut(session_id)
+                .filter(|s| s.pubkey_der == session_der)
+                .ok_or(SIGN_IN_DROPPED_MSG)?;
+            if level.is_some() {
+                s.read_only = level;
+            }
+            record_grant(s, expiration_ns, now)
+        };
+        if opened {
+            self.log_session_opened(session_id, expiration_ns);
+        }
+        Ok(())
     }
 
     /// Resolve an optional account `name` at `domain` to its account number
@@ -1209,6 +1244,36 @@ impl Identities {
         // Keyed the way every reader keys it: the canonical origin.
         self.store(session_id, &target_origin(domain), None, app).await;
         Ok(principal)
+    }
+}
+
+/// Record a grant expiring at `expiration_ns` on `s`, returning whether this
+/// opened the session: a genuine not-live -> live transition, so a re-bind of an
+/// already-live grant (a redeem retry within the delegation's lifetime) is not a
+/// new open. Redeeming a grant is itself activity, so a freshly-opened session
+/// counts as active at once (before its first tool call) on the
+/// `active_sessions` gauge.
+fn record_grant(s: &mut Session, expiration_ns: u64, now: u64) -> bool {
+    let was_live = s.grant_expiration_ns.is_some_and(|e| e > now);
+    s.grant_expiration_ns = Some(expiration_ns);
+    s.last_seen_ns.store(now, Ordering::Relaxed);
+    !was_live && expiration_ns > now
+}
+
+/// The access level an `mcp_register_v2` reply's `permissions` names:
+/// `Some(true)` = read-only (`"queries"`), `Some(false)` = full access (`"all"`),
+/// both case-insensitive. Any UNRECOGNIZED value is `None`, with a warning, so
+/// the level stays unknown rather than assumed to be full access.
+fn access_level(permissions: &str) -> Option<bool> {
+    match permissions.trim().to_ascii_lowercase().as_str() {
+        "queries" => Some(true),
+        "all" => Some(false),
+        other => {
+            tracing::warn!(
+                "mcp_register_v2 reply had unrecognized permissions {other:?}; access level left unknown"
+            );
+            None
+        }
     }
 }
 
@@ -1680,6 +1745,74 @@ mod tests {
         ids.set_permissions("sess2", "something-new").await;
         assert_eq!(ids.is_read_only("sess2").await, None);
         assert!(ids.require_write("sess2").await.is_ok());
+    }
+
+    // The session key a pending connect's session holds, as `authorize` minted it.
+    async fn session_der(ids: &Identities, session_id: &str) -> Vec<u8> {
+        ids.sessions.read().await[session_id].pubkey_der.clone()
+    }
+
+    // A successful registration is recorded on the session it registered: the
+    // grant's expiration and the access level, in one step.
+    #[tokio::test]
+    async fn record_registration_records_on_the_session_it_registered() {
+        let ids = test_ids();
+        ids.ensure_session("sess").await.expect("room for a session");
+        let der = session_der(&ids, "sess").await;
+        let future = now_ns() + 3_600_000_000_000;
+
+        ids.record_registration("sess", &der, future, "queries").await.expect("recorded");
+
+        assert_eq!(ids.grant_expiration_ns("sess").await, Some(future));
+        assert_eq!(ids.is_read_only("sess").await, Some(true));
+    }
+
+    // A registration whose session was reaped or evicted while `mcp_register_v2`
+    // ran is refused, and the session is NOT re-created: a re-created session's
+    // fresh key is not the one II registered, so it could never sign anything.
+    #[tokio::test]
+    async fn record_registration_refuses_a_session_gone_mid_call() {
+        let ids = test_ids();
+        ids.ensure_session("sess").await.expect("room for a session");
+        let der = session_der(&ids, "sess").await;
+        ids.discard_session("sess").await; // reaped while the call ran
+
+        let future = now_ns() + 3_600_000_000_000;
+        let refused = ids.record_registration("sess", &der, future, "all").await;
+
+        assert_eq!(refused, Err(SIGN_IN_DROPPED_MSG.to_owned()));
+        assert!(ids.sessions.read().await.is_empty(), "the session is not re-created");
+    }
+
+    // Nor is a registration recorded on a session that has since been re-created
+    // under the same id with another key: the key II registered is gone with the
+    // old one.
+    #[tokio::test]
+    async fn record_registration_refuses_a_session_re_created_with_another_key() {
+        let ids = test_ids();
+        ids.ensure_session("sess").await.expect("room for a session");
+        let registered = session_der(&ids, "sess").await;
+        ids.discard_session("sess").await;
+        ids.ensure_session("sess").await.expect("room for a session");
+        assert_ne!(session_der(&ids, "sess").await, registered);
+
+        let future = now_ns() + 3_600_000_000_000;
+        let refused = ids.record_registration("sess", &registered, future, "all").await;
+
+        assert_eq!(refused, Err(SIGN_IN_DROPPED_MSG.to_owned()));
+        assert_eq!(ids.grant_expiration_ns("sess").await, None, "no grant on the new key");
+    }
+
+    // A redemption whose connect's session is already gone is refused up front,
+    // before any network call, and does not re-create the session.
+    #[tokio::test]
+    async fn redeem_refuses_a_connect_whose_session_is_gone() {
+        let ids = test_ids();
+
+        let refused = ids.redeem_registration_delegation("gone", vec![], vec![]).await;
+
+        assert_eq!(refused.map(|_| ()), Err(SIGN_IN_DROPPED_MSG.to_owned()));
+        assert!(ids.sessions.read().await.is_empty(), "the session is not re-created");
     }
 
     // `discard_session` drops a session whatever it holds, a live grant included,
@@ -2736,7 +2869,9 @@ mod tests {
     #[tokio::test]
     async fn redeem_guards_missing_key_and_empty_chain() {
         let ids = test_ids();
-        // No X minted yet: even a plausible user_key can't be redeemed.
+        // A session with no X minted yet: even a plausible user_key can't be
+        // redeemed. (No session at all is `redeem_refuses_a_connect_whose_session_is_gone`.)
+        ids.ensure_session("sess").await.expect("room for a session");
         let err = ids
             .redeem_registration_delegation("sess", vec![1], vec![])
             .await
