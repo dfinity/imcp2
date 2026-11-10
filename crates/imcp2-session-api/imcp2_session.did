@@ -43,7 +43,7 @@ type SessionRecord = record {
   op_id : OpId;
   created_at : Seconds;
   grant_expires_at : Seconds;
-  last_active_at : Seconds;
+  last_active_at : Seconds;     // created_at, then consumed_at, then raised by touches
   consumed_at : opt Seconds;
   sealed : blob;                // 3 to 1024 bytes; byte 2 is the key id
 };
@@ -102,7 +102,9 @@ type ChangesPage = record {
   changes : vec Change;         // seq > after, ascending
   complete : bool;              // nothing exists after next_after
   next_after : Seq;             // complete ? max(after, head) : seq of the last change
-  head : Seq;                   // highest seq ever assigned; never lowered
+  head : Seq;                   // highest seq assigned; a snapshot load rewinds it
+                                // (epoch moves once the load is noticed): compare
+                                // positions only within one epoch
   epoch : nat64;                // bumped when the canister history shows a snapshot load
   now_ns : nat64;
   idle_timeout_secs : nat64;

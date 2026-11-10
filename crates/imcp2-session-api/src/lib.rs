@@ -48,8 +48,8 @@ pub use config::{Config, ConfigPatch, InstallArg};
 pub use constants::*;
 pub use errors::{CommonError, ConsumeCodeError, ErrorInfo, PutSessionError};
 pub use rules::{
-    evictable, idle_deadline, idle_purge_cutoff, idle_purge_enabled, namespace_of,
-    reporting_matters, touch_granularity, touches_effective,
+    evictable, eviction_idle, idle_deadline, idle_purge_cutoff, idle_purge_enabled, namespace_of,
+    report_promptly, reporting_matters, touch_granularity, touches_effective,
 };
 pub use types::*;
 

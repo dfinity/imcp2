@@ -60,8 +60,11 @@ pub struct SessionRecord {
     pub op_id: OpId,
     pub created_at: Seconds,
     pub grant_expires_at: Seconds,
-    /// The latest reported activity (see [`idle_deadline`](crate::idle_deadline));
-    /// `created_at` until the first touch.
+    /// The latest reported activity (see [`idle_deadline`](crate::idle_deadline)):
+    /// `created_at` while unconsumed, `consumed_at` from the exchange on (the
+    /// session's first use, which every access token for it carries), then
+    /// raised by touches. A backend that has not reported the session yet can
+    /// therefore take the token's consumption time as what the canister holds.
     pub last_active_at: Seconds,
     /// When the authorization code was consumed; `None` until then.
     pub consumed_at: Option<Seconds>,
@@ -235,7 +238,12 @@ pub struct ChangesPage {
     pub complete: bool,
     /// Where to continue: `complete ? max(after, head) : seq of the last change`.
     pub next_after: Seq,
-    /// The highest `seq` ever assigned; never lowered.
+    /// The highest `seq` assigned. The canister never lowers it, but a snapshot
+    /// load restores the snapshot's value: until the canister notices the load
+    /// (at its next timer run, which then moves `epoch`), `head` may lie below a
+    /// position a backend already holds. Compare feed positions only within one
+    /// `epoch`; on a new one, discard them and resync from 0. New positions
+    /// stay above every earlier one even so (see [`Seq`]).
     pub head: Seq,
     /// Bumped when the canister history shows a snapshot load; a backend
     /// seeing a new epoch discards its mirror and resyncs.
