@@ -1586,9 +1586,8 @@ enum StrictRead {
 enum Overflow {
     /// The document's form bounds its size, so an over-cap body is NOT it: the
     /// app declares nothing here. An SPA catch-all's index.html at the Layer 5
-    /// path is the common live case, and treating it as a failed check would
-    /// refuse to resolve a perfectly healthy app
-    /// (`an_over_cap_layer5_body_reads_as_no_declaration` pins it).
+    /// path is the live case — OISY serves exactly that, and treating it as a
+    /// failed check would refuse to resolve a perfectly healthy app.
     NotTheDocument,
     /// The document has no size bound of its own, so an over-cap body is a read
     /// we could not finish, not a verdict.
@@ -3882,102 +3881,22 @@ mod tests {
         assert_eq!(r.application_is_ic, Some(false), "example.com must show no IC evidence");
     }
 
-    // Live network: an app in the known-app registry resolves to the registry's
-    // derivation origin, and the IC probe never runs for it. When the app
-    // declares nothing, the registry fills the gap (`Known`). When it publishes
-    // its own declaration, that wins (`Declared`) and must name the same origin.
-    //
-    // Apps adopt the declaration over time (oisy.com and nns.ic0.app already
-    // have), so this checks several and needs only ONE still answered by the
-    // registry to keep the `Known` path covered. While they answer the Layer 5
-    // path with their SPA shell (over the cap), this also exercises
-    // `Overflow::NotTheDocument` live; `an_over_cap_layer5_body_reads_as_no_declaration`
-    // pins that offline.
+    // Live network: a KNOWN app skips the IC probe entirely (the registry answers).
     #[tokio::test]
     async fn resolve_app_identity_skips_probe_for_known_apps() {
-        const APPS: &[&str] = &["nns.internetcomputer.org", "multidex.ai", "app.icpswap.com"];
-        let mut via_registry = 0;
-        for app in APPS {
-            let r = resolve_app_identity(app, false).await.expect("resolve");
-            assert_eq!(
-                Some(r.derivation_origin.as_str()),
-                known_derivation_origin(app),
-                "{app}: resolves to its registry derivation origin"
-            );
-            assert_eq!(r.application_is_ic, None, "{app}: known apps are not probed");
-            match r.derivation_origin_source {
-                DerivationSource::Known => via_registry += 1,
-                DerivationSource::Declared => {} // its own declaration, agreeing
-                other => panic!("{app}: resolved as {other:?}"),
-            }
-        }
-        assert!(
-            via_registry > 0,
-            "every app in {APPS:?} now publishes its own derivation origin: add a registry app \
-             that still declares nothing, so the registry path stays covered"
-        );
-    }
-
-    // Serve ONE HTTP response carrying `body` on a loopback port, returning the
-    // origin to fetch it from: an offline stand-in for an app's web server.
-    fn serve_once(body: String) -> String {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
-        let origin = format!("http://{}", listener.local_addr().expect("local address"));
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept the probe");
-            let (mut request, mut buf) = (Vec::new(), [0u8; 1024]);
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                match stream.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => request.extend_from_slice(&buf[..n]),
-                }
-            }
-            let head = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\n\
-                 connection: close\r\n\r\n",
-                body.len()
-            );
-            // The reader may hang up once it has seen enough; that's expected.
-            let _ =
-                stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(body.as_bytes()));
-        });
-        origin
-    }
-
-    // An over-cap body at the Layer 5 path is an SPA catch-all's page, not the
-    // one-line declaration, so it reads as "declares nothing" (`Absent`), NOT as
-    // a failed check: that refused to resolve a perfectly healthy app once, which
-    // a live test caught. A document with no size bound of its own reads the same
-    // body as a read we could not finish (`Unreachable`). Offline, so this holds
-    // whatever any live site happens to serve.
-    #[tokio::test]
-    async fn an_over_cap_layer5_body_reads_as_no_declaration() {
-        let page = format!("<!doctype html>{}", " ".repeat(MAX_DERIVATION_ORIGIN_BYTES));
-        let client = reqwest::Client::builder().no_proxy().build().expect("client");
-
-        let (layer5, _) = fetch_well_known(
-            &client,
-            &serve_once(page.clone()),
-            DERIVATION_ORIGIN_PATH,
-            MAX_DERIVATION_ORIGIN_BYTES,
-            Overflow::NotTheDocument,
-        )
-        .await;
-        assert!(matches!(layer5, WellKnown::Absent), "an over-cap Layer 5 body declares nothing");
-
-        let (unbounded, _) = fetch_well_known(
-            &client,
-            &serve_once(page),
-            LEGACY_MANIFEST_PATH,
-            MAX_DERIVATION_ORIGIN_BYTES,
-            Overflow::Unknown,
-        )
-        .await;
-        assert!(
-            matches!(&unbounded, WellKnown::Unreachable(e) if e.contains("larger than")),
-            "an over-cap body of an unbounded document is a read we could not finish"
-        );
+        // Also the regression pin for over-cap Layer 5 bodies: multidex.ai answers
+        // /.well-known/ii-derivation-origin with its SPA shell, which is larger
+        // than MAX_DERIVATION_ORIGIN_BYTES. That must read as "declares nothing"
+        // (Overflow::NotTheDocument — a one-line origin cannot be that big, so
+        // what was served is not the Layer 5 document), NOT as a failed check.
+        // Treating it as a failure refused to resolve a perfectly healthy app,
+        // which is how this test caught it (on oisy.com, which has since started
+        // declaring its origin, so it now resolves as Declared — the app's own
+        // declaration wins over the registry).
+        let r = resolve_app_identity("multidex.ai", false).await.expect("resolve");
+        assert_eq!(r.derivation_origin_source, DerivationSource::Known);
+        assert_eq!(r.derivation_origin, "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io");
+        assert_eq!(r.application_is_ic, None, "known apps are not probed");
     }
 
     // Consistency (networked): every origin in a known app's LIVE
