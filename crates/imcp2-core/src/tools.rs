@@ -2692,7 +2692,16 @@ mod tests {
         // What every reply carries is required; `methods` is absent on the
         // complete interface, and the declared schema must say so.
         let required = serde_json::to_string(&output["required"]).unwrap_or_default();
-        for always in ["candid", "bytes", "best_effort", "oql", "api_doc_available"] {
+        for always in [
+            "canister_id",
+            "candid",
+            "bytes",
+            "best_effort",
+            "oql",
+            "api_doc_available",
+            "declared_by",
+            "declared_at",
+        ] {
             assert!(
                 required.contains(&format!("\"{always}\"")),
                 "{always} is always present: {required}"
@@ -2766,7 +2775,10 @@ mod tests {
             texts[1]
         );
         assert!(texts[1].contains("own comments"), "{}", texts[1]);
+        let complete = format!("The complete interface is {} bytes.", did.len());
+        assert!(texts[1].ends_with(&complete), "{}", texts[1]);
         let s = structured(&output);
+        assert_eq!(s["candid"], serde_json::json!(texts[0]), "the restricted text, whole: {s}");
         assert_eq!(s["methods"], serde_json::json!(["list"]));
         assert_eq!(s["bytes"], serde_json::json!(texts[0].len()));
         assert_eq!(s["best_effort"], serde_json::json!(false));
@@ -2793,10 +2805,17 @@ mod tests {
                 .collect::<String>();
             format!("type Huge = record {{\n{fields}}};\nservice : {{ m : (Huge) -> () }}")
         };
+        // Whatever its size, the structured object carries the text whole: a
+        // client that reads only that object has no other way to get it.
+        let whole_in_both = |texts: &[String], s: &serde_json::Value| {
+            assert_eq!(s["candid"], serde_json::json!(texts[0]), "whole, not cut: {s}");
+            assert_eq!(s["bytes"], serde_json::json!(texts[0].len()), "{s}");
+        };
         let (texts, output) = reply_to_m(&huge).expect("answered whole");
         let s = structured(&output);
+        whole_in_both(&texts, &s);
         assert_eq!(s["best_effort"], serde_json::json!(false), "{s}");
-        assert!(output.bytes > limit && texts[0].len() == output.bytes, "{} bytes", output.bytes);
+        assert!(output.bytes > limit, "{} bytes", output.bytes);
         assert!(
             texts[1].contains("restricted to 1 of the 1 methods")
                 && texts[1].contains(&format!(
@@ -2809,6 +2828,8 @@ mod tests {
             "{}",
             texts[1]
         );
+        let complete = format!("The complete interface is {} bytes.", huge.len());
+        assert!(texts[1].ends_with(&complete), "{}", texts[1]);
         let chatty = {
             let fields = (0..120)
                 .map(|i| {
@@ -2819,6 +2840,7 @@ mod tests {
         };
         let (texts, output) = reply_to_m(&chatty).expect("best effort");
         let s = structured(&output);
+        whole_in_both(&texts, &s);
         assert_eq!(s["best_effort"], serde_json::json!(true), "{s}");
         assert!(output.bytes <= limit, "{} bytes", output.bytes);
         assert!(
@@ -2828,10 +2850,13 @@ mod tests {
             "{}",
             texts[1]
         );
+        let complete = format!("The complete interface is {} bytes.", chatty.len());
+        assert!(texts[1].ends_with(&complete), "{}", texts[1]);
         let commented =
             huge.replace("type Huge = record {\n", "// Everything.\ntype Huge = record {\n");
         let (texts, output) = reply_to_m(&commented).expect("best effort");
         let s = structured(&output);
+        whole_in_both(&texts, &s);
         assert_eq!(s["best_effort"], serde_json::json!(true), "{s}");
         assert!(output.bytes > limit, "{} bytes", output.bytes);
         assert!(
@@ -2844,6 +2869,8 @@ mod tests {
             "{}",
             texts[1]
         );
+        let complete = format!("The complete interface is {} bytes.", commented.len());
+        assert!(texts[1].ends_with(&complete), "{}", texts[1]);
 
         // A rendering error is the reply's error, verbatim.
         let e = reply(Some(&["lost".to_string()])).expect_err("unknown");
@@ -2853,7 +2880,7 @@ mod tests {
         // with a note saying why.
         let unparseable = format!("service : {{ {} !!!", "m : () -> (); ".repeat(600));
         assert!(unparseable.len() > super::calls::MAX_SERVICE_SUBSET_BYTES);
-        let (texts, _) = super::candid_reply(
+        let (texts, output) = super::candid_reply(
             &unparseable,
             "aaaaa-aa".into(),
             None,
@@ -2863,6 +2890,7 @@ mod tests {
         .expect("verbatim");
         assert_eq!(texts[0], unparseable);
         assert!(texts[1].contains("could not be parsed to offer `methods`"), "{}", texts[1]);
+        whole_in_both(&texts, &structured(&output));
     }
 
     // Every tool must carry MCP annotations, else clients fall back to the unsafe

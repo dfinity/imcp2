@@ -3866,6 +3866,11 @@ mod tests {
             .replace("service : { m", "service : {\n  // The other one.\n  other : () -> ();\n  m");
         let r = render_candid(&elsewhere, Some(&names)).expect("answered whole");
         assert!(!r.best_effort && r.text == whole.text, "{}", r.text);
+        // Nor is a comment on a type the method does not use: that type is
+        // left out of the sub-service, comment and all.
+        let unused = format!("// Unused.\ntype Other = nat;\n{huge}");
+        let r = render_candid(&unused, Some(&names)).expect("answered whole");
+        assert!(!r.best_effort && r.text == whole.text, "{}", r.text);
         // With comments of its own that it cannot shed enough of: stripped — to
         // exactly the comment-free text — and flagged, though still over the limit.
         let commented = huge.replace(
