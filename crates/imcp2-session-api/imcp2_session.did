@@ -35,7 +35,8 @@ type ErrorInfo = record { code : text; message : text };
 type CommonError = variant { Unauthorized; InvalidArgument : text; Other : ErrorInfo };
 
 // A granted session. `sealed` is the XChaCha20-Poly1305 envelope the backends
-// seal under their shared keyring; the canister never sees inside it.
+// seal under their shared keyring; the canister never sees inside it, except
+// its key id (byte 2, after a format and a purpose byte).
 type SessionRecord = record {
   key : Key;
   seq : Seq;                    // 0 until the authorization code is consumed
@@ -44,7 +45,7 @@ type SessionRecord = record {
   grant_expires_at : Seconds;
   last_active_at : Seconds;
   consumed_at : opt Seconds;
-  sealed : blob;                // at most 1024 bytes
+  sealed : blob;                // 3 to 1024 bytes; byte 2 is the key id
 };
 type Tombstone = record {
   key : Key;
@@ -60,7 +61,7 @@ type PutSessionArg = record {
   key : Key;
   op_id : OpId;
   grant_expires_at : Seconds;
-  sealed : blob;
+  sealed : blob;                // 3 to 1024 bytes; byte 2 is the key id
   code_lock : blob;             // 16 bytes: SHA-256(code_proof)[0..16]
 };
 type PutSessionError = variant {
@@ -95,6 +96,7 @@ type GetSessionsResult = variant {
   Err : CommonError;
 };
 
+// `limit`: 500 when null, clamped to 1 to 1000 (0 counts as 1).
 type ListChangesArg = record { after : Seq; limit : opt nat32 };
 type ChangesPage = record {
   changes : vec Change;         // seq > after, ascending

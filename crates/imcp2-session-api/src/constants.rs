@@ -10,16 +10,39 @@
 /// Length of a record [`Key`](crate::Key):
 /// `namespace ‖ SHA-256("imcp2/rk/v1\0" ‖ namespace ‖ sid_uuid)[..16]`.
 ///
+/// `‖` is byte concatenation, `"…"` an ASCII label (`\0` a single zero byte),
+/// `namespace` the 16 bytes below, and `sid_uuid` the 16 raw bytes of the
+/// session id's UUID: not its text, nor the `sess-…` form a backend prints.
+/// `[..16]` keeps the first 16 bytes of the digest.
+///
 /// The key is derived without any secret, so a record keeps its key across a
 /// rotation of the deployment keyring; the session id it hides travels sealed.
+/// The canister treats the key as opaque, apart from its namespace prefix.
+///
+/// For example, under the namespace of [`NAMESPACE_LEN`]'s example, the session
+/// id UUID `6f1c9a3e-2b4d-4c8e-9f00-112233445566` gives the key
+/// `cb75dffbe4cd0801748278c0d15cb9c320fd36c9a961a60d1a694523396cef42`.
 pub const KEY_LEN: usize = 32;
 
 /// Length of a namespace, the leading bytes of every key:
 /// `SHA-256("imcp2/ns/v1\0" ‖ ii_canister ‖ "\0" ‖ issuer)[..16]`.
 ///
+/// `ii_canister` is the Internet Identity canister's principal as raw bytes
+/// (`Principal::as_slice`: 10 bytes for a canister id), not its text form.
+/// `issuer` is the UTF-8 bytes of the backend's OAuth issuer,
+/// `{public_url}{mcp_path}`, exactly as its authorization-server metadata
+/// advertises it, with no normalisation (scheme and host case, a trailing
+/// slash and the port all count). Every backend serving one deployment must
+/// agree on both, or each sees only its own sessions.
+///
 /// One namespace per (II instance, MCP issuer) pair, so a prod and a beta server
 /// sharing one canister never see each other's sessions. Capacity caps and
 /// eviction are per namespace.
+///
+/// For example, production II (`rdmx6-jaaaa-aaaaa-aaadq-cai`, bytes
+/// `00000000000000070101`) with the issuer `https://mcp.example.com/mcp` gives
+/// the namespace `cb75dffbe4cd0801748278c0d15cb9c3`. imcp2's tests pin its
+/// derivations to these same vectors.
 pub const NAMESPACE_LEN: usize = 16;
 
 /// Length of an operation id: `op_id` (makes a redeem idempotent across nodes)
@@ -41,6 +64,18 @@ pub const CODE_LOCK_LEN: usize = 16;
 /// Upper bound on a sealed session envelope. Bounds a record's encoded size, and
 /// with it [`MAX_PAGE_LIMIT`] and [`MAX_GET_KEYS`] under the 2 MiB reply limit.
 pub const MAX_SEALED_LEN: usize = 1024;
+
+/// Where a sealed envelope carries the id of the key it is sealed under. The
+/// envelope begins with a format byte, a purpose byte and this key-id byte;
+/// the rest is opaque to the canister. `admin_purge_sessions` matches
+/// [`PurgeFilter::kid`](crate::PurgeFilter::kid) against it.
+pub const SEALED_KID_OFFSET: usize = 2;
+
+/// Lower bound on a sealed session envelope: the format, purpose and key-id
+/// header, so every stored session can be classified by the key that sealed
+/// it. A real envelope is much longer (the header, a 24-byte nonce and a
+/// 16-byte tag around its ciphertext).
+pub const MIN_SEALED_LEN: usize = SEALED_KID_OFFSET + 1;
 
 // --- Sign-in timings (seconds) ------------------------------------------------
 

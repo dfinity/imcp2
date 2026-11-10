@@ -66,8 +66,10 @@ pub struct SessionRecord {
     /// When the authorization code was consumed; `None` until then.
     pub consumed_at: Option<Seconds>,
     /// The XChaCha20-Poly1305 envelope the backends seal under their shared
-    /// keyring, at most [`MAX_SEALED_LEN`](crate::MAX_SEALED_LEN) bytes. The
-    /// canister never sees inside it; byte 2 is the key id.
+    /// keyring, [`MIN_SEALED_LEN`](crate::MIN_SEALED_LEN) to
+    /// [`MAX_SEALED_LEN`](crate::MAX_SEALED_LEN) bytes. The canister never sees
+    /// inside it, except the key id at
+    /// [`SEALED_KID_OFFSET`](crate::SEALED_KID_OFFSET).
     #[serde(with = "serde_bytes")]
     pub sealed: Vec<u8>,
 }
@@ -133,7 +135,10 @@ pub struct PutSessionArg {
     pub op_id: OpId,
     /// In `(now, now + MAX_GRANT_ACCEPTED]`.
     pub grant_expires_at: Seconds,
-    /// 1 ..= [`MAX_SEALED_LEN`](crate::MAX_SEALED_LEN) bytes.
+    /// [`MIN_SEALED_LEN`](crate::MIN_SEALED_LEN) ..=
+    /// [`MAX_SEALED_LEN`](crate::MAX_SEALED_LEN) bytes, the key id at
+    /// [`SEALED_KID_OFFSET`](crate::SEALED_KID_OFFSET); any other length is
+    /// refused with `InvalidArgument`.
     #[serde(with = "serde_bytes")]
     pub sealed: Vec<u8>,
     /// [`CODE_LOCK_LEN`](crate::CODE_LOCK_LEN) bytes, `SHA-256(code_proof)[..16]`.
@@ -214,7 +219,9 @@ pub struct ListChangesArg {
     /// Return changes with `seq > after`.
     pub after: Seq,
     /// Page size; [`DEFAULT_PAGE_LIMIT`](crate::DEFAULT_PAGE_LIMIT) when `None`,
-    /// clamped to [`MAX_PAGE_LIMIT`](crate::MAX_PAGE_LIMIT).
+    /// clamped to `1 ..=` [`MAX_PAGE_LIMIT`](crate::MAX_PAGE_LIMIT). A limit of
+    /// 0 counts as 1, so that a page with changes left always ends at a change
+    /// and its `next_after` makes progress.
     pub limit: Option<u32>,
 }
 
@@ -269,8 +276,9 @@ pub struct KeyChecks {
 #[derive(CandidType, Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct PurgeFilter {
     pub namespace: Option<Namespace>,
-    /// Matched against byte 2 of the sealed envelope (the key id), to purge
-    /// everything sealed under a leaked key.
+    /// Matched against the sealed envelope's key id (its byte at
+    /// [`SEALED_KID_OFFSET`](crate::SEALED_KID_OFFSET)), to purge everything
+    /// sealed under a leaked key.
     pub kid: Option<u8>,
     /// The node identity that stored the session, to purge what a compromised
     /// node created.

@@ -49,7 +49,7 @@ pub use constants::*;
 pub use errors::{CommonError, ConsumeCodeError, ErrorInfo, PutSessionError};
 pub use rules::{
     evictable, idle_deadline, idle_purge_cutoff, idle_purge_enabled, namespace_of,
-    touch_granularity, touches_effective,
+    reporting_matters, touch_granularity, touches_effective,
 };
 pub use types::*;
 

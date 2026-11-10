@@ -85,16 +85,49 @@ pub const fn idle_purge_cutoff(now: u64, idle_timeout_secs: u64) -> u64 {
     now.saturating_sub(idle_span(idle_timeout_secs))
 }
 
-/// Whether reporting activity can ever make a difference under idle timeout
-/// `idle_timeout_secs`: `idle + touch_granularity(idle) + IDLE_SLACK + CLOCK_SKEW
-/// < MAX_GRANT`.
+/// Whether a backend should still report a session's activity: whether the
+/// idle deadline of the activity the canister last accepted for it,
+/// `reported_at`, may fall before its grant expiry. That is,
+/// `reported_at + idle + touch_granularity(idle) + IDLE_SLACK <
+/// grant_expires_at + CLOCK_SKEW`.
 ///
-/// No grant II issues outlives [`MAX_GRANT`] from its creation, and no session
-/// is idle before one idle span after its creation. When the span (plus skew)
-/// reaches `MAX_GRANT`, grant expiry always removes a session before it could go
-/// idle, so touches would buy nothing but update calls. This is the case at the
-/// 30 d default ([`DEFAULT_IDLE_TIMEOUT`](crate::DEFAULT_IDLE_TIMEOUT)): backends
-/// then make no touch calls at all.
+/// This is the backends' stopping rule. It must be measured from the activity
+/// already reported, never from the time of the request: a busy session's last
+/// report can lag its activity by up to a granularity, and a rule judged by the
+/// current time would stop reporting while the stored deadline still falls
+/// before grant expiry, letting the idle purge remove the session in use.
+///
+/// The [`CLOCK_SKEW`] margin covers a backend clock running ahead of the
+/// canister's. The canister caps every report at its own time
+/// (`touch_sessions`), so such a backend believes its last report later than
+/// the activity the canister holds, by up to the skew. A backend keeps
+/// reporting until even the earliest deadline the canister may hold is past
+/// grant expiry.
+///
+/// Saturating: an overflowing grant expiry counts as never, so reporting goes
+/// on; an overflowing deadline counts as never reached.
+pub const fn reporting_matters(
+    reported_at: u64,
+    grant_expires_at: u64,
+    idle_timeout_secs: u64,
+) -> bool {
+    idle_deadline(reported_at, 0, idle_timeout_secs) < grant_expires_at.saturating_add(CLOCK_SKEW)
+}
+
+/// Whether reporting activity can ever make a difference under idle timeout
+/// `idle_timeout_secs`: [`reporting_matters`] for a session reported at its
+/// creation with the longest grant II issues, so `idle + touch_granularity(idle)
+/// + IDLE_SLACK < MAX_GRANT + CLOCK_SKEW`.
+///
+/// No grant II issues outlives [`MAX_GRANT`] from its creation by more than the
+/// skew between clocks, and no session is idle before one idle span after its
+/// creation. When the span reaches `MAX_GRANT` plus that skew, grant expiry
+/// always removes a session before it could go idle, so touches would buy
+/// nothing but update calls. This is the case at the 30 d default
+/// ([`DEFAULT_IDLE_TIMEOUT`](crate::DEFAULT_IDLE_TIMEOUT)): backends then make
+/// no touch calls at all. The skew counts on the grant's side, so that a timeout
+/// in doubt keeps touches on: switching them off one second too early would let
+/// a session in use reach its idle deadline just before its grant expires.
 ///
 /// This relies on II's cap, not on what `put_session` accepts: a record with a
 /// grant longer than `MAX_GRANT` plus the granularity and slack (possible up to
@@ -102,7 +135,7 @@ pub const fn idle_purge_cutoff(now: u64, idle_timeout_secs: u64) -> u64 {
 /// deadline before its grant expiry without ever being touched. [`evictable`]
 /// guards against such a record explicitly.
 pub const fn touches_effective(idle_timeout_secs: u64) -> bool {
-    idle_span(idle_timeout_secs).saturating_add(CLOCK_SKEW) < MAX_GRANT
+    reporting_matters(0, MAX_GRANT, idle_timeout_secs)
 }
 
 /// Whether a record may be evicted to make room for a new session: only when its
@@ -113,9 +146,13 @@ pub const fn touches_effective(idle_timeout_secs: u64) -> bool {
 ///   * [`touches_effective(idle)`](touches_effective) — otherwise backends send
 ///     no touches at all, and no `last_active_at` means anything;
 ///   * `now + idle + touch_granularity(idle) + IDLE_SLACK + CLOCK_SKEW <
-///     grant_expires_at` — backends report a session's activity only while it
-///     could move the idle deadline before grant expiry, so past this point a
-///     busy session may look idle;
+///     grant_expires_at` — backends report a session's activity only while
+///     [`reporting_matters`], judged by the activity they last reported, so a
+///     busy session may look idle once they stop. This is a conservative guard
+///     on that rule, judged by the canister's clock: while it holds, every
+///     report a backend can have made (at most `CLOCK_SKEW` ahead of `now`)
+///     still has [`reporting_matters`], so a busy session is still being
+///     reported and its `last_active_at` can be trusted;
 ///   * `now - max(last_active_at, idle_floor_at) >= touch_granularity(idle) +
 ///     2 * TOUCH_FLUSH_INTERVAL + MIN_EVICT_IDLE` — activity up to one
 ///     granularity plus two flushes old may not have been reported yet; beyond
@@ -281,14 +318,81 @@ mod tests {
 
     #[test]
     fn touches_are_effective_only_below_the_grant_cap() {
-        // idle + 21_600 + 300 + 60 < 2_592_000  <=>  idle < 2_570_040
-        assert!(touches_effective(2_570_039));
-        assert!(!touches_effective(2_570_040));
+        // idle + 21_600 + 300 < 2_592_000 + 60  <=>  idle < 2_570_160
+        assert!(touches_effective(2_570_159));
+        assert!(!touches_effective(2_570_160));
         assert!(!touches_effective(DEFAULT_IDLE_TIMEOUT));
         assert!(!touches_effective(MAX_IDLE_TIMEOUT));
         assert!(!touches_effective(u64::MAX));
         assert!(touches_effective(MIN_IDLE_TIMEOUT));
         assert!(touches_effective(7 * DAY));
+    }
+
+    // A session whose idle span is just under a full grant's: with touches
+    // off, an untouched session would go idle while its grant still runs.
+    #[test]
+    fn touches_stay_on_while_an_untouched_session_could_go_idle_before_its_grant_ends() {
+        for idle in [2_570_040, 2_570_100, 2_570_159] {
+            let created = 1_700_000_000;
+            assert!(idle_deadline(created, 0, idle) < created + MAX_GRANT + CLOCK_SKEW);
+            assert!(touches_effective(idle), "idle={idle}");
+        }
+    }
+
+    // The stopping rule is judged by the activity already reported, never by
+    // the time of the request. One hour's timeout (span 4200), a grant ending
+    // at 20_000, reports every granularity (300 s).
+    #[test]
+    fn reporting_stops_only_once_the_stored_deadline_passes_grant_expiry() {
+        const HOUR: u64 = 3_600;
+        let grant = 20_000;
+        assert_eq!(idle_span(HOUR), 4_200);
+        // Reported at 15_600: the stored deadline (19_800) still falls before
+        // grant expiry, so the next activity must be reported, even though a
+        // rule judged by `now + span` would have stopped from 15_740 on.
+        assert!(reporting_matters(15_600, grant, HOUR));
+        assert!(15_740 + idle_span(HOUR) + CLOCK_SKEW >= grant);
+        // Within the skew margin: a backend up to CLOCK_SKEW ahead may hold a
+        // report the canister capped, so it keeps reporting.
+        assert!(reporting_matters(15_850, grant, HOUR));
+        // Its deadline (20_100) is past expiry even for a canister clock
+        // CLOCK_SKEW behind: nothing more to report.
+        assert!(!reporting_matters(15_900, grant, HOUR));
+        // Exactly at the edge.
+        assert!(reporting_matters(grant + CLOCK_SKEW - idle_span(HOUR) - 1, grant, HOUR));
+        assert!(!reporting_matters(grant + CLOCK_SKEW - idle_span(HOUR), grant, HOUR));
+    }
+
+    #[test]
+    fn reporting_matters_saturates_towards_reporting() {
+        // A grant that never ends keeps reporting going...
+        assert!(reporting_matters(1_700_000_000, u64::MAX, 7 * DAY));
+        // ...and a deadline that overflows is never reached.
+        assert!(!reporting_matters(u64::MAX, u64::MAX - 1, 7 * DAY));
+    }
+
+    // The eviction guard is conservative: while it holds, every report a
+    // backend can have made, by a clock up to CLOCK_SKEW ahead of the
+    // canister's, still has `reporting_matters`, so a busy session is still
+    // being reported.
+    #[test]
+    fn the_eviction_guard_implies_backends_still_report() {
+        for idle in [MIN_IDLE_TIMEOUT, DAY, 7 * DAY, 2_570_159] {
+            let span = idle_span(idle);
+            let now = 1_700_000_000;
+            for grant in [now + span + CLOCK_SKEW + 1, now + span + 2 * CLOCK_SKEW, now + MAX_GRANT]
+            {
+                if now + span + CLOCK_SKEW >= grant {
+                    continue;
+                }
+                for reported in [0, now - DAY, now, now + CLOCK_SKEW] {
+                    assert!(
+                        reporting_matters(reported, grant, idle),
+                        "idle={idle} grant={grant} reported={reported}"
+                    );
+                }
+            }
+        }
     }
 
     /// A session that meets every eviction condition by exactly one second's
@@ -371,12 +475,12 @@ mod tests {
     #[test]
     fn nothing_is_evicted_while_touches_are_off() {
         // The longest timeout with touches on: the same record is evictable.
-        assert!(touches_effective(2_570_039));
-        assert!(long_grant_never_touched(2_570_039));
+        assert!(touches_effective(2_570_159));
+        assert!(long_grant_never_touched(2_570_159));
         // One second longer, backends stop touching, so its `last_active_at`
         // says nothing, however long the grant.
-        assert!(!touches_effective(2_570_040));
-        assert!(!long_grant_never_touched(2_570_040));
+        assert!(!touches_effective(2_570_160));
+        assert!(!long_grant_never_touched(2_570_160));
         assert!(!long_grant_never_touched(DEFAULT_IDLE_TIMEOUT));
     }
 
