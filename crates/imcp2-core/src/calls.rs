@@ -1405,8 +1405,8 @@ const MAX_UNKNOWN_NAMES_BYTES: usize = 1024;
 /// The most of a library's error message a restricted read's error repeats.
 /// The Candid parser and type checker quote what they could not read — the
 /// token, the unbound name, the whole type — so repeated whole, the message
-/// grows with the canister's interface: a dangling text token comes back at
-/// six bytes per control character, up to several MB from the 1 MiB
+/// grows with the canister's interface: a dangling text token of U+0001s comes
+/// back at five bytes per character (`\u{1}`), up to several MB from the 1 MiB
 /// [`guard_candid_text`] admits, in the one reply `methods` promises to keep
 /// small. The head and the tail of the message are kept: where the parser
 /// says what it found and, after the quote, where it stopped and what it
@@ -3994,19 +3994,24 @@ mod tests {
             assert!(e.contains("omit `methods`"), "names the read that works: {e}");
         }
         // What the parser and type checker quote in their messages is the
-        // canister's own text: a dangling text token (six bytes per control
-        // character, as the token is printed), an unbound name, a whole type
-        // declared as the service. Repeated whole, the error would grow with
-        // the interface — up to several MB from the 1 MiB the guard admits — in
-        // the one reply `methods` keeps small; it is bounded instead, while the
-        // verbatim read of the same text still comes back whole.
+        // canister's own text: a dangling text token (five bytes per U+0001, as
+        // the token is printed), an unbound name, a whole type declared as the
+        // service. Repeated whole, the error would grow with the interface — up
+        // to several MB from the 1 MiB the guard admits — in the one reply
+        // `methods` keeps small; it is bounded instead — keeping the words that
+        // say what went wrong, at the start of the message and at its end —
+        // while the verbatim read of the same text still comes back whole.
         let dangling_text = format!("service : {{ m : () -> () }} \"{}\"", "\u{1}".repeat(100_000));
         let unbound_name = format!("service : {{ m : ({}) -> () }}", "a".repeat(100_000));
         let not_a_service = format!(
             "type T = record {{ {} }}; service : T",
             (0..10_000).map(|i| format!("f{i} : nat")).collect::<Vec<_>>().join("; ")
         );
-        for did in [&dangling_text, &unbound_name, &not_a_service] {
+        for (did, head, tail) in [
+            (&dangling_text, "Unrecognized token `Text(\"\\u{1}", "found at"),
+            (&unbound_name, "Unbound type identifier aaaa", "aaaa"),
+            (&not_a_service, "not a service type: record {", "f9999 : nat;"),
+        ] {
             let e = render_candid(did, Some(&names)).expect_err("needs a parse");
             assert!(
                 e.len() < MAX_QUOTED_ERROR_BYTES + 256,
@@ -4015,7 +4020,9 @@ mod tests {
                 did.len(),
                 &e[..e.len().min(300)]
             );
-            assert!(e.contains("bytes left out"), "says what was cut: {e}");
+            let (before, after) = e.split_once("bytes left out…]").expect("says what was cut");
+            assert!(before.contains(head), "the start of the message survives: {e}");
+            assert!(after.contains(tail), "the end of the message survives: {e}");
             assert!(e.contains("only the complete interface can be read"), "{e}");
             assert!(e.contains(&format!("({} bytes)", did.len())), "says its size: {e}");
             assert_eq!(
@@ -4035,17 +4042,22 @@ mod tests {
         assert_eq!(quoted_error("Unbound type identifier T"), "Unbound type identifier T");
         let exact = "x".repeat(MAX_QUOTED_ERROR_BYTES);
         assert_eq!(quoted_error(&exact), exact, "the limit itself is kept whole");
-        // Three-byte characters: neither cut lands on a boundary, so each moves
-        // to one — the head back, the tail forward — and nothing is split.
+        // Three-byte characters, then two-byte ones, so the kept text is seen
+        // to be the START and the END: 256 is not a boundary among the first,
+        // so the head cut moves back to 255 (85 characters); 2,244 is one among
+        // the second, so the tail keeps 256 bytes (128 characters).
+        let long = format!("{}{}", "€".repeat(500), "£".repeat(500));
+        assert_eq!(long.len(), 2_500);
+        assert_eq!(
+            quoted_error(&long),
+            format!("{} […1989 bytes left out…] {}", "€".repeat(85), "£".repeat(128))
+        );
+        // Three-byte characters throughout: the tail cut, at 2,744, is not a
+        // boundary either and moves forward to 2,745 — nothing is split.
         let long = "€".repeat(1_000);
-        let cut = quoted_error(&long);
-        assert!(cut.len() <= MAX_QUOTED_ERROR_BYTES + 32, "{} bytes", cut.len());
-        assert!(cut.starts_with("€") && cut.ends_with("€"), "{cut}");
-        let kept = cut.matches('€').count() * 3;
-        assert!(cut.contains(&format!("[…{} bytes left out…]", long.len() - kept)), "{cut}");
-        assert!(
-            (MAX_QUOTED_ERROR_BYTES - 4..=MAX_QUOTED_ERROR_BYTES).contains(&kept),
-            "{kept} bytes kept"
+        assert_eq!(
+            quoted_error(&long),
+            format!("{} […2490 bytes left out…] {}", "€".repeat(85), "€".repeat(85))
         );
     }
 }
