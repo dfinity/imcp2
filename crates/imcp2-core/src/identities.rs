@@ -987,21 +987,40 @@ impl Identities {
     ) -> Result<(), String> {
         let level = access_level(permissions);
         let now = now_ns();
-        let opened = {
+        let recorded = {
             let mut sessions = self.sessions.write().await;
-            let s = sessions
-                .get_mut(session_id)
-                .filter(|s| s.pubkey_der == session_der)
-                .ok_or(SIGN_IN_DROPPED_MSG)?;
-            if level.is_some() {
-                s.read_only = level;
+            match sessions.get_mut(session_id) {
+                Some(s) if s.pubkey_der == session_der => {
+                    if level.is_some() {
+                        s.read_only = level;
+                    }
+                    Ok(record_grant(s, expiration_ns, now))
+                }
+                Some(_) => Err("re-created with another key"),
+                None => Err("gone"),
             }
-            record_grant(s, expiration_ns, now)
         };
-        if opened {
-            self.log_session_opened(session_id, expiration_ns);
+        match recorded {
+            Ok(opened) => {
+                if opened {
+                    self.log_session_opened(session_id, expiration_ns);
+                }
+                Ok(())
+            }
+            // Worth an operator's attention: II has already registered this key,
+            // replacing the user's previous MCP session, so the user is left with
+            // neither until they sign in again. Logged after the lock is released.
+            Err(session) => {
+                tracing::warn!(
+                    instance = self.instance.name,
+                    session_id = %session_id,
+                    session,
+                    "sign-in dropped after Internet Identity registered it: its session was \
+                     reaped or evicted while mcp_register_v2 ran"
+                );
+                Err(SIGN_IN_DROPPED_MSG.to_owned())
+            }
         }
-        Ok(())
     }
 
     /// Resolve an optional account `name` at `domain` to its account number
