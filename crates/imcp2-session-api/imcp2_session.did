@@ -1,0 +1,194 @@
+// The imcp2 session canister: the store imcp2 backends share their granted
+// OAuth / Internet Identity sessions through.
+//
+// Times are Unix seconds of IC time unless the name ends in `_ns`.
+// Evolution rules (pinned by the API crate's wire tests):
+//   * records only gain `opt` fields;
+//   * returned variants never gain cases (new conditions travel in `Other`);
+//   * methods are only ever added.
+
+type Key = blob;        // 32 bytes: namespace(16) ‖ SHA-256("imcp2/rk/v1\00" ‖ namespace ‖ sid_uuid)[0..16]
+type Namespace = blob;  // 16 bytes
+type OpId = blob;       // 16 bytes
+type Seconds = nat64;
+type Seq = nat64;       // strictly increasing: max(head + 1, IC time in ns)
+
+type Config = record {
+  authorized : vec principal;            // at most 32, never anonymous; empty = nobody
+  idle_timeout_secs : nat64;             // default 2_592_000 (30 d); 3_600 ..= 31_536_000
+  max_sessions : nat64;                  // default 2_000_000 (memory tripwire)
+  max_sessions_per_namespace : nat64;    // default 1_000_000; <= max_sessions
+  purge_interval_secs : nat32;           // default 60; 10 ..= 3_600
+  purge_batch : nat32;                   // default 2_000; 100 ..= 20_000
+};
+type ConfigPatch = record {
+  authorized : opt vec principal;
+  idle_timeout_secs : opt nat64;
+  max_sessions : opt nat64;
+  max_sessions_per_namespace : opt nat64;
+  purge_interval_secs : opt nat32;
+  purge_batch : opt nat32;
+};
+type InstallArg = variant { Init : ConfigPatch; Upgrade : opt ConfigPatch };
+
+type ErrorInfo = record { code : text; message : text };
+type CommonError = variant { Unauthorized; InvalidArgument : text; Other : ErrorInfo };
+
+// A granted session. `sealed` is the XChaCha20-Poly1305 envelope the backends
+// seal under their shared keyring; the canister never sees inside it.
+type SessionRecord = record {
+  key : Key;
+  seq : Seq;                    // 0 until the authorization code is consumed
+  op_id : OpId;
+  created_at : Seconds;
+  grant_expires_at : Seconds;
+  last_active_at : Seconds;
+  consumed_at : opt Seconds;
+  sealed : blob;                // at most 1024 bytes
+};
+type Tombstone = record {
+  key : Key;
+  seq : Seq;
+  deleted_at : Seconds;
+  grant_expires_at : Seconds;
+  reason : text;                // "idle" | "evicted" | "admin_purge"
+};
+type Change = variant { Live : SessionRecord; Deleted : Tombstone };
+type Lookup = variant { Live : SessionRecord; Deleted : Tombstone; Absent };
+
+type PutSessionArg = record {
+  key : Key;
+  op_id : OpId;
+  grant_expires_at : Seconds;
+  sealed : blob;
+  code_lock : blob;             // 16 bytes: SHA-256(code_proof)[0..16]
+};
+type PutSessionError = variant {
+  Unauthorized;
+  AlreadyExists;
+  Deleted;
+  GrantExpired;
+  CapacityExceeded;
+  InvalidArgument : text;
+  Other : ErrorInfo;
+};
+type PutSessionResult = variant { Ok : SessionRecord; Err : PutSessionError };
+
+type ConsumeCodeArg = record { key : Key; exchange_id : OpId; code_proof : blob };
+type ConsumeCodeError = variant {
+  Unauthorized;
+  AlreadyConsumed;
+  BadProof;
+  NotFound;
+  Deleted;
+  CodeExpired;
+  InvalidArgument : text;
+  Other : ErrorInfo;
+};
+type ConsumeCodeResult = variant { Ok : SessionRecord; Err : ConsumeCodeError };
+
+type Touch = record { key : Key; last_active_at : Seconds };
+type TouchResult = variant { Ok : record { updated : nat32; unknown : vec Key }; Err : CommonError };
+
+type GetSessionsResult = variant {
+  Ok : record { items : vec Lookup; epoch : nat64; now_ns : nat64 };
+  Err : CommonError;
+};
+
+type ListChangesArg = record { after : Seq; limit : opt nat32 };
+type ChangesPage = record {
+  changes : vec Change;         // seq > after, ascending
+  complete : bool;              // nothing exists after next_after
+  next_after : Seq;             // complete ? max(after, head) : seq of the last change
+  head : Seq;                   // highest seq ever assigned; never lowered
+  epoch : nat64;                // bumped when the canister history shows a snapshot load
+  now_ns : nat64;
+  idle_timeout_secs : nat64;
+  idle_floor_at : Seconds;
+  key_checks_version : nat64;
+};
+type ListChangesResult = variant { Ok : ChangesPage; Err : CommonError };
+
+type KeyCheck = record { kid : nat8; check : blob };   // 16 bytes = HKDF(K[kid], "imcp2/keycheck/v1")
+type KeyChecks = record {
+  version : nat64;
+  checks : vec KeyCheck;
+  retired : blob;               // retired kids, one byte each, ascending
+  now_ns : nat64;
+};
+type KeyChecksResult = variant { Ok : KeyChecks; Err : CommonError };
+
+type PurgeFilter = record {
+  namespace : opt Namespace;
+  kid : opt nat8;               // matched against byte 2 of the sealed envelope
+  opened_by : opt principal;
+  created_from : opt Seconds;
+  created_to : opt Seconds;
+};
+type PurgeJob = record {
+  filter : PurgeFilter;
+  started_at : Seconds;
+  scanned : nat64;
+  purged : nat64;
+  done : bool;
+};
+type PurgeJobResult = variant { Ok : PurgeJob; Err : CommonError };
+
+type NamespaceCount = record { namespace : Namespace; sessions : nat64; tombstones : nat64 };
+type CallerStats = record {
+  caller : principal;
+  authorized : bool;
+  opened : nat64;
+  consumed : nat64;
+  last_seen_at : Seconds;
+};
+type Counters = record {
+  opened : nat64;
+  consumed : nat64;
+  abandoned : nat64;
+  expired : nat64;
+  idle_purged : nat64;
+  evicted : nat64;
+  admin_purged : nat64;
+  tombstones_collected : nat64;
+  restores_detected : nat64;
+};
+type Status = record {
+  version : text;
+  git_commit : text;
+  config : Config;
+  sessions : nat64;
+  tombstones : nat64;
+  per_namespace : vec NamespaceCount;
+  head : Seq;
+  epoch : nat64;
+  idle_floor_at : Seconds;
+  key_checks : KeyChecks;
+  callers : vec CallerStats;
+  purge_job : opt PurgeJob;
+  counters : Counters;
+  last_purge_at : Seconds;
+  purge_backlog_secs : nat64;   // age of the oldest record overdue for removal
+  cycle_balance : nat;
+  stable_memory_bytes : nat64;
+  now_ns : nat64;
+};
+type StatusResult = variant { Ok : Status; Err : CommonError };
+type ConfigResult = variant { Ok : Config; Err : CommonError };
+
+service : (InstallArg) -> {
+  // Authorized backends.
+  put_session : (PutSessionArg) -> (PutSessionResult);
+  consume_code : (ConsumeCodeArg) -> (ConsumeCodeResult);
+  touch_sessions : (vec Touch) -> (TouchResult);
+  get_sessions : (vec Key) -> (GetSessionsResult) query;       // also called as an update (replicated read)
+  list_changes : (ListChangesArg) -> (ListChangesResult) query; // also called as an update (replicated read)
+  // Authorized backends and controllers.
+  get_key_checks : () -> (KeyChecksResult) query;
+  get_status : () -> (StatusResult) query;
+  // Controllers only.
+  admin_update_config : (ConfigPatch) -> (ConfigResult);
+  admin_set_key_check : (KeyCheck, bool) -> (KeyChecksResult);  // bool = replace an existing, different check
+  admin_retire_kid : (nat8) -> (KeyChecksResult);
+  admin_purge_sessions : (PurgeFilter) -> (PurgeJobResult);
+}
