@@ -3453,13 +3453,8 @@ mod tests {
         assert!(!redirect_allowed(None, "http://[::1]:8080/cb"));
     }
 
-    /// Hosted-redirect allow-list (auth-code phishing, same-browser variant): an
-    /// allow-listed vendor domain (or subdomain) passes ONLY under that vendor's
-    /// pinned callback path; loopback always passes; everything else (a
-    /// user-content path on an allow-listed origin, a wrong path, an unlisted
-    /// domain, or an authority-trick look-alike) is refused.
-    // Branding's vetting ignores operator entries: a path a deployment adds on a
-    // vendor's domain is a valid redirect but never earns that vendor's name.
+    /// Branding's vetting ignores operator entries: a path a deployment adds on a
+    /// vendor's domain is a valid redirect but never earns that vendor's name.
     #[test]
     fn default_allow_list_vetting_ignores_operator_entries() {
         use super::{
@@ -3483,8 +3478,21 @@ mod tests {
         assert!(redirect_uri_on_default_allow_list("https://claude.ai./api/mcp/auth_callback"));
         assert!(!redirect_uri_on_default_allow_list("https://claude.ai/api/mcp/auth_callback?x=1"));
         assert!(!redirect_uri_on_default_allow_list("http://127.0.0.1:5173/cb"));
+        // An Exact-pinned entry (the callback ChatGPT actually registers) is vetted
+        // as itself, never for a descendant.
+        assert!(redirect_uri_on_default_allow_list(
+            "https://chatgpt.com/connector_platform_oauth_redirect"
+        ));
+        assert!(!redirect_uri_on_default_allow_list(
+            "https://chatgpt.com/connector_platform_oauth_redirect/x"
+        ));
     }
 
+    /// Hosted-redirect allow-list (auth-code phishing, same-browser variant): an
+    /// allow-listed vendor domain (or subdomain) passes ONLY under that vendor's
+    /// pinned callback path; loopback always passes; everything else (a
+    /// user-content path on an allow-listed origin, a wrong path, an unlisted
+    /// domain, or an authority-trick look-alike) is refused.
     #[test]
     fn hosted_redirect_allow_list() {
         // Allow-listed vendor domains/subdomains UNDER their pinned callback path.
@@ -5258,11 +5266,15 @@ mod tests {
     async fn branding_is_bound_to_the_session() {
         use axum::http::StatusCode;
         let store = test_store();
+        let seeded = tokio::time::Instant::now();
         seed_pending_redirect(&store, "sess-claude", "https://claude.ai/api/mcp/auth_callback")
             .await;
         seed_pending_redirect(&store, "sess-native", "http://127.0.0.1:5173/cb").await;
         // Validation trims a trailing root dot, so branding must too.
         seed_pending_redirect(&store, "sess-dot", "https://claude.ai./api/mcp/auth_callback").await;
+        // Every lookup below runs one second before the connects expire, so the
+        // answers hold right up to the boundary (checked from the other side last).
+        tokio::time::advance(super::CONNECT_TTL - std::time::Duration::from_secs(1)).await;
 
         // A vetted session reads as its connector, with the logo under the issuer.
         let (status, doc) = branding_for(&store, Some("sess-claude")).await;
@@ -5289,16 +5301,18 @@ mod tests {
             let authz = store.authz.read().await;
             let pending = authz.get("sess-claude").expect("still pending");
             assert_eq!(pending.redirect_uri, "https://claude.ai/api/mcp/auth_callback");
-            assert!(!pending.remaining().is_zero());
+            assert_eq!(pending.created, seeded, "a lookup must not re-stamp the connect");
+            assert_eq!(pending.remaining(), std::time::Duration::from_secs(1));
             assert!(pending.code.is_none() && !pending.redeeming);
         }
 
         // An EXPIRED connect is gone for branding, by the handshake's own
         // definition of expired (`AuthzPending::remaining`) — even while the map
         // still RETAINS it so the redeem gate can tell a late sign-in it expired.
-        tokio::time::advance(super::CONNECT_TTL).await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
         assert!(store.authz.read().await.contains_key("sess-claude"), "retained after expiry");
         assert_eq!(branding_for(&store, Some("sess-claude")).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(branding_for(&store, Some("sess-dot")).await.0, StatusCode::NOT_FOUND);
     }
 
     // The allow-list invariant (II #4091 matches by EXACT string equality): the

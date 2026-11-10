@@ -82,10 +82,15 @@ pub(crate) const PLACEHOLDER_LOGO_SVG: &str = r##"<svg xmlns="http://www.w3.org/
 /// vendor domains of the compiled-in `DEFAULT_ALLOWED_REDIRECTS` (a test holds
 /// the two sets equal). An `OAUTH_ALLOWED_REDIRECT_PREFIXES` entry is accepted for
 /// redirects but never branded, even on a vendor's domain, because resolution
-/// requires a compiled-in entry ([`connector_for_redirect`]). v1
-/// covers self-authenticating WEB connectors only; native/loopback apps stay
-/// anonymous (their only identity signal is a spoofable `client_name`). Logos
-/// are placeholders — see [`PLACEHOLDER_LOGO_SVG`].
+/// requires a compiled-in entry ([`connector_for_redirect`]). v1 covers
+/// redirect-identified WEB connectors only; native/loopback apps stay anonymous
+/// whatever they present — a `client_name`, or a CIMD `client_id` on a vetted
+/// vendor origin. A vendor's metadata document may list loopback redirects,
+/// which match on any port, so any local app can name that public document,
+/// receive the code on its own listener, and complete PKCE with its own
+/// verifier. Only the redirect the code is delivered to identifies the product,
+/// so do not brand on a verified CIMD `client_id`. Logos are placeholders — see
+/// [`PLACEHOLDER_LOGO_SVG`].
 pub(crate) const CONNECTORS: &[Connector] = &[
     Connector {
         slug: "chatgpt",
@@ -222,6 +227,9 @@ mod tests {
     fn resolves_vetted_redirect_vendors_to_their_slug() {
         let cases = [
             ("https://chatgpt.com/connector/oauth/abc", "chatgpt"),
+            // ChatGPT's issuer-identification callback (an Exact pin): the
+            // redirect a ChatGPT connection actually registers here.
+            ("https://chatgpt.com/connector_platform_oauth_redirect", "chatgpt"),
             ("https://claude.ai/api/mcp/auth_callback", "claude"),
             ("https://cursor.com/agents/mcp/oauth/callback", "cursor"),
             ("https://grok.com/mcp/callback", "grok"),
@@ -272,6 +280,7 @@ mod tests {
             "https://user@claude.ai/api/mcp/auth_callback",
             "https://claude.ai/api/mcp/auth_callback?x=1",
             "https://claude.ai/api/mcp/auth_callback/%2e%2e",
+            "https://chatgpt.com/connector_platform_oauth_redirect/x",
         ] {
             assert!(connector_for_redirect(redirect).is_none(), "redirect {redirect}");
         }

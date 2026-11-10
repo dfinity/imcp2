@@ -391,8 +391,8 @@ async fn dynamic_client_registration_round_trips_and_persists() {
 /// Every assertion here is a REJECTION, which returns before the store is
 /// touched, so this test schedules no persistence write and cannot race the
 /// store-file assertions in `dynamic_client_registration_round_trips_and_persists`
-/// (which already covers the accepting path — a small loopback registration
-/// through these same caps).
+/// (which already covers the accepting path — a small registration of a loopback
+/// URI plus two hosted claude.ai callbacks through these same caps).
 #[tokio::test]
 async fn registration_bounds_redirect_uris() {
     let app = app();
@@ -557,8 +557,14 @@ async fn oauth_endpoints_live_under_each_mount() {
 /// gone, and the static logo serves.
 #[tokio::test]
 async fn branding_endpoints_are_session_bound_and_serve_logos() {
-    // No such session, and no `state` at all: the same 404.
-    for path in ["/mcp/branding?state=sess-does-not-exist", "/mcp/branding"] {
+    // No such session, no `state` at all, and a malformed query (a repeated
+    // `state`, which axum's `Query` alone would reject with a 400): the same
+    // no-store 404.
+    for path in [
+        "/mcp/branding?state=sess-does-not-exist",
+        "/mcp/branding",
+        "/mcp/branding?state=a&state=b",
+    ] {
         let resp = app()
             .oneshot(
                 Request::get(path).header("origin", "https://id.ai").body(Body::empty()).unwrap(),
