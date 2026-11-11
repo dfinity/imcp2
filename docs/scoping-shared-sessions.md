@@ -344,7 +344,9 @@ Times are Unix seconds of IC time unless a name ends in `_ns`.
 
 **Evolution rules,** pinned by the API crate's wire tests:
 
-- Records only gain `opt` fields.
+- Records only gain `opt` fields. (A purge filter's existing conditions are required variants, so
+  that a typo cannot widen a purge; a condition added later would be an `opt` field without that
+  protection, 13.)
 - **A returned variant never gains a case.** A reader rejects an unknown case, which would fail the
   whole reply on every older node. New conditions travel in the existing `Other(ErrorInfo)` cases.
   Tombstone reasons are text for the same reason.
@@ -441,8 +443,16 @@ expired.
 
 **`admin_purge_sessions(filter)`**
 
-- Matches every set field of `PurgeFilter`: `namespace` (16 bytes; the scan then covers only that
-  key range), `kid` (envelope byte 2), `opened_by`, `created_from`, `created_to`.
+- Matches every condition of `PurgeFilter`: `namespace` (16 bytes; the scan then covers only that
+  key range), `kid` (envelope byte 2), `opened_by`, `created_from`, `created_to`. Each is a
+  required `variant { Any; Is : T }` (`Match<T>`), and all `Any` purges everything.
+- **Why required variants.** Candid drops record fields a type does not declare, and dfx annotates a
+  textual argument with the canister's published interface before sending it. With optional fields,
+  a misspelled one silently became "no constraint": alone it purged every session, next to correct
+  fields it widened the purge. Now a misspelled or missing field, or a misspelled tag, is refused
+  before the call is made and when it is decoded (`a_misspelled_or_missing_purge_field_is_refused`
+  runs the arguments through the annotation dfx applies). The stored job keeps `Any` as absent and
+  `Is` as present, the layout an optional filter had.
 - **One job at a time.** Starting another while one runs is refused with
   `Other{code: "purge_in_progress"}`.
 - The timer works through it from a cursor (4.6), and the first step runs right away.
@@ -1682,7 +1692,8 @@ replica, `a_stopped_canister_leaves_a_node_unavailable_not_broken` checks the fi
     `evictable_at_the_exact_edge`, `nothing_is_evicted_while_touches_are_off`,
     `cutoff_agrees_with_deadline_whenever_purge_is_enabled`);
   - the `.did` against every type and method (`every_did_type_has_an_equal_rust_type`,
-    `every_method_signature_matches_the_rust_types`);
+    `every_method_signature_matches_the_rust_types`), and a purge filter's typos refused as dfx
+    would send them (`a_misspelled_or_missing_purge_field_is_refused`);
   - golden wire bytes (`golden_wire_bytes`);
   - compatibility (`payloads_without_later_opt_fields_still_decode`,
     `unknown_record_fields_are_ignored`, `unknown_variant_cases_are_rejected`);
@@ -1945,6 +1956,10 @@ and every refused setting. No II sign-in ran in it; the PocketIC suite covers th
     prompt report lands (4.5). It needs a lowered idle timeout and a namespace or the store at its
     cap, and costs that user one sign-in. Closing it would take a two-phase eviction: mark a
     candidate in the feed, and evict it only if no node touches it within a grace period.
+18. **A purge-filter condition added later.** The filter's conditions are required variants, so a
+    misspelled one is refused (4.3). The evolution rules let records gain only `opt` fields, and a
+    new condition added that way would be dropped by a typo, widening the purge. Add one as a new
+    method, or a new required field in a new filter type, instead.
 
 ## 14. ic-gateway follow-up
 

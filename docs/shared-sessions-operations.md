@@ -574,7 +574,15 @@ Use this when kid `k` has leaked. Pick a new, never-used kid `n` with a fresh ke
      fetch's debounce (at most 30 s after the previous one), then `get_key_checks` as an update.
    - Clients sign in again, under kid n.
    <!-- TODO(reconcile): staging measurement. The ~35 s is derived from the sync loop's timings; measure it on staging. -->
-4. **Purge kid k's records:** `admin_purge_sessions` with `(record { kid = opt (k : nat8) })`.
+4. **Purge kid k's records:** `admin_purge_sessions` with this argument (every filter field is
+   required, Appendix B):
+
+   ```
+   (record { namespace = variant { Any }; kid = variant { Is = (k : nat8) };
+             opened_by = variant { Any }; created_from = variant { Any };
+             created_to = variant { Any } })
+   ```
+
    This tombstones every record sealed under kid k.
 5. **Deploy `n:Kn`.**
 
@@ -1066,7 +1074,13 @@ small positive value is normal.
 1. **Remove it from the allow-list,** and add its replacement in the same call
    (`admin_update_config`, the full list without the stolen principal, plus the new one; 6.3).
 2. **Purge the sessions it opened** with `admin_purge_sessions`:
-   `(record { opened_by = opt principal "<STOLEN_PRINCIPAL>" })`.
+
+   ```
+   (record { namespace = variant { Any }; kid = variant { Any };
+             opened_by = variant { Is = principal "<STOLEN_PRINCIPAL>" };
+             created_from = variant { Any }; created_to = variant { Any } })
+   ```
+
    - This tombstones every session that node opened at redeem. Those users sign in again.
    - One purge job runs at a time. Starting another meanwhile is refused with code
      `purge_in_progress`. `get_status` shows `purge_job` and when it is `done`.
@@ -1448,13 +1462,19 @@ correctly when nothing types it against the `.did`.
 | Purge batch | `admin_update_config` | `(record { purge_batch = opt (<N> : nat32) })` |
 | Publish a key check | `admin_set_key_check` | `(record { kid = <KID> : nat8; check = blob "<16 bytes as \hh escapes>" }, false)` |
 | Retire a kid | `admin_retire_kid` | `(<KID> : nat8)` |
-| Purge one kid's records | `admin_purge_sessions` | `(record { kid = opt (<KID> : nat8) })` |
-| Purge one node's sessions | `admin_purge_sessions` | `(record { opened_by = opt principal "<PRINCIPAL>" })` |
-| Purge one namespace, by creation time | `admin_purge_sessions` | `(record { namespace = opt blob "<16 bytes as \hh escapes>"; created_from = opt (<UNIX_SECONDS> : nat64); created_to = opt (<UNIX_SECONDS> : nat64) })` |
+| Purge one kid's records | `admin_purge_sessions` | `(record { namespace = variant { Any }; kid = variant { Is = (<KID> : nat8) }; opened_by = variant { Any }; created_from = variant { Any }; created_to = variant { Any } })` |
+| Purge one node's sessions | `admin_purge_sessions` | `(record { namespace = variant { Any }; kid = variant { Any }; opened_by = variant { Is = principal "<PRINCIPAL>" }; created_from = variant { Any }; created_to = variant { Any } })` |
+| Purge one namespace, by creation time | `admin_purge_sessions` | `(record { namespace = variant { Is = blob "<16 bytes as \hh escapes>" }; kid = variant { Any }; opened_by = variant { Any }; created_from = variant { Is = (<UNIX_SECONDS> : nat64) }; created_to = variant { Is = (<UNIX_SECONDS> : nat64) } })` |
+| Purge everything (every session, every namespace) | `admin_purge_sessions` | `(record { namespace = variant { Any }; kid = variant { Any }; opened_by = variant { Any }; created_from = variant { Any }; created_to = variant { Any } })` |
 
 **Purge filters.**
 
-- A purge removes the live records that match **every** field you set.
+- A purge removes the live records that match **every** condition. `variant { Any }` places none;
+  `variant { Is = … }` requires that value.
+- **Every field is required.** Candid drops record fields a type does not declare, so with optional
+  fields a misspelled one (`namspace`) would silently have purged more: everything, if it was the
+  only one. As required variants, a misspelled or missing field, or a misspelled tag, is refused by
+  dfx before the call is made. Purging everything has to be written out, every field `Any`.
 - `kid` is matched against byte 2 of the sealed envelope.
 - Namespaces appear in `get_status` `per_namespace`.
 - `created_from` must not be after `created_to`.
