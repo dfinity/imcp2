@@ -203,7 +203,8 @@ above from the agent's side: bundle the project with `icp project bundle`,
 call `icp_deploy_bundle` with the environment's
 `.icp/data/mappings/<environment>.ids.json` as `canister_ids`, and write the
 mapping the tool returns back into that file so the next deploy upgrades
-rather than creates. The document lives at
+rather than creates. Not every client reads resources, so `icp_deploy_guide`
+returns the same document as a tool result. It lives at
 `crates/imcp2-deploy/static/skills/deploy-with-mcp.md`.
 
 Why only here: the tool is built on `icp-project`, a crate the icp CLI does not

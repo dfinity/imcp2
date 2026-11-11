@@ -76,8 +76,10 @@ pub const DEFAULT_CYCLES: u64 = 2_000_000_000_000;
 /// the project, call `icp_deploy_bundle` with the environment's canister-id
 /// mapping, write the returned mapping back — served as the MCP resource
 /// `skill://deploy-with-mcp` by the server that mounts the tool, next to
-/// core's bundled IC skills. Compiled in, like those: what a client reads is
-/// what was reviewed at build time.
+/// core's bundled IC skills, and returned by `icp_deploy_guide` for a client
+/// that does not read resources (as core serves its Candid guide both ways).
+/// Compiled in, like those: what a client reads is what was reviewed at
+/// build time.
 pub const DEPLOY_SKILL_NAME: &str = "deploy-with-mcp";
 /// Its title, for the resource listing.
 pub const DEPLOY_SKILL_TITLE: &str = "Deploy with this MCP server";
@@ -318,8 +320,9 @@ pub fn request_from_args(args: DeployBundleArgs) -> Result<DeployRequest, String
 }
 
 /// The deploy tool group, served alongside the core surface by the binary
-/// that composes it: `icp_deploy_bundle`, and `icp_cycles_balance` — the
-/// check a deploy that will create canisters starts with. The core surface
+/// that composes it: `icp_deploy_bundle`; `icp_cycles_balance` — the check a
+/// deploy that will create canisters starts with; and `icp_deploy_guide`,
+/// the skill around them as a tool result. The core surface
 /// has a tool of that name too, in its protocol/meta half, which the local
 /// server does not serve; this one is the same logic on the surface the
 /// deploy loop runs on. Should the core half be served alongside one day,
@@ -459,11 +462,32 @@ impl IcDeployTools {
             Err(e) => Ok(err(e)),
         }
     }
+
+    #[tool(
+        description = "Return the guide to deploying through this server: the loop around icp_deploy_bundle — bundle the project with `icp project bundle`, call the tool with the bundle and the environment's canister-id mapping, write the mapping it returns back into the project so the next deploy upgrades rather than creates — with what the tool needs and what it returns. The same text is served as the MCP resource `skill://deploy-with-mcp`; call this when the user asks you to deploy an icp project and you have not read that resource.",
+        annotations(title = "Get the deploy guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<DeployGuideOutput>(),
+    )]
+    async fn icp_deploy_guide(
+        &self,
+        Parameters(_args): Parameters<NoArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let output = DeployGuideOutput { content: DEPLOY_SKILL_MD.to_string() };
+        Ok(ok_structured(output.content.clone(), &output))
+    }
 }
 
-/// `icp_cycles_balance` takes no arguments.
+/// `icp_cycles_balance` and `icp_deploy_guide` take no arguments.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct NoArgs {}
+
+/// What `icp_deploy_guide` returns: the skill document, as the resource
+/// serves it.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DeployGuideOutput {
+    /// The guide, Markdown with its frontmatter.
+    pub content: String,
+}
 
 /// Same contract as the core surface's result builder: the human-readable
 /// text plus `structuredContent` conforming to the declared `outputSchema`.
@@ -549,12 +573,24 @@ mod tests {
 
     // The group carries the deploy tool, with honest annotations (it creates
     // canisters and can wipe state) and an object-rooted outputSchema like
-    // every tool on the core surface, and the read-only balance check beside
-    // it.
+    // every tool on the core surface, the read-only balance check beside it,
+    // and the guide: the skill as a tool result, for a client that reads no
+    // resources.
     #[test]
-    fn the_router_carries_the_deploy_tool_and_the_balance_check() {
+    fn the_router_carries_the_deploy_tool_the_balance_check_and_the_guide() {
         let tools = IcDeployTools::tool_router().list_all();
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
+        let guide = tools.iter().find(|t| &*t.name == "icp_deploy_guide").expect("guide");
+        let ann = guide.annotations.clone().expect("annotations");
+        assert_eq!(ann.read_only_hint, Some(true));
+        assert!(guide
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .contains("skill://deploy-with-mcp"));
+        let output =
+            serde_json::to_value(guide.output_schema.as_ref().expect("outputSchema")).unwrap();
+        assert!(output["properties"]["content"].is_object(), "{output}");
         let balance = tools.iter().find(|t| &*t.name == "icp_cycles_balance").expect("balance");
         let ann = balance.annotations.clone().expect("annotations");
         assert_eq!(ann.read_only_hint, Some(true));
