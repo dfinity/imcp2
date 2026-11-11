@@ -39,24 +39,20 @@ flate2 = "1"
 # Each deploy extracts its bundle into a scratch directory that is removed
 # when the deploy ends, whichever way it ends.
 tempfile = "3"
-# The extraction directory is resolved to the spelling the disk knows it by
-# (see `extract_bundle`); `dunce` keeps a Windows path free of the `\\?\`
-# prefix, as icp-project's own host filesystem does.
-dunce = "1"
 
 # The icp CLI's project library and the seams it is driven through, pinned to
 # one commit so the four stay in lockstep (they share a workspace version and
 # are not released independently). Bump the `rev` on all four together.
 #
-# The pinned commit is the head of the dfinity/icp-cli stack #866 -> #868 ->
-# #871: #866 adds `files::Confined` (the filesystem the bundle host reads
-# through, see `src/host.rs`), #868 has `icp project bundle` write an archive
-# of regular files and directories alone, and #871 states the rule for an
-# untrusted project (`icp_project::untrusted`, what `--untrusted` on `icp
-# build`, `deploy` and `sync` applies): what it runs is held to a list, with
-# what each step names a regular file judged by where it really resolves.
-# The host composes the rule as the CLI does. Once the stack is on icp-cli's
-# main, re-pin to main.
+# The pinned commit is the head of dfinity/icp-cli#873, on #868: #868 has
+# `icp project bundle` write an archive of regular files and directories
+# alone, and #873 states the rule for an untrusted project
+# (`icp_project::untrusted`, what `--untrusted` on `icp build`, `deploy` and
+# `sync` applies): the project is read through a filesystem confined to its
+# root by a directory handle and through no symlink, names no recipe, and
+# what it runs is held to a list of regular files there. The host composes
+# the rule as the CLI does. Once the stack is on icp-cli's main, re-pin to
+# main.
 #
 #   * icp-project: manifests, the deploy operation, the id/artifact stores.
 #   * icp-events: the progress event stream the operations report on.
@@ -65,10 +61,10 @@ dunce = "1"
 #     brings wasmtime into this workspace.
 #   * icp-canister-interfaces: the engine-canister registry id a created
 #     canister's subnet is looked up in.
-icp-project = { git = "https://github.com/dfinity/icp-cli", rev = "9056f29c4c2a574551a3334d34913ce04c2cf5cb" }
-icp-events = { git = "https://github.com/dfinity/icp-cli", rev = "9056f29c4c2a574551a3334d34913ce04c2cf5cb" }
-icp-sync-plugin = { git = "https://github.com/dfinity/icp-cli", rev = "9056f29c4c2a574551a3334d34913ce04c2cf5cb" }
-icp-canister-interfaces = { git = "https://github.com/dfinity/icp-cli", rev = "9056f29c4c2a574551a3334d34913ce04c2cf5cb" }
+icp-project = { git = "https://github.com/dfinity/icp-cli", rev = "4b0656f6722e2ef78941d6b10ce9f71a389fd414" }
+icp-events = { git = "https://github.com/dfinity/icp-cli", rev = "4b0656f6722e2ef78941d6b10ce9f71a389fd414" }
+icp-sync-plugin = { git = "https://github.com/dfinity/icp-cli", rev = "4b0656f6722e2ef78941d6b10ce9f71a389fd414" }
+icp-canister-interfaces = { git = "https://github.com/dfinity/icp-cli", rev = "4b0656f6722e2ef78941d6b10ce9f71a389fd414" }
 
 [dev-dependencies]
 # The tests hand-build small bundles (a manifest plus a wasm) and load them

@@ -13,53 +13,54 @@
 //! that passes it may have fetched it from anywhere. So the shape is not
 //! assumed but enforced, and the rule it is held to is the library's own:
 //! `icp_project::untrusted`, the rule for a project someone else handed over
-//! (dfinity/icp-cli#871), the one `--untrusted` on `icp build`, `deploy` and
-//! `sync` applies. The line it draws is between reading and running: what
-//! the project runs is held to a list, stated as what is allowed, and the
-//! host composes it as the CLI does:
+//! (dfinity/icp-cli#873), the one `--untrusted` on `icp build`, `deploy` and
+//! `sync` applies. The host composes it as the CLI does, from the library's
+//! three parts:
 //!
+//! * **The project is read through [`Confined`]**, the host filesystem held
+//!   to the extraction directory: the root is opened once as a directory
+//!   handle and every read is made beneath it, so the operating system
+//!   refuses a path that leaves the root, by `..`, by an absolute path or by
+//!   a symlink; and on top of that a path through a symlink is refused
+//!   wherever it leads. A manifest can name only what the archive brought
+//!   with it. The disk is the byte store because the sync-plugin runtime
+//!   needs real paths to mount.
+//! * **No recipe is fetched** ([`NoRecipes`]): a recipe is build
+//!   instructions read from a file or fetched from a URL while the project
+//!   loads, so a project naming one fails to load, naming the recipe. A
+//!   bundle spells every step out and names none.
 //! * **The loaded project is vetted** ([`Vetted`]) before it is handed out:
 //!   each build step is a pre-built module, each sync step a plugin, and
-//!   what each names is a regular file within the project, judged by where
-//!   it really is once every link is followed and every `..` applied. A
-//!   project with any other step — a script, a download — or a module or
-//!   plugin that resolves outside the root, or to a directory or a pipe,
-//!   fails the load, naming what was found. The loader is
-//!   the one gate on the project's shape; the builder and syncer are the
-//!   library's own, and see no other step.
+//!   what each names is a regular file the confined filesystem will give;
+//!   what a plugin step hands its plugin, each `dirs:` and `files:` entry,
+//!   is a directory or a regular file there too. A project with any other
+//!   step — a script, a download — or a path that is not such a file fails
+//!   the load, naming it. The loader is the one gate on the project's
+//!   shape; the builder and syncer are the library's own, and see no other
+//!   step.
 //!
 //! What a consumer of a bundle adds, this crate adds:
 //!
-//! * **The project is read through [`Confined`]**, the host filesystem held
-//!   to the extraction directory by the spelling of each path — `..` cannot
-//!   climb above the root, an absolute path elsewhere is refused — so a
-//!   manifest can name only what the archive brought with it, and the vet
-//!   resolves each module's real path through the same seam. The disk is
-//!   the byte store because the sync-plugin runtime needs real paths to
-//!   mount. The CLI reads an untrusted project through the host filesystem,
-//!   since reading is not what the rule restricts; a bundle has no business
-//!   outside its own directory, and is held to it.
-//! * **No recipe is fetched** ([`NoRecipes`]): the CLI renders one and vets
-//!   the steps it produces, but a bundle spells every step out, so a project
-//!   naming a recipe is not a bundle and fails to load, naming the recipe.
 //! * **Extraction** writes only regular files and directories, within a total
 //!   size budget and an object budget, under the scratch directory
 //!   ([`extract_bundle`]), and refuses the `.icp` state a deploy seeds for
-//!   itself.
+//!   itself: the library takes what is under `.icp` as its own earlier
+//!   writes, and vets none of it.
 //! * **The bundle is checked before any phase runs** ([`check_bundle`]): every
 //!   canister built by one pre-built wasm in the archive that hashes to its
-//!   recorded checksum, every sync plugin in the archive and what it declares
-//!   with it, and no network but `ic`. The check's own work is bounded by
-//!   the archive, not by what the manifest repeats.
+//!   recorded checksum, every sync plugin in the archive with the bytes it
+//!   declares held to a sum, and no network but `ic`. The check's own work
+//!   is bounded by the archive, not by what the manifest repeats.
+//! * **What the load retains is metered**, so a manifest naming large
+//!   argument files over and over costs no more than [`MAX_PROJECT_BYTES`].
 //!
 //! The rule is one, split three ways upstream (dfinity/icp-cli#863): the
 //! user's own project may run, fetch and link whatever it likes; `icp
 //! project bundle` writes an archive of regular files and directories with
 //! every step spelled out (dfinity/icp-cli#868); and a consumer of a bundle
-//! it does not trust loads it as untrusted (dfinity/icp-cli#871, on #866
-//! for the confined filesystem this crate reads it through). This crate is
-//! that consumer, and pins the stack; until it is on icp-cli's main, the
-//! pin is its head.
+//! it does not trust loads it as untrusted (dfinity/icp-cli#873, on #868).
+//! This crate is that consumer, and pins the stack; until it is on icp-cli's
+//! main, the pin is its head.
 //!
 //! Everything the project library reads or writes — the manifest, the wasms,
 //! the `.icp` id and artifact stores, the build scratch — lives under the
@@ -73,12 +74,11 @@ use std::{
 };
 
 use async_trait::async_trait;
-use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
+use camino::{Utf8Path, Utf8PathBuf};
 use icp_events::StepReporter;
 use icp_project::{
     canister::{
         build::Builder,
-        recipe::{Fetched, Resolve, ResolveError},
         sync::{
             script::{ScriptInvocation, ScriptRunError, ScriptRunner},
             Syncer,
@@ -88,7 +88,7 @@ use icp_project::{
     files::{Confined, FileSystem, FsError, Scratch},
     host::{Host, Ignore},
     manifest::{
-        plugin::NamedPaths, prebuilt::SourceField, recipe::Recipe, BuildStep, ProjectRootLocate,
+        plugin::NamedPaths, prebuilt::SourceField, BuildStep, ProjectRootLocate,
         ProjectRootLocateImpl, SyncStep, PROJECT_MANIFEST,
     },
     network::{
@@ -99,7 +99,7 @@ use icp_project::{
     random::HostRandom,
     store_artifact::ArtifactStore,
     store_id::AccessImpl,
-    untrusted::Vetted,
+    untrusted::{NoRecipes, Vetted},
     Canister, Lazy, Network, Project, ProjectLoadImpl,
 };
 use sha2::{Digest, Sha256};
@@ -257,10 +257,11 @@ impl Access for IcMainnet {
 /// The extracted bundle, as the filesystem the project library reads
 /// through: the library's own [`Confined`], rooted at the scratch directory.
 ///
-/// Every path the library asks about is resolved against that root before
-/// the disk sees it, so a manifest's `path:` — absolute, climbing, or plain —
-/// can name only what the archive brought with it; what is not there is
-/// "not in the bundle", whatever the machine holds at that spelling. A
+/// Every path the library asks about is opened beneath that root's directory
+/// handle, and refused if it passes through a symlink, so a manifest's
+/// `path:` — absolute, climbing, or plain — can name only what the archive
+/// brought with it; what is not there is "not in the bundle", whatever the
+/// machine holds at that spelling or behind a link. A
 /// scratch directory the library asks for (a pre-built build step copies its
 /// module there and the operation reads it back) is made under the root too.
 pub type BundleFs = Confined;
@@ -442,23 +443,6 @@ fn gunzipped_within(path: &Utf8Path, bytes: &[u8], limit: u64) -> Result<u64, Un
     }
 }
 
-/// Recipe resolution for a bundle: none. The CLI fetches and renders a
-/// recipe for an untrusted project too, and vets the steps it renders to;
-/// a bundle has already done that, spelling every canister out as explicit
-/// pre-built steps, so a recipe reference means the archive is not a bundle.
-pub struct NoRecipes;
-
-#[async_trait]
-impl Resolve for NoRecipes {
-    async fn resolve(&self, recipe: &Recipe) -> Result<Fetched, ResolveError> {
-        Err(ResolveError::new(Unsupported(format!(
-            "the manifest names recipe '{}', which a bundle never does: a bundle spells every \
-             step out; rebuild it with `icp project bundle`",
-            recipe.recipe_type
-        ))))
-    }
-}
-
 /// The script runner the syncer is composed with. A bundle has no script
 /// step for it to run — the vetted loader refuses a project with one — so
 /// this spawns nothing; it is here because the syncer takes a runner, not
@@ -584,11 +568,8 @@ fn check_bundle_within<'a>(
             if let Some(expected) = plugin.sha256.as_deref() {
                 checksum_matches(&local.path, expected, &actual).map_err(at)?;
             }
-            let paths = |named: &'a Option<_>| {
-                named.iter().flat_map(NamedPaths::entries).map(|entry| entry.path)
-            };
-            check_declared(fs, dir, paths(&plugin.dirs), paths(&plugin.files), plugin_input)
-                .map_err(at)?;
+            let files = plugin.files.iter().flat_map(NamedPaths::entries).map(|entry| entry.path);
+            check_declared(fs, dir, files, plugin_input).map_err(at)?;
         }
     }
     Ok(())
@@ -636,59 +617,29 @@ impl Verified {
     }
 }
 
-/// Hold a sync step's declared `dirs:` and `files:` to the bundle, by the
-/// runtime's own rule — each is written relative to the canister directory,
-/// may rise out of it with `..` but not above the bundle root, and may not
-/// be absolute — and to what is there: a `dirs:` entry names a directory, a
-/// `files:` entry a file the runtime will read into memory, or a directory
-/// it will mount. The files, counted as often as they are declared, are held
-/// to `budget` bytes in all.
-///
-/// The runtime refuses the same paths at sync, after the canisters have been
-/// created; this is before. Which of the two settings the plugin's interface
-/// accepts, and whether an entry carries a name, is settled by the plugin
-/// itself and stays the runtime's to tell.
+/// Hold the bytes a sync step's `files:` declare to `budget`, counting a
+/// file each time it is declared: the runtime reads every declared file
+/// into memory before the plugin runs. That each `dirs:` and `files:` entry
+/// is in the bundle — under the root, through no symlink, a directory or a
+/// regular file — the vet settled at the load; which of the two settings
+/// the plugin's interface accepts, and whether an entry carries a name, is
+/// the plugin's to say and stays the runtime's to tell.
 fn check_declared<'a>(
     fs: &BundleFs,
     dir: &Utf8Path,
-    dirs: impl IntoIterator<Item = &'a str>,
     files: impl IntoIterator<Item = &'a str>,
     budget: u64,
 ) -> Result<(), Unsupported> {
-    let resolve = |path: &str| -> Result<Utf8PathBuf, Unsupported> {
-        let declared = Utf8Path::new(path);
-        if declared
-            .components()
-            .any(|c| matches!(c, Utf8Component::RootDir | Utf8Component::Prefix(_)))
-        {
-            return Err(Unsupported(format!(
-                "its sync step declares '{path}', an absolute path; a plugin's `dirs:` and \
-                 `files:` are written relative to the canister directory"
-            )));
-        }
-        fs.resolve(&dir.join(declared)).map_err(|_| {
-            Unsupported(format!(
-                "its sync step declares '{path}', which lies outside the bundle; a plugin's \
-                 `dirs:` and `files:` stay within the project"
-            ))
-        })
-    };
-    for path in dirs {
-        if !resolve(path)?.is_dir() {
-            return Err(Unsupported(format!(
-                "its sync step declares '{path}' under `dirs:`, which is not a directory in the \
-                 bundle"
-            )));
-        }
-    }
     let mut left = budget;
     for path in files {
-        let on_disk = resolve(path)?;
-        let meta = std::fs::metadata(&on_disk).map_err(|_| {
+        // Where the vet saw it; a path the vet did not pass never gets here.
+        let not_there = || {
             Unsupported(format!(
                 "its sync step declares '{path}' under `files:`, which is not in the bundle"
             ))
-        })?;
+        };
+        let on_disk = fs.resolve(&dir.join(path)).map_err(|_| not_there())?;
+        let meta = std::fs::metadata(&on_disk).map_err(|_| not_there())?;
         if meta.is_file() {
             if meta.len() > left {
                 return Err(Unsupported(format!(
@@ -734,10 +685,10 @@ fn host_within(fs: BundleFs, project_bytes: u64) -> Host {
     let files: Arc<dyn FileSystem> = Arc::new(fs.clone());
     let wasm: Arc<dyn Fetch> = Arc::new(BundledWasm(fs.clone()));
     // The untrusted rule, composed as `icp --untrusted` composes it: the
-    // project is vetted as it loads, each module's path resolved through
-    // the bundle's own filesystem. That no recipe is fetched is this
-    // crate's rule, not the library's: a bundle has none. The loader is the
-    // one gate on the project's shape, so the builder is the library's own.
+    // project is read through the bundle's own filesystem, no recipe is
+    // fetched, and the project is vetted as it loads, each path a step
+    // names asked of that filesystem. The loader is the one gate on the
+    // project's shape, so the builder is the library's own.
     let project = Lazy::<_, Project>::new(Vetted::new(
         ProjectLoadImpl {
             project_root_locate: locate.clone(),
@@ -792,22 +743,20 @@ fn extract_bundle_within(
             MAX_BUNDLE_BYTES
         ));
     }
-    // The root as the disk knows it. The vet resolves each module's path
-    // through this filesystem and then asks it whether a regular file is at
-    // the resolved spelling, which the filesystem holds to the root by
-    // spelling alone; a root named through a link (macOS keeps its temporary
-    // directories under `/var`, a link to `/private/var`) would put every
-    // resolved path outside it. So the root is resolved once, here, before
-    // the filesystem is held to it.
-    let into = dunce::canonicalize(into)
-        .map_err(|e| format!("the extraction directory '{into}' cannot be resolved: {e}"))?;
-    let into = Utf8PathBuf::from_path_buf(into)
-        .map_err(|p| format!("the extraction directory '{}' is not UTF-8", p.display()))?;
     // A link is refused on the way in, so nothing under the root leads out
-    // of it. Should one appear later, the filesystem follows it as the host
-    // does, and the vet sees a module named through it for where it really
-    // is, refusing one that resolves outside the root.
-    let fs = Confined::new(&into);
+    // of it; should one appear later, the filesystem refuses any path
+    // through it. The root is held as spelled: it and everything above it
+    // are this crate's own (macOS keeps its temporary directories under
+    // `/var`, a link to `/private/var`), and only what lies below is held
+    // to shape.
+    let fs = Confined::new(into).map_err(|e| {
+        let mut why = e.to_string();
+        if let Some(cause) = std::error::Error::source(&e) {
+            why.push_str(": ");
+            why.push_str(&cause.to_string());
+        }
+        format!("the extraction directory cannot be confined to: {why}")
+    })?;
     let unreadable =
         |e: std::io::Error| format!("the bundle is not a readable .tar.gz archive: {e}");
     let decoder = Limited { inner: flate2::read::GzDecoder::new(bytes), left: MAX_EXTRACTED_BYTES };
@@ -1074,8 +1023,8 @@ mod tests {
 
     // A symlink is how an archive reaches past its directory; a bundle
     // carries none, so one is refused rather than written. Should one appear
-    // later, the vet refuses a module that resolves through it to outside
-    // the root (the test after this), so neither gate stands alone.
+    // later, the filesystem refuses any path through it (the test after
+    // this), so neither gate stands alone.
     #[test]
     fn an_archive_with_a_symlink_is_refused() {
         let (_dir, into) = scratch();
@@ -1096,13 +1045,13 @@ mod tests {
     }
 
     // Should a link appear under the root after extraction, the filesystem
-    // follows it as the host does, and the vet sees a module named through
-    // it for where it really is: one that resolves outside the root fails
-    // the load, naming where it leads, and one that resolves within is let
-    // be. The untrusted rule's own test, run through this host.
+    // refuses every path through it, wherever it leads: the vet sees a
+    // module named through one as not a regular file of the project, and a
+    // read through one is refused naming the link. The untrusted rule's own
+    // test, run through this host.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_module_linked_out_of_the_bundle_fails_the_load() {
+    async fn a_module_named_through_a_link_fails_the_load() {
         use std::os::unix::fs::symlink;
         let manifest = |path: &str| {
             format!(
@@ -1114,32 +1063,37 @@ mod tests {
         let secret = elsewhere.path().join("secret.wasm");
         std::fs::write(&secret, b"\0asm").unwrap();
 
-        // Out: refused, naming the link, where it leads and the root.
+        // Out: refused at the load, naming the path.
         let (_dir, into) = scratch();
         let bytes = archive(&[("icp.yaml", manifest("out.wasm").as_bytes())]);
         let fs = extract_bundle(&bytes, &into).unwrap();
         symlink(&secret, into.join("out.wasm")).unwrap();
-        let err = chain(&host_for(fs).project.load().await.expect_err("a link out"));
-        assert!(err.contains("outside the project"), "{err}");
-        assert!(err.contains("out.wasm") && err.contains("secret.wasm"), "{err}");
+        let err = chain(&host_for(fs.clone()).project.load().await.expect_err("a link out"));
+        assert!(err.contains("not a regular file in the project"), "{err}");
+        assert!(err.contains("out.wasm"), "{err}");
+        // And a read through it is refused naming the link, not followed.
+        let err = chain(&fs.read(Utf8Path::new("out.wasm")).await.unwrap_err());
+        assert!(err.contains("passes through") && err.contains("out.wasm"), "{err}");
 
-        // Within: let be, and the module is served through the link.
+        // Within: refused all the same; the rule is no link, not no link out.
         let (_dir, into) = scratch();
         let bytes =
             archive(&[("icp.yaml", manifest("in.wasm").as_bytes()), ("backend.wasm", b"\0asm")]);
         let fs = extract_bundle(&bytes, &into).unwrap();
         symlink("backend.wasm", into.join("in.wasm")).unwrap();
-        let project = host_for(fs.clone()).project.load().await.unwrap();
-        assert_eq!(project.canisters.len(), 1);
-        assert_eq!(fs.read(Utf8Path::new("in.wasm")).await.unwrap(), b"\0asm");
+        let err = chain(&host_for(fs.clone()).project.load().await.expect_err("a link within"));
+        assert!(err.contains("not a regular file in the project"), "{err}");
+        assert!(err.contains("in.wasm"), "{err}");
+        assert!(fs.read(Utf8Path::new("in.wasm")).await.is_err());
+        assert_eq!(fs.read(Utf8Path::new("backend.wasm")).await.unwrap(), b"\0asm");
 
-        // Dangling: nothing can be said about where it leads, so refused.
+        // Dangling: a link is a link, wherever it leads or fails to.
         let (_dir, into) = scratch();
         let bytes = archive(&[("icp.yaml", manifest("gone.wasm").as_bytes())]);
         let fs = extract_bundle(&bytes, &into).unwrap();
         symlink(into.join("nowhere.wasm"), into.join("gone.wasm")).unwrap();
         let err = chain(&host_for(fs).project.load().await.expect_err("a dangling link"));
-        assert!(err.contains("does not resolve to anything"), "{err}");
+        assert!(err.contains("not a regular file in the project"), "{err}");
         assert!(err.contains("gone.wasm"), "{err}");
     }
 
@@ -1159,12 +1113,14 @@ mod tests {
         assert!(err.contains("assets"), "{err}");
     }
 
-    // The root is taken as the disk knows it: named through a link, the
-    // extraction lands in the directory the link leads to, and the project
-    // in it loads — the vet's resolved paths lie under the root it was given.
+    // The root is held as spelled: named through a link, the extraction
+    // lands in the directory the link leads to, the filesystem answers to
+    // the spelling it was given, and the project in it loads — the root and
+    // everything above it are the caller's, and only what lies below is
+    // held to shape.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_root_named_through_a_link_is_the_directory_it_leads_to() {
+    async fn a_root_named_through_a_link_holds_the_project() {
         let manifest = "canisters:\n  - name: backend\n    build:\n      steps:\n        \
                         - type: pre-built\n          path: backend.wasm\n";
         let (dir, into) = scratch();
@@ -1172,10 +1128,11 @@ mod tests {
         std::os::unix::fs::symlink(&into, &alias).unwrap();
         let bytes = archive(&[("icp.yaml", manifest.as_bytes()), ("backend.wasm", b"\0asm")]);
         let fs = extract_bundle(&bytes, &alias).unwrap();
-        assert_eq!(fs.root(), dunce::canonicalize(&into).unwrap());
+        assert_eq!(fs.root(), alias);
         assert!(into.join("backend.wasm").is_file());
-        let project = host_for(fs).project.load().await.unwrap();
+        let project = host_for(fs.clone()).project.load().await.unwrap();
         assert_eq!(project.canisters.len(), 1);
+        assert_eq!(fs.read(Utf8Path::new("backend.wasm")).await.unwrap(), b"\0asm");
         std::fs::remove_file(&alias).unwrap();
     }
 
@@ -1193,8 +1150,9 @@ mod tests {
 
     // The rule for a project someone else handed over is the library's own,
     // and it holds at the load: a script step or a module fetched from a URL
-    // fails the load, before any phase could act on it. So does a recipe,
-    // by this crate's rule: the library would render it, a bundle has none.
+    // fails the load, before any phase could act on it. So does a recipe:
+    // the library would read or fetch it while loading, and an untrusted
+    // project may name none.
     #[tokio::test]
     async fn a_project_asking_more_than_an_untrusted_one_may_fails_to_load() {
         for (manifest, refused) in [
@@ -1208,7 +1166,7 @@ mod tests {
             ),
             (
                 "canisters:\n  - name: backend\n    recipe:\n      type: \"@dfinity/rust@v1\"\n",
-                "recipe '@dfinity/rust@v1', which a bundle never does",
+                "recipe '@dfinity/rust@v1' is refused: an untrusted project may not use a recipe",
             ),
         ] {
             let (_dir, into) = scratch();
@@ -1608,10 +1566,10 @@ mod tests {
         check(&fs, &env, 8192, MAX_PLUGIN_INPUT_BYTES).unwrap();
     }
 
-    // What a plugin declares is held to the bundle before any phase, by the
-    // runtime's rule — relative to the canister directory, within the root,
-    // present, of the kind declared — and the files it will read are held
-    // to a sum, counting a file each time it is declared.
+    // What a sync step hands its plugin is held to the bundle at the load,
+    // by the vet — each entry under the root, through no link, present, of
+    // the kind declared — and the files the runtime will read are held to a
+    // sum here, counting a file each time it is declared.
     #[tokio::test]
     async fn a_sync_step_declares_what_the_bundle_holds() {
         let wasm = wat::parse_str("(module)").unwrap();
@@ -1643,17 +1601,21 @@ mod tests {
             check(&fs, &env, all.0, all.1).unwrap_or_else(|e| panic!("{declared}: {e}"));
         }
 
+        // A file that is not there, a file where a directory is declared, an
+        // absolute path, a path climbing out: each fails the load, before
+        // the check could read anything.
         let refused = [
-            ("      files:\n        config: missing.txt\n", "not in the bundle"),
-            ("      dirs:\n        - config.txt\n", "not a directory"),
-            ("      files:\n        etc: /etc/passwd\n", "an absolute path"),
-            ("      files:\n        up: ../../../x\n", "outside the bundle"),
+            ("      files:\n        config: missing.txt\n", "missing.txt"),
+            ("      dirs:\n        - config.txt\n", "config.txt"),
+            ("      files:\n        etc: /etc/passwd\n", "/etc/passwd"),
+            ("      files:\n        up: ../../../x\n", "x"),
         ];
-        for (declared, reason) in refused {
-            let (_dir, fs, env) = environment(&bundle(declared)).await;
-            let err = check(&fs, &env, all.0, all.1).unwrap_err();
+        for (declared, named) in refused {
+            let (_dir, into) = scratch();
+            let fs = extract_bundle(&bundle(declared), &into).unwrap();
+            let err = chain(&host_for(fs).project.load().await.expect_err(declared));
             assert!(
-                err.contains("canister 'backend'") && err.contains(reason),
+                err.contains("gives its sync plugin") && err.contains(named),
                 "{declared}: {err}"
             );
         }
