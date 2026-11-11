@@ -59,8 +59,7 @@
 //! project bundle` writes an archive of regular files and directories with
 //! every step spelled out (dfinity/icp-cli#868); and a consumer of a bundle
 //! it does not trust loads it as untrusted (dfinity/icp-cli#873, on #868).
-//! This crate is that consumer, and pins the stack; until it is on icp-cli's
-//! main, the pin is its head.
+//! This crate is that consumer, and pins icp-cli's main at the merge of #873.
 //!
 //! Everything the project library reads or writes — the manifest, the wasms,
 //! the `.icp` id and artifact stores, the build scratch — lives under the
