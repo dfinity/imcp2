@@ -193,9 +193,7 @@ pub async fn deploy_bundle(
         }
         None => std::env::temp_dir(),
     };
-    let scratch = tempfile::Builder::new()
-        .prefix("imcp2-deploy-")
-        .tempdir_in(parent)
+    let scratch = deploy_directory(&parent)
         .map_err(|e| RequestError(format!("cannot create a scratch directory: {e}")))?;
     let dir = Utf8PathBuf::from_path_buf(scratch.path().to_path_buf()).map_err(|p| {
         RequestError(format!("scratch directory path is not UTF-8: {}", p.display()))
@@ -472,6 +470,21 @@ fn describe(task: &Task) -> String {
     }
 }
 
+/// A fresh directory for one deploy under `parent`, randomly named, and on
+/// Unix readable by its owner alone: the bundle's files and the ids the
+/// deploy records are the user's business, and the parent (the user's local
+/// data directory, or the system temporary directory) may be more open.
+fn deploy_directory(parent: &std::path::Path) -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("imcp2-deploy-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir_in(parent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,6 +550,24 @@ mod tests {
     // phase of a bundle), then stop where `--no-create` stops `icp deploy`.
     // The outcome reports the failure, the targets, and the log of the phase
     // that succeeded before it.
+    // Each deploy gets its own fresh directory, and on Unix one no other
+    // user of the machine can read: the parent may be world-readable.
+    #[test]
+    fn a_deploy_directory_is_fresh_and_private() {
+        let parent = tempfile::tempdir().unwrap();
+        let a = deploy_directory(parent.path()).unwrap();
+        let b = deploy_directory(parent.path()).unwrap();
+        assert_ne!(a.path(), b.path());
+        assert!(a.path().starts_with(parent.path()));
+        assert!(a.path().file_name().unwrap().to_str().unwrap().starts_with("imcp2-deploy-"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(a.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "mode {mode:o}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_bundle_deploys_up_to_the_create_phase_offline() {
         let (wasm, sha) = wasm();
