@@ -77,11 +77,11 @@ fn key_checks() -> KeyChecks {
 
 fn purge_filter() -> PurgeFilter {
     PurgeFilter {
-        namespace: Some(vec![0xA0; NAMESPACE_LEN]),
-        kid: Some(1),
-        opened_by: Some(node(3)),
-        created_from: Some(1_690_000_000),
-        created_to: Some(1_700_000_000),
+        namespace: Match::Is(vec![0xA0; NAMESPACE_LEN]),
+        kid: Match::Is(1),
+        opened_by: Match::Is(node(3)),
+        created_from: Match::Is(1_690_000_000),
+        created_to: Match::Is(1_700_000_000),
     }
 }
 

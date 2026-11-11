@@ -122,12 +122,16 @@ type KeyChecks = record {
 };
 type KeyChecksResult = variant { Ok : KeyChecks; Err : CommonError };
 
+// A session is purged when it matches every condition; `Any` places none, so
+// all `Any` purges everything. Every field is required, so a misspelled or
+// missing one is refused instead of silently widening the purge (Candid drops
+// fields a type does not declare).
 type PurgeFilter = record {
-  namespace : opt Namespace;
-  kid : opt nat8;               // matched against byte 2 of the sealed envelope
-  opened_by : opt principal;
-  created_from : opt Seconds;
-  created_to : opt Seconds;
+  namespace : variant { Any; Is : Namespace };
+  kid : variant { Any; Is : nat8 };             // byte 2 of the sealed envelope
+  opened_by : variant { Any; Is : principal };
+  created_from : variant { Any; Is : Seconds };
+  created_to : variant { Any; Is : Seconds };
 };
 type PurgeJob = record {
   filter : PurgeFilter;

@@ -279,20 +279,65 @@ pub struct KeyChecks {
     pub now_ns: u64,
 }
 
+/// One condition of a [`PurgeFilter`] (`variant { Any; Is : T }`): `Any`
+/// places no constraint, `Is(value)` requires the field to equal `value`.
+///
+/// A variant rather than an `opt`, so that the condition must be written out:
+/// see [`PurgeFilter`].
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Match<T> {
+    #[default]
+    Any,
+    Is(T),
+}
+
+impl<T> Match<T> {
+    /// Whether this condition places no constraint.
+    pub fn is_any(&self) -> bool {
+        matches!(self, Match::Any)
+    }
+
+    /// The required value, if any.
+    pub fn as_option(&self) -> Option<&T> {
+        match self {
+            Match::Any => None,
+            Match::Is(value) => Some(value),
+        }
+    }
+}
+
+impl<T> From<Option<T>> for Match<T> {
+    fn from(value: Option<T>) -> Self {
+        value.map_or(Match::Any, Match::Is)
+    }
+}
+
 /// Which sessions `admin_purge_sessions` removes (`PurgeFilter`): those matching
-/// every field that is set. The default filter matches everything.
+/// every condition. A filter whose conditions are all [`Match::Any`] matches
+/// every session in every namespace.
+///
+/// **Every field is required.** Candid drops record fields a type does not
+/// declare, and dfx annotates a textual argument with the canister's published
+/// interface before sending it. With optional fields, a misspelled one
+/// (`namspace = …`) would silently become "no constraint": a targeted purge
+/// would widen to a namespace, or to everything. As required variants, a
+/// misspelled or missing field, or a misspelled tag, is refused before the call
+/// is made (by dfx) and when it is decoded, so purging everything has to be
+/// written out as every field `variant { Any }`. A field added later must be
+/// `opt` under the interface's evolution rules, and would not have this
+/// protection. [`PurgeFilter::default`] is the all-`Any` filter.
 #[derive(CandidType, Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct PurgeFilter {
-    pub namespace: Option<Namespace>,
+    pub namespace: Match<Namespace>,
     /// Matched against the sealed envelope's key id (its byte at
     /// [`SEALED_KID_OFFSET`](crate::SEALED_KID_OFFSET)), to purge everything
     /// sealed under a leaked key.
-    pub kid: Option<u8>,
+    pub kid: Match<u8>,
     /// The node identity that stored the session, to purge what a compromised
     /// node created.
-    pub opened_by: Option<Principal>,
-    pub created_from: Option<Seconds>,
-    pub created_to: Option<Seconds>,
+    pub opened_by: Match<Principal>,
+    pub created_from: Match<Seconds>,
+    pub created_to: Match<Seconds>,
 }
 
 /// The progress of an admin purge (`PurgeJob`).

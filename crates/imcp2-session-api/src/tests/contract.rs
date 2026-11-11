@@ -208,3 +208,65 @@ fn a_renamed_field_is_caught() {
     let expected = env.find_type("ListChangesArg").expect("in the .did").clone();
     assert_equal::<Renamed>(&env, &expected, "ListChangesArg");
 }
+
+/// What dfx sends for a textual argument: parsed, annotated with the method's
+/// argument types from the canister's published interface (which drops record
+/// fields the type does not declare, and fills a missing `opt` field with
+/// `null`), then encoded.
+fn as_dfx_sends(method: &str, text: &str) -> Result<Vec<u8>, String> {
+    let (env, actor) = did();
+    let func = env.get_method(&actor, method).map_err(|e| e.to_string())?;
+    let args = candid_parser::parse_idl_args(text).map_err(|e| e.to_string())?;
+    let args = args.annotate_types(true, &env, &func.args).map_err(|e| e.to_string())?;
+    args.to_bytes_with_types(&env, &func.args).map_err(|e| e.to_string())
+}
+
+// A purge filter cannot be widened by a typo: every field is a required
+// variant, so a misspelled or missing field, a misspelled tag, or the old
+// `opt` form fails before anything is sent. Only a filter written out in full
+// goes through, and purging everything means writing every field as `Any`.
+#[test]
+fn a_misspelled_or_missing_purge_field_is_refused() {
+    use candid::Decode;
+
+    let any = "variant { Any }";
+    let ns = format!("variant {{ Is = blob \"{}\" }}", "\\a0".repeat(NAMESPACE_LEN));
+    let full = |namespace: &str, kid: &str| {
+        format!(
+            "(record {{ namespace = {namespace}; kid = {kid}; opened_by = {any}; \
+             created_from = {any}; created_to = {any} }})"
+        )
+    };
+    let refused = [
+        // The typo Copilot described: alone, it used to purge everything.
+        "(record { namspace = opt blob \"\\a0\" })".to_string(),
+        // A misspelled field among correct ones used to drop that condition.
+        full(&ns, any).replace("kid =", "kidd ="),
+        // A missing field.
+        full(&ns, any).replace(&format!("kid = {any}; "), ""),
+        // A misspelled tag.
+        full(&ns, "variant { Iz = 3 }"),
+        // The old optional form.
+        full(&ns, "opt 3"),
+        // Nothing at all.
+        "(record {})".to_string(),
+    ];
+    for text in &refused {
+        assert!(as_dfx_sends(method::ADMIN_PURGE_SESSIONS, text).is_err(), "sent: {text}");
+    }
+
+    let sent = as_dfx_sends(method::ADMIN_PURGE_SESSIONS, &full(&ns, "variant { Is = 3 }"))
+        .expect("a full filter type-checks");
+    let filter = Decode!(&sent, PurgeFilter).expect("decodes");
+    assert_eq!(
+        filter,
+        PurgeFilter {
+            namespace: Match::Is(vec![0xA0; NAMESPACE_LEN]),
+            kid: Match::Is(3),
+            ..PurgeFilter::default()
+        }
+    );
+    let everything =
+        as_dfx_sends(method::ADMIN_PURGE_SESSIONS, &full(any, any)).expect("all Any type-checks");
+    assert_eq!(Decode!(&everything, PurgeFilter).unwrap(), PurgeFilter::default());
+}
