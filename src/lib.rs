@@ -74,6 +74,7 @@
 //! and `II_URL_PROD` / `II_CANISTER_ID_PROD` (the Internet Identity instances).
 
 mod auth;
+mod body_limit;
 mod branding;
 // Docs live in the module itself (`//!` in src/metrics.rs): an outer doc
 // comment here would resolve its intra-doc links in *this* scope rather than
@@ -108,6 +109,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 pub use auth::SharedClients;
+pub use body_limit::DEFAULT_MAX_REQUEST_BODY;
 /// The components this server is composed from, re-exported so embedders keep
 /// importing everything from `imcp2` (the types are `imcp2-core`'s — one
 /// defining crate, so type identity is preserved).
@@ -170,6 +172,9 @@ pub struct McpServer {
     store: auth::AuthStore,
     public_url: String,
     mcp_path: String,
+    /// The largest MCP request body the endpoint reads, in bytes (see
+    /// [`Self::with_max_request_body`]).
+    max_request_body: usize,
     /// Cancels the streamable-HTTP sessions and the session reaper on
     /// [`Self::shutdown`].
     ct: CancellationToken,
@@ -205,8 +210,20 @@ impl McpServer {
             store,
             public_url,
             mcp_path,
+            max_request_body: DEFAULT_MAX_REQUEST_BODY,
             ct: CancellationToken::new(),
         }
+    }
+
+    /// Cap the MCP request body at `bytes` instead of the default
+    /// [`DEFAULT_MAX_REQUEST_BODY`]. The streamable-HTTP transport buffers each
+    /// request body whole before parsing it, so the cap is what bounds the
+    /// memory one authenticated request can take; a body over it is refused
+    /// with `413` before more than the cap is read. The `imcp2` binary sets
+    /// it from `$MCP_MAX_REQUEST_BODY`.
+    pub fn with_max_request_body(mut self, bytes: usize) -> Self {
+        self.max_request_body = bytes;
+        self
     }
 
     /// The operational-files directory this instance uses — where imcp2 creates
@@ -256,7 +273,8 @@ impl McpServer {
     ///     fallback, so the bare mount path, its trailing-slash form, and
     ///     unmatched sub-paths all reach it), bearer-token gated, with the CORS
     ///     preflight answered before authentication and `WWW-Authenticate`
-    ///     exposed cross-origin.
+    ///     exposed cross-origin, and its request body capped behind the gate
+    ///     (see [`Self::with_max_request_body`]).
     ///
     /// Nest with `nest_service` (which forwards the bare trailing-slash form
     /// too, unlike `nest`). Nesting at the application root is the one axum
@@ -317,8 +335,16 @@ impl McpServer {
                 axum::http::header::WWW_AUTHENTICATE,
                 axum::http::HeaderName::from_static("mcp-session-id"),
             ]);
+        // Layers run outermost-last: CORS, then the bearer gate, then the body
+        // cap — so an unauthenticated request is refused on its headers without
+        // its body being read, and an authenticated one is read only up to the
+        // cap before the transport buffers it.
         let gated_mcp = Router::new()
             .fallback_service(mcp_service)
+            .layer(middleware::from_fn_with_state(
+                self.max_request_body,
+                body_limit::limit_request_body,
+            ))
             .layer(middleware::from_fn_with_state(self.store.clone(), auth::require_token))
             .layer(mcp_cors);
 
@@ -633,7 +659,12 @@ mod lib_tests {
         allowed_hosts_for, normalize_mount_path, normalize_public_url, Agent, IiInstance,
         McpConfig, McpServer, SharedClients, IC_URL,
     };
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
     use std::path::PathBuf;
+    use tower::ServiceExt;
 
     /// Build a server whose `clients` load and `state_dir` field both point at
     /// `dir` (the correct pairing). Construction is pure — no network.
@@ -744,5 +775,46 @@ mod lib_tests {
         let hosts = allowed_hosts_for("http://localhost:8000");
         assert_eq!(hosts.iter().filter(|h| *h == "localhost").count(), 1);
         assert!(has(&hosts, "localhost:8000"), "{hosts:?}");
+    }
+
+    /// The body cap guards the MCP endpoint from behind the bearer gate: an
+    /// authenticated oversized request gets `413`, an unauthenticated one still
+    /// gets the `401` challenge with its body left unread.
+    #[tokio::test]
+    async fn the_mcp_endpoint_caps_authenticated_request_bodies() {
+        let dir = std::env::temp_dir().join("imcp2-lib-body-limit-test");
+        let server = server_with_dir(dir).with_max_request_body(64);
+        let bearer = format!("Bearer {}", server.store.test_bearer().await);
+        let oversized = || Body::from(vec![b'x'; 65]);
+
+        let resp = server
+            .mcp_router()
+            .oneshot(Request::post("/").header("authorization", &bearer).body(oversized()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let resp = server
+            .mcp_router()
+            .oneshot(Request::post("/").body(oversized()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "the gate comes first");
+
+        // Within the cap and authenticated: the transport answers, not the cap.
+        let resp = server
+            .mcp_router()
+            .oneshot(
+                Request::post("/")
+                    .header("authorization", &bearer)
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

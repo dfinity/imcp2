@@ -69,6 +69,20 @@ fn require_resource() -> bool {
     }
 }
 
+/// The largest MCP request body the server reads, in bytes: `$MCP_MAX_REQUEST_BODY`
+/// when set, else the library default ([`imcp2::DEFAULT_MAX_REQUEST_BODY`]). A
+/// value that is not a whole number is a configuration error and refuses to
+/// start, rather than silently running with the default.
+fn max_request_body() -> anyhow::Result<usize> {
+    match std::env::var("MCP_MAX_REQUEST_BODY") {
+        Ok(v) => v
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("MCP_MAX_REQUEST_BODY must be a byte count: {e}")),
+        Err(_) => Ok(imcp2::DEFAULT_MAX_REQUEST_BODY),
+    }
+}
+
 /// Whether to also serve the beta Internet Identity instance at `/mcp-beta`.
 /// Off unless `$MCP_SERVE_BETA` is truthy (`1`/`true`/`yes`/`on`), so a
 /// production deployment serves only `/mcp` (production II) and the staging
@@ -309,6 +323,9 @@ async fn main() -> anyhow::Result<()> {
     // the operational directory.
     let clients = SharedClients::load(&state_dir);
 
+    // One request-body cap for every instance (see `max_request_body`).
+    let max_request_body = max_request_body()?;
+
     // Client ID Metadata Documents: on for every instance unless the deploy says no.
     let cimd_on = cimd_enabled();
     if !cimd_on {
@@ -327,7 +344,8 @@ async fn main() -> anyhow::Result<()> {
         state_dir: state_dir.clone(),
         require_resource: require_resource(),
         cimd_enabled: cimd_on,
-    });
+    })
+    .with_max_request_body(max_request_body);
     prod.spawn_session_reaper();
 
     // Beta Internet Identity at `/mcp-beta`: opt in via `$MCP_SERVE_BETA`, so
@@ -342,7 +360,8 @@ async fn main() -> anyhow::Result<()> {
             state_dir,
             require_resource: require_resource(),
             cimd_enabled: cimd_on,
-        });
+        })
+        .with_max_request_body(max_request_body);
         beta.spawn_session_reaper();
         Some(beta)
     } else {
