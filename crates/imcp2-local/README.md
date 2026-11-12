@@ -239,8 +239,10 @@ Internet Identity (`https://id.ai`). Environment overrides, mainly for tests:
 | `IMCP2_MANAGEMENT_ORIGIN` | Derivation origin of the canister-management identity. Defaults to the hosted server's origin so the same anchor keeps the same controller principal locally and hosted. The deploy tools do not use it; they act at `https://cli.id.ai`. |
 | `IMCP2_NO_OPEN` | Truthy: never auto-open the browser on sign-in (the link is still returned in-band). |
 
-All diagnostics go to stderr (`RUST_LOG` filters them); stdout is the MCP
-JSON-RPC channel.
+All diagnostics go to stderr (`RUST_LOG` filters them; the default is `info`);
+stdout is the MCP JSON-RPC channel. A deploy's events — the directory it works
+in, each phase as it completes, how it ended — are logged at `info`, so the
+client's record of a run is also on stderr.
 
 ## Security model — treat it like a wallet
 

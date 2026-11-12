@@ -589,6 +589,13 @@ What the hosted composition adds to the local one:
   by the `imcp2-deploy` host (archive, extracted bytes, entries, module sizes),
   and its sync plugins run in WASI with read-only access to their own deploy
   directory and no network.
+- **The server log has every deploy.** Each deploy's events — the directory it
+  works in, every phase and canister step as the client sees them, and how it
+  ended — are logged at `info` under a `deploy` span carrying the session id,
+  so `journalctl -u imcp2 | grep 'session="…"'` is the record of one run.
+  Upload tickets minted, bundles received or refused, and uploads taken by a
+  deploy are logged at `info` with the session and upload id. The default
+  `RUST_LOG=info` shows all of it.
 
 The feature is off in the default build and on in the native deployment's
 (`deploy/native/build.sh`). `imcp2-deploy` pins icp-cli crates by git, which

@@ -164,6 +164,7 @@ impl Uploads {
             ticket.clone(),
             Ticket { session: session.to_string(), expires: Instant::now() + TICKET_TTL },
         );
+        tracing::info!(session, "upload ticket minted");
         Minted { ticket, expires_in: TICKET_TTL }
     }
 
@@ -180,9 +181,16 @@ impl Uploads {
         let session = {
             let mut state = self.inner.state.lock().await;
             sweep(&mut state);
-            state.tickets.remove(ticket).ok_or(ReceiveError::UnknownTicket)?.session
+            match state.tickets.remove(ticket) {
+                Some(ticket) => ticket.session,
+                None => {
+                    tracing::info!("upload refused: no such ticket (spent, expired or unknown)");
+                    return Err(ReceiveError::UnknownTicket);
+                }
+            }
         };
         if declared_len.is_some_and(|len| len > max as u64) {
+            tracing::warn!(session, ?declared_len, max, "upload refused: declared too large");
             return Err(ReceiveError::TooLarge(max));
         }
         make_private_dir(&self.inner.dir).map_err(|e| ReceiveError::Io(e.to_string()))?;
@@ -192,6 +200,7 @@ impl Uploads {
         let bytes = match received {
             Ok(bytes) => bytes,
             Err(e) => {
+                tracing::warn!(session, %e, "upload failed");
                 let _ = tokio::fs::remove_file(&path).await;
                 return Err(e);
             }
@@ -199,8 +208,9 @@ impl Uploads {
         let mut state = self.inner.state.lock().await;
         state.uploads.insert(
             upload_id.clone(),
-            Upload { session, path, expires: Instant::now() + UPLOAD_TTL },
+            Upload { session: session.clone(), path, expires: Instant::now() + UPLOAD_TTL },
         );
+        tracing::info!(session, upload_id, bytes, "bundle uploaded");
         Ok(Received { upload_id, bytes, expires_in: UPLOAD_TTL })
     }
 
@@ -211,8 +221,10 @@ impl Uploads {
         sweep(&mut state);
         let owned = state.uploads.get(upload_id).is_some_and(|u| u.session == session);
         if !owned {
+            tracing::info!(session, upload_id, "no such upload for the session");
             return None;
         }
+        tracing::info!(session, upload_id, "upload taken by a deploy");
         state.uploads.remove(upload_id).map(|u| TakenUpload { path: u.path })
     }
 }

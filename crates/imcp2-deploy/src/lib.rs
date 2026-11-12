@@ -75,6 +75,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 mod calls;
 mod deploy;
@@ -609,6 +610,8 @@ impl IcDeployTools {
         // A per-app delegation lives five minutes and a deploy can outlast
         // it (an asset sync, several installs), so the identity the agent
         // signs with is kept fresh for as long as the deploy runs.
+        // Every line the deploy logs carries the session it runs for.
+        let span = tracing::info_span!("deploy", session = %sid);
         let identity =
             match RefreshingIdentity::start(self.identities.clone(), sid, CLI_ORIGIN).await {
                 Ok(id) => id,
@@ -624,12 +627,15 @@ impl IcDeployTools {
         let stop = ctx.ct.child_token();
         let _link = link_client_gone(&ctx, stop.clone());
         let watch = Watch { stop, lines: Some(lines) };
-        let result = deploy_bundle(identity, request, watch).await;
+        let result = deploy_bundle(identity, request, watch).instrument(span.clone()).await;
         // The sender went with the run; the forwarder ends once it has
         // delivered what is left.
         let _ = forwarder.await;
         match result {
-            Err(RequestError(e)) => Ok(err(e)),
+            Err(RequestError(e)) => {
+                tracing::warn!(parent: &span, "deploy refused: {e}");
+                Ok(err(e))
+            }
             Ok(outcome) => {
                 let output = DeployBundleOutput::from_outcome(&outcome);
                 let text = output.human();

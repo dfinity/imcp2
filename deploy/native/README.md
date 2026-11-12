@@ -191,7 +191,9 @@ the deploys running at once and `MCP_DEPLOY_MAX_UPLOAD_BYTES` (default 64 MiB) a
 uploaded archive. Caddy's `read_body 30s` applies to the upload `PUT` too: an
 archive at the cap needs roughly 2 MB/s upstream to arrive in time, and the
 timeout is the knob to raise if that bites, since the app's own caps are what
-bound memory and disk.
+bound memory and disk. Every deploy's events are in the unit's log at `info`
+under a `deploy` span with the session id (`journalctl -u imcp2 | grep
+'session="<id>"'` is one run's record), as are uploads received and taken.
 
 The `staging` environment also sets `SERVE_STATUS=1`. `deploy.sh` then keeps the
 Caddyfile's `/status/` block (between its `__STATUS_BEGIN__`/`__STATUS_END__` markers),

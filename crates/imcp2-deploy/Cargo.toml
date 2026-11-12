@@ -76,3 +76,5 @@ icp-canister-interfaces = { git = "https://github.com/dfinity/icp-cli", rev = "8
 # The tests hand-build small bundles (a manifest plus a wasm) and load them
 # through the same host the tool uses.
 wat = "1"
+# One test reads back what a deploy writes to the server's log.
+tracing-subscriber = { workspace = true }
