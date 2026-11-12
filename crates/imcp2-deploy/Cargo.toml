@@ -23,6 +23,8 @@ candid = { workspace = true }
 # `rt-multi-thread`: the sync-plugin runtime runs a wasm component on a
 # blocking thread (`block_in_place`), which only a multi-thread runtime has.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "fs", "io-util"] }
+# The token a running deploy is stopped through.
+tokio-util = "0.7"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
