@@ -136,9 +136,17 @@ impl Drop for TakenUpload {
 }
 
 impl Uploads {
-    /// A store writing its archives under `dir` (made on first use, readable by
-    /// the server's user alone), each at most `max_bytes`.
+    /// A store writing its archives under `dir` (made now, readable by the
+    /// server's user alone), each at most `max_bytes`. The directory is
+    /// canonicalized: a relative `dir` is resolved against the working
+    /// directory here, so the path of a received archive is absolute, as the
+    /// deploy that reads it requires. Should the directory not be makable
+    /// now, it is tried again at each upload, which reports the failure.
     pub fn new(dir: PathBuf, max_bytes: usize) -> Self {
+        let dir = make_private_dir(&dir)
+            .and_then(|()| dir.canonicalize())
+            .or_else(|_| std::path::absolute(&dir))
+            .unwrap_or(dir);
         Self { inner: Arc::new(Inner { dir, max_bytes, state: Mutex::default() }) }
     }
 
@@ -282,6 +290,32 @@ mod tests {
         (dir, uploads)
     }
 
+    // A store given a relative directory (a server started with a relative
+    // state directory) hands out absolute paths: the deploy that reads an
+    // upload takes no other kind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_received_archive_has_an_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // The directory spelled relative to the working directory: up to the
+        // root, then down to it.
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative = PathBuf::new();
+        relative.extend(cwd.components().skip(1).map(|_| ".."));
+        relative.push(dir.path().strip_prefix("/").unwrap());
+        assert!(relative.is_relative(), "{}", relative.display());
+        let uploads = Uploads::new(relative.join("uploads"), 1024);
+        let minted = uploads.mint("sess").await;
+        let received = uploads
+            .receive(&minted.ticket, None, std::io::Cursor::new(b"x".to_vec()))
+            .await
+            .unwrap();
+        let taken = uploads.take(&received.upload_id, "sess").await.unwrap();
+        assert!(taken.path().is_absolute(), "{}", taken.path().display());
+        assert!(taken.path().starts_with(dir.path().canonicalize().unwrap()));
+        assert_eq!(std::fs::read(taken.path()).unwrap(), b"x");
+    }
+
     #[tokio::test]
     async fn a_ticket_receives_one_archive_for_its_session_alone() {
         let (_dir, uploads) = store(1024);
@@ -342,7 +376,8 @@ mod tests {
         assert_eq!(err.unwrap_err(), ReceiveError::UnknownTicket);
         let err = uploads.receive("not-a-ticket", None, std::io::Cursor::new(vec![1])).await;
         assert_eq!(err.unwrap_err(), ReceiveError::UnknownTicket);
-        assert!(!dir.path().join("uploads").exists(), "no directory is made for a refusal");
+        let kept = std::fs::read_dir(dir.path().join("uploads")).unwrap().count();
+        assert_eq!(kept, 0, "nothing is written for a refusal");
         assert!(uploads.receive(&second.ticket, None, std::io::Cursor::new(vec![1])).await.is_ok());
     }
 }

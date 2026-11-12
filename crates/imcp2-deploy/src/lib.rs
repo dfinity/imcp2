@@ -510,11 +510,17 @@ impl IcDeployTools {
         self.uploads.is_some()
     }
 
-    /// Make each deploy's working directory under `dir` (made on first use)
-    /// rather than the system temporary directory, so one a cut-off deploy
-    /// leaves behind is somewhere the user is told to look.
+    /// Make each deploy's working directory under `dir` (made now) rather
+    /// than the system temporary directory, so one a cut-off deploy leaves
+    /// behind is somewhere the user is told to look. The directory is
+    /// canonicalized: a relative `dir` is resolved against the working
+    /// directory here, not when a deploy runs, so every path a deploy works
+    /// with is absolute, and one reached through a link is named as it is.
     pub fn deploys_in(mut self, dir: &std::path::Path) -> Result<Self, String> {
-        let dir = Utf8PathBuf::from_path_buf(dir.to_path_buf())
+        let dir = std::fs::create_dir_all(dir)
+            .and_then(|()| dir.canonicalize())
+            .map_err(|e| format!("cannot make the deploy directory '{}': {e}", dir.display()))?;
+        let dir = Utf8PathBuf::from_path_buf(dir)
             .map_err(|p| format!("the deploy directory '{}' is not UTF-8", p.display()))?;
         self.deploys_dir = Some(dir);
         Ok(self)
@@ -965,6 +971,30 @@ mod tests {
         assert!(request_from_args(empty).unwrap_err().contains("empty"));
         let bad = args(serde_json::json!({ "bundle_base64": "***", "environment": "ic" }));
         assert!(request_from_args(bad).unwrap_err().contains("base64"));
+    }
+
+    // A relative deploy directory (a server started with a relative state
+    // directory) is resolved when it is given, so a deploy's working
+    // directory, and the paths it hands the library, are absolute.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_deploy_directory_is_made_absolute() {
+        let agent =
+            imcp2_core::Agent::builder().with_url(imcp2_core::IC_URL).build().expect("agent");
+        let identities = Identities::new(
+            imcp2_core::IiInstance::prod().expect("prod II"),
+            "https://mcp.example".into(),
+            agent,
+        );
+        let tools = IcDeployTools::new(identities, Arc::new(|_: &_| None))
+            .deploys_in(std::path::Path::new("state/deploys"))
+            .unwrap();
+        let dir = tools.deploys_dir.clone().unwrap();
+        assert!(dir.is_absolute(), "{dir}");
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert_eq!(dir.as_std_path(), cwd.join("state/deploys"));
+        assert!(dir.is_dir(), "made now, not on first use");
+        std::fs::remove_dir_all(cwd.join("state")).unwrap();
     }
 
     // Four base64 characters past the bound is refused on length alone, before

@@ -654,7 +654,8 @@ only runtime file is the OAuth clients store, which the server always uses: it r
 the file on startup and writes it (best-effort) as client registrations change, so
 give it a writable directory. imcp2 creates its operational files in
 `IMCP2_STATE_DIR` (the clients store at `<dir>/oauth-clients.json`); it defaults to
-the working directory. On `SIGTERM` (what
+the working directory, and a relative path is resolved against the working
+directory at startup. On `SIGTERM` (what
 `systemctl stop`/`restart` sends) or `SIGINT`, the server drains in-flight requests
 before exiting, so a redeploy doesn't cut off calls mid-flight. Two requirements
 when hosting:

@@ -44,15 +44,21 @@ fn public_url() -> String {
     std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
 }
 
-/// Directory imcp2 creates its operational files in (today: the persisted
-/// client-registration store). Set with `IMCP2_STATE_DIR`; defaults to the
-/// process's current working directory, so a bare local run keeps
-/// `oauth-clients.json` under the directory it was launched from, as before. The
-/// native deployment points it at the unit's `StateDirectory` (`/var/lib/imcp2`).
+/// Directory imcp2 creates its operational files in (the persisted
+/// client-registration store; with the `deploy` feature, deploy records and
+/// uploaded bundles). Set with `IMCP2_STATE_DIR`; defaults to the process's
+/// current working directory, so a bare local run keeps `oauth-clients.json`
+/// under the directory it was launched from, as before. The native deployment
+/// points it at the unit's `StateDirectory` (`/var/lib/imcp2`). A relative
+/// path is resolved against the working directory here, once: every path
+/// derived from it is absolute, which a deploy reading an uploaded bundle
+/// requires.
 fn state_dir() -> std::path::PathBuf {
-    std::env::var_os("IMCP2_STATE_DIR")
+    let dir = std::env::var_os("IMCP2_STATE_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    std::path::absolute(&dir)
+        .unwrap_or_else(|e| panic!("cannot resolve IMCP2_STATE_DIR '{}': {e}", dir.display()))
 }
 
 /// Whether to enforce strict RFC 8707 resource indicators: require a `resource`
