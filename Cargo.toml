@@ -99,9 +99,17 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["io"] }
 uuid = { workspace = true }
 tower-http = { version = "0.7", features = ["cors"] }
+# The deploy tools on the hosted server (src/deploy.rs), behind the `deploy`
+# feature. imcp2-deploy pins icp-cli crates by git, which crates.io refuses, so
+# the feature keeps `cargo publish` from working until the icp CLI's crates are
+# published; a release build with the feature is a deployment's choice.
+imcp2-deploy = { path = "crates/imcp2-deploy", optional = true }
+# The deploy endpoint: streamed bodies (the upload, the watched event stream).
+futures-util = "0.3"
+http-body-util = "0.1"
 # Metrics exposition at /metrics. Pinned to the version dfinity/ic uses: these
 # series are destined for the same Prometheus / Victoria Metrics clusters that
 # scrape the IC, so matching the org's client keeps one exposition dialect in the
@@ -125,12 +133,17 @@ pocket-ic = { version = "15", optional = true }
 # src/e2e_handshake.rs). Off by default: the standard `cargo test` neither
 # builds `pocket-ic` nor touches the network.
 e2e = ["dep:pocket-ic"]
+# Serves the deploy tools (icp_deploy_bundle, icp_deploy_upload,
+# icp_cycles_balance, icp_deploy_guide) on the MCP endpoint, with the bundle
+# upload route and the event-stream transport for the deploy call. See
+# src/deploy.rs and the note on imcp2-deploy above.
+deploy = ["dep:imcp2-deploy"]
 
 [dev-dependencies]
 # Router-level contract tests (tests/routers.rs) drive the composed app with
 # tower::ServiceExt::oneshot and read bodies via http-body-util.
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
+tempfile = "3"
 # `test-util` is what `#[tokio::test(start_paused = true)]` needs: the pending
 # connect tests in `auth.rs` walk a connect past its TTL and retention on a
 # paused clock instead of waiting them out. A feature on a dependency the crate

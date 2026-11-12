@@ -69,6 +69,27 @@ fn require_resource() -> bool {
     }
 }
 
+/// The deploy tools' knobs, when this binary was built with the `deploy`
+/// feature: `$MCP_DEPLOY_MAX_CONCURRENT` deploys at once across sessions
+/// (default 2) and `$MCP_DEPLOY_MAX_UPLOAD_BYTES` per uploaded archive
+/// (default 64 MiB). A value that is not a whole number refuses to start.
+#[cfg(feature = "deploy")]
+fn deploy_config() -> anyhow::Result<imcp2::deploy::DeployConfig> {
+    let mut config = imcp2::deploy::DeployConfig::default();
+    if let Ok(v) = std::env::var("MCP_DEPLOY_MAX_CONCURRENT") {
+        config.concurrent = v
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("MCP_DEPLOY_MAX_CONCURRENT must be a count: {e}"))?;
+    }
+    if let Ok(v) = std::env::var("MCP_DEPLOY_MAX_UPLOAD_BYTES") {
+        config.max_upload_bytes = v.trim().parse().map_err(|e| {
+            anyhow::anyhow!("MCP_DEPLOY_MAX_UPLOAD_BYTES must be a byte count: {e}")
+        })?;
+    }
+    Ok(config)
+}
+
 /// Whether to also serve the beta Internet Identity instance at `/mcp-beta`.
 /// Off unless `$MCP_SERVE_BETA` is truthy (`1`/`true`/`yes`/`on`), so a
 /// production deployment serves only `/mcp` (production II) and the staging
@@ -309,6 +330,10 @@ async fn main() -> anyhow::Result<()> {
     // the operational directory.
     let clients = SharedClients::load(&state_dir);
 
+    // The deploy tools, on every instance, when built in.
+    #[cfg(feature = "deploy")]
+    let deploy = deploy_config()?;
+
     // Client ID Metadata Documents: on for every instance unless the deploy says no.
     let cimd_on = cimd_enabled();
     if !cimd_on {
@@ -328,6 +353,8 @@ async fn main() -> anyhow::Result<()> {
         require_resource: require_resource(),
         cimd_enabled: cimd_on,
     });
+    #[cfg(feature = "deploy")]
+    let prod = prod.with_deploy(deploy.clone());
     prod.spawn_session_reaper();
 
     // Beta Internet Identity at `/mcp-beta`: opt in via `$MCP_SERVE_BETA`, so
@@ -343,6 +370,8 @@ async fn main() -> anyhow::Result<()> {
             require_resource: require_resource(),
             cimd_enabled: cimd_on,
         });
+        #[cfg(feature = "deploy")]
+        let beta = beta.with_deploy(deploy.clone());
         beta.spawn_session_reaper();
         Some(beta)
     } else {

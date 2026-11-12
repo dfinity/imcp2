@@ -31,6 +31,11 @@ tracing = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Upload tickets and ids are 256 random bits each.
+getrandom = { workspace = true }
+# The HTTP request parts a transport leaves in the request context, where the
+# hosted server says the client has gone.
+http = { workspace = true }
 url = { workspace = true }
 async-trait = "0.1"
 # `icp-project` spells every path as a UTF-8 path.

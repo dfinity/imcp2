@@ -542,6 +542,60 @@ erroring. The design mirrors the reference IC connector's OQL primer (detect +
 teach), adding an ergonomic executor suited to this server's structured-output
 conventions.
 
+## Deploying a project bundle (the `deploy` feature)
+
+Built with `cargo build --features deploy`, the server also serves the
+deploy tools of the `imcp2-deploy` crate on the MCP endpoint: `icp_deploy_bundle`
+deploys an [icp CLI](https://github.com/dfinity/icp-cli) project bundle to the
+Internet Computer as the user — every phase of `icp deploy`, creating the
+canisters that do not exist yet from the user's cycles balance (`icp_cycles_balance`
+reports it) and upgrading those named in `canister_ids` — and `icp_deploy_guide`
+returns the skill that walks an agent through the loop (also the
+`skill://deploy-with-mcp` resource). It signs as the user's default Internet
+Identity account at `https://cli.id.ai`, the principal `icp identity link web`
+links an icp CLI identity to; `crates/imcp2-local/README.md` says what that
+means for sharing canisters and cycles with the CLI.
+
+What the hosted composition adds to the local one:
+
+- **The bundle arrives by upload.** The agent's machine cannot hand this server
+  a file, and a tool call carries only what the model writes, so
+  `icp_deploy_upload` mints a one-time ticket inside the authenticated call and
+  returns the `curl` command that `PUT`s the archive to
+  `{mcp_path}/deploy/upload`. The ticket is 256 random bits, single use, good
+  for five minutes, bound to the session that minted it (the upload it produces
+  is deployable by that session alone), and sent in a request header so it
+  stays out of proxy logs. The route is outside the bearer gate — the ticket is
+  its authentication — and streams the body to disk under
+  `$MCP_DEPLOY_MAX_UPLOAD_BYTES`, refusing a declared length over it unread. An
+  upload is held fifteen minutes for its deploy, and removed with it.
+- **The deploy call is answered as an event stream.** The endpoint answers a
+  POST with plain JSON, the one message a handler returns; a deploy reports
+  each phase as a progress notification before its result, so a `tools/call`
+  of `icp_deploy_bundle` is dispatched to a second rmcp service configured for
+  Server-Sent-Events responses, still stateless. Every other request keeps the
+  JSON service. The stream carries each phase as it completes, which is also
+  what keeps a client's per-call timeout from expiring on a minutes-long
+  deploy (send a progress token).
+- **A client that goes away stops its deploy.** The event stream's body is
+  wrapped so that its drop — the client disconnecting — cancels a token the
+  deploy watches; the deploy stops at its next step, and its working directory
+  stays under `{state_dir}/deploys` with the ids it recorded, for an operator
+  to hand the user.
+- **Bounds.** One deploy per session and `$MCP_DEPLOY_MAX_CONCURRENT` across
+  sessions, refused past the cap rather than queued. Each deploy's directory is
+  made under `{state_dir}/deploys`, readable by the server's user alone, and
+  removed when the deploy returns. The archive and what it unpacks are bounded
+  by the `imcp2-deploy` host (archive, extracted bytes, entries, module sizes),
+  and its sync plugins run in WASI with read-only access to their own deploy
+  directory and no network.
+
+The feature is off in the default build and on in the native deployment's
+(`deploy/native/build.sh`). `imcp2-deploy` pins icp-cli crates by git, which
+crates.io refuses, so the published `imcp2` crate cannot carry the feature
+until the icp CLI's crates are published; `cargo publish` of this crate waits
+on that.
+
 ## Connect from an MCP client
 
 Add the server to Claude Code (replace the URL with wherever it's hosted):
@@ -569,7 +623,10 @@ cargo run
 # serves http://0.0.0.0:8000  (MCP at /mcp against production II, OAuth under it; / redirects to the landing site)
 # honours $PORT (default 8000), $PUBLIC_URL (default http://localhost:8000),
 # $MCP_SERVE_BETA (set it to also serve the beta II instance at /mcp-beta, for staging),
-# and $MCP_SERVE_METRICS (set it to serve the Prometheus exposition at /metrics)
+# and $MCP_SERVE_METRICS (set it to serve the Prometheus exposition at /metrics).
+# Built with `--features deploy` it also serves the deploy tools, with
+# $MCP_DEPLOY_MAX_CONCURRENT deploys at once (default 2) and uploads of at most
+# $MCP_DEPLOY_MAX_UPLOAD_BYTES (default 64 MiB); see "Deploying a project bundle".
 ```
 
 The human-facing pages — the landing page and the `/privacy-policy`,

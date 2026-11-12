@@ -22,7 +22,9 @@ A deploy is three steps, in order:
 
 1. Bundle the project with the icp CLI.
 2. Call `icp_deploy_bundle` with the bundle, the environment, and the
-   environment's current canister-id mapping.
+   environment's current canister-id mapping. On a server that runs
+   elsewhere than the project — one that lists `icp_deploy_upload` — the
+   bundle is uploaded first, on a ticket that tool returns.
 3. Write the mapping the tool returns back into the project.
 
 Skipping step 3 is the mistake that costs the most: the next deploy would
@@ -98,6 +100,25 @@ It is a JSON object from canister name to principal:
 Read it if it exists. If it does not, this is the first deploy of that
 environment and every canister will be created.
 
+### Upload the bundle, on a server that cannot read your files
+
+A server that lists `icp_deploy_upload` runs on another machine than the
+project, so it cannot open `bundle_path`, and a tool call cannot carry the
+archive itself. Upload it first:
+
+1. Call `icp_deploy_upload`. It returns a one-time ticket, good for a few
+   minutes, and the exact `curl` command to run.
+2. Run that command with the archive's path in place of `<bundle.tar.gz>`.
+   It `PUT`s the archive to the server and prints a JSON answer whose
+   `upload_id` names the upload, held for a quarter of an hour.
+3. Pass that id to `icp_deploy_bundle` as `bundle_upload`, in place of
+   `bundle_path`.
+
+A ticket is spent by one upload, successful or not; an upload is spent by
+one deploy. If either lapses, ask for a new ticket and upload again. A
+server that does not list `icp_deploy_upload` takes `bundle_path` or
+`bundle_base64` and refuses `bundle_upload`.
+
 ### Call the tool
 
 Pass the bundle, the environment name, and the mapping as `canister_ids`:
@@ -113,9 +134,10 @@ Pass the bundle, the environment name, and the mapping as `canister_ids`:
 }
 ```
 
-- `bundle_path` must be absolute. When the server cannot read your
-  filesystem, send the archive inline as `bundle_base64` instead; exactly one
-  of the two is accepted.
+- `bundle_path` must be absolute. On a server that cannot read your
+  filesystem, pass `bundle_upload` from the upload above instead (or, for a
+  client that can attach the bytes itself, `bundle_base64`); exactly one of
+  the three is accepted.
 - `environment` is the name as the manifest declares it, `ic` for a default
   project.
 - `canister_ids` is the file's content. Omit it, or send `{}`, on a first
@@ -195,19 +217,21 @@ interchangeably for that environment.
 6. **Expecting the server to keep state.** It keeps nothing between calls:
    no bundle, no mapping. The project's mapping file is the record. The one
    exception is the working directory of a call that never returned, see 8.
-7. **Deploying twice at once.** One deploy runs at a time on this server; a
-   second call while one runs is refused, not queued. Wait for the answer,
-   do step 3, then deploy again from the updated mapping.
+7. **Deploying twice at once.** One deploy runs at a time per session, and
+   a server caps how many run at once in all; a call past either is refused,
+   not queued. Wait for the answer, do step 3, then deploy again from the
+   updated mapping; past the server's cap, wait and try again.
 8. **A call that never returned.** Cancelling the call, or losing the
    connection, interrupts the deploy at its next step; a canister call
    already in flight completes on the network. If the server stopped
    mid-deploy, or you cancelled and never read the answer, the canisters it
-   created are not lost: the deploy's working directory is kept under the
-   user's local data directory
+   created are not lost: the deploy's working directory is kept — on the
+   local server under the user's local data directory
    (`~/.local/share/imcp2-local/deploys/` on Linux,
    `~/Library/Application Support/imcp2-local/deploys/` on macOS,
-   `%LOCALAPPDATA%\imcp2-local\deploys\` on Windows), and its
-   `.icp/data/mappings/<environment>.ids.json` records every canister the
-   deploy had created. Do step 3 with that file's contents, delete the
-   directory, and only then deploy again; otherwise the retry creates a
-   second set.
+   `%LOCALAPPDATA%\imcp2-local\deploys\` on Windows; on a hosted server
+   under its state directory, where its operators can read it for the
+   user), and its `.icp/data/mappings/<environment>.ids.json` records every
+   canister the deploy had created. Do step 3 with that file's contents,
+   delete the directory, and only then deploy again; otherwise the retry
+   creates a second set.

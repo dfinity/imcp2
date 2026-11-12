@@ -183,6 +183,16 @@ The deploy sets `MCP_SERVE_BETA=1` for the `staging` environment (via
 beta Internet Identity instance at `/mcp-beta` alongside the production `/mcp`; a
 binary run without it serves `/mcp` (production II) alone.
 
+The binary is built with the `deploy` feature (`build.sh`), so the MCP endpoint
+also serves the deploy tools (see the repository README, "Deploying a project
+bundle"): deploy directories and uploaded bundles go under the unit's state
+directory (`/var/lib/imcp2/deploys`), `MCP_DEPLOY_MAX_CONCURRENT` (default 2) caps
+the deploys running at once and `MCP_DEPLOY_MAX_UPLOAD_BYTES` (default 64 MiB) an
+uploaded archive. Caddy's `read_body 30s` applies to the upload `PUT` too: an
+archive at the cap needs roughly 2 MB/s upstream to arrive in time, and the
+timeout is the knob to raise if that bites, since the app's own caps are what
+bound memory and disk.
+
 The `staging` environment also sets `SERVE_STATUS=1`. `deploy.sh` then keeps the
 Caddyfile's `/status/` block (between its `__STATUS_BEGIN__`/`__STATUS_END__` markers),
 so the status dashboard is published at `https://<staging domain>/status/`; without it

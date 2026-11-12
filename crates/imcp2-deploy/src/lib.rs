@@ -25,17 +25,27 @@
 //! controlled by the principal here, and reaching it through the lifecycle
 //! tools means adding their principal as a controller first.
 //!
-//! One deploy runs at a time on a server: two at once for the same project,
+//! One deploy runs at a time per session: two at once for the same project,
 //! each with the mapping as it was before either, would create two sets of
 //! canisters. The second call is refused, not queued, since its mapping would
-//! be stale by the time it ran. And a deploy's working directory is kept
-//! under the directory the embedder names until the outcome is assembled,
-//! so a call cut off mid-deploy leaves the ids it created on disk.
+//! be stale by the time it ran. A server also caps how many deploys run at
+//! once across every session ([`IcDeployTools::concurrent`]; one, unless it
+//! says otherwise), and refuses rather than queues past the cap. A deploy's
+//! working directory is kept under the directory the embedder names until the
+//! outcome is assembled, so a call cut off mid-deploy leaves the ids it
+//! created on disk.
 //!
-//! This crate is composed into the local server only. It depends on
-//! `icp-project` straight from the icp-cli repository, which crates.io does
-//! not allow, so it cannot be part of the published `imcp2-core`/`imcp2`
-//! crates (see `Cargo.toml`).
+//! A deploy lasts as long as it lasts: the call reports each phase to the
+//! client as it completes and is interrupted by the client cancelling the
+//! request or, on the hosted server, going away ([`ClientGone`]). Where the
+//! agent cannot hand the server a file — the hosted server — the bundle
+//! arrives through an upload ticket ([`Uploads`], `icp_deploy_upload`).
+//!
+//! The crate is composed into the local server, and into the hosted one
+//! behind its `deploy` feature ([`WithDeploy`] is the handler both mount).
+//! It depends on `icp-project` straight from the icp-cli repository, which
+//! crates.io does not allow, so the published `imcp2` crate cannot carry the
+//! feature until the icp CLI's crates are published (see `Cargo.toml`).
 //!
 //! The bundle is untrusted input, and the rule it is held to is the
 //! library's own: `icp_project::untrusted`, the one `icp --untrusted`
@@ -44,7 +54,10 @@
 //! the rule as the CLI does, and adds the bounds on the archive itself and the
 //! checks on the bundle's shape (see [`host`]).
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::{Arc, Mutex},
+};
 
 use base64::Engine;
 use camino::Utf8PathBuf;
@@ -61,16 +74,36 @@ use rmcp::{
     tool, tool_router, ErrorData as McpError, RoleServer,
 };
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 mod calls;
 mod deploy;
 mod host;
 mod identity;
+mod server;
+mod uploads;
 
 pub use deploy::{
     deploy_bundle, BundleSource, DeployOutcome, DeployRequest, RequestError, Status, Watch,
 };
 use identity::RefreshingIdentity;
+pub use server::WithDeploy;
+pub use uploads::{
+    ReceiveError, Received, Uploads, DEFAULT_MAX_UPLOAD_BYTES, TICKET_HEADER, TICKET_TTL,
+    UPLOAD_TTL,
+};
+
+/// The name of the upload-ticket tool, listed only by a server with an
+/// upload store (see [`IcDeployTools::with_uploads`]).
+pub const UPLOAD_TOOL: &str = "icp_deploy_upload";
+
+/// A transport's word that the client of a request has gone: a token it
+/// cancels when the connection carrying the request's response is dropped,
+/// left in the HTTP request's extensions (which rmcp hands the tool as the
+/// request parts). A deploy stops when it fires, since nobody would read
+/// the answer.
+#[derive(Clone, Debug)]
+pub struct ClientGone(pub CancellationToken);
 
 /// The icp CLI's default funding for a canister it creates (`icp deploy
 /// --cycles`): 2 trillion cycles.
@@ -109,6 +142,11 @@ pub struct DeployBundleArgs {
     /// `bundle_path`, not both.
     #[serde(default)]
     pub bundle_base64: Option<String>,
+    /// The upload id the curl command from `icp_deploy_upload` printed: the
+    /// archive as this server received it. Only on a server that lists
+    /// `icp_deploy_upload`; exactly one of the three bundle arguments.
+    #[serde(default)]
+    pub bundle_upload: Option<String>,
     /// The environment to deploy, by name, among those the bundle's manifest
     /// declares — `ic` for a bundle built with the default settings. It must
     /// be on the `ic` network: this tool deploys to the Internet Computer only.
@@ -251,12 +289,29 @@ const MAX_BUNDLE_BASE64_CHARS: usize = host::MAX_BUNDLE_BYTES.div_ceil(3) * 4;
 
 /// Turn the tool's arguments into a request, rejecting what cannot be deployed
 /// before anything is read or written.
-pub fn request_from_args(args: DeployBundleArgs) -> Result<DeployRequest, String> {
-    let bundle = match (args.bundle_path, args.bundle_base64) {
+pub fn request_from_args(mut args: DeployBundleArgs) -> Result<DeployRequest, String> {
+    let given =
+        [args.bundle_path.is_some(), args.bundle_base64.is_some(), args.bundle_upload.is_some()]
+            .iter()
+            .filter(|g| **g)
+            .count();
+    if given > 1 {
+        return Err("pass one of bundle_path, bundle_base64 or bundle_upload, not several".into());
+    }
+    if let Some(id) = args.bundle_upload.take() {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err("bundle_upload is empty; pass the upload id the upload printed".into());
+        }
+        return finish_request(args, BundleSource::Upload(id.to_string()));
+    }
+    let bundle = match (args.bundle_path.take(), args.bundle_base64.take()) {
         (Some(_), Some(_)) => {
             return Err("pass either bundle_path or bundle_base64, not both".into())
         }
-        (None, None) => return Err("pass the bundle as bundle_path or bundle_base64".into()),
+        (None, None) => {
+            return Err("pass the bundle as bundle_path, bundle_base64 or bundle_upload".into())
+        }
         (Some(path), None) => {
             let path = Utf8PathBuf::from(path.trim());
             if path.as_str().is_empty() {
@@ -293,6 +348,11 @@ pub fn request_from_args(args: DeployBundleArgs) -> Result<DeployRequest, String
             BundleSource::Bytes(bytes)
         }
     };
+    finish_request(args, bundle)
+}
+
+/// The rest of [`request_from_args`], once the bundle source is settled.
+fn finish_request(args: DeployBundleArgs, bundle: BundleSource) -> Result<DeployRequest, String> {
     let environment = args.environment.trim().to_string();
     if environment.is_empty() {
         return Err("environment must name an environment of the bundle, e.g. \"ic\"".into());
@@ -344,15 +404,59 @@ pub struct IcDeployTools {
     /// The authentication seam (see [`SessionResolver`]): asks the embedding
     /// binary which already-validated session this call acts as.
     session: SessionResolver,
-    /// Held for the length of a deploy; a second deploy finds it taken.
-    running: Arc<tokio::sync::Mutex<()>>,
+    /// The deploys running: one slot per deploy the server allows at once,
+    /// and the sessions holding one.
+    slots: Slots,
     /// Where each deploy's working directory is made; see
     /// [`DeployRequest::workdir`].
     deploys_dir: Option<Utf8PathBuf>,
+    /// Where uploaded bundles are received, and the URL a `PUT` goes to,
+    /// on a server the agent cannot hand a file to.
+    uploads: Option<(Uploads, String)>,
 }
 
-/// A running deploy's claim on the server: dropped when the deploy returns.
-pub type DeployClaim = tokio::sync::OwnedMutexGuard<()>;
+/// How many deploys a server runs at once, and for whom.
+#[derive(Clone)]
+struct Slots {
+    /// One permit per deploy the server runs at once.
+    free: Arc<tokio::sync::Semaphore>,
+    /// How many there are in all, for the instructions.
+    total: usize,
+    /// The sessions with a deploy running: one each.
+    sessions: Arc<Mutex<HashSet<String>>>,
+}
+
+/// A running deploy's claim on the server: a slot, and the session's one
+/// deploy. Both are released when it drops, that is, when the deploy returns.
+pub struct DeployClaim {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    session: Option<String>,
+    sessions: Arc<Mutex<HashSet<String>>>,
+}
+
+impl DeployClaim {
+    /// Make the claim the session's: refused if the session already has a
+    /// deploy running.
+    fn for_session(&mut self, sid: &str) -> Result<(), String> {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if !sessions.insert(sid.to_string()) {
+            return Err("a deploy is already running for this session; wait for it to finish, \
+                        write the mapping it returns into the project, and deploy again from \
+                        that"
+                .into());
+        }
+        self.session = Some(sid.to_string());
+        Ok(())
+    }
+}
+
+impl Drop for DeployClaim {
+    fn drop(&mut self) {
+        if let Some(sid) = self.session.take() {
+            self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&sid);
+        }
+    }
+}
 
 /// The derivation origin of the identity the deploy tools act as: the one the
 /// icp CLI's `icp identity link web` (with no `--app`) signs in at. Internet
@@ -364,7 +468,46 @@ pub const CLI_ORIGIN: &str = "https://cli.id.ai";
 #[tool_router(vis = "pub")]
 impl IcDeployTools {
     pub fn new(identities: Identities, session: SessionResolver) -> Self {
-        Self { identities, session, running: Arc::default(), deploys_dir: None }
+        Self {
+            identities,
+            session,
+            slots: Slots {
+                free: Arc::new(tokio::sync::Semaphore::new(1)),
+                total: 1,
+                sessions: Arc::default(),
+            },
+            deploys_dir: None,
+            uploads: None,
+        }
+    }
+
+    /// Run up to `n` deploys at once across sessions (one per session either
+    /// way); the default is one. Past the cap a deploy is refused, not
+    /// queued. `n` is at least one.
+    pub fn concurrent(mut self, n: usize) -> Self {
+        let n = n.max(1);
+        self.slots.free = Arc::new(tokio::sync::Semaphore::new(n));
+        self.slots.total = n;
+        self
+    }
+
+    /// How many deploys this server runs at once.
+    pub fn concurrency(&self) -> usize {
+        self.slots.total
+    }
+
+    /// Serve `icp_deploy_upload` on `uploads`, with `upload_url` the absolute
+    /// URL the agent `PUT`s an archive to (the server mounts the route; see
+    /// [`Uploads`]). Without this, the tool is not listed and `bundle_upload`
+    /// is refused.
+    pub fn with_uploads(mut self, uploads: Uploads, upload_url: String) -> Self {
+        self.uploads = Some((uploads, upload_url));
+        self
+    }
+
+    /// Whether this server receives uploaded bundles.
+    pub fn has_uploads(&self) -> bool {
+        self.uploads.is_some()
     }
 
     /// Make each deploy's working directory under `dir` (made on first use)
@@ -377,9 +520,10 @@ impl IcDeployTools {
         Ok(self)
     }
 
-    /// Claim the server for a deploy, or `None` while another holds it.
+    /// Claim a slot for a deploy, or `None` while every slot is held.
     pub fn claim(&self) -> Option<DeployClaim> {
-        self.running.clone().try_lock_owned().ok()
+        let permit = self.slots.free.clone().try_acquire_owned().ok()?;
+        Some(DeployClaim { _permit: permit, session: None, sessions: self.slots.sessions.clone() })
     }
 
     /// The session's identity at [`CLI_ORIGIN`]: its default account there,
@@ -399,20 +543,30 @@ impl IcDeployTools {
         Parameters(args): Parameters<DeployBundleArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        // One deploy at a time, and the refusal reads nothing: it comes even
-        // before who is asking.
-        let Some(_claim) = self.claim() else {
-            return Ok(err("a deploy is already running on this server; wait for it to \
-                           finish, write the mapping it returns into the project, and \
-                           deploy again from that"
-                .into()));
+        // So many deploys at a time, and the refusal reads nothing: it comes
+        // even before who is asking.
+        let Some(mut claim) = self.claim() else {
+            return Ok(err(if self.concurrency() == 1 {
+                "a deploy is already running on this server; wait for it to finish, write \
+                 the mapping it returns into the project, and deploy again from that"
+                    .into()
+            } else {
+                format!(
+                    "this server is running its {} deploys at once already; wait and try again",
+                    self.concurrency()
+                )
+            }));
         };
         // Who is asking comes before what they sent: an inline bundle is
-        // decoded only for a session allowed to deploy.
+        // decoded only for a session allowed to deploy, and one deploy per
+        // session.
         let Some(sid) = (self.session)(&ctx) else {
             return Ok(err("deploying a bundle needs an authenticated session".into()));
         };
         if let Err(e) = self.identities.require_write(&sid).await {
+            return Ok(err(e));
+        }
+        if let Err(e) = claim.for_session(&sid) {
             return Ok(err(e));
         }
         let mut request = match request_from_args(args) {
@@ -420,6 +574,32 @@ impl IcDeployTools {
             Err(e) => return Ok(err(e)),
         };
         request.workdir = self.deploys_dir.clone();
+        // An uploaded bundle is the session's own, and the file goes with
+        // the handle once the deploy has returned.
+        let _upload = match request.bundle {
+            BundleSource::Upload(ref id) => {
+                let Some((uploads, _)) = &self.uploads else {
+                    return Ok(err("this server takes no uploads; pass the bundle as \
+                                   bundle_path or bundle_base64"
+                        .into()));
+                };
+                let Some(taken) = uploads.take(id, &sid).await else {
+                    return Ok(err(format!(
+                        "no upload '{id}' for this session: it may have expired ({} minutes \
+                         after the upload) or been deployed already; call {UPLOAD_TOOL} and \
+                         upload the archive again",
+                        UPLOAD_TTL.as_secs() / 60
+                    )));
+                };
+                let path = match Utf8PathBuf::from_path_buf(taken.path().to_path_buf()) {
+                    Ok(p) => p,
+                    Err(p) => return Ok(err(format!("upload path is not UTF-8: {}", p.display()))),
+                };
+                request.bundle = BundleSource::Path(path);
+                Some(taken)
+            }
+            _ => None,
+        };
         // A per-app delegation lives five minutes and a deploy can outlast
         // it (an asset sync, several installs), so the identity the agent
         // signs with is kept fresh for as long as the deploy runs.
@@ -433,7 +613,11 @@ impl IcDeployTools {
         let (lines, receiver) = tokio::sync::mpsc::unbounded_channel();
         let forwarder =
             tokio::spawn(forward_lines(ctx.peer.clone(), ctx.meta.get_progress_token(), receiver));
-        let watch = Watch { stop: ctx.ct.child_token(), lines: Some(lines) };
+        // The stop: the client cancelling the request, or (on a server that
+        // says so) going away.
+        let stop = ctx.ct.child_token();
+        let _link = link_client_gone(&ctx, stop.clone());
+        let watch = Watch { stop, lines: Some(lines) };
         let result = deploy_bundle(identity, request, watch).await;
         // The sender went with the run; the forwarder ends once it has
         // delivered what is left.
@@ -496,6 +680,94 @@ impl IcDeployTools {
         let output = DeployGuideOutput { content: DEPLOY_SKILL_MD.to_string() };
         Ok(ok_structured(output.content.clone(), &output))
     }
+
+    #[tool(
+        name = "icp_deploy_upload",
+        description = "Get a one-time ticket to upload a bundle archive to this server, for icp_deploy_bundle to deploy: this server runs elsewhere than the project, so the archive `icp project bundle` wrote cannot be read by path. Returns the upload URL, the ticket, and the exact curl command to run; the command prints a JSON answer whose `upload_id` is what to pass to icp_deploy_bundle as `bundle_upload`. The ticket is good for a few minutes and one upload, and the upload for a quarter of an hour; ask for a new ticket after either lapses.",
+        annotations(title = "Get a bundle upload ticket", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<UploadTicketOutput>(),
+    )]
+    async fn icp_deploy_upload(
+        &self,
+        Parameters(_args): Parameters<NoArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some((uploads, url)) = &self.uploads else {
+            return Ok(err("this server takes no uploads; pass the bundle as bundle_path or \
+                           bundle_base64"
+                .into()));
+        };
+        // A ticket is for a session that could deploy what it uploads.
+        let Some(sid) = (self.session)(&ctx) else {
+            return Ok(err("uploading a bundle needs an authenticated session".into()));
+        };
+        if let Err(e) = self.identities.require_write(&sid).await {
+            return Ok(err(e));
+        }
+        let minted = uploads.mint(&sid).await;
+        let output = UploadTicketOutput {
+            curl: format!(
+                "curl -fsS -T <bundle.tar.gz> -H '{TICKET_HEADER}: {}' '{url}'",
+                minted.ticket
+            ),
+            upload_url: url.clone(),
+            ticket: minted.ticket,
+            header: TICKET_HEADER.into(),
+            expires_in_secs: minted.expires_in.as_secs(),
+            max_bytes: uploads.max_bytes(),
+        };
+        let text = format!(
+            "Upload the bundle within {} minutes by running, with the archive's path in place of \
+             <bundle.tar.gz>:\n\n{}\n\nThe command prints a JSON answer; pass its `upload_id` to \
+             icp_deploy_bundle as `bundle_upload` within {} minutes. The archive may be at most \
+             {} bytes. The ticket is good for one upload.",
+            output.expires_in_secs / 60,
+            output.curl,
+            UPLOAD_TTL.as_secs() / 60,
+            output.max_bytes
+        );
+        Ok(ok_structured(text, &output))
+    }
+}
+
+/// Tie `stop` to the transport's [`ClientGone`] token when the request carries
+/// one, for as long as the returned guard lives: the deploy stops when the
+/// client goes, and the tie is undone when the deploy returns.
+fn link_client_gone(
+    ctx: &RequestContext<RoleServer>,
+    stop: CancellationToken,
+) -> Option<tokio_util::sync::DropGuard> {
+    let gone = ctx
+        .extensions
+        .get::<http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<ClientGone>())
+        .map(|g| g.0.clone())?;
+    let done = CancellationToken::new();
+    let watched = done.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = gone.cancelled() => stop.cancel(),
+            _ = watched.cancelled() => {}
+        }
+    });
+    Some(done.drop_guard())
+}
+
+/// What `icp_deploy_upload` returns.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct UploadTicketOutput {
+    /// The absolute URL to `PUT` the archive to.
+    pub upload_url: String,
+    /// The one-time ticket, sent in the request header named by `header`.
+    pub ticket: String,
+    /// The request header the ticket goes in.
+    pub header: String,
+    /// Seconds the ticket is good for.
+    pub expires_in_secs: u64,
+    /// The most bytes the archive may have.
+    pub max_bytes: usize,
+    /// The command to run, with the archive's path in place of `<bundle.tar.gz>`.
+    pub curl: String,
 }
 
 /// Deliver each log line of a running deploy to the client as it is made: as
@@ -635,7 +907,9 @@ mod tests {
     #[test]
     fn the_router_carries_the_deploy_tool_the_balance_check_and_the_guide() {
         let tools = IcDeployTools::tool_router().list_all();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
+        let upload = tools.iter().find(|t| &*t.name == UPLOAD_TOOL).expect("upload ticket tool");
+        assert_eq!(upload.annotations.clone().expect("annotations").destructive_hint, Some(false));
         let guide = tools.iter().find(|t| &*t.name == "icp_deploy_guide").expect("guide");
         let ann = guide.annotations.clone().expect("annotations");
         assert_eq!(ann.read_only_hint, Some(true));
@@ -677,9 +951,18 @@ mod tests {
         let both = args(serde_json::json!({
             "bundle_path": "/tmp/b.tar.gz", "bundle_base64": "AAAA", "environment": "ic"
         }));
-        assert!(request_from_args(both).unwrap_err().contains("not both"));
+        assert!(request_from_args(both).unwrap_err().contains("not several"));
+        let three = args(serde_json::json!({
+            "bundle_path": "/tmp/b.tar.gz", "bundle_upload": "abc", "environment": "ic"
+        }));
+        assert!(request_from_args(three).unwrap_err().contains("not several"));
         let neither = args(serde_json::json!({ "environment": "ic" }));
-        assert!(request_from_args(neither).unwrap_err().contains("bundle_path or bundle_base64"));
+        assert!(request_from_args(neither).unwrap_err().contains("bundle_upload"));
+        let upload = args(serde_json::json!({ "bundle_upload": " abc ", "environment": "ic" }));
+        let request = request_from_args(upload).unwrap();
+        assert!(matches!(request.bundle, BundleSource::Upload(ref id) if id == "abc"));
+        let empty = args(serde_json::json!({ "bundle_upload": " ", "environment": "ic" }));
+        assert!(request_from_args(empty).unwrap_err().contains("empty"));
         let bad = args(serde_json::json!({ "bundle_base64": "***", "environment": "ic" }));
         assert!(request_from_args(bad).unwrap_err().contains("base64"));
     }

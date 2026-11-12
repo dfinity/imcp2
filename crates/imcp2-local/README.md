@@ -212,10 +212,12 @@ rather than creates. Not every client reads resources, so `icp_deploy_guide`
 returns the same document as a tool result. It lives at
 `crates/imcp2-deploy/static/skills/deploy-with-mcp.md`.
 
-Why only here: the tool is built on `icp-project`, a crate the icp CLI does not
-publish, so it is pulled from git — which the crates.io-published `imcp2-core`
-and `imcp2` cannot do. It lives in its own `imcp2-deploy` crate, composed into
-this binary alone.
+The tool is built on `icp-project`, a crate the icp CLI does not publish, so
+it is pulled from git — which the crates.io-published `imcp2-core` and `imcp2`
+cannot do. It lives in its own `imcp2-deploy` crate, composed into this binary
+and, behind the `deploy` feature, into the hosted server (see the repository
+README), where the bundle arrives through an upload ticket since that server
+cannot read the user's files.
 
 ## Upgrading
 
