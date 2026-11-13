@@ -8,7 +8,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use candid::types::internal::TypeContainer;
 use candid::types::subtype::equal;
-use candid::types::{FuncMode, Type, TypeInner};
+use candid::types::{Type, TypeInner};
 use candid::{CandidType, TypeEnv};
 use candid_parser::utils::CandidSource;
 
@@ -47,20 +47,24 @@ fn named_types() -> Vec<(&'static str, Check)> {
         ("Config", assert_equal::<Config>),
         ("ConfigPatch", assert_equal::<ConfigPatch>),
         ("InstallArg", assert_equal::<InstallArg>),
-        ("ErrorInfo", assert_equal::<ErrorInfo>),
+        ("CommonErrorCase", assert_equal::<CommonErrorCase>),
         ("CommonError", assert_equal::<CommonError>),
         ("SessionRecord", assert_equal::<SessionRecord>),
         ("Tombstone", assert_equal::<Tombstone>),
         ("Change", assert_equal::<Change>),
         ("Lookup", assert_equal::<Lookup>),
         ("PutSessionArg", assert_equal::<PutSessionArg>),
+        ("PutSessionErrorCase", assert_equal::<PutSessionErrorCase>),
         ("PutSessionError", assert_equal::<PutSessionError>),
         ("PutSessionResult", assert_equal::<PutSessionResult>),
         ("ConsumeCodeArg", assert_equal::<ConsumeCodeArg>),
+        ("ConsumeCodeErrorCase", assert_equal::<ConsumeCodeErrorCase>),
         ("ConsumeCodeError", assert_equal::<ConsumeCodeError>),
         ("ConsumeCodeResult", assert_equal::<ConsumeCodeResult>),
         ("Touch", assert_equal::<Touch>),
+        ("TouchSessionsArg", assert_equal::<TouchSessionsArg>),
         ("TouchResult", assert_equal::<TouchResult>),
+        ("GetSessionsArg", assert_equal::<GetSessionsArg>),
         ("GetSessionsResult", assert_equal::<GetSessionsResult>),
         ("ListChangesArg", assert_equal::<ListChangesArg>),
         ("ChangesPage", assert_equal::<ChangesPage>),
@@ -68,6 +72,9 @@ fn named_types() -> Vec<(&'static str, Check)> {
         ("KeyCheck", assert_equal::<KeyCheck>),
         ("KeyChecks", assert_equal::<KeyChecks>),
         ("KeyChecksResult", assert_equal::<KeyChecksResult>),
+        ("GetKeyChecksArg", assert_equal::<GetKeyChecksArg>),
+        ("SetKeyCheckArg", assert_equal::<SetKeyCheckArg>),
+        ("RetireKidArg", assert_equal::<RetireKidArg>),
         ("PurgeFilter", assert_equal::<PurgeFilter>),
         ("PurgeJob", assert_equal::<PurgeJob>),
         ("PurgeJobResult", assert_equal::<PurgeJobResult>),
@@ -75,6 +82,7 @@ fn named_types() -> Vec<(&'static str, Check)> {
         ("CallerStats", assert_equal::<CallerStats>),
         ("Counters", assert_equal::<Counters>),
         ("Status", assert_equal::<Status>),
+        ("GetStatusArg", assert_equal::<GetStatusArg>),
         ("StatusResult", assert_equal::<StatusResult>),
         ("ConfigResult", assert_equal::<ConfigResult>),
     ]
@@ -94,104 +102,17 @@ fn every_did_type_has_an_equal_rust_type() {
     }
 }
 
-/// One method of the service: its Rust argument and reply types, and whether it
-/// is a query.
-struct Method {
-    name: &'static str,
-    args: Vec<Check>,
-    rets: Vec<Check>,
-    query: bool,
-}
-
-fn methods() -> Vec<Method> {
-    fn update(name: &'static str, args: Vec<Check>, ret: Check) -> Method {
-        Method { name, args, rets: vec![ret], query: false }
-    }
-    fn query(name: &'static str, args: Vec<Check>, ret: Check) -> Method {
-        Method { name, args, rets: vec![ret], query: true }
-    }
-    vec![
-        update(
-            method::PUT_SESSION,
-            vec![assert_equal::<PutSessionArg>],
-            assert_equal::<PutSessionResult>,
-        ),
-        update(
-            method::CONSUME_CODE,
-            vec![assert_equal::<ConsumeCodeArg>],
-            assert_equal::<ConsumeCodeResult>,
-        ),
-        update(
-            method::TOUCH_SESSIONS,
-            vec![assert_equal::<Vec<Touch>>],
-            assert_equal::<TouchResult>,
-        ),
-        query(
-            method::GET_SESSIONS,
-            vec![assert_equal::<Vec<Key>>],
-            assert_equal::<GetSessionsResult>,
-        ),
-        query(
-            method::LIST_CHANGES,
-            vec![assert_equal::<ListChangesArg>],
-            assert_equal::<ListChangesResult>,
-        ),
-        query(method::GET_KEY_CHECKS, vec![], assert_equal::<KeyChecksResult>),
-        query(method::GET_STATUS, vec![], assert_equal::<StatusResult>),
-        update(
-            method::ADMIN_UPDATE_CONFIG,
-            vec![assert_equal::<ConfigPatch>],
-            assert_equal::<ConfigResult>,
-        ),
-        update(
-            method::ADMIN_SET_KEY_CHECK,
-            vec![assert_equal::<KeyCheck>, assert_equal::<bool>],
-            assert_equal::<KeyChecksResult>,
-        ),
-        update(method::ADMIN_RETIRE_KID, vec![assert_equal::<u8>], assert_equal::<KeyChecksResult>),
-        update(
-            method::ADMIN_PURGE_SESSIONS,
-            vec![assert_equal::<PurgeFilter>],
-            assert_equal::<PurgeJobResult>,
-        ),
-    ]
-}
-
+/// The install argument. The methods themselves are checked where they are
+/// implemented: the canister compares the interface it exports
+/// (`candid::export_service!`) with this `.did`.
 #[test]
-fn method_constants_name_exactly_the_service_methods() {
+fn the_install_argument_matches_the_rust_type() {
     let (env, actor) = did();
-    let in_did: Vec<&str> =
-        env.as_service(&actor).expect("a service").iter().map(|(name, _)| name.as_str()).collect();
-    let in_did_set: BTreeSet<&str> = in_did.iter().copied().collect();
-    let in_rust: BTreeSet<&str> = method::ALL.iter().copied().collect();
-    assert_eq!(in_rust.len(), method::ALL.len(), "method::ALL lists a method twice");
-    assert_eq!(in_did_set, in_rust);
-    let described: Vec<&str> = methods().iter().map(|m| m.name).collect();
-    assert_eq!(described, method::ALL, "the signature table below covers every method");
-}
-
-#[test]
-fn every_method_signature_matches_the_rust_types() {
-    let (env, actor) = did();
-    let TypeInner::Class(init, service) = actor.as_ref() else {
+    let TypeInner::Class(init, _) = actor.as_ref() else {
         panic!("the service takes an install argument: {actor}");
     };
     assert_eq!(init.len(), 1, "one install argument");
     assert_equal::<InstallArg>(&env, &init[0], "install argument");
-
-    for m in methods() {
-        let func = env.get_method(service, m.name).expect("listed in the .did");
-        assert_eq!(func.args.len(), m.args.len(), "{}: argument count", m.name);
-        for (i, (ty, check)) in func.args.iter().zip(&m.args).enumerate() {
-            check(&env, ty, &format!("{} argument {i}", m.name));
-        }
-        assert_eq!(func.rets.len(), m.rets.len(), "{}: reply count", m.name);
-        for (i, (ty, check)) in func.rets.iter().zip(&m.rets).enumerate() {
-            check(&env, ty, &format!("{} reply {i}", m.name));
-        }
-        let modes: &[FuncMode] = if m.query { &[FuncMode::Query] } else { &[] };
-        assert_eq!(func.modes, modes, "{}: query or update", m.name);
-    }
 }
 
 /// The checks above must be able to fail: a Rust type with one field renamed is
@@ -252,10 +173,10 @@ fn a_misspelled_or_missing_purge_field_is_refused() {
         "(record {})".to_string(),
     ];
     for text in &refused {
-        assert!(as_dfx_sends(method::ADMIN_PURGE_SESSIONS, text).is_err(), "sent: {text}");
+        assert!(as_dfx_sends("admin_purge_sessions", text).is_err(), "sent: {text}");
     }
 
-    let sent = as_dfx_sends(method::ADMIN_PURGE_SESSIONS, &full(&ns, "variant { Is = 3 }"))
+    let sent = as_dfx_sends("admin_purge_sessions", &full(&ns, "variant { Is = 3 }"))
         .expect("a full filter type-checks");
     let filter = Decode!(&sent, PurgeFilter).expect("decodes");
     assert_eq!(
@@ -267,6 +188,6 @@ fn a_misspelled_or_missing_purge_field_is_refused() {
         }
     );
     let everything =
-        as_dfx_sends(method::ADMIN_PURGE_SESSIONS, &full(any, any)).expect("all Any type-checks");
+        as_dfx_sends("admin_purge_sessions", &full(any, any)).expect("all Any type-checks");
     assert_eq!(Decode!(&everything, PurgeFilter).unwrap(), PurgeFilter::default());
 }

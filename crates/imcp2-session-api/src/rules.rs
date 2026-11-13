@@ -1,12 +1,23 @@
 //! The rules the canister and the backends both evaluate.
 //!
+//! **Terms.** A *backend* is an imcp2 process serving MCP clients. While it
+//! serves a session's requests it sends the canister **activity reports**: a
+//! [`Touch`](crate::Touch) through `touch_sessions`, saying the session was in
+//! use at a given time. The canister keeps the latest as the record's
+//! `last_active_at`; its **idle purge** removes a session whose last reported
+//! activity is older than the idle timeout (plus margins), and **eviction**
+//! makes room in a full store by removing a session whose reported activity
+//! shows it unused. Reports are batched and sent coarsely, so `last_active_at`
+//! lags real activity; the rules below add that lag back wherever it matters.
+//!
 //! They live here, as pure functions of plain numbers, so the two sides cannot
 //! drift: the canister purges and evicts by them, and the backends decide by the
-//! same arithmetic whether a touch could ever matter. All arithmetic saturates,
-//! and every saturation in a deadline or an eviction decision errs on the side
-//! of keeping a session (a later deadline, no eviction). The one exception,
-//! [`idle_purge_cutoff`], is only meaningful once [`idle_purge_enabled`] holds,
-//! which rules its saturation out.
+//! same arithmetic when an activity report is worth sending. Every time is in
+//! seconds of IC time. All arithmetic saturates, and every saturation in a
+//! deadline or an eviction decision errs on the side of keeping a session (a
+//! later deadline, no eviction). The one exception, [`idle_purge_cutoff`], is
+//! only meaningful once [`idle_purge_enabled`] holds, which rules its saturation
+//! out.
 
 use crate::constants::{
     CLOCK_SKEW, IDLE_SLACK, KEY_LEN, MAX_GRANT, MAX_TOUCH_GRANULARITY, MIN_EVICT_IDLE,
@@ -21,14 +32,14 @@ const fn max(a: u64, b: u64) -> u64 {
     }
 }
 
-/// How coarsely a session's activity is reported under idle timeout
-/// `idle_timeout_secs`: `clamp(idle / 48, 5 min, 6 h)`.
+/// Returns the **touch granularity** for idle timeout `idle_timeout_secs`, in
+/// seconds: how far a session's activity must advance before a backend reports
+/// it again, `clamp(idle / 48, 5 min, 6 h)`.
 ///
-/// A backend reports a session's activity (`touch_sessions`) only once it has
-/// advanced by at least this much since the last report, so `last_active_at` in
-/// the canister may lag real activity by up to this (plus a flush). The idle
-/// deadline adds it back, so lagging reports never purge an active session;
-/// 1/48 of the timeout keeps that margin around 2% of it.
+/// Because a backend reports only that coarsely, the `last_active_at` the
+/// canister holds may lag real activity by up to this much (plus a flush). The
+/// idle deadline adds it back, so lagging reports never purge an active
+/// session; 1/48 of the timeout keeps that margin around 2% of it.
 pub const fn touch_granularity(idle_timeout_secs: u64) -> u64 {
     let g = idle_timeout_secs / 48;
     if g < MIN_TOUCH_GRANULARITY {
@@ -40,30 +51,31 @@ pub const fn touch_granularity(idle_timeout_secs: u64) -> u64 {
     }
 }
 
-/// `idle + touch_granularity(idle) + IDLE_SLACK`: how long after its last
-/// trustworthy activity a session is idle.
+/// Returns the idle span in seconds, `idle + touch_granularity(idle) +
+/// IDLE_SLACK`: how long after its last trustworthy activity a session is idle.
 const fn idle_span(idle_timeout_secs: u64) -> u64 {
     idle_timeout_secs
         .saturating_add(touch_granularity(idle_timeout_secs))
         .saturating_add(IDLE_SLACK)
 }
 
-/// When a session becomes idle:
-/// `max(last_active_at, idle_floor_at) + idle + touch_granularity(idle) + IDLE_SLACK`.
+/// Returns the time (seconds of IC time) at which a session becomes idle:
+/// `max(last_active_at, idle_floor_at) + idle + touch_granularity(idle) +
+/// IDLE_SLACK`.
 ///
 /// `idle_floor_at` is the canister's floor under every `last_active_at`. It is
 /// raised to `now` when the idle timeout is lowered (sessions were not being
-/// touched under the longer timeout, so their `last_active_at` is stale) and when
-/// a snapshot load is detected (activity after the snapshot was lost). Measuring
-/// from the floor gives every session a full timeout from that moment on, so
-/// neither event can log out an active user.
+/// reported under the longer timeout, so their `last_active_at` is stale) and
+/// when a snapshot load is detected (activity after the snapshot was lost).
+/// Measuring from the floor gives every session a full timeout from that moment
+/// on, so neither event can log out an active user.
 pub const fn idle_deadline(last_active_at: u64, idle_floor_at: u64, idle_timeout_secs: u64) -> u64 {
     max(last_active_at, idle_floor_at).saturating_add(idle_span(idle_timeout_secs))
 }
 
-/// Whether the idle purge may run at all: `now >= idle_floor_at + idle +
-/// touch_granularity(idle) + IDLE_SLACK`, i.e. a full idle span has passed since
-/// the floor was last raised.
+/// Returns whether the canister's idle purge may run at all at `now`: `now >=
+/// idle_floor_at + idle + touch_granularity(idle) + IDLE_SLACK`, i.e. a full
+/// idle span has passed since the floor was last raised.
 ///
 /// Until then every session's [`idle_deadline`], being at least the floor's,
 /// lies in the future, so there is nothing to purge — and gating on this lets
@@ -73,8 +85,9 @@ pub const fn idle_purge_enabled(now: u64, idle_floor_at: u64, idle_timeout_secs:
     now >= idle_deadline(0, idle_floor_at, idle_timeout_secs)
 }
 
-/// The idle purge's cutoff, `now - idle - touch_granularity(idle) - IDLE_SLACK`:
-/// a record with `last_active_at <= cutoff` is idle.
+/// Returns the idle purge's cutoff (seconds of IC time), `now - idle -
+/// touch_granularity(idle) - IDLE_SLACK`: a record with `last_active_at <=
+/// cutoff` is idle.
 ///
 /// Only meaningful while [`idle_purge_enabled`] holds. Then the floor is at most
 /// the cutoff, so `last_active_at <= cutoff` is exactly `now >=`
@@ -85,11 +98,12 @@ pub const fn idle_purge_cutoff(now: u64, idle_timeout_secs: u64) -> u64 {
     now.saturating_sub(idle_span(idle_timeout_secs))
 }
 
-/// Whether a backend should still report a session's activity: whether the
-/// idle deadline of the activity the canister last accepted for it,
-/// `reported_at`, may fall before its grant expiry. That is,
+/// Returns whether a backend should keep sending activity reports for a
+/// session: whether the idle deadline of the activity the canister last
+/// accepted for it, `reported_at`, may fall before its grant expiry. That is,
 /// `reported_at + idle + touch_granularity(idle) + IDLE_SLACK <
-/// grant_expires_at + CLOCK_SKEW`.
+/// grant_expires_at + CLOCK_SKEW`. Once it returns `false`, grant expiry removes
+/// the session before it could go idle, so further reports would buy nothing.
 ///
 /// This is the backends' stopping rule. It must be measured from the activity
 /// already reported, never from the time of the request: a busy session's last
@@ -106,7 +120,7 @@ pub const fn idle_purge_cutoff(now: u64, idle_timeout_secs: u64) -> u64 {
 ///
 /// Saturating: an overflowing grant expiry counts as never, so reporting goes
 /// on; an overflowing deadline counts as never reached.
-pub const fn reporting_matters(
+pub const fn should_report_session_activity(
     reported_at: u64,
     grant_expires_at: u64,
     idle_timeout_secs: u64,
@@ -114,33 +128,36 @@ pub const fn reporting_matters(
     idle_deadline(reported_at, 0, idle_timeout_secs) < grant_expires_at.saturating_add(CLOCK_SKEW)
 }
 
-/// Whether reporting activity can ever make a difference under idle timeout
-/// `idle_timeout_secs`: [`reporting_matters`] for a session reported at its
-/// creation with the longest grant II issues, so `idle + touch_granularity(idle)
-/// + IDLE_SLACK < MAX_GRANT + CLOCK_SKEW`.
+/// Returns whether activity reports can make any difference at all under idle
+/// timeout `idle_timeout_secs`: [`should_report_session_activity`] for a
+/// session reported at its creation with the longest grant II issues, so `idle
+/// + touch_granularity(idle) + IDLE_SLACK < MAX_GRANT + CLOCK_SKEW`. When it is
+/// `false`, backends send no activity reports at all.
 ///
 /// No grant II issues outlives [`MAX_GRANT`] from its creation by more than the
 /// skew between clocks, and no session is idle before one idle span after its
 /// creation. When the span reaches `MAX_GRANT` plus that skew, grant expiry
-/// always removes a session before it could go idle, so touches would buy
+/// always removes a session before it could go idle, so reports would buy
 /// nothing but update calls. This is the case at the 30 d default
 /// ([`DEFAULT_IDLE_TIMEOUT`](crate::DEFAULT_IDLE_TIMEOUT)): backends then make
-/// no touch calls at all. The skew counts on the grant's side, so that a timeout
-/// in doubt keeps touches on: switching them off one second too early would let
-/// a session in use reach its idle deadline just before its grant expires.
+/// no `touch_sessions` calls at all. The skew counts on the grant's side, so
+/// that a timeout in doubt keeps reports on: switching them off one second too
+/// early would let a session in use reach its idle deadline just before its
+/// grant expires.
 ///
 /// This relies on II's cap, not on what `put_session` accepts: a record with a
 /// grant longer than `MAX_GRANT` plus the granularity and slack (possible up to
 /// [`MAX_GRANT_ACCEPTED`](crate::MAX_GRANT_ACCEPTED)) would reach its idle
-/// deadline before its grant expiry without ever being touched. [`evictable`]
+/// deadline before its grant expiry without ever being reported. [`evictable`]
 /// guards against such a record explicitly.
 pub const fn touches_effective(idle_timeout_secs: u64) -> bool {
-    reporting_matters(0, MAX_GRANT, idle_timeout_secs)
+    should_report_session_activity(0, MAX_GRANT, idle_timeout_secs)
 }
 
-/// How long a consumed session must have gone without reported activity before
-/// [`evictable`] may judge it unused: `touch_granularity(idle) + 2 *
-/// TOUCH_FLUSH_INTERVAL + MIN_EVICT_IDLE` (16 320 s under a 7-day timeout).
+/// Returns, in seconds, how long a consumed session must have gone without
+/// reported activity before [`evictable`] may judge it unused:
+/// `touch_granularity(idle) + 2 * TOUCH_FLUSH_INTERVAL + MIN_EVICT_IDLE`
+/// (16 320 s under a 7-day timeout).
 ///
 /// Activity up to one granularity plus two flushes old may not have reached the
 /// canister yet; beyond that, the session must have been idle for
@@ -149,10 +166,10 @@ pub const fn eviction_idle(idle_timeout_secs: u64) -> u64 {
     touch_granularity(idle_timeout_secs) + 2 * TOUCH_FLUSH_INTERVAL + MIN_EVICT_IDLE
 }
 
-/// Whether a backend must report a session's new activity at once, rather than
-/// at its next periodic flush: whether the activity the canister holds for it,
-/// `reported_at`, is old enough that the session may already be, or become
-/// before that flush lands, one [`evictable`] would remove. That is,
+/// Returns whether a backend must send a session's new activity report at once,
+/// rather than at its next periodic flush: whether the activity the canister
+/// holds for it, `reported_at`, is old enough that the session may already be,
+/// or become before that flush lands, one [`evictable`] would remove. That is,
 /// `now - reported_at + CLOCK_SKEW >= touch_granularity(idle) + MIN_EVICT_IDLE`,
 /// which is [`eviction_idle`] less two flush intervals and the skew.
 ///
@@ -182,26 +199,32 @@ pub const fn eviction_idle(idle_timeout_secs: u64) -> u64 {
 /// periodic one (the threshold is at least the granularity), so a prompt report
 /// is always one the periodic flush would have sent later. Saturating: a report
 /// "in the future" counts as just made.
-pub const fn report_promptly(now: u64, reported_at: u64, idle_timeout_secs: u64) -> bool {
+pub const fn should_report_session_activity_promptly(
+    now: u64,
+    reported_at: u64,
+    idle_timeout_secs: u64,
+) -> bool {
     now.saturating_sub(reported_at).saturating_add(CLOCK_SKEW)
         >= touch_granularity(idle_timeout_secs) + MIN_EVICT_IDLE
 }
 
-/// Whether a record may be evicted to make room for a new session: only when its
-/// `last_active_at` can be trusted to say the session is unused. All of:
+/// Returns whether a record may be evicted at `now` to make room for a new
+/// session: only when its `last_active_at` can be trusted to say the session is
+/// unused. All of:
 ///
 ///   * it is `consumed` — an unconsumed record belongs to a sign-in that may be
 ///     in progress, and is removed by the abandon timer anyway;
 ///   * [`touches_effective(idle)`](touches_effective) — otherwise backends send
-///     no touches at all, and no `last_active_at` means anything;
+///     no activity reports at all, and no `last_active_at` means anything;
 ///   * `now + idle + touch_granularity(idle) + IDLE_SLACK + CLOCK_SKEW <
 ///     grant_expires_at` — backends report a session's activity only while
-///     [`reporting_matters`], judged by the activity they last reported, so a
-///     busy session may look idle once they stop. This is a conservative guard
-///     on that rule, judged by the canister's clock: while it holds, every
-///     report a backend can have made (at most `CLOCK_SKEW` ahead of `now`)
-///     still has [`reporting_matters`], so a busy session is still being
-///     reported and its `last_active_at` can be trusted;
+///     [`should_report_session_activity`], judged by the activity they last
+///     reported, so a busy session may look idle once they stop. This is a
+///     conservative guard on that rule, judged by the canister's clock: while
+///     it holds, every report a backend can have made (at most `CLOCK_SKEW`
+///     ahead of `now`) still passes [`should_report_session_activity`], so a
+///     busy session is still being reported and its `last_active_at` can be
+///     trusted;
 ///   * `now - max(last_active_at, idle_floor_at) >= eviction_idle(idle)` —
 ///     activity up to one granularity plus two flushes old may not have been
 ///     reported yet; beyond that the session must have been idle for
@@ -210,12 +233,12 @@ pub const fn report_promptly(now: u64, reported_at: u64, idle_timeout_secs: u64)
 ///
 /// **A session that resumes.** The age above is the age of the *reported*
 /// activity, so it cannot see a user who has just come back. A backend reports
-/// such a session's new activity at once ([`report_promptly`]) instead of at
-/// its next flush, which narrows the gap to the moments before that report
-/// lands: a put that evicts the session in those moments still removes it, and
-/// its user signs in again. This needs a namespace, or the whole store, at its
-/// capacity cap and a lowered idle timeout (nothing is evicted at the 30 d
-/// default), and it is the
+/// such a session's new activity at once
+/// ([`should_report_session_activity_promptly`]) instead of at its next flush,
+/// which narrows the gap to the moments before that report lands: a put that
+/// evicts the session in those moments still removes it, and its user signs in
+/// again. This needs a namespace, or the whole store, at its capacity cap and a
+/// lowered idle timeout (nothing is evicted at the 30 d default), and it is the
 /// price of keeping sign-ins working when the store is full instead of refusing
 /// every new one. Closing it entirely would take a coordinated two-phase
 /// eviction.
@@ -247,7 +270,7 @@ pub const fn evictable(
         && idle_for >= eviction_idle(idle_timeout_secs)
 }
 
-/// The namespace of a record key: its first [`NAMESPACE_LEN`] bytes, or `None`
+/// Returns the namespace of a record key: its first [`NAMESPACE_LEN`] bytes, or `None`
 /// unless the key is exactly [`KEY_LEN`] bytes long.
 pub fn namespace_of(key: &[u8]) -> Option<[u8; NAMESPACE_LEN]> {
     if key.len() != KEY_LEN {
@@ -281,7 +304,7 @@ const _: () = {
     assert!(MAX_GRANT + CLOCK_SKEW <= MAX_GRANT_ACCEPTED);
     // A tombstone outlives every token of its session, on every backend clock.
     assert!(CLOCK_SKEW < TOMBSTONE_GRACE);
-    // `report_promptly`'s threshold (granularity + MIN_EVICT_IDLE - skew) is at
+    // `should_report_session_activity_promptly`'s threshold (granularity + MIN_EVICT_IDLE - skew) is at
     // least the granularity, so a prompt report is always a due one.
     assert!(CLOCK_SKEW <= MIN_EVICT_IDLE);
 };
@@ -412,30 +435,34 @@ mod tests {
         // Reported at 15_600: the stored deadline (19_800) still falls before
         // grant expiry, so the next activity must be reported, even though a
         // rule judged by `now + span` would have stopped from 15_740 on.
-        assert!(reporting_matters(15_600, grant, HOUR));
+        assert!(should_report_session_activity(15_600, grant, HOUR));
         assert!(15_740 + idle_span(HOUR) + CLOCK_SKEW >= grant);
         // Within the skew margin: a backend up to CLOCK_SKEW ahead may hold a
         // report the canister capped, so it keeps reporting.
-        assert!(reporting_matters(15_850, grant, HOUR));
+        assert!(should_report_session_activity(15_850, grant, HOUR));
         // Its deadline (20_100) is past expiry even for a canister clock
         // CLOCK_SKEW behind: nothing more to report.
-        assert!(!reporting_matters(15_900, grant, HOUR));
+        assert!(!should_report_session_activity(15_900, grant, HOUR));
         // Exactly at the edge.
-        assert!(reporting_matters(grant + CLOCK_SKEW - idle_span(HOUR) - 1, grant, HOUR));
-        assert!(!reporting_matters(grant + CLOCK_SKEW - idle_span(HOUR), grant, HOUR));
+        assert!(should_report_session_activity(
+            grant + CLOCK_SKEW - idle_span(HOUR) - 1,
+            grant,
+            HOUR
+        ));
+        assert!(!should_report_session_activity(grant + CLOCK_SKEW - idle_span(HOUR), grant, HOUR));
     }
 
     #[test]
-    fn reporting_matters_saturates_towards_reporting() {
+    fn should_report_session_activity_saturates_towards_reporting() {
         // A grant that never ends keeps reporting going...
-        assert!(reporting_matters(1_700_000_000, u64::MAX, 7 * DAY));
+        assert!(should_report_session_activity(1_700_000_000, u64::MAX, 7 * DAY));
         // ...and a deadline that overflows is never reached.
-        assert!(!reporting_matters(u64::MAX, u64::MAX - 1, 7 * DAY));
+        assert!(!should_report_session_activity(u64::MAX, u64::MAX - 1, 7 * DAY));
     }
 
     // The eviction guard is conservative: while it holds, every report a
     // backend can have made, by a clock up to CLOCK_SKEW ahead of the
-    // canister's, still has `reporting_matters`, so a busy session is still
+    // canister's, still has `should_report_session_activity`, so a busy session is still
     // being reported.
     #[test]
     fn the_eviction_guard_implies_backends_still_report() {
@@ -449,7 +476,7 @@ mod tests {
                 }
                 for reported in [0, now - DAY, now, now + CLOCK_SKEW] {
                     assert!(
-                        reporting_matters(reported, grant, idle),
+                        should_report_session_activity(reported, grant, idle),
                         "idle={idle} grant={grant} reported={reported}"
                     );
                 }
@@ -510,13 +537,13 @@ mod tests {
     }
 
     #[test]
-    fn report_promptly_at_its_exact_threshold() {
+    fn should_report_session_activity_promptly_at_its_exact_threshold() {
         let now = 1_700_000_000;
         for idle in [MIN_IDLE_TIMEOUT, DAY, 7 * DAY, 2_570_159] {
             // now - reported + CLOCK_SKEW == granularity + MIN_EVICT_IDLE.
             let edge = now + CLOCK_SKEW - touch_granularity(idle) - MIN_EVICT_IDLE;
-            assert!(report_promptly(now, edge, idle), "idle={idle}");
-            assert!(!report_promptly(now, edge + 1, idle), "idle={idle}");
+            assert!(should_report_session_activity_promptly(now, edge, idle), "idle={idle}");
+            assert!(!should_report_session_activity_promptly(now, edge + 1, idle), "idle={idle}");
             // Two flush intervals and the skew before eviction becomes possible.
             assert_eq!(
                 now - edge + 2 * TOUCH_FLUSH_INTERVAL + CLOCK_SKEW,
@@ -546,7 +573,7 @@ mod tests {
             let ages = (0..=eviction_idle(idle)).step_by(37).chain(threshold - 2..=threshold + 2);
             for age in ages {
                 let reported = now - age;
-                if report_promptly(now, reported, idle) {
+                if should_report_session_activity_promptly(now, reported, idle) {
                     continue;
                 }
                 let landed = now + 2 * TOUCH_FLUSH_INTERVAL + CLOCK_SKEW;
@@ -559,11 +586,11 @@ mod tests {
     }
 
     #[test]
-    fn report_promptly_saturates() {
+    fn should_report_session_activity_promptly_saturates() {
         // A report "in the future" counts as just made.
-        assert!(!report_promptly(1_000, u64::MAX, 7 * DAY));
+        assert!(!should_report_session_activity_promptly(1_000, u64::MAX, 7 * DAY));
         // An ancient one is overdue.
-        assert!(report_promptly(u64::MAX, 0, 7 * DAY));
+        assert!(should_report_session_activity_promptly(u64::MAX, 0, 7 * DAY));
     }
 
     #[test]

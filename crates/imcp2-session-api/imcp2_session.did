@@ -2,9 +2,12 @@
 // OAuth / Internet Identity sessions through.
 //
 // Times are Unix seconds of IC time unless the name ends in `_ns`.
+// Every method takes one record and returns `variant { Ok : …; Err : … }`.
 // Evolution rules (pinned by the API crate's wire tests):
 //   * records only gain `opt` fields;
-//   * returned variants never gain cases (new conditions travel in `Other`);
+//   * error cases (`err_case`, inside an `opt`) may be added: an older reader
+//     decodes one it does not know as null and still has `err_code`;
+//   * every other returned variant never gains cases;
 //   * methods are only ever added.
 
 type Key = blob;        // 32 bytes: namespace(16) ‖ SHA-256("imcp2/rk/v1\00" ‖ namespace ‖ sid_uuid)[0..16]
@@ -31,8 +34,13 @@ type ConfigPatch = record {
 };
 type InstallArg = variant { Init : ConfigPatch; Upgrade : opt ConfigPatch };
 
-type ErrorInfo = record { code : text; message : text };
-type CommonError = variant { Unauthorized; InvalidArgument : text; Other : ErrorInfo };
+// Errors are records, so that their cases can grow (see the evolution rules).
+// `err_code` is one space shared by every error type, never reused:
+//   1 Unauthorized, 2 InvalidArgument, 10 AlreadyExists, 11 Deleted,
+//   12 GrantExpired, 13 CapacityExceeded, 20 AlreadyConsumed, 21 BadProof,
+//   22 NotFound, 23 CodeExpired, 30 PurgeInProgress.
+type CommonErrorCase = variant { Unauthorized; InvalidArgument; PurgeInProgress };
+type CommonError = record { err_code : nat64; err_case : opt CommonErrorCase; err_str : text };
 
 // A granted session. `sealed` is the XChaCha20-Poly1305 envelope the backends
 // seal under their shared keyring; the canister never sees inside it, except
@@ -64,33 +72,36 @@ type PutSessionArg = record {
   sealed : blob;                // 3 to 1024 bytes; byte 2 is the key id
   code_lock : blob;             // 16 bytes: SHA-256(code_proof)[0..16]
 };
-type PutSessionError = variant {
+type PutSessionErrorCase = variant {
   Unauthorized;
-  AlreadyExists;
-  Deleted;
+  InvalidArgument;
+  AlreadyExists;                // the key is stored under a different op_id
+  Deleted;                      // the key is tombstoned; keys are never reused
   GrantExpired;
-  CapacityExceeded;
-  InvalidArgument : text;
-  Other : ErrorInfo;
+  CapacityExceeded;             // at a cap, and nothing could safely be evicted
 };
+type PutSessionError = record { err_code : nat64; err_case : opt PutSessionErrorCase; err_str : text };
 type PutSessionResult = variant { Ok : SessionRecord; Err : PutSessionError };
 
 type ConsumeCodeArg = record { key : Key; exchange_id : OpId; code_proof : blob };
-type ConsumeCodeError = variant {
+type ConsumeCodeErrorCase = variant {
   Unauthorized;
-  AlreadyConsumed;
-  BadProof;
+  InvalidArgument;
+  AlreadyConsumed;              // exchanged under a different exchange_id
+  BadProof;                     // the record stays unconsumed
   NotFound;
   Deleted;
-  CodeExpired;
-  InvalidArgument : text;
-  Other : ErrorInfo;
+  CodeExpired;                  // past the consume window
 };
+type ConsumeCodeError = record { err_code : nat64; err_case : opt ConsumeCodeErrorCase; err_str : text };
 type ConsumeCodeResult = variant { Ok : SessionRecord; Err : ConsumeCodeError };
 
+// An activity report: the session was in use at `last_active_at`.
 type Touch = record { key : Key; last_active_at : Seconds };
+type TouchSessionsArg = record { touches : vec Touch };        // at most 2000
 type TouchResult = variant { Ok : record { updated : nat32; unknown : vec Key }; Err : CommonError };
 
+type GetSessionsArg = record { keys : vec Key };               // at most 100
 type GetSessionsResult = variant {
   Ok : record { items : vec Lookup; epoch : nat64; now_ns : nat64 };
   Err : CommonError;
@@ -121,6 +132,11 @@ type KeyChecks = record {
   now_ns : nat64;
 };
 type KeyChecksResult = variant { Ok : KeyChecks; Err : CommonError };
+type GetKeyChecksArg = record {};
+// `replace`: whether an existing, different check for `kid` may be replaced
+// (null = false).
+type SetKeyCheckArg = record { kid : nat8; check : blob; replace : opt bool };
+type RetireKidArg = record { kid : nat8 };
 
 // A session is purged when it matches every condition; `Any` places none, so
 // all `Any` purges everything. Every field is required, so a misspelled or
@@ -181,22 +197,51 @@ type Status = record {
   stable_memory_bytes : nat64;
   now_ns : nat64;
 };
+type GetStatusArg = record {};
 type StatusResult = variant { Ok : Status; Err : CommonError };
 type ConfigResult = variant { Ok : Config; Err : CommonError };
 
 service : (InstallArg) -> {
-  // Authorized backends.
+  // --- Authorized backends ---------------------------------------------------
+  // At sign-in (`/oauth/connect/redeem`), before the authorization code is
+  // issued: store the new session's sealed record, unconsumed and outside the
+  // feed. Create-only, and idempotent per `op_id`: a retry from any backend gets
+  // the stored record.
   put_session : (PutSessionArg) -> (PutSessionResult);
+  // At the token exchange (`/oauth/token`): consume the authorization code,
+  // once. Checks the code proof against the record's `code_lock` (so a code is
+  // useless without the session key it was derived from), marks the record
+  // consumed and gives it a feed position, so every backend then mirrors it.
+  // Consensus makes a code single-use across backends; idempotent per
+  // `exchange_id`, so a retried exchange from any backend gets the same record,
+  // and so the same access token.
   consume_code : (ConsumeCodeArg) -> (ConsumeCodeResult);
-  touch_sessions : (vec Touch) -> (TouchResult);
-  get_sessions : (vec Key) -> (GetSessionsResult) query;       // also called as an update (replicated read)
-  list_changes : (ListChangesArg) -> (ListChangesResult) query; // also called as an update (replicated read)
-  // Authorized backends and controllers.
-  get_key_checks : () -> (KeyChecksResult) query;
-  get_status : () -> (StatusResult) query;
-  // Controllers only.
+  // Activity reports (see `Touch`): raise each consumed record's
+  // `last_active_at`, which the idle purge and eviction judge.
+  touch_sessions : (TouchSessionsArg) -> (TouchResult);
+  // Look sessions up by key, agreed by consensus: an answer a backend may act
+  // on, including to drop a session.
+  get_sessions : (GetSessionsArg) -> (GetSessionsResult);
+  // The same answer from one replica, not agreed by consensus: a cheap hint a
+  // backend may only use to add a record it can verify, never to drop one.
+  get_sessions_non_replicated : (GetSessionsArg) -> (GetSessionsResult) query;
+  // A page of the change feed (consumed records and tombstones), agreed by
+  // consensus.
+  list_changes : (ListChangesArg) -> (ListChangesResult);
+  // The same page from one replica: a hint, as for get_sessions_non_replicated.
+  list_changes_non_replicated : (ListChangesArg) -> (ListChangesResult) query;
+  // --- Authorized backends and controllers ------------------------------------
+  // The published key checks and retired key ids.
+  get_key_checks : (GetKeyChecksArg) -> (KeyChecksResult);
+  // Configuration, counts, counters, callers and the purge job.
+  get_status : (GetStatusArg) -> (StatusResult);
+  // --- Controllers -------------------------------------------------------------
+  // Change the configuration. Also re-arms the purge timer, even for an empty
+  // patch, and schedules an immediate timer run, which checks the canister
+  // history for a snapshot load.
   admin_update_config : (ConfigPatch) -> (ConfigResult);
-  admin_set_key_check : (KeyCheck, bool) -> (KeyChecksResult);  // bool = replace an existing, different check
-  admin_retire_kid : (nat8) -> (KeyChecksResult);
+  admin_set_key_check : (SetKeyCheckArg) -> (KeyChecksResult);
+  admin_retire_kid : (RetireKidArg) -> (KeyChecksResult);
+  // Start a resumable purge, which the timer works through.
   admin_purge_sessions : (PurgeFilter) -> (PurgeJobResult);
 }

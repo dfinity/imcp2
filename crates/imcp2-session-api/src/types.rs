@@ -188,13 +188,62 @@ impl fmt::Debug for ConsumeCodeArg {
     }
 }
 
-/// One reported activity (`Touch`). The canister clamps `last_active_at` to its
-/// own `now` and only ever raises a record's value.
+/// An activity report (`Touch`): a backend serving a session's requests tells
+/// the canister, through `touch_sessions`, that the session was in use at
+/// `last_active_at`. The canister clamps `last_active_at` to its own `now` and
+/// only ever raises a record's value; the idle purge and eviction judge it (see
+/// the [rules](crate::idle_deadline)).
 #[derive(CandidType, Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct Touch {
     #[serde(with = "serde_bytes")]
     pub key: Key,
     pub last_active_at: Seconds,
+}
+
+/// The argument of `touch_sessions` (`TouchSessionsArg`): at most
+/// [`MAX_TOUCH_BATCH`](crate::MAX_TOUCH_BATCH) activity reports.
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct TouchSessionsArg {
+    pub touches: Vec<Touch>,
+}
+
+/// The argument of `get_sessions` and `get_sessions_non_replicated`
+/// (`GetSessionsArg`): at most [`MAX_GET_KEYS`](crate::MAX_GET_KEYS) keys.
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct GetSessionsArg {
+    pub keys: Vec<Key>,
+}
+
+/// The argument of `get_key_checks` (`GetKeyChecksArg`): none yet. A record, so
+/// that it can gain `opt` fields.
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct GetKeyChecksArg {}
+
+/// The argument of `get_status` (`GetStatusArg`): none yet. A record, so that
+/// it can gain `opt` fields.
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct GetStatusArg {}
+
+/// The argument of `admin_set_key_check` (`SetKeyCheckArg`): publish the check
+/// of key id `kid`.
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct SetKeyCheckArg {
+    pub kid: u8,
+    /// [`KEY_CHECK_LEN`](crate::KEY_CHECK_LEN) bytes, as `imcp2
+    /// shared-key-check` prints them.
+    #[serde(with = "serde_bytes")]
+    pub check: Vec<u8>,
+    /// Whether an existing, different check for `kid` may be replaced; `None`
+    /// is `false`, so a mistyped check cannot silently overwrite a published
+    /// one.
+    pub replace: Option<bool>,
+}
+
+/// The argument of `admin_retire_kid` (`RetireKidArg`): retire key id `kid`,
+/// whose sealed values are then invalid everywhere.
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct RetireKidArg {
+    pub kid: u8,
 }
 
 /// The `Ok` of `touch_sessions`.
