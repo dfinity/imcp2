@@ -37,9 +37,14 @@
 //!
 //! A deploy lasts as long as it lasts: the call reports each phase to the
 //! client as it completes and is interrupted by the client cancelling the
-//! request or, on the hosted server, going away ([`ClientGone`]). Where the
-//! agent cannot hand the server a file — the hosted server — the bundle
-//! arrives through an upload ticket ([`Uploads`], `icp_deploy_upload`).
+//! request or, on the hosted server, going away ([`ClientGone`]).
+//!
+//! A server takes the bundle one way. One on the project's machine — the
+//! local server — reads it at the path the agent names (`bundle_path`). One
+//! the agent cannot hand a file to — the hosted server — receives it through
+//! an upload ticket ([`Uploads`], `icp_deploy_upload`) and deploys the upload
+//! the agent names (`bundle_upload`); it reads no path a caller gives it.
+//! Each lists the one argument it takes ([`IcDeployTools::tools`]).
 //!
 //! The crate is composed into the local server, and into the hosted one
 //! behind its `deploy` feature ([`WithDeploy`] is the handler both mount).
@@ -59,8 +64,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use base64::Engine;
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use candid::Principal;
 use ic_agent::{identity::DelegatedIdentity, Identity};
 use imcp2_core::{cycles_balance_of, identities::Identities, CyclesBalance, SessionResolver};
@@ -68,7 +72,7 @@ use imcp2_core::{cycles_balance_of, identities::Identities, CyclesBalance, Sessi
 use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, ProgressNotificationParam, ProgressToken},
+    model::{CallToolResult, ContentBlock, ProgressNotificationParam, ProgressToken, Tool},
     schemars,
     service::{Peer, RequestContext},
     tool, tool_router, ErrorData as McpError, RoleServer,
@@ -94,6 +98,8 @@ pub use uploads::{
     UPLOAD_TTL,
 };
 
+/// The name of the deploy tool.
+pub const DEPLOY_TOOL: &str = "icp_deploy_bundle";
 /// The name of the upload-ticket tool, listed only by a server with an
 /// upload store (see [`IcDeployTools::with_uploads`]).
 pub const UPLOAD_TOOL: &str = "icp_deploy_upload";
@@ -135,17 +141,14 @@ pub fn skill_document(path: &str) -> Option<&'static str> {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeployBundleArgs {
     /// Absolute path, on this machine, of the bundle archive — the `.tar.gz`
-    /// that `icp project bundle --output <file>` writes. Either this or
-    /// `bundle_base64`, not both.
+    /// that `icp project bundle --output <file>` writes.
+    // Listed by a server without an upload store, which takes this alone.
     #[serde(default)]
     pub bundle_path: Option<String>,
-    /// The bundle archive itself, base64-encoded. Either this or
-    /// `bundle_path`, not both.
-    #[serde(default)]
-    pub bundle_base64: Option<String>,
     /// The upload id the curl command from `icp_deploy_upload` printed: the
-    /// archive as this server received it. Only on a server that lists
-    /// `icp_deploy_upload`; exactly one of the three bundle arguments.
+    /// bundle archive — the `.tar.gz` that `icp project bundle --output
+    /// <file>` writes — as this server received it.
+    // Listed by a server with an upload store, which takes this alone.
     #[serde(default)]
     pub bundle_upload: Option<String>,
     /// The environment to deploy, by name, among those the bundle's manifest
@@ -284,76 +287,55 @@ impl DeployBundleOutput {
     }
 }
 
-/// The longest `bundle_base64` that can decode to [`host::MAX_BUNDLE_BYTES`]
-/// bytes: four characters per three bytes, the last group padded.
-const MAX_BUNDLE_BASE64_CHARS: usize = host::MAX_BUNDLE_BYTES.div_ceil(3) * 4;
-
 /// Turn the tool's arguments into a request, rejecting what cannot be deployed
-/// before anything is read or written.
-pub fn request_from_args(mut args: DeployBundleArgs) -> Result<DeployRequest, String> {
-    let given =
-        [args.bundle_path.is_some(), args.bundle_base64.is_some(), args.bundle_upload.is_some()]
-            .iter()
-            .filter(|g| **g)
-            .count();
-    if given > 1 {
-        return Err("pass one of bundle_path, bundle_base64 or bundle_upload, not several".into());
-    }
-    if let Some(id) = args.bundle_upload.take() {
-        let id = id.trim();
-        if id.is_empty() {
-            return Err("bundle_upload is empty; pass the upload id the upload printed".into());
+/// before anything is read or written. A server takes the bundle one way: as
+/// an upload id where it has an upload store (`uploads`), as a path where it
+/// does not, and the other argument is refused, so a server reached over the
+/// network reads no path a caller names. What comes back is that argument's
+/// value and what makes the request of the bundle it stands for, so that an
+/// upload is taken only once everything else has passed.
+pub fn request_from_args(
+    args: DeployBundleArgs,
+    uploads: bool,
+) -> Result<(String, impl FnOnce(BundleSource) -> DeployRequest), String> {
+    let bundle = match (args.bundle_path, args.bundle_upload, uploads) {
+        (Some(_), _, true) => {
+            return Err(format!(
+                "this server runs elsewhere than the project and reads no bundle_path; call \
+                 {UPLOAD_TOOL}, upload the archive, and pass the upload id as bundle_upload"
+            ))
         }
-        return finish_request(args, BundleSource::Upload(id.to_string()));
-    }
-    let bundle = match (args.bundle_path.take(), args.bundle_base64.take()) {
-        (Some(_), Some(_)) => {
-            return Err("pass either bundle_path or bundle_base64, not both".into())
+        (_, Some(_), false) => {
+            return Err("this server takes no uploads; pass the bundle as bundle_path".into())
         }
-        (None, None) => {
-            return Err("pass the bundle as bundle_path, bundle_base64 or bundle_upload".into())
+        (None, None, true) => {
+            return Err(format!(
+                "pass the bundle as bundle_upload: the upload id from {UPLOAD_TOOL}"
+            ))
         }
-        (Some(path), None) => {
-            let path = Utf8PathBuf::from(path.trim());
-            if path.as_str().is_empty() {
+        (None, None, false) => {
+            return Err("pass the bundle as bundle_path: the absolute path of the archive".into())
+        }
+        (None, Some(id), true) => {
+            let id = id.trim();
+            if id.is_empty() {
+                return Err("bundle_upload is empty; pass the upload id the upload printed".into());
+            }
+            id.to_string()
+        }
+        (Some(path), None, false) => {
+            let path = path.trim();
+            if path.is_empty() {
                 return Err("bundle_path is empty; pass the absolute path of the bundle".into());
             }
-            if !path.is_absolute() {
+            if !Utf8Path::new(path).is_absolute() {
                 return Err(format!(
                     "bundle_path must be an absolute path on this machine, got '{path}'"
                 ));
             }
-            BundleSource::Path(path)
-        }
-        (None, Some(b64)) => {
-            let b64 = b64.trim();
-            // Bound the encoded text before allocating the decoded copy:
-            // base64 spends four characters per three bytes, so anything
-            // longer than this encodes more than the bundle limit.
-            if b64.len() > MAX_BUNDLE_BASE64_CHARS {
-                return Err(format!(
-                    "bundle_base64 encodes more than the {} byte bundle limit",
-                    host::MAX_BUNDLE_BYTES
-                ));
-            }
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .map_err(|e| format!("bundle_base64 is not valid base64: {e}"))?;
-            if bytes.len() > host::MAX_BUNDLE_BYTES {
-                return Err(format!(
-                    "the bundle is {} bytes, above the {} byte limit",
-                    bytes.len(),
-                    host::MAX_BUNDLE_BYTES
-                ));
-            }
-            BundleSource::Bytes(bytes)
+            path.to_string()
         }
     };
-    finish_request(args, bundle)
-}
-
-/// The rest of [`request_from_args`], once the bundle source is settled.
-fn finish_request(args: DeployBundleArgs, bundle: BundleSource) -> Result<DeployRequest, String> {
     let environment = args.environment.trim().to_string();
     if environment.is_empty() {
         return Err("environment must name an environment of the bundle, e.g. \"ic\"".into());
@@ -378,17 +360,19 @@ fn finish_request(args: DeployBundleArgs, bundle: BundleSource) -> Result<Deploy
         ),
         None => None,
     };
-    Ok(DeployRequest {
+    let cycles = u128::from(args.cycles.unwrap_or(DEFAULT_CYCLES));
+    let (no_create, skip_candid_check) = (args.no_create, args.skip_candid_check);
+    Ok((bundle, move |bundle| DeployRequest {
         bundle,
         environment,
         canister_ids,
         mode,
-        cycles: u128::from(args.cycles.unwrap_or(DEFAULT_CYCLES)),
+        cycles,
         subnet,
-        no_create: args.no_create,
-        skip_candid_check: args.skip_candid_check,
+        no_create,
+        skip_candid_check,
         workdir: None,
-    })
+    }))
 }
 
 /// The deploy tool group, served alongside the core surface by the binary
@@ -412,7 +396,8 @@ pub struct IcDeployTools {
     /// [`DeployRequest::workdir`].
     deploys_dir: Option<Utf8PathBuf>,
     /// Where uploaded bundles are received, and the URL a `PUT` goes to,
-    /// on a server the agent cannot hand a file to.
+    /// on a server the agent cannot hand a file to. With it the bundle is
+    /// an upload; without it, a path.
     uploads: Option<(Uploads, String)>,
 }
 
@@ -499,16 +484,42 @@ impl IcDeployTools {
 
     /// Serve `icp_deploy_upload` on `uploads`, with `upload_url` the absolute
     /// URL the agent `PUT`s an archive to (the server mounts the route; see
-    /// [`Uploads`]). Without this, the tool is not listed and `bundle_upload`
-    /// is refused.
+    /// [`Uploads`]), and take the bundle as `bundle_upload` alone: the server
+    /// is one the agent cannot hand a file to, so `bundle_path` is refused.
+    /// Without this, it is the other way round and the tool is not listed.
     pub fn with_uploads(mut self, uploads: Uploads, upload_url: String) -> Self {
         self.uploads = Some((uploads, upload_url));
         self
     }
 
-    /// Whether this server receives uploaded bundles.
+    /// Whether this server receives its bundles by upload, not by path.
     pub fn has_uploads(&self) -> bool {
         self.uploads.is_some()
+    }
+
+    /// The tools this server lists, which follow from how the bundle reaches
+    /// it: `icp_deploy_upload` only where an upload store exists for it to
+    /// mint tickets on, and of the deploy tool's two bundle arguments the one
+    /// this server takes.
+    pub fn tools(&self) -> Vec<Tool> {
+        let refused = if self.has_uploads() { "bundle_path" } else { "bundle_upload" };
+        Self::tool_router()
+            .list_all()
+            .into_iter()
+            .filter(|t| self.has_uploads() || &*t.name != UPLOAD_TOOL)
+            .map(|mut tool| {
+                if &*tool.name == DEPLOY_TOOL {
+                    let mut schema = (*tool.input_schema).clone();
+                    if let Some(properties) =
+                        schema.get_mut("properties").and_then(|p| p.as_object_mut())
+                    {
+                        properties.remove(refused);
+                    }
+                    tool.input_schema = Arc::new(schema);
+                }
+                tool
+            })
+            .collect()
     }
 
     /// Make each deploy's working directory under `dir` (made now) rather
@@ -541,7 +552,7 @@ impl IcDeployTools {
     }
 
     #[tool(
-        description = "Deploy an icp project bundle (the .tar.gz that `icp project bundle` writes) to the Internet Computer as the user, running every phase of `icp deploy`: create the canisters the bundle names that do not exist yet (funded from the user's cycles balance), wire their ids into each other, apply settings, install or upgrade the code, and run the sync steps (a frontend's asset upload). Pass the bundle by absolute path or base64, the environment name it was built for (usually \"ic\"), and, to upgrade rather than create, the canister_ids a previous deploy returned. The call lasts as long as the deploy and reports each phase as it completes, as a progress notification (send a progressToken) and a log message; cancelling the call interrupts the deploy at its next step. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure or interruption the mapping still holds every canister that was created.",
+        description = "Deploy an icp project bundle (the .tar.gz that `icp project bundle` writes) to the Internet Computer as the user, running every phase of `icp deploy`: create the canisters the bundle names that do not exist yet (funded from the user's cycles balance), wire their ids into each other, apply settings, install or upgrade the code, and run the sync steps (a frontend's asset upload). Pass the bundle the one way this server takes it (the bundle argument listed here), the environment name it was built for (usually \"ic\"), and, to upgrade rather than create, the canister_ids a previous deploy returned. The call lasts as long as the deploy and reports each phase as it completes, as a progress notification (send a progressToken) and a log message; cancelling the call interrupts the deploy at its next step. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure or interruption the mapping still holds every canister that was created.",
         annotations(title = "Deploy a project bundle", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<DeployBundleOutput>(),
     )]
@@ -564,9 +575,8 @@ impl IcDeployTools {
                 )
             }));
         };
-        // Who is asking comes before what they sent: an inline bundle is
-        // decoded only for a session allowed to deploy, and one deploy per
-        // session.
+        // Who is asking comes before what they sent: a bundle is read only
+        // for a session allowed to deploy, and one deploy per session.
         let Some(sid) = (self.session)(&ctx) else {
             return Ok(err("deploying a bundle needs an authenticated session".into()));
         };
@@ -576,37 +586,31 @@ impl IcDeployTools {
         if let Err(e) = claim.for_session(&sid) {
             return Ok(err(e));
         }
-        let mut request = match request_from_args(args) {
+        let (bundle, into_request) = match request_from_args(args, self.has_uploads()) {
             Ok(r) => r,
             Err(e) => return Ok(err(e)),
         };
-        request.workdir = self.deploys_dir.clone();
         // An uploaded bundle is the session's own, and the file goes with
         // the handle once the deploy has returned.
-        let _upload = match request.bundle {
-            BundleSource::Upload(ref id) => {
-                let Some((uploads, _)) = &self.uploads else {
-                    return Ok(err("this server takes no uploads; pass the bundle as \
-                                   bundle_path or bundle_base64"
-                        .into()));
-                };
-                let Some(taken) = uploads.take(id, &sid).await else {
+        let (path, _upload) = match &self.uploads {
+            None => (Utf8PathBuf::from(bundle), None),
+            Some((uploads, _)) => {
+                let Some(taken) = uploads.take(&bundle, &sid).await else {
                     return Ok(err(format!(
-                        "no upload '{id}' for this session: it may have expired ({} minutes \
+                        "no upload '{bundle}' for this session: it may have expired ({} minutes \
                          after the upload) or been deployed already; call {UPLOAD_TOOL} and \
                          upload the archive again",
                         UPLOAD_TTL.as_secs() / 60
                     )));
                 };
-                let path = match Utf8PathBuf::from_path_buf(taken.path().to_path_buf()) {
-                    Ok(p) => p,
+                match Utf8PathBuf::from_path_buf(taken.path().to_path_buf()) {
+                    Ok(path) => (path, Some(taken)),
                     Err(p) => return Ok(err(format!("upload path is not UTF-8: {}", p.display()))),
-                };
-                request.bundle = BundleSource::Path(path);
-                Some(taken)
+                }
             }
-            _ => None,
         };
+        let mut request = into_request(BundleSource::Path(path));
+        request.workdir = self.deploys_dir.clone();
         // A per-app delegation lives five minutes and a deploy can outlast
         // it (an asset sync, several installs), so the identity the agent
         // signs with is kept fresh for as long as the deploy runs.
@@ -705,9 +709,7 @@ impl IcDeployTools {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let Some((uploads, url)) = &self.uploads else {
-            return Ok(err("this server takes no uploads; pass the bundle as bundle_path or \
-                           bundle_base64"
-                .into()));
+            return Ok(err("this server takes no uploads; pass the bundle as bundle_path".into()));
         };
         // A ticket is for a session that could deploy what it uploads.
         let Some(sid) = (self.session)(&ctx) else {
@@ -810,7 +812,7 @@ async fn forward_lines(
                     LoggingLevel::Info,
                     serde_json::Value::String(line),
                 )
-                .with_logger("icp_deploy_bundle");
+                .with_logger(DEPLOY_TOOL);
                 peer.notify_logging_message(param).await
             }
         };
@@ -873,6 +875,26 @@ mod tests {
         serde_json::from_value(json).expect("valid args")
     }
 
+    /// The request a server without an upload store makes of `json`, and
+    /// the one a server with a store makes of it (of the upload id, which
+    /// stands in for the path of the file received).
+    fn by_path(json: serde_json::Value) -> Result<DeployRequest, String> {
+        request_from_args(args(json), false).map(|(b, into)| into(BundleSource::Path(b.into())))
+    }
+    fn tools() -> IcDeployTools {
+        let agent =
+            imcp2_core::Agent::builder().with_url(imcp2_core::IC_URL).build().expect("agent");
+        let identities = Identities::new(
+            imcp2_core::IiInstance::prod().expect("prod II"),
+            "https://mcp.example".into(),
+            agent,
+        );
+        IcDeployTools::new(identities, Arc::new(|_: &_| None))
+    }
+    fn by_upload(json: serde_json::Value) -> Result<DeployRequest, String> {
+        request_from_args(args(json), true).map(|(b, into)| into(BundleSource::Path(b.into())))
+    }
+
     // The skill is in the registry's SKILL.md shape (frontmatter naming it as
     // the URI does, a description for the agent's trigger decision), teaches
     // the three steps around the tool by name, and resolves under the same
@@ -891,7 +913,7 @@ mod tests {
             "canister_ids",
             ".icp/data/mappings/<environment>.ids.json",
             "bundle_path",
-            "bundle_base64",
+            "bundle_upload",
             "authenticate",
             "icp_cycles_balance",
         ] {
@@ -941,12 +963,12 @@ mod tests {
         assert!(output["properties"]["balance"].is_object(), "{output}");
         assert!(output["properties"]["principal"].is_object(), "{output}");
 
-        let tool = tools.iter().find(|t| &*t.name == "icp_deploy_bundle").expect("deploy");
+        let tool = tools.iter().find(|t| &*t.name == DEPLOY_TOOL).expect("deploy");
         let ann = tool.annotations.clone().expect("annotations");
         assert_eq!(ann.read_only_hint, Some(false));
         assert_eq!(ann.destructive_hint, Some(true));
         let schema = serde_json::to_value(&tool.input_schema).unwrap();
-        for field in ["bundle_path", "bundle_base64", "environment", "canister_ids", "mode"] {
+        for field in ["bundle_path", "bundle_upload", "environment", "canister_ids", "mode"] {
             assert!(schema["properties"][field].is_object(), "missing {field}: {schema}");
         }
         assert_eq!(schema["required"], serde_json::json!(["environment"]));
@@ -958,25 +980,65 @@ mod tests {
         }
     }
 
+    // A server takes the bundle one way and lists it that way: a path where
+    // it has no upload store, an upload id where it has one. The other
+    // argument is refused, whatever comes with it, so a server reached over
+    // the network opens no path a caller names. An inline bundle is not an
+    // argument at all.
     #[test]
-    fn exactly_one_bundle_source_is_accepted() {
-        let both = args(serde_json::json!({
-            "bundle_path": "/tmp/b.tar.gz", "bundle_base64": "AAAA", "environment": "ic"
-        }));
-        assert!(request_from_args(both).unwrap_err().contains("not several"));
-        let three = args(serde_json::json!({
+    fn a_server_takes_the_bundle_one_way() {
+        let path = serde_json::json!({ "bundle_path": "/tmp/b.tar.gz", "environment": "ic" });
+        let upload = serde_json::json!({ "bundle_upload": " abc ", "environment": "ic" });
+        let both = serde_json::json!({
             "bundle_path": "/tmp/b.tar.gz", "bundle_upload": "abc", "environment": "ic"
-        }));
-        assert!(request_from_args(three).unwrap_err().contains("not several"));
-        let neither = args(serde_json::json!({ "environment": "ic" }));
-        assert!(request_from_args(neither).unwrap_err().contains("bundle_upload"));
-        let upload = args(serde_json::json!({ "bundle_upload": " abc ", "environment": "ic" }));
-        let request = request_from_args(upload).unwrap();
-        assert!(matches!(request.bundle, BundleSource::Upload(ref id) if id == "abc"));
-        let empty = args(serde_json::json!({ "bundle_upload": " ", "environment": "ic" }));
-        assert!(request_from_args(empty).unwrap_err().contains("empty"));
-        let bad = args(serde_json::json!({ "bundle_base64": "***", "environment": "ic" }));
-        assert!(request_from_args(bad).unwrap_err().contains("base64"));
+        });
+        let neither = serde_json::json!({ "environment": "ic" });
+        let inline = serde_json::json!({ "bundle_base64": "AAAA", "environment": "ic" });
+
+        let request = by_path(path.clone()).unwrap();
+        assert!(matches!(request.bundle, BundleSource::Path(ref p) if p == "/tmp/b.tar.gz"));
+        for refused in [upload.clone(), both.clone()] {
+            assert!(by_path(refused).unwrap_err().contains("takes no uploads"));
+        }
+        for missing in [neither.clone(), inline.clone()] {
+            assert!(by_path(missing).unwrap_err().contains("as bundle_path"));
+        }
+
+        let request = by_upload(upload).unwrap();
+        assert!(matches!(request.bundle, BundleSource::Path(ref id) if id == "abc"));
+        for refused in [path, both] {
+            let e = by_upload(refused).unwrap_err();
+            assert!(e.contains("reads no bundle_path") && e.contains(UPLOAD_TOOL), "{e}");
+        }
+        for missing in [neither, inline] {
+            assert!(by_upload(missing).unwrap_err().contains("as bundle_upload"));
+        }
+        let empty = serde_json::json!({ "bundle_upload": " ", "environment": "ic" });
+        assert!(by_upload(empty).unwrap_err().contains("empty"));
+    }
+
+    // And lists the one argument it takes, with the upload tool beside it
+    // only where there is a store to upload to.
+    #[test]
+    fn a_server_lists_the_bundle_argument_it_takes() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = tools();
+        let hosted = tools().with_uploads(
+            Uploads::new(dir.path().join("uploads"), 1024),
+            "https://mcp.example/deploy/upload".into(),
+        );
+        for (tools, listed, unlisted) in
+            [(local, "bundle_path", "bundle_upload"), (hosted, "bundle_upload", "bundle_path")]
+        {
+            let tools = tools.tools();
+            let uploads = listed == "bundle_upload";
+            assert_eq!(tools.iter().any(|t| &*t.name == UPLOAD_TOOL), uploads);
+            let deploy = tools.iter().find(|t| &*t.name == DEPLOY_TOOL).expect("deploy");
+            let schema = serde_json::to_value(&deploy.input_schema).unwrap();
+            assert!(schema["properties"][listed].is_object(), "{schema}");
+            assert!(schema["properties"][unlisted].is_null(), "{schema}");
+            assert!(schema["properties"]["environment"].is_object(), "{schema}");
+        }
     }
 
     // A relative deploy directory (a server started with a relative state
@@ -985,16 +1047,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_relative_deploy_directory_is_made_absolute() {
-        let agent =
-            imcp2_core::Agent::builder().with_url(imcp2_core::IC_URL).build().expect("agent");
-        let identities = Identities::new(
-            imcp2_core::IiInstance::prod().expect("prod II"),
-            "https://mcp.example".into(),
-            agent,
-        );
-        let tools = IcDeployTools::new(identities, Arc::new(|_: &_| None))
-            .deploys_in(std::path::Path::new("state/deploys"))
-            .unwrap();
+        let tools = tools().deploys_in(std::path::Path::new("state/deploys")).unwrap();
         let dir = tools.deploys_dir.clone().unwrap();
         assert!(dir.is_absolute(), "{dir}");
         let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
@@ -1003,25 +1056,14 @@ mod tests {
         std::fs::remove_dir_all(cwd.join("state")).unwrap();
     }
 
-    // Four base64 characters past the bound is refused on length alone, before
-    // any decoding: the bundle limit is measured on the text, not after a copy
-    // of it has been allocated.
-    #[test]
-    fn an_oversized_inline_bundle_is_refused_before_decoding() {
-        let text = "A".repeat(MAX_BUNDLE_BASE64_CHARS + 4);
-        let big = args(serde_json::json!({ "bundle_base64": text, "environment": "ic" }));
-        let e = request_from_args(big).unwrap_err();
-        assert!(e.contains("encodes more than"), "{e}");
-    }
-
     #[test]
     fn the_request_takes_the_defaults_and_parses_the_ids() {
-        let request = request_from_args(args(serde_json::json!({
+        let request = by_path(serde_json::json!({
             "bundle_path": "/tmp/b.tar.gz",
             "environment": " ic ",
             "canister_ids": { "backend": "aaaaa-aa" },
             "mode": "Upgrade"
-        })))
+        }))
         .unwrap();
         assert_eq!(request.environment, "ic");
         assert_eq!(request.mode, "upgrade");
@@ -1036,41 +1078,43 @@ mod tests {
     // teaches before any I/O: trimmed, present, absolute.
     #[test]
     fn a_bundle_path_is_trimmed_and_must_be_absolute() {
-        let request = request_from_args(args(
-            serde_json::json!({ "bundle_path": "  /b.tar.gz ", "environment": "ic" }),
-        ))
-        .unwrap();
+        let request =
+            by_path(serde_json::json!({ "bundle_path": "  /b.tar.gz ", "environment": "ic" }))
+                .unwrap();
         assert!(matches!(request.bundle, BundleSource::Path(ref p) if p == "/b.tar.gz"));
         for (path, needle) in [("relative/b.tar.gz", "absolute"), ("  ", "empty")] {
-            let e = request_from_args(args(
-                serde_json::json!({ "bundle_path": path, "environment": "ic" }),
-            ))
-            .unwrap_err();
+            let e = by_path(serde_json::json!({ "bundle_path": path, "environment": "ic" }))
+                .unwrap_err();
             assert!(e.contains(needle), "{path:?}: {e}");
         }
     }
 
     #[test]
     fn bad_modes_ids_and_subnets_are_named_in_the_rejection() {
-        let e = request_from_args(args(serde_json::json!({
+        let e = by_path(serde_json::json!({
             "bundle_path": "/b", "environment": "ic", "mode": "yolo"
-        })))
+        }))
         .unwrap_err();
         assert!(e.contains("mode") && e.contains("yolo"), "{e}");
-        let e = request_from_args(args(serde_json::json!({
+        let e = by_path(serde_json::json!({
             "bundle_path": "/b", "environment": "ic", "canister_ids": { "backend": "nope" }
-        })))
+        }))
         .unwrap_err();
         assert!(e.contains("canister_ids[\"backend\"] is not a valid principal"), "{e}");
-        let e = request_from_args(args(serde_json::json!({
+        let e = by_path(serde_json::json!({
             "bundle_path": "/b", "environment": "ic", "subnet": "nope"
-        })))
+        }))
         .unwrap_err();
         assert!(e.contains("subnet"), "{e}");
         let e =
-            request_from_args(args(serde_json::json!({ "bundle_path": "/b", "environment": " " })))
-                .unwrap_err();
+            by_path(serde_json::json!({ "bundle_path": "/b", "environment": " " })).unwrap_err();
         assert!(e.contains("environment"), "{e}");
+        // An upload's deploy is held to the same, before the upload is taken.
+        let e = by_upload(serde_json::json!({
+            "bundle_upload": "abc", "environment": "ic", "mode": "yolo"
+        }))
+        .unwrap_err();
+        assert!(e.contains("mode") && e.contains("yolo"), "{e}");
     }
 
     // The text a client without structured-output support reads carries the

@@ -2484,7 +2484,6 @@ name = "imcp2-deploy"
 version = "0.6.1"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
  "camino",
  "candid",
  "flate2",

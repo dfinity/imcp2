@@ -102,9 +102,11 @@ environment and every canister will be created.
 
 ### Upload the bundle, on a server that cannot read your files
 
-A server that lists `icp_deploy_upload` runs on another machine than the
-project, so it cannot open `bundle_path`, and a tool call cannot carry the
-archive itself. Upload it first:
+A server takes the bundle one way, and `icp_deploy_bundle` lists the one
+argument for it: `bundle_path` on a server running on the project's machine,
+`bundle_upload` on one that is not. A server that lists `icp_deploy_upload`
+is of the second kind: it cannot open a path of yours, and a tool call cannot
+carry the archive itself. Upload it first:
 
 1. Call `icp_deploy_upload`. It returns a one-time ticket, good for a few
    minutes, and the exact `curl` command to run.
@@ -115,9 +117,10 @@ archive itself. Upload it first:
    `bundle_path`.
 
 A ticket is spent by one upload, successful or not; an upload is spent by
-one deploy. If either lapses, ask for a new ticket and upload again. A
-server that does not list `icp_deploy_upload` takes `bundle_path` or
-`bundle_base64` and refuses `bundle_upload`.
+one deploy. If either lapses, ask for a new ticket and upload again. Each
+kind of server refuses the other's argument: one that lists
+`icp_deploy_upload` refuses `bundle_path`, one that does not refuses
+`bundle_upload`.
 
 ### Call the tool
 
@@ -135,9 +138,7 @@ Pass the bundle, the environment name, and the mapping as `canister_ids`:
 ```
 
 - `bundle_path` must be absolute. On a server that cannot read your
-  filesystem, pass `bundle_upload` from the upload above instead (or, for a
-  client that can attach the bytes itself, `bundle_base64`); exactly one of
-  the three is accepted.
+  filesystem, pass `bundle_upload` from the upload above in its place.
 - `environment` is the name as the manifest declares it, `ic` for a default
   project.
 - `canister_ids` is the file's content. Omit it, or send `{}`, on a first

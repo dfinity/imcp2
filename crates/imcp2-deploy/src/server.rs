@@ -43,19 +43,10 @@ impl<H: ServerHandler> WithDeploy<H> {
         &self.deploy
     }
 
-    /// The deploy tools this server lists: `icp_deploy_upload` only where an
-    /// upload store exists for it to mint tickets on.
-    pub fn deploy_tools(&self) -> Vec<Tool> {
-        IcDeployTools::tool_router()
-            .list_all()
-            .into_iter()
-            .filter(|t| self.deploy.has_uploads() || &*t.name != crate::UPLOAD_TOOL)
-            .collect()
-    }
-
-    fn serves(&self, name: &str) -> bool {
-        IcDeployTools::tool_router().has_route(name)
-            && (self.deploy.has_uploads() || name != crate::UPLOAD_TOOL)
+    /// The deploy tool of that name, when this server lists one (see
+    /// [`IcDeployTools::tools`]).
+    fn deploy_tool(&self, name: &str) -> Option<Tool> {
+        self.deploy.tools().into_iter().find(|t| &*t.name == name)
     }
 
     /// The paragraph appended to the inner instructions.
@@ -69,8 +60,7 @@ impl<H: ServerHandler> WithDeploy<H> {
              ticket and the curl command that uploads the archive, and the upload id that \
              command prints is what `icp_deploy_bundle` takes as `bundle_upload`."
         } else {
-            "Pass the bundle as `bundle_path` (an absolute path on this machine) or \
-             `bundle_base64`."
+            "Pass the bundle as `bundle_path`, an absolute path on this machine."
         };
         format!(
             "DEPLOYING. This server adds `icp_deploy_bundle`, the one exception to the rule above \
@@ -110,7 +100,7 @@ impl<H: ServerHandler> ServerHandler for WithDeploy<H> {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let mut result = self.inner.list_tools(request, context).await?;
-        result.tools.extend(self.deploy_tools());
+        result.tools.extend(self.deploy.tools());
         Ok(result)
     }
 
@@ -119,7 +109,7 @@ impl<H: ServerHandler> ServerHandler for WithDeploy<H> {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        if self.serves(&request.name) {
+        if self.deploy_tool(&request.name).is_some() {
             let tcc = ToolCallContext::new(&self.deploy, request, context);
             IcDeployTools::tool_router().call(tcc).await
         } else {
@@ -128,11 +118,7 @@ impl<H: ServerHandler> ServerHandler for WithDeploy<H> {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        if self.serves(name) {
-            IcDeployTools::tool_router().get(name).cloned()
-        } else {
-            self.inner.get_tool(name)
-        }
+        self.deploy_tool(name).or_else(|| self.inner.get_tool(name))
     }
 
     async fn list_resources(

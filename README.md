@@ -568,7 +568,10 @@ What the hosted composition adds to the local one:
   stays out of proxy logs. The route is outside the bearer gate — the ticket is
   its authentication — and streams the body to disk under
   `$MCP_DEPLOY_MAX_UPLOAD_BYTES`, refusing a declared length over it unread. An
-  upload is held fifteen minutes for its deploy, and removed with it.
+  upload is held fifteen minutes for its deploy, and removed with it. The
+  upload is the only way in: `icp_deploy_bundle` lists `bundle_upload` here and
+  refuses the local server's `bundle_path`, so this server opens no file a
+  caller names.
 - **The deploy call is answered as an event stream.** The endpoint answers a
   POST with plain JSON, the one message a handler returns; a deploy reports
   each phase as a progress notification before its result, so a `tools/call`
