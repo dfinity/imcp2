@@ -224,12 +224,14 @@ server actually does, it should cover at least:
   grant expiry and access level inside the seal; it holds no user principal,
   anchor, client id or redirect URI. It is kept until the grant expires (at
   most 30 days) or the configured idle purge removes it, and **sessions then
-  survive process restarts**. Client registrations are no longer stored (the
-  `imcp2_dcr1.` client id carries its redirect URIs), and codes and tokens are
-  self-contained sealed values. Codes are not stored; the backend that issues
-  an access token keeps it, sealed, in memory for about seven minutes (longer
-  only while that backend rebuilds its copy of the session records), so that
-  a retried exchange of the same code gets the same answer. See
+  survive process restarts**. New client registrations are no longer stored
+  (the `imcp2_dcr1.` client id carries its redirect URIs); registrations made
+  before sharing was turned on stay in each backend's `oauth-clients.json`, as
+  before. Codes and tokens are self-contained sealed values. Codes are not
+  stored; the backend that issues an access token keeps it, sealed, in memory
+  for about seven minutes (longer only while that backend rebuilds its copy of
+  the session records), so that a retried exchange of the same code gets the
+  same answer. See
   [`scoping-shared-sessions.md`](scoping-shared-sessions.md), 9.1, for
   everything the canister holds.
 - **Public-network consequence:** calls the user makes execute on the

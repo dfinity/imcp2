@@ -328,7 +328,9 @@ workspace (`imcp2`, `imcp2-core`, `imcp2-local`, `imcp2-session-api`,
   carries it**:
   1. publish a placeholder by hand (as `imcp2` and `imcp2-core` once were; see
      the header of `publish-crate.yml`), from a throwaway copy of the
-     repository (a fresh clone of `main`, say):
+     repository (a fresh clone of `main`, say) that already carries 0.7.0
+     (before it, the crate's manifest says `publish = false`, which Cargo
+     enforces whatever the version or the token):
      - set `version = "0.0.1"` in `crates/imcp2-session-api/Cargo.toml`,
        **and** the `imcp2-session-api` pin in the root `Cargo.toml`'s
        `[workspace.dependencies]` to `version = "0.0.1"`. Editing the crate

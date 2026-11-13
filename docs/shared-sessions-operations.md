@@ -218,10 +218,16 @@ records it, and a snapshot load can be followed by a replay ([8.10](#810-disaste
   each entry somewhere durable if it must outlive that.
   <!-- TODO(reconcile): ownership decision. Name the durable place for journal entries (design record, 13 item 12). -->
 - If you ever call an `admin_*` method by hand, record it in the incident notes as a journal entry.
+- **When a call was made** is when its run's apply job (named `admin on <target>`) started, which
+  each attempt's summary shows as *Started (UTC)*. It is not the run's creation time: a run waits
+  for approval, and a re-run makes its call again later under the same run.
 
 ```sh
 gh run list --workflow deploy-session-canister.yml --limit 200 \
-  --json displayTitle,conclusion,createdAt,url
+  --json databaseId,displayTitle,conclusion,createdAt,updatedAt,attempt,url
+# When attempt <N> of run <RUN_ID> made its call:
+gh run view <RUN_ID> --attempt <N> --json jobs \
+  --jq '.jobs[] | select(.name | startswith("admin on")) | .startedAt'
 ```
 
 ### 2.4 Conventions in this runbook
@@ -1175,7 +1181,10 @@ Steps:
 
 2. **Pick the journal entries to replay, before the load:** step 5 replays the key entries and
    restores the allow-list as soon as the canister is back, so have them at hand. List the admin
-   journal (2.3), and keep this target's `admin` runs created after `T_snap`.
+   journal (2.3), and keep this target's `admin` runs whose apply job started after `T_snap`, in
+   any attempt: a run created before the snapshot counts if it was approved, or re-run, after it.
+   Every such run's `updatedAt` is after `T_snap`, so check the attempts of those runs. Order the
+   entries by that start time; "oldest first" in steps 5 and 8 means this order.
    - **Replay** every run whose last *Outcome* row is `Ok`.
    - **Inspect** a run whose last outcome is `call failed` or `unrecognized reply`, and a run that
      reached its *Admin call* step but has no final outcome (cancelled, timed out, failed, or its
