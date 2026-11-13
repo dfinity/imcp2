@@ -33,6 +33,7 @@ use icp_project::{
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, Span};
 
 use crate::{calls::AgentCalls, host};
 
@@ -42,6 +43,10 @@ pub enum BundleSource {
     Bytes(Vec<u8>),
     /// An absolute path to the archive on this machine.
     Path(Utf8PathBuf),
+    /// An archive uploaded ahead of the call, by the id the upload answered
+    /// with (see [`crate::Uploads`]). The tool turns it into a [`Self::Path`]
+    /// before the deploy; one reaching the deploy as is, is a request error.
+    Upload(String),
 }
 
 // By hand so a request never prints megabytes of archive.
@@ -50,6 +55,7 @@ impl fmt::Debug for BundleSource {
         match self {
             BundleSource::Bytes(bytes) => write!(f, "Bytes({} bytes)", bytes.len()),
             BundleSource::Path(path) => write!(f, "Path({path})"),
+            BundleSource::Upload(id) => write!(f, "Upload({id})"),
         }
     }
 }
@@ -200,6 +206,11 @@ pub async fn deploy_bundle(
     let bytes = match request.bundle {
         BundleSource::Bytes(bytes) => bytes,
         BundleSource::Path(path) => read_bundle_file(&path, host::MAX_BUNDLE_BYTES).await?,
+        BundleSource::Upload(id) => {
+            return Err(RequestError(format!(
+                "the upload '{id}' was not resolved to a file before the deploy"
+            )))
+        }
     };
 
     // The working directory holds the bundle's files, the ids the deploy
@@ -326,7 +337,15 @@ pub async fn deploy_bundle(
     // One reporter for the whole deploy; its events are turned into log lines
     // as they arrive, so a run that fails still reports every phase before it.
     let (reporter, receiver) = icp_events::channel::<Task>();
-    let collector = tokio::spawn(collect_log(receiver, watch.lines));
+    // The collector logs each line too, under the span the caller put the
+    // deploy in (the session), so the server's own log has the events.
+    let collector = tokio::spawn(collect_log(receiver, watch.lines).instrument(Span::current()));
+    tracing::info!(
+        dir = %dir,
+        environment = %request.environment,
+        canisters = ?outcome.canisters,
+        "deploy started"
+    );
 
     // From here the directory outlives this future (see above).
     let workdir = scratch.keep();
@@ -386,6 +405,19 @@ pub async fn deploy_bundle(
     // the directory stays as the record, as it does for a run that is cut
     // off (see [`DeployRequest::workdir`]).
     drop(host);
+    match &outcome.error {
+        None => tracing::info!(
+            status = outcome.status.as_str(),
+            created = ?outcome.created,
+            "deploy finished"
+        ),
+        Some(error) => tracing::warn!(
+            status = outcome.status.as_str(),
+            created = ?outcome.created,
+            %error,
+            "deploy did not finish"
+        ),
+    }
     if outcome.status == Status::Interrupted {
         outcome.log.push(format!(
             "interrupted; the deploy directory '{}' is kept, with the ids it recorded",
@@ -468,6 +500,7 @@ async fn collect_log(
 ) -> Vec<String> {
     let mut log = Vec::new();
     let mut push = |line: String| {
+        tracing::info!("{line}");
         if let Some(lines) = &lines {
             let _ = lines.send(line.clone());
         }
@@ -1030,6 +1063,65 @@ mod tests {
         }
         assert_eq!(streamed, outcome.log);
         assert!(streamed.iter().any(|l| l == "Building canisters: ok"), "{streamed:?}");
+    }
+
+    // The server's log has every line the deploy makes, under the span the
+    // caller runs it in — the collector is a task of its own, so the span
+    // has to be carried to it on purpose.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_log_is_written_to_the_server_log_under_the_callers_span() {
+        use tracing_subscriber::fmt::MakeWriter;
+        #[derive(Clone, Default)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+        // Process-wide: the collector runs on another worker thread, which a
+        // thread-local default would not reach. Installed once for the test
+        // binary; what other tests write goes to the sink too, unread.
+        static SINK: std::sync::OnceLock<Sink> = std::sync::OnceLock::new();
+        let sink = SINK
+            .get_or_init(|| {
+                let sink = Sink::default();
+                let subscriber =
+                    tracing_subscriber::fmt().with_ansi(false).with_writer(sink.clone()).finish();
+                tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
+                sink
+            })
+            .clone();
+
+        let (wasm, sha) = wasm();
+        let span = tracing::info_span!("deploy", session = "sess-1");
+        let outcome = deploy_bundle(
+            Arc::new(AnonymousIdentity),
+            request(bundle(&sha, &wasm), "ic"),
+            Watch::default(),
+        )
+        .instrument(span)
+        .await
+        .unwrap();
+        assert_eq!(outcome.status, Status::Failed);
+        let written = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        // Other tests' deploys write to the sink too; this one's lines are
+        // the ones under its span.
+        let own: Vec<&str> =
+            written.lines().filter(|l| l.contains("deploy{session=\"sess-1\"}")).collect();
+        let has = |needle: &str| own.iter().any(|l| l.contains(needle));
+        assert!(has("deploy started"), "{own:?}");
+        assert!(has("Building canisters: ok"), "{own:?}");
+        assert!(has("deploy did not finish") && has("status=\"failed\""), "{own:?}");
     }
 
     // A stop asked for before the run begins ends it without a step, and

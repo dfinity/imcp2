@@ -43,6 +43,12 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace --all-targets
 
+      # The deploy tools on the hosted server are a feature of `imcp2` (off in
+      # the default build, on in the native deployment's), so they get their
+      # own run.
+      - name: Test the hosted deploy feature
+        run: cargo test --locked -p imcp2 --features deploy --all-targets
+
   # Formatting, enforced rather than merely requested: CONTRIBUTING.md asks for
   # `cargo fmt --all` and the coding guidelines ask for a rustfmt-clean tree,
   # and this is what keeps that true. Without it the tree drifts out of shape

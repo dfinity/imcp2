@@ -1,34 +1,29 @@
-//! The local MCP server: [`IcTools`] wrapped in a thin handler that adds the
-//! two **local-only login tools** and the **deploy tool**. The login tools
+//! The local MCP server: [`IcTools`] with the **deploy tools** beside it
+//! ([`WithDeploy`], the handler the hosted server mounts too), wrapped in a
+//! thin handler that adds the two **local-only login tools**. The login tools
 //! cannot live in `imcp2-core` — they drive this binary's loopback listener
 //! and browser opener, which core cannot call back into — so this wrapper
-//! carries them in its own `#[tool_router]`. The deploy tools
-//! (`icp_deploy_bundle`, `icp_cycles_balance` and `icp_deploy_guide`,
-//! [`IcDeployTools`]) cannot either, for a different reason: it runs on the icp CLI's project library, a git dependency the
-//! published crates cannot carry. The wrapper answers `tools/list` with the
-//! merged list, dispatches `tools/call` to its own router, then the deploy
-//! router, and forwards everything else to the inner [`IcTools`] handler
-//! verbatim. The hosted server contains none of this code, so its tool surface
-//! stays login- and deploy-free by construction (a core-side test guards the
-//! boundary too).
+//! carries them in its own `#[tool_router]`, answers `tools/list` with the
+//! merged list, dispatches `tools/call` to its own router first, and forwards
+//! everything else to the inner handler verbatim. The hosted server contains
+//! no login tool, so its surface stays login-free by construction (a
+//! core-side test guards the boundary too).
 
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult, Resource,
-    ResourceContents, Tool,
+    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{schemars, tool, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
 
 use crate::login::{BeginOutcome, Grant, LoginDriver, LoginStatus};
 use imcp2_core::IcTools;
-use imcp2_deploy::IcDeployTools;
+use imcp2_deploy::{IcDeployTools, WithDeploy};
 
 pub struct LocalServer {
-    tools: IcTools,
-    deploy: IcDeployTools,
+    tools: WithDeploy<IcTools>,
     login: LoginDriver,
     /// Whether the login flow will also try to open the browser itself —
     /// only phrasing: the link is always returned in-band.
@@ -167,7 +162,13 @@ fn human_minutes(mins: u64) -> String {
 #[tool_router]
 impl LocalServer {
     pub fn new(tools: IcTools, deploy: IcDeployTools, login: LoginDriver, auto_open: bool) -> Self {
-        Self { tools, deploy, login, auto_open }
+        Self { tools: WithDeploy::new(tools, deploy), login, auto_open }
+    }
+
+    /// The deploy tools this server serves.
+    #[cfg(test)]
+    pub fn deploy(&self) -> &IcDeployTools {
+        self.tools.deploy()
     }
 
     #[tool(
@@ -264,37 +265,16 @@ impl ServerHandler for LocalServer {
         let mut info = self.tools.get_info();
         info.server_info.name = "imcp2-local".into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
-        // A running deploy reports each phase mid-call: as progress when the
-        // request carried a token, else as a logging message, which a client
-        // only expects from a server that declares it.
-        info.capabilities.logging = Some(Default::default());
-        // The core instructions apply verbatim; add how signing in works here
-        // (the hosted server logs in via OAuth outside the tool surface, so
-        // core's text says nothing about it).
-        let core = info.instructions.take().unwrap_or_default();
+        // The core and deploy instructions apply verbatim; add how signing in
+        // works here (the hosted server logs in via OAuth outside the tool
+        // surface, so neither says anything about it).
+        let inner = info.instructions.take().unwrap_or_default();
         info.instructions = Some(format!(
-            "{core}\n\n\
+            "{inner}\n\n\
              SIGNING IN. On this local server the user signs in through `authenticate`, which \
              returns an id.ai link for them to open. Sessions are held in memory, so the user \
              signs in again after a restart, when the grant expires, or if they revoke it at \
-             id.ai.\n\n\
-             DEPLOYING. This local server adds `icp_deploy_bundle`, the one exception to the \
-             rule above that no tool deploys: it deploys an icp project bundle (`icp project \
-             bundle --output <file>`, built in the user's environment) to the environment it \
-             names, creating the canisters that do not exist yet from the user's cycles \
-             balance (`icp_cycles_balance` reports it) and upgrading those passed in \
-             `canister_ids`. It deploys as the user's default Internet Identity account at \
-             https://cli.id.ai — the principal `icp identity link web` links the CLI to, and \
-             so the CLI's own only when the CLI's selected identity is that link; a local key \
-             or another account is a different principal, which `icp identity principal` \
-             shows — not as the management identity the canister tools act as. It needs an \
-             \"Actions & questions\" session, runs one deploy at a time, lasts as long as the \
-             deploy (send a progressToken to see each phase as it completes; cancelling the \
-             call interrupts the deploy at its next step), and returns the canister-id \
-             mapping to pass back next time. \
-             The `skill://deploy-with-mcp` resource walks through the loop: bundle, deploy, \
-             write the mapping back into the project; `icp_deploy_guide` returns the same \
-             text."
+             id.ai."
         ));
         info
     }
@@ -306,7 +286,6 @@ impl ServerHandler for LocalServer {
     ) -> Result<ListToolsResult, McpError> {
         let mut result = self.tools.list_tools(request, context).await?;
         result.tools.extend(Self::tool_router().list_all());
-        result.tools.extend(IcDeployTools::tool_router().list_all());
         Ok(result)
     }
 
@@ -318,20 +297,13 @@ impl ServerHandler for LocalServer {
         if Self::tool_router().has_route(&request.name) {
             let tcc = ToolCallContext::new(self, request, context);
             Self::tool_router().call(tcc).await
-        } else if IcDeployTools::tool_router().has_route(&request.name) {
-            let tcc = ToolCallContext::new(&self.deploy, request, context);
-            IcDeployTools::tool_router().call(tcc).await
         } else {
             self.tools.call_tool(request, context).await
         }
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        Self::tool_router()
-            .get(name)
-            .cloned()
-            .or_else(|| IcDeployTools::tool_router().get(name).cloned())
-            .or_else(|| self.tools.get_tool(name))
+        Self::tool_router().get(name).cloned().or_else(|| self.tools.get_tool(name))
     }
 
     async fn list_resources(
@@ -339,19 +311,7 @@ impl ServerHandler for LocalServer {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        let first_page = request.as_ref().and_then(|r| r.cursor.as_ref()).is_none();
-        let mut result = self.tools.list_resources(request, context).await?;
-        // The one skill this server adds, next to core's bundled IC skills: the
-        // deploy loop around `icp_deploy_bundle`, which only exists here. Core
-        // lists everything on one page today; should it ever page, the skill
-        // belongs on the first page alone, not on every one.
-        if first_page {
-            result.resources.push(Resource::new(
-                format!("skill://{}", imcp2_deploy::DEPLOY_SKILL_NAME),
-                format!("IC skill: {}", imcp2_deploy::DEPLOY_SKILL_TITLE),
-            ));
-        }
-        Ok(result)
+        self.tools.list_resources(request, context).await
     }
 
     async fn read_resource(
@@ -359,11 +319,6 @@ impl ServerHandler for LocalServer {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
-        if let Some(md) =
-            request.uri.strip_prefix("skill://").and_then(imcp2_deploy::skill_document)
-        {
-            return Ok(ReadResourceResult::new(vec![ResourceContents::text(md, request.uri)]));
-        }
         self.tools.read_resource(request, context).await
     }
 }
@@ -452,7 +407,7 @@ mod tests {
     async fn a_real_mcp_client_sees_the_merged_surface_and_the_login_flow() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let local = test_server();
-        let deploy_tools = local.deploy.clone();
+        let deploy_tools = local.deploy().clone();
         let server = local.serve(server_io);
         let client = ().serve(client_io);
         let (server, client) = tokio::join!(server, client);

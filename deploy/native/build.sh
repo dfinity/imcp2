@@ -79,7 +79,7 @@ RUN printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debia
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY crates ./crates
-RUN cargo build --release
+RUN cargo build --release --features deploy
 FROM scratch AS bin
 COPY --from=build /app/target/release/imcp2 /imcp2
 DOCKERFILE

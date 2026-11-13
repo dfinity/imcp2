@@ -212,10 +212,12 @@ rather than creates. Not every client reads resources, so `icp_deploy_guide`
 returns the same document as a tool result. It lives at
 `crates/imcp2-deploy/static/skills/deploy-with-mcp.md`.
 
-Why only here: the tool is built on `icp-project`, a crate the icp CLI does not
-publish, so it is pulled from git — which the crates.io-published `imcp2-core`
-and `imcp2` cannot do. It lives in its own `imcp2-deploy` crate, composed into
-this binary alone.
+The tool is built on `icp-project`, a crate the icp CLI does not publish, so
+it is pulled from git — which the crates.io-published `imcp2-core` and `imcp2`
+cannot do. It lives in its own `imcp2-deploy` crate, composed into this binary
+and, behind the `deploy` feature, into the hosted server (see the repository
+README), where the bundle arrives through an upload ticket since that server
+cannot read the user's files.
 
 ## Upgrading
 
@@ -237,8 +239,10 @@ Internet Identity (`https://id.ai`). Environment overrides, mainly for tests:
 | `IMCP2_MANAGEMENT_ORIGIN` | Derivation origin of the canister-management identity. Defaults to the hosted server's origin so the same anchor keeps the same controller principal locally and hosted. The deploy tools do not use it; they act at `https://cli.id.ai`. |
 | `IMCP2_NO_OPEN` | Truthy: never auto-open the browser on sign-in (the link is still returned in-band). |
 
-All diagnostics go to stderr (`RUST_LOG` filters them); stdout is the MCP
-JSON-RPC channel.
+All diagnostics go to stderr (`RUST_LOG` filters them; the default is `info`);
+stdout is the MCP JSON-RPC channel. A deploy's events — the directory it works
+in, each phase as it completes, how it ended — are logged at `info`, so the
+client's record of a run is also on stderr.
 
 ## Security model — treat it like a wallet
 
