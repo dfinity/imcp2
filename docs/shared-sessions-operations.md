@@ -41,9 +41,11 @@ or an owner can settle: a measurement, an ownership decision, a threshold.
 
   The rest of the sign-in makes no canister call. The connect cookie, the code, the access token
   and the client id are self-contained.
-- **Every node mirrors the feed.** It polls by query every second and confirms with replicated
-  reads (at most 30 s apart while anything changes, every 5 minutes otherwise). `/mcp` makes no
-  canister call for a mirrored session; a miss reads through by query. Nothing is kept on disk: a
+- **Every node mirrors the feed.** It polls by query every second (`list_changes_non_replicated`,
+  a hint) and confirms with replicated reads (`list_changes`, an update; at most 30 s apart while
+  anything changes, every 5 minutes otherwise). `/mcp` makes no canister call for a mirrored
+  session; a miss reads through by query (`get_sessions_non_replicated`), then by an update
+  (`get_sessions`). Nothing is kept on disk: a
   restarted node rebuilds its mirror from the canister, and **a restart signs nobody out**.
 - **Records are sealed** (XChaCha20-Poly1305) under a **keyring** that every node holds:
   `kid:base64` entries. The canister never sees inside a record. It publishes one **key check**
@@ -353,7 +355,7 @@ dfx build imcp2_session --network ic
 dfx canister install imcp2_session --network ic --mode install \
   --argument '(variant { Init = record { authorized = opt vec { principal "<NODE_1_PRINCIPAL>"; principal "<NODE_2_PRINCIPAL>" } } })'
 dfx canister info <CANISTER_ID> --network ic   # Module hash: the release's .sha256
-dfx canister call <CANISTER_ID> get_status '()' --network ic --update
+dfx canister call <CANISTER_ID> get_status '(record {})' --network ic
 ```
 
 - **Build first.** `dfx canister install` by canister name refuses until `dfx build` has run
@@ -482,16 +484,16 @@ sudo env IMCP2_SHARED_KEYS_FILE=/etc/imcp2/keys /opt/imcp2/imcp2 shared-key-chec
 ```
 
 It reads only the keyring, from `IMCP2_SHARED_KEYS_FILE` or `IMCP2_SHARED_KEYS` by the server's
-rules, and makes no network call. It prints one line per kid, in keyring order: Candid for
-`admin_set_key_check`'s first argument, with the kid's fingerprint in a Candid comment.
+rules, and makes no network call. It prints one line per kid, in keyring order: the whole Candid
+argument of `admin_set_key_check`, with the kid's fingerprint in a Candid comment.
 
 ```text
-record { kid = 2 : nat8; check = blob "\79\fb\95\75\ed\18\e1\c5\09\c1\bc\27\e1\a7\e2\77" } /* fingerprint 79fb9575ed18e1c5 */
-record { kid = 1 : nat8; check = blob "\ea\f4\8e\9d\d7\cc\75\4f\02\7f\54\93\06\d8\6a\2f" } /* fingerprint eaf48e9dd7cc754f */
+(record { kid = 2 : nat8; check = blob "\79\fb\95\75\ed\18\e1\c5\09\c1\bc\27\e1\a7\e2\77" }) /* fingerprint 79fb9575ed18e1c5 */
+(record { kid = 1 : nat8; check = blob "\ea\f4\8e\9d\d7\cc\75\4f\02\7f\54\93\06\d8\6a\2f" }) /* fingerprint eaf48e9dd7cc754f */
 ```
 
-Every byte of the blob is escaped, so the whole line, comment included, pastes into the argument
-below. A keyring it cannot read exits 1 with `Error: …` (naming the variable or the entry, never a
+Every byte of the blob is escaped, so the whole line, comment included, is the argument below as it
+stands. A keyring it cannot read exits 1 with `Error: …` (naming the variable or the entry, never a
 key); an argument after `shared-key-check` exits 2. Appendix A computes the same lines without the
 binary.
 
@@ -503,17 +505,18 @@ Then publish it with the workflow:
 | `target` | the canister's target |
 | `mode` | `admin` |
 | `method` | `admin_set_key_check` |
-| `argument` | `(<the printed line>, false)`, e.g. `(record { kid = 2 : nat8; check = blob "\79\fb\95\75\ed\18\e1\c5\09\c1\bc\27\e1\a7\e2\77" } /* fingerprint 79fb9575ed18e1c5 */, false)` |
+| `argument` | the printed line, e.g. `(record { kid = 2 : nat8; check = blob "\79\fb\95\75\ed\18\e1\c5\09\c1\bc\27\e1\a7\e2\77" }) /* fingerprint 79fb9575ed18e1c5 */` |
 
-By hand, as a controller: `dfx canister call <CANISTER_ID> admin_set_key_check '(<the printed
-line>, false)' --network ic` (then record it in the journal, 2.3).
+By hand, as a controller: `dfx canister call <CANISTER_ID> admin_set_key_check '<the printed
+line>' --network ic` (then record it in the journal, 2.3).
 
 What the canister does with it:
 
 - **The same check again changes nothing,** so a journal replay is harmless.
-- **A different check for a kid that already has one is refused,** unless the second argument is
-  `true`.
-  - Pass `true` only to correct a wrongly published check.
+- **A different check for a kid that already has one is refused,** unless the argument says
+  `replace = opt true` (add `; replace = opt true` inside the record of the printed line). Left
+  out, as printed, it is `null`, which means no.
+  - Replace only to correct a wrongly published check.
   - Every node that holds the old key then turns `Mismatch` on that kid.
 - **A retired kid is refused** for good.
 - **Each change bumps the key-checks version,** which tells the nodes to fetch the checks again.
@@ -549,8 +552,8 @@ rotation. A record sealed under kid 1 stays readable while every node still hold
 record lives longer than 31 days.
 
 1. **Publish kid 2's check.** Run `imcp2 shared-key-check` for K2, then `admin_set_key_check` with
-   kid 2's check and `false` (4.3). The nodes do not hold K2 yet, so compute the check from the
-   new keyring file where you generated it (Appendix A, or `shared-key-check` with
+   the line it prints for kid 2, as is (4.3). The nodes do not hold K2 yet, so compute the check
+   from the new keyring file where you generated it (Appendix A, or `shared-key-check` with
    `IMCP2_SHARED_KEYS_FILE` pointing at that file).
 2. **Deploy `1:K1,2:K2`** to every node (4.2). Every node should show
    `imcp2_shared_key_info{kid="2",state="verified"}` (4.4). Nodes still seal under kid 1.
@@ -560,18 +563,18 @@ record lives longer than 31 days.
    node.
 4. **After 31 days,** nothing sealed under kid 1 can still be live:
    1. deploy `2:K2`;
-   2. run `admin_retire_kid` with `(1 : nat8)`.
+   2. run `admin_retire_kid` with `(record { kid = 1 : nat8 })`.
 
 ### 4.6 Emergency rotation
 
 Use this when kid `k` has leaked. Pick a new, never-used kid `n` with a fresh key `Kn` (4.1).
 
-1. **Publish kid n's check:** `admin_set_key_check` with kid n's check and `false`.
+1. **Publish kid n's check:** `admin_set_key_check` with kid n's line, as is (4.3).
 2. **Deploy `n:Kn,k:Kk`** to every node, and confirm `verified` on kid n everywhere (4.4).
-3. **Retire kid k:** `admin_retire_kid` with `(k : nat8)`.
+3. **Retire kid k:** `admin_retire_kid` with `(record { kid = k : nat8 })`.
    - Within about 35 s, every node answers 401 to every value sealed under kid k (reason
      `retired_kid`). That is a poll (1 s) seeing the key-checks version move, the replicated
-     fetch's debounce (at most 30 s after the previous one), then `get_key_checks` as an update.
+     fetch's debounce (at most 30 s after the previous one), then `get_key_checks` (an update).
    - Clients sign in again, under kid n.
    <!-- TODO(reconcile): staging measurement. The ~35 s is derived from the sync loop's timings; measure it on staging. -->
 4. **Purge kid k's records:** `admin_purge_sessions` with this argument (every filter field is
@@ -698,11 +701,12 @@ Every change is an `admin_update_config` run of the workflow (admin mode).
 
 - **The patch.** Each field you set replaces the current value; fields you leave out stay. The
   whole resulting configuration is validated.
-- **A refused patch changes nothing.** It answers `Err` with `InvalidArgument`, and the run fails.
+- **A refused patch changes nothing.** It answers `Err` with `err_case = opt variant {
+  InvalidArgument }` (code 2) and an `err_str` that names the bound, and the run fails.
 - **The current configuration** is in `get_status` (`config`):
 
   ```sh
-  dfx canister call <CANISTER_ID> get_status '()' --network ic --update
+  dfx canister call <CANISTER_ID> get_status '(record {})' --network ic
   ```
 
 | Field | Default | Allowed |
@@ -1034,14 +1038,14 @@ verification until a retry succeeds.
 check: its first 8 bytes, in hex, are the fingerprint.
 
 ```sh
-dfx canister call <CANISTER_ID> get_key_checks '()' --network ic --update
+dfx canister call <CANISTER_ID> get_key_checks '(record {})' --network ic
 ```
 
 **Fix the node, not the canister.** Copy the keyring from the master copy, install it (4.2),
 restart, and verify (4.4).
 
-- Do not "fix" it with `admin_set_key_check(..., true)` to match one node. That would turn every
-  other node to `Mismatch`.
+- Do not "fix" it with `admin_set_key_check` and `replace = opt true` to match one node. That would
+  turn every other node to `Mismatch`.
 - `sealed_rejected_total{reason="missing_key"}` means a value under a published kid that this node
   lacks: its keyring is behind. Deploy the full keyring.
 
@@ -1082,8 +1086,8 @@ small positive value is normal.
    ```
 
    - This tombstones every session that node opened at redeem. Those users sign in again.
-   - One purge job runs at a time. Starting another meanwhile is refused with code
-     `purge_in_progress`. `get_status` shows `purge_job` and when it is `done`.
+   - One purge job runs at a time. Starting another meanwhile is refused with `PurgeInProgress`
+     (code 30). `get_status` shows `purge_job` and when it is `done`.
 3. **Give the node a new identity** (3.2): install the PEM (4.2), restart, and check `ready`.
 
 ### 8.7 Leaked key
@@ -1266,7 +1270,7 @@ Each node serves these at `/metrics` on its own port. Caddy answers 404 on the p
 |---|---|
 | `imcp2_shared_up` | 1 while an update-path call succeeded within 360 s, a query within 30 s, and a verified sealing kid exists. Catches a frozen canister. (With a longer `replicated_interval` or poll interval than the defaults, the windows stretch to the interval + 60 s and two polls.) |
 | `imcp2_shared_ready` | Node-local readiness (8.3). It stays 1 through canister-wide outages and resyncs, so the load balancer never drains every node at once. The exception is a snapshot load older than a key rotation: the restored key checks leave no verified sealing kid, and it drops to 0 on every node until they are replayed (8.10, step 5). |
-| `imcp2_shared_canister_calls_total{method,mode,outcome}`, `…_call_duration_seconds{method,mode}` | Every canister call: `mode` is `query`, `replicated` or `update`; `outcome` is `ok`, `unauthorized`, `canister_error`, `timeout`, `transport`, `reject` or `decode`. |
+| `imcp2_shared_canister_calls_total{method,mode,outcome}`, `…_call_duration_seconds{method,mode}` | Every canister call, under the name of the method called: `mode` is `query` (the hint twins `get_sessions_non_replicated` and `list_changes_non_replicated`), `replicated` (a read sent as an update: `get_sessions`, `list_changes`, `get_key_checks`, `get_status`) or `update` (a write); `outcome` is `ok`, `unauthorized`, `canister_error`, `timeout`, `transport`, `reject` or `decode`. |
 | `imcp2_shared_cursor`, `imcp2_shared_head`, `imcp2_shared_epoch` | Feed position applied by replicated reads, the canister's latest position, its epoch. A lasting gap between `head` and `cursor` means the node is not applying replicated pages. |
 | `imcp2_shared_mirrored_records`, `imcp2_shared_adopted_sessions` | Mirror size; sessions opened on this node. |
 | `imcp2_shared_resolve_total{result}` | Token resolutions: `ready`, `invalid` (401: garbage, forged, or a retired kid), `gone` (401: purged or absent, authoritatively), `unavailable` (503). |
@@ -1389,8 +1393,8 @@ nodes that adopt the session later, to serve `/mcp`, log them at `debug`.
 |---|---|---|
 | `dfx canister info <CANISTER_ID> --network ic` | anyone | controllers, module hash |
 | `dfx canister status <CANISTER_ID> --network ic` | controller | running status, balance, freezing threshold, idle burn, memory |
-| `dfx canister call <CANISTER_ID> get_status '()' --network ic --update` | controller, or an allow-listed node | version, commit, config, sessions and tombstones per namespace, head, epoch, idle floor, key checks, per-caller statistics, purge job, counters, purge backlog, cycles, stable memory |
-| `dfx canister call <CANISTER_ID> get_key_checks '()' --network ic --update` | controller, or an allow-listed node | published checks, retired kids, version |
+| `dfx canister call <CANISTER_ID> get_status '(record {})' --network ic` | controller, or an allow-listed node | version, commit, config, sessions and tombstones per namespace, head, epoch, idle floor, key checks, per-caller statistics, purge job, counters, purge backlog, cycles, stable memory |
+| `dfx canister call <CANISTER_ID> get_key_checks '(record {})' --network ic` | controller, or an allow-listed node | published checks, retired kids, version |
 | `dfx canister logs <CANISTER_ID> --network ic` | controller | install and upgrade lines, purge runs, restore probes and detections |
 
 The canister has no HTTP interface and no public metrics. The nodes' `imcp2_shared_canister_*`
@@ -1408,10 +1412,16 @@ Its log lines:
 - `[ic-cdk-timers] … too many concurrent timer calls (250), deferring timer to next round`, after a
   long stop or freeze (8.2).
 
-An update call refused by `inspect_message` (including a query method called with `--update`)
-fails with the trap message `inspect_message: <caller> may not call <method>` (error code
-`IC0503`): that is what dfx shows when, say, a non-controller calls an `admin_*` method. A plain
-query from a caller not on the allow-list gets the typed `Err = variant { Unauthorized }`.
+An update call refused by `inspect_message` fails with the trap message `inspect_message: <caller>
+may not call <method>` (error code `IC0503`): that is what dfx shows when, say, a non-controller
+calls an `admin_*` method or a stranger calls `get_status`. Only the two query methods
+(`get_sessions_non_replicated`, `list_changes_non_replicated`) reach the method from a caller not
+on the allow-list, and answer `Err = record { err_code = 1; err_case = opt variant { Unauthorized
+}; … }`.
+
+Every error is such a record: `err_case` names the case, and `err_code` is a code that keeps its
+meaning across releases (listed at the top of the `.did`), which a reader older than the canister
+still gets when it shows `err_case = null`.
 
 ## Appendix A: a key check without the binary
 
@@ -1431,7 +1441,7 @@ for entry in filter(None, (e.strip() for e in re.split(r"[,\r\n]", text))):
     prk = hmac.new(b"", key, hashlib.sha256).digest()          # HKDF-Extract, empty salt
     check = hmac.new(prk, b"imcp2/keycheck/v1\x01", hashlib.sha256).digest()[:16]
     blob = "".join(f"\\{b:02x}" for b in check)
-    print(f'record {{ kid = {int(kid)} : nat8; check = blob "{blob}" }} /* fingerprint {check[:8].hex()} */')
+    print(f'(record {{ kid = {int(kid)} : nat8; check = blob "{blob}" }}) /* fingerprint {check[:8].hex()} */')
 EOF
 python3 -I keycheck.py keys.txt
 ```
@@ -1460,8 +1470,11 @@ correctly when nothing types it against the `.did`.
 | Allow-list | `admin_update_config` | `(record { authorized = opt vec { principal "<NODE_1_PRINCIPAL>"; principal "<NODE_2_PRINCIPAL>" } })` |
 | Capacity caps | `admin_update_config` | `(record { max_sessions = opt (<TOTAL> : nat64); max_sessions_per_namespace = opt (<PER_NAMESPACE> : nat64) })` |
 | Purge batch | `admin_update_config` | `(record { purge_batch = opt (<N> : nat32) })` |
-| Publish a key check | `admin_set_key_check` | `(record { kid = <KID> : nat8; check = blob "<16 bytes as \hh escapes>" }, false)` |
-| Retire a kid | `admin_retire_kid` | `(<KID> : nat8)` |
+| Read the status | `get_status` | `(record {})` |
+| Read the key checks | `get_key_checks` | `(record {})` |
+| Publish a key check (what `shared-key-check` prints) | `admin_set_key_check` | `(record { kid = <KID> : nat8; check = blob "<16 bytes as \hh escapes>" })` |
+| Replace a kid's published check | `admin_set_key_check` | `(record { kid = <KID> : nat8; check = blob "<16 bytes as \hh escapes>"; replace = opt true })` |
+| Retire a kid | `admin_retire_kid` | `(record { kid = <KID> : nat8 })` |
 | Purge one kid's records | `admin_purge_sessions` | `(record { namespace = variant { Any }; kid = variant { Is = (<KID> : nat8) }; opened_by = variant { Any }; created_from = variant { Any }; created_to = variant { Any } })` |
 | Purge one node's sessions | `admin_purge_sessions` | `(record { namespace = variant { Any }; kid = variant { Any }; opened_by = variant { Is = principal "<PRINCIPAL>" }; created_from = variant { Any }; created_to = variant { Any } })` |
 | Purge one namespace, by creation time | `admin_purge_sessions` | `(record { namespace = variant { Is = blob "<16 bytes as \hh escapes>" }; kid = variant { Any }; opened_by = variant { Any }; created_from = variant { Is = (<UNIX_SECONDS> : nat64) }; created_to = variant { Is = (<UNIX_SECONDS> : nat64) } })` |

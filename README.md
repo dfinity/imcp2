@@ -1225,8 +1225,8 @@ installs that binary or restarts anything.
 
    ```bash
    IMCP2_SHARED_KEYS_FILE=/etc/imcp2/keys imcp2 shared-key-check
-   # record { kid = 1 : nat8; check = blob "\ea\f4\8e…" } /* fingerprint eaf48e9dd7cc754f */
-   dfx canister call <canister-id> admin_set_key_check '(<that line>, false)'
+   # (record { kid = 1 : nat8; check = blob "\ea\f4\8e…" }) /* fingerprint eaf48e9dd7cc754f */
+   dfx canister call <canister-id> admin_set_key_check '<that line>'
    ```
 
 **Probes:**

@@ -232,15 +232,23 @@ Every label, prefix and byte layout in `keys.rs`, `seal.rs`, `codec.rs` and
 
 **The canister's interface only grows.** `crates/imcp2-session-api/imcp2_session.did`
 is hand-written, and the tests hold it to the Rust types in both directions
-(`src/tests/contract.rs`), to golden Candid bytes (`src/tests/wire.rs`), and to the
-canister's exported interface (`exported_interface_equals_the_did`). The build
+(`src/tests/contract.rs`), to golden Candid bytes (`src/tests/wire.rs`), to the
+canister's exported interface (`exported_interface_equals_the_did`), and to the
+method names imcp2's client calls (`the_method_table_is_the_did_service`). The build
 script also refuses a module whose exports differ from it.
 
 - Add methods; never remove or change one.
 - Records gain only `opt` fields (old payloads without them must still decode:
   `payloads_without_later_opt_fields_still_decode`).
-- A returned variant never gains a case: an older node would fail to decode the
-  whole reply. New conditions travel in the existing `Other` error cases.
+- Every method takes one record and returns `variant { Ok : …; Err : … }`, so
+  arguments and replies can grow. A method a node acts on is an update; a hint
+  is a separate `*_non_replicated` query.
+- Errors are records (`err_code`, `err_case : opt …`, `err_str`). A new error
+  case may be added, with a new code in the `.did`'s list (codes are never
+  reused): an older node decodes it as `err_case = null`
+  (`an_unknown_error_case_decodes_as_none`) and treats it as no definite answer.
+- Every other returned variant never gains a case: an older node would fail to
+  decode the whole reply.
 - The canister's stable layout is append-only too: memory ids are never reused,
   keys never change layout, values start with a version byte, and a migration
   bumps `SCHEMA` (`crates/imcp2-session-canister/src/storage.rs`).

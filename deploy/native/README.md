@@ -459,8 +459,8 @@ What else to know on the host:
 - **The check covers what the drop-in sets.** A setting you add in another file
   of `imcp2.service.d/` is not passed to it: add the variable to the command
   above to check it too.
-- **Printing the key checks to publish** (no network call; the line is the Candid
-  `admin_set_key_check` takes, with the fingerprint in a comment):
+- **Printing the key checks to publish** (no network call; each line is the whole
+  Candid argument `admin_set_key_check` takes, with the fingerprint in a comment):
 
   ```sh
   sudo env IMCP2_SHARED_KEYS_FILE=/etc/imcp2/keys /opt/imcp2/imcp2 shared-key-check

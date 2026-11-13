@@ -102,7 +102,7 @@ These were settled before the design.
 | D1 | **Granted sessions are canister records.** The sealed record (`RecordPayload`: sid, S, grant expiry, access level) is stored once at redeem and never rewritten. Every node mirrors the consumed records through the change feed, treats its mirror as the existence authority, decrypts a record on first use, and reads through on a miss. | The put/get-and-sync model asked for. S exists only sealed (canister and mirrors) or in a node's RAM. | Canister: `State::put_session` is create-only. Mirror: `Mirror` (6.2). Sync loop: `sync.rs` (6.3). |
 | D2 | **Self-contained credentials.** The cookie, code and token are sealed. The code and the token are bound to S (`code_proof`, `at_bind`), so the deployment key alone cannot forge a usable one. The DCR `client_id` is self-describing and unsealed. | Register and authorize, both unauthenticated, make no canister call. The short hops have no replication lag. | `seal`, `codec`, `dcr` (3). |
 | D3 | **Two awaited updates per sign-in.** `put_session` at redeem fails closed: no code is issued without a durable record. `consume_code` at `/oauth/token` gives single use through consensus, checks the code proof and returns the record. A record enters the feed only when its code is consumed. | Only single use and durability need consensus. Abandoned sign-ins never reach a mirror. | Canister: `State::put_session`, `State::consume_code`. Flow: `shared_flow::redeem`, `shared_flow::token` (7). |
-| D4 | **Queries are hints.** A query answer can add an AEAD-valid, consumed record to a mirror, but **never removes anything**. Only replicated reads (query methods called as updates) delete, move the cursor, start a resync, or justify a 401. | A query answer comes from one replica and is not certified. A sealed record cannot be forged; a tombstone or an absence can. | `Mirror::upsert` refuses a record under a final tombstone; only `Mirror::apply_final_tombstone` deletes. `Inner::poll_once` only adds; `Inner::replicated_fetch` alone deletes (6.3). |
+| D4 | **Queries are hints.** A query answer (from `get_sessions_non_replicated` or `list_changes_non_replicated`) can add an AEAD-valid, consumed record to a mirror, but **never removes anything**. Only replicated reads (`get_sessions` and `list_changes`, update calls) delete, move the cursor, start a resync, or justify a 401. | A query answer comes from one replica and is not certified. A sealed record cannot be forged; a tombstone or an absence can. | `Mirror::upsert` refuses a record under a final tombstone; only `Mirror::apply_final_tombstone` deletes. `Inner::poll_once` only adds; `Inner::replicated_fetch` alone deletes (6.3). |
 | D5 | **401 only on an authoritative fact.** Anything else (outage, lag, key drift, a newer format, a full cache) gets 503 `temporarily_unavailable` with `Retry-After: 5` and no `WWW-Authenticate`. | A 401 makes an MCP client run a full re-authorization. | `OpenError::{Invalid, Unavailable}`, `CodecError::Newer`, `Resolution`, `shared_flow::mcp_unavailable` (6.5, 6.6). |
 | D6 | **A snapshot load is disaster recovery.** The canister detects one from its own **canister history** (`canister_info`), which a snapshot load does not rewind. It then bumps `epoch` and raises `idle_floor_at`. Nodes discard their mirrors and resync. Operators replay admin changes from a journal. Sessions created after the snapshot must re-authorize. | Correct and simple. Automatic re-push from the nodes proved fragile in review. Routine upgrades never load snapshots. | `history.rs`, `State::observe_history`, `State::check_restore` (4.7). `canister_version` cannot be used (4.7). |
 | D7 | **Idle purge** at `max(last_active, idle_floor_at) + idle + granularity + 300 s`, and silent removal at grant expiry. Touches are batched and sent only when they can move a deadline. A record is evicted for capacity only when its `last_active` can be trusted, apart from a user returning in the seconds before the node's prompt report lands (4.5). | Costs nothing at the 30 d default. Lowering the idle timeout later never logs out an active user. | `rules.rs` (4.4, 4.5), `TouchMap` (6.8). |
@@ -281,12 +281,15 @@ Minting is shared mode only: `/oauth/register` calls `shared_flow::client_id_for
   - **the constants** both sides must agree on (`constants.rs`);
   - **the rules** both sides evaluate (`rules.rs`, 4.4 and 4.5);
   - **`Config::apply`**, the one validation of the canister configuration;
-  - one constant per method (`method`).
+  - the error types and their shared code space (`errors.rs`, 4.2).
 
-  It builds for wasm32 and native. Its tests check every Rust type and method name against the
-  `.did` in both directions (`src/tests/contract.rs`). They also pin golden Candid bytes for every
-  request and response and check that a full page, lookup or touch batch fits the message limits
-  (`src/tests/wire.rs`).
+  It builds for wasm32 and native. Its tests check every named type of the `.did` and the install
+  argument against the Rust types in both directions (`src/tests/contract.rs`). They also pin golden
+  Candid bytes for every request and response, show that an error case a newer canister adds
+  decodes on an older reader, and check that a full page, lookup or touch batch fits the message
+  limits (`src/tests/wire.rs`). Method names are not part of the crate: they are checked where they
+  are used, by the canister against the interface it exports and by imcp2's client against the
+  `.did`'s service (`the_method_table_is_the_did_service`).
 - **`crates/imcp2-session-canister`** is the implementation (`publish = false`, `cdylib` + `rlib`):
   - `state.rs`: `State<M: Memory>`, every method as a pure function of the stable state and an
     `Env`. Time, the caller, controller status and the restore counter come in through `Env`, so
@@ -309,19 +312,30 @@ Minting is shared mode only: `/oauth/register` calls `shared_flow::client_id_for
 
 Times are Unix seconds of IC time unless a name ends in `_ns`.
 
+**Conventions.** Every method takes one record and returns `variant { Ok : …; Err : … }`, so that an
+argument can gain `opt` fields and a reply can gain fields without a new method. A method a node
+acts on is an **update**: its answer went through consensus. The two reads a node also takes as
+hints have a **query twin** named `*_non_replicated` (D4).
+
 | Method | Kind | Callers | What it does |
 |---|---|---|---|
-| `put_session` | update | authorized nodes | Stores a new, unconsumed record at redeem. Idempotent per `op_id`. |
-| `consume_code` | update | authorized nodes | Checks the code proof, marks the record consumed (it enters the feed), returns it. Idempotent per `exchange_id`. |
-| `touch_sessions` | update | authorized nodes | Raises `last_active_at`, at most 2000 per call. |
-| `get_sessions` | query, also called as update | authorized nodes | Looks up at most 100 keys: `Live`, `Deleted` or `Absent`. |
-| `list_changes` | query, also called as update | authorized nodes | A page of the compacted change feed. |
-| `get_key_checks` | query, called by nodes as update | nodes, controllers | Published key checks and retired kids. |
-| `get_status` | query, called by nodes as update | nodes, controllers | Everything an operator or a gauge needs. |
+| `put_session` | update | authorized nodes | Stores a new, unconsumed record at redeem (`/oauth/connect/redeem`), before the code is issued. Idempotent per `op_id`. |
+| `consume_code` | update | authorized nodes | At `/oauth/token`: the single-use code exchange, decided by consensus. Checks the code proof, marks the record consumed (it enters the feed), returns it. Idempotent per `exchange_id`. |
+| `touch_sessions` | update | authorized nodes | Activity reports (`TouchSessionsArg`): raises `last_active_at`, at most 2000 per call. |
+| `get_sessions` | update | authorized nodes | Looks up at most 100 keys (`GetSessionsArg`): `Live`, `Deleted` or `Absent`, agreed by consensus. |
+| `get_sessions_non_replicated` | query | authorized nodes | The same lookup from one replica: a hint. |
+| `list_changes` | update | authorized nodes | A page of the compacted change feed, agreed by consensus. |
+| `list_changes_non_replicated` | query | authorized nodes | The same page from one replica: a hint. |
+| `get_key_checks` | update | nodes, controllers | Published key checks and retired kids (`GetKeyChecksArg`, empty). |
+| `get_status` | update | nodes, controllers | Everything an operator or a gauge needs (`GetStatusArg`, empty). |
 | `admin_update_config` | update | controllers | Applies a `ConfigPatch`; re-arms the timer with an immediate run. |
-| `admin_set_key_check` | update | controllers | Publishes a kid's check; `replace` is needed to change one. |
-| `admin_retire_kid` | update | controllers | Retires a kid for good. |
-| `admin_purge_sessions` | update | controllers | Starts a resumable purge by namespace, kid, opener and creation time. |
+| `admin_set_key_check` | update | controllers | Publishes a kid's check (`SetKeyCheckArg`); `replace = opt true` is needed to change one. |
+| `admin_retire_kid` | update | controllers | Retires a kid for good (`RetireKidArg`). |
+| `admin_purge_sessions` | update | controllers | Starts a resumable purge by namespace, kid, opener and creation time (`PurgeFilter`). |
+
+`get_key_checks` and `get_status` have no query twin: a node acts on both answers (its kid states,
+its gauges), and an operator reads them rarely. The sequence diagrams in 8.5 show which call each
+step of a sign-in, the sync loop and the activity reports makes.
 
 **There is no `http_request` and there are no public metrics.**
 
@@ -342,14 +356,31 @@ Times are Unix seconds of IC time unless a name ends in `_ns`.
 | `purge_interval_secs` | 60 | 10 to 3600 |
 | `purge_batch` | 2000 | 100 to 20 000 |
 
+**Errors** are records, not variants (`errors.rs`):
+
+```candid
+type PutSessionError = record { err_code : nat64; err_case : opt PutSessionErrorCase; err_str : text };
+```
+
+- `err_case` names the case (`PutSessionErrorCase`, `ConsumeCodeErrorCase`, or `CommonErrorCase`
+  for every other method). It sits inside an `opt` so that cases can be added: Candid decodes a
+  variant case the reader does not know, inside an `opt`, as `null`.
+- `err_code` is one code space shared by every error type, documented in the `.did` and never
+  reused: 1 `Unauthorized`, 2 `InvalidArgument`, 10 `AlreadyExists`, 11 `Deleted`, 12
+  `GrantExpired`, 13 `CapacityExceeded`, 20 `AlreadyConsumed`, 21 `BadProof`, 22 `NotFound`, 23
+  `CodeExpired`, 30 `PurgeInProgress`. An older reader still has it when it sees `err_case = null`.
+- `err_str` describes the error, with the detail of an `InvalidArgument` (which bound or format).
+- A node treats an `err_case` it does not know like any condition it has no handling for: no
+  definite answer, so 503 and a retry, never a 401 or `invalid_grant`.
+
 **Evolution rules,** pinned by the API crate's wire tests:
 
 - Records only gain `opt` fields. (A purge filter's existing conditions are required variants, so
   that a typo cannot widen a purge; a condition added later would be an `opt` field without that
   protection, 13.)
-- **A returned variant never gains a case.** A reader rejects an unknown case, which would fail the
-  whole reply on every older node. New conditions travel in the existing `Other(ErrorInfo)` cases.
-  Tombstone reasons are text for the same reason.
+- **Error cases may be added** (`an_unknown_error_case_decodes_as_none`).
+- **Every other returned variant never gains a case.** A reader rejects an unknown case, which would
+  fail the whole reply on every older node. Tombstone reasons are text for the same reason.
 - Methods are only ever added.
 
 ### 4.3 Method semantics
@@ -405,7 +436,7 @@ expired.
 - Answers in request order, with `epoch` and `now_ns`.
 - **Unconsumed records are returned too,** so a redeem replayed on another node can recognize its
   own put by `op_id`. The caller must check `consumed_at`.
-- `Absent` is authoritative only from a replicated call.
+- `Absent` is authoritative only from `get_sessions`, never from its query twin.
 
 **`list_changes`** (`State::list_changes`)
 
@@ -425,13 +456,13 @@ expired.
 
 **Key checks**
 
-- `admin_set_key_check(check, replace)`:
+- `admin_set_key_check(record { kid; check; replace })`:
   - kid 0 is refused, and a retired kid cannot be published again;
   - the same value again is a no-op, so an admin-journal replay is safe;
-  - a different value needs `replace = true`, so a typo cannot silently invalidate a key the fleet
-    is sealing with.
-- `admin_retire_kid(kid)` removes the check and records the kid as retired. It is idempotent, and
-  it can retire an unpublished kid before anyone uses it.
+  - a different value needs `replace = opt true` (`null` means false), so a typo cannot silently
+    invalidate a key the fleet is sealing with.
+- `admin_retire_kid(record { kid })` removes the check and records the kid as retired. It is
+  idempotent, and it can retire an unpublished kid before anyone uses it.
 - Every change bumps `key_checks_version`, which nodes see on every feed page.
 
 **`admin_update_config(patch)`**
@@ -453,8 +484,8 @@ expired.
   before the call is made and when it is decoded (`a_misspelled_or_missing_purge_field_is_refused`
   runs the arguments through the annotation dfx applies). The stored job keeps `Any` as absent and
   `Is` as present, the layout an optional filter had.
-- **One job at a time.** Starting another while one runs is refused with
-  `Other{code: "purge_in_progress"}`.
+- **One job at a time.** Starting another while one runs is refused with `PurgeInProgress` (code
+  30).
 - The timer works through it from a cursor (4.6), and the first step runs right away.
 - **`opened_by` resolves to the callers-table index.** The table records at most 1024 principals
   (`MAX_CALLERS`); a record stored by a caller that did not fit carries `UNRECORDED_CALLER`. When
@@ -476,7 +507,14 @@ expired.
 ### 4.4 Idle rules
 
 `rules.rs` holds the arithmetic both sides evaluate, as `const fn`s of plain numbers, so the
-canister and the nodes cannot drift. Every saturation errs towards keeping a session.
+canister and the nodes cannot drift. Every saturation errs towards keeping a session. Each rule's
+documentation says what it returns, in which unit.
+
+**Terms.** An **activity report** is a `Touch { key; last_active_at }` a node sends in
+`touch_sessions` to say the session was in use at that time; the canister keeps the latest as the
+record's `last_active_at`. The **idle purge** (4.6) deletes a consumed session whose reported
+activity is older than the idle timeout allows. **Eviction** (4.5) deletes the least active
+session to make room for a new one at a cap.
 
 - **`touch_granularity(idle) = clamp(idle / 48, 5 min, 6 h)`.** A node reports activity only once
   it has advanced by this much, so `last_active_at` may lag real activity by up to the granularity
@@ -492,32 +530,34 @@ canister and the nodes cannot drift. Every saturation errs towards keeping a ses
 - **`idle_purge_enabled(now, floor, idle)`:** the purge runs only once a full idle span has passed
   since the floor. Until then every deadline lies in the future, and gating on it lets the purge
   compare `last_active_at` with `idle_purge_cutoff` alone, without reading the floor per record.
-- **`reporting_matters(reported, grant_exp, idle) = reported + idle + granularity + IDLE_SLACK <
-  grant_exp + CLOCK_SKEW`**: the nodes' stopping rule (6.8). It is judged by the activity a node
-  last reported, never by the time of the request: a busy session's last report lags its activity
-  by up to a granularity, and a rule judged by now would stop while the stored deadline still
-  falls before grant expiry. The skew counts on the grant's side because the canister caps a
+- **`should_report_session_activity(reported, grant_exp, idle) = reported + idle + granularity +
+  IDLE_SLACK < grant_exp + CLOCK_SKEW`**: the nodes' stopping rule (6.8), true while a report can
+  still move the session's idle deadline before its grant expires. It is judged by the activity a
+  node last reported, never by the time of the request: a busy session's last report lags its
+  activity by up to a granularity, and a rule judged by now would stop while the stored deadline
+  still falls before grant expiry. The skew counts on the grant's side because the canister caps a
   report at its own time, so a node whose clock runs ahead holds a later report than the canister
   does.
-- **`touches_effective(idle) = reporting_matters(0, MAX_GRANT, idle)`**, i.e. `idle + granularity +
-  IDLE_SLACK < MAX_GRANT + CLOCK_SKEW` (30 d, II's grant cap, plus the skew between clocks). When
-  this is false, grant expiry always removes a session before it could go idle, so a touch would
-  buy nothing. **It is false at the 30 d default,** so by default nodes send no touches at all.
-  The boundary is an idle timeout of 2 570 160 s; the skew on the grant's side keeps touches on
-  for a timeout in doubt, so no untouched session can go idle shortly before its grant ends.
+- **`touches_effective(idle) = should_report_session_activity(0, MAX_GRANT, idle)`**, i.e.
+  `idle + granularity + IDLE_SLACK < MAX_GRANT + CLOCK_SKEW` (30 d, II's grant cap, plus the skew
+  between clocks). When this is false, grant expiry always removes a session before it could go
+  idle, so a touch would buy nothing. **It is false at the 30 d default,** so by default nodes send
+  no touches at all. The boundary is an idle timeout of 2 570 160 s; the skew on the grant's side
+  keeps touches on for a timeout in doubt, so no untouched session can go idle shortly before its
+  grant ends.
 - **`eviction_idle(idle) = granularity + 2 × TOUCH_FLUSH_INTERVAL + MIN_EVICT_IDLE`**: how long a
   session must have gone without reported activity before `evictable` (4.5) may judge it unused;
   16 320 s under a 7-day timeout.
-- **`report_promptly(now, reported, idle)`**: `now − reported + CLOCK_SKEW ≥ granularity +
-  MIN_EVICT_IDLE`, i.e. `eviction_idle` less two flush intervals and the skew. When a request
-  finds a session's reported activity this old, the node reports it at once instead of at its
-  next periodic flush (6.8). Below it the periodic flush is in time: sent within one interval (a
+- **`should_report_session_activity_promptly(now, reported, idle)`**: `now − reported + CLOCK_SKEW ≥
+  granularity + MIN_EVICT_IDLE`, i.e. `eviction_idle` less two flush intervals and the skew. When a
+  request finds a session's reported activity this old, the node reports it at once instead of at
+  its next periodic flush (6.8). Below it the periodic flush is in time: sent within one interval (a
   node counts its flush period from the start of the previous flush, 6.3) and answered within
-  another, its report reaches the canister before the session could be judged evictable, for a
-  node clock up to `CLOCK_SKEW` off. This needs `reported` to be no later than what the canister
-  holds; for a session not reported yet that is its consumption time, which `consume_code` records
-  as its first activity. The idle floor is ignored, which errs towards reporting, and a prompt
-  report is always a due one (`CLOCK_SKEW ≤ MIN_EVICT_IDLE`).
+  another, its report reaches the canister before the session could be judged evictable, for a node
+  clock up to `CLOCK_SKEW` off. This needs `reported` to be no later than what the canister holds;
+  for a session not reported yet that is its consumption time, which `consume_code` records as its
+  first activity. The idle floor is ignored, which errs towards reporting, and a prompt report is
+  always a due one (`CLOCK_SKEW ≤ MIN_EVICT_IDLE`).
 
 Compile-time assertions (`const _` in `rules.rs`) pin the relations between the timings:
 
@@ -556,12 +596,12 @@ A candidate is evicted (tombstone, reason `evicted`) only if `evictable` holds, 
 - **`touches_effective(idle)`.** Otherwise no node sends touches, and no `last_active_at` means
   anything;
 - **`now + idle + granularity + IDLE_SLACK + CLOCK_SKEW < grant_expires_at`.** Nodes stop reporting
-  a session once `reporting_matters` fails for its last report, so past that point a busy session
-  may look idle. This condition is a conservative guard on that rule, by the canister's clock:
-  while it holds, any report a node can have made (at most `CLOCK_SKEW` ahead of now) still
-  passes `reporting_matters`, so a busy session is still being reported. For a grant II issued,
-  this already implies the previous condition. It is checked on its own because `put_session`
-  accepts grants up to 31 d;
+  a session once `should_report_session_activity` fails for its last report, so past that point a
+  busy session may look idle. This condition is a conservative guard on that rule, by the
+  canister's clock: while it holds, any report a node can have made (at most `CLOCK_SKEW` ahead of
+  now) still passes `should_report_session_activity`, so a busy session is still being reported.
+  For a grant II issued, this already implies the previous condition. It is checked on its own
+  because `put_session` accepts grants up to 31 d;
 - **`now − max(last_active_at, idle_floor_at) ≥ eviction_idle(idle)`** (`granularity + 2 ×
   TOUCH_FLUSH_INTERVAL + MIN_EVICT_IDLE`, with `MIN_EVICT_IDLE` 1 h). Activity up to one
   granularity plus two flushes old may not have been reported yet, and the session must have been
@@ -572,14 +612,15 @@ store refuses new sign-ins (the node answers 503) rather than logging out active
 
 **A session that resumes.** `evictable` judges the age of the *reported* activity, so it cannot see
 a user who has just come back after a long idle period. A node that serves such a session reports
-its activity on the loop's next round instead of at its next periodic flush (`report_promptly`,
-6.8), which narrows the gap from up to a minute plus the touch call to the moments before that
-report lands: the next round, or the rest of `PROMPT_FLUSH_SPACING` (5 s) since the previous flush
-if that is longer, then one call. A put that evicts the session in those moments still removes it,
-and its user signs in again. This needs a namespace, or the whole store, at its cap and a lowered
-idle timeout, and it is the price of keeping sign-ins working when the store is full; closing it
-entirely would take a coordinated two-phase eviction (13). The test
-`a_resumed_session_is_reported_before_a_put_at_the_cap_can_evict_it` runs the race both ways.
+its activity on the loop's next round instead of at its next periodic flush
+(`should_report_session_activity_promptly`, 6.8), which narrows the gap from up to a minute plus the
+touch call to the moments before that report lands: the next round, or the rest of
+`PROMPT_FLUSH_SPACING` (5 s) since the previous flush if that is longer, then one call. A put that
+evicts the session in those moments still removes it, and its user signs in again. This needs a
+namespace, or the whole store, at its cap and a lowered idle timeout, and it is the price of keeping
+sign-ins working when the store is full; closing it entirely would take a coordinated two-phase
+eviction (13). The test `a_resumed_session_is_reported_before_a_put_at_the_cap_can_evict_it` runs
+the race both ways.
 
 ### 4.6 Purge timer
 
@@ -758,7 +799,8 @@ randomized model run):
 `Access` is one table for both the methods' own checks and `inspect_message`:
 
 - **`Authorized`** (`put_session`, `consume_code`, `touch_sessions`, `get_sessions`,
-  `list_changes`): the caller is in `Config.authorized` and is not anonymous. **Use one identity per
+  `get_sessions_non_replicated`, `list_changes`, `list_changes_non_replicated`): the caller is in
+  `Config.authorized` and is not anonymous. **Use one identity per
   node.**
 - **`AuthorizedOrController`** (`get_key_checks`, `get_status`).
 - **`Controller`** (every `admin_*`). Nodes cannot delete anything.
@@ -767,14 +809,14 @@ The checks are in `State`, not in `#[update(guard = ..)]` guards. Callers get a 
 rather than a reject, and the in-process double enforces the same rules.
 
 `inspect_message` is **a cost filter only** (`ingress_allowed`). It refuses unknown methods, and
-callers the method would refuse anyway, before the canister pays for the message. The query methods
-are in the table because nodes call them as updates for authoritative answers, and an ingress
-update to a query method passes through `inspect_message`; a query call does not.
+callers the method would refuse anyway, before the canister pays for the message. The two query
+twins are in the table too: a query call never passes through `inspect_message`, but an ingress
+update call to a query method does.
 
 A refusal there is a trap (error code `IC0503`, `CanisterCalledTrap`) with the message
 `inspect_message: <caller> may not call <method>`, not `IC0406`. ic-agent reports it as a reject,
-so a node that is not on the allow-list sees `Unauthorized` from its queries and a reject from its
-updates (`backend.rs`, "Unauthorized callers"; the node's `Health::refused` needs both, 6.9).
+so a node that is not on the allow-list sees `Unauthorized` from the query twins and a reject from
+every update (`backend.rs`, "Unauthorized callers"; the node's `Health::refused` needs both, 6.9).
 
 ### 4.10 Limits, memory and cycles
 
@@ -969,19 +1011,26 @@ calls `Inner::round`, which runs, in order, each step the engine's monotonic pac
 (see "Time" below). Each step is an `async fn` of its own, so tests drive the engine step by step
 on a mock clock.
 
+A **hint** is the answer of a query twin (`list_changes_non_replicated`,
+`get_sessions_non_replicated`): free and fast, but one replica's word. A **replicated read** is the
+update method itself (`list_changes`, `get_sessions`), agreed by consensus. The client picks the
+method from the read mode (`ReadMode`, `backend.rs`), and the metrics count each under the name of
+the method it called (6.9). 8.5 draws the loop as a sequence diagram.
+
 **Startup**
 
-1. Call `get_key_checks` **as a replicated read**, retrying after 1, 2, 4 … up to 30 s
+1. Call `get_key_checks` (an update), retrying after 1, 2, 4 … up to 30 s
    (`KEY_CHECKS_BACKOFF_MAX`). Until it answers there is no sealing kid (6.5), so `up` is 0 and
-   nothing is sealed. On a reject, a free query of the same method tells whether the canister
-   refuses this node's identity, so the status says so from the first attempt.
+   nothing is sealed. On a reject, a free query (an empty `get_sessions_non_replicated` lookup)
+   tells whether the canister refuses this node's identity, so the status says so from the first
+   attempt.
 2. Run a full replicated fetch from 0. Polling starts only once it has completed.
 
 The listener binds at once; `/ready/shared` keeps the load balancer away until the node is ready
 (6.9).
 
 **Poll** (`Inner::poll_once`, every `poll_interval`, a free query):
-`list_changes(after = max(cursor, hint), limit = 1000)`.
+`list_changes_non_replicated(after = max(cursor, hint), limit = 1000)`.
 
 - `Live` (consumed): mirror it if it opens under the keyring, has not expired by its sealed grant
   expiry, and is not under a final tombstone.
@@ -996,7 +1045,8 @@ The listener binds at once; `/ready/shared` keeps the load balancer away until t
   replicated fetch. So does a poll answered `Unauthorized`: only the update path may confirm that
   this node is refused (6.9).
 
-**Replicated fetch** (`Inner::replicated_fetch`, the update path). It is due at once before the
+**Replicated fetch** (`Inner::replicated_fetch`, the update path: `list_changes` called as an
+update). It is due at once before the
 first complete fetch and after a failure (once its backoff has passed); otherwise every
 `replicated_interval` (300 s), and, when a poll or a read-through asked for one, at most once per
 `replicated_debounce` (30 s), both counted from the last start.
@@ -1046,7 +1096,7 @@ first complete fetch and after a failure (once its backoff has passed); otherwis
   flush, sending only when the idle timeout makes touches matter (6.8), so never at the 30-day
   default. A request that asks for a prompt report (6.8) brings it forward to the next round, no
   sooner than `PROMPT_FLUSH_SPACING` (5 s) after the previous flush.
-- **Status read** (`get_status`, replicated) right after the initial fetch, then every
+- **Status read** (`get_status`, an update) right after the initial fetch, then every
   `status_interval` (900 s), or 60 s after a failure, for the canister gauges.
 - **Housekeeping** every 60 s (`HOUSEKEEPING_INTERVAL`): `Mirror::prune`, `TouchMap::prune`,
   `ExchangeCache::sweep` (6.7), the adopted index pruned against the servers' caches, and the
@@ -1109,8 +1159,8 @@ result counts `imcp2_shared_resolve_total{result}` (`ready`, `invalid`, `gone`, 
    A mismatch → `Invalid`. A match → adopt if not adopted yet (`AtCapacity` → `Unavailable`), then
    `Ready`.
 3. The negative cache → `Gone`.
-4. A query `get_sessions` (one flight per key; skipped until the node knows the canister's epoch
-   from its first replicated page):
+4. A query `get_sessions_non_replicated` (one flight per key; skipped until the node knows the
+   canister's epoch from its first replicated page):
    - a consumed `Live` that opens and passes the same checks → mirror, adopt, `Ready`;
    - `Absent`, or a not yet consumed `Live` from a replica that lags → ask again after 250 ms,
      then 500 ms (`QUERY_RETRY_PAUSES`, paced);
@@ -1118,7 +1168,7 @@ result counts `imcp2_shared_resolve_total{result}` (`ready`, `invalid`, `gone`, 
      the mirror's → step 5. A query is one replica's word, and may neither delete nor refuse
      anything on its own. (A genuine record, one that opens under AEAD, refuses a token whose
      binding or expiry does not match it, whatever its source.)
-5. A replicated `get_sessions` (one flight per key), at most one per key per 30 s
+5. A replicated read, `get_sessions` (an update; one flight per key), at most one per key per 30 s
    (`Mirror::replicated_allowed`):
    - a consumed `Live` → check as in step 2;
    - `Deleted` or `Absent` → `Gone`, recorded as a final tombstone or a negative answer, with
@@ -1231,39 +1281,40 @@ again and again:
   `consume_code`, which the canister answers by the exchange id with the same record, so the same
   token.
 
-`Refusal::from_consume_error` maps the canister's answers:
+`Refusal::from_consume_error` maps the canister's answers by their `err_case`:
 
-| `ConsumeCodeError` | Answer |
+| `ConsumeCodeError.err_case` | Answer |
 |---|---|
 | `AlreadyConsumed`, `NotFound`, `BadProof` | `invalid_grant` "unknown or used code" |
 | `CodeExpired` | `invalid_grant` "code expired" |
 | `Deleted` | `invalid_grant` "session ended" |
-| `Unauthorized`, `InvalidArgument`, `Other` | transient: 503 |
+| `Unauthorized`, `InvalidArgument`, or `null` (a case a newer canister added) | transient: 503 |
 
 ### 6.8 Touches
 
-`TouchMap` (`touch.rs`) reports activity only when it can matter:
+`TouchMap` (`touch.rs`) sends activity reports (4.4: `Touch`es in `touch_sessions`) only when they
+can matter:
 
 - **Not at all** unless `touches_effective(idle)` holds. At the 30 d default it does not, so by
   default a node makes no touch calls.
-- **Only while a report can move the deadline:** an entry is kept only while `reporting_matters`
-  (4.4) holds for its last report: `reported + idle + granularity + IDLE_SLACK < grant_expires_at
-  + CLOCK_SKEW`. A tracked session stays until its grant expires, so that its last report keeps
-  suppressing new ones.
+- **Only while a report can move the deadline:** an entry is kept only while
+  `should_report_session_activity` (4.4) holds for its last report:
+  `reported + idle + granularity + IDLE_SLACK < grant_expires_at + CLOCK_SKEW`. A tracked session
+  stays until its grant expires, so that its last report keeps suppressing new ones.
 - **Coarsely:** a session is reported again once its activity has advanced by the granularity. A
   flush (every 60 s) sends the stalest first, in batches of 2000, at most 25 batches
   (`MAX_FLUSH_BATCHES`).
 - **Promptly when a session comes back** (4.5). `TouchMap::note` returns whether
-  `report_promptly` holds for the session's last report; `SharedSessions::note_activity` then sets
-  `Inner::prompt_flush`, and the loop's next round flushes, but no sooner than
-  `PROMPT_FLUSH_SPACING` (5 s) after the previous flush. The flag is cleared before the flush, so
-  a request noted during it asks again; a failed flush is retried by the next one, periodic or
-  prompt. A session seen on a node for the first time is judged by its consumption time, which is
-  what the canister holds until a report raises it (`consume_code` records it as the first
-  activity), so the node never judges a session younger than the canister does. Its first request
-  there may ask for a prompt report even if another node reported it since: that report was due
-  anyway and is only sent sooner. The extra cost is at most one update call per 5 s per node, and
-  only while touches are effective.
+  `should_report_session_activity_promptly` holds for the session's last report;
+  `SharedSessions::note_activity` then sets `Inner::prompt_flush`, and the loop's next round
+  flushes, but no sooner than `PROMPT_FLUSH_SPACING` (5 s) after the previous flush. The flag is
+  cleared before the flush, so a request noted during it asks again; a failed flush is retried by
+  the next one, periodic or prompt. A session seen on a node for the first time is judged by its
+  consumption time, which is what the canister holds until a report raises it (`consume_code`
+  records it as the first activity), so the node never judges a session younger than the canister
+  does. Its first request there may ask for a prompt report even if another node reported it since:
+  that report was due anyway and is only sent sooner. The extra cost is at most one update call per
+  5 s per node, and only while touches are effective.
 - **Bounded:** at most `TOUCH_CAP` (200 000) sessions, evicting the soonest-expiring 1% when full.
   Losing an entry loses at most one report.
 - **Feedback:** `TouchMap::mark_reported` records accepted batches, `TouchMap::drop_unknown` drops
@@ -1283,7 +1334,7 @@ again and again:
 
 ### 6.9 Readiness, health and metrics
 
-- **`up`** (`Inner::up`) means an update-path call (an update or a replicated read) was answered
+- **`up`** (`Inner::up`) means an update-path call (any call but the two query twins) was answered
   within 360 s (`UP_UPDATE_WINDOW`, or `replicated_interval` + 60 s if that is longer), a query
   within 30 s (`UP_QUERY_WINDOW`, or two `poll_interval`s if that is longer), and a sealing kid
   exists. This catches a frozen canister, whose queries still answer. It is reported as a metric
@@ -1325,7 +1376,7 @@ again and again:
 | Series | Labels |
 |---|---|
 | `imcp2_shared_up`, `imcp2_shared_ready` | |
-| `imcp2_shared_canister_calls_total` | `method`, `mode` (`query`, `replicated`, `update`), `outcome` (`ok`, `unauthorized`, `canister_error`, `timeout`, `transport`, `reject`, `decode`) |
+| `imcp2_shared_canister_calls_total` | `method` (the method called: a hint counts under `get_sessions_non_replicated` or `list_changes_non_replicated`), `mode` (`query`: a query twin; `replicated`: a read sent as an update; `update`: a write), `outcome` (`ok`, `unauthorized`, `canister_error`, `timeout`, `transport`, `reject`, `decode`) |
 | `imcp2_shared_canister_call_duration_seconds` | `method`, `mode` |
 | `imcp2_shared_cursor`, `_head`, `_epoch`, `_mirrored_records`, `_adopted_sessions` | |
 | `imcp2_shared_resolve_total` | `result` (`ready`, `invalid`, `gone`, `unavailable`) |
@@ -1339,7 +1390,7 @@ again and again:
 | `imcp2_shared_canister_events_total` | `event` (the canister's counters: `opened`, `consumed`, `abandoned`, `expired`, `idle_purged`, `evicted`, `admin_purged`, `tombstones_collected`, `restores_detected`) |
 
 - Every label value is bounded and chosen by code or by the operator.
-- The canister gauges come from `get_status` (called as an update) and are the same on every node:
+- The canister gauges come from `get_status` (an update) and are the same on every node:
   aggregate them with `max()`.
 - In shared mode, `imcp2_live_sessions` and `imcp2_active_sessions` count the sessions **adopted on
   this node** (`src/metrics.rs`, "Sessions shared across processes"). The deployment's count is
@@ -1382,15 +1433,15 @@ value counts as unset everywhere.
   `mirror_cap`, `adopted_cap`, `poll_interval`; then the keyring in sealing order, kids and
   fingerprints only.
 - **`imcp2 shared-key-check`** reads only the keyring, by the server's rules, and makes no network
-  call. It prints one line per kid, in keyring order, which is Candid for
-  `admin_set_key_check`'s first argument with the fingerprint in a block comment:
+  call. It prints one line per kid, in keyring order, which is `admin_set_key_check`'s whole Candid
+  argument (a `SetKeyCheckArg` without `replace`) with the fingerprint in a block comment:
 
   ```text
-  record { kid = 2 : nat8; check = blob "\79\fb\95\75\ed\18\e1\c5\09\c1\bc\27\e1\a7\e2\77" } /* fingerprint 79fb9575ed18e1c5 */
+  (record { kid = 2 : nat8; check = blob "\79\fb\95\75\ed\18\e1\c5\09\c1\bc\27\e1\a7\e2\77" }) /* fingerprint 79fb9575ed18e1c5 */
   ```
 
-  Every byte is escaped, so the whole line pastes as `'(<line>, false)'`. Errors exit 1
-  (`Error: …`), usage errors 2.
+  Every byte is escaped, so the whole line pastes as `'<line>'`. To replace a kid's different
+  check, add `; replace = opt true` inside the record. Errors exit 1 (`Error: …`), usage errors 2.
 - **`imcp2 shared-config-check`** runs the startup checks above and stops. Startup reads its
   configuration in one step, `shared_setup::load_config`: `Settings::from_env` (every variable,
   the IC URL and root-key rules included), then the keyring, then the PEM (every rule, the SEC1
@@ -1459,9 +1510,9 @@ label (`no_sealing_kid`, `identity_refused`, `kid_drift`, `capacity_exceeded`, `
      dapp has the same shape (a canister-signature root of the II canister, delegating to a session
      key its holder chose). Whoever holds one can sign a hop from that session key to the X of a
      connect they started themselves (authorize is free) and pass the check. Such a chain costs at
-     most one `get_sessions` query (step 6: a non-replicated read, which costs the canister no
-     cycles and takes nothing from the replicated-read budget) and one `mcp_register_v2` update,
-     which II refuses because no MCP consent is stored under that root. It never reaches
+     most one `get_sessions_non_replicated` query (step 6: a non-replicated read, which costs the
+     canister no cycles and takes nothing from the replicated-read budget) and one `mcp_register_v2`
+     update, which II refuses because no MCP consent is stored under that root. It never reaches
      `put_session`: II's refusal is the redeem's 400, as for any refused registration.
      `an_ordinary_internet_identity_login_passes_the_root_check_and_ii_refuses_it` (11) runs this
      against the real II.
@@ -1474,16 +1525,18 @@ label (`no_sealing_kid`, `identity_refused`, `kid_drift`, `capacity_exceeded`, `
      trusting another II canister refuses that chain with 400 "not issued by Internet Identity".
 5. Nothing to seal under (`SharedSessions::sealable_kid`) → 503 "briefly unavailable", before II
    or the put is spent on a code that could not be sealed.
-6. If the mirror or one query `get_sessions(key)` shows a `Live` record with `op_id == put_op`
-   (`find_own_record`), take it and go to step 9. A replay thus skips II and the put.
+6. If the mirror or one query `get_sessions_non_replicated(key)` shows a `Live` record with
+   `op_id == put_op` (`find_own_record`), take it and go to step 9. A replay thus skips II and the
+   put.
 7. `Registrar::register(verified, s_seed)`: the `mcp_register_v2` call, about 2 s. Its refusal is
    the redeem's refusal, as today.
 8. Seal the record and await `put_session{key, put_op, grant_exp, sealed, code_lock}`
    (`register_and_put`), retried with the same `op_id` while the canister gives no definite answer,
    pausing 1 s, then doubling up to 4 s, for at most 15 s (`PUT_RETRY_WINDOW`). A definite refusal
-   (`AlreadyExists`, `Deleted`, `GrantExpired`, `CapacityExceeded`, `Unauthorized`,
-   `InvalidArgument`) ends it at once. Any failure → 503 "We couldn't save your sign-in just now.
-   Wait a moment, then restart from your client." **No code is issued without a durable record.**
+   (`err_case` `AlreadyExists`, `Deleted`, `GrantExpired`, `CapacityExceeded`, `Unauthorized` or
+   `InvalidArgument`) ends it at once; a case this release does not know (`null`) is retried. Any
+   failure → 503 "We couldn't save your sign-in just now. Wait a moment, then restart from your
+   client." **No code is issued without a durable record.**
 9. Open the **canister's** record and check that it holds this connect's S (in constant time; else
    503, `record_mismatch`). `adopt_session(Opened)` from it. Never adopt from the local II reply:
    a second redeem's II call returns a later expiry, but the record keeps the first. A full session
@@ -1530,7 +1583,10 @@ label (`no_sealing_kid`, `identity_refused`, `kid_drift`, `capacity_exceeded`, `
 3. **C** opens the code and checks PKCE, then calls `consume_code` (about 2 s). The canister checks
    the proof and the record enters the feed. C mirrors the record and issues the token.
 4. **D**, under a second later, opens the token. It has the record from its 1 s poll, or reads it
-   through by query (about 0.2 s). It checks the binding and adopts. **No update call.**
+   through with a `get_sessions_non_replicated` query (about 0.2 s). It checks the binding and
+   adopts. **No update call.**
+
+8.5 draws this sign-in as a sequence diagram.
 
 The call counts are pinned by `a_sign_in_hops_across_the_nodes_and_every_node_serves_it` (four
 servers over the in-process canister), and the hop from one server to another through real II and
@@ -1559,21 +1615,21 @@ old kid stays readable while every node still holds that kid, and records live a
 
 **Planned rotation, K1 to K2:**
 
-1. `imcp2 shared-key-check` for K2, then `admin_set_key_check` with kid 2's check and `replace =
-   false`.
+1. `imcp2 shared-key-check` for K2, then `admin_set_key_check` with the line it prints for kid 2,
+   as is (no `replace`).
 2. Deploy `1:K1,2:K2`. Every node should show `imcp2_shared_key_info{kid="2",state="verified"}`.
    Nodes still seal under kid 1.
 3. Deploy `2:K2,1:K1`. Nodes now seal under kid 2.
 4. After 31 days, when nothing sealed under kid 1 can still be live, deploy `2:K2`, then
-   `admin_retire_kid(1)`.
+   `admin_retire_kid(record { kid = 1 })`.
 
 **Emergency, kid k leaked:**
 
-1. `admin_set_key_check(n)`.
+1. `admin_set_key_check` with kid n's line.
 2. Deploy `n:Kn,k:Kk` and confirm Verified.
-3. `admin_retire_kid(k)`. Within about 35 s (a poll, the debounced replicated fetch, then
-   `get_key_checks`; 6.3), every node answers 401 to every kid-k value (`retired_kid`), and clients
-   re-authorize under kid n.
+3. `admin_retire_kid(record { kid = k })`. Within about 35 s (a poll, the debounced replicated
+   fetch, then `get_key_checks`; 6.3), every node answers 401 to every kid-k value (`retired_kid`),
+   and clients re-authorize under kid n.
 4. `admin_purge_sessions{kid = k}` tombstones the kid-k records (envelope byte 2).
 5. Deploy `n:Kn`.
 
@@ -1615,6 +1671,133 @@ runs the planned one across four servers (11).
    journal: the rest of the configuration, and purges. The runbook carries the procedure step by
    step (`docs/shared-sessions-operations.md`, 8.10).
 
+### 8.5 Protocol sequence diagrams
+
+Which canister method each step calls, and how. Every arrow to the canister is an update (agreed by
+consensus) unless it says `query` (one replica's answer, a hint, D4).
+
+**A sign-in across four nodes** (8.1). Two awaited updates: `put_session` at redeem and
+`consume_code` at the token exchange.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as Client and browser
+    participant A as Node A
+    participant B as Node B
+    participant C as Node C
+    participant D as Node D
+    participant II as Internet Identity
+    participant SC as Session canister
+    U->>A: /oauth/register, /oauth/authorize
+    Note over A: derives X, seals the connect cookie, no canister call
+    A-->>U: redirect to II, with the connect cookie
+    U->>II: the user consents
+    II-->>U: delegation chain to X
+    U->>B: /oauth/connect/redeem (cookie, chain)
+    Note over B: opens the cookie, verifies the chain locally
+    B->>SC: get_sessions_non_replicated(key), query
+    SC-->>B: Absent (a replayed redeem would find its own record here)
+    B->>II: mcp_register_v2(pub S) as X
+    II-->>B: the grant
+    B->>SC: put_session(key, op_id, grant_expires_at, sealed, code_lock)
+    Note over SC: stored unconsumed, outside the feed
+    SC-->>B: Ok(record)
+    B-->>U: authorization code (sealed, carries the code proof)
+    U->>C: /oauth/token (code, PKCE verifier)
+    Note over C: opens the code, checks PKCE
+    C->>SC: consume_code(key, exchange_id, code_proof)
+    Note over SC: checks the proof against code_lock, consumes once,<br/>gives the record a feed position
+    SC-->>C: Ok(record)
+    C-->>U: access token, bound to S
+    U->>D: /mcp with the access token
+    alt mirrored by D's last poll
+        Note over D: mirror hit
+    else not mirrored yet
+        D->>SC: get_sessions_non_replicated(key), query
+        SC-->>D: Live (it must open under the keyring and match the token)
+    end
+    D-->>U: the tool's answer, no update call
+```
+
+**The sync loop** (6.3) and a read-through (6.4). Hints may only add to the mirror; deletions, the
+cursor, a resync and a 401 wait for an update's answer.
+
+```mermaid
+sequenceDiagram
+    participant N as Node
+    participant M as Mirror
+    participant SC as Session canister
+    Note over N,SC: Startup
+    N->>SC: get_key_checks()
+    SC-->>N: key checks and retired kids
+    opt rejected
+        N->>SC: get_sessions_non_replicated(no keys), query
+        SC-->>N: Unauthorized when this node is not on the allow-list
+    end
+    N->>SC: list_changes(after = 0), page by page until complete
+    SC-->>N: Live records and tombstones
+    N->>M: apply both, cursor = next_after
+    Note over N,SC: Poll, every poll_interval (1 s)
+    N->>SC: list_changes_non_replicated(after = max(cursor, hint)), query
+    SC-->>N: a page from one replica
+    N->>M: add records that open and are consumed, advance the hint
+    Note over N,M: a poll never removes anything and never moves the cursor
+    opt the page shows something new
+        Note over N: ask for a replicated fetch, at most one per 30 s
+    end
+    Note over N,SC: Replicated fetch, when asked for or every 300 s
+    N->>SC: list_changes(after = cursor), page by page until complete
+    SC-->>N: pages agreed by consensus
+    alt the epoch changed (a snapshot load)
+        N->>M: resync: forget everything, fetch again from 0
+    else
+        N->>M: apply Live, apply Deleted as final, move the cursor
+    end
+    opt key_checks_version moved
+        N->>SC: get_key_checks()
+    end
+    Note over N,SC: Every 900 s
+    N->>SC: get_status(), for the canister gauges
+    Note over N,SC: A token whose session is not mirrored
+    N->>SC: get_sessions_non_replicated(key), query, up to 3 tries
+    alt Live, and it opens and matches the token
+        N->>M: mirror and adopt, then serve
+    else Absent, Deleted or no answer
+        N->>SC: get_sessions(key), at most one per key per 30 s
+        SC-->>N: Live serves, Deleted or Absent is a 401
+    end
+```
+
+**Activity reports, the idle purge and eviction** (4.4 to 4.6, 6.8). Nodes report activity only
+while `touches_effective(idle)` holds, so never at the 30-day default.
+
+```mermaid
+sequenceDiagram
+    participant U as Client
+    participant N as Node
+    participant SC as Session canister
+    participant T as Canister timer
+    U->>N: /mcp with the access token
+    Note over N: TouchMap::note, judged by the activity last reported:<br/>should_report_session_activity, and advanced by the granularity
+    alt should_report_session_activity_promptly (back after a long idle)
+        Note over N: report on the loop's next round
+    else
+        Note over N: report at the next periodic flush (60 s)
+    end
+    N->>SC: touch_sessions(touches = [key, last_active_at])
+    Note over SC: last_active_at = max(stored, min(reported, now))
+    SC-->>N: updated, and the keys it does not know
+    loop every purge_interval_secs (60 s)
+        T->>SC: purge step
+        Note over SC: idle purge: past max(last_active_at, idle_floor_at)<br/>+ idle + granularity + 300 s, a tombstone with reason idle.<br/>At grant expiry, removed silently.
+    end
+    Note over SC: put_session at a full namespace or store: evict one session<br/>only if evictable (consumed, touches effective, reported activity<br/>older than eviction_idle), a tombstone with reason evicted.<br/>Otherwise CapacityExceeded.
+    N->>SC: list_changes(after = cursor)
+    SC-->>N: the tombstone
+    Note over N: a final tombstone: the session's next request gets 401
+```
+
 ## 9. Security analysis
 
 ### 9.1 What the canister holds
@@ -1636,7 +1819,7 @@ runs the planned one across four servers (11).
 
 | Attacker holds | Gains |
 |---|---|
-| Nothing (an internet client) | Without an MCP consent of its own at II, at most a free query: no paid call to the canister, and no write. Register and authorize make no call. Redeem reads the canister only after a locally verified II chain, rooted at a canister signature of the server's II canister (a chain rooted at any other key is refused before any call: X is public, so a hop to it proves nothing). That root shows only that some II anchor signed the chain, not consent to this connect: anyone with an ordinary II login for any dapp can root a chain there, and it costs at most one free `get_sessions` query and one `mcp_register_v2` update before II, the consent judge, refuses it (7, redeem step 4). `put_session` follows only II's yes. Token calls it only with a code that opens under the keyring and a matching PKCE verifier. `/mcp` calls it only for a token that opens under the keyring. |
+| Nothing (an internet client) | Without an MCP consent of its own at II, at most a free query: no paid call to the canister, and no write. Register and authorize make no call. Redeem reads the canister only after a locally verified II chain, rooted at a canister signature of the server's II canister (a chain rooted at any other key is refused before any call: X is public, so a hop to it proves nothing). That root shows only that some II anchor signed the chain, not consent to this connect: anyone with an ordinary II login for any dapp can root a chain there, and it costs at most one free `get_sessions_non_replicated` query and one `mcp_register_v2` update before II, the consent judge, refuses it (7, redeem step 4). `put_session` follows only II's yes. Token calls it only with a code that opens under the keyring and a matching PKCE verifier. `/mcp` calls it only for a token that opens under the keyring. |
 | A node identity (stolen PEM) | Cannot consume other users' codes (it lacks `code_proof`) or read S (it lacks the keyring). It can flood `put_session` up to the caps. **Response:** remove it from `authorized`, then `admin_purge_sessions{opened_by}`. |
 | A lying query replica | Cannot remove anything (D4). It can delay removals by at most one replicated interval (5 min). It cannot inject a session: a positive answer must open under AEAD, be consumed, and match the token's `at_bind`. |
 | The key only | Nothing usable. A token needs `at_bind` and a code needs `code_proof`, both from S, and the canister checks the proof. It can still make a node pay: each forged code that passes its own PKCE costs one `consume_code` update (cached per code id, not rate-limited), and each forged token one replicated `get_sessions` (at most one per key per 30 s, and at most 10 000 keys per 30 s per node). |
@@ -1687,16 +1870,21 @@ replica, `a_stopped_canister_leaves_a_node_unavailable_not_broken` checks the fi
     `touches_stay_on_while_an_untouched_session_could_go_idle_before_its_grant_ends`,
     `reporting_stops_only_once_the_stored_deadline_passes_grant_expiry`,
     `the_eviction_guard_implies_backends_still_report`,
-    `eviction_idle_is_the_age_evictable_requires`, `report_promptly_at_its_exact_threshold`,
+    `eviction_idle_is_the_age_evictable_requires`,
+    `should_report_session_activity_promptly_at_its_exact_threshold`,
     `without_a_prompt_report_the_periodic_flush_lands_before_eviction`,
     `evictable_at_the_exact_edge`, `nothing_is_evicted_while_touches_are_off`,
     `cutoff_agrees_with_deadline_whenever_purge_is_enabled`);
-  - the `.did` against every type and method (`every_did_type_has_an_equal_rust_type`,
-    `every_method_signature_matches_the_rust_types`), and a purge filter's typos refused as dfx
-    would send them (`a_misspelled_or_missing_purge_field_is_refused`);
+  - the `.did` against every named type and the install argument
+    (`every_did_type_has_an_equal_rust_type`, `the_install_argument_matches_the_rust_type`), and
+    a purge filter's typos refused as dfx would send them
+    (`a_misspelled_or_missing_purge_field_is_refused`);
+  - the error codes, one meaning per code across the error types
+    (`codes_are_shared_across_error_types`);
   - golden wire bytes (`golden_wire_bytes`);
   - compatibility (`payloads_without_later_opt_fields_still_decode`,
-    `unknown_record_fields_are_ignored`, `unknown_variant_cases_are_rejected`);
+    `unknown_record_fields_are_ignored`, `an_unknown_error_case_decodes_as_none`,
+    `unknown_variant_cases_are_rejected`);
   - size limits (`a_full_change_page_fits_in_a_reply` and siblings).
 - **Canister** (`state/tests.rs`, native, `State` over `VectorMemory`):
   - access for every method and caller class, and that refused callers change nothing;
@@ -1741,7 +1929,9 @@ replica, `a_stopped_canister_leaves_a_node_unavailable_not_broken` checks the fi
     `a_late_exchange_does_not_make_a_session_look_younger_than_the_canister_judges_it`);
   - the stub registrar, and the II registrar's root check (`a_canister_signature_key_names_its_canister`);
   - metric registration;
-  - the canister client over `MemoryCanister` (read modes, timeouts, rejects, decode quotas);
+  - the canister client over `MemoryCanister` (read modes, timeouts, rejects, decode quotas), and
+    its method table against the `.did`'s service, query-ness included
+    (`the_method_table_is_the_did_service`);
   - the sync loop step by step (startup, polls that only add, replicated fetches, resyncs,
     backoff, housekeeping), `resolve` branch by branch, and the engine's status and readiness;
   - the exchange cache swept by the loop, after the initial sync and before it
@@ -1771,9 +1961,10 @@ replica, `a_stopped_canister_leaves_a_node_unavailable_not_broken` checks the fi
 - **The binary** (`src/shared_setup.rs`, `src/main.rs`): every refused setting, named and never
   quoting a key; the PEM forms (one principal per key across SEC1, SEC1 with parameters, PKCS#8 and
   a file with preamble text; P-256, X25519, RSA, encrypted and damaged files refused); the
-  `shared-key-check` lines against golden output, parsed by `candid_parser`, typed against the
-  `.did`'s `admin_set_key_check` and decoded into `KeyCheck`; `shared-config-check` running the
-  startup checks and nothing after them
+  `shared-key-check` lines against golden output, parsed and annotated by `candid_parser` as dfx
+  does, typed against the `.did`'s `admin_set_key_check` and decoded into `SetKeyCheckArg`, with and
+  without `replace = opt true` (`each_line_is_the_argument_of_admin_set_key_check`);
+  `shared-config-check` running the startup checks and nothing after them
   (`shared_config_check_prints_the_principal_and_the_fingerprints`,
   `shared_config_check_refuses_a_p256_or_an_encrypted_identity_by_name`,
   `shared_config_check_refuses_a_31_byte_key_by_name`,
@@ -1882,7 +2073,7 @@ and every refused setting. No II sign-in ran in it; the PocketIC suite covers th
     imported as a dfx identity, and both copies are removed when the job ends.
   - **Deploy:** stop, snapshot (exactly one is kept: the first is created, then replaced; more than
     one is refused), `install --mode upgrade --argument '(variant { Upgrade = null })'`, start,
-    then assert the module hash and that `get_status`, called as an update, reports the tag's
+    then assert the module hash and that `get_status` (an update) reports the tag's
     commit. A module already installed is left alone, an empty canister is refused (the first
     install, with `Init`, is manual), and a failure after the stop starts the canister again.
   - **Admin:** one `admin_*` call with a Candid argument typed by the release's `.did`, refused
@@ -1983,10 +2174,10 @@ Not part of this work; recorded so the wiring stays additive.
   - `imcp2_session.did` (`CANDID`);
   - `constants.rs`: lengths, timings, limits, defaults, `KEY_CHECK_INFO`, tombstone reasons;
   - `rules.rs`: `touch_granularity`, `idle_deadline`, `idle_purge_enabled`, `idle_purge_cutoff`,
-    `reporting_matters`, `touches_effective`, `eviction_idle`, `report_promptly`, `evictable`,
-    `namespace_of`;
+    `should_report_session_activity`, `touches_effective`, `eviction_idle`,
+    `should_report_session_activity_promptly`, `evictable`, `namespace_of`;
   - `config.rs`: `Config`, `ConfigPatch`, `InstallArg`, `Config::apply`;
-  - `types.rs`, `errors.rs`, `method.rs`;
+  - `types.rs`; `errors.rs` (`error_code`, the error records and their cases);
   - `src/tests/{contract,wire}.rs`.
 - **`crates/imcp2-session-canister`:**
   - `lib.rs`: entry points, `arm_purge_timer`, `run_soon`, `purge_run`, `probe_history`,
@@ -2017,7 +2208,8 @@ Not part of this work; recorded so the wiring stays additive.
   - `touch.rs`: `TouchMap`;
   - `registrar.rs`: `Registrar`, `StubRegistrar`;
   - `metrics.rs`: `SharedMetrics`, `CallMode`, `kid_state_label`;
-  - `backend.rs`: `Backend`, `ReadMode`, `CallError`, `DEFAULT_CALL_TIMEOUT`;
+  - `backend.rs`: `Backend`, `ReadMode`, `CallError`, `DEFAULT_CALL_TIMEOUT`, and `method`, the
+    method names (checked against the `.did`'s service);
   - `sessions.rs`: `SharedSessions`, `SharedSessionsConfig`, `SharedStatus`, `KidStatus`,
     `Attachment`, `SealFailure`, `PutFailure`, `AdoptFailure`, `PUT_RETRY_WINDOW`;
   - `sync.rs`: `run`, `Inner::{round, poll_once, replicated_fetch, resync, housekeeping, up,
