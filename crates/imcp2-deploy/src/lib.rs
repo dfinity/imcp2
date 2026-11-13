@@ -406,7 +406,7 @@ pub struct IcDeployTools {
 struct Slots {
     /// One permit per deploy the server runs at once.
     free: Arc<tokio::sync::Semaphore>,
-    /// How many there are in all, for the instructions.
+    /// How many there are in all, for the wording of the refusal.
     total: usize,
     /// The sessions with a deploy running: one each.
     sessions: Arc<Mutex<HashSet<String>>>,
@@ -552,7 +552,7 @@ impl IcDeployTools {
     }
 
     #[tool(
-        description = "Deploy an icp project bundle (the .tar.gz that `icp project bundle` writes) to the Internet Computer as the user, running every phase of `icp deploy`: create the canisters the bundle names that do not exist yet (funded from the user's cycles balance), wire their ids into each other, apply settings, install or upgrade the code, and run the sync steps (a frontend's asset upload). Pass the bundle the one way this server takes it (the bundle argument listed here), the environment name it was built for (usually \"ic\"), and, to upgrade rather than create, the canister_ids a previous deploy returned. The call lasts as long as the deploy and reports each phase as it completes, as a progress notification (send a progressToken) and a log message; cancelling the call interrupts the deploy at its next step. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure or interruption the mapping still holds every canister that was created.",
+        description = "Deploy an icp project bundle (the .tar.gz that `icp project bundle` writes) to the Internet Computer as the user, running every phase of `icp deploy`: create the bundle's new canisters (funded from the user's cycles balance), wire their ids into each other, apply settings, install or upgrade the code, and run the sync steps (a frontend's asset upload). Pass the bundle the one way this server takes it (the bundle argument listed here), the environment name it was built for (usually \"ic\"), and, to upgrade rather than create, the canister_ids a previous deploy returned. The call lasts as long as the deploy and reports each phase as it completes, as a progress notification (send a progressToken) and a log message; cancelling the call interrupts the deploy at its next step. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure or interruption the mapping still holds every canister that was created.",
         annotations(title = "Deploy a project bundle", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<DeployBundleOutput>(),
     )]
@@ -569,10 +569,9 @@ impl IcDeployTools {
                  the mapping it returns into the project, and deploy again from that"
                     .into()
             } else {
-                format!(
-                    "this server is running its {} deploys at once already; wait and try again",
-                    self.concurrency()
-                )
+                "this server is running as many deploys as it can right now; try again in a \
+                 few minutes"
+                    .into()
             }));
         };
         // Who is asking comes before what they sent: a bundle is read only
@@ -652,7 +651,7 @@ impl IcDeployTools {
     }
 
     #[tool(
-        description = "Return the cycles-ledger balance on the Internet Computer of the principal icp_deploy_bundle deploys as, and that principal: your default Internet Identity account at https://cli.id.ai, the one `icp identity link web` links an icp CLI identity to. When `icp identity principal` prints the same principal, the CLI and this tool share canisters and cycles; when it prints another (a local key, or a link to another account), they do not. Call it before a deploy that will create canisters, to check the balance covers them (2T cycles each by default), and to get the principal to add as a controller of a canister created elsewhere.",
+        description = "Return the cycles balance icp_deploy_bundle creates canisters from, and the principal that holds it: the developer principal of the user's identity, distinct from its principals in apps. Call it before a deploy that will create canisters, to check the balance covers them (2T cycles each by default). The principal is where the user sends cycles to top the balance up, and what to add as a controller of a canister created elsewhere.",
         annotations(title = "Check your cycles balance", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<CyclesBalance>(),
     )]

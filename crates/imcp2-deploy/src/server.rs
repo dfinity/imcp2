@@ -3,13 +3,13 @@
 //! [`IcDeployTools`], answering `tools/list` with the merged list, dispatching
 //! `tools/call` to the deploy router first and the inner handler otherwise,
 //! listing and reading the deploy skill next to the inner resources, and
-//! appending to the inner instructions the paragraph that says deploying is
-//! possible here, and how.
+//! putting, where the inner instructions say that nothing here deploys, the
+//! paragraph that says how deploying works.
 //!
 //! Both servers compose this: the local one around its login tools, the
-//! hosted one around the core surface. What differs between them — how the
-//! bundle reaches the server, how many deploys run at once — the deploy tools
-//! know themselves, so the paragraph reads from them.
+//! hosted one around the core surface. What differs between them in what an
+//! agent does — how the bundle reaches the server — the deploy tools know
+//! themselves, so the paragraph reads from them.
 
 use rmcp::{
     handler::server::tool::ToolCallContext,
@@ -49,35 +49,25 @@ impl<H: ServerHandler> WithDeploy<H> {
         self.deploy.tools().into_iter().find(|t| &*t.name == name)
     }
 
-    /// The paragraph appended to the inner instructions.
+    /// The paragraph on deploying: short, since every client reads it, and
+    /// saying nothing of whose principal signs or of how many deploys run at
+    /// once, which no agent acts on (a server that is full says so when asked).
     fn deploying(&self) -> String {
-        let concurrency = match self.deploy.concurrency() {
-            1 => "runs one deploy at a time".to_string(),
-            n => format!("runs at most {n} deploys at a time, one per session"),
-        };
         let bundle = if self.deploy.has_uploads() {
-            "The bundle reaches this server through `icp_deploy_upload`: it returns a one-time \
-             ticket and the curl command that uploads the archive, and the upload id that \
-             command prints is what `icp_deploy_bundle` takes as `bundle_upload`."
+            "Upload the bundle first: `icp_deploy_upload` returns the curl command, and the \
+             upload id it prints goes in `bundle_upload`."
         } else {
-            "Pass the bundle as `bundle_path`, an absolute path on this machine."
+            "Pass the bundle's absolute path as `bundle_path`."
         };
         format!(
-            "DEPLOYING. This server adds `icp_deploy_bundle`, the one exception to the rule above \
-             that no tool deploys: it deploys an icp project bundle (`icp project bundle --output \
-             <file>`, built in the user's environment) to the environment it names, creating the \
-             canisters that do not exist yet from the user's cycles balance (`icp_cycles_balance` \
-             reports it) and upgrading those passed in `canister_ids`. It deploys as the user's \
-             default Internet Identity account at https://cli.id.ai — the principal `icp identity \
-             link web` links the CLI to, and so the CLI's own only when the CLI's selected \
-             identity is that link; a local key or another account is a different principal, \
-             which `icp identity principal` shows — not as the management identity the canister \
-             tools act as. It needs an \"Actions & questions\" session, {concurrency}, lasts as \
-             long as the deploy (send a progressToken to see each phase as it completes; \
-             cancelling the call interrupts the deploy at its next step), and returns the \
-             canister-id mapping to pass back next time. {bundle} The `skill://{DEPLOY_SKILL_NAME}` \
-             resource walks through the loop: bundle, deploy, write the mapping back into the \
-             project; `icp_deploy_guide` returns the same text."
+            "DEPLOYING. `icp_deploy_bundle` deploys an icp project bundle (`icp project bundle \
+             --output <file>`, built in the user's environment) to the Internet Computer, \
+             creating new canisters from the user's cycles balance (`icp_cycles_balance` reports \
+             it) and upgrading those named in `canister_ids`. {bundle} It needs an \"Actions & \
+             questions\" session and lasts as long as the deploy; send a progressToken to see \
+             each phase. It returns `canister_ids`, the app's development metadata: save it \
+             unchanged and pass it back on the next deploy. `icp_deploy_guide` returns the full \
+             steps."
         )
     }
 }
@@ -89,8 +79,11 @@ impl<H: ServerHandler> ServerHandler for WithDeploy<H> {
         // request carried a token, else as a logging message, which a client
         // only expects from a server that declares it.
         info.capabilities.logging = Some(Default::default());
+        // The inner surface closes by saying it deploys nothing; here that
+        // paragraph gives way to the one on how deploying works.
         let inner = info.instructions.take().unwrap_or_default();
-        info.instructions = Some(format!("{inner}\n\n{}", self.deploying()));
+        let inner = inner.replace(imcp2_core::DEPLOYS_ELSEWHERE, "");
+        info.instructions = Some(format!("{}\n\n{}", inner.trim_end(), self.deploying()));
         info
     }
 

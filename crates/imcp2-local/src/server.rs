@@ -421,6 +421,13 @@ mod tests {
         let instructions = info.instructions.as_deref().unwrap_or_default();
         assert!(instructions.contains("SIGNING IN"), "login guidance must be taught");
         assert!(instructions.contains("textual Candid"), "core guidance must survive the merge");
+        // Where core says nothing here deploys, this server says how it does,
+        // without the principal it signs as or how many deploys it runs.
+        assert!(instructions.contains("DEPLOYING. `icp_deploy_bundle` deploys"), "{instructions}");
+        assert!(instructions.contains("`bundle_path`"), "{instructions}");
+        for gone in ["no tool here", "exception", "cli.id.ai", "icp identity", "at a time"] {
+            assert!(!instructions.contains(gone), "`{gone}` in: {instructions}");
+        }
 
         let tools = client.list_all_tools().await.expect("tools/list");
         assert_eq!(

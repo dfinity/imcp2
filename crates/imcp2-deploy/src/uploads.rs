@@ -288,7 +288,7 @@ fn make_private_dir(dir: &Path) -> std::io::Result<()> {
 /// 256 random bits, hex-encoded: a ticket or an upload id.
 fn random_token() -> String {
     let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).expect("the OS random source is available");
+    getrandom::fill(&mut bytes).expect("the OS random source to be available");
     hex::encode(bytes)
 }
 
