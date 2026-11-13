@@ -264,6 +264,10 @@ impl ServerHandler for LocalServer {
         let mut info = self.tools.get_info();
         info.server_info.name = "imcp2-local".into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
+        // A running deploy reports each phase mid-call: as progress when the
+        // request carried a token, else as a logging message, which a client
+        // only expects from a server that declares it.
+        info.capabilities.logging = Some(Default::default());
         // The core instructions apply verbatim; add how signing in works here
         // (the hosted server logs in via OAuth outside the tool surface, so
         // core's text says nothing about it).
@@ -284,8 +288,10 @@ impl ServerHandler for LocalServer {
              so the CLI's own only when the CLI's selected identity is that link; a local key \
              or another account is a different principal, which `icp identity principal` \
              shows — not as the management identity the canister tools act as. It needs an \
-             \"Actions & questions\" session, runs one deploy at a time, and returns the \
-             canister-id mapping to pass back next time. \
+             \"Actions & questions\" session, runs one deploy at a time, lasts as long as the \
+             deploy (send a progressToken to see each phase as it completes; cancelling the \
+             call interrupts the deploy at its next step), and returns the canister-id \
+             mapping to pass back next time. \
              The `skill://deploy-with-mcp` resource walks through the loop: bundle, deploy, \
              write the mapping back into the project; `icp_deploy_guide` returns the same \
              text."

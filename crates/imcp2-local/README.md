@@ -163,10 +163,15 @@ It takes:
   previous call returned). Canisters named there are upgraded in place; the
   rest are created.
 
-It answers with the status (`deployed`, `failed`, `nothing_to_deploy`), the
-resulting canister-id mapping — pass it back next time to upgrade — the
-canisters created, and a log of each phase. A failed deploy still reports every
-canister it created before failing, so the run can be picked up rather than
+The call lasts as long as the deploy, and reports each phase and canister
+step as it completes: as an MCP progress notification when the client's call
+carries a progress token (which also keeps the client's per-call timeout from
+expiring mid-deploy), else as a server log message. Cancelling the call
+interrupts the deploy at its next step. It answers with the status
+(`deployed`, `failed`, `interrupted`, `nothing_to_deploy`), the resulting
+canister-id mapping — pass it back next time to upgrade — the canisters
+created, and a log of each phase. A failed or interrupted deploy still reports
+every canister it created before that, so the run can be picked up rather than
 repeated.
 
 Calls are signed as your **default Internet Identity account at
@@ -191,7 +196,7 @@ data directory — `~/.local/share/imcp2-local/deploys/` on Linux,
 `~/Library/Application Support/imcp2-local/deploys/` on macOS,
 `%LOCALAPPDATA%\imcp2-local\deploys\` on Windows — removed once the deploy
 has returned its answer. A deploy that never returns (the server stopped
-mid-way, the call cancelled) leaves its directory there, and inside it
+mid-way) or is interrupted leaves its directory there, and inside it
 `.icp/data/mappings/<environment>.ids.json` records every canister the
 deploy had created: merge it into the project's mapping before deploying
 again, then delete the directory. Nothing is written to the project the

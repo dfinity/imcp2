@@ -128,22 +128,33 @@ replaced. Pass `skip_candid_check: true` only when the user has accepted the
 break. `mode` (default `auto`; `install`, `reinstall`, `upgrade`),
 `cycles`, `subnet` and `no_create` mirror the flags of `icp deploy`.
 
+### Watch it run
+
+The call lasts as long as the deploy: creating canisters, installing code
+and syncing a frontend's assets take from seconds to minutes. The tool
+reports each phase and canister step the moment it completes, as a progress
+notification when your call carries a `progressToken` (most clients attach
+one; it is also what keeps your client's per-call timeout from expiring
+mid-deploy), else as a server log message. Keep the call open until it
+returns. Cancelling it interrupts the deploy at its next step, see pitfall 8.
+
 ### Read the answer
 
 The tool returns:
 
-- `status`: `deployed`, `failed`, or `nothing_to_deploy`.
+- `status`: `deployed`, `failed`, `interrupted`, or `nothing_to_deploy`.
 - `canister_ids`: the mapping after this run, the ids you passed in plus
   every id created. Step 3 uses this.
 - `created`: the canisters created by this run, in order.
-- `error`: what failed, when the status is `failed`.
+- `error`: what failed, when the status is `failed` or `interrupted`.
 - `log`: one line per phase and per canister task, with the cause of each
   failure.
 
-A deploy that fails still returns every canister it created before failing,
-in both `canister_ids` and `created`. Do step 3 on that answer too, then
-fix the cause the log names and run step 2 again with the updated mapping:
-the retry upgrades what exists and creates only what is still missing.
+A deploy that fails, or is interrupted, still returns every canister it
+created before that, in both `canister_ids` and `created`. Do step 3 on that
+answer too, then fix the cause the log names and run step 2 again with the
+updated mapping: the retry upgrades what exists and creates only what is
+still missing.
 
 ## Step 3: Update the project's mapping file
 
@@ -187,9 +198,12 @@ interchangeably for that environment.
 7. **Deploying twice at once.** One deploy runs at a time on this server; a
    second call while one runs is refused, not queued. Wait for the answer,
    do step 3, then deploy again from the updated mapping.
-8. **A call that never returned.** If the server stopped mid-deploy or the
-   call was cancelled, the canisters it created are not lost: the deploy's
-   working directory is kept under the user's local data directory
+8. **A call that never returned.** Cancelling the call, or losing the
+   connection, interrupts the deploy at its next step; a canister call
+   already in flight completes on the network. If the server stopped
+   mid-deploy, or you cancelled and never read the answer, the canisters it
+   created are not lost: the deploy's working directory is kept under the
+   user's local data directory
    (`~/.local/share/imcp2-local/deploys/` on Linux,
    `~/Library/Application Support/imcp2-local/deploys/` on macOS,
    `%LOCALAPPDATA%\imcp2-local\deploys\` on Windows), and its

@@ -31,6 +31,9 @@ use icp_project::{
     prelude::{IC_MAINNET_NETWORK_API_URL, IC_ROOT_KEY},
 };
 
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
 use crate::{calls::AgentCalls, host};
 
 /// Where the bundle bytes come from.
@@ -85,6 +88,21 @@ pub struct DeployRequest {
     pub workdir: Option<Utf8PathBuf>,
 }
 
+/// How a running deploy is watched: where its progress goes as it happens,
+/// and what tells it to stop.
+#[derive(Clone, Debug, Default)]
+pub struct Watch {
+    /// Cancelled to interrupt the deploy. The run stops at its next step
+    /// (a canister call already in flight completes on the network), and
+    /// the outcome reports [`Status::Interrupted`] with everything that
+    /// landed before the stop.
+    pub stop: CancellationToken,
+    /// Receives each log line as the run produces it, before the outcome
+    /// collects them all; `None` keeps them for the outcome alone. A
+    /// receiver that has gone away is not an error.
+    pub lines: Option<mpsc::UnboundedSender<String>>,
+}
+
 /// How a deploy ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -95,6 +113,9 @@ pub enum Status {
     Failed,
     /// The environment lists no canisters, so there was nothing to do.
     NothingToDeploy,
+    /// The run was stopped through [`Watch::stop`] before it finished;
+    /// `created` and `canister_ids` hold whatever landed before the stop.
+    Interrupted,
 }
 
 impl Status {
@@ -103,6 +124,7 @@ impl Status {
             Status::Deployed => "deployed",
             Status::Failed => "failed",
             Status::NothingToDeploy => "nothing_to_deploy",
+            Status::Interrupted => "interrupted",
         }
     }
 }
@@ -157,15 +179,16 @@ pub fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     text
 }
 
-/// Run one deploy as `identity`.
+/// Run one deploy as `identity`, reporting to and stopped by `watch`.
 ///
 /// `Err` means the request never got as far as a deploy (an unreadable
 /// bundle, an environment the manifest does not declare, a canister name the
 /// id mapping has that the environment does not); `Ok` carries the outcome of
-/// one that ran, failed or not.
+/// one that ran — finished, failed or interrupted.
 pub async fn deploy_bundle(
     identity: Arc<dyn Identity>,
     request: DeployRequest,
+    watch: Watch,
 ) -> Result<DeployOutcome, RequestError> {
     if !INSTALL_MODES.contains(&request.mode.as_str()) {
         return Err(RequestError(format!(
@@ -303,22 +326,41 @@ pub async fn deploy_bundle(
     // One reporter for the whole deploy; its events are turned into log lines
     // as they arrive, so a run that fails still reports every phase before it.
     let (reporter, receiver) = icp_events::channel::<Task>();
-    let collector = tokio::spawn(collect_log(receiver));
+    let collector = tokio::spawn(collect_log(receiver, watch.lines));
 
     // From here the directory outlives this future (see above).
     let workdir = scratch.keep();
     let mut report = DeployReport::default();
-    let result = deploy(&host, &calls, &params, &reporter, &mut report).await;
+    // The run is dropped the moment the stop is asked for: it ends at its
+    // next await, which is the next canister call or plugin step. `biased`
+    // so a stop asked for before the run begins is honoured without a step.
+    let result = {
+        let run = deploy(&host, &calls, &params, &reporter, &mut report);
+        tokio::pin!(run);
+        tokio::select! {
+            biased;
+            _ = watch.stop.cancelled() => None,
+            result = &mut run => Some(result),
+        }
+    };
     // The receiver ends only once every reporter handle is gone.
     drop(reporter);
     outcome.log = collector.await.unwrap_or_default();
     outcome.created = report.created;
 
     match result {
-        Ok(()) => outcome.status = Status::Deployed,
-        Err(e) => {
+        Some(Ok(())) => outcome.status = Status::Deployed,
+        Some(Err(e)) => {
             outcome.status = Status::Failed;
             outcome.error = Some(error_chain(&e));
+        }
+        None => {
+            outcome.status = Status::Interrupted;
+            outcome.error = Some(
+                "the deploy was interrupted before it finished (the call was cancelled or \
+                 the client went away); `canister_ids` holds every canister it had created"
+                    .into(),
+            );
         }
     }
 
@@ -339,9 +381,17 @@ pub async fn deploy_bundle(
     }
 
     // The outcome carries everything the directory recorded; the directory
-    // has done its job.
+    // has done its job. Not after an interruption: the one who asked for it
+    // may be a client that went away and will never read this outcome, so
+    // the directory stays as the record, as it does for a run that is cut
+    // off (see [`DeployRequest::workdir`]).
     drop(host);
-    if let Err(e) = tokio::fs::remove_dir_all(&workdir).await {
+    if outcome.status == Status::Interrupted {
+        outcome.log.push(format!(
+            "interrupted; the deploy directory '{}' is kept, with the ids it recorded",
+            workdir.display()
+        ));
+    } else if let Err(e) = tokio::fs::remove_dir_all(&workdir).await {
         outcome
             .log
             .push(format!("removing the deploy directory '{}' failed: {e}", workdir.display()));
@@ -410,11 +460,19 @@ async fn read_bundle_file(path: &Utf8Path, limit: usize) -> Result<Vec<u8>, Requ
 /// `<what>: ok` / `failed: <why>` / `skipped: <why>`, with a task nested under
 /// a phase indented beneath it. Output lines are not kept — a sync plugin's
 /// retained stderr is the exception, since the operation asked for it to
-/// survive — so the log stays a summary, not a transcript.
+/// survive — so the log stays a summary, not a transcript. Each line also
+/// goes to `lines` the moment it is made, for a watcher that reads along.
 async fn collect_log(
     mut receiver: tokio::sync::mpsc::UnboundedReceiver<icp_events::Event<Task>>,
+    lines: Option<mpsc::UnboundedSender<String>>,
 ) -> Vec<String> {
     let mut log = Vec::new();
+    let mut push = |line: String| {
+        if let Some(lines) = &lines {
+            let _ = lines.send(line.clone());
+        }
+        log.push(line);
+    };
     let mut started: HashMap<TaskId, (String, bool)> = HashMap::new();
     while let Some(event) = receiver.recv().await {
         match event.kind {
@@ -428,9 +486,9 @@ async fn collect_log(
                 let indent = if nested { "  " } else { "" };
                 match outcome {
                     TaskOutcome::Succeeded { retained_output } => {
-                        log.push(format!("{indent}{label}: ok"));
+                        push(format!("{indent}{label}: ok"));
                         for line in retained_output {
-                            log.push(format!("{indent}  {line}"));
+                            push(format!("{indent}  {line}"));
                         }
                     }
                     TaskOutcome::Failed { message, causes } => {
@@ -439,10 +497,10 @@ async fn collect_log(
                             line.push_str(": ");
                             line.push_str(&cause);
                         }
-                        log.push(line);
+                        push(line);
                     }
                     TaskOutcome::Skipped { reason } => {
-                        log.push(format!("{indent}{label}: skipped: {reason}"));
+                        push(format!("{indent}{label}: skipped: {reason}"));
                     }
                 }
             }
@@ -571,10 +629,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_bundle_deploys_up_to_the_create_phase_offline() {
         let (wasm, sha) = wasm();
-        let outcome =
-            deploy_bundle(Arc::new(AnonymousIdentity), request(bundle(&sha, &wasm), "ic"))
-                .await
-                .expect("the request is valid");
+        let outcome = deploy_bundle(
+            Arc::new(AnonymousIdentity),
+            request(bundle(&sha, &wasm), "ic"),
+            Watch::default(),
+        )
+        .await
+        .expect("the request is valid");
         assert_eq!(outcome.status, Status::Failed);
         assert_eq!(outcome.network, "ic");
         assert_eq!(outcome.canisters, ["backend"]);
@@ -593,9 +654,13 @@ mod tests {
     async fn a_wasm_that_does_not_match_its_checksum_is_refused_up_front() {
         let (wasm, _) = wasm();
         let wrong = "0".repeat(64);
-        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bundle(&wrong, &wasm), "ic"))
-            .await
-            .expect_err("a checksum mismatch is refused");
+        let err = deploy_bundle(
+            Arc::new(AnonymousIdentity),
+            request(bundle(&wrong, &wasm), "ic"),
+            Watch::default(),
+        )
+        .await
+        .expect_err("a checksum mismatch is refused");
         assert!(err.0.contains("backend") && err.0.contains("checksum mismatch"), "{err}");
         assert!(err.0.contains(&wrong), "{err}");
     }
@@ -608,7 +673,7 @@ mod tests {
         let (wasm, sha) = wasm();
         let mut local = request(bundle(&sha, &wasm), "local");
         local.no_create = false;
-        let err = deploy_bundle(Arc::new(AnonymousIdentity), local)
+        let err = deploy_bundle(Arc::new(AnonymousIdentity), local, Watch::default())
             .await
             .expect_err("a managed network is refused");
         assert!(err.0.contains("not the Internet Computer") && err.0.contains("`ic`"), "{err}");
@@ -621,9 +686,10 @@ mod tests {
         );
         let bytes =
             archive(&[("icp.yaml", manifest.as_bytes()), ("canisters/backend.wasm", &wasm)]);
-        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "staging"))
-            .await
-            .expect_err("a testnet is refused");
+        let err =
+            deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "staging"), Watch::default())
+                .await
+                .expect_err("a testnet is refused");
         assert!(err.0.contains("testnet") && err.0.contains("not the Internet Computer"), "{err}");
     }
 
@@ -633,15 +699,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn unknown_environments_and_canisters_are_request_errors() {
         let (wasm, sha) = wasm();
-        let err =
-            deploy_bundle(Arc::new(AnonymousIdentity), request(bundle(&sha, &wasm), "staging"))
-                .await
-                .expect_err("no such environment");
+        let err = deploy_bundle(
+            Arc::new(AnonymousIdentity),
+            request(bundle(&sha, &wasm), "staging"),
+            Watch::default(),
+        )
+        .await
+        .expect_err("no such environment");
         assert!(err.0.contains("staging"), "{err}");
 
         let mut request = request(bundle(&sha, &wasm), "ic");
         request.canister_ids.insert("frontend".into(), Principal::management_canister());
-        let err = deploy_bundle(Arc::new(AnonymousIdentity), request)
+        let err = deploy_bundle(Arc::new(AnonymousIdentity), request, Watch::default())
             .await
             .expect_err("no such canister");
         assert!(err.0.contains("frontend"), "{err}");
@@ -656,9 +725,10 @@ mod tests {
         let manifest = "canisters:\n  - name: backend\n    build:\n      steps:\n        \
                         - type: script\n          command: touch /tmp/pwned\n";
         let bytes = archive(&[("icp.yaml", manifest.as_bytes())]);
-        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
-            .await
-            .expect_err("a script step is refused");
+        let err =
+            deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"), Watch::default())
+                .await
+                .expect_err("a script step is refused");
         assert!(
             err.0.contains("canister 'backend' has a build step that is not a pre-built module")
                 && err.0.contains("touch /tmp/pwned"),
@@ -683,9 +753,10 @@ mod tests {
             ("etc/canister.yaml", canister.as_bytes()),
             ("etc/backend.wasm", &wasm),
         ]);
-        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
-            .await
-            .expect_err("a canister directory outside the root is refused");
+        let err =
+            deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"), Watch::default())
+                .await
+                .expect_err("a canister directory outside the root is refused");
         // The confined filesystem finds nothing at `/etc`, so the loader does
         // not find the canister: the spelling itself is the refusal.
         assert!(err.0.contains("canister manifest") && err.0.contains("'/etc'"), "{err}");
@@ -705,9 +776,13 @@ mod tests {
         );
         let bytes =
             archive(&[("icp.yaml", manifest.as_bytes()), ("canisters/backend.wasm", &wasm)]);
-        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "elsewhere"))
-            .await
-            .expect_err("a network that is not `ic` is refused");
+        let err = deploy_bundle(
+            Arc::new(AnonymousIdentity),
+            request(bytes, "elsewhere"),
+            Watch::default(),
+        )
+        .await
+        .expect_err("a network that is not `ic` is refused");
         assert!(err.0.contains("mainnet2") && err.0.contains("not the Internet Computer"), "{err}");
     }
 
@@ -721,9 +796,13 @@ mod tests {
         encoder.write_all(&vec![0u8; host::MAX_WASM_BYTES as usize + 1]).unwrap();
         let gz = encoder.finish().unwrap();
         let sha = hex::encode(Sha256::digest(&gz));
-        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bundle(&sha, &gz), "ic"))
-            .await
-            .expect_err("an over-large gzipped module is refused");
+        let err = deploy_bundle(
+            Arc::new(AnonymousIdentity),
+            request(bundle(&sha, &gz), "ic"),
+            Watch::default(),
+        )
+        .await
+        .expect_err("an over-large gzipped module is refused");
         assert!(err.0.contains("backend") && err.0.contains("expands past"), "{err}");
     }
 
@@ -740,9 +819,10 @@ mod tests {
         );
         let bytes =
             archive(&[("icp.yaml", manifest.as_bytes()), ("canisters/backend.wasm", &wasm)]);
-        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
-            .await
-            .expect_err("case-colliding names are refused");
+        let err =
+            deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"), Watch::default())
+                .await
+                .expect_err("case-colliding names are refused");
         assert!(err.0.contains("differ only in letter case"), "{err}");
     }
 
@@ -759,7 +839,8 @@ mod tests {
         let workdir = Utf8PathBuf::from_path_buf(parent.path().join("deploys")).unwrap();
         let mut request = request(bundle(&sha, &wasm), "ic");
         request.workdir = Some(workdir.clone());
-        let outcome = deploy_bundle(Arc::new(AnonymousIdentity), request).await.unwrap();
+        let outcome =
+            deploy_bundle(Arc::new(AnonymousIdentity), request, Watch::default()).await.unwrap();
         assert_eq!(outcome.status, Status::Failed, "{:?}", outcome.log);
         assert!(workdir.is_dir(), "the parent is made");
         let left: Vec<_> = std::fs::read_dir(&workdir).unwrap().collect();
@@ -773,7 +854,8 @@ mod tests {
     async fn an_unknown_mode_is_refused_at_entry() {
         let mut bad = request(Vec::new(), "ic");
         bad.mode = "yolo".into();
-        let err = deploy_bundle(Arc::new(AnonymousIdentity), bad).await.unwrap_err();
+        let err =
+            deploy_bundle(Arc::new(AnonymousIdentity), bad, Watch::default()).await.unwrap_err();
         assert!(err.0.contains("mode must be one of"), "{}", err.0);
         assert!(err.0.contains("'yolo'"), "{}", err.0);
     }
@@ -809,9 +891,10 @@ mod tests {
         );
         let bytes =
             archive(&[("icp.yaml", manifest.as_bytes()), ("canisters/backend.wasm", &wasm)]);
-        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
-            .await
-            .expect_err("a deeply nested init_args value is refused");
+        let err =
+            deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"), Watch::default())
+                .await
+                .expect_err("a deeply nested init_args value is refused");
         assert!(err.0.contains("`init_args` is nested too deeply"), "{err}");
 
         let interface = format!("service : {{ f : ({}null) -> () }}", "opt ".repeat(200));
@@ -821,9 +904,10 @@ mod tests {
         .unwrap();
         let sha = hex::encode(Sha256::digest(&wasm));
         let bytes = bundle(&sha, &wasm);
-        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
-            .await
-            .expect_err("a deeply nested interface is refused");
+        let err =
+            deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"), Watch::default())
+                .await
+                .expect_err("a deeply nested interface is refused");
         assert!(err.0.contains("`candid:service` interface"), "{err}");
         assert!(err.0.contains("nested too deeply"), "{err}");
 
@@ -833,10 +917,13 @@ mod tests {
         )
         .unwrap();
         let sha = hex::encode(Sha256::digest(&wasm));
-        let outcome =
-            deploy_bundle(Arc::new(AnonymousIdentity), request(bundle(&sha, &wasm), "ic"))
-                .await
-                .unwrap();
+        let outcome = deploy_bundle(
+            Arc::new(AnonymousIdentity),
+            request(bundle(&sha, &wasm), "ic"),
+            Watch::default(),
+        )
+        .await
+        .unwrap();
         assert!(outcome.log.iter().any(|l| l == "Building canisters: ok"), "{:?}", outcome.log);
     }
 
@@ -846,7 +933,8 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
         let mut local = request(Vec::new(), "ic");
         local.bundle = BundleSource::Path(path);
-        let err = deploy_bundle(Arc::new(AnonymousIdentity), local).await.unwrap_err();
+        let err =
+            deploy_bundle(Arc::new(AnonymousIdentity), local, Watch::default()).await.unwrap_err();
         assert!(err.0.contains("not a regular file"), "{}", err.0);
     }
 
@@ -867,9 +955,10 @@ mod tests {
         );
         let bytes =
             archive(&[("icp.yaml", manifest.as_bytes()), ("canisters/backend.wasm", &wasm)]);
-        let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
-            .await
-            .expect_err("a variable file outside the bundle is refused");
+        let err =
+            deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"), Watch::default())
+                .await
+                .expect_err("a variable file outside the bundle is refused");
         assert!(err.0.contains("SECRET"), "{err}");
         assert!(err.0.contains("'/etc/hostname' is outside"), "{err}");
 
@@ -879,9 +968,10 @@ mod tests {
                  path: {path}\n          sha256: {sha}\n"
             );
             let bytes = archive(&[("icp.yaml", manifest.as_bytes())]);
-            let err = deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"))
-                .await
-                .expect_err("a wasm outside the bundle is refused");
+            let err =
+                deploy_bundle(Arc::new(AnonymousIdentity), request(bytes, "ic"), Watch::default())
+                    .await
+                    .expect_err("a wasm outside the bundle is refused");
             assert!(
                 err.0.contains("etc/hostname")
                     && err.0.contains("not a regular file in the project"),
@@ -896,7 +986,7 @@ mod tests {
     #[tokio::test]
     async fn the_event_stream_becomes_a_readable_log() {
         let (reporter, receiver) = icp_events::channel::<Task>();
-        let collector = tokio::spawn(collect_log(receiver));
+        let collector = tokio::spawn(collect_log(receiver, None));
         let phase = reporter.task(Task::phase("Creating canisters:"));
         let create = phase.reporter().task(Task::create("backend"));
         create.finish(TaskOutcome::succeeded());
@@ -920,6 +1010,50 @@ mod tests {
                 "candid_check backend (aaaaa-aa): skipped: not an upgrade",
             ]
         );
+    }
+
+    // A watcher reads each line as the run makes it — the same lines, in the
+    // same order, the outcome collects at the end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_log_is_streamed_as_it_is_made() {
+        let (wasm, sha) = wasm();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let watch = Watch { stop: CancellationToken::new(), lines: Some(tx) };
+        let outcome =
+            deploy_bundle(Arc::new(AnonymousIdentity), request(bundle(&sha, &wasm), "ic"), watch)
+                .await
+                .unwrap();
+        assert_eq!(outcome.status, Status::Failed);
+        let mut streamed = Vec::new();
+        while let Some(line) = rx.recv().await {
+            streamed.push(line);
+        }
+        assert_eq!(streamed, outcome.log);
+        assert!(streamed.iter().any(|l| l == "Building canisters: ok"), "{streamed:?}");
+    }
+
+    // A stop asked for before the run begins ends it without a step, and
+    // the directory stays behind as the record, since whoever asked may
+    // never read the answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_interrupted_deploy_stops_and_keeps_its_directory() {
+        let (wasm, sha) = wasm();
+        let parent = tempfile::tempdir().unwrap();
+        let mut request = request(bundle(&sha, &wasm), "ic");
+        request.workdir = Some(Utf8PathBuf::from_path_buf(parent.path().to_path_buf()).unwrap());
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let watch = Watch { stop, lines: None };
+        let outcome = deploy_bundle(Arc::new(AnonymousIdentity), request, watch).await.unwrap();
+        assert_eq!(outcome.status, Status::Interrupted);
+        assert_eq!(outcome.canisters, ["backend"]);
+        assert!(outcome.created.is_empty());
+        let error = outcome.error.as_deref().unwrap();
+        assert!(error.contains("interrupted"), "{error}");
+        assert!(!outcome.log.iter().any(|l| l.starts_with("Building")), "{:?}", outcome.log);
+        let kept: Vec<_> = std::fs::read_dir(parent.path()).unwrap().flatten().collect();
+        assert_eq!(kept.len(), 1, "the deploy directory is kept");
+        assert!(outcome.log.last().unwrap().contains("is kept"), "{:?}", outcome.log);
     }
 
     #[test]

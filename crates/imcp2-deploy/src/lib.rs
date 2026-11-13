@@ -51,11 +51,13 @@ use camino::Utf8PathBuf;
 use candid::Principal;
 use ic_agent::{identity::DelegatedIdentity, Identity};
 use imcp2_core::{cycles_balance_of, identities::Identities, CyclesBalance, SessionResolver};
+#[allow(deprecated)]
+use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock},
+    model::{CallToolResult, ContentBlock, ProgressNotificationParam, ProgressToken},
     schemars,
-    service::RequestContext,
+    service::{Peer, RequestContext},
     tool, tool_router, ErrorData as McpError, RoleServer,
 };
 use serde::{Deserialize, Serialize};
@@ -65,7 +67,9 @@ mod deploy;
 mod host;
 mod identity;
 
-pub use deploy::{deploy_bundle, BundleSource, DeployOutcome, DeployRequest, RequestError, Status};
+pub use deploy::{
+    deploy_bundle, BundleSource, DeployOutcome, DeployRequest, RequestError, Status, Watch,
+};
 use identity::RefreshingIdentity;
 
 /// The icp CLI's default funding for a canister it creates (`icp deploy
@@ -152,8 +156,9 @@ pub struct CreatedCanister {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DeployBundleOutput {
     /// `deployed`, `failed` (see `error`; `created` and `canister_ids` hold
-    /// what landed before the failure), or `nothing_to_deploy` (the environment
-    /// lists no canisters).
+    /// what landed before the failure), `interrupted` (the call was cancelled
+    /// or the client went away; likewise), or `nothing_to_deploy` (the
+    /// environment lists no canisters).
     pub status: String,
     /// The environment deployed.
     pub environment: String,
@@ -209,6 +214,12 @@ impl DeployBundleOutput {
             "nothing_to_deploy" => format!(
                 "Environment '{}' declares no canisters, so there was nothing to deploy.",
                 self.environment
+            ),
+            "interrupted" => format!(
+                "Deploying environment '{}' to network '{}' was INTERRUPTED: {}",
+                self.environment,
+                self.network,
+                self.error.as_deref().unwrap_or("stopped before it finished")
             ),
             _ => format!(
                 "Deploying environment '{}' to network '{}' FAILED: {}",
@@ -379,7 +390,7 @@ impl IcDeployTools {
     }
 
     #[tool(
-        description = "Deploy an icp project bundle (the .tar.gz that `icp project bundle` writes) to the Internet Computer as the user, running every phase of `icp deploy`: create the canisters the bundle names that do not exist yet (funded from the user's cycles balance), wire their ids into each other, apply settings, install or upgrade the code, and run the sync steps (a frontend's asset upload). Pass the bundle by absolute path or base64, the environment name it was built for (usually \"ic\"), and, to upgrade rather than create, the canister_ids a previous deploy returned. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure the mapping still holds every canister that was created.",
+        description = "Deploy an icp project bundle (the .tar.gz that `icp project bundle` writes) to the Internet Computer as the user, running every phase of `icp deploy`: create the canisters the bundle names that do not exist yet (funded from the user's cycles balance), wire their ids into each other, apply settings, install or upgrade the code, and run the sync steps (a frontend's asset upload). Pass the bundle by absolute path or base64, the environment name it was built for (usually \"ic\"), and, to upgrade rather than create, the canister_ids a previous deploy returned. The call lasts as long as the deploy and reports each phase as it completes, as a progress notification (send a progressToken) and a log message; cancelling the call interrupts the deploy at its next step. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure or interruption the mapping still holds every canister that was created.",
         annotations(title = "Deploy a project bundle", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<DeployBundleOutput>(),
     )]
@@ -417,13 +428,23 @@ impl IcDeployTools {
                 Ok(id) => id,
                 Err(e) => return Ok(err(e)),
             };
-        match deploy_bundle(identity, request).await {
+        // Each phase reaches the client as it completes, and the client's
+        // cancellation of the request stops the deploy.
+        let (lines, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let forwarder =
+            tokio::spawn(forward_lines(ctx.peer.clone(), ctx.meta.get_progress_token(), receiver));
+        let watch = Watch { stop: ctx.ct.child_token(), lines: Some(lines) };
+        let result = deploy_bundle(identity, request, watch).await;
+        // The sender went with the run; the forwarder ends once it has
+        // delivered what is left.
+        let _ = forwarder.await;
+        match result {
             Err(RequestError(e)) => Ok(err(e)),
             Ok(outcome) => {
                 let output = DeployBundleOutput::from_outcome(&outcome);
                 let text = output.human();
                 Ok(match outcome.status {
-                    Status::Failed => err_structured(text, &output),
+                    Status::Failed | Status::Interrupted => err_structured(text, &output),
                     Status::Deployed | Status::NothingToDeploy => ok_structured(text, &output),
                 })
             }
@@ -431,7 +452,7 @@ impl IcDeployTools {
     }
 
     #[tool(
-        description = "Return the cycles-ledger balance on the Internet Computer of the principal icp_deploy_bundle deploys as, and that principal: your default Internet Identity account at https://cli.id.ai, the one `icp identity link web` links an icp CLI identity to. When `icp identity principal` prints the same principal, the CLI and this tool share canisters and cycles; when it prints another (a local key, or a link to another account), they do not. Call it before a deploy that will create canisters, to check the balance covers them (2T cycles each by default), and to get the principal to add as a controller of a canister created elsewhere.",
+        description = "Return the cycles balance on the Internet Computer of the principal icp_deploy_bundle deploys as, and that principal: your default Internet Identity account at https://cli.id.ai, the one `icp identity link web` links an icp CLI identity to. When `icp identity principal` prints the same principal, the CLI and this tool share canisters and cycles; when it prints another (a local key, or a link to another account), they do not. Call it before a deploy that will create canisters, to check the balance covers them (2T cycles each by default), and to get the principal to add as a controller of a canister created elsewhere.",
         annotations(title = "Check your cycles balance", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<CyclesBalance>(),
     )]
@@ -474,6 +495,41 @@ impl IcDeployTools {
     ) -> Result<CallToolResult, McpError> {
         let output = DeployGuideOutput { content: DEPLOY_SKILL_MD.to_string() };
         Ok(ok_structured(output.content.clone(), &output))
+    }
+}
+
+/// Deliver each log line of a running deploy to the client as it is made: as
+/// a progress notification when the request carried a progress token (which
+/// is also what keeps a client's per-call timeout from running out during a
+/// long deploy), else as a logging message, the one other thing a server may
+/// say mid-call. A client that cannot be reached is not an error here; the
+/// outcome carries every line regardless.
+// MCP logging is deprecated (SEP-2577) but still delivered; it is the
+// fallback for a client that sends no progress token, nothing more.
+#[allow(deprecated)]
+async fn forward_lines(
+    peer: Peer<RoleServer>,
+    progress_token: Option<ProgressToken>,
+    mut lines: tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    let mut progress = 0.0;
+    while let Some(line) = lines.recv().await {
+        progress += 1.0;
+        let _ = match &progress_token {
+            Some(token) => {
+                let param =
+                    ProgressNotificationParam::new(token.clone(), progress).with_message(line);
+                peer.notify_progress(param).await
+            }
+            None => {
+                let param = LoggingMessageNotificationParam::new(
+                    LoggingLevel::Info,
+                    serde_json::Value::String(line),
+                )
+                .with_logger("icp_deploy_bundle");
+                peer.notify_logging_message(param).await
+            }
+        };
     }
 }
 

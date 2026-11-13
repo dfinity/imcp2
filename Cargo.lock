@@ -2499,6 +2499,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
  "wat",
