@@ -452,7 +452,7 @@ impl IcDeployTools {
     }
 
     #[tool(
-        description = "Return the cycles-ledger balance on the Internet Computer of the principal icp_deploy_bundle deploys as, and that principal: your default Internet Identity account at https://cli.id.ai, the one `icp identity link web` links an icp CLI identity to. When `icp identity principal` prints the same principal, the CLI and this tool share canisters and cycles; when it prints another (a local key, or a link to another account), they do not. Call it before a deploy that will create canisters, to check the balance covers them (2T cycles each by default), and to get the principal to add as a controller of a canister created elsewhere.",
+        description = "Return the cycles balance on the Internet Computer of the principal icp_deploy_bundle deploys as, and that principal: your default Internet Identity account at https://cli.id.ai, the one `icp identity link web` links an icp CLI identity to. When `icp identity principal` prints the same principal, the CLI and this tool share canisters and cycles; when it prints another (a local key, or a link to another account), they do not. Call it before a deploy that will create canisters, to check the balance covers them (2T cycles each by default), and to get the principal to add as a controller of a canister created elsewhere.",
         annotations(title = "Check your cycles balance", read_only_hint = true, destructive_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<CyclesBalance>(),
     )]
