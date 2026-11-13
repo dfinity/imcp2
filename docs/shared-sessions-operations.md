@@ -1138,8 +1138,10 @@ use it to roll back code (7.2).
 
 - **Sessions created after the snapshot are gone.** Their next request gets 401, and the client
   signs in again.
-- **Sessions purged or evicted after the snapshot come back** until they are purged again. Their
-  II grants were still valid, so this is hygiene only.
+- **Sessions purged or evicted after the snapshot come back** until they are purged again. A
+  purge that revoked sessions (a stolen identity's, 8.6, or a leaked key's, 4.6) is undone too, so
+  step 5 replays it at once. For the rest their II grants were still valid, so this is hygiene
+  only.
 - **Admin changes made after the snapshot are undone** until you replay them (steps 5 and 8).
 - **A key rotation finished after the snapshot drains every node** until its key checks and
   retirements are replayed (step 5). The load restores the snapshot's key list, in which a kid
@@ -1188,11 +1190,12 @@ Steps:
    - **Skip** the `admin_update_config(record {})` runs of this procedure (step 4).
    - **Add** any admin call made by hand since `T_snap`.
    - **Split them:** step 5 replays the `admin_set_key_check` and `admin_retire_kid` entries and
-     restores the allow-list; step 8 replays everything else (the rest of the configuration,
-     purges). `authorized` replaces the whole list (6.3), so restoring it takes one call with the
-     list the latest entry that set `authorized` sent; replaying older lists, even for a moment,
-     would admit again a node removed since. Note that list, and leave `authorized` out of the
-     `admin_update_config` entries step 8 replays.
+     the **revocation purges** (`admin_purge_sessions` by `opened_by` for a stolen identity, 8.6, or
+     by `kid` for a leaked key, 4.6), and restores the allow-list; step 8 replays everything else
+     (the rest of the configuration, other purges). `authorized` replaces the whole list (6.3), so
+     restoring it takes one call with the list the latest entry that set `authorized` sent;
+     replaying older lists, even for a moment, would admit again a node removed since. Note that
+     list, and leave `authorized` out of the `admin_update_config` entries step 8 replays.
 3. **Load it:**
 
    ```sh
@@ -1212,11 +1215,13 @@ Steps:
      stale activity times), and the next run, within `purge_interval_secs`, probes again.
    - Without this call, the next timer run does the same within `purge_interval_secs`, but only if
      the timer is armed.
-5. **Replay the key checks and retirements, and restore the allow-list, right away,** before the
-   checks below: the `admin_set_key_check` and `admin_retire_kid` entries of step 2, oldest first,
-   with the same argument, and `tag` = the release now installed. They are idempotent. If an entry
-   since `T_snap` set `authorized`, then run `admin_update_config` with
-   `(record { authorized = opt vec { … } })` and the list step 2 noted (Appendix B).
+5. **Replay the key checks, retirements and revocation purges, and restore the allow-list, right
+   away,** before the checks below: the `admin_set_key_check` and `admin_retire_kid` entries of
+   step 2, oldest first, with the same argument, and `tag` = the release now installed. They are
+   idempotent. If an entry since `T_snap` set `authorized`, then run `admin_update_config` with
+   `(record { authorized = opt vec { … } })` and the list step 2 noted (Appendix B). Then start
+   the revocation purges step 2 picked, one at a time (wait for `purge_job.done` in `get_status`
+   before the next).
    - **Until then, a key rotation finished since `T_snap` takes every node down.** The restored
      key list is the snapshot's, so a kid published since is `unpublished` in it. A node that
      holds no kid the snapshot verified has no sealing kid (4.1): at its next replicated fetch,
@@ -1232,6 +1237,9 @@ Steps:
      again a node identity removed since `T_snap` (a stolen one, 8.6), which can flood
      `put_session` up to the caps meanwhile, and refuses a node added since, which is not ready
      until then.
+   - **And replaying the revocation purges.** The load brought back the sessions they removed,
+     and every node mirrors them again at its resync: until the purge runs again, their tokens
+     work.
 6. **Check the canister:**
    - its log shows
      `restore check: the canister history shows a snapshot load; epoch <a> -> <b>, idle floor raised to now`;
@@ -1247,8 +1255,8 @@ Steps:
    - `imcp2_shared_ready` is 1 (a node that dropped before step 5 is back within about 35 s of
      it), and `shared.synced` is `true` again once the rebuild is done. A node allow-listed
      after `T_snap` is ready again once step 5 restored the list, with no restart (8.3).
-8. **Replay the rest** of step 2's entries (the rest of the configuration, purges), oldest first,
-   with the same method and argument (an `admin_update_config` entry without its `authorized`
+8. **Replay the rest** of step 2's entries (the rest of the configuration, other purges), oldest
+   first, with the same method and argument (an `admin_update_config` entry without its `authorized`
    field, which step 5 restored; one that set nothing else is done), and `tag` = the release now
    installed.
    - Purges run one at a time: wait for `purge_job.done` in `get_status` before the next.
@@ -1490,4 +1498,6 @@ correctly when nothing types it against the `.did`.
   dfx before the call is made. Purging everything has to be written out, every field `Any`.
 - `kid` is matched against byte 2 of the sealed envelope.
 - Namespaces appear in `get_status` `per_namespace`.
-- `created_from` must not be after `created_to`.
+- `created_from` and `created_to` are inclusive: they match sessions created at or after, and at or
+  before, the given time (`created_at`, Unix seconds). `created_from` must not be after
+  `created_to`.

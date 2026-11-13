@@ -102,7 +102,7 @@ These were settled before the design.
 | D1 | **Granted sessions are canister records.** The sealed record (`RecordPayload`: sid, S, grant expiry, access level) is stored once at redeem and never rewritten. Every node mirrors the consumed records through the change feed, treats its mirror as the existence authority, decrypts a record on first use, and reads through on a miss. | The put/get-and-sync model asked for. S exists only sealed (canister and mirrors) or in a node's RAM. | Canister: `State::put_session` is create-only. Mirror: `Mirror` (6.2). Sync loop: `sync.rs` (6.3). |
 | D2 | **Self-contained credentials.** The cookie, code and token are sealed. The code and the token are bound to S (`code_proof`, `at_bind`), so the deployment key alone cannot forge a usable one. The DCR `client_id` is self-describing and unsealed. | Register and authorize, both unauthenticated, make no canister call. The short hops have no replication lag. | `seal`, `codec`, `dcr` (3). |
 | D3 | **Two awaited updates per sign-in.** `put_session` at redeem fails closed: no code is issued without a durable record. `consume_code` at `/oauth/token` gives single use through consensus, checks the code proof and returns the record. A record enters the feed only when its code is consumed. | Only single use and durability need consensus. Abandoned sign-ins never reach a mirror. | Canister: `State::put_session`, `State::consume_code`. Flow: `shared_flow::redeem`, `shared_flow::token` (7). |
-| D4 | **Queries are hints.** A query answer (from `get_sessions_non_replicated` or `list_changes_non_replicated`) can add an AEAD-valid, consumed record to a mirror, but **never removes anything**. Only replicated reads (`get_sessions` and `list_changes`, update calls) delete, move the cursor, start a resync, or justify a 401. | A query answer comes from one replica and is not certified. A sealed record cannot be forged; a tombstone or an absence can. | `Mirror::upsert` refuses a record under a final tombstone; only `Mirror::apply_final_tombstone` deletes. `Inner::poll_once` only adds; `Inner::replicated_fetch` alone deletes (6.3). |
+| D4 | **Queries are hints.** A query answer (from `get_sessions_non_replicated` or `list_changes_non_replicated`) can add an AEAD-valid, consumed record to a mirror, but **never removes anything**, and never revives a key whose deletion the node has read from an update (its final tombstone refuses the record): a stale replica can delay a deletion until the next replicated read, never undo it. Only replicated reads (`get_sessions` and `list_changes`, update calls) delete, move the cursor, start a resync, or justify a 401. | A query answer comes from one replica and is not certified. A sealed record cannot be forged; a tombstone or an absence can. | `Mirror::upsert` refuses a record under a final tombstone; only `Mirror::apply_final_tombstone` deletes. `Inner::poll_once` only adds; `Inner::replicated_fetch` alone deletes (6.3). |
 | D5 | **401 only on an authoritative fact.** Anything else (outage, lag, key drift, a newer format, a full cache) gets 503 `temporarily_unavailable` with `Retry-After: 5` and no `WWW-Authenticate`. | A 401 makes an MCP client run a full re-authorization. | `OpenError::{Invalid, Unavailable}`, `CodecError::Newer`, `Resolution`, `shared_flow::mcp_unavailable` (6.5, 6.6). |
 | D6 | **A snapshot load is disaster recovery.** The canister detects one from its own **canister history** (`canister_info`), which a snapshot load does not rewind. It then bumps `epoch` and raises `idle_floor_at`. Nodes discard their mirrors and resync. Operators replay admin changes from a journal. Sessions created after the snapshot must re-authorize. | Correct and simple. Automatic re-push from the nodes proved fragile in review. Routine upgrades never load snapshots. | `history.rs`, `State::observe_history`, `State::check_restore` (4.7). `canister_version` cannot be used (4.7). |
 | D7 | **Idle purge** at `max(last_active, idle_floor_at) + idle + granularity + 300 s`, and silent removal at grant expiry. Touches are batched and sent only when they can move a deadline. A record is evicted for capacity only when its `last_active` can be trusted, apart from a user returning in the seconds before the node's prompt report lands (4.5). | Costs nothing at the 30 d default. Lowering the idle timeout later never logs out an active user. | `rules.rs` (4.4, 4.5), `TouchMap` (6.8). |
@@ -475,8 +475,9 @@ expired.
 **`admin_purge_sessions(filter)`**
 
 - Matches every condition of `PurgeFilter`: `namespace` (16 bytes; the scan then covers only that
-  key range), `kid` (envelope byte 2), `opened_by`, `created_from`, `created_to`. Each is a
-  required `variant { Any; Is : T }` (`Match<T>`), and all `Any` purges everything.
+  key range), `kid` (envelope byte 2), `opened_by`, `created_from` and `created_to` (inclusive
+  bounds: `created_at ≥ created_from`, `created_at ≤ created_to`). Each is a required
+  `variant { Any; Is : T }` (`Match<T>`), and all `Any` purges everything.
 - **Why required variants.** Candid drops record fields a type does not declare, and dfx annotates a
   textual argument with the canister's published interface before sending it. With optional fields,
   a misspelled one silently became "no constraint": alone it purged every session, next to correct
@@ -548,16 +549,18 @@ session to make room for a new one at a cap.
 - **`eviction_idle(idle) = granularity + 2 × TOUCH_FLUSH_INTERVAL + MIN_EVICT_IDLE`**: how long a
   session must have gone without reported activity before `evictable` (4.5) may judge it unused;
   16 320 s under a 7-day timeout.
-- **`should_report_session_activity_promptly(now, reported, idle)`**: `now − reported + CLOCK_SKEW ≥
-  granularity + MIN_EVICT_IDLE`, i.e. `eviction_idle` less two flush intervals and the skew. When a
-  request finds a session's reported activity this old, the node reports it at once instead of at
-  its next periodic flush (6.8). Below it the periodic flush is in time: sent within one interval (a
-  node counts its flush period from the start of the previous flush, 6.3) and answered within
-  another, its report reaches the canister before the session could be judged evictable, for a node
-  clock up to `CLOCK_SKEW` off. This needs `reported` to be no later than what the canister holds;
-  for a session not reported yet that is its consumption time, which `consume_code` records as its
+- **`should_report_session_activity_promptly(now, reported, idle)`**: `now − reported + 2 ×
+  CLOCK_SKEW ≥ granularity + MIN_EVICT_IDLE`, i.e. `eviction_idle` less two flush intervals and
+  twice the skew. When a request finds a session's reported activity this old, the node reports it
+  at once instead of at its next periodic flush (6.8). Below it the periodic flush is in time: sent
+  within one interval (a node counts its flush period from the start of the previous flush, 6.3)
+  and answered within another, its report reaches the canister before the session could be judged
+  evictable, for a node clock up to `CLOCK_SKEW` off both when it sent its last report and now.
+  `reported` is the activity the node last reported, as it sent it; the canister may hold one up
+  to `CLOCK_SKEW` earlier, since it caps reports at its own time, and the second skew covers that.
+  For a session not reported yet it is the consumption time, which `consume_code` records as the
   first activity. The idle floor is ignored, which errs towards reporting, and a prompt report is
-  always a due one (`CLOCK_SKEW ≤ MIN_EVICT_IDLE`).
+  always a due one (`2 × CLOCK_SKEW ≤ MIN_EVICT_IDLE`).
 
 Compile-time assertions (`const _` in `rules.rs`) pin the relations between the timings:
 
@@ -567,7 +570,7 @@ Compile-time assertions (`const _` in `rules.rs`) pin the relations between the 
 - `touch_granularity(MIN_IDLE_TIMEOUT) + IDLE_SLACK < MIN_IDLE_TIMEOUT`.
 - `!touches_effective(DEFAULT_IDLE_TIMEOUT)` and `touches_effective(7 d)`.
 - `MAX_GRANT + CLOCK_SKEW ≤ MAX_GRANT_ACCEPTED`, and `CLOCK_SKEW < TOMBSTONE_GRACE`.
-- `CLOCK_SKEW ≤ MIN_EVICT_IDLE`: a prompt report is always a due one.
+- `2 × CLOCK_SKEW ≤ MIN_EVICT_IDLE`: a prompt report is always a due one.
 
 ### 4.5 Capacity and eviction
 
@@ -1563,8 +1566,11 @@ label (`no_sealing_kid`, `identity_refused`, `kid_drift`, `capacity_exceeded`, `
 
    The principal comes from S, so `issue_token`'s `"unknown"` and 3600 s fallbacks are not used. A
    retry of the same exchange gets the identical token, and a replay repeats the first exchange's
-   `expires_in`. After a kid rotation between two attempts, the second token differs but is still
-   valid.
+   `expires_in`. The retry boundary: `exchange_id` comes from the code and its PKCE verifier, so
+   only the verifier's holder can repeat an exchange, and only while the node accepts the code
+   (`CODE_TTL` within `CLOCK_SKEW`, checked before any call); a repeat never mints a second
+   credential. Any other exchange of a consumed code is `AlreadyConsumed`, so `invalid_grant`. After
+   a kid rotation between two attempts, the second token differs but is still valid.
 5. A 503 is `{"error":"temporarily_unavailable","error_description":"the session store is briefly
    unavailable; retry shortly"}`; a full session cache is one (`at_capacity`), never
    `invalid_grant`.
@@ -1647,8 +1653,10 @@ runs the planned one across four servers (11).
    `purge_interval_secs`. A run whose probe fails skips the idle purge, and the next run probes
    again.
 2. Right away, the operator replays the key checks and retirements made since the snapshot from
-   the admin journal (`admin_set_key_check`, `admin_retire_kid`; idempotent for this reason), and
-   restores the allow-list the latest entry since then set (`authorized` replaces the whole list).
+   the admin journal (`admin_set_key_check`, `admin_retire_kid`; idempotent for this reason),
+   restores the allow-list the latest entry since then set (`authorized` replaces the whole list),
+   and starts again the purges that revoked sessions since (by `opened_by` for a stolen identity,
+   by `kid` for a leaked key), whose sessions the load brought back.
    The load restored the snapshot's allow-list, which admits again a node identity removed since
    (a stolen one, 9.2), and the snapshot's key list, in which a kid published since is
    unpublished. A node whose keyring holds only such kids (a rotation finished since) has no
@@ -1662,14 +1670,17 @@ runs the planned one across four servers (11).
 4. Consequences:
    - **Sessions created after the snapshot are gone.** An authoritative `Absent` gives 401, and the
      client re-authorizes.
-   - **Sessions purged or evicted after the snapshot come back** until they are purged again. Their
-     II grants were still valid, so this is hygiene only.
+   - **Sessions purged or evicted after the snapshot come back** until they are purged again.
+     Revocation purges are replayed at once (step 2); for the rest, their II grants were still
+     valid, so this is hygiene only. A code consumed after the snapshot is unconsumed again, but
+     useless: by the time a load is done, its 300 s consume window and the node's 120 s code
+     lifetime have usually passed, and a repeated exchange gets only the identical token.
    - **No active user is idle-purged.** A timer run idle-purges only after a successful probe, the
      first of which raises the floor, and the floor gives every session a full timeout. Eviction
      at a cap is not guarded that way until that probe (4.7).
 5. **Runbook:** replay the rest of the `admin_*` calls made since the snapshot from the admin
-   journal: the rest of the configuration, and purges. The runbook carries the procedure step by
-   step (`docs/shared-sessions-operations.md`, 8.10).
+   journal: the rest of the configuration, and the other purges. The runbook carries the procedure
+   step by step (`docs/shared-sessions-operations.md`, 8.10).
 
 ### 8.5 Protocol sequence diagrams
 
