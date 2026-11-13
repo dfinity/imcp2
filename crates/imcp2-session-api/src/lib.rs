@@ -30,7 +30,11 @@
 //! `variant { Ok : …; Err : … }`, so that arguments and replies can grow. A
 //! method whose answer a backend acts on is an update (agreed by consensus);
 //! where a cheap single-replica answer is useful as a hint, it has a separate
-//! `*_non_replicated` query twin, so that no caller gets a hint by mistake.
+//! `*_non_replicated` query twin, so that no caller gets a hint by mistake. A
+//! backend may only use a hint to add a record it can verify (it opens under
+//! the keyring and is consumed), never to drop one, and never for a key whose
+//! deletion it has already read from an update: a stale replica can then delay
+//! a deletion until the backend's next replicated read, but never undo one.
 //!
 //! **Evolution rules**, pinned by this crate's wire tests:
 //!   * records only gain `opt` fields — an older payload without them still

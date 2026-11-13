@@ -116,7 +116,10 @@ type ChangesPage = record {
   head : Seq;                   // highest seq assigned; a snapshot load rewinds it
                                 // (epoch moves once the load is noticed): compare
                                 // positions only within one epoch
-  epoch : nat64;                // bumped when the canister history shows a snapshot load
+  epoch : nat64;                // bumped when the canister history shows a snapshot load,
+                                // which restores the snapshot's state wholesale (sessions
+                                // deleted after it are live again): operators replay
+                                // revocations from their admin journal right after it
   now_ns : nat64;
   idle_timeout_secs : nat64;
   idle_floor_at : Seconds;
@@ -146,8 +149,8 @@ type PurgeFilter = record {
   namespace : variant { Any; Is : Namespace };
   kid : variant { Any; Is : nat8 };             // byte 2 of the sealed envelope
   opened_by : variant { Any; Is : principal };
-  created_from : variant { Any; Is : Seconds };
-  created_to : variant { Any; Is : Seconds };
+  created_from : variant { Any; Is : Seconds };  // created_at >= created_from
+  created_to : variant { Any; Is : Seconds };    // created_at <= created_to
 };
 type PurgeJob = record {
   filter : PurgeFilter;
@@ -214,7 +217,10 @@ service : (InstallArg) -> {
   // consumed and gives it a feed position, so every backend then mirrors it.
   // Consensus makes a code single-use across backends; idempotent per
   // `exchange_id`, so a retried exchange from any backend gets the same record,
-  // and so the same access token.
+  // and so the same access token: a retry never mints a second credential.
+  // `exchange_id` is derived from the code and its PKCE verifier, so only the
+  // client that holds the verifier can retry, and only while backends still
+  // accept the code; any other exchange of a consumed code is AlreadyConsumed.
   consume_code : (ConsumeCodeArg) -> (ConsumeCodeResult);
   // Activity reports (see `Touch`): raise each consumed record's
   // `last_active_at`, which the idle purge and eviction judge.
@@ -223,7 +229,9 @@ service : (InstallArg) -> {
   // on, including to drop a session.
   get_sessions : (GetSessionsArg) -> (GetSessionsResult);
   // The same answer from one replica, not agreed by consensus: a cheap hint a
-  // backend may only use to add a record it can verify, never to drop one.
+  // backend may only use to add a record it can verify, never to drop one, and
+  // never for a key whose deletion it has already read from an update. A stale
+  // replica can delay a deletion until the next replicated read, never undo it.
   get_sessions_non_replicated : (GetSessionsArg) -> (GetSessionsResult) query;
   // A page of the change feed (consumed records and tombstones), agreed by
   // consensus.

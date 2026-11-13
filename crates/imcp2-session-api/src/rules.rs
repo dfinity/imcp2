@@ -167,28 +167,31 @@ pub const fn eviction_idle(idle_timeout_secs: u64) -> u64 {
 }
 
 /// Returns whether a backend must send a session's new activity report at once,
-/// rather than at its next periodic flush: whether the activity the canister
-/// holds for it, `reported_at`, is old enough that the session may already be,
-/// or become before that flush lands, one [`evictable`] would remove. That is,
-/// `now - reported_at + CLOCK_SKEW >= touch_granularity(idle) + MIN_EVICT_IDLE`,
-/// which is [`eviction_idle`] less two flush intervals and the skew.
+/// rather than at its next periodic flush: whether the session's last reported
+/// activity, `reported_at`, is old enough that the session may already be, or
+/// become before that flush lands, one [`evictable`] would remove. That is,
+/// `now - reported_at + 2 * CLOCK_SKEW >= touch_granularity(idle) +
+/// MIN_EVICT_IDLE`, which is [`eviction_idle`] less two flush intervals and
+/// twice the skew. All times are Unix seconds.
 ///
-/// `reported_at` must not be later than the `last_active_at` the canister
-/// holds: the backend's last report the canister accepted, or, for a session
-/// it has not reported yet, the token's consumption time, which the canister
-/// records as the session's first activity
+/// `reported_at` is the activity the backend last reported and the canister
+/// accepted, as the backend sent it, or, for a session it has not reported
+/// yet, the token's consumption time, which the canister records as the
+/// session's first activity
 /// ([`SessionRecord::last_active_at`](crate::SessionRecord::last_active_at)).
-/// A later `reported_at` would make the session look younger than the
-/// canister judges it.
+/// The canister may hold an activity up to [`CLOCK_SKEW`] earlier than the one
+/// sent, since it caps reports at its own time: one skew of the threshold
+/// covers that, the other the backend's clock now. A `reported_at` later than
+/// that would make the session look younger than the canister judges it.
 ///
 /// Below this threshold the periodic flush is in time, provided the backend
 /// sends a noted report within one [`TOUCH_FLUSH_INTERVAL`] (counting its flush
 /// period from the start of the previous flush, however long that took) and its
 /// call is answered within another (backends bound their calls well below it,
 /// and send the stalest reports first). By then the canister's age for the
-/// session, `now' - last_active_at`, is still below `eviction_idle`. That holds
-/// for a backend clock up to [`CLOCK_SKEW`] off the canister's, since the
-/// canister caps reports at its own time. From the threshold on, a session
+/// session, `now' - last_active_at`, is still below `eviction_idle`, for a
+/// backend clock up to [`CLOCK_SKEW`] off the canister's, both when it sent its
+/// last report and now. From the threshold on, a session
 /// whose user returns after a long idle period could be evicted, when its
 /// namespace or the whole store is at its capacity cap, while its new activity
 /// waits for the flush; the backend reports it promptly instead, which leaves
@@ -204,7 +207,7 @@ pub const fn should_report_session_activity_promptly(
     reported_at: u64,
     idle_timeout_secs: u64,
 ) -> bool {
-    now.saturating_sub(reported_at).saturating_add(CLOCK_SKEW)
+    now.saturating_sub(reported_at).saturating_add(2 * CLOCK_SKEW)
         >= touch_granularity(idle_timeout_secs) + MIN_EVICT_IDLE
 }
 
@@ -304,9 +307,10 @@ const _: () = {
     assert!(MAX_GRANT + CLOCK_SKEW <= MAX_GRANT_ACCEPTED);
     // A tombstone outlives every token of its session, on every backend clock.
     assert!(CLOCK_SKEW < TOMBSTONE_GRACE);
-    // `should_report_session_activity_promptly`'s threshold (granularity + MIN_EVICT_IDLE - skew) is at
-    // least the granularity, so a prompt report is always a due one.
-    assert!(CLOCK_SKEW <= MIN_EVICT_IDLE);
+    // `should_report_session_activity_promptly`'s threshold (granularity +
+    // MIN_EVICT_IDLE - 2 skews) is at least the granularity, so a prompt report
+    // is always a due one.
+    assert!(2 * CLOCK_SKEW <= MIN_EVICT_IDLE);
 };
 
 #[cfg(test)]
@@ -540,13 +544,13 @@ mod tests {
     fn should_report_session_activity_promptly_at_its_exact_threshold() {
         let now = 1_700_000_000;
         for idle in [MIN_IDLE_TIMEOUT, DAY, 7 * DAY, 2_570_159] {
-            // now - reported + CLOCK_SKEW == granularity + MIN_EVICT_IDLE.
-            let edge = now + CLOCK_SKEW - touch_granularity(idle) - MIN_EVICT_IDLE;
+            // now - reported + 2 * CLOCK_SKEW == granularity + MIN_EVICT_IDLE.
+            let edge = now + 2 * CLOCK_SKEW - touch_granularity(idle) - MIN_EVICT_IDLE;
             assert!(should_report_session_activity_promptly(now, edge, idle), "idle={idle}");
             assert!(!should_report_session_activity_promptly(now, edge + 1, idle), "idle={idle}");
-            // Two flush intervals and the skew before eviction becomes possible.
+            // Two flush intervals and two skews before eviction becomes possible.
             assert_eq!(
-                now - edge + 2 * TOUCH_FLUSH_INTERVAL + CLOCK_SKEW,
+                now - edge + 2 * TOUCH_FLUSH_INTERVAL + 2 * CLOCK_SKEW,
                 eviction_idle(idle),
                 "idle={idle}"
             );
@@ -555,10 +559,13 @@ mod tests {
 
     // The guarantee the threshold exists for: a session that does not need a
     // prompt report cannot be evicted before the periodic flush, sent within one
-    // interval and answered within another, has landed, even when the backend's
-    // clock is CLOCK_SKEW behind the canister's (the canister then judges an age
-    // up to CLOCK_SKEW longer). The longest grant `put_session` accepts keeps
-    // the expiry condition from ruling eviction out at any of these timeouts.
+    // interval and answered within another, has landed. Checked in the worst
+    // case for the clocks: the backend's was CLOCK_SKEW ahead of the canister's
+    // when it sent the report it judges by (the canister capped that report at
+    // its own time, so it holds an activity CLOCK_SKEW earlier), and is
+    // CLOCK_SKEW behind it now (the canister's time when the flush lands is
+    // CLOCK_SKEW later). The longest grant `put_session` accepts keeps the
+    // expiry condition from ruling eviction out at any of these timeouts.
     #[test]
     fn without_a_prompt_report_the_periodic_flush_lands_before_eviction() {
         use crate::constants::MAX_GRANT_ACCEPTED;
@@ -569,18 +576,16 @@ mod tests {
             // teeth at every timeout.
             assert!(evictable(now, now - eviction_idle(idle), grant, true, 0, idle), "{idle}");
             // A grid, plus every age around the threshold, where a slip shows.
-            let threshold = touch_granularity(idle) + MIN_EVICT_IDLE - CLOCK_SKEW;
+            let threshold = touch_granularity(idle) + MIN_EVICT_IDLE - 2 * CLOCK_SKEW;
             let ages = (0..=eviction_idle(idle)).step_by(37).chain(threshold - 2..=threshold + 2);
             for age in ages {
                 let reported = now - age;
                 if should_report_session_activity_promptly(now, reported, idle) {
                     continue;
                 }
-                let landed = now + 2 * TOUCH_FLUSH_INTERVAL + CLOCK_SKEW;
-                assert!(
-                    !evictable(landed, reported, grant, true, 0, idle),
-                    "idle={idle} age={age}"
-                );
+                let held = reported - CLOCK_SKEW;
+                let landed = now + CLOCK_SKEW + 2 * TOUCH_FLUSH_INTERVAL;
+                assert!(!evictable(landed, held, grant, true, 0, idle), "idle={idle} age={age}");
             }
         }
     }

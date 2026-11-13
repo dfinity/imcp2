@@ -169,7 +169,13 @@ pub struct ConsumeCodeArg {
     #[serde(with = "serde_bytes")]
     pub key: Key,
     /// Derived from the code and its PKCE verifier, so a token request retried on
-    /// any node is the same exchange and gets the same answer.
+    /// any backend is the same exchange and gets the same answer: the same
+    /// record, from which the backend derives the identical access token, so a
+    /// retry never mints a second credential. Only the client holding the
+    /// verifier can repeat an exchange, and only while backends still accept
+    /// the code ([`CODE_TTL`](crate::CODE_TTL) from its issue, within
+    /// [`CLOCK_SKEW`](crate::CLOCK_SKEW)); any other exchange of a consumed
+    /// code is refused with `AlreadyConsumed`.
     #[serde(with = "serde_bytes")]
     pub exchange_id: OpId,
     /// [`CODE_PROOF_LEN`](crate::CODE_PROOF_LEN) bytes, checked against the
@@ -295,7 +301,12 @@ pub struct ChangesPage {
     /// stay above every earlier one even so (see [`Seq`]).
     pub head: Seq,
     /// Bumped when the canister history shows a snapshot load; a backend
-    /// seeing a new epoch discards its mirror and resyncs.
+    /// seeing a new epoch discards its mirror and resyncs. A load restores the
+    /// snapshot's state wholesale: sessions deleted after the snapshot (purged
+    /// ones included) are live again, and sessions created after it are gone.
+    /// Operators replay the revocations made since (key retirements, purges of
+    /// a stolen identity's or a leaked key's sessions) from their admin journal
+    /// right after the load.
     pub epoch: u64,
     pub now_ns: u64,
     pub idle_timeout_secs: u64,
@@ -329,7 +340,9 @@ pub struct KeyChecks {
 }
 
 /// One condition of a [`PurgeFilter`] (`variant { Any; Is : T }`): `Any`
-/// places no constraint, `Is(value)` requires the field to equal `value`.
+/// places no constraint, `Is(value)` places the field's condition with
+/// `value`: equality for most fields, an inclusive bound for
+/// [`PurgeFilter::created_from`] and [`PurgeFilter::created_to`].
 ///
 /// A variant rather than an `opt`, so that the condition must be written out:
 /// see [`PurgeFilter`].
@@ -385,7 +398,10 @@ pub struct PurgeFilter {
     /// The node identity that stored the session, to purge what a compromised
     /// node created.
     pub opened_by: Match<Principal>,
+    /// `Is(t)` matches sessions created at `t` or later (`created_at >= t`).
     pub created_from: Match<Seconds>,
+    /// `Is(t)` matches sessions created at `t` or earlier (`created_at <= t`).
+    /// Not before `created_from`.
     pub created_to: Match<Seconds>,
 }
 
@@ -443,6 +459,7 @@ pub struct Status {
     pub tombstones: u64,
     pub per_namespace: Vec<NamespaceCount>,
     pub head: Seq,
+    /// See [`ChangesPage::epoch`].
     pub epoch: u64,
     pub idle_floor_at: Seconds,
     pub key_checks: KeyChecks,
