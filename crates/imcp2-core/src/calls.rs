@@ -646,7 +646,7 @@ pub(crate) fn on_deep_stack<T: Send>(f: impl FnOnce() -> T + Send) -> Option<T> 
 /// — Candid lexes `type` as a keyword, never an identifier, so it cannot appear as
 /// a field name (`record { type : nat }` is a syntax error); the quoted form
 /// `record { "type" : nat }` is a string literal, which the scan already skips.
-pub(crate) fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
+pub fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
     if text.len() > MAX_CANDID_TEXT_BYTES {
         return Err(format!(
             "{what} is too large to parse ({} bytes; limit {MAX_CANDID_TEXT_BYTES})",
