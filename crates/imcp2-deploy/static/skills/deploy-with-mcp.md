@@ -1,6 +1,6 @@
 ---
 name: deploy-with-mcp
-description: "Deploy an icp project to the Internet Computer through this MCP server's icp_deploy_bundle tool instead of running icp deploy yourself. Covers the three steps an agent performs: bundle the project with icp project bundle, call icp_deploy_bundle with the bundle and the environment's canister-id mapping, and write the mapping the tool returns back into the project. Use when the user asks you to deploy, ship, publish, upgrade or redeploy an icp project, or asks what icp_deploy_bundle needs. Do NOT use for projects targeting a local network (run icp deploy there) or for building the project (see the icp-cli skill)."
+description: "Deploy an icp project to the Internet Computer through this MCP server's icp_deploy_bundle tool instead of running icp deploy yourself. Covers the three steps an agent performs: bundle the project with icp project bundle, call icp_deploy_bundle with the bundle and the environment's canister ids file, and write the canister ids the tool returns back to that file. Use when the user asks you to deploy, ship, publish, upgrade or redeploy an icp project, or asks what icp_deploy_bundle needs. Do NOT use for projects targeting a local network (run icp deploy there) or for building the project (see the icp-cli skill)."
 license: Apache-2.0
 metadata:
   title: Deploy with this MCP server
@@ -38,17 +38,11 @@ not know the canisters already exist and would create a second set.
   tool answers that it needs an authenticated session, call `authenticate`,
   have the user open the returned id.ai link, then retry. Check with
   `auth_status`.
-- Cycles. Every canister the bundle names that does not exist yet is created
-  from the user's cycles balance, 2T cycles each unless `cycles` says
-  otherwise. `icp_cycles_balance` reports the balance and the principal
-  it belongs to: the user's default Internet Identity account at
-  `https://cli.id.ai`, the one `icp identity link web` links an icp CLI
-  identity to. If `icp identity principal` prints the same principal, the
-  CLI and this tool share canisters and cycles; if it prints another (a
-  local key, or a link to another account), they do not — say so before
-  the user switches between the two. Before a deploy that will create
-  canisters, tell the user how many and confirm; creation is not undone by
-  a later failure.
+- Cycles. Each new canister is created from the user's cycles balance, 2T
+  cycles unless `cycles` says otherwise. `icp_cycles_balance` reports the
+  balance and the principal that holds it, which is where the user sends
+  cycles to top it up. Before a deploy that will create canisters, tell the
+  user how many and confirm; creation is not undone by a later failure.
 - An environment on the `ic` network (mainnet), which every manifest has.
   The tool deploys to the Internet Computer only: an environment on any other
   network — the default `local`, a testnet — is refused. Deploy those with
@@ -80,31 +74,26 @@ If the build fails, fix the project and rebuild. Nothing has been sent yet.
 
 ## Step 2: Request the deployment
 
-### Read the environment's canister-id mapping
+### Read the environment's canister ids file
 
-The icp CLI keeps one mapping file per environment:
+The project keeps one file per environment, the record of which canisters
+on the network are this app's:
 
 ```
 .icp/data/mappings/<environment>.ids.json
 ```
 
-It is a JSON object from canister name to principal:
-
-```json
-{
-  "backend": "rrkah-fqaaa-aaaaa-aaaaq-cai",
-  "frontend": "ryjl3-tyaaa-aaaaa-aaaba-cai"
-}
-```
-
-Read it if it exists. If it does not, this is the first deploy of that
-environment and every canister will be created.
+Read it if it exists and pass its content on unchanged; there is nothing in
+it to interpret or edit. If it does not exist, this is the first deploy of
+that environment and every canister will be created.
 
 ### Upload the bundle, on a server that cannot read your files
 
-A server that lists `icp_deploy_upload` runs on another machine than the
-project, so it cannot open `bundle_path`, and a tool call cannot carry the
-archive itself. Upload it first:
+A server takes the bundle one way, and `icp_deploy_bundle` lists the one
+argument for it: `bundle_path` on a server running on the project's machine,
+`bundle_upload` on one that is not. A server that lists `icp_deploy_upload`
+is of the second kind: it cannot open a path of yours, and a tool call cannot
+carry the archive itself. Upload it first:
 
 1. Call `icp_deploy_upload`. It returns a one-time ticket, good for a few
    minutes, and the exact `curl` command to run.
@@ -115,29 +104,26 @@ archive itself. Upload it first:
    `bundle_path`.
 
 A ticket is spent by one upload, successful or not; an upload is spent by
-one deploy. If either lapses, ask for a new ticket and upload again. A
-server that does not list `icp_deploy_upload` takes `bundle_path` or
-`bundle_base64` and refuses `bundle_upload`.
+one deploy. If either lapses, ask for a new ticket and upload again. Each
+kind of server refuses the other's argument: one that lists
+`icp_deploy_upload` refuses `bundle_path`, one that does not refuses
+`bundle_upload`.
 
 ### Call the tool
 
-Pass the bundle, the environment name, and the mapping as `canister_ids`:
+Pass the bundle, the environment name, and the file's content as
+`canister_ids`:
 
 ```json
 {
   "bundle_path": "/absolute/path/to/myapp.tar.gz",
   "environment": "ic",
-  "canister_ids": {
-    "backend": "rrkah-fqaaa-aaaaa-aaaaq-cai",
-    "frontend": "ryjl3-tyaaa-aaaaa-aaaba-cai"
-  }
+  "canister_ids": { "backend": "rrkah-fqaaa-aaaaa-aaaaq-cai" }
 }
 ```
 
 - `bundle_path` must be absolute. On a server that cannot read your
-  filesystem, pass `bundle_upload` from the upload above instead (or, for a
-  client that can attach the bytes itself, `bundle_base64`); exactly one of
-  the three is accepted.
+  filesystem, pass `bundle_upload` from the upload above in its place.
 - `environment` is the name as the manifest declares it, `ic` for a default
   project.
 - `canister_ids` is the file's content. Omit it, or send `{}`, on a first
@@ -180,8 +166,9 @@ still missing.
 
 ## Step 3: Update the project's mapping file
 
-Write the returned `canister_ids` into the environment's mapping file,
-replacing the entries it names and keeping any others:
+Write the returned `canister_ids` to the environment's file, unchanged, in
+place of what was there (it holds every id you passed in, plus the new
+ones):
 
 ```
 .icp/data/mappings/<environment>.ids.json
@@ -192,10 +179,6 @@ the project's only record of which on-chain canisters belong to it; the
 `icp-cli` skill lists committing `.icp/data/` to version control as the
 rule, and losing the file as the pitfall. Tell the user which canisters were
 created and their ids.
-
-After this step, `icp deploy -e <environment>` from the CLI and
-`icp_deploy_bundle` from here see the same canisters and can be used
-interchangeably for that environment.
 
 ## Common Pitfalls
 
@@ -217,10 +200,10 @@ interchangeably for that environment.
 6. **Expecting the server to keep state.** It keeps nothing between calls:
    no bundle, no mapping. The project's mapping file is the record. The one
    exception is the working directory of a call that never returned, see 8.
-7. **Deploying twice at once.** One deploy runs at a time per session, and
-   a server caps how many run at once in all; a call past either is refused,
-   not queued. Wait for the answer, do step 3, then deploy again from the
-   updated mapping; past the server's cap, wait and try again.
+7. **Deploying twice at once.** One deploy runs at a time per session; a
+   second is refused, not queued. Wait for the answer, do step 3, then deploy
+   again from the updated file. A server that answers that it is busy is
+   deploying for others: try again in a few minutes.
 8. **A call that never returned.** Cancelling the call, or losing the
    connection, interrupts the deploy at its next step; a canister call
    already in flight completes on the network. If the server stopped

@@ -24,7 +24,9 @@
 //!     `icp_deploy_upload` mints inside an authenticated call (see
 //!     [`imcp2_deploy::Uploads`] for the ticket's properties). The route is
 //!     outside the bearer gate — the ticket is its authentication — and
-//!     streams the body to disk under its own cap.
+//!     streams the body to disk under its own cap. The upload is the only
+//!     way in: the deploy tool here lists `bundle_upload` and refuses a
+//!     `bundle_path`, so the server opens no file a caller names.
 //!
 //! The working directories and uploads live under the state directory
 //! (`{state_dir}/deploys`), each readable by the server's user alone.
@@ -300,6 +302,16 @@ mod tests {
             assert!(names.contains(&tool), "{tool} must be listed: {names:?}");
         }
         assert!(!names.contains(&"authenticate"), "no login tool on the hosted server");
+        // The bundle is an upload here, and the deploy tool lists it so.
+        let deploy = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "icp_deploy_bundle")
+            .unwrap();
+        let properties = &deploy["inputSchema"]["properties"];
+        assert!(properties["bundle_upload"].is_object(), "{properties}");
+        assert!(properties["bundle_path"].is_null(), "{properties}");
 
         // A ticket, minted inside the authenticated call.
         let resp = post(
@@ -347,6 +359,19 @@ mod tests {
         let upload_id = uploaded["upload_id"].as_str().unwrap().to_string();
         assert_eq!(uploaded["bytes"], 12);
         assert_eq!(put(Some(&ticket), vec![1]).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        // A path is no way in: this server opens no file a caller names,
+        // whether or not an upload comes with it, and the upload is not spent.
+        for arguments in [
+            serde_json::json!({ "bundle_path": "/etc/hostname", "environment": "ic" }),
+            serde_json::json!({
+                "bundle_path": "/etc/hostname", "bundle_upload": upload_id, "environment": "ic"
+            }),
+        ] {
+            let call = serde_json::json!({ "name": "icp_deploy_bundle", "arguments": arguments });
+            let stream = text(post(&app, &bearer, rpc("tools/call", call)).await).await;
+            assert!(stream.contains("reads no bundle_path"), "{stream}");
+        }
 
         // The deploy call is answered as an event stream carrying the result:
         // offline, with a made-up session, the error that the identity cannot

@@ -41,12 +41,10 @@ use crate::{calls::AgentCalls, host};
 pub enum BundleSource {
     /// The archive itself.
     Bytes(Vec<u8>),
-    /// An absolute path to the archive on this machine.
+    /// An absolute path to the archive on this machine: the one the agent
+    /// named, or the file an upload was received into (see
+    /// [`crate::Uploads`]).
     Path(Utf8PathBuf),
-    /// An archive uploaded ahead of the call, by the id the upload answered
-    /// with (see [`crate::Uploads`]). The tool turns it into a [`Self::Path`]
-    /// before the deploy; one reaching the deploy as is, is a request error.
-    Upload(String),
 }
 
 // By hand so a request never prints megabytes of archive.
@@ -55,7 +53,6 @@ impl fmt::Debug for BundleSource {
         match self {
             BundleSource::Bytes(bytes) => write!(f, "Bytes({} bytes)", bytes.len()),
             BundleSource::Path(path) => write!(f, "Path({path})"),
-            BundleSource::Upload(id) => write!(f, "Upload({id})"),
         }
     }
 }
@@ -206,11 +203,6 @@ pub async fn deploy_bundle(
     let bytes = match request.bundle {
         BundleSource::Bytes(bytes) => bytes,
         BundleSource::Path(path) => read_bundle_file(&path, host::MAX_BUNDLE_BYTES).await?,
-        BundleSource::Upload(id) => {
-            return Err(RequestError(format!(
-                "the upload '{id}' was not resolved to a file before the deploy"
-            )))
-        }
     };
 
     // The working directory holds the bundle's files, the ids the deploy

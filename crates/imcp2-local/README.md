@@ -153,7 +153,7 @@ frontend's assets.
 It takes:
 
 - the **bundle** — the self-contained archive `icp project bundle --output
-  <file>` writes, by absolute path (`bundle_path`) or inline (`bundle_base64`);
+  <file>` writes, by absolute path (`bundle_path`);
 - the **environment** to deploy, by name, among those the bundle declares
   (`ic` for a bundle built with the defaults). It must be on the `ic`
   network: the tool deploys to the Internet Computer only, so a locally
