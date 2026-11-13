@@ -171,6 +171,7 @@ the box publicly reachable and report the address to set DNS *before* the deploy
 | Workflow | Trigger | Target | Environment |
 |---|---|---|---|
 | [`deploy-candidate.yml`](../../.github/workflows/deploy-candidate.yml) | push tag `rc-X.Y.Z-N`; or a manual run naming an earlier `rc-*` tag or a commit SHA | staging | `staging` |
+| [`deploy-session-canister.yml`](../../.github/workflows/deploy-session-canister.yml) | manual run only: a release tag, a target, and `deploy` or `admin` | the session canister of staging or prod | `session-canister-staging` / `session-canister-prod` |
 
 Staging is the only host this repository deploys, and it moves only when someone cuts
 a candidate, so the revision under test is a named, reproducible point in history that
@@ -207,25 +208,25 @@ regression there stops the rollout), cross-builds the binary with `build.sh`, th
 ### Cutting a candidate
 
 ```sh
-# the version bump (all three Cargo.toml files) has landed on main; then:
-git tag rc-0.6.0-1 <commit on main>
-git push origin rc-0.6.0-1
+# the version bump (every Cargo.toml of the workspace) has landed on main; then:
+git tag rc-0.7.0-1 <commit on main>
+git push origin rc-0.7.0-1
 ```
 
 The workflow refuses a tag whose version does not match the manifests or whose commit
-is not on `main`, deploys, and publishes a GitHub prerelease `rc-0.6.0-1` carrying the
-deployed binary. A failed candidate is followed by a fix on `main` and `rc-0.6.0-2`;
+is not on `main`, deploys, and publishes a GitHub prerelease `rc-0.7.0-1` carrying the
+deployed binary. A failed candidate is followed by a fix on `main` and `rc-0.7.0-2`;
 nothing is bumped after a candidate, so the commit that is promoted is the one tested.
 
 ### Promoting a candidate
 
 ```sh
-git tag v0.6.0 rc-0.6.0-1^{}   # the candidate's commit, exactly
-git push origin v0.6.0
+git tag v0.7.0 rc-0.7.0-1^{}   # the candidate's commit, exactly
+git push origin v0.7.0
 ```
 
 Nothing is deployed by this. `publish-crate.yml` publishes the crates, refusing a
-commit unless an `rc-0.6.0-N` tag on it has its prerelease with the deployed binary,
+commit unless an `rc-0.7.0-N` tag on it has its prerelease with the deployed binary,
 which exists only if that candidate's staging deploy succeeded; `v-release.yml` ships
 the local MCP binaries. Production picks the new crate up with a dependency bump of
 its own.
@@ -339,6 +340,7 @@ renders it into the unit like the secrets above:
 | Variable | Value |
 |---|---|
 | `OAUTH_CIMD_ENABLED` | Client ID Metadata Documents — the registration mode Claude and ChatGPT prefer over DCR — are **on** unless this is a falsey value (`0`/`false`/`no`/`off`); unset or empty is on. A roll-out kill switch, to be removed once CIMD has run in production for a while. The value is rendered into the unit at deploy time and read once at start-up, so to switch CIMD off, set the variable to `0` **and redeploy** — `workflow_dispatch` with the same ref is enough, no rebuild; changing the variable alone changes nothing on the host |
+| `IMCP2_SHARED_CANISTER_ID` | Turns on [shared sessions](#shared-sessions): the id of the session canister this host shares its OAuth / Internet Identity sessions through (a canister id such as `xxxxx-xxxxx-xxxxx-xxxxx-cai`; `deploy.sh` refuses any other shape). Set, `deploy.sh` installs a systemd drop-in pointing imcp2 at it and **refuses to deploy** unless the host holds the credentials below; unset or empty removes the drop-in. Like the variable above, it takes effect at the next deploy |
 
 > **Set these as repository-level secrets** (**Settings → Secrets and variables →
 > Actions**). The callers pass them into the reusable workflow, and a job that calls
@@ -369,6 +371,133 @@ to **Settings → Environments → staging** and add a **Required reviewer**. Th
 that matters for a release is the one on the `release` environment, which gates the
 crates.io publish (see `publish-crate.yml`'s header).
 
+### Shared sessions
+
+With `IMCP2_SHARED_CANISTER_ID` set on the `staging` environment, the host shares
+its sessions through that canister (design: `docs/scoping-shared-sessions.md`;
+operations: `docs/shared-sessions-operations.md`). Two credentials make that work,
+and **neither is ever in this repository or in a GitHub secret**: an operator
+places them on the host, as with `/etc/imcp-status/statuspage.env`.
+
+| File | Content |
+|---|---|
+| `/etc/imcp2/keys` | The deployment keyring: `kid:base64` entries in sealing-preference order, one per line or comma-separated (the same on every backend) |
+| `/etc/imcp2/identity.pem` | This node's identity for the canister (its own, on the canister's `authorized` list) |
+
+```sh
+sudo install -d -m 700 -o root -g root /etc/imcp2
+sudo install -m 600 -o root -g root keys.txt /etc/imcp2/keys
+sudo install -m 600 -o root -g root node.pem /etc/imcp2/identity.pem
+shred -u keys.txt node.pem   # or however the copies got onto the box
+```
+
+`deploy.sh` checks both before it ships anything (each must be a regular file,
+owned by root, mode `600`, not empty) and stops with these instructions otherwise,
+leaving the host as it was. That check cannot see inside them, so the deploy then
+ships the new binary **beside** the running one, as `/opt/imcp2/imcp2.new`, and
+runs it as root on these two files with the variables the drop-in sets:
+
+```sh
+sudo env -i IMCP2_SHARED_CANISTER_ID=<canister id> \
+  IMCP2_SHARED_KEYS_FILE=/etc/imcp2/keys \
+  IMCP2_SHARED_IDENTITY_PEM_FILE=/etc/imcp2/identity.pem \
+  /opt/imcp2/imcp2.new shared-config-check
+```
+
+`shared-config-check` runs every check imcp2 makes on its shared-sessions
+configuration at start, before it binds, then stops, with no network call. It
+prints the canister id, the node's principal and the keyring's fingerprints (all
+public), or the `Error:` line a start would print, naming the variable and never
+quoting a key. A keyring entry cut short, or an identity that is encrypted, on
+another curve (P-256) or otherwise unusable, fails the deploy here, while the old
+process still serves: nothing is installed, and the host keeps running, and would
+restart into, its old binary and drop-in. Only once the check passes does the
+deploy move the binary into place, render
+`/etc/systemd/system/imcp2.service.d/shared.conf` and restart:
+
+```ini
+[Service]
+Environment=IMCP2_SHARED_CANISTER_ID=<canister id>
+LoadCredential=keys:/etc/imcp2/keys
+LoadCredential=identity.pem:/etc/imcp2/identity.pem
+Environment=IMCP2_SHARED_KEYS_FILE=%d/keys IMCP2_SHARED_IDENTITY_PEM_FILE=%d/identity.pem
+```
+
+`LoadCredential=` hands each file to the service in its private credentials
+directory (`%d`), readable by the service's user alone, so the originals stay
+root-only. After the restart the deploy asserts that systemd runs imcp2 with the
+drop-in (or without it, when the variable is unset), and reports, without failing,
+whether `/ready/shared` answers 200 within 30 s (`shared sessions: /ready/shared ->
+200`, or a warning pointing at the runbook). A node that is not ready yet (identity
+not on the allow-list, key check not published, first sync pending) answers 503 on
+the MCP routes. The service still runs as `ec2-user`; now that it holds a fleet-wide
+key, moving it to a dedicated user is the next hardening step.
+
+What else to know on the host:
+
+- **The drop-in sets only those three variables.** The other `IMCP2_SHARED_*`
+  settings keep their defaults: mainnet (`IMCP2_SHARED_IC_URL` unset, so
+  `https://icp-api.io`; `IMCP2_SHARED_FETCH_ROOT_KEY` off), a mirror of at most
+  500 000 records, 50 000 sessions open per instance, a 1000 ms poll. To change one,
+  add its `Environment=` line in another file of `imcp2.service.d/` (the deploy
+  rewrites or removes only `shared.conf`); `imcp2 --help` lists them all with their
+  ranges.
+- **A bad keyring or identity stops imcp2 at start.** It exits with `Error: …`
+  naming the variable (never a key), and `Restart=always` retries every 3 s, so
+  `journalctl -u imcp2` shows the reason. An unreachable canister does not stop it:
+  it runs and is not ready. A deploy checks both files before it restarts
+  anything (above), but a file changed by hand is read only at the next start,
+  so check it before restarting:
+
+  ```sh
+  sudo env -i IMCP2_SHARED_CANISTER_ID=<canister id> \
+    IMCP2_SHARED_KEYS_FILE=/etc/imcp2/keys \
+    IMCP2_SHARED_IDENTITY_PEM_FILE=/etc/imcp2/identity.pem \
+    /opt/imcp2/imcp2 shared-config-check && sudo systemctl restart imcp2
+  ```
+
+- **The check covers what the drop-in sets.** A setting you add in another file
+  of `imcp2.service.d/` is not passed to it: add the variable to the command
+  above to check it too.
+- **Printing the key checks to publish** (no network call; each line is the whole
+  Candid argument `admin_set_key_check` takes, with the fingerprint in a comment):
+
+  ```sh
+  sudo env IMCP2_SHARED_KEYS_FILE=/etc/imcp2/keys /opt/imcp2/imcp2 shared-key-check
+  ```
+
+- **`/ready/shared` is public** through Caddy, like `/version` (one bit, and
+  `robots.txt` disallows `/ready/`). Use it only to pick MCP upstreams, never as a
+  liveness check: a node stays ready through a canister outage on purpose.
+- **Stopping** waits at most 5 s after the drain to send pending activity reports
+  to the canister, inside `TimeoutStopSec=30`.
+
+### The session canister
+
+[`deploy-session-canister.yml`](../../.github/workflows/deploy-session-canister.yml)
+upgrades the session canister to the module a release carries (`deploy`), or makes
+one `admin_*` call on it (`admin`); its header documents the inputs. Every
+`rc-*` prerelease and `v*` release carries the module
+(`imcp2-session-canister.wasm.gz`, its `.sha256`, `imcp2_session.did`,
+`build-info.txt`), built reproducibly by `scripts/build-session-canister-docker.sh`,
+and a deploy installs it only after rebuilding it from the tag to that digest. The
+runs of `admin` mode are the **admin journal** the runbook replays after a snapshot
+load.
+
+Set up once per target, in **Settings → Environments**:
+
+| Environment | Secret | Variable | Protection rules |
+|---|---|---|---|
+| `session-canister-staging` | `SESSION_CANISTER_CONTROLLER_PEM` | `SESSION_CANISTER_ID` | Required reviewers, prevent self-review; deployment branches: `main` |
+| `session-canister-prod` | `SESSION_CANISTER_CONTROLLER_PEM` | `SESSION_CANISTER_ID` | The same |
+
+The PEM is a controller identity of that canister and lives only there: not in the
+`staging` environment, which has no reviewers and whose secrets any job deploying
+the host could read. `SESSION_CANISTER_ID` is the canister the workflow acts on;
+`IMCP2_SHARED_CANISTER_ID` on `staging` is the one the host uses, and is normally
+the same canister, set only once that canister is staged and its key check
+published.
+
 ## Operating
 
 ```sh
@@ -389,13 +518,27 @@ The optional Statuspage pusher (`/etc/imcp-status/statuspage.env`) drives its
 component from the first configured instance unless `STATUSPAGE_TARGET` names
 another — set it to `production` there, so the public page reflects production.
 
+With [shared sessions](#shared-sessions) on, three more checks on the host:
+
+```sh
+curl -s http://127.0.0.1:8000/ready/shared                 # "ready" (200) or "not ready" (503)
+curl -s http://127.0.0.1:8000/version | jq .shared         # the node's link to the canister
+curl -s http://127.0.0.1:8000/metrics | grep '^imcp2_shared_key_info'   # kid states
+```
+
+`.shared.node_principal` is the principal the canister's allow-list must hold, and
+`.shared.identity_refused` says whether it does not. The runbook,
+[`docs/shared-sessions-operations.md`](../../docs/shared-sessions-operations.md),
+covers every state these show.
+
 ## Files
 
 | File | Purpose |
 |---|---|
 | `build.sh` | Cross-build `build-out/imcp2` (linux/arm64, bullseye glibc) |
-| `deploy.sh` | Ship binary + `monitoring/`, render & install units/Caddyfile, (re)start services |
+| `deploy.sh` | Ship binary + `monitoring/`, check the shared-sessions files with the new binary (when sharing is on), install it, render & install units/Caddyfile, (re)start services |
 | `imcp2.service` | systemd unit for the app (`__PUBLIC_URL__` substituted at deploy) |
+| (rendered by `deploy.sh`) | `/etc/systemd/system/imcp2.service.d/shared.conf`, only while `IMCP2_SHARED_CANISTER_ID` is set ([Shared sessions](#shared-sessions)) |
 | `imcp-status.service` | systemd unit for the status dashboard (`__TARGETS__`, `__TARGET_II__`, `__ALLOWED_HOSTS__` substituted at deploy) |
 | `caddy.service` | systemd unit for Caddy |
 | `Caddyfile` | Caddy config (`__DOMAIN__`, `__ACME_EMAIL__` substituted at deploy) |
