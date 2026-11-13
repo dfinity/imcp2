@@ -28,6 +28,7 @@ use icp_project::{
         deploy::{deploy, resolve_targets, DeployParams, DeployReport},
         task::Task,
     },
+    prelude::{IC_MAINNET_NETWORK_API_URL, IC_ROOT_KEY},
 };
 
 use crate::{calls::AgentCalls, host};
@@ -75,6 +76,13 @@ pub struct DeployRequest {
     pub no_create: bool,
     /// Skip the Candid interface compatibility check on upgrades.
     pub skip_candid_check: bool,
+    /// Where the deploy's working directory is made (the system temporary
+    /// directory when `None`). A run that returns removes it; a run that is
+    /// cut off — the server stopped mid-deploy, the call cancelled — leaves
+    /// it, and with it `.icp/data/mappings/<environment>.ids.json`, which
+    /// records every canister the deploy created, so a caller who never got
+    /// the answer can recover the ids instead of creating a second set.
+    pub workdir: Option<Utf8PathBuf>,
 }
 
 /// How a deploy ended.
@@ -171,12 +179,21 @@ pub async fn deploy_bundle(
         BundleSource::Path(path) => read_bundle_file(&path, host::MAX_BUNDLE_BYTES).await?,
     };
 
-    // The scratch directory lives exactly as long as this function: the
-    // bundle's files, the ids the deploy records, and the build artifacts all
-    // go with it, whichever way the deploy ends.
-    let scratch = tempfile::Builder::new()
-        .prefix("imcp2-deploy-")
-        .tempdir()
+    // The working directory holds the bundle's files, the ids the deploy
+    // records, and the build artifacts. Until the deploy starts it is a
+    // temporary directory, gone with any early return; from then on it is
+    // kept on purpose and removed only once the outcome — the ids above all —
+    // has been assembled, so a run that is cut off leaves its record behind.
+    let parent = match &request.workdir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                RequestError(format!("cannot create the deploy directory '{dir}': {e}"))
+            })?;
+            dir.as_std_path().to_path_buf()
+        }
+        None => std::env::temp_dir(),
+    };
+    let scratch = deploy_directory(&parent)
         .map_err(|e| RequestError(format!("cannot create a scratch directory: {e}")))?;
     let dir = Utf8PathBuf::from_path_buf(scratch.path().to_path_buf()).map_err(|p| {
         RequestError(format!("scratch directory path is not UTF-8: {}", p.display()))
@@ -270,26 +287,13 @@ pub async fn deploy_bundle(
     };
 
     // The agent is made by the first phase that reaches the network, as the
-    // CLI does: a deploy that fails to load its wasms never resolves a root
-    // key. The identity is already unlocked — it is the session's — so what
-    // is deferred here is only the network resolution.
-    let network = env.network.clone();
-    let host_for_agent = host.clone();
+    // CLI does: a deploy that fails to load its wasms never builds one. The
+    // network is the Internet Computer — `check_bundle` held the environment
+    // to it — so the agent is the mainnet one, as the balance check's is.
     let calls = Deferred::new(move || {
-        let host = host_for_agent.clone();
-        let network = network.clone();
         let identity = identity.clone();
         async move {
-            let access =
-                host.network.access(&network).await.map_err(|e| RequestError(error_chain(&e)))?;
-            let agent = Agent::builder()
-                .with_url(access.api_url.as_str())
-                .with_arc_identity(identity)
-                .build()
-                .map_err(|e| {
-                    RequestError(format!("cannot build an agent for {}: {e}", access.api_url))
-                })?;
-            agent.set_root_key(access.root_key);
+            let agent = mainnet_agent(identity).map_err(RequestError)?;
             let calls: Arc<dyn CanisterCalls> =
                 Arc::new(AgentCalls::new(agent).map_err(RequestError)?);
             Ok::<_, RequestError>(calls)
@@ -301,6 +305,8 @@ pub async fn deploy_bundle(
     let (reporter, receiver) = icp_events::channel::<Task>();
     let collector = tokio::spawn(collect_log(receiver));
 
+    // From here the directory outlives this future (see above).
+    let workdir = scratch.keep();
     let mut report = DeployReport::default();
     let result = deploy(&host, &calls, &params, &reporter, &mut report).await;
     // The receiver ends only once every reporter handle is gone.
@@ -332,8 +338,28 @@ pub async fn deploy_bundle(
         outcome.canister_ids.insert(name.clone(), *id);
     }
 
-    drop(scratch);
+    // The outcome carries everything the directory recorded; the directory
+    // has done its job.
+    drop(host);
+    if let Err(e) = tokio::fs::remove_dir_all(&workdir).await {
+        outcome
+            .log
+            .push(format!("removing the deploy directory '{}' failed: {e}", workdir.display()));
+    }
     Ok(outcome)
+}
+
+/// An agent for the Internet Computer signing as `identity`: the mainnet
+/// endpoint and the pinned root key, the one network a deploy reaches. The
+/// balance check uses the same, so what it reports is what a deploy spends.
+pub fn mainnet_agent(identity: Arc<dyn Identity>) -> Result<Agent, String> {
+    let agent = Agent::builder()
+        .with_url(IC_MAINNET_NETWORK_API_URL)
+        .with_arc_identity(identity)
+        .build()
+        .map_err(|e| format!("cannot build an agent for the Internet Computer: {e}"))?;
+    agent.set_root_key(IC_ROOT_KEY.to_vec());
+    Ok(agent)
 }
 
 /// Read the bundle at `path`, which must be an absolute path to a regular
@@ -444,6 +470,21 @@ fn describe(task: &Task) -> String {
     }
 }
 
+/// A fresh directory for one deploy under `parent`, randomly named, and on
+/// Unix readable by its owner alone: the bundle's files and the ids the
+/// deploy records are the user's business, and the parent (the user's local
+/// data directory, or the system temporary directory) may be more open.
+fn deploy_directory(parent: &std::path::Path) -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("imcp2-deploy-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir_in(parent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +534,7 @@ mod tests {
             // verified the bundled wasm.
             no_create: true,
             skip_candid_check: false,
+            workdir: None,
         }
     }
 
@@ -508,6 +550,24 @@ mod tests {
     // phase of a bundle), then stop where `--no-create` stops `icp deploy`.
     // The outcome reports the failure, the targets, and the log of the phase
     // that succeeded before it.
+    // Each deploy gets its own fresh directory, and on Unix one no other
+    // user of the machine can read: the parent may be world-readable.
+    #[test]
+    fn a_deploy_directory_is_fresh_and_private() {
+        let parent = tempfile::tempdir().unwrap();
+        let a = deploy_directory(parent.path()).unwrap();
+        let b = deploy_directory(parent.path()).unwrap();
+        assert_ne!(a.path(), b.path());
+        assert!(a.path().starts_with(parent.path()));
+        assert!(a.path().file_name().unwrap().to_str().unwrap().starts_with("imcp2-deploy-"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(a.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "mode {mode:o}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_bundle_deploys_up_to_the_create_phase_offline() {
         let (wasm, sha) = wasm();
@@ -689,6 +749,23 @@ mod tests {
     // A `bundle_path` is read only when it is a regular file: a directory
     // here, and by the same check a device or a pipe, whose length says
     // nothing about what reading it would produce.
+    // A deploy works under the directory it is given and removes its own
+    // when it returns, so a run that is cut off is the only one to leave a
+    // record there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deploy_works_under_its_directory_and_removes_it_when_done() {
+        let (wasm, sha) = wasm();
+        let parent = tempfile::tempdir().unwrap();
+        let workdir = Utf8PathBuf::from_path_buf(parent.path().join("deploys")).unwrap();
+        let mut request = request(bundle(&sha, &wasm), "ic");
+        request.workdir = Some(workdir.clone());
+        let outcome = deploy_bundle(Arc::new(AnonymousIdentity), request).await.unwrap();
+        assert_eq!(outcome.status, Status::Failed, "{:?}", outcome.log);
+        assert!(workdir.is_dir(), "the parent is made");
+        let left: Vec<_> = std::fs::read_dir(&workdir).unwrap().collect();
+        assert!(left.is_empty(), "the run's own directory is removed: {left:?}");
+    }
+
     // The library resolves the mode at install, after creation, and panics on
     // a spelling it does not know: refused at entry instead, before anything
     // is read.

@@ -7,7 +7,10 @@ It serves the same tools as the hosted server at
 [mcp.internetcomputer.org](https://mcp.internetcomputer.org) — canister reads
 and writes in textual Candid, app discovery, OQL, canister management —
 against the same **IC mainnet** and the same **production Internet
-Identity**. What it drops is the hosted server's entire OAuth 2.1 layer: a
+Identity**, plus two tools of its own: `icp_deploy_bundle`, which deploys an
+icp project bundle (see [Deploying a project bundle](#deploying-a-project-bundle)),
+and `icp_cycles_balance`, which reports the balance those deploys draw on.
+What it drops is the hosted server's entire OAuth 2.1 layer: a
 single-user process reached over a pipe needs no bearer tokens, so your II
 login never passes through a third-party server.
 
@@ -136,6 +139,79 @@ Sessions are **in memory only**: you sign in again after a restart, when the
 grant expires, or if you revoke it at id.ai (Manage access). Signing in again
 is the same one-step browser round-trip — no client restart needed.
 
+## Deploying a project bundle
+
+`icp_deploy_bundle` deploys an [icp CLI](https://github.com/dfinity/icp-cli)
+project to the Internet Computer as you, running the same phases as
+`icp deploy` through the CLI's own project library: it creates the canisters
+that do not exist yet (funded from your cycles-ledger balance, 2T cycles each
+by default), wires their ids into each other's environment variables, applies
+the manifest's settings, installs or upgrades the code (with the Candid
+compatibility check on upgrades), and runs the sync steps that upload a
+frontend's assets.
+
+It takes:
+
+- the **bundle** — the self-contained archive `icp project bundle --output
+  <file>` writes, by absolute path (`bundle_path`) or inline (`bundle_base64`);
+- the **environment** to deploy, by name, among those the bundle declares
+  (`ic` for a bundle built with the defaults). It must be on the `ic`
+  network: the tool deploys to the Internet Computer only, so a locally
+  launched network or a testnet is refused;
+- optionally the **canister ids** from an earlier deploy (`canister_ids`, a
+  name → id map: the contents of the CLI's `<environment>.ids.json`, or what a
+  previous call returned). Canisters named there are upgraded in place; the
+  rest are created.
+
+It answers with the status (`deployed`, `failed`, `nothing_to_deploy`), the
+resulting canister-id mapping — pass it back next time to upgrade — the
+canisters created, and a log of each phase. A failed deploy still reports every
+canister it created before failing, so the run can be picked up rather than
+repeated.
+
+Calls are signed as your **default Internet Identity account at
+`https://cli.id.ai`**, the origin `icp identity link web` links an icp CLI
+identity to. When the CLI's selected identity is such a link to the same
+account, `icp` and this tool deploy as the same principal: the canisters are
+the ones `icp` lists and controls, and they are funded from the same cycles
+balance. An `icp` identity that is a local key (`icp identity new`) or a link
+to another account is a different principal, which shares neither.
+`icp_cycles_balance` reports the balance and the principal used here, read
+from the Internet Computer whatever `IMCP2_IC_URL` says; compare it with
+`icp identity principal` before treating the two as interchangeable. It is
+not the management identity the canister lifecycle tools act as (see
+`IMCP2_MANAGEMENT_ORIGIN`); to reach a deployed canister through those tools,
+add their principal as a controller. The session must have been granted
+"Actions & questions" at sign-in.
+
+One deploy runs at a time: a second call while one is running is refused
+rather than queued, since the mapping it carries would be stale by the time
+it ran. The bundle is extracted into a working directory under your local
+data directory — `~/.local/share/imcp2-local/deploys/` on Linux,
+`~/Library/Application Support/imcp2-local/deploys/` on macOS,
+`%LOCALAPPDATA%\imcp2-local\deploys\` on Windows — removed once the deploy
+has returned its answer. A deploy that never returns (the server stopped
+mid-way, the call cancelled) leaves its directory there, and inside it
+`.icp/data/mappings/<environment>.ids.json` records every canister the
+deploy had created: merge it into the project's mapping before deploying
+again, then delete the directory. Nothing is written to the project the
+bundle came from.
+
+The server also serves a skill for the agent, `skill://deploy-with-mcp`,
+next to the IC skills the core surface bundles. It walks through the loop
+above from the agent's side: bundle the project with `icp project bundle`,
+call `icp_deploy_bundle` with the environment's
+`.icp/data/mappings/<environment>.ids.json` as `canister_ids`, and write the
+mapping the tool returns back into that file so the next deploy upgrades
+rather than creates. Not every client reads resources, so `icp_deploy_guide`
+returns the same document as a tool result. It lives at
+`crates/imcp2-deploy/static/skills/deploy-with-mcp.md`.
+
+Why only here: the tool is built on `icp-project`, a crate the icp CLI does not
+publish, so it is pulled from git — which the crates.io-published `imcp2-core`
+and `imcp2` cannot do. It lives in its own `imcp2-deploy` crate, composed into
+this binary alone.
+
 ## Upgrading
 
 Client registrations point at a stable installed path, so an upgrade is a
@@ -153,7 +229,7 @@ Internet Identity (`https://id.ai`). Environment overrides, mainly for tests:
 | `IMCP2_IC_URL` | IC API endpoint. |
 | `IMCP2_FETCH_ROOT_KEY` | Truthy: trust the endpoint's fetched root key — honoured **only** when `IMCP2_IC_URL` targets loopback (a local replica / PocketIC); startup refuses otherwise. |
 | `II_URL_PROD` / `II_CANISTER_ID_PROD` | Override the Internet Identity instance (e.g. beta II, or an II canister in PocketIC). |
-| `IMCP2_MANAGEMENT_ORIGIN` | Derivation origin of the canister-management identity. Defaults to the hosted server's origin so the same anchor keeps the same controller principal locally and hosted. |
+| `IMCP2_MANAGEMENT_ORIGIN` | Derivation origin of the canister-management identity. Defaults to the hosted server's origin so the same anchor keeps the same controller principal locally and hosted. The deploy tools do not use it; they act at `https://cli.id.ai`. |
 | `IMCP2_NO_OPEN` | Truthy: never auto-open the browser on sign-in (the link is still returned in-band). |
 
 All diagnostics go to stderr (`RUST_LOG` filters them); stdout is the MCP
