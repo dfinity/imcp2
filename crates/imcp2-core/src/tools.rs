@@ -2480,26 +2480,47 @@ fn candid_reply(
     }
     if let Some(covered) = &rendering.methods {
         let declared = rendering.method_count.unwrap_or_default();
-        texts.push(if rendering.best_effort {
+        let mut note = if rendering.best_effort {
             format!(
                 "This interface is restricted to the method asked for, with the type definitions \
                  it uses (and the service's init arguments omitted). Its comments were STRIPPED: \
                  with them it came to more than {} bytes, so this is a best effort — the \
-                 signature and type definitions are complete, the explanations are not. The \
-                 complete interface is {} bytes.",
-                calls::MAX_SERVICE_SUBSET_BYTES,
-                did.len()
+                 signature and type definitions are complete, the explanations are not.",
+                calls::MAX_SERVICE_SUBSET_BYTES
             )
         } else {
             format!(
                 "This interface is restricted to {} of the {declared} methods the canister \
                  declares, with the type definitions they use and the interface's own comments \
                  on them (and the service's init arguments omitted): a valid Candid interface \
-                 for calling them. The complete interface is {} bytes.",
-                covered.len(),
-                did.len()
+                 for calling them.",
+                covered.len()
             )
-        });
+        };
+        // One method is always answered, whatever its size. Over the limit, say
+        // so — and that nothing more can be cut from it — rather than leave a
+        // reply that size to be taken for one cut short.
+        if output.bytes > calls::MAX_SERVICE_SUBSET_BYTES {
+            note.push_str(&if rendering.best_effort {
+                format!(
+                    " Even without them it is {} bytes, still over the {}-byte limit a reply \
+                     keeps to, and cannot be cut further: the one method asked for is always \
+                     answered.",
+                    output.bytes,
+                    calls::MAX_SERVICE_SUBSET_BYTES
+                )
+            } else {
+                format!(
+                    " It is {} bytes, over the {}-byte limit a reply keeps to, and carries no \
+                     comment to strip, so it cannot be cut further: the one method asked for is \
+                     always answered.",
+                    output.bytes,
+                    calls::MAX_SERVICE_SUBSET_BYTES
+                )
+            });
+        }
+        note.push_str(&format!(" The complete interface is {} bytes.", did.len()));
+        texts.push(note);
     }
     // Signal an OQL query surface structurally (`oql: true`). When set, the
     // guidance pointer is a SEPARATE text, so the interface stays the raw `.did`
@@ -2668,6 +2689,25 @@ mod tests {
             assert!(properties.contains_key(present), "{present} must be declared: {output}");
         }
         assert_eq!(properties["candid"]["type"], serde_json::json!("string"), "{output}");
+        // What every reply carries is required; `methods` is absent on the
+        // complete interface, and the declared schema must say so.
+        let required = serde_json::to_string(&output["required"]).unwrap_or_default();
+        for always in [
+            "canister_id",
+            "candid",
+            "bytes",
+            "best_effort",
+            "oql",
+            "api_doc_available",
+            "declared_by",
+            "declared_at",
+        ] {
+            assert!(
+                required.contains(&format!("\"{always}\"")),
+                "{always} is always present: {required}"
+            );
+        }
+        assert!(!required.contains("\"methods\""), "absent on the complete interface: {required}");
     }
 
     // The reply a read assembles, without a replica: the interface comes first,
@@ -2735,10 +2775,102 @@ mod tests {
             texts[1]
         );
         assert!(texts[1].contains("own comments"), "{}", texts[1]);
+        let complete = format!("The complete interface is {} bytes.", did.len());
+        assert!(texts[1].ends_with(&complete), "{}", texts[1]);
         let s = structured(&output);
+        assert_eq!(s["candid"], serde_json::json!(texts[0]), "the restricted text, whole: {s}");
         assert_eq!(s["methods"], serde_json::json!(["list"]));
         assert_eq!(s["bytes"], serde_json::json!(texts[0].len()));
         assert_eq!(s["best_effort"], serde_json::json!(false));
+
+        // One method over the limit, three ways. Comment-free: whole, not a best
+        // effort, and the note says it is over the limit with nothing to strip —
+        // never that comments were stripped when none were. With comments it
+        // sheds to get under the limit: stripped and flagged. With comments it
+        // sheds and is still over: stripped, flagged, and said to be still over.
+        let one = ["m".to_string()];
+        let reply_to_m = |did: &str| {
+            super::candid_reply(
+                did,
+                "aaaaa-aa".into(),
+                Some(&one),
+                "https://app.example".into(),
+                "/.well-known/ic-architecture".into(),
+            )
+        };
+        let limit = super::calls::MAX_SERVICE_SUBSET_BYTES;
+        let huge = {
+            let fields = (0..400)
+                .map(|i| format!("  f{i} : opt vec record {{ x : nat; y : text }};\n"))
+                .collect::<String>();
+            format!("type Huge = record {{\n{fields}}};\nservice : {{ m : (Huge) -> () }}")
+        };
+        // Whatever its size, the structured object carries the text whole: a
+        // client that reads only that object has no other way to get it.
+        let whole_in_both = |texts: &[String], s: &serde_json::Value| {
+            assert_eq!(s["candid"], serde_json::json!(texts[0]), "whole, not cut: {s}");
+            assert_eq!(s["bytes"], serde_json::json!(texts[0].len()), "{s}");
+        };
+        let (texts, output) = reply_to_m(&huge).expect("answered whole");
+        let s = structured(&output);
+        whole_in_both(&texts, &s);
+        assert_eq!(s["best_effort"], serde_json::json!(false), "{s}");
+        assert!(output.bytes > limit, "{} bytes", output.bytes);
+        assert!(
+            texts[1].contains("restricted to 1 of the 1 methods")
+                && texts[1].contains(&format!(
+                    "It is {} bytes, over the {limit}-byte limit",
+                    output.bytes
+                ))
+                && texts[1].contains("carries no comment to strip")
+                && texts[1].contains("cannot be cut further")
+                && !texts[1].contains("STRIPPED"),
+            "{}",
+            texts[1]
+        );
+        let complete = format!("The complete interface is {} bytes.", huge.len());
+        assert!(texts[1].ends_with(&complete), "{}", texts[1]);
+        let chatty = {
+            let fields = (0..120)
+                .map(|i| {
+                    format!("  // Field {i}: what it holds, in what unit, and when it is set.\n  f{i} : nat;\n")
+                })
+                .collect::<String>();
+            format!("type Chatty = record {{\n{fields}}};\nservice : {{ m : (Chatty) -> () }}")
+        };
+        let (texts, output) = reply_to_m(&chatty).expect("best effort");
+        let s = structured(&output);
+        whole_in_both(&texts, &s);
+        assert_eq!(s["best_effort"], serde_json::json!(true), "{s}");
+        assert!(output.bytes <= limit, "{} bytes", output.bytes);
+        assert!(
+            texts[1].contains("Its comments were STRIPPED")
+                && !texts[1].contains("still over")
+                && !texts[1].contains("cannot be cut further"),
+            "{}",
+            texts[1]
+        );
+        let complete = format!("The complete interface is {} bytes.", chatty.len());
+        assert!(texts[1].ends_with(&complete), "{}", texts[1]);
+        let commented =
+            huge.replace("type Huge = record {\n", "// Everything.\ntype Huge = record {\n");
+        let (texts, output) = reply_to_m(&commented).expect("best effort");
+        let s = structured(&output);
+        whole_in_both(&texts, &s);
+        assert_eq!(s["best_effort"], serde_json::json!(true), "{s}");
+        assert!(output.bytes > limit, "{} bytes", output.bytes);
+        assert!(
+            texts[1].contains("Its comments were STRIPPED")
+                && texts[1].contains(&format!(
+                    "Even without them it is {} bytes, still over the {limit}-byte limit",
+                    output.bytes
+                ))
+                && texts[1].contains("cannot be cut further"),
+            "{}",
+            texts[1]
+        );
+        let complete = format!("The complete interface is {} bytes.", commented.len());
+        assert!(texts[1].ends_with(&complete), "{}", texts[1]);
 
         // A rendering error is the reply's error, verbatim.
         let e = reply(Some(&["lost".to_string()])).expect_err("unknown");
@@ -2748,7 +2880,7 @@ mod tests {
         // with a note saying why.
         let unparseable = format!("service : {{ {} !!!", "m : () -> (); ".repeat(600));
         assert!(unparseable.len() > super::calls::MAX_SERVICE_SUBSET_BYTES);
-        let (texts, _) = super::candid_reply(
+        let (texts, output) = super::candid_reply(
             &unparseable,
             "aaaaa-aa".into(),
             None,
@@ -2758,6 +2890,7 @@ mod tests {
         .expect("verbatim");
         assert_eq!(texts[0], unparseable);
         assert!(texts[1].contains("could not be parsed to offer `methods`"), "{}", texts[1]);
+        whole_in_both(&texts, &structured(&output));
     }
 
     // Every tool must carry MCP annotations, else clients fall back to the unsafe
