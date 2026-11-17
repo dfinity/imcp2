@@ -2682,9 +2682,7 @@ const CONNECT_EXPIRED_MSG: &str = "This connect request has expired. Restart fro
 /// under the `authz` lock: the code an earlier attempt already minted, else
 /// `fresh` (`true` = newly minted, still to be recorded in `codes`). Leaves the
 /// connect's `redeeming` mark to the [`RedemptionClaim`] that set it: once a code
-/// is recorded, that code is what a later claim gets, and a refused connect must
-/// stay claimed until its own claim lets go, or a second registration could
-/// start before this one's guard clears the mark out from under it.
+/// is recorded, that code is what a later claim gets.
 ///
 /// Not refused for being past [`CONNECT_TTL`]: the TTL bounds when a redemption
 /// may START (the gate, and [`claim_redemption`] under the lock), and one that
@@ -2695,11 +2693,11 @@ const CONNECT_EXPIRED_MSG: &str = "This connect request has expired. Restart fro
 /// the session holding the key II registered, and fails the redemption, before
 /// it gets here, when that session was reaped or evicted mid-call.
 ///
-/// Refused only when the connect itself is gone (evicted at the cap, or kept
-/// past [`EXPIRED_CONNECT_RETENTION`]). That refusal also discards the session
-/// the registration just granted ([`Identities::discard_session`]): no code will
-/// ever reach it, and with a grant recorded nothing else would drop it before
-/// the grant expired.
+/// Refused only when the connect itself is gone: evicted at the cap, or swept
+/// once it has been expired for [`EXPIRED_CONNECT_RETENTION`]. That refusal
+/// also discards the session the registration just granted
+/// ([`Identities::discard_session`]): no code will ever reach it, and with a
+/// grant recorded nothing else would drop it before the grant expired.
 async fn reserve_code(
     store: &AuthStore,
     state: &str,
