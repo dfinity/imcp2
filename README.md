@@ -601,10 +601,8 @@ What the hosted composition adds to the local one:
   `RUST_LOG=info` shows all of it.
 
 The feature is off in the default build and on in the native deployment's
-(`deploy/native/build.sh`). `imcp2-deploy` pins icp-cli crates by git, which
-crates.io refuses, so the published `imcp2` crate cannot carry the feature
-until the icp CLI's crates are published; `cargo publish` of this crate waits
-on that.
+(`deploy/native/build.sh`). `imcp2-deploy` is not published to crates.io, so
+the published `imcp2` crate cannot carry the feature until it is.
 
 ## Connect from an MCP client
 

@@ -12,10 +12,9 @@
 //! — the principal `icp identity link web` links the CLI to, so `icp` and
 //! this tool deploy as the same controller when the CLI's selected identity
 //! is that link (a local key or another account is another principal).
-//! Local-only because that library is a git dependency the published crates
-//! cannot carry. A deploy's working directory lives under the OS's local
-//! data directory (`imcp2-local/deploys/`) until the deploy returns, so one
-//! cut off mid-way leaves the ids it created where the README says to look.
+//! A deploy's working directory lives under the OS's local data directory
+//! (`imcp2-local/deploys/`) until the deploy returns, so one cut off mid-way
+//! leaves the ids it created where the README says to look.
 //!
 //! Signing in is a built-in browser handshake (see `login`): the
 //! `authenticate` tool returns an id.ai link, a transient loopback listener

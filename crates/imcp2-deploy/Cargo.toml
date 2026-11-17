@@ -5,12 +5,12 @@ edition = "2021"
 description = "The imcp2 `icp_deploy_bundle` tool: deploys an icp project bundle through the icp CLI's own project library."
 license = "Apache-2.0"
 repository = "https://github.com/dfinity/imcp2"
-# NOT publishable, by construction: the deploy runs on `icp-project` (and its
-# siblings) pulled straight from the icp-cli git repository — those crates are
-# `publish = false` upstream, and crates.io refuses any crate with a git
-# dependency. That is why this is its own crate rather than a module of
-# `imcp2-core`, and why only `imcp2-local` (released as dist binaries, never
-# published) composes it: `imcp2-core` and `imcp2` keep publishing untouched.
+# Not published. The deploy runs on `icp-project` and its siblings, which
+# bring wasmtime with them; this is its own crate rather than a module of
+# `imcp2-core` so that core does not carry that tree. `imcp2-local` composes
+# it always, the hosted `imcp2` behind its `deploy` feature. The icp CLI's
+# crates are on crates.io, so nothing upstream stops this one being published;
+# until it is, the published `imcp2` cannot carry the feature.
 publish = false
 
 [dependencies]
@@ -46,13 +46,13 @@ flate2 = "1"
 # when the deploy ends, whichever way it ends.
 tempfile = "3"
 
-# The icp CLI's project library and the seams it is driven through, pinned to
-# one commit so the four stay in lockstep (they share a workspace version and
-# are not released independently). Bump the `rev` on all four together.
+# The icp CLI's project library and the seams it is driven through, from
+# crates.io. The four share a workspace version upstream and are released
+# together: bump all four together.
 #
-# The pinned commit is icp-cli's main at the merge of dfinity/icp-cli#873
-# (on #868): #868 has `icp project bundle` write an archive of regular files
-# and directories alone, and #873 states the rule for an untrusted project
+# 0.1 has what this crate is built on, dfinity/icp-cli#873 (on #868): #868
+# has `icp project bundle` write an archive of regular files and directories
+# alone, and #873 states the rule for an untrusted project
 # (`icp_project::untrusted`, what `--untrusted` on `icp build`, `deploy` and
 # `sync` applies): the project is read through a filesystem confined to its
 # root by a directory handle and through no symlink, names no recipe, and
@@ -66,10 +66,10 @@ tempfile = "3"
 #     brings wasmtime into this workspace.
 #   * icp-canister-interfaces: the engine-canister registry id a created
 #     canister's subnet is looked up in.
-icp-project = { git = "https://github.com/dfinity/icp-cli", rev = "8f98455d021f1f7dacf91f3244844f324a1c503b" }
-icp-events = { git = "https://github.com/dfinity/icp-cli", rev = "8f98455d021f1f7dacf91f3244844f324a1c503b" }
-icp-sync-plugin = { git = "https://github.com/dfinity/icp-cli", rev = "8f98455d021f1f7dacf91f3244844f324a1c503b" }
-icp-canister-interfaces = { git = "https://github.com/dfinity/icp-cli", rev = "8f98455d021f1f7dacf91f3244844f324a1c503b" }
+icp-project = "0.1"
+icp-events = "0.1"
+icp-sync-plugin = "0.1"
+icp-canister-interfaces = "0.1"
 
 [dev-dependencies]
 # The tests hand-build small bundles (a manifest plus a wasm) and load them

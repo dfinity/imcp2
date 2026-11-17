@@ -103,9 +103,9 @@ tokio-util = { version = "0.7", features = ["io"] }
 uuid = { workspace = true }
 tower-http = { version = "0.7", features = ["cors"] }
 # The deploy tools on the hosted server (src/deploy.rs), behind the `deploy`
-# feature. imcp2-deploy pins icp-cli crates by git, which crates.io refuses, so
-# the feature keeps `cargo publish` from working until the icp CLI's crates are
-# published; a release build with the feature is a deployment's choice.
+# feature. imcp2-deploy is not published, so the published `imcp2` cannot
+# carry the feature until it is; a release build with the feature is a
+# deployment's choice.
 imcp2-deploy = { path = "crates/imcp2-deploy", optional = true }
 # The deploy endpoint: streamed bodies (the upload, the watched event stream).
 futures-util = "0.3"
