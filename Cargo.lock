@@ -1873,6 +1873,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "imcp2-session-api"
+version = "0.6.1"
+dependencies = [
+ "candid",
+ "candid_parser",
+ "hex",
+ "serde",
+ "serde_bytes",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

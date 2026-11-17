@@ -33,7 +33,12 @@ exclude = [
 ]
 
 [workspace]
-members = [".", "crates/imcp2-core", "crates/imcp2-local"]
+members = [
+    ".",
+    "crates/imcp2-core",
+    "crates/imcp2-local",
+    "crates/imcp2-session-api",
+]
 
 # The hosted server releases to crates.io (publish-crate.yml), never as dist
 # binaries — dist releases only imcp2-local (see dist-workspace.toml).
@@ -46,6 +51,9 @@ dist = false
 [workspace.dependencies]
 httpdate = "1.0.3"
 imcp2-core = { path = "crates/imcp2-core", version = "0.6.1" }
+thiserror = "2"
+# Candid `blob` fields encode as one byte string, not element by element.
+serde_bytes = "0.11"
 rmcp = "2.1"
 axum = "0.8"
 anyhow = "1"

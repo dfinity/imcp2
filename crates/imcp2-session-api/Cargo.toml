@@ -1,0 +1,24 @@
+[package]
+name = "imcp2-session-api"
+version = "0.6.1"
+edition = "2021"
+description = "Candid types, constants and shared rules for the imcp2 session canister, the store imcp2 backends use to share OAuth and Internet Identity sessions."
+license = "Apache-2.0"
+repository = "https://github.com/dfinity/imcp2"
+homepage = "https://mcp.internetcomputer.org"
+keywords = ["mcp", "internet-computer", "icp", "candid"]
+categories = ["api-bindings"]
+# Not published yet: no published crate depends on it until imcp2 does, and its
+# first release needs a placeholder published by hand (so that its trusted
+# publisher can be configured) before `cargo publish --workspace` can upload it.
+publish = false
+
+[dependencies]
+candid = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+serde_bytes = { workspace = true }
+
+[dev-dependencies]
+candid_parser = { workspace = true }
+hex = { workspace = true }
