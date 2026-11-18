@@ -224,12 +224,18 @@ pub async fn deploy_bundle(
     let dir = Utf8PathBuf::from_path_buf(scratch.path().to_path_buf()).map_err(|p| {
         RequestError(format!("scratch directory path is not UTF-8: {}", p.display()))
     })?;
-    let fs = {
+    // The extraction owns the directory while it runs: a blocking task is
+    // not stopped when this future is dropped, and one that outlived the
+    // directory would write its files back under a path nothing removes.
+    let (scratch, fs) = {
         let dir = dir.clone();
-        tokio::task::spawn_blocking(move || host::extract_bundle(&bytes, &dir))
-            .await
-            .map_err(|e| RequestError(format!("bundle extraction panicked: {e}")))?
-            .map_err(RequestError)?
+        let (scratch, fs) = tokio::task::spawn_blocking(move || {
+            let fs = host::extract_bundle(&bytes, &dir);
+            (scratch, fs)
+        })
+        .await
+        .map_err(|e| RequestError(format!("bundle extraction panicked: {e}")))?;
+        (scratch, fs.map_err(RequestError)?)
     };
 
     let host = host::host_for(fs.clone());
@@ -331,7 +337,8 @@ pub async fn deploy_bundle(
     let (reporter, receiver) = icp_events::channel::<Task>();
     // The collector logs each line too, under the span the caller put the
     // deploy in (the session), so the server's own log has the events.
-    let collector = tokio::spawn(collect_log(receiver, watch.lines).instrument(Span::current()));
+    let lines = watch.lines;
+    let collector = tokio::spawn(collect_log(receiver, lines.clone()).instrument(Span::current()));
     tracing::info!(
         dir = %dir,
         environment = %request.environment,
@@ -375,21 +382,25 @@ pub async fn deploy_bundle(
         }
     }
 
+    // What this function itself has to say goes where the run's lines went:
+    // to the watcher as it is said, and into the outcome's log.
+    let note = |log: &mut Vec<String>, line: String| {
+        forward(&lines, &line);
+        log.push(line);
+    };
+
     // Whatever the store holds now: the seeded ids plus every id created before
     // a failure, which is what a retry needs to pass back in.
-    match host.ids_by_environment(&selection).await {
-        Ok(ids) => outcome.canister_ids = ids.into_iter().collect(),
+    let stored = match host.ids_by_environment(&selection).await {
+        Ok(ids) => Some(ids.into_iter().collect()),
         Err(e) => {
-            outcome.log.push(format!("reading the canister ids back failed: {}", error_chain(&e)));
+            let line = format!("reading the canister ids back failed: {}", error_chain(&e));
+            note(&mut outcome.log, line);
+            None
         }
-    }
-    // A created id is reported before it is recorded, so the created list is
-    // the authority: it fills in whatever the store failed to record — or to
-    // read back — because a mapping missing a canister that exists would have
-    // the retry create it again.
-    for (name, id) in &outcome.created {
-        outcome.canister_ids.insert(name.clone(), *id);
-    }
+    };
+    outcome.canister_ids =
+        ids_for_a_retry(std::mem::take(&mut outcome.canister_ids), stored, &outcome.created);
 
     // The outcome carries everything the directory recorded; the directory
     // has done its job. Not after an interruption: the one who asked for it
@@ -411,16 +422,42 @@ pub async fn deploy_bundle(
         ),
     }
     if outcome.status == Status::Interrupted {
-        outcome.log.push(format!(
+        let line = format!(
             "interrupted; the deploy directory '{}' is kept, with the ids it recorded",
             workdir.display()
-        ));
+        );
+        note(&mut outcome.log, line);
     } else if let Err(e) = tokio::fs::remove_dir_all(&workdir).await {
-        outcome
-            .log
-            .push(format!("removing the deploy directory '{}' failed: {e}", workdir.display()));
+        let line = format!("removing the deploy directory '{}' failed: {e}", workdir.display());
+        note(&mut outcome.log, line);
     }
     Ok(outcome)
+}
+
+/// The mapping a deploy hands back, which is what a retry passes in: what
+/// the id store holds — or, when it could not be read back, the ids the
+/// caller seeded it with — and over that every canister this run created.
+/// A created id is reported before it is recorded, so the created list is
+/// the authority: it fills in whatever the store failed to record or to
+/// read back, because a mapping missing a canister that exists would have
+/// the retry create, and fund, a second one.
+fn ids_for_a_retry(
+    seeded: BTreeMap<String, Principal>,
+    stored: Option<BTreeMap<String, Principal>>,
+    created: &[(String, Principal)],
+) -> BTreeMap<String, Principal> {
+    let mut ids = stored.unwrap_or(seeded);
+    ids.extend(created.iter().cloned());
+    ids
+}
+
+/// Send one log line where the deploy's lines go: the server's log, under
+/// the caller's span, and the watcher, if there is one and it still listens.
+fn forward(lines: &Option<mpsc::UnboundedSender<String>>, line: &str) {
+    tracing::info!("{line}");
+    if let Some(lines) = lines {
+        let _ = lines.send(line.to_string());
+    }
 }
 
 /// An agent for the Internet Computer signing as `identity`: the mainnet
@@ -492,10 +529,7 @@ async fn collect_log(
 ) -> Vec<String> {
     let mut log = Vec::new();
     let mut push = |line: String| {
-        tracing::info!("{line}");
-        if let Some(lines) = &lines {
-            let _ = lines.send(line.clone());
-        }
+        forward(&lines, &line);
         log.push(line);
     };
     let mut started: HashMap<TaskId, (String, bool)> = HashMap::new();
@@ -1127,7 +1161,8 @@ mod tests {
         request.workdir = Some(Utf8PathBuf::from_path_buf(parent.path().to_path_buf()).unwrap());
         let stop = CancellationToken::new();
         stop.cancel();
-        let watch = Watch { stop, lines: None };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let watch = Watch { stop, lines: Some(tx) };
         let outcome = deploy_bundle(Arc::new(AnonymousIdentity), request, watch).await.unwrap();
         assert_eq!(outcome.status, Status::Interrupted);
         assert_eq!(outcome.canisters, ["backend"]);
@@ -1138,6 +1173,42 @@ mod tests {
         let kept: Vec<_> = std::fs::read_dir(parent.path()).unwrap().flatten().collect();
         assert_eq!(kept.len(), 1, "the deploy directory is kept");
         assert!(outcome.log.last().unwrap().contains("is kept"), "{:?}", outcome.log);
+        // The watcher is told where the record is, not the outcome's reader
+        // alone: it may be the only one still there.
+        let mut streamed = Vec::new();
+        while let Some(line) = rx.recv().await {
+            streamed.push(line);
+        }
+        assert_eq!(streamed, outcome.log);
+    }
+
+    // What a retry is handed never lacks a canister that exists: the ids
+    // this run created are in the mapping whether the store recorded them,
+    // recorded some of them, or could not be read back at all.
+    #[test]
+    fn the_mapping_for_a_retry_holds_every_created_canister() {
+        let id = |n: u8| Principal::from_slice(&[n]);
+        let map = |ids: &[(&str, u8)]| -> BTreeMap<String, Principal> {
+            ids.iter().map(|(name, n)| (name.to_string(), id(*n))).collect()
+        };
+        let seeded = map(&[("backend", 1)]);
+        let created = [("frontend".to_string(), id(2)), ("worker".to_string(), id(3))];
+
+        // The store recorded one creation and missed the other.
+        let partial = map(&[("backend", 1), ("frontend", 2)]);
+        assert_eq!(
+            ids_for_a_retry(seeded.clone(), Some(partial), &created),
+            map(&[("backend", 1), ("frontend", 2), ("worker", 3)])
+        );
+        // The store could not be read back: the seeded ids stand, with the
+        // created ones over them.
+        assert_eq!(
+            ids_for_a_retry(seeded.clone(), None, &created),
+            map(&[("backend", 1), ("frontend", 2), ("worker", 3)])
+        );
+        // Nothing created: the store's word, or the seed's.
+        assert_eq!(ids_for_a_retry(seeded.clone(), Some(map(&[("backend", 1)])), &[]), seeded);
+        assert_eq!(ids_for_a_retry(seeded.clone(), None, &[]), seeded);
     }
 
     #[test]
