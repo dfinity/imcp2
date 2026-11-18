@@ -100,8 +100,11 @@ pub enum ReceiveError {
     UnknownTicket,
     /// The body is over the cap (the value); nothing is kept.
     TooLarge(usize),
-    /// The body could not be read, or the file not written.
-    Io(String),
+    /// The body could not be read: the client's side of the transfer.
+    Body(String),
+    /// The archive could not be stored (the directory not made, the file not
+    /// written): the server's fault, not the request's.
+    Storage(String),
 }
 
 impl std::fmt::Display for ReceiveError {
@@ -111,7 +114,8 @@ impl std::fmt::Display for ReceiveError {
                 "unknown, used or expired upload ticket; call icp_deploy_upload for a new one",
             ),
             ReceiveError::TooLarge(max) => write!(f, "the archive is over the {max}-byte limit"),
-            ReceiveError::Io(e) => write!(f, "could not receive the archive: {e}"),
+            ReceiveError::Body(e) => write!(f, "could not read the archive: {e}"),
+            ReceiveError::Storage(e) => write!(f, "could not store the archive: {e}"),
         }
     }
 }
@@ -193,7 +197,10 @@ impl Uploads {
             tracing::warn!(session, ?declared_len, max, "upload refused: declared too large");
             return Err(ReceiveError::TooLarge(max));
         }
-        make_private_dir(&self.inner.dir).map_err(|e| ReceiveError::Io(e.to_string()))?;
+        make_private_dir(&self.inner.dir).map_err(|e| {
+            tracing::error!(session, %e, "upload failed: the upload directory cannot be made");
+            ReceiveError::Storage(e.to_string())
+        })?;
         let upload_id = random_token();
         let path = self.inner.dir.join(format!("{upload_id}.tar.gz"));
         let received = write_up_to(&path, &mut body, max).await;
@@ -240,11 +247,11 @@ async fn write_up_to(
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options.open(path).await.map_err(|e| ReceiveError::Io(e.to_string()))?;
+    let mut file = options.open(path).await.map_err(|e| ReceiveError::Storage(e.to_string()))?;
     let mut total = 0usize;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = body.read(&mut buf).await.map_err(|e| ReceiveError::Io(e.to_string()))?;
+        let n = body.read(&mut buf).await.map_err(|e| ReceiveError::Body(e.to_string()))?;
         if n == 0 {
             break;
         }
@@ -252,9 +259,9 @@ async fn write_up_to(
         if total > max {
             return Err(ReceiveError::TooLarge(max));
         }
-        file.write_all(&buf[..n]).await.map_err(|e| ReceiveError::Io(e.to_string()))?;
+        file.write_all(&buf[..n]).await.map_err(|e| ReceiveError::Storage(e.to_string()))?;
     }
-    file.flush().await.map_err(|e| ReceiveError::Io(e.to_string()))?;
+    file.flush().await.map_err(|e| ReceiveError::Storage(e.to_string()))?;
     Ok(total)
 }
 
@@ -391,5 +398,36 @@ mod tests {
         let kept = std::fs::read_dir(dir.path().join("uploads")).unwrap().count();
         assert_eq!(kept, 0, "nothing is written for a refusal");
         assert!(uploads.receive(&second.ticket, None, std::io::Cursor::new(vec![1])).await.is_ok());
+    }
+
+    /// A body that fails to arrive is the request's failure; a file that
+    /// cannot be written is the server's. The two are told apart, so a full
+    /// disk is not reported to the client as a bad request.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_read_and_a_failed_write_are_told_apart() {
+        struct Broken;
+        impl AsyncRead for Broken {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("connection reset")))
+            }
+        }
+        let (dir, uploads) = store(1024);
+        let t = uploads.mint("s").await;
+        let err = uploads.receive(&t.ticket, None, Broken).await.unwrap_err();
+        assert!(matches!(err, ReceiveError::Body(_)), "{err:?}");
+        let kept = std::fs::read_dir(dir.path().join("uploads")).unwrap().count();
+        assert_eq!(kept, 0, "nothing is kept of an upload that did not arrive");
+
+        // The directory gone and its parent a file: nothing can be stored.
+        let t = uploads.mint("s").await;
+        std::fs::remove_dir_all(dir.path().join("uploads")).unwrap();
+        std::fs::write(dir.path().join("uploads"), b"in the way").unwrap();
+        let err = uploads.receive(&t.ticket, None, std::io::Cursor::new(vec![1])).await;
+        assert!(matches!(err, Err(ReceiveError::Storage(_))), "{err:?}");
     }
 }

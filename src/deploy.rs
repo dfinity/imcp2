@@ -215,7 +215,12 @@ async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response
         Err(e @ ReceiveError::TooLarge(_)) => {
             (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response()
         }
-        Err(e @ ReceiveError::Io(_)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e @ ReceiveError::Body(_)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        // The server's fault, and said so: a full disk or an unwritable
+        // directory is not a request the client can correct.
+        Err(e @ ReceiveError::Storage(_)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 

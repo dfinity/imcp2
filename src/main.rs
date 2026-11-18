@@ -52,9 +52,15 @@ fn public_url() -> String {
 /// points it at the unit's `StateDirectory` (`/var/lib/imcp2`). A relative
 /// path is resolved against the working directory here, once: every path
 /// derived from it is absolute, which a deploy reading an uploaded bundle
-/// requires.
+/// requires. An empty value reads as unset (the working directory), as it did
+/// before the path was resolved: an empty path is not one that resolves.
 fn state_dir() -> std::path::PathBuf {
-    let dir = std::env::var_os("IMCP2_STATE_DIR")
+    resolve_state_dir(std::env::var_os("IMCP2_STATE_DIR"))
+}
+
+fn resolve_state_dir(configured: Option<std::ffi::OsString>) -> std::path::PathBuf {
+    let dir = configured
+        .filter(|dir| !dir.is_empty())
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     std::path::absolute(&dir)
@@ -78,15 +84,14 @@ fn require_resource() -> bool {
 /// The deploy tools' knobs, when this binary was built with the `deploy`
 /// feature: `$MCP_DEPLOY_MAX_CONCURRENT` deploys at once across sessions
 /// (default 2) and `$MCP_DEPLOY_MAX_UPLOAD_BYTES` per uploaded archive
-/// (default 64 MiB). A value that is not a whole number refuses to start.
+/// (default 64 MiB). A value that is not a whole number refuses to start, and
+/// so does a count of zero: the tools run at least one deploy, so a zero would
+/// be a cap the server then exceeds.
 #[cfg(feature = "deploy")]
 fn deploy_config() -> anyhow::Result<imcp2::deploy::DeployConfig> {
     let mut config = imcp2::deploy::DeployConfig::default();
     if let Ok(v) = std::env::var("MCP_DEPLOY_MAX_CONCURRENT") {
-        config.concurrent = v
-            .trim()
-            .parse()
-            .map_err(|e| anyhow::anyhow!("MCP_DEPLOY_MAX_CONCURRENT must be a count: {e}"))?;
+        config.concurrent = deploy_concurrency(&v)?;
     }
     if let Ok(v) = std::env::var("MCP_DEPLOY_MAX_UPLOAD_BYTES") {
         config.max_upload_bytes = v.trim().parse().map_err(|e| {
@@ -94,6 +99,21 @@ fn deploy_config() -> anyhow::Result<imcp2::deploy::DeployConfig> {
         })?;
     }
     Ok(config)
+}
+
+/// `$MCP_DEPLOY_MAX_CONCURRENT` as a count of at least one.
+#[cfg(feature = "deploy")]
+fn deploy_concurrency(value: &str) -> anyhow::Result<usize> {
+    let count: usize = value
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("MCP_DEPLOY_MAX_CONCURRENT must be a count: {e}"))?;
+    anyhow::ensure!(
+        count > 0,
+        "MCP_DEPLOY_MAX_CONCURRENT must be at least 1: the deploy tools cannot be capped at \
+         zero deploys (build without the `deploy` feature to serve none)"
+    );
+    Ok(count)
 }
 
 /// Whether to also serve the beta Internet Identity instance at `/mcp-beta`.
@@ -608,6 +628,29 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// An empty `IMCP2_STATE_DIR` is the working directory, as an unset one
+    /// is, and whatever is configured comes out absolute.
+    #[test]
+    fn an_empty_state_dir_reads_as_unset() {
+        let cwd = std::path::absolute(".").unwrap();
+        assert_eq!(super::resolve_state_dir(None), cwd);
+        assert_eq!(super::resolve_state_dir(Some("".into())), cwd);
+        let relative = super::resolve_state_dir(Some("state".into()));
+        assert!(relative.is_absolute(), "{}", relative.display());
+        assert!(relative.ends_with("state"), "{}", relative.display());
+    }
+
+    /// The deploy cap is a count of at least one: zero is refused at startup
+    /// rather than quietly served as one.
+    #[cfg(feature = "deploy")]
+    #[test]
+    fn a_deploy_cap_of_zero_is_refused() {
+        assert_eq!(super::deploy_concurrency(" 3 ").unwrap(), 3);
+        let zero = super::deploy_concurrency("0").unwrap_err().to_string();
+        assert!(zero.contains("at least 1"), "{zero}");
+        assert!(super::deploy_concurrency("two").is_err());
+    }
 
     /// `OAUTH_CIMD_ENABLED`'s reading: on unless it says off.
     #[test]

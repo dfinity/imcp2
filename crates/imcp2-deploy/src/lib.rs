@@ -1046,13 +1046,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_relative_deploy_directory_is_made_absolute() {
-        let tools = tools().deploys_in(std::path::Path::new("state/deploys")).unwrap();
+        // A directory of this test's own, made in the working directory and
+        // removed with the guard: nothing that was already there is touched.
+        let own = tempfile::Builder::new().prefix("relative-deploys-").tempdir_in(".").unwrap();
+        let relative = std::path::Path::new(own.path().file_name().unwrap()).join("deploys");
+        assert!(relative.is_relative(), "{}", relative.display());
+        let tools = tools().deploys_in(&relative).unwrap();
         let dir = tools.deploys_dir.clone().unwrap();
         assert!(dir.is_absolute(), "{dir}");
         let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
-        assert_eq!(dir.as_std_path(), cwd.join("state/deploys"));
+        assert_eq!(dir.as_std_path(), cwd.join(&relative));
         assert!(dir.is_dir(), "made now, not on first use");
-        std::fs::remove_dir_all(cwd.join("state")).unwrap();
     }
 
     #[test]
