@@ -22,6 +22,9 @@ candid = { workspace = true }
 # `rt-multi-thread`: the sync-plugin runtime runs a wasm component on a
 # blocking thread (`block_in_place`), which only a multi-thread runtime has.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "fs", "io-util"] }
+# The token a running deploy is stopped through.
+tokio-util = "0.7"
+serde_json = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
@@ -64,3 +67,5 @@ icp-canister-interfaces = "0.1"
 # The tests hand-build small bundles (a manifest plus a wasm) and load them
 # through the same host the tool uses.
 wat = "1"
+# One test reads back what a deploy writes to the server's log.
+tracing-subscriber = { workspace = true }

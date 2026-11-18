@@ -2337,11 +2337,14 @@ dependencies = [
  "icp-project",
  "icp-sync-plugin",
  "imcp2-core",
+ "serde_json",
  "sha2 0.11.0",
  "tar",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "wat",
 ]
 

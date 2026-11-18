@@ -6,5 +6,6 @@
 //! together, and the account of the whole, come with the last of them.
 
 pub mod calls;
+pub mod deploy;
 pub mod host;
 pub mod identity;
