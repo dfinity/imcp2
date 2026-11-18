@@ -61,8 +61,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ic-agent = "0.49"
 # Floor at 0.10.31: earlier 0.10.x decode/encode large `Nat`/`Int` in O(n²), which
 # a caller-influenced textual `Nat` under the 1 MiB guard turns into seconds of
-# worker-blocking CPU (ICPBB-382); 0.10.31 made it O(n).
-candid = { version = "0.10.31", features = ["value"] }
+# worker-blocking CPU (ICPBB-382); 0.10.31 made it O(n). Floor at 0.10.39: the
+# subtype check — a deploy's upgrade compatibility check, over two interfaces
+# the caller writes — before it ran exponentially long on a short chain of
+# `opt` aliases whose leaves differ, and panicked past its own recursion limit.
+candid = { version = "0.10.39", features = ["value"] }
 candid_parser = "0.3.2"
 tokio = "1"
 serde = { version = "1", features = ["derive"] }
