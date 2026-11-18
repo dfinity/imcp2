@@ -2328,8 +2328,10 @@ version = "0.6.1"
 dependencies = [
  "async-trait",
  "camino",
+ "candid",
  "flate2",
  "hex",
+ "ic-agent",
  "icp-canister-interfaces",
  "icp-events",
  "icp-project",
@@ -2339,6 +2341,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tracing",
  "wat",
 ]
 

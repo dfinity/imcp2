@@ -17,9 +17,12 @@ publish = false
 # The session engine (which Internet Identity session a call acts as, and
 # the management identity minted from it) and the `SessionResolver` seam.
 imcp2-core = { workspace = true }
+ic-agent = { workspace = true }
+candid = { workspace = true }
 # `rt-multi-thread`: the sync-plugin runtime runs a wasm component on a
 # blocking thread (`block_in_place`), which only a multi-thread runtime has.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "fs", "io-util"] }
+tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 async-trait = "0.1"

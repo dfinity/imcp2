@@ -5,4 +5,6 @@
 //! The modules arrive one change at a time; the MCP tools that tie them
 //! together, and the account of the whole, come with the last of them.
 
+pub mod calls;
 pub mod host;
+pub mod identity;
