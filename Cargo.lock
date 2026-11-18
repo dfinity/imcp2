@@ -2330,6 +2330,7 @@ dependencies = [
  "camino",
  "candid",
  "flate2",
+ "getrandom 0.3.4",
  "hex",
  "ic-agent",
  "icp-canister-interfaces",

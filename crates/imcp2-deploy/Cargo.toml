@@ -28,6 +28,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Upload tickets and ids are 256 random bits each.
+getrandom = { workspace = true }
 async-trait = "0.1"
 # `icp-project` spells every path as a UTF-8 path.
 camino = "1"
