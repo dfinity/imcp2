@@ -209,7 +209,8 @@ created and their ids.
    deploying for others: try again in a few minutes.
 8. **A call that never returned.** Cancelling the call, or losing the
    connection, interrupts the deploy at its next step; a canister call
-   already in flight completes on the network. A server that restarts
+   already in flight is waited for and what it did is recorded, so a
+   canister it created is in the result. A server that restarts
    interrupts the deploy the same way and still answers: the result's
    `canister_ids` holds what was created, so do step 3 with it and deploy
    again. If the server stopped mid-deploy, or you cancelled and never read

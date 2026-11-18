@@ -321,20 +321,25 @@ impl Uploads {
                 tracing::warn!(session, "upload refused: another is arriving for the session");
                 return Err(ReceiveError::Busy);
             }
-            // The archive the session was holding gives way to this one.
-            let replaced: Vec<String> = state
+            // The archive the session was holding gives way to this one, so
+            // its bytes are room this one may use — but it goes only once
+            // this one is let in: a refusal leaves the session what it had.
+            let (replaced, giving_way): (Vec<String>, u64) = state
                 .uploads
                 .iter()
                 .filter(|(_, u)| u.session == session)
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in replaced {
-                remove_upload(&mut state, &id);
-            }
+                .fold((Vec::new(), 0), |(mut ids, bytes), (id, u)| {
+                    ids.push(id.clone());
+                    (ids, bytes + u.bytes)
+                });
             let reserved = declared_len.unwrap_or(max as u64);
-            if state.bytes + reserved > self.inner.max_total_bytes {
+            let held = state.bytes.saturating_sub(giving_way);
+            if held + reserved > self.inner.max_total_bytes {
                 tracing::warn!(session, held = state.bytes, "upload refused: the store is full");
                 return Err(ReceiveError::Full);
+            }
+            for id in replaced {
+                remove_upload(&mut state, &id);
             }
             state.bytes += reserved;
             state.receiving.insert(session.clone());
@@ -661,6 +666,36 @@ mod tests {
         assert_eq!(put("e", Some(4), 4).await.unwrap_err(), ReceiveError::Full);
         drop(taken);
         assert!(put("e", Some(4), 4).await.is_ok());
+    }
+
+    // A session's new upload takes the place of the one it held, so that
+    // one's bytes count as room; and when there is still no room, the
+    // refusal costs the session nothing: what it held is still deployable.
+    #[tokio::test]
+    async fn a_refused_replacement_leaves_the_session_its_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = Uploads::with_budget(dir.path().join("uploads"), 10, 12);
+        let put = |session: &'static str, declared: Option<u64>, len: usize| {
+            let uploads = uploads.clone();
+            async move {
+                let t = uploads.mint(session).await;
+                uploads.receive(&t.ticket, declared, std::io::Cursor::new(vec![0; len])).await
+            }
+        };
+        let first = put("a", Some(4), 4).await.unwrap();
+        put("b", Some(6), 6).await.unwrap();
+        // 10 of 12 held, 4 of them `a`'s own: 9 more is 15 without them.
+        assert_eq!(put("a", Some(9), 9).await.unwrap_err(), ReceiveError::Full);
+        assert_eq!(uploads.inner.state().bytes, 10);
+        assert!(
+            uploads.inner.state().uploads.contains_key(&first.upload_id),
+            "refused, the session still holds its upload"
+        );
+        // 6 more fits only because `a`'s 4 give way; then they do.
+        let second = put("a", Some(6), 6).await.unwrap();
+        assert_eq!(uploads.inner.state().bytes, 12);
+        assert!(uploads.take(&first.upload_id, "a").await.is_none(), "the first was replaced");
+        assert!(uploads.take(&second.upload_id, "a").await.is_some());
     }
 
     // A body longer than the length it declared is cut off at that length:

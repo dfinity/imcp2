@@ -12,7 +12,12 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
-    sync::Arc,
+    future::Future,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -35,7 +40,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span};
 
-use crate::{calls::AgentCalls, host};
+use crate::{
+    calls::{AgentCalls, UntilStopped},
+    host,
+};
 
 /// Where the bundle bytes come from.
 pub enum BundleSource {
@@ -97,10 +105,11 @@ pub struct DeployRequest {
 /// and what tells it to stop.
 #[derive(Clone, Debug, Default)]
 pub struct Watch {
-    /// Cancelled to interrupt the deploy. The run stops at its next step
-    /// (a canister call already in flight completes on the network), and
-    /// the outcome reports [`Status::Interrupted`] with everything that
-    /// landed before the stop. Cancelled while the bundle is still being
+    /// Cancelled to interrupt the deploy. The run stops at its next step:
+    /// a canister call already in flight is waited for and its result
+    /// recorded (a canister it created is in the outcome), no further call
+    /// is made, and the outcome reports [`Status::Interrupted`] with
+    /// everything that landed. Cancelled while the bundle is still being
     /// read and checked — before anything was created — there is no outcome,
     /// only the refusal that says so.
     pub stop: CancellationToken,
@@ -343,13 +352,20 @@ pub async fn deploy_bundle(
     // CLI does: a deploy that fails to load its wasms never builds one. The
     // network is the Internet Computer — `check_bundle` held the environment
     // to it — so the agent is the mainnet one, as the balance check's is.
-    let calls = Deferred::new(move || {
-        let identity = identity.clone();
-        async move {
-            let agent = mainnet_agent(identity).map_err(RequestError)?;
-            let calls: Arc<dyn CanisterCalls> =
-                Arc::new(AgentCalls::new(agent).map_err(RequestError)?);
-            Ok::<_, RequestError>(calls)
+    //
+    // The calls stop being made when the deploy is told to stop, and say
+    // whether any was made at all: see [`run_until_stopped`].
+    let begun = Arc::new(AtomicBool::new(false));
+    let calls = Deferred::new({
+        let (stop, begun) = (watch.stop.clone(), begun.clone());
+        move || {
+            let (identity, stop, begun) = (identity.clone(), stop.clone(), begun.clone());
+            async move {
+                let agent = mainnet_agent(identity).map_err(RequestError)?;
+                let calls = AgentCalls::new(agent).map_err(RequestError)?;
+                let calls: Arc<dyn CanisterCalls> = Arc::new(UntilStopped::new(calls, stop, begun));
+                Ok::<_, RequestError>(calls)
+            }
         }
     });
 
@@ -370,36 +386,48 @@ pub async fn deploy_bundle(
     // From here the directory outlives this future (see above).
     let workdir = scratch.keep();
     let mut report = DeployReport::default();
-    // The run is dropped the moment the stop is asked for: it ends at its
-    // next await, which is the next canister call or plugin step. `biased`
-    // so a stop asked for before the run begins is honoured without a step.
-    let result = {
-        let run = deploy(&host, &calls, &params, &reporter, &mut report);
-        tokio::pin!(run);
-        tokio::select! {
-            biased;
-            _ = watch.stop.cancelled() => None,
-            result = &mut run => Some(result),
-        }
-    };
+    let result = run_until_stopped(
+        deploy(&host, &calls, &params, &reporter, &mut report),
+        &watch.stop,
+        &begun,
+        STOP_GRACE,
+    )
+    .await;
     // The receiver ends only once every reporter handle is gone.
     drop(reporter);
     outcome.log = collector.await.unwrap_or_default();
     outcome.created = report.created;
 
+    let interrupted = "the deploy was interrupted before it finished (the call was cancelled, the \
+                       client went away or the server is stopping); `canister_ids` holds every \
+                       canister it had created";
     match result {
         Some(Ok(())) => outcome.status = Status::Deployed,
+        // Stopped, the run ends in whichever error its next call's refusal
+        // became: that is the interruption, not a failure of the deploy.
+        Some(Err(e)) if watch.stop.is_cancelled() => {
+            outcome.status = Status::Interrupted;
+            outcome.error = Some(interrupted.into());
+            tracing::info!(ended = %error_chain(&e), "the interrupted run ended");
+        }
         Some(Err(e)) => {
             outcome.status = Status::Failed;
             outcome.error = Some(error_chain(&e));
         }
         None => {
             outcome.status = Status::Interrupted;
-            outcome.error = Some(
-                "the deploy was interrupted before it finished (the call was cancelled or \
-                 the client went away); `canister_ids` holds every canister it had created"
-                    .into(),
-            );
+            outcome.error = Some(if begun.load(Ordering::SeqCst) {
+                // The one case in which the list may be short, said plainly:
+                // the caller is about to decide whether to create again.
+                format!(
+                    "{interrupted} — except that a call was still unanswered {} seconds after \
+                     the stop and was given up on: if it was creating a canister, that canister \
+                     may exist without being listed, so check before deploying again",
+                    STOP_GRACE.as_secs()
+                )
+            } else {
+                interrupted.into()
+            });
         }
     }
 
@@ -459,6 +487,41 @@ pub async fn deploy_bundle(
         note(&mut outcome.log, line);
     }
     Ok(outcome)
+}
+
+/// How long a deploy that was told to stop is given to end of its own
+/// accord: for the calls it had in flight to be answered and recorded.
+/// Within what a stopping server has before it is killed (the native unit's
+/// `TimeoutStopSec` is thirty seconds).
+const STOP_GRACE: Duration = Duration::from_secs(20);
+
+/// Run a deploy until it ends or `stop` is cancelled, and say how it ended;
+/// `None` is a run that was dropped.
+///
+/// A stop does not drop a run that has made a call (`begun`, which
+/// [`UntilStopped`] sets): a call in flight may already have created a
+/// canister, and only the run going on to its answer records which. The
+/// calls refuse to begin another once stopped, so the run ends by itself
+/// within a step; it is given `grace` to, and dropped after that, so that a
+/// call that is never answered cannot hold a stopping server. A run that has
+/// made no call has nothing to lose, and is dropped at once. `biased` so
+/// that a stop asked for before the run begins is honoured without a step.
+async fn run_until_stopped<T>(
+    run: impl Future<Output = T>,
+    stop: &CancellationToken,
+    begun: &AtomicBool,
+    grace: Duration,
+) -> Option<T> {
+    tokio::pin!(run);
+    tokio::select! {
+        biased;
+        _ = stop.cancelled() => {}
+        result = &mut run => return Some(result),
+    }
+    if !begun.load(Ordering::SeqCst) {
+        return None;
+    }
+    tokio::time::timeout(grace, run).await.ok()
 }
 
 /// The mapping a deploy hands back, which is what a retry passes in: what
@@ -1297,6 +1360,37 @@ mod tests {
             streamed.push(line);
         }
         assert_eq!(streamed, outcome.log);
+    }
+
+    // What a stop does to a run depends on whether the run has made a call.
+    // One that has made none has nothing to lose and is dropped where it is;
+    // one that has is let run on to its end — its calls now refuse to begin,
+    // so that is soon — for the answer of a call in flight to be recorded;
+    // and one that still has not ended after the grace is dropped after all.
+    #[tokio::test]
+    async fn a_stop_waits_for_a_run_that_has_made_a_call_and_not_for_ever() {
+        let grace = Duration::from_millis(200);
+        let ends_soon = || async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            "recorded"
+        };
+        let stop = CancellationToken::new();
+        stop.cancel();
+
+        let begun = AtomicBool::new(false);
+        assert_eq!(run_until_stopped(ends_soon(), &stop, &begun, grace).await, None);
+
+        let begun = AtomicBool::new(true);
+        assert_eq!(run_until_stopped(ends_soon(), &stop, &begun, grace).await, Some("recorded"));
+
+        let started = std::time::Instant::now();
+        let never = std::future::pending::<&str>();
+        assert_eq!(run_until_stopped(never, &stop, &begun, grace).await, None);
+        assert!(started.elapsed() >= grace);
+
+        // Not stopped, a run simply runs.
+        let running = CancellationToken::new();
+        assert_eq!(run_until_stopped(ends_soon(), &running, &begun, grace).await, Some("recorded"));
     }
 
     // What a retry is handed never lacks a canister that exists: the ids

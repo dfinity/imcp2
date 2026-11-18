@@ -8,6 +8,11 @@
 //! installed on it, which subnet it sits on — so they are answered from
 //! certificates rather than from anything a canister says about itself.
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use async_trait::async_trait;
 use candid::Principal;
 use ic_agent::{
@@ -17,6 +22,7 @@ use ic_agent::{
 };
 use icp_project::calls::{Authority, Call, CallError, CanisterCalls, RouteTo};
 use imcp2_core::guard_candid_text;
+use tokio_util::sync::CancellationToken;
 
 /// The metadata section the upgrade compatibility check reads from the
 /// deployed canister and parses as Candid.
@@ -266,10 +272,189 @@ impl CanisterCalls for AgentCalls {
     }
 }
 
+/// [`CanisterCalls`] that stop being made once a deploy is told to stop,
+/// which is how a deploy is interrupted without losing what it was doing.
+///
+/// A call already submitted may have taken effect on the Internet Computer —
+/// a canister created, and paid for — whether or not anyone waits for its
+/// answer, so a deploy that was simply dropped mid-call would not know the
+/// canister it had just made, and a retry would make and fund another. Here
+/// a call in flight runs to its answer, which the deploy records as it
+/// always does, and every call asked for after the stop is refused unmade:
+/// the deploy then ends of its own accord, at its next step, having
+/// reported everything that landed.
+pub struct UntilStopped<C> {
+    inner: C,
+    stop: CancellationToken,
+    /// Set once any call has been let through: until then there is nothing
+    /// in flight or unreported, and the deploy can be dropped where it is.
+    begun: Arc<AtomicBool>,
+}
+
+impl<C> UntilStopped<C> {
+    pub fn new(inner: C, stop: CancellationToken, begun: Arc<AtomicBool>) -> Self {
+        Self { inner, stop, begun }
+    }
+
+    /// Let a call through, or refuse it because the deploy is stopping. The
+    /// refusal is one that would not go differently on another attempt, so
+    /// nothing above retries it.
+    fn admit(&self, canister: Principal, method: &str) -> Result<(), CallError> {
+        if self.stop.is_cancelled() {
+            return Err(CallError::failed(canister, method, Stopping));
+        }
+        self.begun.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Why [`UntilStopped`] refused a call.
+#[derive(Debug)]
+struct Stopping;
+
+impl std::fmt::Display for Stopping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the deploy is being stopped, so the call was not made")
+    }
+}
+
+impl std::error::Error for Stopping {}
+
+#[async_trait]
+impl<C: CanisterCalls> CanisterCalls for UntilStopped<C> {
+    fn caller(&self) -> Principal {
+        self.inner.caller()
+    }
+
+    async fn update(&self, call: Call) -> Result<Vec<u8>, CallError> {
+        self.admit(call.canister, &call.method)?;
+        self.inner.update(call).await
+    }
+
+    async fn query(&self, call: Call) -> Result<Vec<u8>, CallError> {
+        self.admit(call.canister, &call.method)?;
+        self.inner.query(call).await
+    }
+
+    async fn metadata_section(
+        &self,
+        canister: Principal,
+        path: &str,
+        authority: Authority,
+    ) -> Result<Option<Vec<u8>>, CallError> {
+        self.admit(canister, "read_state(metadata)")?;
+        self.inner.metadata_section(canister, path, authority).await
+    }
+
+    async fn controllers(&self, canister: Principal) -> Result<Option<Vec<Principal>>, CallError> {
+        self.admit(canister, "read_state(controllers)")?;
+        self.inner.controllers(canister).await
+    }
+
+    async fn module_hash(&self, canister: Principal) -> Result<Option<Vec<u8>>, CallError> {
+        self.admit(canister, "read_state(module_hash)")?;
+        self.inner.module_hash(canister).await
+    }
+
+    async fn subnet_of(&self, canister: Principal) -> Result<Principal, CallError> {
+        self.admit(canister, "subnet_of")?;
+        self.inner.subnet_of(canister).await
+    }
+
+    async fn subnet_uses_engine_operator(&self, subnet: Principal) -> Result<bool, CallError> {
+        self.admit(subnet, "subnet_type")?;
+        self.inner.subnet_uses_engine_operator(subnet).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ic_agent::hash_tree::{fork, label, leaf, pruned};
+
+    /// Calls whose update is answered when the test says so.
+    struct Held(tokio::sync::Notify);
+
+    #[async_trait]
+    impl CanisterCalls for Held {
+        fn caller(&self) -> Principal {
+            Principal::anonymous()
+        }
+        async fn update(&self, _call: Call) -> Result<Vec<u8>, CallError> {
+            self.0.notified().await;
+            Ok(b"created".to_vec())
+        }
+        async fn query(&self, _call: Call) -> Result<Vec<u8>, CallError> {
+            Ok(Vec::new())
+        }
+        async fn metadata_section(
+            &self,
+            _canister: Principal,
+            _path: &str,
+            _authority: Authority,
+        ) -> Result<Option<Vec<u8>>, CallError> {
+            Ok(None)
+        }
+        async fn controllers(
+            &self,
+            _canister: Principal,
+        ) -> Result<Option<Vec<Principal>>, CallError> {
+            Ok(None)
+        }
+        async fn module_hash(&self, _canister: Principal) -> Result<Option<Vec<u8>>, CallError> {
+            Ok(None)
+        }
+        async fn subnet_of(&self, canister: Principal) -> Result<Principal, CallError> {
+            Ok(canister)
+        }
+        async fn subnet_uses_engine_operator(&self, _subnet: Principal) -> Result<bool, CallError> {
+            Ok(false)
+        }
+    }
+
+    // The call that was in flight when the stop came is answered, and its
+    // answer returned: that is the canister a dropped deploy would have
+    // lost. Every call after the stop is refused without being made.
+    #[tokio::test]
+    async fn a_stop_lets_the_call_in_flight_finish_and_refuses_the_next() {
+        let (stop, begun) = (CancellationToken::new(), Arc::new(AtomicBool::new(false)));
+        let calls =
+            UntilStopped::new(Held(tokio::sync::Notify::new()), stop.clone(), begun.clone());
+        let call = || Call::new(canister(), "create_canister", Vec::new());
+        assert!(!begun.load(Ordering::SeqCst));
+        let in_flight = calls.update(call());
+        tokio::pin!(in_flight);
+        assert!(futures_poll(&mut in_flight).await.is_none(), "the call is waiting for its answer");
+        assert!(begun.load(Ordering::SeqCst), "a call has been let through");
+
+        stop.cancel();
+        calls.inner.0.notify_one();
+        assert_eq!(in_flight.await.unwrap(), b"created");
+
+        let refused = calls.update(call()).await.unwrap_err();
+        assert!(matches!(refused, CallError::Failed { .. }), "{refused:?}");
+        let why = std::error::Error::source(&refused).unwrap().to_string();
+        assert!(why.contains("being stopped"), "{why}");
+        for refused in [
+            calls.query(call()).await.is_err(),
+            calls.controllers(canister()).await.is_err(),
+            calls.module_hash(canister()).await.is_err(),
+            calls.subnet_of(canister()).await.is_err(),
+            calls.subnet_uses_engine_operator(canister()).await.is_err(),
+            calls.metadata_section(canister(), PATH, Authority::Direct).await.is_err(),
+        ] {
+            assert!(refused);
+        }
+    }
+
+    /// One poll of `future`: its output if it is ready.
+    async fn futures_poll<F: std::future::Future + Unpin>(future: &mut F) -> Option<F::Output> {
+        std::future::poll_fn(|cx| match std::pin::Pin::new(&mut *future).poll(cx) {
+            std::task::Poll::Ready(out) => std::task::Poll::Ready(Some(out)),
+            std::task::Poll::Pending => std::task::Poll::Ready(None),
+        })
+        .await
+    }
 
     const PATH: &str = "candid:service";
 

@@ -653,20 +653,30 @@ impl IcDeployTools {
         // signs with is kept fresh for as long as the deploy runs.
         // Every line the deploy logs carries the session it runs for.
         let span = tracing::info_span!("deploy", session = %sid);
-        let identity =
-            match RefreshingIdentity::start(self.identities.clone(), sid, CLI_ORIGIN).await {
-                Ok(id) => id,
-                Err(e) => return Ok(err(e)),
-            };
+        // The stop: the client cancelling the request, or (on a server that
+        // says so) going away, or the server itself stopping. In place
+        // before the first wait on the network, which is the identity's:
+        // a request that held its slot and its upload through that wait,
+        // deaf to a stop, would hold a stopping server with it.
+        let stop = ctx.ct.child_token();
+        let _link = link_stops(client_gone(&ctx).into_iter().chain(self.stopping.clone()), &stop);
+        let starting = RefreshingIdentity::start(self.identities.clone(), sid, CLI_ORIGIN);
+        let identity = match until(&stop, starting).await {
+            Some(Ok(id)) => id,
+            Some(Err(e)) => return Ok(err(e)),
+            None => {
+                tracing::info!(parent: &span, "deploy stopped before it began");
+                return Ok(err("the deploy was interrupted before it began (the call was \
+                               cancelled, the client went away or the server is stopping); \
+                               nothing was created"
+                    .into()));
+            }
+        };
         // Each phase reaches the client as it completes, and the client's
         // cancellation of the request stops the deploy.
         let (lines, receiver) = tokio::sync::mpsc::unbounded_channel();
         let forwarder =
             tokio::spawn(forward_lines(ctx.peer.clone(), ctx.meta.get_progress_token(), receiver));
-        // The stop: the client cancelling the request, or (on a server that
-        // says so) going away, or the server itself stopping.
-        let stop = ctx.ct.child_token();
-        let _link = link_stops(client_gone(&ctx).into_iter().chain(self.stopping.clone()), &stop);
         let watch = Watch { stop, lines: Some(lines) };
         let result = deploy_bundle(identity, request, watch).instrument(span.clone()).await;
         // The sender went with the run; the forwarder ends once it has
@@ -787,6 +797,19 @@ fn client_gone(ctx: &RequestContext<RoleServer>) -> Option<CancellationToken> {
         .get::<http::request::Parts>()
         .and_then(|parts| parts.extensions.get::<ClientGone>())
         .map(|gone| gone.0.clone())
+}
+
+/// `work`'s output, or `None` if `stop` is cancelled first — or already is:
+/// the stop is looked at before the work is.
+async fn until<T>(
+    stop: &CancellationToken,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = stop.cancelled() => None,
+        out = work => Some(out),
+    }
 }
 
 /// Tie `stop` to each of `sources` for as long as the returned guard lives:
@@ -1103,6 +1126,18 @@ mod tests {
 
     // The deploy's stop follows whichever of its sources goes first, and
     // stops following once the deploy has returned.
+    // What a deploy waits on before it runs — its identity, fetched over the
+    // network — gives way to a stop, and to one already asked for at once.
+    #[tokio::test]
+    async fn a_wait_before_the_deploy_gives_way_to_a_stop() {
+        let stop = CancellationToken::new();
+        assert_eq!(until(&stop, async { 1 }).await, Some(1));
+        let (stopper, waiting) = (stop.clone(), until(&stop, std::future::pending::<u8>()));
+        let (out, ()) = tokio::join!(waiting, async move { stopper.cancel() });
+        assert_eq!(out, None);
+        assert_eq!(until(&stop, async { 1 }).await, None, "a stop already asked for comes first");
+    }
+
     #[tokio::test]
     async fn a_deploy_is_stopped_by_any_of_its_sources_until_it_returns() {
         let (gone, stopping) = (CancellationToken::new(), CancellationToken::new());

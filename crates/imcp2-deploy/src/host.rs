@@ -874,6 +874,13 @@ fn extract_bundle_within(
             return Err(too_large());
         }
         if entry.unpack_in(fs.root().as_std_path()).map_err(unreadable)? {
+            // The mode the archive names for the entry is replaced at once,
+            // before the next entry is written under it: the tree is the
+            // server's to read and to remove, and a directory an archive
+            // marked read-only would be neither (see `own`).
+            own(fs.root().join(&rel).as_std_path(), kind.is_dir()).map_err(|e| {
+                format!("the archive entry '{path}' could not be made the server's own: {e}")
+            })?;
             dirs.extend(implied);
             if kind.is_dir() {
                 dirs.insert(rel);
@@ -887,6 +894,22 @@ fn extract_bundle_within(
         ));
     }
     Ok(fs)
+}
+
+/// Give an extracted file or directory the mode everything a deploy writes
+/// has: the owner's alone, readable and — a directory — writable and
+/// searchable, so that it can be removed. An archive holds regular files and
+/// directories only, so `path` is never a link to follow.
+#[cfg(unix)]
+fn own(path: &std::path::Path, is_dir: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if is_dir { 0o700 } else { 0o600 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn own(_path: &std::path::Path, _is_dir: bool) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn too_large() -> String {
@@ -1323,6 +1346,40 @@ mod tests {
         let err = extract_bundle_within(&bytes, &into, 2).unwrap_err();
         assert!(err.contains(PROJECT_MANIFEST), "{err}");
         assert!(into.join("a/x").exists());
+    }
+
+    // The modes an archive names are not kept: a directory entry marked
+    // read-only, written after its files, would otherwise leave a tree the
+    // server's own user cannot remove, and the bundle would outlive its
+    // deploy. What is extracted is the owner's alone, to read and to remove.
+    #[cfg(unix)]
+    #[test]
+    fn what_is_extracted_can_be_removed_whatever_modes_the_archive_names() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o444);
+        header.set_cksum();
+        archive.append_data(&mut header, "locked/x", &b"x"[..]).unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o555);
+        header.set_cksum();
+        archive.append_data(&mut header, "locked/", &b""[..]).unwrap();
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+        let (_dir, into) = scratch();
+        // Not a bundle (no manifest), which is beside the point: the entries
+        // were written before that is known.
+        extract_bundle(&bytes, &into).unwrap_err();
+        let mode = |path: &str| std::fs::metadata(into.join(path)).unwrap().permissions().mode();
+        assert_eq!(mode("locked") & 0o777, 0o700);
+        assert_eq!(mode("locked/x") & 0o777, 0o600);
+        std::fs::remove_dir_all(into.join("locked")).unwrap();
     }
 
     // Counting what a path implies costs a lookup per component, so the

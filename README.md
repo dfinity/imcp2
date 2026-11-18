@@ -597,7 +597,11 @@ What the hosted composition adds to the local one:
   minutes and a restart gives the process seconds, so on the shutdown signal
   every running deploy is told to stop before the drain begins: it ends at
   its next step and answers with the canisters it had created, the drain
-  waits for that answer, and a deploy asked for meanwhile is refused.
+  waits for that answer, and a deploy asked for meanwhile is refused. A
+  stop never drops a canister call in flight — the call may already have
+  created, and funded, a canister that only its answer names — so the
+  deploy waits for that answer and makes no further call; it waits twenty
+  seconds at most, and says so in its answer if a call was given up on.
 - **Bounds.** One deploy per session and `$MCP_DEPLOY_MAX_CONCURRENT` across
   sessions and endpoints (the slots are the process's, shared by `/mcp` and
   `/mcp-beta`), refused past the cap rather than queued. Each deploy's
