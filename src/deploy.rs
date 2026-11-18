@@ -38,20 +38,42 @@
 //! the directory holds over time (see [`Deploys::new`] and
 //! [`Deploys::spawn_sweeper`]).
 //!
-//! An embedder turns the tools on with one call, and nothing else changes in
-//! how it serves or stops the server: everything it sets is a field of
-//! [`DeployConfig`] (no environment variable is read here), the sweeper
-//! starts with [`McpServer::spawn_session_reaper`], and
-//! [`McpServer::shutdown`] stops the deploys that are running.
+//! An embedder turns the tools on by making one [`Deploys`] as the process
+//! starts and handing a clone to each server: everything it sets is a field
+//! of [`DeployConfig`] (no environment variable is read here), and the
+//! sweeper starts with [`McpServer::spawn_session_reaper`].
+//!
+//! Stopping is the one thing to get in the right order. An embedder that
+//! drains in-flight requests calls [`Deploys::stop`] *before* the drain: a
+//! deploy lasts minutes, so a drain that began first would wait on deploys
+//! nothing had told to stop, and whatever cuts the drain short would cut
+//! them off with their answers unsent. [`McpServer::shutdown`] stops them
+//! too, which covers an embedder that does not drain and is the backstop
+//! for one that does. And before shutting down or exiting, it waits for the
+//! deploys to have ended ([`Deploys::stopped`], a bounded wait): one that is
+//! waiting on a canister call in flight, its client gone, holds no
+//! connection open for a drain to wait on.
 //!
 //! ```rust,no_run
-//! # fn with(config: imcp2::McpConfig) -> std::io::Result<imcp2::McpServer> {
+//! # async fn serve(
+//! #     config: imcp2::McpConfig,
+//! #     signal: impl std::future::Future<Output = ()>,
+//! # ) -> std::io::Result<()> {
 //! use imcp2::deploy::{DeployConfig, Deploys};
 //!
-//! let deploys = Deploys::new(&DeployConfig { concurrent: 1, ..Default::default() }, &config.state_dir)?;
-//! let server = imcp2::McpServer::new(config).with_deploy(deploys);
+//! // Once per process, over the state directory the servers share. An
+//! // error is a state directory another running server owns.
+//! let config_for_deploys = DeployConfig { concurrent: 1, ..Default::default() };
+//! let deploys = Deploys::new(&config_for_deploys, &config.state_dir)?;
+//! let server = imcp2::McpServer::new(config).with_deploy(deploys.clone());
 //! server.spawn_session_reaper(); // the deploy sweeper with it
-//! # Ok(server) }
+//! // ... serve `server.mcp_router()` ...
+//! signal.await;
+//! deploys.stop(); // before draining in-flight requests
+//! // ... drain ...
+//! deploys.stopped().await; // each deploy has ended, or been given its time
+//! server.shutdown();
+//! # Ok(()) }
 //! ```
 
 use std::{
@@ -761,11 +783,15 @@ mod tests {
         let deploys = Deploys::new(&config(), dir.path()).unwrap();
         let prod = server_in(dir.path(), "/mcp", deploys.clone());
         let beta = server_in(dir.path(), "/mcp-beta", deploys.clone());
-        assert!(!deploys.sweeping.load(Ordering::SeqCst));
+        // Counted in tasks: nothing here yields, so on this one-thread
+        // runtime every task spawned is still alive when it is counted.
+        let tasks = || tokio::runtime::Handle::current().metrics().num_alive_tasks();
+        let before = tasks();
         prod.spawn_session_reaper();
-        assert!(deploys.sweeping.load(Ordering::SeqCst), "the reaper starts the sweeper");
+        assert_eq!(tasks() - before, 2, "the session reaper, and the sweeper with it");
         // A second instance on the same state starts no second sweeper.
         beta.spawn_session_reaper();
+        assert_eq!(tasks() - before, 3, "its session reaper alone");
         assert!(!deploys.stopping.is_cancelled());
         prod.shutdown();
         assert!(deploys.stopping.is_cancelled(), "a shutdown stops the deploys");

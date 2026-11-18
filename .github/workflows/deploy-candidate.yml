@@ -140,7 +140,7 @@ jobs:
             exit 1
           fi
           version="${BASH_REMATCH[1]}"
-          for pkg in imcp2-core imcp2 imcp2-local; do
+          for pkg in imcp2-core imcp2-deploy imcp2 imcp2-local; do
             manifest="$(cargo metadata --format-version 1 --no-deps |
               jq -er --arg pkg "$pkg" '.packages[] | select(.name == $pkg) | .version')"
             echo "candidate=$version $pkg=$manifest"

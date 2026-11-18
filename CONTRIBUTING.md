@@ -124,12 +124,13 @@ instructions.
 
 ## Releasing
 
-A release takes two human actions, both tag pushes, and all three crates
-(`imcp2`, `imcp2-core`, `imcp2-local`) share one version.
+A release takes two human actions, both tag pushes, and all four crates
+(`imcp2`, `imcp2-core`, `imcp2-deploy`, `imcp2-local`) share one version.
 
 1. **Land the version bump on `main`.** Set `version` in `Cargo.toml`,
-   `crates/imcp2-core/Cargo.toml` and `crates/imcp2-local/Cargo.toml`, plus the
-   workspace's `imcp2-core` pin, refresh `Cargo.lock` (`cargo update -w`), and
+   `crates/imcp2-core/Cargo.toml`, `crates/imcp2-deploy/Cargo.toml` and
+   `crates/imcp2-local/Cargo.toml`, plus the workspace's `imcp2-core` and
+   `imcp2-deploy` pins, refresh `Cargo.lock` (`cargo update -w`), and
    merge that like any other change.
 2. **Cut a candidate.** Tag that commit `rc-X.Y.Z-1` and push the tag.
    `.github/workflows/deploy-candidate.yml` checks that the tag names the
@@ -139,8 +140,8 @@ A release takes two human actions, both tag pushes, and all three crates
    after a candidate, so the commit that is promoted is the one that was tested.
 3. **Promote.** Tag the same commit `vX.Y.Z` and push. Two workflows run from
    it, and nothing is deployed by either:
-   - `.github/workflows/publish-crate.yml` publishes `imcp2-core` and `imcp2` to
-     crates.io. It checks the tag against every `Cargo.toml`, that the commit is
+   - `.github/workflows/publish-crate.yml` publishes `imcp2-core`, `imcp2-deploy` and
+     `imcp2` to crates.io. It checks the tag against every `Cargo.toml`, that the commit is
      on `main`, and that an `rc-X.Y.Z-N` tag on it has its prerelease with the
      deployed binary (which exists only if the staging deploy succeeded), runs
      the suite and a dry-run package, and only then publishes from a second job

@@ -635,11 +635,16 @@ crate turns it on the same way (`features = ["deploy"]`), and `imcp2-deploy`
 comes from crates.io with it. Nothing here is read from the environment by the
 library: the `$MCP_DEPLOY_*` variables above are the bundled binary's, which
 maps them onto `imcp2::deploy::DeployConfig`, and an embedder sets that
-struct's fields from its own configuration. The rest is one call —
-`McpServer::with_deploy(Deploys::new(&config, &state_dir))` — since
-`spawn_session_reaper` starts the deploy sweeper and `shutdown` stops the
-running deploys; an embedder that drains in-flight requests calls
-`Deploys::stop` before the drain, as the bundled binary does.
+struct's fields from its own configuration. It makes one `Deploys` for the
+process (`Deploys::new(&config, &state_dir)`) as it starts and hands a clone
+to each server it serves the tools on (`McpServer::with_deploy`). One, not
+one per server: the caps are the process's, and making a second over a
+directory in use would clear the uploads and deploys of the first. Nothing
+more is needed to run it — `spawn_session_reaper` starts the deploy sweeper
+and `shutdown` stops the running deploys — but an embedder that drains
+in-flight requests calls `Deploys::stop` *before* the drain, as the bundled
+binary does: a drain that began first would wait on deploys nothing had told
+to stop.
 
 ## Connect from an MCP client
 
