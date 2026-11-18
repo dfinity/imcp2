@@ -75,6 +75,8 @@
 
 mod auth;
 mod branding;
+#[cfg(feature = "deploy")]
+pub mod deploy;
 // Docs live in the module itself (`//!` in src/metrics.rs): an outer doc
 // comment here would resolve its intra-doc links in *this* scope rather than
 // the module's, silently breaking the links to `Registry` and `MatchedPath`.
@@ -170,6 +172,10 @@ pub struct McpServer {
     store: auth::AuthStore,
     public_url: String,
     mcp_path: String,
+    /// The deploy tools, when a deployment turns them on (see
+    /// [`Self::with_deploy`]).
+    #[cfg(feature = "deploy")]
+    deploy: Option<deploy::DeployConfig>,
     /// Cancels the streamable-HTTP sessions and the session reaper on
     /// [`Self::shutdown`].
     ct: CancellationToken,
@@ -205,8 +211,18 @@ impl McpServer {
             store,
             public_url,
             mcp_path,
+            #[cfg(feature = "deploy")]
+            deploy: None,
             ct: CancellationToken::new(),
         }
+    }
+
+    /// Serve the deploy tools on the MCP endpoint (see [`deploy`]): deploy
+    /// records and uploads go under `{state_dir}/deploys`.
+    #[cfg(feature = "deploy")]
+    pub fn with_deploy(mut self, config: deploy::DeployConfig) -> Self {
+        self.deploy = Some(config);
+        self
     }
 
     /// The operational-files directory this instance uses — where imcp2 creates
@@ -263,9 +279,20 @@ impl McpServer {
     /// won't allow; for a root-mounted instance `.merge` this router instead
     /// and set `mcp_path: "".into()`.
     pub fn mcp_router(&self) -> Router {
-        let mcp_service = {
+        // Stateless + plain-JSON responses: our tools are pure
+        // request/response with no server-initiated messages, and this is
+        // the most compatible mode across MCP clients (ChatGPT's connector
+        // does not complete the stateful SSE/session handshake the rmcp
+        // defaults require). The one exception is a deploy call, which
+        // reports progress before its result (see [`deploy`]).
+        let transport = StreamableHttpServerConfig::default()
+            .with_stateful_mode(false)
+            .with_json_response(true)
+            .with_cancellation_token(self.ct.child_token())
+            .with_allowed_hosts(self.allowed_hosts());
+        let plain_mcp = || {
             let (agent, identities) = (self.agent.clone(), self.identities.clone());
-            StreamableHttpService::new(
+            Router::new().fallback_service(StreamableHttpService::new(
                 move || {
                     Ok(tools::IcTools::new(
                         agent.clone(),
@@ -277,18 +304,18 @@ impl McpServer {
                     ))
                 },
                 LocalSessionManager::default().into(),
-                // Stateless + plain-JSON responses: our tools are pure
-                // request/response with no server-initiated messages, and this
-                // is the most compatible mode across MCP clients (ChatGPT's
-                // connector does not complete the stateful SSE/session
-                // handshake the rmcp defaults require).
-                StreamableHttpServerConfig::default()
-                    .with_stateful_mode(false)
-                    .with_json_response(true)
-                    .with_cancellation_token(self.ct.child_token())
-                    .with_allowed_hosts(self.allowed_hosts()),
-            )
+                transport.clone(),
+            ))
         };
+        // With the deploy tools, the endpoint also has an open route next to
+        // the gated one: the bundle upload, authenticated by its ticket.
+        #[cfg(feature = "deploy")]
+        let (mcp_service, open_routes) = match &self.deploy {
+            Some(config) => self.deploy_mcp_routers(config, transport.clone()),
+            None => (plain_mcp(), Router::new()),
+        };
+        #[cfg(not(feature = "deploy"))]
+        let (mcp_service, open_routes) = (plain_mcp(), Router::new());
 
         // The MCP resource is gated by a bearer token issued after Internet
         // Identity login. Browser-based MCP clients (e.g. the Grok/ChatGPT
@@ -317,8 +344,7 @@ impl McpServer {
                 axum::http::header::WWW_AUTHENTICATE,
                 axum::http::HeaderName::from_static("mcp-session-id"),
             ]);
-        let gated_mcp = Router::new()
-            .fallback_service(mcp_service)
+        let gated_mcp = mcp_service
             .layer(middleware::from_fn_with_state(self.store.clone(), auth::require_token))
             .layer(mcp_cors);
 
@@ -361,6 +387,7 @@ impl McpServer {
             .nest("/oauth", oauth)
             .merge(oidc_alternate)
             .merge(branding)
+            .merge(open_routes)
             // Everything else is the MCP endpoint: the bare mount path, its
             // trailing-slash form, and any sub-path (the streamable service
             // dispatches on method, not path) — same breadth `nest_service`

@@ -44,15 +44,21 @@ fn public_url() -> String {
     std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
 }
 
-/// Directory imcp2 creates its operational files in (today: the persisted
-/// client-registration store). Set with `IMCP2_STATE_DIR`; defaults to the
-/// process's current working directory, so a bare local run keeps
-/// `oauth-clients.json` under the directory it was launched from, as before. The
-/// native deployment points it at the unit's `StateDirectory` (`/var/lib/imcp2`).
+/// Directory imcp2 creates its operational files in (the persisted
+/// client-registration store; with the `deploy` feature, deploy records and
+/// uploaded bundles). Set with `IMCP2_STATE_DIR`; defaults to the process's
+/// current working directory, so a bare local run keeps `oauth-clients.json`
+/// under the directory it was launched from, as before. The native deployment
+/// points it at the unit's `StateDirectory` (`/var/lib/imcp2`). A relative
+/// path is resolved against the working directory here, once: every path
+/// derived from it is absolute, which a deploy reading an uploaded bundle
+/// requires.
 fn state_dir() -> std::path::PathBuf {
-    std::env::var_os("IMCP2_STATE_DIR")
+    let dir = std::env::var_os("IMCP2_STATE_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    std::path::absolute(&dir)
+        .unwrap_or_else(|e| panic!("cannot resolve IMCP2_STATE_DIR '{}': {e}", dir.display()))
 }
 
 /// Whether to enforce strict RFC 8707 resource indicators: require a `resource`
@@ -67,6 +73,27 @@ fn require_resource() -> bool {
         Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
         Err(_) => true,
     }
+}
+
+/// The deploy tools' knobs, when this binary was built with the `deploy`
+/// feature: `$MCP_DEPLOY_MAX_CONCURRENT` deploys at once across sessions
+/// (default 2) and `$MCP_DEPLOY_MAX_UPLOAD_BYTES` per uploaded archive
+/// (default 64 MiB). A value that is not a whole number refuses to start.
+#[cfg(feature = "deploy")]
+fn deploy_config() -> anyhow::Result<imcp2::deploy::DeployConfig> {
+    let mut config = imcp2::deploy::DeployConfig::default();
+    if let Ok(v) = std::env::var("MCP_DEPLOY_MAX_CONCURRENT") {
+        config.concurrent = v
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("MCP_DEPLOY_MAX_CONCURRENT must be a count: {e}"))?;
+    }
+    if let Ok(v) = std::env::var("MCP_DEPLOY_MAX_UPLOAD_BYTES") {
+        config.max_upload_bytes = v.trim().parse().map_err(|e| {
+            anyhow::anyhow!("MCP_DEPLOY_MAX_UPLOAD_BYTES must be a byte count: {e}")
+        })?;
+    }
+    Ok(config)
 }
 
 /// Whether to also serve the beta Internet Identity instance at `/mcp-beta`.
@@ -309,6 +336,10 @@ async fn main() -> anyhow::Result<()> {
     // the operational directory.
     let clients = SharedClients::load(&state_dir);
 
+    // The deploy tools, on every instance, when built in.
+    #[cfg(feature = "deploy")]
+    let deploy = deploy_config()?;
+
     // Client ID Metadata Documents: on for every instance unless the deploy says no.
     let cimd_on = cimd_enabled();
     if !cimd_on {
@@ -328,6 +359,8 @@ async fn main() -> anyhow::Result<()> {
         require_resource: require_resource(),
         cimd_enabled: cimd_on,
     });
+    #[cfg(feature = "deploy")]
+    let prod = prod.with_deploy(deploy.clone());
     prod.spawn_session_reaper();
 
     // Beta Internet Identity at `/mcp-beta`: opt in via `$MCP_SERVE_BETA`, so
@@ -343,6 +376,8 @@ async fn main() -> anyhow::Result<()> {
             require_resource: require_resource(),
             cimd_enabled: cimd_on,
         });
+        #[cfg(feature = "deploy")]
+        let beta = beta.with_deploy(deploy.clone());
         beta.spawn_session_reaper();
         Some(beta)
     } else {
