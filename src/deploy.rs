@@ -37,8 +37,31 @@
 //! on the process, whose memory and disk they protect. It also bounds what
 //! the directory holds over time (see [`Deploys::new`] and
 //! [`Deploys::spawn_sweeper`]).
+//!
+//! An embedder turns the tools on with one call, and nothing else changes in
+//! how it serves or stops the server: everything it sets is a field of
+//! [`DeployConfig`] (no environment variable is read here), the sweeper
+//! starts with [`McpServer::spawn_session_reaper`], and
+//! [`McpServer::shutdown`] stops the deploys that are running.
+//!
+//! ```rust,no_run
+//! # fn with(config: imcp2::McpConfig) -> std::io::Result<imcp2::McpServer> {
+//! use imcp2::deploy::{DeployConfig, Deploys};
+//!
+//! let deploys = Deploys::new(&DeployConfig { concurrent: 1, ..Default::default() }, &config.state_dir)?;
+//! let server = imcp2::McpServer::new(config).with_deploy(deploys);
+//! server.spawn_session_reaper(); // the deploy sweeper with it
+//! # Ok(server) }
+//! ```
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -64,13 +87,14 @@ use crate::{auth, tools::IcTools, McpServer};
 #[derive(Clone, Debug)]
 pub struct DeployConfig {
     /// How many deploys run at once across every session (one per session
-    /// either way); past it a deploy is refused, not queued.
+    /// either way); past it a deploy is refused, not queued. At least one: a
+    /// zero is read as one.
     pub concurrent: usize,
     /// The cap on an uploaded archive, in bytes.
     pub max_upload_bytes: usize,
     /// The cap on every uploaded archive the server has at once — arriving,
     /// waiting for its deploy, or being deployed — in bytes; an upload past
-    /// it is refused. At least one archive's worth.
+    /// it is refused. At least one archive's worth: less is read as one.
     pub max_stored_upload_bytes: usize,
 }
 
@@ -115,6 +139,9 @@ pub struct Deploys {
     /// The lock on `dir` that makes this process its one owner; released
     /// when the last clone goes.
     _owned: Arc<std::fs::File>,
+    /// Whether the sweeper has been started: one per process, however many
+    /// instances ask for it.
+    sweeping: Arc<AtomicBool>,
 }
 
 /// The file in the deploy directory whose lock says a process owns it.
@@ -162,6 +189,7 @@ impl Deploys {
             dir,
             stopping: CancellationToken::new(),
             _owned: Arc::new(owned),
+            sweeping: Arc::default(),
         })
     }
 
@@ -188,6 +216,10 @@ impl Deploys {
     /// draining in-flight requests: a deploy lasts minutes, and a drain that
     /// waited one out would be cut short by whatever stops the process, the
     /// deploy with it and its answer unsent. Also ends the sweeper.
+    ///
+    /// [`McpServer::shutdown`] calls it as well, so a server that is shut
+    /// down leaves no deploy running whether or not its embedder drains; one
+    /// that does drain calls this first, for the answers to be sent.
     pub fn stop(&self) {
         self.stopping.cancel();
     }
@@ -197,7 +229,14 @@ impl Deploys {
     /// only when it is used), and so are the records of interrupted deploys
     /// older than [`DEPLOY_RECORD_TTL`]. Ends with [`Self::stop`]. Must be
     /// called from within a tokio runtime.
+    ///
+    /// [`McpServer::spawn_session_reaper`] calls it, so an embedder has no
+    /// second task to remember; the first call starts the one sweeper and
+    /// later ones (another instance on the same state) do nothing.
     pub fn spawn_sweeper(&self) {
+        if self.sweeping.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let this = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(SWEEP_EVERY);
@@ -711,6 +750,25 @@ mod tests {
         )
         .await;
         assert!(said.contains("restarting"), "{said}");
+    }
+
+    /// An embedder that only does what it did before the tools existed —
+    /// start the reaper, shut the server down — has the sweeper running,
+    /// once for the process, and its deploys stopped.
+    #[tokio::test]
+    async fn the_servers_own_lifecycle_runs_the_deploy_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let deploys = Deploys::new(&config(), dir.path()).unwrap();
+        let prod = server_in(dir.path(), "/mcp", deploys.clone());
+        let beta = server_in(dir.path(), "/mcp-beta", deploys.clone());
+        assert!(!deploys.sweeping.load(Ordering::SeqCst));
+        prod.spawn_session_reaper();
+        assert!(deploys.sweeping.load(Ordering::SeqCst), "the reaper starts the sweeper");
+        // A second instance on the same state starts no second sweeper.
+        beta.spawn_session_reaper();
+        assert!(!deploys.stopping.is_cancelled());
+        prod.shutdown();
+        assert!(deploys.stopping.is_cancelled(), "a shutdown stops the deploys");
     }
 
     /// What a start finds from the run before it: uploads nothing can deploy

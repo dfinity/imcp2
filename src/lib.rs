@@ -220,7 +220,9 @@ impl McpServer {
     /// Serve the deploy tools on the MCP endpoint (see [`deploy`]), on the
     /// process's deploy state: the same [`deploy::Deploys`] goes to every
     /// instance that serves them, made over this instance's state directory
-    /// (deploy records and uploads go under `{state_dir}/deploys`).
+    /// (deploy records and uploads go under `{state_dir}/deploys`). Nothing
+    /// else is asked of the embedder: [`Self::spawn_session_reaper`] and
+    /// [`Self::shutdown`] cover the deploy state too.
     #[cfg(feature = "deploy")]
     pub fn with_deploy(mut self, deploys: deploy::Deploys) -> Self {
         self.deploy = Some(deploys);
@@ -460,6 +462,12 @@ impl McpServer {
     /// Tied to [`Self::shutdown`] so the task stops cleanly on drain. Must be
     /// called from within a tokio runtime.
     pub fn spawn_session_reaper(&self) {
+        // The deploy tools' own periodic work rides the same call, so that
+        // turning them on adds nothing to what an embedder must run.
+        #[cfg(feature = "deploy")]
+        if let Some(deploys) = &self.deploy {
+            deploys.spawn_sweeper();
+        }
         let ids = self.identities.clone();
         let store = self.store.clone();
         let reap_ct = self.ct.child_token();
@@ -491,7 +499,18 @@ impl McpServer {
     /// Cancel the MCP transport's live sessions and the session reaper; call
     /// AFTER draining in-flight requests on graceful shutdown (cancelling
     /// first would cut the very requests the drain is waiting on).
+    ///
+    /// With the deploy tools on, this also stops the deploys that are
+    /// running and the deploy sweeper ([`deploy::Deploys::stop`]), on every
+    /// instance sharing that state: a process that is shutting one instance
+    /// down is stopping. A deploy lasts minutes, so a drain does not wait one
+    /// out — call [`deploy::Deploys::stop`] BEFORE the drain for each running
+    /// deploy to answer with what it created.
     pub fn shutdown(&self) {
+        #[cfg(feature = "deploy")]
+        if let Some(deploys) = &self.deploy {
+            deploys.stop();
+        }
         self.ct.cancel();
     }
 

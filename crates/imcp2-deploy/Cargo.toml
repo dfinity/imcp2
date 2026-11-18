@@ -5,13 +5,18 @@ edition = "2021"
 description = "The imcp2 `icp_deploy_bundle` tool: deploys an icp project bundle through the icp CLI's own project library."
 license = "Apache-2.0"
 repository = "https://github.com/dfinity/imcp2"
-# Not published. The deploy runs on `icp-project` and its siblings, which
-# bring wasmtime with them; this is its own crate rather than a module of
-# `imcp2-core` so that core does not carry that tree. `imcp2-local` composes
-# it always, the hosted `imcp2` behind its `deploy` feature. The icp CLI's
-# crates are on crates.io, so nothing upstream stops this one being published;
-# until it is, the published `imcp2` cannot carry the feature.
-publish = false
+homepage = "https://mcp.internetcomputer.org"
+keywords = ["mcp", "internet-computer", "icp", "deploy"]
+categories = ["network-programming", "api-bindings"]
+# The deploy runs on `icp-project` and its siblings, which bring wasmtime with
+# them; this is its own crate rather than a module of `imcp2-core` so that
+# core does not carry that tree. `imcp2-local` composes it always, the hosted
+# `imcp2` behind its `deploy` feature.
+#
+# Published for that feature's sake, not to be used on its own: a crate on
+# crates.io can only depend on crates that are there too, and an embedder of
+# `imcp2` (the gateway) takes it from the registry. It releases in lockstep
+# with the other crates (publish-crate.yml).
 
 [dependencies]
 # The session engine (which Internet Identity session a call acts as, and

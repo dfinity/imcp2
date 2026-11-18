@@ -630,8 +630,16 @@ What the hosted composition adds to the local one:
   `RUST_LOG=info` shows all of it.
 
 The feature is off in the default build and on in the native deployment's
-(`deploy/native/build.sh`). `imcp2-deploy` is not published to crates.io, so
-the published `imcp2` crate cannot carry the feature until it is.
+(`deploy/native/build.sh`). An application that embeds the published `imcp2`
+crate turns it on the same way (`features = ["deploy"]`), and `imcp2-deploy`
+comes from crates.io with it. Nothing here is read from the environment by the
+library: the `$MCP_DEPLOY_*` variables above are the bundled binary's, which
+maps them onto `imcp2::deploy::DeployConfig`, and an embedder sets that
+struct's fields from its own configuration. The rest is one call —
+`McpServer::with_deploy(Deploys::new(&config, &state_dir))` — since
+`spawn_session_reaper` starts the deploy sweeper and `shutdown` stops the
+running deploys; an embedder that drains in-flight requests calls
+`Deploys::stop` before the drain, as the bundled binary does.
 
 ## Connect from an MCP client
 

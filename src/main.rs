@@ -391,13 +391,10 @@ async fn main() -> anyhow::Result<()> {
 
     // The deploy tools, on every instance, when built in: one set of slots
     // and one upload store for the process, so the caps hold across the
-    // instances. Making it clears what the run before left behind.
+    // instances. Making it clears what the run before left behind; its
+    // sweeper starts with the first instance's session reaper.
     #[cfg(feature = "deploy")]
-    let deploys = {
-        let deploys = imcp2::deploy::Deploys::new(&deploy_config()?, &state_dir)?;
-        deploys.spawn_sweeper();
-        deploys
-    };
+    let deploys = imcp2::deploy::Deploys::new(&deploy_config()?, &state_dir)?;
 
     // Client ID Metadata Documents: on for every instance unless the deploy says no.
     let cimd_on = cimd_enabled();

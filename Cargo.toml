@@ -46,6 +46,7 @@ dist = false
 [workspace.dependencies]
 httpdate = "1.0.3"
 imcp2-core = { path = "crates/imcp2-core", version = "0.6.1" }
+imcp2-deploy = { path = "crates/imcp2-deploy", version = "0.6.1" }
 rmcp = "2.1"
 axum = "0.8"
 anyhow = "1"
@@ -106,10 +107,10 @@ tokio-util = { version = "0.7", features = ["io"] }
 uuid = { workspace = true }
 tower-http = { version = "0.7", features = ["cors"] }
 # The deploy tools on the hosted server (src/deploy.rs), behind the `deploy`
-# feature. imcp2-deploy is not published, so the published `imcp2` cannot
-# carry the feature until it is; a release build with the feature is a
-# deployment's choice.
-imcp2-deploy = { path = "crates/imcp2-deploy", optional = true }
+# feature. Named by version as well as by path (the workspace pin), which is
+# what lets the published `imcp2` carry the feature: an embedder turns it on
+# and takes imcp2-deploy from crates.io.
+imcp2-deploy = { workspace = true, optional = true }
 # The deploy endpoint: streamed bodies (the upload, the watched event stream).
 futures-util = "0.3"
 http-body-util = "0.1"
