@@ -99,7 +99,10 @@ carry the archive itself. Upload it first:
    minutes, and the exact `curl` command to run.
 2. Run that command with the archive's path in place of `<bundle.tar.gz>`.
    It `PUT`s the archive to the server and prints a JSON answer whose
-   `upload_id` names the upload, held for a quarter of an hour.
+   `upload_id` names the upload, held for a quarter of an hour. One upload
+   at a time: a new one replaces the one before it, so upload again only to
+   replace. A server that answers that it is full is holding other users'
+   bundles: ask for a new ticket and try again in a few minutes.
 3. Pass that id to `icp_deploy_bundle` as `bundle_upload`, in place of
    `bundle_path`.
 
@@ -206,9 +209,11 @@ created and their ids.
    deploying for others: try again in a few minutes.
 8. **A call that never returned.** Cancelling the call, or losing the
    connection, interrupts the deploy at its next step; a canister call
-   already in flight completes on the network. If the server stopped
-   mid-deploy, or you cancelled and never read the answer, the canisters it
-   created are not lost: the deploy's working directory is kept — on the
+   already in flight completes on the network. A server that restarts
+   interrupts the deploy the same way and still answers: the result's
+   `canister_ids` holds what was created, so do step 3 with it and deploy
+   again. If the server stopped mid-deploy, or you cancelled and never read
+   the answer, the canisters it created are not lost: the deploy's working directory is kept — on the
    local server under the user's local data directory
    (`~/.local/share/imcp2-local/deploys/` on Linux,
    `~/Library/Application Support/imcp2-local/deploys/` on macOS,

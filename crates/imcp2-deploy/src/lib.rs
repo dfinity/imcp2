@@ -30,14 +30,19 @@
 //! canisters. The second call is refused, not queued, since its mapping would
 //! be stale by the time it ran. A server also caps how many deploys run at
 //! once across every session ([`IcDeployTools::concurrent`]; one, unless it
-//! says otherwise), and refuses rather than queues past the cap. A deploy's
+//! says otherwise), and refuses rather than queues past the cap; a process
+//! serving the tools at more than one endpoint gives them one set of slots
+//! ([`DeploySlots`]), so the cap is the process's. A deploy's
 //! working directory is kept under the directory the embedder names until the
 //! outcome is assembled, so a call cut off mid-deploy leaves the ids it
 //! created on disk.
 //!
 //! A deploy lasts as long as it lasts: the call reports each phase to the
 //! client as it completes and is interrupted by the client cancelling the
-//! request or, on the hosted server, going away ([`ClientGone`]).
+//! request, by the server saying it is stopping
+//! ([`IcDeployTools::stopped_by`]) or, on the hosted server, by the client
+//! going away ([`ClientGone`]). Interrupted, it still answers, with every
+//! canister it had created.
 //!
 //! A server takes the bundle one way. One on the project's machine — the
 //! local server — reads it at the path the agent names (`bundle_path`). One
@@ -89,13 +94,14 @@ mod server;
 mod uploads;
 
 pub use deploy::{
-    deploy_bundle, BundleSource, DeployOutcome, DeployRequest, RequestError, Status, Watch,
+    deploy_bundle, prune_abandoned_deploys, remove_old_deploy_records, BundleSource, DeployOutcome,
+    DeployRequest, RequestError, Status, Watch,
 };
 use identity::RefreshingIdentity;
 pub use server::WithDeploy;
 pub use uploads::{
-    ReceiveError, Received, Uploads, DEFAULT_MAX_UPLOAD_BYTES, TICKET_HEADER, TICKET_TTL,
-    UPLOAD_TTL,
+    ReceiveError, Received, Uploads, DEFAULT_MAX_UPLOAD_BYTES, DEFAULT_STORED_UPLOADS,
+    TICKET_HEADER, TICKET_TTL, UPLOAD_TTL,
 };
 
 /// The name of the deploy tool.
@@ -391,7 +397,9 @@ pub struct IcDeployTools {
     session: SessionResolver,
     /// The deploys running: one slot per deploy the server allows at once,
     /// and the sessions holding one.
-    slots: Slots,
+    slots: DeploySlots,
+    /// Cancelled when the server begins to stop; see [`Self::stopped_by`].
+    stopping: Option<CancellationToken>,
     /// Where each deploy's working directory is made; see
     /// [`DeployRequest::workdir`].
     deploys_dir: Option<Utf8PathBuf>,
@@ -401,15 +409,26 @@ pub struct IcDeployTools {
     uploads: Option<(Uploads, String)>,
 }
 
-/// How many deploys a server runs at once, and for whom.
+/// How many deploys a server runs at once, and for whom. A clone is the same
+/// slots: a process that serves the deploy tools at more than one endpoint
+/// makes one of these and hands it to each ([`IcDeployTools::with_slots`]),
+/// so the cap is on the process, which is what the memory behind it is.
 #[derive(Clone)]
-struct Slots {
+pub struct DeploySlots {
     /// One permit per deploy the server runs at once.
     free: Arc<tokio::sync::Semaphore>,
     /// How many there are in all, for the wording of the refusal.
     total: usize,
     /// The sessions with a deploy running: one each.
     sessions: Arc<Mutex<HashSet<String>>>,
+}
+
+impl DeploySlots {
+    /// Slots for `n` deploys at once (at least one), one per session.
+    pub fn new(n: usize) -> Self {
+        let n = n.max(1);
+        Self { free: Arc::new(tokio::sync::Semaphore::new(n)), total: n, sessions: Arc::default() }
+    }
 }
 
 /// A running deploy's claim on the server: a slot, and the session's one
@@ -457,11 +476,8 @@ impl IcDeployTools {
         Self {
             identities,
             session,
-            slots: Slots {
-                free: Arc::new(tokio::sync::Semaphore::new(1)),
-                total: 1,
-                sessions: Arc::default(),
-            },
+            slots: DeploySlots::new(1),
+            stopping: None,
             deploys_dir: None,
             uploads: None,
         }
@@ -470,10 +486,26 @@ impl IcDeployTools {
     /// Run up to `n` deploys at once across sessions (one per session either
     /// way); the default is one. Past the cap a deploy is refused, not
     /// queued. `n` is at least one.
-    pub fn concurrent(mut self, n: usize) -> Self {
-        let n = n.max(1);
-        self.slots.free = Arc::new(tokio::sync::Semaphore::new(n));
-        self.slots.total = n;
+    pub fn concurrent(self, n: usize) -> Self {
+        self.with_slots(DeploySlots::new(n))
+    }
+
+    /// Run deploys in `slots`, which other servers of the process may hold
+    /// too: the cap, and the one deploy per session, are then across all of
+    /// them.
+    pub fn with_slots(mut self, slots: DeploySlots) -> Self {
+        self.slots = slots;
+        self
+    }
+
+    /// Interrupt the deploys running when `stopping` is cancelled, and refuse
+    /// to begin one after: for a server to cancel as it starts shutting
+    /// down, before it waits for its requests to finish. A deploy lasts
+    /// minutes, longer than a server is given to stop, and one killed
+    /// mid-run answers nothing; interrupted, it stops at its next step and
+    /// returns the canisters it had created, as any interrupted deploy does.
+    pub fn stopped_by(mut self, stopping: CancellationToken) -> Self {
+        self.stopping = Some(stopping);
         self
     }
 
@@ -561,6 +593,12 @@ impl IcDeployTools {
         Parameters(args): Parameters<DeployBundleArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        // A server on its way out begins nothing it would have to interrupt.
+        if self.stopping.as_ref().is_some_and(|s| s.is_cancelled()) {
+            return Ok(err("this server is restarting; nothing was deployed. Try again in a \
+                           minute, with the same bundle and mapping"
+                .into()));
+        }
         // So many deploys at a time, and the refusal reads nothing: it comes
         // even before who is asking.
         let Some(mut claim) = self.claim() else {
@@ -626,9 +664,9 @@ impl IcDeployTools {
         let forwarder =
             tokio::spawn(forward_lines(ctx.peer.clone(), ctx.meta.get_progress_token(), receiver));
         // The stop: the client cancelling the request, or (on a server that
-        // says so) going away.
+        // says so) going away, or the server itself stopping.
         let stop = ctx.ct.child_token();
-        let _link = link_client_gone(&ctx, stop.clone());
+        let _link = link_stops(client_gone(&ctx).into_iter().chain(self.stopping.clone()), &stop);
         let watch = Watch { stop, lines: Some(lines) };
         let result = deploy_bundle(identity, request, watch).instrument(span.clone()).await;
         // The sender went with the run; the forwarder ends once it has
@@ -743,27 +781,32 @@ impl IcDeployTools {
     }
 }
 
-/// Tie `stop` to the transport's [`ClientGone`] token when the request carries
-/// one, for as long as the returned guard lives: the deploy stops when the
-/// client goes, and the tie is undone when the deploy returns.
-fn link_client_gone(
-    ctx: &RequestContext<RoleServer>,
-    stop: CancellationToken,
-) -> Option<tokio_util::sync::DropGuard> {
-    let gone = ctx
-        .extensions
+/// The transport's [`ClientGone`] token, when the request carries one.
+fn client_gone(ctx: &RequestContext<RoleServer>) -> Option<CancellationToken> {
+    ctx.extensions
         .get::<http::request::Parts>()
         .and_then(|parts| parts.extensions.get::<ClientGone>())
-        .map(|g| g.0.clone())?;
+        .map(|gone| gone.0.clone())
+}
+
+/// Tie `stop` to each of `sources` for as long as the returned guard lives:
+/// the deploy stops when any of them is cancelled, and the ties are undone
+/// when the deploy returns.
+fn link_stops(
+    sources: impl Iterator<Item = CancellationToken>,
+    stop: &CancellationToken,
+) -> tokio_util::sync::DropGuard {
     let done = CancellationToken::new();
-    let watched = done.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = gone.cancelled() => stop.cancel(),
-            _ = watched.cancelled() => {}
-        }
-    });
-    Some(done.drop_guard())
+    for source in sources {
+        let (stop, done) = (stop.clone(), done.clone());
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = source.cancelled() => stop.cancel(),
+                _ = done.cancelled() => {}
+            }
+        });
+    }
+    done.drop_guard()
 }
 
 /// What `icp_deploy_upload` returns.
@@ -1038,6 +1081,46 @@ mod tests {
             assert!(schema["properties"][unlisted].is_null(), "{schema}");
             assert!(schema["properties"]["environment"].is_object(), "{schema}");
         }
+    }
+
+    // Two servers of one process — the hosted binary's two endpoints — on
+    // one set of slots: the cap is across both, and so is the one deploy a
+    // session runs.
+    #[test]
+    fn servers_sharing_slots_share_the_cap_and_the_sessions() {
+        let slots = DeploySlots::new(2);
+        let (one, other) = (tools().with_slots(slots.clone()), tools().with_slots(slots));
+        assert_eq!((one.concurrency(), other.concurrency()), (2, 2));
+        let mut first = one.claim().expect("a slot");
+        let mut second = other.claim().expect("the other slot");
+        assert!(one.claim().is_none() && other.claim().is_none(), "two in all, not two each");
+        first.for_session("s").unwrap();
+        assert!(second.for_session("s").is_err(), "one deploy per session, on either server");
+        drop(first);
+        assert!(other.claim().is_some(), "a slot freed on one is free on the other");
+        second.for_session("s").unwrap();
+    }
+
+    // The deploy's stop follows whichever of its sources goes first, and
+    // stops following once the deploy has returned.
+    #[tokio::test]
+    async fn a_deploy_is_stopped_by_any_of_its_sources_until_it_returns() {
+        let (gone, stopping) = (CancellationToken::new(), CancellationToken::new());
+        let stop = CancellationToken::new();
+        let link = link_stops([gone.clone(), stopping.clone()].into_iter(), &stop);
+        tokio::task::yield_now().await;
+        assert!(!stop.is_cancelled());
+        stopping.cancel();
+        stop.cancelled().await;
+        drop(link);
+
+        let (gone, stop) = (CancellationToken::new(), CancellationToken::new());
+        let link = link_stops(std::iter::once(gone.clone()), &stop);
+        drop(link);
+        tokio::task::yield_now().await;
+        gone.cancel();
+        tokio::task::yield_now().await;
+        assert!(!stop.is_cancelled(), "a returned deploy's stop is left alone");
     }
 
     // A relative deploy directory (a server started with a relative state

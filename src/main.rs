@@ -82,21 +82,54 @@ fn require_resource() -> bool {
 }
 
 /// The deploy tools' knobs, when this binary was built with the `deploy`
-/// feature: `$MCP_DEPLOY_MAX_CONCURRENT` deploys at once across sessions
-/// (default 2) and `$MCP_DEPLOY_MAX_UPLOAD_BYTES` per uploaded archive
-/// (default 64 MiB). A value that is not a whole number refuses to start, and
-/// so does a count of zero: the tools run at least one deploy, so a zero would
-/// be a cap the server then exceeds.
+/// feature: `$MCP_DEPLOY_MAX_CONCURRENT` deploys at once across sessions and
+/// endpoints (default 2), `$MCP_DEPLOY_MAX_UPLOAD_BYTES` per uploaded archive
+/// (default 64 MiB), and `$MCP_DEPLOY_MAX_STORED_UPLOAD_BYTES` for every
+/// uploaded archive the server has at once (default eight archives' worth).
+/// A value that is not a whole number refuses to start, and so does a count
+/// of zero — the tools run at least one deploy, so a zero would be a cap the
+/// server then exceeds — and a store too small for one archive.
 #[cfg(feature = "deploy")]
 fn deploy_config() -> anyhow::Result<imcp2::deploy::DeployConfig> {
-    let mut config = imcp2::deploy::DeployConfig::default();
-    if let Ok(v) = std::env::var("MCP_DEPLOY_MAX_CONCURRENT") {
-        config.concurrent = deploy_concurrency(&v)?;
+    let var = |name: &str| std::env::var(name).ok();
+    deploy_config_from(
+        var("MCP_DEPLOY_MAX_CONCURRENT").as_deref(),
+        var("MCP_DEPLOY_MAX_UPLOAD_BYTES").as_deref(),
+        var("MCP_DEPLOY_MAX_STORED_UPLOAD_BYTES").as_deref(),
+    )
+}
+
+#[cfg(feature = "deploy")]
+fn deploy_config_from(
+    concurrent: Option<&str>,
+    max_upload_bytes: Option<&str>,
+    max_stored_upload_bytes: Option<&str>,
+) -> anyhow::Result<imcp2::deploy::DeployConfig> {
+    use imcp2::deploy::DeployConfig;
+    let bytes = |name: &str, value: &str| {
+        value
+            .trim()
+            .parse::<usize>()
+            .map_err(|e| anyhow::anyhow!("{name} must be a byte count: {e}"))
+    };
+    // The store's default follows the archive cap, so raising one alone
+    // leaves a store that still takes several.
+    let mut config = match max_upload_bytes {
+        Some(v) => DeployConfig::with_max_upload_bytes(bytes("MCP_DEPLOY_MAX_UPLOAD_BYTES", v)?),
+        None => DeployConfig::default(),
+    };
+    if let Some(v) = concurrent {
+        config.concurrent = deploy_concurrency(v)?;
     }
-    if let Ok(v) = std::env::var("MCP_DEPLOY_MAX_UPLOAD_BYTES") {
-        config.max_upload_bytes = v.trim().parse().map_err(|e| {
-            anyhow::anyhow!("MCP_DEPLOY_MAX_UPLOAD_BYTES must be a byte count: {e}")
-        })?;
+    if let Some(v) = max_stored_upload_bytes {
+        config.max_stored_upload_bytes = bytes("MCP_DEPLOY_MAX_STORED_UPLOAD_BYTES", v)?;
+        anyhow::ensure!(
+            config.max_stored_upload_bytes >= config.max_upload_bytes,
+            "MCP_DEPLOY_MAX_STORED_UPLOAD_BYTES ({}) must be at least \
+             MCP_DEPLOY_MAX_UPLOAD_BYTES ({}): a store smaller than one archive takes none",
+            config.max_stored_upload_bytes,
+            config.max_upload_bytes
+        );
     }
     Ok(config)
 }
@@ -356,9 +389,15 @@ async fn main() -> anyhow::Result<()> {
     // the operational directory.
     let clients = SharedClients::load(&state_dir);
 
-    // The deploy tools, on every instance, when built in.
+    // The deploy tools, on every instance, when built in: one set of slots
+    // and one upload store for the process, so the caps hold across the
+    // instances. Making it clears what the run before left behind.
     #[cfg(feature = "deploy")]
-    let deploy = deploy_config()?;
+    let deploys = {
+        let deploys = imcp2::deploy::Deploys::new(&deploy_config()?, &state_dir);
+        deploys.spawn_sweeper();
+        deploys
+    };
 
     // Client ID Metadata Documents: on for every instance unless the deploy says no.
     let cimd_on = cimd_enabled();
@@ -380,7 +419,7 @@ async fn main() -> anyhow::Result<()> {
         cimd_enabled: cimd_on,
     });
     #[cfg(feature = "deploy")]
-    let prod = prod.with_deploy(deploy.clone());
+    let prod = prod.with_deploy(deploys.clone());
     prod.spawn_session_reaper();
 
     // Beta Internet Identity at `/mcp-beta`: opt in via `$MCP_SERVE_BETA`, so
@@ -397,7 +436,7 @@ async fn main() -> anyhow::Result<()> {
             cimd_enabled: cimd_on,
         });
         #[cfg(feature = "deploy")]
-        let beta = beta.with_deploy(deploy.clone());
+        let beta = beta.with_deploy(deploys.clone());
         beta.spawn_session_reaper();
         Some(beta)
     } else {
@@ -574,7 +613,18 @@ async fn main() -> anyhow::Result<()> {
     // serve error (accept failure, etc.) still cancels the tokens before the
     // error propagates. (Stateless, no long-lived SSE, so there's nothing for
     // the tokens to cut post-drain.)
-    let serve_result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await;
+    //
+    // The one request a drain cannot wait out is a deploy: it lasts minutes,
+    // and the unit is given seconds to stop (`TimeoutStopSec`). So deploys
+    // are told to stop when the signal arrives, before the drain: each ends
+    // at its next step and answers with the canisters it had created, and
+    // the drain then waits for that answer like any other response.
+    let stopping = async move {
+        shutdown_signal().await;
+        #[cfg(feature = "deploy")]
+        deploys.stop();
+    };
+    let serve_result = axum::serve(listener, app).with_graceful_shutdown(stopping).await;
     prod.shutdown();
     if let Some(beta) = &beta {
         beta.shutdown();
@@ -639,6 +689,24 @@ mod tests {
         let relative = super::resolve_state_dir(Some("state".into()));
         assert!(relative.is_absolute(), "{}", relative.display());
         assert!(relative.ends_with("state"), "{}", relative.display());
+    }
+
+    /// The store's cap follows the archive's unless it is set, and a store
+    /// smaller than one archive is refused.
+    #[cfg(feature = "deploy")]
+    #[test]
+    fn the_upload_store_holds_several_archives_unless_told_otherwise() {
+        let config = super::deploy_config_from(None, None, None).unwrap();
+        assert_eq!(config.concurrent, 2);
+        assert_eq!(config.max_stored_upload_bytes, 8 * config.max_upload_bytes);
+        let config = super::deploy_config_from(Some("3"), Some("1000"), None).unwrap();
+        assert_eq!((config.concurrent, config.max_upload_bytes), (3, 1000));
+        assert_eq!(config.max_stored_upload_bytes, 8000);
+        let config = super::deploy_config_from(None, Some("1000"), Some("1000")).unwrap();
+        assert_eq!(config.max_stored_upload_bytes, 1000);
+        let small = super::deploy_config_from(None, Some("1000"), Some("999")).unwrap_err();
+        assert!(small.to_string().contains("at least"), "{small}");
+        assert!(super::deploy_config_from(None, Some("lots"), None).is_err());
     }
 
     /// The deploy cap is a count of at least one: zero is refused at startup

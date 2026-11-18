@@ -175,7 +175,7 @@ pub struct McpServer {
     /// The deploy tools, when a deployment turns them on (see
     /// [`Self::with_deploy`]).
     #[cfg(feature = "deploy")]
-    deploy: Option<deploy::DeployConfig>,
+    deploy: Option<deploy::Deploys>,
     /// Cancels the streamable-HTTP sessions and the session reaper on
     /// [`Self::shutdown`].
     ct: CancellationToken,
@@ -217,11 +217,13 @@ impl McpServer {
         }
     }
 
-    /// Serve the deploy tools on the MCP endpoint (see [`deploy`]): deploy
-    /// records and uploads go under `{state_dir}/deploys`.
+    /// Serve the deploy tools on the MCP endpoint (see [`deploy`]), on the
+    /// process's deploy state: the same [`deploy::Deploys`] goes to every
+    /// instance that serves them, made over this instance's state directory
+    /// (deploy records and uploads go under `{state_dir}/deploys`).
     #[cfg(feature = "deploy")]
-    pub fn with_deploy(mut self, config: deploy::DeployConfig) -> Self {
-        self.deploy = Some(config);
+    pub fn with_deploy(mut self, deploys: deploy::Deploys) -> Self {
+        self.deploy = Some(deploys);
         self
     }
 
@@ -311,7 +313,7 @@ impl McpServer {
         // the gated one: the bundle upload, authenticated by its ticket.
         #[cfg(feature = "deploy")]
         let (mcp_service, open_routes) = match &self.deploy {
-            Some(config) => self.deploy_mcp_routers(config, transport.clone()),
+            Some(deploys) => self.deploy_mcp_routers(deploys, transport.clone()),
             None => (plain_mcp(), Router::new()),
         };
         #[cfg(not(feature = "deploy"))]

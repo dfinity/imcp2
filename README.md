@@ -568,7 +568,13 @@ What the hosted composition adds to the local one:
   stays out of proxy logs. The route is outside the bearer gate — the ticket is
   its authentication — and streams the body to disk under
   `$MCP_DEPLOY_MAX_UPLOAD_BYTES`, refusing a declared length over it unread. An
-  upload is held fifteen minutes for its deploy, and removed with it. The
+  upload is held fifteen minutes for its deploy, and removed with it. A
+  session has one upload at a time — a `PUT` while another of its own is
+  arriving is refused (409), and one that begins replaces the archive the
+  session was holding — and every archive the server has, arriving, held or
+  being deployed, counts against `$MCP_DEPLOY_MAX_STORED_UPLOAD_BYTES`
+  (default eight archives' worth), reserved before the body is read; past it
+  a `PUT` is refused (507). A `PUT` abandoned mid-body leaves nothing. The
   upload is the only way in: `icp_deploy_bundle` lists `bundle_upload` here and
   refuses the local server's `bundle_path`, so this server opens no file a
   caller names.
@@ -583,12 +589,24 @@ What the hosted composition adds to the local one:
 - **A client that goes away stops its deploy.** The event stream's body is
   wrapped so that its drop — the client disconnecting — cancels a token the
   deploy watches; the deploy stops at its next step, and its working directory
-  stays under `{state_dir}/deploys` with the ids it recorded, for an operator
-  to hand the user.
+  stays under `{state_dir}/deploys`, cut down to the ids it recorded
+  (`.icp/data/mappings/<environment>.ids.json`), for an operator to hand the
+  user. A client that goes away while the bundle is still being extracted and
+  checked stops the deploy there, before anything is created.
+- **A server that is stopping interrupts its deploys.** A deploy lasts
+  minutes and a restart gives the process seconds, so on the shutdown signal
+  every running deploy is told to stop before the drain begins: it ends at
+  its next step and answers with the canisters it had created, the drain
+  waits for that answer, and a deploy asked for meanwhile is refused.
 - **Bounds.** One deploy per session and `$MCP_DEPLOY_MAX_CONCURRENT` across
-  sessions, refused past the cap rather than queued. Each deploy's directory is
-  made under `{state_dir}/deploys`, readable by the server's user alone, and
-  removed when the deploy returns. The archive and what it unpacks are bounded
+  sessions and endpoints (the slots are the process's, shared by `/mcp` and
+  `/mcp-beta`), refused past the cap rather than queued. Each deploy's
+  directory is made under `{state_dir}/deploys`, readable by the server's user
+  alone, and removed when the deploy returns. What an interruption or a
+  killed process leaves there is bounded too: a start removes the uploads of
+  the run before and cuts each cut-off deploy's directory down to its ids,
+  and a sweep every minute removes lapsed uploads and id records older than
+  seven days. The archive and what it unpacks are bounded
   by the `imcp2-deploy` host (archive, extracted bytes, entries, module sizes),
   and its sync plugins run in WASI with read-only access to their own deploy
   directory and no network.
@@ -633,8 +651,10 @@ cargo run
 # $MCP_SERVE_BETA (set it to also serve the beta II instance at /mcp-beta, for staging),
 # and $MCP_SERVE_METRICS (set it to serve the Prometheus exposition at /metrics).
 # Built with `--features deploy` it also serves the deploy tools, with
-# $MCP_DEPLOY_MAX_CONCURRENT deploys at once (default 2) and uploads of at most
-# $MCP_DEPLOY_MAX_UPLOAD_BYTES (default 64 MiB); see "Deploying a project bundle".
+# $MCP_DEPLOY_MAX_CONCURRENT deploys at once (default 2), uploads of at most
+# $MCP_DEPLOY_MAX_UPLOAD_BYTES (default 64 MiB) and
+# $MCP_DEPLOY_MAX_STORED_UPLOAD_BYTES of them in all (default eight times that);
+# see "Deploying a project bundle".
 ```
 
 The human-facing pages — the landing page and the `/privacy-policy`,

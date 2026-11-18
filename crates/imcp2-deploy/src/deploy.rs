@@ -83,11 +83,13 @@ pub struct DeployRequest {
     /// Skip the Candid interface compatibility check on upgrades.
     pub skip_candid_check: bool,
     /// Where the deploy's working directory is made (the system temporary
-    /// directory when `None`). A run that returns removes it; a run that is
-    /// cut off — the server stopped mid-deploy, the call cancelled — leaves
-    /// it, and with it `.icp/data/mappings/<environment>.ids.json`, which
-    /// records every canister the deploy created, so a caller who never got
-    /// the answer can recover the ids instead of creating a second set.
+    /// directory when `None`). A run that finishes or fails removes it. One
+    /// that is interrupted leaves it, cut down to its record
+    /// (`.icp/data/mappings/<environment>.ids.json`, every canister the
+    /// deploy created), so a caller who never got the answer can recover the
+    /// ids instead of creating a second set; the bundle's own files, which
+    /// the caller still has, go. One cut off with the process leaves it
+    /// whole, for [`prune_abandoned_deploys`] to cut down at the next start.
     pub workdir: Option<Utf8PathBuf>,
 }
 
@@ -98,7 +100,9 @@ pub struct Watch {
     /// Cancelled to interrupt the deploy. The run stops at its next step
     /// (a canister call already in flight completes on the network), and
     /// the outcome reports [`Status::Interrupted`] with everything that
-    /// landed before the stop.
+    /// landed before the stop. Cancelled while the bundle is still being
+    /// read and checked — before anything was created — there is no outcome,
+    /// only the refusal that says so.
     pub stop: CancellationToken,
     /// Receives each log line as the run produces it, before the outcome
     /// collects them all; `None` keeps them for the outcome alone. A
@@ -200,6 +204,18 @@ pub async fn deploy_bundle(
             request.mode
         )));
     }
+    // Nobody to deploy for, nothing read: the bundle's extraction, the
+    // project's loading and the bundle's checking each do up to a gigabyte
+    // of work, so the stop is looked at before each of them.
+    let stopped = || match watch.stop.is_cancelled() {
+        true => Err(RequestError(
+            "the deploy was interrupted before it began (the call was cancelled, the client \
+             went away, or the server is stopping); nothing was created"
+                .into(),
+        )),
+        false => Ok(()),
+    };
+    stopped()?;
     let bytes = match request.bundle {
         BundleSource::Bytes(bytes) => bytes,
         BundleSource::Path(path) => read_bundle_file(&path, host::MAX_BUNDLE_BYTES).await?,
@@ -219,6 +235,7 @@ pub async fn deploy_bundle(
         }
         None => std::env::temp_dir(),
     };
+    stopped()?;
     let scratch = deploy_directory(&parent)
         .map_err(|e| RequestError(format!("cannot create a scratch directory: {e}")))?;
     let dir = Utf8PathBuf::from_path_buf(scratch.path().to_path_buf()).map_err(|p| {
@@ -238,6 +255,7 @@ pub async fn deploy_bundle(
         (scratch, fs.map_err(RequestError)?)
     };
 
+    stopped()?;
     let host = host::host_for(fs.clone());
     // The load is where the untrusted rule holds (a script step, a module or
     // plugin fetched from a URL or not a regular file under the root, a
@@ -254,6 +272,7 @@ pub async fn deploy_bundle(
             .map_err(|e| RequestError(format!("project load panicked: {e}")))?
             .map_err(|e| RequestError(error_chain(&e)))?;
     }
+    stopped()?;
     let selection = EnvironmentSelection::Named(request.environment.clone());
     let env = host.get_environment(&selection).await.map_err(|e| RequestError(error_chain(&e)))?;
     // Before any phase runs: a bundle that is not one — a wasm that is
@@ -277,6 +296,8 @@ pub async fn deploy_bundle(
         .map_err(|e| RequestError(format!("bundle check panicked: {e}")))?
         .map_err(RequestError)?;
     }
+
+    stopped()?;
 
     // Seed the id store with the mapping the caller passed: from here on the
     // operation sees those canisters as existing, exactly as it would see the
@@ -405,8 +426,9 @@ pub async fn deploy_bundle(
     // The outcome carries everything the directory recorded; the directory
     // has done its job. Not after an interruption: the one who asked for it
     // may be a client that went away and will never read this outcome, so
-    // the directory stays as the record, as it does for a run that is cut
-    // off (see [`DeployRequest::workdir`]).
+    // the directory stays as the record — cut down to it, since the bundle's
+    // files are the caller's to send again and a directory per interrupted
+    // run would otherwise hold a bundle each (see [`DeployRequest::workdir`]).
     drop(host);
     match &outcome.error {
         None => tracing::info!(
@@ -422,6 +444,11 @@ pub async fn deploy_bundle(
         ),
     }
     if outcome.status == Status::Interrupted {
+        let pruning = workdir.clone();
+        let pruned = tokio::task::spawn_blocking(move || prune_to_record(&pruning)).await;
+        if let Ok(Err(e)) = &pruned {
+            tracing::warn!(dir = %workdir.display(), %e, "could not cut the directory down");
+        }
         let line = format!(
             "interrupted; the deploy directory '{}' is kept, with the ids it recorded",
             workdir.display()
@@ -587,13 +614,99 @@ fn describe(task: &Task) -> String {
     }
 }
 
+/// What every deploy directory's name starts with.
+const DEPLOY_DIR_PREFIX: &str = "imcp2-deploy-";
+
+/// The path, inside a deploy directory, of the record a cut-off deploy
+/// leaves: the id mappings, one file per environment.
+const RECORD_PATH: [&str; 3] = [".icp", "data", "mappings"];
+
+/// Cut a deploy directory down to its record: everything goes but
+/// `.icp/data/mappings`, the ids the deploy created. The bundle's files, the
+/// build scratch and the artifact store are most of a directory and none of
+/// what a retry needs.
+fn prune_to_record(workdir: &std::path::Path) -> std::io::Result<()> {
+    let mut dir = workdir.to_path_buf();
+    for keep in RECORD_PATH {
+        for entry in std::fs::read_dir(&dir)?.flatten() {
+            if entry.file_name() == keep {
+                continue;
+            }
+            // A link is removed, never followed.
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            let path = entry.path();
+            if is_dir {
+                std::fs::remove_dir_all(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+        }
+        dir.push(keep);
+        if !dir.is_dir() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// The deploy directories under `parent`: those [`deploy_directory`] named.
+fn deploy_directories(parent: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with(DEPLOY_DIR_PREFIX)))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect()
+}
+
+/// Cut every deploy directory under `parent` down to its record (see
+/// [`DeployRequest::workdir`]), and say how many there were. For a server to
+/// call as it starts, before it runs a deploy: each directory there then is
+/// one a deploy was cut off in when an earlier process stopped, still
+/// holding its whole bundle. Not for a server with a deploy running, whose
+/// directory it would empty.
+pub fn prune_abandoned_deploys(parent: &std::path::Path) -> usize {
+    let dirs = deploy_directories(parent);
+    for dir in &dirs {
+        if let Err(e) = prune_to_record(dir) {
+            tracing::warn!(dir = %dir.display(), %e, "could not cut the directory down");
+        }
+    }
+    dirs.len()
+}
+
+/// Remove the deploy directories under `parent` last changed more than
+/// `older_than` ago, and say how many went: a record nobody came for. Safe
+/// beside running deploys so long as `older_than` is longer than a deploy
+/// lasts, as days are.
+pub fn remove_old_deploy_records(
+    parent: &std::path::Path,
+    older_than: std::time::Duration,
+) -> usize {
+    let old = |dir: &std::path::PathBuf| {
+        std::fs::metadata(dir)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age > older_than)
+    };
+    deploy_directories(parent)
+        .into_iter()
+        .filter(old)
+        .filter(|dir| std::fs::remove_dir_all(dir).is_ok())
+        .count()
+}
+
 /// A fresh directory for one deploy under `parent`, randomly named, and on
 /// Unix readable by its owner alone: the bundle's files and the ids the
 /// deploy records are the user's business, and the parent (the user's local
 /// data directory, or the system temporary directory) may be more open.
 fn deploy_directory(parent: &std::path::Path) -> std::io::Result<tempfile::TempDir> {
     let mut builder = tempfile::Builder::new();
-    builder.prefix("imcp2-deploy-");
+    builder.prefix(DEPLOY_DIR_PREFIX);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1096,37 +1209,7 @@ mod tests {
     // has to be carried to it on purpose.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_log_is_written_to_the_server_log_under_the_callers_span() {
-        use tracing_subscriber::fmt::MakeWriter;
-        #[derive(Clone, Default)]
-        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for Sink {
-            type Writer = Sink;
-            fn make_writer(&'a self) -> Sink {
-                self.clone()
-            }
-        }
-        // Process-wide: the collector runs on another worker thread, which a
-        // thread-local default would not reach. Installed once for the test
-        // binary; what other tests write goes to the sink too, unread.
-        static SINK: std::sync::OnceLock<Sink> = std::sync::OnceLock::new();
-        let sink = SINK
-            .get_or_init(|| {
-                let sink = Sink::default();
-                let subscriber =
-                    tracing_subscriber::fmt().with_ansi(false).with_writer(sink.clone()).finish();
-                tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
-                sink
-            })
-            .clone();
+        let sink = server_log();
 
         let (wasm, sha) = wasm();
         let span = tracing::info_span!("deploy", session = "sess-1");
@@ -1139,7 +1222,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome.status, Status::Failed);
-        let written = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let written = String::from_utf8(sink.written.lock().unwrap().clone()).unwrap();
         // Other tests' deploys write to the sink too; this one's lines are
         // the ones under its span.
         let own: Vec<&str> =
@@ -1150,20 +1233,47 @@ mod tests {
         assert!(has("deploy did not finish") && has("status=\"failed\""), "{own:?}");
     }
 
-    // A stop asked for before the run begins ends it without a step, and
-    // the directory stays behind as the record, since whoever asked may
-    // never read the answer.
+    // A stop asked for before the deploy begins costs nothing: the bundle
+    // is not extracted, no directory is made, and the refusal says nothing
+    // was created.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_interrupted_deploy_stops_and_keeps_its_directory() {
+    async fn a_deploy_stopped_before_it_begins_reads_nothing() {
         let (wasm, sha) = wasm();
         let parent = tempfile::tempdir().unwrap();
         let mut request = request(bundle(&sha, &wasm), "ic");
         request.workdir = Some(Utf8PathBuf::from_path_buf(parent.path().to_path_buf()).unwrap());
         let stop = CancellationToken::new();
         stop.cancel();
+        let watch = Watch { stop, lines: None };
+        let refused = deploy_bundle(Arc::new(AnonymousIdentity), request, watch).await.unwrap_err();
+        assert!(refused.0.contains("interrupted before it began"), "{refused}");
+        assert!(refused.0.contains("nothing was created"), "{refused}");
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0, "no directory is made");
+    }
+
+    // A stop asked for once the checks have passed ends the run without a
+    // step, and the directory stays behind as the record, since whoever
+    // asked may never read the answer — cut down to the record: the bundle's
+    // files go.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_interrupted_deploy_stops_and_keeps_its_record() {
+        let (wasm, sha) = wasm();
+        let parent = tempfile::tempdir().unwrap();
+        let mut request = request(bundle(&sha, &wasm), "ic");
+        request.workdir = Some(Utf8PathBuf::from_path_buf(parent.path().to_path_buf()).unwrap());
+        // Stopped at the moment the deploy says it has started: the checks
+        // are behind it and no step has begun. The server log is where it
+        // says so, and the log's writer runs inside the very poll that goes
+        // on to the first step, so the stop is in place before that step.
+        let stop = CancellationToken::new();
+        server_log().stop_when_started("to-interrupt", stop.clone());
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let watch = Watch { stop, lines: Some(tx) };
-        let outcome = deploy_bundle(Arc::new(AnonymousIdentity), request, watch).await.unwrap();
+        let watch = Watch { stop: stop.clone(), lines: Some(tx) };
+        let outcome = deploy_bundle(Arc::new(AnonymousIdentity), request, watch)
+            .instrument(tracing::info_span!("deploy", session = "to-interrupt"))
+            .await
+            .unwrap();
+        assert!(stop.is_cancelled(), "the deploy got as far as starting");
         assert_eq!(outcome.status, Status::Interrupted);
         assert_eq!(outcome.canisters, ["backend"]);
         assert!(outcome.created.is_empty());
@@ -1173,6 +1283,13 @@ mod tests {
         let kept: Vec<_> = std::fs::read_dir(parent.path()).unwrap().flatten().collect();
         assert_eq!(kept.len(), 1, "the deploy directory is kept");
         assert!(outcome.log.last().unwrap().contains("is kept"), "{:?}", outcome.log);
+        // Cut down to the record: the manifest and the wasm are gone.
+        let left: Vec<_> = std::fs::read_dir(kept[0].path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.iter().all(|name| name == ".icp"), "{left:?}");
         // The watcher is told where the record is, not the outcome's reader
         // alone: it may be the only one still there.
         let mut streamed = Vec::new();
@@ -1237,5 +1354,135 @@ mod tests {
             error_chain(&Outer(Inner)),
             "failed to install canister 'backend': canister rejected the call"
         );
+    }
+
+    /// The server log, captured: everything the test binary's deploys write,
+    /// and a way to stop one deploy the moment it logs that it has started.
+    #[derive(Clone, Default)]
+    struct ServerLog {
+        written: Arc<std::sync::Mutex<Vec<u8>>>,
+        /// A session to look for, and the token to cancel when the deploy
+        /// under that session's span says "deploy started".
+        stops: Arc<std::sync::Mutex<Vec<(String, CancellationToken)>>>,
+    }
+
+    impl ServerLog {
+        fn stop_when_started(&self, session: &str, stop: CancellationToken) {
+            self.stops.lock().unwrap().push((format!("session=\"{session}\""), stop));
+        }
+    }
+
+    impl std::io::Write for ServerLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.lock().unwrap().extend_from_slice(buf);
+            let line = String::from_utf8_lossy(buf);
+            if line.contains("deploy started") {
+                for (session, stop) in self.stops.lock().unwrap().iter() {
+                    if line.contains(session.as_str()) {
+                        stop.cancel();
+                    }
+                }
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ServerLog {
+        type Writer = ServerLog;
+        fn make_writer(&'a self) -> ServerLog {
+            self.clone()
+        }
+    }
+
+    /// The one subscriber of the test binary, installed on first use.
+    /// Process-wide: a deploy's collector runs on another worker thread,
+    /// which a thread-local default would not reach — and a callsite first
+    /// hit on a thread without that default would be cached as uninteresting
+    /// for every thread. What other tests write goes to it too, unread.
+    fn server_log() -> ServerLog {
+        static LOG: std::sync::OnceLock<ServerLog> = std::sync::OnceLock::new();
+        LOG.get_or_init(|| {
+            let log = ServerLog::default();
+            let subscriber =
+                tracing_subscriber::fmt().with_ansi(false).with_writer(log.clone()).finish();
+            tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
+            log
+        })
+        .clone()
+    }
+
+    /// A directory as a deploy leaves it mid-run: the bundle, the artifact
+    /// store, and the ids it had recorded.
+    fn a_deploy_directory(parent: &std::path::Path) -> std::path::PathBuf {
+        let dir = deploy_directory(parent).unwrap().keep();
+        for (path, contents) in [
+            ("icp.yaml", "canisters: []"),
+            ("canisters/backend.wasm", "wasm"),
+            (".icp/cache/artifacts/backend", "artifact"),
+            (".icp/data/other/thing", "other"),
+            (".icp/data/mappings/ic.ids.json", "{\"backend\": \"aaaaa-aa\"}"),
+        ] {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        dir
+    }
+
+    fn files_under(dir: &std::path::Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(at) = pending.pop() {
+            for entry in std::fs::read_dir(&at).unwrap().flatten() {
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    let relative = entry.path().strip_prefix(dir).unwrap().to_path_buf();
+                    found.push(relative.to_string_lossy().into_owned());
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    // What a server does as it starts: every directory a deploy was cut off
+    // in keeps the ids it recorded and nothing else, and what is not a
+    // deploy's directory is left alone.
+    #[test]
+    fn an_abandoned_deploy_directory_is_cut_down_to_its_record() {
+        let parent = tempfile::tempdir().unwrap();
+        let cut_off = a_deploy_directory(parent.path());
+        // One that had recorded nothing yet.
+        let empty = deploy_directory(parent.path()).unwrap().keep();
+        std::fs::write(empty.join("icp.yaml"), "canisters: []").unwrap();
+        std::fs::create_dir(parent.path().join("uploads")).unwrap();
+        std::fs::write(parent.path().join("uploads/x.tar.gz"), "upload").unwrap();
+
+        assert_eq!(prune_abandoned_deploys(parent.path()), 2);
+        assert_eq!(files_under(&cut_off), [".icp/data/mappings/ic.ids.json"]);
+        assert!(files_under(&empty).is_empty());
+        assert_eq!(files_under(&parent.path().join("uploads")), ["x.tar.gz"]);
+        // Again changes nothing.
+        assert_eq!(prune_abandoned_deploys(parent.path()), 2);
+        assert_eq!(files_under(&cut_off), [".icp/data/mappings/ic.ids.json"]);
+    }
+
+    // A record nobody came for goes once it is old; a recent one, and
+    // anything that is not a deploy's directory, stays.
+    #[test]
+    fn an_old_deploy_record_is_removed_and_a_recent_one_kept() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = a_deploy_directory(parent.path());
+        std::fs::create_dir(parent.path().join("uploads")).unwrap();
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        assert_eq!(remove_old_deploy_records(parent.path(), day), 0);
+        assert!(dir.is_dir());
+        assert_eq!(remove_old_deploy_records(parent.path(), std::time::Duration::ZERO), 1);
+        assert!(!dir.exists());
+        assert!(parent.path().join("uploads").is_dir());
     }
 }

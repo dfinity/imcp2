@@ -30,8 +30,15 @@
 //!
 //! The working directories and uploads live under the state directory
 //! (`{state_dir}/deploys`), each readable by the server's user alone.
+//!
+//! What a process shares across the endpoints it serves the tools at — the
+//! deploy slots, the upload store, the word that the server is stopping — is
+//! one [`Deploys`], made once and handed to each [`McpServer`]: the caps are
+//! on the process, whose memory and disk they protect. It also bounds what
+//! the directory holds over time (see [`Deploys::new`] and
+//! [`Deploys::spawn_sweeper`]).
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -42,7 +49,9 @@ use axum::{
     Json, Router,
 };
 use futures_util::{StreamExt, TryStreamExt};
-use imcp2_deploy::{ClientGone, IcDeployTools, ReceiveError, Uploads, WithDeploy, TICKET_HEADER};
+use imcp2_deploy::{
+    ClientGone, DeploySlots, IcDeployTools, ReceiveError, Uploads, WithDeploy, TICKET_HEADER,
+};
 use rmcp::transport::{
     streamable_http_server::{session::local::LocalSessionManager, tower::StreamableHttpService},
     StreamableHttpServerConfig,
@@ -59,11 +68,122 @@ pub struct DeployConfig {
     pub concurrent: usize,
     /// The cap on an uploaded archive, in bytes.
     pub max_upload_bytes: usize,
+    /// The cap on every uploaded archive the server has at once — arriving,
+    /// waiting for its deploy, or being deployed — in bytes; an upload past
+    /// it is refused. At least one archive's worth.
+    pub max_stored_upload_bytes: usize,
 }
 
 impl Default for DeployConfig {
     fn default() -> Self {
-        Self { concurrent: 2, max_upload_bytes: imcp2_deploy::DEFAULT_MAX_UPLOAD_BYTES }
+        Self::with_max_upload_bytes(imcp2_deploy::DEFAULT_MAX_UPLOAD_BYTES)
+    }
+}
+
+impl DeployConfig {
+    /// The defaults, around a cap of `max_upload_bytes` on one archive: two
+    /// deploys at once, and [`imcp2_deploy::DEFAULT_STORED_UPLOADS`] archives'
+    /// worth of uploads in all.
+    pub fn with_max_upload_bytes(max_upload_bytes: usize) -> Self {
+        Self {
+            concurrent: 2,
+            max_upload_bytes,
+            max_stored_upload_bytes: max_upload_bytes
+                .saturating_mul(imcp2_deploy::DEFAULT_STORED_UPLOADS),
+        }
+    }
+}
+
+/// How long the record of an interrupted deploy (the ids it had created) is
+/// kept for someone to come for.
+pub const DEPLOY_RECORD_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How often the sweeper looks for what has lapsed.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
+
+/// What a process's deploy endpoints share: the slots deploys run in, the
+/// store uploads are received into, and the word that the server is
+/// stopping. Cheap to clone; made once per process and handed to every
+/// [`McpServer`] that serves the tools ([`McpServer::with_deploy`]).
+#[derive(Clone)]
+pub struct Deploys {
+    slots: DeploySlots,
+    uploads: Uploads,
+    /// `{state_dir}/deploys`: each deploy's working directory, and `uploads`.
+    dir: std::path::PathBuf,
+    stopping: CancellationToken,
+}
+
+impl Deploys {
+    /// The deploy state under `state_dir` — the state directory of every
+    /// [`McpServer`] this is handed to — as `config` bounds it.
+    ///
+    /// Made as the process starts, before a deploy runs, it clears what an
+    /// earlier process left: uploads nothing can deploy any more are removed,
+    /// and the directory of each deploy that was cut off — still holding its
+    /// whole bundle — is cut down to the ids it recorded.
+    pub fn new(config: &DeployConfig, state_dir: &Path) -> Self {
+        let dir = state_dir.join("deploys");
+        let uploads = Uploads::with_budget(
+            dir.join("uploads"),
+            config.max_upload_bytes,
+            config.max_stored_upload_bytes,
+        );
+        let cut_off = imcp2_deploy::prune_abandoned_deploys(&dir);
+        if cut_off > 0 {
+            tracing::info!(
+                dir = %dir.display(),
+                cut_off,
+                "kept the ids of deploys an earlier run was stopped in"
+            );
+        }
+        Self {
+            slots: DeploySlots::new(config.concurrent),
+            uploads,
+            dir,
+            stopping: CancellationToken::new(),
+        }
+    }
+
+    /// Say that the server is stopping: every running deploy is interrupted
+    /// at its next step and answers with the canisters it had created, and
+    /// no new one begins. Call it when the shutdown signal arrives, *before*
+    /// draining in-flight requests: a deploy lasts minutes, and a drain that
+    /// waited one out would be cut short by whatever stops the process, the
+    /// deploy with it and its answer unsent. Also ends the sweeper.
+    pub fn stop(&self) {
+        self.stopping.cancel();
+    }
+
+    /// Start the periodic sweep that keeps the deploy directory bounded on
+    /// an idle server: uploads past their time are removed (the store sweeps
+    /// only when it is used), and so are the records of interrupted deploys
+    /// older than [`DEPLOY_RECORD_TTL`]. Ends with [`Self::stop`]. Must be
+    /// called from within a tokio runtime.
+    pub fn spawn_sweeper(&self) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SWEEP_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = this.stopping.cancelled() => break,
+                    _ = tick.tick() => {
+                        let this = this.clone();
+                        let _ = tokio::task::spawn_blocking(move || this.sweep()).await;
+                    }
+                }
+            }
+        });
+    }
+
+    /// One sweep; see [`Self::spawn_sweeper`].
+    fn sweep(&self) {
+        self.uploads.sweep();
+        let removed = imcp2_deploy::remove_old_deploy_records(&self.dir, DEPLOY_RECORD_TTL);
+        if removed > 0 {
+            tracing::info!(removed, "removed the records of old interrupted deploys");
+        }
     }
 }
 
@@ -93,15 +213,17 @@ impl McpServer {
     /// as the plain endpoint would use it.
     pub(crate) fn deploy_mcp_routers(
         &self,
-        config: &DeployConfig,
+        deploys: &Deploys,
         transport: StreamableHttpServerConfig,
     ) -> (Router, Router) {
-        let deploys_dir = self.state_dir().join("deploys");
-        let uploads = Uploads::new(deploys_dir.join("uploads"), config.max_upload_bytes);
+        let uploads = deploys.uploads.clone();
         let upload_url = format!("{}{}{UPLOAD_PATH}", self.public_url, self.mcp_path);
+        // The slots, the store and the stop are the process's, shared with
+        // every other endpoint and every router built from this server.
         let deploy = IcDeployTools::new(self.identities.clone(), auth::bearer_session_resolver())
-            .concurrent(config.concurrent)
-            .deploys_in(&deploys_dir)
+            .with_slots(deploys.slots.clone())
+            .stopped_by(deploys.stopping.clone())
+            .deploys_in(&deploys.dir)
             .unwrap_or_else(|e| panic!("the state directory must be a UTF-8 path: {e}"))
             .with_uploads(uploads.clone(), upload_url);
         let service = |transport: StreamableHttpServerConfig| {
@@ -215,6 +337,10 @@ async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response
         Err(e @ ReceiveError::TooLarge(_)) => {
             (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response()
         }
+        Err(e @ ReceiveError::Busy) => (StatusCode::CONFLICT, e.to_string()).into_response(),
+        Err(e @ ReceiveError::Full) => {
+            (StatusCode::INSUFFICIENT_STORAGE, e.to_string()).into_response()
+        }
         Err(e @ ReceiveError::Body(_)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
         // The server's fault, and said so: a full disk or an unwritable
         // directory is not a request the client can correct.
@@ -231,21 +357,30 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    fn config() -> DeployConfig {
+        DeployConfig { concurrent: 2, ..DeployConfig::with_max_upload_bytes(1024) }
+    }
+
     fn server() -> (tempfile::TempDir, McpServer) {
         let dir = tempfile::tempdir().unwrap();
-        let state_dir = dir.path().to_path_buf();
-        let server = McpServer::new(McpConfig {
+        let deploys = Deploys::new(&config(), dir.path());
+        let server = server_in(dir.path(), "/mcp", deploys);
+        (dir, server)
+    }
+
+    fn server_in(state_dir: &Path, mcp_path: &str, deploys: Deploys) -> McpServer {
+        let state_dir = state_dir.to_path_buf();
+        McpServer::new(McpConfig {
             agent: Agent::builder().with_url(IC_URL).build().expect("agent"),
             instance: IiInstance::prod().expect("prod instance"),
             public_url: "https://mcp.example.com".into(),
-            mcp_path: "/mcp".into(),
+            mcp_path: mcp_path.into(),
             clients: SharedClients::load(&state_dir),
             state_dir,
             require_resource: true,
             cimd_enabled: false,
         })
-        .with_deploy(DeployConfig { concurrent: 2, max_upload_bytes: 1024 });
-        (dir, server)
+        .with_deploy(deploys)
     }
 
     fn rpc(method: &str, params: serde_json::Value) -> String {
@@ -285,7 +420,10 @@ mod tests {
     async fn the_hosted_endpoint_serves_the_deploy_loop() {
         let (_dir, server) = server();
         let bearer = format!("Bearer {}", server.store.test_bearer().await);
-        // Built once, as a deployment does: the upload store lives in it.
+        // The made-up session's grant has lapsed, so the identity a deploy
+        // signs with is refused here, before anything is asked of Internet
+        // Identity: the test stays on this machine.
+        server.identities.set_grant_expiration("test-session", 1).await;
         let app = server.mcp_router();
 
         // tools/list stays plain JSON, and lists the deploy tools.
@@ -379,8 +517,8 @@ mod tests {
         }
 
         // The deploy call is answered as an event stream carrying the result:
-        // offline, with a made-up session, the error that the identity cannot
-        // be derived — raised after the upload was found for this session,
+        // with a session whose grant has lapsed, the error that says to
+        // reconnect — raised after the upload was found for this session,
         // which is what the next call shows.
         let resp = post(
             &app,
@@ -407,6 +545,7 @@ mod tests {
         assert_eq!(answer["result"]["isError"], true, "{answer}");
         let said = answer["result"]["content"][0]["text"].as_str().unwrap();
         assert!(!said.contains("no upload"), "the upload must be found: {said}");
+        assert!(!said.contains("mcp_prepare_delegation"), "nothing is asked of II: {said}");
         // Spent with the deploy: a second deploy of the same upload finds none.
         let resp = post(
             &app,
@@ -439,6 +578,97 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn call(app: &Router, bearer: &str, tool: &str, arguments: serde_json::Value) -> String {
+        let call = serde_json::json!({ "name": tool, "arguments": arguments });
+        text(post(app, bearer, rpc("tools/call", call)).await).await
+    }
+
+    /// Two endpoints of one process, as the binary serves production and
+    /// beta, and a router built twice from one of them: one upload store and
+    /// one set of slots between them all, so the caps are the process's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_endpoints_of_a_process_share_its_deploy_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let deploys = Deploys::new(&config(), dir.path());
+        let prod = server_in(dir.path(), "/mcp", deploys.clone());
+        let beta = server_in(dir.path(), "/mcp-beta", deploys.clone());
+        let bearer = format!("Bearer {}", prod.store.test_bearer().await);
+        let (app, again) = (prod.mcp_router(), prod.mcp_router());
+
+        // A ticket minted through one router is honoured by the other's
+        // upload route: the store is not the router's own.
+        let minted = call(&app, &bearer, "icp_deploy_upload", serde_json::json!({})).await;
+        let minted: serde_json::Value = serde_json::from_str(&minted).unwrap();
+        let ticket = minted["result"]["structuredContent"]["ticket"].as_str().unwrap();
+        let put = Request::put(UPLOAD_PATH).header(TICKET_HEADER, ticket);
+        let resp = again.oneshot(put.body(Body::from("bundle")).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Both slots held — by whichever endpoint — and neither has one left.
+        let held = [deploys.slots.clone(), deploys.slots.clone()].map(|slots| {
+            IcDeployTools::new(prod.identities.clone(), Arc::new(|_: &_| None))
+                .with_slots(slots)
+                .claim()
+                .expect("a slot")
+        });
+        for (server, path) in [(&prod, "prod"), (&beta, "beta")] {
+            let bearer = format!("Bearer {}", server.store.test_bearer().await);
+            let said = call(
+                &server.mcp_router(),
+                &bearer,
+                "icp_deploy_bundle",
+                serde_json::json!({ "bundle_upload": "x", "environment": "ic" }),
+            )
+            .await;
+            assert!(said.contains("as many deploys as it can"), "{path}: {said}");
+        }
+        drop(held);
+    }
+
+    /// Once the server has said it is stopping, a deploy does not begin, and
+    /// the upload it named is not spent on the refusal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopping_server_begins_no_deploy() {
+        let dir = tempfile::tempdir().unwrap();
+        let deploys = Deploys::new(&config(), dir.path());
+        let server = server_in(dir.path(), "/mcp", deploys.clone());
+        let bearer = format!("Bearer {}", server.store.test_bearer().await);
+        let app = server.mcp_router();
+        deploys.stop();
+        let said = call(
+            &app,
+            &bearer,
+            "icp_deploy_bundle",
+            serde_json::json!({ "bundle_upload": "x", "environment": "ic" }),
+        )
+        .await;
+        assert!(said.contains("restarting"), "{said}");
+    }
+
+    /// What a start finds from the run before it: uploads nothing can deploy
+    /// are gone, and a deploy that was cut off keeps its ids and nothing else.
+    #[test]
+    fn a_start_clears_what_the_run_before_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let deploys_dir = dir.path().join("deploys");
+        let upload = deploys_dir.join("uploads").join(format!("{}.tar.gz", "a".repeat(64)));
+        let cut_off = deploys_dir.join("imcp2-deploy-abc123");
+        let ids = cut_off.join(".icp/data/mappings/ic.ids.json");
+        for (path, contents) in
+            [(&upload, "archive"), (&cut_off.join("canisters/app.wasm"), "wasm"), (&ids, "{}")]
+        {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        let deploys = Deploys::new(&config(), dir.path());
+        assert!(!upload.exists(), "an upload from the run before is removed");
+        assert!(!cut_off.join("canisters").exists(), "the bundle's files are removed");
+        assert!(ids.is_file(), "the ids are kept");
+        // A sweep leaves a recent record where it is.
+        deploys.sweep();
+        assert!(ids.is_file());
     }
 
     /// Dropping the response body — what a disconnect does — fires the token.

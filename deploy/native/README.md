@@ -187,8 +187,13 @@ The binary is built with the `deploy` feature (`build.sh`), so the MCP endpoint
 also serves the deploy tools (see the repository README, "Deploying a project
 bundle"): deploy directories and uploaded bundles go under the unit's state
 directory (`/var/lib/imcp2/deploys`), `MCP_DEPLOY_MAX_CONCURRENT` (default 2) caps
-the deploys running at once and `MCP_DEPLOY_MAX_UPLOAD_BYTES` (default 64 MiB) an
-uploaded archive. Caddy's `read_body 30s` applies to the upload `PUT` too: an
+the deploys running at once (across `/mcp` and `/mcp-beta` together),
+`MCP_DEPLOY_MAX_UPLOAD_BYTES` (default 64 MiB) an uploaded archive, and
+`MCP_DEPLOY_MAX_STORED_UPLOAD_BYTES` (default eight times that) every archive
+held at once. A restart interrupts the deploys that are running: each stops at
+its next step and answers with the canisters it had created before the unit's
+`TimeoutStopSec` runs out, and the ids of one that was killed anyway stay under
+`deploys/imcp2-deploy-*/.icp/data/mappings/` for seven days. Caddy's `read_body 30s` applies to the upload `PUT` too: an
 archive at the cap needs roughly 2 MB/s upstream to arrive in time, and the
 timeout is the knob to raise if that bites, since the app's own caps are what
 bound memory and disk. Every deploy's events are in the unit's log at `info`
