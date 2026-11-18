@@ -49,6 +49,12 @@ mod management;
 #[cfg(all(test, feature = "e2e"))]
 mod e2e_canister_tools;
 
+/// The bound on caller-supplied textual Candid (size, nesting depth, type
+/// declarations) that the call tools apply before parsing, for an embedder
+/// that hands Candid text from an untrusted source to a parser of its own
+/// (the local server's deploy tools, with a bundle's arguments and
+/// interfaces).
+pub use calls::guard_candid_text;
 /// The IC [`Agent`] type the components are built around, re-exported so
 /// callers construct the injected agent from the exact `ic-agent` version this
 /// crate links.

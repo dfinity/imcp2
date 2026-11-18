@@ -1,0 +1,63 @@
+[package]
+name = "imcp2-deploy"
+version = "0.6.1"
+edition = "2021"
+description = "The imcp2 `icp_deploy_bundle` tool: deploys an icp project bundle through the icp CLI's own project library."
+license = "Apache-2.0"
+repository = "https://github.com/dfinity/imcp2"
+# Not published. The deploy runs on `icp-project` and its siblings, which
+# bring wasmtime with them; this is its own crate rather than a module of
+# `imcp2-core` so that core does not carry that tree. `imcp2-local` composes
+# it always, the hosted `imcp2` behind its `deploy` feature. The icp CLI's
+# crates are on crates.io, so nothing upstream stops this one being published;
+# until it is, the published `imcp2` cannot carry the feature.
+publish = false
+
+[dependencies]
+# The session engine (which Internet Identity session a call acts as, and
+# the management identity minted from it) and the `SessionResolver` seam.
+imcp2-core = { workspace = true }
+# `rt-multi-thread`: the sync-plugin runtime runs a wasm component on a
+# blocking thread (`block_in_place`), which only a multi-thread runtime has.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "fs", "io-util"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
+async-trait = "0.1"
+# `icp-project` spells every path as a UTF-8 path.
+camino = "1"
+# A bundle is the `.tar.gz` that `icp project bundle` writes.
+tar = "0.4"
+flate2 = "1"
+# Each deploy extracts its bundle into a scratch directory that is removed
+# when the deploy ends, whichever way it ends.
+tempfile = "3"
+
+# The icp CLI's project library and the seams it is driven through, from
+# crates.io. The four share a workspace version upstream and are released
+# together: bump all four together.
+#
+# 0.1 has what this crate is built on, dfinity/icp-cli#873 (on #868): #868
+# has `icp project bundle` write an archive of regular files and directories
+# alone, and #873 states the rule for an untrusted project
+# (`icp_project::untrusted`, what `--untrusted` on `icp build`, `deploy` and
+# `sync` applies): the project is read through a filesystem confined to its
+# root by a directory handle and through no symlink, names no recipe, and
+# what it runs is held to a list of regular files there. The host composes
+# the rule as the CLI does.
+#
+#   * icp-project: manifests, the deploy operation, the id/artifact stores.
+#   * icp-events: the progress event stream the operations report on.
+#   * icp-sync-plugin: the wasmtime runtime that runs a canister's sync plugin
+#     (the asset uploads of a frontend canister). The heavy one — it is what
+#     brings wasmtime into this workspace.
+#   * icp-canister-interfaces: the engine-canister registry id a created
+#     canister's subnet is looked up in.
+icp-project = "0.1"
+icp-events = "0.1"
+icp-sync-plugin = "0.1"
+icp-canister-interfaces = "0.1"
+
+[dev-dependencies]
+# The tests hand-build small bundles (a manifest plus a wasm) and load them
+# through the same host the tool uses.
+wat = "1"
