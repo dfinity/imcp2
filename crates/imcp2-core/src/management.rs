@@ -152,6 +152,17 @@ fn default_init_arg() -> String {
 /// here can operate a canister the user created.
 pub async fn cycles_balance(ids: &Identities, session_id: &str) -> Result<CyclesBalance, String> {
     let (agent, principal) = management_agent(ids, session_id).await?;
+    cycles_balance_of(&agent, principal).await
+}
+
+/// The cycles-ledger balance of `principal`, read through `agent`. The query
+/// is anonymous-readable, so the agent's identity only matters for routing;
+/// callers acting as a principal other than the management identity (the
+/// deploy tools) pair this with their own agent.
+pub async fn cycles_balance_of(
+    agent: &Agent,
+    principal: Principal,
+) -> Result<CyclesBalance, String> {
     let ledger = parse_principal(CYCLES_LEDGER)?;
     let account = Account { owner: principal, subaccount: None };
     let arg = Encode!(&account).map_err(|e| format!("encode account: {e}"))?;

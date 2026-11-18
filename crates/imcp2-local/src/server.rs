@@ -1,12 +1,13 @@
-//! The local MCP server: [`IcTools`] wrapped in a thin handler that adds the
-//! two **local-only login tools**. They cannot live in `imcp2-core` — they
-//! drive this binary's loopback listener and browser opener, which core cannot
-//! call back into — so this wrapper carries them in its own `#[tool_router]`,
-//! answers `tools/list` with the merged list, dispatches `tools/call` to its
-//! own router first, and forwards everything else to the inner [`IcTools`]
-//! handler verbatim. The hosted server contains none of this code, so its tool
-//! surface stays login-free by construction (a core-side test guards the
-//! boundary too).
+//! The local MCP server: [`IcTools`] with the **deploy tools** beside it
+//! ([`WithDeploy`], the handler the hosted server mounts too), wrapped in a
+//! thin handler that adds the two **local-only login tools**. The login tools
+//! cannot live in `imcp2-core` — they drive this binary's loopback listener
+//! and browser opener, which core cannot call back into — so this wrapper
+//! carries them in its own `#[tool_router]`, answers `tools/list` with the
+//! merged list, dispatches `tools/call` to its own router first, and forwards
+//! everything else to the inner handler verbatim. The hosted server contains
+//! no login tool, so its surface stays login-free by construction (a
+//! core-side test guards the boundary too).
 
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
@@ -19,9 +20,10 @@ use rmcp::{schemars, tool, tool_router, ErrorData as McpError, RoleServer, Serve
 
 use crate::login::{BeginOutcome, Grant, LoginDriver, LoginStatus};
 use imcp2_core::IcTools;
+use imcp2_deploy::{IcDeployTools, WithDeploy};
 
 pub struct LocalServer {
-    tools: IcTools,
+    tools: WithDeploy<IcTools>,
     login: LoginDriver,
     /// Whether the login flow will also try to open the browser itself —
     /// only phrasing: the link is always returned in-band.
@@ -159,8 +161,14 @@ fn human_minutes(mins: u64) -> String {
 
 #[tool_router]
 impl LocalServer {
-    pub fn new(tools: IcTools, login: LoginDriver, auto_open: bool) -> Self {
-        Self { tools, login, auto_open }
+    pub fn new(tools: IcTools, deploy: IcDeployTools, login: LoginDriver, auto_open: bool) -> Self {
+        Self { tools: WithDeploy::new(tools, deploy), login, auto_open }
+    }
+
+    /// The deploy tools this server serves.
+    #[cfg(test)]
+    pub fn deploy(&self) -> &IcDeployTools {
+        self.tools.deploy()
     }
 
     #[tool(
@@ -257,12 +265,12 @@ impl ServerHandler for LocalServer {
         let mut info = self.tools.get_info();
         info.server_info.name = "imcp2-local".into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
-        // The core instructions apply verbatim; add how signing in works here
-        // (the hosted server logs in via OAuth outside the tool surface, so
-        // core's text says nothing about it).
-        let core = info.instructions.take().unwrap_or_default();
+        // The core and deploy instructions apply verbatim; add how signing in
+        // works here (the hosted server logs in via OAuth outside the tool
+        // surface, so neither says anything about it).
+        let inner = info.instructions.take().unwrap_or_default();
         info.instructions = Some(format!(
-            "{core}\n\n\
+            "{inner}\n\n\
              SIGNING IN. On this local server the user signs in through `authenticate`, which \
              returns an id.ai link for them to open. Sessions are held in memory, so the user \
              signs in again after a restart, when the grant expires, or if they revoke it at \
@@ -332,8 +340,9 @@ mod tests {
         );
         let slot = SessionSlot::new();
         let tools = IcTools::new(agent, identities.clone(), slot.resolver());
+        let deploy = IcDeployTools::new(identities.clone(), slot.resolver());
         let login = crate::login::LoginDriver::new(identities, slot, /* auto_open */ false);
-        LocalServer::new(tools, login, /* auto_open */ false)
+        LocalServer::new(tools, deploy, login, /* auto_open */ false)
     }
 
     // The wrapper's own router carries EXACTLY the two login tools — the rest
@@ -389,14 +398,17 @@ mod tests {
 
     // A REAL MCP round-trip over an in-process duplex pipe (the same
     // byte-stream shape stdio serves): initialize; tools/list is the merged
-    // surface (the 11 served core tools + the 2 login tools); tools/call dispatches
-    // login tools to the wrapper and everything else to IcTools; the login
+    // surface (the 10 served core tools + the 2 login tools + the deploy tool);
+    // tools/call dispatches login tools to the wrapper, the deploy tool to its
+    // router, and everything else to IcTools; the login
     // lifecycle (signed out → link → pending) runs through the MCP layer —
     // all with no network and no browser.
     #[tokio::test]
     async fn a_real_mcp_client_sees_the_merged_surface_and_the_login_flow() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server = test_server().serve(server_io);
+        let local = test_server();
+        let deploy_tools = local.deploy().clone();
+        let server = local.serve(server_io);
         let client = ().serve(client_io);
         let (server, client) = tokio::join!(server, client);
         let server = server.expect("server up");
@@ -409,10 +421,30 @@ mod tests {
         let instructions = info.instructions.as_deref().unwrap_or_default();
         assert!(instructions.contains("SIGNING IN"), "login guidance must be taught");
         assert!(instructions.contains("textual Candid"), "core guidance must survive the merge");
+        // Where core says nothing here deploys, this server says how it does,
+        // without the principal it signs as or how many deploys it runs.
+        assert!(instructions.contains("DEPLOYING. `icp_deploy_bundle` deploys"), "{instructions}");
+        assert!(instructions.contains("`bundle_path`"), "{instructions}");
+        for gone in ["no tool here", "exception", "cli.id.ai", "icp identity", "at a time"] {
+            assert!(!instructions.contains(gone), "`{gone}` in: {instructions}");
+        }
 
         let tools = client.list_all_tools().await.expect("tools/list");
-        assert_eq!(tools.len(), 12, "10 served core tools + authenticate + auth_status");
-        for expected in ["get_canister_candid", "canister_query", "authenticate", "auth_status"] {
+        assert_eq!(
+            tools.len(),
+            15,
+            "10 served core tools + authenticate + auth_status + icp_deploy_bundle + \
+             icp_cycles_balance + icp_deploy_guide"
+        );
+        for expected in [
+            "get_canister_candid",
+            "canister_query",
+            "authenticate",
+            "auth_status",
+            "icp_deploy_bundle",
+            "icp_cycles_balance",
+            "icp_deploy_guide",
+        ] {
             assert!(tools.iter().any(|t| &*t.name == expected), "missing {expected}");
         }
 
@@ -465,6 +497,57 @@ mod tests {
         assert!(is_error, "an invalid canister id is a tool error");
         assert!(text.contains("invalid canister id"), "{text}");
 
+        // The deploy tools dispatch to their own router through the wrapper:
+        // signed out, `icp_deploy_bundle` refuses before reading the bundle
+        // (the path named here does not exist, and must not be reached for)
+        // or touching the network.
+        let (is_error, text, _) = call(
+            "icp_deploy_bundle",
+            Some(serde_json::json!({
+                "bundle_path": "/nonexistent/bundle.tar.gz",
+                "environment": "ic"
+            })),
+        )
+        .await;
+        assert!(is_error, "a deploy without a session is a tool error");
+        assert!(text.contains("authenticated session"), "{text}");
+
+        // The guide needs no session and is the skill document itself, as
+        // text and as structured content, for a client that reads no
+        // resources.
+        let (is_error, text, structured) = call("icp_deploy_guide", None).await;
+        assert!(!is_error, "{text}");
+        assert_eq!(text, imcp2_deploy::DEPLOY_SKILL_MD);
+        assert_eq!(
+            structured.expect("structuredContent")["content"],
+            imcp2_deploy::DEPLOY_SKILL_MD
+        );
+
+        // While a deploy runs, a second is refused before anything else —
+        // before even the session check — so two cannot create two sets of
+        // canisters from one stale mapping.
+        let busy = deploy_tools.claim().expect("no deploy is running");
+        let (is_error, text, _) = call(
+            "icp_deploy_bundle",
+            Some(serde_json::json!({
+                "bundle_path": "/nonexistent/bundle.tar.gz",
+                "environment": "ic"
+            })),
+        )
+        .await;
+        assert!(is_error, "a second deploy is a tool error");
+        assert!(text.contains("already running"), "{text}");
+        drop(busy);
+        let (_, text, _) = call(
+            "icp_deploy_bundle",
+            Some(serde_json::json!({
+                "bundle_path": "/nonexistent/bundle.tar.gz",
+                "environment": "ic"
+            })),
+        )
+        .await;
+        assert!(text.contains("authenticated session"), "released: {text}");
+
         // Deferral: a protocol/meta tool is not just unlisted — calling it
         // fails with the router's standard "tool not found" error (the
         // invalid-params shape any unknown tool name gets), rather than
@@ -502,14 +585,29 @@ mod tests {
         let (server, client) = tokio::join!(server, client);
         let (server, client) = (server.expect("server up"), client.expect("client up"));
 
+        // The deploy skill joins the first page only: a client that follows a
+        // cursor must not meet it again.
+        let mut page = rmcp::model::PaginatedRequestParams::default();
+        page.cursor = Some("next".into());
+        let later = client.list_resources(Some(page)).await.expect("resources/list with a cursor");
+        assert!(
+            !later.resources.iter().any(|r| r.uri == "skill://deploy-with-mcp"),
+            "the deploy skill must not repeat on a later page"
+        );
+
         let resources = client.list_all_resources().await.expect("resources/list");
         let skills: Vec<String> =
             resources.iter().map(|r| r.uri.clone()).filter(|u| u.starts_with("skill://")).collect();
         assert_eq!(
             skills.len(),
             imcp2_core::skills::BUNDLED_SKILLS.len()
-                + imcp2_core::skills::BUNDLED_SKILL_REFERENCES.len(),
-            "every bundled document must be advertised: {skills:?}"
+                + imcp2_core::skills::BUNDLED_SKILL_REFERENCES.len()
+                + 1,
+            "every bundled document, plus this server's deploy skill, must be advertised: {skills:?}"
+        );
+        assert!(
+            skills.iter().any(|u| u == "skill://deploy-with-mcp"),
+            "the deploy skill is advertised: {skills:?}"
         );
 
         for uri in &skills {
@@ -556,6 +654,12 @@ mod tests {
         );
         let api_reference = one("skill://writing-motoko/references/api-reference.md").await;
         assert!(!api_reference.trim().is_empty());
+
+        // This server's own skill arrives whole through the same surface, and
+        // names the tool it teaches — which only this server lists.
+        let deploy = one("skill://deploy-with-mcp").await;
+        assert_eq!(deploy, imcp2_deploy::DEPLOY_SKILL_MD);
+        assert!(deploy.contains("icp_deploy_bundle"), "{deploy:.400}");
 
         // An unknown skill, and an unknown companion of a real skill, are both
         // resource-not-found — not a panic, a disconnect, or a silent empty.
