@@ -552,6 +552,14 @@ impl Uploads {
     ) -> Result<Received, ReceiveError> {
         let limits = self.inner.limits;
         let upload_id = random_token();
+        // A ticket the store never minted is refused before anything else is
+        // looked at: the route is outside the bearer gate, and a sweep is
+        // work over every ticket and upload under the lock every session's
+        // calls wait on. A known ticket's expiry is looked at by the sweep.
+        if !self.inner.state().tickets.contains_key(ticket) {
+            tracing::info!("upload refused: no such ticket (spent, expired or unknown)");
+            return Err(ReceiveError::UnknownTicket);
+        }
         let (receiving, making_way) = self.locked(|state, lapsed| {
             if self.inner.stopping.is_cancelled() {
                 tracing::info!("upload refused: the server is stopping");
@@ -1285,6 +1293,21 @@ pub(crate) mod tests {
                 stopping: CancellationToken::new(),
             }),
         }
+    }
+
+    // The upload route is outside the bearer gate: a ticket the store never
+    // minted is refused without the sweep, which is work over every ticket
+    // and upload under the lock. What has lapsed waits for a call that has
+    // a ticket, or for the sweeper.
+    #[tokio::test]
+    async fn an_unknown_ticket_is_refused_before_the_store_is_swept() {
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
+        let received = put(&uploads, "s", bundle(1)).await.unwrap();
+        let lapsed = lapse(&uploads, &received.upload_id);
+        let refused = uploads.receive(&"0".repeat(64), None, std::io::Cursor::new(bundle(1))).await;
+        assert_eq!(refused.unwrap_err(), ReceiveError::UnknownTicket);
+        assert_eq!(uploads.held().uploads, 1, "not swept");
+        assert!(lapsed.exists());
     }
 
     // A stopping server takes no new upload and gives up on the one

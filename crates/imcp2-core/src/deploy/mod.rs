@@ -807,11 +807,25 @@ impl IcDeployTools {
         let (lines, receiver) = tokio::sync::mpsc::unbounded_channel();
         let forwarder =
             tokio::spawn(forward_lines(ctx.peer.clone(), ctx.meta.get_progress_token(), receiver));
+        let stopped = stop.clone();
         let watch = Watch { stop, lines: Some(lines) };
         let result = deploy_bundle(identity, request, watch).instrument(span.clone()).await;
         // The sender went with the run; the forwarder ends once it has
-        // delivered what is left.
-        let _ = forwarder.await;
+        // delivered what is left. Not waited for past a stop, nor for long:
+        // each notification waits on the transport's bounded queue, so a
+        // client that keeps the stream open without reading it would hold
+        // this call — and its slot — for ever. The outcome's log has every
+        // line a notification would have carried.
+        let mut forwarder = forwarder;
+        tokio::select! {
+            biased;
+            _ = &mut forwarder => {}
+            _ = stopped.cancelled() => forwarder.abort(),
+            _ = tokio::time::sleep(FORWARD_GRACE) => {
+                tracing::warn!(parent: &span, "the deploy's progress was not read; dropped");
+                forwarder.abort();
+            }
+        }
         match result {
             Err(refused) => {
                 tracing::warn!(parent: &span, "deploy refused: {refused}");
@@ -1027,6 +1041,10 @@ pub struct UploadTicketOutput {
     /// The command to run, with the archive's path in place of `<bundle.tar.gz>`.
     pub curl: String,
 }
+
+/// How long a deploy that has ended waits for its last progress lines to be
+/// delivered before it answers without them.
+const FORWARD_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Deliver each log line of a running deploy to the client as it is made: as
 /// a progress notification when the request carried a progress token (which

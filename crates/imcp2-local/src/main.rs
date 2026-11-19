@@ -211,22 +211,66 @@ async fn serve() -> anyhow::Result<()> {
         .await?;
     tracing::info!("imcp2-local serving MCP over stdio");
     let cancel = service.cancellation_token();
-    // Runs until the client closes the pipe (or the service errors).
-    let quit = service.waiting().await;
-    // A deploy may still be running: rmcp waits only five seconds for the
-    // calls in flight when the pipe closes, and returning here would end the
-    // runtime under a deploy waiting on a canister call — one that may have
-    // created, and funded, a canister only its answer names. So every call
-    // still running is cancelled (a deploy stops at its next step and keeps
-    // its record of the canisters it created), and the deploy is waited for,
-    // for as long as a stopped deploy takes to end and no longer, however
-    // the service ended.
+    // Runs until the client closes the pipe (or the service errors), or the
+    // process is told to stop: a client that shuts its servers down with a
+    // signal, or Ctrl-C in a terminal.
+    let waiting = service.waiting();
+    tokio::pin!(waiting);
+    let mut quit = None;
+    tokio::select! {
+        ended = &mut waiting => quit = Some(ended),
+        () = shutdown_signal() => tracing::info!("asked to stop"),
+    }
+    // A deploy may still be running: rmcp waits only seconds for the calls
+    // in flight as it ends, and returning here would end the runtime under a
+    // deploy waiting on a canister call — one that may have created, and
+    // funded, a canister only its answer names. So every call still running
+    // is cancelled (a deploy stops at its next step and keeps its record of
+    // the canisters it created), and the deploy is waited for, for as long
+    // as a stopped deploy takes to end and no longer, however the service
+    // ended.
     cancel.cancel();
+    let quit = match quit {
+        Some(ended) => ended,
+        None => waiting.await,
+    };
     if tokio::time::timeout(STOP_GRACE + STOP_MARGIN, slots.idle()).await.is_err() {
         tracing::warn!("a deploy had not ended when the server stopped waiting for it");
     }
     quit?;
     Ok(())
+}
+
+/// Resolves when the process is asked to stop: SIGINT (Ctrl-C) or, on Unix,
+/// SIGTERM, which is what a client or service manager sends. If a handler
+/// cannot be installed, that signal is not waited on and the process keeps
+/// its default behaviour for it.
+async fn shutdown_signal() {
+    let interrupt = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    () = interrupt => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "could not install a SIGTERM handler ({e}); stopping on SIGINT only"
+                );
+                interrupt.await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    interrupt.await;
 }
 
 #[cfg(test)]
