@@ -3073,6 +3073,25 @@ fn token_ttl(default: Duration, grant_expiration_ns: Option<u64>, now_ns: u64) -
     }
 }
 
+#[cfg(test)]
+impl AuthStore {
+    /// A live bearer token for a made-up session, so a test in the crate root
+    /// can get past [`require_token`] without an Internet Identity handshake.
+    pub(crate) async fn test_bearer(&self) -> String {
+        let token = format!("mcp-token-test-{}", Uuid::new_v4());
+        self.tokens.write().await.insert(
+            token.clone(),
+            TokenInfo {
+                principal: "test-principal".into(),
+                session_id: "test-session".into(),
+                created: Instant::now(),
+                ttl: Duration::from_secs(600),
+            },
+        );
+        token
+    }
+}
+
 /// Mint + store an access token bound to the session key's principal, its
 /// lifetime matched to the II grant's expiration (see [`token_ttl`]).
 async fn issue_token(store: &AuthStore, session_id: &str) -> Response {

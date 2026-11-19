@@ -102,9 +102,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["io"] }
 uuid = { workspace = true }
 tower-http = { version = "0.7", features = ["cors"] }
+# The deploy endpoint: streamed bodies (the upload, the watched event stream).
+futures-util = "0.3"
+http-body-util = "0.1"
 # Metrics exposition at /metrics. Pinned to the version dfinity/ic uses: these
 # series are destined for the same Prometheus / Victoria Metrics clusters that
 # scrape the IC, so matching the org's client keeps one exposition dialect in the
@@ -133,12 +136,17 @@ e2e = ["dep:pocket-ic"]
 # Router-level contract tests (tests/routers.rs) drive the composed app with
 # tower::ServiceExt::oneshot and read bodies via http-body-util.
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
+tempfile = "3"
 # `test-util` is what `#[tokio::test(start_paused = true)]` needs: the pending
 # connect tests in `auth.rs` walk a connect past its TTL and retention on a
 # paused clock instead of waiting them out. A feature on a dependency the crate
 # already has, so the lockfile does not change.
 tokio = { workspace = true, features = ["test-util"] }
+# The deploy endpoint's tests upload a bundle, which the server extracts as it
+# arrives: they build the smallest one there is. Both are already in the
+# tree, through imcp2-core's deploy tools.
+tar = "0.4"
+flate2 = "1"
 
 # The profile that 'dist' will build with
 [profile.dist]
