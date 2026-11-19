@@ -29,16 +29,20 @@ pub enum Refused {
     SessionBusy,
     /// The server was stopping.
     Stopping,
+    /// The upload store had no room for the deploy to run in: a running
+    /// deploy is charged the most its directory may come to.
+    NoRoom,
 }
 
 impl Refused {
-    pub const ALL: [Self; 3] = [Self::Busy, Self::SessionBusy, Self::Stopping];
+    pub const ALL: [Self; 4] = [Self::Busy, Self::SessionBusy, Self::Stopping, Self::NoRoom];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Busy => "busy",
             Self::SessionBusy => "session_busy",
             Self::Stopping => "stopping",
+            Self::NoRoom => "no_room",
         }
     }
 }

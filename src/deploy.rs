@@ -24,9 +24,11 @@
 //!     `icp_deploy_upload` mints inside an authenticated call (see
 //!     [`imcp2_deploy::Uploads`] for the ticket's properties). The route is
 //!     outside the bearer gate — the ticket is its authentication — and
-//!     streams the body to disk under its own cap. The upload is the only
-//!     way in: the deploy tool here lists `bundle_upload` and refuses a
-//!     `bundle_path`, so the server opens no file a caller names.
+//!     the body is extracted as it arrives, never kept, and stopped at the
+//!     byte that takes the archive, or what it extracts to, past its limit.
+//!     The upload is the only way in: the deploy tool here lists
+//!     `bundle_upload` and refuses a `bundle_path`, so the server opens no
+//!     file a caller names.
 //!
 //! The working directories and uploads live under the state directory
 //! (`{state_dir}/deploys`), each readable by the server's user alone.
@@ -117,30 +119,59 @@ pub struct DeployConfig {
     /// either way); past it a deploy is refused, not queued. At least one: a
     /// zero is read as one.
     pub concurrent: usize,
-    /// The cap on an uploaded archive, in bytes.
+    /// The cap on an uploaded archive, compressed, in bytes. No more than
+    /// [`Self::max_extracted_bytes`]: more is read as that.
     pub max_upload_bytes: usize,
-    /// The cap on every uploaded archive the server has at once — arriving,
-    /// waiting for its deploy, or being deployed — in bytes; an upload past
-    /// it is refused. At least one archive's worth: less is read as one.
-    pub max_stored_upload_bytes: usize,
+    /// The cap on what one bundle comes to on this server, in bytes: what
+    /// its archive extracts to, and with that the copy of each canister's
+    /// module its deploy keeps beside it. Counted as what the files and
+    /// directories occupy ([`imcp2_deploy::occupies`]) — whole blocks, and
+    /// an entry each — which is what they cost where the state directory is
+    /// a RAM filesystem. An upload is extracted as it arrives and stopped at
+    /// the byte that passes this.
+    pub max_extracted_bytes: usize,
+    /// The cap on every bundle the server has at once, extracted, in bytes:
+    /// one that is arriving or being deployed counts as
+    /// [`Self::max_extracted_bytes`], one that is waiting as what it came
+    /// to. Past it an upload is refused, and a deploy that has no room to
+    /// run in. `None` is one bundle for each deploy that runs at once and
+    /// one more, arriving or waiting; less than one bundle is read as one.
+    ///
+    /// Together with [`Self::concurrent`] this is what the deploy tools
+    /// keep under the state directory, and so — on a RAM filesystem — what
+    /// they hold of the process's memory besides its heap.
+    pub max_stored_bytes: Option<usize>,
 }
 
 impl Default for DeployConfig {
+    /// Two deploys at once, archives of 64 MiB, bundles of 128 MiB, and
+    /// three of those in all.
     fn default() -> Self {
-        Self::with_max_upload_bytes(imcp2_deploy::DEFAULT_MAX_UPLOAD_BYTES)
+        Self {
+            concurrent: 2,
+            max_upload_bytes: imcp2_deploy::DEFAULT_MAX_UPLOAD_BYTES,
+            max_extracted_bytes: imcp2_deploy::DEFAULT_MAX_EXTRACTED_BYTES,
+            max_stored_bytes: None,
+        }
     }
 }
 
 impl DeployConfig {
-    /// The defaults, around a cap of `max_upload_bytes` on one archive: two
-    /// deploys at once, and [`imcp2_deploy::DEFAULT_STORED_UPLOADS`] archives'
-    /// worth of uploads in all.
-    pub fn with_max_upload_bytes(max_upload_bytes: usize) -> Self {
-        Self {
-            concurrent: 2,
-            max_upload_bytes,
-            max_stored_upload_bytes: max_upload_bytes
-                .saturating_mul(imcp2_deploy::DEFAULT_STORED_UPLOADS),
+    /// How large a bundle this takes.
+    pub fn limits(&self) -> imcp2_deploy::BundleLimits {
+        imcp2_deploy::BundleLimits::new(
+            self.max_upload_bytes as u64,
+            self.max_extracted_bytes as u64,
+        )
+    }
+
+    /// What the server holds of bundles in all, extracted:
+    /// [`Self::max_stored_bytes`], or its default.
+    pub fn stored_bytes(&self) -> u64 {
+        let bundle = self.max_extracted_bytes as u64;
+        match self.max_stored_bytes {
+            Some(bytes) => (bytes as u64).max(bundle),
+            None => bundle.saturating_mul(self.concurrent.max(1) as u64 + 1),
         }
     }
 }
@@ -221,11 +252,8 @@ impl Deploys {
     pub fn new(config: &DeployConfig, state_dir: &Path) -> std::io::Result<Self> {
         let dir = state_dir.join("deploys");
         let owned = own_directory(&dir)?;
-        let uploads = Uploads::with_budget(
-            dir.join("uploads"),
-            config.max_upload_bytes,
-            config.max_stored_upload_bytes,
-        );
+        let uploads =
+            Uploads::with_budget(dir.join("uploads"), config.limits(), config.stored_bytes());
         let cut_off = imcp2_deploy::prune_abandoned_deploys(&dir);
         if cut_off > 0 {
             tracing::info!(
@@ -472,11 +500,13 @@ fn cancel_on_drop(response: Response, gone: CancellationToken) -> Response {
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
-/// What a successful `PUT` answers with.
+/// What a successful `PUT` answers with: the id to deploy, what the bundle
+/// extracted to and what its archive was, in bytes, and how long it is held.
 #[derive(serde::Serialize)]
 struct Uploaded {
     upload_id: String,
-    bytes: usize,
+    bytes: u64,
+    archive_bytes: u64,
     expires_in_secs: u64,
 }
 
@@ -494,20 +524,23 @@ impl Abandoned {
 impl Drop for Abandoned {
     fn drop(&mut self) {
         if let Some(metrics) = self.0.take().as_ref().and_then(|m| m.0.get()) {
-            metrics.upload(Upload::BodyError, None);
+            metrics.upload(Upload::BodyError);
         }
     }
 }
 
-/// Receive an archive on the ticket in [`TICKET_HEADER`].
+/// Receive a bundle on the ticket in [`TICKET_HEADER`]: the body is
+/// extracted as it arrives, and the answer may come before the body has
+/// ended — at the byte that passes a limit, or the entry a bundle never
+/// carries — with the rest unread.
 async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response {
-    let count = |outcome: Upload, bytes: Option<usize>| {
+    let count = |outcome: Upload| {
         if let Some(metrics) = mcp.metrics.0.get() {
-            metrics.upload(outcome, bytes);
+            metrics.upload(outcome);
         }
     };
     let Some(ticket) = request.headers().get(TICKET_HEADER).and_then(|v| v.to_str().ok()) else {
-        count(Upload::BadTicket, None);
+        count(Upload::BadTicket);
         return (
             StatusCode::UNAUTHORIZED,
             format!("send the upload ticket in the {TICKET_HEADER} header"),
@@ -529,24 +562,26 @@ async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response
     let abandoned = Abandoned(Some(mcp.metrics.clone()));
     let received = mcp.uploads.receive(&ticket, declared, reader).await;
     abandoned.answered();
-    count(
-        match &received {
-            Ok(_) => Upload::Accepted,
-            Err(ReceiveError::UnknownTicket) => Upload::BadTicket,
-            Err(ReceiveError::TooLarge(_)) => Upload::TooLarge,
-            Err(ReceiveError::Busy) => Upload::SessionBusy,
-            Err(ReceiveError::Full) => Upload::StoreFull,
-            Err(ReceiveError::Body(_)) => Upload::BodyError,
-            Err(ReceiveError::Storage(_)) => Upload::StorageError,
-        },
-        received.as_ref().ok().map(|r| r.bytes),
-    );
+    count(match &received {
+        Ok(received) => {
+            Upload::Accepted { archive_bytes: received.archive_bytes, bytes: received.bytes }
+        }
+        Err(ReceiveError::UnknownTicket) => Upload::BadTicket,
+        Err(ReceiveError::TooLarge(_)) => Upload::TooLarge,
+        Err(ReceiveError::ExtractsTooLarge(_)) => Upload::ExtractsTooLarge,
+        Err(ReceiveError::Busy) => Upload::SessionBusy,
+        Err(ReceiveError::Full) => Upload::StoreFull,
+        Err(ReceiveError::Body(_)) => Upload::BodyError,
+        Err(ReceiveError::NotABundle(_)) => Upload::NotABundle,
+        Err(ReceiveError::Storage(_)) => Upload::StorageError,
+    });
     match received {
         Ok(received) => (
             StatusCode::CREATED,
             Json(Uploaded {
                 upload_id: received.upload_id,
                 bytes: received.bytes,
+                archive_bytes: received.archive_bytes,
                 expires_in_secs: received.expires_in.as_secs(),
             }),
         )
@@ -554,8 +589,14 @@ async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response
         Err(e @ ReceiveError::UnknownTicket) => {
             (StatusCode::FORBIDDEN, e.to_string()).into_response()
         }
-        Err(e @ ReceiveError::TooLarge(_)) => {
+        // Either size: the archive's own, or what it extracts to. The body
+        // says which, and the count keeps them apart.
+        Err(e @ (ReceiveError::TooLarge(_) | ReceiveError::ExtractsTooLarge(_))) => {
             (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response()
+        }
+        // Read, and not a bundle: nothing a retry of the same file changes.
+        Err(e @ ReceiveError::NotABundle(_)) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()
         }
         Err(e @ ReceiveError::Busy) => (StatusCode::CONFLICT, e.to_string()).into_response(),
         Err(e @ ReceiveError::Full) => {
@@ -578,8 +619,32 @@ mod tests {
     use tower::ServiceExt;
 
     fn config() -> DeployConfig {
-        DeployConfig { concurrent: 2, ..DeployConfig::with_max_upload_bytes(1024) }
+        DeployConfig {
+            concurrent: 2,
+            max_upload_bytes: 2048,
+            max_extracted_bytes: 64 * 1024,
+            max_stored_bytes: None,
+        }
     }
+
+    /// The smallest bundle there is: an archive of a manifest. It extracts
+    /// to [`BUNDLE_BYTES`].
+    fn bundle() -> Vec<u8> {
+        let manifest = b"canisters: []\n";
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append_data(&mut header, "icp.yaml", &manifest[..]).unwrap();
+        archive.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// What [`bundle`] extracts to: one file, a block and an entry.
+    const BUNDLE_BYTES: u64 = imcp2_deploy::BLOCK_BYTES + imcp2_deploy::ENTRY_BYTES;
 
     fn server() -> (tempfile::TempDir, McpServer) {
         let dir = tempfile::tempdir().unwrap();
@@ -694,8 +759,8 @@ mod tests {
         );
         assert!(result["structuredContent"]["curl"].as_str().unwrap().contains(&ticket));
 
-        // The PUT: refused without a ticket, with a wrong one, and over the cap;
-        // accepted on the ticket, once.
+        // The PUT: refused without a ticket, with a wrong one, over the cap,
+        // and for what is not a bundle; accepted on the ticket, once.
         let put = |ticket: Option<&str>, body: Vec<u8>| {
             let mut req = Request::put(UPLOAD_PATH);
             if let Some(t) = ticket {
@@ -705,7 +770,7 @@ mod tests {
         };
         assert_eq!(put(None, vec![1]).await.unwrap().status(), StatusCode::UNAUTHORIZED);
         assert_eq!(put(Some("bogus"), vec![1]).await.unwrap().status(), StatusCode::FORBIDDEN);
-        let resp = put(Some(&ticket), vec![0; 1025]).await.unwrap();
+        let resp = put(Some(&ticket), vec![0; 2049]).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
         // The over-cap attempt spent the ticket: mint another.
         let resp = post(
@@ -716,11 +781,28 @@ mod tests {
         .await;
         let answer: serde_json::Value = serde_json::from_str(&text(resp).await).unwrap();
         let ticket = answer["result"]["structuredContent"]["ticket"].as_str().unwrap().to_string();
+        // The body is extracted as it arrives, so what is not a bundle is
+        // refused here, on the upload, and that ticket is spent too.
         let resp = put(Some(&ticket), b"not a bundle".to_vec()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(text(resp).await.contains(".tar.gz"));
+        let resp = post(
+            &app,
+            &bearer,
+            rpc("tools/call", serde_json::json!({ "name": "icp_deploy_upload", "arguments": {} })),
+        )
+        .await;
+        let answer: serde_json::Value = serde_json::from_str(&text(resp).await).unwrap();
+        let ticket = answer["result"]["structuredContent"]["ticket"].as_str().unwrap().to_string();
+        let archive = bundle();
+        let resp = put(Some(&ticket), archive.clone()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
         let uploaded: serde_json::Value = serde_json::from_str(&text(resp).await).unwrap();
         let upload_id = uploaded["upload_id"].as_str().unwrap().to_string();
-        assert_eq!(uploaded["bytes"], 12);
+        // What it extracted to, which is what the server keeps of it, and
+        // what arrived.
+        assert_eq!(uploaded["bytes"], BUNDLE_BYTES);
+        assert_eq!(uploaded["archive_bytes"], archive.len());
         assert_eq!(put(Some(&ticket), vec![1]).await.unwrap().status(), StatusCode::FORBIDDEN);
 
         // A path is no way in: this server opens no file a caller names,
@@ -823,7 +905,7 @@ mod tests {
         let minted: serde_json::Value = serde_json::from_str(&minted).unwrap();
         let ticket = minted["result"]["structuredContent"]["ticket"].as_str().unwrap();
         let put = Request::put(UPLOAD_PATH).header(TICKET_HEADER, ticket);
-        let resp = again.oneshot(put.body(Body::from("bundle")).unwrap()).await.unwrap();
+        let resp = again.oneshot(put.body(Body::from(bundle())).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
 
         // Both slots held — by whichever endpoint — and neither has one left.
@@ -878,7 +960,8 @@ mod tests {
             r#"imcp2_deploy_uploads_total{outcome="store_full"} 0"#,
             "imcp2_deploys_running 0",
             "imcp2_deploy_slots 2",
-            "imcp2_deploy_upload_store_capacity_bytes 8192",
+            // A bundle for each deploy at once, and one more.
+            "imcp2_deploy_upload_store_capacity_bytes 196608",
         ] {
             has(&out, series);
         }
@@ -886,37 +969,70 @@ mod tests {
         let bearer = format!("Bearer {}", server.store.test_bearer().await);
         let app = server.mcp_router();
         // An upload with no ticket, and one with a ticket nobody minted.
-        let put = |ticket: Option<&str>, body: &'static str| {
+        let put = |ticket: Option<&str>, body: Vec<u8>| {
             let mut put = Request::put(UPLOAD_PATH);
             if let Some(ticket) = ticket {
                 put = put.header(TICKET_HEADER, ticket);
             }
             app.clone().oneshot(put.body(Body::from(body)).unwrap())
         };
-        assert_eq!(put(None, "x").await.unwrap().status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(put(Some("nope"), "x").await.unwrap().status(), StatusCode::FORBIDDEN);
-        // One abandoned mid-body: the request is dropped while the server
-        // waits for more, and no answer is ever made.
-        let minted = call(&app, &bearer, "icp_deploy_upload", serde_json::json!({})).await;
-        let minted: serde_json::Value = serde_json::from_str(&minted).unwrap();
-        let ticket = minted["result"]["structuredContent"]["ticket"].as_str().unwrap();
+        assert_eq!(put(None, vec![1]).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(put(Some("nope"), vec![1]).await.unwrap().status(), StatusCode::FORBIDDEN);
+        // One that is received: extracted as it arrived, and held.
+        let mint = || async {
+            let minted = call(&app, &bearer, "icp_deploy_upload", serde_json::json!({})).await;
+            let minted: serde_json::Value = serde_json::from_str(&minted).unwrap();
+            minted["result"]["structuredContent"]["ticket"].as_str().unwrap().to_string()
+        };
+        let archive = bundle();
+        let resp = put(Some(&mint().await), archive.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        metrics.refresh().await;
+        let out = scrape();
+        for series in [
+            "imcp2_deploy_uploads_held 1".to_string(),
+            // What the server keeps of it is what it extracted to.
+            format!("imcp2_deploy_upload_store_bytes {BUNDLE_BYTES}"),
+            "imcp2_deploy_upload_bytes_count 1".to_string(),
+            format!("imcp2_deploy_upload_bytes_sum {}", archive.len()),
+            "imcp2_deploy_bundle_extracted_bytes_count 1".to_string(),
+            format!("imcp2_deploy_bundle_extracted_bytes_sum {BUNDLE_BYTES}"),
+        ] {
+            has(&out, &series);
+        }
+
+        // One that is read and is not a bundle, and one that extracts to
+        // more than a bundle may: both refused on the upload, each counted
+        // as what it was. (A megabyte of zeros is an archive of a kilobyte.)
+        let resp = put(Some(&mint().await), b"not a bundle".to_vec()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let mut bomb = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::best(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1 << 20);
+        header.set_mode(0o644);
+        header.set_cksum();
+        bomb.append_data(&mut header, "icp.yaml", &vec![0u8; 1 << 20][..]).unwrap();
+        let bomb = bomb.into_inner().unwrap().finish().unwrap();
+        assert!(bomb.len() <= 1024 * 2, "{}", bomb.len());
+        let resp = put(Some(&mint().await), bomb).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(text(resp).await.contains("extracts to more than"));
+
+        // And one abandoned mid-body: the request is dropped while the
+        // server waits for more, and no answer is ever made.
         let never_ends = futures_util::stream::once(async {
             Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"half"))
         })
         .chain(futures_util::stream::pending());
         let abandoned = Request::put(UPLOAD_PATH)
-            .header(TICKET_HEADER, ticket)
+            .header(TICKET_HEADER, mint().await)
             .body(Body::from_stream(never_ends))
             .unwrap();
         let waited = Duration::from_millis(50);
         assert!(tokio::time::timeout(waited, app.clone().oneshot(abandoned)).await.is_err());
-
-        // And one that is received (the session's own, so it would have
-        // taken the place of an earlier one it held).
-        let minted = call(&app, &bearer, "icp_deploy_upload", serde_json::json!({})).await;
-        let minted: serde_json::Value = serde_json::from_str(&minted).unwrap();
-        let ticket = minted["result"]["structuredContent"]["ticket"].as_str().unwrap();
-        assert_eq!(put(Some(ticket), "bundle").await.unwrap().status(), StatusCode::CREATED);
 
         // A deploy of an upload that does not exist holds a slot for as long
         // as it takes to say so: rejected, and timed.
@@ -942,11 +1058,10 @@ mod tests {
         for series in [
             r#"imcp2_deploy_uploads_total{outcome="bad_ticket"} 2"#,
             r#"imcp2_deploy_uploads_total{outcome="accepted"} 1"#,
+            r#"imcp2_deploy_uploads_total{outcome="not_a_bundle"} 1"#,
+            r#"imcp2_deploy_uploads_total{outcome="extracts_too_large"} 1"#,
             r#"imcp2_deploy_uploads_total{outcome="body_error"} 1"#,
             "imcp2_deploy_upload_bytes_count 1",
-            "imcp2_deploy_upload_bytes_sum 6",
-            "imcp2_deploy_uploads_held 1",
-            "imcp2_deploy_upload_store_bytes 6",
             r#"imcp2_deploys_total{outcome="rejected"} 1"#,
             "imcp2_deploy_duration_seconds_count 1",
             r#"imcp2_deploy_refusals_total{reason="busy"} 1"#,

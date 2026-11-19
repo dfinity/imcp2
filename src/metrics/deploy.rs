@@ -29,30 +29,50 @@ const DEPLOY_SECONDS: &[f64] =
 const UPLOAD_BYTES: &[f64] =
     &[65_536.0, 262_144.0, 1_048_576.0, 4_194_304.0, 16_777_216.0, 67_108_864.0, 268_435_456.0];
 
+/// How large a bundle is once extracted, in bytes: 64 KiB to a gibibyte by
+/// fours. Where the limit on it should sit is read off this.
+const EXTRACTED_BYTES: &[f64] = &[
+    65_536.0,
+    262_144.0,
+    1_048_576.0,
+    4_194_304.0,
+    16_777_216.0,
+    67_108_864.0,
+    268_435_456.0,
+    1_073_741_824.0,
+];
+
 /// What became of a `PUT` to the upload route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Upload {
-    /// Received whole, and held for its deploy.
-    Accepted,
+    /// Received whole, extracted, and held for its deploy: what its archive
+    /// was and what it extracted to.
+    Accepted { archive_bytes: u64, bytes: u64 },
     /// No ticket was sent, or one that is spent, expired or unknown.
     BadTicket,
-    /// The archive is over the cap on one archive.
+    /// The archive is over the cap on one archive, compressed.
     TooLarge,
+    /// The archive extracts to more than a bundle may: stopped as it arrived.
+    ExtractsTooLarge,
+    /// What arrived is not a bundle.
+    NotABundle,
     /// The store had no room: the budget for every archive was spent.
     StoreFull,
     /// Another upload was arriving for the same session.
     SessionBusy,
     /// The body could not be read to its end, or was longer than declared.
     BodyError,
-    /// The archive could not be written: the server's fault.
+    /// The bundle could not be written: the server's fault.
     StorageError,
 }
 
 impl Upload {
-    const ALL: [Self; 7] = [
-        Self::Accepted,
+    const ALL: [Self; 9] = [
+        Self::Accepted { archive_bytes: 0, bytes: 0 },
         Self::BadTicket,
         Self::TooLarge,
+        Self::ExtractsTooLarge,
+        Self::NotABundle,
         Self::StoreFull,
         Self::SessionBusy,
         Self::BodyError,
@@ -61,9 +81,11 @@ impl Upload {
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::Accepted => "accepted",
+            Self::Accepted { .. } => "accepted",
             Self::BadTicket => "bad_ticket",
             Self::TooLarge => "too_large",
+            Self::ExtractsTooLarge => "extracts_too_large",
+            Self::NotABundle => "not_a_bundle",
             Self::StoreFull => "store_full",
             Self::SessionBusy => "session_busy",
             Self::BodyError => "body_error",
@@ -82,6 +104,7 @@ pub(crate) struct DeployMetrics {
     duration: Histogram,
     uploads: IntCounterVec,
     upload_bytes: Histogram,
+    extracted_bytes: Histogram,
     store_bytes: IntGauge,
     store_capacity: IntGauge,
     uploads_held: IntGauge,
@@ -135,7 +158,8 @@ impl DeployMetrics {
                 metric!("deploy_refusals_total"),
                 "Deploys asked for and not begun, by reason: busy (every slot was held — a \
                  sustained rate means the cap is too low), session_busy (the session already \
-                 had one running), stopping (the server was shutting down).",
+                 had one running), stopping (the server was shutting down), no_room (the \
+                 upload store had no room for the deploy to run in).",
                 "reason",
             )?,
             duration: histogram(
@@ -145,25 +169,35 @@ impl DeployMetrics {
             )?,
             uploads: counters(
                 metric!("deploy_uploads_total"),
-                "Bundle uploads, by outcome: accepted, bad_ticket, too_large (over the cap on \
-                 one archive), store_full (no room in the budget for all of them), \
-                 session_busy (another was arriving for the session), body_error, \
-                 storage_error (the server could not write it).",
+                "Bundle uploads, by outcome: accepted, bad_ticket, too_large (the archive is \
+                 over its cap), extracts_too_large (it extracts to more than a bundle may; \
+                 stopped as it arrived), not_a_bundle, store_full (no room in the budget for \
+                 all of them), session_busy (another was arriving for the session), \
+                 body_error (the transfer failed, stalled or was abandoned), storage_error \
+                 (the server could not write it).",
                 "outcome",
             )?,
             upload_bytes: histogram(
                 metric!("deploy_upload_bytes"),
-                "The size of each accepted bundle archive, in bytes.",
+                "The size of each accepted bundle archive, compressed, in bytes.",
                 UPLOAD_BYTES,
+            )?,
+            extracted_bytes: histogram(
+                metric!("deploy_bundle_extracted_bytes"),
+                "What each accepted bundle extracted to, in bytes, counted as what its files \
+                 and directories occupy (whole 4 KiB blocks, and 1 KiB an entry). The limit \
+                 on it is read off this.",
+                EXTRACTED_BYTES,
             )?,
             store_bytes: gauge(
                 metric!("deploy_upload_store_bytes"),
-                "Bytes counted against the upload store's budget: the reservation of each \
-                 archive arriving, and the size of each waiting or being deployed.",
+                "Extracted bytes counted against the upload store's budget, which is what \
+                 the deploy tools keep under the state directory: a bundle arriving or being \
+                 deployed counts as the most one may come to, one waiting as what it came to.",
             )?,
             store_capacity: gauge(
                 metric!("deploy_upload_store_capacity_bytes"),
-                "The upload store's budget, in bytes.",
+                "The upload store's budget, in extracted bytes.",
             )?,
             uploads_held: gauge(
                 metric!("deploy_uploads_held"),
@@ -186,12 +220,12 @@ impl DeployMetrics {
         Ok(this)
     }
 
-    /// Count one `PUT` to the upload route; `bytes` is an accepted archive's
-    /// size.
-    pub(crate) fn upload(&self, outcome: Upload, bytes: Option<usize>) {
+    /// Count one `PUT` to the upload route, with an accepted bundle's sizes.
+    pub(crate) fn upload(&self, outcome: Upload) {
         self.uploads.with_label_values(&[outcome.as_str()]).inc();
-        if let Some(bytes) = bytes {
-            self.upload_bytes.observe(bytes as f64);
+        if let Upload::Accepted { archive_bytes, bytes } = outcome {
+            self.upload_bytes.observe(archive_bytes as f64);
+            self.extracted_bytes.observe(bytes as f64);
         }
     }
 

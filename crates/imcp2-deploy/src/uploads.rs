@@ -16,26 +16,47 @@
 //!   * one pending ticket per session — minting another drops the previous;
 //!   * bound to the session that minted it: the upload it produces is
 //!     deployable by that session alone, so an id leaking elsewhere is useless;
-//!   * the body is streamed to disk under the cap, a declared length over the
-//!     cap refused unread, so a ticket flood costs a lookup each.
+//!   * a declared length over the archive limit is refused unread, so a
+//!     ticket flood costs a lookup each.
+//!
+//! **The archive is extracted as it arrives, and never kept.** The body is
+//! fed to the bundle extractor ([`crate::host::extract_bundle_from`]) a
+//! chunk at a time, on a thread of its own, and what the store holds for the
+//! deploy is the extracted bundle: a directory of its own under the store's,
+//! readable by the server's user alone. So the archive is nowhere whole —
+//! not in memory, not on disk — and both of its sizes are held while it is
+//! still arriving: the compressed bytes read, and what they have inflated to
+//! ([`BundleLimits`]). The byte that passes either stops the read, and the
+//! request is answered then, with whatever had been written removed. An
+//! archive that is not a bundle is refused here too, before any deploy is
+//! asked for.
 //!
 //! An upload is held for [`UPLOAD_TTL`] for its deploy to begin; the deploy
-//! that takes it removes it, and one never taken is swept at expiry. Each
-//! archive is a file of its own under the store's directory, readable by the
-//! server's user alone.
+//! that takes it takes the directory for its own (a rename, nothing copied),
+//! and one never taken is swept at expiry.
 //!
 //! What the store may hold is bounded, whatever a session does with its
-//! tickets:
+//! tickets. The bound is on extracted bytes, since those are what the
+//! server keeps — in memory, where its state directory is a RAM filesystem:
 //!
 //!   * a session has one upload at a time: a `PUT` while another of the
-//!     session's is still arriving is refused, and one that begins replaces
-//!     the archive the session was holding;
-//!   * every archive — arriving, held, or with its deploy — counts against
-//!     one budget for the whole store, reserved before a byte of the body is
-//!     read (the declared length, or the cap when none is declared) and
-//!     settled to the size that arrived; past the budget a `PUT` is refused;
-//!   * an archive whose `PUT` is abandoned mid-body goes with the request,
-//!     and its reservation with it;
+//!     session's is still arriving is refused, and one that is let in
+//!     replaces the bundle the session was holding;
+//!   * every bundle counts against one budget for the whole store. One that
+//!     is arriving is charged the most it may extract to
+//!     ([`BundleLimits::extracted_bytes`]), reserved before a byte of the
+//!     body is read: its size is not known until it has all arrived. One
+//!     that is waiting is charged what it did extract to. And one with its
+//!     deploy is charged the limit again, for as long as the deploy runs:
+//!     the deploy's directory grows beyond the bundle (the copy of each
+//!     canister's module the build keeps), and the limit is what
+//!     [`crate::host::check_bundle`] holds that directory to. Past the
+//!     budget a `PUT` is refused, and so is a deploy that would have to grow
+//!     into room that is not there;
+//!   * a body that stops arriving ([`UPLOAD_IDLE`]) or takes too long in all
+//!     ([`UPLOAD_TIME`]) is given up on, and a `PUT` that fails or is
+//!     abandoned leaves nothing: the partial bundle goes with it, and its
+//!     reservation;
 //!   * the directory is the store's own: what an earlier process left in it
 //!     is removed when the store is made, since nothing could deploy it.
 
@@ -46,25 +67,37 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use camino::Utf8PathBuf;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
-/// The default cap on an uploaded archive, in bytes: a real bundle is a
-/// manifest, a few modules and a frontend's assets, well inside this.
+use crate::host::{self, BundleLimits, ExtractError};
+
+/// The default cap on an uploaded archive, compressed, in bytes: a real
+/// bundle is a manifest, a few modules and a frontend's assets, well inside
+/// this.
 pub const DEFAULT_MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
-/// The default budget for every archive a store has at once, as a multiple
-/// of its per-archive cap.
-pub const DEFAULT_STORED_UPLOADS: usize = 8;
+/// The default cap on what an uploaded bundle extracts to, and on what its
+/// deploy's directory comes to, in bytes.
+pub const DEFAULT_MAX_EXTRACTED_BYTES: usize = 128 * 1024 * 1024;
+/// The default budget for every bundle a store has at once, as a multiple of
+/// what one may extract to: a server sets its own from how many deploys it
+/// runs at once (one arriving or waiting besides).
+pub const DEFAULT_STORED_BUNDLES: usize = 3;
 /// How long a ticket is good for: minutes, enough to run one `curl`.
 pub const TICKET_TTL: Duration = Duration::from_secs(5 * 60);
-/// How long an upload waits for its deploy to begin.
-pub const UPLOAD_TTL: Duration = Duration::from_secs(15 * 60);
+/// How long an upload waits for its deploy to begin. Minutes: the deploy is
+/// the agent's next call, and a waiting bundle is held in full.
+pub const UPLOAD_TTL: Duration = Duration::from_secs(5 * 60);
+/// How long a body may go without a byte arriving before it is given up on.
+pub const UPLOAD_IDLE: Duration = Duration::from_secs(30);
+/// How long a body may take to arrive in all: an upload holds its
+/// reservation and a thread for as long as it lasts.
+pub const UPLOAD_TIME: Duration = Duration::from_secs(10 * 60);
 /// The request header a `PUT` presents its ticket in — a header rather than
 /// the path, so the ticket stays out of a proxy's access log.
 pub const TICKET_HEADER: &str = "x-deploy-upload-ticket";
-/// What an archive's file is named after its id.
-const ARCHIVE_SUFFIX: &str = ".tar.gz";
 
-/// The store: a directory of received archives and the tickets and uploads
+/// The store: a directory of extracted bundles and the tickets and uploads
 /// outstanding. Cheap to clone; one per directory, shared by every endpoint
 /// of the process that receives into it.
 #[derive(Clone)]
@@ -74,8 +107,10 @@ pub struct Uploads {
 
 struct Inner {
     dir: PathBuf,
-    max_bytes: usize,
+    limits: BundleLimits,
     max_total_bytes: u64,
+    /// [`UPLOAD_IDLE`] and [`UPLOAD_TIME`], which a test shortens.
+    patience: (Duration, Duration),
     state: Mutex<State>,
 }
 
@@ -93,8 +128,7 @@ struct State {
     uploads: HashMap<String, Upload>,
     /// The sessions with a `PUT` arriving: one each.
     receiving: HashSet<String>,
-    /// What counts against the budget: the reservation of each archive
-    /// arriving, and the size of each held or with its deploy.
+    /// What counts against the budget: see the module docs.
     bytes: u64,
 }
 
@@ -105,7 +139,7 @@ struct Ticket {
 
 struct Upload {
     session: String,
-    path: PathBuf,
+    dir: PathBuf,
     bytes: u64,
     expires: Instant,
 }
@@ -117,12 +151,13 @@ pub struct Minted {
     pub expires_in: Duration,
 }
 
-/// An archive just received: the id its deploy names, its size, and how long
-/// the store holds it.
+/// A bundle just received: the id its deploy names, what it extracted to and
+/// what its archive was, in bytes, and how long the store holds it.
 #[derive(Debug)]
 pub struct Received {
     pub upload_id: String,
-    pub bytes: usize,
+    pub bytes: u64,
+    pub archive_bytes: u64,
     pub expires_in: Duration,
 }
 
@@ -131,15 +166,19 @@ pub struct Received {
 pub enum ReceiveError {
     /// No such ticket, or one already used or expired.
     UnknownTicket,
-    /// The body is over the cap (the value); nothing is kept.
-    TooLarge(usize),
+    /// The archive is over the cap on one, compressed (the value).
+    TooLarge(u64),
+    /// The archive extracts to more than a bundle may (the value).
+    ExtractsTooLarge(u64),
     /// Another upload of the session's is still arriving.
     Busy,
     /// The store is holding as much as it may, across every session.
     Full,
     /// The body could not be read: the client's side of the transfer.
     Body(String),
-    /// The archive could not be stored (the directory not made, the file not
+    /// What arrived is not a bundle.
+    NotABundle(String),
+    /// The bundle could not be stored (the directory not made, a file not
     /// written): the server's fault, not the request's.
     Storage(String),
 }
@@ -150,7 +189,16 @@ impl std::fmt::Display for ReceiveError {
             ReceiveError::UnknownTicket => f.write_str(
                 "unknown, used or expired upload ticket; call icp_deploy_upload for a new one",
             ),
-            ReceiveError::TooLarge(max) => write!(f, "the archive is over the {max}-byte limit"),
+            ReceiveError::TooLarge(max) => write!(
+                f,
+                "the bundle archive is over the {max}-byte limit this server takes; make the \
+                 bundle smaller"
+            ),
+            ReceiveError::ExtractsTooLarge(max) => write!(
+                f,
+                "the bundle extracts to more than the {max} bytes this server takes; make the \
+                 bundle smaller (fewer or smaller assets, gzip-compressed modules)"
+            ),
             ReceiveError::Busy => f.write_str(
                 "another upload for this session is still arriving; wait for it to finish, \
                  then call icp_deploy_upload for a new ticket",
@@ -160,54 +208,90 @@ impl std::fmt::Display for ReceiveError {
                  icp_deploy_upload for a new ticket and try again in a few minutes",
             ),
             ReceiveError::Body(e) => write!(f, "could not read the archive: {e}"),
-            ReceiveError::Storage(e) => write!(f, "could not store the archive: {e}"),
+            ReceiveError::NotABundle(e) => f.write_str(e),
+            ReceiveError::Storage(e) => write!(f, "could not store the bundle: {e}"),
         }
     }
 }
 
-/// An upload handed to its deploy: the archive's path, and the file's removal
-/// — with its share of the store's budget — when this is dropped, whichever
-/// way the deploy ends.
+impl From<ExtractError> for ReceiveError {
+    fn from(e: ExtractError) -> Self {
+        match e {
+            ExtractError::ArchiveTooLarge(max) => Self::TooLarge(max),
+            ExtractError::ExtractsTooLarge(max) => Self::ExtractsTooLarge(max),
+            ExtractError::Source(why) => Self::Body(why),
+            ExtractError::NotABundle(why) => Self::NotABundle(why),
+            ExtractError::Storage(why) => Self::Storage(why),
+        }
+    }
+}
+
+/// Why an upload was not handed to a deploy.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TakeError {
+    /// The session has no such upload: never made, expired, replaced, or
+    /// deployed already.
+    NoSuchUpload,
+    /// The upload is there, and stays, but the store has no room for its
+    /// deploy to run in.
+    NoRoom,
+}
+
+/// An upload handed to its deploy: the bundle's directory, for the deploy to
+/// take as its own, and its hold on the store's budget — the room a running
+/// deploy is charged — released when this is dropped, whichever way the
+/// deploy ends. A directory the deploy never took goes then too.
 pub struct TakenUpload {
-    path: PathBuf,
+    dir: PathBuf,
     bytes: u64,
+    charged: u64,
     store: Arc<Inner>,
 }
 
 impl TakenUpload {
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// The directory the bundle was extracted into.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// What the bundle extracted to, in bytes.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
     }
 }
 
 impl std::fmt::Debug for TakenUpload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TakenUpload").field("path", &self.path).finish_non_exhaustive()
+        f.debug_struct("TakenUpload").field("dir", &self.dir).finish_non_exhaustive()
     }
 }
 
 impl Drop for TakenUpload {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Gone already when the deploy moved it in, which is the usual case.
+        let _ = std::fs::remove_dir_all(&self.dir);
         let mut state = self.store.state();
-        state.bytes = state.bytes.saturating_sub(self.bytes);
+        state.bytes = state.bytes.saturating_sub(self.charged);
     }
 }
 
-/// An archive arriving: the session's one `PUT`, its file and its
-/// reservation. Dropped before [`Self::finish`] — the body failed, or the
-/// request was abandoned and its future dropped mid-read — it takes the
-/// partial file and the reservation with it.
+/// A bundle arriving: the session's one `PUT`, its directory and its
+/// reservation. Dropped before [`Self::finish`] — the body failed, or was
+/// given up on — it takes the partial bundle and the reservation with it.
+/// It is owned by the thread that extracts, not by the request: a request
+/// that is abandoned stops nothing by being dropped, and the extraction ends
+/// when its body does.
 struct Receiving {
     store: Arc<Inner>,
     session: String,
-    path: PathBuf,
+    dir: PathBuf,
     reserved: u64,
     finished: bool,
 }
 
 impl Receiving {
-    /// The archive arrived whole, `bytes` of it: hold it for its deploy.
+    /// The bundle arrived whole, `bytes` of it extracted: hold it for its
+    /// deploy.
     fn finish(mut self, upload_id: &str, bytes: u64) {
         let mut state = self.store.state();
         state.receiving.remove(&self.session);
@@ -216,7 +300,7 @@ impl Receiving {
             upload_id.to_string(),
             Upload {
                 session: self.session.clone(),
-                path: self.path.clone(),
+                dir: self.dir.clone(),
                 bytes,
                 expires: Instant::now() + UPLOAD_TTL,
             },
@@ -230,7 +314,7 @@ impl Drop for Receiving {
         if self.finished {
             return;
         }
-        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir_all(&self.dir);
         let mut state = self.store.state();
         state.receiving.remove(&self.session);
         state.bytes = state.bytes.saturating_sub(self.reserved);
@@ -240,51 +324,61 @@ impl Drop for Receiving {
 /// What an upload store holds at a moment; see [`Uploads::held`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Held {
-    /// The bytes counted against the budget: the reservation of each archive
-    /// arriving, and the size of each waiting or with its deploy.
+    /// The bytes counted against the budget: see the module docs.
     pub bytes: u64,
     /// The budget.
     pub max_bytes: u64,
-    /// The archives waiting for their deploy.
+    /// The bundles waiting for their deploy.
     pub uploads: usize,
-    /// The archives arriving.
+    /// The bundles arriving.
     pub receiving: usize,
 }
 
 impl Uploads {
-    /// A store writing its archives under `dir`, each at most `max_bytes`
-    /// and [`DEFAULT_STORED_UPLOADS`] times that in all; see
+    /// A store extracting its bundles under `dir`, each within `limits`, and
+    /// [`DEFAULT_STORED_BUNDLES`] of the largest in all; see
     /// [`Self::with_budget`].
-    pub fn new(dir: PathBuf, max_bytes: usize) -> Self {
-        Self::with_budget(dir, max_bytes, max_bytes.saturating_mul(DEFAULT_STORED_UPLOADS))
+    pub fn new(dir: PathBuf, limits: BundleLimits) -> Self {
+        let budget = limits.extracted_bytes.saturating_mul(DEFAULT_STORED_BUNDLES as u64);
+        Self::with_budget(dir, limits, budget)
     }
 
-    /// A store writing its archives under `dir` (made now, readable by the
-    /// server's user alone), each at most `max_bytes` and `max_total_bytes`
-    /// in all (at least one archive's worth). The directory is
-    /// canonicalized: a relative `dir` is resolved against the working
-    /// directory here, so the path of a received archive is absolute, as the
-    /// deploy that reads it requires. Should the directory not be makable
-    /// now, it is tried again at each upload, which reports the failure.
+    /// A store extracting its bundles under `dir` (made now, readable by the
+    /// server's user alone), each within `limits`, and holding at most
+    /// `max_total_bytes` of them in all, extracted (at least one bundle's
+    /// worth). The directory is canonicalized: a relative `dir` is resolved
+    /// against the working directory here, so the path of a received bundle
+    /// is absolute, as the deploy that takes it requires. Should the
+    /// directory not be makable now, it is tried again at each upload, which
+    /// reports the failure.
     ///
-    /// The directory is this store's alone, one store per process: archives
+    /// The directory is this store's alone, one store per process: bundles
     /// already in it were received by a process that has gone, with the
     /// tickets and sessions they belonged to, so they are removed here.
-    pub fn with_budget(dir: PathBuf, max_bytes: usize, max_total_bytes: usize) -> Self {
+    pub fn with_budget(dir: PathBuf, limits: BundleLimits, max_total_bytes: u64) -> Self {
         let dir = make_private_dir(&dir)
             .and_then(|()| dir.canonicalize())
             .or_else(|_| std::path::absolute(&dir))
             .unwrap_or(dir);
-        let left = remove_archives(&dir);
+        let left = remove_leftovers(&dir);
         if left > 0 {
             tracing::info!(dir = %dir.display(), left, "removed uploads an earlier run left");
         }
-        let max_total_bytes = max_total_bytes.max(max_bytes) as u64;
-        Self { inner: Arc::new(Inner { dir, max_bytes, max_total_bytes, state: Mutex::default() }) }
+        let max_total_bytes = max_total_bytes.max(limits.extracted_bytes);
+        Self {
+            inner: Arc::new(Inner {
+                dir,
+                limits,
+                max_total_bytes,
+                patience: (UPLOAD_IDLE, UPLOAD_TIME),
+                state: Mutex::default(),
+            }),
+        }
     }
 
-    pub fn max_bytes(&self) -> usize {
-        self.inner.max_bytes
+    /// How large a bundle this store takes.
+    pub fn limits(&self) -> BundleLimits {
+        self.inner.limits
     }
 
     /// What the store holds now, against what it may.
@@ -298,7 +392,7 @@ impl Uploads {
         }
     }
 
-    /// Drop expired tickets, and expired uploads with their files. Every
+    /// Drop expired tickets, and expired uploads with their bundles. Every
     /// operation does this first; a server calls it on a timer as well, so
     /// an idle store does not hold what has lapsed.
     pub fn sweep(&self) {
@@ -319,17 +413,22 @@ impl Uploads {
         Minted { ticket, expires_in: TICKET_TTL }
     }
 
-    /// Receive an archive on `ticket`: the ticket is spent first, a declared
-    /// length over the cap is refused unread, room is reserved for it (see
-    /// the module docs), and the body is streamed to a file up to what was
-    /// reserved and no further.
+    /// Receive a bundle on `ticket`: the ticket is spent first, a declared
+    /// length over the archive limit is refused unread, room is reserved
+    /// (see the module docs), and the body is extracted as it is read, up
+    /// to the limits and no further.
+    ///
+    /// The extraction runs on a thread of its own, which owns the body: it
+    /// goes on to the body's end whether or not the caller is still waiting,
+    /// and cleans up after itself either way. A caller that goes away loses
+    /// only the answer.
     pub async fn receive(
         &self,
         ticket: &str,
         declared_len: Option<u64>,
-        mut body: impl AsyncRead + Unpin,
+        body: impl AsyncRead + Unpin + Send + 'static,
     ) -> Result<Received, ReceiveError> {
-        let max = self.inner.max_bytes;
+        let limits = self.inner.limits;
         let upload_id = random_token();
         let receiving = {
             let mut state = self.inner.state();
@@ -338,7 +437,8 @@ impl Uploads {
                 tracing::info!("upload refused: no such ticket (spent, expired or unknown)");
                 return Err(ReceiveError::UnknownTicket);
             };
-            if declared_len.is_some_and(|len| len > max as u64) {
+            if declared_len.is_some_and(|len| len > limits.archive_bytes) {
+                let max = limits.archive_bytes;
                 tracing::warn!(session, ?declared_len, max, "upload refused: declared too large");
                 return Err(ReceiveError::TooLarge(max));
             }
@@ -346,7 +446,7 @@ impl Uploads {
                 tracing::warn!(session, "upload refused: another is arriving for the session");
                 return Err(ReceiveError::Busy);
             }
-            // The archive the session was holding gives way to this one, so
+            // The bundle the session was holding gives way to this one, so
             // its bytes are room this one may use — but it goes only once
             // this one is let in: a refusal leaves the session what it had.
             let (replaced, giving_way): (Vec<String>, u64) = state
@@ -357,7 +457,9 @@ impl Uploads {
                     ids.push(id.clone());
                     (ids, bytes + u.bytes)
                 });
-            let reserved = declared_len.unwrap_or(max as u64);
+            // Its size is known only once it has arrived: the most it may
+            // extract to is held for it until then.
+            let reserved = limits.extracted_bytes;
             let held = state.bytes.saturating_sub(giving_way);
             if held + reserved > self.inner.max_total_bytes {
                 tracing::warn!(session, held = state.bytes, "upload refused: the store is full");
@@ -371,96 +473,109 @@ impl Uploads {
             Receiving {
                 store: self.inner.clone(),
                 session,
-                path: self.inner.dir.join(format!("{upload_id}{ARCHIVE_SUFFIX}")),
+                dir: self.inner.dir.join(&upload_id),
                 reserved,
                 finished: false,
             }
         };
         let session = receiving.session.clone();
-        make_private_dir(&self.inner.dir).map_err(|e| {
-            tracing::error!(session, %e, "upload failed: the upload directory cannot be made");
-            ReceiveError::Storage(e.to_string())
-        })?;
-        // `reserved` fits a usize: it is at most the cap.
-        let limit = receiving.reserved as usize;
-        let bytes = match write_up_to(&receiving.path, &mut body, limit).await {
-            Ok(bytes) => bytes,
-            // Past a declared length that was itself within the cap.
-            Err(ReceiveError::TooLarge(_)) if limit < max => {
-                tracing::warn!(session, limit, "upload failed: longer than its declared length");
-                return Err(ReceiveError::Body(format!(
-                    "the body is longer than the {limit} bytes it declared"
-                )));
+        let (root, (idle, time)) = (self.inner.dir.clone(), self.inner.patience);
+        let runtime = tokio::runtime::Handle::current();
+        let id = upload_id.clone();
+        // The guard goes to the thread with the body: see `Receiving`.
+        let extracting = tokio::task::spawn_blocking(move || {
+            make_private_dir(&root)
+                .and_then(|()| make_new_private_dir(&receiving.dir))
+                .map_err(|e| ReceiveError::Storage(e.to_string()))?;
+            let dir = Utf8PathBuf::from_path_buf(receiving.dir.clone()).map_err(|p| {
+                ReceiveError::Storage(format!("the upload path '{}' is not UTF-8", p.display()))
+            })?;
+            let body = Arriving { body, runtime, idle, deadline: Instant::now() + time, time };
+            let extracted = host::extract_bundle_from(body, &dir, &limits)?;
+            receiving.finish(&id, extracted.bytes);
+            Ok::<_, ReceiveError>((extracted.bytes, extracted.archive_bytes))
+        });
+        let outcome = extracting.await.unwrap_or_else(|e| {
+            Err(ReceiveError::Storage(format!("the extraction did not finish: {e}")))
+        });
+        match outcome {
+            Ok((bytes, archive_bytes)) => {
+                tracing::info!(session, upload_id, bytes, archive_bytes, "bundle uploaded");
+                Ok(Received { upload_id, bytes, archive_bytes, expires_in: UPLOAD_TTL })
             }
             Err(e) => {
-                tracing::warn!(session, %e, "upload failed");
-                return Err(e);
+                match &e {
+                    ReceiveError::Storage(_) => tracing::error!(session, %e, "upload failed"),
+                    _ => tracing::warn!(session, %e, "upload refused"),
+                }
+                Err(e)
             }
-        };
-        receiving.finish(&upload_id, bytes as u64);
-        tracing::info!(session, upload_id, bytes, "bundle uploaded");
-        Ok(Received { upload_id, bytes, expires_in: UPLOAD_TTL })
+        }
     }
 
     /// Hand `upload_id` to its deploy, if `session` is the one that uploaded
-    /// it: the archive's path, removed when the returned handle drops.
-    pub async fn take(&self, upload_id: &str, session: &str) -> Option<TakenUpload> {
+    /// it and there is room for the deploy to run: the bundle's directory,
+    /// and its hold on the budget until the returned handle drops. A deploy
+    /// is charged the most its directory may come to, not what its bundle
+    /// extracted to (see the module docs), so the hold grows here; an upload
+    /// refused for want of that room is left as it was, to be asked for
+    /// again.
+    pub async fn take(&self, upload_id: &str, session: &str) -> Result<TakenUpload, TakeError> {
         let mut state = self.inner.state();
         sweep(&mut state);
-        let owned = state.uploads.get(upload_id).is_some_and(|u| u.session == session);
-        if !owned {
+        let Some(bytes) =
+            state.uploads.get(upload_id).filter(|u| u.session == session).map(|u| u.bytes)
+        else {
             tracing::info!(session, upload_id, "no such upload for the session");
-            return None;
+            return Err(TakeError::NoSuchUpload);
+        };
+        let charged = self.inner.limits.extracted_bytes.max(bytes);
+        if state.bytes + (charged - bytes) > self.inner.max_total_bytes {
+            tracing::warn!(session, upload_id, held = state.bytes, "no room to deploy the upload");
+            return Err(TakeError::NoRoom);
         }
+        state.bytes += charged - bytes;
         tracing::info!(session, upload_id, "upload taken by a deploy");
-        // Its bytes stay counted until the handle drops, with the file.
-        state.uploads.remove(upload_id).map(|u| TakenUpload {
-            path: u.path,
-            bytes: u.bytes,
-            store: self.inner.clone(),
-        })
+        let upload = state.uploads.remove(upload_id).expect("looked up above, under the lock");
+        Ok(TakenUpload { dir: upload.dir, bytes, charged, store: self.inner.clone() })
     }
 }
 
-/// Write `body` to a new file at `path`, readable by the owner alone, refusing
-/// — and reading no further — once more than `max` bytes have arrived.
-async fn write_up_to(
-    path: &Path,
-    body: &mut (impl AsyncRead + Unpin),
-    max: usize,
-) -> Result<usize, ReceiveError> {
-    // Created here and now, not on another thread while this future waits:
-    // the caller's guard removes the file if this future is dropped, and a
-    // creation still on its way when that happened would land after the
-    // removal, leaving a file nothing knows of. Making an empty file is
-    // quick; everything after it that waits has the file to its name.
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options.open(path).map_err(|e| ReceiveError::Storage(e.to_string()))?;
-    let mut file = tokio::fs::File::from_std(file);
-    let mut total = 0usize;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = body.read(&mut buf).await.map_err(|e| ReceiveError::Body(e.to_string()))?;
-        if n == 0 {
-            break;
-        }
-        total += n;
-        if total > max {
-            return Err(ReceiveError::TooLarge(max));
-        }
-        file.write_all(&buf[..n]).await.map_err(|e| ReceiveError::Storage(e.to_string()))?;
-    }
-    file.flush().await.map_err(|e| ReceiveError::Storage(e.to_string()))?;
-    Ok(total)
+/// A request body as the extractor reads it: a blocking reader over an
+/// asynchronous one, on a thread that may block. Each read waits for the
+/// next chunk, but not for ever: a body that stops arriving, or that has
+/// taken too long in all, ends in an error, and the extraction with it.
+struct Arriving<R> {
+    body: R,
+    runtime: tokio::runtime::Handle,
+    idle: Duration,
+    deadline: Instant,
+    time: Duration,
 }
 
-/// Drop expired tickets, and expired uploads with their files.
+impl<R: AsyncRead + Unpin> std::io::Read for Arriving<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let timed_out = |why: String| std::io::Error::new(std::io::ErrorKind::TimedOut, why);
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(timed_out(format!(
+                "the upload took longer than the {} seconds one may",
+                self.time.as_secs()
+            )));
+        }
+        let wait = self.idle.min(left);
+        let body = &mut self.body;
+        match self.runtime.block_on(async { tokio::time::timeout(wait, body.read(buf)).await }) {
+            Ok(read) => read,
+            Err(_) => Err(timed_out(format!(
+                "no data arrived for {} seconds, or the upload ran out of time",
+                wait.as_secs()
+            ))),
+        }
+    }
+}
+
+/// Drop expired tickets, and expired uploads with their bundles.
 fn sweep(state: &mut State) {
     let now = Instant::now();
     state.tickets.retain(|_, t| t.expires > now);
@@ -471,31 +586,36 @@ fn sweep(state: &mut State) {
     }
 }
 
-/// Forget a held upload: its file, and its share of the budget.
+/// Forget a held upload: its bundle, and its share of the budget.
 fn remove_upload(state: &mut State, upload_id: &str) {
     if let Some(upload) = state.uploads.remove(upload_id) {
-        let _ = std::fs::remove_file(&upload.path);
+        let _ = std::fs::remove_dir_all(&upload.dir);
         state.bytes = state.bytes.saturating_sub(upload.bytes);
     }
 }
 
-/// Remove every archive file directly under `dir` — what a store names its
-/// files, and nothing else — and say how many there were.
-fn remove_archives(dir: &Path) -> usize {
+/// Remove every upload directly under `dir` — what a store names its
+/// bundles (and what an earlier version named its archives), and nothing
+/// else — and say how many there were.
+fn remove_leftovers(dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
+    let is_id = |id: &str| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit());
     entries
         .flatten()
         .filter(|entry| {
             let name = entry.file_name();
-            let is_archive = name.to_str().is_some_and(|n| {
-                n.strip_suffix(ARCHIVE_SUFFIX)
-                    .is_some_and(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
-            });
-            is_archive
-                && entry.file_type().is_ok_and(|t| t.is_file())
-                && std::fs::remove_file(entry.path()).is_ok()
+            let Some(name) = name.to_str() else { return false };
+            // A link is removed, never followed.
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            if is_dir && is_id(name) {
+                std::fs::remove_dir_all(entry.path()).is_ok()
+            } else if !is_dir && name.strip_suffix(".tar.gz").is_some_and(is_id) {
+                std::fs::remove_file(entry.path()).is_ok()
+            } else {
+                false
+            }
         })
         .count()
 }
@@ -514,6 +634,18 @@ fn make_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
+/// `dir`, created now and not before, and on Unix readable by its owner
+/// alone: a bundle's own directory, which nothing else has written into.
+fn make_new_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(dir)
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir(dir)
+}
+
 /// 256 random bits, hex-encoded: a ticket or an upload id.
 fn random_token() -> String {
     let mut bytes = [0u8; 32];
@@ -522,21 +654,73 @@ fn random_token() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::io::Write;
 
-    fn store(max: usize) -> (tempfile::TempDir, Uploads) {
+    /// A bundle archive: a manifest, and `filler` bytes of something else.
+    /// It extracts to the manifest's length and the filler's.
+    pub(crate) fn bundle(filler: usize) -> Vec<u8> {
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (path, data) in [("icp.yaml", MANIFEST.to_vec()), ("assets/blob", vec![7u8; filler])] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, &data[..]).unwrap();
+        }
+        archive.into_inner().unwrap().finish().unwrap()
+    }
+
+    const MANIFEST: &[u8] = b"canisters: []\n";
+
+    /// What [`bundle`] extracts to, as it is counted: the manifest, the
+    /// filler, and the directory the filler is in.
+    fn extracted(filler: usize) -> u64 {
+        host::occupies(MANIFEST.len() as u64) + host::occupies(filler as u64) + host::ENTRY_BYTES
+    }
+
+    /// What the smallest bundle extracts to: the unit the budget tests count in.
+    const U: u64 = 2 * (host::BLOCK_BYTES + host::ENTRY_BYTES) + host::ENTRY_BYTES;
+
+    /// Limits small enough to pass: `archive` bytes compressed, `extracted`
+    /// extracted.
+    fn limits(archive: u64, extracted: u64) -> BundleLimits {
+        BundleLimits::new(archive, extracted)
+    }
+
+    fn store(limits: BundleLimits) -> (tempfile::TempDir, Uploads) {
         let dir = tempfile::tempdir().unwrap();
-        let uploads = Uploads::new(dir.path().join("uploads"), max);
+        let uploads = Uploads::new(dir.path().join("uploads"), limits);
         (dir, uploads)
     }
 
-    // A store given a relative directory (a server started with a relative
-    // state directory) hands out absolute paths: the deploy that reads an
-    // upload takes no other kind.
+    async fn put(
+        uploads: &Uploads,
+        session: &str,
+        body: Vec<u8>,
+    ) -> Result<Received, ReceiveError> {
+        let t = uploads.mint(session).await;
+        uploads.receive(&t.ticket, Some(body.len() as u64), std::io::Cursor::new(body)).await
+    }
+
+    /// What is under the store's directory.
+    fn kept(uploads: &Uploads) -> usize {
+        std::fs::read_dir(&uploads.inner.dir).map(|entries| entries.count()).unwrap_or(0)
+    }
+
+    // The archive is extracted as it arrives: what the store holds, and
+    // hands the deploy, is the bundle's directory, and the archive is
+    // nowhere. A store given a relative directory (a server started with a
+    // relative state directory) hands out absolute paths: the deploy that
+    // takes an upload takes no other kind.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_received_archive_has_an_absolute_path() {
+    async fn a_bundle_is_extracted_as_it_arrives() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         // The directory spelled relative to the working directory: up to the
         // root, then down to it.
@@ -545,87 +729,159 @@ mod tests {
         relative.extend(cwd.components().skip(1).map(|_| ".."));
         relative.push(dir.path().strip_prefix("/").unwrap());
         assert!(relative.is_relative(), "{}", relative.display());
-        let uploads = Uploads::new(relative.join("uploads"), 1024);
-        let minted = uploads.mint("sess").await;
-        let received = uploads
-            .receive(&minted.ticket, None, std::io::Cursor::new(b"x".to_vec()))
-            .await
-            .unwrap();
+        let uploads = Uploads::new(relative.join("uploads"), limits(1 << 20, 1 << 20));
+
+        let archive = bundle(100);
+        let received = put(&uploads, "sess", archive.clone()).await.unwrap();
+        assert_eq!(received.bytes, extracted(100));
+        assert_eq!(received.archive_bytes, archive.len() as u64);
+        assert_eq!(uploads.inner.state().bytes, extracted(100), "settled to what it extracted to");
+
         let taken = uploads.take(&received.upload_id, "sess").await.unwrap();
-        assert!(taken.path().is_absolute(), "{}", taken.path().display());
-        assert!(taken.path().starts_with(dir.path().canonicalize().unwrap()));
-        assert_eq!(std::fs::read(taken.path()).unwrap(), b"x");
+        assert!(taken.dir().is_absolute(), "{}", taken.dir().display());
+        assert!(taken.dir().starts_with(dir.path().canonicalize().unwrap()));
+        assert_eq!(taken.bytes(), extracted(100));
+        assert_eq!(std::fs::read(taken.dir().join("icp.yaml")).unwrap(), MANIFEST);
+        assert_eq!(std::fs::read(taken.dir().join("assets/blob")).unwrap(), vec![7u8; 100]);
+        let mode = std::fs::metadata(taken.dir()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "the bundle is the server's user's alone");
+        // Nothing but the bundle's directory: no archive was kept.
+        assert_eq!(kept(&uploads), 1);
+        let bundle_dir = taken.dir().to_path_buf();
+        drop(taken);
+        assert!(!bundle_dir.exists(), "a bundle its deploy never moved goes with the handle");
+        assert_eq!(uploads.inner.state().bytes, 0);
     }
 
     #[tokio::test]
-    async fn a_ticket_receives_one_archive_for_its_session_alone() {
-        let (_dir, uploads) = store(1024);
+    async fn a_ticket_receives_one_bundle_for_its_session_alone() {
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
         let minted = uploads.mint("sess-a").await;
-        assert_eq!(minted.ticket.len(), 64);
+        assert_eq!(minted.ticket.len(), 64, "256 bits, hex");
+        let body = || std::io::Cursor::new(bundle(10));
+        let received = uploads.receive(&minted.ticket, None, body()).await.unwrap();
 
-        let received = uploads
-            .receive(&minted.ticket, Some(5), std::io::Cursor::new(b"hello".to_vec()))
-            .await
-            .unwrap();
-        assert_eq!(received.bytes, 5);
-        // Spent: a second PUT on the same ticket is refused.
-        let again = uploads.receive(&minted.ticket, None, std::io::Cursor::new(Vec::new())).await;
+        // Single use: the same ticket again is unknown.
+        let again = uploads.receive(&minted.ticket, None, body()).await;
         assert_eq!(again.unwrap_err(), ReceiveError::UnknownTicket);
 
-        // Another session cannot take it; the owner can, once.
-        assert!(uploads.take(&received.upload_id, "sess-b").await.is_none());
-        let taken = uploads.take(&received.upload_id, "sess-a").await.expect("owner takes it");
-        assert_eq!(std::fs::read(taken.path()).unwrap(), b"hello");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(taken.path()).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "mode {mode:o}");
-        }
-        assert!(uploads.take(&received.upload_id, "sess-a").await.is_none());
-        let path = taken.path().to_path_buf();
+        // The upload is deployable by the session that made it alone, once.
+        let other = uploads.take(&received.upload_id, "sess-b").await.unwrap_err();
+        assert_eq!(other, TakeError::NoSuchUpload);
+        let taken = uploads.take(&received.upload_id, "sess-a").await.unwrap();
+        let twice = uploads.take(&received.upload_id, "sess-a").await.unwrap_err();
+        assert_eq!(twice, TakeError::NoSuchUpload);
         drop(taken);
-        assert!(!path.exists(), "the archive goes with the handle");
-    }
-
-    #[tokio::test]
-    async fn an_archive_over_the_cap_is_refused_and_nothing_kept() {
-        let (dir, uploads) = store(16);
-        // Declared over the cap: refused unread.
-        let t = uploads.mint("s").await;
-        let err = uploads.receive(&t.ticket, Some(17), std::io::Cursor::new(vec![0; 17])).await;
-        assert_eq!(err.unwrap_err(), ReceiveError::TooLarge(16));
-        // Undeclared and over the cap: refused once the cap is passed, the
-        // partial file removed.
-        let t = uploads.mint("s").await;
-        let err = uploads.receive(&t.ticket, None, std::io::Cursor::new(vec![0; 17])).await;
-        assert_eq!(err.unwrap_err(), ReceiveError::TooLarge(16));
-        let kept = std::fs::read_dir(dir.path().join("uploads")).unwrap().count();
-        assert_eq!(kept, 0, "nothing is kept of a refused upload");
-        // Exactly at the cap passes.
-        let t = uploads.mint("s").await;
-        let ok = uploads.receive(&t.ticket, None, std::io::Cursor::new(vec![0; 16])).await.unwrap();
-        assert_eq!(ok.bytes, 16);
     }
 
     #[tokio::test]
     async fn minting_again_drops_the_previous_ticket_and_unknown_tickets_cost_nothing() {
-        let (dir, uploads) = store(1024);
-        let first = uploads.mint("s").await;
-        let second = uploads.mint("s").await;
-        let err = uploads.receive(&first.ticket, None, std::io::Cursor::new(vec![1])).await;
-        assert_eq!(err.unwrap_err(), ReceiveError::UnknownTicket);
-        let err = uploads.receive("not-a-ticket", None, std::io::Cursor::new(vec![1])).await;
-        assert_eq!(err.unwrap_err(), ReceiveError::UnknownTicket);
-        let kept = std::fs::read_dir(dir.path().join("uploads")).unwrap().count();
-        assert_eq!(kept, 0, "nothing is written for a refusal");
-        assert!(uploads.receive(&second.ticket, None, std::io::Cursor::new(vec![1])).await.is_ok());
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
+        let first = uploads.mint("sess").await;
+        let second = uploads.mint("sess").await;
+        let body = || std::io::Cursor::new(bundle(1));
+        let refused = uploads.receive(&first.ticket, None, body()).await;
+        assert_eq!(refused.unwrap_err(), ReceiveError::UnknownTicket);
+        assert!(uploads.receive(&second.ticket, None, body()).await.is_ok());
+        let unknown = uploads.receive("0".repeat(64).as_str(), None, body()).await;
+        assert_eq!(unknown.unwrap_err(), ReceiveError::UnknownTicket);
     }
 
-    /// A body that fails to arrive is the request's failure; a file that
-    /// cannot be written is the server's. The two are told apart, so a full
-    /// disk is not reported to the client as a bad request.
-    #[cfg(unix)]
+    // The archive limit: a declared length over it is refused before a byte
+    // is read, and an undeclared body is stopped at the byte that passes it.
+    // Either way the ticket is spent and nothing is kept.
+    #[tokio::test]
+    async fn an_archive_over_the_limit_is_refused_and_nothing_kept() {
+        let archive = bundle(2000);
+        let (_dir, uploads) = store(limits(archive.len() as u64 - 1, 1 << 20));
+
+        // A body that would fail if it were read: it is not.
+        struct Unread;
+        impl AsyncRead for Unread {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                panic!("a body declared too large is not read")
+            }
+        }
+        let t = uploads.mint("s").await;
+        let declared = uploads.receive(&t.ticket, Some(archive.len() as u64), Unread).await;
+        assert_eq!(declared.unwrap_err(), ReceiveError::TooLarge(archive.len() as u64 - 1));
+        let again = uploads.receive(&t.ticket, None, std::io::Cursor::new(Vec::new())).await;
+        assert_eq!(again.unwrap_err(), ReceiveError::UnknownTicket, "the ticket was spent");
+
+        let t = uploads.mint("s").await;
+        let streamed =
+            uploads.receive(&t.ticket, None, std::io::Cursor::new(archive.clone())).await;
+        assert_eq!(streamed.unwrap_err(), ReceiveError::TooLarge(archive.len() as u64 - 1));
+        assert_eq!(kept(&uploads), 0);
+        assert_eq!(uploads.inner.state().bytes, 0);
+        assert!(uploads.inner.state().receiving.is_empty());
+    }
+
+    // The limit that matters where the bundle is kept in memory: what the
+    // archive inflates to. An archive far inside the archive limit that
+    // extracts past it is stopped while it is still arriving — the rest of
+    // the body is never read — and what had been written is removed.
+    #[tokio::test]
+    async fn a_bundle_that_extracts_past_the_limit_is_stopped_as_it_arrives() {
+        // Compresses a thousandfold: a megabyte of one byte.
+        let archive = bundle(1 << 20);
+        assert!(archive.len() < 16 * 1024, "{}", archive.len());
+        let (_dir, uploads) = store(limits(1 << 20, 64 * 1024));
+
+        // The archive, then a tail that fails the test if it is reached.
+        struct Tail {
+            head: std::io::Cursor<Vec<u8>>,
+        }
+        impl AsyncRead for Tail {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let before = buf.filled().len();
+                let read = std::pin::Pin::new(&mut self.head).poll_read(cx, buf);
+                assert!(buf.filled().len() > before, "read past the bundle that was refused");
+                read
+            }
+        }
+        let t = uploads.mint("s").await;
+        let body = Tail { head: std::io::Cursor::new(archive) };
+        let refused = uploads.receive(&t.ticket, None, body).await.unwrap_err();
+        assert_eq!(refused, ReceiveError::ExtractsTooLarge(64 * 1024));
+        assert!(refused.to_string().contains("extracts to more than"), "{refused}");
+        assert_eq!(kept(&uploads), 0, "what had been extracted is removed");
+        assert_eq!(uploads.inner.state().bytes, 0);
+
+        // One that fits, to the block, is taken; a byte into the next is not.
+        let (_dir, uploads) = store(limits(1 << 20, extracted(4096)));
+        assert_eq!(put(&uploads, "s", bundle(4096)).await.unwrap().bytes, extracted(4096));
+        let over = put(&uploads, "t", bundle(4097)).await.unwrap_err();
+        assert_eq!(over, ReceiveError::ExtractsTooLarge(extracted(4096)));
+    }
+
+    // What arrives is held to being a bundle while it arrives: the refusal
+    // comes on the upload, not on the deploy it would have failed.
+    #[tokio::test]
+    async fn what_is_not_a_bundle_is_refused_on_arrival() {
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
+        let refused = put(&uploads, "s", b"not an archive".to_vec()).await.unwrap_err();
+        assert!(matches!(&refused, ReceiveError::NotABundle(why) if why.contains(".tar.gz")));
+
+        // An archive, with no manifest in it.
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&[0u8; 1024]).unwrap();
+        let refused = put(&uploads, "s", encoder.finish().unwrap()).await.unwrap_err();
+        assert!(matches!(&refused, ReceiveError::NotABundle(why) if why.contains("icp.yaml")));
+        assert_eq!(kept(&uploads), 0);
+        assert_eq!(uploads.inner.state().bytes, 0);
+    }
+
+    // A body that fails is the client's side; a bundle that cannot be
+    // written is the server's.
     #[tokio::test]
     async fn a_failed_read_and_a_failed_write_are_told_apart() {
         struct Broken;
@@ -638,68 +894,82 @@ mod tests {
                 std::task::Poll::Ready(Err(std::io::Error::other("connection reset")))
             }
         }
-        let (dir, uploads) = store(1024);
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
         let t = uploads.mint("s").await;
-        let err = uploads.receive(&t.ticket, None, Broken).await.unwrap_err();
-        assert!(matches!(err, ReceiveError::Body(_)), "{err:?}");
-        let kept = std::fs::read_dir(dir.path().join("uploads")).unwrap().count();
-        assert_eq!(kept, 0, "nothing is kept of an upload that did not arrive");
+        let body = uploads.receive(&t.ticket, None, Broken).await.unwrap_err();
+        assert!(matches!(&body, ReceiveError::Body(why) if why.contains("connection reset")));
+        assert_eq!(kept(&uploads), 0);
 
-        // The directory gone and its parent a file: nothing can be stored.
-        let t = uploads.mint("s").await;
-        std::fs::remove_dir_all(dir.path().join("uploads")).unwrap();
-        std::fs::write(dir.path().join("uploads"), b"in the way").unwrap();
-        let err = uploads.receive(&t.ticket, None, std::io::Cursor::new(vec![1])).await;
-        assert!(matches!(err, Err(ReceiveError::Storage(_))), "{err:?}");
+        // The store's directory is a file: no bundle's directory can be made.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("uploads");
+        std::fs::write(&blocked, "in the way").unwrap();
+        let uploads = Uploads::new(blocked, limits(1 << 20, 1 << 20));
+        let storage = put(&uploads, "s", bundle(1)).await.unwrap_err();
+        assert!(matches!(storage, ReceiveError::Storage(_)), "{storage:?}");
+        assert_eq!(uploads.inner.state().bytes, 0);
     }
 
-    // One session, however many tickets it mints, has one archive in the
-    // store: a new upload replaces the one it was holding.
+    // A session's new upload takes the place of the one it held.
     #[tokio::test]
     async fn a_new_upload_replaces_the_one_the_session_was_holding() {
-        let (dir, uploads) = store(1024);
-        let mut first = None;
-        for _ in 0..5 {
-            let t = uploads.mint("s").await;
-            let r = uploads.receive(&t.ticket, None, std::io::Cursor::new(vec![7; 9])).await;
-            first.get_or_insert(r.unwrap().upload_id);
-        }
-        let kept = std::fs::read_dir(dir.path().join("uploads")).unwrap().count();
-        assert_eq!(kept, 1, "one archive per session");
-        assert!(uploads.take(&first.unwrap(), "s").await.is_none(), "the first was replaced");
-        assert_eq!(uploads.inner.state().bytes, 9);
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
+        let first = put(&uploads, "s", bundle(10)).await.unwrap();
+        let second = put(&uploads, "s", bundle(20)).await.unwrap();
+        assert_eq!(kept(&uploads), 1, "one bundle for the session");
+        assert_eq!(uploads.inner.state().bytes, extracted(20));
+        let replaced = uploads.take(&first.upload_id, "s").await.unwrap_err();
+        assert_eq!(replaced, TakeError::NoSuchUpload);
+        assert!(uploads.take(&second.upload_id, "s").await.is_ok());
     }
 
-    // The budget is the whole store's: reserved before the body is read, by
-    // the declared length or else the cap, settled to what arrived, and
-    // given back when an archive leaves — expired, replaced, or deployed.
+    // The budget is the whole store's, in extracted bytes. A bundle that is
+    // arriving is charged the most it may extract to, since its size is not
+    // known yet; one that is waiting, what it did extract to; and one with
+    // its deploy the limit again, for the room the deploy grows into.
     #[tokio::test]
-    async fn the_store_refuses_past_its_budget_and_takes_again_once_there_is_room() {
+    async fn the_budget_is_charged_by_what_a_bundle_may_come_to() {
         let dir = tempfile::tempdir().unwrap();
-        let uploads = Uploads::with_budget(dir.path().join("uploads"), 10, 25);
-        let put = |session: &'static str, declared: Option<u64>, len: usize| {
-            let uploads = uploads.clone();
-            async move {
-                let t = uploads.mint(session).await;
-                uploads.receive(&t.ticket, declared, std::io::Cursor::new(vec![0; len])).await
-            }
-        };
-        // Undeclared: the cap is reserved, and settled to the 4 that came.
-        let a = put("a", None, 4).await.unwrap();
-        assert_eq!(uploads.inner.state().bytes, 4);
-        let _b = put("b", Some(10), 10).await.unwrap();
-        // 14 held: an undeclared body would reserve 10 more, and fits.
-        let _c = put("c", None, 10).await.unwrap();
-        assert_eq!(uploads.inner.state().bytes, 24);
-        // Full, whoever asks and whatever they declare beyond the room left.
-        assert_eq!(put("d", Some(2), 2).await.unwrap_err(), ReceiveError::Full);
-        assert_eq!(put("d", None, 1).await.unwrap_err(), ReceiveError::Full);
-        assert!(put("d", Some(1), 1).await.is_ok());
-        // A deploy's archive counts until the deploy lets go of it.
-        let taken = uploads.take(&a.upload_id, "a").await.unwrap();
-        assert_eq!(put("e", Some(4), 4).await.unwrap_err(), ReceiveError::Full);
-        drop(taken);
-        assert!(put("e", Some(4), 4).await.is_ok());
+        // Every bundle here is the smallest there is, `U`; one may come to
+        // ten times that, and the store holds two at the limit and one more.
+        let (limit, budget) = (10 * U, 21 * U);
+        assert_eq!(extracted(1), U);
+        let uploads =
+            Uploads::with_budget(dir.path().join("uploads"), limits(1 << 20, limit), budget);
+
+        // Waiting: what they extracted to.
+        let a = put(&uploads, "a", bundle(1)).await.unwrap();
+        let b = put(&uploads, "b", bundle(1)).await.unwrap();
+        assert_eq!(uploads.held().bytes, 2 * U);
+        assert_eq!(uploads.held().uploads, 2);
+
+        // With its deploy: the limit, until the deploy lets go.
+        let running = uploads.take(&a.upload_id, "a").await.unwrap();
+        assert_eq!(uploads.held().bytes, 11 * U);
+        // An arrival reserves the limit before a byte is read: 11 held and
+        // 10 more is the budget exactly, so one fits, and settles...
+        let c = put(&uploads, "c", bundle(1)).await.unwrap();
+        assert_eq!(uploads.held().bytes, 12 * U);
+        // ...and the next has 12 held, which with its 10 is past it.
+        assert_eq!(put(&uploads, "d", bundle(1)).await.unwrap_err(), ReceiveError::Full);
+
+        // A second deploy needs the limit too: 12 held, 9 more is the
+        // budget exactly.
+        let second = uploads.take(&b.upload_id, "b").await.unwrap();
+        assert_eq!(uploads.held().bytes, 21 * U);
+        // A third has no room to grow into. Its upload stays, to be asked
+        // for again once there is.
+        assert_eq!(uploads.take(&c.upload_id, "c").await.unwrap_err(), TakeError::NoRoom);
+        assert_eq!(uploads.held().uploads, 1);
+        drop(running);
+        assert_eq!(uploads.held().bytes, 11 * U);
+        let third = uploads.take(&c.upload_id, "c").await.unwrap();
+        drop((second, third));
+        assert_eq!(uploads.held(), Held { bytes: 0, max_bytes: budget, uploads: 0, receiving: 0 });
+
+        // A budget is at least one bundle's worth.
+        let tiny = Uploads::with_budget(dir.path().join("tiny"), limits(1 << 20, limit), 1);
+        assert_eq!(tiny.held().max_bytes, limit);
     }
 
     // A session's new upload takes the place of the one it held, so that
@@ -708,122 +978,159 @@ mod tests {
     #[tokio::test]
     async fn a_refused_replacement_leaves_the_session_its_upload() {
         let dir = tempfile::tempdir().unwrap();
-        let uploads = Uploads::with_budget(dir.path().join("uploads"), 10, 12);
-        let put = |session: &'static str, declared: Option<u64>, len: usize| {
-            let uploads = uploads.clone();
-            async move {
-                let t = uploads.mint(session).await;
-                uploads.receive(&t.ticket, declared, std::io::Cursor::new(vec![0; len])).await
-            }
-        };
-        let first = put("a", Some(4), 4).await.unwrap();
-        put("b", Some(6), 6).await.unwrap();
-        // 10 of 12 held, 4 of them `a`'s own: 9 more is 15 without them.
-        assert_eq!(put("a", Some(9), 9).await.unwrap_err(), ReceiveError::Full);
-        assert_eq!(uploads.inner.state().bytes, 10);
+        // One may come to ten of the smallest, `U`, and the store holds
+        // eleven: an arrival beside one small bundle, and no more.
+        let uploads =
+            Uploads::with_budget(dir.path().join("uploads"), limits(1 << 20, 10 * U), 11 * U);
+        let first = put(&uploads, "a", bundle(1)).await.unwrap();
+        let other = put(&uploads, "b", bundle(2 * 4096)).await.unwrap();
+        let both = U + extracted(2 * 4096);
+        assert!(extracted(2 * 4096) > U);
+        // `a`'s own `U` gives way, but `b`'s is more than the one `U` to
+        // spare beside the ten an arrival reserves.
+        assert_eq!(put(&uploads, "a", bundle(1)).await.unwrap_err(), ReceiveError::Full);
+        assert_eq!(uploads.held().bytes, both);
         assert!(
             uploads.inner.state().uploads.contains_key(&first.upload_id),
             "refused, the session still holds its upload"
         );
-        // 6 more fits only because `a`'s 4 give way; then they do.
-        let second = put("a", Some(6), 6).await.unwrap();
-        assert_eq!(uploads.inner.state().bytes, 12);
-        assert!(uploads.take(&first.upload_id, "a").await.is_none(), "the first was replaced");
-        assert!(uploads.take(&second.upload_id, "a").await.is_some());
+        // With `b`'s gone there is room, `a`'s own giving way; then it does.
+        drop(uploads.take(&other.upload_id, "b").await.unwrap());
+        let second = put(&uploads, "a", bundle(4097)).await.unwrap();
+        assert_eq!(uploads.held().bytes, extracted(4097));
+        assert_eq!(uploads.take(&first.upload_id, "a").await.unwrap_err(), TakeError::NoSuchUpload);
+        assert!(uploads.take(&second.upload_id, "a").await.is_ok());
     }
 
-    // A body longer than the length it declared is cut off at that length:
-    // the reservation is what the store agreed to hold.
-    #[tokio::test]
-    async fn a_body_longer_than_it_declared_is_refused() {
-        let (dir, uploads) = store(1024);
-        let t = uploads.mint("s").await;
-        let err = uploads.receive(&t.ticket, Some(3), std::io::Cursor::new(vec![0; 9])).await;
-        assert!(matches!(err, Err(ReceiveError::Body(_))), "{err:?}");
-        let kept = std::fs::read_dir(dir.path().join("uploads")).unwrap().count();
-        assert_eq!(kept, 0);
-        assert_eq!(uploads.inner.state().bytes, 0);
+    /// A body that yields `head` and then nothing more, for ever: an upload
+    /// whose sender has stalled.
+    struct Stalled {
+        head: std::io::Cursor<Vec<u8>>,
     }
 
-    // A `PUT` abandoned mid-body — its future dropped — leaves nothing: not
-    // the partial file, not the reservation, not the session's turn. And
-    // while it is arriving, the session's second `PUT` is refused.
-    #[tokio::test]
-    async fn an_abandoned_upload_leaves_nothing_behind() {
-        /// Yields one byte, then never completes.
-        struct Stalls(bool);
-        impl AsyncRead for Stalls {
-            fn poll_read(
-                mut self: std::pin::Pin<&mut Self>,
-                _: &mut std::task::Context<'_>,
-                buf: &mut tokio::io::ReadBuf<'_>,
-            ) -> std::task::Poll<std::io::Result<()>> {
-                if std::mem::replace(&mut self.0, true) {
-                    return std::task::Poll::Pending;
-                }
-                buf.put_slice(b"x");
-                std::task::Poll::Ready(Ok(()))
+    impl AsyncRead for Stalled {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let _ = std::pin::Pin::new(&mut self.head).poll_read(cx, buf);
+            match buf.filled().len() > before {
+                true => std::task::Poll::Ready(Ok(())),
+                false => std::task::Poll::Pending,
             }
         }
-        let (dir, uploads) = store(1024);
-        let files = || std::fs::read_dir(dir.path().join("uploads")).unwrap().count();
-        let first = uploads.mint("s").await;
-        let arriving = {
-            let uploads = uploads.clone();
-            tokio::spawn(async move { uploads.receive(&first.ticket, None, Stalls(false)).await })
-        };
-        // Wait for the first to be under way.
-        while files() == 0 {
-            tokio::task::yield_now().await;
+    }
+
+    /// `uploads`, with the patience of a test.
+    fn impatient(uploads: Uploads, idle: Duration, time: Duration) -> Uploads {
+        let inner = &uploads.inner;
+        Uploads {
+            inner: Arc::new(Inner {
+                dir: inner.dir.clone(),
+                limits: inner.limits,
+                max_total_bytes: inner.max_total_bytes,
+                patience: (idle, time),
+                state: Mutex::default(),
+            }),
         }
-        assert_eq!(uploads.inner.state().bytes, 1024, "the cap is reserved");
-        let second = uploads.mint("s").await;
-        let err = uploads.receive(&second.ticket, None, std::io::Cursor::new(vec![1])).await;
-        assert_eq!(err.unwrap_err(), ReceiveError::Busy);
-        // Another session is not held up by it.
-        let other = uploads.mint("t").await;
-        assert!(uploads
-            .receive(&other.ticket, Some(1), std::io::Cursor::new(vec![1]))
-            .await
-            .is_ok());
-
-        arriving.abort();
-        assert!(arriving.await.unwrap_err().is_cancelled());
-        assert_eq!(files(), 1, "the partial file went with the request");
-        assert_eq!(uploads.inner.state().bytes, 1, "and so did its reservation");
-        let third = uploads.mint("s").await;
-        assert!(uploads.receive(&third.ticket, None, std::io::Cursor::new(vec![1])).await.is_ok());
     }
 
-    // A store is made over a directory an earlier process may have left
-    // archives in: nothing knows them any more, so they go — and only they.
-    #[tokio::test]
-    async fn a_new_store_removes_the_archives_an_earlier_one_left() {
-        let (dir, uploads) = store(1024);
+    // A body that stops arriving is given up on, and so is one that takes
+    // too long in all: the session's turn, the partial bundle and the
+    // reservation go, and the session can upload again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upload_that_stalls_is_given_up_on() {
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
+        let half = || {
+            let mut archive = bundle(50_000);
+            archive.truncate(archive.len() / 2);
+            Stalled { head: std::io::Cursor::new(archive) }
+        };
+
+        let idle = impatient(uploads.clone(), Duration::from_millis(50), Duration::from_secs(60));
+        let t = idle.mint("s").await;
+        let stalled = idle.receive(&t.ticket, None, half()).await.unwrap_err();
+        assert!(matches!(&stalled, ReceiveError::Body(why) if why.contains("no data arrived")));
+        assert_eq!(kept(&idle), 0, "the partial bundle is removed");
+        assert_eq!(idle.held(), Held { bytes: 0, max_bytes: 3 << 20, uploads: 0, receiving: 0 });
+        assert!(put(&idle, "s", bundle(1)).await.is_ok(), "the session can upload again");
+
+        let slow = impatient(uploads, Duration::from_secs(60), Duration::from_millis(50));
+        let t = slow.mint("s").await;
+        let late = slow.receive(&t.ticket, None, half()).await.unwrap_err();
+        assert!(matches!(&late, ReceiveError::Body(_)), "{late:?}");
+        assert_eq!(slow.held().bytes, 0);
+    }
+
+    // A request that is abandoned — its future dropped while the body is
+    // still arriving — stops nothing by going: the extraction is the
+    // thread's, and ends when the body does, cleaning up after itself. The
+    // file an earlier version could leave behind has nowhere to come from.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_abandoned_upload_leaves_nothing_behind() {
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
+        let uploads = impatient(uploads, Duration::from_millis(200), Duration::from_secs(60));
+        let mut archive = bundle(50_000);
+        archive.truncate(archive.len() / 2);
         let t = uploads.mint("s").await;
-        uploads.receive(&t.ticket, None, std::io::Cursor::new(vec![1])).await.unwrap();
-        let into = dir.path().join("uploads");
-        std::fs::write(into.join("notes.txt"), b"not an archive").unwrap();
-        drop(uploads);
-        assert_eq!(std::fs::read_dir(&into).unwrap().count(), 2);
-
-        let _again = Uploads::new(into.clone(), 1024);
-        let left: Vec<_> =
-            std::fs::read_dir(&into).unwrap().flatten().map(|e| e.file_name()).collect();
-        assert_eq!(left, ["notes.txt"], "{left:?}");
+        let body = Stalled { head: std::io::Cursor::new(archive) };
+        {
+            let receiving = uploads.receive(&t.ticket, None, body);
+            tokio::pin!(receiving);
+            let abandoned = tokio::time::timeout(Duration::from_millis(50), &mut receiving).await;
+            assert!(abandoned.is_err(), "still arriving");
+            assert_eq!(uploads.held().receiving, 1);
+            assert_eq!(uploads.held().bytes, 1 << 20, "the most it may come to is held for it");
+            // While it arrives, the session has no second upload.
+            assert_eq!(put(&uploads, "s", bundle(1)).await.unwrap_err(), ReceiveError::Busy);
+        }
+        // The body ends (here, by stalling); the thread cleans up.
+        for _ in 0..100 {
+            if uploads.held().receiving == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(uploads.held(), Held { bytes: 0, max_bytes: 3 << 20, uploads: 0, receiving: 0 });
+        assert_eq!(kept(&uploads), 0);
     }
 
-    // The timer's sweep drops what has lapsed without an upload to prompt it.
+    // Uploads from a process that has gone: no ticket or session of this one
+    // can deploy them, so a new store starts from an empty directory — of
+    // what a store names its own, and nothing else.
+    #[tokio::test]
+    async fn a_new_store_removes_the_bundles_an_earlier_one_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().join("uploads");
+        let earlier = Uploads::new(at.clone(), limits(1 << 20, 1 << 20));
+        put(&earlier, "s", bundle(10)).await.unwrap();
+        // What an earlier version kept, and something that is not the store's.
+        std::fs::write(at.join(format!("{}.tar.gz", "a".repeat(64))), "an archive").unwrap();
+        std::fs::write(at.join("notes.txt"), "not an upload").unwrap();
+        assert_eq!(kept(&earlier), 3);
+
+        let later = Uploads::new(at.clone(), limits(1 << 20, 1 << 20));
+        assert_eq!(kept(&later), 1);
+        assert!(at.join("notes.txt").exists());
+    }
+
     #[tokio::test]
     async fn a_sweep_removes_an_expired_upload_and_its_bytes() {
-        let (dir, uploads) = store(1024);
-        let t = uploads.mint("s").await;
-        let r = uploads.receive(&t.ticket, None, std::io::Cursor::new(vec![1; 5])).await.unwrap();
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
+        let received = put(&uploads, "s", bundle(10)).await.unwrap();
+        let bundle_dir = {
+            let mut state = uploads.inner.state();
+            let upload = state.uploads.get_mut(&received.upload_id).unwrap();
+            upload.expires = Instant::now() - Duration::from_secs(1);
+            upload.dir.clone()
+        };
+        assert!(bundle_dir.is_dir());
         uploads.sweep();
-        assert_eq!(uploads.inner.state().bytes, 5, "not yet expired");
-        uploads.inner.state().uploads.get_mut(&r.upload_id).unwrap().expires = Instant::now();
-        uploads.sweep();
-        assert_eq!(uploads.inner.state().bytes, 0);
-        assert_eq!(std::fs::read_dir(dir.path().join("uploads")).unwrap().count(), 0);
+        assert!(!bundle_dir.exists());
+        assert_eq!(uploads.held(), Held { bytes: 0, max_bytes: 3 << 20, uploads: 0, receiving: 0 });
+        let gone = uploads.take(&received.upload_id, "s").await.unwrap_err();
+        assert_eq!(gone, TakeError::NoSuchUpload);
     }
 }

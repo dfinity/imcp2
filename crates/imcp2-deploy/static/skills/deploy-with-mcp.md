@@ -99,10 +99,23 @@ carry the archive itself. Upload it first:
    minutes, and the exact `curl` command to run.
 2. Run that command with the archive's path in place of `<bundle.tar.gz>`.
    It `PUT`s the archive to the server and prints a JSON answer whose
-   `upload_id` names the upload, held for a quarter of an hour. One upload
-   at a time: a new one replaces the one before it, so upload again only to
-   replace. A server that answers that it is full is holding other users'
-   bundles: ask for a new ticket and try again in a few minutes.
+   `upload_id` names the upload, held for five minutes: deploy it next. One
+   upload at a time: a new one replaces the one before it, so upload again
+   only to replace. A server that answers that it is full is holding other
+   users' bundles: ask for a new ticket and try again in a few minutes.
+
+   The server extracts the archive as it arrives, and stops the upload if
+   the archive, or what it extracts to, passes the limit the ticket's answer
+   names (`max_bytes`, `max_extracted_bytes`). It answers `413` and says
+   which, but `curl` is still sending and often reports only a failed
+   transfer: `Broken pipe`, `Connection reset`, exit code 55 or 56. Read an
+   upload that fails that way as a bundle that is too large, not as a
+   network fault to retry: check the archive's size, and what it extracts to
+   (`tar -tzvf <bundle.tar.gz>`), against the two limits. What a bundle
+   extracts to is counted as the space it occupies, so thousands of small
+   files weigh more than their bytes: each takes at least 5 KiB. An answer
+   of `422` means the server read the file and it is not a bundle; rebuild
+   it with `icp project bundle`. A new ticket is needed after any of these.
 3. Pass that id to `icp_deploy_bundle` as `bundle_upload`, in place of
    `bundle_path`.
 

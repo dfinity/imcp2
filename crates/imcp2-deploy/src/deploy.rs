@@ -42,7 +42,7 @@ use tracing::{Instrument, Span};
 
 use crate::{
     calls::{AgentCalls, UntilStopped},
-    host,
+    host::{self, BundleLimits},
 };
 
 /// Where the bundle bytes come from.
@@ -50,9 +50,12 @@ pub enum BundleSource {
     /// The archive itself.
     Bytes(Vec<u8>),
     /// An absolute path to the archive on this machine: the one the agent
-    /// named, or the file an upload was received into (see
-    /// [`crate::Uploads`]).
+    /// named.
     Path(Utf8PathBuf),
+    /// A bundle already extracted, by an upload store as the archive
+    /// arrived (see [`crate::Uploads`]): its directory, which the deploy
+    /// takes for its own, and what it extracted to, in bytes.
+    Extracted { dir: Utf8PathBuf, bytes: u64 },
 }
 
 // By hand so a request never prints megabytes of archive.
@@ -61,6 +64,7 @@ impl fmt::Debug for BundleSource {
         match self {
             BundleSource::Bytes(bytes) => write!(f, "Bytes({} bytes)", bytes.len()),
             BundleSource::Path(path) => write!(f, "Path({path})"),
+            BundleSource::Extracted { dir, bytes } => write!(f, "Extracted({dir}, {bytes} bytes)"),
         }
     }
 }
@@ -72,6 +76,9 @@ pub const INSTALL_MODES: [&str; 4] = ["auto", "install", "reinstall", "upgrade"]
 #[derive(Debug)]
 pub struct DeployRequest {
     pub bundle: BundleSource,
+    /// How large a bundle this deploy takes: its archive, what it extracts
+    /// to, and what its directory may come to.
+    pub limits: BundleLimits,
     /// The environment, by name, among those the bundle's manifest declares.
     pub environment: String,
     /// Canister ids to start from: a canister named here is upgraded in place
@@ -261,9 +268,16 @@ pub async fn deploy_bundle(
         false => Ok(()),
     };
     stopped()?;
-    let bytes = match request.bundle {
-        BundleSource::Bytes(bytes) => bytes,
-        BundleSource::Path(path) => read_bundle_file(&path, host::MAX_BUNDLE_BYTES).await?,
+    let limits = request.limits;
+    // An archive is read as it is extracted, never whole: one named by path
+    // is opened here, held to the archive limit by its size before a byte
+    // of it is read.
+    let bundle = match request.bundle {
+        BundleSource::Bytes(bytes) => Bundle::Archive(Box::new(std::io::Cursor::new(bytes))),
+        BundleSource::Path(path) => {
+            Bundle::Archive(Box::new(open_bundle_file(&path, limits.archive_bytes).await?))
+        }
+        BundleSource::Extracted { dir, bytes } => Bundle::Extracted { dir, bytes },
     };
 
     // The working directory holds the bundle's files, the ids the deploy
@@ -292,19 +306,36 @@ pub async fn deploy_bundle(
     // The extraction owns the directory while it runs: a blocking task is
     // not stopped when this future is dropped, and one that outlived the
     // directory would write its files back under a path nothing removes.
-    let (scratch, fs) = {
+    // A bundle that arrived extracted is moved in instead, whole: its
+    // directory becomes this one.
+    let (scratch, fs, bundle_bytes) = {
         let dir = dir.clone();
-        let (scratch, fs) = tokio::task::spawn_blocking(move || {
-            let fs = host::extract_bundle(&bytes, &dir);
-            (scratch, fs)
+        let (scratch, bundle) = tokio::task::spawn_blocking(move || {
+            // What the server could not write or move is its own failure,
+            // not the bundle's.
+            let bundle = match bundle {
+                Bundle::Archive(archive) => host::extract_bundle_from(archive, &dir, &limits)
+                    .map(|extracted| (extracted.fs, extracted.bytes))
+                    .map_err(|e| match e {
+                        host::ExtractError::Storage(_) => RequestError::server_fault(e),
+                        refused => RequestError(refused.to_string()),
+                    }),
+                Bundle::Extracted { dir: from, bytes } => std::fs::rename(&from, &dir)
+                    .map_err(|e| format!("the uploaded bundle could not be moved in: {e}"))
+                    .and_then(|()| host::open_bundle(&dir))
+                    .map(|fs| (fs, bytes))
+                    .map_err(RequestError::server_fault),
+            };
+            (scratch, bundle)
         })
         .await
         .map_err(|e| RequestError::server_fault(format!("bundle extraction panicked: {e}")))?;
-        (scratch, fs.map_err(RequestError)?)
+        let (fs, bytes) = bundle?;
+        (scratch, fs, bytes)
     };
 
     stopped()?;
-    let host = host::host_for(fs.clone());
+    let host = host::host_for(fs.clone(), &limits);
     // The load is where the untrusted rule holds (a script step, a module or
     // plugin fetched from a URL or not a regular file under the root, a
     // recipe: the project does not load), so it is the first thing a bundle outside the
@@ -338,6 +369,8 @@ pub async fn deploy_bundle(
                 &fs,
                 &network,
                 canisters.iter().map(|(dir, canister)| (dir.as_path(), canister)),
+                bundle_bytes,
+                &limits,
             )
         })
         .await
@@ -636,16 +669,23 @@ pub fn mainnet_agent(identity: Arc<dyn Identity>) -> Result<Agent, String> {
     Ok(agent)
 }
 
-/// Read the bundle at `path`, which must be an absolute path to a regular
-/// file of at most `limit` bytes, and nothing else: a device or a pipe reports
-/// a length that says nothing about what a read of it produces (`/dev/zero`
-/// is 0 bytes long and endless; a FIFO blocks on open), so the size check
-/// means something for a regular file only. The path is checked before it
-/// is opened, so a pipe is never opened; the open file is checked again, so
-/// a file replaced or grown between the two is still read to the limit and
-/// no further.
-async fn read_bundle_file(path: &Utf8Path, limit: usize) -> Result<Vec<u8>, RequestError> {
-    use tokio::io::AsyncReadExt;
+/// A bundle on its way into a deploy's directory: an archive still to be
+/// extracted, or a directory one already was extracted into.
+enum Bundle {
+    Archive(Box<dyn std::io::Read + Send>),
+    Extracted { dir: Utf8PathBuf, bytes: u64 },
+}
+
+/// Open the archive at `path` for reading, if it is one this deploy may
+/// read: an absolute path to a regular file of at most `limit` bytes, and
+/// nothing else. A device or a pipe reports a length that says nothing
+/// about what a read of it produces (`/dev/zero` is 0 bytes long and
+/// endless; a FIFO blocks on open), so the path is checked before it is
+/// opened and a pipe never is. The file is looked at again once open — what
+/// a path names can change between the two — and the size is a first
+/// refusal only: the extraction counts what it reads, so a file that grows
+/// is still held to the limit.
+async fn open_bundle_file(path: &Utf8Path, limit: u64) -> Result<std::fs::File, RequestError> {
     if !path.is_absolute() {
         return Err(RequestError(format!(
             "bundle_path must be an absolute path on this machine, got '{path}'"
@@ -660,7 +700,7 @@ async fn read_bundle_file(path: &Utf8Path, limit: usize) -> Result<Vec<u8>, Requ
     if !meta.is_file() {
         return Err(not_regular());
     }
-    if meta.len() > limit as u64 {
+    if meta.len() > limit {
         return Err(too_large(meta.len()));
     }
     let file = tokio::fs::File::open(path.as_std_path()).await.map_err(cannot)?;
@@ -668,16 +708,10 @@ async fn read_bundle_file(path: &Utf8Path, limit: usize) -> Result<Vec<u8>, Requ
     if !meta.is_file() {
         return Err(not_regular());
     }
-    if meta.len() > limit as u64 {
+    if meta.len() > limit {
         return Err(too_large(meta.len()));
     }
-    // One byte past the limit is enough to tell that the file outgrew it.
-    let mut bytes = Vec::with_capacity(meta.len() as usize);
-    file.take(limit as u64 + 1).read_to_end(&mut bytes).await.map_err(cannot)?;
-    if bytes.len() > limit {
-        return Err(too_large(bytes.len() as u64));
-    }
-    Ok(bytes)
+    Ok(file.into_std().await)
 }
 
 /// Turn the operation's event stream into one line per finished task:
@@ -890,6 +924,7 @@ mod tests {
     fn request(bytes: Vec<u8>, environment: &str) -> DeployRequest {
         DeployRequest {
             bundle: BundleSource::Bytes(bytes),
+            limits: BundleLimits::LOCAL,
             environment: environment.into(),
             canister_ids: BTreeMap::new(),
             mode: "auto".into(),
@@ -1168,19 +1203,20 @@ mod tests {
         assert!(err.0.contains("'yolo'"), "{}", err.0);
     }
 
-    // The file is read to the limit and one byte past it, never to its end:
-    // a file that grows between the size check and the read is still bounded.
+    // A file over the archive limit is refused by its size, unopened; one
+    // that grows past it after the check is stopped by the extraction, which
+    // counts what it reads (`host`'s tests).
     #[tokio::test]
-    async fn a_bundle_file_is_read_to_its_limit_and_no_further() {
+    async fn a_bundle_file_over_the_limit_is_refused_by_its_size() {
         let dir = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.path().join("b.tar.gz")).unwrap();
         std::fs::write(&path, [7u8; 32]).unwrap();
-        assert_eq!(read_bundle_file(&path, 32).await.unwrap().len(), 32);
-        let err = read_bundle_file(&path, 16).await.unwrap_err();
+        assert_eq!(open_bundle_file(&path, 32).await.unwrap().metadata().unwrap().len(), 32);
+        let err = open_bundle_file(&path, 16).await.unwrap_err();
         assert!(err.0.contains("above the 16 byte limit"), "{}", err.0);
-        let err = read_bundle_file(Utf8Path::new("relative/b.tar.gz"), 32).await.unwrap_err();
+        let err = open_bundle_file(Utf8Path::new("relative/b.tar.gz"), 32).await.unwrap_err();
         assert!(err.0.contains("absolute"), "{}", err.0);
-        let err = read_bundle_file(&path.with_file_name("missing"), 32).await.unwrap_err();
+        let err = open_bundle_file(&path.with_file_name("missing"), 32).await.unwrap_err();
         assert!(err.0.contains("cannot read bundle"), "{}", err.0);
     }
 
@@ -1318,6 +1354,52 @@ mod tests {
                 "candid_check backend (aaaaa-aa): skipped: not an upgrade",
             ]
         );
+    }
+
+    // An uploaded bundle reaches its deploy already extracted: the store
+    // extracted it as it arrived, and the deploy takes that directory for
+    // its own — moved, not copied or extracted again — and runs from it as
+    // from one it extracted itself. The room the store holds for the deploy
+    // is given back when the deploy has returned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_uploaded_bundle_is_deployed_from_where_it_was_extracted() {
+        let (wasm, sha) = wasm();
+        let state = tempfile::tempdir().unwrap();
+        let limits = BundleLimits::new(1 << 20, 1 << 20);
+        let uploads = crate::Uploads::new(state.path().join("deploys/uploads"), limits);
+        let ticket = uploads.mint("s").await.ticket;
+        let archive = std::io::Cursor::new(bundle(&sha, &wasm));
+        let received = uploads.receive(&ticket, None, archive).await.unwrap();
+        let taken = uploads.take(&received.upload_id, "s").await.unwrap();
+        let uploaded = taken.dir().to_path_buf();
+        assert!(uploaded.join("canisters/backend.wasm").is_file());
+        assert_eq!(uploads.held().bytes, 1 << 20, "a running deploy holds the limit");
+
+        let mut request = request(Vec::new(), "ic");
+        request.bundle = BundleSource::Extracted {
+            dir: Utf8PathBuf::from_path_buf(uploaded.clone()).unwrap(),
+            bytes: taken.bytes(),
+        };
+        request.limits = limits;
+        let workdirs = state.path().join("deploys");
+        request.workdir = Some(Utf8PathBuf::from_path_buf(workdirs.clone()).unwrap());
+        let outcome = deploy_bundle(Arc::new(AnonymousIdentity), request, Watch::default())
+            .await
+            .expect("the request is valid");
+        // As far as a deploy gets offline: built from the bundle, then
+        // stopped where `no_create` stops it.
+        assert_eq!(outcome.status, Status::Failed);
+        assert!(outcome.log.iter().any(|l| l == "Building canisters: ok"), "{:?}", outcome.log);
+        assert!(!uploaded.exists(), "the bundle was moved into the deploy's directory");
+        // The deploy's directory went with the deploy; the store's stays.
+        let left: Vec<_> = std::fs::read_dir(&workdirs)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["uploads"]);
+        drop(taken);
+        assert_eq!(uploads.held().bytes, 0);
     }
 
     // A watcher reads each line as the run makes it — the same lines, in the

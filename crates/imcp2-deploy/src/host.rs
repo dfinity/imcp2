@@ -43,9 +43,16 @@
 //!
 //! * **Extraction** writes only regular files and directories, within a total
 //!   size budget and an object budget, under the scratch directory
-//!   ([`extract_bundle`]), and refuses the `.icp` state a deploy seeds for
-//!   itself: the library takes what is under `.icp` as its own earlier
-//!   writes, and vets none of it.
+//!   ([`extract_bundle_from`]), and refuses the `.icp` state a deploy seeds
+//!   for itself: the library takes what is under `.icp` as its own earlier
+//!   writes, and vets none of it. The archive is read as a stream — a file,
+//!   or a request body as it arrives — and never held whole, and the size
+//!   budget is in the bytes a bundle occupies ([`occupies`]), which is what
+//!   it costs a server that keeps it in memory. How large is the server's
+//!   to say ([`BundleLimits`]).
+//! * **What the deploy adds to the directory is counted with it**: the copy
+//!   of each canister's module the build keeps beside the bundle, held to
+//!   the same budget before any is made ([`check_bundle`]).
 //! * **The bundle is checked before any phase runs** ([`check_bundle`]): every
 //!   canister built by one pre-built wasm in the archive that hashes to its
 //!   recorded checksum, every sync plugin in the archive with the bytes it
@@ -66,6 +73,7 @@
 //! extracted directory, which is removed when the deploy ends.
 
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet},
     fmt,
     io::Read,
@@ -163,6 +171,128 @@ pub const MAX_WASM_BYTES_IN_ALL: u64 = MAX_EXTRACTED_BYTES;
 /// its configuration, a few KiB; the directories it declares are mounted,
 /// not read, and cost nothing here.
 pub const MAX_PLUGIN_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The unit a filesystem keeps a file's bytes in: a file of one byte takes a
+/// whole one, in memory where the filesystem is a RAM one (a page) as on a
+/// disk (a block).
+pub const BLOCK_BYTES: u64 = 4096;
+
+/// What a file or a directory costs besides its bytes — its inode and its
+/// name — as this crate counts it: about what a RAM filesystem holds in
+/// kernel memory for each.
+pub const ENTRY_BYTES: u64 = 1024;
+
+/// What a file of `len` bytes occupies where it is extracted to, or (with a
+/// `len` of zero) a directory: its bytes in whole blocks, and its entry.
+/// This is what a bundle's size is counted in. The sum of the files' own
+/// sizes would say that a quarter of a million one-byte files come to a
+/// quarter of a megabyte, where they hold a gigabyte of pages.
+pub fn occupies(len: u64) -> u64 {
+    len.div_ceil(BLOCK_BYTES).saturating_mul(BLOCK_BYTES).saturating_add(ENTRY_BYTES)
+}
+
+/// How large a bundle a server takes. The constants above are what a server
+/// on the user's own machine takes ([`BundleLimits::LOCAL`]): the disk is the
+/// user's and so is the bundle. A server that deploys for others, and keeps
+/// what it extracts in memory, sets its own ([`BundleLimits::new`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BundleLimits {
+    /// The most an archive may be, compressed, in bytes.
+    pub archive_bytes: u64,
+    /// The most a deploy's directory may come to, in bytes, counted as what
+    /// its files and directories occupy ([`occupies`]): what the archive
+    /// extracts to and, with that, the copy of each canister's module that
+    /// the deploy keeps beside the bundle (see [`check_bundle`]).
+    pub extracted_bytes: u64,
+    /// The most files and directories an archive may extract to.
+    pub entries: usize,
+}
+
+impl BundleLimits {
+    /// What a server on the user's own machine takes.
+    pub const LOCAL: Self = Self {
+        archive_bytes: MAX_BUNDLE_BYTES as u64,
+        extracted_bytes: MAX_EXTRACTED_BYTES,
+        entries: MAX_BUNDLE_ENTRIES,
+    };
+
+    /// Limits of `archive_bytes` compressed and `extracted_bytes` extracted.
+    /// An archive is never larger than what it extracts to, so the first is
+    /// held to the second.
+    pub fn new(archive_bytes: u64, extracted_bytes: u64) -> Self {
+        Self {
+            archive_bytes: archive_bytes.min(extracted_bytes),
+            extracted_bytes,
+            entries: MAX_BUNDLE_ENTRIES,
+        }
+    }
+
+    /// What loading the project may read in all ([`MAX_PROJECT_BYTES`]), and
+    /// no more than the bundle may hold.
+    fn project_bytes(&self) -> u64 {
+        MAX_PROJECT_BYTES.min(self.extracted_bytes)
+    }
+
+    /// What the decompressed stream may come to. Not what is kept — that is
+    /// the entries, counted as they are written — but what is read through:
+    /// an archive's framing (a header and padding for each entry, more for a
+    /// long name) on top of its contents. Several times the contents' own
+    /// limit covers any real archive, and is what bounds the work of reading
+    /// one that is mostly padding.
+    fn stream_bytes(&self) -> u64 {
+        self.extracted_bytes.saturating_mul(3).saturating_add(1024 * 1024)
+    }
+}
+
+impl Default for BundleLimits {
+    fn default() -> Self {
+        Self::LOCAL
+    }
+}
+
+/// Why an archive was not extracted. The kinds are what a server answers and
+/// counts differently: which limit was passed, the sender's side of the
+/// transfer, an archive that is not a bundle, and the server's own storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtractError {
+    /// The archive is larger, compressed, than the limit (the value).
+    ArchiveTooLarge(u64),
+    /// The archive extracts to more than the limit (the value).
+    ExtractsTooLarge(u64),
+    /// The archive could not be read to its end: the transfer failed.
+    Source(String),
+    /// What arrived is not a bundle: not a `.tar.gz`, an entry a bundle
+    /// never carries, too many entries, no manifest.
+    NotABundle(String),
+    /// What was extracted could not be written.
+    Storage(String),
+}
+
+impl fmt::Display for ExtractError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ArchiveTooLarge(max) => {
+                write!(f, "the bundle archive is larger than the {max} byte limit")
+            }
+            Self::ExtractsTooLarge(max) => {
+                write!(f, "the bundle extracts to more than the {max} byte limit")
+            }
+            Self::Source(why) => write!(f, "the bundle could not be read to its end: {why}"),
+            Self::NotABundle(why) => f.write_str(why),
+            Self::Storage(why) => write!(f, "the bundle could not be extracted: {why}"),
+        }
+    }
+}
+
+/// A bundle just extracted: the filesystem a deploy reads it through, and
+/// how much there was of it.
+pub struct Extracted {
+    pub fs: BundleFs,
+    /// What its files and directories occupy ([`occupies`]).
+    pub bytes: u64,
+    /// How much was read of the archive, compressed.
+    pub archive_bytes: u64,
+}
 
 /// A plain error for the seams below: each carries one sentence, and the
 /// library wraps it whole at its own boundary (`AccessError::new` and the
@@ -298,11 +428,12 @@ fn read_bytes(fs: &BundleFs, path: &Utf8Path) -> Result<Vec<u8>, Unsupported> {
 struct Metered {
     inner: BundleFs,
     left: Mutex<u64>,
+    budget: u64,
 }
 
 impl Metered {
     fn new(inner: BundleFs, budget: u64) -> Self {
-        Self { inner, left: Mutex::new(budget) }
+        Self { inner, left: Mutex::new(budget), budget }
     }
 
     /// Charge `path`'s size to the budget, or refuse the read.
@@ -317,7 +448,7 @@ impl Metered {
                 "loading the project reads more than {} bytes of manifests, argument files and \
                  variable files in all, more than a project ever holds; a canister's arguments \
                  fit in one message",
-                MAX_PROJECT_BYTES
+                self.budget
             ))));
         }
         *left -= size;
@@ -434,7 +565,8 @@ fn gunzipped_within(path: &Utf8Path, bytes: &[u8], limit: u64) -> Result<u64, Un
     if !bytes.starts_with(&[0x1f, 0x8b]) {
         return Ok(0);
     }
-    let mut decoder = Limited { inner: flate2::read::GzDecoder::new(bytes), left: limit };
+    let mut decoder =
+        Limited { inner: flate2::read::GzDecoder::new(bytes), left: limit, tripped: None };
     match std::io::copy(&mut decoder, &mut std::io::sink()) {
         Ok(expanded) => Ok(expanded),
         Err(_) => Err(Unsupported(format!(
@@ -507,12 +639,29 @@ impl ScriptRunner for NoScripts {
 /// directory through the confined filesystem, so one outside the bundle root
 /// — which the sync-plugin runtime would take as its own sandbox root — is
 /// not found and the project does not load.
+///
+/// And the directory the deploy will fill is held to
+/// [`BundleLimits::extracted_bytes`] before it is filled: the build keeps a
+/// copy of each canister's module beside the bundle (the library's artifact
+/// store, one file per canister name), so a manifest of fifty canisters
+/// naming one module would have the deploy write it fifty times over.
+/// `bundle_bytes` is what the bundle itself extracted to; with the copies it
+/// may come to the limit and no more.
 pub fn check_bundle<'a>(
     fs: &BundleFs,
     network: &Network,
     canisters: impl IntoIterator<Item = (&'a Utf8Path, &'a Canister)>,
+    bundle_bytes: u64,
+    limits: &BundleLimits,
 ) -> Result<(), String> {
-    check_bundle_within(fs, network, canisters, MAX_WASM_BYTES_IN_ALL, MAX_PLUGIN_INPUT_BYTES)
+    check_bundle_within(
+        fs,
+        network,
+        canisters,
+        limits.extracted_bytes.min(MAX_WASM_BYTES_IN_ALL),
+        MAX_PLUGIN_INPUT_BYTES,
+        (bundle_bytes, limits.extracted_bytes),
+    )
 }
 
 /// [`check_bundle`] with the two sums as parameters, so a test can reach
@@ -523,6 +672,7 @@ fn check_bundle_within<'a>(
     canisters: impl IntoIterator<Item = (&'a Utf8Path, &'a Canister)>,
     wasm_in_all: u64,
     plugin_input: u64,
+    (bundle_bytes, directory_bytes): (u64, u64),
 ) -> Result<(), String> {
     IcMainnet::mainnet(network).map_err(|e| e.0)?;
     let canisters: Vec<_> = canisters.into_iter().collect();
@@ -538,7 +688,10 @@ fn check_bundle_within<'a>(
             }
         }
     }
-    let mut verified = Verified { hashes: BTreeMap::new(), wasm_left: wasm_in_all };
+    let mut verified = Verified { hashes: BTreeMap::new(), wasm_left: wasm_in_all, wasm_in_all };
+    // What the deploy's directory will hold: the bundle, and a copy of its
+    // module for each canister.
+    let mut directory = bundle_bytes;
     for (dir, canister) in canisters {
         let name = &canister.name;
         let at = |e: Unsupported| format!("canister '{name}': {e}");
@@ -566,6 +719,21 @@ fn check_bundle_within<'a>(
             ))));
         };
         checksum_matches(&local.path, expected, &actual).map_err(at)?;
+        let module = locate(fs, &dir.join(&local.path))
+            .and_then(|on_disk| {
+                std::fs::metadata(&on_disk).map_err(|e| Unsupported(format!("'{on_disk}': {e}")))
+            })
+            .map_err(at)?
+            .len();
+        directory = directory.saturating_add(occupies(module));
+        if directory > directory_bytes {
+            return Err(format!(
+                "the bundle comes to more than the {directory_bytes} bytes this server holds for \
+                 one deploy, counting the copy of each canister's module the deploy keeps \
+                 beside it (canister '{name}' is where it passes that); make the bundle \
+                 smaller, for one by gzip-compressing its modules"
+            ));
+        }
         for (field, args) in
             [("init_args", &canister.init_args), ("upgrade_args", &canister.upgrade_args)]
         {
@@ -610,6 +778,8 @@ struct Verified {
     hashes: BTreeMap<Utf8PathBuf, String>,
     /// What the gzip-compressed files seen so far may still expand to, in all.
     wasm_left: u64,
+    /// What they may expand to in all, for the refusal to name.
+    wasm_in_all: u64,
 }
 
 impl Verified {
@@ -633,8 +803,9 @@ impl Verified {
         let expanded = gunzipped_within(path, &bytes, MAX_WASM_BYTES)?;
         if expanded > self.wasm_left {
             return Err(Unsupported(format!(
-                "the bundle's gzip-compressed modules expand to more than \
-                 {MAX_WASM_BYTES_IN_ALL} bytes in all, more than a bundle extracts to"
+                "the bundle's gzip-compressed modules expand to more than {} bytes in all, \
+                 more than a bundle extracts to",
+                self.wasm_in_all
             )));
         }
         self.wasm_left -= expanded;
@@ -703,8 +874,8 @@ fn check_declared<'a>(
 /// with the memory bound the icp CLI gives them. Nor is the number of
 /// canisters or steps a manifest declares: the phases do their work once per
 /// canister, and each canister costs the caller the cycles that create it.
-pub fn host_for(fs: BundleFs) -> Host {
-    host_within(fs, MAX_PROJECT_BYTES)
+pub fn host_for(fs: BundleFs, limits: &BundleLimits) -> Host {
+    host_within(fs, limits.project_bytes())
 }
 
 /// [`host_for`] with the project-loading budget as a parameter, so a test can
@@ -747,51 +918,165 @@ fn host_within(fs: BundleFs, project_bytes: u64) -> Host {
     }
 }
 
-/// Extract a bundle archive into `into`, which must exist and be empty, and
-/// return it as the filesystem the deploy reads through, confined to it.
+/// Extract a bundle archive, read from `archive`, into `into`, which must
+/// exist and be empty, and return it as the filesystem the deploy reads
+/// through, confined to it.
+///
+/// The archive is read as a stream and written as it is read: it is never
+/// held whole, in memory or on disk, so a caller may hand in a request body
+/// as it arrives. Both of its sizes are held as it goes — the compressed
+/// bytes read, to [`BundleLimits::archive_bytes`], and what the entries
+/// occupy ([`occupies`]), to [`BundleLimits::extracted_bytes`], each entry
+/// counted from its header before a byte of it is written — and reading
+/// stops at the byte that passes either. What was written by then is the caller's to remove, with
+/// the directory.
 ///
 /// Only regular files and directories are written — `icp project bundle`
 /// writes nothing else, and a symlink or a device node is how an archive
-/// reaches past its directory — and their sizes may not add up to more than
-/// [`MAX_EXTRACTED_BYTES`], nor their number, with the directories their
-/// paths imply, to more than [`MAX_BUNDLE_ENTRIES`]. `tar` refuses entry
+/// reaches past its directory — and no more of them, with the directories
+/// their paths imply, than [`BundleLimits::entries`]. `tar` refuses entry
 /// paths that would land outside `into`. What it extracts is then required
-/// to look like a bundle, i.e. to carry a project manifest at its root.
+/// to look like a bundle, i.e. to carry a project manifest at its root. The
+/// archive is read to its end either way, so that a sender is heard out.
+pub fn extract_bundle_from(
+    archive: impl Read,
+    into: &Utf8Path,
+    limits: &BundleLimits,
+) -> Result<Extracted, ExtractError> {
+    let meter = Meter::default();
+    let extracted_bytes = limits.extracted_bytes;
+    let source = Source { inner: archive, left: limits.archive_bytes, limits, meter: &meter };
+    let result = extract_stream(source, into, limits, &meter);
+    // A reader that stopped the extraction says why itself: what `tar` or
+    // the decoder made of its error is only that something went wrong.
+    match (meter.tripped.take(), result) {
+        (Some(why), _) => Err(why),
+        (None, Err(why)) => Err(why),
+        (None, Ok((fs, bytes))) => {
+            debug_assert!(bytes <= extracted_bytes);
+            Ok(Extracted { fs, bytes, archive_bytes: meter.archive.get() })
+        }
+    }
+}
+
+/// [`extract_bundle_from`] for an archive already in memory, under the local
+/// limits and with the refusal as a sentence.
+#[cfg(test)]
 pub fn extract_bundle(bytes: &[u8], into: &Utf8Path) -> Result<BundleFs, String> {
     extract_bundle_within(bytes, into, MAX_BUNDLE_ENTRIES)
 }
 
 /// [`extract_bundle`] with the files-and-directories cap as a parameter, so a
 /// test can reach it without writing a quarter of a million files.
+#[cfg(test)]
 fn extract_bundle_within(
     bytes: &[u8],
     into: &Utf8Path,
     max_entries: usize,
 ) -> Result<BundleFs, String> {
-    if bytes.len() > MAX_BUNDLE_BYTES {
-        return Err(format!(
-            "the bundle is {} bytes, above the {} byte limit",
-            bytes.len(),
-            MAX_BUNDLE_BYTES
-        ));
-    }
+    let limits = BundleLimits { entries: max_entries, ..BundleLimits::LOCAL };
+    extract_bundle_from(bytes, into, &limits).map(|e| e.fs).map_err(|e| e.to_string())
+}
+
+/// The filesystem a deploy reads a bundle through, over a directory a bundle
+/// was already extracted into by [`extract_bundle_from`] (an upload, taken
+/// by its deploy): confined to it, like one just extracted.
+pub fn open_bundle(dir: &Utf8Path) -> Result<BundleFs, String> {
+    confined(dir).map_err(|e| e.to_string())
+}
+
+/// `into`, as the confined filesystem everything below it is read through.
+fn confined(into: &Utf8Path) -> Result<BundleFs, ExtractError> {
     // A link is refused on the way in, so nothing under the root leads out
     // of it; should one appear later, the filesystem refuses any path
     // through it. The root is held as spelled: it and everything above it
     // are this crate's own (macOS keeps its temporary directories under
     // `/var`, a link to `/private/var`), and only what lies below is held
     // to shape.
-    let fs = Confined::new(into).map_err(|e| {
+    Confined::new(into).map_err(|e| {
         let mut why = e.to_string();
         if let Some(cause) = std::error::Error::source(&e) {
             why.push_str(": ");
             why.push_str(&cause.to_string());
         }
-        format!("the extraction directory cannot be confined to: {why}")
-    })?;
-    let unreadable =
-        |e: std::io::Error| format!("the bundle is not a readable .tar.gz archive: {e}");
-    let decoder = Limited { inner: flate2::read::GzDecoder::new(bytes), left: MAX_EXTRACTED_BYTES };
+        ExtractError::Storage(format!("the extraction directory cannot be confined to: {why}"))
+    })
+}
+
+/// What the readers of one extraction share with it: how much of the archive
+/// has been read, and the reason one of them stopped it.
+#[derive(Default)]
+struct Meter {
+    archive: Cell<u64>,
+    tripped: Cell<Option<ExtractError>>,
+}
+
+impl Meter {
+    /// Record why the extraction stops, unless something already has, and
+    /// return the error a reader stops it with.
+    fn trip(&self, why: ExtractError) -> std::io::Error {
+        let said = why.to_string();
+        let first = self.tripped.take().unwrap_or(why);
+        self.tripped.set(Some(first));
+        std::io::Error::other(said)
+    }
+}
+
+/// The archive as it is read: counted, held to the archive limit, and its
+/// own failures — the sender's — told apart from the archive's contents.
+struct Source<'a, R> {
+    inner: R,
+    left: u64,
+    limits: &'a BundleLimits,
+    meter: &'a Meter,
+}
+
+impl<R: Read> Read for Source<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = match self.inner.read(buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Err(e),
+            Err(e) => return Err(self.meter.trip(ExtractError::Source(e.to_string()))),
+        };
+        if n as u64 > self.left {
+            return Err(self.meter.trip(ExtractError::ArchiveTooLarge(self.limits.archive_bytes)));
+        }
+        self.left -= n as u64;
+        self.meter.archive.set(self.meter.archive.get() + n as u64);
+        Ok(n)
+    }
+}
+
+/// The body of [`extract_bundle_from`]: the filesystem, and the sum of the
+/// entries' sizes.
+fn extract_stream<R: Read>(
+    source: Source<'_, R>,
+    into: &Utf8Path,
+    limits: &BundleLimits,
+    meter: &Meter,
+) -> Result<(BundleFs, u64), ExtractError> {
+    let max_entries = limits.entries;
+    let fs = confined(into)?;
+    // An error writing is the server's; any other is the archive's.
+    let unreadable = |e: std::io::Error| {
+        use std::io::ErrorKind::{
+            PermissionDenied, QuotaExceeded, ReadOnlyFilesystem, StorageFull,
+        };
+        match e.kind() {
+            StorageFull | QuotaExceeded | PermissionDenied | ReadOnlyFilesystem => {
+                ExtractError::Storage(e.to_string())
+            }
+            _ => ExtractError::NotABundle(format!(
+                "the bundle is not a readable .tar.gz archive: {e}"
+            )),
+        }
+    };
+    let too_large = || ExtractError::ExtractsTooLarge(limits.extracted_bytes);
+    let decoder = Limited {
+        inner: flate2::read::GzDecoder::new(source),
+        left: limits.stream_bytes(),
+        tripped: Some((meter, limits.extracted_bytes)),
+    };
     let mut archive = tar::Archive::new(decoder);
     let mut total: u64 = 0;
     // Files and directories written so far, counting each directory an
@@ -800,10 +1085,10 @@ fn extract_bundle_within(
     // would otherwise cost inodes the entry count never sees.
     let mut objects: usize = 0;
     let too_many = || {
-        format!(
+        ExtractError::NotABundle(format!(
             "the bundle holds more than {max_entries} files and directories, more than a bundle \
              ever has"
-        )
+        ))
     };
     // The directories that exist so far, written as entries or implied by
     // the paths of earlier ones, relative to the root.
@@ -816,20 +1101,21 @@ fn extract_bundle_within(
         }
         let kind = entry.header().entry_type();
         let path = entry.path().map_err(unreadable)?.into_owned();
-        let path = Utf8PathBuf::from_path_buf(path)
-            .map_err(|p| format!("the archive entry '{}' is not UTF-8", p.display()))?;
+        let path = Utf8PathBuf::from_path_buf(path).map_err(|p| {
+            ExtractError::NotABundle(format!("the archive entry '{}' is not UTF-8", p.display()))
+        })?;
         if path.as_str().len() > MAX_ENTRY_PATH_BYTES {
-            return Err(format!(
+            return Err(ExtractError::NotABundle(format!(
                 "an archive entry's path is {} bytes long, more than the {MAX_ENTRY_PATH_BYTES} \
                  a path can be",
                 path.as_str().len()
-            ));
+            )));
         }
         if !(kind.is_file() || kind.is_dir()) {
-            return Err(format!(
+            return Err(ExtractError::NotABundle(format!(
                 "the archive entry '{path}' is not a regular file or directory ({kind:?}), which \
                  a bundle never carries; rebuild it with `icp project bundle`"
-            ));
+            )));
         }
         // Where the entry lands, relative to the root: `tar` refuses a path
         // that would leave `into`, so resolving it against the root is only
@@ -837,9 +1123,9 @@ fn extract_bundle_within(
         let rel = match fs.resolve(&path) {
             Ok(resolved) => resolved.strip_prefix(fs.root()).unwrap_or(&resolved).to_path_buf(),
             Err(_) => {
-                return Err(format!(
+                return Err(ExtractError::NotABundle(format!(
                     "the archive entry '{path}' would land outside the extraction directory"
-                ))
+                )))
             }
         };
         // `.icp` is the library's own state under the project root: the id
@@ -850,10 +1136,10 @@ fn extract_bundle_within(
         // Compared without regard to case: on a case-insensitive disk `.ICP`
         // is the same directory.
         if rel.components().next().is_some_and(|c| c.as_str().eq_ignore_ascii_case(STATE_DIR)) {
-            return Err(format!(
+            return Err(ExtractError::NotABundle(format!(
                 "the archive entry '{path}' is under `{STATE_DIR}/`, the project state a bundle \
                  never carries; rebuild it with `icp project bundle`"
-            ));
+            )));
         }
         // The parents this entry implies that nothing before it did. A known
         // directory's own parents are known too, so the walk up stops at the
@@ -869,8 +1155,12 @@ fn extract_bundle_within(
         if objects > max_entries {
             return Err(too_many());
         }
-        total = total.saturating_add(entry.size());
-        if total > MAX_EXTRACTED_BYTES {
+        // What the entry will occupy, and each directory made on the way to
+        // it, known from the header: refused before any of it is written.
+        total = total
+            .saturating_add(occupies(entry.size()))
+            .saturating_add(ENTRY_BYTES.saturating_mul(implied.len() as u64));
+        if total > limits.extracted_bytes {
             return Err(too_large());
         }
         if entry.unpack_in(fs.root().as_std_path()).map_err(unreadable)? {
@@ -879,7 +1169,9 @@ fn extract_bundle_within(
             // server's to read and to remove, and a directory an archive
             // marked read-only would be neither (see `own`).
             own(fs.root().join(&rel).as_std_path()).map_err(|e| {
-                format!("the archive entry '{path}' could not be made the server's own: {e}")
+                ExtractError::Storage(format!(
+                    "the archive entry '{path}' could not be made the server's own: {e}"
+                ))
             })?;
             dirs.extend(implied);
             if kind.is_dir() {
@@ -887,13 +1179,20 @@ fn extract_bundle_within(
             }
         }
     }
+    // The rest of the stream is read through, both limits still holding: an
+    // archive ends in padding, and may be followed by more, and a sender
+    // whose body is left half-read sees its connection cut, not an answer.
+    let mut decoder = archive.into_inner();
+    std::io::copy(&mut decoder, &mut std::io::sink()).map_err(unreadable)?;
+    let mut source = decoder.inner.into_inner();
+    std::io::copy(&mut source, &mut std::io::sink()).map_err(unreadable)?;
     if !fs.root().join(PROJECT_MANIFEST).is_file() {
-        return Err(format!(
+        return Err(ExtractError::NotABundle(format!(
             "the archive carries no `{PROJECT_MANIFEST}` at its root, so it is not an icp \
              project bundle (`icp project bundle` writes one)"
-        ));
+        )));
     }
-    Ok(fs)
+    Ok((fs, total))
 }
 
 /// Give an extracted file or directory the mode everything a deploy writes
@@ -919,23 +1218,24 @@ fn own(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn too_large() -> String {
-    format!("the bundle extracts to more than the {MAX_EXTRACTED_BYTES} byte limit")
-}
-
 /// A reader that fails once more than `left` bytes have passed through it:
 /// the decompressed stream's own bound, independent of what the entry
-/// headers claim.
-struct Limited<R> {
+/// headers claim. In an extraction it says so to the extraction's meter,
+/// with the limit that was passed.
+struct Limited<'a, R> {
     inner: R,
     left: u64,
+    tripped: Option<(&'a Meter, u64)>,
 }
 
-impl<R: Read> Read for Limited<R> {
+impl<R: Read> Read for Limited<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         if n as u64 > self.left {
-            return Err(std::io::Error::other(too_large()));
+            return Err(match self.tripped {
+                Some((meter, limit)) => meter.trip(ExtractError::ExtractsTooLarge(limit)),
+                None => std::io::Error::other("more than the limit"),
+            });
         }
         self.left -= n as u64;
         Ok(n)
@@ -1055,9 +1355,58 @@ mod tests {
     #[test]
     fn oversized_bundles_are_refused_before_extraction() {
         let (_dir, into) = scratch();
-        let big = vec![0u8; MAX_BUNDLE_BYTES + 1];
-        let err = extract_bundle(&big, &into).unwrap_err();
-        assert!(err.contains("limit"), "{err}");
+        // Held to the archive limit as it is read, since a stream has no
+        // length to check first: an archive one byte over is stopped.
+        let bytes = archive(&[("icp.yaml", b"canisters: []\n")]);
+        let over = BundleLimits { archive_bytes: bytes.len() as u64 - 1, ..BundleLimits::LOCAL };
+        let err = extract_bundle_from(&bytes[..], &into, &over).err().unwrap();
+        assert_eq!(err, ExtractError::ArchiveTooLarge(bytes.len() as u64 - 1));
+        let (_dir, into) = scratch();
+        let fits = BundleLimits { archive_bytes: bytes.len() as u64, ..BundleLimits::LOCAL };
+        let extracted = extract_bundle_from(&bytes[..], &into, &fits).ok().unwrap();
+        assert_eq!(extracted.archive_bytes, bytes.len() as u64);
+        // What it extracted to is what it occupies: a block for the
+        // manifest's few bytes, and its entry.
+        assert_eq!(extracted.bytes, BLOCK_BYTES + ENTRY_BYTES);
+    }
+
+    // What a bundle extracts to is counted as what it occupies, which is
+    // what a server that keeps bundles in memory pays: small files cost a
+    // block each, and every file and directory its entry. The limit is held
+    // from the headers, before the entry that passes it is written. And the
+    // sender's own failure is told from an archive that is not one.
+    #[test]
+    fn a_bundle_is_held_to_what_it_occupies() {
+        let files: Vec<(String, &[u8])> =
+            (0..10).map(|i| (format!("assets/{i}"), &b"x"[..])).collect();
+        let mut entries: Vec<(&str, &[u8])> = vec![("icp.yaml", b"canisters: []\n")];
+        entries.extend(files.iter().map(|(path, data)| (path.as_str(), *data)));
+        let bytes = archive(&entries);
+        // Eleven files of a block each, and their entries with the one
+        // directory their paths imply: far more than their 24 bytes.
+        let occupied = 11 * (BLOCK_BYTES + ENTRY_BYTES) + ENTRY_BYTES;
+        let (_dir, into) = scratch();
+        let fits = BundleLimits { extracted_bytes: occupied, ..BundleLimits::LOCAL };
+        assert_eq!(extract_bundle_from(&bytes[..], &into, &fits).ok().unwrap().bytes, occupied);
+        let (_dir, into) = scratch();
+        let over = BundleLimits { extracted_bytes: occupied - 1, ..BundleLimits::LOCAL };
+        let err = extract_bundle_from(&bytes[..], &into, &over).err().unwrap();
+        assert_eq!(err, ExtractError::ExtractsTooLarge(occupied - 1));
+        assert!(!into.join("assets/9").exists(), "the entry that passes it is not written");
+
+        struct Cut<'a>(&'a [u8]);
+        impl Read for Cut<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.is_empty() {
+                    true => Err(std::io::Error::other("connection reset")),
+                    false => self.0.read(buf),
+                }
+            }
+        }
+        let (_dir, into) = scratch();
+        let half = Cut(&bytes[..bytes.len() / 2]);
+        let err = extract_bundle_from(half, &into, &BundleLimits::LOCAL).err().unwrap();
+        assert_eq!(err, ExtractError::Source("connection reset".into()));
     }
 
     // A small archive can claim a huge file: the entry's size is what tar
@@ -1130,7 +1479,13 @@ mod tests {
         let bytes = archive(&[("icp.yaml", manifest("out.wasm").as_bytes())]);
         let fs = extract_bundle(&bytes, &into).unwrap();
         symlink(&secret, into.join("out.wasm")).unwrap();
-        let err = chain(&host_for(fs.clone()).project.load().await.expect_err("a link out"));
+        let err = chain(
+            &host_for(fs.clone(), &BundleLimits::LOCAL)
+                .project
+                .load()
+                .await
+                .expect_err("a link out"),
+        );
         assert!(err.contains("not a regular file in the project"), "{err}");
         assert!(err.contains("out.wasm"), "{err}");
         // And a read through it is refused naming the link, not followed.
@@ -1143,7 +1498,13 @@ mod tests {
             archive(&[("icp.yaml", manifest("in.wasm").as_bytes()), ("backend.wasm", b"\0asm")]);
         let fs = extract_bundle(&bytes, &into).unwrap();
         symlink("backend.wasm", into.join("in.wasm")).unwrap();
-        let err = chain(&host_for(fs.clone()).project.load().await.expect_err("a link within"));
+        let err = chain(
+            &host_for(fs.clone(), &BundleLimits::LOCAL)
+                .project
+                .load()
+                .await
+                .expect_err("a link within"),
+        );
         assert!(err.contains("not a regular file in the project"), "{err}");
         assert!(err.contains("in.wasm"), "{err}");
         assert!(fs.read(Utf8Path::new("in.wasm")).await.is_err());
@@ -1154,7 +1515,9 @@ mod tests {
         let bytes = archive(&[("icp.yaml", manifest("gone.wasm").as_bytes())]);
         let fs = extract_bundle(&bytes, &into).unwrap();
         symlink(into.join("nowhere.wasm"), into.join("gone.wasm")).unwrap();
-        let err = chain(&host_for(fs).project.load().await.expect_err("a dangling link"));
+        let err = chain(
+            &host_for(fs, &BundleLimits::LOCAL).project.load().await.expect_err("a dangling link"),
+        );
         assert!(err.contains("not a regular file in the project"), "{err}");
         assert!(err.contains("gone.wasm"), "{err}");
     }
@@ -1170,7 +1533,9 @@ mod tests {
         let (_dir, into) = scratch();
         let bytes = archive_with_dirs(&[("icp.yaml", manifest.as_bytes())], &["assets"]);
         let fs = extract_bundle(&bytes, &into).unwrap();
-        let err = chain(&host_for(fs).project.load().await.expect_err("a directory"));
+        let err = chain(
+            &host_for(fs, &BundleLimits::LOCAL).project.load().await.expect_err("a directory"),
+        );
         assert!(err.contains("not a regular file"), "{err}");
         assert!(err.contains("assets"), "{err}");
     }
@@ -1192,7 +1557,7 @@ mod tests {
         let fs = extract_bundle(&bytes, &alias).unwrap();
         assert_eq!(fs.root(), alias);
         assert!(into.join("backend.wasm").is_file());
-        let project = host_for(fs.clone()).project.load().await.unwrap();
+        let project = host_for(fs.clone(), &BundleLimits::LOCAL).project.load().await.unwrap();
         assert_eq!(project.canisters.len(), 1);
         assert_eq!(fs.read(Utf8Path::new("backend.wasm")).await.unwrap(), b"\0asm");
         std::fs::remove_file(&alias).unwrap();
@@ -1233,7 +1598,7 @@ mod tests {
         ] {
             let (_dir, into) = scratch();
             let fs = extract_bundle(&archive(&[("icp.yaml", manifest.as_bytes())]), &into).unwrap();
-            let err = host_for(fs).project.load().await.expect_err(refused);
+            let err = host_for(fs, &BundleLimits::LOCAL).project.load().await.expect_err(refused);
             let err = chain(&err);
             assert!(err.contains(refused), "{refused}: {err}");
             // The refusal names the step, so the reader sees what was asked.
@@ -1624,7 +1989,7 @@ mod tests {
     async fn environment(bytes: &[u8]) -> (tempfile::TempDir, BundleFs, Environment) {
         let (dir, into) = scratch();
         let fs = extract_bundle(bytes, &into).unwrap();
-        let env = host_for(fs.clone())
+        let env = host_for(fs.clone(), &BundleLimits::LOCAL)
             .get_environment(&EnvironmentSelection::Named("ic".into()))
             .await
             .unwrap();
@@ -1643,6 +2008,7 @@ mod tests {
             env.canisters.values().map(|(dir, canister)| (dir.as_path(), canister)),
             wasm_in_all,
             plugin_input,
+            (0, u64::MAX),
         )
     }
 
@@ -1684,6 +2050,45 @@ mod tests {
         let err = check(&fs, &env, 4096, MAX_PLUGIN_INPUT_BYTES).unwrap_err();
         assert!(err.contains("canister 'b'") && err.contains("in all"), "{err}");
         check(&fs, &env, 8192, MAX_PLUGIN_INPUT_BYTES).unwrap();
+    }
+
+    // The deploy keeps a copy of each canister's module beside the bundle,
+    // one per canister however many name the same file: so what a bundle
+    // will come to in its deploy's directory is the bundle and those copies,
+    // and that is what is held to the limit, before any copy is made. A
+    // small archive of one module and many canisters is the case it is for.
+    #[tokio::test]
+    async fn the_copies_a_deploy_makes_of_its_modules_count_against_the_limit() {
+        let wasm = wat::parse_str("(module)").unwrap();
+        let sha = hex::encode(Sha256::digest(&wasm));
+        let canisters: String = (0..5)
+            .map(|i| {
+                format!(
+                    "  - name: c{i}\n    build:\n      steps:\n        - type: pre-built\n          \
+                     path: m.wasm\n          sha256: {sha}\n"
+                )
+            })
+            .collect();
+        let manifest = format!("canisters:\n{canisters}");
+        let bytes = archive(&[("icp.yaml", manifest.as_bytes()), ("m.wasm", &wasm)]);
+        let (_dir, fs, env) = environment(&bytes).await;
+        // The bundle: a manifest and a module, a block and an entry each.
+        let bundle = 2 * occupies(1);
+        let check = |limit: u64| {
+            check_bundle(
+                &fs,
+                &env.network,
+                env.canisters.values().map(|(dir, canister)| (dir.as_path(), canister)),
+                bundle,
+                &BundleLimits { extracted_bytes: limit, ..BundleLimits::LOCAL },
+            )
+        };
+        // Five canisters, five copies of the one module.
+        let in_all = bundle + 5 * occupies(wasm.len() as u64);
+        check(in_all).unwrap();
+        let err = check(in_all - 1).unwrap_err();
+        assert!(err.contains("the copy of each canister's module"), "{err}");
+        assert!(err.contains("canister 'c4'"), "{err}");
     }
 
     // What a sync step hands its plugin is held to the bundle at the load,
@@ -1733,7 +2138,9 @@ mod tests {
         for (declared, named) in refused {
             let (_dir, into) = scratch();
             let fs = extract_bundle(&bundle(declared), &into).unwrap();
-            let err = chain(&host_for(fs).project.load().await.expect_err(declared));
+            let err = chain(
+                &host_for(fs, &BundleLimits::LOCAL).project.load().await.expect_err(declared),
+            );
             assert!(
                 err.contains("gives its sync plugin") && err.contains(named),
                 "{declared}: {err}"

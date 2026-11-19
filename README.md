@@ -566,18 +566,45 @@ What the hosted composition adds to the local one:
   for five minutes, bound to the session that minted it (the upload it produces
   is deployable by that session alone), and sent in a request header so it
   stays out of proxy logs. The route is outside the bearer gate — the ticket is
-  its authentication — and streams the body to disk under
-  `$MCP_DEPLOY_MAX_UPLOAD_BYTES`, refusing a declared length over it unread. An
-  upload is held fifteen minutes for its deploy, and removed with it. A
+  its authentication. An upload is held five minutes for its deploy. A
   session has one upload at a time — a `PUT` while another of its own is
-  arriving is refused (409), and one that begins replaces the archive the
-  session was holding — and every archive the server has, arriving, held or
-  being deployed, counts against `$MCP_DEPLOY_MAX_STORED_UPLOAD_BYTES`
-  (default eight archives' worth), reserved before the body is read; past it
-  a `PUT` is refused (507). A `PUT` abandoned mid-body leaves nothing. The
-  upload is the only way in: `icp_deploy_bundle` lists `bundle_upload` here and
-  refuses the local server's `bundle_path`, so this server opens no file a
-  caller names.
+  arriving is refused (409), and one that is let in replaces the bundle the
+  session was holding. The upload is the only way in: `icp_deploy_bundle`
+  lists `bundle_upload` here and refuses the local server's `bundle_path`, so
+  this server opens no file a caller names.
+- **The archive is extracted as it arrives, and never kept.** The body is fed
+  to the bundle extractor a chunk at a time, so the archive is nowhere whole,
+  in memory or on disk; what the server holds for the deploy is the extracted
+  bundle, which the deploy then takes as its directory (a rename, nothing
+  copied or extracted again). Both of its sizes are held while it is still
+  arriving, and the upload is stopped at the byte that passes either:
+  `$MCP_DEPLOY_MAX_UPLOAD_BYTES` of archive (a declared length over it is
+  refused unread), and `$MCP_DEPLOY_MAX_EXTRACTED_BYTES` extracted — each
+  entry counted from its header, before it is written. Both answer `413`, the
+  body saying which; a client still sending may see the connection close
+  rather than the answer. What arrives and is not a bundle (not a `.tar.gz`,
+  an entry a bundle never carries, no manifest) is refused on the upload too
+  (`422`), not on the deploy. A body that stalls for thirty seconds, or takes
+  more than ten minutes, is given up on, and a `PUT` that fails or is
+  abandoned leaves nothing behind.
+- **What the server keeps is bounded in the bytes it occupies.** The state
+  directory may be a RAM filesystem, where a bundle is memory, so a bundle's
+  size is counted as what its files and directories occupy: each file in
+  whole 4 KiB blocks, and 1 KiB for each file and directory (a quarter of a
+  million one-byte files are a gigabyte of pages, not a quarter of a
+  megabyte). `$MCP_DEPLOY_MAX_EXTRACTED_BYTES` (default 128 MiB) holds one
+  bundle to that, and with it the copy of each canister's module that its
+  deploy keeps beside it — checked before the deploy makes any, so fifty
+  canisters naming one module cannot have it written fifty times. Every
+  bundle the server has counts against `$MCP_DEPLOY_MAX_STORED_BYTES`
+  (default: one bundle for each deploy that runs at once, and one more): one
+  that is arriving or being deployed as the most a bundle may come to, since
+  that is what it may grow to, and one that is waiting as what it did come
+  to. Past it a `PUT` is refused (507), and so is a deploy with no room to
+  run in, its upload kept for another try. So the most the deploy tools keep
+  under the state directory is that budget — 384 MiB by default — beside
+  what a running deploy holds on the heap (a module at a time, read to check
+  it).
 - **The deploy call is answered as an event stream.** The endpoint answers a
   POST with plain JSON, the one message a handler returns; a deploy reports
   each phase as a progress notification before its result, so a `tools/call`
@@ -617,9 +644,9 @@ What the hosted composition adds to the local one:
   started over a state directory in use is refused, since it would clear the
   first one's uploads and deploys as leftovers),
   and a sweep every minute removes lapsed uploads and id records older than
-  seven days. The archive and what it unpacks are bounded
-  by the `imcp2-deploy` host (archive, extracted bytes, entries, module sizes),
-  and its sync plugins run in WASI with read-only access to their own deploy
+  seven days. The number of files and directories a bundle holds, and what
+  its modules expand to, are bounded by the `imcp2-deploy` host as well, and
+  its sync plugins run in WASI with read-only access to their own deploy
   directory and no network.
 - **The server log has every deploy.** Each deploy's events — the directory it
   works in, every phase and canister step as the client sees them, and how it
@@ -637,12 +664,12 @@ What the hosted composition adds to the local one:
   | Series | What it answers |
   |---|---|
   | `imcp2_deploys_running`, `imcp2_deploy_slots` | How full the server is: deploys holding a slot against the cap. |
-  | `imcp2_deploy_refusals_total{reason}` | Deploys not begun: `busy` (every slot held; a sustained rate means the cap is too low), `session_busy`, `stopping`. |
+  | `imcp2_deploy_refusals_total{reason}` | Deploys not begun: `busy` (every slot held; a sustained rate means the cap is too low), `session_busy`, `stopping`, `no_room` (the store had no room for the deploy to run in). |
   | `imcp2_deploys_total{outcome}` | Deploys that held a slot: `succeeded`, `failed`, `rejected` (refused before anything was created, for the request, the bundle, or an identity that could not be derived), `setup_failed` (the server could not prepare it; nothing wrong with the request), `interrupted`. |
   | `imcp2_deploy_duration_seconds` | How long a deploy held its slot. |
-  | `imcp2_deploy_uploads_total{outcome}` | Uploads: `accepted`, `bad_ticket`, `too_large`, `store_full`, `session_busy`, `body_error`, `storage_error`. |
-  | `imcp2_deploy_upload_bytes` | The size of each accepted archive. |
-  | `imcp2_deploy_upload_store_bytes`, `imcp2_deploy_upload_store_capacity_bytes` | What the upload store holds against its budget. |
+  | `imcp2_deploy_uploads_total{outcome}` | Uploads: `accepted`, `bad_ticket`, `too_large` (the archive), `extracts_too_large` (what it extracts to), `not_a_bundle`, `store_full`, `session_busy`, `body_error`, `storage_error`. |
+  | `imcp2_deploy_upload_bytes`, `imcp2_deploy_bundle_extracted_bytes` | The size of each accepted archive, and what it extracted to: where the two limits should sit is read off these. |
+  | `imcp2_deploy_upload_store_bytes`, `imcp2_deploy_upload_store_capacity_bytes` | What the deploy tools keep under the state directory, in extracted bytes, against the budget. |
   | `imcp2_deploy_uploads_held`, `imcp2_deploy_uploads_arriving` | Uploads waiting for their deploy, and arriving. |
 
   Every label value is one of those listed; nothing a client sends becomes
@@ -699,10 +726,11 @@ cargo run
 # $MCP_SERVE_BETA (set it to also serve the beta II instance at /mcp-beta, for staging),
 # and $MCP_SERVE_METRICS (set it to serve the Prometheus exposition at /metrics).
 # Built with `--features deploy` it also serves the deploy tools, with
-# $MCP_DEPLOY_MAX_CONCURRENT deploys at once (default 2), uploads of at most
-# $MCP_DEPLOY_MAX_UPLOAD_BYTES (default 64 MiB) and
-# $MCP_DEPLOY_MAX_STORED_UPLOAD_BYTES of them in all (default eight times that);
-# see "Deploying a project bundle".
+# $MCP_DEPLOY_MAX_CONCURRENT deploys at once (default 2), archives of at most
+# $MCP_DEPLOY_MAX_UPLOAD_BYTES (default 64 MiB) that extract to at most
+# $MCP_DEPLOY_MAX_EXTRACTED_BYTES (default 128 MiB), and
+# $MCP_DEPLOY_MAX_STORED_BYTES of extracted bundles in all (default: one for
+# each deploy at once, and one more); see "Deploying a project bundle".
 ```
 
 The human-facing pages — the landing page and the `/privacy-policy`,

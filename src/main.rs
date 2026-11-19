@@ -82,54 +82,71 @@ fn require_resource() -> bool {
 }
 
 /// The deploy tools' knobs, when this binary was built with the `deploy`
-/// feature: `$MCP_DEPLOY_MAX_CONCURRENT` deploys at once across sessions and
-/// endpoints (default 2), `$MCP_DEPLOY_MAX_UPLOAD_BYTES` per uploaded archive
-/// (default 64 MiB), and `$MCP_DEPLOY_MAX_STORED_UPLOAD_BYTES` for every
-/// uploaded archive the server has at once (default eight archives' worth).
-/// A value that is not a whole number refuses to start, and so does a count
-/// of zero — the tools run at least one deploy, so a zero would be a cap the
-/// server then exceeds — and a store too small for one archive.
+/// feature:
+///
+///   * `$MCP_DEPLOY_MAX_CONCURRENT` deploys at once across sessions and
+///     endpoints (default 2);
+///   * `$MCP_DEPLOY_MAX_UPLOAD_BYTES` per uploaded archive, compressed
+///     (default 64 MiB);
+///   * `$MCP_DEPLOY_MAX_EXTRACTED_BYTES` per bundle as extracted, which is
+///     what the server keeps of it (default 128 MiB);
+///   * `$MCP_DEPLOY_MAX_STORED_BYTES` for every bundle the server has at
+///     once, extracted (default: one bundle for each deploy at once, and one
+///     more).
+///
+/// A value that is not a whole number refuses to start, and so does one
+/// that contradicts another rather than being quietly bent to fit: a count
+/// of zero (the tools run at least one deploy), an archive cap over what a
+/// bundle may extract to (an archive is never larger than its contents),
+/// and a store too small for one bundle.
 #[cfg(feature = "deploy")]
 fn deploy_config() -> anyhow::Result<imcp2::deploy::DeployConfig> {
     let var = |name: &str| std::env::var(name).ok();
-    deploy_config_from(
+    deploy_config_from([
         var("MCP_DEPLOY_MAX_CONCURRENT").as_deref(),
         var("MCP_DEPLOY_MAX_UPLOAD_BYTES").as_deref(),
-        var("MCP_DEPLOY_MAX_STORED_UPLOAD_BYTES").as_deref(),
-    )
+        var("MCP_DEPLOY_MAX_EXTRACTED_BYTES").as_deref(),
+        var("MCP_DEPLOY_MAX_STORED_BYTES").as_deref(),
+    ])
 }
 
+/// [`deploy_config`], from the four variables' values in the order above.
 #[cfg(feature = "deploy")]
 fn deploy_config_from(
-    concurrent: Option<&str>,
-    max_upload_bytes: Option<&str>,
-    max_stored_upload_bytes: Option<&str>,
+    [concurrent, max_upload_bytes, max_extracted_bytes, max_stored_bytes]: [Option<&str>; 4],
 ) -> anyhow::Result<imcp2::deploy::DeployConfig> {
-    use imcp2::deploy::DeployConfig;
     let bytes = |name: &str, value: &str| {
         value
             .trim()
             .parse::<usize>()
             .map_err(|e| anyhow::anyhow!("{name} must be a byte count: {e}"))
     };
-    // The store's default follows the archive cap, so raising one alone
-    // leaves a store that still takes several.
-    let mut config = match max_upload_bytes {
-        Some(v) => DeployConfig::with_max_upload_bytes(bytes("MCP_DEPLOY_MAX_UPLOAD_BYTES", v)?),
-        None => DeployConfig::default(),
-    };
+    let mut config = imcp2::deploy::DeployConfig::default();
     if let Some(v) = concurrent {
         config.concurrent = deploy_concurrency(v)?;
     }
-    if let Some(v) = max_stored_upload_bytes {
-        config.max_stored_upload_bytes = bytes("MCP_DEPLOY_MAX_STORED_UPLOAD_BYTES", v)?;
+    if let Some(v) = max_upload_bytes {
+        config.max_upload_bytes = bytes("MCP_DEPLOY_MAX_UPLOAD_BYTES", v)?;
+    }
+    if let Some(v) = max_extracted_bytes {
+        config.max_extracted_bytes = bytes("MCP_DEPLOY_MAX_EXTRACTED_BYTES", v)?;
+    }
+    anyhow::ensure!(
+        config.max_upload_bytes <= config.max_extracted_bytes,
+        "MCP_DEPLOY_MAX_UPLOAD_BYTES ({}) must be at most MCP_DEPLOY_MAX_EXTRACTED_BYTES ({}): \
+         an archive is never larger than what it extracts to",
+        config.max_upload_bytes,
+        config.max_extracted_bytes
+    );
+    if let Some(v) = max_stored_bytes {
+        let stored = bytes("MCP_DEPLOY_MAX_STORED_BYTES", v)?;
         anyhow::ensure!(
-            config.max_stored_upload_bytes >= config.max_upload_bytes,
-            "MCP_DEPLOY_MAX_STORED_UPLOAD_BYTES ({}) must be at least \
-             MCP_DEPLOY_MAX_UPLOAD_BYTES ({}): a store smaller than one archive takes none",
-            config.max_stored_upload_bytes,
-            config.max_upload_bytes
+            stored >= config.max_extracted_bytes,
+            "MCP_DEPLOY_MAX_STORED_BYTES ({stored}) must be at least \
+             MCP_DEPLOY_MAX_EXTRACTED_BYTES ({}): a store smaller than one bundle takes none",
+            config.max_extracted_bytes
         );
+        config.max_stored_bytes = Some(stored);
     }
     Ok(config)
 }
@@ -702,22 +719,33 @@ mod tests {
         assert!(relative.ends_with("state"), "{}", relative.display());
     }
 
-    /// The store's cap follows the archive's unless it is set, and a store
-    /// smaller than one archive is refused.
+    /// What the server holds follows from how many deploys it runs and how
+    /// large a bundle may be, unless it is set; and values that contradict
+    /// one another are refused, not bent to fit.
     #[cfg(feature = "deploy")]
     #[test]
-    fn the_upload_store_holds_several_archives_unless_told_otherwise() {
-        let config = super::deploy_config_from(None, None, None).unwrap();
+    fn the_deploy_limits_follow_one_another_unless_told_otherwise() {
+        const MIB: usize = 1024 * 1024;
+        let config = super::deploy_config_from([None; 4]).unwrap();
         assert_eq!(config.concurrent, 2);
-        assert_eq!(config.max_stored_upload_bytes, 8 * config.max_upload_bytes);
-        let config = super::deploy_config_from(Some("3"), Some("1000"), None).unwrap();
+        assert_eq!((config.max_upload_bytes, config.max_extracted_bytes), (64 * MIB, 128 * MIB));
+        // Two running and one more.
+        assert_eq!(config.stored_bytes(), 3 * 128 * MIB as u64);
+        assert_eq!(config.limits().extracted_bytes, 128 * MIB as u64);
+
+        let config =
+            super::deploy_config_from([Some("3"), Some("1000"), Some(" 5000 "), None]).unwrap();
         assert_eq!((config.concurrent, config.max_upload_bytes), (3, 1000));
-        assert_eq!(config.max_stored_upload_bytes, 8000);
-        let config = super::deploy_config_from(None, Some("1000"), Some("1000")).unwrap();
-        assert_eq!(config.max_stored_upload_bytes, 1000);
-        let small = super::deploy_config_from(None, Some("1000"), Some("999")).unwrap_err();
-        assert!(small.to_string().contains("at least"), "{small}");
-        assert!(super::deploy_config_from(None, Some("lots"), None).is_err());
+        assert_eq!(config.stored_bytes(), 4 * 5000);
+        let config = super::deploy_config_from([None, None, None, Some("999999999")]).unwrap();
+        assert_eq!(config.stored_bytes(), 999_999_999);
+
+        let archive_over = super::deploy_config_from([None, Some("2000"), Some("1000"), None]);
+        assert!(archive_over.unwrap_err().to_string().contains("at most"));
+        let small = super::deploy_config_from([None, Some("10"), Some("1000"), Some("999")]);
+        assert!(small.unwrap_err().to_string().contains("at least"));
+        assert!(super::deploy_config_from([None, Some("lots"), None, None]).is_err());
+        assert!(super::deploy_config_from([None, None, Some("-1"), None]).is_err());
     }
 
     /// The deploy cap is a count of at least one: zero is refused at startup

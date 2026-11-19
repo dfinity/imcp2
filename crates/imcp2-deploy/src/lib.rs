@@ -101,12 +101,14 @@ pub use deploy::{
     deploy_bundle, prune_abandoned_deploys, remove_old_deploy_records, BundleSource, DeployOutcome,
     DeployRequest, RequestError, Status, Watch, STOP_GRACE,
 };
+pub use host::{occupies, BundleLimits, BLOCK_BYTES, ENTRY_BYTES};
 use identity::RefreshingIdentity;
 pub use observe::{DeployObserver, Ended, Refused};
 pub use server::WithDeploy;
 pub use uploads::{
-    Held, ReceiveError, Received, Uploads, DEFAULT_MAX_UPLOAD_BYTES, DEFAULT_STORED_UPLOADS,
-    TICKET_HEADER, TICKET_TTL, UPLOAD_TTL,
+    Held, ReceiveError, Received, TakeError, Uploads, DEFAULT_MAX_EXTRACTED_BYTES,
+    DEFAULT_MAX_UPLOAD_BYTES, DEFAULT_STORED_BUNDLES, TICKET_HEADER, TICKET_TTL, UPLOAD_IDLE,
+    UPLOAD_TIME, UPLOAD_TTL,
 };
 
 /// The name of the deploy tool.
@@ -375,6 +377,7 @@ pub fn request_from_args(
     let (no_create, skip_candid_check) = (args.no_create, args.skip_candid_check);
     Ok((bundle, move |bundle| DeployRequest {
         bundle,
+        limits: BundleLimits::LOCAL,
         environment,
         canister_ids,
         mode,
@@ -729,28 +732,48 @@ impl IcDeployTools {
             Ok(r) => r,
             Err(e) => return rejected(e),
         };
-        // An uploaded bundle is the session's own, and the file goes with
-        // the handle once the deploy has returned.
-        let (path, _upload) = match &self.uploads {
-            None => (Utf8PathBuf::from(bundle), None),
+        // An uploaded bundle is the session's own, extracted as it arrived:
+        // the deploy takes its directory, and holds the room the store keeps
+        // for a running deploy until it has returned. A bundle named by path
+        // is the user's own file on the user's own machine, and is held to
+        // what such a server takes.
+        let (source, limits, _upload) = match &self.uploads {
+            None => (BundleSource::Path(Utf8PathBuf::from(bundle)), BundleLimits::LOCAL, None),
             Some((uploads, _)) => {
-                let Some(taken) = uploads.take(&bundle, &sid).await else {
-                    return rejected(format!(
-                        "no upload '{bundle}' for this session: it may have expired ({} minutes \
-                         after the upload) or been deployed already; call {UPLOAD_TOOL} and \
-                         upload the archive again",
-                        UPLOAD_TTL.as_secs() / 60
-                    ));
+                let taken = match uploads.take(&bundle, &sid).await {
+                    Ok(taken) => taken,
+                    Err(TakeError::NoSuchUpload) => {
+                        return rejected(format!(
+                            "no upload '{bundle}' for this session: it may have expired ({} \
+                             minutes after the upload) or been deployed already; call \
+                             {UPLOAD_TOOL} and upload the archive again",
+                            UPLOAD_TTL.as_secs() / 60
+                        ))
+                    }
+                    Err(TakeError::NoRoom) => {
+                        let why = format!(
+                            "this server has no room to run another deploy right now; nothing \
+                             was deployed and the upload is kept. Try again in a few minutes \
+                             with the same `bundle_upload`; if it has expired by then ({} \
+                             minutes after the upload), call {UPLOAD_TOOL} and upload again",
+                            UPLOAD_TTL.as_secs() / 60
+                        );
+                        return (err(why), Told::Refused(Refused::NoRoom));
+                    }
                 };
-                match Utf8PathBuf::from_path_buf(taken.path().to_path_buf()) {
-                    Ok(path) => (path, Some(taken)),
+                match Utf8PathBuf::from_path_buf(taken.dir().to_path_buf()) {
+                    Ok(dir) => {
+                        let source = BundleSource::Extracted { dir, bytes: taken.bytes() };
+                        (source, uploads.limits(), Some(taken))
+                    }
                     Err(p) => {
                         return rejected(format!("upload path is not UTF-8: {}", p.display()))
                     }
                 }
             }
         };
-        let mut request = into_request(BundleSource::Path(path));
+        let mut request = into_request(source);
+        request.limits = limits;
         request.workdir = self.deploys_dir.clone();
         // A per-app delegation lives five minutes and a deploy can outlast
         // it (an asset sync, several installs), so the identity the agent
@@ -852,7 +875,7 @@ impl IcDeployTools {
 
     #[tool(
         name = "icp_deploy_upload",
-        description = "Get a one-time ticket to upload a bundle archive to this server, for icp_deploy_bundle to deploy: this server runs elsewhere than the project, so the archive `icp project bundle` wrote cannot be read by path. Returns the upload URL, the ticket, and the exact curl command to run; the command prints a JSON answer whose `upload_id` is what to pass to icp_deploy_bundle as `bundle_upload`. The ticket is good for a few minutes and one upload, and the upload for a quarter of an hour; ask for a new ticket after either lapses.",
+        description = "Get a one-time ticket to upload a bundle archive to this server, for icp_deploy_bundle to deploy: this server runs elsewhere than the project, so the archive `icp project bundle` wrote cannot be read by path. Returns the upload URL, the ticket, and the exact curl command to run; the command prints a JSON answer whose `upload_id` is what to pass to icp_deploy_bundle as `bundle_upload`. The server extracts the archive as it arrives and stops the upload if the archive, or what it extracts to, passes the limits returned here (`max_bytes`, `max_extracted_bytes`); curl may report that as a failed transfer (broken pipe, connection reset) rather than as the server's answer, so read an upload that fails that way as a bundle that is too large. The ticket is good for a few minutes and one upload, and the upload for five minutes; ask for a new ticket after either lapses.",
         annotations(title = "Get a bundle upload ticket", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false),
         output_schema = schema_for_output::<UploadTicketOutput>(),
     )]
@@ -881,17 +904,21 @@ impl IcDeployTools {
             ticket: minted.ticket,
             header: TICKET_HEADER.into(),
             expires_in_secs: minted.expires_in.as_secs(),
-            max_bytes: uploads.max_bytes(),
+            max_bytes: uploads.limits().archive_bytes,
+            max_extracted_bytes: uploads.limits().extracted_bytes,
         };
         let text = format!(
             "Upload the bundle within {} minutes by running, with the archive's path in place of \
              <bundle.tar.gz>:\n\n{}\n\nThe command prints a JSON answer; pass its `upload_id` to \
              icp_deploy_bundle as `bundle_upload` within {} minutes. The archive may be at most \
-             {} bytes. The ticket is good for one upload.",
+             {} bytes and extract to at most {} bytes; the server extracts it as it arrives and \
+             stops the upload at either limit, which curl may report as a failed or reset \
+             connection rather than as the server's answer. The ticket is good for one upload.",
             output.expires_in_secs / 60,
             output.curl,
             UPLOAD_TTL.as_secs() / 60,
-            output.max_bytes
+            output.max_bytes,
+            output.max_extracted_bytes
         );
         Ok(ok_structured(text, &output))
     }
@@ -988,7 +1015,10 @@ pub struct UploadTicketOutput {
     /// Seconds the ticket is good for.
     pub expires_in_secs: u64,
     /// The most bytes the archive may have.
-    pub max_bytes: usize,
+    pub max_bytes: u64,
+    /// The most bytes the archive may extract to: the server extracts it as
+    /// it arrives, and stops the upload when it passes this.
+    pub max_extracted_bytes: u64,
     /// The command to run, with the archive's path in place of `<bundle.tar.gz>`.
     pub curl: String,
 }
@@ -1233,7 +1263,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let local = tools();
         let hosted = tools().with_uploads(
-            Uploads::new(dir.path().join("uploads"), 1024),
+            Uploads::new(dir.path().join("uploads"), BundleLimits::new(1024, 4096)),
             "https://mcp.example/deploy/upload".into(),
         );
         for (tools, listed, unlisted) in

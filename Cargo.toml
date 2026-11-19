@@ -153,6 +153,11 @@ tempfile = "3"
 # paused clock instead of waiting them out. A feature on a dependency the crate
 # already has, so the lockfile does not change.
 tokio = { workspace = true, features = ["test-util"] }
+# The deploy endpoint's tests upload a bundle, which the server extracts as it
+# arrives: they build the smallest one there is. Both are already in the
+# tree, through imcp2-deploy.
+tar = "0.4"
+flate2 = "1"
 
 # The profile that 'dist' will build with
 [profile.dist]
