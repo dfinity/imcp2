@@ -30,6 +30,10 @@
 //! through the host's boundary-node client and the whole process links a
 //! single `ic-agent`.
 
+// The deploy tools: `icp_deploy_bundle` and what serves it. Documented in the
+// module itself (`//!` in src/deploy/mod.rs): an outer doc comment here would
+// have its intra-doc links resolved in this scope, not the module's.
+pub mod deploy;
 pub mod identities;
 pub mod iiconnect;
 pub mod public_fetch;
@@ -49,6 +53,12 @@ mod management;
 #[cfg(all(test, feature = "e2e"))]
 mod e2e_canister_tools;
 
+/// The bound on caller-supplied textual Candid (size, nesting depth, type
+/// declarations) that the call tools apply before parsing, for an embedder
+/// that hands Candid text from an untrusted source to a parser of its own
+/// (the local server's deploy tools, with a bundle's arguments and
+/// interfaces).
+pub use calls::guard_candid_text;
 /// The IC [`Agent`] type the components are built around, re-exported so
 /// callers construct the injected agent from the exact `ic-agent` version this
 /// crate links.
