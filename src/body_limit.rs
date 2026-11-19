@@ -16,9 +16,22 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-/// The default cap on an MCP request body, in bytes. An IC ingress message
-/// carries at most 2 MiB, so any one canister call fits well under this even
-/// once its argument is spelled out as JSON.
+/// The default cap on an MCP request body, in bytes.
+///
+/// This is a limit on the serialized HTTP request, separate from the IC's own:
+/// an ingress message bounds the *encoded* call (2 MiB), whereas the body here
+/// is JSON that carries the argument as textual Candid, possibly an interface
+/// the caller supplies beside it, and JSON's escaping of both. A call whose
+/// encoded argument the IC would take can therefore still be over this cap.
+///
+/// The default is sized against what the tools read instead. They take at most
+/// 1 MiB of text per field (the argument, a caller-supplied interface, an OQL
+/// query), and a request with the argument and an interface both at that size
+/// is 2 to 3 MiB as JSON, so a request the tools would act on is not turned
+/// away here first. (Reaching the cap takes both at that size and a client that
+/// also escapes non-ASCII text as `\uXXXX`.) Set another cap with
+/// [`crate::McpServer::with_max_request_body`]; the `imcp2` binary reads it
+/// from `$MCP_MAX_REQUEST_BODY`.
 pub const DEFAULT_MAX_REQUEST_BODY: usize = 4 * 1024 * 1024;
 
 /// Refuse a request whose body is over `max` bytes with `413 Payload Too
