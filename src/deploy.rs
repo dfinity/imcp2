@@ -262,6 +262,12 @@ pub(crate) struct DeployMcp {
     json: McpService,
     sse: McpService,
     uploads: Uploads,
+    /// The lock on the deploy directory, held for as long as a router made
+    /// from this is: a router outlives the [`Deploys`] it was made from if
+    /// its embedder lets it, and goes on receiving uploads and running
+    /// deploys in the directory — which a second server, finding the lock
+    /// free, would clear as leftovers.
+    _owned: Arc<std::fs::File>,
 }
 
 impl McpServer {
@@ -307,6 +313,7 @@ impl McpServer {
             json: service(transport.clone().with_json_response(true)),
             sse: service(transport.with_json_response(false)),
             uploads,
+            _owned: deploys._owned.clone(),
         });
         (
             Router::new().fallback(dispatch).with_state(mcp.clone()),
@@ -745,12 +752,16 @@ mod tests {
         assert!(refused.to_string().contains("another running server"), "{refused}");
         assert!(upload.exists(), "the first server's upload is untouched");
 
-        // A clone is the same server, and the directory is free once the
-        // last of them has gone.
+        // A clone is the same server, and so is a router made from it, which
+        // goes on serving after the handles it was made from have gone: the
+        // directory is free once the last of them has.
         let clone = first.clone();
+        let router = server_in(dir.path(), "/mcp", first.clone()).mcp_router();
         drop(first);
         assert!(Deploys::new(&config(), dir.path()).is_err());
         drop(clone);
+        assert!(Deploys::new(&config(), dir.path()).is_err(), "a router is still serving");
+        drop(router);
         Deploys::new(&config(), dir.path()).unwrap();
     }
 
