@@ -83,7 +83,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::Duration,
 };
@@ -106,7 +106,12 @@ use rmcp::transport::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{auth, tools::IcTools, McpServer};
+use crate::{
+    auth,
+    metrics::deploy::{DeployMetrics, Upload},
+    tools::IcTools,
+    McpServer,
+};
 
 /// What a hosted deployment configures of the deploy tools.
 #[derive(Clone, Debug)]
@@ -205,6 +210,30 @@ pub struct Deploys {
     /// Whether the sweeper has been started: one per process, however many
     /// instances ask for it.
     sweeping: Arc<AtomicBool>,
+    /// Where deploys and uploads are counted, once a [`crate::metrics::Metrics`]
+    /// has been made over a server with this state; until then, nowhere.
+    metrics: Reporting,
+}
+
+/// The collectors a process's deploy state reports to, set once (see
+/// [`crate::metrics::Metrics::new`]). It is the deploy tools' observer
+/// itself, so the tools are built before the collectors exist and report to
+/// them from the moment they do.
+#[derive(Clone, Default)]
+struct Reporting(Arc<OnceLock<DeployMetrics>>);
+
+impl imcp2_core::deploy::DeployObserver for Reporting {
+    fn refused(&self, why: imcp2_core::deploy::Refused) {
+        if let Some(metrics) = self.0.get() {
+            metrics.refused(why);
+        }
+    }
+
+    fn ended(&self, how: imcp2_core::deploy::Ended, lasted: Duration) {
+        if let Some(metrics) = self.0.get() {
+            metrics.ended(how, lasted);
+        }
+    }
 }
 
 /// The file in the deploy directory whose lock says a process owns it.
@@ -256,6 +285,7 @@ impl Deploys {
             stopping: CancellationToken::new(),
             _owned: Arc::new(owned),
             sweeping: Arc::default(),
+            metrics: Reporting::default(),
         })
     }
 
@@ -274,6 +304,19 @@ impl Deploys {
     pub async fn stopped(&self) -> bool {
         let within = imcp2_core::deploy::STOP_GRACE + STOP_MARGIN;
         tokio::time::timeout(within, self.slots.idle()).await.is_ok()
+    }
+
+    /// Count this state's deploys and uploads in `metrics` from now on. The
+    /// first call decides: a second set of collectors is left unfed rather
+    /// than each event being split between two.
+    pub(crate) fn report_to(&self, metrics: DeployMetrics) {
+        let _ = self.metrics.0.set(metrics);
+    }
+
+    /// What is read rather than counted: the deploys running, the slots
+    /// there are, and what the upload store holds.
+    pub(crate) fn gauges(&self) -> (usize, usize, imcp2_core::deploy::Held) {
+        (self.slots.running(), self.slots.total(), self.uploads.held())
     }
 
     /// Say that the server is stopping: every running deploy is interrupted
@@ -377,6 +420,7 @@ pub(crate) struct DeployMcp {
     /// deploys in the directory — which a second server, finding the lock
     /// free, would clear as leftovers.
     _owned: Arc<std::fs::File>,
+    metrics: Reporting,
 }
 
 impl McpServer {
@@ -399,7 +443,8 @@ impl McpServer {
             .stopped_by(deploys.stopping.clone())
             .deploys_in(&deploys.dir)
             .unwrap_or_else(|e| panic!("the state directory must be a UTF-8 path: {e}"))
-            .with_uploads(uploads.clone(), upload_url);
+            .with_uploads(uploads.clone(), upload_url)
+            .observed_by(Arc::new(deploys.metrics.clone()));
         let service = |transport: StreamableHttpServerConfig| {
             let (agent, identities, deploy) =
                 (self.agent.clone(), self.identities.clone(), deploy.clone());
@@ -423,6 +468,7 @@ impl McpServer {
             sse: service(transport.with_json_response(false)),
             uploads,
             _owned: deploys._owned.clone(),
+            metrics: deploys.metrics.clone(),
         });
         (
             Router::new().fallback(dispatch).with_state(mcp.clone()),
@@ -480,12 +526,37 @@ struct Uploaded {
     expires_in_secs: u64,
 }
 
+/// Counts an upload as a body that never arrived if it is dropped before
+/// the receive has answered; see [`upload`].
+struct Abandoned(Option<Reporting>);
+
+impl Abandoned {
+    /// The receive answered: its own outcome is the one to count.
+    fn answered(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Abandoned {
+    fn drop(&mut self) {
+        if let Some(metrics) = self.0.take().as_ref().and_then(|m| m.0.get()) {
+            metrics.upload(Upload::BodyError);
+        }
+    }
+}
+
 /// Receive a bundle on the ticket in [`TICKET_HEADER`]: the body is
 /// extracted as it arrives, and the answer may come before the body has
 /// ended — at the byte that passes a limit, or the entry a bundle never
 /// carries — with the rest unread.
 async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response {
+    let count = |outcome: Upload| {
+        if let Some(metrics) = mcp.metrics.0.get() {
+            metrics.upload(outcome);
+        }
+    };
     let Some(ticket) = request.headers().get(TICKET_HEADER).and_then(|v| v.to_str().ok()) else {
+        count(Upload::BadTicket);
         return (
             StatusCode::UNAUTHORIZED,
             format!("send the upload ticket in the {TICKET_HEADER} header"),
@@ -501,7 +572,26 @@ async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response
     let reader = tokio_util::io::StreamReader::new(
         request.into_body().into_data_stream().map_err(std::io::Error::other),
     );
+    // A request abandoned mid-body never returns from the receive: its
+    // future is dropped where it waits. That is a body that did not arrive,
+    // and is counted as one, by the guard, unless the receive answers.
+    let abandoned = Abandoned(Some(mcp.metrics.clone()));
     let received = mcp.uploads.receive(&ticket, declared, reader).await;
+    abandoned.answered();
+    count(match &received {
+        Ok(received) => {
+            Upload::Accepted { archive_bytes: received.archive_bytes, bytes: received.bytes }
+        }
+        Err(ReceiveError::UnknownTicket) => Upload::BadTicket,
+        Err(ReceiveError::TooLarge(_)) => Upload::TooLarge,
+        Err(ReceiveError::ExtractsTooLarge(_)) => Upload::ExtractsTooLarge,
+        Err(ReceiveError::Busy) => Upload::SessionBusy,
+        Err(ReceiveError::Full) => Upload::StoreFull,
+        Err(ReceiveError::Body(_)) => Upload::BodyError,
+        Err(ReceiveError::NotABundle(_)) => Upload::NotABundle,
+        Err(ReceiveError::PluginNotAllowed(_)) => Upload::PluginNotAllowed,
+        Err(ReceiveError::Storage(_)) => Upload::StorageError,
+    });
     match received {
         Ok(received) => (
             StatusCode::CREATED,
@@ -569,6 +659,34 @@ mod tests {
         header.set_mode(0o644);
         header.set_cksum();
         archive.append_data(&mut header, "icp.yaml", &manifest[..]).unwrap();
+        archive.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// A bundle of one canister synced by a plugin nobody vouched for.
+    fn bundle_with_plugin() -> Vec<u8> {
+        // The loader does not check the module against its checksum (the
+        // deploy does): any sha256 will do here.
+        let canister = format!(
+            "name: frontend\nbuild:\n  steps:\n    - type: pre-built\n      path: frontend.wasm\n      \
+             sha256: {}\nsync:\n  steps:\n    - type: plugin\n      path: sync.wasm\n",
+            "0".repeat(64)
+        );
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (path, data) in [
+            ("icp.yaml", &b"canisters:\n  - canisters/frontend\n"[..]),
+            ("canisters/frontend/canister.yaml", canister.as_bytes()),
+            ("canisters/frontend/frontend.wasm", &b"\0asm\x01\0\0\0"[..]),
+            ("canisters/frontend/sync.wasm", &b"\0asm a plugin nobody vouched for"[..]),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, data).unwrap();
+        }
         archive.into_inner().unwrap().finish().unwrap()
     }
 
@@ -856,6 +974,159 @@ mod tests {
             assert!(said.contains("as many deploys as it can"), "{path}: {said}");
         }
         drop(held);
+    }
+
+    /// The deploy series, fed by the real thing: uploads and deploy calls
+    /// through the router, each landing in the one series that names what
+    /// happened, with the gauges read off the state at a refresh. A handle
+    /// made the way an embedder makes it — over the server, nothing more.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deploys_and_uploads_are_counted() {
+        use prometheus::{Encoder, Registry, TextEncoder};
+        let dir = tempfile::tempdir().unwrap();
+        let deploys = Deploys::new(&config(), dir.path()).unwrap();
+        let server = server_in(dir.path(), "/mcp", deploys.clone());
+        let registry = Registry::new();
+        let metrics = crate::metrics::Metrics::new(&registry, "0", "0", 0, &[&server]).unwrap();
+        let scrape = || {
+            let mut out = Vec::new();
+            TextEncoder::new().encode(&registry.gather(), &mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let has = |out: &str, series: &str| {
+            assert!(out.lines().any(|line| line == series), "no {series} in:\n{out}");
+        };
+
+        // Before anything happens every series is there, at zero, and the
+        // cap is already known.
+        let out = scrape();
+        for series in [
+            r#"imcp2_deploys_total{outcome="succeeded"} 0"#,
+            r#"imcp2_deploys_total{outcome="interrupted"} 0"#,
+            r#"imcp2_deploy_refusals_total{reason="busy"} 0"#,
+            r#"imcp2_deploy_uploads_total{outcome="store_full"} 0"#,
+            "imcp2_deploys_running 0",
+            "imcp2_deploy_slots 2",
+            // A bundle for each deploy at once, and one more.
+            "imcp2_deploy_upload_store_capacity_bytes 196608",
+        ] {
+            has(&out, series);
+        }
+
+        let bearer = format!("Bearer {}", server.store.test_bearer().await);
+        let app = server.mcp_router();
+        // An upload with no ticket, and one with a ticket nobody minted.
+        let put = |ticket: Option<&str>, body: Vec<u8>| {
+            let mut put = Request::put(UPLOAD_PATH);
+            if let Some(ticket) = ticket {
+                put = put.header(TICKET_HEADER, ticket);
+            }
+            app.clone().oneshot(put.body(Body::from(body)).unwrap())
+        };
+        assert_eq!(put(None, vec![1]).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(put(Some("nope"), vec![1]).await.unwrap().status(), StatusCode::FORBIDDEN);
+        // One that is received: extracted as it arrived, and held.
+        let mint = || async {
+            let minted = call(&app, &bearer, "icp_deploy_upload", serde_json::json!({})).await;
+            let minted: serde_json::Value = serde_json::from_str(&minted).unwrap();
+            minted["result"]["structuredContent"]["ticket"].as_str().unwrap().to_string()
+        };
+        let archive = bundle();
+        let resp = put(Some(&mint().await), archive.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        metrics.refresh().await;
+        let out = scrape();
+        for series in [
+            "imcp2_deploy_uploads_held 1".to_string(),
+            // What the server keeps of it is what it extracted to.
+            format!("imcp2_deploy_upload_store_bytes {BUNDLE_BYTES}"),
+            "imcp2_deploy_upload_bytes_count 1".to_string(),
+            format!("imcp2_deploy_upload_bytes_sum {}", archive.len()),
+            "imcp2_deploy_bundle_extracted_bytes_count 1".to_string(),
+            format!("imcp2_deploy_bundle_extracted_bytes_sum {BUNDLE_BYTES}"),
+        ] {
+            has(&out, &series);
+        }
+
+        // One that is read and is not a bundle, and one that extracts to
+        // more than a bundle may: both refused on the upload, each counted
+        // as what it was. (A megabyte of zeros is an archive of a kilobyte.)
+        let resp = put(Some(&mint().await), b"not a bundle".to_vec()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let mut bomb = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::best(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1 << 20);
+        header.set_mode(0o644);
+        header.set_cksum();
+        bomb.append_data(&mut header, "icp.yaml", &vec![0u8; 1 << 20][..]).unwrap();
+        let bomb = bomb.into_inner().unwrap().finish().unwrap();
+        assert!(bomb.len() <= 1024 * 2, "{}", bomb.len());
+        let resp = put(Some(&mint().await), bomb).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(text(resp).await.contains("extracts to more than"));
+
+        // And a bundle with a sync plugin this server does not run: read,
+        // a bundle, and refused for what it would have the server run.
+        let resp = put(Some(&mint().await), bundle_with_plugin()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let said = text(resp).await;
+        assert!(said.contains("is not one this server runs"), "{said}");
+        assert!(said.contains("the static-site sync plugin, v1.0.0"), "{said}");
+
+        // And one abandoned mid-body: the request is dropped while the
+        // server waits for more, and no answer is ever made.
+        let never_ends = futures_util::stream::once(async {
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"half"))
+        })
+        .chain(futures_util::stream::pending());
+        let abandoned = Request::put(UPLOAD_PATH)
+            .header(TICKET_HEADER, mint().await)
+            .body(Body::from_stream(never_ends))
+            .unwrap();
+        let waited = Duration::from_millis(50);
+        assert!(tokio::time::timeout(waited, app.clone().oneshot(abandoned)).await.is_err());
+
+        // A deploy of an upload that does not exist holds a slot for as long
+        // as it takes to say so: rejected, and timed.
+        let deploy = serde_json::json!({ "bundle_upload": "x", "environment": "ic" });
+        call(&app, &bearer, "icp_deploy_bundle", deploy.clone()).await;
+        // With every slot held, the next is refused as busy; and once the
+        // server is stopping, as that.
+        let held = [(); 2].map(|()| {
+            IcDeployTools::new(server.identities.clone(), Arc::new(|_: &_| None))
+                .with_slots(deploys.slots.clone())
+                .claim()
+                .unwrap()
+        });
+        call(&app, &bearer, "icp_deploy_bundle", deploy.clone()).await;
+        metrics.refresh().await;
+        has(&scrape(), "imcp2_deploys_running 2");
+        drop(held);
+        deploys.stop();
+        call(&app, &bearer, "icp_deploy_bundle", deploy).await;
+
+        metrics.refresh().await;
+        let out = scrape();
+        for series in [
+            r#"imcp2_deploy_uploads_total{outcome="bad_ticket"} 2"#,
+            r#"imcp2_deploy_uploads_total{outcome="accepted"} 1"#,
+            r#"imcp2_deploy_uploads_total{outcome="not_a_bundle"} 1"#,
+            r#"imcp2_deploy_uploads_total{outcome="extracts_too_large"} 1"#,
+            r#"imcp2_deploy_uploads_total{outcome="plugin_not_allowed"} 1"#,
+            r#"imcp2_deploy_uploads_total{outcome="body_error"} 1"#,
+            "imcp2_deploy_upload_bytes_count 1",
+            r#"imcp2_deploys_total{outcome="rejected"} 1"#,
+            "imcp2_deploy_duration_seconds_count 1",
+            r#"imcp2_deploy_refusals_total{reason="busy"} 1"#,
+            r#"imcp2_deploy_refusals_total{reason="stopping"} 1"#,
+            r#"imcp2_deploy_refusals_total{reason="session_busy"} 0"#,
+            "imcp2_deploys_running 0",
+        ] {
+            has(&out, series);
+        }
     }
 
     /// Once the server has said it is stopping, a deploy does not begin, and
