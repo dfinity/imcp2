@@ -66,14 +66,21 @@ You can revoke a connection at any time at <https://id.ai/manage/settings>.
 
 ## Safety limits
 
-- **Opt-in canisters only.** Tools that touch a canister work only on canisters
-  the owning app declares in its
+- **Declared canisters only.** Tools that touch a canister work only when the
+  app origin you supply lists that canister in its
   [service-discoverability](https://docs.internetcomputer.org/guides/frontends/service-discoverability/)
-  manifest.
-- **No financial operations.** Token transfers, approvals, and other ledger
-  value-moving methods are refused, as is every update call to a canister whose
-  interface declares ICRC-1/ICRC-2 methods. There are no canister creation,
-  funding, or management tools; use the [`icp` CLI](https://github.com/dfinity/icp-cli)
+  manifest. Publishing that manifest is how an app's operators opt in. The
+  check confirms that the named origin publishes the listing. Whoever controls
+  the origin controls the manifest, so the listing can name a canister its
+  publisher does not control, and an anonymous call can reach a canister that
+  origin declares.
+- **Financial operations are not supported.** `canister_update_call` refuses
+  standardized ledger transfer and approval methods, any method whose name
+  carries a financial keyword, and every update call to a canister whose
+  interface declares ICRC-1 or ICRC-2 methods. A bespoke value-moving method
+  under an unrelated name, on a canister whose published interface is not a
+  ledger's, is not detected. There are no canister creation, funding, or
+  management tools; use the [`icp` CLI](https://github.com/dfinity/icp-cli)
   for those.
 
 ## Getting connected
