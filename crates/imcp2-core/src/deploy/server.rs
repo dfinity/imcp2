@@ -11,7 +11,10 @@
 //! agent does — how the bundle reaches the server — the deploy tools know
 //! themselves, so the paragraph reads from them.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 #[allow(deprecated)]
 use rmcp::model::SetLevelRequestParams;
@@ -35,13 +38,14 @@ pub struct WithDeploy<H> {
     inner: H,
     deploy: IcDeployTools,
     /// Whether the client takes the log messages a deploy's progress falls
-    /// back on (see [`Self::sends_log_messages`]).
-    log_messages: AtomicBool,
+    /// back on (see [`Self::sends_log_messages`]). Shared with the deploy
+    /// calls running, which read it for each line they send.
+    log_messages: Arc<AtomicBool>,
 }
 
 impl<H: ServerHandler> WithDeploy<H> {
     pub fn new(inner: H, deploy: IcDeployTools) -> Self {
-        Self { inner, deploy, log_messages: AtomicBool::new(true) }
+        Self { inner, deploy, log_messages: Arc::new(AtomicBool::new(true)) }
     }
 
     /// Whether a deploy sent no progress token reports its phases as log
@@ -49,9 +53,10 @@ impl<H: ServerHandler> WithDeploy<H> {
     /// messages from a level above theirs (`info`) only.
     ///
     /// The level is this handler's, so it lasts as long as the handler does:
-    /// the connection, on a server that keeps one (stdio). A stateless HTTP
-    /// server makes a handler for each request, so a level set there is
-    /// accepted and applies to no later call.
+    /// the connection, on a server that keeps one (stdio), where it holds
+    /// from the moment it is set, for a deploy already running too. A
+    /// stateless HTTP server makes a handler for each request, so a level
+    /// set there is accepted and applies to no other call.
     pub fn sends_log_messages(&self) -> bool {
         self.log_messages.load(Ordering::Relaxed)
     }
@@ -140,7 +145,7 @@ impl<H: ServerHandler> ServerHandler for WithDeploy<H> {
         mut context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         if self.deploy_tool(&request.name).is_some() {
-            context.extensions.insert(LogMessages(self.sends_log_messages()));
+            context.extensions.insert(LogMessages(self.log_messages.clone()));
             let tcc = ToolCallContext::new(&self.deploy, request, context);
             IcDeployTools::tool_router().call(tcc).await
         } else {

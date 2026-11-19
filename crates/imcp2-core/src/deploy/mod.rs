@@ -131,8 +131,19 @@ pub struct ClientGone(pub CancellationToken);
 /// log messages: the word of the handler serving the tools ([`WithDeploy`]),
 /// from the level its client last asked for with `logging/setLevel`, left in
 /// the request's extensions. Absent, it does.
-#[derive(Clone, Copy, Debug)]
-pub struct LogMessages(pub bool);
+///
+/// It is the handler's own flag, shared, not what the flag read as the call
+/// began: a deploy lasts minutes, and a level the client sets while one runs
+/// holds for the lines that deploy has yet to send.
+#[derive(Clone, Debug)]
+pub struct LogMessages(pub Arc<std::sync::atomic::AtomicBool>);
+
+impl LogMessages {
+    /// Whether log messages at `info` are wanted now.
+    fn wanted(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 /// Whether a client that asked for log messages from `level` up is sent the
 /// ones a deploy's progress goes out as, which are `info`.
@@ -835,9 +846,12 @@ impl IcDeployTools {
         // Each phase reaches the client as it completes, and the client's
         // cancellation of the request stops the deploy.
         let (lines, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let log_messages = ctx.extensions.get::<LogMessages>().is_none_or(|log| log.0);
-        let channel = Channel::of(ctx.meta.get_progress_token(), log_messages);
-        let forwarder = tokio::spawn(forward_lines(ctx.peer.clone(), channel, receiver));
+        let forwarder = tokio::spawn(forward_lines(
+            ctx.peer.clone(),
+            ctx.meta.get_progress_token(),
+            ctx.extensions.get::<LogMessages>().cloned(),
+            receiver,
+        ));
         let stopped = stop.clone();
         let watch = Watch { stop, lines: Some(lines) };
         let result = deploy_bundle(identity, request, watch).instrument(span.clone()).await;
@@ -1087,49 +1101,52 @@ async fn delivered(
     false
 }
 
-/// How a running deploy's lines reach its client as they are made.
+/// How one of a running deploy's lines reaches its client as it is made.
 #[derive(Debug, PartialEq)]
-enum Channel {
-    /// As progress notifications under the token the request carried, which
+enum Channel<'a> {
+    /// As a progress notification under the token the request carried, which
     /// is also what keeps a client's per-call timeout from running out
     /// during a long deploy.
-    Progress(ProgressToken),
-    /// As log messages at `info`, the one other thing a server may say
+    Progress(&'a ProgressToken),
+    /// As a log message at `info`, the one other thing a server may say
     /// mid-call: the fallback for a client that sent no progress token.
     Log,
-    /// Not at all: no token, and the client asked for log messages from a
+    /// Not at all: no token, and the client asks for log messages from a
     /// level above `info` only. The outcome still carries every line.
     Nowhere,
 }
 
-impl Channel {
-    /// The channel for a request with this progress token, from a client
-    /// that does or does not take log messages at `info` ([`LogMessages`]).
-    /// Progress was asked for by the request itself, whatever the log level.
-    fn of(progress_token: Option<ProgressToken>, log_messages: bool) -> Self {
-        match (progress_token, log_messages) {
-            (Some(token), _) => Self::Progress(token),
-            (None, true) => Self::Log,
-            (None, false) => Self::Nowhere,
+impl<'a> Channel<'a> {
+    /// The channel for a line of a request with this progress token, from a
+    /// client that does or does not take log messages at `info` as the line
+    /// is made ([`LogMessages`]). Progress was asked for by the request
+    /// itself, whatever the log level.
+    fn of(progress_token: Option<&'a ProgressToken>, log_messages: Option<&LogMessages>) -> Self {
+        match progress_token {
+            Some(token) => Self::Progress(token),
+            None if log_messages.is_none_or(LogMessages::wanted) => Self::Log,
+            None => Self::Nowhere,
         }
     }
 }
 
 /// Deliver each log line of a running deploy to the client as it is made,
-/// over `channel`. A client that cannot be reached is not an error here; the
-/// outcome carries every line regardless.
+/// over the channel that is the line's as it is made ([`Channel::of`]). A
+/// client that cannot be reached is not an error here; the outcome carries
+/// every line regardless.
 // MCP logging is deprecated (SEP-2577) but still delivered; it is the
 // fallback for a client that sends no progress token, nothing more.
 #[allow(deprecated)]
 async fn forward_lines(
     peer: Peer<RoleServer>,
-    channel: Channel,
+    progress_token: Option<ProgressToken>,
+    log_messages: Option<LogMessages>,
     mut lines: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
     let mut progress = 0.0;
     while let Some(line) = lines.recv().await {
         progress += 1.0;
-        let _ = match &channel {
+        let _ = match Channel::of(progress_token.as_ref(), log_messages.as_ref()) {
             Channel::Progress(token) => {
                 let param =
                     ProgressNotificationParam::new(token.clone(), progress).with_message(line);
@@ -1494,17 +1511,30 @@ mod tests {
 
     // A deploy's progress goes under the progress token its request carried,
     // whatever log level the client asked for; without a token it falls back
-    // on log messages at `info`, which a client that asked for a higher
-    // level only is not sent.
+    // on log messages at `info`, which a client that asks for a higher
+    // level only is not sent. The level is read for each line: one set while
+    // the deploy runs holds for the lines it has yet to send.
     #[test]
     #[allow(deprecated)]
     fn progress_falls_back_on_log_messages_the_client_takes() {
         use rmcp::model::NumberOrString;
-        let token = || ProgressToken(NumberOrString::Number(7));
-        assert_eq!(Channel::of(Some(token()), true), Channel::Progress(token()));
-        assert_eq!(Channel::of(Some(token()), false), Channel::Progress(token()));
-        assert_eq!(Channel::of(None, true), Channel::Log);
-        assert_eq!(Channel::of(None, false), Channel::Nowhere);
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let token = ProgressToken(NumberOrString::Number(7));
+        let wanted = LogMessages(Arc::new(AtomicBool::new(true)));
+        // A handler that says nothing of the level: the messages are sent.
+        assert_eq!(Channel::of(None, None), Channel::Log);
+        assert_eq!(Channel::of(Some(&token), None), Channel::Progress(&token));
+
+        assert_eq!(Channel::of(None, Some(&wanted)), Channel::Log);
+        assert_eq!(Channel::of(Some(&token), Some(&wanted)), Channel::Progress(&token));
+        // The level is raised mid-deploy, on the handler's own flag...
+        let handlers = wanted.clone();
+        handlers.0.store(false, Ordering::Relaxed);
+        assert_eq!(Channel::of(None, Some(&wanted)), Channel::Nowhere);
+        assert_eq!(Channel::of(Some(&token), Some(&wanted)), Channel::Progress(&token));
+        // ...and lowered again.
+        handlers.0.store(true, Ordering::Relaxed);
+        assert_eq!(Channel::of(None, Some(&wanted)), Channel::Log);
 
         // `info` messages are wanted from `debug` or `info` up, and from no
         // level above.
