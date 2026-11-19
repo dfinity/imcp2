@@ -53,14 +53,16 @@
 //!
 //! The crate is composed into the local server, and into the hosted one
 //! behind its `deploy` feature ([`WithDeploy`] is the handler both mount).
-//! It depends on `icp-project` straight from the icp-cli repository, which
-//! crates.io does not allow, so the published `imcp2` crate cannot carry the
-//! feature until the icp CLI's crates are published (see `Cargo.toml`).
+//! It is published for that feature's sake — a crate on crates.io can only
+//! depend on crates that are there too, and an application that embeds
+//! `imcp2` takes this one from the registry — and is not meant to be used
+//! on its own. It runs on the icp CLI's own crates (`icp-project` and its
+//! siblings), from crates.io.
 //!
 //! The bundle is untrusted input, and the rule it is held to is the
 //! library's own: `icp_project::untrusted`, the one `icp --untrusted`
 //! applies (dfinity/icp-cli#873, on #868 for what `icp project bundle`
-//! writes; issue #865). This crate pins icp-cli's main at their merge, composes
+//! writes; issue #865). This crate depends on the release that has them, composes
 //! the rule as the CLI does, and adds the bounds on the archive itself and the
 //! checks on the bundle's shape (see [`host`]).
 

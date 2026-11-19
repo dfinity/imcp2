@@ -239,8 +239,12 @@ impl Deploys {
     /// waited one out would be cut short by whatever stops the process, the
     /// deploy with it and its answer unsent. Also ends the sweeper.
     ///
-    /// [`McpServer::shutdown`] calls it as well, so a server that is shut
-    /// down leaves no deploy running whether or not its embedder drains; one
+    /// This only says so: it returns at once, and a deploy with a canister
+    /// call in flight goes on until that call is answered. Await
+    /// [`Self::stopped`] for the deploys to have ended, before exiting.
+    ///
+    /// [`McpServer::shutdown`] calls it as well, so no server is shut down
+    /// with its deploys untold, whether or not its embedder drains; one
     /// that does drain calls this first, for the answers to be sent.
     pub fn stop(&self) {
         self.stopping.cancel();

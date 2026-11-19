@@ -9,7 +9,7 @@ repository = "https://github.com/dfinity/imcp2"
 # Distributed as signed release binaries (the design's end-user setup and
 # signing components), not through crates.io — flip deliberately if that ever
 # changes. This also keeps the tag-lockstep publish workflow scoped to
-# imcp2-core + imcp2.
+# imcp2-core, imcp2-deploy and imcp2.
 publish = false
 
 # The one dist-released app in this workspace: release binaries + installers

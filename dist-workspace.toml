@@ -1,8 +1,9 @@
 # Release configuration for the `imcp2-local` binary (the design's end-user
 # distribution channel), built with dist (cargo-dist) following the ICP CLI's
 # setup. Only `imcp2-local` is distributed (see `[package.metadata.dist]` in
-# the crate manifests); the same `vX.Y.Z` tag publishes the `imcp2`/`imcp2-core`
-# crates to crates.io through .github/workflows/publish-crate.yml.
+# the crate manifests); the same `vX.Y.Z` tag publishes the `imcp2`,
+# `imcp2-core` and `imcp2-deploy` crates to crates.io through
+# .github/workflows/publish-crate.yml.
 [workspace]
 members = ["cargo:."]
 
