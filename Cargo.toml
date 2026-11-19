@@ -61,11 +61,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # against this ic-agent line — its current release pins an older one, which
 # would revert the read-only delegation-permissions support this depends on.
 ic-agent = "0.49"
-# Floor at 0.10.31: earlier 0.10.x decode/encode large `Nat`/`Int` in O(n²), which
-# a caller-influenced textual `Nat` under the 1 MiB guard turns into seconds of
-# worker-blocking CPU (ICPBB-382); 0.10.31 made it O(n).
-candid = { version = "0.10.31", features = ["value"] }
-candid_parser = "0.3.2"
+candid = { version = "0.10.41", features = ["value"] }
+candid_parser = "0.4.2"
 tokio = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -101,9 +98,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["io"] }
 uuid = { workspace = true }
 tower-http = { version = "0.7", features = ["cors"] }
+# The deploy endpoint: streamed bodies (the upload, the watched event stream).
+futures-util = "0.3"
 # `LengthLimitError`, to tell a body over the MCP request cap from a transport
 # error (src/body_limit.rs). Already in the tree via axum.
 http-body-util = "0.1"
@@ -135,14 +134,19 @@ e2e = ["dep:pocket-ic"]
 # Router-level contract tests (tests/routers.rs) drive the composed app with
 # tower::ServiceExt::oneshot and read bodies via http-body-util.
 tower = { version = "0.5", features = ["util"] }
-# Streamed (chunked) request bodies for the body-cap tests. Already in the
-# tree via tokio and hyper.
-futures-util = "0.3"
+tempfile = "3"
+# Streamed (chunked) request bodies for the body-cap tests come from
+# `futures-util`, a dependency above.
 # `test-util` is what `#[tokio::test(start_paused = true)]` needs: the pending
 # connect tests in `auth.rs` walk a connect past its TTL and retention on a
 # paused clock instead of waiting them out. A feature on a dependency the crate
 # already has, so the lockfile does not change.
 tokio = { workspace = true, features = ["test-util"] }
+# The deploy endpoint's tests upload a bundle, which the server extracts as it
+# arrives: they build the smallest one there is. Both are already in the
+# tree, through imcp2-core's deploy tools.
+tar = "0.4"
+flate2 = "1"
 
 # The profile that 'dist' will build with
 [profile.dist]

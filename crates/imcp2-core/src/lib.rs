@@ -30,6 +30,10 @@
 //! through the host's boundary-node client and the whole process links a
 //! single `ic-agent`.
 
+// The deploy tools: `icp_deploy_bundle` and what serves it. Documented in the
+// module itself (`//!` in src/deploy/mod.rs): an outer doc comment here would
+// have its intra-doc links resolved in this scope, not the module's.
+pub mod deploy;
 pub mod identities;
 pub mod iiconnect;
 pub mod public_fetch;
@@ -49,12 +53,22 @@ mod management;
 #[cfg(all(test, feature = "e2e"))]
 mod e2e_canister_tools;
 
+/// The bound on caller-supplied textual Candid (size, nesting depth, type
+/// declarations) that the call tools apply before parsing, for an embedder
+/// that hands Candid text from an untrusted source to a parser of its own
+/// (the local server's deploy tools, with a bundle's arguments and
+/// interfaces).
+pub use calls::guard_candid_text;
 /// The IC [`Agent`] type the components are built around, re-exported so
 /// callers construct the injected agent from the exact `ic-agent` version this
 /// crate links.
 pub use ic_agent::{self, Agent};
 pub use identities::{IiInstance, SessionGauges};
-pub use tools::{IcCanisterTools, IcProtocolTools, IcTools, SessionResolver};
+/// The cycles-ledger balance of a session's management principal: the
+/// `icp_cycles_balance` tool's logic, for an embedder that serves that tool
+/// on its own surface (the local server's deploy tools do).
+pub use management::{cycles_balance, cycles_balance_of, CyclesBalance};
+pub use tools::{IcCanisterTools, IcProtocolTools, IcTools, SessionResolver, DEPLOYS_ELSEWHERE};
 
 /// A sensible default IC API boundary node (the public mainnet endpoint) for
 /// callers that just want `Agent::builder().with_url(IC_URL).build()`. A host

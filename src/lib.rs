@@ -76,6 +76,7 @@
 mod auth;
 mod body_limit;
 mod branding;
+pub mod deploy;
 // Docs live in the module itself (`//!` in src/metrics.rs): an outer doc
 // comment here would resolve its intra-doc links in *this* scope rather than
 // the module's, silently breaking the links to `Registry` and `MatchedPath`.
@@ -172,6 +173,9 @@ pub struct McpServer {
     store: auth::AuthStore,
     public_url: String,
     mcp_path: String,
+    /// The deploy tools, when a deployment turns them on (see
+    /// [`Self::with_deploy`]).
+    deploy: Option<deploy::Deploys>,
     /// The largest MCP request body the endpoint reads, in bytes (see
     /// [`Self::with_max_request_body`]).
     max_request_body: usize,
@@ -210,9 +214,28 @@ impl McpServer {
             store,
             public_url,
             mcp_path,
+            deploy: None,
             max_request_body: DEFAULT_MAX_REQUEST_BODY,
             ct: CancellationToken::new(),
         }
+    }
+
+    /// Serve the deploy tools on the MCP endpoint (see [`deploy`]), on the
+    /// process's deploy state: the same [`deploy::Deploys`] goes to every
+    /// instance that serves them, made over this instance's state directory
+    /// (deploy records and uploads go under `{state_dir}/deploys`).
+    ///
+    /// Running it asks nothing more: [`Self::spawn_session_reaper`] starts
+    /// the deploy sweeper too. Stopping it does, of an embedder that drains
+    /// in-flight requests: call [`deploy::Deploys::stop`] *before* the drain
+    /// (a drain begun first waits on deploys nothing has told to stop, until
+    /// whatever bounds it cuts their answers off) and
+    /// [`deploy::Deploys::stopped`] after it, before [`Self::shutdown`].
+    /// `shutdown` stops the deploys as well, but only as a backstop: by then
+    /// it is too late for them to answer.
+    pub fn with_deploy(mut self, deploys: deploy::Deploys) -> Self {
+        self.deploy = Some(deploys);
+        self
     }
 
     /// Cap the MCP request body at `bytes` instead of the default
@@ -281,9 +304,20 @@ impl McpServer {
     /// won't allow; for a root-mounted instance `.merge` this router instead
     /// and set `mcp_path: "".into()`.
     pub fn mcp_router(&self) -> Router {
-        let mcp_service = {
+        // Stateless + plain-JSON responses: our tools are pure
+        // request/response with no server-initiated messages, and this is
+        // the most compatible mode across MCP clients (ChatGPT's connector
+        // does not complete the stateful SSE/session handshake the rmcp
+        // defaults require). The one exception is a deploy call, which
+        // reports progress before its result (see [`deploy`]).
+        let transport = StreamableHttpServerConfig::default()
+            .with_stateful_mode(false)
+            .with_json_response(true)
+            .with_cancellation_token(self.ct.child_token())
+            .with_allowed_hosts(self.allowed_hosts());
+        let plain_mcp = || {
             let (agent, identities) = (self.agent.clone(), self.identities.clone());
-            StreamableHttpService::new(
+            Router::new().fallback_service(StreamableHttpService::new(
                 move || {
                     Ok(tools::IcTools::new(
                         agent.clone(),
@@ -295,17 +329,14 @@ impl McpServer {
                     ))
                 },
                 LocalSessionManager::default().into(),
-                // Stateless + plain-JSON responses: our tools are pure
-                // request/response with no server-initiated messages, and this
-                // is the most compatible mode across MCP clients (ChatGPT's
-                // connector does not complete the stateful SSE/session
-                // handshake the rmcp defaults require).
-                StreamableHttpServerConfig::default()
-                    .with_stateful_mode(false)
-                    .with_json_response(true)
-                    .with_cancellation_token(self.ct.child_token())
-                    .with_allowed_hosts(self.allowed_hosts()),
-            )
+                transport.clone(),
+            ))
+        };
+        // With the deploy tools, the endpoint also has an open route next to
+        // the gated one: the bundle upload, authenticated by its ticket.
+        let (mcp_service, open_routes) = match &self.deploy {
+            Some(deploys) => self.deploy_mcp_routers(deploys, transport.clone()),
+            None => (plain_mcp(), Router::new()),
         };
 
         // The MCP resource is gated by a bearer token issued after Internet
@@ -338,9 +369,10 @@ impl McpServer {
         // Layers run outermost-last: CORS, then the bearer gate, then the body
         // cap — so an unauthenticated request is refused on its headers without
         // its body being read, and an authenticated one is read only up to the
-        // cap before the transport buffers it.
-        let gated_mcp = Router::new()
-            .fallback_service(mcp_service)
+        // cap before the transport buffers it. (The deploy dispatch reads the
+        // body again for its method; the bundle upload is a route of its own,
+        // outside both, with its own limits.)
+        let gated_mcp = mcp_service
             .layer(middleware::from_fn_with_state(
                 self.max_request_body,
                 body_limit::limit_request_body,
@@ -387,6 +419,7 @@ impl McpServer {
             .nest("/oauth", oauth)
             .merge(oidc_alternate)
             .merge(branding)
+            .merge(open_routes)
             // Everything else is the MCP endpoint: the bare mount path, its
             // trailing-slash form, and any sub-path (the streamable service
             // dispatches on method, not path) — same breadth `nest_service`
@@ -457,6 +490,11 @@ impl McpServer {
     /// Tied to [`Self::shutdown`] so the task stops cleanly on drain. Must be
     /// called from within a tokio runtime.
     pub fn spawn_session_reaper(&self) {
+        // The deploy tools' own periodic work rides the same call, so that
+        // turning them on adds nothing to what an embedder must run.
+        if let Some(deploys) = &self.deploy {
+            deploys.spawn_sweeper();
+        }
         let ids = self.identities.clone();
         let store = self.store.clone();
         let reap_ct = self.ct.child_token();
@@ -488,7 +526,17 @@ impl McpServer {
     /// Cancel the MCP transport's live sessions and the session reaper; call
     /// AFTER draining in-flight requests on graceful shutdown (cancelling
     /// first would cut the very requests the drain is waiting on).
+    ///
+    /// With the deploy tools on, this also stops the deploys that are
+    /// running and the deploy sweeper ([`deploy::Deploys::stop`]), on every
+    /// instance sharing that state: a process that is shutting one instance
+    /// down is stopping. A deploy lasts minutes, so a drain does not wait one
+    /// out — call [`deploy::Deploys::stop`] BEFORE the drain for each running
+    /// deploy to answer with what it created.
     pub fn shutdown(&self) {
+        if let Some(deploys) = &self.deploy {
+            deploys.stop();
+        }
         self.ct.cancel();
     }
 

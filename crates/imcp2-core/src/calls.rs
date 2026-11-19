@@ -646,7 +646,7 @@ pub(crate) fn on_deep_stack<T: Send>(f: impl FnOnce() -> T + Send) -> Option<T> 
 /// — Candid lexes `type` as a keyword, never an identifier, so it cannot appear as
 /// a field name (`record { type : nat }` is a syntax error); the quoted form
 /// `record { "type" : nat }` is a string literal, which the scan already skips.
-pub(crate) fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
+pub fn guard_candid_text(what: &str, text: &str) -> Result<(), String> {
     if text.len() > MAX_CANDID_TEXT_BYTES {
         return Err(format!(
             "{what} is too large to parse ({} bytes; limit {MAX_CANDID_TEXT_BYTES})",
@@ -1232,8 +1232,10 @@ fn interface_docs(prog: &IDLProg) -> InterfaceDocs {
         for binding in service_bindings(prog, &actor.typ, prog.decs.len() + 1) {
             docs.methods.insert(binding.id.clone(), binding.docs.clone());
             if let IDLType::FuncT(func) = &binding.typ {
-                let args: Vec<TypeDoc> = func.args.iter().map(|ty| type_doc(ty, &[])).collect();
-                let rets: Vec<TypeDoc> = func.rets.iter().map(|ty| type_doc(ty, &[])).collect();
+                let args: Vec<TypeDoc> =
+                    func.args.iter().map(|ty| type_doc(&ty.typ, &[])).collect();
+                let rets: Vec<TypeDoc> =
+                    func.rets.iter().map(|ty| type_doc(&ty.typ, &[])).collect();
                 if args.iter().chain(&rets).any(|doc| !doc.fields.is_empty()) {
                     docs.signatures.insert(binding.id.clone(), (args, rets));
                 }
@@ -2571,6 +2573,54 @@ mod tests {
             (0..180).map(|i| format!("type t{i}=record{{a:nat;b:opt text}};")).collect::<String>()
         );
         assert!(guard_candid_text("d", &realistic).is_ok(), "real interfaces must pass");
+    }
+
+    // `candid`'s subtype check is the upgrade compatibility check a deploy runs
+    // between a bundle's interface and the deployed one, both the caller's to
+    // write. Before 0.10.39 it retried a failed `opt` both ways with no memory
+    // of what it had refuted, so two dozen alias links whose leaves differ —
+    // half a kilobyte, well inside the guard — ran for minutes on a thread
+    // nothing can interrupt. The workspace floor on `candid` is what this
+    // pins. With the floor the check is polynomial in the resolved depth, not
+    // instant: a chain at the declaration limit still costs seconds.
+    #[test]
+    fn the_subtype_check_remembers_what_it_refuted() {
+        use super::guard_candid_text;
+        use candid::types::subtype::{subtype_with_config, OptReport};
+        use candid_parser::utils::CandidSource;
+
+        let chain = |links: usize, leaf: &str| {
+            let mut s = String::new();
+            for i in 0..links {
+                s.push_str(&format!("type t{i}=opt t{};", i + 1));
+            }
+            s.push_str(&format!("type t{links}={leaf};service:{{m:(t0)->(t0)}}"));
+            s
+        };
+        for links in [24, 64] {
+            let (new, old) = (chain(links, "nat"), chain(links, "int"));
+            guard_candid_text("new", &new).expect("the guard admits the new interface");
+            guard_candid_text("old", &old).expect("the guard admits the old interface");
+            let (done, finished) = std::sync::mpsc::channel();
+            // Its own thread, so that a check that runs away fails the test
+            // rather than hanging it.
+            std::thread::spawn(move || {
+                let load = |text: &str| match CandidSource::Text(text).load() {
+                    Ok((env, Some(service))) => (env, service),
+                    other => panic!("the interface does not load: {:?}", other.err()),
+                };
+                let (mut env, new) = load(&new);
+                let (old_env, old) = load(&old);
+                let old = env.merge_type(old_env, old);
+                let mut gamma = std::collections::HashSet::new();
+                let verdict = subtype_with_config(OptReport::Error, &mut gamma, &env, &new, &old);
+                let _ = done.send(verdict.is_ok());
+            });
+            let compatible = finished
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the subtype check answers, and soon");
+            assert!(!compatible, "an argument narrowed from int to nat is not an upgrade");
+        }
     }
 
     // The alias chain arrives through the caller-supplied `candid` argument, so

@@ -18,7 +18,11 @@ rmcp = { workspace = true, features = ["server", "macros"] }
 ic-agent = { workspace = true }
 candid = { workspace = true }
 candid_parser = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "net", "time"] }
+# `rt-multi-thread`: the deploy tools' sync-plugin runtime runs a wasm
+# component on a blocking thread (`block_in_place`), which only a
+# multi-thread runtime has. `fs` and `io-util`: a bundle is read as a stream,
+# from a file or a request body.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "net", "time", "fs", "io-util"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -32,6 +36,49 @@ getrandom = { workspace = true }
 urlencoding = { workspace = true }
 url = { workspace = true }
 httpdate = { workspace = true }
+
+# ── The deploy tools (`src/deploy`) ─────────────────────────────────────────
+# Always built: both servers serve them, the local one always and the remote
+# one where its embedder turns them on.
+#
+# The token a running deploy is stopped through.
+tokio-util = "0.7"
+# The HTTP request parts a transport leaves in the request context, where the
+# remote server says the client has gone.
+http = { workspace = true }
+async-trait = "0.1"
+# `icp-project` spells every path as a UTF-8 path.
+camino = "1"
+# A bundle is the `.tar.gz` that `icp project bundle` writes.
+tar = "0.4"
+flate2 = "1"
+# Each deploy works in a directory of its own that is removed when the deploy
+# ends, whichever way it ends.
+tempfile = "3"
+# The icp CLI's project library and the seams it is driven through, from
+# crates.io. The four share a workspace version upstream and are released
+# together: bump all four together.
+#
+# 0.1 has what the deploy tools are built on, dfinity/icp-cli#873 (on #868):
+# #868 has `icp project bundle` write an archive of regular files and
+# directories alone, and #873 states the rule for an untrusted project
+# (`icp_project::untrusted`, what `--untrusted` on `icp build`, `deploy` and
+# `sync` applies): the project is read through a filesystem confined to its
+# root by a directory handle and through no symlink, names no recipe, and
+# what it runs is held to a list of regular files there.
+#
+#   * icp-project: manifests, the deploy operation, the id/artifact stores.
+#   * icp-events: the progress event stream the operations report on.
+#   * icp-sync-plugin: the wasmtime runtime that runs a canister's sync plugin
+#     (the asset uploads of a frontend canister). The heavy one — it is what
+#     brings wasmtime into every build of this crate.
+#   * icp-canister-interfaces: the engine-canister registry id a created
+#     canister's subnet is looked up in.
+icp-project = "0.1"
+icp-events = "0.1"
+icp-sync-plugin = "0.1"
+icp-canister-interfaces = "0.1"
+
 # Only for the end-to-end canister-tool tests (src/e2e_canister_tools.rs),
 # behind the `e2e` feature so the default build compiles neither. `pocket-ic`
 # runs a real replica locally (needs the POCKET_IC_BIN server binary at
@@ -51,9 +98,12 @@ wat = { version = "1", optional = true }
 e2e = ["dep:pocket-ic", "dep:wat", "rmcp/client"]
 
 [dev-dependencies]
-# Synthetic responses for pinning `public_fetch`'s acceptance rules without a
-# network (`reqwest::Response: From<http::Response<_>>`).
-http = { workspace = true }
+# The deploy tools' tests hand-build small bundles (a manifest plus a wasm)
+# and load them through the same host the tools use. Also an optional
+# dependency above, for the `e2e` tests: here it is for the default ones.
+wat = "1"
+# One deploy test reads back what a deploy writes to the server's log.
+tracing-subscriber = { workspace = true }
 # `test-util` is what `#[tokio::test(start_paused = true)]` needs: the
 # `mcp_get_delegation` retry tests in `identities.rs` read the real backoff
 # `sleep`s off a paused clock instead of waiting them out. A feature on a
