@@ -73,22 +73,26 @@ fn require_resource() -> bool {
 
 /// The largest MCP request body the server reads, in bytes: `$MCP_MAX_REQUEST_BODY`
 /// when set, else the library default ([`imcp2::DEFAULT_MAX_REQUEST_BODY`]). A
-/// value that is not a whole number is a configuration error and refuses to
-/// start, rather than silently running with the default.
+/// blank value reads as unset. Any other value that is not a whole number is a
+/// configuration error and refuses to start, rather than silently running with
+/// the default.
 fn max_request_body() -> anyhow::Result<usize> {
     max_request_body_from(std::env::var("MCP_MAX_REQUEST_BODY"))
 }
 
-/// [`max_request_body`]'s reading of the variable. Only an unset variable means
-/// the default: one that is set to something that is not Unicode is not a byte
-/// count either, so it is refused like any other value that is not one.
+/// [`max_request_body`]'s reading of the variable. Unset means the default, and
+/// so does blank: the native deploy renders a variable nobody set as `NAME=`
+/// (see `deploy/native/imcp2.service`), and every variable templated there reads
+/// that as unset, so this one does too rather than stop the service the day it
+/// is templated. A value that is not Unicode is neither blank nor a byte count,
+/// so it is refused like any other value that is not one.
 fn max_request_body_from(value: Result<String, std::env::VarError>) -> anyhow::Result<usize> {
     use std::env::VarError;
     match value.as_deref().map(str::trim) {
+        Err(VarError::NotPresent) | Ok("") => Ok(imcp2::DEFAULT_MAX_REQUEST_BODY),
         Ok(v) => v.parse().map_err(|e| {
             anyhow::anyhow!("MCP_MAX_REQUEST_BODY must be a byte count, got {v:?}: {e}")
         }),
-        Err(VarError::NotPresent) => Ok(imcp2::DEFAULT_MAX_REQUEST_BODY),
         Err(VarError::NotUnicode(raw)) => {
             Err(anyhow::anyhow!("MCP_MAX_REQUEST_BODY must be a byte count, got {raw:?}"))
         }
@@ -618,9 +622,9 @@ mod tests {
         }
     }
 
-    /// `MCP_MAX_REQUEST_BODY`'s reading: the default only when it is unset, and
-    /// an error (which `main` refuses to start on) for anything set that is not
-    /// a byte count. That includes a value that is not Unicode, which
+    /// `MCP_MAX_REQUEST_BODY`'s reading: the default when it is unset or blank,
+    /// and an error (which `main` refuses to start on) for anything else that is
+    /// not a byte count. That includes a value that is not Unicode, which
     /// `std::env::var` reports as an error too and which must not be mistaken
     /// for the variable being absent.
     #[test]
@@ -630,6 +634,12 @@ mod tests {
 
         let unset = max_request_body_from(Err(VarError::NotPresent));
         assert_eq!(unset.unwrap(), imcp2::DEFAULT_MAX_REQUEST_BODY);
+
+        // Blank is how the deploy unit renders a variable nobody set.
+        for blank in ["", " ", "\t", " \n"] {
+            let read = max_request_body_from(Ok(blank.into()));
+            assert_eq!(read.unwrap(), imcp2::DEFAULT_MAX_REQUEST_BODY, "{blank:?}");
+        }
 
         for (value, bytes) in [("1048576", 1 << 20), (" 65536 ", 65536), ("1", 1)] {
             let read = max_request_body_from(Ok(value.into()));
