@@ -1,0 +1,4 @@
+# The Windows release job (v-release.yml) runs this under Git Bash, and the
+# Windows runner's Git checks out with core.autocrlf=true; a CRLF copy fails
+# in bash (`set: pipefail\r: invalid option name`).
+.github/scripts/install-dist.sh text eol=lf

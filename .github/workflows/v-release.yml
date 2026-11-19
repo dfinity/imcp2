@@ -61,10 +61,10 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Install dist
-        # we specify bash to get pipefail; it guards against the `curl` command
-        # failing. otherwise `sh` won't catch that `curl` returned non-0
+        # Hand-edited (see `allow-dirty` in dist-workspace.toml): dist is
+        # installed from a pinned archive. See .github/scripts/install-dist.sh.
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
+        run: bash .github/scripts/install-dist.sh
       - name: Cache dist
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
@@ -132,7 +132,10 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: Install dist
-        run: ${{ matrix.install_dist.run }}
+        # Hand-edited: the pinned install, in place of `matrix.install_dist.run`.
+        # See .github/scripts/install-dist.sh.
+        shell: bash
+        run: bash .github/scripts/install-dist.sh
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
