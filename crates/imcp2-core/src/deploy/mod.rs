@@ -114,6 +114,10 @@ pub const DEPLOY_TOOL: &str = "icp_deploy_bundle";
 /// The name of the upload-ticket tool, listed only by a server with an
 /// upload store (see [`IcDeployTools::with_uploads`]).
 pub const UPLOAD_TOOL: &str = "icp_deploy_upload";
+/// Where the deploy tool's description stops being the same on every
+/// server: the sentence that the one on how this server takes the bundle
+/// follows (see [`IcDeployTools::tools`]).
+const BEFORE_THE_BUNDLE: &str = "running every phase of `icp deploy`.";
 
 /// A transport's word that the client of a request has gone: a token it
 /// cancels when the connection carrying the request's response is dropped,
@@ -122,6 +126,31 @@ pub const UPLOAD_TOOL: &str = "icp_deploy_upload";
 /// the answer.
 #[derive(Clone, Debug)]
 pub struct ClientGone(pub CancellationToken);
+
+/// Whether a deploy that was sent no progress token reports its phases as
+/// log messages: the word of the handler serving the tools ([`WithDeploy`]),
+/// from the level its client last asked for with `logging/setLevel`, left in
+/// the request's extensions. Absent, it does.
+///
+/// It is the handler's own flag, shared, not what the flag read as the call
+/// began: a deploy lasts minutes, and a level the client sets while one runs
+/// holds for the lines that deploy has yet to send.
+#[derive(Clone, Debug)]
+pub struct LogMessages(pub Arc<std::sync::atomic::AtomicBool>);
+
+impl LogMessages {
+    /// Whether log messages at `info` are wanted now.
+    fn wanted(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Whether a client that asked for log messages from `level` up is sent the
+/// ones a deploy's progress goes out as, which are `info`.
+#[allow(deprecated)]
+pub(crate) fn wants_info(level: LoggingLevel) -> bool {
+    matches!(level, LoggingLevel::Debug | LoggingLevel::Info)
+}
 
 /// The icp CLI's default funding for a canister it creates (`icp deploy
 /// --cycles`): 2 trillion cycles.
@@ -594,10 +623,17 @@ impl IcDeployTools {
 
     /// The tools this server lists, which follow from how the bundle reaches
     /// it: `icp_deploy_upload` only where an upload store exists for it to
-    /// mint tickets on, and of the deploy tool's two bundle arguments the one
-    /// this server takes.
+    /// mint tickets on, of the deploy tool's two bundle arguments the one
+    /// this server takes, and in its description the sentence on how to hand
+    /// the bundle over — by the upload tool, or by path — which names
+    /// nothing a server of the other kind has.
     pub fn tools(&self) -> Vec<Tool> {
         let refused = if self.has_uploads() { "bundle_path" } else { "bundle_upload" };
+        let bundle = if self.has_uploads() {
+            format!("Upload that bundle using `{UPLOAD_TOOL}`.")
+        } else {
+            "Pass that bundle's absolute path as `bundle_path`.".to_string()
+        };
         Self::tool_router()
             .list_all()
             .into_iter()
@@ -611,6 +647,11 @@ impl IcDeployTools {
                         properties.remove(refused);
                     }
                     tool.input_schema = Arc::new(schema);
+                    if let Some(description) = tool.description.take() {
+                        let said = format!("{BEFORE_THE_BUNDLE} {bundle}");
+                        tool.description =
+                            Some(description.replacen(BEFORE_THE_BUNDLE, &said, 1).into());
+                    }
                 }
                 tool
             })
@@ -653,7 +694,7 @@ impl IcDeployTools {
     }
 
     #[tool(
-        description = "Deploy an icp project bundle (the .tar.gz that `icp project bundle` writes) to the Internet Computer as the user, running every phase of `icp deploy`: create the bundle's new canisters (funded from the user's cycles balance), wire their ids into each other, apply settings, install or upgrade the code, and run the sync steps (a frontend's asset upload). Pass the bundle the one way this server takes it (the bundle argument listed here), the environment name it was built for (usually \"ic\"), and, to upgrade rather than create, the canister_ids a previous deploy returned. The call lasts as long as the deploy and reports each phase as it completes, as a progress notification (send a progressToken) and a log message; cancelling the call interrupts the deploy at its next step. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure or interruption the mapping still holds every canister that was created.",
+        description = "Deploy an icp project bundle (the .tar.gz that `icp project bundle` writes) to the Internet Computer as the user, running every phase of `icp deploy`. Pass the canister_ids a previous deploy returned to upgrade rather than create anew. The call lasts as long as the deploy and reports each phase as it completes, as a progress notification (send a progressToken) and a log message; cancelling the call interrupts the deploy at its next step. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure or interruption the mapping still holds every canister that was created.",
         annotations(title = "Deploy a project bundle", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<DeployBundleOutput>(),
     )]
@@ -805,8 +846,12 @@ impl IcDeployTools {
         // Each phase reaches the client as it completes, and the client's
         // cancellation of the request stops the deploy.
         let (lines, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let forwarder =
-            tokio::spawn(forward_lines(ctx.peer.clone(), ctx.meta.get_progress_token(), receiver));
+        let forwarder = tokio::spawn(forward_lines(
+            ctx.peer.clone(),
+            ctx.meta.get_progress_token(),
+            ctx.extensions.get::<LogMessages>().cloned(),
+            receiver,
+        ));
         let stopped = stop.clone();
         let watch = Watch { stop, lines: Some(lines) };
         let result = deploy_bundle(identity, request, watch).instrument(span.clone()).await;
@@ -1056,30 +1101,58 @@ async fn delivered(
     false
 }
 
-/// Deliver each log line of a running deploy to the client as it is made: as
-/// a progress notification when the request carried a progress token (which
-/// is also what keeps a client's per-call timeout from running out during a
-/// long deploy), else as a logging message, the one other thing a server may
-/// say mid-call. A client that cannot be reached is not an error here; the
-/// outcome carries every line regardless.
+/// How one of a running deploy's lines reaches its client as it is made.
+#[derive(Debug, PartialEq)]
+enum Channel<'a> {
+    /// As a progress notification under the token the request carried, which
+    /// is also what keeps a client's per-call timeout from running out
+    /// during a long deploy.
+    Progress(&'a ProgressToken),
+    /// As a log message at `info`, the one other thing a server may say
+    /// mid-call: the fallback for a client that sent no progress token.
+    Log,
+    /// Not at all: no token, and the client asks for log messages from a
+    /// level above `info` only. The outcome still carries every line.
+    Nowhere,
+}
+
+impl<'a> Channel<'a> {
+    /// The channel for a line of a request with this progress token, from a
+    /// client that does or does not take log messages at `info` as the line
+    /// is made ([`LogMessages`]). Progress was asked for by the request
+    /// itself, whatever the log level.
+    fn of(progress_token: Option<&'a ProgressToken>, log_messages: Option<&LogMessages>) -> Self {
+        match progress_token {
+            Some(token) => Self::Progress(token),
+            None if log_messages.is_none_or(LogMessages::wanted) => Self::Log,
+            None => Self::Nowhere,
+        }
+    }
+}
+
+/// Deliver each log line of a running deploy to the client as it is made,
+/// over the channel that is the line's as it is made ([`Channel::of`]). A
+/// client that cannot be reached is not an error here; the outcome carries
+/// every line regardless.
 // MCP logging is deprecated (SEP-2577) but still delivered; it is the
 // fallback for a client that sends no progress token, nothing more.
 #[allow(deprecated)]
 async fn forward_lines(
     peer: Peer<RoleServer>,
     progress_token: Option<ProgressToken>,
+    log_messages: Option<LogMessages>,
     mut lines: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
     let mut progress = 0.0;
     while let Some(line) = lines.recv().await {
         progress += 1.0;
-        let _ = match &progress_token {
-            Some(token) => {
+        let _ = match Channel::of(progress_token.as_ref(), log_messages.as_ref()) {
+            Channel::Progress(token) => {
                 let param =
                     ProgressNotificationParam::new(token.clone(), progress).with_message(line);
                 peer.notify_progress(param).await
             }
-            None => {
+            Channel::Log => {
                 let param = LoggingMessageNotificationParam::new(
                     LoggingLevel::Info,
                     serde_json::Value::String(line),
@@ -1087,6 +1160,8 @@ async fn forward_lines(
                 .with_logger(DEPLOY_TOOL);
                 peer.notify_logging_message(param).await
             }
+            // Read and dropped, so the run's sender never fills.
+            Channel::Nowhere => continue,
         };
     }
 }
@@ -1309,6 +1384,17 @@ mod tests {
             assert!(schema["properties"][listed].is_object(), "{schema}");
             assert!(schema["properties"][unlisted].is_null(), "{schema}");
             assert!(schema["properties"]["environment"].is_object(), "{schema}");
+            // And says, in the tool's description, how to hand the bundle
+            // over here, naming nothing a server of the other kind has.
+            let said = deploy.description.as_deref().expect("a description");
+            let how = match uploads {
+                true => "Upload that bundle using `icp_deploy_upload`.",
+                false => "Pass that bundle's absolute path as `bundle_path`.",
+            };
+            let whole = format!("every phase of `icp deploy`. {how} Pass the canister_ids");
+            assert!(said.contains(&whole), "{said}");
+            assert!(!said.contains(unlisted), "{said}");
+            assert_eq!(said.contains(UPLOAD_TOOL), uploads, "{said}");
         }
     }
 
@@ -1421,6 +1507,50 @@ mod tests {
         drop(running);
         waiting.await;
         assert_eq!(slots.running(), 0);
+    }
+
+    // A deploy's progress goes under the progress token its request carried,
+    // whatever log level the client asked for; without a token it falls back
+    // on log messages at `info`, which a client that asks for a higher
+    // level only is not sent. The level is read for each line: one set while
+    // the deploy runs holds for the lines it has yet to send.
+    #[test]
+    #[allow(deprecated)]
+    fn progress_falls_back_on_log_messages_the_client_takes() {
+        use rmcp::model::NumberOrString;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let token = ProgressToken(NumberOrString::Number(7));
+        let wanted = LogMessages(Arc::new(AtomicBool::new(true)));
+        // A handler that says nothing of the level: the messages are sent.
+        assert_eq!(Channel::of(None, None), Channel::Log);
+        assert_eq!(Channel::of(Some(&token), None), Channel::Progress(&token));
+
+        assert_eq!(Channel::of(None, Some(&wanted)), Channel::Log);
+        assert_eq!(Channel::of(Some(&token), Some(&wanted)), Channel::Progress(&token));
+        // The level is raised mid-deploy, on the handler's own flag...
+        let handlers = wanted.clone();
+        handlers.0.store(false, Ordering::Relaxed);
+        assert_eq!(Channel::of(None, Some(&wanted)), Channel::Nowhere);
+        assert_eq!(Channel::of(Some(&token), Some(&wanted)), Channel::Progress(&token));
+        // ...and lowered again.
+        handlers.0.store(true, Ordering::Relaxed);
+        assert_eq!(Channel::of(None, Some(&wanted)), Channel::Log);
+
+        // `info` messages are wanted from `debug` or `info` up, and from no
+        // level above.
+        use LoggingLevel::*;
+        for (level, wanted) in [
+            (Debug, true),
+            (Info, true),
+            (Notice, false),
+            (Warning, false),
+            (Error, false),
+            (Critical, false),
+            (Alert, false),
+            (Emergency, false),
+        ] {
+            assert_eq!(wants_info(level), wanted, "{level:?}");
+        }
     }
 
     // A deploy that has ended answers, and gives its slot back, whether or

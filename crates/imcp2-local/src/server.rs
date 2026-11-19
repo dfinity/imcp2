@@ -289,6 +289,16 @@ impl ServerHandler for LocalServer {
         Ok(result)
     }
 
+    /// The deploy tools' to answer: they are what declares logging.
+    #[allow(deprecated)]
+    async fn set_level(
+        &self,
+        request: rmcp::model::SetLevelRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tools.set_level(request, context).await
+    }
+
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -343,6 +353,39 @@ mod tests {
         let deploy = IcDeployTools::new(identities.clone(), slot.resolver());
         let login = crate::login::LoginDriver::new(identities, slot, /* auto_open */ false);
         LocalServer::new(tools, deploy, login, /* auto_open */ false)
+    }
+
+    // The server declares logging (a deploy without a progress token reports
+    // its phases as log messages), so a client may set the level, and is
+    // answered rather than told there is no such method. The deploy tools
+    // log at `info` alone: a level above it turns their messages off, and
+    // one at or below it turns them back on, for the connection.
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn a_real_mcp_client_can_set_the_log_level() {
+        use rmcp::model::{LoggingLevel, SetLevelRequestParams};
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = test_server().serve(server_io);
+        let client = ().serve(client_io);
+        let (server, client) = tokio::join!(server, client);
+        let (server, client) = (server.expect("server up"), client.expect("client up"));
+        let declared = client.peer_info().expect("initialized").capabilities.logging.is_some();
+        assert!(declared, "logging is declared");
+        let sends = || server.service().tools.sends_log_messages();
+        assert!(sends(), "until the client says otherwise");
+
+        for (level, sent) in [
+            (LoggingLevel::Warning, false),
+            (LoggingLevel::Info, true),
+            (LoggingLevel::Error, false),
+            (LoggingLevel::Debug, true),
+        ] {
+            client
+                .set_level(SetLevelRequestParams::new(level))
+                .await
+                .unwrap_or_else(|e| panic!("logging/setLevel {level:?}: {e}"));
+            assert_eq!(sends(), sent, "after {level:?}");
+        }
     }
 
     // The wrapper's own router carries EXACTLY the two login tools — the rest
