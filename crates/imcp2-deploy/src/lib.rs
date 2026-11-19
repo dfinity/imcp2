@@ -95,7 +95,7 @@ mod uploads;
 
 pub use deploy::{
     deploy_bundle, prune_abandoned_deploys, remove_old_deploy_records, BundleSource, DeployOutcome,
-    DeployRequest, RequestError, Status, Watch,
+    DeployRequest, RequestError, Status, Watch, STOP_GRACE,
 };
 use identity::RefreshingIdentity;
 pub use server::WithDeploy;
@@ -428,6 +428,15 @@ impl DeploySlots {
     pub fn new(n: usize) -> Self {
         let n = n.max(1);
         Self { free: Arc::new(tokio::sync::Semaphore::new(n)), total: n, sessions: Arc::default() }
+    }
+
+    /// Wait until no deploy holds a slot. For a server that has told its
+    /// deploys to stop: each one ends within [`STOP_GRACE`], and a process
+    /// that exited before then would cut off the very answer the deploy is
+    /// waiting to record.
+    pub async fn idle(&self) {
+        // Every permit at once is every slot free; they go straight back.
+        let _ = self.free.acquire_many(self.total as u32).await;
     }
 }
 
@@ -1136,6 +1145,21 @@ mod tests {
         let (out, ()) = tokio::join!(waiting, async move { stopper.cancel() });
         assert_eq!(out, None);
         assert_eq!(until(&stop, async { 1 }).await, None, "a stop already asked for comes first");
+    }
+
+    #[tokio::test]
+    async fn a_server_can_wait_for_its_deploys_to_end() {
+        let slots = DeploySlots::new(2);
+        let tools = tools().with_slots(slots.clone());
+        slots.idle().await;
+        let running = tools.claim().unwrap();
+        let waiting = slots.idle();
+        tokio::pin!(waiting);
+        let timed = tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting);
+        assert!(timed.await.is_err(), "a deploy is still running");
+        drop(running);
+        waiting.await;
+        assert!(tools.claim().is_some(), "waiting took no slot");
     }
 
     #[tokio::test]

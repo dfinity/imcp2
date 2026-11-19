@@ -312,9 +312,13 @@ impl<C> UntilStopped<C> {
 #[derive(Debug)]
 struct Stopping;
 
+/// What [`UntilStopped`]'s refusal reads as, for a deploy to tell it from
+/// an error a call that was made came back with.
+pub(crate) const STOPPING: &str = "the deploy is being stopped, so the call was not made";
+
 impl std::fmt::Display for Stopping {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the deploy is being stopped, so the call was not made")
+        f.write_str(STOPPING)
     }
 }
 

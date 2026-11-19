@@ -400,15 +400,19 @@ pub async fn deploy_bundle(
 
     let interrupted = "the deploy was interrupted before it finished (the call was cancelled, the \
                        client went away or the server is stopping); `canister_ids` holds every \
-                       canister it had created";
+                       canister it is known to have created";
     match result {
         Some(Ok(())) => outcome.status = Status::Deployed,
-        // Stopped, the run ends in whichever error its next call's refusal
-        // became: that is the interruption, not a failure of the deploy.
+        // Stopped, the run ends in an error: the refusal of the call it went
+        // on to make, or what a call in flight came back with. The first is
+        // the interruption and nothing more. The second is said, since it is
+        // what the caller has to go on — above all a call that went
+        // unanswered, which may have created a canister nothing lists.
         Some(Err(e)) if watch.stop.is_cancelled() => {
             outcome.status = Status::Interrupted;
-            outcome.error = Some(interrupted.into());
-            tracing::info!(ended = %error_chain(&e), "the interrupted run ended");
+            let ended = error_chain(&e);
+            tracing::info!(%ended, "the interrupted run ended");
+            outcome.error = Some(interrupted_with(interrupted, &ended));
         }
         Some(Err(e)) => {
             outcome.status = Status::Failed;
@@ -471,14 +475,23 @@ pub async fn deploy_bundle(
             "deploy did not finish"
         ),
     }
-    if outcome.status == Status::Interrupted {
+    // Nor after a run that finished once a stop had been asked for: it ran
+    // to its end in the time it was given, but whoever asked for the stop may
+    // be the client, gone, and the ids it never read are in the record alone.
+    let stopped = watch.stop.is_cancelled();
+    if outcome.status == Status::Interrupted || stopped {
         let pruning = workdir.clone();
         let pruned = tokio::task::spawn_blocking(move || prune_to_record(&pruning)).await;
         if let Ok(Err(e)) = &pruned {
             tracing::warn!(dir = %workdir.display(), %e, "could not cut the directory down");
         }
         let line = format!(
-            "interrupted; the deploy directory '{}' is kept, with the ids it recorded",
+            "{}; the deploy directory '{}' is kept, with the ids it recorded",
+            if outcome.status == Status::Interrupted {
+                "interrupted"
+            } else {
+                "asked to stop as it finished"
+            },
             workdir.display()
         );
         note(&mut outcome.log, line);
@@ -492,8 +505,29 @@ pub async fn deploy_bundle(
 /// How long a deploy that was told to stop is given to end of its own
 /// accord: for the calls it had in flight to be answered and recorded.
 /// Within what a stopping server has before it is killed (the native unit's
-/// `TimeoutStopSec` is thirty seconds).
-const STOP_GRACE: Duration = Duration::from_secs(20);
+/// `TimeoutStopSec` is thirty seconds). A server that stops its deploys
+/// waits this long, and a little more, for them to have ended before it
+/// exits.
+pub const STOP_GRACE: Duration = Duration::from_secs(20);
+
+/// What an interrupted deploy says of itself when its run ended in `ended`
+/// (an error chain). The refusal of a call the stop prevented is the
+/// interruption itself and adds nothing; anything else is what a call in
+/// flight came back with, and is passed on — with the warning it calls for
+/// when a call went unanswered, since that call may have taken effect.
+fn interrupted_with(interrupted: &str, ended: &str) -> String {
+    if ended.contains(crate::calls::STOPPING) && !ended.contains("went unanswered") {
+        return interrupted.to_string();
+    }
+    let mut said = format!("{interrupted}. The run ended with: {ended}");
+    if ended.contains("went unanswered") {
+        said.push_str(
+            ". A call went unanswered: if it was creating a canister, that canister may exist \
+             without being listed, so check before deploying again",
+        );
+    }
+    said
+}
 
 /// Run a deploy until it ends or `stop` is cancelled, and say how it ended;
 /// `None` is a run that was dropped.
@@ -1391,6 +1425,26 @@ mod tests {
         // Not stopped, a run simply runs.
         let running = CancellationToken::new();
         assert_eq!(run_until_stopped(ends_soon(), &running, &begun, grace).await, Some("recorded"));
+    }
+
+    // An interrupted deploy's answer does not claim more than is known. The
+    // refusal of the call the stop prevented is only the interruption; an
+    // error a call in flight came back with is passed on, and one that went
+    // unanswered comes with the warning that its canister may exist.
+    #[test]
+    fn an_interrupted_deploy_says_what_its_run_ended_with() {
+        let base = "interrupted";
+        let refused = format!("call to 'x' on aaaaa-aa failed: {}", crate::calls::STOPPING);
+        assert_eq!(interrupted_with(base, &refused), base);
+        let rejected = interrupted_with(base, "call to 'x' on aaaaa-aa was rejected: no");
+        assert!(rejected.contains("The run ended with: call to 'x'"), "{rejected}");
+        assert!(!rejected.contains("may exist"), "{rejected}");
+        let unanswered = "call to 'create_canister' on aaaaa-aa went unanswered: timed out";
+        for ended in [unanswered.to_string(), format!("{unanswered}; then: {refused}")] {
+            let said = interrupted_with(base, &ended);
+            assert!(said.contains("went unanswered"), "{said}");
+            assert!(said.contains("may exist without being listed"), "{said}");
+        }
     }
 
     // What a retry is handed never lacks a canister that exists: the ids

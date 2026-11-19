@@ -601,14 +601,21 @@ What the hosted composition adds to the local one:
   stop never drops a canister call in flight — the call may already have
   created, and funded, a canister that only its answer names — so the
   deploy waits for that answer and makes no further call; it waits twenty
-  seconds at most, and says so in its answer if a call was given up on.
+  seconds at most, and says so in its answer if a call was given up on. The
+  process in turn waits for its deploys to have ended before it exits, drain
+  or no drain: a deploy whose client has gone holds no connection open. A
+  deploy that finishes after it was asked to stop keeps its record too, as
+  an interrupted one does.
 - **Bounds.** One deploy per session and `$MCP_DEPLOY_MAX_CONCURRENT` across
   sessions and endpoints (the slots are the process's, shared by `/mcp` and
   `/mcp-beta`), refused past the cap rather than queued. Each deploy's
   directory is made under `{state_dir}/deploys`, readable by the server's user
   alone, and removed when the deploy returns. What an interruption or a
   killed process leaves there is bounded too: a start removes the uploads of
-  the run before and cuts each cut-off deploy's directory down to its ids,
+  the run before and cuts each cut-off deploy's directory down to its ids
+  (having first locked the directory, `deploys/.lock`: a second server
+  started over a state directory in use is refused, since it would clear the
+  first one's uploads and deploys as leftovers),
   and a sweep every minute removes lapsed uploads and id records older than
   seven days. The archive and what it unpacks are bounded
   by the `imcp2-deploy` host (archive, extracted bytes, entries, module sizes),

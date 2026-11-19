@@ -394,7 +394,7 @@ async fn main() -> anyhow::Result<()> {
     // instances. Making it clears what the run before left behind.
     #[cfg(feature = "deploy")]
     let deploys = {
-        let deploys = imcp2::deploy::Deploys::new(&deploy_config()?, &state_dir);
+        let deploys = imcp2::deploy::Deploys::new(&deploy_config()?, &state_dir)?;
         deploys.spawn_sweeper();
         deploys
     };
@@ -619,12 +619,26 @@ async fn main() -> anyhow::Result<()> {
     // are told to stop when the signal arrives, before the drain: each ends
     // at its next step and answers with the canisters it had created, and
     // the drain then waits for that answer like any other response.
-    let stopping = async move {
-        shutdown_signal().await;
+    //
+    // The drain is not the whole of the wait, though. A stopped deploy with
+    // a canister call in flight waits for its answer, which is what names a
+    // canister the call created — and if its client has gone, no connection
+    // holds the drain open for it. So once the drain is done the deploys are
+    // waited for too, for a bounded time, before anything is cancelled.
+    let stopping = {
         #[cfg(feature = "deploy")]
-        deploys.stop();
+        let deploys = deploys.clone();
+        async move {
+            shutdown_signal().await;
+            #[cfg(feature = "deploy")]
+            deploys.stop();
+        }
     };
     let serve_result = axum::serve(listener, app).with_graceful_shutdown(stopping).await;
+    #[cfg(feature = "deploy")]
+    if !deploys.stopped().await {
+        tracing::warn!("a deploy had not ended when the server stopped waiting for it");
+    }
     prod.shutdown();
     if let Some(beta) = &beta {
         beta.shutdown();

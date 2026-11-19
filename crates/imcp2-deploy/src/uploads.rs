@@ -404,11 +404,20 @@ async fn write_up_to(
     body: &mut (impl AsyncRead + Unpin),
     max: usize,
 ) -> Result<usize, ReceiveError> {
-    let mut options = tokio::fs::OpenOptions::new();
+    // Created here and now, not on another thread while this future waits:
+    // the caller's guard removes the file if this future is dropped, and a
+    // creation still on its way when that happened would land after the
+    // removal, leaving a file nothing knows of. Making an empty file is
+    // quick; everything after it that waits has the file to its name.
+    let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(path).await.map_err(|e| ReceiveError::Storage(e.to_string()))?;
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path).map_err(|e| ReceiveError::Storage(e.to_string()))?;
+    let mut file = tokio::fs::File::from_std(file);
     let mut total = 0usize;
     let mut buf = vec![0u8; 64 * 1024];
     loop {

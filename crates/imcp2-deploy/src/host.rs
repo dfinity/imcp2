@@ -878,7 +878,7 @@ fn extract_bundle_within(
             // before the next entry is written under it: the tree is the
             // server's to read and to remove, and a directory an archive
             // marked read-only would be neither (see `own`).
-            own(fs.root().join(&rel).as_std_path(), kind.is_dir()).map_err(|e| {
+            own(fs.root().join(&rel).as_std_path()).map_err(|e| {
                 format!("the archive entry '{path}' could not be made the server's own: {e}")
             })?;
             dirs.extend(implied);
@@ -898,17 +898,24 @@ fn extract_bundle_within(
 
 /// Give an extracted file or directory the mode everything a deploy writes
 /// has: the owner's alone, readable and — a directory — writable and
-/// searchable, so that it can be removed. An archive holds regular files and
-/// directories only, so `path` is never a link to follow.
+/// searchable, so that it can be removed. Which it is is read off the disk,
+/// not the entry's header: an old-style header for a regular file whose name
+/// ends in `/` is unpacked as a directory. An archive holds regular files
+/// and directories only, so `path` is never a link, and is not followed.
 #[cfg(unix)]
-fn own(path: &std::path::Path, is_dir: bool) -> std::io::Result<()> {
+fn own(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mode = if is_dir { 0o700 } else { 0o600 };
+    let kind = std::fs::symlink_metadata(path)?.file_type();
+    let mode = match (kind.is_dir(), kind.is_file()) {
+        (true, _) => 0o700,
+        (_, true) => 0o600,
+        _ => return Ok(()),
+    };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 #[cfg(not(unix))]
-fn own(_path: &std::path::Path, _is_dir: bool) -> std::io::Result<()> {
+fn own(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1380,6 +1387,30 @@ mod tests {
         assert_eq!(mode("locked") & 0o777, 0o700);
         assert_eq!(mode("locked/x") & 0o777, 0o600);
         std::fs::remove_dir_all(into.join("locked")).unwrap();
+
+        // An old-style header calls a directory a regular file whose name
+        // ends in `/`: it is one on disk, and gets a directory's mode.
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append_data(&mut header, "old/x", &b"x"[..]).unwrap();
+        let mut header = tar::Header::new_old();
+        header.set_path("old/").unwrap();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append(&header, &b""[..]).unwrap();
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+        let (_dir, into) = scratch();
+        extract_bundle(&bytes, &into).unwrap_err();
+        let mode = |path: &str| std::fs::metadata(into.join(path)).unwrap().permissions().mode();
+        assert_eq!(mode("old") & 0o777, 0o700);
+        std::fs::remove_dir_all(into.join("old")).unwrap();
     }
 
     // Counting what a path implies costs a lookup per component, so the

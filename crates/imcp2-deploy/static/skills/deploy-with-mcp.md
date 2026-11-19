@@ -212,8 +212,15 @@ created and their ids.
    already in flight is waited for and what it did is recorded, so a
    canister it created is in the result. A server that restarts
    interrupts the deploy the same way and still answers: the result's
-   `canister_ids` holds what was created, so do step 3 with it and deploy
-   again. If the server stopped mid-deploy, or you cancelled and never read
+   `canister_ids` holds what is known to have been created, so do step 3
+   with it and deploy again. One exception, which the result's error names:
+   if it says a call **went unanswered** or **was given up on**, a canister
+   that call was creating may exist without being listed. Do not deploy
+   again yet: tell the user, and have them check for a canister they do not
+   recognise (`icp canister list` for their identity, or their cycles
+   balance having dropped by one canister's funding more than the mapping
+   accounts for) and add it to the mapping first. The same caution applies
+   to the record below. If the server stopped mid-deploy, or you cancelled and never read
    the answer, the canisters it created are not lost: the deploy's working directory is kept — on the
    local server under the user's local data directory
    (`~/.local/share/imcp2-local/deploys/` on Linux,

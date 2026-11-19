@@ -112,7 +112,19 @@ pub struct Deploys {
     /// `{state_dir}/deploys`: each deploy's working directory, and `uploads`.
     dir: std::path::PathBuf,
     stopping: CancellationToken,
+    /// The lock on `dir` that makes this process its one owner; released
+    /// when the last clone goes.
+    _owned: Arc<std::fs::File>,
 }
+
+/// The file in the deploy directory whose lock says a process owns it.
+const LOCK_FILE: &str = ".lock";
+
+/// How long past [`imcp2_deploy::STOP_GRACE`] a stopping server waits for
+/// its deploys to have ended: the grace is each deploy's own, and what comes
+/// after it — reading the ids back, cutting the directory down, answering —
+/// takes a moment more.
+const STOP_MARGIN: Duration = Duration::from_secs(5);
 
 impl Deploys {
     /// The deploy state under `state_dir` — the state directory of every
@@ -122,8 +134,15 @@ impl Deploys {
     /// earlier process left: uploads nothing can deploy any more are removed,
     /// and the directory of each deploy that was cut off — still holding its
     /// whole bundle — is cut down to the ids it recorded.
-    pub fn new(config: &DeployConfig, state_dir: &Path) -> Self {
+    ///
+    /// That clearing is why the directory is locked first, for as long as
+    /// this (or a clone) lives: to a second process started over the same
+    /// state directory, the uploads and deploys of the first — alive, and
+    /// in the middle of them — would look like what a dead one left. It is
+    /// refused here instead, having touched nothing.
+    pub fn new(config: &DeployConfig, state_dir: &Path) -> std::io::Result<Self> {
         let dir = state_dir.join("deploys");
+        let owned = own_directory(&dir)?;
         let uploads = Uploads::with_budget(
             dir.join("uploads"),
             config.max_upload_bytes,
@@ -137,12 +156,30 @@ impl Deploys {
                 "kept the ids of deploys an earlier run was stopped in"
             );
         }
-        Self {
+        Ok(Self {
             slots: DeploySlots::new(config.concurrent),
             uploads,
             dir,
             stopping: CancellationToken::new(),
-        }
+            _owned: Arc::new(owned),
+        })
+    }
+
+    /// Wait for the deploys that were running at [`Self::stop`] to have
+    /// ended, and say whether they all did. Call it after the stop — and
+    /// after draining in-flight requests, where a server does — and before
+    /// [`McpServer::shutdown`] or exiting.
+    ///
+    /// A drain does not cover this. A stopped deploy with a canister call
+    /// in flight waits for the answer (up to [`imcp2_deploy::STOP_GRACE`]),
+    /// because the answer is what names a canister the call created; and
+    /// one whose client has already gone has no connection for a drain to
+    /// wait on. A process that exited then would lose that canister after
+    /// all. The wait is bounded — the grace and a margin — so a deploy that
+    /// will not end cannot hold the process: `false` says one was left.
+    pub async fn stopped(&self) -> bool {
+        let within = imcp2_deploy::STOP_GRACE + STOP_MARGIN;
+        tokio::time::timeout(within, self.slots.idle()).await.is_ok()
     }
 
     /// Say that the server is stopping: every running deploy is interrupted
@@ -184,6 +221,28 @@ impl Deploys {
         if removed > 0 {
             tracing::info!(removed, "removed the records of old interrupted deploys");
         }
+    }
+}
+
+/// Make `dir` and take the lock that says this process owns it, or say why
+/// not: another process holds it.
+fn own_directory(dir: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(std::io::Error::new(
+            std::io::ErrorKind::ResourceBusy,
+            format!(
+                "the deploy directory '{}' belongs to another running server (it holds the \
+                 lock '{}'): two servers cannot share a state directory, since each would \
+                 clear the other's uploads and deploys as leftovers",
+                dir.display(),
+                path.display()
+            ),
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
     }
 }
 
@@ -363,7 +422,7 @@ mod tests {
 
     fn server() -> (tempfile::TempDir, McpServer) {
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path());
+        let deploys = Deploys::new(&config(), dir.path()).unwrap();
         let server = server_in(dir.path(), "/mcp", deploys);
         (dir, server)
     }
@@ -591,7 +650,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_endpoints_of_a_process_share_its_deploy_state() {
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path());
+        let deploys = Deploys::new(&config(), dir.path()).unwrap();
         let prod = server_in(dir.path(), "/mcp", deploys.clone());
         let beta = server_in(dir.path(), "/mcp-beta", deploys.clone());
         let bearer = format!("Bearer {}", prod.store.test_bearer().await);
@@ -632,7 +691,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stopping_server_begins_no_deploy() {
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path());
+        let deploys = Deploys::new(&config(), dir.path()).unwrap();
         let server = server_in(dir.path(), "/mcp", deploys.clone());
         let bearer = format!("Bearer {}", server.store.test_bearer().await);
         let app = server.mcp_router();
@@ -662,13 +721,63 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, contents).unwrap();
         }
-        let deploys = Deploys::new(&config(), dir.path());
+        let deploys = Deploys::new(&config(), dir.path()).unwrap();
         assert!(!upload.exists(), "an upload from the run before is removed");
         assert!(!cut_off.join("canisters").exists(), "the bundle's files are removed");
         assert!(ids.is_file(), "the ids are kept");
         // A sweep leaves a recent record where it is.
         deploys.sweep();
         assert!(ids.is_file());
+    }
+
+    /// A second server over a state directory in use is refused before it
+    /// clears anything: what is there belongs to the first, which is alive.
+    #[test]
+    fn a_state_directory_has_one_server_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Deploys::new(&config(), dir.path()).unwrap();
+        let upload = dir.path().join("deploys/uploads").join(format!("{}.tar.gz", "a".repeat(64)));
+        std::fs::write(&upload, "the first server's upload").unwrap();
+
+        let Err(refused) = Deploys::new(&config(), dir.path()) else {
+            panic!("a second server took a directory in use");
+        };
+        assert!(refused.to_string().contains("another running server"), "{refused}");
+        assert!(upload.exists(), "the first server's upload is untouched");
+
+        // A clone is the same server, and the directory is free once the
+        // last of them has gone.
+        let clone = first.clone();
+        drop(first);
+        assert!(Deploys::new(&config(), dir.path()).is_err());
+        drop(clone);
+        Deploys::new(&config(), dir.path()).unwrap();
+    }
+
+    /// A stopping server waits for the deploy that is still ending.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopping_server_waits_for_its_deploys_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let deploys = Deploys::new(&config(), dir.path()).unwrap();
+        let server = server_in(dir.path(), "/mcp", deploys.clone());
+        let tools = IcDeployTools::new(server.identities.clone(), Arc::new(|_: &_| None))
+            .with_slots(deploys.slots.clone());
+        assert!(deploys.stopped().await, "nothing is running");
+
+        let running = tools.claim().unwrap();
+        let ending = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(running);
+        });
+        deploys.stop();
+        assert!(deploys.stopped().await, "the deploy ended within the grace");
+        ending.await.unwrap();
+
+        // One that never ends is given the grace and a margin, no more.
+        let _stuck = tools.claim().unwrap();
+        let started = tokio::time::Instant::now();
+        assert!(!deploys.stopped().await);
+        assert_eq!(started.elapsed(), imcp2_deploy::STOP_GRACE + STOP_MARGIN);
     }
 
     /// Dropping the response body — what a disconnect does — fires the token.
