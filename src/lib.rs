@@ -801,20 +801,28 @@ mod lib_tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "the gate comes first");
 
-        // Within the cap and authenticated: the transport answers, not the cap.
+        // Within the cap and authenticated: the body reaches the transport
+        // whole, and the transport answers the JSON-RPC request it carries. The
+        // `Host` is one the transport allows (it turns any other away before
+        // reading a body), and the `id` in the reply exists nowhere but in the
+        // request body, so a body the cap dropped or cut short could not
+        // produce it.
         let resp = server
             .mcp_router()
             .oneshot(
                 Request::post("/")
+                    .header("host", "mcp.example.com")
                     .header("authorization", &bearer)
                     .header("content-type", "application/json")
                     .header("accept", "application/json, text/event-stream")
-                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
+                    .body(Body::from(r#"{"jsonrpc":"2.0","id":4242,"method":"ping"}"#))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_ne!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let reply: serde_json::Value = serde_json::from_slice(&body).expect("a JSON-RPC reply");
+        assert_eq!(reply, serde_json::json!({ "jsonrpc": "2.0", "id": 4242, "result": {} }));
     }
 }
