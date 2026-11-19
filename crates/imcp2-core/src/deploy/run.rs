@@ -515,9 +515,12 @@ pub async fn deploy_bundle(
             tracing::info!(%ended, "the interrupted run ended");
             outcome.error = Some(interrupted_with(interrupted, &ended));
         }
+        // Not stopped, and failed: the error is the answer, with the same
+        // warning when a call went unanswered — the caller's next move is a
+        // retry, and a retry creates what the mapping does not list.
         Some(Err(e)) => {
             outcome.status = Status::Failed;
-            outcome.error = Some(error_chain(&e));
+            outcome.error = Some(failed_with(&error_chain(&e)));
         }
         None => {
             outcome.status = Status::Interrupted;
@@ -553,8 +556,8 @@ pub async fn deploy_bundle(
             None
         }
     };
-    outcome.canister_ids =
-        ids_for_a_retry(std::mem::take(&mut outcome.canister_ids), stored, &outcome.created);
+    let seeded = std::mem::take(&mut outcome.canister_ids);
+    outcome.canister_ids = ids_for_a_retry(seeded, stored.clone(), &outcome.created);
 
     // The outcome carries everything the directory recorded, but it has not
     // reached the caller yet: it is sent after this returns, and a client
@@ -583,6 +586,30 @@ pub async fn deploy_bundle(
     let stopped = watch.stop.is_cancelled();
     let interrupted = outcome.status == Status::Interrupted || stopped;
     if keeps_its_record(interrupted, &outcome.created) {
+        // The record is for a caller this answer never reaches, so it is
+        // brought up to the answer first: a canister that was created and
+        // that the store did not record is in neither otherwise.
+        if !outcome.created.is_empty() {
+            let (dir, name, ids) = (dir.clone(), env.name.clone(), outcome.canister_ids.clone());
+            let completed =
+                tokio::task::spawn_blocking(move || complete_record(&dir, &name, stored, &ids))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("the write panicked: {e}")));
+            match completed {
+                Ok(false) => {}
+                Ok(true) => {
+                    let line = "the ids the deploy's record was missing were added to it".into();
+                    note(&mut outcome.log, line);
+                }
+                Err(e) => {
+                    let line = format!(
+                        "the deploy's record could not be completed ({e}): `canister_ids` in \
+                         this answer is the only full list of what was created"
+                    );
+                    note(&mut outcome.log, line);
+                }
+            }
+        }
         let pruning = workdir.clone();
         let pruned = tokio::task::spawn_blocking(move || prune_to_record(&pruning)).await;
         if let Ok(Err(e)) = &pruned {
@@ -633,12 +660,25 @@ fn interrupted_with(interrupted: &str, ended: &str) -> String {
     }
     let mut said = format!("{interrupted}. The run ended with: {ended}");
     if ended.contains("went unanswered") {
-        said.push_str(
-            ". A call went unanswered: if it was creating a canister, that canister may exist \
-             without being listed, so check before deploying again",
-        );
+        said.push_str(UNANSWERED);
     }
     said
+}
+
+/// What follows an error chain in which a call went unanswered: the call may
+/// have taken effect all the same.
+const UNANSWERED: &str = ". A call went unanswered: if it was creating a canister, that canister \
+                          may exist without being listed, so check before deploying again";
+
+/// What a deploy that failed says of itself when its run ended in `ended`
+/// (an error chain): the chain, and the warning it calls for when a call
+/// went unanswered — a timeout or a dropped connection after the call was
+/// sent says nothing of whether it took effect.
+fn failed_with(ended: &str) -> String {
+    match ended.contains("went unanswered") {
+        true => format!("{ended}{UNANSWERED}"),
+        false => ended.to_string(),
+    }
 }
 
 /// Run a deploy until it ends or `stop` is cancelled, and say how it ended;
@@ -853,19 +893,39 @@ fn seed_ids(
     icp_project::fs::json::save(&file, ids).map_err(|e| e.to_string())
 }
 
+/// Bring a deploy's record up to `ids`, the mapping its answer carries, when
+/// what the store holds (`stored`; `None` when it could not be read) is not
+/// that already, and say whether it had to be written.
+fn complete_record(
+    dir: &Utf8Path,
+    environment: &str,
+    stored: Option<BTreeMap<String, Principal>>,
+    ids: &BTreeMap<String, Principal>,
+) -> Result<bool, String> {
+    if stored.as_ref() == Some(ids) {
+        return Ok(false);
+    }
+    seed_ids(dir, environment, ids).map(|()| true)
+}
+
 /// Cut a deploy directory down to its record: everything goes but
 /// `.icp/data/mappings`, the ids the deploy created. The bundle's files, the
 /// build scratch and the artifact store are most of a directory and none of
 /// what a retry needs.
+///
+/// Each part of the record's path is gone into only as a directory of the
+/// deploy's own. One that is a link (a directory somebody else made, under a
+/// parent others can write to, may hold one) is removed like anything else
+/// that is not the record: followed, it would have what it points at emptied.
 fn prune_to_record(workdir: &std::path::Path) -> std::io::Result<()> {
     let mut dir = workdir.to_path_buf();
     for keep in RECORD_PATH {
         for entry in std::fs::read_dir(&dir)?.flatten() {
-            if entry.file_name() == keep {
+            // A link is removed, never followed: its type is its own.
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            if is_dir && entry.file_name() == keep {
                 continue;
             }
-            // A link is removed, never followed.
-            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
             let path = entry.path();
             if is_dir {
                 std::fs::remove_dir_all(&path)?;
@@ -874,7 +934,7 @@ fn prune_to_record(workdir: &std::path::Path) -> std::io::Result<()> {
             }
         }
         dir.push(keep);
-        if !dir.is_dir() {
+        if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
             break;
         }
     }
@@ -1640,9 +1700,45 @@ mod tests {
         }
     }
 
-    // What a retry is handed never lacks a canister that exists: the ids
-    // this run created are in the mapping whether the store recorded them,
-    // recorded some of them, or could not be read back at all.
+    // A deploy that failed with a call unanswered was not stopped, and its
+    // caller will try again: it is told that the call may have taken effect.
+    // Any other failure is the error chain and nothing more.
+    #[test]
+    fn a_failed_deploy_warns_of_a_call_that_went_unanswered() {
+        let rejected = "call to 'install_code' on aaaaa-aa was rejected: no";
+        assert_eq!(failed_with(rejected), rejected);
+        let unanswered = "call to 'create_canister' on aaaaa-aa went unanswered: timed out";
+        let said = failed_with(unanswered);
+        assert!(said.starts_with(unanswered), "{said}");
+        assert!(said.contains("may exist without being listed"), "{said}");
+    }
+
+    // The record a deploy leaves is the mapping its answer carries: where
+    // the store recorded less (a write of its own failed) or could not be
+    // read back, the record is written up to it, and left alone otherwise.
+    #[test]
+    fn the_record_is_brought_up_to_the_mapping_the_answer_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let file = dir.path().join(".icp/data/mappings/ic.ids.json");
+        let read = || -> BTreeMap<String, Principal> {
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap()
+        };
+        let seeded: BTreeMap<String, Principal> =
+            [("backend".to_string(), Principal::from_slice(&[1, 1, 1]))].into();
+        let mut all = seeded.clone();
+        all.insert("frontend".to_string(), Principal::from_slice(&[2, 1, 1]));
+        seed_ids(&root, "ic", &seeded).unwrap();
+
+        assert_eq!(complete_record(&root, "ic", Some(seeded.clone()), &seeded), Ok(false));
+        assert_eq!(complete_record(&root, "ic", Some(seeded.clone()), &all), Ok(true));
+        assert_eq!(read(), all);
+        // Not read back: written, whatever it held.
+        seed_ids(&root, "ic", &seeded).unwrap();
+        assert_eq!(complete_record(&root, "ic", None, &all), Ok(true));
+        assert_eq!(read(), all);
+    }
+
     // A run that created a canister keeps its record however it ended: its
     // answer, the one other place the ids are, may never reach the caller.
     #[test]
@@ -1849,6 +1945,37 @@ mod tests {
         // Again changes nothing.
         assert_eq!(prune_abandoned_deploys(parent.path()), 2);
         assert_eq!(files_under(&cut_off), [".icp/data/mappings/ic.ids.json"]);
+    }
+
+    // A part of the record's path that is a link is not gone into: what it
+    // points at is somebody else's, and stays as it was. The link goes, like
+    // anything in a deploy directory that is not the record.
+    #[cfg(unix)]
+    #[test]
+    fn pruning_removes_a_link_where_the_record_would_be_and_never_follows_it() {
+        let parent = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        // The link at each depth of the record's path, to a directory with
+        // a file at every level pruning would empty if it went in.
+        for depth in 0..RECORD_PATH.len() {
+            let dir = deploy_directory(parent.path()).unwrap().keep();
+            let (own, linked) = RECORD_PATH.split_at(depth);
+            let at = own.iter().fold(dir.clone(), |path, part| path.join(part));
+            std::fs::create_dir_all(&at).unwrap();
+            let target = elsewhere.path().join(format!("depth-{depth}"));
+            let mut level = target.clone();
+            for part in linked {
+                std::fs::create_dir_all(&level).unwrap();
+                std::fs::write(level.join("not-the-deploys"), "kept").unwrap();
+                level.push(part);
+            }
+            let untouched = files_under(elsewhere.path());
+            std::os::unix::fs::symlink(&target, at.join(linked[0])).unwrap();
+
+            prune_to_record(&dir).unwrap();
+            assert!(std::fs::symlink_metadata(at.join(linked[0])).is_err(), "depth {depth}");
+            assert_eq!(files_under(elsewhere.path()), untouched, "depth {depth}");
+        }
     }
 
     // A record nobody came for goes once it is old; a recent one, and
