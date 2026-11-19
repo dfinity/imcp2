@@ -1232,8 +1232,10 @@ fn interface_docs(prog: &IDLProg) -> InterfaceDocs {
         for binding in service_bindings(prog, &actor.typ, prog.decs.len() + 1) {
             docs.methods.insert(binding.id.clone(), binding.docs.clone());
             if let IDLType::FuncT(func) = &binding.typ {
-                let args: Vec<TypeDoc> = func.args.iter().map(|ty| type_doc(ty, &[])).collect();
-                let rets: Vec<TypeDoc> = func.rets.iter().map(|ty| type_doc(ty, &[])).collect();
+                let args: Vec<TypeDoc> =
+                    func.args.iter().map(|ty| type_doc(&ty.typ, &[])).collect();
+                let rets: Vec<TypeDoc> =
+                    func.rets.iter().map(|ty| type_doc(&ty.typ, &[])).collect();
                 if args.iter().chain(&rets).any(|doc| !doc.fields.is_empty()) {
                     docs.signatures.insert(binding.id.clone(), (args, rets));
                 }
