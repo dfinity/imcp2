@@ -45,6 +45,16 @@ post-announce-jobs = ["./imcp2-local-install-note", "./imcp2-local-mcpb"]
 # only read access and the job that attests and uploads gets the rest.
 github-custom-job-permissions = { "imcp2-local-mcpb" = { contents = "write", id-token = "write", attestations = "write" } }
 
+# Runners for the release builds, where dist's own default is one GitHub no
+# longer serves. dist 0.31 builds aarch64-apple-darwin on `macos-14`, which
+# GitHub now refuses ("The configuration 'macos-14-arm64-us-default' is not
+# supported"), and a refused build skips the `host` job, so no GitHub release
+# is made at all. The other targets keep dist's defaults. Check this table
+# when bumping `cargo-dist-version`: a newer dist may move its defaults past
+# this, and the entry can then go.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
 # Pin GitHub Actions to exact commit SHAs in the generated release.yml
 [dist.github-action-commits]
 "actions/checkout" = "de0fac2e4500dabe0009e67214ff5f5447ce83dd"          # v6.0.2
