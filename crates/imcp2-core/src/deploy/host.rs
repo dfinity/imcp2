@@ -206,7 +206,8 @@ pub struct BundleLimits {
     /// The most a deploy's directory may come to, in bytes, counted as what
     /// its files and directories occupy ([`occupies`]): what the archive
     /// extracts to and, with that, the copy of each canister's module that
-    /// the deploy keeps beside the bundle (see [`check_bundle`]).
+    /// the deploy keeps beside the bundle (see [`check_bundle`], and there
+    /// for the scratch copies a build holds briefly, which are not counted).
     pub extracted_bytes: u64,
     /// The most files and directories an archive may extract to.
     pub entries: usize,
@@ -832,6 +833,19 @@ impl ScriptRunner for NoScripts {
 /// naming one module would have the deploy write it fifty times over.
 /// `bundle_bytes` is what the bundle itself extracted to; with the copies it
 /// may come to the limit and no more.
+///
+/// One thing is in the directory and not in that count. While a canister is
+/// being built, the library holds a second copy of its module there — the
+/// build's scratch output (`.scratch-*/out.wasm`), written before the
+/// artifact is saved and removed as that canister's build returns — and the
+/// canisters are built at once. So for the length of the build phase a
+/// deploy's directory can pass the limit by what its modules come to: at
+/// most half the limit again, since the bundle and the counted copies hold
+/// each module twice within it. That is left uncounted on purpose, as the
+/// lesser cost: counted, the largest module a server takes would fall from
+/// half the limit to a third. A server whose state directory is a RAM
+/// filesystem leaves that much headroom for each deploy it runs at once
+/// (see the README's "Deploying a project bundle").
 ///
 /// And every sync plugin a canister of the environment names is one the
 /// server runs (`plugins`), by the hash of the module that is about to run.

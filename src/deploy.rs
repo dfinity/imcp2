@@ -135,6 +135,11 @@ pub struct DeployConfig {
     /// an entry each — which is what they cost where the state directory is
     /// a RAM filesystem. An upload is extracted as it arrives and stopped at
     /// the byte that passes this.
+    ///
+    /// Not counted: the scratch copy of each module a deploy's build phase
+    /// holds until that module's build returns. A running deploy can so
+    /// pass this cap for a moment, by what its modules come to — at most
+    /// half the cap again (see [`imcp2_core::deploy::BundleLimits`]).
     pub max_extracted_bytes: usize,
     /// The cap on every bundle the server has at once, extracted, in bytes:
     /// one that is arriving or being deployed counts as
@@ -145,7 +150,10 @@ pub struct DeployConfig {
     ///
     /// Together with [`Self::concurrent`] this is what the deploy tools
     /// keep under the state directory, and so — on a RAM filesystem — what
-    /// they hold of the process's memory besides its heap.
+    /// they hold of the process's memory besides its heap. Size the
+    /// directory with headroom over it: half of
+    /// [`Self::max_extracted_bytes`] for each deploy that runs at once, for
+    /// the scratch copies a build phase holds uncounted.
     pub max_stored_bytes: Option<usize>,
     /// Sync plugins this server runs besides the ones it knows
     /// ([`imcp2_core::deploy::KNOWN_PLUGINS`]), each by the sha256 of its module,

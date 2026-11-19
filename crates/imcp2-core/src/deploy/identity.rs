@@ -51,6 +51,15 @@ impl RefreshingIdentity {
     /// derivation resolves to is the one refreshed from then on: the default
     /// is the user's to change, and a deploy must finish as the principal it
     /// started as.
+    ///
+    /// The unnamed account has no number to ask for, so a deploy that
+    /// started as it asks for the default again at each refresh. That is
+    /// the same account wherever the default cannot be changed, which is so
+    /// at the origin the deploy tools sign in at
+    /// ([`crate::deploy::CLI_ORIGIN`]): the user cannot change the default
+    /// account there. At an origin where they could, a change mid-deploy
+    /// would have every later refresh refused (see
+    /// [`Self::refresh_with`]).
     pub async fn start(
         identities: Identities,
         session_id: String,

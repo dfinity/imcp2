@@ -601,7 +601,15 @@ What the hosted composition adds to the local one:
   (default: one bundle for each deploy that runs at once, and one more): one
   that is arriving or being deployed as the most a bundle may come to, since
   that is what it may grow to, and one that is waiting as what it did come
-  to. Past it a `PUT` is refused (507), and so is a deploy with no room to
+  to. One thing is on disk and uncounted: while a deploy builds its
+  canisters, the icp library holds a scratch copy of each module in the
+  deploy's directory until that module's build returns, so a running deploy
+  can pass `$MCP_DEPLOY_MAX_EXTRACTED_BYTES` for a moment by what its modules
+  come to, at most half of it again (a bundle of one 60 MiB module passes
+  the 128 MiB check at 120 MiB and takes about 180 MiB while it builds).
+  Size a RAM-backed state directory with that headroom for each deploy that
+  runs at once: with the defaults, 384 MiB counted and 128 MiB more. Past
+  the budget a `PUT` is refused (507), and so is a deploy with no room to
   run in, its upload kept for another try. So the most the deploy tools keep
   under the state directory is that budget — 384 MiB by default — beside
   what a running deploy holds on the heap (a module at a time, read to check
