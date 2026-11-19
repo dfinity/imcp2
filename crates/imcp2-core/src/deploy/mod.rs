@@ -111,10 +111,14 @@ pub const DEPLOY_TOOL: &str = "icp_deploy";
 /// The name of the upload-ticket tool, listed only by a server with an
 /// upload store (see [`IcDeployTools::with_uploads`]).
 pub const UPLOAD_TOOL: &str = "icp_deploy_upload";
-/// Where the deploy tool's description stops being the same on every
-/// server: the sentence that the one on how this server takes the bundle
-/// follows (see [`IcDeployTools::tools`]).
-const BEFORE_THE_BUNDLE: &str = "running every phase of `icp deploy`.";
+/// The deploy tool's step on handing the bundle over, as its description
+/// says it: by the upload tool, which only a server with an upload store
+/// lists. A server without one says [`PATH_STEP`] in its place (see
+/// [`IcDeployTools::tools`]).
+const UPLOAD_STEP: &str = "(2) upload that bundle via icp_deploy_upload;";
+/// That step on a server without an upload store, which takes the bundle
+/// by path.
+const PATH_STEP: &str = "(2) pass that bundle's absolute path as `bundle_path`;";
 
 /// A transport's word that the client of a request has gone: a token it
 /// cancels when the connection carrying the request's response is dropped,
@@ -619,11 +623,6 @@ impl IcDeployTools {
     /// nothing a server of the other kind has.
     pub fn tools(&self) -> Vec<Tool> {
         let refused = if self.has_uploads() { "bundle_path" } else { "bundle_upload" };
-        let bundle = if self.has_uploads() {
-            format!("Upload that bundle using `{UPLOAD_TOOL}`.")
-        } else {
-            "Pass that bundle's absolute path as `bundle_path`.".to_string()
-        };
         Self::tool_router()
             .list_all()
             .into_iter()
@@ -637,10 +636,11 @@ impl IcDeployTools {
                         properties.remove(refused);
                     }
                     tool.input_schema = Arc::new(schema);
-                    if let Some(description) = tool.description.take() {
-                        let said = format!("{BEFORE_THE_BUNDLE} {bundle}");
-                        tool.description =
-                            Some(description.replacen(BEFORE_THE_BUNDLE, &said, 1).into());
+                    if !self.has_uploads() {
+                        if let Some(description) = tool.description.take() {
+                            tool.description =
+                                Some(description.replacen(UPLOAD_STEP, PATH_STEP, 1).into());
+                        }
                     }
                 }
                 tool
@@ -1296,10 +1296,10 @@ mod tests {
             // over here, naming nothing a server of the other kind has.
             let said = deploy.description.as_deref().expect("a description");
             let how = match uploads {
-                true => "Upload that bundle using `icp_deploy_upload`.",
-                false => "Pass that bundle's absolute path as `bundle_path`.",
+                true => "(2) upload that bundle via icp_deploy_upload;",
+                false => "(2) pass that bundle's absolute path as `bundle_path`;",
             };
-            let whole = format!("every phase of `icp deploy`. {how} Pass the canister_ids");
+            let whole = format!("`icp project bundle --output <file>.tar.gz`; {how} (3) save the");
             assert!(said.contains(&whole), "{said}");
             assert!(!said.contains(unlisted), "{said}");
             assert_eq!(said.contains(UPLOAD_TOOL), uploads, "{said}");

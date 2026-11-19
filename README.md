@@ -48,7 +48,7 @@ Published on [crates.io](https://crates.io/crates/imcp2), API docs on
 
 ```toml
 [dependencies]
-imcp2 = "0.6"
+imcp2 = "0.7"
 ```
 
 One `McpServer` serves one Internet Identity instance as two
