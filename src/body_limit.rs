@@ -18,18 +18,19 @@ use axum::{
 
 /// The default cap on an MCP request body, in bytes.
 ///
-/// This is a limit on the serialized HTTP request, separate from the IC's own:
-/// an ingress message bounds the *encoded* call (2 MiB), whereas the body here
-/// is JSON that carries the argument as textual Candid, possibly an interface
-/// the caller supplies beside it, and JSON's escaping of both. A call whose
-/// encoded argument the IC would take can therefore still be over this cap.
+/// The cap is a budget for the serialized HTTP request, independent of the two
+/// limits it could be mistaken for. The IC's ingress limit (2 MiB) bounds the
+/// *encoded* call, whereas the body here is JSON that carries the argument as
+/// textual Candid and possibly an interface the caller supplies beside it. The
+/// tools' own limits (1 MiB of text per field) count that text after JSON
+/// decoding; on the wire, JSON's escaping can double it or more, and the
+/// JSON-RPC envelope comes on top.
 ///
-/// The default is sized against what the tools read instead. They take at most
-/// 1 MiB of text per field (the argument, a caller-supplied interface, an OQL
-/// query), and a request with the argument and an interface both at that size
-/// is 2 to 3 MiB as JSON, so a request the tools would act on is not turned
-/// away here first. (Reaching the cap takes both at that size and a client that
-/// also escapes non-ASCII text as `\uXXXX`.) Set another cap with
+/// So 4 MiB is headroom, not a promise that every request the tools would
+/// accept fits. Ordinary requests are far below it, and two fields at the
+/// tools' limit with little to escape come to about 2 MiB. A request whose
+/// fields are near that limit and need heavy escaping can still exceed the
+/// cap, and is then refused with `413`. Set another cap with
 /// [`crate::McpServer::with_max_request_body`]; the `imcp2` binary reads it
 /// from `$MCP_MAX_REQUEST_BODY`.
 pub const DEFAULT_MAX_REQUEST_BODY: usize = 4 * 1024 * 1024;
