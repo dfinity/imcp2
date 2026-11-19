@@ -123,6 +123,20 @@ pub const UPLOAD_TOOL: &str = "icp_deploy_upload";
 #[derive(Clone, Debug)]
 pub struct ClientGone(pub CancellationToken);
 
+/// Whether a deploy that was sent no progress token reports its phases as
+/// log messages: the word of the handler serving the tools ([`WithDeploy`]),
+/// from the level its client last asked for with `logging/setLevel`, left in
+/// the request's extensions. Absent, it does.
+#[derive(Clone, Copy, Debug)]
+pub struct LogMessages(pub bool);
+
+/// Whether a client that asked for log messages from `level` up is sent the
+/// ones a deploy's progress goes out as, which are `info`.
+#[allow(deprecated)]
+pub(crate) fn wants_info(level: LoggingLevel) -> bool {
+    matches!(level, LoggingLevel::Debug | LoggingLevel::Info)
+}
+
 /// The icp CLI's default funding for a canister it creates (`icp deploy
 /// --cycles`): 2 trillion cycles.
 pub const DEFAULT_CYCLES: u64 = 2_000_000_000_000;
@@ -805,8 +819,9 @@ impl IcDeployTools {
         // Each phase reaches the client as it completes, and the client's
         // cancellation of the request stops the deploy.
         let (lines, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let forwarder =
-            tokio::spawn(forward_lines(ctx.peer.clone(), ctx.meta.get_progress_token(), receiver));
+        let log_messages = ctx.extensions.get::<LogMessages>().is_none_or(|log| log.0);
+        let channel = Channel::of(ctx.meta.get_progress_token(), log_messages);
+        let forwarder = tokio::spawn(forward_lines(ctx.peer.clone(), channel, receiver));
         let stopped = stop.clone();
         let watch = Watch { stop, lines: Some(lines) };
         let result = deploy_bundle(identity, request, watch).instrument(span.clone()).await;
@@ -1056,30 +1071,55 @@ async fn delivered(
     false
 }
 
-/// Deliver each log line of a running deploy to the client as it is made: as
-/// a progress notification when the request carried a progress token (which
-/// is also what keeps a client's per-call timeout from running out during a
-/// long deploy), else as a logging message, the one other thing a server may
-/// say mid-call. A client that cannot be reached is not an error here; the
+/// How a running deploy's lines reach its client as they are made.
+#[derive(Debug, PartialEq)]
+enum Channel {
+    /// As progress notifications under the token the request carried, which
+    /// is also what keeps a client's per-call timeout from running out
+    /// during a long deploy.
+    Progress(ProgressToken),
+    /// As log messages at `info`, the one other thing a server may say
+    /// mid-call: the fallback for a client that sent no progress token.
+    Log,
+    /// Not at all: no token, and the client asked for log messages from a
+    /// level above `info` only. The outcome still carries every line.
+    Nowhere,
+}
+
+impl Channel {
+    /// The channel for a request with this progress token, from a client
+    /// that does or does not take log messages at `info` ([`LogMessages`]).
+    /// Progress was asked for by the request itself, whatever the log level.
+    fn of(progress_token: Option<ProgressToken>, log_messages: bool) -> Self {
+        match (progress_token, log_messages) {
+            (Some(token), _) => Self::Progress(token),
+            (None, true) => Self::Log,
+            (None, false) => Self::Nowhere,
+        }
+    }
+}
+
+/// Deliver each log line of a running deploy to the client as it is made,
+/// over `channel`. A client that cannot be reached is not an error here; the
 /// outcome carries every line regardless.
 // MCP logging is deprecated (SEP-2577) but still delivered; it is the
 // fallback for a client that sends no progress token, nothing more.
 #[allow(deprecated)]
 async fn forward_lines(
     peer: Peer<RoleServer>,
-    progress_token: Option<ProgressToken>,
+    channel: Channel,
     mut lines: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
     let mut progress = 0.0;
     while let Some(line) = lines.recv().await {
         progress += 1.0;
-        let _ = match &progress_token {
-            Some(token) => {
+        let _ = match &channel {
+            Channel::Progress(token) => {
                 let param =
                     ProgressNotificationParam::new(token.clone(), progress).with_message(line);
                 peer.notify_progress(param).await
             }
-            None => {
+            Channel::Log => {
                 let param = LoggingMessageNotificationParam::new(
                     LoggingLevel::Info,
                     serde_json::Value::String(line),
@@ -1087,6 +1127,8 @@ async fn forward_lines(
                 .with_logger(DEPLOY_TOOL);
                 peer.notify_logging_message(param).await
             }
+            // Read and dropped, so the run's sender never fills.
+            Channel::Nowhere => continue,
         };
     }
 }
@@ -1421,6 +1463,37 @@ mod tests {
         drop(running);
         waiting.await;
         assert_eq!(slots.running(), 0);
+    }
+
+    // A deploy's progress goes under the progress token its request carried,
+    // whatever log level the client asked for; without a token it falls back
+    // on log messages at `info`, which a client that asked for a higher
+    // level only is not sent.
+    #[test]
+    #[allow(deprecated)]
+    fn progress_falls_back_on_log_messages_the_client_takes() {
+        use rmcp::model::NumberOrString;
+        let token = || ProgressToken(NumberOrString::Number(7));
+        assert_eq!(Channel::of(Some(token()), true), Channel::Progress(token()));
+        assert_eq!(Channel::of(Some(token()), false), Channel::Progress(token()));
+        assert_eq!(Channel::of(None, true), Channel::Log);
+        assert_eq!(Channel::of(None, false), Channel::Nowhere);
+
+        // `info` messages are wanted from `debug` or `info` up, and from no
+        // level above.
+        use LoggingLevel::*;
+        for (level, wanted) in [
+            (Debug, true),
+            (Info, true),
+            (Notice, false),
+            (Warning, false),
+            (Error, false),
+            (Critical, false),
+            (Alert, false),
+            (Emergency, false),
+        ] {
+            assert_eq!(wants_info(level), wanted, "{level:?}");
+        }
     }
 
     // A deploy that has ended answers, and gives its slot back, whether or

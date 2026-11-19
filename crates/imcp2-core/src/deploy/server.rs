@@ -11,6 +11,10 @@
 //! agent does — how the bundle reaches the server — the deploy tools know
 //! themselves, so the paragraph reads from them.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[allow(deprecated)]
+use rmcp::model::SetLevelRequestParams;
 use rmcp::{
     handler::server::tool::ToolCallContext,
     model::{
@@ -22,17 +26,34 @@ use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
 };
 
-use crate::deploy::{skill_document, IcDeployTools, DEPLOY_SKILL_NAME, DEPLOY_SKILL_TITLE};
+use crate::deploy::{
+    skill_document, wants_info, IcDeployTools, LogMessages, DEPLOY_SKILL_NAME, DEPLOY_SKILL_TITLE,
+};
 
 /// An inner handler with the deploy tools served beside it.
 pub struct WithDeploy<H> {
     inner: H,
     deploy: IcDeployTools,
+    /// Whether the client takes the log messages a deploy's progress falls
+    /// back on (see [`Self::sends_log_messages`]).
+    log_messages: AtomicBool,
 }
 
 impl<H: ServerHandler> WithDeploy<H> {
     pub fn new(inner: H, deploy: IcDeployTools) -> Self {
-        Self { inner, deploy }
+        Self { inner, deploy, log_messages: AtomicBool::new(true) }
+    }
+
+    /// Whether a deploy sent no progress token reports its phases as log
+    /// messages: it does until the client asks, with `logging/setLevel`, for
+    /// messages from a level above theirs (`info`) only.
+    ///
+    /// The level is this handler's, so it lasts as long as the handler does:
+    /// the connection, on a server that keeps one (stdio). A stateless HTTP
+    /// server makes a handler for each request, so a level set there is
+    /// accepted and applies to no later call.
+    pub fn sends_log_messages(&self) -> bool {
+        self.log_messages.load(Ordering::Relaxed)
     }
 
     pub fn inner(&self) -> &H {
@@ -77,7 +98,8 @@ impl<H: ServerHandler> ServerHandler for WithDeploy<H> {
         let mut info = self.inner.get_info();
         // A running deploy reports each phase mid-call: as progress when the
         // request carried a token, else as a logging message, which a client
-        // only expects from a server that declares it.
+        // only expects from a server that declares it. Declaring it is also
+        // taking `logging/setLevel`: see `set_level`.
         info.capabilities.logging = Some(Default::default());
         // The inner surface closes by saying it deploys nothing; here that
         // paragraph gives way to the one on how deploying works.
@@ -97,12 +119,28 @@ impl<H: ServerHandler> ServerHandler for WithDeploy<H> {
         Ok(result)
     }
 
+    /// The log level the client asks for: the capability [`Self::get_info`]
+    /// declares is the client's leave to send this. The deploy tools log at
+    /// one level, `info`, so what the level decides is whether they log.
+    // MCP logging is deprecated (SEP-2577) but is what a deploy's progress
+    // falls back on for a client that sends no progress token.
+    #[allow(deprecated)]
+    async fn set_level(
+        &self,
+        request: SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.log_messages.store(wants_info(request.level), Ordering::Relaxed);
+        Ok(())
+    }
+
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         if self.deploy_tool(&request.name).is_some() {
+            context.extensions.insert(LogMessages(self.sends_log_messages()));
             let tcc = ToolCallContext::new(&self.deploy, request, context);
             IcDeployTools::tool_router().call(tcc).await
         } else {
