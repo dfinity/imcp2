@@ -569,7 +569,8 @@ cargo run
 # serves http://0.0.0.0:8000  (MCP at /mcp against production II, OAuth under it; / redirects to the landing site)
 # honours $PORT (default 8000), $PUBLIC_URL (default http://localhost:8000),
 # $MCP_SERVE_BETA (set it to also serve the beta II instance at /mcp-beta, for staging),
-# and $MCP_SERVE_METRICS (set it to serve the Prometheus exposition at /metrics)
+# $MCP_SERVE_METRICS (set it to serve the Prometheus exposition at /metrics),
+# and $MCP_MAX_REQUEST_BODY (the cap on an MCP request body in bytes, default 4 MiB)
 ```
 
 The human-facing pages — the landing page and the `/privacy-policy`,
