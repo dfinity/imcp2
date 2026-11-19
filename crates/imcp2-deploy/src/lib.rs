@@ -731,9 +731,8 @@ impl IcDeployTools {
             Some(Err(e)) => return rejected(e),
             None => {
                 tracing::info!(parent: &span, "deploy stopped before it began");
-                let why = "the deploy was interrupted before it began (the call was cancelled, \
-                           the client went away or the server is stopping); nothing was created";
-                return (err(why.into()), Told::Ended(Ended::Interrupted));
+                let RequestError(why) = RequestError::interrupted();
+                return (err(why), Told::Ended(Ended::Interrupted));
             }
         };
         // Each phase reaches the client as it completes, and the client's
@@ -747,20 +746,19 @@ impl IcDeployTools {
         // delivered what is left.
         let _ = forwarder.await;
         match result {
-            Err(RequestError(e)) => {
-                tracing::warn!(parent: &span, "deploy refused: {e}");
-                rejected(e)
+            Err(refused) => {
+                tracing::warn!(parent: &span, "deploy refused: {refused}");
+                let how = how_it_ended(&Err(refused.was_interrupted()));
+                (err(refused.0), Told::Ended(how))
             }
             Ok(outcome) => {
                 let output = DeployBundleOutput::from_outcome(&outcome);
                 let text = output.human();
+                let how = Told::Ended(how_it_ended(&Ok(outcome.status)));
                 match outcome.status {
-                    Status::Failed => (err_structured(text, &output), Told::Ended(Ended::Failed)),
-                    Status::Interrupted => {
-                        (err_structured(text, &output), Told::Ended(Ended::Interrupted))
-                    }
+                    Status::Failed | Status::Interrupted => (err_structured(text, &output), how),
                     Status::Deployed | Status::NothingToDeploy => {
-                        (ok_structured(text, &output), Told::Ended(Ended::Succeeded))
+                        (ok_structured(text, &output), how)
                     }
                 }
             }
@@ -866,6 +864,20 @@ fn client_gone(ctx: &RequestContext<RoleServer>) -> Option<CancellationToken> {
         .get::<http::request::Parts>()
         .and_then(|parts| parts.extensions.get::<ClientGone>())
         .map(|gone| gone.0.clone())
+}
+
+/// How a deploy that ran, or was refused before it could, is counted:
+/// `Ok` its outcome's status, `Err` a refusal and whether that refusal was a
+/// stop ([`RequestError::was_interrupted`]). A stop is an interruption
+/// whenever it comes — while the bundle is still being read as much as
+/// mid-run — and never a bundle that was rejected.
+fn how_it_ended(result: &Result<Status, bool>) -> Ended {
+    match result {
+        Ok(Status::Deployed | Status::NothingToDeploy) => Ended::Succeeded,
+        Ok(Status::Failed) => Ended::Failed,
+        Ok(Status::Interrupted) | Err(true) => Ended::Interrupted,
+        Err(false) => Ended::Rejected,
+    }
 }
 
 /// What a deploy call tells the observer as it returns.
@@ -1211,6 +1223,21 @@ mod tests {
         let (out, ()) = tokio::join!(waiting, async move { stopper.cancel() });
         assert_eq!(out, None);
         assert_eq!(until(&stop, async { 1 }).await, None, "a stop already asked for comes first");
+    }
+
+    // A deploy stopped while its bundle was still being read is counted as
+    // interrupted, like one stopped mid-run: only a request or bundle that
+    // was itself refused is a rejection.
+    #[test]
+    fn a_stop_is_counted_as_an_interruption_whenever_it_comes() {
+        let stopped_early = RequestError::interrupted();
+        assert_eq!(how_it_ended(&Err(stopped_early.was_interrupted())), Ended::Interrupted);
+        let bad_bundle = RequestError("the archive carries no icp.yaml".into());
+        assert_eq!(how_it_ended(&Err(bad_bundle.was_interrupted())), Ended::Rejected);
+        assert_eq!(how_it_ended(&Ok(Status::Interrupted)), Ended::Interrupted);
+        assert_eq!(how_it_ended(&Ok(Status::Failed)), Ended::Failed);
+        assert_eq!(how_it_ended(&Ok(Status::Deployed)), Ended::Succeeded);
+        assert_eq!(how_it_ended(&Ok(Status::NothingToDeploy)), Ended::Succeeded);
     }
 
     #[tokio::test]

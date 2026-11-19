@@ -173,6 +173,28 @@ pub struct DeployOutcome {
 #[derive(Debug)]
 pub struct RequestError(pub String);
 
+/// What a deploy stopped before it began says. It is still a
+/// [`RequestError`] — nothing was created, and there is no outcome — but it
+/// is not the request's fault, and [`RequestError::was_interrupted`] tells
+/// it from one that is.
+const INTERRUPTED_BEFORE_IT_BEGAN: &str =
+    "the deploy was interrupted before it began (the call was cancelled, the client went away, \
+     or the server is stopping); nothing was created";
+
+impl RequestError {
+    /// The refusal of a deploy that was stopped while its bundle was still
+    /// being read and checked.
+    pub fn interrupted() -> Self {
+        Self(INTERRUPTED_BEFORE_IT_BEGAN.into())
+    }
+
+    /// Whether this is [`Self::interrupted`]: a stop, not a request or a
+    /// bundle that was refused.
+    pub fn was_interrupted(&self) -> bool {
+        self.0 == INTERRUPTED_BEFORE_IT_BEGAN
+    }
+}
+
 impl fmt::Display for RequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -217,11 +239,7 @@ pub async fn deploy_bundle(
     // project's loading and the bundle's checking each do up to a gigabyte
     // of work, so the stop is looked at before each of them.
     let stopped = || match watch.stop.is_cancelled() {
-        true => Err(RequestError(
-            "the deploy was interrupted before it began (the call was cancelled, the client \
-             went away, or the server is stopping); nothing was created"
-                .into(),
-        )),
+        true => Err(RequestError::interrupted()),
         false => Ok(()),
     };
     stopped()?;
@@ -1345,6 +1363,9 @@ mod tests {
         let refused = deploy_bundle(Arc::new(AnonymousIdentity), request, watch).await.unwrap_err();
         assert!(refused.0.contains("interrupted before it began"), "{refused}");
         assert!(refused.0.contains("nothing was created"), "{refused}");
+        // A stop, which a server counts apart from a bundle it refused.
+        assert!(refused.was_interrupted());
+        assert!(!RequestError("no such environment".into()).was_interrupted());
         assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0, "no directory is made");
     }
 

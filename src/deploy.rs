@@ -480,6 +480,25 @@ struct Uploaded {
     expires_in_secs: u64,
 }
 
+/// Counts an upload as a body that never arrived if it is dropped before
+/// the receive has answered; see [`upload`].
+struct Abandoned(Option<Reporting>);
+
+impl Abandoned {
+    /// The receive answered: its own outcome is the one to count.
+    fn answered(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Abandoned {
+    fn drop(&mut self) {
+        if let Some(metrics) = self.0.take().as_ref().and_then(|m| m.0.get()) {
+            metrics.upload(Upload::BodyError, None);
+        }
+    }
+}
+
 /// Receive an archive on the ticket in [`TICKET_HEADER`].
 async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response {
     let count = |outcome: Upload, bytes: Option<usize>| {
@@ -504,7 +523,12 @@ async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response
     let reader = tokio_util::io::StreamReader::new(
         request.into_body().into_data_stream().map_err(std::io::Error::other),
     );
+    // A request abandoned mid-body never returns from the receive: its
+    // future is dropped where it waits. That is a body that did not arrive,
+    // and is counted as one, by the guard, unless the receive answers.
+    let abandoned = Abandoned(Some(mcp.metrics.clone()));
     let received = mcp.uploads.receive(&ticket, declared, reader).await;
+    abandoned.answered();
     count(
         match &received {
             Ok(_) => Upload::Accepted,
@@ -861,8 +885,7 @@ mod tests {
 
         let bearer = format!("Bearer {}", server.store.test_bearer().await);
         let app = server.mcp_router();
-        // An upload with no ticket, one with a ticket nobody minted, and one
-        // that is received.
+        // An upload with no ticket, and one with a ticket nobody minted.
         let put = |ticket: Option<&str>, body: &'static str| {
             let mut put = Request::put(UPLOAD_PATH);
             if let Some(ticket) = ticket {
@@ -872,6 +895,24 @@ mod tests {
         };
         assert_eq!(put(None, "x").await.unwrap().status(), StatusCode::UNAUTHORIZED);
         assert_eq!(put(Some("nope"), "x").await.unwrap().status(), StatusCode::FORBIDDEN);
+        // One abandoned mid-body: the request is dropped while the server
+        // waits for more, and no answer is ever made.
+        let minted = call(&app, &bearer, "icp_deploy_upload", serde_json::json!({})).await;
+        let minted: serde_json::Value = serde_json::from_str(&minted).unwrap();
+        let ticket = minted["result"]["structuredContent"]["ticket"].as_str().unwrap();
+        let never_ends = futures_util::stream::once(async {
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"half"))
+        })
+        .chain(futures_util::stream::pending());
+        let abandoned = Request::put(UPLOAD_PATH)
+            .header(TICKET_HEADER, ticket)
+            .body(Body::from_stream(never_ends))
+            .unwrap();
+        let waited = Duration::from_millis(50);
+        assert!(tokio::time::timeout(waited, app.clone().oneshot(abandoned)).await.is_err());
+
+        // And one that is received (the session's own, so it would have
+        // taken the place of an earlier one it held).
         let minted = call(&app, &bearer, "icp_deploy_upload", serde_json::json!({})).await;
         let minted: serde_json::Value = serde_json::from_str(&minted).unwrap();
         let ticket = minted["result"]["structuredContent"]["ticket"].as_str().unwrap();
@@ -901,6 +942,7 @@ mod tests {
         for series in [
             r#"imcp2_deploy_uploads_total{outcome="bad_ticket"} 2"#,
             r#"imcp2_deploy_uploads_total{outcome="accepted"} 1"#,
+            r#"imcp2_deploy_uploads_total{outcome="body_error"} 1"#,
             "imcp2_deploy_upload_bytes_count 1",
             "imcp2_deploy_upload_bytes_sum 6",
             "imcp2_deploy_uploads_held 1",
