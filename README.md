@@ -638,7 +638,7 @@ What the hosted composition adds to the local one:
   |---|---|
   | `imcp2_deploys_running`, `imcp2_deploy_slots` | How full the server is: deploys holding a slot against the cap. |
   | `imcp2_deploy_refusals_total{reason}` | Deploys not begun: `busy` (every slot held; a sustained rate means the cap is too low), `session_busy`, `stopping`. |
-  | `imcp2_deploys_total{outcome}` | Deploys that held a slot: `succeeded`, `failed`, `rejected` (refused before anything was created), `interrupted`. |
+  | `imcp2_deploys_total{outcome}` | Deploys that held a slot: `succeeded`, `failed`, `rejected` (refused before anything was created, for the request, the bundle, or an identity that could not be derived), `setup_failed` (the server could not prepare it; nothing wrong with the request), `interrupted`. |
   | `imcp2_deploy_duration_seconds` | How long a deploy held its slot. |
   | `imcp2_deploy_uploads_total{outcome}` | Uploads: `accepted`, `bad_ticket`, `too_large`, `store_full`, `session_busy`, `body_error`, `storage_error`. |
   | `imcp2_deploy_upload_bytes` | The size of each accepted archive. |

@@ -50,22 +50,32 @@ pub enum Ended {
     Succeeded,
     /// A phase failed; canisters may have been created.
     Failed,
-    /// The request or its bundle was refused before anything was created:
-    /// bad arguments, no such upload, a bundle outside the rule.
+    /// Refused before anything was created, for what the caller sent or
+    /// holds: bad arguments, no such upload, a bundle outside the rule, or
+    /// an identity that could not be derived for the session (a grant that
+    /// has lapsed, which is the session's; or Internet Identity not
+    /// answering, which is not — the two are not told apart here).
     Rejected,
+    /// Not begun because the server could not prepare it: its directory
+    /// could not be made, or a step of its own failed. Nothing was created,
+    /// and nothing was wrong with the request. A rate of these is the
+    /// server's trouble, not its users'.
+    SetupFailed,
     /// Stopped before it finished: the call cancelled, the client gone, or
     /// the server stopping.
     Interrupted,
 }
 
 impl Ended {
-    pub const ALL: [Self; 4] = [Self::Succeeded, Self::Failed, Self::Rejected, Self::Interrupted];
+    pub const ALL: [Self; 5] =
+        [Self::Succeeded, Self::Failed, Self::Rejected, Self::SetupFailed, Self::Interrupted];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Rejected => "rejected",
+            Self::SetupFailed => "setup_failed",
             Self::Interrupted => "interrupted",
         }
     }

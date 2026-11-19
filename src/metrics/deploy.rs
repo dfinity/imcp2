@@ -124,9 +124,11 @@ impl DeployMetrics {
             deploys: counters(
                 metric!("deploys_total"),
                 "Deploys that held a slot, by how they ended: succeeded, failed (a phase \
-                 failed; canisters may exist), rejected (the request or bundle was refused \
-                 before anything was created), interrupted (cancelled, client gone, or the \
-                 server stopping).",
+                 failed; canisters may exist), rejected (refused before anything was created, \
+                 for the request, the bundle, or an identity that could not be derived for \
+                 the session), setup_failed (the server could not prepare it; nothing was \
+                 wrong with the request), interrupted (cancelled, client gone, or the server \
+                 stopping).",
                 "outcome",
             )?,
             refusals: counters(

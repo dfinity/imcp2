@@ -428,13 +428,29 @@ pub struct DeploySlots {
     total: usize,
     /// The sessions with a deploy running: one each.
     sessions: Arc<Mutex<HashSet<String>>>,
+    /// The deploys holding a slot, counted on their own: what is free of the
+    /// permits says how many could begin, which is not the same thing to
+    /// someone watching them end.
+    running: Arc<Running>,
+}
+
+/// How many deploys hold a slot, and the word to whoever waits for none to.
+#[derive(Default)]
+struct Running {
+    count: std::sync::atomic::AtomicUsize,
+    ended: tokio::sync::Notify,
 }
 
 impl DeploySlots {
     /// Slots for `n` deploys at once (at least one), one per session.
     pub fn new(n: usize) -> Self {
         let n = n.max(1);
-        Self { free: Arc::new(tokio::sync::Semaphore::new(n)), total: n, sessions: Arc::default() }
+        Self {
+            free: Arc::new(tokio::sync::Semaphore::new(n)),
+            total: n,
+            sessions: Arc::default(),
+            running: Arc::default(),
+        }
     }
 
     /// Wait until no deploy holds a slot. For a server that has told its
@@ -442,8 +458,15 @@ impl DeploySlots {
     /// that exited before then would cut off the very answer the deploy is
     /// waiting to record.
     pub async fn idle(&self) {
-        // Every permit at once is every slot free; they go straight back.
-        let _ = self.free.acquire_many(self.total as u32).await;
+        loop {
+            // Listening before looking: a deploy that ends between the two
+            // is not missed.
+            let ended = self.running.ended.notified();
+            if self.running() == 0 {
+                return;
+            }
+            ended.await;
+        }
     }
 
     /// How many deploys there may be at once.
@@ -453,7 +476,7 @@ impl DeploySlots {
 
     /// How many deploys hold a slot now.
     pub fn running(&self) -> usize {
-        self.total.saturating_sub(self.free.available_permits())
+        self.running.count.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -463,6 +486,7 @@ pub struct DeployClaim {
     _permit: tokio::sync::OwnedSemaphorePermit,
     session: Option<String>,
     sessions: Arc<Mutex<HashSet<String>>>,
+    running: Arc<Running>,
 }
 
 impl DeployClaim {
@@ -486,6 +510,8 @@ impl Drop for DeployClaim {
         if let Some(sid) = self.session.take() {
             self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&sid);
         }
+        self.running.count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.running.ended.notify_waiters();
     }
 }
 
@@ -608,7 +634,13 @@ impl IcDeployTools {
     /// Claim a slot for a deploy, or `None` while every slot is held.
     pub fn claim(&self) -> Option<DeployClaim> {
         let permit = self.slots.free.clone().try_acquire_owned().ok()?;
-        Some(DeployClaim { _permit: permit, session: None, sessions: self.slots.sessions.clone() })
+        self.slots.running.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(DeployClaim {
+            _permit: permit,
+            session: None,
+            sessions: self.slots.sessions.clone(),
+            running: self.slots.running.clone(),
+        })
     }
 
     /// The session's identity at [`CLI_ORIGIN`]: its default account there,
@@ -650,10 +682,17 @@ impl IcDeployTools {
             }));
         };
         // From here the call holds a slot until it returns, and what became
-        // of it is told once, as it does.
-        let held_since = Instant::now();
+        // of it is told once, as it does — or as it is dropped, should the
+        // transport give the call up while it runs: the slot goes back
+        // either way, and a deploy that vanished from the count would make
+        // the others look like all there were.
+        let mut telling = Telling {
+            tools: self,
+            held_since: Instant::now(),
+            told: Told::Ended(Ended::Interrupted),
+        };
         let (result, told) = self.deploy_in_slot(claim, args, ctx).await;
-        self.told(told, held_since);
+        telling.told = told;
         Ok(result)
     }
 
@@ -748,13 +787,13 @@ impl IcDeployTools {
         match result {
             Err(refused) => {
                 tracing::warn!(parent: &span, "deploy refused: {refused}");
-                let how = how_it_ended(&Err(refused.was_interrupted()));
+                let how = how_it_ended(Err(&refused));
                 (err(refused.0), Told::Ended(how))
             }
             Ok(outcome) => {
                 let output = DeployBundleOutput::from_outcome(&outcome);
                 let text = output.human();
-                let how = Told::Ended(how_it_ended(&Ok(outcome.status)));
+                let how = Told::Ended(how_it_ended(Ok(outcome.status)));
                 match outcome.status {
                     Status::Failed | Status::Interrupted => (err_structured(text, &output), how),
                     Status::Deployed | Status::NothingToDeploy => {
@@ -867,23 +906,41 @@ fn client_gone(ctx: &RequestContext<RoleServer>) -> Option<CancellationToken> {
 }
 
 /// How a deploy that ran, or was refused before it could, is counted:
-/// `Ok` its outcome's status, `Err` a refusal and whether that refusal was a
-/// stop ([`RequestError::was_interrupted`]). A stop is an interruption
+/// `Ok` its outcome's status, `Err` the refusal. A stop is an interruption
 /// whenever it comes — while the bundle is still being read as much as
-/// mid-run — and never a bundle that was rejected.
-fn how_it_ended(result: &Result<Status, bool>) -> Ended {
+/// mid-run — and never a bundle that was rejected; and a refusal that is the
+/// server's own failure is not one of the request.
+fn how_it_ended(result: Result<Status, &RequestError>) -> Ended {
     match result {
         Ok(Status::Deployed | Status::NothingToDeploy) => Ended::Succeeded,
         Ok(Status::Failed) => Ended::Failed,
-        Ok(Status::Interrupted) | Err(true) => Ended::Interrupted,
-        Err(false) => Ended::Rejected,
+        Ok(Status::Interrupted) => Ended::Interrupted,
+        Err(refused) if refused.was_interrupted() => Ended::Interrupted,
+        Err(refused) if refused.is_server_fault() => Ended::SetupFailed,
+        Err(_) => Ended::Rejected,
     }
 }
 
 /// What a deploy call tells the observer as it returns.
+#[derive(Clone, Copy)]
 enum Told {
     Refused(Refused),
     Ended(Ended),
+}
+
+/// Tells the observer what became of a deploy that holds a slot, when it is
+/// dropped: what the call set it to as it returned, or — never set, the
+/// call's future having been dropped mid-run — that it was interrupted.
+struct Telling<'a> {
+    tools: &'a IcDeployTools,
+    held_since: Instant,
+    told: Told,
+}
+
+impl Drop for Telling<'_> {
+    fn drop(&mut self) {
+        self.tools.told(self.told, self.held_since);
+    }
 }
 
 /// `work`'s output, or `None` if `stop` is cancelled first — or already is:
@@ -1231,13 +1288,52 @@ mod tests {
     #[test]
     fn a_stop_is_counted_as_an_interruption_whenever_it_comes() {
         let stopped_early = RequestError::interrupted();
-        assert_eq!(how_it_ended(&Err(stopped_early.was_interrupted())), Ended::Interrupted);
+        assert_eq!(how_it_ended(Err(&stopped_early)), Ended::Interrupted);
         let bad_bundle = RequestError("the archive carries no icp.yaml".into());
-        assert_eq!(how_it_ended(&Err(bad_bundle.was_interrupted())), Ended::Rejected);
-        assert_eq!(how_it_ended(&Ok(Status::Interrupted)), Ended::Interrupted);
-        assert_eq!(how_it_ended(&Ok(Status::Failed)), Ended::Failed);
-        assert_eq!(how_it_ended(&Ok(Status::Deployed)), Ended::Succeeded);
-        assert_eq!(how_it_ended(&Ok(Status::NothingToDeploy)), Ended::Succeeded);
+        assert_eq!(how_it_ended(Err(&bad_bundle)), Ended::Rejected);
+        // What the server could not do is not held against the request.
+        let no_room = RequestError::server_fault("cannot create a scratch directory: no space");
+        assert_eq!(how_it_ended(Err(&no_room)), Ended::SetupFailed);
+        assert_eq!(how_it_ended(Ok(Status::Interrupted)), Ended::Interrupted);
+        assert_eq!(how_it_ended(Ok(Status::Failed)), Ended::Failed);
+        assert_eq!(how_it_ended(Ok(Status::Deployed)), Ended::Succeeded);
+        assert_eq!(how_it_ended(Ok(Status::NothingToDeploy)), Ended::Succeeded);
+    }
+
+    /// Counts what it is told.
+    #[derive(Default)]
+    struct Tally(Mutex<Vec<String>>);
+
+    impl DeployObserver for Tally {
+        fn refused(&self, why: Refused) {
+            self.0.lock().unwrap().push(format!("refused:{}", why.as_str()));
+        }
+        fn ended(&self, how: Ended, _lasted: std::time::Duration) {
+            self.0.lock().unwrap().push(format!("ended:{}", how.as_str()));
+        }
+    }
+
+    // A deploy call that is dropped while it holds a slot — the transport
+    // giving it up mid-run — is still counted, as interrupted: its slot goes
+    // back, and it must not go missing from what the server ran. One that
+    // returns is counted as what it returned, once.
+    #[test]
+    fn a_deploy_dropped_mid_run_is_counted_as_interrupted() {
+        let tally = Arc::new(Tally::default());
+        let tools = tools().observed_by(tally.clone());
+        let telling =
+            |told| Telling { tools: &tools, held_since: Instant::now(), told: Told::Ended(told) };
+        // Dropped as it was made: the call never set what became of it.
+        drop(telling(Ended::Interrupted));
+        // Returned: set, then dropped.
+        let mut returned = telling(Ended::Interrupted);
+        returned.told = Told::Ended(Ended::Succeeded);
+        drop(returned);
+        let mut refused = telling(Ended::Interrupted);
+        refused.told = Told::Refused(Refused::SessionBusy);
+        drop(refused);
+        let seen = tally.0.lock().unwrap().clone();
+        assert_eq!(seen, ["ended:interrupted", "ended:succeeded", "refused:session_busy"]);
     }
 
     #[tokio::test]
@@ -1246,13 +1342,23 @@ mod tests {
         let tools = tools().with_slots(slots.clone());
         slots.idle().await;
         let running = tools.claim().unwrap();
+        let other = tools.claim().unwrap();
+        assert_eq!(slots.running(), 2);
         let waiting = slots.idle();
         tokio::pin!(waiting);
         let timed = tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting);
-        assert!(timed.await.is_err(), "a deploy is still running");
+        assert!(timed.await.is_err(), "deploys are still running");
+        // The count follows the deploys as they end, wait or no wait: one
+        // gone is one fewer running, not a server that looks full.
+        drop(other);
+        assert_eq!(slots.running(), 1);
+        let timed = tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting);
+        assert!(timed.await.is_err(), "one is still running");
+        assert_eq!(slots.running(), 1, "the wait holds no slot of its own");
+        assert!(tools.claim().is_some(), "nor keeps one from being taken");
         drop(running);
         waiting.await;
-        assert!(tools.claim().is_some(), "waiting took no slot");
+        assert_eq!(slots.running(), 0);
     }
 
     #[tokio::test]

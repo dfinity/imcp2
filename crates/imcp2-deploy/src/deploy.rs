@@ -181,7 +181,25 @@ const INTERRUPTED_BEFORE_IT_BEGAN: &str =
     "the deploy was interrupted before it began (the call was cancelled, the client went away, \
      or the server is stopping); nothing was created";
 
+/// What a refusal that is the server's own fault begins with: see
+/// [`RequestError::server_fault`].
+const SERVER_FAULT: &str = "this server could not prepare the deploy";
+
 impl RequestError {
+    /// A deploy that could not begin for a reason that is the server's: its
+    /// directory could not be made, a step of its own failed. Nothing was
+    /// created and the request may be fine, so it says so — the caller can
+    /// try again, which is no use after a refusal of the bundle — and
+    /// [`Self::is_server_fault`] tells it from one.
+    pub fn server_fault(what: impl fmt::Display) -> Self {
+        Self(format!("{SERVER_FAULT}, and nothing was created; try again later ({what})"))
+    }
+
+    /// Whether this is a [`Self::server_fault`].
+    pub fn is_server_fault(&self) -> bool {
+        self.0.starts_with(SERVER_FAULT)
+    }
+
     /// The refusal of a deploy that was stopped while its bundle was still
     /// being read and checked.
     pub fn interrupted() -> Self {
@@ -256,17 +274,20 @@ pub async fn deploy_bundle(
     let parent = match &request.workdir {
         Some(dir) => {
             std::fs::create_dir_all(dir).map_err(|e| {
-                RequestError(format!("cannot create the deploy directory '{dir}': {e}"))
+                RequestError::server_fault(format!(
+                    "cannot create the deploy directory '{dir}': {e}"
+                ))
             })?;
             dir.as_std_path().to_path_buf()
         }
         None => std::env::temp_dir(),
     };
     stopped()?;
-    let scratch = deploy_directory(&parent)
-        .map_err(|e| RequestError(format!("cannot create a scratch directory: {e}")))?;
+    let scratch = deploy_directory(&parent).map_err(|e| {
+        RequestError::server_fault(format!("cannot create a scratch directory: {e}"))
+    })?;
     let dir = Utf8PathBuf::from_path_buf(scratch.path().to_path_buf()).map_err(|p| {
-        RequestError(format!("scratch directory path is not UTF-8: {}", p.display()))
+        RequestError::server_fault(format!("scratch directory path is not UTF-8: {}", p.display()))
     })?;
     // The extraction owns the directory while it runs: a blocking task is
     // not stopped when this future is dropped, and one that outlived the
@@ -278,7 +299,7 @@ pub async fn deploy_bundle(
             (scratch, fs)
         })
         .await
-        .map_err(|e| RequestError(format!("bundle extraction panicked: {e}")))?;
+        .map_err(|e| RequestError::server_fault(format!("bundle extraction panicked: {e}")))?;
         (scratch, fs.map_err(RequestError)?)
     };
 
@@ -296,7 +317,7 @@ pub async fn deploy_bundle(
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || handle.block_on(project.load()))
             .await
-            .map_err(|e| RequestError(format!("project load panicked: {e}")))?
+            .map_err(|e| RequestError::server_fault(format!("project load panicked: {e}")))?
             .map_err(|e| RequestError(error_chain(&e)))?;
     }
     stopped()?;
@@ -320,7 +341,7 @@ pub async fn deploy_bundle(
             )
         })
         .await
-        .map_err(|e| RequestError(format!("bundle check panicked: {e}")))?
+        .map_err(|e| RequestError::server_fault(format!("bundle check panicked: {e}")))?
         .map_err(RequestError)?;
     }
 
@@ -1366,6 +1387,12 @@ mod tests {
         // A stop, which a server counts apart from a bundle it refused.
         assert!(refused.was_interrupted());
         assert!(!RequestError("no such environment".into()).was_interrupted());
+        // And a failure of the server's own is told from both.
+        let fault = RequestError::server_fault("cannot create a scratch directory: no space");
+        assert!(fault.is_server_fault() && !fault.was_interrupted());
+        assert!(fault.0.contains("try again later") && fault.0.contains("no space"), "{fault}");
+        assert!(!refused.is_server_fault());
+        assert!(!RequestError("no such environment".into()).is_server_fault());
         assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0, "no directory is made");
     }
 
