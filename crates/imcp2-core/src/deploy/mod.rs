@@ -114,6 +114,10 @@ pub const DEPLOY_TOOL: &str = "icp_deploy_bundle";
 /// The name of the upload-ticket tool, listed only by a server with an
 /// upload store (see [`IcDeployTools::with_uploads`]).
 pub const UPLOAD_TOOL: &str = "icp_deploy_upload";
+/// Where the deploy tool's description stops being the same on every
+/// server: the sentence that the one on how this server takes the bundle
+/// follows (see [`IcDeployTools::tools`]).
+const BEFORE_THE_BUNDLE: &str = "running every phase of `icp deploy`.";
 
 /// A transport's word that the client of a request has gone: a token it
 /// cancels when the connection carrying the request's response is dropped,
@@ -608,10 +612,17 @@ impl IcDeployTools {
 
     /// The tools this server lists, which follow from how the bundle reaches
     /// it: `icp_deploy_upload` only where an upload store exists for it to
-    /// mint tickets on, and of the deploy tool's two bundle arguments the one
-    /// this server takes.
+    /// mint tickets on, of the deploy tool's two bundle arguments the one
+    /// this server takes, and in its description the sentence on how to hand
+    /// the bundle over — by the upload tool, or by path — which names
+    /// nothing a server of the other kind has.
     pub fn tools(&self) -> Vec<Tool> {
         let refused = if self.has_uploads() { "bundle_path" } else { "bundle_upload" };
+        let bundle = if self.has_uploads() {
+            format!("Upload that bundle using `{UPLOAD_TOOL}`.")
+        } else {
+            "Pass that bundle's absolute path as `bundle_path`.".to_string()
+        };
         Self::tool_router()
             .list_all()
             .into_iter()
@@ -625,6 +636,11 @@ impl IcDeployTools {
                         properties.remove(refused);
                     }
                     tool.input_schema = Arc::new(schema);
+                    if let Some(description) = tool.description.take() {
+                        let said = format!("{BEFORE_THE_BUNDLE} {bundle}");
+                        tool.description =
+                            Some(description.replacen(BEFORE_THE_BUNDLE, &said, 1).into());
+                    }
                 }
                 tool
             })
@@ -667,7 +683,7 @@ impl IcDeployTools {
     }
 
     #[tool(
-        description = "Deploy an icp project bundle (the .tar.gz that `icp project bundle` writes) to the Internet Computer as the user, running every phase of `icp deploy`: create the bundle's new canisters (funded from the user's cycles balance), wire their ids into each other, apply settings, install or upgrade the code, and run the sync steps (a frontend's asset upload). Pass the bundle the one way this server takes it (the bundle argument listed here), the environment name it was built for (usually \"ic\"), and, to upgrade rather than create, the canister_ids a previous deploy returned. The call lasts as long as the deploy and reports each phase as it completes, as a progress notification (send a progressToken) and a log message; cancelling the call interrupts the deploy at its next step. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure or interruption the mapping still holds every canister that was created.",
+        description = "Deploy an icp project bundle (the .tar.gz that `icp project bundle` writes) to the Internet Computer as the user, running every phase of `icp deploy`. Pass the canister_ids a previous deploy returned to upgrade rather than create anew. The call lasts as long as the deploy and reports each phase as it completes, as a progress notification (send a progressToken) and a log message; cancelling the call interrupts the deploy at its next step. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure or interruption the mapping still holds every canister that was created.",
         annotations(title = "Deploy a project bundle", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<DeployBundleOutput>(),
     )]
@@ -1351,6 +1367,17 @@ mod tests {
             assert!(schema["properties"][listed].is_object(), "{schema}");
             assert!(schema["properties"][unlisted].is_null(), "{schema}");
             assert!(schema["properties"]["environment"].is_object(), "{schema}");
+            // And says, in the tool's description, how to hand the bundle
+            // over here, naming nothing a server of the other kind has.
+            let said = deploy.description.as_deref().expect("a description");
+            let how = match uploads {
+                true => "Upload that bundle using `icp_deploy_upload`.",
+                false => "Pass that bundle's absolute path as `bundle_path`.",
+            };
+            let whole = format!("every phase of `icp deploy`. {how} Pass the canister_ids");
+            assert!(said.contains(&whole), "{said}");
+            assert!(!said.contains(unlisted), "{said}");
+            assert_eq!(said.contains(UPLOAD_TOOL), uploads, "{said}");
         }
     }
 
