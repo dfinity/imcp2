@@ -69,6 +69,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -92,6 +93,7 @@ mod calls;
 mod deploy;
 mod host;
 mod identity;
+mod observe;
 mod server;
 mod uploads;
 
@@ -100,9 +102,10 @@ pub use deploy::{
     DeployRequest, RequestError, Status, Watch, STOP_GRACE,
 };
 use identity::RefreshingIdentity;
+pub use observe::{DeployObserver, Ended, Refused};
 pub use server::WithDeploy;
 pub use uploads::{
-    ReceiveError, Received, Uploads, DEFAULT_MAX_UPLOAD_BYTES, DEFAULT_STORED_UPLOADS,
+    Held, ReceiveError, Received, Uploads, DEFAULT_MAX_UPLOAD_BYTES, DEFAULT_STORED_UPLOADS,
     TICKET_HEADER, TICKET_TTL, UPLOAD_TTL,
 };
 
@@ -409,6 +412,8 @@ pub struct IcDeployTools {
     /// on a server the agent cannot hand a file to. With it the bundle is
     /// an upload; without it, a path.
     uploads: Option<(Uploads, String)>,
+    /// Told how each deploy call went; see [`Self::observed_by`].
+    observer: Option<Arc<dyn DeployObserver>>,
 }
 
 /// How many deploys a server runs at once, and for whom. A clone is the same
@@ -439,6 +444,16 @@ impl DeploySlots {
     pub async fn idle(&self) {
         // Every permit at once is every slot free; they go straight back.
         let _ = self.free.acquire_many(self.total as u32).await;
+    }
+
+    /// How many deploys there may be at once.
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// How many deploys hold a slot now.
+    pub fn running(&self) -> usize {
+        self.total.saturating_sub(self.free.available_permits())
     }
 }
 
@@ -491,7 +506,16 @@ impl IcDeployTools {
             stopping: None,
             deploys_dir: None,
             uploads: None,
+            observer: None,
         }
+    }
+
+    /// Tell `observer` how each deploy call goes — refused, or how it ended
+    /// and how long it held its slot — for a server to count (see
+    /// [`DeployObserver`]).
+    pub fn observed_by(mut self, observer: Arc<dyn DeployObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Run up to `n` deploys at once across sessions (one per session either
@@ -606,13 +630,15 @@ impl IcDeployTools {
     ) -> Result<CallToolResult, McpError> {
         // A server on its way out begins nothing it would have to interrupt.
         if self.stopping.as_ref().is_some_and(|s| s.is_cancelled()) {
+            self.told(Told::Refused(Refused::Stopping), Instant::now());
             return Ok(err("this server is restarting; nothing was deployed. Try again in a \
                            minute, with the same bundle and mapping"
                 .into()));
         }
         // So many deploys at a time, and the refusal reads nothing: it comes
         // even before who is asking.
-        let Some(mut claim) = self.claim() else {
+        let Some(claim) = self.claim() else {
+            self.told(Told::Refused(Refused::Busy), Instant::now());
             return Ok(err(if self.concurrency() == 1 {
                 "a deploy is already running on this server; wait for it to finish, write \
                  the mapping it returns into the project, and deploy again from that"
@@ -623,20 +649,46 @@ impl IcDeployTools {
                     .into()
             }));
         };
+        // From here the call holds a slot until it returns, and what became
+        // of it is told once, as it does.
+        let held_since = Instant::now();
+        let (result, told) = self.deploy_in_slot(claim, args, ctx).await;
+        self.told(told, held_since);
+        Ok(result)
+    }
+
+    /// Tell the observer, if there is one, what became of a deploy call.
+    fn told(&self, told: Told, held_since: Instant) {
+        let Some(observer) = &self.observer else { return };
+        match told {
+            Told::Refused(why) => observer.refused(why),
+            Told::Ended(how) => observer.ended(how, held_since.elapsed()),
+        }
+    }
+
+    /// The deploy call once it holds a slot (`claim`, given back as this
+    /// returns): the answer, and what to tell the observer of it.
+    async fn deploy_in_slot(
+        &self,
+        mut claim: DeployClaim,
+        args: DeployBundleArgs,
+        ctx: RequestContext<RoleServer>,
+    ) -> (CallToolResult, Told) {
+        let rejected = |why: String| (err(why), Told::Ended(Ended::Rejected));
         // Who is asking comes before what they sent: a bundle is read only
         // for a session allowed to deploy, and one deploy per session.
         let Some(sid) = (self.session)(&ctx) else {
-            return Ok(err("deploying a bundle needs an authenticated session".into()));
+            return rejected("deploying a bundle needs an authenticated session".into());
         };
         if let Err(e) = self.identities.require_write(&sid).await {
-            return Ok(err(e));
+            return rejected(e);
         }
         if let Err(e) = claim.for_session(&sid) {
-            return Ok(err(e));
+            return (err(e), Told::Refused(Refused::SessionBusy));
         }
         let (bundle, into_request) = match request_from_args(args, self.has_uploads()) {
             Ok(r) => r,
-            Err(e) => return Ok(err(e)),
+            Err(e) => return rejected(e),
         };
         // An uploaded bundle is the session's own, and the file goes with
         // the handle once the deploy has returned.
@@ -644,16 +696,18 @@ impl IcDeployTools {
             None => (Utf8PathBuf::from(bundle), None),
             Some((uploads, _)) => {
                 let Some(taken) = uploads.take(&bundle, &sid).await else {
-                    return Ok(err(format!(
+                    return rejected(format!(
                         "no upload '{bundle}' for this session: it may have expired ({} minutes \
                          after the upload) or been deployed already; call {UPLOAD_TOOL} and \
                          upload the archive again",
                         UPLOAD_TTL.as_secs() / 60
-                    )));
+                    ));
                 };
                 match Utf8PathBuf::from_path_buf(taken.path().to_path_buf()) {
                     Ok(path) => (path, Some(taken)),
-                    Err(p) => return Ok(err(format!("upload path is not UTF-8: {}", p.display()))),
+                    Err(p) => {
+                        return rejected(format!("upload path is not UTF-8: {}", p.display()))
+                    }
                 }
             }
         };
@@ -674,13 +728,12 @@ impl IcDeployTools {
         let starting = RefreshingIdentity::start(self.identities.clone(), sid, CLI_ORIGIN);
         let identity = match until(&stop, starting).await {
             Some(Ok(id)) => id,
-            Some(Err(e)) => return Ok(err(e)),
+            Some(Err(e)) => return rejected(e),
             None => {
                 tracing::info!(parent: &span, "deploy stopped before it began");
-                return Ok(err("the deploy was interrupted before it began (the call was \
-                               cancelled, the client went away or the server is stopping); \
-                               nothing was created"
-                    .into()));
+                let why = "the deploy was interrupted before it began (the call was cancelled, \
+                           the client went away or the server is stopping); nothing was created";
+                return (err(why.into()), Told::Ended(Ended::Interrupted));
             }
         };
         // Each phase reaches the client as it completes, and the client's
@@ -696,15 +749,20 @@ impl IcDeployTools {
         match result {
             Err(RequestError(e)) => {
                 tracing::warn!(parent: &span, "deploy refused: {e}");
-                Ok(err(e))
+                rejected(e)
             }
             Ok(outcome) => {
                 let output = DeployBundleOutput::from_outcome(&outcome);
                 let text = output.human();
-                Ok(match outcome.status {
-                    Status::Failed | Status::Interrupted => err_structured(text, &output),
-                    Status::Deployed | Status::NothingToDeploy => ok_structured(text, &output),
-                })
+                match outcome.status {
+                    Status::Failed => (err_structured(text, &output), Told::Ended(Ended::Failed)),
+                    Status::Interrupted => {
+                        (err_structured(text, &output), Told::Ended(Ended::Interrupted))
+                    }
+                    Status::Deployed | Status::NothingToDeploy => {
+                        (ok_structured(text, &output), Told::Ended(Ended::Succeeded))
+                    }
+                }
             }
         }
     }
@@ -808,6 +866,12 @@ fn client_gone(ctx: &RequestContext<RoleServer>) -> Option<CancellationToken> {
         .get::<http::request::Parts>()
         .and_then(|parts| parts.extensions.get::<ClientGone>())
         .map(|gone| gone.0.clone())
+}
+
+/// What a deploy call tells the observer as it returns.
+enum Told {
+    Refused(Refused),
+    Ended(Ended),
 }
 
 /// `work`'s output, or `None` if `stop` is cancelled first — or already is:

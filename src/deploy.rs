@@ -80,7 +80,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::Duration,
 };
@@ -103,7 +103,12 @@ use rmcp::transport::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{auth, tools::IcTools, McpServer};
+use crate::{
+    auth,
+    metrics::deploy::{DeployMetrics, Upload},
+    tools::IcTools,
+    McpServer,
+};
 
 /// What a hosted deployment configures of the deploy tools.
 #[derive(Clone, Debug)]
@@ -164,6 +169,30 @@ pub struct Deploys {
     /// Whether the sweeper has been started: one per process, however many
     /// instances ask for it.
     sweeping: Arc<AtomicBool>,
+    /// Where deploys and uploads are counted, once a [`crate::metrics::Metrics`]
+    /// has been made over a server with this state; until then, nowhere.
+    metrics: Reporting,
+}
+
+/// The collectors a process's deploy state reports to, set once (see
+/// [`crate::metrics::Metrics::new`]). It is the deploy tools' observer
+/// itself, so the tools are built before the collectors exist and report to
+/// them from the moment they do.
+#[derive(Clone, Default)]
+struct Reporting(Arc<OnceLock<DeployMetrics>>);
+
+impl imcp2_deploy::DeployObserver for Reporting {
+    fn refused(&self, why: imcp2_deploy::Refused) {
+        if let Some(metrics) = self.0.get() {
+            metrics.refused(why);
+        }
+    }
+
+    fn ended(&self, how: imcp2_deploy::Ended, lasted: Duration) {
+        if let Some(metrics) = self.0.get() {
+            metrics.ended(how, lasted);
+        }
+    }
 }
 
 /// The file in the deploy directory whose lock says a process owns it.
@@ -212,6 +241,7 @@ impl Deploys {
             stopping: CancellationToken::new(),
             _owned: Arc::new(owned),
             sweeping: Arc::default(),
+            metrics: Reporting::default(),
         })
     }
 
@@ -230,6 +260,19 @@ impl Deploys {
     pub async fn stopped(&self) -> bool {
         let within = imcp2_deploy::STOP_GRACE + STOP_MARGIN;
         tokio::time::timeout(within, self.slots.idle()).await.is_ok()
+    }
+
+    /// Count this state's deploys and uploads in `metrics` from now on. The
+    /// first call decides: a second set of collectors is left unfed rather
+    /// than each event being split between two.
+    pub(crate) fn report_to(&self, metrics: DeployMetrics) {
+        let _ = self.metrics.0.set(metrics);
+    }
+
+    /// What is read rather than counted: the deploys running, the slots
+    /// there are, and what the upload store holds.
+    pub(crate) fn gauges(&self) -> (usize, usize, imcp2_deploy::Held) {
+        (self.slots.running(), self.slots.total(), self.uploads.held())
     }
 
     /// Say that the server is stopping: every running deploy is interrupted
@@ -333,6 +376,7 @@ pub(crate) struct DeployMcp {
     /// deploys in the directory — which a second server, finding the lock
     /// free, would clear as leftovers.
     _owned: Arc<std::fs::File>,
+    metrics: Reporting,
 }
 
 impl McpServer {
@@ -355,7 +399,8 @@ impl McpServer {
             .stopped_by(deploys.stopping.clone())
             .deploys_in(&deploys.dir)
             .unwrap_or_else(|e| panic!("the state directory must be a UTF-8 path: {e}"))
-            .with_uploads(uploads.clone(), upload_url);
+            .with_uploads(uploads.clone(), upload_url)
+            .observed_by(Arc::new(deploys.metrics.clone()));
         let service = |transport: StreamableHttpServerConfig| {
             let (agent, identities, deploy) =
                 (self.agent.clone(), self.identities.clone(), deploy.clone());
@@ -379,6 +424,7 @@ impl McpServer {
             sse: service(transport.with_json_response(false)),
             uploads,
             _owned: deploys._owned.clone(),
+            metrics: deploys.metrics.clone(),
         });
         (
             Router::new().fallback(dispatch).with_state(mcp.clone()),
@@ -436,7 +482,13 @@ struct Uploaded {
 
 /// Receive an archive on the ticket in [`TICKET_HEADER`].
 async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response {
+    let count = |outcome: Upload, bytes: Option<usize>| {
+        if let Some(metrics) = mcp.metrics.0.get() {
+            metrics.upload(outcome, bytes);
+        }
+    };
     let Some(ticket) = request.headers().get(TICKET_HEADER).and_then(|v| v.to_str().ok()) else {
+        count(Upload::BadTicket, None);
         return (
             StatusCode::UNAUTHORIZED,
             format!("send the upload ticket in the {TICKET_HEADER} header"),
@@ -452,7 +504,20 @@ async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response
     let reader = tokio_util::io::StreamReader::new(
         request.into_body().into_data_stream().map_err(std::io::Error::other),
     );
-    match mcp.uploads.receive(&ticket, declared, reader).await {
+    let received = mcp.uploads.receive(&ticket, declared, reader).await;
+    count(
+        match &received {
+            Ok(_) => Upload::Accepted,
+            Err(ReceiveError::UnknownTicket) => Upload::BadTicket,
+            Err(ReceiveError::TooLarge(_)) => Upload::TooLarge,
+            Err(ReceiveError::Busy) => Upload::SessionBusy,
+            Err(ReceiveError::Full) => Upload::StoreFull,
+            Err(ReceiveError::Body(_)) => Upload::BodyError,
+            Err(ReceiveError::Storage(_)) => Upload::StorageError,
+        },
+        received.as_ref().ok().map(|r| r.bytes),
+    );
+    match received {
         Ok(received) => (
             StatusCode::CREATED,
             Json(Uploaded {
@@ -756,6 +821,99 @@ mod tests {
             assert!(said.contains("as many deploys as it can"), "{path}: {said}");
         }
         drop(held);
+    }
+
+    /// The deploy series, fed by the real thing: uploads and deploy calls
+    /// through the router, each landing in the one series that names what
+    /// happened, with the gauges read off the state at a refresh. A handle
+    /// made the way an embedder makes it — over the server, nothing more.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deploys_and_uploads_are_counted() {
+        use prometheus::{Encoder, Registry, TextEncoder};
+        let dir = tempfile::tempdir().unwrap();
+        let deploys = Deploys::new(&config(), dir.path()).unwrap();
+        let server = server_in(dir.path(), "/mcp", deploys.clone());
+        let registry = Registry::new();
+        let metrics = crate::metrics::Metrics::new(&registry, "0", "0", 0, &[&server]).unwrap();
+        let scrape = || {
+            let mut out = Vec::new();
+            TextEncoder::new().encode(&registry.gather(), &mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let has = |out: &str, series: &str| {
+            assert!(out.lines().any(|line| line == series), "no {series} in:\n{out}");
+        };
+
+        // Before anything happens every series is there, at zero, and the
+        // cap is already known.
+        let out = scrape();
+        for series in [
+            r#"imcp2_deploys_total{outcome="succeeded"} 0"#,
+            r#"imcp2_deploys_total{outcome="interrupted"} 0"#,
+            r#"imcp2_deploy_refusals_total{reason="busy"} 0"#,
+            r#"imcp2_deploy_uploads_total{outcome="store_full"} 0"#,
+            "imcp2_deploys_running 0",
+            "imcp2_deploy_slots 2",
+            "imcp2_deploy_upload_store_capacity_bytes 8192",
+        ] {
+            has(&out, series);
+        }
+
+        let bearer = format!("Bearer {}", server.store.test_bearer().await);
+        let app = server.mcp_router();
+        // An upload with no ticket, one with a ticket nobody minted, and one
+        // that is received.
+        let put = |ticket: Option<&str>, body: &'static str| {
+            let mut put = Request::put(UPLOAD_PATH);
+            if let Some(ticket) = ticket {
+                put = put.header(TICKET_HEADER, ticket);
+            }
+            app.clone().oneshot(put.body(Body::from(body)).unwrap())
+        };
+        assert_eq!(put(None, "x").await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(put(Some("nope"), "x").await.unwrap().status(), StatusCode::FORBIDDEN);
+        let minted = call(&app, &bearer, "icp_deploy_upload", serde_json::json!({})).await;
+        let minted: serde_json::Value = serde_json::from_str(&minted).unwrap();
+        let ticket = minted["result"]["structuredContent"]["ticket"].as_str().unwrap();
+        assert_eq!(put(Some(ticket), "bundle").await.unwrap().status(), StatusCode::CREATED);
+
+        // A deploy of an upload that does not exist holds a slot for as long
+        // as it takes to say so: rejected, and timed.
+        let deploy = serde_json::json!({ "bundle_upload": "x", "environment": "ic" });
+        call(&app, &bearer, "icp_deploy_bundle", deploy.clone()).await;
+        // With every slot held, the next is refused as busy; and once the
+        // server is stopping, as that.
+        let held = [(); 2].map(|()| {
+            IcDeployTools::new(server.identities.clone(), Arc::new(|_: &_| None))
+                .with_slots(deploys.slots.clone())
+                .claim()
+                .unwrap()
+        });
+        call(&app, &bearer, "icp_deploy_bundle", deploy.clone()).await;
+        metrics.refresh().await;
+        has(&scrape(), "imcp2_deploys_running 2");
+        drop(held);
+        deploys.stop();
+        call(&app, &bearer, "icp_deploy_bundle", deploy).await;
+
+        metrics.refresh().await;
+        let out = scrape();
+        for series in [
+            r#"imcp2_deploy_uploads_total{outcome="bad_ticket"} 2"#,
+            r#"imcp2_deploy_uploads_total{outcome="accepted"} 1"#,
+            "imcp2_deploy_upload_bytes_count 1",
+            "imcp2_deploy_upload_bytes_sum 6",
+            "imcp2_deploy_uploads_held 1",
+            "imcp2_deploy_upload_store_bytes 6",
+            r#"imcp2_deploys_total{outcome="rejected"} 1"#,
+            "imcp2_deploy_duration_seconds_count 1",
+            r#"imcp2_deploy_refusals_total{reason="busy"} 1"#,
+            r#"imcp2_deploy_refusals_total{reason="stopping"} 1"#,
+            r#"imcp2_deploy_refusals_total{reason="session_busy"} 0"#,
+            "imcp2_deploys_running 0",
+        ] {
+            has(&out, series);
+        }
     }
 
     /// Once the server has said it is stopping, a deploy does not begin, and

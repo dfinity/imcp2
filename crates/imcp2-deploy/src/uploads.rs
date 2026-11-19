@@ -237,6 +237,20 @@ impl Drop for Receiving {
     }
 }
 
+/// What an upload store holds at a moment; see [`Uploads::held`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Held {
+    /// The bytes counted against the budget: the reservation of each archive
+    /// arriving, and the size of each waiting or with its deploy.
+    pub bytes: u64,
+    /// The budget.
+    pub max_bytes: u64,
+    /// The archives waiting for their deploy.
+    pub uploads: usize,
+    /// The archives arriving.
+    pub receiving: usize,
+}
+
 impl Uploads {
     /// A store writing its archives under `dir`, each at most `max_bytes`
     /// and [`DEFAULT_STORED_UPLOADS`] times that in all; see
@@ -271,6 +285,17 @@ impl Uploads {
 
     pub fn max_bytes(&self) -> usize {
         self.inner.max_bytes
+    }
+
+    /// What the store holds now, against what it may.
+    pub fn held(&self) -> Held {
+        let state = self.inner.state();
+        Held {
+            bytes: state.bytes,
+            max_bytes: self.inner.max_total_bytes,
+            uploads: state.uploads.len(),
+            receiving: state.receiving.len(),
+        }
     }
 
     /// Drop expired tickets, and expired uploads with their files. Every

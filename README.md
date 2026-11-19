@@ -629,6 +629,27 @@ What the hosted composition adds to the local one:
   deploy are logged at `info` with the session and upload id. The default
   `RUST_LOG=info` shows all of it.
 
+- **Deploys are counted.** A deploy is one `tools/call` inside a `POST`,
+  answered `200` however it went, so the request metrics do not see it. With
+  the deploy tools on, `imcp2::metrics::Metrics` also publishes, as totals for
+  the process:
+
+  | Series | What it answers |
+  |---|---|
+  | `imcp2_deploys_running`, `imcp2_deploy_slots` | How full the server is: deploys holding a slot against the cap. |
+  | `imcp2_deploy_refusals_total{reason}` | Deploys not begun: `busy` (every slot held; a sustained rate means the cap is too low), `session_busy`, `stopping`. |
+  | `imcp2_deploys_total{outcome}` | Deploys that held a slot: `succeeded`, `failed`, `rejected` (refused before anything was created), `interrupted`. |
+  | `imcp2_deploy_duration_seconds` | How long a deploy held its slot. |
+  | `imcp2_deploy_uploads_total{outcome}` | Uploads: `accepted`, `bad_ticket`, `too_large`, `store_full`, `session_busy`, `body_error`, `storage_error`. |
+  | `imcp2_deploy_upload_bytes` | The size of each accepted archive. |
+  | `imcp2_deploy_upload_store_bytes`, `imcp2_deploy_upload_store_capacity_bytes` | What the upload store holds against its budget. |
+  | `imcp2_deploy_uploads_held`, `imcp2_deploy_uploads_arriving` | Uploads waiting for their deploy, and arriving. |
+
+  Every label value is one of those listed; nothing a client sends becomes
+  one. An embedder gets them by building `Metrics` over its servers as it
+  already does: the counters are fed as things happen and the gauges by
+  `Metrics::refresh`.
+
 The feature is off in the default build and on in the native deployment's
 (`deploy/native/build.sh`). An application that embeds the published `imcp2`
 crate turns it on the same way (`features = ["deploy"]`), and `imcp2-deploy`
