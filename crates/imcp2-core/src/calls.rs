@@ -53,9 +53,10 @@ pub struct GetCandidArgs {
     /// refused with the list of every method the service declares, so ask for
     /// fewer at a time; a single method is always answered, with its comments
     /// stripped if that is what it takes. A name the service does not declare is
-    /// an error listing the declared names. Omitted, the complete interface is
-    /// returned when it keeps to the limit; a larger one is refused with the
-    /// list of every method it declares, so pass `methods`.
+    /// an error listing the declared names, and an empty list is refused rather
+    /// than read as no restriction. Omitted, the complete interface is returned
+    /// when it keeps to the limit; a larger one is refused with the list of every
+    /// method it declares, so pass `methods`.
     #[serde(default)]
     pub methods: Option<Vec<String>>,
 }
@@ -64,9 +65,9 @@ pub struct GetCandidArgs {
 /// because clients that read the structured content show the model nothing
 /// else. A reply is kept to 5 KB, except for the two renderings that cannot be
 /// cut further: an interface that could not be parsed, and the one method asked
-/// for when it is over the limit even with its comments stripped. Those are
-/// carried whole here too, since a client that reads only this object has no
-/// other way to get the interface.
+/// for when it is over the limit even without its comments — or has none to
+/// strip. Those are carried whole here too, since a client that reads only this
+/// object has no other way to get the interface.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct GetCandidOutput {
     /// The canister whose interface was read.
@@ -84,8 +85,10 @@ pub struct GetCandidOutput {
     /// True when the interface text is a best effort: the one method asked for
     /// came to more than the 5 KB limit with its comments, so they were stripped
     /// and the signature and type definitions are returned without them. False
-    /// when the text is complete, comments included — always for the complete
-    /// interface.
+    /// when the text carries every comment the interface has for it — always
+    /// for the complete interface, and for the one method asked for when it is
+    /// over the limit with no comment to strip, which comes back whole (see
+    /// `bytes`).
     pub best_effort: bool,
     /// True when the canister declares an OQL query surface. Reads then go through
     /// get_canister_oql_schema and canister_query's `oql` argument, and this server refuses
@@ -951,8 +954,8 @@ fn api_doc_declared(env: &TypeEnv, actor: &Type) -> Option<&'static str> {
 /// Byte limit a `methods` reply keeps to, comments included: small enough to
 /// survive any client's truncation and to be read whole. Over it, a selection of
 /// several methods is refused (ask for fewer at a time) and a single method
-/// comes back with its comments stripped, whatever size that leaves — the
-/// smallest complete answer there is for it.
+/// comes back with its comments stripped — when it has any — whatever size that
+/// leaves: the smallest complete answer there is for it.
 pub(crate) const MAX_SERVICE_SUBSET_BYTES: usize = 5 * 1024;
 
 /// What [`render_candid`] made of a canister's interface for one
@@ -966,8 +969,10 @@ pub struct CandidRendering {
     /// The methods `text` is restricted to, sorted by name; `None` when it is the
     /// complete interface.
     pub methods: Option<Vec<String>>,
-    /// True when `text` is a restricted `.did` whose comments were stripped to
-    /// get under [`MAX_SERVICE_SUBSET_BYTES`] (one method was asked for).
+    /// True when `text` is a restricted `.did` whose comments were stripped
+    /// because with them the one method asked for came to more than
+    /// [`MAX_SERVICE_SUBSET_BYTES`]; false when `text` carries every comment the
+    /// interface has for it — a method over the limit with none to strip included.
     pub best_effort: bool,
     /// Methods the service declares in total; `None` when the interface could not
     /// be parsed, which only the verbatim read survives.
@@ -1000,7 +1005,9 @@ pub struct CandidRendering {
 ///   the result is a plain `service : { … }` that parses and encodes against
 ///   those methods. The text keeps to [`MAX_SERVICE_SUBSET_BYTES`]: over it,
 ///   several methods are refused with every declared name listed, and one
-///   method is answered with its comments stripped, flagged as a best effort.
+///   method is answered whatever its size — with its comments stripped, flagged
+///   as a best effort, when it has any; whole, and not so flagged, when it has
+///   none, the flag saying what was done rather than what size resulted.
 ///
 /// Method names are trimmed and de-duplicated; a name the service does not
 /// declare is an error listing the declared names, so a mistyped name is
@@ -1048,7 +1055,12 @@ pub fn render_candid(did: &str, methods: Option<&[String]>) -> Result<CandidRend
         let prog: IDLProg = match did.parse() {
             Ok(prog) => prog,
             Err(_) if verbatim => return Ok(unparsed()),
-            Err(e) => return Err(only_verbatim(format!("it does not parse as Candid: {e}"))),
+            Err(e) => {
+                return Err(only_verbatim(format!(
+                    "it does not parse as Candid: {}",
+                    quoted_error(e)
+                )))
+            }
         };
         let mut env = TypeEnv::new();
         let actor = match candid_parser::typing::check_prog(&mut env, &prog) {
@@ -1056,12 +1068,19 @@ pub fn render_candid(did: &str, methods: Option<&[String]>) -> Result<CandidRend
             Ok(None) if verbatim => return Ok(unparsed()),
             Ok(None) => return Err(only_verbatim("it declares no service".into())),
             Err(_) if verbatim => return Ok(unparsed()),
-            Err(e) => return Err(only_verbatim(format!("it does not type-check: {e}"))),
+            Err(e) => {
+                return Err(only_verbatim(format!("it does not type-check: {}", quoted_error(e))))
+            }
         };
         let service = match env.as_service(&actor) {
             Ok(service) => service,
             Err(_) if verbatim => return Ok(unparsed()),
-            Err(e) => return Err(only_verbatim(format!("its service type is unusable: {e}"))),
+            Err(e) => {
+                return Err(only_verbatim(format!(
+                    "its service type is unusable: {}",
+                    quoted_error(e)
+                )))
+            }
         };
         let oql = oql_declared(&env, &actor);
         let api_doc_available = api_doc_declared(&env, &actor).is_some();
@@ -1122,9 +1141,10 @@ pub fn render_candid(did: &str, methods: Option<&[String]>) -> Result<CandidRend
 /// definition they use, transitively, and nothing else, printed with the
 /// comments `docs` carries for them — or, when that comes to more than
 /// [`MAX_SERVICE_SUBSET_BYTES`], refused for several methods (the error lists
-/// every method `service` declares) and printed WITHOUT comments for one, as a
-/// best effort (`true` in the result). Must run on the deep stack — it walks and
-/// prints the parsed, untrusted interface (CWE-674).
+/// every method `service` declares) and, for one, printed WITHOUT its comments
+/// as a best effort (`true` in the result) when it has any, and as it is
+/// (`false`) when it has none: one method is always answered. Must run on the
+/// deep stack — it walks and prints the parsed, untrusted interface (CWE-674).
 fn restricted_did(
     env: &TypeEnv,
     docs: &InterfaceDocs,
@@ -1137,7 +1157,7 @@ fn restricted_did(
     // the same closure the binding generators use, so a recursive or mutually
     // recursive definition is chased exactly once.
     let needed: BTreeSet<&str> = candid_parser::bindings::analysis::chase_actor(env, &projected)
-        .map_err(|e| format!("could not resolve the types those methods use: {e}"))?
+        .map_err(|e| format!("could not resolve the types those methods use: {}", quoted_error(e)))?
         .into_iter()
         .collect();
     // In the interface's own order. A name the syntax tree does not declare
@@ -1154,7 +1174,12 @@ fn restricted_did(
         return Ok((commented, false));
     }
     if requested == 1 {
-        return Ok((print_subset(env, &order, &InterfaceDocs::default(), &methods), true));
+        // One method is always answered. Its comments go when it has any — the
+        // best effort the flag reports — and a method whose rendering has none
+        // is returned as it is, not flagged: nothing was stripped from it, and
+        // the flag says what was done, not what size resulted.
+        let stripped = print_subset(env, &order, &InterfaceDocs::default(), &methods);
+        return Ok(if stripped == commented { (commented, false) } else { (stripped, true) });
     }
     Err(format!(
         "the {requested} methods asked for come to {} bytes with the types they use and their \
@@ -1389,6 +1414,37 @@ fn type_text(ty: &Type, doc: Option<&TypeDoc>, indent: &str) -> String {
 /// Budget for the unknown names an error echoes back: the caller's own input,
 /// so a small share of the limit — the declared names are what helps.
 const MAX_UNKNOWN_NAMES_BYTES: usize = 1024;
+
+/// The most of a library's error message a restricted read's error repeats.
+/// The Candid parser and type checker quote what they could not read — the
+/// token, the unbound name, the whole type — so repeated whole, the message
+/// grows with the canister's interface: a dangling text token of U+0001s comes
+/// back at five bytes per character (`\u{1}`), up to several MB from the 1 MiB
+/// [`guard_candid_text`] admits, in the one reply `methods` promises to keep
+/// small. The head and the tail of the message are kept: where the parser
+/// says what it found and, after the quote, where it stopped and what it
+/// expected.
+const MAX_QUOTED_ERROR_BYTES: usize = 512;
+
+/// `message` as a restricted read's error repeats it: whole when it keeps to
+/// [`MAX_QUOTED_ERROR_BYTES`], else its head and tail, cut on character
+/// boundaries, around a count of the bytes left out.
+fn quoted_error(message: impl std::fmt::Display) -> String {
+    let message = message.to_string();
+    if message.len() <= MAX_QUOTED_ERROR_BYTES {
+        return message;
+    }
+    let half = MAX_QUOTED_ERROR_BYTES / 2;
+    let mut head = half;
+    while !message.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = message.len() - half;
+    while !message.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{} […{} bytes left out…] {}", &message[..head], tail - head, &message[tail..])
+}
 
 /// The error for `methods` naming what the service does not declare: the
 /// unknown names (as many as fit a small budget, the rest counted), then every
@@ -3791,7 +3847,8 @@ mod tests {
     // The reply keeps to the byte limit, comments included. Over it, several
     // methods are refused — with every declared method listed, so the caller
     // can choose fewer — and one method is answered with its comments stripped
-    // as a best effort, flagged as such.
+    // as a best effort, flagged as such — or whole and unflagged when it has
+    // none to strip: the flag says what was done, not what size resulted.
     #[test]
     fn render_candid_keeps_to_the_limit_by_refusing_several_or_stripping_one() {
         use super::{render_candid, MAX_SERVICE_SUBSET_BYTES};
@@ -3828,16 +3885,44 @@ mod tests {
         let names = ["c".to_string()];
         let r = render_candid(&did, Some(&names)).expect("renders");
         assert!(!r.best_effort && !r.text.contains("Chatty"), "{}", r.text);
-        // A single method that is over the limit even stripped is still answered:
-        // the smallest complete answer there is for it.
+        // A single method that is over the limit without a comment to strip is
+        // still answered, whole and as it is — the smallest complete answer
+        // there is for it — and NOT flagged: nothing was stripped from it.
         let huge = {
             let fields = (0..400)
                 .map(|i| format!("  f{i} : opt vec record {{ x : nat; y : text }};\n"))
                 .collect::<String>();
             format!("type Huge = record {{\n{fields}}};\nservice : {{ m : (Huge) -> () }}")
         };
-        let r = render_candid(&huge, Some(&["m".to_string()])).expect("best effort");
-        assert!(r.best_effort && r.text.len() > MAX_SERVICE_SUBSET_BYTES, "{} bytes", r.text.len());
+        let names = ["m".to_string()];
+        let whole = render_candid(&huge, Some(&names)).expect("answered whole");
+        assert!(!whole.best_effort, "nothing to strip: {}", whole.text);
+        assert!(whole.text.len() > MAX_SERVICE_SUBSET_BYTES, "{} bytes", whole.text.len());
+        assert!(
+            whole.text.contains("f399 : opt vec record { x : nat; y : text }"),
+            "{}",
+            whole.text
+        );
+        // Comments on another method, not this one: nothing of this method's is
+        // stripped, so the same whole, unflagged answer.
+        let elsewhere = huge
+            .replace("service : { m", "service : {\n  // The other one.\n  other : () -> ();\n  m");
+        let r = render_candid(&elsewhere, Some(&names)).expect("answered whole");
+        assert!(!r.best_effort && r.text == whole.text, "{}", r.text);
+        // Nor is a comment on a type the method does not use: that type is
+        // left out of the sub-service, comment and all.
+        let unused = format!("// Unused.\ntype Other = nat;\n{huge}");
+        let r = render_candid(&unused, Some(&names)).expect("answered whole");
+        assert!(!r.best_effort && r.text == whole.text, "{}", r.text);
+        // With comments of its own that it cannot shed enough of: stripped — to
+        // exactly the comment-free text — and flagged, though still over the limit.
+        let commented = huge.replace(
+            "type Huge = record {\n",
+            "// Everything.\ntype Huge = record {\n  // The first.\n",
+        );
+        let r = render_candid(&commented, Some(&names)).expect("best effort");
+        assert!(r.best_effort, "comments stripped: {}", r.text);
+        assert_eq!(r.text, whole.text, "the comment-free text, byte for byte");
     }
 
     // A selection the service cannot satisfy is an error the caller repairs in
@@ -3919,7 +4004,9 @@ mod tests {
     // restricted read says so and names the read that works.
     #[test]
     fn render_candid_needs_a_parseable_interface_only_for_a_restricted_read() {
-        use super::{render_candid, CandidRendering, MAX_CANDID_TYPE_DECLS};
+        use super::{
+            render_candid, CandidRendering, MAX_CANDID_TYPE_DECLS, MAX_QUOTED_ERROR_BYTES,
+        };
         let too_many_types = format!(
             "{}service : {{ m : () -> () }}",
             (0..=MAX_CANDID_TYPE_DECLS).map(|i| format!("type t{i} = nat; ")).collect::<String>()
@@ -3948,5 +4035,71 @@ mod tests {
             assert!(e.contains(&format!("({} bytes)", did.len())), "says its size: {e}");
             assert!(e.contains("omit `methods`"), "names the read that works: {e}");
         }
+        // What the parser and type checker quote in their messages is the
+        // canister's own text: a dangling text token (five bytes per U+0001, as
+        // the token is printed), an unbound name, a whole type declared as the
+        // service. Repeated whole, the error would grow with the interface — up
+        // to several MB from the 1 MiB the guard admits — in the one reply
+        // `methods` keeps small; it is bounded instead — keeping the words that
+        // say what went wrong, at the start of the message and at its end —
+        // while the verbatim read of the same text still comes back whole.
+        let dangling_text = format!("service : {{ m : () -> () }} \"{}\"", "\u{1}".repeat(100_000));
+        let unbound_name = format!("service : {{ m : ({}) -> () }}", "a".repeat(100_000));
+        let not_a_service = format!(
+            "type T = record {{ {} }}; service : T",
+            (0..10_000).map(|i| format!("f{i} : nat")).collect::<Vec<_>>().join("; ")
+        );
+        for (did, head, tail) in [
+            (&dangling_text, "Unrecognized token `Text(\"\\u{1}", "found at"),
+            (&unbound_name, "Unbound type identifier aaaa", "aaaa"),
+            (&not_a_service, "not a service type: record {", "f9999 : nat;"),
+        ] {
+            let e = render_candid(did, Some(&names)).expect_err("needs a parse");
+            assert!(
+                e.len() < MAX_QUOTED_ERROR_BYTES + 256,
+                "{} bytes of error for a {}-byte interface: {}",
+                e.len(),
+                did.len(),
+                &e[..e.len().min(300)]
+            );
+            let (before, after) = e.split_once("bytes left out…]").expect("says what was cut");
+            assert!(before.contains(head), "the start of the message survives: {e}");
+            assert!(after.contains(tail), "the end of the message survives: {e}");
+            assert!(e.contains("only the complete interface can be read"), "{e}");
+            assert!(e.contains(&format!("({} bytes)", did.len())), "says its size: {e}");
+            assert_eq!(
+                &render_candid(did, None).expect("verbatim").text,
+                did,
+                "whole, as published"
+            );
+        }
+    }
+
+    // A library message a restricted read's error repeats is cut to its head
+    // and tail on character boundaries, with the bytes left out counted; a
+    // short one is repeated as it is.
+    #[test]
+    fn quoted_error_keeps_the_head_and_tail_of_a_long_message() {
+        use super::{quoted_error, MAX_QUOTED_ERROR_BYTES};
+        assert_eq!(quoted_error("Unbound type identifier T"), "Unbound type identifier T");
+        let exact = "x".repeat(MAX_QUOTED_ERROR_BYTES);
+        assert_eq!(quoted_error(&exact), exact, "the limit itself is kept whole");
+        // Three-byte characters, then two-byte ones, so the kept text is seen
+        // to be the START and the END: 256 is not a boundary among the first,
+        // so the head cut moves back to 255 (85 characters); 2,244 is one among
+        // the second, so the tail keeps 256 bytes (128 characters).
+        let long = format!("{}{}", "€".repeat(500), "£".repeat(500));
+        assert_eq!(long.len(), 2_500);
+        assert_eq!(
+            quoted_error(&long),
+            format!("{} […1989 bytes left out…] {}", "€".repeat(85), "£".repeat(128))
+        );
+        // Three-byte characters throughout: the tail cut, at 2,744, is not a
+        // boundary either and moves forward to 2,745 — nothing is split.
+        let long = "€".repeat(1_000);
+        assert_eq!(
+            quoted_error(&long),
+            format!("{} […2490 bytes left out…] {}", "€".repeat(85), "€".repeat(85))
+        );
     }
 }

@@ -1586,8 +1586,9 @@ enum StrictRead {
 enum Overflow {
     /// The document's form bounds its size, so an over-cap body is NOT it: the
     /// app declares nothing here. An SPA catch-all's index.html at the Layer 5
-    /// path is the live case — OISY serves exactly that, and treating it as a
-    /// failed check would refuse to resolve a perfectly healthy app.
+    /// path is the common live case, and treating it as a failed check would
+    /// refuse to resolve a perfectly healthy app
+    /// (`an_over_cap_layer5_page_declares_nothing` pins it offline).
     NotTheDocument,
     /// The document has no size bound of its own, so an over-cap body is a read
     /// we could not finish, not a verdict.
@@ -3897,6 +3898,82 @@ mod tests {
         assert_eq!(r.derivation_origin_source, DerivationSource::Known);
         assert_eq!(r.derivation_origin, "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io");
         assert_eq!(r.application_is_ic, None, "known apps are not probed");
+    }
+
+    // A loopback stand-in for an app's web server, so a test doesn't depend on
+    // what any live site happens to serve. It answers each request by its path
+    // from `routes` (status, body), answers anything else with a 404, and
+    // returns the origin to probe.
+    fn serve_paths(routes: Vec<(&'static str, u16, String)>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+        let origin = format!("http://{}", listener.local_addr().expect("local address"));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let (mut request, mut buf) = (Vec::new(), [0u8; 1024]);
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let path = request.split_whitespace().nth(1).unwrap_or_default();
+                let (status, body) = routes
+                    .iter()
+                    .find(|(p, ..)| *p == path)
+                    .map_or((404, ""), |(_, status, body)| (*status, body.as_str()));
+                let head = format!(
+                    "HTTP/1.1 {status} {}\r\ncontent-type: text/html\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n",
+                    if status == 200 { "OK" } else { "Not Found" },
+                    body.len()
+                );
+                // The client may hang up once it has read enough; that's expected.
+                let _ = stream
+                    .write_all(head.as_bytes())
+                    .and_then(|()| stream.write_all(body.as_bytes()));
+            }
+        });
+        origin
+    }
+
+    fn loopback_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().expect("client")
+    }
+
+    // An app whose SPA serves its index.html for every path, the Layer 5 one
+    // included, declares nothing there. The over-cap page is not the one-line
+    // document, so resolution falls through to the legacy manifest (absent here)
+    // and then the application-origin default. It must NOT be read as a failed
+    // check: that once refused to resolve perfectly healthy apps. This drives the
+    // resolver itself, so the policy it picks for the Layer 5 path is pinned too.
+    #[tokio::test]
+    async fn an_over_cap_layer5_page_declares_nothing() {
+        let page = format!("<!doctype html>{}", " ".repeat(MAX_DERIVATION_ORIGIN_BYTES));
+        let origin = serve_paths(vec![(DERIVATION_ORIGIN_PATH, 200, page)]);
+
+        let r = resolve_declared_origin(&loopback_client(), &origin).await.expect("resolves");
+
+        assert_eq!(r.source, DerivationSource::AppUrlDefault);
+        assert_eq!(r.derivation_origin, origin);
+    }
+
+    // The legacy manifest has no size bound of its own, so an over-cap one is a
+    // read we could not finish, not an absence. Resolution refuses rather than
+    // default past a declaration the manifest may carry.
+    #[tokio::test]
+    async fn an_over_cap_legacy_manifest_is_not_read_as_absent() {
+        let manifest = format!("{{\"padding\":\"{}\"}}", " ".repeat(MAX_META_BYTES));
+        let origin = serve_paths(vec![(LEGACY_MANIFEST_PATH, 200, manifest)]);
+
+        let resolved = resolve_declared_origin(&loopback_client(), &origin).await.map(|r| r.source);
+
+        assert!(
+            matches!(&resolved, Err(e) if e.contains(LEGACY_MANIFEST_PATH)),
+            "an over-cap legacy manifest must not resolve: {resolved:?}"
+        );
     }
 
     // Consistency (networked): every origin in a known app's LIVE
