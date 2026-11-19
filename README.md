@@ -621,6 +621,11 @@ What the hosted composition adds to the local one:
   (`.icp/data/mappings/<environment>.ids.json`), for an operator to hand the
   user. A client that goes away while the bundle is still being extracted and
   checked stops the deploy there, before anything is created.
+- **So does a client that cancels the call.** The stateless transport drops
+  notifications unread, so the dispatch keeps each running deploy call's token
+  by its session and JSON-RPC id, and a `notifications/cancelled` from the same
+  session naming that id cancels it: the deploy stops as above, though the
+  client keeps the response open.
 - **A server that is stopping interrupts its deploys.** A deploy lasts
   minutes and a restart gives the process seconds, so on the shutdown signal
   every running deploy is told to stop before the drain begins: it ends at
@@ -633,12 +638,16 @@ What the hosted composition adds to the local one:
   process in turn waits for its deploys to have ended before it exits, drain
   or no drain: a deploy whose client has gone holds no connection open. A
   deploy that finishes after it was asked to stop keeps its record too, as
-  an interrupted one does.
+  an interrupted one does, and so does any deploy that created a canister:
+  its answer is sent after the deploy returns, and a client that goes away
+  while it is sent would otherwise have no record of the canisters it paid
+  for.
 - **Bounds.** One deploy per session and `$MCP_DEPLOY_MAX_CONCURRENT` across
   sessions and endpoints (the slots are the process's, shared by `/mcp` and
   `/mcp-beta`), refused past the cap rather than queued. Each deploy's
   directory is made under `{state_dir}/deploys`, readable by the server's user
-  alone, and removed when the deploy returns. What an interruption or a
+  alone, and removed when the deploy returns unless it is kept as a record
+  (above). What an interruption or a
   killed process leaves there is bounded too: a start removes the uploads of
   the run before and cuts each cut-off deploy's directory down to its ids
   (having first locked the directory, `deploys/.lock`: a second server
@@ -690,7 +699,7 @@ What the hosted composition adds to the local one:
   | `imcp2_deploy_refusals_total{reason}` | Deploys not begun: `busy` (every slot held; a sustained rate means the cap is too low), `session_busy`, `stopping`, `no_room` (the store had no room for the deploy to run in). |
   | `imcp2_deploys_total{outcome}` | Deploys that held a slot: `succeeded`, `failed`, `rejected` (refused before anything was created, for the request, the bundle, or an identity that could not be derived), `setup_failed` (the server could not prepare it; nothing wrong with the request), `interrupted`. |
   | `imcp2_deploy_duration_seconds` | How long a deploy held its slot. |
-  | `imcp2_deploy_uploads_total{outcome}` | Uploads: `accepted`, `bad_ticket`, `too_large` (the archive), `extracts_too_large` (what it extracts to), `not_a_bundle`, `plugin_not_allowed`, `store_full`, `session_busy`, `body_error`, `storage_error`. |
+  | `imcp2_deploy_uploads_total{outcome}` | Uploads: `accepted`, `bad_ticket`, `too_large` (the archive), `extracts_too_large` (what it extracts to), `not_a_bundle`, `plugin_not_allowed`, `store_full`, `session_busy`, `body_error`, `storage_error`, `stopping` (the server was stopping). |
   | `imcp2_deploy_upload_bytes`, `imcp2_deploy_bundle_extracted_bytes` | The size of each accepted archive, and what it extracted to: where the two limits should sit is read off these. |
   | `imcp2_deploy_upload_store_bytes`, `imcp2_deploy_upload_store_capacity_bytes` | What the deploy tools keep under the state directory, in extracted bytes, against the budget. |
   | `imcp2_deploy_uploads_held`, `imcp2_deploy_uploads_arriving` | Uploads waiting for their deploy, and arriving. |

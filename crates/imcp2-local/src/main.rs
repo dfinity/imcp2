@@ -50,11 +50,17 @@ mod setup;
 #[cfg(all(test, feature = "e2e"))]
 mod e2e_local_login;
 
-use imcp2_core::deploy::IcDeployTools;
+use imcp2_core::deploy::{DeploySlots, IcDeployTools, STOP_GRACE};
 use imcp2_core::{identities::Identities, IcTools, IiInstance};
 use login::SessionSlot;
 use rmcp::ServiceExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// How long past [`STOP_GRACE`] the process waits for a stopped deploy to
+/// have ended: the grace is the deploy's own, and what comes after it —
+/// reading the ids back, cutting its directory down to the record — takes a
+/// moment more. The hosted server waits as long.
+const STOP_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 const HELP: &str = "\
 imcp2-local — Internet Computer MCP server for local use (stdio)
@@ -190,7 +196,11 @@ async fn serve() -> anyhow::Result<()> {
              XDG_DATA_HOME) and start again"
         );
     };
+    // The deploy slot is kept here as well as in the tools, to wait on as
+    // the process ends (below).
+    let slots = DeploySlots::new(1);
     let deploy = IcDeployTools::new(identities.clone(), slot.resolver())
+        .with_slots(slots.clone())
         .deploys_in(&data.join("imcp2-local").join("deploys"))
         .map_err(anyhow::Error::msg)?;
     let auto_open = !truthy("IMCP2_NO_OPEN");
@@ -200,8 +210,22 @@ async fn serve() -> anyhow::Result<()> {
         .serve(rmcp::transport::stdio())
         .await?;
     tracing::info!("imcp2-local serving MCP over stdio");
+    let cancel = service.cancellation_token();
     // Runs until the client closes the pipe (or the service errors).
-    service.waiting().await?;
+    let quit = service.waiting().await;
+    // A deploy may still be running: rmcp waits only five seconds for the
+    // calls in flight when the pipe closes, and returning here would end the
+    // runtime under a deploy waiting on a canister call — one that may have
+    // created, and funded, a canister only its answer names. So every call
+    // still running is cancelled (a deploy stops at its next step and keeps
+    // its record of the canisters it created), and the deploy is waited for,
+    // for as long as a stopped deploy takes to end and no longer, however
+    // the service ended.
+    cancel.cancel();
+    if tokio::time::timeout(STOP_GRACE + STOP_MARGIN, slots.idle()).await.is_err() {
+        tracing::warn!("a deploy had not ended when the server stopped waiting for it");
+    }
+    quit?;
     Ok(())
 }
 

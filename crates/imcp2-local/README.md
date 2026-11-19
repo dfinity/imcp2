@@ -195,11 +195,13 @@ it ran. The bundle is extracted into a working directory under your local
 data directory — `~/.local/share/imcp2-local/deploys/` on Linux,
 `~/Library/Application Support/imcp2-local/deploys/` on macOS,
 `%LOCALAPPDATA%\imcp2-local\deploys\` on Windows — removed once the deploy
-has returned its answer. A deploy that never returns (the server stopped
-mid-way) or is interrupted leaves its directory there, and inside it
-`.icp/data/mappings/<environment>.ids.json` records every canister the
-deploy had created: merge it into the project's mapping before deploying
-again, then delete the directory. Nothing is written to the project the
+has returned its answer, unless it created canisters. A deploy that created
+canisters, that never returns (the server stopped mid-way) or that is
+interrupted leaves its directory there, cut down to
+`.icp/data/mappings/<environment>.ids.json`, which records every canister the
+deploy had created: if your agent never received the deploy's answer, merge it
+into the project's mapping before deploying again. Once the project's mapping
+has the ids, the directory can be deleted. Nothing is written to the project the
 bundle came from.
 
 The server also serves a skill for the agent, `skill://deploy-with-mcp`,

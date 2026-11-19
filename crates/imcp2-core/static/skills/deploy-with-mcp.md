@@ -108,7 +108,12 @@ carry the archive itself. Upload it first:
    minutes, and the exact `curl` command to run.
 2. Run that command with the archive's path in place of `<bundle.tar.gz>`.
    It `PUT`s the archive to the server and prints a JSON answer whose
-   `upload_id` names the upload, held for five minutes: deploy it next. One
+   `upload_id` names the upload, held for five minutes: deploy it next. A
+   refused upload exits non-zero and prints the server's reason instead
+   (the limit it passed, why it is not a bundle, the plugin hash a server
+   does not run): read it before trying again. The command needs curl 7.76
+   or later for `--fail-with-body`; with an older one, drop the flag and
+   read the outcome off the printed answer. One
    upload at a time: a new one replaces the one before it, so upload again
    only to replace. A server that answers that it is full is holding other
    users' bundles: ask for a new ticket and try again in a few minutes.

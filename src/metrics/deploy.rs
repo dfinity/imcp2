@@ -66,10 +66,12 @@ pub(crate) enum Upload {
     BodyError,
     /// The bundle could not be written: the server's fault.
     StorageError,
+    /// The server was stopping: refused, or given up on as it arrived.
+    Stopping,
 }
 
 impl Upload {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Accepted { archive_bytes: 0, bytes: 0 },
         Self::BadTicket,
         Self::TooLarge,
@@ -80,6 +82,7 @@ impl Upload {
         Self::SessionBusy,
         Self::BodyError,
         Self::StorageError,
+        Self::Stopping,
     ];
 
     fn as_str(self) -> &'static str {
@@ -94,6 +97,7 @@ impl Upload {
             Self::SessionBusy => "session_busy",
             Self::BodyError => "body_error",
             Self::StorageError => "storage_error",
+            Self::Stopping => "stopping",
         }
     }
 }
@@ -179,7 +183,7 @@ impl DeployMetrics {
                  plugin this server does not run), store_full (no room in the budget for \
                  all of them), session_busy (another was arriving for the session), \
                  body_error (the transfer failed, stalled or was abandoned), storage_error \
-                 (the server could not write it).",
+                 (the server could not write it), stopping (the server was stopping).",
                 "outcome",
             )?,
             upload_bytes: histogram(

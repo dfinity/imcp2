@@ -18,7 +18,11 @@
 //!   * **The client going away.** The SSE response body is wrapped so that
 //!     its drop — the client disconnecting, or the stream ending — cancels a
 //!     token the deploy tool watches ([`ClientGone`]): a deploy nobody will
-//!     read the answer of stops at its next step.
+//!     read the answer of stops at its next step. The same token is how a
+//!     client's `notifications/cancelled` reaches the deploy it names, which
+//!     the stateless transport would otherwise drop unread: the dispatch
+//!     keeps each running deploy call's token by its session and JSON-RPC
+//!     id, and cancels the one a cancellation from that session names.
 //!   * **How the bundle arrives.** The agent's machine cannot hand this server
 //!     a file, and a tool call carries only what the model writes, so an
 //!     archive is `PUT` to `{mcp_path}/deploy/upload` on a one-time ticket that
@@ -80,10 +84,11 @@
 //! ```
 
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     time::Duration,
 };
@@ -186,8 +191,9 @@ impl DeployConfig {
     }
 }
 
-/// How long the record of an interrupted deploy (the ids it had created) is
-/// kept for someone to come for.
+/// How long the record of a deploy (the ids it had created) is kept for
+/// someone to come for: one that was interrupted, or that created canisters
+/// and may not have got its answer to its client.
 pub const DEPLOY_RECORD_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// How often the sweeper looks for what has lapsed.
@@ -261,15 +267,31 @@ impl Deploys {
     /// refused here instead, having touched nothing.
     ///
     /// Also an error: an entry of [`DeployConfig::allowed_plugins`] that is
-    /// not a sha256. A list read wrong is not run with.
+    /// not a sha256 (a list read wrong is not run with), and a state
+    /// directory whose path is not UTF-8, which the deploy tools could not
+    /// work in.
     pub fn new(config: &DeployConfig, state_dir: &Path) -> std::io::Result<Self> {
         let plugins = imcp2_core::deploy::AllowedPlugins::known_and(&config.allowed_plugins)
             .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?;
         let dir = state_dir.join("deploys");
-        let owned = own_directory(&dir)?;
+        let owned = Arc::new(own_directory(&dir)?);
+        // Named as every deploy will name it, and refused here — before
+        // anything in it is cleared — if a deploy could not: the deploy
+        // tools work with UTF-8 paths alone.
+        let dir = dir.canonicalize()?;
+        if dir.to_str().is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("the deploy directory '{}' is not a UTF-8 path", dir.display()),
+            ));
+        }
+        // The store holds the lock too, for as long as it or a thread
+        // extracting a bundle into it lives: an upload outlives the request
+        // that started it, and so may outlive every handle on this.
         let uploads =
             Uploads::with_budget(dir.join("uploads"), config.limits(), config.stored_bytes())
-                .allowing(plugins);
+                .allowing(plugins)
+                .held_with(owned.clone());
         let cut_off = imcp2_core::deploy::prune_abandoned_deploys(&dir);
         if cut_off > 0 {
             tracing::info!(
@@ -283,7 +305,7 @@ impl Deploys {
             uploads,
             dir,
             stopping: CancellationToken::new(),
-            _owned: Arc::new(owned),
+            _owned: owned,
             sweeping: Arc::default(),
             metrics: Reporting::default(),
         })
@@ -326,6 +348,10 @@ impl Deploys {
     /// waited one out would be cut short by whatever stops the process, the
     /// deploy with it and its answer unsent. Also ends the sweeper.
     ///
+    /// Uploads are stopped with them: one asked for from now on is refused,
+    /// and one still arriving is given up on, so that a slow body cannot
+    /// hold the drain past what the process is given to stop.
+    ///
     /// This only says so: it returns at once, and a deploy with a canister
     /// call in flight goes on until that call is answered. Await
     /// [`Self::stopped`] for the deploys to have ended, before exiting.
@@ -335,12 +361,13 @@ impl Deploys {
     /// that does drain calls this first, for the answers to be sent.
     pub fn stop(&self) {
         self.stopping.cancel();
+        self.uploads.stop();
     }
 
     /// Start the periodic sweep that keeps the deploy directory bounded on
     /// an idle server: uploads past their time are removed (the store sweeps
-    /// only when it is used), and so are the records of interrupted deploys
-    /// older than [`DEPLOY_RECORD_TTL`]. Ends with [`Self::stop`]. Must be
+    /// only when it is used), and so are the deploy records older than
+    /// [`DEPLOY_RECORD_TTL`]. Ends with [`Self::stop`]. Must be
     /// called from within a tokio runtime.
     ///
     /// [`McpServer::spawn_session_reaper`] calls it, so an embedder has no
@@ -371,7 +398,7 @@ impl Deploys {
         self.uploads.sweep();
         let removed = imcp2_core::deploy::remove_old_deploy_records(&self.dir, DEPLOY_RECORD_TTL);
         if removed > 0 {
-            tracing::info!(removed, "removed the records of old interrupted deploys");
+            tracing::info!(removed, "removed the records of old deploys");
         }
     }
 }
@@ -421,7 +448,19 @@ pub(crate) struct DeployMcp {
     /// free, would clear as leftovers.
     _owned: Arc<std::fs::File>,
     metrics: Reporting,
+    /// The deploy calls running: see [`InFlight`].
+    in_flight: InFlight,
 }
+
+/// The deploy calls whose response is still being sent, each by the session
+/// that made it and the JSON-RPC id it was made under — what a
+/// `notifications/cancelled` names — with the token that stops it.
+/// Each entry carries the number its call was given, so that a call gives up
+/// its own place and not one a later call under the same id took.
+type InFlight = Arc<Mutex<HashMap<(String, String), (u64, CancellationToken)>>>;
+
+/// Numbers the deploy calls [`InFlight`] keeps.
+static NEXT_CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl McpServer {
     /// The MCP endpoint with the deploy tools, as two routers: the dispatch
@@ -442,7 +481,9 @@ impl McpServer {
             .with_slots(deploys.slots.clone())
             .stopped_by(deploys.stopping.clone())
             .deploys_in(&deploys.dir)
-            .unwrap_or_else(|e| panic!("the state directory must be a UTF-8 path: {e}"))
+            // `Deploys::new` made the directory and refused a path that is
+            // not UTF-8, which is all this can fail on.
+            .unwrap_or_else(|e| panic!("the deploy directory, checked as it was made: {e}"))
             .with_uploads(uploads.clone(), upload_url)
             .observed_by(Arc::new(deploys.metrics.clone()));
         let service = |transport: StreamableHttpServerConfig| {
@@ -469,6 +510,7 @@ impl McpServer {
             uploads,
             _owned: deploys._owned.clone(),
             metrics: deploys.metrics.clone(),
+            in_flight: InFlight::default(),
         });
         (
             Router::new().fallback(dispatch).with_state(mcp.clone()),
@@ -485,15 +527,97 @@ async fn dispatch(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Respon
         Ok(bytes) => bytes,
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response(),
     };
-    let deploy_call = parts.method == Method::POST && is_deploy_call(&bytes);
-    let mut request = Request::from_parts(parts, Body::from(bytes));
+    let post = parts.method == Method::POST;
+    let deploy_call = post && is_deploy_call(&bytes);
+    // Who is asking, as the bearer gate in front of this established: a
+    // cancellation reaches only the calls of the session that sends it.
+    let session = parts.extensions.get::<auth::AuthedSession>().map(|s| s.session_id.clone());
+    if post {
+        // The transport acknowledges a notification and drops it, so the
+        // deploy a cancellation names is stopped here, before it goes on.
+        if let Some(session) = &session {
+            cancel_named(&mcp.in_flight, session, &bytes);
+        }
+    }
+    let mut request = Request::from_parts(parts, Body::from(bytes.clone()));
     if !deploy_call {
         return mcp.json.handle(request).await.into_response();
     }
     let gone = CancellationToken::new();
     request.extensions_mut().insert(ClientGone(gone.clone()));
+    // Kept by session and request id while the call runs, for a
+    // cancellation to find; a call without either can be stopped only by
+    // its client going away.
+    let registered = session.and_then(|session| register(&mcp.in_flight, session, &bytes, &gone));
     let response = mcp.sse.handle(request).await;
-    cancel_on_drop(response.into_response(), gone)
+    cancel_on_drop(response.into_response(), gone, registered)
+}
+
+/// Keep the deploy call in `body`, made by `session`, in `in_flight` with
+/// `stop`, for a cancellation to find; `None` for a call with no id.
+fn register(
+    in_flight: &InFlight,
+    session: String,
+    body: &[u8],
+    stop: &CancellationToken,
+) -> Option<Registered> {
+    let key = (session, request_id(body)?);
+    // A second call under an id still running is the client's mistake: a
+    // cancellation naming the id then stops the later one.
+    let call = NEXT_CALL.fetch_add(1, Ordering::Relaxed);
+    in_flight.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), (call, stop.clone()));
+    Some(Registered { in_flight: in_flight.clone(), key, call })
+}
+
+/// If `body` is a `notifications/cancelled` from `session`, stop the deploy
+/// call of that session's it names, if one is running.
+fn cancel_named(in_flight: &InFlight, session: &str, body: &[u8]) {
+    let Some(id) = cancelled_request(body) else { return };
+    let key = (session.to_string(), id);
+    let stop =
+        in_flight.lock().unwrap_or_else(|e| e.into_inner()).get(&key).map(|(_, stop)| stop.clone());
+    if let Some(stop) = stop {
+        tracing::info!(session, request = %key.1, "deploy cancelled by the client");
+        stop.cancel();
+    }
+}
+
+/// A deploy call's place in [`InFlight`], given up when its response body
+/// goes — the call has answered, or its client is gone.
+struct Registered {
+    in_flight: InFlight,
+    key: (String, String),
+    /// The number this call was registered under: an entry a later call
+    /// under the same id put in its place is that call's, and stays.
+    call: u64,
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if in_flight.get(&self.key).is_some_and(|(call, _)| *call == self.call) {
+            in_flight.remove(&self.key);
+        }
+    }
+}
+
+/// The JSON-RPC id of the request in `body`, as its JSON text (the form a
+/// `notifications/cancelled` repeats it in), if it has one.
+fn request_id(body: &[u8]) -> Option<String> {
+    let message = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let id = message.get("id").filter(|id| id.is_string() || id.is_number())?;
+    Some(id.to_string())
+}
+
+/// The id of the request `body` cancels, as its JSON text, when `body` is a
+/// `notifications/cancelled`.
+fn cancelled_request(body: &[u8]) -> Option<String> {
+    let message = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    if message["method"] != "notifications/cancelled" {
+        return None;
+    }
+    let id = &message["params"]["requestId"];
+    (id.is_string() || id.is_number()).then(|| id.to_string())
 }
 
 /// Whether `body` is a JSON-RPC `tools/call` of `icp_deploy_bundle`.
@@ -505,10 +629,16 @@ fn is_deploy_call(body: &[u8]) -> bool {
 }
 
 /// `response` with its body wrapped so that dropping the body — the client
-/// disconnecting, or the stream ending — cancels `gone`.
-fn cancel_on_drop(response: Response, gone: CancellationToken) -> Response {
+/// disconnecting, or the stream ending — cancels `gone`, and gives up the
+/// call's place in [`InFlight`] if it has one.
+fn cancel_on_drop(
+    response: Response,
+    gone: CancellationToken,
+    registered: Option<Registered>,
+) -> Response {
     let (parts, body) = response.into_parts();
-    let guard = gone.drop_guard();
+    // Dropped in order: the token is cancelled, then the place given up.
+    let guard = (gone.drop_guard(), registered);
     let stream = futures_util::stream::unfold(
         (body.into_data_stream(), guard),
         |(mut data, guard)| async move { data.next().await.map(|item| (item, (data, guard))) },
@@ -591,6 +721,7 @@ async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response
         Err(ReceiveError::NotABundle(_)) => Upload::NotABundle,
         Err(ReceiveError::PluginNotAllowed(_)) => Upload::PluginNotAllowed,
         Err(ReceiveError::Storage(_)) => Upload::StorageError,
+        Err(ReceiveError::Stopping) => Upload::Stopping,
     });
     match received {
         Ok(received) => (
@@ -625,6 +756,10 @@ async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response
         // directory is not a request the client can correct.
         Err(e @ ReceiveError::Storage(_)) => {
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+        // Not the request's fault, and over once the server is back.
+        Err(e @ ReceiveError::Stopping) => {
+            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
         }
     }
 }
@@ -1256,10 +1391,82 @@ mod tests {
         let gone = CancellationToken::new();
         let pending = futures_util::stream::pending::<Result<axum::body::Bytes, axum::Error>>();
         let response = Response::new(Body::from_stream(pending));
-        let watched = cancel_on_drop(response, gone.clone());
+        let watched = cancel_on_drop(response, gone.clone(), None);
         assert!(!gone.is_cancelled());
         drop(watched);
         assert!(gone.is_cancelled(), "the body's drop must cancel the token");
+    }
+
+    // A cancellation reaches the running deploy call it names — by its own
+    // session and the call's JSON-RPC id, never another session's — and a
+    // call gives up its place when its response goes.
+    #[test]
+    fn a_cancellation_stops_the_deploy_call_it_names() {
+        let call = |id: serde_json::Value| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "icp_deploy_bundle" }
+            })
+            .to_string()
+        };
+        let cancel = |id: serde_json::Value| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": { "requestId": id, "reason": "user stopped it" }
+            })
+            .to_string()
+        };
+        let in_flight = InFlight::default();
+        let stop = CancellationToken::new();
+        let registered =
+            register(&in_flight, "alice".into(), call(serde_json::json!(7)).as_bytes(), &stop);
+        assert!(registered.is_some());
+
+        cancel_named(&in_flight, "mallory", cancel(serde_json::json!(7)).as_bytes());
+        assert!(!stop.is_cancelled(), "another session's cancellation is ignored");
+        cancel_named(&in_flight, "alice", cancel(serde_json::json!(8)).as_bytes());
+        cancel_named(&in_flight, "alice", cancel(serde_json::json!("7")).as_bytes());
+        assert!(!stop.is_cancelled(), "another id, a string id is not a number");
+        cancel_named(&in_flight, "alice", call(serde_json::json!(7)).as_bytes());
+        assert!(!stop.is_cancelled(), "only a cancellation cancels");
+        cancel_named(&in_flight, "alice", cancel(serde_json::json!(7)).as_bytes());
+        assert!(stop.is_cancelled());
+
+        drop(registered);
+        assert!(in_flight.lock().unwrap().is_empty(), "the place is given up");
+
+        // A later call under the same id keeps its place when the earlier
+        // one's goes, and is the one a cancellation stops.
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        let body = call(serde_json::json!("a"));
+        let earlier = register(&in_flight, "alice".into(), body.as_bytes(), &first);
+        let later = register(&in_flight, "alice".into(), body.as_bytes(), &second);
+        drop(earlier);
+        cancel_named(&in_flight, "alice", cancel(serde_json::json!("a")).as_bytes());
+        assert!(second.is_cancelled() && !first.is_cancelled());
+        drop(later);
+        assert!(in_flight.lock().unwrap().is_empty());
+
+        assert!(register(&in_flight, "alice".into(), b"{\"method\":\"x\"}", &first).is_none());
+    }
+
+    // The deploy tools work in UTF-8 paths alone: a state directory whose
+    // path is not one is refused as the state is made, with an error the
+    // embedder can handle, and nothing in it is cleared.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_directory_that_is_not_utf8_is_refused_up_front() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join(std::ffi::OsStr::from_bytes(b"state-\xff"));
+        let leftover = state.join("deploys").join("uploads").join("a".repeat(64));
+        if std::fs::create_dir_all(&leftover).is_err() {
+            // A filesystem that takes UTF-8 names alone cannot hold one.
+            return;
+        }
+        let err = Deploys::new(&config(), &state).err().expect("refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(leftover.exists(), "nothing cleared");
     }
 
     #[test]

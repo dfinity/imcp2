@@ -902,7 +902,7 @@ impl IcDeployTools {
         let minted = uploads.mint(&sid).await;
         let output = UploadTicketOutput {
             curl: format!(
-                "curl -fsS -T <bundle.tar.gz> -H '{TICKET_HEADER}: {}' '{url}'",
+                "curl -sS --fail-with-body -T <bundle.tar.gz> -H '{TICKET_HEADER}: {}' '{url}'",
                 minted.ticket
             ),
             upload_url: url.clone(),

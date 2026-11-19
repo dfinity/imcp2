@@ -102,13 +102,18 @@ pub struct DeployRequest {
     /// Skip the Candid interface compatibility check on upgrades.
     pub skip_candid_check: bool,
     /// Where the deploy's working directory is made (the system temporary
-    /// directory when `None`). A run that finishes or fails removes it. One
-    /// that is interrupted leaves it, cut down to its record
+    /// directory when `None`). A run that created no canister removes it as
+    /// it returns. One that was interrupted, or that created a canister
+    /// however it ended, leaves it, cut down to its record
     /// (`.icp/data/mappings/<environment>.ids.json`, every canister the
     /// deploy created), so a caller who never got the answer can recover the
     /// ids instead of creating a second set; the bundle's own files, which
-    /// the caller still has, go. One cut off with the process leaves it
-    /// whole, for [`prune_abandoned_deploys`] to cut down at the next start.
+    /// the caller still has, go. The answer is not yet delivered when this
+    /// returns — the client can still go away while it is sent — so a
+    /// finished run that created canisters keeps its record too, until it
+    /// expires ([`remove_old_deploy_records`]). One cut off with the process
+    /// leaves it whole, for [`prune_abandoned_deploys`] to cut down at the
+    /// next start.
     pub workdir: Option<Utf8PathBuf>,
 }
 
@@ -389,11 +394,29 @@ pub async fn deploy_bundle(
     // Seed the id store with the mapping the caller passed: from here on the
     // operation sees those canisters as existing, exactly as it would see the
     // ids a previous `icp deploy` recorded in the project's `.icp` directory.
-    for (name, id) in &request.canister_ids {
-        host.set_canister_id_for_env(name, *id, &selection)
-            .await
-            .map_err(|e| RequestError(error_chain(&e)))?;
+    // Every name is checked first, as the store would check each, and the
+    // mapping is then written whole, once — the store's own register reads
+    // and rewrites the file per entry — and off the runtime's workers. The
+    // file is the store's for an environment on the IC, a connected network
+    // (`check_bundle` held it to that), in a directory the bundle could not
+    // have put an `.icp` in.
+    if let Some(name) = request.canister_ids.keys().find(|name| !env.canisters.contains_key(*name))
+    {
+        return Err(RequestError(format!(
+            "canister '{name}' not found in environment '{}'",
+            request.environment
+        )));
     }
+    if !request.canister_ids.is_empty() {
+        let (dir, name, ids) = (dir.clone(), env.name.clone(), request.canister_ids.clone());
+        tokio::task::spawn_blocking(move || seed_ids(&dir, &name, &ids))
+            .await
+            .map_err(|e| RequestError::server_fault(format!("seeding the ids panicked: {e}")))?
+            .map_err(|e| {
+                RequestError::server_fault(format!("could not record the canister ids passed: {e}"))
+            })?;
+    }
+    stopped()?;
 
     let canisters =
         resolve_targets(&host, &selection, &[]).await.map_err(|e| RequestError(error_chain(&e)))?;
@@ -533,12 +556,13 @@ pub async fn deploy_bundle(
     outcome.canister_ids =
         ids_for_a_retry(std::mem::take(&mut outcome.canister_ids), stored, &outcome.created);
 
-    // The outcome carries everything the directory recorded; the directory
-    // has done its job. Not after an interruption: the one who asked for it
-    // may be a client that went away and will never read this outcome, so
-    // the directory stays as the record — cut down to it, since the bundle's
-    // files are the caller's to send again and a directory per interrupted
+    // The outcome carries everything the directory recorded, but it has not
+    // reached the caller yet: it is sent after this returns, and a client
+    // that goes away while it is sent never reads it. So a run that created
+    // a canister keeps the directory as the record — cut down to it, since
+    // the bundle's files are the caller's to send again and a directory per
     // run would otherwise hold a bundle each (see [`DeployRequest::workdir`]).
+    // Only a run that created nothing has nothing to lose by removing it.
     drop(host);
     match &outcome.error {
         None => tracing::info!(
@@ -557,22 +581,32 @@ pub async fn deploy_bundle(
     // to its end in the time it was given, but whoever asked for the stop may
     // be the client, gone, and the ids it never read are in the record alone.
     let stopped = watch.stop.is_cancelled();
-    if outcome.status == Status::Interrupted || stopped {
+    let interrupted = outcome.status == Status::Interrupted || stopped;
+    if keeps_its_record(interrupted, &outcome.created) {
         let pruning = workdir.clone();
         let pruned = tokio::task::spawn_blocking(move || prune_to_record(&pruning)).await;
         if let Ok(Err(e)) = &pruned {
             tracing::warn!(dir = %workdir.display(), %e, "could not cut the directory down");
         }
-        let line = format!(
-            "{}; the deploy directory '{}' is kept, with the ids it recorded",
-            if outcome.status == Status::Interrupted {
-                "interrupted"
-            } else {
-                "asked to stop as it finished"
-            },
-            workdir.display()
-        );
-        note(&mut outcome.log, line);
+        if interrupted {
+            let line = format!(
+                "{}; the deploy directory '{}' is kept, with the ids it recorded",
+                if outcome.status == Status::Interrupted {
+                    "interrupted"
+                } else {
+                    "asked to stop as it finished"
+                },
+                workdir.display()
+            );
+            note(&mut outcome.log, line);
+        } else {
+            // Said to the server's log alone: a caller reading this outcome
+            // has the ids already, and the record is for one that does not.
+            tracing::info!(
+                dir = %workdir.display(),
+                "the deploy created canisters; its directory is kept with the ids it recorded"
+            );
+        }
     } else if let Err(e) = tokio::fs::remove_dir_all(&workdir).await {
         let line = format!("removing the deploy directory '{}' failed: {e}", workdir.display());
         note(&mut outcome.log, line);
@@ -796,6 +830,28 @@ const DEPLOY_DIR_PREFIX: &str = "imcp2-deploy-";
 /// The path, inside a deploy directory, of the record a cut-off deploy
 /// leaves: the id mappings, one file per environment.
 const RECORD_PATH: [&str; 3] = [".icp", "data", "mappings"];
+
+/// Whether a deploy's directory stays, cut down to its record, as the
+/// deploy returns: after an interruption, and after any run that created a
+/// canister, whose ids the caller may never receive (see
+/// [`DeployRequest::workdir`]).
+fn keeps_its_record(interrupted: bool, created: &[(String, Principal)]) -> bool {
+    interrupted || !created.is_empty()
+}
+
+/// Write `ids` as the id store's mapping for `environment` on a connected
+/// network, under the project root `dir`: the file the store's register
+/// writes one entry at a time, written once.
+fn seed_ids(
+    dir: &Utf8Path,
+    environment: &str,
+    ids: &BTreeMap<String, Principal>,
+) -> Result<(), String> {
+    let mappings = RECORD_PATH.iter().fold(dir.to_path_buf(), |path, part| path.join(part));
+    std::fs::create_dir_all(&mappings).map_err(|e| e.to_string())?;
+    let file = mappings.join(format!("{environment}.ids.json"));
+    icp_project::fs::json::save(&file, ids).map_err(|e| e.to_string())
+}
 
 /// Cut a deploy directory down to its record: everything goes but
 /// `.icp/data/mappings`, the ids the deploy created. The bundle's files, the
@@ -1587,6 +1643,45 @@ mod tests {
     // What a retry is handed never lacks a canister that exists: the ids
     // this run created are in the mapping whether the store recorded them,
     // recorded some of them, or could not be read back at all.
+    // A run that created a canister keeps its record however it ended: its
+    // answer, the one other place the ids are, may never reach the caller.
+    #[test]
+    fn a_run_that_created_a_canister_keeps_its_record() {
+        let created = [("backend".to_string(), Principal::management_canister())];
+        assert!(keeps_its_record(false, &created), "finished, or failed, having created one");
+        assert!(keeps_its_record(true, &created));
+        assert!(keeps_its_record(true, &[]), "interrupted: a call may have created one");
+        assert!(!keeps_its_record(false, &[]), "nothing created, nothing to keep");
+    }
+
+    // The mapping a caller passes is written once, as the file the id store
+    // reads: the store itself, looking at the project root, finds every id.
+    #[test]
+    fn the_seeded_mapping_is_the_one_the_id_store_reads() {
+        use icp_project::{
+            manifest::{ProjectRootLocate, ProjectRootLocateError},
+            store_id::{Access, AccessImpl},
+        };
+        struct Root(Utf8PathBuf);
+        impl ProjectRootLocate for Root {
+            fn locate(&self) -> Result<Utf8PathBuf, ProjectRootLocateError> {
+                Ok(self.0.clone())
+            }
+            fn locate_member(&self) -> Result<Utf8PathBuf, ProjectRootLocateError> {
+                Ok(self.0.clone())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let ids: BTreeMap<String, Principal> = (0..50u8)
+            .map(|n| (format!("canister-{n}"), Principal::from_slice(&[n, 1, 1])))
+            .collect();
+        seed_ids(&root, "ic", &ids).unwrap();
+        let store = AccessImpl::new(Arc::new(Root(root)));
+        // Connected, the IC: the data store, not the cache.
+        assert_eq!(store.lookup_by_environment(false, "ic").unwrap(), ids);
+    }
+
     #[test]
     fn the_mapping_for_a_retry_holds_every_created_canister() {
         let id = |n: u8| Principal::from_slice(&[n]);

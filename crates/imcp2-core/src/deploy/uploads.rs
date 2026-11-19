@@ -71,6 +71,7 @@ use std::{
 
 use camino::Utf8PathBuf;
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::deploy::host::{self, AllowedPlugins, BundleLimits, ExtractError, VetError};
 
@@ -117,6 +118,16 @@ struct Inner {
     /// [`UPLOAD_IDLE`] and [`UPLOAD_TIME`], which a test shortens.
     patience: (Duration, Duration),
     state: Mutex<State>,
+    /// Whatever the server holds for as long as anything works in the
+    /// directory (see [`Uploads::held_with`]): kept here, it lives as long as
+    /// the store and every thread that extracts or removes a bundle for it.
+    lease: std::sync::OnceLock<Arc<dyn std::any::Any + Send + Sync>>,
+    /// Cancelled when the server begins to stop: see [`Uploads::stop`].
+    stopping: CancellationToken,
+    /// Removals running on their own, not awaited by anything: a taken
+    /// bundle's, dropped where a deploy returned. Counted for a test to wait
+    /// on.
+    removing: std::sync::atomic::AtomicUsize,
 }
 
 impl Inner {
@@ -125,6 +136,34 @@ impl Inner {
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// Remove bundles that have left the store, and only then give back the
+    /// room they held: a bundle is charged until its files are gone. Blocks
+    /// on the filesystem, and never with the state locked: a bundle can be
+    /// thousands of files, and every operation of the store waits on that
+    /// lock.
+    fn remove(&self, doomed: Doomed) {
+        for (dir, bytes) in doomed {
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut state = self.state();
+            state.bytes = state.bytes.saturating_sub(bytes);
+        }
+    }
+}
+
+/// Bundles on their way out of the store: each one's directory, and the
+/// bytes it is charged until that directory has been removed.
+type Doomed = Vec<(PathBuf, u64)>;
+
+/// Remove `doomed` on a blocking thread, and wait for it: for the store's
+/// async operations, which must not block the runtime's workers on the
+/// filesystem.
+async fn remove_off_the_runtime(store: &Arc<Inner>, doomed: Doomed) {
+    if doomed.is_empty() {
+        return;
+    }
+    let store = store.clone();
+    let _ = tokio::task::spawn_blocking(move || store.remove(doomed)).await;
 }
 
 #[derive(Default)]
@@ -188,6 +227,9 @@ pub enum ReceiveError {
     /// The bundle could not be stored (the directory not made, a file not
     /// written): the server's fault, not the request's.
     Storage(String),
+    /// The server is stopping: the upload was refused, or given up on as it
+    /// arrived.
+    Stopping,
 }
 
 impl std::fmt::Display for ReceiveError {
@@ -217,6 +259,10 @@ impl std::fmt::Display for ReceiveError {
             ReceiveError::Body(e) => write!(f, "could not read the archive: {e}"),
             ReceiveError::NotABundle(e) | ReceiveError::PluginNotAllowed(e) => f.write_str(e),
             ReceiveError::Storage(e) => write!(f, "could not store the bundle: {e}"),
+            ReceiveError::Stopping => f.write_str(
+                "this server is restarting; nothing was kept. Wait a minute, call \
+                 icp_deploy_upload for a new ticket and upload again",
+            ),
         }
     }
 }
@@ -275,10 +321,28 @@ impl std::fmt::Debug for TakenUpload {
 
 impl Drop for TakenUpload {
     fn drop(&mut self) {
-        // Gone already when the deploy moved it in, which is the usual case.
-        let _ = std::fs::remove_dir_all(&self.dir);
-        let mut state = self.store.state();
-        state.bytes = state.bytes.saturating_sub(self.charged);
+        // Gone already when the deploy moved it in, which is the usual case:
+        // then only the room is given back. A directory still there is
+        // removed off the runtime (this is dropped where a deploy returns),
+        // and its room given back once it is gone.
+        let doomed = vec![(std::mem::take(&mut self.dir), self.charged)];
+        if !doomed[0].0.exists() {
+            let mut state = self.store.state();
+            state.bytes = state.bytes.saturating_sub(self.charged);
+            return;
+        }
+        let store = self.store.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                use std::sync::atomic::Ordering::SeqCst;
+                store.removing.fetch_add(1, SeqCst);
+                drop(runtime.spawn_blocking(move || {
+                    store.remove(doomed);
+                    store.removing.fetch_sub(1, SeqCst);
+                }));
+            }
+            Err(_) => store.remove(doomed),
+        }
     }
 }
 
@@ -380,6 +444,9 @@ impl Uploads {
                 max_total_bytes,
                 patience: (UPLOAD_IDLE, UPLOAD_TIME),
                 state: Mutex::default(),
+                lease: std::sync::OnceLock::new(),
+                stopping: CancellationToken::new(),
+                removing: Default::default(),
             }),
         }
     }
@@ -391,6 +458,25 @@ impl Uploads {
     pub fn allowing(self, plugins: AllowedPlugins) -> Self {
         let _ = self.inner.plugins.set(plugins);
         self
+    }
+
+    /// Hold `lease` for as long as anything works in this store's directory:
+    /// the store and its clones, and every thread extracting or removing a
+    /// bundle, which can outlive the request that started it. For a server
+    /// whose lock on the directory says it is the directory's one owner: a
+    /// second store made over it once the lock is free would clear a bundle
+    /// an earlier one is still writing. The first word stands.
+    pub fn held_with(self, lease: Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        let _ = self.inner.lease.set(lease);
+        self
+    }
+
+    /// Say that the server is stopping: an upload asked for from now on is
+    /// refused, and one arriving is given up on at its next read, its bundle
+    /// removed — rather than holding a stopping server for as long as a body
+    /// may take to arrive. Returns at once.
+    pub fn stop(&self) {
+        self.inner.stopping.cancel();
     }
 
     /// The sync plugins a bundle may carry here: what an upload is held to
@@ -419,19 +505,26 @@ impl Uploads {
     /// operation does this first; a server calls it on a timer as well, so
     /// an idle store does not hold what has lapsed.
     pub fn sweep(&self) {
-        sweep(&mut self.inner.state());
+        let mut doomed = Doomed::new();
+        sweep(&mut self.inner.state(), &mut doomed);
+        self.inner.remove(doomed);
     }
 
     /// Mint a ticket for `session`, dropping any it already holds.
     pub async fn mint(&self, session: &str) -> Minted {
-        let mut state = self.inner.state();
-        sweep(&mut state);
-        state.tickets.retain(|_, t| t.session != session);
-        let ticket = random_token();
-        state.tickets.insert(
-            ticket.clone(),
-            Ticket { session: session.to_string(), expires: Instant::now() + TICKET_TTL },
-        );
+        let mut doomed = Doomed::new();
+        let ticket = {
+            let mut state = self.inner.state();
+            sweep(&mut state, &mut doomed);
+            state.tickets.retain(|_, t| t.session != session);
+            let ticket = random_token();
+            state.tickets.insert(
+                ticket.clone(),
+                Ticket { session: session.to_string(), expires: Instant::now() + TICKET_TTL },
+            );
+            ticket
+        };
+        remove_off_the_runtime(&self.inner, doomed).await;
         tracing::info!(session, "upload ticket minted");
         Minted { ticket, expires_in: TICKET_TTL }
     }
@@ -453,9 +546,15 @@ impl Uploads {
     ) -> Result<Received, ReceiveError> {
         let limits = self.inner.limits;
         let upload_id = random_token();
-        let receiving = {
+        let mut doomed = Doomed::new();
+        // What lapsed is removed whether or not this upload is let in.
+        let receiving = (|| {
             let mut state = self.inner.state();
-            sweep(&mut state);
+            sweep(&mut state, &mut doomed);
+            if self.inner.stopping.is_cancelled() {
+                tracing::info!("upload refused: the server is stopping");
+                return Err(ReceiveError::Stopping);
+            }
             let Some(Ticket { session, .. }) = state.tickets.remove(ticket) else {
                 tracing::info!("upload refused: no such ticket (spent, expired or unknown)");
                 return Err(ReceiveError::UnknownTicket);
@@ -488,21 +587,25 @@ impl Uploads {
                 tracing::warn!(session, held = state.bytes, "upload refused: the store is full");
                 return Err(ReceiveError::Full);
             }
+            // Out of the store now, and charged until its files are gone.
             for id in replaced {
-                remove_upload(&mut state, &id);
+                remove_upload(&mut state, &id, &mut doomed);
             }
             state.bytes += reserved;
             state.receiving.insert(session.clone());
-            Receiving {
+            Ok(Receiving {
                 store: self.inner.clone(),
                 session,
                 dir: self.inner.dir.join(&upload_id),
                 reserved,
                 finished: false,
-            }
-        };
+            })
+        })();
+        remove_off_the_runtime(&self.inner, doomed).await;
+        let receiving = receiving?;
         let session = receiving.session.clone();
         let (root, (idle, time)) = (self.inner.dir.clone(), self.inner.patience);
+        let stop = self.inner.stopping.clone();
         let runtime = tokio::runtime::Handle::current();
         let plugins = self.plugins();
         let id = upload_id.clone();
@@ -515,7 +618,8 @@ impl Uploads {
                 ReceiveError::Storage(format!("the upload path '{}' is not UTF-8", p.display()))
             })?;
             let vetting = runtime.clone();
-            let body = Arriving { body, runtime, idle, deadline: Instant::now() + time, time };
+            let body =
+                Arriving { body, runtime, idle, deadline: Instant::now() + time, time, stop };
             let extracted = host::extract_bundle_from(body, &dir, &limits)?;
             // All of it has arrived and is a bundle's shape: now whether it
             // is one this server will deploy. Said here, on the upload, and
@@ -529,9 +633,19 @@ impl Uploads {
             receiving.finish(&id, extracted.bytes);
             Ok::<_, ReceiveError>((extracted.bytes, extracted.archive_bytes))
         });
-        let outcome = extracting.await.unwrap_or_else(|e| {
-            Err(ReceiveError::Storage(format!("the extraction did not finish: {e}")))
-        });
+        let outcome = extracting
+            .await
+            .unwrap_or_else(|e| {
+                Err(ReceiveError::Storage(format!("the extraction did not finish: {e}")))
+            })
+            // A body cut off because the server is stopping is said as that,
+            // not as a transfer that failed.
+            .map_err(|e| match e {
+                ReceiveError::Body(_) if self.inner.stopping.is_cancelled() => {
+                    ReceiveError::Stopping
+                }
+                e => e,
+            });
         match outcome {
             Ok((bytes, archive_bytes)) => {
                 tracing::info!(session, upload_id, bytes, archive_bytes, "bundle uploaded");
@@ -555,8 +669,22 @@ impl Uploads {
     /// refused for want of that room is left as it was, to be asked for
     /// again.
     pub async fn take(&self, upload_id: &str, session: &str) -> Result<TakenUpload, TakeError> {
+        let mut doomed = Doomed::new();
+        let taken = self.take_locked(upload_id, session, &mut doomed);
+        remove_off_the_runtime(&self.inner, doomed).await;
+        taken
+    }
+
+    /// [`Self::take`] under the lock, leaving what lapsed in `doomed` for the
+    /// caller to remove once the lock is released.
+    fn take_locked(
+        &self,
+        upload_id: &str,
+        session: &str,
+        doomed: &mut Doomed,
+    ) -> Result<TakenUpload, TakeError> {
         let mut state = self.inner.state();
-        sweep(&mut state);
+        sweep(&mut state, doomed);
         let Some(bytes) =
             state.uploads.get(upload_id).filter(|u| u.session == session).map(|u| u.bytes)
         else {
@@ -585,6 +713,9 @@ struct Arriving<R> {
     idle: Duration,
     deadline: Instant,
     time: Duration,
+    /// The store's [`Uploads::stop`]: a body still arriving then is given up
+    /// on at its next read.
+    stop: CancellationToken,
 }
 
 impl<R: AsyncRead + Unpin> std::io::Read for Arriving<R> {
@@ -598,10 +729,22 @@ impl<R: AsyncRead + Unpin> std::io::Read for Arriving<R> {
             )));
         }
         let wait = self.idle.min(left);
-        let body = &mut self.body;
-        match self.runtime.block_on(async { tokio::time::timeout(wait, body.read(buf)).await }) {
-            Ok(read) => read,
-            Err(_) => Err(timed_out(format!(
+        let (body, stop) = (&mut self.body, &self.stop);
+        let read = self.runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => None,
+                read = tokio::time::timeout(wait, body.read(buf)) => Some(read),
+            }
+        });
+        match read {
+            // Not `Interrupted`, which readers take as "try again".
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "the server is stopping",
+            )),
+            Some(Ok(read)) => read,
+            Some(Err(_)) => Err(timed_out(format!(
                 "no data arrived for {} seconds, or the upload ran out of time",
                 wait.as_secs()
             ))),
@@ -609,22 +752,23 @@ impl<R: AsyncRead + Unpin> std::io::Read for Arriving<R> {
     }
 }
 
-/// Drop expired tickets, and expired uploads with their bundles.
-fn sweep(state: &mut State) {
+/// Drop expired tickets, and expired uploads, their bundles left in
+/// `doomed` for removal.
+fn sweep(state: &mut State, doomed: &mut Doomed) {
     let now = Instant::now();
     state.tickets.retain(|_, t| t.expires > now);
     let expired: Vec<String> =
         state.uploads.iter().filter(|(_, u)| u.expires <= now).map(|(id, _)| id.clone()).collect();
     for id in expired {
-        remove_upload(state, &id);
+        remove_upload(state, &id, doomed);
     }
 }
 
-/// Forget a held upload: its bundle, and its share of the budget.
-fn remove_upload(state: &mut State, upload_id: &str) {
+/// Forget a held upload, leaving its bundle in `doomed` to be removed with
+/// the state unlocked: its share of the budget stays charged until then.
+fn remove_upload(state: &mut State, upload_id: &str, doomed: &mut Doomed) {
     if let Some(upload) = state.uploads.remove(upload_id) {
-        let _ = std::fs::remove_dir_all(&upload.dir);
-        state.bytes = state.bytes.saturating_sub(upload.bytes);
+        doomed.push((upload.dir, upload.bytes));
     }
 }
 
@@ -741,6 +885,14 @@ pub(crate) mod tests {
         uploads.receive(&t.ticket, Some(body.len() as u64), std::io::Cursor::new(body)).await
     }
 
+    /// Wait for the bundles dropped handles left to be removed, and their
+    /// room given back.
+    async fn settled(uploads: &Uploads) {
+        while uploads.inner.removing.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     /// What is under the store's directory.
     fn kept(uploads: &Uploads) -> usize {
         std::fs::read_dir(&uploads.inner.dir).map(|entries| entries.count()).unwrap_or(0)
@@ -783,6 +935,7 @@ pub(crate) mod tests {
         assert_eq!(kept(&uploads), 1);
         let bundle_dir = taken.dir().to_path_buf();
         drop(taken);
+        settled(&uploads).await;
         assert!(!bundle_dir.exists(), "a bundle its deploy never moved goes with the handle");
         assert_eq!(uploads.inner.state().bytes, 0);
     }
@@ -1044,9 +1197,11 @@ pub(crate) mod tests {
         assert_eq!(uploads.take(&c.upload_id, "c").await.unwrap_err(), TakeError::NoRoom);
         assert_eq!(uploads.held().uploads, 1);
         drop(running);
+        settled(&uploads).await;
         assert_eq!(uploads.held().bytes, 11 * U);
         let third = uploads.take(&c.upload_id, "c").await.unwrap();
         drop((second, third));
+        settled(&uploads).await;
         assert_eq!(uploads.held(), Held { bytes: 0, max_bytes: budget, uploads: 0, receiving: 0 });
 
         // A budget is at least one bundle's worth.
@@ -1078,6 +1233,7 @@ pub(crate) mod tests {
         );
         // With `b`'s gone there is room, `a`'s own giving way; then it does.
         drop(uploads.take(&other.upload_id, "b").await.unwrap());
+        settled(&uploads).await;
         let second = put(&uploads, "a", bundle(4097)).await.unwrap();
         assert_eq!(uploads.held().bytes, extracted(4097));
         assert_eq!(uploads.take(&first.upload_id, "a").await.unwrap_err(), TakeError::NoSuchUpload);
@@ -1116,8 +1272,93 @@ pub(crate) mod tests {
                 max_total_bytes: inner.max_total_bytes,
                 patience: (idle, time),
                 state: Mutex::default(),
+                lease: std::sync::OnceLock::new(),
+                stopping: CancellationToken::new(),
+                removing: Default::default(),
             }),
         }
+    }
+
+    // A stopping server takes no new upload and gives up on the one
+    // arriving, at once rather than when its body ends: the partial bundle
+    // and its reservation go with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_store_refuses_uploads_and_gives_up_on_what_is_arriving() {
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
+        let mut archive = bundle(50_000);
+        archive.truncate(archive.len() / 2);
+        let t = uploads.mint("s").await;
+        let arriving = {
+            let uploads = uploads.clone();
+            let body = Stalled { head: std::io::Cursor::new(archive) };
+            tokio::spawn(async move { uploads.receive(&t.ticket, None, body).await })
+        };
+        while uploads.held().receiving == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let started = Instant::now();
+        uploads.stop();
+        let given_up = arriving.await.unwrap().unwrap_err();
+        assert_eq!(given_up, ReceiveError::Stopping);
+        assert!(started.elapsed() < Duration::from_secs(5), "not left to its idle timeout");
+        assert_eq!(kept(&uploads), 0, "the partial bundle is removed");
+        assert_eq!(uploads.held().bytes, 0);
+
+        let t = uploads.mint("s").await;
+        let refused = uploads.receive(&t.ticket, None, std::io::Cursor::new(bundle(1))).await;
+        assert_eq!(refused.unwrap_err(), ReceiveError::Stopping);
+    }
+
+    // What the server holds the directory by lives as long as anything
+    // works in it: past the store's last handle, while a bundle is still
+    // being extracted for a request that has gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_lease_outlives_the_store_while_a_bundle_is_arriving() {
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
+        let uploads = impatient(uploads, Duration::from_millis(300), Duration::from_secs(60));
+        let lease: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
+        let held = Arc::downgrade(&lease);
+        let uploads = uploads.held_with(lease);
+        let mut archive = bundle(50_000);
+        archive.truncate(archive.len() / 2);
+        let t = uploads.mint("s").await;
+        let arriving = {
+            let uploads = uploads.clone();
+            let body = Stalled { head: std::io::Cursor::new(archive) };
+            tokio::spawn(async move { uploads.receive(&t.ticket, None, body).await })
+        };
+        while uploads.held().receiving == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The request goes, and the store's last handle with it.
+        arriving.abort();
+        drop(uploads);
+        assert!(held.upgrade().is_some(), "the extraction still holds the lease");
+        // Its body stalled, it ends at its idle timeout, and lets go.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while held.upgrade().is_some() {
+            assert!(Instant::now() < deadline, "the extraction ended and let the lease go");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // A bundle leaving the store is charged until its files are gone, and
+    // its files go with the store's state unlocked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_bundle_is_charged_until_its_files_are_gone() {
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
+        let first = put(&uploads, "s", bundle(1)).await.unwrap();
+        let doomed = {
+            let mut doomed = Doomed::new();
+            let mut state = uploads.inner.state();
+            remove_upload(&mut state, &first.upload_id, &mut doomed);
+            doomed
+        };
+        assert_eq!(uploads.held().bytes, first.bytes, "charged while its files are there");
+        assert_eq!(uploads.held().uploads, 0);
+        uploads.inner.remove(doomed);
+        assert_eq!(uploads.held().bytes, 0);
+        assert_eq!(kept(&uploads), 0);
     }
 
     // A body that stops arriving is given up on, and so is one that takes
