@@ -1397,6 +1397,25 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    /// The endpoint declares logging, so `logging/setLevel` is a request it
+    /// answers, not one it has no method for. It keeps nothing of it: the
+    /// transport is stateless, each request served by a handler of its own,
+    /// so the level reaches no later call, which reports its progress as it
+    /// would have.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_hosted_endpoint_answers_a_log_level_request() {
+        let (_dir, server) = server();
+        let bearer = format!("Bearer {}", server.store.test_bearer().await);
+        let app = server.mcp_router();
+        let resp =
+            post(&app, &bearer, rpc("logging/setLevel", serde_json::json!({ "level": "warning" })))
+                .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let answer: serde_json::Value = serde_json::from_str(&text(resp).await).unwrap();
+        assert!(answer["result"].is_object(), "{answer}");
+        assert!(answer["error"].is_null(), "{answer}");
+    }
+
     /// A stopping server takes no upload: the `PUT` is refused as the
     /// server's doing, something to try again, and nothing of it is kept.
     #[tokio::test(flavor = "multi_thread")]
