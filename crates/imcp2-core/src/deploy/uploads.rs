@@ -274,7 +274,9 @@ pub enum TakeError {
 /// An upload handed to its deploy: the bundle's directory, for the deploy to
 /// take as its own, and its hold on the store's budget — the room a running
 /// deploy is charged — released when this is dropped, whichever way the
-/// deploy ends. A directory the deploy never took goes then too.
+/// deploy ends. A directory the deploy never took goes then too, removed
+/// off the lock and off the runtime's workers like a bundle that lapsed,
+/// and charged until it has gone.
 pub struct TakenUpload {
     dir: PathBuf,
     bytes: u64,
@@ -302,10 +304,22 @@ impl std::fmt::Debug for TakenUpload {
 
 impl Drop for TakenUpload {
     fn drop(&mut self) {
-        // Gone already when the deploy moved it in, which is the usual case.
-        let _ = std::fs::remove_dir_all(&self.dir);
-        let mut state = self.store.state();
-        state.bytes = state.bytes.saturating_sub(self.charged);
+        // Gone already when the deploy moved it in, which is the usual case:
+        // there is only the room to give back.
+        if self.dir.symlink_metadata().is_err() {
+            let mut state = self.store.state();
+            state.bytes = state.bytes.saturating_sub(self.charged);
+            return;
+        }
+        // Still there: the deploy was refused or stopped before it took the
+        // bundle. That is a tree to remove, and this runs where a deploy
+        // call returns, on one of the runtime's workers: it goes the way a
+        // lapsed bundle does, its room held until it has gone.
+        clear(vec![Leaving {
+            store: self.store.clone(),
+            dir: std::mem::take(&mut self.dir),
+            bytes: self.charged,
+        }]);
     }
 }
 
@@ -914,6 +928,19 @@ pub(crate) mod tests {
         uploads.receive(&t.ticket, Some(body.len() as u64), std::io::Cursor::new(body)).await
     }
 
+    /// Wait for the store to hold `bytes`. A bundle its deploy never took is
+    /// removed on a thread of its own once the handle is dropped, and is
+    /// charged until it has gone.
+    async fn holds(uploads: &Uploads, bytes: u64) {
+        for _ in 0..500 {
+            if uploads.held().bytes == bytes {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(uploads.held().bytes, bytes, "the store never came to hold that");
+    }
+
     /// What is under the store's directory.
     fn kept(uploads: &Uploads) -> usize {
         std::fs::read_dir(&uploads.inner.dir).map(|entries| entries.count()).unwrap_or(0)
@@ -956,8 +983,9 @@ pub(crate) mod tests {
         assert_eq!(kept(&uploads), 1);
         let bundle_dir = taken.dir().to_path_buf();
         drop(taken);
+        // Removed off this thread, and charged until it has gone.
+        holds(&uploads, 0).await;
         assert!(!bundle_dir.exists(), "a bundle its deploy never moved goes with the handle");
-        assert_eq!(uploads.inner.state().bytes, 0);
     }
 
     #[tokio::test]
@@ -1217,9 +1245,10 @@ pub(crate) mod tests {
         assert_eq!(uploads.take(&c.upload_id, "c").await.unwrap_err(), TakeError::NoRoom);
         assert_eq!(uploads.held().uploads, 1);
         drop(running);
-        assert_eq!(uploads.held().bytes, 11 * U);
+        holds(&uploads, 11 * U).await;
         let third = uploads.take(&c.upload_id, "c").await.unwrap();
         drop((second, third));
+        holds(&uploads, 0).await;
         assert_eq!(uploads.held(), Held { bytes: 0, max_bytes: budget, uploads: 0, receiving: 0 });
 
         // A budget is at least one bundle's worth.
@@ -1251,6 +1280,7 @@ pub(crate) mod tests {
         );
         // With `b`'s gone there is room, `a`'s own giving way; then it does.
         drop(uploads.take(&other.upload_id, "b").await.unwrap());
+        holds(&uploads, U).await;
         let second = put(&uploads, "a", bundle(4097)).await.unwrap();
         assert_eq!(uploads.held().bytes, extracted(4097));
         assert_eq!(uploads.take(&first.upload_id, "a").await.unwrap_err(), TakeError::NoSuchUpload);
@@ -1308,6 +1338,46 @@ pub(crate) mod tests {
         assert_eq!(refused.unwrap_err(), ReceiveError::UnknownTicket);
         assert_eq!(uploads.held().uploads, 1, "not swept");
         assert!(lapsed.exists());
+    }
+
+    // A bundle its deploy never took — the deploy was refused or stopped
+    // first — is not removed by the drop of its handle, which runs where a
+    // deploy call returns, on a worker of the runtime: the drop hands it to
+    // a thread that may block, and returns, and the bundle is charged until
+    // it has gone. One the deploy did take leaves only its room to give
+    // back, and that is given back at once.
+    #[tokio::test]
+    async fn a_bundle_its_deploy_never_took_is_removed_off_the_thread_that_drops_it() {
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
+        let received = put(&uploads, "s", bundle(10)).await.unwrap();
+        let taken = uploads.take(&received.upload_id, "s").await.unwrap();
+        let bundle_dir = taken.dir().to_path_buf();
+        // With the state locked nothing can be uncharged, so a drop that
+        // removed the bundle itself would wait here for the lock, to give
+        // the room back. The drop is made on a thread of its own, for one
+        // that waits to fail this test and not hang it.
+        let state = uploads.inner.state();
+        let charged = state.bytes;
+        let runtime = tokio::runtime::Handle::current();
+        let dropping = std::thread::spawn(move || {
+            let _on = runtime.enter();
+            drop(taken);
+        });
+        let started = Instant::now();
+        while !dropping.is_finished() {
+            assert!(started.elapsed() < Duration::from_secs(10), "the drop did the removal");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(state.bytes, charged, "charged until it has gone");
+        drop(state);
+        holds(&uploads, 0).await;
+        assert!(!bundle_dir.exists());
+
+        let received = put(&uploads, "s", bundle(10)).await.unwrap();
+        let taken = uploads.take(&received.upload_id, "s").await.unwrap();
+        std::fs::remove_dir_all(taken.dir()).unwrap(); // moved in by its deploy
+        drop(taken);
+        assert_eq!(uploads.held().bytes, 0, "nothing to remove: its room is free at once");
     }
 
     // A stopping server takes no new upload and gives up on the one
@@ -1521,6 +1591,7 @@ pub(crate) mod tests {
         assert!(!lapsed.exists());
         assert_eq!(uploads.held().bytes, 10 * U);
         drop(running);
+        holds(&uploads, 0).await;
 
         // The same for an arrival, which reserves ten: two waiting bundles
         // leave it no room, and one of them lapsed does.

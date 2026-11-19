@@ -428,12 +428,6 @@ fn own_directory(dir: &Path) -> std::io::Result<std::fs::File> {
 /// The path, under the MCP mount, an archive is `PUT` to.
 pub const UPLOAD_PATH: &str = "/deploy/upload";
 
-/// The most of a request body the dispatch buffers to read the method and
-/// tool name: an MCP request is small JSON, and a bundle never rides inline
-/// here. (The body cap in front of the endpoint, where there is one, holds
-/// it lower still.)
-const DISPATCH_MAX_BODY: usize = 4 * 1024 * 1024;
-
 type McpService = StreamableHttpService<WithDeploy<IcTools>, LocalSessionManager>;
 
 /// The two transports and the upload store behind the deploy-aware endpoint.
@@ -450,6 +444,12 @@ pub(crate) struct DeployMcp {
     metrics: Reporting,
     /// The deploy calls running: see [`InFlight`].
     in_flight: InFlight,
+    /// The most of a request body the dispatch buffers to read the method
+    /// and tool name: the endpoint's own cap
+    /// ([`McpServer::with_max_request_body`]), which the layer in front of
+    /// the dispatch has already held the body to. A cap of its own here
+    /// would be a second, lower limit on every call, deploy or not.
+    max_request_body: usize,
 }
 
 /// The deploy calls whose response is still being sent, each by the session
@@ -511,6 +511,7 @@ impl McpServer {
             _owned: deploys._owned.clone(),
             metrics: deploys.metrics.clone(),
             in_flight: InFlight::default(),
+            max_request_body: self.max_request_body,
         });
         (
             Router::new().fallback(dispatch).with_state(mcp.clone()),
@@ -523,7 +524,7 @@ impl McpServer {
 /// for the client going away, and everything else to the JSON transport.
 async fn dispatch(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
-    let bytes = match axum::body::to_bytes(body, DISPATCH_MAX_BODY).await {
+    let bytes = match axum::body::to_bytes(body, mcp.max_request_body).await {
         Ok(bytes) => bytes,
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response(),
     };
@@ -1359,6 +1360,33 @@ mod tests {
         assert!(said.contains("interrupted before it began"), "{said}");
         assert_eq!(deploys.slots.running(), 0, "the cancelled deploy gives its slot back");
         drop(silent);
+    }
+
+    /// The dispatch buffers a request to read its method, and reads as much
+    /// as the endpoint is set to take — not a lower cap of its own, which
+    /// would hold every call to it whatever the server was configured with.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_dispatch_reads_what_the_endpoints_cap_allows() {
+        const MIB: usize = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let deploys = Deploys::new(&config(), dir.path()).unwrap();
+        let server = server_in(dir.path(), "/mcp", deploys).with_max_request_body(6 * MIB);
+        let bearer = format!("Bearer {}", server.store.test_bearer().await);
+        let app = server.mcp_router();
+        let padded = |bytes: usize| {
+            let arguments = serde_json::json!({ "padding": "x".repeat(bytes) });
+            rpc(
+                "tools/call",
+                serde_json::json!({ "name": "icp_deploy_guide", "arguments": arguments }),
+            )
+        };
+        // Past the default cap, within this server's.
+        let taken = post(&app, &bearer, padded(5 * MIB)).await;
+        assert_eq!(taken.status(), StatusCode::OK);
+        assert!(text(taken).await.contains("\"result\""));
+        // Past this server's.
+        let refused = post(&app, &bearer, padded(7 * MIB)).await;
+        assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     /// A stopping server takes no upload: the `PUT` is refused as the

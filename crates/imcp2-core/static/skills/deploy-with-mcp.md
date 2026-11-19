@@ -35,9 +35,13 @@ not know the canisters already exist and would create a second set.
 - The icp CLI (0.3.0 or later) on the machine that builds the project.
   Installation and project configuration are in the `icp-cli` skill.
 - A signed-in session with the "Actions & questions" access level. If a
-  tool answers that it needs an authenticated session, call `authenticate`,
-  have the user open the returned id.ai link, then retry. Check with
-  `auth_status`.
+  tool answers that it needs an authenticated session, or that the session
+  is over, how to sign in depends on the server. One that lists an
+  `authenticate` tool (the local server) signs in through it: call it, have
+  the user open the returned id.ai link, then retry; check with
+  `auth_status`. One that does not (a hosted server) is signed in to by the
+  MCP client as it connects: ask the user to reconnect the server in their
+  client, then retry.
 - Cycles. Each new canister is created from the user's cycles balance, 2T
   cycles unless `cycles` says otherwise. `icp_cycles_balance` reports the
   balance and the principal that holds it, which is where the user sends
@@ -122,10 +126,14 @@ carry the archive itself. Upload it first:
    the archive, or what it extracts to, passes the limit the ticket's answer
    names (`max_bytes`, `max_extracted_bytes`). It answers `413` and says
    which, but `curl` is still sending and often reports only a failed
-   transfer: `Broken pipe`, `Connection reset`, exit code 55 or 56. Read an
-   upload that fails that way as a bundle that is too large, not as a
-   network fault to retry: check the archive's size, and what it extracts to
-   (`tar -tzvf <bundle.tar.gz>`), against the two limits. What a bundle
+   transfer: `Broken pipe`, `Connection reset`, exit code 55 or 56. If
+   `curl` printed the server's answer, go by that. If it printed only the
+   failed transfer, take the bundle for too large before taking the network
+   for faulty: check the archive's size, and what it extracts to
+   (`tar -tzvf <bundle.tar.gz>`), against the two limits. Only a bundle
+   within both was cut off for another reason (a ticket already spent, a
+   server that is full or restarting, the network): ask for a new ticket
+   and upload once more. What a bundle
    extracts to is counted as the space it occupies, so thousands of small
    files weigh more than their bytes: each takes at least 5 KiB. An answer
    of `422` means the server read the file and it is not a bundle; rebuild
