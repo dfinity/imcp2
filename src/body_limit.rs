@@ -162,4 +162,19 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(text(resp).await, MAX.to_string());
     }
+
+    /// A body that fails while being read is a bad request, not an oversized
+    /// one: the stream breaks well inside the cap, so answering `413` would
+    /// send the client off to shrink a request that was never too large.
+    #[tokio::test]
+    async fn a_body_that_fails_mid_read_is_a_bad_request_not_too_large() {
+        let pieces = [
+            Ok(Bytes::from_static(b"within the cap")),
+            Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "peer went away")),
+        ];
+        let body = Body::from_stream(futures_util::stream::iter(pieces));
+        let resp = app().oneshot(Request::post("/").body(body).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(text(resp).await, "could not read the request body");
+    }
 }
