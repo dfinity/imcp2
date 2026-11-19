@@ -19,7 +19,9 @@
 //! URL baked into the discovery documents and the II handshake),
 //! `$MCP_SERVE_BETA` (opt in to the `/mcp-beta` staging instance),
 //! `$MCP_SERVE_METRICS` (opt in to the Prometheus exposition at `/metrics`; off
-//! by default because nothing here can know whether a proxy is hiding it), and
+//! by default because nothing here can know whether a proxy is hiding it),
+//! `$MCP_MAX_REQUEST_BODY` (the cap on an MCP request body in bytes, default
+//! 4 MiB), and
 //! `$OPENAI_APPS_CHALLENGE_TOKEN` (serve the OpenAI Apps domain-verification
 //! token at `/.well-known/openai-apps-challenge`; 404 while unset).
 //!
@@ -74,12 +76,22 @@ fn require_resource() -> bool {
 /// value that is not a whole number is a configuration error and refuses to
 /// start, rather than silently running with the default.
 fn max_request_body() -> anyhow::Result<usize> {
-    match std::env::var("MCP_MAX_REQUEST_BODY") {
-        Ok(v) => v
-            .trim()
-            .parse()
-            .map_err(|e| anyhow::anyhow!("MCP_MAX_REQUEST_BODY must be a byte count: {e}")),
-        Err(_) => Ok(imcp2::DEFAULT_MAX_REQUEST_BODY),
+    max_request_body_from(std::env::var("MCP_MAX_REQUEST_BODY"))
+}
+
+/// [`max_request_body`]'s reading of the variable. Only an unset variable means
+/// the default: one that is set to something that is not Unicode is not a byte
+/// count either, so it is refused like any other value that is not one.
+fn max_request_body_from(value: Result<String, std::env::VarError>) -> anyhow::Result<usize> {
+    use std::env::VarError;
+    match value.as_deref().map(str::trim) {
+        Ok(v) => v.parse().map_err(|e| {
+            anyhow::anyhow!("MCP_MAX_REQUEST_BODY must be a byte count, got {v:?}: {e}")
+        }),
+        Err(VarError::NotPresent) => Ok(imcp2::DEFAULT_MAX_REQUEST_BODY),
+        Err(VarError::NotUnicode(raw)) => {
+            Err(anyhow::anyhow!("MCP_MAX_REQUEST_BODY must be a byte count, got {raw:?}"))
+        }
     }
 }
 
@@ -603,6 +615,41 @@ mod tests {
         }
         for value in [Some("0"), Some("false"), Some("No"), Some("OFF"), Some(" 0 ")] {
             assert!(!cimd_enabled_by(value), "{value:?} should switch CIMD off");
+        }
+    }
+
+    /// `MCP_MAX_REQUEST_BODY`'s reading: the default only when it is unset, and
+    /// an error (which `main` refuses to start on) for anything set that is not
+    /// a byte count. That includes a value that is not Unicode, which
+    /// `std::env::var` reports as an error too and which must not be mistaken
+    /// for the variable being absent.
+    #[test]
+    fn max_request_body_values() {
+        use super::max_request_body_from;
+        use std::env::VarError;
+
+        let unset = max_request_body_from(Err(VarError::NotPresent));
+        assert_eq!(unset.unwrap(), imcp2::DEFAULT_MAX_REQUEST_BODY);
+
+        for (value, bytes) in [("1048576", 1 << 20), (" 65536 ", 65536), ("1", 1)] {
+            let read = max_request_body_from(Ok(value.into()));
+            assert_eq!(read.unwrap(), bytes, "{value:?}");
+        }
+
+        for value in ["4MiB", "4 MiB", "-1", "1.5", "1e6", "0x400", "yes"] {
+            let err = max_request_body_from(Ok(value.into())).expect_err(value);
+            assert!(err.to_string().contains("MCP_MAX_REQUEST_BODY"), "{value:?}: {err}");
+        }
+
+        // Unix lets a variable hold any bytes; these are a number followed by
+        // one that is not UTF-8.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = std::ffi::OsString::from_vec(vec![b'6', b'4', 0xff]);
+            let err = max_request_body_from(Err(VarError::NotUnicode(raw)))
+                .expect_err("a value that is not Unicode is not a byte count");
+            assert!(err.to_string().contains("MCP_MAX_REQUEST_BODY"), "{err}");
         }
     }
 
