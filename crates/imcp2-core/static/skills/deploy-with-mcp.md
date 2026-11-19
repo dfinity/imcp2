@@ -43,9 +43,7 @@ not know the canisters already exist and would create a second set.
   MCP client as it connects: ask the user to reconnect the server in their
   client, then retry.
 - Cycles. Each new canister is created from the user's cycles balance, 2T
-  cycles unless `cycles` says otherwise. `icp_cycles_balance` reports the
-  balance and the principal that holds it, which is where the user sends
-  cycles to top it up. Before a deploy that will create canisters, tell the
+  cycles unless `cycles` says otherwise. Before a deploy that will create canisters, tell the
   user how many and confirm; creation is not undone by a later failure.
 - An environment on the `ic` network (mainnet), which every manifest has.
   The tool deploys to the Internet Computer only: an environment on any other

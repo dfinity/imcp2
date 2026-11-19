@@ -1,7 +1,6 @@
 //! The deploy tools — the `icp_deploy_bundle` MCP tool: deploy an icp project
 //! bundle to the Internet Computer as the user, through the icp CLI's own
-//! project library (`icp-project`, the code behind `icp deploy`). Next to it,
-//! `icp_cycles_balance`: the balance those deploys create canisters from.
+//! project library (`icp-project`, the code behind `icp deploy`).
 //!
 //! The tool takes a bundle (the `.tar.gz` that `icp project bundle` writes),
 //! the name of an environment the bundle declares, and optionally the canister
@@ -17,9 +16,8 @@
 //! link to the same account, the two deploy as the same principal: the
 //! canisters are the ones `icp` lists and controls, and the cycles are the
 //! same balance. The CLI can also use a local key (`icp identity new`) or a
-//! link to another account, and those are other principals sharing neither;
-//! `icp_cycles_balance` names the principal used here, for the user to
-//! compare with `icp identity principal`. This is deliberately NOT the
+//! link to another account, and those are other principals sharing neither.
+//! This is deliberately NOT the
 //! management identity the canister lifecycle tools act as (the default
 //! account at the server's own origin): a canister a deploy creates is
 //! controlled by the principal here, and reaching it through the lifecycle
@@ -70,10 +68,9 @@ use std::{
     time::Instant,
 };
 
-use crate::{cycles_balance_of, identities::Identities, CyclesBalance, SessionResolver};
+use crate::{identities::Identities, SessionResolver};
 use camino::{Utf8Path, Utf8PathBuf};
 use candid::Principal;
-use ic_agent::{identity::DelegatedIdentity, Identity};
 #[allow(deprecated)]
 use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::{
@@ -131,9 +128,7 @@ pub const DEFAULT_CYCLES: u64 = 2_000_000_000_000;
 /// the project, call `icp_deploy_bundle` with the environment's canister-id
 /// mapping, write the returned mapping back — served as the MCP resource
 /// `skill://deploy-with-mcp` by the server that mounts the tool, next to
-/// core's bundled IC skills, and returned by `icp_deploy_guide` for a client
-/// that does not read resources (as core serves its Candid guide both ways).
-/// Compiled in, like those: what a client reads is what was reviewed at
+/// core's bundled IC skills. Compiled in, like those: what a client reads is what was reviewed at
 /// build time.
 pub const DEPLOY_SKILL_NAME: &str = "deploy-with-mcp";
 /// Its title, for the resource listing.
@@ -179,7 +174,7 @@ pub struct DeployBundleArgs {
     #[serde(default = "default_mode")]
     pub mode: String,
     /// Cycles to fund each canister this deploy creates, taken from the user's
-    /// cycles-ledger balance (see icp_cycles_balance). Default 2 trillion.
+    /// cycles-ledger balance. Default 2 trillion.
     #[serde(default)]
     pub cycles: Option<u64>,
     /// Subnet to create canisters on. Default: picked by the network.
@@ -389,13 +384,8 @@ pub fn request_from_args(
 }
 
 /// The deploy tool group, served alongside the core surface by the binary
-/// that composes it: `icp_deploy_bundle`; `icp_cycles_balance` — the check a
-/// deploy that will create canisters starts with; and `icp_deploy_guide`,
-/// the skill around them as a tool result. The core surface
-/// has a tool of that name too, in its protocol/meta half, which the local
-/// server does not serve; this one is the same logic on the surface the
-/// deploy loop runs on. Should the core half be served alongside one day,
-/// drop this copy rather than list the name twice.
+/// that composes it: `icp_deploy_bundle`, and `icp_deploy_upload` on a server
+/// that takes bundles by upload.
 #[derive(Clone)]
 pub struct IcDeployTools {
     identities: Identities,
@@ -645,15 +635,8 @@ impl IcDeployTools {
         })
     }
 
-    /// The session's identity at [`CLI_ORIGIN`]: its default account there,
-    /// derived on demand like any other per-app delegation. Good for the
-    /// next few minutes; a deploy uses [`RefreshingIdentity`] instead.
-    async fn cli_identity(&self, sid: &str) -> Result<DelegatedIdentity, String> {
-        self.identities.delegated_identity(sid, CLI_ORIGIN, None).await
-    }
-
     #[tool(
-        description = "Deploy an icp project bundle (the .tar.gz that `icp project bundle` writes) to the Internet Computer as the user, running every phase of `icp deploy`: create the bundle's new canisters (funded from the user's cycles balance), wire their ids into each other, apply settings, install or upgrade the code, and run the sync steps (a frontend's asset upload). Pass the bundle the one way this server takes it (the bundle argument listed here), the environment name it was built for (usually \"ic\"), and, to upgrade rather than create, the canister_ids a previous deploy returned. The call lasts as long as the deploy and reports each phase as it completes, as a progress notification (send a progressToken) and a log message; cancelling the call interrupts the deploy at its next step. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure or interruption the mapping still holds every canister that was created.",
+        description = "Deploy an icp project (the user's app) to the Internet Computer as the user, running every phase of `icp deploy`: create its new canisters (funded from the user's cycles balance, 2T cycles each by default), wire their ids into each other, apply settings, install or upgrade the code, and run the sync steps (a frontend's asset upload). Use it when the user asks to deploy their app. The steps: (1) bundle the project in the user's environment with `icp project bundle --output <file>.tar.gz`; (2) hand the bundle over the one way this server takes it: on a server that lists icp_deploy_upload, call that tool, run the command it returns and pass the printed `upload_id` as `bundle_upload`; otherwise pass the archive's absolute path as `bundle_path`; (3) call this tool with the environment the bundle was built for (usually \"ic\") and, as `canister_ids`, the content of the project's `.icp/data/mappings/<environment>.ids.json` if it exists; (4) write the `canister_ids` this tool returns, unchanged, to that file. Skipping step 4 makes the next deploy create a new set of canisters instead of upgrading these. Before a deploy that will create canisters, tell the user how many and confirm. The call lasts as long as the deploy and reports each phase as it completes, as a progress notification (send a progressToken) and a log message; cancelling the call interrupts the deploy at its next step. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure or interruption the mapping still holds every canister that was created, so write it back then too. The resource `skill://deploy-with-mcp` has the full guide.",
         annotations(title = "Deploy a project bundle", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<DeployBundleOutput>(),
     )]
@@ -834,52 +817,6 @@ impl IcDeployTools {
                 }
             }
         }
-    }
-
-    #[tool(
-        description = "Return the cycles balance icp_deploy_bundle creates canisters from, and the principal that holds it: the developer principal of the user's identity, distinct from its principals in apps. Call it before a deploy that will create canisters, to check the balance covers them (2T cycles each by default). The principal is where the user sends cycles to top the balance up, and what to add as a controller of a canister created elsewhere.",
-        annotations(title = "Check your cycles balance", read_only_hint = true, destructive_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<CyclesBalance>(),
-    )]
-    async fn icp_cycles_balance(
-        &self,
-        Parameters(_args): Parameters<NoArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let Some(sid) = (self.session)(&ctx) else {
-            return Ok(err("checking your cycles balance needs an authenticated session".into()));
-        };
-        let identity = match self.cli_identity(&sid).await {
-            Ok(id) => id,
-            Err(e) => return Ok(err(e)),
-        };
-        let principal = match identity.sender() {
-            Ok(p) => p,
-            Err(e) => return Ok(err(format!("could not derive your principal: {e}"))),
-        };
-        // The balance a deploy draws on is the one on the Internet Computer,
-        // whatever endpoint the rest of the server is pointed at.
-        let agent = match run::mainnet_agent(Arc::new(identity)) {
-            Ok(agent) => agent,
-            Err(e) => return Ok(err(e)),
-        };
-        match cycles_balance_of(&agent, principal).await {
-            Ok(balance) => Ok(ok_structured(balance.human(), &balance)),
-            Err(e) => Ok(err(e)),
-        }
-    }
-
-    #[tool(
-        description = "Return the guide to deploying through this server: the loop around icp_deploy_bundle — bundle the project with `icp project bundle`, call the tool with the bundle and the environment's canister-id mapping, write the mapping it returns back into the project so the next deploy upgrades rather than creates — with what the tool needs and what it returns. The same text is served as the MCP resource `skill://deploy-with-mcp`; call this when the user asks you to deploy an icp project and you have not read that resource.",
-        annotations(title = "Get the deploy guide", read_only_hint = true, destructive_hint = false, open_world_hint = false),
-        output_schema = schema_for_output::<DeployGuideOutput>(),
-    )]
-    async fn icp_deploy_guide(
-        &self,
-        Parameters(_args): Parameters<NoArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let output = DeployGuideOutput { content: DEPLOY_SKILL_MD.to_string() };
-        Ok(ok_structured(output.content.clone(), &output))
     }
 
     #[tool(
@@ -1091,17 +1028,9 @@ async fn forward_lines(
     }
 }
 
-/// `icp_cycles_balance` and `icp_deploy_guide` take no arguments.
+/// `icp_deploy_upload` takes no arguments.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct NoArgs {}
-
-/// What `icp_deploy_guide` returns: the skill document, as the resource
-/// serves it.
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct DeployGuideOutput {
-    /// The guide, Markdown with its frontmatter.
-    pub content: String,
-}
 
 /// Same contract as the core surface's result builder: the human-readable
 /// text plus `structuredContent` conforming to the declared `outputSchema`.
@@ -1186,7 +1115,6 @@ mod tests {
             "bundle_path",
             "bundle_upload",
             "authenticate",
-            "icp_cycles_balance",
         ] {
             assert!(body.contains(needle), "the skill must mention `{needle}`");
         }
@@ -1206,33 +1134,13 @@ mod tests {
 
     // The group carries the deploy tool, with honest annotations (it creates
     // canisters and can wipe state) and an object-rooted outputSchema like
-    // every tool on the core surface, the read-only balance check beside it,
-    // and the guide: the skill as a tool result, for a client that reads no
-    // resources.
+    // every tool on the core surface, and the upload-ticket tool beside it.
     #[test]
-    fn the_router_carries_the_deploy_tool_the_balance_check_and_the_guide() {
+    fn the_router_carries_the_deploy_and_upload_tools() {
         let tools = IcDeployTools::tool_router().list_all();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 2);
         let upload = tools.iter().find(|t| &*t.name == UPLOAD_TOOL).expect("upload ticket tool");
         assert_eq!(upload.annotations.clone().expect("annotations").destructive_hint, Some(false));
-        let guide = tools.iter().find(|t| &*t.name == "icp_deploy_guide").expect("guide");
-        let ann = guide.annotations.clone().expect("annotations");
-        assert_eq!(ann.read_only_hint, Some(true));
-        assert!(guide
-            .description
-            .as_deref()
-            .unwrap_or_default()
-            .contains("skill://deploy-with-mcp"));
-        let output =
-            serde_json::to_value(guide.output_schema.as_ref().expect("outputSchema")).unwrap();
-        assert!(output["properties"]["content"].is_object(), "{output}");
-        let balance = tools.iter().find(|t| &*t.name == "icp_cycles_balance").expect("balance");
-        let ann = balance.annotations.clone().expect("annotations");
-        assert_eq!(ann.read_only_hint, Some(true));
-        let output =
-            serde_json::to_value(balance.output_schema.as_ref().expect("outputSchema")).unwrap();
-        assert!(output["properties"]["balance"].is_object(), "{output}");
-        assert!(output["properties"]["principal"].is_object(), "{output}");
 
         let tool = tools.iter().find(|t| &*t.name == DEPLOY_TOOL).expect("deploy");
         let ann = tool.annotations.clone().expect("annotations");

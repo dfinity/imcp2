@@ -432,9 +432,8 @@ mod tests {
         let tools = client.list_all_tools().await.expect("tools/list");
         assert_eq!(
             tools.len(),
-            15,
-            "10 served core tools + authenticate + auth_status + icp_deploy_bundle + \
-             icp_cycles_balance + icp_deploy_guide"
+            13,
+            "10 served core tools + authenticate + auth_status + icp_deploy_bundle"
         );
         for expected in [
             "get_canister_candid",
@@ -442,8 +441,6 @@ mod tests {
             "authenticate",
             "auth_status",
             "icp_deploy_bundle",
-            "icp_cycles_balance",
-            "icp_deploy_guide",
         ] {
             assert!(tools.iter().any(|t| &*t.name == expected), "missing {expected}");
         }
@@ -511,17 +508,6 @@ mod tests {
         .await;
         assert!(is_error, "a deploy without a session is a tool error");
         assert!(text.contains("authenticated session"), "{text}");
-
-        // The guide needs no session and is the skill document itself, as
-        // text and as structured content, for a client that reads no
-        // resources.
-        let (is_error, text, structured) = call("icp_deploy_guide", None).await;
-        assert!(!is_error, "{text}");
-        assert_eq!(text, imcp2_core::deploy::DEPLOY_SKILL_MD);
-        assert_eq!(
-            structured.expect("structuredContent")["content"],
-            imcp2_core::deploy::DEPLOY_SKILL_MD
-        );
 
         // While a deploy runs, a second is refused before anything else —
         // before even the session check — so two cannot create two sets of

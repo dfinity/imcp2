@@ -922,7 +922,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        for tool in ["open_app", "icp_deploy_bundle", "icp_deploy_upload", "icp_cycles_balance"] {
+        for tool in ["open_app", "icp_deploy_bundle", "icp_deploy_upload"] {
             assert!(names.contains(&tool), "{tool} must be listed: {names:?}");
         }
         assert!(!names.contains(&"authenticate"), "no login tool on the hosted server");
@@ -1385,7 +1385,7 @@ mod tests {
             let arguments = serde_json::json!({ "padding": "x".repeat(bytes) });
             rpc(
                 "tools/call",
-                serde_json::json!({ "name": "icp_deploy_guide", "arguments": arguments }),
+                serde_json::json!({ "name": "icp_deploy_upload", "arguments": arguments }),
             )
         };
         // Past the default cap, within this server's.

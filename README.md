@@ -549,10 +549,9 @@ endpoint — the bundled binary always, an application that embeds the crate
 where it turns them on (`McpServer::with_deploy`): `icp_deploy_bundle`
 deploys an [icp CLI](https://github.com/dfinity/icp-cli) project bundle to the
 Internet Computer as the user — every phase of `icp deploy`, creating the
-canisters that do not exist yet from the user's cycles balance (`icp_cycles_balance`
-reports it) and upgrading those named in `canister_ids` — and `icp_deploy_guide`
-returns the skill that walks an agent through the loop (also the
-`skill://deploy-with-mcp` resource). It signs as the user's default Internet
+canisters that do not exist yet from the user's cycles balance and upgrading
+those named in `canister_ids` — and the `skill://deploy-with-mcp` resource
+walks an agent through the loop. It signs as the user's default Internet
 Identity account at `https://cli.id.ai`, the principal `icp identity link web`
 links an icp CLI identity to; `crates/imcp2-local/README.md` says what that
 means for sharing canisters and cycles with the CLI.

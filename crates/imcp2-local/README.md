@@ -7,9 +7,8 @@ It serves the same tools as the hosted server at
 [mcp.internetcomputer.org](https://mcp.internetcomputer.org) — canister reads
 and writes in textual Candid, app discovery, OQL, canister management —
 against the same **IC mainnet** and the same **production Internet
-Identity**, plus two tools of its own: `icp_deploy_bundle`, which deploys an
-icp project bundle (see [Deploying a project bundle](#deploying-a-project-bundle)),
-and `icp_cycles_balance`, which reports the balance those deploys draw on.
+Identity**, plus a tool of its own: `icp_deploy_bundle`, which deploys an
+icp project bundle (see [Deploying a project bundle](#deploying-a-project-bundle)).
 What it drops is the hosted server's entire OAuth 2.1 layer: a
 single-user process reached over a pipe needs no bearer tokens, so your II
 login never passes through a third-party server.
@@ -180,10 +179,7 @@ identity to. When the CLI's selected identity is such a link to the same
 account, `icp` and this tool deploy as the same principal: the canisters are
 the ones `icp` lists and controls, and they are funded from the same cycles
 balance. An `icp` identity that is a local key (`icp identity new`) or a link
-to another account is a different principal, which shares neither.
-`icp_cycles_balance` reports the balance and the principal used here, read
-from the Internet Computer whatever `IMCP2_IC_URL` says; compare it with
-`icp identity principal` before treating the two as interchangeable. It is
+to another account is a different principal, which shares neither. It is
 not the management identity the canister lifecycle tools act as (see
 `IMCP2_MANAGEMENT_ORIGIN`); to reach a deployed canister through those tools,
 add their principal as a controller. The session must have been granted
@@ -210,8 +206,7 @@ above from the agent's side: bundle the project with `icp project bundle`,
 call `icp_deploy_bundle` with the environment's
 `.icp/data/mappings/<environment>.ids.json` as `canister_ids`, and write the
 mapping the tool returns back into that file so the next deploy upgrades
-rather than creates. Not every client reads resources, so `icp_deploy_guide`
-returns the same document as a tool result. It lives at
+rather than creates. It lives at
 `crates/imcp2-core/static/skills/deploy-with-mcp.md`.
 
 The tool is built on `icp-project`, the icp CLI's project library, which
