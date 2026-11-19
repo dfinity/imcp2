@@ -1333,7 +1333,10 @@ fn extract_stream<R: Read>(
         // manifests, modules, plugins, argument files and images), and one
         // that did could point a deploy at canisters the caller never named.
         // Compared without regard to case: on a case-insensitive disk `.ICP`
-        // is the same directory.
+        // is the same directory. This is the refusal that names the entry,
+        // made before it is written; a spelling it does not know that the
+        // disk takes for the same name is caught once the archive is out
+        // ([`refuse_state`]).
         if rel.components().next().is_some_and(|c| c.as_str().eq_ignore_ascii_case(STATE_DIR)) {
             return Err(ExtractError::NotABundle(format!(
                 "the archive entry '{path}' is under `{STATE_DIR}/`, the project state a bundle \
@@ -1385,6 +1388,7 @@ fn extract_stream<R: Read>(
     std::io::copy(&mut decoder, &mut std::io::sink()).map_err(unreadable)?;
     let mut source = decoder.inner.into_inner();
     std::io::copy(&mut source, &mut std::io::sink()).map_err(unreadable)?;
+    refuse_state(fs.root())?;
     if !fs.root().join(PROJECT_MANIFEST).is_file() {
         return Err(ExtractError::NotABundle(format!(
             "the archive carries no `{PROJECT_MANIFEST}` at its root, so it is not an icp \
@@ -1392,6 +1396,29 @@ fn extract_stream<R: Read>(
         )));
     }
     Ok((fs, total))
+}
+
+/// Refuse an extraction that left the library's state directory under
+/// `root`, whatever the archive called it.
+///
+/// The entries were compared with the name as they were read, but a name is
+/// the disk's to interpret: Windows takes `.icp.`, `.icp ` and
+/// `.icp::$INDEX_ALLOCATION` for `.icp`, and another filesystem may fold a
+/// spelling this code has not heard of. So the question is asked of the disk,
+/// which answers for every spelling it honours: the directory was empty
+/// before the archive was written into it, and nothing but the archive has
+/// written there since.
+fn refuse_state(root: &Utf8Path) -> Result<(), ExtractError> {
+    match std::fs::symlink_metadata(root.join(STATE_DIR)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ExtractError::Storage(format!(
+            "whether the archive wrote `{STATE_DIR}/` could not be told: {e}"
+        ))),
+        Ok(_) => Err(ExtractError::NotABundle(format!(
+            "the archive wrote `{STATE_DIR}/`, the project state a bundle never carries, under \
+             another spelling of the name; rebuild it with `icp project bundle`"
+        ))),
+    }
 }
 
 /// Give an extracted file or directory the mode everything a deploy writes
@@ -1845,6 +1872,33 @@ mod tests {
         let err = extract_bundle(&bytes, &into).unwrap_err();
         assert!(err.contains("`.icp/`"), "{err}");
         assert!(!into.join(".icp").exists());
+    }
+
+    // The spelling check cannot know every name a disk takes for `.icp`
+    // (Windows drops a trailing dot or space, and reads a stream suffix as
+    // the directory), so the disk is asked once the archive is out: state
+    // that is there is refused, however it came to be.
+    #[test]
+    fn state_on_disk_is_refused_whatever_the_archive_called_it() {
+        let (_dir, into) = scratch();
+        refuse_state(&into).unwrap();
+        std::fs::create_dir_all(into.join(".icp/data/mappings")).unwrap();
+        let err = refuse_state(&into).unwrap_err();
+        assert!(matches!(err, ExtractError::NotABundle(_)), "{err}");
+        assert!(err.to_string().contains("`.icp/`"), "{err}");
+    }
+
+    // The alias itself, where the disk has it.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_alias_of_the_state_directory_is_refused() {
+        let (_dir, into) = scratch();
+        let bytes = archive(&[
+            ("icp.yaml", b"canisters: []"),
+            (".icp./data/mappings/ic.ids.json", b"{\"backend\": \"aaaaa-aa\"}"),
+        ]);
+        let err = extract_bundle(&bytes, &into).unwrap_err();
+        assert!(err.contains("`.icp/`"), "{err}");
     }
 
     // The cap counts files and directories alike, the directories by what
