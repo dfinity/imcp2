@@ -206,21 +206,32 @@ async fn serve() -> anyhow::Result<()> {
     let auto_open = !truthy("IMCP2_NO_OPEN");
     let login = login::LoginDriver::new(identities, slot, auto_open);
 
-    let service = server::LocalServer::new(tools, deploy, login, auto_open)
-        .serve(rmcp::transport::stdio())
-        .await?;
+    // From here a signal — a client or service manager stopping the server,
+    // or Ctrl-C in a terminal — is taken in hand rather than left to kill
+    // the process, so that a running deploy is stopped and waited for.
+    let stop = shutdown_signal();
+    tokio::pin!(stop);
+    let service = tokio::select! {
+        service = server::LocalServer::new(tools, deploy, login, auto_open)
+            .serve(rmcp::transport::stdio()) => service?,
+        () = &mut stop => {
+            tracing::info!("asked to stop before a client had connected");
+            exit_on_a_signal();
+        }
+    };
     tracing::info!("imcp2-local serving MCP over stdio");
     let cancel = service.cancellation_token();
     // Runs until the client closes the pipe (or the service errors), or the
-    // process is told to stop: a client that shuts its servers down with a
-    // signal, or Ctrl-C in a terminal.
+    // process is told to stop.
     let waiting = service.waiting();
     tokio::pin!(waiting);
-    let mut quit = None;
-    tokio::select! {
-        ended = &mut waiting => quit = Some(ended),
-        () = shutdown_signal() => tracing::info!("asked to stop"),
-    }
+    let quit = tokio::select! {
+        ended = &mut waiting => Some(ended),
+        () = &mut stop => {
+            tracing::info!("asked to stop");
+            None
+        }
+    };
     // A deploy may still be running: rmcp waits only seconds for the calls
     // in flight as it ends, and returning here would end the runtime under a
     // deploy waiting on a canister call — one that may have created, and
@@ -230,51 +241,117 @@ async fn serve() -> anyhow::Result<()> {
     // as a stopped deploy takes to end and no longer, however the service
     // ended.
     cancel.cancel();
-    let quit = match quit {
-        Some(ended) => ended,
-        None => waiting.await,
-    };
-    if tokio::time::timeout(STOP_GRACE + STOP_MARGIN, slots.idle()).await.is_err() {
+    if !deploys_ended(&slots).await {
         tracing::warn!("a deploy had not ended when the server stopped waiting for it");
     }
-    quit?;
-    Ok(())
+    match quit {
+        Some(ended) => {
+            ended?;
+            Ok(())
+        }
+        None => {
+            // The service is given a moment to send what its calls answered
+            // and close, and no longer: see `exit_on_a_signal`.
+            let _ = tokio::time::timeout(STOP_MARGIN, waiting).await;
+            exit_on_a_signal();
+        }
+    }
 }
 
-/// Resolves when the process is asked to stop: SIGINT (Ctrl-C) or, on Unix,
-/// SIGTERM, which is what a client or service manager sends. If a handler
-/// cannot be installed, that signal is not waited on and the process keeps
-/// its default behaviour for it.
-async fn shutdown_signal() {
-    let interrupt = async {
+/// Whether the deploys running in `slots` have ended, waiting for as long as
+/// a stopped deploy is given to end ([`STOP_GRACE`], and a margin) and no
+/// longer.
+async fn deploys_ended(slots: &DeploySlots) -> bool {
+    tokio::time::timeout(STOP_GRACE + STOP_MARGIN, slots.idle()).await.is_ok()
+}
+
+/// End the process once a signal has been handled. Not a return from
+/// `serve`: the transport reads stdin on a thread of the runtime that cannot
+/// be interrupted, and with the pipe still open — which is how a signal
+/// finds it — a return would wait on that read for as long as the client
+/// keeps the pipe, the signal ignored in effect.
+fn exit_on_a_signal() -> ! {
+    std::process::exit(0)
+}
+
+/// A future that resolves when the process is asked to stop: SIGINT
+/// (Ctrl-C) or, on Unix, SIGTERM, which is what a client or service manager
+/// sends. The handlers are installed by the call, not by the first poll, so
+/// no signal from then on is left to its default of killing the process. A
+/// signal whose handler cannot be installed is not waited on, and keeps that
+/// default.
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    #[cfg(unix)]
+    let signals = {
+        use tokio::signal::unix::{signal, SignalKind};
+        [("SIGINT", SignalKind::interrupt()), ("SIGTERM", SignalKind::terminate())].map(
+            |(name, kind)| {
+                signal(kind)
+                    .map_err(|e| tracing::warn!("could not install a handler for {name}: {e}"))
+                    .ok()
+            },
+        )
+    };
+    async move {
+        #[cfg(unix)]
+        {
+            let received = |signal: Option<tokio::signal::unix::Signal>| async move {
+                match signal {
+                    Some(mut signal) => {
+                        signal.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            let [interrupt, terminate] = signals;
+            tokio::select! {
+                () = received(interrupt) => {}
+                () = received(terminate) => {}
+            }
+        }
+        #[cfg(not(unix))]
         if tokio::signal::ctrl_c().await.is_err() {
             std::future::pending::<()>().await;
         }
-    };
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    () = interrupt => {}
-                    _ = term.recv() => {}
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "could not install a SIGTERM handler ({e}); stopping on SIGINT only"
-                );
-                interrupt.await;
-            }
-        }
     }
-    #[cfg(not(unix))]
-    interrupt.await;
 }
 
 #[cfg(test)]
 mod tests {
+    // As the process ends, a deploy still running is waited for — it is
+    // recording the canisters it created — and one that will not end is
+    // given a stopped deploy's time and no more, so it cannot hold the
+    // process.
+    #[tokio::test(start_paused = true)]
+    async fn an_ending_server_waits_for_its_deploy_and_not_for_ever() {
+        use super::{deploys_ended, DeploySlots, IcDeployTools, STOP_GRACE, STOP_MARGIN};
+        let agent = imcp2_core::Agent::builder().with_url("http://127.0.0.1:9").build().unwrap();
+        let identities = imcp2_core::identities::Identities::new(
+            imcp2_core::IiInstance::prod().expect("prod II"),
+            "https://mcp.internetcomputer.org".into(),
+            agent,
+        );
+        let slots = DeploySlots::new(1);
+        let tools = IcDeployTools::new(identities, super::SessionSlot::new().resolver())
+            .with_slots(slots.clone());
+        assert!(deploys_ended(&slots).await, "nothing is running");
+
+        let running = tools.claim().unwrap();
+        let ending = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            drop(running);
+        });
+        let started = tokio::time::Instant::now();
+        assert!(deploys_ended(&slots).await, "the deploy ended within its time");
+        assert_eq!(started.elapsed().as_secs(), 10, "and was waited for");
+        ending.await.unwrap();
+
+        let _stuck = tools.claim().unwrap();
+        let started = tokio::time::Instant::now();
+        assert!(!deploys_ended(&slots).await);
+        assert_eq!(started.elapsed(), STOP_GRACE + STOP_MARGIN);
+    }
+
     // The root-key guard must accept every loopback shape a test harness
     // reasonably uses and refuse everything else — mainnet above all. A truthy
     // IMCP2_FETCH_ROOT_KEY against a non-loopback endpoint aborts startup

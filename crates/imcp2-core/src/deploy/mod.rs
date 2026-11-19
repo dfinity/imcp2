@@ -811,20 +811,10 @@ impl IcDeployTools {
         let watch = Watch { stop, lines: Some(lines) };
         let result = deploy_bundle(identity, request, watch).instrument(span.clone()).await;
         // The sender went with the run; the forwarder ends once it has
-        // delivered what is left. Not waited for past a stop, nor for long:
-        // each notification waits on the transport's bounded queue, so a
-        // client that keeps the stream open without reading it would hold
-        // this call — and its slot — for ever. The outcome's log has every
-        // line a notification would have carried.
-        let mut forwarder = forwarder;
-        tokio::select! {
-            biased;
-            _ = &mut forwarder => {}
-            _ = stopped.cancelled() => forwarder.abort(),
-            _ = tokio::time::sleep(FORWARD_GRACE) => {
-                tracing::warn!(parent: &span, "the deploy's progress was not read; dropped");
-                forwarder.abort();
-            }
+        // delivered what is left, or is given up on (see [`delivered`]). The
+        // outcome's log has every line a notification would have carried.
+        if !delivered(forwarder, &stopped).await {
+            tracing::info!(parent: &span, "the deploy's last progress lines were not delivered");
         }
         match result {
             Err(refused) => {
@@ -1045,6 +1035,26 @@ pub struct UploadTicketOutput {
 /// How long a deploy that has ended waits for its last progress lines to be
 /// delivered before it answers without them.
 const FORWARD_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wait for `forwarder` to have delivered a finished deploy's last lines,
+/// and say whether it did. Not past a stop, nor for longer than
+/// [`FORWARD_GRACE`]: each notification waits on the transport's bounded
+/// queue, so a client that keeps the stream open without reading it would
+/// otherwise hold the call — and its slot — for ever. A forwarder given up
+/// on is aborted.
+async fn delivered(
+    mut forwarder: tokio::task::JoinHandle<()>,
+    stopped: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = &mut forwarder => return true,
+        _ = stopped.cancelled() => {}
+        _ = tokio::time::sleep(FORWARD_GRACE) => {}
+    }
+    forwarder.abort();
+    false
+}
 
 /// Deliver each log line of a running deploy to the client as it is made: as
 /// a progress notification when the request carried a progress token (which
@@ -1411,6 +1421,32 @@ mod tests {
         drop(running);
         waiting.await;
         assert_eq!(slots.running(), 0);
+    }
+
+    // A deploy that has ended answers, and gives its slot back, whether or
+    // not its client reads the progress it is sent: the lines left are
+    // waited for only until a stop, and only so long without one.
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_deploy_does_not_wait_on_progress_nobody_reads() {
+        let unread = || tokio::spawn(std::future::pending::<()>());
+        let running = CancellationToken::new();
+        assert!(delivered(tokio::spawn(async {}), &running).await, "read, it is delivered");
+
+        // Never read, and the deploy stopped: not waited for at all.
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        let forwarder = unread();
+        let aborted = forwarder.abort_handle();
+        let started = tokio::time::Instant::now();
+        assert!(!delivered(forwarder, &stopped).await);
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        tokio::task::yield_now().await;
+        assert!(aborted.is_finished(), "a forwarder given up on is aborted");
+
+        // Never read, and nothing stopping the deploy: so long, and no more.
+        let started = tokio::time::Instant::now();
+        assert!(!delivered(unread(), &running).await);
+        assert_eq!(started.elapsed(), FORWARD_GRACE);
     }
 
     #[tokio::test]

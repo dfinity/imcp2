@@ -69,4 +69,9 @@ base64 = { workspace = true }
 # The wrapper tests run a REAL MCP round-trip: the server served over an
 # in-process duplex pipe (the same shape as stdio), driven by rmcp's client.
 rmcp = { workspace = true, features = ["client"] }
-tokio = { workspace = true, features = ["io-util"] }
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs: the test
+# of the wait for a stopped deploy runs its seconds on a paused clock.
+tokio = { workspace = true, features = ["io-util", "test-util"] }
+# The shutdown test (tests/shutdown.rs) gives the spawned binary a home of
+# its own.
+tempfile = "3"

@@ -836,9 +836,14 @@ mod tests {
     }
 
     fn server_in(state_dir: &Path, mcp_path: &str, deploys: Deploys) -> McpServer {
+        server_at(state_dir, mcp_path, deploys, IC_URL)
+    }
+
+    /// [`server_in`], with the IC endpoint the server calls at `ic_url`.
+    fn server_at(state_dir: &Path, mcp_path: &str, deploys: Deploys, ic_url: &str) -> McpServer {
         let state_dir = state_dir.to_path_buf();
         McpServer::new(McpConfig {
-            agent: Agent::builder().with_url(IC_URL).build().expect("agent"),
+            agent: Agent::builder().with_url(ic_url).build().expect("agent"),
             instance: IiInstance::prod().expect("prod instance"),
             public_url: "https://mcp.example.com".into(),
             mcp_path: mcp_path.into(),
@@ -1262,6 +1267,116 @@ mod tests {
         ] {
             has(&out, series);
         }
+    }
+
+    /// A ticket for the made-up session, minted the way an agent gets one.
+    async fn ticket(app: &Router, bearer: &str) -> String {
+        let minted = call(app, bearer, "icp_deploy_upload", serde_json::json!({})).await;
+        let answer: serde_json::Value = serde_json::from_str(&minted).unwrap();
+        answer["result"]["structuredContent"]["ticket"].as_str().expect("a ticket").to_string()
+    }
+
+    /// `PUT` `body` on `ticket`.
+    async fn put(app: &Router, ticket: &str, body: Vec<u8>) -> Response {
+        let request = Request::put(UPLOAD_PATH).header(TICKET_HEADER, ticket);
+        app.clone().oneshot(request.body(Body::from(body)).unwrap()).await.unwrap()
+    }
+
+    /// A deploy call in flight is cancelled by its client the way MCP has
+    /// it: a `notifications/cancelled` naming the call's id, sent on its own
+    /// request while the call's event stream stays open. Over the composed
+    /// router — the bearer gate, the body cap, the dispatch and both
+    /// transports — with nothing stubbed but the network: the server's IC
+    /// endpoint is a listener that takes a connection and never answers, so
+    /// the deploy is held at the first thing it asks of the network, the
+    /// identity it would sign with.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancellation_notification_stops_the_deploy_call_in_flight() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ic_url = format!("http://{}", silent.local_addr().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let deploys = Deploys::new(&config(), dir.path()).unwrap();
+        let server = server_at(dir.path(), "/mcp", deploys.clone(), &ic_url);
+        let bearer = format!("Bearer {}", server.store.test_bearer().await);
+        let app = server.mcp_router();
+
+        let uploaded = put(&app, &ticket(&app, &bearer).await, bundle()).await;
+        assert_eq!(uploaded.status(), StatusCode::CREATED);
+        let uploaded: serde_json::Value = serde_json::from_str(&text(uploaded).await).unwrap();
+
+        // The deploy call, under an id of its own, left running.
+        let deploy = serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {
+                "name": "icp_deploy_bundle",
+                "arguments": { "bundle_upload": uploaded["upload_id"], "environment": "ic" }
+            }
+        })
+        .to_string();
+        let mut deploying = tokio::spawn({
+            let (app, bearer) = (app.clone(), bearer.clone());
+            async move { text(post(&app, &bearer, deploy).await).await }
+        });
+        let began = std::time::Instant::now();
+        while deploys.slots.running() == 0 {
+            assert!(began.elapsed() < Duration::from_secs(30), "the deploy never began");
+            assert!(!deploying.is_finished(), "the deploy ended before it could be cancelled");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let cancel = |id: u32| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": { "requestId": id, "reason": "the user stopped it" }
+            })
+            .to_string()
+        };
+        // A cancellation of some other call leaves this one running.
+        let other = post(&app, &bearer, cancel(8)).await;
+        assert_eq!(other.status(), StatusCode::ACCEPTED);
+        let still = tokio::time::timeout(Duration::from_millis(300), &mut deploying).await;
+        assert!(still.is_err(), "only the call named is cancelled");
+        assert_eq!(deploys.slots.running(), 1);
+
+        // Its own stops it: the call answers, on the stream it was given,
+        // that it was interrupted, and its slot is free.
+        let own = post(&app, &bearer, cancel(7)).await;
+        assert_eq!(own.status(), StatusCode::ACCEPTED);
+        let stream = tokio::time::timeout(Duration::from_secs(30), deploying)
+            .await
+            .expect("the cancelled deploy answers")
+            .unwrap();
+        let data = stream
+            .lines()
+            .filter_map(|l| l.strip_prefix("data:"))
+            .map(str::trim)
+            .find(|d| d.contains("\"result\""))
+            .unwrap_or_else(|| panic!("the stream carries the result: {stream}"));
+        let answer: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(answer["id"], 7, "{answer}");
+        assert_eq!(answer["result"]["isError"], true, "{answer}");
+        let said = answer["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(said.contains("interrupted before it began"), "{said}");
+        assert_eq!(deploys.slots.running(), 0, "the cancelled deploy gives its slot back");
+        drop(silent);
+    }
+
+    /// A stopping server takes no upload: the `PUT` is refused as the
+    /// server's doing, something to try again, and nothing of it is kept.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopping_server_takes_no_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let deploys = Deploys::new(&config(), dir.path()).unwrap();
+        let server = server_in(dir.path(), "/mcp", deploys.clone());
+        let bearer = format!("Bearer {}", server.store.test_bearer().await);
+        let app = server.mcp_router();
+        let ticket = ticket(&app, &bearer).await;
+        deploys.stop();
+        let refused = put(&app, &ticket, bundle()).await;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(text(refused).await.contains("restarting"));
+        let (_, _, held) = deploys.gauges();
+        assert_eq!((held.uploads, held.receiving, held.bytes), (0, 0, 0));
     }
 
     /// Once the server has said it is stopping, a deploy does not begin, and
