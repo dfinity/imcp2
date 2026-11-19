@@ -41,6 +41,10 @@ macro_rules! metric {
     };
 }
 
+// After the macro, which it uses: a macro is in scope only below where it is
+// defined.
+pub(crate) mod deploy;
+
 /// The shared bucket for unmatched routes / non-standard methods.
 const UNMATCHED_ROUTE: &str = "other";
 const UNKNOWN_METHOD: &str = "other";
@@ -73,6 +77,9 @@ pub struct Metrics {
     /// Servers whose session gauges [`Metrics::refresh`] republishes. Fixed at
     /// construction.
     servers: Vec<crate::McpServer>,
+    /// The deploy state [`Metrics::refresh`] republishes the gauges of, with
+    /// the collectors: when a server serves the deploy tools.
+    deploys: Option<(crate::deploy::Deploys, deploy::DeployMetrics)>,
 }
 
 impl Metrics {
@@ -85,6 +92,14 @@ impl Metrics {
     /// simply absent.
     ///
     /// `version` and `commit` become the labels of a `build_info` gauge.
+    ///
+    /// With a server among `servers` that serves
+    /// the deploy tools ([`crate::McpServer::with_deploy`]), the deploy
+    /// series are registered too and fed from then on — the counters as
+    /// deploys and uploads happen, the gauges by [`Self::refresh`]. Nothing
+    /// more is asked of the caller. The deploy state reports to the first
+    /// handle made over it: build one `Metrics` per process, as for the
+    /// registry.
     ///
     /// Returns [`prometheus::Error::AlreadyReg`] when a name is already taken,
     /// e.g. when called twice against one registry — build one and clone it.
@@ -182,6 +197,17 @@ impl Metrics {
             active_sessions.with_label_values(&[name]).set(0);
         }
 
+        // The deploy state is the process's, one whichever server names it.
+        let deploys = match servers.iter().find_map(|s| s.deploy.clone()) {
+            Some(deploys) => {
+                let collectors = deploy::DeployMetrics::register(registry)?;
+                deploys.report_to(collectors.clone());
+                collectors.refresh(&deploys);
+                Some((deploys, collectors))
+            }
+            None => None,
+        };
+
         Ok(Self {
             requests,
             duration,
@@ -189,6 +215,7 @@ impl Metrics {
             active_sessions,
             scrapes,
             servers: servers.iter().map(|s| (*s).clone()).collect(),
+            deploys,
         })
     }
 
@@ -204,8 +231,9 @@ impl Metrics {
         self.duration.with_label_values(&[route, method]).observe(elapsed);
     }
 
-    /// Recompute the session gauges from each server's session map. They are
-    /// derived state, so something must decide when to pull them: call this
+    /// Recompute the session gauges from each server's session map (and,
+    /// with the deploy tools, the deploy gauges from the deploy state). They
+    /// are derived state, so something must decide when to pull them: call this
     /// from your exposition path just before gathering, or on a timer.
     pub async fn refresh(&self) {
         for server in &self.servers {
@@ -213,6 +241,9 @@ impl Metrics {
             let name = server.instance().name;
             self.live_sessions.with_label_values(&[name]).set(g.live as i64);
             self.active_sessions.with_label_values(&[name]).set(g.active as i64);
+        }
+        if let Some((deploys, collectors)) = &self.deploys {
+            collectors.refresh(deploys);
         }
     }
 

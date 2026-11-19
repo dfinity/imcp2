@@ -679,6 +679,27 @@ What the hosted composition adds to the local one:
   deploy are logged at `info` with the session and upload id. The default
   `RUST_LOG=info` shows all of it.
 
+- **Deploys are counted.** A deploy is one `tools/call` inside a `POST`,
+  answered `200` however it went, so the request metrics do not see it. With
+  the deploy tools on, `imcp2::metrics::Metrics` also publishes, as totals for
+  the process:
+
+  | Series | What it answers |
+  |---|---|
+  | `imcp2_deploys_running`, `imcp2_deploy_slots` | How full the server is: deploys holding a slot against the cap. |
+  | `imcp2_deploy_refusals_total{reason}` | Deploys not begun: `busy` (every slot held; a sustained rate means the cap is too low), `session_busy`, `stopping`, `no_room` (the store had no room for the deploy to run in). |
+  | `imcp2_deploys_total{outcome}` | Deploys that held a slot: `succeeded`, `failed`, `rejected` (refused before anything was created, for the request, the bundle, or an identity that could not be derived), `setup_failed` (the server could not prepare it; nothing wrong with the request), `interrupted`. |
+  | `imcp2_deploy_duration_seconds` | How long a deploy held its slot. |
+  | `imcp2_deploy_uploads_total{outcome}` | Uploads: `accepted`, `bad_ticket`, `too_large` (the archive), `extracts_too_large` (what it extracts to), `not_a_bundle`, `plugin_not_allowed`, `store_full`, `session_busy`, `body_error`, `storage_error`. |
+  | `imcp2_deploy_upload_bytes`, `imcp2_deploy_bundle_extracted_bytes` | The size of each accepted archive, and what it extracted to: where the two limits should sit is read off these. |
+  | `imcp2_deploy_upload_store_bytes`, `imcp2_deploy_upload_store_capacity_bytes` | What the deploy tools keep under the state directory, in extracted bytes, against the budget. |
+  | `imcp2_deploy_uploads_held`, `imcp2_deploy_uploads_arriving` | Uploads waiting for their deploy, and arriving. |
+
+  Every label value is one of those listed; nothing a client sends becomes
+  one. An embedder gets them by building `Metrics` over its servers as it
+  already does: the counters are fed as things happen and the gauges by
+  `Metrics::refresh`.
+
 The deploy tools are part of every build: there is no feature to turn on. The
 bundled binary always serves them; an application that embeds the `imcp2`
 crate serves them once it calls `McpServer::with_deploy`, and not before.
