@@ -3,10 +3,10 @@
 //! the icp CLI's own project library (`icp-project`, the code behind `icp
 //! deploy`).
 //!
-//! The module lands in steps: so far the bundle host and the upload store.
-//! The deploy pipeline, the MCP tools and the servers that serve them
-//! follow, and the items here are public until the tools that use them are
-//! in.
+//! The module lands in steps: so far the bundle host, the upload store and
+//! the deploy pipeline ([`run::deploy_bundle`]). The MCP tools and the
+//! servers that serve them follow, and the items here are public until the
+//! tools that use them are in.
 //!
 //! The bundle is untrusted input, and the rule it is held to is the
 //! library's own: `icp_project::untrusted`, the one `icp --untrusted`
@@ -19,7 +19,10 @@
 //! crates.io, which is where the wasmtime runtime in this crate's
 //! dependencies comes from: a sync plugin runs on it.
 
+pub mod calls;
 pub mod host;
+pub mod identity;
+pub mod run;
 pub mod uploads;
 
 pub use uploads::Uploads;
