@@ -12,9 +12,10 @@
   "license": "Apache-2.0",
   "keywords": [
     "internet computer",
-    "icp mcp",
-    "icp canister",
+    "icp",
+    "canister",
     "dfinity",
-    "internet identity"
+    "internet identity",
+    "cloud engines"
   ]
 }
