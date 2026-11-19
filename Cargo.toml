@@ -18,7 +18,8 @@ categories = [
 ]
 # Everything the library and the bundled binary compile from ships; the
 # deployment scaffolding (container, systemd/native deploy, dashboards, CI,
-# submission docs) is repository-only and would just inflate the .crate.
+# submission docs, plugin-marketplace manifests) is repository-only and would
+# just inflate the .crate.
 # `src/assets` is NOT optional: it is pulled in at compile time with
 # `include_str!`. `crates/` holds the other workspace members (each packaged
 # on its own), so it is excluded from THIS package.
@@ -30,6 +31,7 @@ exclude = [
     "deploy/",
     "docs/",
     "monitoring/",
+    "plugins/",
 ]
 
 [workspace]

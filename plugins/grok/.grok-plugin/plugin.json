@@ -1,0 +1,20 @@
+{
+  "name": "icp",
+  "version": "1.0.0",
+  "description": "Official Internet Computer (ICP) MCP server by DFINITY. Read canister Candid interfaces and API docs, discover the canisters behind an ICP app, query app data via Candid or OQL, and, with consent, make update calls as your Internet Identity account at an app. Financial transactions are refused.",
+  "author": {
+    "name": "DFINITY Foundation",
+    "email": "mcp@dfinity.org",
+    "url": "https://dfinity.org"
+  },
+  "homepage": "https://internetcomputer.org/icp-mcp/",
+  "repository": "https://github.com/dfinity/imcp2",
+  "license": "Apache-2.0",
+  "keywords": [
+    "internet computer",
+    "icp mcp",
+    "icp canister",
+    "dfinity",
+    "internet identity"
+  ]
+}
