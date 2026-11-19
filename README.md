@@ -644,7 +644,10 @@ more is needed to run it — `spawn_session_reaper` starts the deploy sweeper
 and `shutdown` stops the running deploys — but an embedder that drains
 in-flight requests calls `Deploys::stop` *before* the drain, as the bundled
 binary does: a drain that began first would wait on deploys nothing had told
-to stop.
+to stop. After the drain, and before `shutdown` or exiting, it awaits
+`Deploys::stopped`: a bounded wait for each deploy to have ended, which a
+drain does not cover when a deploy's client has already gone. `Deploys::new`
+fails when another running server owns the state directory.
 
 ## Connect from an MCP client
 

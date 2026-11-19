@@ -186,6 +186,12 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace --all-targets
 
+      # The hosted deploy tools are a feature of `imcp2`, off in the default
+      # build the step above tests, and what an embedder turns on in the crate
+      # this publishes: so, as in ci.yml, they get their own run.
+      - name: Test the hosted deploy feature
+        run: cargo test --locked -p imcp2 --features deploy --all-targets
+
       # Rehearses the real thing — packages the published crates and compiles each package in
       # isolation — but stops short of uploading, so a package that only builds
       # because of something untracked in the working tree fails here rather than

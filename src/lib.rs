@@ -220,9 +220,16 @@ impl McpServer {
     /// Serve the deploy tools on the MCP endpoint (see [`deploy`]), on the
     /// process's deploy state: the same [`deploy::Deploys`] goes to every
     /// instance that serves them, made over this instance's state directory
-    /// (deploy records and uploads go under `{state_dir}/deploys`). Nothing
-    /// else is asked of the embedder: [`Self::spawn_session_reaper`] and
-    /// [`Self::shutdown`] cover the deploy state too.
+    /// (deploy records and uploads go under `{state_dir}/deploys`).
+    ///
+    /// Running it asks nothing more: [`Self::spawn_session_reaper`] starts
+    /// the deploy sweeper too. Stopping it does, of an embedder that drains
+    /// in-flight requests: call [`deploy::Deploys::stop`] *before* the drain
+    /// (a drain begun first waits on deploys nothing has told to stop, until
+    /// whatever bounds it cuts their answers off) and
+    /// [`deploy::Deploys::stopped`] after it, before [`Self::shutdown`].
+    /// `shutdown` stops the deploys as well, but only as a backstop: by then
+    /// it is too late for them to answer.
     #[cfg(feature = "deploy")]
     pub fn with_deploy(mut self, deploys: deploy::Deploys) -> Self {
         self.deploy = Some(deploys);
