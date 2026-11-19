@@ -49,8 +49,11 @@ registration and client ID metadata documents are both supported. You sign in wi
 [Internet Identity](https://id.ai) (passkey-based) and choose on the consent screen:
 
 - a session duration (10 minutes to 30 days), and
-- an access level: **Questions only** (read-only; the Internet Computer rejects
-  state-changing calls signed for that session) or **Actions & questions**.
+- an access level: **Questions only** or **Actions & questions**. Questions only
+  makes the Internet Computer reject state-changing calls signed as your
+  account at an app. An anonymous `canister_update_call`, made with no
+  derivation origin, is not signed with that session, so this access level
+  does not apply to it.
 
 You can revoke a connection at any time at <https://id.ai/manage/settings>.
 
@@ -91,7 +94,7 @@ session duration and access level, and return to Grok.
 
 Example prompts:
 
-- "What interface does canister gftcp-myaaa-aaaar-qcaaa-cai expose, and what can it do?"
+- "Open https://opencloud.org and show the Candid interface of a canister it declares."
 - "What canisters are behind https://opencloud.org, and which one holds the app's data?"
 - "Open opencloud.org and list my accounts there."
 
