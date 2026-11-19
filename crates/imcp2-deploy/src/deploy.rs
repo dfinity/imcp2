@@ -42,7 +42,7 @@ use tracing::{Instrument, Span};
 
 use crate::{
     calls::{AgentCalls, UntilStopped},
-    host::{self, BundleLimits},
+    host::{self, AllowedPlugins, BundleLimits},
 };
 
 /// Where the bundle bytes come from.
@@ -79,6 +79,10 @@ pub struct DeployRequest {
     /// How large a bundle this deploy takes: its archive, what it extracts
     /// to, and what its directory may come to.
     pub limits: BundleLimits,
+    /// Which sync plugins this deploy runs: any the bundle brings, on the
+    /// user's own machine; the ones the server knows, where it deploys for
+    /// others.
+    pub plugins: AllowedPlugins,
     /// The environment, by name, among those the bundle's manifest declares.
     pub environment: String,
     /// Canister ids to start from: a canister named here is upgraded in place
@@ -269,6 +273,7 @@ pub async fn deploy_bundle(
     };
     stopped()?;
     let limits = request.limits;
+    let plugins = request.plugins.clone();
     // An archive is read as it is extracted, never whole: one named by path
     // is opened here, held to the archive limit by its size before a byte
     // of it is read.
@@ -371,6 +376,7 @@ pub async fn deploy_bundle(
                 canisters.iter().map(|(dir, canister)| (dir.as_path(), canister)),
                 bundle_bytes,
                 &limits,
+                &plugins,
             )
         })
         .await
@@ -925,6 +931,7 @@ mod tests {
         DeployRequest {
             bundle: BundleSource::Bytes(bytes),
             limits: BundleLimits::LOCAL,
+            plugins: AllowedPlugins::Any,
             environment: environment.into(),
             canister_ids: BTreeMap::new(),
             mode: "auto".into(),

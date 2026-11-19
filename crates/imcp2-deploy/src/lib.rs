@@ -101,7 +101,7 @@ pub use deploy::{
     deploy_bundle, prune_abandoned_deploys, remove_old_deploy_records, BundleSource, DeployOutcome,
     DeployRequest, RequestError, Status, Watch, STOP_GRACE,
 };
-pub use host::{occupies, BundleLimits, BLOCK_BYTES, ENTRY_BYTES};
+pub use host::{occupies, AllowedPlugins, BundleLimits, BLOCK_BYTES, ENTRY_BYTES, KNOWN_PLUGINS};
 use identity::RefreshingIdentity;
 pub use observe::{DeployObserver, Ended, Refused};
 pub use server::WithDeploy;
@@ -378,6 +378,7 @@ pub fn request_from_args(
     Ok((bundle, move |bundle| DeployRequest {
         bundle,
         limits: BundleLimits::LOCAL,
+        plugins: AllowedPlugins::Any,
         environment,
         canister_ids,
         mode,
@@ -736,9 +737,14 @@ impl IcDeployTools {
         // the deploy takes its directory, and holds the room the store keeps
         // for a running deploy until it has returned. A bundle named by path
         // is the user's own file on the user's own machine, and is held to
-        // what such a server takes.
-        let (source, limits, _upload) = match &self.uploads {
-            None => (BundleSource::Path(Utf8PathBuf::from(bundle)), BundleLimits::LOCAL, None),
+        // what such a server takes — any sync plugin it brings among it,
+        // where an upload's are the ones its server knows.
+        let (source, (limits, plugins), _upload) = match &self.uploads {
+            None => (
+                BundleSource::Path(Utf8PathBuf::from(bundle)),
+                (BundleLimits::LOCAL, AllowedPlugins::Any),
+                None,
+            ),
             Some((uploads, _)) => {
                 let taken = match uploads.take(&bundle, &sid).await {
                     Ok(taken) => taken,
@@ -764,7 +770,7 @@ impl IcDeployTools {
                 match Utf8PathBuf::from_path_buf(taken.dir().to_path_buf()) {
                     Ok(dir) => {
                         let source = BundleSource::Extracted { dir, bytes: taken.bytes() };
-                        (source, uploads.limits(), Some(taken))
+                        (source, (uploads.limits(), uploads.plugins()), Some(taken))
                     }
                     Err(p) => {
                         return rejected(format!("upload path is not UTF-8: {}", p.display()))
@@ -774,6 +780,7 @@ impl IcDeployTools {
         };
         let mut request = into_request(source);
         request.limits = limits;
+        request.plugins = plugins;
         request.workdir = self.deploys_dir.clone();
         // A per-app delegation lives five minutes and a deploy can outlast
         // it (an asset sync, several installs), so the identity the agent

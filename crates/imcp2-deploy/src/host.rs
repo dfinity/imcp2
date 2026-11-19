@@ -50,6 +50,10 @@
 //!   budget is in the bytes a bundle occupies ([`occupies`]), which is what
 //!   it costs a server that keeps it in memory. How large is the server's
 //!   to say ([`BundleLimits`]).
+//! * **A sync plugin is run only if the server knows it**, where the server
+//!   deploys for others ([`AllowedPlugins`]): by the hash of its module, on
+//!   the upload ([`vet_plugins`]) and again before the deploy
+//!   ([`check_bundle`]).
 //! * **What the deploy adds to the directory is counted with it**: the copy
 //!   of each canister's module the build keeps beside the bundle, held to
 //!   the same budget before any is made ([`check_bundle`]).
@@ -248,6 +252,187 @@ impl Default for BundleLimits {
     fn default() -> Self {
         Self::LOCAL
     }
+}
+
+/// The sync plugins a server that deploys for others runs unless it is told
+/// otherwise, each by the sha256 of its module and what it is.
+///
+/// A sync plugin is a program the bundle brings and the server runs: it is
+/// held to a sandbox (WASI, its own deploy directory read-only, no network)
+/// and a compute budget, but not to a memory limit short of its address
+/// space, and it runs inside the server's own process. So a server whose
+/// bundles are not its user's own runs the plugins it knows, and no others.
+/// A plugin is known by what it is — the hash of its bytes, which is also
+/// what `icp project bundle` records for it — never by the name or path the
+/// bundle gives it, which are the bundle's to choose.
+pub const KNOWN_PLUGINS: [(&str, &str); 3] = [
+    (
+        "6deedcc2127a3bda014af9e08aff83ee58c95125050acb296676aa234906a08e",
+        "the static-site sync plugin, v1.0.0",
+    ),
+    (
+        "afb5d626761e891a42e5c36e8799bf521823de9f55c5102860bd3a237d3b164f",
+        "the static-site sync plugin, v0.4.3",
+    ),
+    (
+        "ca7cb5666c30d2875f8d5e10535f8a53f97a86c79c263f7d5bdac2fdd1bbf83c",
+        "the asset canister sync plugin",
+    ),
+];
+
+/// Which sync plugins a server runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum AllowedPlugins {
+    /// Whatever the bundle brings: for a server on the user's own machine,
+    /// where the bundle and what it runs are the user's own.
+    #[default]
+    Any,
+    /// Those whose module hashes to one of these (lowercase hex sha256, with
+    /// what each is), and no others. With none listed, a bundle with any
+    /// sync plugin is refused; one with none deploys as ever.
+    Only(Arc<BTreeMap<String, String>>),
+}
+
+impl AllowedPlugins {
+    /// [`KNOWN_PLUGINS`], and no others.
+    pub fn known() -> Self {
+        Self::known_and(std::iter::empty::<&str>()).expect("the built-in hashes are well formed")
+    }
+
+    /// [`KNOWN_PLUGINS`] and `more`, each the sha256 of a plugin's module in
+    /// hex: what a server's operator adds, for a plugin release newer than
+    /// this build. Refused whole if one is not a sha256.
+    pub fn known_and(more: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Self, String> {
+        let mut allowed: BTreeMap<String, String> =
+            KNOWN_PLUGINS.iter().map(|(sha, what)| (sha.to_string(), what.to_string())).collect();
+        for sha in more {
+            let sha = sha.as_ref().trim().to_ascii_lowercase();
+            if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "'{sha}' is not the sha256 of a plugin: 64 hexadecimal characters"
+                ));
+            }
+            allowed.entry(sha).or_insert_with(|| "allowed by this server's configuration".into());
+        }
+        Ok(Self::Only(Arc::new(allowed)))
+    }
+
+    /// Whether a plugin whose module hashes to `sha256` (hex) is one this
+    /// server runs.
+    pub fn allows(&self, sha256: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Only(allowed) => allowed.contains_key(&sha256.to_ascii_lowercase()),
+        }
+    }
+
+    /// Refuse the plugin at `path` whose module hashes to `sha256`, unless
+    /// it is one this server runs: with what it is, and what would be.
+    fn check(&self, path: &Utf8Path, sha256: &str) -> Result<(), Unsupported> {
+        if self.allows(sha256) {
+            return Ok(());
+        }
+        let Self::Only(allowed) = self else { return Ok(()) };
+        let runs = match allowed.is_empty() {
+            true => "it runs no sync plugin".to_string(),
+            false => format!(
+                "it runs: {}",
+                allowed
+                    .iter()
+                    .map(|(sha, what)| format!("{what} ({sha})"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        };
+        Err(Unsupported(format!(
+            "its sync plugin '{path}' (sha256 {sha256}) is not one this server runs; {runs}. A \
+             sync plugin is a program the server runs for the bundle, so a server that deploys \
+             for others runs only the releases it knows: use one of them, or deploy this \
+             bundle with a server of your own"
+        )))
+    }
+}
+
+/// Why an uploaded bundle is not one a server will deploy, found before any
+/// deploy is asked for: see [`vet_plugins`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VetError {
+    /// The project does not load: it is not a bundle a deploy could run.
+    NotABundle(String),
+    /// It carries a sync plugin this server does not run.
+    PluginNotAllowed(String),
+}
+
+/// Hold a bundle just extracted to the plugins a server runs, before any
+/// deploy is asked for: every sync plugin of every canister the project
+/// declares, whichever environment a deploy would later name. A bundle that
+/// carries a plugin the server does not run is refused whole — it is not
+/// deployed in part — and the project is loaded to find them, so one that
+/// does not load is refused here as well, with the loader's reason.
+///
+/// This is the early word, on the upload. [`check_bundle`] holds the deploy
+/// itself to the same list, on what it is about to run.
+pub async fn vet_plugins(
+    fs: &BundleFs,
+    limits: &BundleLimits,
+    plugins: &AllowedPlugins,
+) -> Result<(), VetError> {
+    if *plugins == AllowedPlugins::Any {
+        return Ok(());
+    }
+    let project = host_for(fs.clone(), limits).project.load().await.map_err(|e| {
+        let mut why = e.to_string();
+        let mut source = std::error::Error::source(&e);
+        while let Some(cause) = source {
+            why.push_str(": ");
+            why.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        VetError::NotABundle(why)
+    })?;
+    // Each module is hashed once, however many canisters name it.
+    let mut hashes: BTreeMap<Utf8PathBuf, String> = BTreeMap::new();
+    for (dir, canister) in project.canisters.values() {
+        let at = |e: Unsupported| format!("canister '{}': {e}", canister.name);
+        for step in &canister.sync.steps {
+            let SyncStep::Plugin(plugin) = step else { continue };
+            let SourceField::Local(local) = &plugin.source else {
+                return Err(VetError::NotABundle(at(Unsupported(
+                    "synced by a remote plugin, which a bundle never is; rebuild the bundle \
+                     with `icp project bundle`"
+                        .into(),
+                ))));
+            };
+            let on_disk =
+                locate(fs, &dir.join(&local.path)).map_err(|e| VetError::NotABundle(at(e)))?;
+            let sha256 = match hashes.get(&on_disk) {
+                Some(sha256) => sha256.clone(),
+                None => {
+                    let sha256 = sha256_of(&on_disk).map_err(|e| VetError::NotABundle(at(e)))?;
+                    hashes.insert(on_disk, sha256.clone());
+                    sha256
+                }
+            };
+            plugins.check(&local.path, &sha256).map_err(|e| VetError::PluginNotAllowed(at(e)))?;
+        }
+    }
+    Ok(())
+}
+
+/// The sha256 of the file at `path`, in hex, read through rather than into
+/// memory: a module may be as large as a bundle.
+fn sha256_of(path: &Utf8Path) -> Result<String, Unsupported> {
+    let unreadable = |e: std::io::Error| Unsupported(format!("'{path}': {e}"));
+    let mut file = std::fs::File::open(path).map_err(unreadable)?;
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        match file.read(&mut chunk).map_err(unreadable)? {
+            0 => break,
+            n => hasher.update(&chunk[..n]),
+        }
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Why an archive was not extracted. The kinds are what a server answers and
@@ -647,12 +832,19 @@ impl ScriptRunner for NoScripts {
 /// naming one module would have the deploy write it fifty times over.
 /// `bundle_bytes` is what the bundle itself extracted to; with the copies it
 /// may come to the limit and no more.
+///
+/// And every sync plugin a canister of the environment names is one the
+/// server runs (`plugins`), by the hash of the module that is about to run.
+/// An upload was held to the same list as it arrived ([`vet_plugins`]); this
+/// is the check that counts, made on the deploy's own directory, for the
+/// canisters it is deploying, immediately before it deploys them.
 pub fn check_bundle<'a>(
     fs: &BundleFs,
     network: &Network,
     canisters: impl IntoIterator<Item = (&'a Utf8Path, &'a Canister)>,
     bundle_bytes: u64,
     limits: &BundleLimits,
+    plugins: &AllowedPlugins,
 ) -> Result<(), String> {
     check_bundle_within(
         fs,
@@ -661,6 +853,7 @@ pub fn check_bundle<'a>(
         limits.extracted_bytes.min(MAX_WASM_BYTES_IN_ALL),
         MAX_PLUGIN_INPUT_BYTES,
         (bundle_bytes, limits.extracted_bytes),
+        plugins,
     )
 }
 
@@ -673,6 +866,7 @@ fn check_bundle_within<'a>(
     wasm_in_all: u64,
     plugin_input: u64,
     (bundle_bytes, directory_bytes): (u64, u64),
+    plugins: &AllowedPlugins,
 ) -> Result<(), String> {
     IcMainnet::mainnet(network).map_err(|e| e.0)?;
     let canisters: Vec<_> = canisters.into_iter().collect();
@@ -761,6 +955,9 @@ fn check_bundle_within<'a>(
             if let Some(expected) = plugin.sha256.as_deref() {
                 checksum_matches(&local.path, expected, &actual).map_err(at)?;
             }
+            // By what the module is, not by what the manifest says of it:
+            // the hash just taken of the bytes that will run.
+            plugins.check(&local.path, &actual).map_err(at)?;
             let files = plugin.files.iter().flat_map(NamedPaths::entries).map(|entry| entry.path);
             check_declared(fs, dir, files, plugin_input).map_err(at)?;
         }
@@ -871,7 +1068,9 @@ fn check_declared<'a>(
 /// sets no store limiter, so a plugin may allocate up to that space before
 /// its time runs out. The runner builds its own engine and store, so the
 /// limiter belongs there, upstream; until it has one, a bundle's plugins run
-/// with the memory bound the icp CLI gives them. Nor is the number of
+/// with the memory bound the icp CLI gives them — which is why a server that
+/// deploys for others runs only the plugins it knows ([`AllowedPlugins`]):
+/// what an unknown program might allocate is answered by not running it. Nor is the number of
 /// canisters or steps a manifest declares: the phases do their work once per
 /// canister, and each canister costs the caller the cycles that create it.
 pub fn host_for(fs: BundleFs, limits: &BundleLimits) -> Host {
@@ -2009,6 +2208,7 @@ mod tests {
             wasm_in_all,
             plugin_input,
             (0, u64::MAX),
+            &AllowedPlugins::Any,
         )
     }
 
@@ -2081,6 +2281,7 @@ mod tests {
                 env.canisters.values().map(|(dir, canister)| (dir.as_path(), canister)),
                 bundle,
                 &BundleLimits { extracted_bytes: limit, ..BundleLimits::LOCAL },
+                &AllowedPlugins::Any,
             )
         };
         // Five canisters, five copies of the one module.
@@ -2089,6 +2290,116 @@ mod tests {
         let err = check(in_all - 1).unwrap_err();
         assert!(err.contains("the copy of each canister's module"), "{err}");
         assert!(err.contains("canister 'c4'"), "{err}");
+    }
+
+    /// A bundle of one canister synced by the plugin `plugin`, at a path
+    /// and under a canister name of the bundle's choosing.
+    fn bundle_with_plugin(plugin: &[u8]) -> Vec<u8> {
+        let wasm = wat::parse_str("(module)").unwrap();
+        let sha = hex::encode(Sha256::digest(&wasm));
+        let canister = format!(
+            "name: frontend\nbuild:\n  steps:\n    - type: pre-built\n      path: frontend.wasm\n      \
+             sha256: {sha}\nsync:\n  steps:\n    - type: plugin\n      path: sync.wasm\n"
+        );
+        archive(&[
+            ("icp.yaml", b"canisters:\n  - canisters/frontend\n"),
+            ("canisters/frontend/canister.yaml", canister.as_bytes()),
+            ("canisters/frontend/frontend.wasm", &wasm),
+            ("canisters/frontend/sync.wasm", plugin),
+        ])
+    }
+
+    // The list a server that deploys for others starts from, and what an
+    // operator adds to it: by the hash of a plugin's module, however it is
+    // spelled, and nothing that is not one.
+    #[test]
+    fn the_plugins_a_server_runs_are_named_by_hash() {
+        let known = AllowedPlugins::known();
+        for (sha, _) in KNOWN_PLUGINS {
+            assert_eq!(sha.len(), 64);
+            assert!(known.allows(sha) && known.allows(&sha.to_ascii_uppercase()));
+        }
+        let other = "0".repeat(64);
+        assert!(!known.allows(&other));
+        let extended =
+            AllowedPlugins::known_and([format!("  {}  ", other.to_uppercase())]).unwrap();
+        assert!(extended.allows(&other) && extended.allows(KNOWN_PLUGINS[0].0));
+        for not_a_hash in ["", "abc", &"g".repeat(64), &"0".repeat(63)] {
+            let err = AllowedPlugins::known_and([not_a_hash]).unwrap_err();
+            assert!(err.contains("not the sha256 of a plugin"), "{err}");
+        }
+        // On the user's own machine, whatever the bundle brings.
+        assert!(AllowedPlugins::Any.allows(&other));
+        assert_eq!(AllowedPlugins::default(), AllowedPlugins::Any);
+    }
+
+    // A bundle's sync plugin runs inside the server, so a server that
+    // deploys for others runs only the ones it knows: a deploy is refused,
+    // before anything is created, when a canister it is deploying is synced
+    // by any other — whatever the bundle calls it, and whatever checksum the
+    // manifest records for it. The refusal says which plugin, by its hash,
+    // and what the server would run.
+    #[tokio::test]
+    async fn a_deploy_runs_only_the_plugins_its_server_knows() {
+        let plugin = b"\0asm a plugin nobody vouched for";
+        let sha = hex::encode(Sha256::digest(plugin));
+        let (_dir, fs, env) = environment(&bundle_with_plugin(plugin)).await;
+        let check = |plugins: &AllowedPlugins| {
+            check_bundle(
+                &fs,
+                &env.network,
+                env.canisters.values().map(|(dir, canister)| (dir.as_path(), canister)),
+                0,
+                &BundleLimits::LOCAL,
+                plugins,
+            )
+        };
+        check(&AllowedPlugins::Any).unwrap();
+        let err = check(&AllowedPlugins::known()).unwrap_err();
+        assert!(err.contains("canister 'frontend'"), "{err}");
+        assert!(err.contains(&format!("'sync.wasm' (sha256 {sha})")), "{err}");
+        assert!(err.contains("is not one this server runs"), "{err}");
+        for (known, what) in KNOWN_PLUGINS {
+            assert!(err.contains(known) && err.contains(what), "{err}");
+        }
+        // Allowed by its hash, it deploys.
+        check(&AllowedPlugins::known_and([&sha]).unwrap()).unwrap();
+        // A server that knows none runs none, and says so.
+        let none = AllowedPlugins::Only(Arc::default());
+        assert!(check(&none).unwrap_err().contains("it runs no sync plugin"));
+    }
+
+    // The same list, held on the upload: the whole project is looked at,
+    // since the environment a deploy will name is not known yet, and a
+    // bundle with a plugin the server does not run is refused whole. One
+    // with no plugin passes; one whose project does not load is refused for
+    // that; and a server that runs anything does not look at all.
+    #[tokio::test]
+    async fn an_upload_is_held_to_the_plugins_its_server_knows() {
+        let plugin = b"\0asm a plugin nobody vouched for";
+        let sha = hex::encode(Sha256::digest(plugin));
+        let (_dir, into) = scratch();
+        let fs = extract_bundle(&bundle_with_plugin(plugin), &into).unwrap();
+        let limits = BundleLimits::LOCAL;
+
+        let refused = vet_plugins(&fs, &limits, &AllowedPlugins::known()).await.unwrap_err();
+        let VetError::PluginNotAllowed(why) = &refused else { panic!("{refused:?}") };
+        assert!(why.contains("canister 'frontend'") && why.contains(&sha), "{why}");
+        vet_plugins(&fs, &limits, &AllowedPlugins::known_and([&sha]).unwrap()).await.unwrap();
+        vet_plugins(&fs, &limits, &AllowedPlugins::Any).await.unwrap();
+
+        // No plugin, nothing to refuse.
+        let (_dir, into) = scratch();
+        let plain = extract_bundle(&archive(&[("icp.yaml", b"canisters: []\n")]), &into).unwrap();
+        vet_plugins(&plain, &limits, &AllowedPlugins::known()).await.unwrap();
+
+        // A project that does not load is not a bundle, and is said to be
+        // here rather than at the deploy; unless nothing is looked at.
+        let (_dir, into) = scratch();
+        let broken = extract_bundle(&archive(&[("icp.yaml", b"canisters: 7\n")]), &into).unwrap();
+        let refused = vet_plugins(&broken, &limits, &AllowedPlugins::known()).await.unwrap_err();
+        assert!(matches!(refused, VetError::NotABundle(_)), "{refused:?}");
+        vet_plugins(&broken, &limits, &AllowedPlugins::Any).await.unwrap();
     }
 
     // What a sync step hands its plugin is held to the bundle at the load,

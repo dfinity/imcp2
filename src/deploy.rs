@@ -141,6 +141,14 @@ pub struct DeployConfig {
     /// keep under the state directory, and so — on a RAM filesystem — what
     /// they hold of the process's memory besides its heap.
     pub max_stored_bytes: Option<usize>,
+    /// Sync plugins this server runs besides the ones it knows
+    /// ([`imcp2_deploy::KNOWN_PLUGINS`]), each by the sha256 of its module,
+    /// in hex: for a plugin release newer than this build. A sync plugin is
+    /// a program the bundle brings and the server runs, inside its own
+    /// process, so a bundle that carries one not listed is refused — on the
+    /// upload, and again by the deploy. Adding a hash here is vouching for
+    /// that program.
+    pub allowed_plugins: Vec<String>,
 }
 
 impl Default for DeployConfig {
@@ -152,6 +160,7 @@ impl Default for DeployConfig {
             max_upload_bytes: imcp2_deploy::DEFAULT_MAX_UPLOAD_BYTES,
             max_extracted_bytes: imcp2_deploy::DEFAULT_MAX_EXTRACTED_BYTES,
             max_stored_bytes: None,
+            allowed_plugins: Vec::new(),
         }
     }
 }
@@ -249,11 +258,17 @@ impl Deploys {
     /// state directory, the uploads and deploys of the first — alive, and
     /// in the middle of them — would look like what a dead one left. It is
     /// refused here instead, having touched nothing.
+    ///
+    /// Also an error: an entry of [`DeployConfig::allowed_plugins`] that is
+    /// not a sha256. A list read wrong is not run with.
     pub fn new(config: &DeployConfig, state_dir: &Path) -> std::io::Result<Self> {
+        let plugins = imcp2_deploy::AllowedPlugins::known_and(&config.allowed_plugins)
+            .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?;
         let dir = state_dir.join("deploys");
         let owned = own_directory(&dir)?;
         let uploads =
-            Uploads::with_budget(dir.join("uploads"), config.limits(), config.stored_bytes());
+            Uploads::with_budget(dir.join("uploads"), config.limits(), config.stored_bytes())
+                .allowing(plugins);
         let cut_off = imcp2_deploy::prune_abandoned_deploys(&dir);
         if cut_off > 0 {
             tracing::info!(
@@ -573,6 +588,7 @@ async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response
         Err(ReceiveError::Full) => Upload::StoreFull,
         Err(ReceiveError::Body(_)) => Upload::BodyError,
         Err(ReceiveError::NotABundle(_)) => Upload::NotABundle,
+        Err(ReceiveError::PluginNotAllowed(_)) => Upload::PluginNotAllowed,
         Err(ReceiveError::Storage(_)) => Upload::StorageError,
     });
     match received {
@@ -594,8 +610,9 @@ async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response
         Err(e @ (ReceiveError::TooLarge(_) | ReceiveError::ExtractsTooLarge(_))) => {
             (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response()
         }
-        // Read, and not a bundle: nothing a retry of the same file changes.
-        Err(e @ ReceiveError::NotABundle(_)) => {
+        // Read, and not a bundle, or one with a sync plugin this server
+        // does not run: nothing a retry of the same file changes.
+        Err(e @ (ReceiveError::NotABundle(_) | ReceiveError::PluginNotAllowed(_))) => {
             (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()
         }
         Err(e @ ReceiveError::Busy) => (StatusCode::CONFLICT, e.to_string()).into_response(),
@@ -624,6 +641,7 @@ mod tests {
             max_upload_bytes: 2048,
             max_extracted_bytes: 64 * 1024,
             max_stored_bytes: None,
+            allowed_plugins: Vec::new(),
         }
     }
 
@@ -640,6 +658,34 @@ mod tests {
         header.set_mode(0o644);
         header.set_cksum();
         archive.append_data(&mut header, "icp.yaml", &manifest[..]).unwrap();
+        archive.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// A bundle of one canister synced by a plugin nobody vouched for.
+    fn bundle_with_plugin() -> Vec<u8> {
+        // The loader does not check the module against its checksum (the
+        // deploy does): any sha256 will do here.
+        let canister = format!(
+            "name: frontend\nbuild:\n  steps:\n    - type: pre-built\n      path: frontend.wasm\n      \
+             sha256: {}\nsync:\n  steps:\n    - type: plugin\n      path: sync.wasm\n",
+            "0".repeat(64)
+        );
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (path, data) in [
+            ("icp.yaml", &b"canisters:\n  - canisters/frontend\n"[..]),
+            ("canisters/frontend/canister.yaml", canister.as_bytes()),
+            ("canisters/frontend/frontend.wasm", &b"\0asm\x01\0\0\0"[..]),
+            ("canisters/frontend/sync.wasm", &b"\0asm a plugin nobody vouched for"[..]),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, data).unwrap();
+        }
         archive.into_inner().unwrap().finish().unwrap()
     }
 
@@ -1021,6 +1067,14 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert!(text(resp).await.contains("extracts to more than"));
 
+        // And a bundle with a sync plugin this server does not run: read,
+        // a bundle, and refused for what it would have the server run.
+        let resp = put(Some(&mint().await), bundle_with_plugin()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let said = text(resp).await;
+        assert!(said.contains("is not one this server runs"), "{said}");
+        assert!(said.contains("the static-site sync plugin, v1.0.0"), "{said}");
+
         // And one abandoned mid-body: the request is dropped while the
         // server waits for more, and no answer is ever made.
         let never_ends = futures_util::stream::once(async {
@@ -1060,6 +1114,7 @@ mod tests {
             r#"imcp2_deploy_uploads_total{outcome="accepted"} 1"#,
             r#"imcp2_deploy_uploads_total{outcome="not_a_bundle"} 1"#,
             r#"imcp2_deploy_uploads_total{outcome="extracts_too_large"} 1"#,
+            r#"imcp2_deploy_uploads_total{outcome="plugin_not_allowed"} 1"#,
             r#"imcp2_deploy_uploads_total{outcome="body_error"} 1"#,
             "imcp2_deploy_upload_bytes_count 1",
             r#"imcp2_deploys_total{outcome="rejected"} 1"#,

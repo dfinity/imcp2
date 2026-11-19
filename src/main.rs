@@ -92,7 +92,10 @@ fn require_resource() -> bool {
 ///     what the server keeps of it (default 128 MiB);
 ///   * `$MCP_DEPLOY_MAX_STORED_BYTES` for every bundle the server has at
 ///     once, extracted (default: one bundle for each deploy at once, and one
-///     more).
+///     more);
+///   * `$MCP_DEPLOY_ALLOWED_PLUGINS`, the sha256 of each sync plugin the
+///     server runs besides the ones it knows, in hex, separated by commas or
+///     spaces (default: none besides).
 ///
 /// A value that is not a whole number refuses to start, and so does one
 /// that contradicts another rather than being quietly bent to fit: a count
@@ -108,6 +111,23 @@ fn deploy_config() -> anyhow::Result<imcp2::deploy::DeployConfig> {
         var("MCP_DEPLOY_MAX_EXTRACTED_BYTES").as_deref(),
         var("MCP_DEPLOY_MAX_STORED_BYTES").as_deref(),
     ])
+    .map(|config| imcp2::deploy::DeployConfig {
+        allowed_plugins: allowed_plugins(var("MCP_DEPLOY_ALLOWED_PLUGINS").as_deref()),
+        ..config
+    })
+}
+
+/// `$MCP_DEPLOY_ALLOWED_PLUGINS` as its entries. Whether each is a sha256 is
+/// for [`imcp2::deploy::Deploys::new`] to say, which refuses to start on one
+/// that is not: a list misread is a plugin wrongly refused, or wrongly run.
+#[cfg(feature = "deploy")]
+fn allowed_plugins(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// [`deploy_config`], from the four variables' values in the order above.
@@ -746,6 +766,28 @@ mod tests {
         assert!(small.unwrap_err().to_string().contains("at least"));
         assert!(super::deploy_config_from([None, Some("lots"), None, None]).is_err());
         assert!(super::deploy_config_from([None, None, Some("-1"), None]).is_err());
+    }
+
+    /// The plugins an operator adds are a list, however it is punctuated,
+    /// and one that is not a hash stops the server from starting.
+    #[cfg(feature = "deploy")]
+    #[test]
+    fn the_plugins_an_operator_allows_are_read_as_a_list() {
+        assert!(super::allowed_plugins(None).is_empty());
+        assert!(super::allowed_plugins(Some("  , ")).is_empty());
+        let (a, b) = ("a".repeat(64), "B".repeat(64));
+        let listed = super::allowed_plugins(Some(&format!(" {a},{b}\n{a} ")));
+        assert_eq!(listed, [a.clone(), b, a]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let config =
+            |allowed_plugins| imcp2::deploy::DeployConfig { allowed_plugins, ..Default::default() };
+        let Err(refused) = imcp2::deploy::Deploys::new(&config(vec!["nope".into()]), dir.path())
+        else {
+            panic!("a server started with a plugin list it could not read");
+        };
+        assert!(refused.to_string().contains("not the sha256 of a plugin"), "{refused}");
+        imcp2::deploy::Deploys::new(&config(listed), dir.path()).unwrap();
     }
 
     /// The deploy cap is a count of at least one: zero is refused at startup

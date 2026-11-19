@@ -67,6 +67,15 @@ Rules that matter here:
   frontend's `dist/`, for example), or the archive would include itself.
 - Only `plugin` sync steps can be replayed from a bundle. A canister with a
   `script` sync step cannot be bundled; the CLI says so.
+- A server that deploys for others runs only the sync plugins it knows: the
+  released plugins that upload a frontend's assets, each known by the hash
+  of its module. A bundle whose canister is synced by any other plugin — a
+  build of your own, a release the server has not been told of — is refused
+  on the upload (`422`) or by the deploy, and the refusal lists the hashes
+  the server runs. That is not something to retry or work around: tell the
+  user, who can switch the project to a listed plugin release and bundle
+  again, or deploy with a server of their own (`imcp2-local`, or `icp
+  deploy`), which runs whatever the project brings.
 - The bundle is built for the environments the manifest declares. Pick the
   one you will deploy in step 2 now, and build with the matching settings.
 

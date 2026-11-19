@@ -29,7 +29,9 @@
 //! ([`BundleLimits`]). The byte that passes either stops the read, and the
 //! request is answered then, with whatever had been written removed. An
 //! archive that is not a bundle is refused here too, before any deploy is
-//! asked for.
+//! asked for, and so is a bundle that carries a sync plugin the server does
+//! not run ([`AllowedPlugins`]): the project is loaded once it has arrived,
+//! and each plugin it names held to the list by the hash of its module.
 //!
 //! An upload is held for [`UPLOAD_TTL`] for its deploy to begin; the deploy
 //! that takes it takes the directory for its own (a rename, nothing copied),
@@ -70,7 +72,7 @@ use std::{
 use camino::Utf8PathBuf;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::host::{self, BundleLimits, ExtractError};
+use crate::host::{self, AllowedPlugins, BundleLimits, ExtractError, VetError};
 
 /// The default cap on an uploaded archive, compressed, in bytes: a real
 /// bundle is a manifest, a few modules and a frontend's assets, well inside
@@ -108,6 +110,9 @@ pub struct Uploads {
 struct Inner {
     dir: PathBuf,
     limits: BundleLimits,
+    /// The sync plugins a bundle may carry: the ones a server that deploys
+    /// for others knows, unless [`Uploads::allowing`] says otherwise.
+    plugins: std::sync::OnceLock<AllowedPlugins>,
     max_total_bytes: u64,
     /// [`UPLOAD_IDLE`] and [`UPLOAD_TIME`], which a test shortens.
     patience: (Duration, Duration),
@@ -178,6 +183,8 @@ pub enum ReceiveError {
     Body(String),
     /// What arrived is not a bundle.
     NotABundle(String),
+    /// The bundle carries a sync plugin this server does not run.
+    PluginNotAllowed(String),
     /// The bundle could not be stored (the directory not made, a file not
     /// written): the server's fault, not the request's.
     Storage(String),
@@ -208,7 +215,7 @@ impl std::fmt::Display for ReceiveError {
                  icp_deploy_upload for a new ticket and try again in a few minutes",
             ),
             ReceiveError::Body(e) => write!(f, "could not read the archive: {e}"),
-            ReceiveError::NotABundle(e) => f.write_str(e),
+            ReceiveError::NotABundle(e) | ReceiveError::PluginNotAllowed(e) => f.write_str(e),
             ReceiveError::Storage(e) => write!(f, "could not store the bundle: {e}"),
         }
     }
@@ -369,11 +376,27 @@ impl Uploads {
             inner: Arc::new(Inner {
                 dir,
                 limits,
+                plugins: std::sync::OnceLock::new(),
                 max_total_bytes,
                 patience: (UPLOAD_IDLE, UPLOAD_TIME),
                 state: Mutex::default(),
             }),
         }
+    }
+
+    /// Take bundles that carry these sync plugins, in place of the ones a
+    /// store takes unless told ([`AllowedPlugins::known`]): for a server to
+    /// say as it makes the store, before a bundle arrives. The first word
+    /// stands.
+    pub fn allowing(self, plugins: AllowedPlugins) -> Self {
+        let _ = self.inner.plugins.set(plugins);
+        self
+    }
+
+    /// The sync plugins a bundle may carry here: what an upload is held to
+    /// as it arrives, and what its deploy is held to again.
+    pub fn plugins(&self) -> AllowedPlugins {
+        self.inner.plugins.get_or_init(AllowedPlugins::known).clone()
     }
 
     /// How large a bundle this store takes.
@@ -481,6 +504,7 @@ impl Uploads {
         let session = receiving.session.clone();
         let (root, (idle, time)) = (self.inner.dir.clone(), self.inner.patience);
         let runtime = tokio::runtime::Handle::current();
+        let plugins = self.plugins();
         let id = upload_id.clone();
         // The guard goes to the thread with the body: see `Receiving`.
         let extracting = tokio::task::spawn_blocking(move || {
@@ -490,8 +514,18 @@ impl Uploads {
             let dir = Utf8PathBuf::from_path_buf(receiving.dir.clone()).map_err(|p| {
                 ReceiveError::Storage(format!("the upload path '{}' is not UTF-8", p.display()))
             })?;
+            let vetting = runtime.clone();
             let body = Arriving { body, runtime, idle, deadline: Instant::now() + time, time };
             let extracted = host::extract_bundle_from(body, &dir, &limits)?;
+            // All of it has arrived and is a bundle's shape: now whether it
+            // is one this server will deploy. Said here, on the upload, and
+            // the bundle not kept, rather than at the deploy it would fail.
+            vetting.block_on(host::vet_plugins(&extracted.fs, &limits, &plugins)).map_err(|e| {
+                match e {
+                    VetError::NotABundle(why) => ReceiveError::NotABundle(why),
+                    VetError::PluginNotAllowed(why) => ReceiveError::PluginNotAllowed(why),
+                }
+            })?;
             receiving.finish(&id, extracted.bytes);
             Ok::<_, ReceiveError>((extracted.bytes, extracted.archive_bytes))
         });
@@ -880,6 +914,54 @@ pub(crate) mod tests {
         assert_eq!(uploads.inner.state().bytes, 0);
     }
 
+    // A bundle that carries a sync plugin the server does not run is
+    // refused as it arrives, and not kept: the plugin is a program the
+    // server would run for it. A store takes the plugins a server that
+    // deploys for others knows unless it is told which; told this one's
+    // hash, it takes the bundle.
+    #[tokio::test]
+    async fn a_bundle_with_a_plugin_the_server_does_not_run_is_refused_on_arrival() {
+        use sha2::{Digest, Sha256};
+        let plugin = b"\0asm a plugin nobody vouched for";
+        let sha = hex::encode(Sha256::digest(plugin));
+        let module = b"\0asm\x01\0\0\0";
+        let canister = format!(
+            "name: frontend\nbuild:\n  steps:\n    - type: pre-built\n      path: frontend.wasm\n      \
+             sha256: {}\nsync:\n  steps:\n    - type: plugin\n      path: sync.wasm\n",
+            hex::encode(Sha256::digest(module))
+        );
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (path, data) in [
+            ("icp.yaml", &b"canisters:\n  - canisters/frontend\n"[..]),
+            ("canisters/frontend/canister.yaml", canister.as_bytes()),
+            ("canisters/frontend/frontend.wasm", &module[..]),
+            ("canisters/frontend/sync.wasm", &plugin[..]),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, data).unwrap();
+        }
+        let archive = archive.into_inner().unwrap().finish().unwrap();
+
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
+        assert_eq!(uploads.plugins(), AllowedPlugins::known());
+        let refused = put(&uploads, "s", archive.clone()).await.unwrap_err();
+        let ReceiveError::PluginNotAllowed(why) = &refused else { panic!("{refused:?}") };
+        assert!(why.contains(&sha) && why.contains("is not one this server runs"), "{why}");
+        assert_eq!(kept(&uploads), 0, "the bundle is not kept");
+        assert_eq!(uploads.held(), Held { bytes: 0, max_bytes: 3 << 20, uploads: 0, receiving: 0 });
+
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
+        let uploads = uploads.allowing(AllowedPlugins::known_and([&sha]).unwrap());
+        assert!(put(&uploads, "s", archive).await.is_ok());
+        assert_eq!(kept(&uploads), 1);
+    }
+
     // A body that fails is the client's side; a bundle that cannot be
     // written is the server's.
     #[tokio::test]
@@ -1030,6 +1112,7 @@ pub(crate) mod tests {
             inner: Arc::new(Inner {
                 dir: inner.dir.clone(),
                 limits: inner.limits,
+                plugins: inner.plugins.clone(),
                 max_total_bytes: inner.max_total_bytes,
                 patience: (idle, time),
                 state: Mutex::default(),

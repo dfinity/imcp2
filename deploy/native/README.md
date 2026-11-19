@@ -192,7 +192,11 @@ the deploys running at once (across `/mcp` and `/mcp-beta` together),
 `MCP_DEPLOY_MAX_EXTRACTED_BYTES` (default 128 MiB) what it extracts to — an
 upload is extracted as it arrives and stopped at either — and
 `MCP_DEPLOY_MAX_STORED_BYTES` (default three bundles' worth: one for each
-deploy at once, and one more) every extracted bundle held at once. A restart interrupts the deploys that are running: each stops at
+deploy at once, and one more) every extracted bundle held at once. A bundle's
+sync plugins are run only if the server knows them by hash;
+`MCP_DEPLOY_ALLOWED_PLUGINS` adds the sha256 of a plugin release newer than
+the build (comma- or space-separated), and adding one is vouching for a
+program that runs inside this process. A restart interrupts the deploys that are running: each stops at
 its next step and answers with the canisters it had created before the unit's
 `TimeoutStopSec` runs out, and the ids of one that was killed anyway stay under
 `deploys/imcp2-deploy-*/.icp/data/mappings/` for seven days. Caddy's `read_body 30s` applies to the upload `PUT` too: an

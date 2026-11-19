@@ -56,6 +56,8 @@ pub(crate) enum Upload {
     ExtractsTooLarge,
     /// What arrived is not a bundle.
     NotABundle,
+    /// The bundle carries a sync plugin this server does not run.
+    PluginNotAllowed,
     /// The store had no room: the budget for every archive was spent.
     StoreFull,
     /// Another upload was arriving for the same session.
@@ -67,12 +69,13 @@ pub(crate) enum Upload {
 }
 
 impl Upload {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Accepted { archive_bytes: 0, bytes: 0 },
         Self::BadTicket,
         Self::TooLarge,
         Self::ExtractsTooLarge,
         Self::NotABundle,
+        Self::PluginNotAllowed,
         Self::StoreFull,
         Self::SessionBusy,
         Self::BodyError,
@@ -86,6 +89,7 @@ impl Upload {
             Self::TooLarge => "too_large",
             Self::ExtractsTooLarge => "extracts_too_large",
             Self::NotABundle => "not_a_bundle",
+            Self::PluginNotAllowed => "plugin_not_allowed",
             Self::StoreFull => "store_full",
             Self::SessionBusy => "session_busy",
             Self::BodyError => "body_error",
@@ -171,7 +175,8 @@ impl DeployMetrics {
                 metric!("deploy_uploads_total"),
                 "Bundle uploads, by outcome: accepted, bad_ticket, too_large (the archive is \
                  over its cap), extracts_too_large (it extracts to more than a bundle may; \
-                 stopped as it arrived), not_a_bundle, store_full (no room in the budget for \
+                 stopped as it arrived), not_a_bundle, plugin_not_allowed (it carries a sync \
+                 plugin this server does not run), store_full (no room in the budget for \
                  all of them), session_busy (another was arriving for the session), \
                  body_error (the transfer failed, stalled or was abandoned), storage_error \
                  (the server could not write it).",

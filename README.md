@@ -645,9 +645,31 @@ What the hosted composition adds to the local one:
   first one's uploads and deploys as leftovers),
   and a sweep every minute removes lapsed uploads and id records older than
   seven days. The number of files and directories a bundle holds, and what
-  its modules expand to, are bounded by the `imcp2-deploy` host as well, and
-  its sync plugins run in WASI with read-only access to their own deploy
-  directory and no network.
+  its modules expand to, are bounded by the `imcp2-deploy` host as well.
+- **Only the sync plugins the server knows are run.** A sync plugin is a
+  program the bundle brings and the server runs — in WASI, with read-only
+  access to its own deploy directory and no network, under a compute budget,
+  but with no memory limit short of its address space, and inside the
+  server's own process. So this server runs the plugin releases it knows and
+  no others, each known by the sha256 of its module (which is what `icp
+  project bundle` records for it), never by the name or path the bundle
+  gives it:
+
+  | sha256 | Plugin |
+  |---|---|
+  | `6deedcc2127a3bda014af9e08aff83ee58c95125050acb296676aa234906a08e` | static-site sync, v1.0.0 |
+  | `afb5d626761e891a42e5c36e8799bf521823de9f55c5102860bd3a237d3b164f` | static-site sync, v0.4.3 |
+  | `ca7cb5666c30d2875f8d5e10535f8a53f97a86c79c263f7d5bdac2fdd1bbf83c` | asset canister sync |
+
+  `$MCP_DEPLOY_ALLOWED_PLUGINS` adds to the list (hashes separated by commas
+  or spaces), for a release newer than the build; an entry that is not a
+  sha256 stops the server from starting. A bundle with a plugin not on it is
+  refused twice over: on the upload (`422`), where every canister the
+  project declares is looked at, and again by the deploy, on the modules it
+  is about to run for the canisters it is deploying, before anything is
+  created. The refusal names the plugin's hash and what the server runs. A
+  bundle with no sync plugin is unaffected, and the local server, where the
+  bundle is the user's own, runs whatever it brings.
 - **The server log has every deploy.** Each deploy's events — the directory it
   works in, every phase and canister step as the client sees them, and how it
   ended — are logged at `info` under a `deploy` span carrying the session id,
@@ -667,7 +689,7 @@ What the hosted composition adds to the local one:
   | `imcp2_deploy_refusals_total{reason}` | Deploys not begun: `busy` (every slot held; a sustained rate means the cap is too low), `session_busy`, `stopping`, `no_room` (the store had no room for the deploy to run in). |
   | `imcp2_deploys_total{outcome}` | Deploys that held a slot: `succeeded`, `failed`, `rejected` (refused before anything was created, for the request, the bundle, or an identity that could not be derived), `setup_failed` (the server could not prepare it; nothing wrong with the request), `interrupted`. |
   | `imcp2_deploy_duration_seconds` | How long a deploy held its slot. |
-  | `imcp2_deploy_uploads_total{outcome}` | Uploads: `accepted`, `bad_ticket`, `too_large` (the archive), `extracts_too_large` (what it extracts to), `not_a_bundle`, `store_full`, `session_busy`, `body_error`, `storage_error`. |
+  | `imcp2_deploy_uploads_total{outcome}` | Uploads: `accepted`, `bad_ticket`, `too_large` (the archive), `extracts_too_large` (what it extracts to), `not_a_bundle`, `plugin_not_allowed`, `store_full`, `session_busy`, `body_error`, `storage_error`. |
   | `imcp2_deploy_upload_bytes`, `imcp2_deploy_bundle_extracted_bytes` | The size of each accepted archive, and what it extracted to: where the two limits should sit is read off these. |
   | `imcp2_deploy_upload_store_bytes`, `imcp2_deploy_upload_store_capacity_bytes` | What the deploy tools keep under the state directory, in extracted bytes, against the budget. |
   | `imcp2_deploy_uploads_held`, `imcp2_deploy_uploads_arriving` | Uploads waiting for their deploy, and arriving. |
@@ -730,7 +752,9 @@ cargo run
 # $MCP_DEPLOY_MAX_UPLOAD_BYTES (default 64 MiB) that extract to at most
 # $MCP_DEPLOY_MAX_EXTRACTED_BYTES (default 128 MiB), and
 # $MCP_DEPLOY_MAX_STORED_BYTES of extracted bundles in all (default: one for
-# each deploy at once, and one more); see "Deploying a project bundle".
+# each deploy at once, and one more), and running the sync plugins it knows
+# plus those named in $MCP_DEPLOY_ALLOWED_PLUGINS; see "Deploying a project
+# bundle".
 ```
 
 The human-facing pages — the landing page and the `/privacy-policy`,
