@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "icp": {
+      "type": "http",
+      "url": "https://mcp.internetcomputer.org/mcp"
+    }
+  }
+}

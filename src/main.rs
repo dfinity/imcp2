@@ -19,7 +19,9 @@
 //! URL baked into the discovery documents and the II handshake),
 //! `$MCP_SERVE_BETA` (opt in to the `/mcp-beta` staging instance),
 //! `$MCP_SERVE_METRICS` (opt in to the Prometheus exposition at `/metrics`; off
-//! by default because nothing here can know whether a proxy is hiding it), and
+//! by default because nothing here can know whether a proxy is hiding it),
+//! `$MCP_MAX_REQUEST_BODY` (the cap on an MCP request body in bytes, default
+//! 4 MiB), and
 //! `$OPENAI_APPS_CHALLENGE_TOKEN` (serve the OpenAI Apps domain-verification
 //! token at `/.well-known/openai-apps-challenge`; 404 while unset).
 //!
@@ -179,6 +181,34 @@ fn deploy_concurrency(value: &str) -> anyhow::Result<usize> {
          zero deploys"
     );
     Ok(count)
+}
+
+/// The largest MCP request body the server reads, in bytes: `$MCP_MAX_REQUEST_BODY`
+/// when set, else the library default ([`imcp2::DEFAULT_MAX_REQUEST_BODY`]). A
+/// blank value reads as unset. Any other value that is not a whole number is a
+/// configuration error and refuses to start, rather than silently running with
+/// the default.
+fn max_request_body() -> anyhow::Result<usize> {
+    max_request_body_from(std::env::var("MCP_MAX_REQUEST_BODY"))
+}
+
+/// [`max_request_body`]'s reading of the variable. Unset means the default, and
+/// so does blank: the native deploy renders a variable nobody set as `NAME=`
+/// (see `deploy/native/imcp2.service`), and every variable templated there reads
+/// that as unset, so this one does too rather than stop the service the day it
+/// is templated. A value that is not Unicode is neither blank nor a byte count,
+/// so it is refused like any other value that is not one.
+fn max_request_body_from(value: Result<String, std::env::VarError>) -> anyhow::Result<usize> {
+    use std::env::VarError;
+    match value.as_deref().map(str::trim) {
+        Err(VarError::NotPresent) | Ok("") => Ok(imcp2::DEFAULT_MAX_REQUEST_BODY),
+        Ok(v) => v.parse().map_err(|e| {
+            anyhow::anyhow!("MCP_MAX_REQUEST_BODY must be a byte count, got {v:?}: {e}")
+        }),
+        Err(VarError::NotUnicode(raw)) => {
+            Err(anyhow::anyhow!("MCP_MAX_REQUEST_BODY must be a byte count, got {raw:?}"))
+        }
+    }
 }
 
 /// Whether to also serve the beta Internet Identity instance at `/mcp-beta`.
@@ -426,6 +456,8 @@ async fn main() -> anyhow::Result<()> {
     // instances. Making it clears what the run before left behind; its
     // sweeper starts with the first instance's session reaper.
     let deploys = imcp2::deploy::Deploys::new(&deploy_config()?, &state_dir)?;
+    // One request-body cap for every instance (see `max_request_body`).
+    let max_request_body = max_request_body()?;
 
     // Client ID Metadata Documents: on for every instance unless the deploy says no.
     let cimd_on = cimd_enabled();
@@ -445,7 +477,8 @@ async fn main() -> anyhow::Result<()> {
         state_dir: state_dir.clone(),
         require_resource: require_resource(),
         cimd_enabled: cimd_on,
-    });
+    })
+    .with_max_request_body(max_request_body);
     let prod = prod.with_deploy(deploys.clone());
     prod.spawn_session_reaper();
 
@@ -461,7 +494,8 @@ async fn main() -> anyhow::Result<()> {
             state_dir,
             require_resource: require_resource(),
             cimd_enabled: cimd_on,
-        });
+        })
+        .with_max_request_body(max_request_body);
         let beta = beta.with_deploy(deploys.clone());
         beta.spawn_session_reaper();
         Some(beta)
@@ -797,6 +831,47 @@ mod tests {
         }
         for value in [Some("0"), Some("false"), Some("No"), Some("OFF"), Some(" 0 ")] {
             assert!(!cimd_enabled_by(value), "{value:?} should switch CIMD off");
+        }
+    }
+
+    /// `MCP_MAX_REQUEST_BODY`'s reading: the default when it is unset or blank,
+    /// and an error (which `main` refuses to start on) for anything else that is
+    /// not a byte count. That includes a value that is not Unicode, which
+    /// `std::env::var` reports as an error too and which must not be mistaken
+    /// for the variable being absent.
+    #[test]
+    fn max_request_body_values() {
+        use super::max_request_body_from;
+        use std::env::VarError;
+
+        let unset = max_request_body_from(Err(VarError::NotPresent));
+        assert_eq!(unset.unwrap(), imcp2::DEFAULT_MAX_REQUEST_BODY);
+
+        // Blank is how the deploy unit renders a variable nobody set.
+        for blank in ["", " ", "\t", " \n"] {
+            let read = max_request_body_from(Ok(blank.into()));
+            assert_eq!(read.unwrap(), imcp2::DEFAULT_MAX_REQUEST_BODY, "{blank:?}");
+        }
+
+        for (value, bytes) in [("1048576", 1 << 20), (" 65536 ", 65536), ("1", 1)] {
+            let read = max_request_body_from(Ok(value.into()));
+            assert_eq!(read.unwrap(), bytes, "{value:?}");
+        }
+
+        for value in ["4MiB", "4 MiB", "-1", "1.5", "1e6", "0x400", "yes"] {
+            let err = max_request_body_from(Ok(value.into())).expect_err(value);
+            assert!(err.to_string().contains("MCP_MAX_REQUEST_BODY"), "{value:?}: {err}");
+        }
+
+        // Unix lets a variable hold any bytes; these are a number followed by
+        // one that is not UTF-8.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = std::ffi::OsString::from_vec(vec![b'6', b'4', 0xff]);
+            let err = max_request_body_from(Err(VarError::NotUnicode(raw)))
+                .expect_err("a value that is not Unicode is not a byte count");
+            assert!(err.to_string().contains("MCP_MAX_REQUEST_BODY"), "{err}");
         }
     }
 

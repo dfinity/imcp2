@@ -12,6 +12,13 @@ members = ["cargo:."]
 cargo-dist-version = "0.31.0"
 # CI backends to support
 ci = "github"
+# v-release.yml is hand-edited where it installs dist: both "Install dist"
+# steps run .github/scripts/install-dist.sh, which installs a pinned archive.
+# Without this, `dist plan` rejects the edited file. dist will no longer regenerate the
+# workflow, so a config change that alters it, or a `cargo-dist-version` bump
+# (which also needs new digests in that script), means regenerating it with
+# this line removed and then reapplying the two "Install dist" edits.
+allow-dirty = ["ci"]
 # The installers to generate for each app
 installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)

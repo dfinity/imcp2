@@ -18,7 +18,8 @@ categories = [
 ]
 # Everything the library and the bundled binary compile from ships; the
 # deployment scaffolding (container, systemd/native deploy, dashboards, CI,
-# submission docs) is repository-only and would just inflate the .crate.
+# submission docs, plugin-marketplace manifests) is repository-only and would
+# just inflate the .crate.
 # `src/assets` is NOT optional: it is pulled in at compile time with
 # `include_str!`. `crates/` holds the other workspace members (each packaged
 # on its own), so it is excluded from THIS package.
@@ -30,6 +31,7 @@ exclude = [
     "deploy/",
     "docs/",
     "monitoring/",
+    "plugins/",
 ]
 
 [workspace]
@@ -101,6 +103,8 @@ uuid = { workspace = true }
 tower-http = { version = "0.7", features = ["cors"] }
 # The deploy endpoint: streamed bodies (the upload, the watched event stream).
 futures-util = "0.3"
+# `LengthLimitError`, to tell a body over the MCP request cap from a transport
+# error (src/body_limit.rs). Already in the tree via axum.
 http-body-util = "0.1"
 # Metrics exposition at /metrics. Pinned to the version dfinity/ic uses: these
 # series are destined for the same Prometheus / Victoria Metrics clusters that
@@ -131,6 +135,8 @@ e2e = ["dep:pocket-ic"]
 # tower::ServiceExt::oneshot and read bodies via http-body-util.
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+# Streamed (chunked) request bodies for the body-cap tests come from
+# `futures-util`, a dependency above.
 # `test-util` is what `#[tokio::test(start_paused = true)]` needs: the pending
 # connect tests in `auth.rs` walk a connect past its TTL and retention on a
 # paused clock instead of waiting them out. A feature on a dependency the crate
