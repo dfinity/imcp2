@@ -60,7 +60,20 @@
 //!     abandoned leaves nothing: the partial bundle goes with it, and its
 //!     reservation;
 //!   * the directory is the store's own: what an earlier process left in it
-//!     is removed when the store is made, since nothing could deploy it.
+//!     is removed when the store is made, since nothing could deploy it. One
+//!     that was there already is made the server's user's alone like one the
+//!     store makes, and refused if it cannot be: under a directory another
+//!     user can write to, a bundle could be swapped for another tree between
+//!     its upload and its deploy.
+//!
+//! A bundle that lapses or is replaced is removed off the lock the store's
+//! state is under, on a thread that may block: removing a tree is as slow as
+//! the tree is large, and every session's calls wait on that lock. Its bytes
+//! stay charged until it is gone, so the budget is of what is on disk, not of
+//! what is still meant to be. An arrival or a deploy that finds a lapsed
+//! bundle counts it as room and sees it gone before it writes; one that
+//! comes while another call's removal is still running may be refused for
+//! the moment that takes.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -328,6 +341,38 @@ impl Drop for Receiving {
     }
 }
 
+/// A bundle the store has stopped holding — lapsed, or replaced — and has
+/// yet to remove. Its bytes stay charged while its directory is there: the
+/// drop removes the directory and then releases them. It takes the state's
+/// lock to do so, and may take as long as the tree is large, so it is never
+/// dropped under that lock, and where there is a choice, on a thread that
+/// may block ([`clear`]).
+struct Leaving {
+    store: Arc<Inner>,
+    dir: PathBuf,
+    bytes: u64,
+}
+
+impl Drop for Leaving {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+        let mut state = self.store.state();
+        state.bytes = state.bytes.saturating_sub(self.bytes);
+    }
+}
+
+/// Remove `leaving` on a thread that may block, when there is a runtime to
+/// lend one, and here when there is not.
+fn clear(leaving: Vec<Leaving>) {
+    if leaving.is_empty() {
+        return;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => drop(runtime.spawn_blocking(move || drop(leaving))),
+        Err(_) => drop(leaving),
+    }
+}
+
 /// What an upload store holds at a moment; see [`Uploads::held`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Held {
@@ -417,23 +462,42 @@ impl Uploads {
 
     /// Drop expired tickets, and expired uploads with their bundles. Every
     /// operation does this first; a server calls it on a timer as well, so
-    /// an idle store does not hold what has lapsed.
+    /// an idle store does not hold what has lapsed. The bundles are removed
+    /// on a thread that may block when this is called on a runtime (they,
+    /// and their bytes, may outlast the call by that removal), and before
+    /// it returns when it is not.
     pub fn sweep(&self) {
-        sweep(&mut self.inner.state());
+        self.locked(|_, _| ());
+    }
+
+    /// Run `f` on the state, swept, under its lock. `f` is handed the
+    /// bundles that sweep found lapsed, and may add to them, or take the
+    /// ones it must see gone before it goes on; what it leaves is removed
+    /// once the lock is released ([`clear`]), never under it.
+    fn locked<T>(&self, f: impl FnOnce(&mut State, &mut Vec<Leaving>) -> T) -> T {
+        // Declared before the guard, so dropped after it, however this ends.
+        let mut leaving = Vec::new();
+        let out = {
+            let mut state = self.inner.state();
+            sweep(&self.inner, &mut state, &mut leaving);
+            f(&mut state, &mut leaving)
+        };
+        clear(leaving);
+        out
     }
 
     /// Mint a ticket for `session`, dropping any it already holds.
     pub async fn mint(&self, session: &str) -> Minted {
-        let mut state = self.inner.state();
-        sweep(&mut state);
-        state.tickets.retain(|_, t| t.session != session);
-        let ticket = random_token();
-        state.tickets.insert(
-            ticket.clone(),
-            Ticket { session: session.to_string(), expires: Instant::now() + TICKET_TTL },
-        );
-        tracing::info!(session, "upload ticket minted");
-        Minted { ticket, expires_in: TICKET_TTL }
+        self.locked(|state, _| {
+            state.tickets.retain(|_, t| t.session != session);
+            let ticket = random_token();
+            state.tickets.insert(
+                ticket.clone(),
+                Ticket { session: session.to_string(), expires: Instant::now() + TICKET_TTL },
+            );
+            tracing::info!(session, "upload ticket minted");
+            Minted { ticket, expires_in: TICKET_TTL }
+        })
     }
 
     /// Receive a bundle on `ticket`: the ticket is spent first, a declared
@@ -453,9 +517,7 @@ impl Uploads {
     ) -> Result<Received, ReceiveError> {
         let limits = self.inner.limits;
         let upload_id = random_token();
-        let receiving = {
-            let mut state = self.inner.state();
-            sweep(&mut state);
+        let (receiving, making_way) = self.locked(|state, lapsed| {
             let Some(Ticket { session, .. }) = state.tickets.remove(ticket) else {
                 tracing::info!("upload refused: no such ticket (spent, expired or unknown)");
                 return Err(ReceiveError::UnknownTicket);
@@ -480,27 +542,32 @@ impl Uploads {
                     ids.push(id.clone());
                     (ids, bytes + u.bytes)
                 });
+            // So are the bytes of the bundles that have lapsed: charged
+            // still, since they are still there, and removed with the one
+            // replaced before a byte of this one is written.
+            let lapsing: u64 = lapsed.iter().map(|l| l.bytes).sum();
             // Its size is known only once it has arrived: the most it may
             // extract to is held for it until then.
             let reserved = limits.extracted_bytes;
-            let held = state.bytes.saturating_sub(giving_way);
+            let held = state.bytes.saturating_sub(giving_way).saturating_sub(lapsing);
             if held + reserved > self.inner.max_total_bytes {
                 tracing::warn!(session, held = state.bytes, "upload refused: the store is full");
                 return Err(ReceiveError::Full);
             }
-            for id in replaced {
-                remove_upload(&mut state, &id);
-            }
+            let mut making_way = std::mem::take(lapsed);
+            making_way
+                .extend(replaced.iter().filter_map(|id| remove_upload(&self.inner, state, id)));
             state.bytes += reserved;
             state.receiving.insert(session.clone());
-            Receiving {
+            let receiving = Receiving {
                 store: self.inner.clone(),
                 session,
                 dir: self.inner.dir.join(&upload_id),
                 reserved,
                 finished: false,
-            }
-        };
+            };
+            Ok((receiving, making_way))
+        })?;
         let session = receiving.session.clone();
         let (root, (idle, time)) = (self.inner.dir.clone(), self.inner.patience);
         let runtime = tokio::runtime::Handle::current();
@@ -508,6 +575,9 @@ impl Uploads {
         let id = upload_id.clone();
         // The guard goes to the thread with the body: see `Receiving`.
         let extracting = tokio::task::spawn_blocking(move || {
+            // The room this bundle was let in on is made first: what the
+            // session was holding, and what had lapsed.
+            drop(making_way);
             make_private_dir(&root)
                 .and_then(|()| make_new_private_dir(&receiving.dir))
                 .map_err(|e| ReceiveError::Storage(e.to_string()))?;
@@ -555,23 +625,33 @@ impl Uploads {
     /// refused for want of that room is left as it was, to be asked for
     /// again.
     pub async fn take(&self, upload_id: &str, session: &str) -> Result<TakenUpload, TakeError> {
-        let mut state = self.inner.state();
-        sweep(&mut state);
-        let Some(bytes) =
-            state.uploads.get(upload_id).filter(|u| u.session == session).map(|u| u.bytes)
-        else {
-            tracing::info!(session, upload_id, "no such upload for the session");
-            return Err(TakeError::NoSuchUpload);
-        };
-        let charged = self.inner.limits.extracted_bytes.max(bytes);
-        if state.bytes + (charged - bytes) > self.inner.max_total_bytes {
-            tracing::warn!(session, upload_id, held = state.bytes, "no room to deploy the upload");
-            return Err(TakeError::NoRoom);
+        let (taken, making_way) = self.locked(|state, lapsed| {
+            let Some(bytes) =
+                state.uploads.get(upload_id).filter(|u| u.session == session).map(|u| u.bytes)
+            else {
+                tracing::info!(session, upload_id, "no such upload for the session");
+                return Err(TakeError::NoSuchUpload);
+            };
+            let charged = self.inner.limits.extracted_bytes.max(bytes);
+            // What has lapsed is room, as it is for an arrival: removed
+            // before the deploy is handed its bundle.
+            let lapsing: u64 = lapsed.iter().map(|l| l.bytes).sum();
+            let held = state.bytes.saturating_sub(lapsing);
+            if held + (charged - bytes) > self.inner.max_total_bytes {
+                tracing::warn!(session, upload_id, held, "no room to deploy the upload");
+                return Err(TakeError::NoRoom);
+            }
+            state.bytes += charged - bytes;
+            tracing::info!(session, upload_id, "upload taken by a deploy");
+            let upload = state.uploads.remove(upload_id).expect("looked up above, under the lock");
+            let taken = TakenUpload { dir: upload.dir, bytes, charged, store: self.inner.clone() };
+            Ok((taken, std::mem::take(lapsed)))
+        })?;
+        if !making_way.is_empty() {
+            // Dropped where it runs, or with the closure if it never does.
+            let _ = tokio::task::spawn_blocking(move || drop(making_way)).await;
         }
-        state.bytes += charged - bytes;
-        tracing::info!(session, upload_id, "upload taken by a deploy");
-        let upload = state.uploads.remove(upload_id).expect("looked up above, under the lock");
-        Ok(TakenUpload { dir: upload.dir, bytes, charged, store: self.inner.clone() })
+        Ok(taken)
     }
 }
 
@@ -609,23 +689,22 @@ impl<R: AsyncRead + Unpin> std::io::Read for Arriving<R> {
     }
 }
 
-/// Drop expired tickets, and expired uploads with their bundles.
-fn sweep(state: &mut State) {
+/// Drop expired tickets, and stop holding expired uploads: their bundles
+/// are added to `leaving`, for the caller to remove once the lock is
+/// released.
+fn sweep(store: &Arc<Inner>, state: &mut State, leaving: &mut Vec<Leaving>) {
     let now = Instant::now();
     state.tickets.retain(|_, t| t.expires > now);
     let expired: Vec<String> =
         state.uploads.iter().filter(|(_, u)| u.expires <= now).map(|(id, _)| id.clone()).collect();
-    for id in expired {
-        remove_upload(state, &id);
-    }
+    leaving.extend(expired.iter().filter_map(|id| remove_upload(store, state, id)));
 }
 
-/// Forget a held upload: its bundle, and its share of the budget.
-fn remove_upload(state: &mut State, upload_id: &str) {
-    if let Some(upload) = state.uploads.remove(upload_id) {
-        let _ = std::fs::remove_dir_all(&upload.dir);
-        state.bytes = state.bytes.saturating_sub(upload.bytes);
-    }
+/// Stop holding an upload. Its bundle, and its share of the budget, go when
+/// what this returns is dropped, which is not to be under the lock.
+fn remove_upload(store: &Arc<Inner>, state: &mut State, upload_id: &str) -> Option<Leaving> {
+    let upload = state.uploads.remove(upload_id)?;
+    Some(Leaving { store: store.clone(), dir: upload.dir, bytes: upload.bytes })
 }
 
 /// Remove every upload directly under `dir` — what a store names its
@@ -654,18 +733,38 @@ fn remove_leftovers(dir: &Path) -> usize {
         .count()
 }
 
-/// `dir`, created if missing, and on Unix readable by its owner alone.
+/// `dir`, created if missing, and on Unix its owner's alone — one that was
+/// there already too, which is made so, or refused if it cannot be (it is
+/// another user's). Under a directory others can write to, a bundle's own
+/// could be renamed away and another tree put in its place.
 fn make_private_dir(dir: &Path) -> std::io::Result<()> {
-    if dir.is_dir() {
-        return Ok(());
-    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        if !dir.is_dir() {
+            // The mode is less the umask, which only takes bits away.
+            return std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+        }
+        if std::fs::metadata(dir)?.permissions().mode() & 0o777 == 0o700 {
+            return Ok(());
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "the upload directory '{}' is open to other users and could not be made                      private: {e}",
+                    dir.display()
+                ),
+            )
+        })
     }
     #[cfg(not(unix))]
-    std::fs::create_dir_all(dir)
+    {
+        if dir.is_dir() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(dir)
+    }
 }
 
 /// `dir`, created now and not before, and on Unix readable by its owner
@@ -1199,21 +1298,114 @@ pub(crate) mod tests {
         assert!(at.join("notes.txt").exists());
     }
 
+    /// Make `upload_id` one that lapsed a second ago, and say where it is.
+    fn lapse(uploads: &Uploads, upload_id: &str) -> PathBuf {
+        let mut state = uploads.inner.state();
+        let upload = state.uploads.get_mut(upload_id).unwrap();
+        upload.expires = Instant::now() - Duration::from_secs(1);
+        upload.dir.clone()
+    }
+
+    // A sweep stops holding what has lapsed at once, and removes it off the
+    // lock, on a thread that may block: the bundle and its bytes go together,
+    // when it has been removed.
     #[tokio::test]
     async fn a_sweep_removes_an_expired_upload_and_its_bytes() {
         let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
         let received = put(&uploads, "s", bundle(10)).await.unwrap();
-        let bundle_dir = {
-            let mut state = uploads.inner.state();
-            let upload = state.uploads.get_mut(&received.upload_id).unwrap();
-            upload.expires = Instant::now() - Duration::from_secs(1);
-            upload.dir.clone()
-        };
+        let bundle_dir = lapse(&uploads, &received.upload_id);
         assert!(bundle_dir.is_dir());
         uploads.sweep();
-        assert!(!bundle_dir.exists());
-        assert_eq!(uploads.held(), Held { bytes: 0, max_bytes: 3 << 20, uploads: 0, receiving: 0 });
+        assert_eq!(uploads.held().uploads, 0);
         let gone = uploads.take(&received.upload_id, "s").await.unwrap_err();
         assert_eq!(gone, TakeError::NoSuchUpload);
+        for _ in 0..100 {
+            if uploads.held().bytes == 0 {
+                break;
+            }
+            // Charged for as long as it is there.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!bundle_dir.exists());
+        assert_eq!(uploads.held(), Held { bytes: 0, max_bytes: 3 << 20, uploads: 0, receiving: 0 });
+    }
+
+    // With no runtime to lend a thread, the sweep removes what has lapsed
+    // itself, before it returns.
+    #[test]
+    fn a_sweep_off_a_runtime_removes_what_lapsed_before_it_returns() {
+        let (_dir, uploads) = store(limits(1 << 20, 1 << 20));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let received = runtime.block_on(put(&uploads, "s", bundle(10))).unwrap();
+        let bundle_dir = lapse(&uploads, &received.upload_id);
+        uploads.sweep();
+        assert!(!bundle_dir.exists());
+        assert_eq!(uploads.held().bytes, 0);
+    }
+
+    // A bundle that has lapsed is room for an arrival and for a deploy, as
+    // it was when it was removed under the lock: it is gone before either
+    // is let on, and its bytes with it.
+    #[tokio::test]
+    async fn what_has_lapsed_is_room_for_an_arrival_and_for_a_deploy() {
+        let dir = tempfile::tempdir().unwrap();
+        // One may come to ten of the smallest, `U`, and the store holds
+        // eleven.
+        let uploads =
+            Uploads::with_budget(dir.path().join("uploads"), limits(1 << 20, 10 * U), 11 * U);
+        let waiting = put(&uploads, "a", bundle(1)).await.unwrap();
+        let large = put(&uploads, "b", bundle(2 * 4096)).await.unwrap();
+        assert!(extracted(2 * 4096) > U);
+
+        // A deploy of `a`'s grows to ten: with `b`'s held there is no room.
+        let no_room = uploads.take(&waiting.upload_id, "a").await.unwrap_err();
+        assert_eq!(no_room, TakeError::NoRoom);
+        // Lapsed, `b`'s is room, and gone by the time the deploy has its
+        // bundle.
+        let lapsed = lapse(&uploads, &large.upload_id);
+        let running = uploads.take(&waiting.upload_id, "a").await.unwrap();
+        assert!(!lapsed.exists());
+        assert_eq!(uploads.held().bytes, 10 * U);
+        drop(running);
+
+        // The same for an arrival, which reserves ten: two waiting bundles
+        // leave it no room, and one of them lapsed does.
+        let first = put(&uploads, "c", bundle(1)).await.unwrap();
+        put(&uploads, "d", bundle(1)).await.unwrap();
+        assert_eq!(put(&uploads, "e", bundle(1)).await.unwrap_err(), ReceiveError::Full);
+        // (The ticket first: minting sweeps too, and what a sweep finds
+        // that is not making way for its own call stays charged until a
+        // thread has removed it.)
+        let t = uploads.mint("e").await;
+        let lapsed = lapse(&uploads, &first.upload_id);
+        uploads.receive(&t.ticket, None, std::io::Cursor::new(bundle(1))).await.unwrap();
+        assert!(!lapsed.exists());
+        assert_eq!(uploads.held().bytes, 2 * U);
+    }
+
+    // A store's directory that was there already, open to other users, is
+    // made the server's user's alone, as one the store makes is — when the
+    // store is made, and again at an upload should it have been opened
+    // since. Under a directory others can write to, a bundle could be
+    // swapped for another tree before its deploy.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_directory_that_was_there_already_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().join("uploads");
+        let open = || {
+            std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o777)).unwrap();
+        };
+        let mode = || std::fs::metadata(&at).unwrap().permissions().mode() & 0o777;
+        std::fs::create_dir(&at).unwrap();
+        open();
+        assert_eq!(mode(), 0o777);
+
+        let uploads = Uploads::new(at.clone(), limits(1 << 20, 1 << 20));
+        assert_eq!(mode(), 0o700);
+        open();
+        put(&uploads, "s", bundle(1)).await.unwrap();
+        assert_eq!(mode(), 0o700);
     }
 }
