@@ -1,6 +1,6 @@
 ---
 name: deploy-with-mcp
-description: "Deploy an icp project to the Internet Computer through this MCP server's icp_deploy_bundle tool instead of running icp deploy yourself. Covers the three steps an agent performs: bundle the project with icp project bundle, call icp_deploy_bundle with the bundle and the environment's canister ids file, and write the canister ids the tool returns back to that file. Use when the user asks you to deploy, ship, publish, upgrade or redeploy an icp project, or asks what icp_deploy_bundle needs. Do NOT use for projects targeting a local network (run icp deploy there) or for building the project (see the icp-cli skill)."
+description: "Deploy an icp project to the Internet Computer through this MCP server's icp_deploy tool instead of running icp deploy yourself. Covers the three steps an agent performs: bundle the project with icp project bundle, call icp_deploy with the bundle and the environment's canister ids file, and write the canister ids the tool returns back to that file. Use when the user asks you to deploy, ship, publish, upgrade or redeploy an icp project, or asks what icp_deploy needs. Do NOT use for projects targeting a local network (run icp deploy there) or for building the project (see the icp-cli skill)."
 license: Apache-2.0
 metadata:
   title: Deploy with this MCP server
@@ -11,7 +11,7 @@ metadata:
 
 ## What This Is
 
-This server has one tool that deploys: `icp_deploy_bundle`. It takes a
+This server has one tool that deploys: `icp_deploy`. It takes a
 project bundle, an environment name and the environment's canister-id
 mapping, runs every phase of `icp deploy` on the server's side (create,
 wire ids, apply settings, install or upgrade, sync), and returns the status
@@ -21,7 +21,7 @@ it, bundle it, and keep its canister ids.
 A deploy is three steps, in order:
 
 1. Bundle the project with the icp CLI.
-2. Call `icp_deploy_bundle` with the bundle, the environment, and the
+2. Call `icp_deploy` with the bundle, the environment, and the
    environment's current canister-id mapping. On a server that runs
    elsewhere than the project — one that lists `icp_deploy_upload` — the
    bundle is uploaded first, on a ticket that tool returns.
@@ -43,9 +43,7 @@ not know the canisters already exist and would create a second set.
   MCP client as it connects: ask the user to reconnect the server in their
   client, then retry.
 - Cycles. Each new canister is created from the user's cycles balance, 2T
-  cycles unless `cycles` says otherwise. `icp_cycles_balance` reports the
-  balance and the principal that holds it, which is where the user sends
-  cycles to top it up. Before a deploy that will create canisters, tell the
+  cycles unless `cycles` says otherwise. Before a deploy that will create canisters, tell the
   user how many and confirm; creation is not undone by a later failure.
 - An environment on the `ic` network (mainnet), which every manifest has.
   The tool deploys to the Internet Computer only: an environment on any other
@@ -102,7 +100,7 @@ that environment and every canister will be created.
 
 ### Upload the bundle, on a server that cannot read your files
 
-A server takes the bundle one way, and `icp_deploy_bundle` lists the one
+A server takes the bundle one way, and `icp_deploy` lists the one
 argument for it: `bundle_path` on a server running on the project's machine,
 `bundle_upload` on one that is not. A server that lists `icp_deploy_upload`
 is of the second kind: it cannot open a path of yours, and a tool call cannot
@@ -138,7 +136,7 @@ carry the archive itself. Upload it first:
    files weigh more than their bytes: each takes at least 5 KiB. An answer
    of `422` means the server read the file and it is not a bundle; rebuild
    it with `icp project bundle`. A new ticket is needed after any of these.
-3. Pass that id to `icp_deploy_bundle` as `bundle_upload`, in place of
+3. Pass that id to `icp_deploy` as `bundle_upload`, in place of
    `bundle_path`.
 
 A ticket is spent by one upload, successful or not; an upload is spent by

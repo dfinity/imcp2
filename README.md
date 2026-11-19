@@ -546,13 +546,12 @@ conventions.
 
 The server also serves the deploy tools (`imcp2_core::deploy`) on the MCP
 endpoint — the bundled binary always, an application that embeds the crate
-where it turns them on (`McpServer::with_deploy`): `icp_deploy_bundle`
+where it turns them on (`McpServer::with_deploy`): `icp_deploy`
 deploys an [icp CLI](https://github.com/dfinity/icp-cli) project bundle to the
 Internet Computer as the user — every phase of `icp deploy`, creating the
-canisters that do not exist yet from the user's cycles balance (`icp_cycles_balance`
-reports it) and upgrading those named in `canister_ids` — and `icp_deploy_guide`
-returns the skill that walks an agent through the loop (also the
-`skill://deploy-with-mcp` resource). It signs as the user's default Internet
+canisters that do not exist yet from the user's cycles balance and upgrading
+those named in `canister_ids` — and the `skill://deploy-with-mcp` resource
+walks an agent through the loop. It signs as the user's default Internet
 Identity account at `https://cli.id.ai`, the principal `icp identity link web`
 links an icp CLI identity to; `crates/imcp2-local/README.md` says what that
 means for sharing canisters and cycles with the CLI.
@@ -570,7 +569,7 @@ What the hosted composition adds to the local one:
   its authentication. An upload is held five minutes for its deploy. A
   session has one upload at a time — a `PUT` while another of its own is
   arriving is refused (409), and one that is let in replaces the bundle the
-  session was holding. The upload is the only way in: `icp_deploy_bundle`
+  session was holding. The upload is the only way in: `icp_deploy`
   lists `bundle_upload` here and refuses the local server's `bundle_path`, so
   this server opens no file a caller names.
 - **The archive is extracted as it arrives, and never kept.** The body is fed
@@ -617,7 +616,7 @@ What the hosted composition adds to the local one:
 - **The deploy call is answered as an event stream.** The endpoint answers a
   POST with plain JSON, the one message a handler returns; a deploy reports
   each phase as a progress notification before its result, so a `tools/call`
-  of `icp_deploy_bundle` is dispatched to a second rmcp service configured for
+  of `icp_deploy` is dispatched to a second rmcp service configured for
   Server-Sent-Events responses, still stateless. Every other request keeps the
   JSON service. The stream carries each phase as it completes, which is also
   what keeps a client's per-call timeout from expiring on a minutes-long

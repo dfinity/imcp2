@@ -6,7 +6,7 @@
 //! authorization server: a single-user process reached over a pipe needs no
 //! bearer tokens — the OS process boundary is the auth gate.
 //!
-//! On top of the core surface it serves `icp_deploy_bundle` (from
+//! On top of the core surface it serves `icp_deploy` (from
 //! `imcp2_core::deploy`): deploying an icp project bundle through the icp CLI's own
 //! project library, as the user's default II account at `https://cli.id.ai`
 //! — the principal `icp identity link web` links the CLI to, so `icp` and
