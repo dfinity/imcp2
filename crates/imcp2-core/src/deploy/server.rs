@@ -60,7 +60,7 @@ impl<H: ServerHandler> WithDeploy<H> {
             "Pass the bundle's absolute path as `bundle_path`."
         };
         format!(
-            "DEPLOYING. `icp_deploy_bundle` deploys an icp project bundle (`icp project bundle \
+            "DEPLOYING. `icp_deploy` deploys an icp project bundle (`icp project bundle \
              --output <file>`, built in the user's environment) to the Internet Computer, \
              creating new canisters from the user's cycles balance and upgrading those named in `canister_ids`. {bundle} It needs an \"Actions & \
              questions\" session and lasts as long as the deploy; send a progressToken to see \

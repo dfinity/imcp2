@@ -10,7 +10,7 @@
 //!     with plain JSON, the one message the handler returns. A deploy reports
 //!     each phase as a notification *before* its result, which plain JSON
 //!     cannot carry — in rmcp's JSON mode the first message out would be
-//!     taken for the result. So a `tools/call` of `icp_deploy_bundle` is
+//!     taken for the result. So a `tools/call` of `icp_deploy` is
 //!     handed to a second rmcp service configured for Server-Sent-Events
 //!     responses, still stateless, whose stream carries every notification
 //!     and then the result; every other request keeps the JSON service. The
@@ -629,12 +629,12 @@ fn cancelled_request(body: &[u8]) -> Option<String> {
     (id.is_string() || id.is_number()).then(|| id.to_string())
 }
 
-/// Whether `body` is a JSON-RPC `tools/call` of `icp_deploy_bundle`.
+/// Whether `body` is a JSON-RPC `tools/call` of `icp_deploy`.
 fn is_deploy_call(body: &[u8]) -> bool {
     let Ok(message) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;
     };
-    message["method"] == "tools/call" && message["params"]["name"] == "icp_deploy_bundle"
+    message["method"] == "tools/call" && message["params"]["name"] == "icp_deploy"
 }
 
 /// `response` with its body wrapped so that dropping the body — the client
@@ -922,7 +922,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        for tool in ["open_app", "icp_deploy_bundle", "icp_deploy_upload"] {
+        for tool in ["open_app", "icp_deploy", "icp_deploy_upload"] {
             assert!(names.contains(&tool), "{tool} must be listed: {names:?}");
         }
         assert!(!names.contains(&"authenticate"), "no login tool on the hosted server");
@@ -931,7 +931,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|t| t["name"] == "icp_deploy_bundle")
+            .find(|t| t["name"] == "icp_deploy")
             .unwrap();
         let properties = &deploy["inputSchema"]["properties"];
         assert!(properties["bundle_upload"].is_object(), "{properties}");
@@ -1009,7 +1009,7 @@ mod tests {
                 "bundle_path": "/etc/hostname", "bundle_upload": upload_id, "environment": "ic"
             }),
         ] {
-            let call = serde_json::json!({ "name": "icp_deploy_bundle", "arguments": arguments });
+            let call = serde_json::json!({ "name": "icp_deploy", "arguments": arguments });
             let stream = text(post(&app, &bearer, rpc("tools/call", call)).await).await;
             assert!(stream.contains("reads no bundle_path"), "{stream}");
         }
@@ -1024,7 +1024,7 @@ mod tests {
             rpc(
                 "tools/call",
                 serde_json::json!({
-                    "name": "icp_deploy_bundle",
+                    "name": "icp_deploy",
                     "arguments": { "bundle_upload": upload_id, "environment": "ic" }
                 }),
             ),
@@ -1051,7 +1051,7 @@ mod tests {
             rpc(
                 "tools/call",
                 serde_json::json!({
-                    "name": "icp_deploy_bundle",
+                    "name": "icp_deploy",
                     "arguments": { "bundle_upload": upload_id, "environment": "ic" }
                 }),
             ),
@@ -1069,7 +1069,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(rpc(
                         "tools/call",
-                        serde_json::json!({ "name": "icp_deploy_bundle", "arguments": {} }),
+                        serde_json::json!({ "name": "icp_deploy", "arguments": {} }),
                     )))
                     .unwrap(),
             )
@@ -1116,7 +1116,7 @@ mod tests {
             let said = call(
                 &server.mcp_router(),
                 &bearer,
-                "icp_deploy_bundle",
+                "icp_deploy",
                 serde_json::json!({ "bundle_upload": "x", "environment": "ic" }),
             )
             .await;
@@ -1241,7 +1241,7 @@ mod tests {
         // A deploy of an upload that does not exist holds a slot for as long
         // as it takes to say so: rejected, and timed.
         let deploy = serde_json::json!({ "bundle_upload": "x", "environment": "ic" });
-        call(&app, &bearer, "icp_deploy_bundle", deploy.clone()).await;
+        call(&app, &bearer, "icp_deploy", deploy.clone()).await;
         // With every slot held, the next is refused as busy; and once the
         // server is stopping, as that.
         let held = [(); 2].map(|()| {
@@ -1250,12 +1250,12 @@ mod tests {
                 .claim()
                 .unwrap()
         });
-        call(&app, &bearer, "icp_deploy_bundle", deploy.clone()).await;
+        call(&app, &bearer, "icp_deploy", deploy.clone()).await;
         metrics.refresh().await;
         has(&scrape(), "imcp2_deploys_running 2");
         drop(held);
         deploys.stop();
-        call(&app, &bearer, "icp_deploy_bundle", deploy).await;
+        call(&app, &bearer, "icp_deploy", deploy).await;
 
         metrics.refresh().await;
         let out = scrape();
@@ -1317,7 +1317,7 @@ mod tests {
         let deploy = serde_json::json!({
             "jsonrpc": "2.0", "id": 7, "method": "tools/call",
             "params": {
-                "name": "icp_deploy_bundle",
+                "name": "icp_deploy",
                 "arguments": { "bundle_upload": uploaded["upload_id"], "environment": "ic" }
             }
         })
@@ -1428,7 +1428,7 @@ mod tests {
         let said = call(
             &app,
             &bearer,
-            "icp_deploy_bundle",
+            "icp_deploy",
             serde_json::json!({ "bundle_upload": "x", "environment": "ic" }),
         )
         .await;
@@ -1556,7 +1556,7 @@ mod tests {
         let call = |id: serde_json::Value| {
             serde_json::json!({
                 "jsonrpc": "2.0", "id": id, "method": "tools/call",
-                "params": { "name": "icp_deploy_bundle" }
+                "params": { "name": "icp_deploy" }
             })
             .to_string()
         };
@@ -1623,7 +1623,7 @@ mod tests {
     #[test]
     fn only_a_deploy_call_is_dispatched_to_the_event_stream() {
         assert!(is_deploy_call(
-            rpc("tools/call", serde_json::json!({ "name": "icp_deploy_bundle" })).as_bytes()
+            rpc("tools/call", serde_json::json!({ "name": "icp_deploy" })).as_bytes()
         ));
         assert!(!is_deploy_call(
             rpc("tools/call", serde_json::json!({ "name": "icp_deploy_upload" })).as_bytes()

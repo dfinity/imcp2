@@ -7,7 +7,7 @@ It serves the same tools as the hosted server at
 [mcp.internetcomputer.org](https://mcp.internetcomputer.org) — canister reads
 and writes in textual Candid, app discovery, OQL, canister management —
 against the same **IC mainnet** and the same **production Internet
-Identity**, plus a tool of its own: `icp_deploy_bundle`, which deploys an
+Identity**, plus a tool of its own: `icp_deploy`, which deploys an
 icp project bundle (see [Deploying a project bundle](#deploying-a-project-bundle)).
 What it drops is the hosted server's entire OAuth 2.1 layer: a
 single-user process reached over a pipe needs no bearer tokens, so your II
@@ -140,7 +140,7 @@ is the same one-step browser round-trip — no client restart needed.
 
 ## Deploying a project bundle
 
-`icp_deploy_bundle` deploys an [icp CLI](https://github.com/dfinity/icp-cli)
+`icp_deploy` deploys an [icp CLI](https://github.com/dfinity/icp-cli)
 project to the Internet Computer as you, running the same phases as
 `icp deploy` through the CLI's own project library: it creates the canisters
 that do not exist yet (funded from your cycles-ledger balance, 2T cycles each
@@ -203,7 +203,7 @@ bundle came from.
 The server also serves a skill for the agent, `skill://deploy-with-mcp`,
 next to the IC skills the core surface bundles. It walks through the loop
 above from the agent's side: bundle the project with `icp project bundle`,
-call `icp_deploy_bundle` with the environment's
+call `icp_deploy` with the environment's
 `.icp/data/mappings/<environment>.ids.json` as `canister_ids`, and write the
 mapping the tool returns back into that file so the next deploy upgrades
 rather than creates. It lives at

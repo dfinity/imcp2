@@ -30,7 +30,7 @@
 //! through the host's boundary-node client and the whole process links a
 //! single `ic-agent`.
 
-// The deploy tools: `icp_deploy_bundle` and what serves it. Documented in the
+// The deploy tools: `icp_deploy` and what serves it. Documented in the
 // module itself (`//!` in src/deploy/mod.rs): an outer doc comment here would
 // have its intra-doc links resolved in this scope, not the module's.
 pub mod deploy;

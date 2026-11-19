@@ -6,7 +6,7 @@
 //! bytes to arrive some other way. This is that way: `icp_deploy_upload`
 //! mints a ticket inside an authenticated tool call, the agent presents it on
 //! an ordinary `PUT` of the archive (the one thing the ticket is good for),
-//! and the upload id that `PUT` answers with is what `icp_deploy_bundle`
+//! and the upload id that `PUT` answers with is what `icp_deploy`
 //! takes as `bundle_upload`. The ticket derives its authority from the bearer
 //! token presented on the tool call — the same chain of trust as any tool
 //! call — scoped down to one `PUT`:

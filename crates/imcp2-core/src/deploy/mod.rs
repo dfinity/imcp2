@@ -1,4 +1,4 @@
-//! The deploy tools — the `icp_deploy_bundle` MCP tool: deploy an icp project
+//! The deploy tools — the `icp_deploy` MCP tool: deploy an icp project
 //! bundle to the Internet Computer as the user, through the icp CLI's own
 //! project library (`icp-project`, the code behind `icp deploy`).
 //!
@@ -107,7 +107,7 @@ pub use uploads::{
 };
 
 /// The name of the deploy tool.
-pub const DEPLOY_TOOL: &str = "icp_deploy_bundle";
+pub const DEPLOY_TOOL: &str = "icp_deploy";
 /// The name of the upload-ticket tool, listed only by a server with an
 /// upload store (see [`IcDeployTools::with_uploads`]).
 pub const UPLOAD_TOOL: &str = "icp_deploy_upload";
@@ -125,7 +125,7 @@ pub struct ClientGone(pub CancellationToken);
 pub const DEFAULT_CYCLES: u64 = 2_000_000_000_000;
 
 /// The skill that teaches an agent the deploy loop around this tool — bundle
-/// the project, call `icp_deploy_bundle` with the environment's canister-id
+/// the project, call `icp_deploy` with the environment's canister-id
 /// mapping, write the returned mapping back — served as the MCP resource
 /// `skill://deploy-with-mcp` by the server that mounts the tool, next to
 /// core's bundled IC skills. Compiled in, like those: what a client reads is what was reviewed at
@@ -143,7 +143,7 @@ pub fn skill_document(path: &str) -> Option<&'static str> {
     path.trim().eq_ignore_ascii_case(DEPLOY_SKILL_NAME).then_some(DEPLOY_SKILL_MD)
 }
 
-/// Arguments of `icp_deploy_bundle`.
+/// Arguments of `icp_deploy`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeployBundleArgs {
     /// Absolute path, on this machine, of the bundle archive — the `.tar.gz`
@@ -200,7 +200,7 @@ pub struct CreatedCanister {
     pub canister_id: String,
 }
 
-/// Structured result of `icp_deploy_bundle`.
+/// Structured result of `icp_deploy`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DeployBundleOutput {
     /// `deployed`, `failed` (see `error`; `created` and `canister_ids` hold
@@ -384,7 +384,7 @@ pub fn request_from_args(
 }
 
 /// The deploy tool group, served alongside the core surface by the binary
-/// that composes it: `icp_deploy_bundle`, and `icp_deploy_upload` on a server
+/// that composes it: `icp_deploy`, and `icp_deploy_upload` on a server
 /// that takes bundles by upload.
 #[derive(Clone)]
 pub struct IcDeployTools {
@@ -640,7 +640,7 @@ impl IcDeployTools {
         annotations(title = "Deploy a project bundle", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<DeployBundleOutput>(),
     )]
-    async fn icp_deploy_bundle(
+    async fn icp_deploy(
         &self,
         Parameters(args): Parameters<DeployBundleArgs>,
         ctx: RequestContext<RoleServer>,
@@ -821,7 +821,7 @@ impl IcDeployTools {
 
     #[tool(
         name = "icp_deploy_upload",
-        description = "Get a one-time ticket to upload a bundle archive to this server, for icp_deploy_bundle to deploy: this server runs elsewhere than the project, so the archive `icp project bundle` wrote cannot be read by path. Returns the upload URL, the ticket, and the exact curl command to run; the command prints a JSON answer whose `upload_id` is what to pass to icp_deploy_bundle as `bundle_upload`. The server extracts the archive as it arrives and stops the upload if the archive, or what it extracts to, passes the limits returned here (`max_bytes`, `max_extracted_bytes`); curl may report that as a failed transfer (broken pipe, connection reset) rather than as the server's answer, so read an upload that fails that way as a bundle that is too large. The ticket is good for a few minutes and one upload, and the upload for five minutes; ask for a new ticket after either lapses.",
+        description = "Get a one-time ticket to upload a bundle archive to this server, for icp_deploy to deploy: this server runs elsewhere than the project, so the archive `icp project bundle` wrote cannot be read by path. Returns the upload URL, the ticket, and the exact curl command to run; the command prints a JSON answer whose `upload_id` is what to pass to icp_deploy as `bundle_upload`. The server extracts the archive as it arrives and stops the upload if the archive, or what it extracts to, passes the limits returned here (`max_bytes`, `max_extracted_bytes`); curl may report that as a failed transfer (broken pipe, connection reset) rather than as the server's answer, so read an upload that fails that way as a bundle that is too large. The ticket is good for a few minutes and one upload, and the upload for five minutes; ask for a new ticket after either lapses.",
         annotations(title = "Get a bundle upload ticket", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false),
         output_schema = schema_for_output::<UploadTicketOutput>(),
     )]
@@ -856,7 +856,7 @@ impl IcDeployTools {
         let text = format!(
             "Upload the bundle within {} minutes by running, with the archive's path in place of \
              <bundle.tar.gz>:\n\n{}\n\nThe command prints a JSON answer; pass its `upload_id` to \
-             icp_deploy_bundle as `bundle_upload` within {} minutes. The archive may be at most \
+             icp_deploy as `bundle_upload` within {} minutes. The archive may be at most \
              {} bytes and extract to at most {} bytes; the server extracts it as it arrives and \
              stops the upload at either limit, which curl may report as a failed or reset \
              connection rather than as the server's answer. The ticket is good for one upload.",
@@ -1109,7 +1109,7 @@ mod tests {
         assert!(front.contains(&format!("title: {DEPLOY_SKILL_TITLE}")), "{front}");
         for needle in [
             "icp project bundle",
-            "icp_deploy_bundle",
+            "icp_deploy",
             "canister_ids",
             ".icp/data/mappings/<environment>.ids.json",
             "bundle_path",

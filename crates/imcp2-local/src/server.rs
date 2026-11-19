@@ -423,7 +423,7 @@ mod tests {
         assert!(instructions.contains("textual Candid"), "core guidance must survive the merge");
         // Where core says nothing here deploys, this server says how it does,
         // without the principal it signs as or how many deploys it runs.
-        assert!(instructions.contains("DEPLOYING. `icp_deploy_bundle` deploys"), "{instructions}");
+        assert!(instructions.contains("DEPLOYING. `icp_deploy` deploys"), "{instructions}");
         assert!(instructions.contains("`bundle_path`"), "{instructions}");
         for gone in ["no tool here", "exception", "cli.id.ai", "icp identity", "at a time"] {
             assert!(!instructions.contains(gone), "`{gone}` in: {instructions}");
@@ -433,15 +433,11 @@ mod tests {
         assert_eq!(
             tools.len(),
             13,
-            "10 served core tools + authenticate + auth_status + icp_deploy_bundle"
+            "10 served core tools + authenticate + auth_status + icp_deploy"
         );
-        for expected in [
-            "get_canister_candid",
-            "canister_query",
-            "authenticate",
-            "auth_status",
-            "icp_deploy_bundle",
-        ] {
+        for expected in
+            ["get_canister_candid", "canister_query", "authenticate", "auth_status", "icp_deploy"]
+        {
             assert!(tools.iter().any(|t| &*t.name == expected), "missing {expected}");
         }
 
@@ -495,11 +491,11 @@ mod tests {
         assert!(text.contains("invalid canister id"), "{text}");
 
         // The deploy tools dispatch to their own router through the wrapper:
-        // signed out, `icp_deploy_bundle` refuses before reading the bundle
+        // signed out, `icp_deploy` refuses before reading the bundle
         // (the path named here does not exist, and must not be reached for)
         // or touching the network.
         let (is_error, text, _) = call(
-            "icp_deploy_bundle",
+            "icp_deploy",
             Some(serde_json::json!({
                 "bundle_path": "/nonexistent/bundle.tar.gz",
                 "environment": "ic"
@@ -514,7 +510,7 @@ mod tests {
         // canisters from one stale mapping.
         let busy = deploy_tools.claim().expect("no deploy is running");
         let (is_error, text, _) = call(
-            "icp_deploy_bundle",
+            "icp_deploy",
             Some(serde_json::json!({
                 "bundle_path": "/nonexistent/bundle.tar.gz",
                 "environment": "ic"
@@ -525,7 +521,7 @@ mod tests {
         assert!(text.contains("already running"), "{text}");
         drop(busy);
         let (_, text, _) = call(
-            "icp_deploy_bundle",
+            "icp_deploy",
             Some(serde_json::json!({
                 "bundle_path": "/nonexistent/bundle.tar.gz",
                 "environment": "ic"
@@ -645,7 +641,7 @@ mod tests {
         // names the tool it teaches — which only this server lists.
         let deploy = one("skill://deploy-with-mcp").await;
         assert_eq!(deploy, imcp2_core::deploy::DEPLOY_SKILL_MD);
-        assert!(deploy.contains("icp_deploy_bundle"), "{deploy:.400}");
+        assert!(deploy.contains("icp_deploy"), "{deploy:.400}");
 
         // An unknown skill, and an unknown companion of a real skill, are both
         // resource-not-found — not a panic, a disconnect, or a silent empty.
