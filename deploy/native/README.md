@@ -183,6 +183,30 @@ The deploy sets `MCP_SERVE_BETA=1` for the `staging` environment (via
 beta Internet Identity instance at `/mcp-beta` alongside the production `/mcp`; a
 binary run without it serves `/mcp` (production II) alone.
 
+The MCP endpoint
+also serves the deploy tools (see the repository README, "Deploying a project
+bundle"): deploy directories and uploaded bundles go under the unit's state
+directory (`/var/lib/imcp2/deploys`), `MCP_DEPLOY_MAX_CONCURRENT` (default 2) caps
+the deploys running at once (across `/mcp` and `/mcp-beta` together),
+`MCP_DEPLOY_MAX_UPLOAD_BYTES` (default 64 MiB) an uploaded archive,
+`MCP_DEPLOY_MAX_EXTRACTED_BYTES` (default 128 MiB) what it extracts to — an
+upload is extracted as it arrives and stopped at either — and
+`MCP_DEPLOY_MAX_STORED_BYTES` (default three bundles' worth: one for each
+deploy at once, and one more) every extracted bundle held at once. A bundle's
+sync plugins are run only if the server knows them by hash;
+`MCP_DEPLOY_ALLOWED_PLUGINS` adds the sha256 of a plugin release newer than
+the build (comma- or space-separated), and adding one is vouching for a
+program that runs inside this process. A restart interrupts the deploys that are running: each stops at
+its next step and answers with the canisters it had created before the unit's
+`TimeoutStopSec` runs out, and the ids of one that was killed anyway stay under
+`deploys/imcp2-deploy-*/.icp/data/mappings/` for seven days. Caddy's `read_body 30s` applies to the upload `PUT` too: an
+archive at the cap needs roughly 2 MB/s upstream to arrive in time, and the
+timeout is the knob to raise if that bites, since the app's own caps are what
+bound memory and disk (and the app gives up on a body itself: thirty seconds
+without a byte, ten minutes in all). Every deploy's events are in the unit's log at `info`
+under a `deploy` span with the session id (`journalctl -u imcp2 | grep
+'session="<id>"'` is one run's record), as are uploads received and taken.
+
 The `staging` environment also sets `SERVE_STATUS=1`. `deploy.sh` then keeps the
 Caddyfile's `/status/` block (between its `__STATUS_BEGIN__`/`__STATUS_END__` markers),
 so the status dashboard is published at `https://<staging domain>/status/`; without it

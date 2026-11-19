@@ -44,15 +44,27 @@ fn public_url() -> String {
     std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
 }
 
-/// Directory imcp2 creates its operational files in (today: the persisted
-/// client-registration store). Set with `IMCP2_STATE_DIR`; defaults to the
-/// process's current working directory, so a bare local run keeps
-/// `oauth-clients.json` under the directory it was launched from, as before. The
-/// native deployment points it at the unit's `StateDirectory` (`/var/lib/imcp2`).
+/// Directory imcp2 creates its operational files in (the persisted
+/// client-registration store, and the deploy tools' records and uploaded
+/// bundles). Set with `IMCP2_STATE_DIR`; defaults to the process's
+/// current working directory, so a bare local run keeps `oauth-clients.json`
+/// under the directory it was launched from, as before. The native deployment
+/// points it at the unit's `StateDirectory` (`/var/lib/imcp2`). A relative
+/// path is resolved against the working directory here, once: every path
+/// derived from it is absolute, which a deploy reading an uploaded bundle
+/// requires. An empty value reads as unset (the working directory), as it did
+/// before the path was resolved: an empty path is not one that resolves.
 fn state_dir() -> std::path::PathBuf {
-    std::env::var_os("IMCP2_STATE_DIR")
+    resolve_state_dir(std::env::var_os("IMCP2_STATE_DIR"))
+}
+
+fn resolve_state_dir(configured: Option<std::ffi::OsString>) -> std::path::PathBuf {
+    let dir = configured
+        .filter(|dir| !dir.is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    std::path::absolute(&dir)
+        .unwrap_or_else(|e| panic!("cannot resolve IMCP2_STATE_DIR '{}': {e}", dir.display()))
 }
 
 /// Whether to enforce strict RFC 8707 resource indicators: require a `resource`
@@ -67,6 +79,106 @@ fn require_resource() -> bool {
         Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
         Err(_) => true,
     }
+}
+
+/// The deploy tools' knobs:
+///
+///   * `$MCP_DEPLOY_MAX_CONCURRENT` deploys at once across sessions and
+///     endpoints (default 2);
+///   * `$MCP_DEPLOY_MAX_UPLOAD_BYTES` per uploaded archive, compressed
+///     (default 64 MiB);
+///   * `$MCP_DEPLOY_MAX_EXTRACTED_BYTES` per bundle as extracted, which is
+///     what the server keeps of it (default 128 MiB);
+///   * `$MCP_DEPLOY_MAX_STORED_BYTES` for every bundle the server has at
+///     once, extracted (default: one bundle for each deploy at once, and one
+///     more);
+///   * `$MCP_DEPLOY_ALLOWED_PLUGINS`, the sha256 of each sync plugin the
+///     server runs besides the ones it knows, in hex, separated by commas or
+///     spaces (default: none besides).
+///
+/// A value that is not a whole number refuses to start, and so does one
+/// that contradicts another rather than being quietly bent to fit: a count
+/// of zero (the tools run at least one deploy), an archive cap over what a
+/// bundle may extract to (an archive is never larger than its contents),
+/// and a store too small for one bundle.
+fn deploy_config() -> anyhow::Result<imcp2::deploy::DeployConfig> {
+    let var = |name: &str| std::env::var(name).ok();
+    deploy_config_from([
+        var("MCP_DEPLOY_MAX_CONCURRENT").as_deref(),
+        var("MCP_DEPLOY_MAX_UPLOAD_BYTES").as_deref(),
+        var("MCP_DEPLOY_MAX_EXTRACTED_BYTES").as_deref(),
+        var("MCP_DEPLOY_MAX_STORED_BYTES").as_deref(),
+    ])
+    .map(|config| imcp2::deploy::DeployConfig {
+        allowed_plugins: allowed_plugins(var("MCP_DEPLOY_ALLOWED_PLUGINS").as_deref()),
+        ..config
+    })
+}
+
+/// `$MCP_DEPLOY_ALLOWED_PLUGINS` as its entries. Whether each is a sha256 is
+/// for [`imcp2::deploy::Deploys::new`] to say, which refuses to start on one
+/// that is not: a list misread is a plugin wrongly refused, or wrongly run.
+fn allowed_plugins(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// [`deploy_config`], from the four variables' values in the order above.
+fn deploy_config_from(
+    [concurrent, max_upload_bytes, max_extracted_bytes, max_stored_bytes]: [Option<&str>; 4],
+) -> anyhow::Result<imcp2::deploy::DeployConfig> {
+    let bytes = |name: &str, value: &str| {
+        value
+            .trim()
+            .parse::<usize>()
+            .map_err(|e| anyhow::anyhow!("{name} must be a byte count: {e}"))
+    };
+    let mut config = imcp2::deploy::DeployConfig::default();
+    if let Some(v) = concurrent {
+        config.concurrent = deploy_concurrency(v)?;
+    }
+    if let Some(v) = max_upload_bytes {
+        config.max_upload_bytes = bytes("MCP_DEPLOY_MAX_UPLOAD_BYTES", v)?;
+    }
+    if let Some(v) = max_extracted_bytes {
+        config.max_extracted_bytes = bytes("MCP_DEPLOY_MAX_EXTRACTED_BYTES", v)?;
+    }
+    anyhow::ensure!(
+        config.max_upload_bytes <= config.max_extracted_bytes,
+        "MCP_DEPLOY_MAX_UPLOAD_BYTES ({}) must be at most MCP_DEPLOY_MAX_EXTRACTED_BYTES ({}): \
+         an archive is never larger than what it extracts to",
+        config.max_upload_bytes,
+        config.max_extracted_bytes
+    );
+    if let Some(v) = max_stored_bytes {
+        let stored = bytes("MCP_DEPLOY_MAX_STORED_BYTES", v)?;
+        anyhow::ensure!(
+            stored >= config.max_extracted_bytes,
+            "MCP_DEPLOY_MAX_STORED_BYTES ({stored}) must be at least \
+             MCP_DEPLOY_MAX_EXTRACTED_BYTES ({}): a store smaller than one bundle takes none",
+            config.max_extracted_bytes
+        );
+        config.max_stored_bytes = Some(stored);
+    }
+    Ok(config)
+}
+
+/// `$MCP_DEPLOY_MAX_CONCURRENT` as a count of at least one.
+fn deploy_concurrency(value: &str) -> anyhow::Result<usize> {
+    let count: usize = value
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("MCP_DEPLOY_MAX_CONCURRENT must be a count: {e}"))?;
+    anyhow::ensure!(
+        count > 0,
+        "MCP_DEPLOY_MAX_CONCURRENT must be at least 1: the deploy tools cannot be capped at \
+         zero deploys"
+    );
+    Ok(count)
 }
 
 /// Whether to also serve the beta Internet Identity instance at `/mcp-beta`.
@@ -309,6 +421,12 @@ async fn main() -> anyhow::Result<()> {
     // the operational directory.
     let clients = SharedClients::load(&state_dir);
 
+    // The deploy tools, on every instance: one set of slots
+    // and one upload store for the process, so the caps hold across the
+    // instances. Making it clears what the run before left behind; its
+    // sweeper starts with the first instance's session reaper.
+    let deploys = imcp2::deploy::Deploys::new(&deploy_config()?, &state_dir)?;
+
     // Client ID Metadata Documents: on for every instance unless the deploy says no.
     let cimd_on = cimd_enabled();
     if !cimd_on {
@@ -328,6 +446,7 @@ async fn main() -> anyhow::Result<()> {
         require_resource: require_resource(),
         cimd_enabled: cimd_on,
     });
+    let prod = prod.with_deploy(deploys.clone());
     prod.spawn_session_reaper();
 
     // Beta Internet Identity at `/mcp-beta`: opt in via `$MCP_SERVE_BETA`, so
@@ -343,6 +462,7 @@ async fn main() -> anyhow::Result<()> {
             require_resource: require_resource(),
             cimd_enabled: cimd_on,
         });
+        let beta = beta.with_deploy(deploys.clone());
         beta.spawn_session_reaper();
         Some(beta)
     } else {
@@ -519,7 +639,29 @@ async fn main() -> anyhow::Result<()> {
     // serve error (accept failure, etc.) still cancels the tokens before the
     // error propagates. (Stateless, no long-lived SSE, so there's nothing for
     // the tokens to cut post-drain.)
-    let serve_result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await;
+    //
+    // The one request a drain cannot wait out is a deploy: it lasts minutes,
+    // and the unit is given seconds to stop (`TimeoutStopSec`). So deploys
+    // are told to stop when the signal arrives, before the drain: each ends
+    // at its next step and answers with the canisters it had created, and
+    // the drain then waits for that answer like any other response.
+    //
+    // The drain is not the whole of the wait, though. A stopped deploy with
+    // a canister call in flight waits for its answer, which is what names a
+    // canister the call created — and if its client has gone, no connection
+    // holds the drain open for it. So once the drain is done the deploys are
+    // waited for too, for a bounded time, before anything is cancelled.
+    let stopping = {
+        let deploys = deploys.clone();
+        async move {
+            shutdown_signal().await;
+            deploys.stop();
+        }
+    };
+    let serve_result = axum::serve(listener, app).with_graceful_shutdown(stopping).await;
+    if !deploys.stopped().await {
+        tracing::warn!("a deploy had not ended when the server stopped waiting for it");
+    }
     prod.shutdown();
     if let Some(beta) = &beta {
         beta.shutdown();
@@ -573,6 +715,77 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// An empty `IMCP2_STATE_DIR` is the working directory, as an unset one
+    /// is, and whatever is configured comes out absolute.
+    #[test]
+    fn an_empty_state_dir_reads_as_unset() {
+        let cwd = std::path::absolute(".").unwrap();
+        assert_eq!(super::resolve_state_dir(None), cwd);
+        assert_eq!(super::resolve_state_dir(Some("".into())), cwd);
+        let relative = super::resolve_state_dir(Some("state".into()));
+        assert!(relative.is_absolute(), "{}", relative.display());
+        assert!(relative.ends_with("state"), "{}", relative.display());
+    }
+
+    /// What the server holds follows from how many deploys it runs and how
+    /// large a bundle may be, unless it is set; and values that contradict
+    /// one another are refused, not bent to fit.
+    #[test]
+    fn the_deploy_limits_follow_one_another_unless_told_otherwise() {
+        const MIB: usize = 1024 * 1024;
+        let config = super::deploy_config_from([None; 4]).unwrap();
+        assert_eq!(config.concurrent, 2);
+        assert_eq!((config.max_upload_bytes, config.max_extracted_bytes), (64 * MIB, 128 * MIB));
+        // Two running and one more.
+        assert_eq!(config.stored_bytes(), 3 * 128 * MIB as u64);
+        assert_eq!(config.limits().extracted_bytes, 128 * MIB as u64);
+
+        let config =
+            super::deploy_config_from([Some("3"), Some("1000"), Some(" 5000 "), None]).unwrap();
+        assert_eq!((config.concurrent, config.max_upload_bytes), (3, 1000));
+        assert_eq!(config.stored_bytes(), 4 * 5000);
+        let config = super::deploy_config_from([None, None, None, Some("999999999")]).unwrap();
+        assert_eq!(config.stored_bytes(), 999_999_999);
+
+        let archive_over = super::deploy_config_from([None, Some("2000"), Some("1000"), None]);
+        assert!(archive_over.unwrap_err().to_string().contains("at most"));
+        let small = super::deploy_config_from([None, Some("10"), Some("1000"), Some("999")]);
+        assert!(small.unwrap_err().to_string().contains("at least"));
+        assert!(super::deploy_config_from([None, Some("lots"), None, None]).is_err());
+        assert!(super::deploy_config_from([None, None, Some("-1"), None]).is_err());
+    }
+
+    /// The plugins an operator adds are a list, however it is punctuated,
+    /// and one that is not a hash stops the server from starting.
+    #[test]
+    fn the_plugins_an_operator_allows_are_read_as_a_list() {
+        assert!(super::allowed_plugins(None).is_empty());
+        assert!(super::allowed_plugins(Some("  , ")).is_empty());
+        let (a, b) = ("a".repeat(64), "B".repeat(64));
+        let listed = super::allowed_plugins(Some(&format!(" {a},{b}\n{a} ")));
+        assert_eq!(listed, [a.clone(), b, a]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let config =
+            |allowed_plugins| imcp2::deploy::DeployConfig { allowed_plugins, ..Default::default() };
+        let Err(refused) = imcp2::deploy::Deploys::new(&config(vec!["nope".into()]), dir.path())
+        else {
+            panic!("a server started with a plugin list it could not read");
+        };
+        assert!(refused.to_string().contains("not the sha256 of a plugin"), "{refused}");
+        imcp2::deploy::Deploys::new(&config(listed), dir.path()).unwrap();
+    }
+
+    /// The deploy cap is a count of at least one: zero is refused at startup
+    /// rather than quietly served as one.
+    #[test]
+    fn a_deploy_cap_of_zero_is_refused() {
+        assert_eq!(super::deploy_concurrency(" 3 ").unwrap(), 3);
+        let zero = super::deploy_concurrency("0").unwrap_err().to_string();
+        assert!(zero.contains("at least 1"), "{zero}");
+        assert!(super::deploy_concurrency("two").is_err());
+    }
 
     /// `OAUTH_CIMD_ENABLED`'s reading: on unless it says off.
     #[test]

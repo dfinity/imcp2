@@ -542,6 +542,162 @@ erroring. The design mirrors the reference IC connector's OQL primer (detect +
 teach), adding an ergonomic executor suited to this server's structured-output
 conventions.
 
+## Deploying a project bundle
+
+The server also serves the deploy tools (`imcp2_core::deploy`) on the MCP
+endpoint — the bundled binary always, an application that embeds the crate
+where it turns them on (`McpServer::with_deploy`): `icp_deploy_bundle`
+deploys an [icp CLI](https://github.com/dfinity/icp-cli) project bundle to the
+Internet Computer as the user — every phase of `icp deploy`, creating the
+canisters that do not exist yet from the user's cycles balance (`icp_cycles_balance`
+reports it) and upgrading those named in `canister_ids` — and `icp_deploy_guide`
+returns the skill that walks an agent through the loop (also the
+`skill://deploy-with-mcp` resource). It signs as the user's default Internet
+Identity account at `https://cli.id.ai`, the principal `icp identity link web`
+links an icp CLI identity to; `crates/imcp2-local/README.md` says what that
+means for sharing canisters and cycles with the CLI.
+
+What the hosted composition adds to the local one:
+
+- **The bundle arrives by upload.** The agent's machine cannot hand this server
+  a file, and a tool call carries only what the model writes, so
+  `icp_deploy_upload` mints a one-time ticket inside the authenticated call and
+  returns the `curl` command that `PUT`s the archive to
+  `{mcp_path}/deploy/upload`. The ticket is 256 random bits, single use, good
+  for five minutes, bound to the session that minted it (the upload it produces
+  is deployable by that session alone), and sent in a request header so it
+  stays out of proxy logs. The route is outside the bearer gate — the ticket is
+  its authentication. An upload is held five minutes for its deploy. A
+  session has one upload at a time — a `PUT` while another of its own is
+  arriving is refused (409), and one that is let in replaces the bundle the
+  session was holding. The upload is the only way in: `icp_deploy_bundle`
+  lists `bundle_upload` here and refuses the local server's `bundle_path`, so
+  this server opens no file a caller names.
+- **The archive is extracted as it arrives, and never kept.** The body is fed
+  to the bundle extractor a chunk at a time, so the archive is nowhere whole,
+  in memory or on disk; what the server holds for the deploy is the extracted
+  bundle, which the deploy then takes as its directory (a rename, nothing
+  copied or extracted again). Both of its sizes are held while it is still
+  arriving, and the upload is stopped at the byte that passes either:
+  `$MCP_DEPLOY_MAX_UPLOAD_BYTES` of archive (a declared length over it is
+  refused unread), and `$MCP_DEPLOY_MAX_EXTRACTED_BYTES` extracted — each
+  entry counted from its header, before it is written. Both answer `413`, the
+  body saying which; a client still sending may see the connection close
+  rather than the answer. What arrives and is not a bundle (not a `.tar.gz`,
+  an entry a bundle never carries, no manifest) is refused on the upload too
+  (`422`), not on the deploy. A body that stalls for thirty seconds, or takes
+  more than ten minutes, is given up on, and a `PUT` that fails or is
+  abandoned leaves nothing behind.
+- **What the server keeps is bounded in the bytes it occupies.** The state
+  directory may be a RAM filesystem, where a bundle is memory, so a bundle's
+  size is counted as what its files and directories occupy: each file in
+  whole 4 KiB blocks, and 1 KiB for each file and directory (a quarter of a
+  million one-byte files are a gigabyte of pages, not a quarter of a
+  megabyte). `$MCP_DEPLOY_MAX_EXTRACTED_BYTES` (default 128 MiB) holds one
+  bundle to that, and with it the copy of each canister's module that its
+  deploy keeps beside it — checked before the deploy makes any, so fifty
+  canisters naming one module cannot have it written fifty times. Every
+  bundle the server has counts against `$MCP_DEPLOY_MAX_STORED_BYTES`
+  (default: one bundle for each deploy that runs at once, and one more): one
+  that is arriving or being deployed as the most a bundle may come to, since
+  that is what it may grow to, and one that is waiting as what it did come
+  to. Past it a `PUT` is refused (507), and so is a deploy with no room to
+  run in, its upload kept for another try. So the most the deploy tools keep
+  under the state directory is that budget — 384 MiB by default — beside
+  what a running deploy holds on the heap (a module at a time, read to check
+  it).
+- **The deploy call is answered as an event stream.** The endpoint answers a
+  POST with plain JSON, the one message a handler returns; a deploy reports
+  each phase as a progress notification before its result, so a `tools/call`
+  of `icp_deploy_bundle` is dispatched to a second rmcp service configured for
+  Server-Sent-Events responses, still stateless. Every other request keeps the
+  JSON service. The stream carries each phase as it completes, which is also
+  what keeps a client's per-call timeout from expiring on a minutes-long
+  deploy (send a progress token).
+- **A client that goes away stops its deploy.** The event stream's body is
+  wrapped so that its drop — the client disconnecting — cancels a token the
+  deploy watches; the deploy stops at its next step, and its working directory
+  stays under `{state_dir}/deploys`, cut down to the ids it recorded
+  (`.icp/data/mappings/<environment>.ids.json`), for an operator to hand the
+  user. A client that goes away while the bundle is still being extracted and
+  checked stops the deploy there, before anything is created.
+- **A server that is stopping interrupts its deploys.** A deploy lasts
+  minutes and a restart gives the process seconds, so on the shutdown signal
+  every running deploy is told to stop before the drain begins: it ends at
+  its next step and answers with the canisters it had created, the drain
+  waits for that answer, and a deploy asked for meanwhile is refused. A
+  stop never drops a canister call in flight — the call may already have
+  created, and funded, a canister that only its answer names — so the
+  deploy waits for that answer and makes no further call; it waits twenty
+  seconds at most, and says so in its answer if a call was given up on. The
+  process in turn waits for its deploys to have ended before it exits, drain
+  or no drain: a deploy whose client has gone holds no connection open. A
+  deploy that finishes after it was asked to stop keeps its record too, as
+  an interrupted one does.
+- **Bounds.** One deploy per session and `$MCP_DEPLOY_MAX_CONCURRENT` across
+  sessions and endpoints (the slots are the process's, shared by `/mcp` and
+  `/mcp-beta`), refused past the cap rather than queued. Each deploy's
+  directory is made under `{state_dir}/deploys`, readable by the server's user
+  alone, and removed when the deploy returns. What an interruption or a
+  killed process leaves there is bounded too: a start removes the uploads of
+  the run before and cuts each cut-off deploy's directory down to its ids
+  (having first locked the directory, `deploys/.lock`: a second server
+  started over a state directory in use is refused, since it would clear the
+  first one's uploads and deploys as leftovers),
+  and a sweep every minute removes lapsed uploads and id records older than
+  seven days. The number of files and directories a bundle holds, and what
+  its modules expand to, are bounded by the bundle host as well.
+- **Only the sync plugins the server knows are run.** A sync plugin is a
+  program the bundle brings and the server runs — in WASI, with read-only
+  access to its own deploy directory and no network, under a compute budget,
+  but with no memory limit short of its address space, and inside the
+  server's own process. So this server runs the plugin releases it knows and
+  no others, each known by the sha256 of its module (which is what `icp
+  project bundle` records for it), never by the name or path the bundle
+  gives it:
+
+  | sha256 | Plugin |
+  |---|---|
+  | `6deedcc2127a3bda014af9e08aff83ee58c95125050acb296676aa234906a08e` | static-site sync, v1.0.0 |
+  | `afb5d626761e891a42e5c36e8799bf521823de9f55c5102860bd3a237d3b164f` | static-site sync, v0.4.3 |
+  | `ca7cb5666c30d2875f8d5e10535f8a53f97a86c79c263f7d5bdac2fdd1bbf83c` | asset canister sync |
+
+  `$MCP_DEPLOY_ALLOWED_PLUGINS` adds to the list (hashes separated by commas
+  or spaces), for a release newer than the build; an entry that is not a
+  sha256 stops the server from starting. A bundle with a plugin not on it is
+  refused twice over: on the upload (`422`), where every canister the
+  project declares is looked at, and again by the deploy, on the modules it
+  is about to run for the canisters it is deploying, before anything is
+  created. The refusal names the plugin's hash and what the server runs. A
+  bundle with no sync plugin is unaffected, and the local server, where the
+  bundle is the user's own, runs whatever it brings.
+- **The server log has every deploy.** Each deploy's events — the directory it
+  works in, every phase and canister step as the client sees them, and how it
+  ended — are logged at `info` under a `deploy` span carrying the session id,
+  so `journalctl -u imcp2 | grep 'session="…"'` is the record of one run.
+  Upload tickets minted, bundles received or refused, and uploads taken by a
+  deploy are logged at `info` with the session and upload id. The default
+  `RUST_LOG=info` shows all of it.
+
+The deploy tools are part of every build: there is no feature to turn on. The
+bundled binary always serves them; an application that embeds the `imcp2`
+crate serves them once it calls `McpServer::with_deploy`, and not before.
+Nothing here is read from the environment by the library: the `$MCP_DEPLOY_*` variables above are the bundled binary's, which
+maps them onto `imcp2::deploy::DeployConfig`, and an embedder sets that
+struct's fields from its own configuration. It makes one `Deploys` for the
+process (`Deploys::new(&config, &state_dir)`) as it starts and hands a clone
+to each server it serves the tools on (`McpServer::with_deploy`). One, not
+one per server: the caps are the process's, and making a second over a
+directory in use would clear the uploads and deploys of the first. Nothing
+more is needed to run it — `spawn_session_reaper` starts the deploy sweeper
+and `shutdown` stops the running deploys — but an embedder that drains
+in-flight requests calls `Deploys::stop` *before* the drain, as the bundled
+binary does: a drain that began first would wait on deploys nothing had told
+to stop. After the drain, and before `shutdown` or exiting, it awaits
+`Deploys::stopped`: a bounded wait for each deploy to have ended, which a
+drain does not cover when a deploy's client has already gone. `Deploys::new`
+fails when another running server owns the state directory.
+
 ## Connect from an MCP client
 
 Add the server to Claude Code (replace the URL with wherever it's hosted):
@@ -569,7 +725,15 @@ cargo run
 # serves http://0.0.0.0:8000  (MCP at /mcp against production II, OAuth under it; / redirects to the landing site)
 # honours $PORT (default 8000), $PUBLIC_URL (default http://localhost:8000),
 # $MCP_SERVE_BETA (set it to also serve the beta II instance at /mcp-beta, for staging),
-# and $MCP_SERVE_METRICS (set it to serve the Prometheus exposition at /metrics)
+# and $MCP_SERVE_METRICS (set it to serve the Prometheus exposition at /metrics).
+# It also serves the deploy tools, with
+# $MCP_DEPLOY_MAX_CONCURRENT deploys at once (default 2), archives of at most
+# $MCP_DEPLOY_MAX_UPLOAD_BYTES (default 64 MiB) that extract to at most
+# $MCP_DEPLOY_MAX_EXTRACTED_BYTES (default 128 MiB), and
+# $MCP_DEPLOY_MAX_STORED_BYTES of extracted bundles in all (default: one for
+# each deploy at once, and one more), and running the sync plugins it knows
+# plus those named in $MCP_DEPLOY_ALLOWED_PLUGINS; see "Deploying a project
+# bundle".
 ```
 
 The human-facing pages — the landing page and the `/privacy-policy`,
@@ -597,7 +761,8 @@ only runtime file is the OAuth clients store, which the server always uses: it r
 the file on startup and writes it (best-effort) as client registrations change, so
 give it a writable directory. imcp2 creates its operational files in
 `IMCP2_STATE_DIR` (the clients store at `<dir>/oauth-clients.json`); it defaults to
-the working directory. On `SIGTERM` (what
+the working directory, and a relative path is resolved against the working
+directory at startup. On `SIGTERM` (what
 `systemctl stop`/`restart` sends) or `SIGINT`, the server drains in-flight requests
 before exiting, so a redeploy doesn't cut off calls mid-flight. Two requirements
 when hosting:

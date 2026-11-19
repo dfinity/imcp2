@@ -62,7 +62,10 @@ MemoryMax=2G
 MemorySwapMax=0
 # Graceful stop: systemd sends SIGTERM (the app drains in-flight requests on it),
 # then waits up to TimeoutStopSec before escalating to SIGKILL. Ample for our
-# short request handlers; keeps a `restart` from cutting live requests.
+# short request handlers; keeps a `restart` from cutting live requests. The one
+# long request, a deploy, is not waited out: on SIGTERM the app interrupts each
+# running deploy at its next step, and the drain waits only for it to answer
+# with the canisters it had created.
 KillSignal=SIGTERM
 TimeoutStopSec=30
 
