@@ -60,7 +60,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # pinned by the same crate the hosts use) is deferred until ic-bn-lib releases
 # against this ic-agent line — its current release pins an older one, which
 # would revert the read-only delegation-permissions support this depends on.
-ic-agent = "0.49"
+ic-agent = "0.50"
 candid = { version = "0.10.41", features = ["value"] }
 candid_parser = "0.4.2"
 tokio = "1"
