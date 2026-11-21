@@ -70,8 +70,8 @@ host — an API boundary node or a gateway — passes in its own route-configure
 agent, so the whole process links one `ic-agent` and shares one boundary-node
 client. (`ic-agent` stays a direct dependency until
 [`ic-bn-lib`](https://github.com/dfinity/ic-bn-lib) — the shared BN/gateway
-crate it should eventually be sourced through — releases against ic-agent 0.49;
-see `Cargo.toml`.)
+crate it should eventually be sourced through — releases against the same
+ic-agent line; see `Cargo.toml`.)
 
 ```rust
 use imcp2::{auth_callbacks_router, Agent, IiInstance, McpConfig, McpServer, SharedClients, IC_URL};
