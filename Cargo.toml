@@ -58,8 +58,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Deliberately a direct dependency for now: sourcing ic-agent through ic-bn-lib
 # (the shared boundary-node/gateway crate, the eventual goal so the version is
 # pinned by the same crate the hosts use) is deferred until ic-bn-lib releases
-# against this ic-agent line — its current release pins an older one, which
-# would revert the read-only delegation-permissions support this depends on.
+# against this ic-agent line — its current release pins an older one, whose
+# elliptic-curve 0.13 stack brings back crypto-bigint 0.5.5 (RUSTSEC-2026-0387).
 ic-agent = "0.50"
 candid = { version = "0.10.41", features = ["value"] }
 candid_parser = "0.4.2"
