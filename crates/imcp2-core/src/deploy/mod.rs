@@ -92,7 +92,9 @@ mod run;
 mod server;
 mod uploads;
 
-pub use host::{occupies, AllowedPlugins, BundleLimits, BLOCK_BYTES, ENTRY_BYTES, KNOWN_PLUGINS};
+pub use host::{
+    occupies, AllowedPlugins, BundleLimits, PluginLimits, BLOCK_BYTES, ENTRY_BYTES, KNOWN_PLUGINS,
+};
 use identity::RefreshingIdentity;
 pub use observe::{DeployObserver, Ended, Refused};
 pub use run::{
@@ -405,6 +407,7 @@ pub fn request_from_args(
         bundle,
         limits: BundleLimits::LOCAL,
         plugins: AllowedPlugins::Any,
+        plugin_limits: PluginLimits::default(),
         environment,
         canister_ids,
         mode,
@@ -439,6 +442,8 @@ pub struct IcDeployTools {
     uploads: Option<(Uploads, String)>,
     /// Told how each deploy call went; see [`Self::observed_by`].
     observer: Option<Arc<dyn DeployObserver>>,
+    /// What each sync plugin run is held to; see [`Self::with_plugin_limits`].
+    plugin_limits: PluginLimits,
 }
 
 /// How many deploys a server runs at once, and for whom. A clone is the same
@@ -558,7 +563,17 @@ impl IcDeployTools {
             deploys_dir: None,
             uploads: None,
             observer: None,
+            plugin_limits: PluginLimits::default(),
         }
+    }
+
+    /// Hold each sync plugin a deploy runs to `limits` — its memory, its CPU
+    /// time and how long it may take — instead of the icp CLI's defaults. A
+    /// plugin runs inside this process, so a server that deploys for others
+    /// sets what it can spare; see [`PluginLimits`].
+    pub fn with_plugin_limits(mut self, limits: PluginLimits) -> Self {
+        self.plugin_limits = limits;
+        self
     }
 
     /// Tell `observer` how each deploy call goes — refused, or how it ended
@@ -803,6 +818,7 @@ impl IcDeployTools {
         let mut request = into_request(source);
         request.limits = limits;
         request.plugins = plugins;
+        request.plugin_limits = self.plugin_limits;
         request.workdir = self.deploys_dir.clone();
         // A per-app delegation lives five minutes and a deploy can outlast
         // it (an asset sync, several installs), so the identity the agent

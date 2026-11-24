@@ -1644,20 +1644,13 @@ impl SharedClients {
     /// Load the persisted client registrations from `state_dir` once, to be shared
     /// by every instance on the origin (the store lives at
     /// `{state_dir}/oauth-clients.json`). `state_dir` is the operational-files
-    /// directory the embedder configures as [`McpConfig::state_dir`](crate::McpConfig);
-    /// build ONE `SharedClients` from it and hand a clone to each instance so a
-    /// registration made against either instance's AS is known to both and the
-    /// persisted snapshot never loses the other's entries.
+    /// directory the embedder configures as [`McpConfig::state_dir`](crate::McpConfig).
+    /// [`McpServer::new`](crate::McpServer::new) loads it and each
+    /// [`sibling`](crate::McpServer::sibling) shares it, so a registration made
+    /// against either instance's AS is known to both and the persisted snapshot
+    /// never loses the other's entries.
     pub fn load(state_dir: impl AsRef<Path>) -> Self {
         Self(ClientStore::load(state_dir.as_ref().to_path_buf()))
-    }
-
-    /// The operational directory this store loads from and persists to — the
-    /// authoritative location, so [`McpServer::state_dir`](crate::McpServer::state_dir)
-    /// reports where files actually go rather than a separately-stored copy that
-    /// could drift from the one passed to [`Self::load`].
-    pub fn state_dir(&self) -> &Path {
-        &self.0.state_dir
     }
 }
 
@@ -1682,6 +1675,20 @@ impl AuthStore {
             cimd: CimdState::shared(),
             cimd_enabled,
         }
+    }
+
+    /// A store for another instance of the same server (see
+    /// [`crate::McpServer::sibling`]): its own tokens and pending logins, over
+    /// the same client registrations and settings.
+    pub fn for_instance(&self, identities: Identities, mcp_path: String) -> Self {
+        Self::new(
+            identities,
+            SharedClients(self.clients.clone()),
+            self.public_url.clone(),
+            mcp_path,
+            self.require_resource,
+            self.cimd_enabled,
+        )
     }
 
     /// This store with CIMD switched on or off, and with CIMD state of its own,

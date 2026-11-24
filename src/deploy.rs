@@ -1,5 +1,5 @@
-//! The deploy tools on the hosted server, for an embedder that turns them
-//! on ([`McpServer::with_deploy`]; the bundled binary always does): the
+//! The deploy tools on the hosted server, which every [`McpServer`] serves
+//! (configured at [`McpConfig::deploy`](crate::McpConfig::deploy)): the
 //! core surface served with [`imcp2_core::deploy`]'s tools beside it, a bundle
 //! upload route, and a transport that streams a deploy's progress and tells
 //! it when the client has gone.
@@ -40,15 +40,16 @@
 //!
 //! What a process shares across the endpoints it serves the tools at — the
 //! deploy slots, the upload store, the word that the server is stopping — is
-//! one [`Deploys`], made once and handed to each [`McpServer`]: the caps are
-//! on the process, whose memory and disk they protect. It also bounds what
-//! the directory holds over time (see [`Deploys::new`] and
-//! [`Deploys::spawn_sweeper`]).
+//! one [`Deploys`], made by [`McpServer::new`] and shared with every
+//! [`McpServer::sibling`]: the caps are on the process, whose memory and disk
+//! they protect. It also bounds what the directory holds over time (cleared
+//! as the server is made, and swept while it runs).
 //!
-//! An embedder turns the tools on by making one [`Deploys`] as the process
-//! starts and handing a clone to each server: everything it sets is a field
-//! of [`DeployConfig`] (no environment variable is read here), and the
-//! sweeper starts with [`McpServer::spawn_session_reaper`].
+//! An embedder configures the tools with its server: everything
+//! it sets is a field of [`DeployConfig`], at
+//! [`McpConfig::deploy`](crate::McpConfig::deploy) (no environment variable
+//! is read here), and the sweeper starts with
+//! [`McpServer::spawn_session_reaper`].
 //!
 //! Stopping is the one thing to get in the right order. An embedder that
 //! drains in-flight requests calls [`Deploys::stop`] *before* the drain: a
@@ -66,13 +67,14 @@
 //! #     config: imcp2::McpConfig,
 //! #     signal: impl std::future::Future<Output = ()>,
 //! # ) -> std::io::Result<()> {
-//! use imcp2::deploy::{DeployConfig, Deploys};
+//! use imcp2::deploy::DeployConfig;
 //!
-//! // Once per process, over the state directory the servers share. An
-//! // error is a state directory another running server owns.
-//! let config_for_deploys = DeployConfig { concurrent: 1, ..Default::default() };
-//! let deploys = Deploys::new(&config_for_deploys, &config.state_dir)?;
-//! let server = imcp2::McpServer::new(config).with_deploy(deploys.clone());
+//! // An error is a state directory another running server owns.
+//! let server = imcp2::McpServer::new(imcp2::McpConfig {
+//!     deploy: DeployConfig { concurrent: 1, ..Default::default() },
+//!     ..config
+//! })?;
+//! let deploys = server.deploys().clone();
 //! server.spawn_session_reaper(); // the deploy sweeper with it
 //! // ... serve `server.mcp_router()` ...
 //! signal.await;
@@ -110,6 +112,9 @@ use rmcp::transport::{
     StreamableHttpServerConfig,
 };
 use tokio_util::sync::CancellationToken;
+
+/// What a sync plugin run is held to; see [`DeployConfig::plugin_limits`].
+pub use imcp2_core::deploy::PluginLimits;
 
 use crate::{
     auth,
@@ -163,11 +168,19 @@ pub struct DeployConfig {
     /// upload, and again by the deploy. Adding a hash here is vouching for
     /// that program.
     pub allowed_plugins: Vec<String>,
+    /// What each run of a sync plugin is held to — its memory, its CPU time
+    /// and how long it may take from start to finish — where the default
+    /// leaves each at the icp CLI's own: 4 GiB, 60 seconds of compute, and
+    /// no limit on the run as a whole. A plugin runs inside the server's
+    /// process, one for each deploy at once ([`Self::concurrent`]), so the
+    /// memory limit times that is what plugins can take of the process's
+    /// memory together.
+    pub plugin_limits: PluginLimits,
 }
 
 impl Default for DeployConfig {
-    /// Two deploys at once, archives of 64 MiB, bundles of 128 MiB, and
-    /// three of those in all.
+    /// Two deploys at once, archives of 64 MiB, bundles of 128 MiB, three
+    /// of those in all, and sync plugins held to the icp CLI's own limits.
     fn default() -> Self {
         Self {
             concurrent: 2,
@@ -175,6 +188,7 @@ impl Default for DeployConfig {
             max_extracted_bytes: imcp2_core::deploy::DEFAULT_MAX_EXTRACTED_BYTES,
             max_stored_bytes: None,
             allowed_plugins: Vec::new(),
+            plugin_limits: PluginLimits::default(),
         }
     }
 }
@@ -209,12 +223,14 @@ const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 /// What a process's deploy endpoints share: the slots deploys run in, the
 /// store uploads are received into, and the word that the server is
-/// stopping. Cheap to clone; made once per process and handed to every
-/// [`McpServer`] that serves the tools ([`McpServer::with_deploy`]).
+/// stopping. Cheap to clone; made once per process, by [`McpServer::new`]
+/// from [`crate::McpConfig::deploy`], and shared with the server's siblings. An embedder reaches it at [`McpServer::deploys`].
 #[derive(Clone)]
 pub struct Deploys {
     slots: DeploySlots,
     uploads: Uploads,
+    /// What each sync plugin run is held to.
+    plugin_limits: PluginLimits,
     /// `{state_dir}/deploys`: each deploy's working directory, and `uploads`.
     dir: std::path::PathBuf,
     stopping: CancellationToken,
@@ -260,8 +276,8 @@ const LOCK_FILE: &str = ".lock";
 const STOP_MARGIN: Duration = Duration::from_secs(5);
 
 impl Deploys {
-    /// The deploy state under `state_dir` — the state directory of every
-    /// [`McpServer`] this is handed to — as `config` bounds it.
+    /// The deploy state under `state_dir` — the state directory of the
+    /// [`McpServer`] it is made for — as `config` bounds it.
     ///
     /// Made as the process starts, before a deploy runs, it clears what an
     /// earlier process left: uploads nothing can deploy any more are removed,
@@ -278,7 +294,7 @@ impl Deploys {
     /// not a sha256 (a list read wrong is not run with), and a state
     /// directory whose path is not UTF-8, which the deploy tools could not
     /// work in.
-    pub fn new(config: &DeployConfig, state_dir: &Path) -> std::io::Result<Self> {
+    pub(crate) fn new(config: &DeployConfig, state_dir: &Path) -> std::io::Result<Self> {
         let plugins = imcp2_core::deploy::AllowedPlugins::known_and(&config.allowed_plugins)
             .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?;
         let dir = state_dir.join("deploys");
@@ -311,6 +327,7 @@ impl Deploys {
         Ok(Self {
             slots: DeploySlots::new(config.concurrent),
             uploads,
+            plugin_limits: config.plugin_limits,
             dir,
             stopping: CancellationToken::new(),
             _owned: owned,
@@ -493,6 +510,7 @@ impl McpServer {
             // not UTF-8, which is all this can fail on.
             .unwrap_or_else(|e| panic!("the deploy directory, checked as it was made: {e}"))
             .with_uploads(uploads.clone(), upload_url)
+            .with_plugin_limits(deploys.plugin_limits)
             .observed_by(Arc::new(deploys.metrics.clone()));
         let service = |transport: StreamableHttpServerConfig| {
             let (agent, identities, deploy) =
@@ -776,7 +794,7 @@ async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Agent, IiInstance, McpConfig, SharedClients, IC_URL};
+    use crate::{Agent, IiInstance, McpConfig, IC_URL};
     use axum::http::Request;
     use tower::ServiceExt;
 
@@ -787,6 +805,7 @@ mod tests {
             max_extracted_bytes: 64 * 1024,
             max_stored_bytes: None,
             allowed_plugins: Vec::new(),
+            plugin_limits: PluginLimits::default(),
         }
     }
 
@@ -851,17 +870,17 @@ mod tests {
     /// [`server_in`], with the IC endpoint the server calls at `ic_url`.
     fn server_at(state_dir: &Path, mcp_path: &str, deploys: Deploys, ic_url: &str) -> McpServer {
         let state_dir = state_dir.to_path_buf();
-        McpServer::new(McpConfig {
+        let config = McpConfig {
             agent: Agent::builder().with_url(ic_url).build().expect("agent"),
             instance: IiInstance::prod().expect("prod instance"),
             public_url: "https://mcp.example.com".into(),
             mcp_path: mcp_path.into(),
-            clients: SharedClients::load(&state_dir),
             state_dir,
             require_resource: true,
             cimd_enabled: false,
-        })
-        .with_deploy(deploys)
+            deploy: self::config(),
+        };
+        McpServer::with_deploys(config, deploys)
     }
 
     fn rpc(method: &str, params: serde_json::Value) -> String {

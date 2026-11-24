@@ -26,24 +26,24 @@
 //! boundary-node client and the whole process links a single `ic-agent`.
 //!
 //! ```rust,no_run
-//! use imcp2::{auth_callbacks_router, Agent, IiInstance, McpConfig, McpServer, SharedClients, IC_URL};
+//! use imcp2::{auth_callbacks_router, Agent, IiInstance, McpConfig, McpServer, IC_URL};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     // Or hand in the host's own agent instead of building a default one.
 //!     let agent = Agent::builder().with_url(IC_URL).build()?;
-//!     // Where imcp2 keeps operational state (the client-registration store).
-//!     let state_dir = std::path::PathBuf::from("/var/lib/imcp2");
 //!     let server = McpServer::new(McpConfig {
 //!         agent,
 //!         instance: IiInstance::beta().map_err(anyhow::Error::msg)?,
 //!         public_url: "https://mcp.example.com".into(),
 //!         mcp_path: "/mcp".into(),
-//!         clients: SharedClients::load(&state_dir),
-//!         state_dir,
+//!         // Where imcp2 keeps operational state (the client-registration store,
+//!         // and the deploy tools' uploads and records).
+//!         state_dir: "/var/lib/imcp2".into(),
 //!         require_resource: true, // strict RFC 8707 (reject a missing `resource`)
 //!         cimd_enabled: true, // Client ID Metadata Documents (URL client_ids); false turns them off
-//!     });
+//!         deploy: Default::default(), // the deploy tools' caps (see `imcp2::deploy`)
+//!     })?;
 //!     server.spawn_session_reaper();
 //!     let app = axum::Router::new()
 //!         // nest_service (not nest): it also forwards the bare
@@ -61,10 +61,11 @@
 //! ```
 //!
 //! Several instances can share one origin (e.g. production II at `/mcp`, beta
-//! II at `/mcp-beta`): give each its own `McpServer` (sessions and tokens
-//! never cross instances), share ONE [`SharedClients`] between them — loaded
-//! once from the same [`McpConfig::state_dir`] — so dynamic client registrations
-//! (II-agnostic) persist to a single snapshot, and pass every instance to
+//! II at `/mcp-beta`): build the first with [`McpServer::new`] and each other
+//! from it with [`McpServer::sibling`]. Each is its own `McpServer` (sessions
+//! and tokens never cross instances) over the one state directory: dynamic
+//! client registrations (II-agnostic) persist to a single snapshot, and the
+//! deploy tools' caps hold across the process. Pass every instance to
 //! [`auth_callbacks_router`] so the one allow-list document declares all
 //! callbacks.
 //!
@@ -102,14 +103,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use rmcp::transport::{
-    streamable_http_server::{session::local::LocalSessionManager, tower::StreamableHttpService},
-    StreamableHttpServerConfig,
-};
+use rmcp::transport::StreamableHttpServerConfig;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-pub use auth::SharedClients;
+use auth::SharedClients;
 pub use body_limit::DEFAULT_MAX_REQUEST_BODY;
 /// The components this server is composed from, re-exported so embedders keep
 /// importing everything from `imcp2` (the types are `imcp2-core`'s — one
@@ -135,15 +133,10 @@ pub struct McpConfig {
     /// endpoints live at `{issuer}/oauth/*`, and the discovery documents at
     /// the matching path-inserted well-known locations.
     pub mcp_path: String,
-    /// The dynamic-client-registration store. Share ONE across every instance
-    /// on an origin (registrations are II-agnostic and persist to one file).
-    /// Build it from [`Self::state_dir`] via [`SharedClients::load`].
-    pub clients: SharedClients,
     /// Directory in which imcp2 creates its operational files — the persistent
-    /// state a restart must survive. Today the only such file is the
-    /// dynamic-client-registration store (`{state_dir}/oauth-clients.json`, loaded
-    /// into [`Self::clients`]); it is a directory rather than a file path so
-    /// future operational state has one configured home. The embedding
+    /// state a restart must survive: the dynamic-client-registration store
+    /// (`{state_dir}/oauth-clients.json`) and, with the deploy tools on, their
+    /// uploads and deploy records (`{state_dir}/deploys`). The embedding
     /// application owns this location (it is not read from the environment); the
     /// `imcp2` binary sets it from `$IMCP2_STATE_DIR`.
     pub state_dir: PathBuf,
@@ -162,6 +155,20 @@ pub struct McpConfig {
     /// embedding application; the `imcp2` binary has it on unless
     /// `$OAUTH_CIMD_ENABLED` switches it off.
     pub cimd_enabled: bool,
+    /// The deploy tools on the MCP endpoint (see [`deploy`]), which every
+    /// server serves: the caps on deploys and bundles, the sync plugins run
+    /// and what each is held to. `DeployConfig::default()` for the defaults.
+    /// Their files go under `{state_dir}/deploys`.
+    ///
+    /// Running the tools asks nothing more: [`McpServer::spawn_session_reaper`]
+    /// starts the deploy sweeper too. Stopping them does, of an embedder that
+    /// drains in-flight requests: call [`deploy::Deploys::stop`] (on
+    /// [`McpServer::deploys`]) *before* the drain (a drain begun first waits
+    /// on deploys nothing has told to stop, until whatever bounds it cuts
+    /// their answers off) and [`deploy::Deploys::stopped`] after it, before
+    /// [`McpServer::shutdown`]. `shutdown` stops the deploys as well, but only
+    /// as a backstop: by then it is too late for them to answer.
+    pub deploy: deploy::DeployConfig,
 }
 
 /// One MCP server instance: the shared state behind [`Self::mcp_router`] and
@@ -173,9 +180,9 @@ pub struct McpServer {
     store: auth::AuthStore,
     public_url: String,
     mcp_path: String,
-    /// The deploy tools, when a deployment turns them on (see
-    /// [`Self::with_deploy`]).
-    deploy: Option<deploy::Deploys>,
+    /// The deploy tools' state (see [`McpConfig::deploy`]), and with it the
+    /// lock that makes this server the state directory's one owner.
+    deploy: deploy::Deploys,
     /// The largest MCP request body the endpoint reads, in bytes (see
     /// [`Self::with_max_request_body`]).
     max_request_body: usize,
@@ -185,24 +192,33 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    pub fn new(config: McpConfig) -> Self {
-        // Single operational home: `clients` must have been loaded from the same
-        // `state_dir` this config declares. Enforcing it here (rather than storing
-        // a second copy of the path) keeps `Self::state_dir` — which reports the
-        // store's actual directory — from ever disagreeing with the field.
-        assert_eq!(
-            config.clients.state_dir(),
-            config.state_dir,
-            "McpConfig.clients must be loaded from McpConfig.state_dir \
-             (SharedClients::load(&state_dir))",
-        );
+    /// Build the server, and with it what it keeps under
+    /// [`McpConfig::state_dir`], which it takes as its own: the deploy
+    /// directory is locked and cleared of what an earlier run left (see
+    /// [`deploy`]), and the client registrations are loaded.
+    ///
+    /// An error is a state directory another running server owns, one that
+    /// cannot be written or whose path is not UTF-8, or an entry of
+    /// [`deploy::DeployConfig::allowed_plugins`] that is not a sha256. So a
+    /// second instance in the same process is not a second `new` over the
+    /// same directory, which is refused — two servers there would each clear
+    /// the other's uploads and overwrite the other's client registrations —
+    /// but a [`Self::sibling`] of the first.
+    pub fn new(config: McpConfig) -> std::io::Result<Self> {
+        let deploys = deploy::Deploys::new(&config.deploy, &config.state_dir)?;
+        Ok(Self::with_deploys(config, deploys))
+    }
+
+    /// [`Self::new`], on deploy state already made over the state directory
+    /// (and [`McpConfig::deploy`] not looked at).
+    pub(crate) fn with_deploys(config: McpConfig, deploys: deploy::Deploys) -> Self {
         let public_url = normalize_public_url(&config.public_url);
         let mcp_path = normalize_mount_path(&config.mcp_path);
         let identities =
             identities::Identities::new(config.instance, public_url.clone(), config.agent.clone());
         let store = auth::AuthStore::new(
             identities.clone(),
-            config.clients,
+            SharedClients::load(&config.state_dir),
             public_url.clone(),
             mcp_path.clone(),
             config.require_resource,
@@ -214,28 +230,43 @@ impl McpServer {
             store,
             public_url,
             mcp_path,
-            deploy: None,
+            deploy: deploys,
             max_request_body: DEFAULT_MAX_REQUEST_BODY,
             ct: CancellationToken::new(),
         }
     }
 
-    /// Serve the deploy tools on the MCP endpoint (see [`deploy`]), on the
-    /// process's deploy state: the same [`deploy::Deploys`] goes to every
-    /// instance that serves them, made over this instance's state directory
-    /// (deploy records and uploads go under `{state_dir}/deploys`).
-    ///
-    /// Running it asks nothing more: [`Self::spawn_session_reaper`] starts
-    /// the deploy sweeper too. Stopping it does, of an embedder that drains
-    /// in-flight requests: call [`deploy::Deploys::stop`] *before* the drain
-    /// (a drain begun first waits on deploys nothing has told to stop, until
-    /// whatever bounds it cuts their answers off) and
-    /// [`deploy::Deploys::stopped`] after it, before [`Self::shutdown`].
-    /// `shutdown` stops the deploys as well, but only as a backstop: by then
-    /// it is too late for them to answer.
-    pub fn with_deploy(mut self, deploys: deploy::Deploys) -> Self {
-        self.deploy = Some(deploys);
-        self
+    /// Another instance of this server in the same process: a different
+    /// Internet Identity (`instance`) served at a different path
+    /// (`mcp_path`) of the same origin, e.g. beta II at `/mcp-beta` beside
+    /// production at `/mcp`. Everything else is this server's: the agent,
+    /// the public URL, the OAuth settings and the request-body cap as they
+    /// are now, and — shared, not copied — the client registrations and the
+    /// deploy state, so a client registered at one is known to both and the
+    /// deploy caps hold across them. Sessions and tokens are each
+    /// instance's own, and so is its [`Self::shutdown`].
+    pub fn sibling(&self, instance: IiInstance, mcp_path: &str) -> Self {
+        let mcp_path = normalize_mount_path(mcp_path);
+        let identities =
+            identities::Identities::new(instance, self.public_url.clone(), self.agent.clone());
+        Self {
+            agent: self.agent.clone(),
+            store: self.store.for_instance(identities.clone(), mcp_path.clone()),
+            identities,
+            public_url: self.public_url.clone(),
+            mcp_path,
+            deploy: self.deploy.clone(),
+            max_request_body: self.max_request_body,
+            ct: CancellationToken::new(),
+        }
+    }
+
+    /// The deploy tools' state: for an embedder to stop the running deploys
+    /// before it drains requests ([`deploy::Deploys::stop`]) and wait for
+    /// them after ([`deploy::Deploys::stopped`]). The same state on every
+    /// [`Self::sibling`].
+    pub fn deploys(&self) -> &deploy::Deploys {
+        &self.deploy
     }
 
     /// Cap the MCP request body at `bytes` instead of the default
@@ -251,8 +282,7 @@ impl McpServer {
 
     /// The operational-files directory this instance uses — where imcp2 creates
     /// the state a restart must survive (today, the client-registration store).
-    /// Reported straight from the client store, so it is the directory files
-    /// actually go to (construction enforces it equals [`McpConfig::state_dir`]).
+    /// This is [`McpConfig::state_dir`], reported from the client store.
     /// Exposed so an embedder can place its own operational files under the same
     /// home.
     pub fn state_dir(&self) -> &Path {
@@ -315,29 +345,9 @@ impl McpServer {
             .with_json_response(true)
             .with_cancellation_token(self.ct.child_token())
             .with_allowed_hosts(self.allowed_hosts());
-        let plain_mcp = || {
-            let (agent, identities) = (self.agent.clone(), self.identities.clone());
-            Router::new().fallback_service(StreamableHttpService::new(
-                move || {
-                    Ok(tools::IcTools::new(
-                        agent.clone(),
-                        identities.clone(),
-                        // Multi-user: each request's session is whatever the
-                        // bearer-token gate already validated (auth stays in
-                        // THIS crate; core only asks the injected resolver).
-                        auth::bearer_session_resolver(),
-                    ))
-                },
-                LocalSessionManager::default().into(),
-                transport.clone(),
-            ))
-        };
-        // With the deploy tools, the endpoint also has an open route next to
-        // the gated one: the bundle upload, authenticated by its ticket.
-        let (mcp_service, open_routes) = match &self.deploy {
-            Some(deploys) => self.deploy_mcp_routers(deploys, transport.clone()),
-            None => (plain_mcp(), Router::new()),
-        };
+        // The endpoint has an open route next to the gated one: the bundle
+        // upload, authenticated by its ticket.
+        let (mcp_service, open_routes) = self.deploy_mcp_routers(&self.deploy, transport);
 
         // The MCP resource is gated by a bearer token issued after Internet
         // Identity login. Browser-based MCP clients (e.g. the Grok/ChatGPT
@@ -491,10 +501,8 @@ impl McpServer {
     /// called from within a tokio runtime.
     pub fn spawn_session_reaper(&self) {
         // The deploy tools' own periodic work rides the same call, so that
-        // turning them on adds nothing to what an embedder must run.
-        if let Some(deploys) = &self.deploy {
-            deploys.spawn_sweeper();
-        }
+        // they add nothing to what an embedder must run.
+        self.deploy.spawn_sweeper();
         let ids = self.identities.clone();
         let store = self.store.clone();
         let reap_ct = self.ct.child_token();
@@ -527,16 +535,14 @@ impl McpServer {
     /// AFTER draining in-flight requests on graceful shutdown (cancelling
     /// first would cut the very requests the drain is waiting on).
     ///
-    /// With the deploy tools on, this also stops the deploys that are
+    /// This also stops the deploys that are
     /// running and the deploy sweeper ([`deploy::Deploys::stop`]), on every
     /// instance sharing that state: a process that is shutting one instance
     /// down is stopping. A deploy lasts minutes, so a drain does not wait one
     /// out — call [`deploy::Deploys::stop`] BEFORE the drain for each running
     /// deploy to answer with what it created.
     pub fn shutdown(&self) {
-        if let Some(deploys) = &self.deploy {
-            deploys.stop();
-        }
+        self.deploy.stop();
         self.ct.cancel();
     }
 
@@ -705,7 +711,7 @@ fn normalize_public_url(raw: &str) -> String {
 mod lib_tests {
     use super::{
         allowed_hosts_for, normalize_mount_path, normalize_public_url, Agent, IiInstance,
-        McpConfig, McpServer, SharedClients, IC_URL,
+        McpConfig, McpServer, IC_URL,
     };
     use axum::{
         body::Body,
@@ -714,46 +720,58 @@ mod lib_tests {
     use std::path::PathBuf;
     use tower::ServiceExt;
 
-    /// Build a server whose `clients` load and `state_dir` field both point at
-    /// `dir` (the correct pairing). Construction is pure — no network.
-    fn server_with_dir(dir: PathBuf) -> McpServer {
-        McpServer::new(McpConfig {
+    fn config(dir: PathBuf, instance: IiInstance, mcp_path: &str) -> McpConfig {
+        McpConfig {
             agent: Agent::builder().with_url(IC_URL).build().expect("agent"),
-            instance: IiInstance::prod().expect("prod instance"),
+            instance,
             public_url: "https://mcp.example.com".into(),
-            mcp_path: "/mcp".into(),
-            clients: SharedClients::load(&dir),
+            mcp_path: mcp_path.into(),
             state_dir: dir,
             require_resource: true,
             cimd_enabled: false,
-        })
+            deploy: Default::default(),
+        }
     }
 
-    /// `state_dir()` reports the directory the client store actually uses (single
-    /// source of truth), not a separately-stored copy.
+    /// A server over a state directory of its own, which lasts as long as
+    /// the handle returned with it. Construction touches no network.
+    fn server() -> (tempfile::TempDir, McpServer) {
+        let dir = tempfile::tempdir().unwrap();
+        let prod = IiInstance::prod().expect("prod instance");
+        let server = McpServer::new(config(dir.path().to_path_buf(), prod, "/mcp")).unwrap();
+        (dir, server)
+    }
+
+    /// `state_dir()` reports the directory the server was configured with.
     #[test]
     fn state_dir_reports_the_store_directory() {
-        let dir = std::env::temp_dir().join("imcp2-lib-state-dir-test");
-        let server = server_with_dir(dir.clone());
-        assert_eq!(server.state_dir(), dir);
+        let (dir, server) = server();
+        assert_eq!(server.state_dir(), dir.path());
     }
 
-    /// Constructing with `clients` loaded from a DIFFERENT directory than
-    /// `state_dir` is a programmer error and must fail loudly at construction,
-    /// rather than let `state_dir()` silently report a directory files don't use.
+    /// A sibling serves another Internet Identity at another path over the
+    /// same state, the deploy tools' included; a second server built over
+    /// the directory is not one, and is refused.
     #[test]
-    #[should_panic(expected = "must be loaded from McpConfig.state_dir")]
-    fn mismatched_state_dir_and_clients_panics() {
-        let _ = McpServer::new(McpConfig {
-            agent: Agent::builder().with_url(IC_URL).build().expect("agent"),
-            instance: IiInstance::prod().expect("prod instance"),
-            public_url: "https://mcp.example.com".into(),
-            mcp_path: "/mcp".into(),
-            clients: SharedClients::load(std::env::temp_dir().join("dir-a")),
-            state_dir: std::env::temp_dir().join("dir-b"),
-            require_resource: true,
-            cimd_enabled: false,
-        });
+    fn a_sibling_shares_the_state_and_serves_its_own_instance() {
+        let (dir, prod) = server();
+        let prod = prod.with_max_request_body(1234);
+        let beta = prod.sibling(IiInstance::beta().expect("beta instance"), "mcp-beta/");
+        assert_eq!(beta.mcp_path(), "/mcp-beta");
+        assert_eq!(beta.instance().name, IiInstance::beta().unwrap().name);
+        assert_eq!(prod.instance().name, IiInstance::prod().unwrap().name);
+        assert_eq!(beta.state_dir(), prod.state_dir());
+        assert_eq!(beta.max_request_body, 1234);
+
+        let again = |path: &str| {
+            let beta = IiInstance::beta().expect("beta instance");
+            McpServer::new(config(dir.path().to_path_buf(), beta, path))
+        };
+        let Err(refused) = again("/mcp-beta") else { panic!("two servers over one directory") };
+        assert!(refused.to_string().contains("another running server"), "{refused}");
+        // The directory is free once every instance over it has gone.
+        drop((prod, beta));
+        again("/mcp").unwrap();
     }
 
     /// `public_url` canonicalizes to a clean origin regardless of the shape the
@@ -830,8 +848,8 @@ mod lib_tests {
     /// gets the `401` challenge with its body left unread.
     #[tokio::test]
     async fn the_mcp_endpoint_caps_authenticated_request_bodies() {
-        let dir = std::env::temp_dir().join("imcp2-lib-body-limit-test");
-        let server = server_with_dir(dir).with_max_request_body(64);
+        let (_dir, server) = server();
+        let server = server.with_max_request_body(64);
         let bearer = format!("Bearer {}", server.store.test_bearer().await);
         let oversized = || Body::from(vec![b'x'; 65]);
 

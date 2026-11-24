@@ -196,7 +196,11 @@ deploy at once, and one more) every extracted bundle held at once. A bundle's
 sync plugins are run only if the server knows them by hash;
 `MCP_DEPLOY_ALLOWED_PLUGINS` adds the sha256 of a plugin release newer than
 the build (comma- or space-separated), and adding one is vouching for a
-program that runs inside this process. A restart interrupts the deploys that are running: each stops at
+program that runs inside this process. Each plugin run is held to
+`MCP_DEPLOY_PLUGIN_MAX_MEMORY_BYTES`, `MCP_DEPLOY_PLUGIN_MAX_COMPUTE_SECS` (CPU
+time) and `MCP_DEPLOY_PLUGIN_MAX_WALL_CLOCK_SECS` (default: the icp CLI's own
+4 GiB, 60 seconds, and no wall-clock limit); size the memory limit, times
+`MCP_DEPLOY_MAX_CONCURRENT`, to what the unit has. A restart interrupts the deploys that are running: each stops at
 its next step and answers with the canisters it had created before the unit's
 `TimeoutStopSec` runs out, and the ids of one that was killed anyway stay under
 `deploys/imcp2-deploy-*/.icp/data/mappings/` for seven days. Caddy's `read_body 30s` applies to the upload `PUT` too: an

@@ -481,28 +481,6 @@ dependencies = [
 
 [[package]]
 name = "candid_parser"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "470a4cf0c110e217e54ab3d21c4a9c290736c4a70ab6263d65155522d4b93fb6"
-dependencies = [
- "anyhow",
- "candid",
- "codespan-reporting",
- "convert_case",
- "handlebars",
- "hex",
- "lalrpop",
- "lalrpop-util",
- "logos",
- "num-bigint",
- "pretty",
- "serde",
- "thiserror 1.0.69",
- "toml",
-]
-
-[[package]]
-name = "candid_parser"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0869423fd06018874025dcde34b6c094cf679faa9d552ba2cbbb1d7b62177aa4"
@@ -2164,8 +2142,7 @@ dependencies = [
 [[package]]
 name = "icp-canister-interfaces"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a722f13dea8657d80c1685eb351d617033a037bb6b160e1ea985dc253f32ae4"
+source = "git+https://github.com/dfinity/icp-cli?rev=8180586ecc77a7c8b2af271fc9257b888d353b02#8180586ecc77a7c8b2af271fc9257b888d353b02"
 dependencies = [
  "bigdecimal",
  "candid",
@@ -2178,8 +2155,7 @@ dependencies = [
 [[package]]
 name = "icp-events"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e82f292eace905ab7efb4e47a2e478630d9bc460d5e29189646d8ec65546b7b8"
+source = "git+https://github.com/dfinity/icp-cli?rev=8180586ecc77a7c8b2af271fc9257b888d353b02#8180586ecc77a7c8b2af271fc9257b888d353b02"
 dependencies = [
  "serde",
  "tokio",
@@ -2188,15 +2164,14 @@ dependencies = [
 [[package]]
 name = "icp-project"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a612b7b1c6403a15ad157c414e1673a59da5cdf45e23501801158eb6bf1264f7"
+source = "git+https://github.com/dfinity/icp-cli?rev=8180586ecc77a7c8b2af271fc9257b888d353b02#8180586ecc77a7c8b2af271fc9257b888d353b02"
 dependencies = [
  "async-trait",
  "bigdecimal",
  "camino",
  "camino-tempfile",
  "candid",
- "candid_parser 0.3.2",
+ "candid_parser",
  "cap-std",
  "dunce",
  "flate2",
@@ -2236,8 +2211,7 @@ dependencies = [
 [[package]]
 name = "icp-sync-plugin"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e41c961777033576d0ae1c5127438d474b93205a08c36e90a6fb736689574146"
+source = "git+https://github.com/dfinity/icp-cli?rev=8180586ecc77a7c8b2af271fc9257b888d353b02#8180586ecc77a7c8b2af271fc9257b888d353b02"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2249,6 +2223,7 @@ dependencies = [
  "semver",
  "snafu",
  "tokio",
+ "tracing",
  "wasmtime",
  "wasmtime-wasi",
 ]
@@ -2410,7 +2385,7 @@ dependencies = [
  "base64 0.22.1",
  "camino",
  "candid",
- "candid_parser 0.4.2",
+ "candid_parser",
  "crc32fast",
  "flate2",
  "getrandom 0.3.4",

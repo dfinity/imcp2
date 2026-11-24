@@ -42,7 +42,7 @@ use tracing::{Instrument, Span};
 
 use crate::deploy::{
     calls::{AgentCalls, UntilStopped},
-    host::{self, AllowedPlugins, BundleLimits},
+    host::{self, AllowedPlugins, BundleLimits, PluginLimits},
 };
 
 /// Where the bundle bytes come from.
@@ -83,6 +83,9 @@ pub struct DeployRequest {
     /// user's own machine; the ones the server knows, where it deploys for
     /// others.
     pub plugins: AllowedPlugins,
+    /// What each sync plugin run is held to: the icp CLI's defaults, unless
+    /// the server sets its own.
+    pub plugin_limits: PluginLimits,
     /// The environment, by name, among those the bundle's manifest declares.
     pub environment: String,
     /// Canister ids to start from: a canister named here is upgraded in place
@@ -345,7 +348,7 @@ pub async fn deploy_bundle(
     };
 
     stopped()?;
-    let host = host::host_for(fs.clone(), &limits);
+    let host = host::host_for(fs.clone(), &limits, request.plugin_limits);
     // The load is where the untrusted rule holds (a script step, a module or
     // plugin fetched from a URL or not a regular file under the root, a
     // recipe: the project does not load), so it is the first thing a bundle outside the
@@ -1048,6 +1051,7 @@ mod tests {
             bundle: BundleSource::Bytes(bytes),
             limits: BundleLimits::LOCAL,
             plugins: AllowedPlugins::Any,
+            plugin_limits: PluginLimits::default(),
             environment: environment.into(),
             canister_ids: BTreeMap::new(),
             mode: "auto".into(),
