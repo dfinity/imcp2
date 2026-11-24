@@ -205,13 +205,7 @@ impl McpServer {
     /// the other's uploads and overwrite the other's client registrations —
     /// but a [`Self::sibling`] of the first.
     pub fn new(config: McpConfig) -> std::io::Result<Self> {
-        let deploys = deploy::Deploys::new(&config.deploy, &config.state_dir)?;
-        Ok(Self::with_deploys(config, deploys))
-    }
-
-    /// [`Self::new`], on deploy state already made over the state directory
-    /// (and [`McpConfig::deploy`] not looked at).
-    pub(crate) fn with_deploys(config: McpConfig, deploys: deploy::Deploys) -> Self {
+        let deploy = deploy::Deploys::new(&config.deploy, &config.state_dir)?;
         let public_url = normalize_public_url(&config.public_url);
         let mcp_path = normalize_mount_path(&config.mcp_path);
         let identities =
@@ -224,16 +218,16 @@ impl McpServer {
             config.require_resource,
             config.cimd_enabled,
         );
-        Self {
+        Ok(Self {
             agent: config.agent,
             identities,
             store,
             public_url,
             mcp_path,
-            deploy: deploys,
+            deploy,
             max_request_body: DEFAULT_MAX_REQUEST_BODY,
             ct: CancellationToken::new(),
-        }
+        })
     }
 
     /// Another instance of this server in the same process: a different

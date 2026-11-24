@@ -858,29 +858,34 @@ mod tests {
 
     fn server() -> (tempfile::TempDir, McpServer) {
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let server = server_in(dir.path(), "/mcp", deploys);
+        let server = server_in(dir.path());
         (dir, server)
     }
 
-    fn server_in(state_dir: &Path, mcp_path: &str, deploys: Deploys) -> McpServer {
-        server_at(state_dir, mcp_path, deploys, IC_URL)
+    /// A server at `/mcp` over `state_dir`, which must be free.
+    fn server_in(state_dir: &Path) -> McpServer {
+        server_at(state_dir, IC_URL).unwrap()
     }
 
-    /// [`server_in`], with the IC endpoint the server calls at `ic_url`.
-    fn server_at(state_dir: &Path, mcp_path: &str, deploys: Deploys, ic_url: &str) -> McpServer {
-        let state_dir = state_dir.to_path_buf();
-        let config = McpConfig {
+    /// A server at `/mcp` over `state_dir` that calls the IC at `ic_url`, or
+    /// why there is none: the directory is another server's.
+    fn server_at(state_dir: &Path, ic_url: &str) -> std::io::Result<McpServer> {
+        McpServer::new(McpConfig {
             agent: Agent::builder().with_url(ic_url).build().expect("agent"),
             instance: IiInstance::prod().expect("prod instance"),
             public_url: "https://mcp.example.com".into(),
-            mcp_path: mcp_path.into(),
-            state_dir,
+            mcp_path: "/mcp".into(),
+            state_dir: state_dir.to_path_buf(),
             require_resource: true,
             cimd_enabled: false,
-            deploy: self::config(),
-        };
-        McpServer::with_deploys(config, deploys)
+            deploy: config(),
+        })
+    }
+
+    /// A second endpoint of `server`'s process, at `/mcp-beta`: the same
+    /// Internet Identity, so that only the path differs.
+    fn beside(server: &McpServer) -> McpServer {
+        server.sibling(IiInstance::prod().expect("prod instance"), "/mcp-beta")
     }
 
     fn rpc(method: &str, params: serde_json::Value) -> String {
@@ -1108,9 +1113,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_endpoints_of_a_process_share_its_deploy_state() {
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let prod = server_in(dir.path(), "/mcp", deploys.clone());
-        let beta = server_in(dir.path(), "/mcp-beta", deploys.clone());
+        let prod = server_in(dir.path());
+        let deploys = prod.deploys().clone();
+        let beta = beside(&prod);
         let bearer = format!("Bearer {}", prod.store.test_bearer().await);
         let (app, again) = (prod.mcp_router(), prod.mcp_router());
 
@@ -1152,8 +1157,8 @@ mod tests {
     async fn deploys_and_uploads_are_counted() {
         use prometheus::{Encoder, Registry, TextEncoder};
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let server = server_in(dir.path(), "/mcp", deploys.clone());
+        let server = server_in(dir.path());
+        let deploys = server.deploys().clone();
         let registry = Registry::new();
         let metrics = crate::metrics::Metrics::new(&registry, "0", "0", 0, &[&server]).unwrap();
         let scrape = || {
@@ -1323,8 +1328,8 @@ mod tests {
         let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let ic_url = format!("http://{}", silent.local_addr().unwrap());
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let server = server_at(dir.path(), "/mcp", deploys.clone(), &ic_url);
+        let server = server_at(dir.path(), &ic_url).unwrap();
+        let deploys = server.deploys().clone();
         let bearer = format!("Bearer {}", server.store.test_bearer().await);
         let app = server.mcp_router();
 
@@ -1396,8 +1401,7 @@ mod tests {
     async fn the_dispatch_reads_what_the_endpoints_cap_allows() {
         const MIB: usize = 1024 * 1024;
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let server = server_in(dir.path(), "/mcp", deploys).with_max_request_body(6 * MIB);
+        let server = server_in(dir.path()).with_max_request_body(6 * MIB);
         let bearer = format!("Bearer {}", server.store.test_bearer().await);
         let app = server.mcp_router();
         let padded = |bytes: usize| {
@@ -1440,8 +1444,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stopping_server_takes_no_upload() {
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let server = server_in(dir.path(), "/mcp", deploys.clone());
+        let server = server_in(dir.path());
+        let deploys = server.deploys().clone();
         let bearer = format!("Bearer {}", server.store.test_bearer().await);
         let app = server.mcp_router();
         let ticket = ticket(&app, &bearer).await;
@@ -1458,8 +1462,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stopping_server_begins_no_deploy() {
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let server = server_in(dir.path(), "/mcp", deploys.clone());
+        let server = server_in(dir.path());
+        let deploys = server.deploys().clone();
         let bearer = format!("Bearer {}", server.store.test_bearer().await);
         let app = server.mcp_router();
         deploys.stop();
@@ -1479,9 +1483,9 @@ mod tests {
     #[tokio::test]
     async fn the_servers_own_lifecycle_runs_the_deploy_state() {
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let prod = server_in(dir.path(), "/mcp", deploys.clone());
-        let beta = server_in(dir.path(), "/mcp-beta", deploys.clone());
+        let prod = server_in(dir.path());
+        let deploys = prod.deploys().clone();
+        let beta = beside(&prod);
         // Counted in tasks: nothing here yields, so on this one-thread
         // runtime every task spawned is still alive when it is counted.
         let tasks = || tokio::runtime::Handle::current().metrics().num_alive_tasks();
@@ -1525,35 +1529,37 @@ mod tests {
     #[test]
     fn a_state_directory_has_one_server_at_a_time() {
         let dir = tempfile::tempdir().unwrap();
-        let first = Deploys::new(&config(), dir.path()).unwrap();
+        let first = server_in(dir.path());
         let upload = dir.path().join("deploys/uploads").join(format!("{}.tar.gz", "a".repeat(64)));
         std::fs::write(&upload, "the first server's upload").unwrap();
 
-        let Err(refused) = Deploys::new(&config(), dir.path()) else {
+        let Err(refused) = server_at(dir.path(), IC_URL) else {
             panic!("a second server took a directory in use");
         };
         assert!(refused.to_string().contains("another running server"), "{refused}");
         assert!(upload.exists(), "the first server's upload is untouched");
 
-        // A clone is the same server, and so is a router made from it, which
-        // goes on serving after the handles it was made from have gone: the
-        // directory is free once the last of them has.
-        let clone = first.clone();
-        let router = server_in(dir.path(), "/mcp", first.clone()).mcp_router();
+        // A clone is the same server, and so are a sibling and a router made
+        // from it, which go on serving after the handles they were made from
+        // have gone: the directory is free once the last of them has.
+        let (clone, sibling) = (first.clone(), beside(&first));
+        let router = first.mcp_router();
         drop(first);
-        assert!(Deploys::new(&config(), dir.path()).is_err());
+        assert!(server_at(dir.path(), IC_URL).is_err());
         drop(clone);
-        assert!(Deploys::new(&config(), dir.path()).is_err(), "a router is still serving");
+        assert!(server_at(dir.path(), IC_URL).is_err(), "a sibling is still serving");
+        drop(sibling);
+        assert!(server_at(dir.path(), IC_URL).is_err(), "a router is still serving");
         drop(router);
-        Deploys::new(&config(), dir.path()).unwrap();
+        server_at(dir.path(), IC_URL).unwrap();
     }
 
     /// A stopping server waits for the deploy that is still ending.
     #[tokio::test(start_paused = true)]
     async fn a_stopping_server_waits_for_its_deploys_to_end() {
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let server = server_in(dir.path(), "/mcp", deploys.clone());
+        let server = server_in(dir.path());
+        let deploys = server.deploys().clone();
         let tools = IcDeployTools::new(server.identities.clone(), Arc::new(|_: &_| None))
             .with_slots(deploys.slots.clone());
         assert!(deploys.stopped().await, "nothing is running");
