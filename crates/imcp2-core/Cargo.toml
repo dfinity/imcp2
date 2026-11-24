@@ -55,14 +55,12 @@ flate2 = "1"
 # Each deploy works in a directory of its own that is removed when the deploy
 # ends, whichever way it ends.
 tempfile = "3"
-# The icp CLI's project library and the seams it is driven through. The four
-# share a workspace version upstream and are released together: bump all four
-# together.
+# The icp CLI's project library and the seams it is driven through, from
+# crates.io. The four share a workspace version upstream and are released
+# together: bump all four together.
 #
-# Pinned to a commit of icp-cli's main until its next release is on crates.io
-# (then: back to a crates.io version): the commit has dfinity/icp-cli#885,
-# the memory, compute and wall-clock limits on a sync plugin run that
-# `PluginLimits` sets, which 0.1 on crates.io does not.
+# 0.2 adds dfinity/icp-cli#885, the memory, compute and wall-clock limits on
+# a sync plugin run that `PluginLimits` sets.
 #
 # 0.1 has the rest of what the deploy tools are built on, dfinity/icp-cli#873 (on #868):
 # #868 has `icp project bundle` write an archive of regular files and
@@ -79,10 +77,10 @@ tempfile = "3"
 #     brings wasmtime into every build of this crate.
 #   * icp-canister-interfaces: the engine-canister registry id a created
 #     canister's subnet is looked up in.
-icp-project = { git = "https://github.com/dfinity/icp-cli", rev = "8180586ecc77a7c8b2af271fc9257b888d353b02" }
-icp-events = { git = "https://github.com/dfinity/icp-cli", rev = "8180586ecc77a7c8b2af271fc9257b888d353b02" }
-icp-sync-plugin = { git = "https://github.com/dfinity/icp-cli", rev = "8180586ecc77a7c8b2af271fc9257b888d353b02" }
-icp-canister-interfaces = { git = "https://github.com/dfinity/icp-cli", rev = "8180586ecc77a7c8b2af271fc9257b888d353b02" }
+icp-project = "0.2"
+icp-events = "0.2"
+icp-sync-plugin = "0.2"
+icp-canister-interfaces = "0.2"
 
 # Only for the end-to-end canister-tool tests (src/e2e_canister_tools.rs),
 # behind the `e2e` feature so the default build compiles neither. `pocket-ic`
