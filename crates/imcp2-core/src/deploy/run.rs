@@ -724,7 +724,7 @@ fn insufficient_cycles(deploy_principal: Principal, cycles: u128, ended: &str) -
          needs more cycles before this app can be deployed. You can fund future with \
          CyclePay at {CYCLEPAY_URL}{deploy_principal} — let me know once the payment has gone \
          through and I'll retry deploying.\" Do not retry until the user confirms they are done funding. \
-         Then deploy again with the same bundle and with the `canister_ids` returned here \
+         Then retry deploying with the same bundle and with the `canister_ids` returned here \
          (write them back to the project first): any canister already created is listed there \
          and will not be created again. Note: this is the deploy account, not the principal \
          `icp_cycles_balance` reports. Details: {details}"
