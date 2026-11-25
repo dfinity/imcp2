@@ -5,4 +5,4 @@
 # individual. Restrict admin + write access to the owning team and enforce the
 # four-eyes principle on all merges.
 
-* @dfinity/identity
+* @dfinity/identity @dfinity/sdk
