@@ -139,7 +139,9 @@ pub struct McpConfig {
     /// (`{state_dir}/oauth-clients.json`) and, with the deploy tools on, their
     /// uploads and deploy records (`{state_dir}/deploys`). The embedding
     /// application owns this location (it is not read from the environment); the
-    /// `imcp2` binary sets it from `$IMCP2_STATE_DIR`.
+    /// `imcp2` binary sets it from `$IMCP2_STATE_DIR`. A relative path is
+    /// resolved against the working directory once, by [`McpServer::new`], so
+    /// a later change of directory moves nothing.
     pub state_dir: PathBuf,
     /// Strict RFC 8707 resource indicators: when `true`, both OAuth legs REQUIRE
     /// a `resource` naming this instance, refusing a request that omits it (not
@@ -206,14 +208,17 @@ impl McpServer {
     /// the other's uploads and overwrite the other's client registrations —
     /// but a [`Self::sibling`] of the first.
     pub fn new(config: McpConfig) -> std::io::Result<Self> {
-        let deploy = deploy::Deploys::new(&config.deploy, &config.state_dir)?;
+        // Resolved once, so the lock and every write after it name the same
+        // directory whatever the working directory becomes.
+        let state_dir = std::path::absolute(&config.state_dir)?;
+        let deploy = deploy::Deploys::new(&config.deploy, &state_dir)?;
         let public_url = normalize_public_url(&config.public_url);
         let mcp_path = normalize_mount_path(&config.mcp_path);
         let identities =
             identities::Identities::new(config.instance, public_url.clone(), config.agent.clone());
         let store = auth::AuthStore::new(
             identities.clone(),
-            SharedClients::load(&config.state_dir, deploy.owner()),
+            SharedClients::load(&state_dir, deploy.owner()),
             public_url.clone(),
             mcp_path.clone(),
             config.require_resource,
@@ -280,7 +285,8 @@ impl McpServer {
 
     /// The operational-files directory this instance uses — where imcp2 creates
     /// the state a restart must survive (today, the client-registration store).
-    /// This is [`McpConfig::state_dir`], reported from the client store.
+    /// This is [`McpConfig::state_dir`], made absolute, reported from the
+    /// client store.
     /// Exposed so an embedder can place its own operational files under the same
     /// home.
     pub fn state_dir(&self) -> &Path {
@@ -745,6 +751,20 @@ mod lib_tests {
     fn state_dir_reports_the_store_directory() {
         let (dir, server) = server();
         assert_eq!(server.state_dir(), dir.path());
+    }
+
+    /// A relative state directory is resolved once, as the server is made:
+    /// what it reports, and where it keeps its files, is absolute.
+    #[test]
+    fn a_relative_state_dir_is_made_absolute() {
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let relative = PathBuf::from(dir.path().file_name().unwrap());
+        assert!(relative.is_relative());
+        let prod = IiInstance::prod().expect("prod instance");
+        let server = McpServer::new(config(relative.clone(), prod, "/mcp")).unwrap();
+        assert!(server.state_dir().is_absolute(), "{}", server.state_dir().display());
+        assert_eq!(server.state_dir(), std::path::absolute(&relative).unwrap());
+        assert_eq!(server.state_dir().canonicalize().unwrap(), dir.path().canonicalize().unwrap());
     }
 
     /// A sibling serves another Internet Identity at another path over the

@@ -446,9 +446,18 @@ impl ClientStore {
                 while store.dirty.swap(false, Ordering::SeqCst) {
                     let snapshot = store.registrations.read().await.clone();
                     let file = store.file();
-                    tokio::task::spawn_blocking(move || persist_clients_to(&file, &snapshot))
-                        .await
-                        .ok();
+                    // The write holds the directory's lock itself: on a
+                    // runtime shutting down, this task — and with it the
+                    // store's hold — can be dropped while the blocking
+                    // write goes on, and a second server must not take the
+                    // directory under it.
+                    let owned = store._owned.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _owned = owned;
+                        persist_clients_to(&file, &snapshot)
+                    })
+                    .await
+                    .ok();
                     tokio::time::sleep(PERSIST_MIN_INTERVAL).await;
                 }
                 store.writing.store(false, Ordering::SeqCst);
