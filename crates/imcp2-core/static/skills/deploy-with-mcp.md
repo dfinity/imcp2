@@ -272,8 +272,9 @@ created and their ids.
    delete the directory, and only then deploy again; otherwise the retry
    creates a second set.
 9. **NOT ENOUGH CYCLES.** The deploy account could not pay for a new
-   canister. The error says what the funds needed are estimated at, $3 for
-   each canister still to be created, and gives a CyclePay link
+   canister. The error says what the funds needed are estimated at, $4 for
+   each canister still to be created and $5 at the least, and gives a
+   CyclePay link
    (`https://www.cyclepay.org/?dest=ledger&to=<principal>&usd=<amount>`)
    where the user can buy cycles by card, for the deploy principal and that
    amount. First do step 3 with the returned `canister_ids`, right away and

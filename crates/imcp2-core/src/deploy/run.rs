@@ -712,9 +712,14 @@ pub const CYCLEPAY_URL: &str = "https://www.cyclepay.org/?dest=ledger&to=";
 /// The funds a deploy short of cycles asks for, in whole US dollars for each
 /// canister it has still to create. An estimate, and a fixed one: it follows
 /// neither the cycles a canister is created with nor the balance there is.
-pub const USD_PER_CANISTER: u64 = 3;
+/// It leaves room for the card fee, which takes more of a small amount.
+pub const USD_PER_CANISTER: u64 = 4;
 
-/// The most a CyclePay link preselects, in whole US dollars; a link that
+/// The least a deploy short of cycles asks for, in whole US dollars: the
+/// least CyclePay takes by card from a user who has not signed in there.
+pub const CYCLEPAY_MIN_USD: u64 = 5;
+
+/// The most CyclePay takes in one payment, in whole US dollars; a link that
 /// names more has its amount set aside.
 const CYCLEPAY_MAX_USD: u64 = 200;
 
@@ -743,16 +748,26 @@ fn is_insufficient_cycles(error: &DeployError) -> bool {
 
 /// What a deploy that ran out of cycles says, for the agent to relay: what
 /// the funds needed are estimated at — [`USD_PER_CANISTER`] for each of the
-/// `to_create` canisters the deploy has still to create — where to buy
-/// cycles for that amount, for the principal to fund (the deploy identity's,
-/// which is not the one `icp_cycles_balance` reports), and what to do next.
-/// The library's own text is left out: its advice is the CLI's.
+/// `to_create` canisters the deploy has still to create, and no less than
+/// [`CYCLEPAY_MIN_USD`] — where to buy cycles for that amount, for the
+/// principal to fund (the deploy identity's, which is not the one
+/// `icp_cycles_balance` reports), and what to do next. An estimate over what
+/// one payment takes says so: the link is then for one payment's most. The
+/// library's own text is left out: its advice is the CLI's.
 fn insufficient_cycles(deploy_principal: Principal, cycles: u128, to_create: usize) -> String {
     // A run that failed creating a canister has at least that one to create.
     let to_create = u64::try_from(to_create).unwrap_or(u64::MAX).max(1);
-    let usd = USD_PER_CANISTER.saturating_mul(to_create);
+    let usd = USD_PER_CANISTER.saturating_mul(to_create).max(CYCLEPAY_MIN_USD);
     let canisters = if to_create == 1 { "canister" } else { "canisters" };
     let url = cyclepay_url(deploy_principal, usd.min(CYCLEPAY_MAX_USD));
+    let in_parts = if usd > CYCLEPAY_MAX_USD {
+        format!(
+            " One payment is ${CYCLEPAY_MAX_USD} at the most, which is what the link is for; \
+             the rest takes further payments there."
+        )
+    } else {
+        String::new()
+    };
     format!(
         "NOT ENOUGH CYCLES: the deploy could not create canister(s) because your Internet \
          Identity does not have enough cycles. Each new canister is funded with {cycles} cycles \
@@ -760,11 +775,11 @@ fn insufficient_cycles(deploy_principal: Principal, cycles: u128, to_create: usi
          to the project now, whatever happens next: any canister already created is listed \
          there and will not be created again. Then tell the user, in these words or close to \
          them: \"Your identity needs more cycles before this app can be deployed. The deployment \
-         funds needed are estimated at ${USD_PER_CANISTER} per canister: ${usd} for the \
-         {to_create} {canisters} still to be created. You can fund it with CyclePay at {url} — \
-         let me know once the payment has gone through and I'll retry deploying.\" Do not retry \
-         until the user confirms they are done funding; then retry deploying with the same \
-         bundle and those `canister_ids`."
+         funds needed are estimated at ${USD_PER_CANISTER} per canister, ${CYCLEPAY_MIN_USD} at \
+         the least: ${usd} for the {to_create} {canisters} still to be created. You can fund it \
+         with CyclePay at {url} — let me know once the payment has gone through and I'll retry \
+         deploying.{in_parts}\" Do not retry until the user confirms they are done funding; \
+         then retry deploying with the same bundle and those `canister_ids`."
     )
 }
 
@@ -1931,11 +1946,13 @@ mod tests {
         assert!(said.starts_with("NOT ENOUGH CYCLES: "), "{said}");
         // The estimate, and the link with the principal and that amount.
         assert!(
-            said.contains("estimated at $3 per canister: $6 for the 2 canisters still to be"),
+            said.contains(
+                "estimated at $4 per canister, $5 at the least: $8 for the 2 canisters still to be"
+            ),
             "{said}"
         );
         assert!(
-            said.contains("https://www.cyclepay.org/?dest=ledger&to=2vxsx-fae&usd=6 "),
+            said.contains("https://www.cyclepay.org/?dest=ledger&to=2vxsx-fae&usd=8 "),
             "{said}"
         );
         assert!(said.contains("You can fund it with CyclePay at"), "{said}");
@@ -1951,16 +1968,32 @@ mod tests {
     fn the_funds_asked_for_go_by_the_canisters_still_to_create() {
         let deploy_principal = Principal::from_text("2vxsx-fae").unwrap();
         let said = |to_create| insufficient_cycles(deploy_principal, 2_000_000_000_000, to_create);
-        // One canister, and the run that failed creating one has no fewer.
+        // One canister, and the run that failed creating one has no fewer:
+        // the least asked for, which is more than one canister's estimate.
         for to_create in [0, 1] {
             let said = said(to_create);
-            assert!(said.contains("$3 for the 1 canister still to be created"), "{said}");
-            assert!(said.contains("to=2vxsx-fae&usd=3 "), "{said}");
+            assert!(said.contains("$5 for the 1 canister still to be created"), "{said}");
+            assert!(said.contains("to=2vxsx-fae&usd=5 "), "{said}");
+            assert!(!said.contains("One payment is"), "{said}");
         }
-        // The link names no more than CyclePay preselects; the estimate is whole.
-        let said = said(70);
-        assert!(said.contains("$210 for the 70 canisters still to be created"), "{said}");
-        assert!(said.contains("to=2vxsx-fae&usd=200 "), "{said}");
+        // The most one payment takes is asked for whole, in one link.
+        let said_50 = said(50);
+        assert!(said_50.contains("$200 for the 50 canisters still to be created"), "{said_50}");
+        assert!(said_50.contains("to=2vxsx-fae&usd=200 "), "{said_50}");
+        assert!(!said_50.contains("One payment is"), "{said_50}");
+        // Past it the estimate is whole, the link is for one payment's most,
+        // and the user is told the rest takes more.
+        let said_70 = said(70);
+        assert!(said_70.contains("$280 for the 70 canisters still to be created"), "{said_70}");
+        assert!(said_70.contains("to=2vxsx-fae&usd=200 "), "{said_70}");
+        assert!(
+            said_70.contains(
+                "deploying. One payment is $200 at the most, which is what the link is for; the \
+                 rest takes further payments there.\" Do not retry"
+            ),
+            "{said_70}"
+        );
+        assert!(!said_70.contains('\n') && !said_70.contains("  "), "{said_70}");
 
         // Those to create are the deploy's canisters the mapping has no id for.
         let id = Principal::management_canister();
