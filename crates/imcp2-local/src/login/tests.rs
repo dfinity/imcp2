@@ -10,11 +10,7 @@ use imcp2_core::IiInstance;
 /// are all local), which is exactly what these tests rely on.
 fn test_driver() -> (LoginDriver, SessionSlot) {
     let agent = imcp2_core::Agent::builder().with_url(imcp2_core::IC_URL).build().expect("agent");
-    let identities = Identities::new(
-        IiInstance::prod().expect("prod II instance"),
-        "https://mcp.internetcomputer.org".into(),
-        agent,
-    );
+    let identities = Identities::new(IiInstance::prod().expect("prod II instance"), agent);
     let slot = SessionSlot::new();
     (LoginDriver::new(identities, slot.clone(), /* auto_open */ false), slot)
 }

@@ -19,7 +19,7 @@ use rmcp::{
 
 use crate::{
     calls, compliance, discover, discoverability, discoverability::OriginSource, identities,
-    identities::Identities, management, skills,
+    identities::Identities, skills,
 };
 use std::sync::Arc;
 
@@ -49,14 +49,14 @@ const OQL_PRIMER_MD: &str = include_str!("../static/oql-primer.md");
 
 // Per-tool argument and output types live in the module that implements the
 // tool: `calls` (get_canister_candid, canister_query, canister_update_call),
-// `discover`, `identities`, `skills`, `management`. main.rs only wires the tools
+// `discover`, `identities`, `skills`. main.rs only wires the tools
 // together.
 
 /// The app- and canister-scoped tools: everything that reads, discovers, or
 /// calls ONE app or canister (the `…canister…` / `…_app…` names) — Candid and
 /// OQL reads (with `icp_oql_guide`, the dialect guide those reads use),
 /// update calls, app resolution/discovery, and the per-app identity tools.
-/// This is the surface [`IcTools`] serves in this version.
+/// This is the surface [`IcTools`] serves.
 #[derive(Clone)]
 pub struct IcCanisterTools {
     agent: Agent,
@@ -66,34 +66,8 @@ pub struct IcCanisterTools {
     session: SessionResolver,
 }
 
-/// The IC protocol / meta-level tools: dashboard name/id lookups, the
-/// official IC skills, and canister MANAGEMENT as the standing management
-/// principal — lifecycle and settings for a canister that already exists.
-/// Creating and funding canisters is not among them: those tools were
-/// dropped, and the user does that work with the icp CLI.
-///
-/// NOT served by the default [`IcTools`] composition in this version — we
-/// anticipate this will come in a future version. Until then the type, its
-/// tools, and their tests stay ready, and an embedder that wants the group
-/// today can construct it with [`IcProtocolTools::new`] and serve its
-/// `tool_router()` itself.
-#[derive(Clone)]
-pub struct IcProtocolTools {
-    identities: Identities,
-    skills: skills::SkillsCatalog,
-    /// The authentication seam (see [`SessionResolver`]): asks the embedding
-    /// binary which already-validated session this call acts as.
-    session: SessionResolver,
-}
-
 /// The served MCP tool surface: [`IcCanisterTools`] behind one
-/// [`ServerHandler`], plus the candid/OQL/skill resources. The IC protocol /
-/// meta-level half ([`IcProtocolTools`]) is split out and deliberately NOT
-/// served in this version — we anticipate this will come in a future version;
-/// re-enabling it means composing its router back into `all_tools`,
-/// `call_tool`, and `get_tool` here (or dispatching [`IcProtocolTools`]'s
-/// router from an embedder's own [`ServerHandler`] — the type has no handler
-/// of its own but stays fully usable as library code).
+/// [`ServerHandler`], plus the candid/OQL/skill resources.
 #[derive(Clone)]
 pub struct IcTools {
     canister: IcCanisterTools,
@@ -116,24 +90,9 @@ impl IcTools {
     }
 
     /// Every tool on the served surface — the app/canister tools; exactly the
-    /// list `tools/list` returns. The protocol/meta tools are deferred (we
-    /// anticipate they will come in a future version) and are NOT listed.
+    /// list `tools/list` returns.
     pub fn all_tools() -> Vec<Tool> {
         IcCanisterTools::tool_router().list_all()
-    }
-}
-
-impl IcProtocolTools {
-    /// Build the protocol/meta half on its own. The default [`IcTools`]
-    /// composition does not serve these tools in this version (we anticipate
-    /// this will come in a future version); an embedder that wants the group
-    /// today can construct it here and serve its `tool_router()` alongside.
-    pub fn new(
-        identities: Identities,
-        skills: skills::SkillsCatalog,
-        session: SessionResolver,
-    ) -> Self {
-        Self { identities, skills, session }
     }
 }
 
@@ -204,7 +163,7 @@ impl IcCanisterTools {
     )]
     async fn candid_syntax_guide(
         &self,
-        Parameters(_args): Parameters<management::NoArgs>,
+        Parameters(_args): Parameters<calls::NoArgs>,
     ) -> Result<CallToolResult, McpError> {
         let output = calls::CandidGuideOutput { content: CANDID_TEXTUAL_MD.to_string() };
         Ok(ok_structured(output.content.clone(), &output))
@@ -217,7 +176,7 @@ impl IcCanisterTools {
     )]
     async fn icp_oql_guide(
         &self,
-        Parameters(_args): Parameters<management::NoArgs>,
+        Parameters(_args): Parameters<calls::NoArgs>,
     ) -> Result<CallToolResult, McpError> {
         let output = calls::OqlGuideOutput { content: OQL_PRIMER_MD.to_string() };
         Ok(ok_structured(output.content.clone(), &output))
@@ -1371,293 +1330,6 @@ impl IcCanisterTools {
     }
 }
 
-#[tool_router(vis = "pub")]
-impl IcProtocolTools {
-    /// The already-validated session id this tool call acts as, per the
-    /// embedding binary's [`SessionResolver`].
-    fn current_session_id(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
-        (self.session)(ctx)
-    }
-
-    #[tool(
-        description = "Find canisters by name in the IC dashboard's service registries: token ledgers by symbol or name, and the SNS project catalog. Use this when the user names a token, project or service instead of giving a canister id. It covers the Internet Computer's labelled services only, not arbitrary canisters.",
-        annotations(title = "Find canisters by name", read_only_hint = true, destructive_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<discover::FindCanisterOutput>(),
-    )]
-    async fn icp_find_canister_by_name(
-        &self,
-        Parameters(discover::FindCanisterArgs { query }): Parameters<discover::FindCanisterArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        match discover::search_by_name(&query).await {
-            Ok(matches) if !matches.is_empty() => {
-                let mut out = format!("Canisters matching \"{query}\":\n");
-                for m in &matches {
-                    out.push_str(&format!(
-                        "- {} — {} [{}]{}\n",
-                        m.canister_id,
-                        m.name,
-                        m.kind,
-                        m.note.as_deref().map(|n| format!("  — {n}")).unwrap_or_default(),
-                    ));
-                }
-                out.push_str(
-                    "\nConfirm an interface with get_canister_candid, then read with canister_query and \
-                     write with canister_update_call. \
-                     For an SNS match the id is the project root — icp_lookup_canister_info_by_id it to learn more.",
-                );
-                let output = discover::FindCanisterOutput::from((query, matches));
-                Ok(ok_structured(out, &output))
-            }
-            Ok(_) => {
-                let text = format!(
-                    "No named canisters found matching \"{query}\". This searches known tokens (ICRC \
-                     ledgers) and SNS projects, so an arbitrary canister won't appear unless it's a \
-                     labelled service. If you have a website, try open_app; if you already \
-                     have a canister id, try icp_lookup_canister_info_by_id or get_canister_candid."
-                );
-                let output = discover::FindCanisterOutput::from((query, Vec::new()));
-                Ok(ok_structured(text, &output))
-            }
-            Err(e) => Ok(err(e)),
-        }
-    }
-
-    #[tool(
-        description = "Identify what a canister is, from the IC dashboard: its name, type, controllers, subnet, module hash, language and latest upgrade proposal. Use this to make sense of a bare canister id.",
-        annotations(title = "Identify a canister", read_only_hint = true, destructive_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<discover::CanisterIdentityOutput>(),
-    )]
-    async fn icp_lookup_canister_info_by_id(
-        &self,
-        Parameters(discover::LookupCanisterArgs { canister_id }): Parameters<
-            discover::LookupCanisterArgs,
-        >,
-    ) -> Result<CallToolResult, McpError> {
-        let client = match discover::http_client() {
-            Ok(c) => c,
-            Err(e) => return Ok(err(e)),
-        };
-        match discover::lookup_canister(&client, &canister_id).await {
-            Ok(info) => {
-                let text = format_canister_info(&info);
-                let output = discover::CanisterIdentityOutput::from(info);
-                Ok(ok_structured(text, &output))
-            }
-            Err(e) => Ok(err(e)),
-        }
-    }
-
-    // ---- ICP skills awareness ----------------------------------------------
-
-    #[tool(
-        description = "List the skills published at skills.internetcomputer.org: how-to guides for authoring and shipping Internet Computer apps. Returns each skill's name with a one-line summary. Use this when a task involves writing, building or deploying code for the Internet Computer; icp_get_skill returns one skill in full.",
-        annotations(title = "List Internet Computer skills", read_only_hint = true, destructive_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<skills::SkillsOutput>(),
-    )]
-    async fn icp_list_skills(
-        &self,
-        Parameters(_args): Parameters<management::NoArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        match self.skills.list().await {
-            Ok(s) => {
-                let text = skills::SkillsCatalog::format_list(&s);
-                let output = skills::SkillsOutput::from(s);
-                Ok(ok_structured(text, &output))
-            }
-            Err(e) => Ok(err(e)),
-        }
-    }
-
-    #[tool(
-        description = "Fetch one skill in full from skills.internetcomputer.org, by name. Use this when a skill listed by icp_list_skills covers the task at hand.",
-        annotations(title = "Get an Internet Computer skill", read_only_hint = true, destructive_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<skills::SkillOutput>(),
-    )]
-    async fn icp_get_skill(
-        &self,
-        Parameters(skills::GetSkillArgs { name }): Parameters<skills::GetSkillArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        match self.skills.get(&name).await {
-            Ok(md) => {
-                let output = skills::SkillOutput { name, content: md };
-                Ok(ok_structured(output.content.clone(), &output))
-            }
-            Err(e) => Ok(err(e)),
-        }
-    }
-
-    // ---- Canister management (as your standing II principal) --------------
-
-    #[tool(
-        description = "Return the cycles-ledger balance of the principal this connector manages canisters as, and that principal. Use this to check whether canister operations can be funded, or to get the principal to add as a controller when the user creates a canister with the icp CLI.",
-        annotations(title = "Check your cycles balance", read_only_hint = true, destructive_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<management::CyclesBalance>(),
-    )]
-    async fn icp_cycles_balance(
-        &self,
-        Parameters(_args): Parameters<management::NoArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let sid = match self.current_session_id(&ctx) {
-            Some(s) => s,
-            None => {
-                return Ok(
-                    err("checking your cycles balance needs an authenticated session".into()),
-                )
-            }
-        };
-        match management::cycles_balance(&self.identities, &sid).await {
-            Ok(b) => Ok(ok_structured(b.human(), &b)),
-            Err(e) => Ok(err(e)),
-        }
-    }
-
-    #[tool(
-        description = "Install a compiled Wasm module on a canister the user controls. Use this when the user has already built a module; `mode` selects install, reinstall or upgrade.",
-        annotations(title = "Install code on a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<management::CanisterActionOutput>(),
-    )]
-    async fn icp_install_code(
-        &self,
-        Parameters(args): Parameters<management::InstallCodeArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let sid = match self.current_session_id(&ctx) {
-            Some(s) => s,
-            None => return Ok(err("installing code needs an authenticated session".into())),
-        };
-        let canister_id = args.canister_id.clone();
-        Ok(ok_canister_action(
-            canister_id,
-            management::install_code(&self.identities, &sid, args).await,
-        ))
-    }
-
-    #[tool(
-        description = "Report a canister's run state, cycle balance, module hash, memory size, controllers and allocations. Use this to inspect a canister the user controls. It only reads, but the Internet Computer serves it as an update call, so it needs a session authorized for \"Actions & questions\" rather than \"Questions only\".",
-        annotations(title = "Get canister status", read_only_hint = true, destructive_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<management::CanisterActionOutput>(),
-    )]
-    async fn icp_canister_status(
-        &self,
-        Parameters(args): Parameters<management::CanisterRefArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let sid = match self.current_session_id(&ctx) {
-            Some(s) => s,
-            None => {
-                return Ok(err("reading canister status needs an authenticated session".into()))
-            }
-        };
-        let canister_id = args.canister_id.clone();
-        Ok(ok_canister_action(
-            canister_id,
-            management::canister_status(&self.identities, &sid, args).await,
-        ))
-    }
-
-    #[tool(
-        description = "Change a canister's settings: controllers, compute and memory allocation, freezing threshold, reserved-cycles limit, Wasm memory limit, or log visibility. Only the fields passed are changed. Passing `controllers` replaces the whole set, so it must include every principal that should keep control.",
-        annotations(title = "Update canister settings", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true),
-        output_schema = schema_for_output::<management::CanisterActionOutput>(),
-    )]
-    async fn icp_update_canister_settings(
-        &self,
-        Parameters(args): Parameters<management::UpdateSettingsArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let sid = match self.current_session_id(&ctx) {
-            Some(s) => s,
-            None => return Ok(err("updating settings needs an authenticated session".into())),
-        };
-        let canister_id = args.canister_id.clone();
-        Ok(ok_canister_action(
-            canister_id,
-            management::update_canister_settings(&self.identities, &sid, args).await,
-        ))
-    }
-
-    #[tool(
-        description = "Start a stopped canister the user controls.",
-        annotations(title = "Start a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
-        output_schema = schema_for_output::<management::CanisterActionOutput>(),
-    )]
-    async fn icp_start_canister(
-        &self,
-        Parameters(management::CanisterRefArgs { canister_id }): Parameters<
-            management::CanisterRefArgs,
-        >,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let sid = match self.current_session_id(&ctx) {
-            Some(s) => s,
-            None => return Ok(err("starting a canister needs an authenticated session".into())),
-        };
-        let result = management::start_canister(&self.identities, &sid, &canister_id).await;
-        Ok(ok_canister_action(canister_id, result))
-    }
-
-    #[tool(
-        description = "Stop a running canister the user controls. A canister must be stopped before it can be deleted.",
-        annotations(title = "Stop a canister", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
-        output_schema = schema_for_output::<management::CanisterActionOutput>(),
-    )]
-    async fn icp_stop_canister(
-        &self,
-        Parameters(management::CanisterRefArgs { canister_id }): Parameters<
-            management::CanisterRefArgs,
-        >,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let sid = match self.current_session_id(&ctx) {
-            Some(s) => s,
-            None => return Ok(err("stopping a canister needs an authenticated session".into())),
-        };
-        let result = management::stop_canister(&self.identities, &sid, &canister_id).await;
-        Ok(ok_canister_action(canister_id, result))
-    }
-
-    #[tool(
-        description = "Remove a canister's code and state, leaving it empty with its id and cycles intact. Use this to clear a canister without deleting it.",
-        annotations(title = "Uninstall code from a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true),
-        output_schema = schema_for_output::<management::CanisterActionOutput>(),
-    )]
-    async fn icp_uninstall_code(
-        &self,
-        Parameters(management::CanisterRefArgs { canister_id }): Parameters<
-            management::CanisterRefArgs,
-        >,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let sid = match self.current_session_id(&ctx) {
-            Some(s) => s,
-            None => return Ok(err("uninstalling code needs an authenticated session".into())),
-        };
-        let result = management::uninstall_code(&self.identities, &sid, &canister_id).await;
-        Ok(ok_canister_action(canister_id, result))
-    }
-
-    #[tool(
-        description = "Delete a canister permanently. It must be stopped first, and any cycles left in it are burned.",
-        annotations(title = "Delete a canister", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
-        output_schema = schema_for_output::<management::CanisterActionOutput>(),
-    )]
-    async fn icp_delete_canister(
-        &self,
-        Parameters(management::CanisterRefArgs { canister_id }): Parameters<
-            management::CanisterRefArgs,
-        >,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let sid = match self.current_session_id(&ctx) {
-            Some(s) => s,
-            None => return Ok(err("deleting a canister needs an authenticated session".into())),
-        };
-        let result = management::delete_canister(&self.identities, &sid, &canister_id).await;
-        Ok(ok_canister_action(canister_id, result))
-    }
-}
-
 /// The rejection for an OQL read (`get_canister_oql_schema`, or `canister_query`'s
 /// `oql` path) attempted with NO derivation origin. OQL reads per-app data gated by
 /// the caller's principal, so an anonymous read is signed as 2vxsx-fae and returns
@@ -2209,10 +1881,8 @@ impl ServerHandler for IcTools {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        // Only the canister/app router is served in this version (the
-        // protocol/meta tools are deferred); a miss produces the router's
-        // standard "tool not found" (invalid-params) error — the same shape
-        // any unknown tool name gets.
+        // A miss produces the router's standard "tool not found"
+        // (invalid-params) error — the same shape any unknown tool name gets.
         let tcc = ToolCallContext::new(&self.canister, request, context);
         IcCanisterTools::tool_router().call(tcc).await
     }
@@ -2366,35 +2036,6 @@ fn data_access_note(
          for now. The flag reports the interface's `schema`/`execute` declaration, not what the \
          canister stores. {how}"
     ))
-}
-
-/// Render an IC dashboard canister identity as readable text for icp_lookup_canister_info_by_id.
-fn format_canister_info(info: &discover::CanisterInfo) -> String {
-    let mut s = format!("Canister {}\n", info.canister_id);
-    s.push_str(&format!(
-        "- name: {}\n",
-        info.name.as_deref().unwrap_or("(unlabelled — not a known/named canister)")
-    ));
-    if let Some(t) = &info.canister_type {
-        s.push_str(&format!("- type: {t}\n"));
-    }
-    if let Some(sub) = &info.subnet_id {
-        s.push_str(&format!("- subnet: {sub}\n"));
-    }
-    if !info.controllers.is_empty() {
-        s.push_str(&format!("- controllers: {}\n", info.controllers.join(", ")));
-    }
-    if let Some(lang) = &info.language {
-        s.push_str(&format!("- language: {lang}\n"));
-    }
-    if let Some(mh) = &info.module_hash {
-        s.push_str(&format!("- module hash: {mh}\n"));
-    }
-    if let Some(p) = info.latest_upgrade_proposal {
-        s.push_str(&format!("- latest upgrade: NNS proposal {p}\n"));
-    }
-    s.push_str("\nFetch its interface with get_canister_candid, then read with canister_query and write with canister_update_call.");
-    s
 }
 
 /// Render the user's accounts at an app (from `Identities::list_accounts`) as
@@ -2600,30 +2241,6 @@ fn ok_structured_blocks<T: serde::Serialize>(texts: Vec<String>, value: &T) -> C
         _ => None,
     };
     result
-}
-
-/// Map a management/lifecycle tool's `Result<String, String>` (the human
-/// confirmation message) to a `CallToolResult`, attaching a
-/// `management::CanisterActionOutput { canister_id, message }` as structured content on
-/// success so the reply conforms to the tool's declared `outputSchema`.
-///
-/// The `canister_id` is normalized to its canonical principal text: the
-/// management layer accepts ids with surrounding whitespace (it parses via
-/// `Principal::from_text(s.trim())`) and renders the canonical form in its
-/// messages, so we canonicalize here too to keep the structured field
-/// consistent with the text. On the success path the id always parses (the
-/// operation just used it); the trimmed input is only a defensive fallback.
-fn ok_canister_action(canister_id: String, r: Result<String, String>) -> CallToolResult {
-    match r {
-        Ok(message) => {
-            let canister_id = Principal::from_text(canister_id.trim())
-                .map(|p| p.to_text())
-                .unwrap_or_else(|_| canister_id.trim().to_string());
-            let output = management::CanisterActionOutput { canister_id, message };
-            ok_structured(output.message.clone(), &output)
-        }
-        Err(text) => err(text),
-    }
 }
 
 fn err(text: String) -> CallToolResult {
@@ -2909,13 +2526,8 @@ mod tests {
     // get_canister_candid as destructive. Assert the read/write classification serializes.
     #[test]
     fn every_tool_has_correct_read_write_annotations() {
-        let served = super::IcTools::all_tools();
-        assert_eq!(served.len(), 10, "expected 10 served tools, got {}", served.len());
-        // The deferred protocol half keeps its annotation contracts too, so
-        // wiring it back in a future version can't regress them.
-        let mut tools = served;
-        tools.extend(super::IcProtocolTools::tool_router().list_all());
-        assert_eq!(tools.len(), 22, "expected 22 tools across both halves, got {}", tools.len());
+        let tools = super::IcTools::all_tools();
+        assert_eq!(tools.len(), 10, "expected 10 served tools, got {}", tools.len());
         assert!(
             tools.iter().all(|t| t.annotations.is_some()),
             "every tool must carry annotations (else clients assume write/destructive)"
@@ -2929,24 +2541,19 @@ mod tests {
                 .clone()
                 .unwrap_or_else(|| panic!("tool {name} has no annotations"))
         };
-        // Pure reads (and status, which reads but is an update call) are read-only,
+        // Pure reads are read-only,
         // AND set destructive_hint=false explicitly so a naive client that doesn't
         // gate destructive on read_only can't mislabel them.
         for name in [
             "get_canister_candid",
             "canister_query",
             "get_canister_oql_schema",
-            "icp_find_canister_by_name",
-            "icp_lookup_canister_info_by_id",
-            "icp_list_skills",
-            "icp_get_skill",
+            "candid_syntax_guide",
             "icp_oql_guide",
             "get_canister_api_doc",
             "open_app",
             "list_app_accounts",
-            "icp_cycles_balance",
             "get_app_principal",
-            "icp_canister_status",
         ] {
             let a = ann(name);
             assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");
@@ -2955,27 +2562,6 @@ mod tests {
                 Some(false),
                 "{name} should set destructive=false explicitly"
             );
-        }
-        // Destructive writes: not read-only, destructive — overwriting/removing
-        // state: delete, uninstall, install (reinstall and upgrade replace the
-        // running module), settings (can hand control away). `destructiveHint` is
-        // what a client gates its confirmation prompt on.
-        for name in [
-            "icp_delete_canister",
-            "icp_uninstall_code",
-            "icp_install_code",
-            "icp_update_canister_settings",
-        ] {
-            let a = ann(name);
-            assert_eq!(a.read_only_hint, Some(false), "{name} should not be read-only");
-            assert_eq!(a.destructive_hint, Some(true), "{name} should be destructive");
-        }
-        // Additive/reversible writes: not read-only, not destructive. These change
-        // run state only, cost nothing, and each is undone by its counterpart.
-        for name in ["icp_start_canister", "icp_stop_canister"] {
-            let a = ann(name);
-            assert_eq!(a.read_only_hint, Some(false), "{name} should not be read-only");
-            assert_eq!(a.destructive_hint, Some(false), "{name} should not be destructive");
         }
         // The update-call tool is conservatively write + destructive.
         let cc = ann("canister_update_call");
@@ -3209,8 +2795,7 @@ mod tests {
     // Regression guard for that boundary.
     #[test]
     fn the_core_router_carries_no_local_login_tools() {
-        let mut tools = super::IcTools::all_tools();
-        tools.extend(super::IcProtocolTools::tool_router().list_all());
+        let tools = super::IcTools::all_tools();
         for name in ["authenticate", "auth_status"] {
             assert!(
                 tools.iter().all(|t| &*t.name != name),
@@ -3219,62 +2804,23 @@ mod tests {
         }
     }
 
-    // The user-facing contract of THIS version: only the canister/app tools
-    // are served; the protocol/meta group is deferred, and the instructions
-    // describe the current surface only (per review: what isn't in this
-    // version isn't mentioned).
+    // The served surface is exactly the app/canister tools. icp_oql_guide is
+    // the one icp_-named tool among them: it is part of the canister OQL read
+    // flow (guide → schema → query). The canister-management and lookup tools
+    // that used to sit beside these are gone, so their names must not route.
     #[test]
-    fn the_default_composition_defers_the_protocol_tools() {
+    fn the_served_surface_is_the_canister_tools() {
         let served = super::IcTools::all_tools();
         assert_eq!(served.len(), 10, "{:?}", served.iter().map(|t| &t.name).collect::<Vec<_>>());
-        // icp_oql_guide is the one icp_-named tool that stays served: it is
-        // part of the canister OQL read flow (guide → schema → query).
         assert!(served.iter().all(|t| !t.name.starts_with("icp_") || &*t.name == "icp_oql_guide"));
         assert!(served.iter().any(|t| &*t.name == "icp_oql_guide"));
-        assert_eq!(super::IcProtocolTools::tool_router().list_all().len(), 12);
-        // tools/call routes through the canister router alone, so a deferred
-        // name is not just unlisted — it is not routable at all.
         assert!(!super::IcCanisterTools::tool_router().has_route("icp_get_skill"));
         assert!(!super::IcCanisterTools::tool_router().has_route("icp_install_code"));
-        assert!(!super::SERVER_INSTRUCTIONS.contains("future version"));
-    }
-
-    // The tool surface is split by scope: the protocol / meta-level tools
-    // live on IcProtocolTools, everything app-/canister-scoped on
-    // IcCanisterTools — no overlap, nothing dropped: every definition lives
-    // on exactly one router, while tools/list serves the canister half alone
-    // in this version. icp_oql_guide is the one icp_-named exception
-    // on the canister side: it serves the OQL dialect the canister read flow
-    // (guide → schema → query) depends on, so it belongs with those tools.
-    #[test]
-    fn the_split_follows_the_icp_prefix_taxonomy() {
-        let canister = super::IcCanisterTools::tool_router().list_all();
-        let protocol = super::IcProtocolTools::tool_router().list_all();
-        for t in &canister {
-            assert!(
-                !t.name.starts_with("icp_") || &*t.name == "icp_oql_guide",
-                "{} is icp_-prefixed and belongs on IcProtocolTools",
-                t.name
-            );
-        }
-        for t in &protocol {
-            assert!(
-                t.name.starts_with("icp_"),
-                "{} is not icp_-prefixed and belongs on IcCanisterTools",
-                t.name
-            );
-        }
-        // In this version the served surface is the canister half alone: the
-        // protocol tools are deferred (we anticipate a future version serves
-        // them again), but stay intact and non-overlapping for the return.
-        let all = super::IcTools::all_tools();
-        assert_eq!(all.len(), canister.len());
-        let mut names: Vec<&str> =
-            canister.iter().map(|t| &*t.name).chain(protocol.iter().map(|t| &*t.name)).collect();
+        let mut names: Vec<&str> = served.iter().map(|t| &*t.name).collect();
         names.sort_unstable();
         let total = names.len();
         names.dedup();
-        assert_eq!(names.len(), total, "tool names must be unique across the split routers");
+        assert_eq!(names.len(), total, "tool names must be unique");
     }
 
     // The model-readable metadata — the server instructions, every served tool
@@ -3345,13 +2891,7 @@ mod tests {
     fn model_readable_metadata_respects_marketplace_policy() {
         let mut surfaces =
             vec![("server instructions".to_string(), super::SERVER_INSTRUCTIONS.to_string())];
-        // Every tool DEFINED here, not just the 11 served: a deferred description
-        // still ships in the crate, and scanning the served set alone is how
-        // `ALWAYS call this FIRST` and a hyphenated `web-search` errand survived
-        // on the protocol half.
-        let mut defined = super::IcTools::all_tools();
-        defined.extend(super::IcProtocolTools::tool_router().list_all());
-        for tool in defined {
+        for tool in super::IcTools::all_tools() {
             surfaces.push((
                 tool.name.to_string(),
                 tool.description.as_deref().unwrap_or_default().to_string(),
@@ -3473,9 +3013,9 @@ mod tests {
             ),
             (
                 // The INSTRUCTION to decode, not the name of an encoding: a tool that
-                // legitimately takes base64 (icp_install_code's `wasm_base64`) says so in
-                // its schema, and banning the bare word would force that parameter to lie
-                // about its own format. The smuggling shapes below stay.
+                // legitimately takes base64 says so in its schema, and banning the bare
+                // word would force that parameter to lie about its own format. The
+                // smuggling shapes below stay.
                 "smuggles an encoded instruction",
                 &["b64decode", "rot13", "decode and", "decode the following"],
             ),
@@ -3565,8 +3105,7 @@ mod tests {
     // whole surface: a new tool added without an output schema fails here.
     #[test]
     fn every_tool_declares_an_object_output_schema() {
-        let mut tools = super::IcTools::all_tools();
-        tools.extend(super::IcProtocolTools::tool_router().list_all());
+        let tools = super::IcTools::all_tools();
         for t in &tools {
             let schema = t
                 .output_schema
@@ -3579,26 +3118,6 @@ mod tests {
                 t.name
             );
         }
-    }
-
-    // Spot-check icp_find_canister_by_name's schema lists the expected properties.
-    #[test]
-    fn find_canister_declares_output_schema() {
-        let tools = super::IcProtocolTools::tool_router().list_all();
-        let tool = tools
-            .iter()
-            .find(|t| &*t.name == "icp_find_canister_by_name")
-            .expect("icp_find_canister_by_name tool not found");
-        let schema = tool
-            .output_schema
-            .as_ref()
-            .expect("icp_find_canister_by_name must declare an output schema");
-        let props = schema
-            .get("properties")
-            .and_then(|v| v.as_object())
-            .expect("outputSchema must have properties");
-        assert!(props.contains_key("query"), "outputSchema should describe `query`");
-        assert!(props.contains_key("matches"), "outputSchema should describe `matches`");
     }
 
     // The object-root guard in ok_structured must drop non-object payloads
@@ -3614,49 +3133,6 @@ mod tests {
 
         let s = super::ok_structured("t".to_string(), &"hello");
         assert!(s.structured_content.is_none(), "a bare string must be dropped");
-    }
-
-    // ok_canister_action normalizes the canister id to its canonical principal
-    // text, so the structured field matches the id the management layer acted
-    // on (it trims/parses the input) rather than echoing raw whitespace.
-    #[test]
-    fn ok_canister_action_canonicalizes_canister_id() {
-        let result = super::ok_canister_action(
-            "  ryjl3-tyaaa-aaaaa-aaaba-cai  ".to_string(),
-            Ok("Started ryjl3-tyaaa-aaaaa-aaaba-cai.".to_string()),
-        );
-        let value = result.structured_content.expect("structured content must be attached");
-        assert_eq!(
-            value.get("canister_id"),
-            Some(&serde_json::json!("ryjl3-tyaaa-aaaaa-aaaba-cai")),
-            "structured canister_id must be the canonical, trimmed principal text"
-        );
-    }
-
-    // A structured icp_find_canister_by_name reply must round-trip through the declared
-    // schema shape: text for humans, plus a machine-readable object with a
-    // `matches` array carrying each match's fields.
-    #[test]
-    fn find_canister_output_serializes_to_declared_shape() {
-        let output = super::discover::FindCanisterOutput {
-            query: "ckUSDC".to_string(),
-            matches: vec![super::discover::FoundCanister {
-                canister_id: "xevnm-gaaaa-aaaar-qafnq-cai".to_string(),
-                name: "ckUSDC".to_string(),
-                kind: "token".to_string(),
-                note: None,
-            }],
-        };
-        let result = super::ok_structured("human text".to_string(), &output);
-        let value = result.structured_content.expect("structured content must be attached");
-        assert_eq!(value.get("query"), Some(&serde_json::json!("ckUSDC")));
-        let matches = value.get("matches").and_then(|v| v.as_array()).expect("matches array");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(
-            matches[0].get("canister_id"),
-            Some(&serde_json::json!("xevnm-gaaaa-aaaar-qafnq-cai"))
-        );
-        assert_eq!(matches[0].get("kind"), Some(&serde_json::json!("token")));
     }
 
     // resolve_identity_target's validation rules are part of the tool contract. It

@@ -17,11 +17,6 @@
 //! canisters are the ones `icp` lists and controls, and the cycles are the
 //! same balance. The CLI can also use a local key (`icp identity new`) or a
 //! link to another account, and those are other principals sharing neither.
-//! This is deliberately NOT the
-//! management identity the canister lifecycle tools act as (the default
-//! account at the server's own origin): a canister a deploy creates is
-//! controlled by the principal here, and reaching it through the lifecycle
-//! tools means adding their principal as a controller first.
 //!
 //! One deploy runs at a time per session: two at once for the same project,
 //! each with the mapping as it was before either, would create two sets of
@@ -1188,11 +1183,7 @@ mod tests {
     }
     fn tools() -> IcDeployTools {
         let agent = crate::Agent::builder().with_url(crate::IC_URL).build().expect("agent");
-        let identities = Identities::new(
-            crate::IiInstance::prod().expect("prod II"),
-            "https://mcp.example".into(),
-            agent,
-        );
+        let identities = Identities::new(crate::IiInstance::prod().expect("prod II"), agent);
         IcDeployTools::new(identities, Arc::new(|_: &_| None))
     }
     fn by_upload(json: serde_json::Value) -> Result<DeployRequest, String> {

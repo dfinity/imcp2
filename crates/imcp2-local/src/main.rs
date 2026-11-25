@@ -32,12 +32,6 @@
 //!   * `II_URL_PROD` / `II_CANISTER_ID_PROD` — override production Internet
 //!     Identity (e.g. to point a test build at beta II or a PocketIC-deployed
 //!     II canister).
-//!   * `IMCP2_MANAGEMENT_ORIGIN` — the derivation origin of the canister-
-//!     management identity (default `https://mcp.internetcomputer.org`, the
-//!     hosted server's origin, so the same anchor gets the SAME controller/
-//!     funder principal locally and hosted — canisters created through one
-//!     stay manageable through the other). Not used by the deploy tools,
-//!     which act at `https://cli.id.ai`.
 //!   * `IMCP2_NO_OPEN` — truthy disables the best-effort browser auto-open on
 //!     sign-in (the link is always returned in-band regardless).
 
@@ -77,7 +71,7 @@ registration invokes). Subcommands:
   --help, -h       This text.
 
 Environment (serving): IMCP2_IC_URL, IMCP2_FETCH_ROOT_KEY (loopback only),
-II_URL_PROD / II_CANISTER_ID_PROD, IMCP2_MANAGEMENT_ORIGIN, IMCP2_NO_OPEN —
+II_URL_PROD / II_CANISTER_ID_PROD, IMCP2_NO_OPEN —
 see the crate documentation for details.
 ";
 
@@ -106,13 +100,6 @@ fn truthy(var: &str) -> bool {
 
 fn ic_url() -> String {
     std::env::var("IMCP2_IC_URL").unwrap_or_else(|_| imcp2_core::IC_URL.to_string())
-}
-
-/// See the crate docs: defaults to the hosted server's origin so management
-/// principals stay continuous across the two deployments.
-fn management_origin() -> String {
-    std::env::var("IMCP2_MANAGEMENT_ORIGIN")
-        .unwrap_or_else(|_| "https://mcp.internetcomputer.org".to_string())
 }
 
 /// Whether `url` targets a loopback host — the only endpoints
@@ -162,7 +149,7 @@ async fn serve() -> anyhow::Result<()> {
 
     let instance = IiInstance::prod().map_err(anyhow::Error::msg)?;
     tracing::info!(ii = %instance.ii_url, "using Internet Identity instance \"{}\"", instance.name);
-    let identities = Identities::new(instance, management_origin(), agent.clone());
+    let identities = Identities::new(instance, agent.clone());
 
     // The same 60-second session reaper the hosted server runs: expired
     // grants, abandoned sign-in keys, and their cached delegations leave
@@ -328,7 +315,6 @@ mod tests {
         let agent = imcp2_core::Agent::builder().with_url("http://127.0.0.1:9").build().unwrap();
         let identities = imcp2_core::identities::Identities::new(
             imcp2_core::IiInstance::prod().expect("prod II"),
-            "https://mcp.internetcomputer.org".into(),
             agent,
         );
         let slots = DeploySlots::new(1);

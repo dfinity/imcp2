@@ -1298,8 +1298,8 @@ way.) Treat any `Unauthorized` from II
 as "session over → reconnect": the server surfaces a reconnect message and does
 not retry.
 
-Set the public base URL (used in the discovery docs, as the MCP origin, and as the
-management identity's derivation origin) with `PUBLIC_URL`. The `/mcp` endpoint is
+Set the public base URL (used in the discovery docs and as the MCP origin) with
+`PUBLIC_URL`. The `/mcp` endpoint is
 **production** Internet Identity: `II_URL_PROD` (browser login, default
 `https://id.ai`) plus `II_CANISTER_ID_PROD` (the canister the `mcp_*` calls target,
 default `rdmx6-jaaaa-aaaaa-aaadq-cai`); both point at the same II.

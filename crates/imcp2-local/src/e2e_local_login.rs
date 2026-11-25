@@ -303,7 +303,6 @@ async fn local_login_end_to_end() {
             ii_url: gateway.to_string().trim_end_matches('/').to_string(),
             ii_canister: ii,
         },
-        "http://localhost:8000".into(), // management-identity origin; any fixed value
         agent,
     );
     let slot = SessionSlot::new();

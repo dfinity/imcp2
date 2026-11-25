@@ -5,7 +5,7 @@ AI tool (Claude Desktop, Claude Code, Codex, Cursor, Antigravity, the
 Perplexity macOS app, …) spawns on your machine and talks to over **stdio**.
 It serves the same tools as the hosted server at
 [mcp.internetcomputer.org](https://mcp.internetcomputer.org) — canister reads
-and writes in textual Candid, app discovery, OQL, canister management —
+and writes in textual Candid, app discovery, OQL —
 against the same **IC mainnet** and the same **production Internet
 Identity**, plus a tool of its own: `icp_deploy`, which deploys an
 icp project bundle (see [Deploying a project bundle](#deploying-a-project-bundle)).
@@ -179,11 +179,8 @@ identity to. When the CLI's selected identity is such a link to the same
 account, `icp` and this tool deploy as the same principal: the canisters are
 the ones `icp` lists and controls, and they are funded from the same cycles
 balance. An `icp` identity that is a local key (`icp identity new`) or a link
-to another account is a different principal, which shares neither. It is
-not the management identity the canister lifecycle tools act as (see
-`IMCP2_MANAGEMENT_ORIGIN`); to reach a deployed canister through those tools,
-add their principal as a controller. The session must have been granted
-"Actions & questions" at sign-in.
+to another account is a different principal, which shares neither. The
+session must have been granted "Actions & questions" at sign-in.
 
 One deploy runs at a time: a second call while one is running is refused
 rather than queued, since the mapping it carries would be stale by the time
@@ -232,7 +229,6 @@ Internet Identity (`https://id.ai`). Environment overrides, mainly for tests:
 | `IMCP2_IC_URL` | IC API endpoint. |
 | `IMCP2_FETCH_ROOT_KEY` | Truthy: trust the endpoint's fetched root key — honoured **only** when `IMCP2_IC_URL` targets loopback (a local replica / PocketIC); startup refuses otherwise. |
 | `II_URL_PROD` / `II_CANISTER_ID_PROD` | Override the Internet Identity instance (e.g. beta II, or an II canister in PocketIC). |
-| `IMCP2_MANAGEMENT_ORIGIN` | Derivation origin of the canister-management identity. Defaults to the hosted server's origin so the same anchor keeps the same controller principal locally and hosted. The deploy tools do not use it; they act at `https://cli.id.ai`. |
 | `IMCP2_NO_OPEN` | Truthy: never auto-open the browser on sign-in (the link is still returned in-band). |
 
 All diagnostics go to stderr (`RUST_LOG` filters them; the default is `info`);

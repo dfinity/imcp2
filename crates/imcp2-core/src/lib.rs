@@ -5,10 +5,7 @@
 //!     (canister reads and writes in textual Candid, app/canister discovery,
 //!     OQL), an [`rmcp`] `ServerHandler` ready to serve over whichever
 //!     transport the binary picks (streamable-HTTP in the hosted `imcp2`
-//!     server, stdio in a local one). The protocol/meta half
-//!     ([`tools::IcProtocolTools`] — dashboard lookups, the IC skills tools,
-//!     canister management) is deferred from the default composition; we
-//!     anticipate it will come in a future version.
+//!     server, stdio in a local one).
 //!   * [`identities`] — the Internet Identity session engine: the per-connection
 //!     session-key grant (registered with II via `mcp_register_v2`) and the
 //!     short-lived per-app account delegations minted from it on demand.
@@ -44,7 +41,6 @@ mod calls;
 mod compliance;
 mod discover;
 mod discoverability;
-mod management;
 
 // End-to-end tests for the canister tools, against real canisters in PocketIC.
 // In-crate (not tests/) so they can use the feature-gated optional `pocket-ic`
@@ -64,11 +60,7 @@ pub use calls::guard_candid_text;
 /// crate links.
 pub use ic_agent::{self, Agent};
 pub use identities::{IiInstance, SessionGauges};
-/// The cycles-ledger balance of a session's management principal: the
-/// `icp_cycles_balance` tool's logic, for an embedder that serves that tool
-/// on its own surface (the local server's deploy tools do).
-pub use management::{cycles_balance, cycles_balance_of, CyclesBalance};
-pub use tools::{IcCanisterTools, IcProtocolTools, IcTools, SessionResolver, DEPLOYS_ELSEWHERE};
+pub use tools::{IcCanisterTools, IcTools, SessionResolver, DEPLOYS_ELSEWHERE};
 
 /// A sensible default IC API boundary node (the public mainnet endpoint) for
 /// callers that just want `Agent::builder().with_url(IC_URL).build()`. A host
